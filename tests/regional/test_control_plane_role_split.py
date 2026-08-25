@@ -530,17 +530,47 @@ def test_ingress_reports_no_processor_worker_threads(monkeypatch) -> None:
     replicas x 24 lanes of capacity that does not exist.
     """
 
-    assert "gpu_fault_processor_workers 0" in _metrics(monkeypatch, "ingress")
+    metrics = _metrics(monkeypatch, "ingress")
+
+    assert "gpu_fault_processor_workers 0" in metrics
+    assert "gpu_fault_processor_active_consumer 0" in metrics
 
 
 def test_consuming_tier_still_reports_its_worker_threads(monkeypatch) -> None:
     """Zeroing the ingress tier must not zero the tier that consumes."""
 
-    assert "gpu_fault_processor_workers 24" in _metrics(monkeypatch, "worker")
+    metrics = _metrics(monkeypatch, "worker")
+
+    assert "gpu_fault_processor_workers 24" in metrics
+    assert "gpu_fault_processor_active_consumer 1" in metrics
 
 
 def test_spool_tier_reports_no_main_processor_threads(monkeypatch) -> None:
     metrics = _metrics(monkeypatch, "spool-worker")
 
     assert "gpu_fault_processor_workers 0" in metrics
+    assert "gpu_fault_processor_active_consumer 0" in metrics
     assert "gpu_fault_telemetry_spool_enabled 1" in metrics
+
+
+def test_ingress_health_reports_inactive_processor(monkeypatch) -> None:
+    monkeypatch.setenv("GPU_FAULT_SERVICE_ROLE", "ingress")
+    monkeypatch.setenv("GPU_FAULT_PROCESSOR_MODE", "active-active")
+    monkeypatch.setenv("POD_UID", "pod-role-split-ingress-health")
+    app = create_app(
+        ApplicationContext(
+            store=build_store(),
+            execution_token="control-plane-role-split-token-" + "x" * 32,
+        )
+    )
+
+    async def run() -> dict:
+        async with asgi_client(app) as client:
+            response = await client.get("/healthz")
+            assert response.status_code == 200
+            return response.json()
+
+    health = asyncio.run(run())
+
+    assert health["service_role"] == "ingress"
+    assert health["processor_role"] == "inactive"

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from gpu_fault.app.authorization import authorization_bucket
-
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -9,6 +7,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
 from gpu_fault import __version__, module_digest
+from gpu_fault.app.authorization import authorization_bucket
 from gpu_fault.operation_registry import OPERATION_REGISTRY
 
 
@@ -51,7 +50,9 @@ async def healthz(
         "agent_registry": ("enabled" if ctx.fleet_registry is not None else "disabled"),
         "processor_mode": dependencies.processor_mode,
         "processor_role": (
-            "spool-consumer"
+            "inactive"
+            if dependencies.service_role == "ingress"
+            else "spool-consumer"
             if dependencies.service_role == "spool-worker"
             else "active-consumer"
             if processor is not None and processor.active_consumers

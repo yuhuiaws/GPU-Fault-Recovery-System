@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from gpu_fault.app.authorization import authorization_bucket
-
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
+from gpu_fault.app.authorization import authorization_bucket
 from gpu_fault.app.builtin_metric_contributors import (
     orchestration_metric_lines,
     policy_metric_lines,
     remote_command_metric_lines,
+)
+from gpu_fault.app.metric_contributors import (
+    MetricContributorRegistry,
 )
 from gpu_fault.app.metrics_sections import (
     render_admission_metrics,
@@ -23,9 +25,6 @@ from gpu_fault.app.metrics_sections import (
     render_runtime_metrics_two,
     render_spool_metrics_one,
     render_spool_metrics_two,
-)
-from gpu_fault.app.metric_contributors import (
-    MetricContributorRegistry,
 )
 from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.async_store import StoreIoCapacityExceeded
@@ -160,6 +159,8 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
             "unhealthy_since": None,
         }
     )
+    services_active = background_services_enabled
+    runtime["active_consumer"] = int(services_active and runtime["active_consumer"])
     claim = runtime.get("claim") or {}
     # Threads that exist, not env that was set. The pools are created
     # by run_processor, which does not start when background services
@@ -167,9 +168,7 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
     # there is inert. Reporting it anyway made a sum over replicas
     # overstate the fleet's consumer capacity by the whole ingress
     # tier.
-    processor_worker_threads = (
-        runtime["worker_count"] if background_services_enabled else 0
-    )
+    processor_worker_threads = runtime["worker_count"] if services_active else 0
     render_processor_metrics_1(
         lines,
         runtime,

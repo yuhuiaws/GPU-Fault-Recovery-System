@@ -69,6 +69,18 @@ def test_regional_region_is_operator_selected_and_fail_closed() -> None:
     assert release_template["cpu_eks_arn"] == "REPLACE_WITH_CPU_EKS_ARN"
 
 
+def test_manual_forbids_multiple_global_load_balancer_controllers() -> None:
+    text = manual()
+    section = text.split("#### CPU-3. 安装 AWS Load Balancer Controller", 1)[1].split(
+        "#### CPU-4.", 1
+    )[0]
+
+    assert "managed_by=EKS" in section
+    assert "必须复用它" in section
+    assert "不得在同一集群运行两个" in section
+    assert "平台管理的 CRD" in section
+
+
 def test_manual_uses_current_regional_rollout_contracts() -> None:
     text = manual()
 
