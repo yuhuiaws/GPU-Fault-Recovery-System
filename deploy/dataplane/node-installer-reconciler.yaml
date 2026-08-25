@@ -84,6 +84,8 @@ spec:
               value: gpu-fault-system
             - name: GPU_FAULT_CLUSTER_ID
               value: REPLACE_WITH_CLUSTER_ID
+            - name: GPU_FAULT_HYPERPOD_CLUSTER
+              value: REPLACE_WITH_HYPERPOD_CLUSTER
             - name: GPU_FAULT_INSTALLER_VERSION
               value: REPLACE_WITH_INSTALLER_VERSION
             - name: GPU_FAULT_INSTALLER_CONFIG_DIGEST

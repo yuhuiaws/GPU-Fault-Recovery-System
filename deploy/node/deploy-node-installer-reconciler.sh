@@ -6,6 +6,7 @@ REPO_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 KUBECTL_CONTEXT="${GPU_FAULT_KUBECTL_CONTEXT:-}"
 NAMESPACE="${GPU_FAULT_NAMESPACE:-gpu-fault-system}"
 CLUSTER_ID="${GPU_FAULT_CLUSTER_ID:-}"
+HYPERPOD_CLUSTER="${GPU_FAULT_HYPERPOD_CLUSTER:-${CLUSTER_ID}}"
 VERSION="${GPU_FAULT_VERSION:-0.10.0}"
 CONFIG_DIGEST="${GPU_FAULT_INSTALLER_CONFIG_DIGEST:-}"
 ARTIFACT_SHA256="${GPU_FAULT_INSTALLER_ARTIFACT_SHA256:-}"
@@ -29,7 +30,7 @@ for command in kubectl sed; do
         exit 1
     }
 done
-for value in KUBECTL_CONTEXT CLUSTER_ID CONFIG_DIGEST ARTIFACT_SHA256 WHEEL_CONFIG_MAP; do
+for value in KUBECTL_CONTEXT CLUSTER_ID HYPERPOD_CLUSTER CONFIG_DIGEST ARTIFACT_SHA256 WHEEL_CONFIG_MAP; do
     [[ -n "${!value}" ]] || {
         printf 'ERROR: %s is required\n' "${value}" >&2
         exit 2
@@ -63,6 +64,7 @@ if [[ -n "${FLEET_MASTER_FILE}" ]]; then
     GPU_FAULT_KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
     GPU_FAULT_NAMESPACE="${NAMESPACE}" \
     GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
+    GPU_FAULT_HYPERPOD_CLUSTER="${HYPERPOD_CLUSTER}" \
     GPU_FAULT_FLEET_MASTER_FILE="${FLEET_MASTER_FILE}" \
     GPU_FAULT_NODE_ACTION_KEYS_SECRET="${NODE_ACTION_KEYS_SECRET}" \
         "${SCRIPT_DIR}/provision-node-action-keys.sh"
@@ -77,11 +79,12 @@ fi
 
 NODE="$(
     kubectl_context get nodes \
-        -l "sagemaker.amazonaws.com/cluster-name=${CLUSTER_ID}" \
+        -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER}" \
         -o jsonpath='{.items[0].metadata.name}'
 )"
 [[ -n "${NODE}" ]] || {
-    printf 'ERROR: no Ready HyperPod node found for %s\n' "${CLUSTER_ID}" >&2
+    printf 'ERROR: no Ready HyperPod node found for %s\n' \
+        "${HYPERPOD_CLUSTER}" >&2
     exit 1
 }
 MANIFEST="$(mktemp)"
@@ -111,6 +114,7 @@ kubectl_context -n "${NAMESPACE}" create configmap \
 
 sed \
     -e "s#REPLACE_WITH_CLUSTER_ID#${CLUSTER_ID}#g" \
+    -e "s#REPLACE_WITH_HYPERPOD_CLUSTER#${HYPERPOD_CLUSTER}#g" \
     -e "s#REPLACE_WITH_INSTALLER_VERSION#${VERSION}#g" \
     -e "s#REPLACE_WITH_INSTALLER_CONFIG_DIGEST#${CONFIG_DIGEST}#g" \
     -e "s#REPLACE_WITH_INSTALLER_ARTIFACT_SHA256#${ARTIFACT_SHA256}#g" \

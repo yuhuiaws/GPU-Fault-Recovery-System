@@ -257,7 +257,6 @@ class RegionalRelease:
         self.state.update(
             {
                 "phase": phase,
-                "aws_region": self.config.aws_region,
                 "release_id": self.wheel_sha[:12],
                 "wheel_sha256": self.wheel_sha,
                 "bundle_sha256": self.bundle_sha,
@@ -702,6 +701,7 @@ class RegionalRelease:
             "GPU_FAULT_KUBECTL_CONTEXT": target.context,
             "GPU_FAULT_NAMESPACE": self.config.namespace,
             "GPU_FAULT_CLUSTER_ID": target.cluster_id,
+            "GPU_FAULT_HYPERPOD_CLUSTER": target.hyperpod_cluster_name,
             "GPU_FAULT_INSTALLER_CONFIG_MAP": bundle_cm,
             "GPU_FAULT_INSTALLER_CONFIG_DIGEST": config_digest,
             "GPU_FAULT_INSTALLER_ARTIFACT_SHA256": artifact_sha,

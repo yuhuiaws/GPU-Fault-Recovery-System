@@ -629,6 +629,7 @@ def test_boot011_documents_all_required_executor_inputs() -> None:
     assert "EXECUTOR_IRSA_ROLE_ARN" in section
     assert "REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN" in section
     assert "provision-node-action-keys.sh" in section
+    assert "GPU_FAULT_HYPERPOD_CLUSTER" in section
     assert "--from-file=node-action-secret=" not in section
 
 

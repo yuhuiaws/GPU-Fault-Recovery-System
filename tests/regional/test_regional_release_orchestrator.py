@@ -53,7 +53,7 @@ def config_file(tmp_path: Path, *, clusters=None) -> Path:
                 "context": "gpu-a-context",
                 "executor_irsa_role_arn": "arn:aws:iam::1:role/a",
                 "region": REGION,
-                "hyperpod_cluster_name": "gpu-a",
+                "hyperpod_cluster_name": "hp-gpu-a",
                 "eks_cluster_arn": GPU_EKS_ARN,
             }
         ],
@@ -94,7 +94,7 @@ def manifest_config_file(tmp_path: Path) -> Path:
                         "context": "gpu-a-context",
                         "executor_irsa_role_arn": ("arn:aws:iam::1:role/a"),
                         "region": REGION,
-                        "hyperpod_cluster_name": "gpu-a",
+                        "hyperpod_cluster_name": "hp-gpu-a",
                         "eks_cluster_arn": GPU_EKS_ARN,
                     }
                 ],
@@ -110,7 +110,7 @@ def test_release_config_requires_unique_clusters(tmp_path) -> None:
         "context": "gpu-a-context",
         "executor_irsa_role_arn": "arn:aws:iam::1:role/a",
         "region": REGION,
-        "hyperpod_cluster_name": "gpu-a",
+        "hyperpod_cluster_name": "hp-gpu-a",
         "eks_cluster_arn": GPU_EKS_ARN,
     }
 
@@ -214,11 +214,11 @@ class PreflightRunner:
             return json.dumps(
                 {
                     "EksClusterArn": (
-                        GPU_EKS_ARN if cluster_name == "gpu-a" else CPU_EKS_ARN
+                        GPU_EKS_ARN if cluster_name == "hp-gpu-a" else CPU_EKS_ARN
                     ),
                     "NodeRecovery": (
                         self.gpu_node_recovery
-                        if cluster_name == "gpu-a"
+                        if cluster_name == "hp-gpu-a"
                         else "Automatic"
                     ),
                 }
@@ -411,6 +411,8 @@ def test_release_renders_one_runtime_image_across_gpu_roles(
         config_digest=config.agent_config_digest,
     )
     assert runner.calls[-1][1]["env"]["GPU_FAULT_RUNTIME_IMAGE"] == runtime_image
+    assert runner.calls[-1][1]["env"]["GPU_FAULT_CLUSTER_ID"] == "gpu-a"
+    assert runner.calls[-1][1]["env"]["GPU_FAULT_HYPERPOD_CLUSTER"] == "hp-gpu-a"
 
 
 def test_release_rejects_invalid_runtime_image(tmp_path, monkeypatch) -> None:

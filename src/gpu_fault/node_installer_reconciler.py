@@ -327,7 +327,7 @@ def main() -> None:
         core,
         batch,
         namespace=namespace,
-        cluster_name=_required_env("GPU_FAULT_CLUSTER_ID"),
+        cluster_name=_required_env("GPU_FAULT_HYPERPOD_CLUSTER"),
         version=_required_env("GPU_FAULT_INSTALLER_VERSION"),
         config_digest=_required_env("GPU_FAULT_INSTALLER_CONFIG_DIGEST"),
         artifact_sha256=_required_env("GPU_FAULT_INSTALLER_ARTIFACT_SHA256"),

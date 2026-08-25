@@ -63,7 +63,7 @@ class CoreApi:
         self.patches = []
 
     def list_node(self, *, label_selector):
-        assert label_selector == "sagemaker.amazonaws.com/cluster-name=cluster-a"
+        assert label_selector == "sagemaker.amazonaws.com/cluster-name=hp-cluster-a"
         return SimpleNamespace(items=self.nodes)
 
     def patch_node(self, name, body):
@@ -136,7 +136,7 @@ def reconciler(core, batch):
         core,
         batch,
         namespace="gpu-fault-system",
-        cluster_name="cluster-a",
+        cluster_name="hp-cluster-a",
         version="0.10.0",
         config_digest="config-sha",
         artifact_sha256=ARTIFACT,

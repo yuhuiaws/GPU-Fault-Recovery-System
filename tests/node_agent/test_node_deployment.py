@@ -98,8 +98,13 @@ def test_regional_node_keys_are_derived_before_the_job() -> None:
 
     assert "derive_node_action_secret" in provision
     assert "GPU_FAULT_FLEET_MASTER_FILE" in provision
+    assert "GPU_FAULT_HYPERPOD_CLUSTER" in provision
+    assert "cluster-name=${HYPERPOD_CLUSTER}" in provision
+    assert '"${MASTER_FILE}" "${CLUSTER_ID}" "${node}"' in provision
     assert '--from-file="${key_dir}"' in provision
     assert "GPU_FAULT_FLEET_MASTER_FILE" in reconciler
+    assert "GPU_FAULT_HYPERPOD_CLUSTER" in reconciler
+    assert "cluster-name=${HYPERPOD_CLUSTER}" in reconciler
     assert "provision-node-action-keys.sh" in reconciler
     assert "GPU_FAULT_INSTALLER_ARTIFACT_SHA256" in installer
     assert "GPU_FAULT_INSTALLER_ARTIFACT_SHA256" in reconciler
@@ -109,6 +114,7 @@ def test_regional_node_keys_are_derived_before_the_job() -> None:
     manifest = (ROOT / "deploy/dataplane/node-installer-reconciler.yaml").read_text()
     assert "GPU_FAULT_INSTALLER_TEMPLATE_PATH" in manifest
     assert "REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP" in manifest
+    assert "REPLACE_WITH_HYPERPOD_CLUSTER" in manifest
     assert 'NODE_ACTION_SECRET_NAME="${NODE_ACTION_KEYS_SECRET}"' in installer
     assert 'NODE_ACTION_SECRET_KEY="${NODE_NAME}"' in installer
     assert 'DERIVE_NODE_ACTION_SECRET="false"' in installer

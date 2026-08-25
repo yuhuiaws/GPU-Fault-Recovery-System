@@ -6,6 +6,7 @@ REPO_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 KUBECTL_CONTEXT="${GPU_FAULT_KUBECTL_CONTEXT:-}"
 NAMESPACE="${GPU_FAULT_NAMESPACE:-gpu-fault-system}"
 CLUSTER_ID="${GPU_FAULT_CLUSTER_ID:-}"
+HYPERPOD_CLUSTER="${GPU_FAULT_HYPERPOD_CLUSTER:-${CLUSTER_ID}}"
 MASTER_FILE="${GPU_FAULT_FLEET_MASTER_FILE:-}"
 SECRET_NAME="$(
     printf '%s' \
@@ -26,6 +27,10 @@ done
     printf 'ERROR: GPU_FAULT_CLUSTER_ID is required\n' >&2
     exit 2
 }
+[[ -n "${HYPERPOD_CLUSTER}" ]] || {
+    printf 'ERROR: GPU_FAULT_HYPERPOD_CLUSTER is required\n' >&2
+    exit 2
+}
 [[ -f "${MASTER_FILE}" ]] || {
     printf 'ERROR: GPU_FAULT_FLEET_MASTER_FILE is required\n' >&2
     exit 2
@@ -41,12 +46,13 @@ kubectl_context() {
 
 mapfile -t nodes < <(
     kubectl_context get nodes \
-        -l "sagemaker.amazonaws.com/cluster-name=${CLUSTER_ID}" \
+        -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER}" \
         -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' |
         sort
 )
 ((${#nodes[@]} > 0)) || {
-    printf 'ERROR: no nodes found for %s\n' "${CLUSTER_ID}" >&2
+    printf 'ERROR: no nodes found for HyperPod cluster %s\n' \
+        "${HYPERPOD_CLUSTER}" >&2
     exit 1
 }
 
