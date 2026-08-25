@@ -1,0 +1,172 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: gpu-fault-processor-capacity
+  namespace: gpu-fault-system
+spec:
+  groups:
+    - name: gpu-fault-processor-capacity
+      rules:
+        - alert: GpuFaultProcessorQueueDepthHigh
+          expr: max(gpu_fault_processor_queue_depth) > 7000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Regional GPU fault processor queue exceeds 70 percent
+        - alert: GpuFaultProcessorQueueDepthCritical
+          expr: max(gpu_fault_processor_queue_depth) > 9000
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: Regional GPU fault processor queue exceeds 90 percent
+        - alert: GpuFaultProcessorOldestRequestDelayed
+          expr: max(gpu_fault_processor_queue_oldest_age_seconds) > 30
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Oldest GPU fault processor request is delayed
+        - alert: GpuFaultProcessorClusterBacklogHigh
+          expr: max by (cluster_id) (gpu_fault_processor_cluster_queue_depth) > 700
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: A GPU cluster processor backlog exceeds 70 percent
+        - alert: GpuFaultProcessorAdmissionRejected
+          expr: sum(rate(gpu_fault_processor_admission_rejections_total[5m])) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: GPU fault processor rejected requests due to capacity
+        - alert: GpuFaultStoreIoSaturated
+          expr: max(gpu_fault_store_io_in_flight / gpu_fault_store_io_max_in_flight) > 0.9
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: GPU fault control-plane Store I/O capacity exceeds 90 percent
+        - alert: GpuFaultStoreIoRejected
+          expr: sum(rate(gpu_fault_store_io_rejections_total[5m])) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: GPU fault control-plane rejected Store I/O work
+        - alert: GpuFaultCollectorSilent
+          expr: max by (cluster_id, node_id, collector, channel) (gpu_fault_collector_silent_nodes) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: A required GPU fault collector is missing or stale
+            description: >-
+              Check the node systemd service, TLS trust, regional token,
+              outbox file and the collector's last successful batch.
+        - alert: GpuFaultCollectorMetricsSnapshotStale
+          expr: absent(gpu_fault_collector_metrics_snapshot_age_seconds) or min(gpu_fault_collector_metrics_snapshot_age_seconds) > 120
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: GPU fault collector metrics snapshots are stale
+            description: >-
+              Ensure the metrics scraper targets ingress replicas and
+              check ingress connectivity to the shared store.
+        - alert: GpuFaultProcessorP95Slow
+          expr: histogram_quantile(0.95, sum by (le) (rate(gpu_fault_processor_request_processing_seconds_bucket[5m]))) > 5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: GPU fault processor p95 request duration exceeds 5 seconds
+        - alert: GpuFaultTelemetrySpoolListenerDown
+          expr: min(gpu_fault_telemetry_spool_notifications_enabled{pod=~"gpu-fault-telemetry-spool-worker-.*"}) == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: Telemetry spool consumer fell back to polling
+        - alert: GpuFaultTelemetrySpoolDataLoss
+          expr: increase(gpu_fault_telemetry_spool_dropped_total[5m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: Telemetry spool dropped routine samples
+        - alert: GpuFaultTelemetrySpoolAdmissionRejected
+          expr: sum(increase(gpu_fault_telemetry_spool_rejected_total[5m])) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: Telemetry spool rejected routine samples
+        - alert: GpuFaultTelemetrySpoolReplayError
+          expr: increase(gpu_fault_telemetry_spool_errors_total[5m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: Telemetry spool replay failed
+        - alert: GpuFaultTelemetrySpoolDrainDelayed
+          expr: max(gpu_fault_telemetry_spool_oldest_age_seconds) > 60
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Telemetry spool has not drained within 60 seconds
+    - name: gpu-fault-remote-command
+      rules:
+        # A PENDING remote command whose execution_owner no adapter in the
+        # target GPU cluster advertises is never claimed. There is no
+        # unclaimed timeout and no dead-letter state, so without this alert
+        # recovery silently never happens. 600s is five times the default
+        # GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS of 120.
+        - alert: GpuFaultRemoteCommandUnclaimed
+          expr: max by (cluster_id) (gpu_fault_remote_command_oldest_unclaimed_seconds) > 600
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: A GPU cluster remote command was never claimed by an executor
+            description: >-
+              Check that the runtime profile owner for the stuck step is
+              advertised by an adapter the target cluster executor actually
+              constructed, and that the executor can reach the control plane
+              over TLS.
+        # An executor that is Ready but cannot claim (bad token, missing
+        # private CA trust) produces no commands at all, which this catches
+        # only when work exists. Pair it with the executor-side
+        # last_successful_claim_at liveness marker.
+        - alert: GpuFaultRemoteCommandExecutorInternalError
+          expr: increase(gpu_fault_remote_command_executor_internal_errors_total[15m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: A cluster executor failed a command through an internal defect
+            description: >-
+              The failure is an executor bug, not a refused recovery action.
+              Read the executor Pod log stack trace before retrying.
+    - name: gpu-fault-policy-coverage
+      rules:
+        - alert: GpuFaultUnknownProductFamily
+          expr: sum by (product) (increase(gpu_fault_policy_unknown_product_total[15m])) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: A GPU product is not mapped to an NVIDIA Catalog family
+            description: >-
+              Add the product prefix to spec.catalog.productFamilies in the
+              pinned XID catalog before enabling automated XID recovery.
+    - name: gpu-fault-orchestration-invariants
+      rules:
+        - alert: GpuFaultExclusiveNodeOwnershipInvariantViolation
+          expr: increase(gpu_fault_ambiguous_attempt_ownership_total[15m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: Multiple active attempts claim the same GPU node
+            description: >-
+              Recovery failed closed because workload ownership was
+              ambiguous. Remove the overlapping assignment or stale
+              observation before retrying node mutation.

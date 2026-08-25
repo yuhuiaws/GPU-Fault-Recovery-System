@@ -1,0 +1,43 @@
+"""Stable pytest nodeids for split test_misc.py cases."""
+
+# ruff: noqa: F401
+from ._misc_cases_1 import (
+    test_active_job_recovery_is_scoped_to_the_exact_attempt,
+    test_active_workload_dcgm_execution_review_does_not_drain,
+    test_aggregation_window_scales_with_attempt_size,
+    test_critical_host_quarantine_joins_running_attempt_recovery,
+    test_direct_official_action_creates_owned_proactive_workflow,
+    test_failed_gpu_validation_escalates_to_idempotent_reboot,
+    test_finished_node_workflow_does_not_absorb_a_later_fault,
+    test_gpu_memory_signal_uses_official_drain_and_reset_boundaries,
+    test_gpu_warning_runs_dcgm_diagnostic_and_failure_drains,
+    test_hung_triage_node_cap_can_be_disabled,
+    test_hung_triage_node_cap_rejects_negative_values,
+    test_hyperpod_restart_vm_uses_node_reboot_not_stop_start,
+    test_idle_host_quarantine_joins_active_node_reset,
+    test_idle_node_equal_rank_widens_unsubmitted_reset,
+    test_multi_node_validation_failure_reboots_all_failed_nodes_once,
+    test_non_hyperpod_restart_vm_keeps_distinct_operation,
+    test_restart_parameters_prioritize_exact_logical_job_id,
+    test_running_gpu_recovery_accepts_same_node_rdma_diagnostics,
+    test_wide_attempt_hung_triage_samples_representative_nodes,
+    test_workload_only_actions_stay_separate_per_gpu,
+)
+from ._misc_cases_2 import (
+    test_approved_adapter_resolves_official_workflow,
+    test_event_ingestion_is_idempotent,
+    test_failed_firmware_remediation_escalates_directly_to_support,
+    test_failed_validation_delegates_reboot_to_managed_hyperpod,
+    test_fencing_and_idempotent_execution,
+    test_ignore_event_has_incident_without_workflow,
+    test_missing_workflow_adapter_runs_only_safety_steps,
+    test_passive_recovery_waits_for_proactive_incident,
+    test_policy_pre_actions_are_compiled_into_the_workflow,
+    test_pre_actions_do_not_stop_workloads_on_an_idle_node,
+    test_remediation_failure_chain_ends_in_hardware_offline_support,
+    test_reset_failure_is_not_misclassified_by_earlier_dcgm_step,
+    test_reset_operation_failure_escalates_to_reboot,
+    test_restart_app_requires_workload_identity,
+    test_unknown_workload_state_blocks_destructive_action,
+    test_update_swfw_compiles_quiesced_version_pinned_workflow,
+)

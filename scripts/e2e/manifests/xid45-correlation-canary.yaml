@@ -1,0 +1,117 @@
+# Render REPLACE_WITH_WHEEL_CONFIGMAP with scripts/e2e/render_manifest.py.
+# Do not apply this source manifest directly.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-xid45-canary
+  namespace: gpu-fault-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gpu-fault-xid45-canary
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-xid45-canary
+      annotations:
+        gpu-fault.io/artifact-sha256: 8c5f1cfa2d1c879a404d9412660e6038cb7571db037a7a761e3c1f4776134482
+    spec:
+      serviceAccountName: gpu-fault-control-plane
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: gpu-fault-xid45-canary
+      containers:
+        - name: api
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors,postgres]'
+              && exec uvicorn gpu_fault.app:create_app --factory
+              --host 0.0.0.0 --port 8080 --no-proxy-headers
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: GPU_FAULT_EXECUTOR_MODE
+              value: active
+            - name: GPU_FAULT_STORE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-aurora
+                  key: postgres-url
+            - name: GPU_FAULT_EXECUTION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-control-plane-active
+                  key: execution-token
+            - name: GPU_FAULT_ALLOWED_OPERATIONS
+              value: FREEZE_EVIDENCE
+            - name: GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER
+              value: "false"
+            - name: GPU_FAULT_XID_CORRELATION_POLL_SECONDS
+              value: "1"
+            - name: GPU_FAULT_XID_CORRELATION_LEASE_SECONDS
+              value: "30"
+            - name: GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR
+              value: "false"
+            - name: GPU_FAULT_ENABLE_KUBERNETES_ADAPTER
+              value: "false"
+            - name: GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER
+              value: "false"
+            - name: GPU_FAULT_ENABLE_AGENT_REGISTRY
+              value: "false"
+            - name: GPU_FAULT_ENABLE_HYPERPOD_ADAPTER
+              value: "false"
+            - name: GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER
+              value: "false"
+            - name: GPU_FAULT_ALLOW_EMAIL
+              value: "false"
+            # This canary runs with the active executor enabled, which
+            # now refuses to start without an external alert channel. It
+            # has every adapter disabled and exists only to exercise XID
+            # correlation, so nothing here can page anyone by design.
+            - name: GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+      volumes:
+        - name: artifact
+          configMap:
+            name: REPLACE_WITH_WHEEL_CONFIGMAP

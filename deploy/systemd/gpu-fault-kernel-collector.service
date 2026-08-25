@@ -1,0 +1,33 @@
+[Unit]
+Description=GPU fault kernel XID/SXID collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gpu-fault/collector.env
+ExecStart=/opt/gpu-fault/venv/bin/gpu-fault-collector kernel
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/dev/kmsg /proc/sys/kernel/random/boot_id
+# ProtectSystem=strict makes /var read-only, and the collector CLI
+# defaults GPU_FAULT_COLLECTOR_OUTBOX_PATH to
+# /var/lib/gpu-fault/outbox/kernel.ndjson. Without this the outbox write
+# fails with EROFS and every XID/SXID that could not be delivered is
+# dropped -- which is exactly the case the outbox exists for.
+StateDirectory=gpu-fault
+# Resource control
+CPUWeight=20
+CPUQuota=50%
+MemoryHigh=192M
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=128
+IOWeight=20
+
+[Install]
+WantedBy=multi-user.target

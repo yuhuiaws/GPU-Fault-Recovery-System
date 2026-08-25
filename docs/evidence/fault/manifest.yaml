@@ -1,0 +1,7 @@
+schema_version: 1
+curated_at: "2026-08-24"
+provenance: public-redacted
+provenance_note: >-
+  Raw execution reports are retained in a private evidence store. The public
+  source tree intentionally contains no environment-specific fault reports.
+reports: []

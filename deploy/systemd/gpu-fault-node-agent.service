@@ -1,0 +1,28 @@
+[Unit]
+Description=GPU fault signed node action agent
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gpu-fault/node-agent.env
+ExecStart=/opt/gpu-fault/venv/bin/gpu-fault-node-agent
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gpu-fault
+# Resource control: keep the agent from ever competing with the
+# training job for memory or CPU on a 192 vCPU / 2 TiB node.
+CPUWeight=20
+CPUQuota=200%
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=0
+TasksMax=512
+IOWeight=20
+
+[Install]
+WantedBy=multi-user.target

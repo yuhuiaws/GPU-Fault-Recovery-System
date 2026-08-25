@@ -1,0 +1,129 @@
+schema_version: 1
+source_document: docs/区域模式端到端验收测试用例.md
+ordering_rule: >-
+  phases 按 sequence 升序执行；phase 内按 entries 顺序展开。
+  range 按 start 到 end 递增。文档物理位置和 case ID 数字均不表示
+  执行顺序。
+phases:
+  - sequence: 0
+    name: 可部署性
+    maintenance_window: 否
+    entries:
+      - range: {prefix: BOOT, start: 11, end: 18}
+  - sequence: 1
+    name: 启动配置守卫
+    maintenance_window: 否
+    entries:
+      - range: {prefix: BOOT, start: 1, end: 10}
+  - sequence: 2
+    name: 身份边界
+    maintenance_window: 否
+    entries:
+      - range: {prefix: AUTH, start: 1, end: 15}
+  - sequence: 3
+    name: 单集群状态隔离
+    maintenance_window: 否
+    entries:
+      - range: {prefix: ISO, start: 1, end: 5}
+  - sequence: 4
+    name: Remote command 协议
+    maintenance_window: 否
+    entries:
+      - range: {prefix: CMD, start: 1, end: 16}
+  - sequence: 5
+    name: Workflow 抢占与 DAG
+    maintenance_window: 分级
+    entries:
+      - range: {prefix: PREEMPT, start: 1, end: 31}
+  - sequence: 6
+    name: 爆炸半径
+    maintenance_window: 否
+    entries:
+      - range: {prefix: BLAST, start: 1, end: 4}
+  - sequence: 7
+    name: 单集群闭环
+    maintenance_window: 否
+    entries:
+      - case: GF-REGIONAL-E2E-001
+  - sequence: 8
+    name: 通知
+    maintenance_window: 否
+    entries:
+      - range: {prefix: NOTIFY, start: 1, end: 6}
+  - sequence: 9
+    name: 容量
+    maintenance_window: 否
+    entries:
+      - range: {prefix: CAP, start: 1, end: 5}
+  - sequence: 10
+    name: 网络中断与补交
+    maintenance_window: 建议
+    entries:
+      - range: {prefix: NET, start: 1, end: 4}
+  - sequence: 11
+    name: 非破坏性 HA
+    maintenance_window: 建议
+    entries:
+      - case: GF-REGIONAL-HA-001
+      - case: GF-REGIONAL-HA-002
+      - range: {prefix: HA, start: 5, end: 8}
+  - sequence: 12
+    name: 训练工作负载基线
+    maintenance_window: 是
+    entries:
+      - range: {prefix: WORKLOAD, start: 1, end: 2}
+  - sequence: 13
+    name: 破坏性动作（非 warm spare）
+    maintenance_window: 是
+    entries:
+      - case: GF-REGIONAL-DESTR-011
+      - range: {prefix: DESTR, start: 5, end: 7}
+      - case: GF-REGIONAL-DESTR-010
+      - case: GF-REGIONAL-DESTR-001
+      - case: GF-REGIONAL-DESTR-002
+      - case: GF-REGIONAL-DESTR-009
+      - case: GF-REGIONAL-DESTR-012
+    notes:
+      - DESTR-011 必须先证明 provider replace 开关关闭。
+      - DESTR-009 必须先于 DESTR-012。
+      - DESTR-012 子用例严格按 B、A、D、C 执行。
+  - sequence: 14
+    name: Warm spare
+    maintenance_window: 是
+    entries:
+      - case: GF-REGIONAL-DESTR-003
+      - case: GF-REGIONAL-DESTR-008
+  - sequence: 15
+    name: 故障转移与约束否证
+    maintenance_window: 分级
+    entries:
+      - range: {prefix: HA, start: 3, end: 4}
+      - case: GF-REGIONAL-DESTR-013
+    notes:
+      - DESTR-013 必须最后执行，以覆盖前序维护窗口的 CloudTrail。
+  - sequence: 16
+    name: 多物理集群
+    maintenance_window: 否
+    prerequisite: 至少两个 enabled 的物理 GPU 集群
+    entries:
+      - case: GF-REGIONAL-ISO-006
+      - case: GF-REGIONAL-E2E-002
+  - sequence: 17
+    name: 采集与判定覆盖
+    maintenance_window: 分级
+    entries:
+      - range: {prefix: COLLECT, start: 1, end: 7}
+      - range: {prefix: COLLECT, start: 9, end: 12}
+      - case: GF-REGIONAL-COLLECT-008
+      - case: GF-REGIONAL-COLLECT-013
+      - case: GF-REGIONAL-COLLECT-014
+      - case: GF-REGIONAL-COLLECT-016
+      - case: GF-REGIONAL-COLLECT-017
+      - case: GF-REGIONAL-COLLECT-015
+    notes:
+      - COLLECT-004 的expected-count替代路径会触发真实HyperPod reboot，必须在维护窗口执行。
+      - 后六条包含 reset、EFA mutation、workload restart 或 reboot，
+        必须在维护窗口执行。
+do_not_run:
+  - case: GF-REGIONAL-DESTR-004
+    reason: provider replace 已由架构与 IAM 明确禁止，该用例已作废。

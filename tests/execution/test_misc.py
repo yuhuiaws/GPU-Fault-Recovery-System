@@ -1,0 +1,43 @@
+"""Stable pytest nodeids for split test_misc.py cases."""
+
+# ruff: noqa: F401
+from ._misc_cases_1 import (
+    test_expired_quiesce_allows_restore_but_not_hardware_action,
+    test_failed_reset_runs_restore_compensation_before_terminal,
+    test_hung_bundle_fans_out_to_all_attempt_nodes_after_failure,
+    test_hung_triage_dispatches_nodes_concurrently,
+    test_hung_triage_tolerates_unreachable_node,
+    test_knows_node_prefers_registry_over_stale_endpoint_map,
+    test_managed_recovery_observer_never_submits_mutation,
+    test_post_reboot_handoff_restore_uses_fresh_agent_generation,
+    test_predecessor_terminal_save_preserves_successor_incident_pointer,
+    test_queued_successor_does_not_fence_running_predecessor,
+    test_registry_addressing_fences_on_agent_generation,
+    test_reset_all_successor_inherits_quiesce_but_not_verify,
+    test_reset_to_reboot_hands_off_quiesce_and_skips_low_reset,
+    test_serial_dispatch_is_kept_for_mutating_operations,
+    test_submitted_reboot_finishes_before_replace_successor,
+    test_submitted_reset_restores_before_reboot_preemption,
+)
+from ._misc_cases_2 import (
+    test_active_environment_requires_an_alert_channel,
+    test_active_environment_requires_durable_configuration,
+    test_active_environment_selects_postgres_store,
+    test_dcgm_config_severity_failure_does_not_drain,
+    test_execute_api_requires_token,
+    test_hung_triage_confirms_the_rank_that_stopped_enqueueing,
+    test_hung_triage_ignores_missing_start_times_shared_by_all,
+    test_hung_triage_many_lagging_ranks_marks_fabric_suspected,
+    test_hung_triage_orders_weak_candidates_by_efa_zero_time,
+    test_hung_triage_rewrites_bundle_to_culprit_and_control,
+    test_hung_triage_weak_ignores_traits_shared_by_every_rank,
+    test_hung_triage_without_dumps_falls_through_to_cpu_gpu,
+    test_mechanical_inspection_waits_for_incident_fenced_annotation,
+    test_reboot_confirmation_prefers_structured_source_boot_id,
+    test_same_incident_stale_node_generation_is_always_rejected,
+    test_sqlite_expired_lease_is_taken_over_and_fences_stale_owner,
+    test_storeless_adapter_fails_closed_when_control_plane_errors,
+    test_storeless_adapter_refuses_live_predecessor,
+    test_storeless_adapter_without_provider_refuses_takeover,
+    test_validation_sample_age_matches_gpu_metrics_silence,
+)

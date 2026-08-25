@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-fault-postgres-counter-shards-rollback
+  namespace: gpu-fault-system
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 720
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-postgres-counter-shards-rollback
+    spec:
+      restartPolicy: Never
+      serviceAccountName: gpu-fault-control-plane
+      containers:
+        - name: migrate
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[postgres]'
+              && exec gpu-fault-store-migrate
+              --restore-legacy-processor-counters
+          env:
+            - name: GPU_FAULT_STORE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-aurora
+                  key: postgres-url
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+      volumes:
+        - name: artifact
+          configMap:
+            name: REPLACE_WITH_WHEEL_CONFIGMAP

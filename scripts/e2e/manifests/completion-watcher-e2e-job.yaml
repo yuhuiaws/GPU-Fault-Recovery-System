@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-fault-watch-e2e
+  namespace: gpu-fault-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        gpu-fault.io/managed: "true"
+        gpu-fault.io/job-id: passive-watch-e2e
+        gpu-fault.io/attempt-id: passive-watch-e2e-a1
+        gpu-fault.io/role: worker
+        gpu-fault.io/critical: "true"
+      annotations:
+        gpu-fault.io/rank: "0"
+        gpu-fault.io/expected-critical-ranks: "1"
+        gpu-fault.io/training-container: trainer
+        gpu-fault.io/runtime-profile-version: hyperpod-v1
+        gpu-fault.io/restart-budget: "1"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command:
+            - /bin/sh
+            - -c
+            - sleep 5; exit 23
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

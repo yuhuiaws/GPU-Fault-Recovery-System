@@ -1,0 +1,124 @@
+# “regional-hyperpod-safe” 与唯一生产部署路径的术语映射见 config/README.md。
+# 每个 OWN/DELEGATE 的 owner 必须由目标 GPU 集群 executor 实际构造的
+# adapter 广告出来，否则该 owner 的 remote command 永远不会被 claim。
+# nodeReboot / nodeReplace 的 gpu-fault-hyperpod-adapter 要求 executor
+# 设置 GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true；默认清单为 false，
+# 注册本 profile 前必须先按部署和运维手册"阶段 D"打开它。
+# 校验命令见 docs/部署和运维手册.md 的"区域模式故障排查"小节。
+cluster_id: REPLACE_WITH_HYPERPOD_CLUSTER
+environment: hyperpod-eks
+profile_version: hyperpod-v1
+claims:
+  - capability: gpuDetection
+    mode: AUGMENT
+    owner: hyperpod-hma
+    adapter: hyperpod-hma
+  - capability: providerHealthIsolation
+    mode: OBSERVE
+    owner: hyperpod-hma
+    adapter: hyperpod-hma
+  - capability: evidenceCapture
+    mode: OWN
+    owner: gpu-fault-control-plane
+    adapter: control-plane-evidence
+  - capability: schedulerDrain
+    mode: OWN
+    owner: gpu-fault-kubernetes-adapter
+    adapter: regional-cluster-executor
+  - capability: checkpointRestore
+    mode: OWN
+    owner: gpu-fault-kubernetes-adapter
+    adapter: regional-cluster-executor
+  - capability: workloadStop
+    mode: OWN
+    owner: gpu-fault-kubernetes-adapter
+    adapter: regional-cluster-executor
+  - capability: workloadRestart
+    mode: OWN
+    owner: gpu-fault-kubernetes-adapter
+    adapter: regional-cluster-executor
+  - capability: mechanicalInspection
+    mode: OWN
+    owner: gpu-fault-kubernetes-adapter
+    adapter: regional-cluster-executor
+  - capability: deepDiagnostics
+    mode: OWN
+    owner: gpu-fault-validation-adapter
+    adapter: control-plane-validation
+  - capability: supportEscalation
+    mode: OWN
+    owner: gpu-fault-support-escalation
+    adapter: fixed-template-email
+  - capability: diagnosticBundleCapture
+    mode: OBSERVE
+    owner: gpu-fault-node-agent
+  - capability: gpuReset
+    mode: OBSERVE
+    owner: gpu-fault-node-agent
+  - capability: fabricManagerRestart
+    mode: OBSERVE
+    owner: gpu-fault-node-agent
+  - capability: fabricReset
+    mode: OBSERVE
+    owner: gpu-fault-node-agent
+  - capability: nvlinkDiagnostics
+    mode: OBSERVE
+    owner: gpu-fault-node-agent
+  - capability: memoryDiagnostics
+    mode: OBSERVE
+    owner: gpu-fault-node-agent
+  - capability: driverRemediation
+    mode: OBSERVE
+    owner: gpu-fault-node-agent
+  - capability: softwareFirmwareUpdate
+    mode: OBSERVE
+    owner: gpu-fault-node-agent
+  - capability: nodeReboot
+    mode: OWN
+    owner: gpu-fault-hyperpod-adapter
+    adapter: regional-cluster-executor
+  - capability: nodeReplace
+    mode: OWN
+    owner: gpu-fault-hyperpod-adapter
+    adapter: regional-cluster-executor
+observed:
+  - capability: evidenceCapture
+    owner: gpu-fault-control-plane
+    available: true
+    version: v1
+  - capability: schedulerDrain
+    owner: gpu-fault-kubernetes-adapter
+    available: true
+    version: regional-v1
+  - capability: checkpointRestore
+    owner: gpu-fault-kubernetes-adapter
+    available: true
+    version: regional-v1
+  - capability: workloadStop
+    owner: gpu-fault-kubernetes-adapter
+    available: true
+    version: regional-v1
+  - capability: workloadRestart
+    owner: gpu-fault-kubernetes-adapter
+    available: true
+    version: regional-v1
+  - capability: mechanicalInspection
+    owner: gpu-fault-kubernetes-adapter
+    available: true
+    version: regional-v1
+  - capability: deepDiagnostics
+    owner: gpu-fault-validation-adapter
+    available: true
+    version: v1
+  - capability: supportEscalation
+    owner: gpu-fault-support-escalation
+    available: true
+    version: fixed-template-v1
+  - capability: nodeReboot
+    owner: gpu-fault-hyperpod-adapter
+    available: true
+    version: provider-reboot-v1
+  - capability: nodeReplace
+    owner: gpu-fault-hyperpod-adapter
+    available: true
+    version: warm-spare-v1

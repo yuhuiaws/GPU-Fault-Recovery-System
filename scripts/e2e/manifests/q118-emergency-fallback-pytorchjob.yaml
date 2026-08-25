@@ -1,0 +1,173 @@
+# E2E FIXTURE: driven by scripts/e2e/, not a supported deployment entry point.
+# Resource profile is deliberately small: 1 GPU and 1 EFA device per Pod.
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: gpu-fault-q118-fallback
+  namespace: gpu-fault-system
+  labels:
+    gpu-fault.io/managed: "true"
+    gpu-fault.io/job-id: q118-fallback-20260813
+    gpu-fault.io/attempt-id: q118-fallback-20260813-a001
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: gpu-fault-q118-fallback
+            gpu-fault.io/managed: "true"
+            gpu-fault.io/job-id: q118-fallback-20260813
+            gpu-fault.io/attempt-id: q118-fallback-20260813-a001
+            gpu-fault.io/role: master
+            gpu-fault.io/critical: "true"
+          annotations:
+            gpu-fault.io/expected-critical-ranks: "3"
+            gpu-fault.io/training-container: pytorch
+            gpu-fault.io/runtime-profile-version: hyperpod-v1
+            gpu-fault.io/rank-offset: "0"
+            gpu-fault.io/restart-budget: "1"
+        spec:
+          restartPolicy: Never
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: gpu-fault-q118-fallback
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: pytorch
+              image: public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  cat >/tmp/q118_train.py <<'PY'
+                  import socket
+                  import time
+
+                  import torch
+                  import torch.distributed as dist
+
+                  dist.init_process_group(backend="nccl")
+                  rank = dist.get_rank()
+                  local_rank = int(__import__("os").environ["LOCAL_RANK"])
+                  torch.cuda.set_device(local_rank)
+                  value = torch.tensor([float(rank + 1)], device="cuda")
+                  step = 0
+                  while True:
+                      value.fill_(float(rank + 1))
+                      dist.all_reduce(value)
+                      if step % 5 == 0:
+                          print(
+                              f"Q118_HEARTBEAT rank={rank} step={step} "
+                              f"node={socket.gethostname()} "
+                              f"sum={value.item()}",
+                              flush=True,
+                          )
+                      step += 1
+                      time.sleep(1)
+                  PY
+                  exec torchrun \
+                    --nnodes="${WORLD_SIZE}" \
+                    --nproc-per-node=1 \
+                    --node-rank="${RANK}" \
+                    --master-addr="${MASTER_ADDR}" \
+                    --master-port="${MASTER_PORT}" \
+                    /tmp/q118_train.py
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                  nvidia.com/gpu: "1"
+                  vpc.amazonaws.com/efa: "1"
+                limits:
+                  cpu: "4"
+                  memory: 16Gi
+                  nvidia.com/gpu: "1"
+                  vpc.amazonaws.com/efa: "1"
+    Worker:
+      replicas: 2
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: gpu-fault-q118-fallback
+            gpu-fault.io/managed: "true"
+            gpu-fault.io/job-id: q118-fallback-20260813
+            gpu-fault.io/attempt-id: q118-fallback-20260813-a001
+            gpu-fault.io/role: worker
+            gpu-fault.io/critical: "true"
+          annotations:
+            gpu-fault.io/expected-critical-ranks: "3"
+            gpu-fault.io/training-container: pytorch
+            gpu-fault.io/runtime-profile-version: hyperpod-v1
+            gpu-fault.io/rank-offset: "1"
+            gpu-fault.io/restart-budget: "1"
+        spec:
+          restartPolicy: Never
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: gpu-fault-q118-fallback
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: pytorch
+              image: public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  cat >/tmp/q118_train.py <<'PY'
+                  import socket
+                  import time
+
+                  import torch
+                  import torch.distributed as dist
+
+                  dist.init_process_group(backend="nccl")
+                  rank = dist.get_rank()
+                  local_rank = int(__import__("os").environ["LOCAL_RANK"])
+                  torch.cuda.set_device(local_rank)
+                  value = torch.tensor([float(rank + 1)], device="cuda")
+                  step = 0
+                  while True:
+                      value.fill_(float(rank + 1))
+                      dist.all_reduce(value)
+                      if step % 5 == 0:
+                          print(
+                              f"Q118_HEARTBEAT rank={rank} step={step} "
+                              f"node={socket.gethostname()} "
+                              f"sum={value.item()}",
+                              flush=True,
+                          )
+                      step += 1
+                      time.sleep(1)
+                  PY
+                  exec torchrun \
+                    --nnodes="${WORLD_SIZE}" \
+                    --nproc-per-node=1 \
+                    --node-rank="${RANK}" \
+                    --master-addr="${MASTER_ADDR}" \
+                    --master-port="${MASTER_PORT}" \
+                    /tmp/q118_train.py
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                  nvidia.com/gpu: "1"
+                  vpc.amazonaws.com/efa: "1"
+                limits:
+                  cpu: "4"
+                  memory: 16Gi
+                  nvidia.com/gpu: "1"
+                  vpc.amazonaws.com/efa: "1"

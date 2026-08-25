@@ -1,0 +1,73 @@
+# Render REPLACE_WITH_WHEEL_CONFIGMAP with scripts/e2e/render_manifest.py.
+# Do not apply this source manifest directly.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-kernel-validation
+  namespace: gpu-fault-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-fault-kernel-validation
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-kernel-validation
+    spec:
+      containers:
+        - name: api
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors]'
+              && exec uvicorn gpu_fault.app:create_app --factory
+              --host 0.0.0.0 --port 8080 --no-proxy-headers
+          env:
+            - name: GPU_FAULT_EXECUTOR_MODE
+              value: simulation
+            - name: GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER
+              value: "false"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+      volumes:
+        - name: artifact
+          configMap:
+            name: REPLACE_WITH_WHEEL_CONFIGMAP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-fault-kernel-validation
+  namespace: gpu-fault-system
+spec:
+  selector:
+    app: gpu-fault-kernel-validation
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _environment(path: Path) -> dict[str, str]:
+    environment = {}
+    for document in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+        if not isinstance(document, dict):
+            continue
+        template = document.get("spec", {}).get("template", {})
+        containers = template.get("spec", {}).get("containers", [])
+        for container in containers:
+            for item in container.get("env", []):
+                if "value" in item:
+                    environment[item["name"]] = str(item["value"])
+    return environment
+
+
+def test_control_plane_manifests_default_to_dedicated_hot_state() -> None:
+    for relative in (
+        "deploy/control-plane/base/control-plane-deployment.yaml",
+        "deploy/control-plane/regional/regional-control-plane-patch.yaml",
+    ):
+        environment = _environment(ROOT / relative)
+        assert environment["GPU_FAULT_POSTGRES_HOT_STATE_MODE"] == "dedicated"
+        assert environment["GPU_FAULT_PROCESSOR_QUEUE_STATE_MODE"] == "dedicated"
+
+
+def test_hyperpod_deploy_keeps_dedicated_and_role_split_defaults() -> None:
+    script = (ROOT / "deploy/hyperpod/deploy.sh").read_text(encoding="utf-8")
+
+    assert "GPU_FAULT_POSTGRES_HOT_STATE_MODE:-dedicated" in script
+    assert "GPU_FAULT_PROCESSOR_QUEUE_STATE_MODE:-dedicated" in script
+    # The split is applied from the checked-in manifests before the
+    # environment below is set on both tiers, and the deploy fails if
+    # the worker tier did not come up.
+    assert "control-plane/regional/generated/${manifest}.yaml" in script
+    assert "verify-control-plane-role-split.sh" in script
+    assert "deployment/gpu-fault-control-worker" in script
+    assert "enable-control-plane-role-split" not in script
+
+
+def test_hyperpod_deploy_runs_schema_ddl_in_a_job() -> None:
+    """DDL must not run inside an API process.
+
+    The in-process bootstrap takes SHARE ROW EXCLUSIVE on
+    gpu_fault_processor_queue, which blocks every admission, claim and
+    completion while it holds, and uvicorn recycles ingress processes on
+    --limit-max-requests, so a `true` default turns a one-off into a
+    recurring stall. The manifests say false; this asserts deploy.sh's
+    imperative `set env` does not put it back to true, and that the
+    migration Job it replaces the bootstrap with actually runs.
+    """
+
+    script = (ROOT / "deploy/hyperpod/deploy.sh").read_text(encoding="utf-8")
+
+    assert "GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT:-false" in script
+    assert "postgres-schema-ensure-job.yaml" in script
+    assert "job/gpu-fault-postgres-schema-ensure --timeout=12m" in script
+    for relative in (
+        "deploy/control-plane/base/control-plane-deployment.yaml",
+        "deploy/control-plane/regional/regional-control-plane-patch.yaml",
+    ):
+        environment = _environment(ROOT / relative)
+        assert environment["GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT"] == "false"

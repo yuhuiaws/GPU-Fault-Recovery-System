@@ -1,0 +1,41 @@
+"""Stable pytest nodeids for split test_hma.py cases."""
+
+# ruff: noqa: F401
+from ._hma_cases_1 import (
+    test_fabric_manager_full_reset_uses_mandatory_inventory_channel,
+    test_fabric_manager_log_endpoint_creates_sxid_workflow,
+    test_fabric_manager_rejects_sxid_severity_conflict,
+    test_fabric_manager_sxid10003_resolves_local_fabric_reset,
+    test_fabric_manager_sxid_19084_requires_full_reset,
+    test_hma_and_kernel_observations_merge_into_one_incident,
+    test_hma_cloudwatch_endpoint_runs_xid94_policy,
+    test_hma_deployment_discovery_exposes_coverage_gap,
+    test_hma_discovery_endpoint_does_not_invent_metrics,
+    test_hma_node_contract_preserves_state_and_deduplicates_fault,
+    test_kernel_always_fatal_sxid_uses_local_gpu_inventory,
+    test_kernel_drill_id_is_parsed_out_of_raw_message,
+    test_kernel_event_identity_is_scoped_by_cluster,
+    test_kernel_fallback_captures_hma_disabled_xid94,
+    test_kernel_ingestion_rejects_blank_node_identity,
+    test_kernel_ingestion_wakes_dispatcher,
+    test_kernel_nvlink5_accepts_fixed_width_unprefixed_hex,
+    test_kernel_nvlink5_does_not_use_registers_from_another_xid,
+    test_kernel_nvlink5_extracts_official_register_payload,
+    test_kernel_nvlink5_incomplete_payload_remains_missing,
+    test_kernel_xid74_does_not_invent_missing_link_identity,
+    test_kernel_xid74_extracts_exact_seven_registers,
+    test_official_hma_cloudwatch_format_normalizes_xid,
+    test_raw_kubernetes_node_object_uses_hma_contract,
+    test_same_kernel_record_in_two_clusters_creates_two_incidents,
+    test_sxid_accepts_official_summary_and_rejects_continuation,
+)
+from ._hma_cases_2 import (
+    test_cross_source_pci_mismatch_does_not_merge,
+    test_delayed_cross_source_event_merges_within_five_minutes,
+    test_kernel_event_uses_observed_workload_topology,
+    test_kernel_xid74_first_mechanical_event_resets_gpu,
+    test_kernel_xid_does_not_guess_from_stale_or_ambiguous_pci,
+    test_kernel_xid_resolves_recent_unique_pci_to_gpu_uuid,
+    test_kernel_xid_uses_boot_fenced_inventory_channel,
+    test_same_kernel_source_prefers_monotonic_time,
+)

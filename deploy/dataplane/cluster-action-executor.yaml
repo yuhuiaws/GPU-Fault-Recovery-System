@@ -1,0 +1,289 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-fault-cluster-executor
+  namespace: gpu-fault-system
+  annotations:
+    # IRSA. Without this the pod has no AWS credentials at all and every
+    # HyperPod call fails -- which used to surface only when a real GPU
+    # broke, as NoCredentialsError inside REPLACE_NODE. Substitute it
+    # (the deployment manual seds this placeholder alongside the wheel
+    # ConfigMap name) and make sure the role's trust policy lists this
+    # ServiceAccount: the ":sub" condition value accepts an array, so an
+    # existing role can be reused by appending
+    # system:serviceaccount:gpu-fault-system:gpu-fault-cluster-executor
+    # rather than cloning its policies. The executor refuses to start
+    # with GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true and no resolvable
+    # credentials, so an unsubstituted placeholder fails loudly here
+    # instead of silently at the next fault.
+    eks.amazonaws.com/role-arn: REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gpu-fault-cluster-executor
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "patch", "create"]
+  - apiGroups: ["kubeflow.org"]
+    resources: ["pytorchjobs"]
+    verbs: ["get", "list", "watch", "patch", "create"]
+  - apiGroups: ["jobset.x-k8s.io"]
+    resources: ["jobsets"]
+    verbs: ["get", "list", "watch", "patch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-fault-cluster-executor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpu-fault-cluster-executor
+subjects:
+  - kind: ServiceAccount
+    name: gpu-fault-cluster-executor
+    namespace: gpu-fault-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-cluster-executor
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: executor
+    gpu-fault.io/cleanup-order: "10"
+    gpu-fault.io/deploy-mode: regional_rollout
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gpu-fault-cluster-executor
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-cluster-executor
+    spec:
+      serviceAccountName: gpu-fault-cluster-executor
+      tolerations:
+        - key: gpu-fault.io/quarantined
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: gpu-fault-cluster-executor
+      containers:
+        - name: executor
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |-
+              attempt=1
+              until python -m pip install --no-cache-dir --retries 3 --timeout 15 \
+                '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors,postgres]'; do
+                if [ "${attempt}" -ge 4 ]; then
+                  echo "executor dependency installation failed after ${attempt} attempts" >&2
+                  exit 1
+                fi
+                delay=$((attempt * 5))
+                echo "executor dependency installation failed; retrying in ${delay}s" >&2
+                sleep "${delay}"
+                attempt=$((attempt + 1))
+              done
+              touch /tmp/executor-ready
+              exec gpu-fault-cluster-executor
+          env:
+            - name: AWS_REGION
+              value: us-west-2
+            - name: AWS_DEFAULT_REGION
+              value: us-west-2
+            - name: GPU_FAULT_CONTROL_PLANE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: control-plane-url
+            - name: GPU_FAULT_CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-token
+            - name: GPU_FAULT_CLUSTER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-id
+            - name: GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: allowed-namespaces
+            # Scope the private NLB CA to the regional control-plane
+            # client. SSL_CERT_FILE/REQUESTS_CA_BUNDLE must stay unset:
+            # setting either to this private-only bundle also replaces
+            # boto3's public AWS trust roots and breaks STS/HyperPod
+            # mutations.
+            - name: GPU_FAULT_CONTROL_PLANE_CA_FILE
+              value: /etc/gpu-fault/tls/ca.crt
+            # GPU_FAULT_STORE_URL is deliberately absent: with
+            # GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true the executor
+            # never constructs a store, so injecting Aurora credentials
+            # onto the data plane would grant control-plane database
+            # access for no functional benefit.
+            - name: GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS
+              value: "2"
+            - name: GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS
+              value: "120"
+            - name: GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE
+              value: "5"
+            - name: GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS
+              value: "5"
+            - name: GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE
+              value: "true"
+            # The regional architecture delegates every mutation to the
+            # data plane, so all three ENABLE_* switches belong on true
+            # here (BOOT-004/005 forbid them on the *control* plane, not
+            # here). They were false, which made this file unappliable:
+            # a stock `kubectl apply` silently turned off node actions
+            # and the HyperPod reboot path on a live cluster.
+            #
+            # Leaving NODE_ACTION_ADAPTER false is not the safe default
+            # it looks like: with no node-action adapter the fleet agent
+            # product is always None, and the policy quietly downgrades
+            # "restart the application" to "isolate the whole node".
+            - name: GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER
+              value: "true"
+            - name: GPU_FAULT_NODE_ACTION_KEYS_DIR
+              value: /etc/gpu-fault/node-action-keys
+            # Only needed when GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER is
+            # true. Marked optional so the default deployment does not
+            # require a key the deployment manual never creates.
+            - name: GPU_FAULT_NODE_AGENT_ENDPOINTS
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: node-agent-endpoints
+                  optional: true
+            # Requires GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER, which comes
+            # from an optional secret key below: on a cluster whose
+            # gpu-fault-regional-connection Secret lacks
+            # hyperpod-confirm-cluster-name the executor fails closed at
+            # startup with that variable named. That is deliberate -- an
+            # adapter that cannot confirm which cluster it is mutating
+            # must not run.
+            - name: GPU_FAULT_ENABLE_HYPERPOD_ADAPTER
+              value: "true"
+            # Not a risk knob: this is the second lock on "never call
+            # BatchReplaceClusterNodes". The guard that refuses to fall
+            # back to the provider replacement API lives in the
+            # `spare_coordinator is not None` branch
+            # (src/gpu_fault/adapters/hyperpod/lifecycle.py). If this is
+            # set false, that guard does not exist and the independent
+            # ALLOW_HYPERPOD_REPLACE=false below becomes the last lock
+            # before the provider API. With no spare-labelled nodes,
+            # keeping this true makes REPLACE_NODE fail explicitly,
+            # which is the intended behaviour for this deployment.
+            - name: GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER
+              value: "true"
+            - name: GPU_FAULT_HYPERPOD_SPARE_LABEL
+              value: gpu-fault.io/spare
+            - name: GPU_FAULT_HYPERPOD_SPARE_LABEL_VALUE
+              value: "true"
+            - name: GPU_FAULT_HYPERPOD_CLUSTER
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: hyperpod-cluster-name
+                  optional: true
+            - name: GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: hyperpod-confirm-cluster-name
+                  optional: true
+            - name: GPU_FAULT_ALLOW_HYPERPOD_REBOOT
+              value: "true"
+            - name: GPU_FAULT_ALLOW_HYPERPOD_REPLACE
+              value: "false"
+            - name: GPU_FAULT_REQUIRED_AGENT_VERSION
+              value: "0.10.0"
+            - name: GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS
+              value: "90"
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -f /tmp/executor-ready"]
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 120
+          # The marker file only proves pip install ran, and the previous
+          # probe only fetched the anonymous /healthz -- which answers 200
+          # for a completely misconfigured executor, because it is not
+          # bound to this executor's identity in any way. A wrong or
+          # revoked per-cluster token, a broken trust chain, and a backlog
+          # whose execution owners this executor does not implement all
+          # kept the Pod Ready while it claimed nothing.
+          #
+          # gpu-fault-cluster-executor-readiness POSTs
+          # /v1/regional/executors/readiness with the per-cluster bearer
+          # token and X-GPU-Fault-Cluster-ID, and reports the executor's
+          # advertised execution owners plus the age of its last
+          # successful claim. The control plane answers 503 when the open
+          # backlog needs an owner this executor does not advertise.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/executor-ready && gpu-fault-cluster-executor-readiness
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+            - name: control-plane-ca
+              mountPath: /etc/gpu-fault/tls
+              readOnly: true
+            - name: node-action-keys
+              mountPath: /etc/gpu-fault/node-action-keys
+              readOnly: true
+      volumes:
+        - name: control-plane-ca
+          secret:
+            secretName: gpu-fault-regional-connection
+            items:
+              - key: ca.crt
+                path: ca.crt
+        - name: artifact
+          configMap:
+            name: gpu-fault-control-plane-wheel-0100
+        - name: node-action-keys
+          secret:
+            secretName: gpu-fault-node-action-keys

@@ -1,0 +1,15 @@
+# Role-split renderer input template. This deliberately does not use the
+# reserved kustomization.yaml filename: it must never be passed directly to
+# `kubectl apply -k`. render-control-plane-role-split.sh copies these three
+# files into a temporary directory, installs this template there as
+# kustomization.yaml, and feeds the build to the role-split renderer.
+#
+# The intermediate build is a single Deployment that both serves ingress and
+# claims the queue. It is not a supported runtime topology.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - regional-control-plane-prerequisites.yaml
+  - control-plane-deployment.yaml
+patches:
+  - path: regional-control-plane-patch.yaml

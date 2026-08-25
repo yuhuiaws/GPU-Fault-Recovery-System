@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-fault-api-nlb
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: nlb
+    gpu-fault.io/cleanup-order: "10"
+    gpu-fault.io/cleanup-action: reset
+    service.beta.kubernetes.io/aws-load-balancer-name: gpu-fault-regional-us-west-2
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-ip-address-type: ipv4
+    service.beta.kubernetes.io/aws-load-balancer-subnets: REPLACE_WITH_PUBLIC_SUBNETS
+    service.beta.kubernetes.io/aws-load-balancer-security-groups: REPLACE_WITH_NLB_SECURITY_GROUP
+    service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules: "true"
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: REPLACE_WITH_TLS_CERTIFICATE_ARN
+    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+    service.beta.kubernetes.io/aws-load-balancer-ssl-negotiation-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /healthz
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: traffic-port
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "10"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold: "2"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold: "2"
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+    service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: deregistration_delay.timeout_seconds=30
+spec:
+  loadBalancerClass: service.k8s.aws/nlb
+  selector:
+    app: gpu-fault-api-ha
+  ports:
+    - name: tls
+      port: 443
+      targetPort: http
+      protocol: TCP
+  type: LoadBalancer

@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+import logging
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+from gpu_fault.regional import (
+    RegionalClusterRegistration,
+    cluster_token_sha256,
+)
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def sync_regional_cluster_registry(
+    store: Any,
+    values: Iterable[Mapping[str, Any]],
+) -> list[RegionalClusterRegistration]:
+    """Make the durable registry exactly match the validated config."""
+
+    configured: list[RegionalClusterRegistration] = []
+    configured_ids: set[str] = set()
+    for value in values:
+        item = dict(value)
+        token = item.pop("token", None)
+        if token:
+            item["token_sha256"] = cluster_token_sha256(str(token))
+        registration = RegionalClusterRegistration(**item)
+        store.save_regional_cluster(registration)
+        configured.append(registration)
+        configured_ids.add(registration.cluster_id)
+
+    removed = []
+    for registration in store.list_regional_clusters():
+        if registration.cluster_id in configured_ids:
+            continue
+        store.delete_regional_cluster(registration.cluster_id)
+        removed.append(registration.cluster_id)
+    if removed:
+        LOGGER.warning(
+            "removed regional cluster registrations absent from "
+            "the declarative registry: %s",
+            ", ".join(sorted(removed)),
+        )
+    return sorted(
+        configured,
+        key=lambda item: item.cluster_id,
+    )

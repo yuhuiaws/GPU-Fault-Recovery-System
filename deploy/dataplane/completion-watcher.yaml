@@ -1,0 +1,147 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-fault-completion-watcher
+  namespace: gpu-fault-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gpu-fault-completion-watcher
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["kubeflow.org"]
+    resources: ["pytorchjobs"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["jobset.x-k8s.io"]
+    resources: ["jobsets"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-fault-completion-watcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpu-fault-completion-watcher
+subjects:
+  - kind: ServiceAccount
+    name: gpu-fault-completion-watcher
+    namespace: gpu-fault-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-completion-watcher
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: producer
+    gpu-fault.io/cleanup-order: "20"
+    gpu-fault.io/deploy-mode: regional_rollout
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-fault-completion-watcher
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-completion-watcher
+    spec:
+      serviceAccountName: gpu-fault-completion-watcher
+      tolerations:
+        - key: gpu-fault.io/quarantined
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: watcher
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors]'
+              && exec gpu-fault-completion-watcher
+          env:
+            - name: GPU_FAULT_CONTROL_PLANE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: control-plane-url
+            - name: GPU_FAULT_CLUSTER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-id
+            - name: GPU_FAULT_CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-token
+            - name: SSL_CERT_FILE
+              value: /etc/gpu-fault/tls/ca.crt
+            - name: GPU_FAULT_WATCHER_ENVIRONMENT
+              value: hyperpod-eks
+            - name: GPU_FAULT_WATCHER_POLL_SECONDS
+              value: "3"
+            - name: GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS
+              value: "30"
+            - name: GPU_FAULT_WATCHER_RECONCILE_DEBOUNCE_SECONDS
+              value: "0.5"
+            - name: GPU_FAULT_WATCHER_CLEANUP_TIMEOUT_SECONDS
+              value: "30"
+            - name: GPU_FAULT_PROCESSOR_RECEIPT_TIMEOUT_SECONDS
+              value: "120"
+            - name: GPU_FAULT_PROCESSOR_RECEIPT_POLL_SECONDS
+              value: "0.25"
+            - name: GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS
+              value: "30"
+            - name: GPU_FAULT_DEFAULT_RESTART_BUDGET
+              value: "1"
+            - name: GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS
+              value: "true"
+            - name: GPU_FAULT_DISCOVER_POD_GPU_UUIDS
+              value: "true"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+            - name: control-plane-ca
+              mountPath: /etc/gpu-fault/tls
+              readOnly: true
+      volumes:
+        - name: artifact
+          configMap:
+            name: gpu-fault-control-plane-wheel-0100
+        - name: control-plane-ca
+          secret:
+            secretName: gpu-fault-regional-connection
+            items:
+              - key: ca.crt
+                path: ca.crt

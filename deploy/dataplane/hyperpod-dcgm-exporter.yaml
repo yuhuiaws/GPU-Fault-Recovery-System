@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-fault-dcgm-exporter
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: producer
+    gpu-fault.io/cleanup-order: "70"
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: gpu-fault-dcgm-exporter
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-dcgm-exporter
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node.kubernetes.io/instance-type: ml.p5en.48xlarge
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: exporter
+          image: nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04
+          args: ["-a", "0.0.0.0:9400"]
+          env:
+            - name: DCGM_REMOTE_HOSTENGINE_INFO
+              value: "127.0.0.1:5555"
+            - name: DCGM_EXPORTER_COLLECTORS
+              value: /etc/dcgm-exporter/gpu-fault-counters.csv
+          ports:
+            - name: metrics
+              containerPort: 9400
+              hostPort: 9400
+          readinessProbe:
+            httpGet:
+              host: 127.0.0.1
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: counters
+              mountPath: /etc/dcgm-exporter/gpu-fault-counters.csv
+              subPath: gpu-fault-counters.csv
+              readOnly: true
+      volumes:
+        - name: counters
+          configMap:
+            name: gpu-fault-dcgm-counters

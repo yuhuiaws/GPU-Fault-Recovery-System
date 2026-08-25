@@ -1,0 +1,28 @@
+[Unit]
+Description=GPU fault system, dmesg and training log collector
+After=network-online.target systemd-journald.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gpu-fault/collector.env
+ExecStart=/opt/gpu-fault/venv/bin/gpu-fault-collector logs
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+StateDirectory=gpu-fault
+SupplementaryGroups=systemd-journal
+# Resource control
+CPUWeight=20
+CPUQuota=100%
+MemoryHigh=512M
+MemoryMax=768M
+MemorySwapMax=0
+TasksMax=128
+IOWeight=20
+
+[Install]
+WantedBy=multi-user.target

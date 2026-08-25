@@ -1,0 +1,27 @@
+[Unit]
+Description=GPU fault host, storage and network telemetry collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gpu-fault/collector.env
+ExecStart=/opt/gpu-fault/venv/bin/gpu-fault-collector host
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gpu-fault
+# Resource control
+CPUWeight=20
+CPUQuota=100%
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=256
+IOWeight=20
+
+[Install]
+WantedBy=multi-user.target

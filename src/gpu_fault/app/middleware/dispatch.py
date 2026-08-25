@@ -1,0 +1,455 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import secrets
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+
+from gpu_fault.app.runtime import ProcessorDispatchState
+from gpu_fault.async_store import (
+    REQUEST_DEADLINE,
+    StoreIoCapacityExceeded,
+)
+from gpu_fault.processor import (
+    ProcessorRequest,
+    ProcessorRequestStatus,
+)
+from gpu_fault.processor_diagnostics import (
+    bind_processor_replay,
+    report_processor_replay_phase,
+    reset_processor_replay,
+)
+
+
+@dataclass(frozen=True)
+class ProcessorDispatchDependencies:
+    context: Any
+    processor: Any | None
+    state: ProcessorDispatchState
+    store_io: Any
+    decode_io: Any
+    fault_store_io: Any
+    fault_decode_io: Any
+    processor_admission_batcher: Any
+    fault_admission_batcher: Any
+    evidence_admission_batcher: Any
+    telemetry_spool_batcher: Any
+    processor_replay_tracker: Any
+    requires_processor: Callable[[Request], bool]
+    replay_authorized: Callable[[Request], bool]
+    returns_processor_receipt: Callable[[str], bool]
+    is_fault_ingress_path: Callable[[str], bool]
+    decode_json_body: Callable
+    processor_max_queue_depth: int
+    processor_max_cluster_queue_depth: int
+    processor_fault_reserved_queue_depth: int
+    processor_fault_reserved_cluster_depth: int
+    processor_global_admission_guard: int
+    processor_max_request_bytes: int
+    processor_retry_after_seconds: int
+    processor_queue_bypass_enabled: bool
+    processor_queue_bypass_paths: set[str]
+    processor_admission_rejections: dict[str, int]
+    processor_admission_rejections_by_path: dict[str, int]
+    processor_queue_bypasses_by_path: dict[str, int]
+    telemetry_spool_enabled: bool
+    telemetry_spool_max_item_bytes: int
+    telemetry_spool_rejections: dict[str, int]
+    telemetry_spool_admitted_by_path: dict[str, int]
+    telemetry_request_budget_seconds: float
+
+
+@dataclass(frozen=True)
+class PreparedProcessorRequest:
+    item: ProcessorRequest
+    body: bytes
+    store_pool: Any
+    server_timing: dict[str, float]
+
+
+async def _handle_replay(
+    request: Request,
+    call_next,
+    dependencies: ProcessorDispatchDependencies,
+) -> Response | None:
+    processor = dependencies.processor
+    if request.headers.get("X-GPU-Fault-Processor-Replay") is None:
+        return None
+    if not dependencies.replay_authorized(request):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": (
+                    "processor replay is accepted only from "
+                    "loopback with a valid replay secret"
+                )
+            },
+        )
+    try:
+        request_id = request.headers["X-GPU-Fault-Processor-Request-ID"]
+        lane_owner = request.headers["X-GPU-Fault-Processor-Owner-ID"]
+        if not request_id or len(request_id) > 256:
+            raise ValueError("invalid request ID")
+        lane_epoch = None
+        lane_token = None
+        lane_key = None
+        if processor.active_consumers:
+            lane_epoch = int(request.headers["X-GPU-Fault-Processor-Lane-Epoch"])
+            lane_token = request.headers["X-GPU-Fault-Processor-Lane-Token"]
+            lane_key = base64.urlsafe_b64decode(
+                request.headers["X-GPU-Fault-Processor-Lane-Key"].encode("ascii")
+            ).decode("utf-8")
+    except (KeyError, ValueError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "invalid processor replay headers"},
+        )
+    tracker = dependencies.processor_replay_tracker
+    tracker.start(
+        request_id,
+        owner_id=lane_owner,
+        path=request.url.path,
+        lane_epoch=lane_epoch,
+        phase=(
+            "lane_validation" if processor.active_consumers else "leadership_validation"
+        ),
+    )
+    replay_context = bind_processor_replay(tracker, request_id)
+    try:
+        if processor.active_consumers:
+            lane_valid = await dependencies.store_io.run(
+                dependencies.context.store.validate_processor_lane,
+                lane_key,
+                lane_owner,
+                lane_epoch,
+                lane_token,
+            )
+            if not lane_valid:
+                return JSONResponse(
+                    status_code=409,
+                    content={"detail": "processor lane lease changed"},
+                    headers={"X-GPU-Fault-Processor-Retry": ("lane-lease-changed")},
+                )
+        elif not processor.is_leader():
+            return JSONResponse(
+                status_code=409,
+                content={"detail": "processor leadership changed"},
+            )
+        report_processor_replay_phase("handler_dispatch")
+        response = await call_next(request)
+        report_processor_replay_phase("response_ready")
+        return response
+    finally:
+        reset_processor_replay(replay_context)
+        tracker.finish(request_id)
+
+
+async def _prepare_request(
+    request: Request,
+    dependencies: ProcessorDispatchDependencies,
+) -> PreparedProcessorRequest | Response:
+    server_timing = request.scope.setdefault("gpu_fault_server_timing", {})
+    decode_started = time.monotonic()
+    body = await request.body()
+    fault_ingress = dependencies.is_fault_ingress_path(request.url.path)
+    decode_pool = (
+        dependencies.fault_decode_io if fault_ingress else dependencies.decode_io
+    )
+    store_pool = dependencies.fault_store_io if fault_ingress else dependencies.store_io
+    payload = request.scope.get("gpu_fault_json_payload")
+    if payload is None:
+        try:
+            body, payload = await decode_pool.run(
+                dependencies.decode_json_body,
+                body,
+                (
+                    ""
+                    if request.scope.get("gpu_fault_body_decompressed", False)
+                    else request.headers.get("Content-Encoding", "")
+                ),
+            )
+        except StoreIoCapacityExceeded:
+            return JSONResponse(
+                status_code=503,
+                headers={"Retry-After": "2"},
+                content={"detail": "request decode capacity exceeded"},
+            )
+        except OverflowError:
+            dependencies.state.oversize_rejections += 1
+            return _oversize_response(dependencies)
+        except (
+            OSError,
+            EOFError,
+            json.JSONDecodeError,
+            ValueError,
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "invalid JSON request body"},
+            )
+        request.scope["gpu_fault_json_payload"] = payload
+        request._body = body
+    server_timing["decode"] = (time.monotonic() - decode_started) * 1000
+    if len(body) > dependencies.processor_max_request_bytes:
+        dependencies.state.oversize_rejections += 1
+        return _oversize_response(dependencies)
+    request_build_started = time.monotonic()
+    try:
+        item = await decode_pool.run(
+            ProcessorRequest.from_http,
+            method=request.method,
+            path=request.url.path,
+            query=request.url.query,
+            body=body,
+            content_type=request.headers.get("Content-Type"),
+            cluster_id=request.headers.get("X-GPU-Fault-Cluster-ID"),
+            execution_authorized=bool(
+                dependencies.context.execution_token
+                and request.headers.get("X-GPU-Fault-Execution-Token")
+                and secrets.compare_digest(
+                    request.headers["X-GPU-Fault-Execution-Token"],
+                    dependencies.context.execution_token,
+                )
+            ),
+            parsed_payload=payload,
+        )
+    except StoreIoCapacityExceeded:
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "2"},
+            content={"detail": "request decode capacity exceeded"},
+        )
+    server_timing["request_build"] = (time.monotonic() - request_build_started) * 1000
+    return PreparedProcessorRequest(
+        item=item,
+        body=body,
+        store_pool=store_pool,
+        server_timing=server_timing,
+    )
+
+
+def _oversize_response(
+    dependencies: ProcessorDispatchDependencies,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=413,
+        content={
+            "detail": "processor request body is too large",
+            "max_bytes": dependencies.processor_max_request_bytes,
+        },
+    )
+
+
+async def _try_spool(
+    prepared: PreparedProcessorRequest,
+    dependencies: ProcessorDispatchDependencies,
+) -> Response | None:
+    item = prepared.item
+    if not (
+        dependencies.telemetry_spool_enabled
+        and len(prepared.body) <= dependencies.telemetry_spool_max_item_bytes
+        and item.spoolable()
+    ):
+        return None
+    token = REQUEST_DEADLINE.set(
+        time.monotonic() + dependencies.telemetry_request_budget_seconds
+    )
+    try:
+        try:
+            spooled, result = await dependencies.telemetry_spool_batcher.submit(item)
+        except StoreIoCapacityExceeded:
+            return JSONResponse(
+                status_code=503,
+                headers={"Retry-After": "2"},
+                content={"detail": "store I/O capacity exceeded"},
+            )
+    finally:
+        REQUEST_DEADLINE.reset(token)
+    if result in {"global", "cluster"}:
+        dependencies.telemetry_spool_rejections[result] += 1
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(dependencies.processor_retry_after_seconds)},
+            content={
+                "detail": "telemetry spool capacity exceeded",
+                "scope": result,
+            },
+        )
+    if spooled is None:
+        raise RuntimeError("telemetry spool admission returned no request")
+    dependencies.state.telemetry_spool_admitted += 1
+    admitted = dependencies.telemetry_spool_admitted_by_path
+    admitted[item.path] = admitted.get(item.path, 0) + 1
+    if result == "coalesced":
+        dependencies.state.telemetry_spool_coalesced += 1
+    return JSONResponse(
+        status_code=202,
+        content={
+            "accepted": True,
+            "spooled": True,
+            "coalesced": result == "coalesced",
+        },
+    )
+
+
+async def _enqueue(
+    prepared: PreparedProcessorRequest,
+    dependencies: ProcessorDispatchDependencies,
+) -> tuple[ProcessorRequest, str | None] | Response:
+    item = prepared.item
+    started = time.monotonic()
+    try:
+        priority = item.queue_priority()
+        if priority == 100:
+            queued, result = await dependencies.processor_admission_batcher.submit(item)
+        elif priority == 0:
+            queued, result = await dependencies.fault_admission_batcher.submit(item)
+        elif priority == 50:
+            queued, result = await dependencies.evidence_admission_batcher.submit(item)
+        else:
+            queued, result = await prepared.store_pool.run(
+                dependencies.context.store.try_enqueue_processor_request,
+                item,
+                max_depth=dependencies.processor_max_queue_depth,
+                max_cluster_depth=(dependencies.processor_max_cluster_queue_depth),
+                reserved_fault_depth=(
+                    dependencies.processor_fault_reserved_queue_depth
+                ),
+                reserved_cluster_fault_depth=(
+                    dependencies.processor_fault_reserved_cluster_depth
+                ),
+                global_admission_guard=(dependencies.processor_global_admission_guard),
+            )
+        prepared.server_timing["admission"] = (time.monotonic() - started) * 1000
+    except StoreIoCapacityExceeded:
+        prepared.server_timing["admission"] = (time.monotonic() - started) * 1000
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "2"},
+            content={"detail": "store I/O capacity exceeded"},
+        )
+    if result in {
+        "global",
+        "cluster",
+        "global_reserved",
+        "cluster_reserved",
+    }:
+        dependencies.processor_admission_rejections[result] += 1
+        if result in {"cluster", "cluster_reserved"}:
+            cluster_key = f"{result}\x1f{item.cluster_id}"
+            rejections = dependencies.processor_admission_rejections
+            rejections[cluster_key] = rejections.get(cluster_key, 0) + 1
+        by_path = dependencies.processor_admission_rejections_by_path
+        by_path[item.path] = by_path.get(item.path, 0) + 1
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(dependencies.processor_retry_after_seconds)},
+            content={
+                "detail": "processor queue capacity exceeded",
+                "scope": result,
+            },
+        )
+    if queued is None:
+        raise RuntimeError("processor admission returned no queued request")
+    if result == "coalesced":
+        dependencies.state.telemetry_coalesced += 1
+    return queued, result
+
+
+async def _wait_for_response(
+    item: ProcessorRequest,
+    dependencies: ProcessorDispatchDependencies,
+) -> Response:
+    deadline = time.monotonic() + float(
+        os.getenv(
+            "GPU_FAULT_PROCESSOR_RESPONSE_TIMEOUT_SECONDS",
+            "115",
+        )
+    )
+    while time.monotonic() < deadline:
+        try:
+            current = await dependencies.store_io.run(
+                dependencies.context.store.get_processor_request,
+                item.request_id,
+            )
+        except StoreIoCapacityExceeded:
+            return JSONResponse(
+                status_code=503,
+                headers={"Retry-After": "2"},
+                content={"detail": "store I/O capacity exceeded"},
+            )
+        if current.status is ProcessorRequestStatus.COMPLETED:
+            headers = {}
+            if current.response_content_type:
+                headers["Content-Type"] = current.response_content_type
+            return Response(
+                content=current.response_body(),
+                status_code=current.response_status or 500,
+                headers=headers,
+            )
+        await asyncio.sleep(0.1)
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "2"},
+        content={
+            "detail": "processor response timed out",
+            "processor_request_id": item.request_id,
+        },
+    )
+
+
+async def dispatch_processor_request(
+    request: Request,
+    call_next,
+    dependencies: ProcessorDispatchDependencies,
+) -> Response:
+    processor = dependencies.processor
+    if processor is None or not dependencies.requires_processor(request):
+        return await call_next(request)
+    replay = await _handle_replay(request, call_next, dependencies)
+    if replay is not None:
+        return replay
+    prepared = await _prepare_request(request, dependencies)
+    if isinstance(prepared, Response):
+        return prepared
+    if (
+        dependencies.processor_queue_bypass_enabled
+        and request.url.path in dependencies.processor_queue_bypass_paths
+    ):
+        by_path = dependencies.processor_queue_bypasses_by_path
+        by_path[request.url.path] = by_path.get(request.url.path, 0) + 1
+        return await call_next(request)
+    spooled = await _try_spool(prepared, dependencies)
+    if spooled is not None:
+        return spooled
+    admitted = await _enqueue(prepared, dependencies)
+    if isinstance(admitted, Response):
+        return admitted
+    item, result = admitted
+    if dependencies.returns_processor_receipt(request.url.path):
+        return JSONResponse(
+            status_code=202,
+            content={
+                "accepted": True,
+                "processor_request_id": item.request_id,
+                "status_url": (f"/v1/processor/requests/{item.request_id}"),
+                "coalesced": result == "coalesced",
+            },
+        )
+    return await _wait_for_response(item, dependencies)
+
+
+def install_processor_dispatch(
+    app: FastAPI,
+    dependencies: ProcessorDispatchDependencies,
+) -> None:
+    @app.middleware("http")
+    async def processor_dispatch(request: Request, call_next):
+        return await dispatch_processor_request(request, call_next, dependencies)

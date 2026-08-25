@@ -1,0 +1,41 @@
+"""Stable pytest nodeids for split test_executor.py cases."""
+
+# ruff: noqa: F401
+from ._executor_cases_1 import (
+    test_active_executor_completes_and_is_idempotent,
+    test_active_executor_waits_and_resumes_external_operation,
+    test_dag_branch_failure_still_dispatches_other_ready_branch,
+    test_dag_cycle_is_rejected_before_execution,
+    test_dag_fans_out_node_branches_and_joins_once,
+    test_dag_rebind_persists_incident_before_later_step_waits,
+    test_dispatcher_backlog_gate_is_scoped_and_bounded,
+    test_dispatcher_executes_durable_pending_workflow,
+    test_dispatcher_expires_stuck_predecessor_and_runs_successor,
+    test_dispatcher_internal_error_blocks_workflow_without_hot_loop,
+    test_dispatcher_releases_successor_after_predecessor_superseded,
+    test_dispatcher_resolves_chained_preemptions_to_highest_action,
+    test_dispatcher_skips_workflow_until_aggregation_window_expires,
+    test_dispatcher_waits_for_predecessor_terminal_state,
+    test_dispatcher_waits_for_same_node_processor_backlog,
+    test_executor_restores_when_successor_cannot_take_quiesce_handoff,
+    test_executor_supersedes_at_clean_step_boundary,
+    test_five_level_preemption_is_arrival_order_independent,
+    test_fleet_preflight_does_not_withdraw_containment_only_plan,
+    test_fleet_preflight_holds_before_destructive_step,
+    test_fleet_preflight_retries_after_pin_alignment,
+    test_preemption_config_disabled_keeps_predecessor_running,
+    test_terminal_quarantine_dag_finishes_without_shared_restart,
+)
+from ._executor_cases_2 import (
+    test_dispatcher_background_loop_executes_and_stops,
+    test_dispatcher_background_loop_survives_transient_store_error,
+    test_dispatcher_reconciles_previously_failed_workflow,
+    test_dispatcher_treats_lease_contention_as_waiting,
+    test_dispatcher_wake_interrupts_poll_wait,
+    test_executor_identity_is_unique_by_default,
+    test_hung_triage_result_and_dag_rewrite_are_saved_together,
+    test_preemption_survives_store_failover_and_lease_takeover,
+    test_sqlite_store_persists_workflow_and_atomic_claim,
+    test_transient_store_error_does_not_block_active_workflow,
+    test_workflow_preemption_config_is_enabled_by_default,
+)

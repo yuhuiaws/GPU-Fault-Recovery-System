@@ -1,0 +1,189 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-fault-node-endpoint-migration
+  namespace: gpu-fault-system
+spec:
+  selector:
+    matchLabels:
+      app: gpu-fault-node-endpoint-migration
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-node-endpoint-migration
+    spec:
+      hostPID: true
+      hostNetwork: true
+      nodeSelector:
+        sagemaker.amazonaws.com/cluster-name: REPLACE_WITH_CLUSTER_ID
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: migration
+          resources:
+            requests:
+              cpu: "50m"
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi
+          image: public.ecr.aws/docker/library/busybox:1.36
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              host_dir=/host/etc/gpu-fault
+              connection_dir=/connection
+              endpoint="$(cat "${connection_dir}/control-plane-url")"
+              token="$(cat "${connection_dir}/cluster-token")"
+
+              upsert_env() {
+                file="$1"
+                key="$2"
+                value="$3"
+                temporary="${file}.tmp.$$"
+                awk -v key="${key}" \
+                  '$0 !~ ("^" key "=") { print }' \
+                  "${file}" > "${temporary}"
+                printf '%s="%s"\n' "${key}" "${value}" \
+                  >> "${temporary}"
+                chmod 0600 "${temporary}"
+                mv "${temporary}" "${file}"
+              }
+
+              cp "${connection_dir}/ca.crt" \
+                "${host_dir}/control-plane-ca.crt"
+              chmod 0644 "${host_dir}/control-plane-ca.crt"
+              artifact_name=gpu_fault_control_plane-0.10.0-py3-none-any.whl
+              host_artifact="/var/lib/gpu-fault/${artifact_name}"
+              cp "/artifact/${artifact_name}" \
+                "/host${host_artifact}"
+              chroot /host /opt/gpu-fault/venv/bin/pip install \
+                --no-deps --force-reinstall "${host_artifact}"
+
+              collector_env="${host_dir}/collector.env"
+              upsert_env "${collector_env}" \
+                GPU_FAULT_CONTROL_PLANE_URL "${endpoint}"
+              upsert_env "${collector_env}" \
+                GPU_FAULT_CONTROL_PLANE_TOKEN "${token}"
+              upsert_env "${collector_env}" SSL_CERT_FILE \
+                /etc/gpu-fault/control-plane-ca.crt
+              upsert_env "${collector_env}" \
+                GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR false
+              upsert_env "${collector_env}" \
+                GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR false
+
+              node_env="${host_dir}/node-agent.env"
+              if [ -f "${node_env}" ]; then
+                node_action_master="$(
+                  cat "${connection_dir}/node-action-secret"
+                )"
+                cluster_id="$(
+                  cat "${connection_dir}/cluster-id"
+                )"
+                node_action_secret="$(
+                  chroot /host /usr/bin/env \
+                    GPU_FAULT_FLEET_SECRET="${node_action_master}" \
+                    GPU_FAULT_CLUSTER_ID="${cluster_id}" \
+                    GPU_FAULT_NODE_ID="${TARGET_NODE_NAME}" \
+                    /opt/gpu-fault/venv/bin/python -c '
+              import hashlib
+              import hmac
+              import os
+
+              context = (
+                  "gpu-fault/node-action/v1\0"
+                  + os.environ["GPU_FAULT_CLUSTER_ID"]
+                  + "\0"
+                  + os.environ["GPU_FAULT_NODE_ID"]
+              ).encode()
+              print(
+                  hmac.new(
+                      os.environ[
+                          "GPU_FAULT_FLEET_SECRET"
+                      ].encode(),
+                      context,
+                      hashlib.sha256,
+                  ).hexdigest()
+              )
+              '
+                )"
+                unset node_action_master
+                upsert_env "${node_env}" \
+                  GPU_FAULT_NODE_CONTROL_PLANE_URL "${endpoint}"
+                upsert_env "${node_env}" \
+                  GPU_FAULT_NODE_CONTROL_PLANE_TOKEN "${token}"
+                upsert_env "${node_env}" \
+                  GPU_FAULT_NODE_ACTION_SECRET "${node_action_secret}"
+                upsert_env "${node_env}" \
+                  GPU_FAULT_NODE_ACTION_KEY_VERSION 2
+                upsert_env "${node_env}" \
+                  GPU_FAULT_NODE_AGENT_HOST "${TARGET_NODE_IP}"
+                upsert_env "${node_env}" \
+                  GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT true
+                upsert_env "${node_env}" SSL_CERT_FILE \
+                  /etc/gpu-fault/control-plane-ca.crt
+                upsert_env "${node_env}" \
+                  GPU_FAULT_NODE_ARTIFACT_SHA256 \
+                  REPLACE_WITH_ARTIFACT_SHA256
+              fi
+
+              chroot /host systemctl disable --now \
+                gpu-fault-log-collector.service
+              for service in \
+                gpu-fault-kernel-collector.service \
+                gpu-fault-fabric-manager-collector.service \
+                gpu-fault-metrics-collector.service \
+                gpu-fault-host-collector.service \
+                gpu-fault-node-agent.service; do
+                chroot /host systemctl restart "${service}"
+              done
+
+              printf 'endpoint=%s\n' "${endpoint}"
+              printf 'ca_sha256='
+              sha256sum "${host_dir}/control-plane-ca.crt" \
+                | awk '{ print $1 }'
+              printf 'artifact_sha256='
+              sha256sum "/host${host_artifact}" | awk '{ print $1 }'
+              chroot /host systemctl is-active \
+                gpu-fault-kernel-collector.service \
+                gpu-fault-fabric-manager-collector.service \
+                gpu-fault-metrics-collector.service \
+                gpu-fault-host-collector.service \
+                gpu-fault-node-agent.service
+              printf 'node_log='
+              chroot /host systemctl is-enabled \
+                gpu-fault-log-collector.service 2>/dev/null || true
+              sleep 3600
+          env:
+            - name: TARGET_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: TARGET_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          volumeMounts:
+            - name: host
+              mountPath: /host
+              mountPropagation: HostToContainer
+            - name: connection
+              mountPath: /connection
+              readOnly: true
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+            type: Directory
+        - name: connection
+          secret:
+            secretName: gpu-fault-regional-connection
+        - name: artifact
+          configMap:
+            name: REPLACE_WITH_WHEEL_CONFIG_MAP

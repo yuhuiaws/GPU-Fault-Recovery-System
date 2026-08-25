@@ -1,0 +1,243 @@
+# E2E FIXTURE: driven by scripts/e2e/, not a supported deployment entry point.
+# Resource profile assumes p5en-class nodes with 8 GPUs and 16 EFA devices per Pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-fault-q118-gpu-script
+  namespace: gpu-fault-system
+data:
+  train.py: |
+    import os
+    import socket
+    import time
+
+    import torch
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel
+
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    dtype = torch.bfloat16
+
+    layers = []
+    for _ in range(4):
+        layers.extend(
+            [
+                torch.nn.Linear(4096, 4096, bias=False),
+                torch.nn.GELU(),
+            ]
+        )
+    model = torch.nn.Sequential(*layers).to(
+        device=device, dtype=dtype
+    )
+    model = DistributedDataParallel(
+        model,
+        device_ids=[local_rank],
+        gradient_as_bucket_view=True,
+        bucket_cap_mb=64,
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=1.0e-4)
+    features = torch.randn(
+        512, 4096, device=device, dtype=dtype
+    )
+    target = torch.randn(
+        512, 4096, device=device, dtype=dtype
+    )
+
+    step = 0
+    while True:
+        started = time.monotonic()
+        optimizer.zero_grad(set_to_none=True)
+        output = model(features)
+        loss = (output - target).float().square().mean()
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize()
+        elapsed = time.monotonic() - started
+        if step % 5 == 0:
+            print(
+                "Q118_GPU_TRAIN "
+                f"rank={rank}/{world_size} "
+                f"local_rank={local_rank} step={step} "
+                f"loss={loss.item():.6f} "
+                f"step_ms={elapsed * 1000:.1f} "
+                f"memory_mib="
+                f"{torch.cuda.memory_allocated() / 1048576:.1f} "
+                f"node={socket.gethostname()}",
+                flush=True,
+            )
+        step += 1
+---
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: gpu-fault-q118-gpu-intensive
+  namespace: gpu-fault-system
+  labels:
+    gpu-fault.io/managed: "true"
+    gpu-fault.io/job-id: q118-gpu-intensive-20260813
+    gpu-fault.io/attempt-id: q118-gpu-intensive-20260813-a001
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: gpu-fault-q118-gpu-intensive
+            gpu-fault.io/managed: "true"
+            gpu-fault.io/job-id: q118-gpu-intensive-20260813
+            gpu-fault.io/attempt-id: q118-gpu-intensive-20260813-a001
+            gpu-fault.io/role: master
+            gpu-fault.io/critical: "true"
+          annotations:
+            gpu-fault.io/expected-critical-ranks: "3"
+            gpu-fault.io/training-container: pytorch
+            gpu-fault.io/runtime-profile-version: hyperpod-v1
+            gpu-fault.io/rank-offset: "0"
+            gpu-fault.io/restart-budget: "1"
+        spec:
+          restartPolicy: Never
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: gpu-fault-q118-gpu-intensive
+                  topologyKey: kubernetes.io/hostname
+          volumes:
+            - name: script
+              configMap:
+                name: gpu-fault-q118-gpu-script
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi
+          containers:
+            - name: pytorch
+              image: public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  exec torchrun \
+                    --nnodes="${WORLD_SIZE}" \
+                    --nproc-per-node=8 \
+                    --node-rank="${RANK}" \
+                    --master-addr="${MASTER_ADDR}" \
+                    --master-port="${MASTER_PORT}" \
+                    /opt/q118/train.py
+              env:
+                - name: NCCL_DEBUG
+                  value: INFO
+                - name: NCCL_ASYNC_ERROR_HANDLING
+                  value: "1"
+                - name: FI_PROVIDER
+                  value: efa
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+              volumeMounts:
+                - name: script
+                  mountPath: /opt/q118
+                  readOnly: true
+                - name: dshm
+                  mountPath: /dev/shm
+              resources:
+                requests:
+                  cpu: "32"
+                  memory: 128Gi
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "16"
+                limits:
+                  cpu: "64"
+                  memory: 256Gi
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "16"
+    Worker:
+      replicas: 2
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: gpu-fault-q118-gpu-intensive
+            gpu-fault.io/managed: "true"
+            gpu-fault.io/job-id: q118-gpu-intensive-20260813
+            gpu-fault.io/attempt-id: q118-gpu-intensive-20260813-a001
+            gpu-fault.io/role: worker
+            gpu-fault.io/critical: "true"
+          annotations:
+            gpu-fault.io/expected-critical-ranks: "3"
+            gpu-fault.io/training-container: pytorch
+            gpu-fault.io/runtime-profile-version: hyperpod-v1
+            gpu-fault.io/rank-offset: "1"
+            gpu-fault.io/restart-budget: "1"
+        spec:
+          restartPolicy: Never
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: gpu-fault-q118-gpu-intensive
+                  topologyKey: kubernetes.io/hostname
+          volumes:
+            - name: script
+              configMap:
+                name: gpu-fault-q118-gpu-script
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi
+          containers:
+            - name: pytorch
+              image: public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  exec torchrun \
+                    --nnodes="${WORLD_SIZE}" \
+                    --nproc-per-node=8 \
+                    --node-rank="${RANK}" \
+                    --master-addr="${MASTER_ADDR}" \
+                    --master-port="${MASTER_PORT}" \
+                    /opt/q118/train.py
+              env:
+                - name: NCCL_DEBUG
+                  value: INFO
+                - name: NCCL_ASYNC_ERROR_HANDLING
+                  value: "1"
+                - name: FI_PROVIDER
+                  value: efa
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+              volumeMounts:
+                - name: script
+                  mountPath: /opt/q118
+                  readOnly: true
+                - name: dshm
+                  mountPath: /dev/shm
+              resources:
+                requests:
+                  cpu: "32"
+                  memory: 128Gi
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "16"
+                limits:
+                  cpu: "64"
+                  memory: 256Gi
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "16"

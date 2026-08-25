@@ -1,0 +1,27 @@
+[Unit]
+Description=GPU fault dedicated DCGM Exporter
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gpu-fault/dcgm-exporter.env
+ExecStartPre=-@CONTAINER_RUNTIME@ rm -f gpu-fault-dcgm-exporter
+ExecStart=@CONTAINER_RUNTIME@ run --rm --name gpu-fault-dcgm-exporter --gpus all --network host --cap-add SYS_ADMIN --security-opt no-new-privileges --cpus 2 --cpu-shares 128 --memory 2g --memory-reservation 1g --pids-limit 512 -e DCGM_EXPORTER_COLLECTORS=/etc/dcgm-exporter/gpu-fault-counters.csv -v /etc/gpu-fault/dcgm-counters.csv:/etc/dcgm-exporter/gpu-fault-counters.csv:ro ${GPU_FAULT_DCGM_EXPORTER_IMAGE} -a 127.0.0.1:9400
+ExecStop=-@CONTAINER_RUNTIME@ stop -t 15 gpu-fault-dcgm-exporter
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+# Resource control: the container payload lives in the runtime's own
+# cgroup, so its ceiling is set by the run flags above; these limits
+# bound the supervising client process.
+CPUWeight=20
+MemoryHigh=192M
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=128
+IOWeight=20
+
+[Install]
+WantedBy=multi-user.target

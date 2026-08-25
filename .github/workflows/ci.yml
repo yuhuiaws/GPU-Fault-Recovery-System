@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gpu_fault
+          POSTGRES_PASSWORD: gpu_fault
+          POSTGRES_DB: gpu_fault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gpu_fault -d gpu_fault_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      GPU_FAULT_TEST_POSTGRES_URL: >-
+        postgresql://gpu_fault:gpu_fault@127.0.0.1:5432/gpu_fault_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: >-
+          python -m pip install
+          '.[dev,collectors,postgres,performance]'
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: python -m ruff format --check src deploy scripts tools
+      - run: >-
+          python -m ruff format --check \
+            --config 'format.skip-magic-trailing-comma=true' tests
+      - run: >-
+          python -m ruff check src tests deploy scripts tools
+      - run: python -m ruff check --select I tests
+      - run: python scripts/check-mypy-baseline.py
+      - run: python scripts/check-mixin-contracts.py
+      - run: python scripts/check-test-private-coupling.py
+      - run: python scripts/check-assert-messages.py
+      - run: python scripts/check-public-release.py
+      - run: >-
+          PYTHONPYCACHEPREFIX=/tmp/gpu-fault-pycache
+          python -m compileall -q src tests deploy scripts tools
+      - run: python scripts/check-python-architecture.py
+      - run: >-
+          PYTHON=python
+          deploy/control-plane/tools/update-deployment-contracts.sh --check
+      - run: python scripts/check-deploy-layout.py
+      - run: python scripts/check-artifacts.py
+      - run: >-
+          python -m yamllint --strict -c .yamllint
+          deploy examples testcases config scripts/e2e scripts/perf
+      - run: >-
+          find deploy scripts tools -type f -name '*.sh' -print0 |
+          sort -z |
+          xargs -0 -n1 bash -n
+      - run: >-
+          find deploy scripts tools -type f -name '*.sh' -print0 |
+          sort -z |
+          xargs -0 shellcheck --severity=warning
+      - run: >-
+          PYTHONPATH=src
+          python tools/generate_nvidia_xid_policy.py --check
+      - run: make docs-check
+      - name: Check pull-request documentation impact
+        if: github.event_name == 'pull_request'
+        run: >-
+          python scripts/check-doc-impact.py
+          --base "${{ github.event.pull_request.base.sha }}"
+          --head HEAD
+          --event-path "${GITHUB_EVENT_PATH}"
+      - run: >-
+          python -m gpu_fault.config_cli validate
+          deploy/control-plane/regional/generated
+      - run: make artifact-check
+      - name: Run full suite with coverage floor
+        run: >-
+          GPU_FAULT_TEST_POSTGRES_URL=
+          python -m pytest -n 4
+          --cov=src/gpu_fault
+          --cov-branch
+          --cov-fail-under=78
+          --cov-report=term-missing
+      - name: Run PostgreSQL backend tests serially
+        run: make test-postgres
+      - name: Run unit and component fault scenario catalog runner
+        run: make fault-test-cases-ci
+      - name: Upload fault test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fault-test-report
+          path: artifacts/fault/fault-tests-*.json
+          if-no-files-found: error
+          retention-days: 30

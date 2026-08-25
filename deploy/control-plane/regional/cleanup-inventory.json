@@ -1,0 +1,405 @@
+{
+  "schema_version": 1,
+  "generated_by": "scripts/generate-cleanup-inventory.py",
+  "cpu": {
+    "manifest_globs": [
+      "deploy/control-plane/base/*.yaml",
+      "deploy/control-plane/regional/*.yaml",
+      "deploy/control-plane/regional/generated/*.yaml",
+      "deploy/observability/*.yaml"
+    ],
+    "implicit_namespace_kinds": [
+      "ConfigMap",
+      "Kustomization",
+      "Namespace",
+      "Secret"
+    ],
+    "database_pod_preference": [
+      "gpu-fault-control-worker",
+      "gpu-fault-telemetry-spool-worker",
+      "gpu-fault-api-ha"
+    ],
+    "resources": [
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-api-ha",
+        "scope": "namespaced",
+        "phase": "ingress",
+        "order": 10,
+        "clean": "delete"
+      },
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-control-worker",
+        "scope": "namespaced",
+        "phase": "consumer",
+        "order": 10,
+        "clean": "delete"
+      },
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-telemetry-spool-worker",
+        "scope": "namespaced",
+        "phase": "consumer",
+        "order": 20,
+        "clean": "delete"
+      },
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-adot",
+        "scope": "namespaced",
+        "phase": "auxiliary",
+        "order": 10,
+        "clean": "delete"
+      },
+      {
+        "kind": "cronjob",
+        "name": "gpu-fault-aurora-credential-refresh",
+        "scope": "namespaced",
+        "phase": "auxiliary",
+        "order": 20,
+        "clean": "delete"
+      },
+      {
+        "kind": "daemonset",
+        "name": "gpu-fault-control-plane-sysctl",
+        "scope": "namespaced",
+        "phase": "auxiliary",
+        "order": 30,
+        "clean": "delete"
+      },
+      {
+        "kind": "poddisruptionbudget",
+        "name": "gpu-fault-adot",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "poddisruptionbudget",
+        "name": "gpu-fault-api-ha",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "poddisruptionbudget",
+        "name": "gpu-fault-control-worker-pdb",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "poddisruptionbudget",
+        "name": "gpu-fault-telemetry-spool-worker-pdb",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "prometheusrule",
+        "name": "gpu-fault-processor-capacity",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "namespace"
+      },
+      {
+        "kind": "role",
+        "name": "gpu-fault-adot-discovery",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "role",
+        "name": "gpu-fault-aurora-credential-refresh",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "rolebinding",
+        "name": "gpu-fault-adot-discovery",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "rolebinding",
+        "name": "gpu-fault-aurora-credential-refresh",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "service",
+        "name": "gpu-fault-api",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-adot",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-aurora-credential-refresh",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-control-plane",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "service",
+        "name": "gpu-fault-api-nlb",
+        "scope": "namespaced",
+        "phase": "nlb",
+        "order": 10,
+        "clean": "reset"
+      }
+    ]
+  },
+  "gpu": {
+    "manifest_globs": [
+      "deploy/dataplane/**/*.yaml"
+    ],
+    "implicit_namespace_kinds": [
+      "ConfigMap",
+      "Kustomization",
+      "Namespace",
+      "Secret"
+    ],
+    "node_annotations": [
+      "gpu-fault.io/installer-version",
+      "gpu-fault.io/installer-config-digest",
+      "gpu-fault.io/installer-artifact-sha256",
+      "gpu-fault.io/installer-node-uid",
+      "gpu-fault.io/installer-state"
+    ],
+    "resources": [
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-node-installer-reconciler",
+        "scope": "namespaced",
+        "phase": "producer",
+        "order": 10,
+        "clean": "delete",
+        "deploy": "regional_reconciler",
+        "manifest": "node-installer-reconciler.yaml"
+      },
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-completion-watcher",
+        "scope": "namespaced",
+        "phase": "producer",
+        "order": 20,
+        "clean": "delete",
+        "deploy": "regional_rollout",
+        "manifest": "completion-watcher.yaml"
+      },
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-kubernetes-node-resource-collector",
+        "scope": "namespaced",
+        "phase": "producer",
+        "order": 30,
+        "clean": "delete",
+        "deploy": "regional_rollout",
+        "manifest": "kubernetes-node-resource-collector.yaml"
+      },
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-hma-watcher",
+        "scope": "namespaced",
+        "phase": "producer",
+        "order": 40,
+        "clean": "delete"
+      },
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-hma-cloudwatch-consumer",
+        "scope": "namespaced",
+        "phase": "producer",
+        "order": 50,
+        "clean": "delete"
+      },
+      {
+        "kind": "daemonset",
+        "name": "gpu-fault-metrics-collector",
+        "scope": "namespaced",
+        "phase": "producer",
+        "order": 60,
+        "clean": "delete"
+      },
+      {
+        "kind": "daemonset",
+        "name": "gpu-fault-dcgm-exporter",
+        "scope": "namespaced",
+        "phase": "producer",
+        "order": 70,
+        "clean": "delete"
+      },
+      {
+        "kind": "deployment",
+        "name": "gpu-fault-cluster-executor",
+        "scope": "namespaced",
+        "phase": "executor",
+        "order": 10,
+        "clean": "delete",
+        "deploy": "regional_rollout",
+        "manifest": "cluster-action-executor.yaml"
+      },
+      {
+        "kind": "clusterrole",
+        "name": "gpu-fault-cluster-executor",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "clusterrole",
+        "name": "gpu-fault-completion-watcher",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "clusterrole",
+        "name": "gpu-fault-hma-watcher",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "clusterrole",
+        "name": "gpu-fault-kubernetes-node-resource-collector",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "clusterrole",
+        "name": "gpu-fault-node-installer-reconciler",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "clusterrolebinding",
+        "name": "gpu-fault-cluster-executor",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "clusterrolebinding",
+        "name": "gpu-fault-completion-watcher",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "clusterrolebinding",
+        "name": "gpu-fault-hma-watcher",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "clusterrolebinding",
+        "name": "gpu-fault-kubernetes-node-resource-collector",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "clusterrolebinding",
+        "name": "gpu-fault-node-installer-reconciler",
+        "scope": "cluster",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-cluster-executor",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-completion-watcher",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-hma-cloudwatch-consumer",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-hma-watcher",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-kubernetes-node-resource-collector",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-node-installer-reconciler",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      }
+    ]
+  }
+}

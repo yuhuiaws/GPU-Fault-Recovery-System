@@ -1,0 +1,537 @@
+from __future__ import annotations
+
+import ast
+import json
+import re
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+import pytest
+import yaml
+
+from gpu_fault.policy import load_xid_policy
+from tools import run_fault_test_cases as runner
+from tools.run_fault_test_cases import (
+    TRACE_PREFIX,
+    _extract_processing_trace,
+    load_catalog,
+    run_case,
+    select_cases,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+CATALOG = ROOT / "testcases" / "fault-scenarios.yaml"
+REGIONAL_DOCUMENT = ROOT / "docs" / "区域模式端到端验收测试用例.md"
+REGIONAL_CASE_HEADING = re.compile(
+    r"^### (GF-REGIONAL-[A-Z0-9-]+)(?:[：:].*)?$", re.MULTILINE
+)
+REGIONAL_RISK_LABEL = re.compile(r"^\s*[-*] 等级[：:]\s*`([a-z-]+)`", re.MULTILINE)
+REGIONAL_RISK_TABLE_HEADING = "### 2.2 风险等级词表（唯一取值来源）"
+REGIONAL_RISK_TABLE_ROW = re.compile(r"^\| `([a-z-]+)` \|", re.MULTILINE)
+# 手册里"这条用例真跑过"只有这几种写法：小节标题里的执行记录/执行结论，
+# 或者一条 ``- <日期> 真机结果：`` 的行内结论。层级从 H2 起算：记录搬进
+# 执行史时整段提了一级，写死 #{4,6} 会把 `### 真实环境执行结论` 漏掉。
+REGIONAL_EXECUTION_RECORD = re.compile(
+    r"^(?:#{2,6}\s|[-*] |\*\*)"
+    r".*?(?:执行记录|执行结论|真机结果|真机执行记录|真机验证)",
+    re.MULTILINE,
+)
+
+
+def _heading_slug(value: str) -> str:
+    result = []
+    for character in value.strip().lower():
+        if character.isspace():
+            result.append("-")
+        elif character == "-":
+            result.append(character)
+        elif unicodedata.category(character).startswith(("P", "S")):
+            continue
+        else:
+            result.append(character)
+    return "".join(result)
+
+
+def _heading_anchors(path: Path) -> set[str]:
+    anchors = set()
+    occurrences: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"^#{1,6}\s+(.+?)\s*#*$", line)
+        if match is None:
+            continue
+        base = _heading_slug(match.group(1))
+        occurrence = occurrences.get(base, 0)
+        occurrences[base] = occurrence + 1
+        anchors.add(base if occurrence == 0 else f"{base}-{occurrence}")
+    return anchors
+
+
+def test_fault_scenario_catalog_is_complete_and_unique() -> None:
+    # 精确条数而不是下界：``>= 500`` 只增不减，删掉一条用例它照样绿。
+    # 显式用例数来自 YAML，两个生成家族直接跟固定 Catalog rule ID 集合。
+    raw = yaml.safe_load(CATALOG.read_text(encoding="utf-8"))
+    xid_values = {rule.xid for rule in load_xid_policy().catalog_rules}
+    cases = load_catalog(CATALOG)
+    ids = {case["id"] for case in cases}
+
+    assert len(cases) == len(raw["test_cases"]) + len(xid_values) * 2
+    assert len(ids) == len(cases)
+    assert {f"GF-XID-KMSG-{value:03d}" for value in xid_values} <= ids
+    assert {f"GF-XID-KMSG-B200-{value:03d}" for value in xid_values} <= ids
+    assert {family["generator"] for family in raw["generated_test_families"]} == {
+        "xid_catalog_rules"
+    }
+    assert all(
+        "start" not in family and "end" not in family
+        for family in raw["generated_test_families"]
+    )
+    assert {
+        "xid-policy",
+        "xid-collector",
+        "xid-kmsg-replay",
+        "xid-kmsg-replay-b200",
+        "gpu-product-discovery",
+        "sxid-policy",
+        "dcgm-diagnostics",
+        "gpu-metrics",
+        "host-health",
+        "training-recovery",
+        "restart-guard",
+        "notification",
+        "closed-loop",
+        "hyperpod-managed",
+        "spare-failover",
+        "live-cluster",
+        "destructive-acceptance",
+        "attempt-generation-fence",
+        "regional-startup-guard",
+        "regional-authentication",
+        "regional-high-availability",
+        "regional-notification",
+        "regional-capacity",
+        "regional-preemption",
+        "regional-collector",
+        "regional-workload",
+    }.issubset({case["category"] for case in cases})
+
+
+def test_every_automated_case_references_a_real_pytest_function() -> None:
+    cases = load_catalog(CATALOG)
+    parsed: dict[Path, set[str]] = {}
+    nodeids = []
+
+    for case in cases:
+        if case["automation"] != "pytest":
+            continue
+        path_text, function_name = case["pytest_nodeid"].split("::", 1)
+        function_name = function_name.split("[", 1)[0]
+        path = ROOT / path_text
+        assert path.is_file(), case["id"]
+        if path not in parsed:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            names = {
+                node.name
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            for node in tree.body:
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                names.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if (alias.asname or alias.name).startswith("test_")
+                )
+            parsed[path] = names
+        assert function_name in parsed[path], case["id"]
+        nodeids.append(case["pytest_nodeid"])
+
+    assert len(nodeids) == len(set(nodeids))
+
+
+def test_every_pytest_reference_is_collectable() -> None:
+    cases = load_catalog(CATALOG)
+    nodeids = [
+        case["pytest_nodeid"] for case in cases if case["automation"] == "pytest"
+    ]
+    nodeids.extend(case["related_pytest"] for case in cases if "related_pytest" in case)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-o",
+            "addopts=",
+            *nodeids,
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout
+
+
+def test_manual_cases_reference_real_document_sections() -> None:
+    cases = load_catalog(CATALOG)
+    parsed: dict[Path, set[str]] = {}
+
+    for case in cases:
+        if case["automation"] != "manual":
+            continue
+        procedure = case["procedure"]
+        assert isinstance(procedure, str), case["id"]
+        path_text, separator, anchor = procedure.partition("#")
+        assert separator and anchor, case["id"]
+        path = ROOT / path_text
+        assert path.suffix == ".md", case["id"]
+        assert path.is_file(), case["id"]
+        if path not in parsed:
+            parsed[path] = _heading_anchors(path)
+        assert anchor in parsed[path], case["id"]
+
+
+def test_default_selection_excludes_destructive_manual_cases() -> None:
+    cases = load_catalog(CATALOG)
+    selected = select_cases(
+        cases,
+        case_ids=set(),
+        categories=set(),
+        levels=set(),
+        include_manual=False,
+        include_live=False,
+    )
+
+    assert selected
+    assert all(case["risk"] == "non-destructive" for case in selected)
+    assert all(case["automation"] == "pytest" for case in selected)
+
+
+def test_live_case_requires_explicit_opt_in() -> None:
+    cases = load_catalog(CATALOG)
+    selected = select_cases(
+        cases,
+        case_ids={"GF-LIVE-000"},
+        categories=set(),
+        levels=set(),
+        include_manual=False,
+        include_live=True,
+    )
+
+    assert [case["id"] for case in selected] == ["GF-LIVE-000"]
+    assert selected[0]["risk"] == "live-non-destructive"
+
+
+def test_include_live_does_not_execute_an_unselected_command() -> None:
+    cases = load_catalog(CATALOG)
+    selected = select_cases(
+        cases,
+        case_ids=set(),
+        categories=set(),
+        levels=set(),
+        include_manual=False,
+        include_live=True,
+    )
+
+    assert all(case["automation"] != "command" for case in selected)
+
+
+def test_superseded_manual_case_reports_its_replacement() -> None:
+    cases = load_catalog(CATALOG)
+    case = next(
+        item
+        for item in cases
+        if (item.get("evidence") or {}).get("verdict") == "SUPERSEDED"
+    )
+
+    result = run_case(case)
+
+    assert result["status"] == "NOT_RUN"
+    assert result["reason"] == (f"superseded by {case['superseded_by']}")
+    assert result["evidence"]["verdict"] == "SUPERSEDED"
+    assert result["superseded_by"] == case["superseded_by"]
+
+
+def test_processing_trace_is_extracted_from_pytest_output() -> None:
+    trace, output = _extract_processing_trace(
+        "pytest prelude\n"
+        + TRACE_PREFIX
+        + '{"schema_version":1,"xid":94}\n'
+        + ". [100%]\n"
+    )
+
+    assert trace == {"schema_version": 1, "xid": 94}
+    assert output == "pytest prelude\n. [100%]"
+
+
+@pytest.mark.parametrize(
+    ("catalog_text", "message"),
+    [
+        (
+            """\
+schema_version: 1
+test_cases:
+  - id: GF-BAD-001
+    id: GF-BAD-002
+""",
+            "duplicate YAML key",
+        ),
+        (
+            """\
+schema_version: 1
+test_cases:
+  - id: GF-BAD-001
+    title: invalid automation
+    category: test
+    level: unit
+    risk: non-destructive
+    problem: invalid
+    injection: invalid
+    expected: [must fail]
+    automation: pyest
+""",
+            "unsupported test case automation",
+        ),
+        (
+            """\
+schema_version: 1
+test_cases:
+  - id: GF-BAD-001
+    title: invalid expected
+    category: test
+    level: unit
+    risk: non-destructive
+    problem: invalid
+    injection: invalid
+    expected: must fail
+    automation: pytest
+    pytest_nodeid: tests/regional/test_api.py::test_health
+""",
+            "field expected",
+        ),
+        (
+            """\
+schema_version: 1
+test_cases:
+  - id: GF-BAD-001
+    title: invalid risk
+    category: test
+    level: unit
+    risk: destructive-reboot
+    problem: invalid
+    injection: invalid
+    expected: [must fail]
+    automation: pytest
+    pytest_nodeid: tests/regional/test_api.py::test_health
+""",
+            "unsupported test case risk",
+        ),
+        (
+            """\
+schema_version: 1
+test_cases:
+  - id: GF-BAD-001
+    title: invalid level
+    category: test
+    level: smoke
+    risk: non-destructive
+    problem: invalid
+    injection: invalid
+    expected: [must fail]
+    automation: pytest
+    pytest_nodeid: tests/regional/test_api.py::test_health
+""",
+            "unsupported test case level",
+        ),
+    ],
+)
+def test_catalog_loader_rejects_malformed_cases(
+    tmp_path: Path, catalog_text: str, message: str
+) -> None:
+    path = tmp_path / "fault-scenarios.yaml"
+    path.write_text(catalog_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_catalog(path)
+
+
+def test_risk_vocabulary_has_no_dead_or_undeclared_values() -> None:
+    # 风险等级只有一份词表：目录的 ``risk`` 和文档的「等级」共用它。
+    # 双向相等，所以既挡住未声明的新写法（如 destructive-reboot），
+    # 也挡住没人用的僵尸取值。
+    catalog_risks = {case["risk"] for case in load_catalog(CATALOG)}
+    documented_risks = set(
+        REGIONAL_RISK_LABEL.findall(REGIONAL_DOCUMENT.read_text(encoding="utf-8"))
+    )
+
+    assert catalog_risks | documented_risks == (runner.RISK_VALUES)
+
+
+def test_level_vocabulary_has_no_dead_or_undeclared_values() -> None:
+    levels = {case["level"] for case in load_catalog(CATALOG)}
+
+    assert levels == runner.LEVEL_VALUES
+
+
+def test_evidence_verdict_vocabulary_and_supersession_are_closed() -> None:
+    cases = load_catalog(CATALOG)
+    statuses = {case["evidence"]["verdict"] for case in cases if "evidence" in case}
+    case_ids = {case["id"] for case in cases}
+
+    assert statuses == runner.CURRENT_STATUS_VALUES
+    for case in cases:
+        verdict = (case.get("evidence") or {}).get("verdict")
+        if verdict == "SUPERSEDED":
+            assert case["automation"] == "manual"
+            assert case["superseded_by"] in case_ids
+        else:
+            assert "superseded_by" not in case
+
+
+def test_regional_cases_have_machine_readable_verdicts() -> None:
+    regional = [
+        case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
+    ]
+
+    assert len(regional) == 147
+    assert all((case.get("evidence") or {}).get("verdict") for case in regional)
+    assert {(case["evidence"]["verdict"]) for case in regional} == {
+        "PASS",
+        "BLOCKED",
+        "SUPERSEDED",
+    }
+
+
+def test_catalog_has_only_structured_json_safe_evidence() -> None:
+    raw = yaml.safe_load(CATALOG.read_text(encoding="utf-8"))
+    legacy = runner.LEGACY_EVIDENCE_FIELDS
+
+    for case in raw["test_cases"]:
+        assert not legacy.intersection(case), case["id"]
+        evidence = case.get("evidence")
+        if evidence is None:
+            continue
+        assert set(evidence) == {"verdict"}
+        json.dumps(evidence)
+
+
+def test_catalog_contains_no_real_infrastructure_identities() -> None:
+    text = CATALOG.read_text(encoding="utf-8")
+
+    assert re.search(r"hyperpod-i-[0-9a-f]{8,}", text) is None
+    assert re.search(r"\bhp-cluster-hypd-[A-Za-z0-9-]+\b", text) is None
+    assert "control-plane-" + "GPU-fault-solution" not in text
+    assert (
+        re.search(r"workflow-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", text) is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            "    evidence:\n      verdict: PASSED\n",
+            "unsupported test case evidence verdict",
+        ),
+        ("    evidence:\n      verdict: SUPERSEDED\n", "superseded_by"),
+        (
+            "    evidence:\n      verdict: PASS\n    superseded_by: GF-OTHER\n",
+            "superseded_by requires evidence.verdict=SUPERSEDED",
+        ),
+    ],
+)
+def test_catalog_rejects_invalid_current_status_contract(
+    tmp_path: Path, extra: str, message: str
+) -> None:
+    path = tmp_path / "fault-scenarios.yaml"
+    path.write_text(
+        """\
+schema_version: 1
+test_cases:
+  - id: GF-STATUS-001
+    title: status contract
+    category: test
+    level: unit
+    risk: non-destructive
+    problem: invalid status
+    injection: none
+    expected: [must validate]
+    automation: manual
+    procedure: docs/故障模拟测试手册.md#1-范围
+"""
+        + extra,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_catalog(path)
+
+
+def test_document_declares_every_risk_value() -> None:
+    text = REGIONAL_DOCUMENT.read_text(encoding="utf-8")
+    start = text.index(REGIONAL_RISK_TABLE_HEADING)
+    end = text.index("\n## ", start)
+    declared = set(REGIONAL_RISK_TABLE_ROW.findall(text[start:end]))
+
+    assert declared == runner.RISK_VALUES
+
+
+def _regional_case_bodies() -> dict[str, str]:
+    lines = REGIONAL_DOCUMENT.read_text(encoding="utf-8").splitlines()
+    starts: list[tuple[int, str | None]] = []
+    for index, line in enumerate(lines):
+        heading = REGIONAL_CASE_HEADING.match(line)
+        if heading is not None:
+            starts.append((index, heading.group(1)))
+        elif line.startswith("### ") or line.startswith("## "):
+            starts.append((index, None))
+    bodies = {}
+    for position, (index, case_id) in enumerate(starts):
+        if case_id is None:
+            continue
+        end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
+        bodies[case_id] = "\n".join(lines[index + 1 : end])
+    return bodies
+
+
+def test_every_documented_execution_record_is_reflected_in_the_catalog() -> None:
+    # 公开规格不得重新混入执行结果。若某段仍以执行记录措辞出现，
+    # catalog 必须至少具有机器 verdict，避免它成为无法判读的散文结论。
+    catalog = {
+        case["id"]: case
+        for case in load_catalog(CATALOG)
+        if case["id"].startswith("GF-REGIONAL-")
+    }
+    bodies = _regional_case_bodies()
+    missing = sorted(
+        case_id
+        for case_id, body in bodies.items()
+        if REGIONAL_EXECUTION_RECORD.search(body)
+        and not (catalog[case_id].get("evidence") or {}).get("verdict")
+    )
+
+    assert missing == []
+
+
+def test_catalog_and_document_agree_on_the_regional_case_set() -> None:
+    # 集合相等，两个方向都守：文档新增用例必须进目录（否则它既不会被
+    # runner 选中，也不会进 --collect-only 的引用体检），目录里也不许留
+    # 文档已删掉的孤儿条目。与 tests/regional/test_regional_execution_order.py
+    # 对执行顺序的守法一致。
+    documented = set(
+        REGIONAL_CASE_HEADING.findall(REGIONAL_DOCUMENT.read_text(encoding="utf-8"))
+    )
+    catalogued = {
+        case["id"]
+        for case in load_catalog(CATALOG)
+        if case["id"].startswith("GF-REGIONAL-")
+    }
+
+    assert documented == catalogued

@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-fault-store-migration
+  namespace: gpu-fault-system
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      # 下面的 source volume 是 hostPath，所以这个 Job 必须落在当时跑单副本
+      # SQLite 控制面的那台节点上。但节点名是每套环境各自的实例 id，写死
+      # 只对当初那台 dev 节点有效；手册 §11 也已经声明「不接受硬编码
+      # nodeName」。apply 前替换成本环境的节点名。
+      nodeName: REPLACE_WITH_SQLITE_SOURCE_NODE
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[postgres]'
+              && exec gpu-fault-store-migrate
+              --sqlite-path /source/control-plane.db
+          env:
+            - name: GPU_FAULT_STORE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-postgres
+                  key: postgres-url
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+            - name: source
+              mountPath: /source
+      volumes:
+        - name: artifact
+          configMap:
+            name: gpu-fault-control-plane-wheel-0100
+        - name: source
+          hostPath:
+            path: /var/lib/gpu-fault-control-plane
+            type: Directory

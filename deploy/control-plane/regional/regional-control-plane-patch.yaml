@@ -1,0 +1,186 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-api-ha
+  namespace: gpu-fault-system
+spec:
+  replicas: 3
+  template:
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              app: gpu-fault-api-ha
+      containers:
+        - name: api
+          # Bounded so a queue burst cannot expand the API into the
+          # node's memory and take the co-scheduled worker with it.
+          resources:
+            requests:
+              cpu: "4"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+          env:
+            - name: GPU_FAULT_DEPLOYMENT_MODE
+              value: regional
+            # The SES client region comes only from AWS_REGION or
+            # AWS_DEFAULT_REGION; it is not derived from Pod Identity.
+            # Without it every notification fails with botocore
+            # NoRegionError while fault handling itself looks healthy.
+            # Replace for a non-Oregon deployment.
+            - name: AWS_REGION
+              value: us-west-2
+            - name: AWS_DEFAULT_REGION
+              value: us-west-2
+            # In asynchronous delivery mode notifications are written to
+            # the outbox and drained by the dispatcher. Enabling email
+            # without the dispatcher leaves every notification PENDING
+            # forever, so these two switches must be set together.
+            - name: GPU_FAULT_ALLOW_EMAIL
+              value: "true"
+            - name: GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED
+              value: "true"
+            - name: GPU_FAULT_PROCESSOR_MODE
+              value: active-active
+            - name: GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS
+              value: "30"
+            - name: GPU_FAULT_PROCESSOR_REQUEST_RENEW_SECONDS
+              value: "5"
+            - name: GPU_FAULT_PROCESSOR_REQUEST_MAX_EXECUTION_SECONDS
+              value: "20"
+            - name: GPU_FAULT_PROCESSOR_RETRYABLE_RESPONSE_MAX_AGE_SECONDS
+              value: "300"
+            - name: GPU_FAULT_PROCESSOR_RESPONSE_TIMEOUT_SECONDS
+              value: "115"
+            - name: GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE
+              value: "true"
+            - name: GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS
+              value: "5"
+            - name: GPU_FAULT_PROCESSOR_WORKERS
+              value: "24"
+            - name: GPU_FAULT_PROCESSOR_FAULT_WORKERS
+              value: "4"
+            - name: GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS
+              value: "4"
+            - name: GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS
+              value: "8"
+            - name: GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS
+              value: "8"
+            # Ceiling on how long a telemetry stream that came back
+            # empty waits before it re-issues its claim query. Six
+            # worker replicas polling seven streams every 100ms cost
+            # about 500 commits a second on an idle control plane,
+            # roughly a quarter of what the writer can commit at 16
+            # ACU. The fault stream is exempt from the backoff, so
+            # escalation latency does not move. Set to 0.1 to go back
+            # to polling every stream every round.
+            - name: GPU_FAULT_PROCESSOR_IDLE_BACKOFF_MAX_SECONDS
+              value: "2"
+            - name: GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH
+              value: "65536"
+            - name: GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH
+              value: "1024"
+            - name: GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH
+              value: "8192"
+            - name: GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH
+              value: "128"
+            - name: GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS
+              value: "2"
+            - name: GPU_FAULT_PROCESSOR_MAX_REQUEST_BYTES
+              value: "16777216"
+            - name: GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD
+              value: "256"
+            - name: GPU_FAULT_PROCESSOR_QUEUE_STATE_MODE
+              value: "dedicated"
+            - name: GPU_FAULT_STORE_IO_WORKERS
+              value: "32"
+            # The synchronized cold-start storm arrives as one spike per
+            # cluster, and the whole point of the 202 receipt is to
+            # absorb it. In-flight is the queue in front of the 32
+            # threads; the end-to-end request deadline below is what
+            # keeps a queued request from outliving its client.
+            - name: GPU_FAULT_STORE_IO_MAX_IN_FLIGHT
+              value: "1024"
+            - name: GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS
+              value: "30"
+            # One budget for the whole request, clamping the ingress
+            # wait, the store I/O admission wait and the pool checkout.
+            # Before this each queue had its own timeout and a request
+            # could hold capacity for over a minute while the collector
+            # that sent it gave up after fifteen seconds.
+            - name: GPU_FAULT_REQUEST_BUDGET_SECONDS
+              value: "15"
+            - name: GPU_FAULT_POSTGRES_POOL_MIN_SIZE
+              value: "2"
+            # Sized to the store I/O thread pool: a smaller pool would
+            # move the concurrency limit into the checkout, a larger one
+            # only raises the fleet's connection ceiling, which is this
+            # times 4 uvicorn workers times 3 replicas.
+            - name: GPU_FAULT_POSTGRES_POOL_MAX_SIZE
+              value: "32"
+            - name: GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS
+              value: "10"
+            # Hand the burst's connections back instead of parking them
+            # on the writer until the next restart.
+            - name: GPU_FAULT_POSTGRES_POOL_MAX_IDLE_SECONDS
+              value: "300"
+            - name: GPU_FAULT_POSTGRES_POOL_MAX_LIFETIME_SECONDS
+              value: "3600"
+            - name: GPU_FAULT_POSTGRES_STATEMENT_TIMEOUT_SECONDS
+              value: "60"
+            # Bootstrap DDL is a separate step, not a pod start
+            # side effect: _create_schema takes an exclusive lock on
+            # the queue table to reseed the counts, so with several
+            # replicas restarting (uvicorn --limit-max-requests
+            # recycles workers on its own) it periodically froze the
+            # live queue. Run postgres-schema-ensure-job.yaml before
+            # rolling, and keep this false.
+            - name: GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT
+              value: "false"
+            - name: GPU_FAULT_POSTGRES_HOT_STATE_MODE
+              value: "dedicated"
+            - name: GPU_FAULT_GPU_METRICS_BATCH_RETENTION_SECONDS
+              value: "86400"
+            - name: GPU_FAULT_HOT_STATE_TERMINAL_RETENTION_SECONDS
+              value: "2592000"
+            - name: GPU_FAULT_HOT_STATE_LATEST_RETENTION_SECONDS
+              value: "2592000"
+            - name: GPU_FAULT_GPU_FINDING_HISTORY_RETENTION_SECONDS
+              value: "2592000"
+            - name: GPU_FAULT_REGIONAL_CLUSTERS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-clusters
+                  key: clusters.json
+            - name: GPU_FAULT_ENABLE_KUBERNETES_ADAPTER
+              value: "false"
+            - name: GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER
+              value: "false"
+            - name: GPU_FAULT_ENABLE_HYPERPOD_ADAPTER
+              value: "false"
+            - name: GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER
+              value: "true"
+            - name: GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER
+              value: "false"
+            - name: GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS
+              value: "false"
+            - name: GPU_FAULT_REMOTE_EXECUTION_OWNERS
+              value: >-
+                gpu-fault-kubernetes-adapter,
+                gpu-fault-node-agent,
+                gpu-fault-hyperpod-adapter
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 2

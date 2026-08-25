@@ -1,0 +1,20 @@
+[Unit]
+Description=Validate GPU fault control-plane TLS certificates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/gpu-fault/collector.env
+ExecStart=/opt/gpu-fault/check-control-plane-certificate ${GPU_FAULT_CONTROL_PLANE_URL} ${SSL_CERT_FILE} ${GPU_FAULT_CERTIFICATE_MIN_VALIDITY_SECONDS}
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Resource control
+CPUWeight=10
+MemoryHigh=192M
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=64
+IOWeight=10

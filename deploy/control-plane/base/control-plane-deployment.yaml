@@ -1,0 +1,527 @@
+# Shared control-plane Deployment base.
+#
+# The historical single-cluster HyperPod installer and the regional CPU
+# control plane both derive from this manifest. Regional deployment overlays
+# regional-control-plane-patch.yaml and then splits the result into ingress,
+# control-worker and telemetry-spool-worker roles. Do not apply this file
+# directly.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-api-ha
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: ingress
+    gpu-fault.io/cleanup-order: "10"
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: gpu-fault-api-ha
+  template:
+    metadata:
+      annotations:
+        gpu-fault.io/artifact-sha256: 209840015cc3057e191931f113d35dff733cf1b7483d68dd6b6b26a7de9a112b
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
+      labels:
+        app: gpu-fault-api-ha
+    spec:
+      # Kubernetes derives service-link variables from Service names. The
+      # gpu-fault-api Services therefore inject GPU_FAULT_API_* names that
+      # collide with the application's fail-closed environment inventory.
+      enableServiceLinks: false
+      serviceAccountName: gpu-fault-control-plane
+      terminationGracePeriodSeconds: 120
+      tolerations:
+        - key: gpu-fault.io/quarantined
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 60
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 60
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: gpu-fault-api-ha
+      containers:
+        - name: api
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 20"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors,postgres,performance]'
+              && exec uvicorn gpu_fault.app:create_app --factory
+              --host 0.0.0.0 --port 8080
+              --workers 4 --loop uvloop --http httptools
+              --backlog 8192 --limit-concurrency 4096
+              --timeout-keep-alive 5 --no-proxy-headers
+              --timeout-graceful-shutdown 60
+              --timeout-worker-healthcheck 20
+              --limit-max-requests 20000
+              --limit-max-requests-jitter 2000
+              --no-access-log
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: GPU_FAULT_EXECUTOR_MODE
+              value: active
+            - name: GPU_FAULT_SERVICE_ROLE
+              value: ingress
+            - name: GPU_FAULT_STORE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-aurora
+                  key: postgres-url
+            - name: GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS
+              value: "180"
+            - name: GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER
+              value: "true"
+            - name: GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION
+              value: "true"
+            - name: GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS
+              value: "5"
+            - name: GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS
+              value: "8"
+            - name: GPU_FAULT_XID_CORRELATION_POLL_SECONDS
+              value: "1"
+            - name: GPU_FAULT_XID_CORRELATION_LEASE_SECONDS
+              value: "30"
+            - name: GPU_FAULT_DEFAULT_RESTART_BUDGET
+              value: "1"
+            - name: GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS
+              value: "5"
+            - name: GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_MAX_SECONDS
+              value: "30"
+            - name: GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS
+              value: "30"
+            - name: GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE
+              value: "true"
+            - name: GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS
+              value: "5"
+            - name: GPU_FAULT_PROCESSOR_WORKERS
+              value: "24"
+            - name: GPU_FAULT_PROCESSOR_FAULT_WORKERS
+              value: "4"
+            - name: GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS
+              value: "4"
+            - name: GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS
+              value: "8"
+            - name: GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS
+              value: "8"
+            - name: GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH
+              value: "65536"
+            - name: GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH
+              value: "1024"
+            - name: GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH
+              value: "8192"
+            - name: GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH
+              value: "128"
+            - name: GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS
+              value: "2"
+            - name: GPU_FAULT_PROCESSOR_MAX_REQUEST_BYTES
+              value: "16777216"
+            - name: GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD
+              value: "256"
+            - name: GPU_FAULT_PROCESSOR_CLEANUP_INTERVAL_SECONDS
+              value: "60"
+            - name: GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS
+              value: "600"
+            - name: GPU_FAULT_PROCESSOR_CLEANUP_BATCH_SIZE
+              value: "1000"
+            - name: GPU_FAULT_PROCESSOR_QUEUE_STATE_MODE
+              value: "dedicated"
+            - name: GPU_FAULT_STORE_IO_WORKERS
+              value: "32"
+            - name: GPU_FAULT_STORE_IO_MAX_IN_FLIGHT
+              value: "1024"
+            - name: GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS
+              value: "30"
+            # One budget for the whole request, clamping the ingress
+            # wait, the store I/O admission wait and the pool checkout.
+            # Before this each queue had its own timeout and a request
+            # could hold capacity for over a minute while the collector
+            # that sent it gave up after fifteen seconds.
+            - name: GPU_FAULT_REQUEST_BUDGET_SECONDS
+              value: "15"
+            - name: GPU_FAULT_POSTGRES_POOL_MIN_SIZE
+              value: "2"
+            # Sized to the store I/O thread pool above: a smaller pool
+            # moves the concurrency limit into the checkout, where it
+            # surfaces as a PoolTimeout instead of as backpressure. The
+            # fleet ceiling is this times --workers times replicas.
+            - name: GPU_FAULT_POSTGRES_POOL_MAX_SIZE
+              value: "32"
+            - name: GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS
+              value: "10"
+            # Hand the burst's connections back instead of parking them
+            # on the writer until the next restart.
+            - name: GPU_FAULT_POSTGRES_POOL_MAX_IDLE_SECONDS
+              value: "300"
+            - name: GPU_FAULT_POSTGRES_POOL_MAX_LIFETIME_SECONDS
+              value: "3600"
+            - name: GPU_FAULT_POSTGRES_STATEMENT_TIMEOUT_SECONDS
+              value: "60"
+            # Bootstrap DDL is a separate step, not a pod start
+            # side effect: _create_schema takes an exclusive lock on
+            # the queue table to reseed the counts, so with several
+            # replicas restarting (uvicorn --limit-max-requests
+            # recycles workers on its own) it periodically froze the
+            # live queue. Run postgres-schema-ensure-job.yaml before
+            # rolling, and keep this false.
+            - name: GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT
+              value: "false"
+            - name: GPU_FAULT_POSTGRES_HOT_STATE_MODE
+              value: "dedicated"
+            - name: GPU_FAULT_GPU_METRICS_BATCH_RETENTION_SECONDS
+              value: "86400"
+            - name: GPU_FAULT_HOT_STATE_TERMINAL_RETENTION_SECONDS
+              value: "2592000"
+            - name: GPU_FAULT_HOT_STATE_LATEST_RETENTION_SECONDS
+              value: "2592000"
+            - name: GPU_FAULT_GPU_FINDING_HISTORY_RETENTION_SECONDS
+              value: "2592000"
+            - name: GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS
+              value: "1048576"
+            - name: GPU_FAULT_EFA_TRAFFIC_SPIKE_RATIO
+              value: "4"
+            - name: GPU_FAULT_EFA_TRAFFIC_DROP_RATIO
+              value: "0.25"
+            - name: GPU_FAULT_EFA_TRAFFIC_ZERO_BPS
+              value: "1"
+            - name: GPU_FAULT_EFA_TRAFFIC_ZERO_WARNING_SECONDS
+              value: "60"
+            # Checkpoint writes and graph compilation idle the
+            # fabric for minutes on a healthy attempt, so the hang
+            # threshold sits above the longest quiet phase and the
+            # progress suppression below restarts its clock whenever a
+            # rank is still stepping.
+            - name: GPU_FAULT_EFA_TRAFFIC_ZERO_HUNG_SECONDS
+              value: "600"
+            - name: GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED
+              value: "true"
+            # The node measures per-rank liveness from procfs, so this
+            # path needs no application instrumentation. Suppression is
+            # bounded: past the budget the escalation proceeds even if
+            # something still looks like progress.
+            - name: GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED
+              value: "true"
+            - name: GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS
+              value: "1800"
+            - name: GPU_FAULT_EFA_TRAFFIC_BASELINE_ALPHA
+              value: "0.2"
+            - name: GPU_FAULT_EFA_TRAFFIC_STARTUP_GRACE_SECONDS
+              value: "120"
+            - name: GPU_FAULT_HUNG_STRACE_SAMPLE_COUNT
+              value: "3"
+            - name: GPU_FAULT_HUNG_STRACE_SAMPLE_DURATION_SECONDS
+              value: "3"
+            - name: GPU_FAULT_HUNG_STRACE_SAMPLE_INTERVAL_SECONDS
+              value: "2"
+            - name: GPU_FAULT_HUNG_PYSPY_SAMPLE_COUNT
+              value: "3"
+            - name: GPU_FAULT_HUNG_PYSPY_SAMPLE_INTERVAL_SECONDS
+              value: "2"
+            - name: GPU_FAULT_HUNG_PYSPY_TIMEOUT_SECONDS
+              value: "10"
+            - name: GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT
+              value: "5"
+            - name: GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS
+              value: "300"
+            - name: GPU_FAULT_MEMORY_AVAILABLE_WARNING_PERCENT
+              value: "5"
+            - name: GPU_FAULT_MEMORY_PRESSURE_DURATION_SECONDS
+              value: "60"
+            - name: GPU_FAULT_PAGE_CACHE_WARNING_PERCENT
+              value: "90"
+            - name: GPU_FAULT_PAGE_CACHE_DURATION_SECONDS
+              value: "300"
+            - name: GPU_FAULT_LOCAL_FILESYSTEM_WARNING_PERCENT
+              value: "90"
+            - name: GPU_FAULT_LOCAL_FILESYSTEM_DURATION_SECONDS
+              value: "60"
+            - name: GPU_FAULT_EMAIL_SENDER
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-email
+                  key: email-sender
+                  optional: true
+            - name: GPU_FAULT_EMAIL_RECIPIENTS
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-email
+                  key: email-recipients
+                  optional: true
+            - name: GPU_FAULT_ALLOW_EMAIL
+              value: "true"
+            - name: GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY
+              value: "true"
+            - name: GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED
+              value: "true"
+            - name: GPU_FAULT_NOTIFICATION_POLL_SECONDS
+              value: "2"
+            - name: GPU_FAULT_NOTIFICATION_BATCH_SIZE
+              value: "25"
+            - name: GPU_FAULT_NOTIFICATION_LEASE_SECONDS
+              value: "120"
+            - name: GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS
+              value: "8"
+            # Notifications keep accumulating while the dispatcher is off.
+            # Anything older than this window is treated as history and
+            # suppressed the first time the dispatcher runs, so enabling
+            # delivery does not mail the whole archive at once.
+            - name: GPU_FAULT_NOTIFICATION_BACKLOG_GRACE_SECONDS
+              value: "300"
+            - name: GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG
+              value: "false"
+            - name: GPU_FAULT_HOST_NOTIFICATION_COOLDOWN_SECONDS
+              value: "3600"
+            - name: GPU_FAULT_SES_CONFIGURATION_SET
+              value: ""
+            - name: GPU_FAULT_ENABLE_KUBERNETES_ADAPTER
+              value: "true"
+            - name: GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER
+              value: "true"
+            - name: GPU_FAULT_ENABLE_AGENT_REGISTRY
+              value: "true"
+            - name: GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER
+              value: "false"
+            - name: GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER
+              value: "true"
+            - name: GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS
+              value: "20"
+            - name: GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS
+              value: "2700"
+            - name: GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS
+              value: "60"
+            - name: GPU_FAULT_HYPERPOD_SPARE_LABEL
+              value: gpu-fault.io/spare
+            - name: GPU_FAULT_HYPERPOD_SPARE_LABEL_VALUE
+              value: "true"
+            - name: GPU_FAULT_SPARE_HEALTH_SCAN_SECONDS
+              value: "30"
+            - name: GPU_FAULT_SPARE_HEALTH_FAILURE_THRESHOLD
+              value: "2"
+            - name: GPU_FAULT_GPU_INVENTORY_SILENT_AFTER_SECONDS
+              value: "180"
+            - name: GPU_FAULT_GPU_METRICS_SILENT_AFTER_SECONDS
+              value: "420"
+            - name: GPU_FAULT_HOST_TELEMETRY_SILENT_AFTER_SECONDS
+              value: "420"
+            - name: GPU_FAULT_SPARE_UNAVAILABLE_RECHECK_SECONDS
+              value: "3600"
+            - name: GPU_FAULT_SPARE_UNAVAILABLE_ALERT_SECONDS
+              value: "86400"
+            - name: GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS
+              value: "true"
+            - name: GPU_FAULT_DCGM_EXPORTER_PORT
+              value: "9400"
+            - name: GPU_FAULT_QUICK_DIAGNOSTIC_TIMEOUT_SECONDS
+              value: "10"
+            - name: GPU_FAULT_NODE_AGENT_ENDPOINTS
+              value: "{}"
+            - name: GPU_FAULT_REQUIRED_AGENT_VERSION
+              value: 0.10.0
+            # These pins are per-build. build_artifacts writes the wheel
+            # SHA-256 and the digest computed by gpu_fault.node_agent to
+            # this required ConfigMap before either Deployment is
+            # applied, so a Pod can never start with pinning disabled.
+            - name: GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: required-agent-artifact-sha256
+            - name: GPU_FAULT_COMPATIBLE_AGENT_ARTIFACT_SHA256S
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: compatible-agent-artifact-sha256s
+                  optional: true
+            - name: GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: required-agent-protocol-version
+            - name: GPU_FAULT_COMPATIBLE_AGENT_PROTOCOL_VERSIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: compatible-agent-protocol-versions
+                  optional: true
+            - name: GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: required-regional-executor-protocol-version
+            - name: GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: compatible-regional-executor-protocol-versions
+                  optional: true
+            - name: GPU_FAULT_REQUIRED_POLICY_VERSION
+              value: nvidia-xid-catalog-610/sha256:ffb82509abb57457
+            - name: GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION
+              value: hyperpod-v1
+            - name: GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: required-agent-config-digest
+            - name: GPU_FAULT_COMPATIBLE_AGENT_CONFIG_DIGESTS
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: compatible-agent-config-digests
+                  optional: true
+            - name: GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: required-node-action-key-version
+            - name: GPU_FAULT_NODE_ACTION_KEYS_DIR
+              value: /etc/gpu-fault/node-action-keys
+            - name: GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS
+              value: "90"
+            - name: GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS
+              value: "420"
+            - name: GPU_FAULT_ALLOWED_OPERATIONS
+              value: FREEZE_EVIDENCE,COLLECT_HUNG_TRIAGE,COLLECT_DIAGNOSTIC_BUNDLE,RUN_DCGM_DIAGNOSTIC,MARK_UNSCHEDULABLE,QUARANTINE,CHECKPOINT_WORKLOADS,STOP_WORKLOADS,RESTART_WORKLOAD,QUIESCE_GPU_SERVICES,VERIFY_NO_GPU_CLIENTS,TRIGGER_HEALTH_SNAPSHOT,RUN_FIELD_DIAGNOSTIC,RUN_NVLINK74_WORKFLOW,CHECK_MECHANICALS,REMEDIATE_DRIVER,REMEDIATE_EFA_DRIVER,RESTART_EFA_DEVICE_PLUGIN,RESTART_GPU_DEVICE_PLUGIN,UPDATE_SOFTWARE_FIRMWARE,RESET_GPU,RESET_ALL_GPUS_NVSWITCHES,RESTORE_GPU_SERVICES,RESTART_FABRIC_MANAGER,RESTART_NODE,REPLACE_NODE,ESCALATE_SUPPORT,VALIDATE_GPU,VALIDATE_HOST,VALIDATE_FABRIC,RESTORE_SCHEDULING
+            - name: GPU_FAULT_VALIDATION_REQUIRE_RDMA
+              value: "true"
+            - name: GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS
+              value: "120"
+            - name: GPU_FAULT_TRANSIENT_GPU_WARNING_GRACE_SECONDS
+              value: "120"
+            - name: GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS
+              value: "45"
+            - name: GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES
+              value: "2"
+            - name: GPU_FAULT_DCGM_POWER_LIMIT_RATIO
+              value: "0.95"
+            - name: GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT
+              value: "80"
+            - name: GPU_FAULT_DCGM_ECC_SBE_DELTA_WARNING
+              value: "1"
+            - name: GPU_FAULT_DCGM_RETIRED_PAGES_SBE_DELTA_WARNING
+              value: "1"
+            - name: GPU_FAULT_DCGM_RETIRED_PAGES_DBE_DELTA_CRITICAL
+              value: "1"
+            - name: GPU_FAULT_DCGM_ROW_REMAP_CORRECTABLE_DELTA_WARNING
+              value: "1"
+            - name: GPU_FAULT_DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES
+              value: "3"
+            - name: GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR
+              value: "false"
+            - name: GPU_FAULT_TRAINING_HEALTH_SCAN_SECONDS
+              value: "15"
+            - name: GPU_FAULT_EVIDENCE_RETENTION_HOURS
+              value: "24"
+            - name: GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE
+              value: "10000"
+            - name: GPU_FAULT_EXECUTION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-control-plane-active
+                  key: execution-token
+            - name: GPU_FAULT_PROCESSOR_REPLAY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-control-plane-active
+                  key: processor-replay-secret
+            - name: GPU_FAULT_NODE_ACTION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-control-plane-active
+                  key: node-action-secret
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 2
+          # One core was the request back when this ran a single
+          # uvicorn process. It now runs --workers 4, each with its own
+          # store I/O thread pool, so a request of 1 gave the Pod 1/4 of
+          # the CPU shares it actually needs and the scheduler packed
+          # the node as if it were idle. The request is what the burst
+          # steady state measures; the limit keeps the headroom the
+          # cold-start storm needs without letting a queue backlog
+          # expand the API across the whole node.
+          resources:
+            requests:
+              cpu: "4"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+            - name: node-action-keys
+              mountPath: /etc/gpu-fault/node-action-keys
+              readOnly: true
+      volumes:
+        - name: artifact
+          configMap:
+            name: gpu-fault-control-plane-wheel-0100
+        - name: node-action-keys
+          secret:
+            secretName: gpu-fault-node-action-keys
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gpu-fault-api-ha
+  namespace: gpu-fault-system
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: gpu-fault-api-ha

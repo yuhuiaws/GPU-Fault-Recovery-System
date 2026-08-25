@@ -1,0 +1,137 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-fault-node-installer-reconciler
+  namespace: gpu-fault-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gpu-fault-node-installer-reconciler
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["gpu-fault-node-installer-template"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-fault-node-installer-reconciler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpu-fault-node-installer-reconciler
+subjects:
+  - kind: ServiceAccount
+    name: gpu-fault-node-installer-reconciler
+    namespace: gpu-fault-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-node-installer-reconciler
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: producer
+    gpu-fault.io/cleanup-order: "10"
+    gpu-fault.io/deploy-mode: regional_reconciler
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: this controller rewrites the software
+  # on every GPU host, and its target bundle comes from env
+  # (GPU_FAULT_INSTALLER_CONFIG_DIGEST) plus the template ConfigMap.
+  # Under RollingUpdate the surge pod and the terminating pod hold
+  # *different* digests, so both create their own installer Job for the
+  # same node -- the Job names differ because the digest is part of the
+  # name, so nothing collides and nothing serialises them. Whichever
+  # lands second wins the venv, while the new pod sees its own Job
+  # Complete and annotates the node with the new digest. The node then
+  # runs the old wheel while claiming the new one, and reconcile
+  # reports "current" forever. maxUnavailable alone cannot fix this:
+  # any overlap at all is enough.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gpu-fault-node-installer-reconciler
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-node-installer-reconciler
+    spec:
+      serviceAccountName: gpu-fault-node-installer-reconciler
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: reconciler
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors]'
+              && touch /tmp/reconciler-ready
+              && exec gpu-fault-node-installer-reconciler
+          env:
+            - name: GPU_FAULT_NAMESPACE
+              value: gpu-fault-system
+            - name: GPU_FAULT_CLUSTER_ID
+              value: REPLACE_WITH_CLUSTER_ID
+            - name: GPU_FAULT_INSTALLER_VERSION
+              value: REPLACE_WITH_INSTALLER_VERSION
+            - name: GPU_FAULT_INSTALLER_CONFIG_DIGEST
+              value: REPLACE_WITH_INSTALLER_CONFIG_DIGEST
+            - name: GPU_FAULT_INSTALLER_ARTIFACT_SHA256
+              value: REPLACE_WITH_INSTALLER_ARTIFACT_SHA256
+            - name: GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP
+              value: REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP
+            - name: GPU_FAULT_INSTALLER_TEMPLATE_PATH
+              value: /etc/gpu-fault/installer-template/job.yaml
+            - name: GPU_FAULT_NODE_ACTION_KEYS_SECRET
+              value: gpu-fault-node-action-keys
+            - name: GPU_FAULT_DCGM_METRICS_URL
+              value: REPLACE_WITH_DCGM_METRICS_URL
+            - name: GPU_FAULT_RECONCILE_SECONDS
+              value: "15"
+            - name: GPU_FAULT_INSTALL_RETRY_SECONDS
+              value: "300"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/reconciler-ready
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+            - name: installer-template
+              mountPath: /etc/gpu-fault/installer-template
+              readOnly: true
+      volumes:
+        - name: artifact
+          configMap:
+            name: gpu-fault-control-plane-wheel-0100
+        - name: installer-template
+          configMap:
+            name: REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP

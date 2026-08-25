@@ -1,0 +1,40 @@
+"""Stable pytest nodeids for split test_regional_control_plane.py cases."""
+
+# ruff: noqa: F401
+from ._regional_control_plane_cases_1 import (
+    test_agent_registry_requires_artifact_and_config_pins,
+    test_attempt_index_is_cluster_scoped,
+    test_empty_namespace_allowlist_fails_closed,
+    test_executor_protocol_gate_blocks_before_command_lease,
+    test_executor_readiness_rejects_an_executor_that_cannot_claim,
+    test_failed_remote_restart_releases_restart_budget,
+    test_hyperpod_submission_reservation_is_exclusive,
+    test_hyperpod_submissions_are_cluster_scoped,
+    test_regional_api_authenticates_cluster_and_rejects_spoofing,
+    test_regional_api_sends_executor_workload_restart_notification,
+    test_regional_api_sends_gpu_reset_completion_once,
+    test_regional_context_loads_registry_and_remote_adapter,
+    test_regional_context_rejects_local_kubernetes_adapter,
+    test_regional_spare_health_rejects_cross_cluster_payload,
+    test_regional_spare_health_uses_fleet_registry,
+    test_remote_claim_filters_execution_owners_and_legacy_api,
+    test_remote_command_digest_ignores_dag_scheduling_metadata,
+    test_remote_command_digest_includes_rebound_nodes,
+    test_remote_command_digest_includes_step_parameters,
+    test_remote_command_lease_and_result_advance_adapter,
+    test_running_observations_are_scoped_without_eager_decisions,
+    test_unclaimed_remote_commands_are_dead_lettered,
+)
+from ._regional_control_plane_cases_2 import (
+    test_hyperpod_submission_paths_require_a_cluster_token,
+    test_incident_ownership_route_answers_takeover_question,
+    test_node_installer_can_read_back_its_own_gpu_metrics,
+    test_regional_advisory_notification_rejects_other_clusters,
+    test_regional_executor_can_page_operator_on_spare_shortage,
+    test_regional_executor_can_persist_workload_log_evidence,
+    test_regional_ownership_provider_reads_the_route,
+    test_regional_registry_persists_evidence_over_api,
+    test_regional_registry_persists_notification_over_api,
+    test_regional_registry_satisfies_the_notification_sink_protocol,
+    test_remote_hyperpod_submission_endpoints_enforce_cluster_binding,
+)

@@ -1,0 +1,50 @@
+__pycache__/
+*.py[cod]
+
+.coverage
+.coverage.*
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.claude/
+.agents/
+.codex/
+
+build/
+dist/
+htmlcov/
+*.egg-info/
+*.whl
+/GPU_FAILURE_AUTOMATION_DESIGN.html
+/html-assets/mermaid.min.js
+
+artifacts/*
+!artifacts/README.md
+
+# Internal design-research snapshots. These files remain local and must not
+# be added to the public repository.
+/RESEARCH.md
+/CLOUD_PROVIDER_SOURCE_REVIEW.md
+/EKS_AGENT_SOURCE_REVIEW.md
+/EKS_NVIDIA_CONSISTENCY.md
+/HYPERPOD_SOURCE_REVIEW.md
+/EKS_REFERENCE_IMPLEMENTATION.md
+/HYPERPOD_ADAPTER.md
+/HYPERPOD_GPU_METRICS_TEST.md
+/IMPLEMENTATION.md
+/K8S_COMPLETION_WATCHER_IMPLEMENTATION.md
+/PORTABLE_DEPLOYMENT_ARCHITECTURE.md
+/RUNTIME_WORKFLOW_INTEGRATION.md
+
+# Live-environment documentation and execution evidence. Keep these files in
+# the local/private archive, never in the public repository.
+/internal-docs/
+/internal-assets/
+/docs/history/
+/docs/security/
+/docs/evidence/perf/
+/docs/架构重构批次.md
+/docs/代码审阅报告整改矩阵.md
+/docs/性能瓶颈审阅报告整改矩阵.md

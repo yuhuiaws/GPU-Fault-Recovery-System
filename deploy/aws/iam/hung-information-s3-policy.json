@@ -1,0 +1,31 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListHungDiagnosticPrefix",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::REPLACE_WITH_EVIDENCE_BUCKET",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "gpu-fault/hung_information",
+            "gpu-fault/hung_information/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "WriteHungDiagnosticBundles",
+      "Effect": "Allow",
+      "Action": [
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::REPLACE_WITH_EVIDENCE_BUCKET/gpu-fault/hung_information/*"
+    }
+  ]
+}

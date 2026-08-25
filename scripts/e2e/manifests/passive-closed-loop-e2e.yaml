@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-fault-indexed-loop
+  namespace: gpu-fault-system
+spec:
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        gpu-fault.io/managed: "true"
+        gpu-fault.io/job-id: passive-indexed-loop
+        gpu-fault.io/attempt-id: passive-indexed-loop-a1
+        gpu-fault.io/role: worker
+        gpu-fault.io/critical: "true"
+      annotations:
+        gpu-fault.io/expected-critical-ranks: "2"
+        gpu-fault.io/training-container: trainer
+        # Must name a profile that is actually registered on the control
+        # plane; deploy.sh registers exactly one, named by
+        # ${GPU_FAULT_RUNTIME_PROFILE} (default hyperpod-v1). Naming an
+        # unregistered profile makes the watcher's
+        # POST /v1/attempts/terminal fail 404 forever.
+        gpu-fault.io/runtime-profile-version: hyperpod-v1
+        gpu-fault.io/restart-budget: "1"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          env:
+            - name: ATTEMPT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['gpu-fault.io/attempt-id']
+            - name: COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              case "$ATTEMPT_ID" in
+                *-r-*) sleep 3; exit 0 ;;
+                *)
+                  if [ "$COMPLETION_INDEX" = "0" ]; then
+                    sleep 8;
+                    exit 37;
+                  fi;
+                  sleep 300;
+                  exit 0
+                  ;;
+              esac
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

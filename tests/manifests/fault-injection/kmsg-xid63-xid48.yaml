@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-fault-kmsg-inject-xid63-xid48-20260809
+  namespace: gpu-fault-system
+spec:
+  # GF-REGIONAL-COLLECT-008: WORKFLOW_XID_48 companion branch.
+  # XID 63 must land FIRST to reach the branch under test.
+  # _workflow_xid_48 (policy.py:1428) has no window-open branch, so
+  # XID 48 is decided in place at ingest against whatever is already
+  # in the store. If 48 arrives first it is judged solo (RESET_GPU)
+  # and a later 63 never rewrites that verdict.
+  #
+  # That asymmetry is a labelling difference, NOT a lost cordon: both
+  # branches compile to the same 8 operations, because
+  # _catalog_operations already appends MARK_UNSCHEDULABLE for every
+  # RESET_GPU and _with_pre_actions skips duplicates. Pinned by
+  # test_xid_48_solo_and_companion_compile_the_same_containment.
+  nodeSelector:
+    gpu-fault.io/e2e-target-a: "true"
+  hostNetwork: true
+  restartPolicy: Never
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: inject
+      resources:
+        requests:
+          cpu: "10m"
+          memory: 32Mi
+        limits:
+          cpu: "200m"
+          memory: 128Mi
+      image: public.ecr.aws/docker/library/busybox:1.36
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          date -u +"xid63_written_at=%Y-%m-%dT%H:%M:%SZ"
+          printf '%s\n' \
+            'NVRM: Xid (PCI:0000:59:00): 63, pid=920863, name=python, Row remapping event' \
+            > /host-dev-kmsg
+          # 6s: inside companionWindowSeconds=30, clear of the 5s
+          # multi-node aggregation window.
+          sleep 6
+          date -u +"xid48_written_at=%Y-%m-%dT%H:%M:%SZ"
+          printf '%s\n' \
+            'NVRM: Xid (PCI:0000:59:00): 48, pid=920948, name=python, Double Bit ECC Error' \
+            > /host-dev-kmsg
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: dev-kmsg
+          mountPath: /host-dev-kmsg
+  volumes:
+    - name: dev-kmsg
+      hostPath:
+        path: /dev/kmsg
+        type: CharDevice

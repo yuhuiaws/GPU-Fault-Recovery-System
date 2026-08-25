@@ -1,0 +1,41 @@
+"""Stable pytest nodeids for split test_node_action.py cases."""
+
+# ruff: noqa: F401
+from ._node_action_cases_1 import (
+    test_control_plane_persists_remote_warm_spare_success_email,
+    test_hyperpod_automatic_recovery_cannot_bypass_spare_only_mode,
+    test_hyperpod_replace_is_blocked_when_spares_are_insufficient,
+    test_hyperpod_replace_maps_two_fault_nodes_to_two_warm_spares,
+    test_hyperpod_replace_records_activated_spare_nodes,
+    test_hyperpod_spare_checker_uses_node_agent_for_each_phase,
+    test_hyperpod_step_waits_for_external_confirmation,
+    test_pending_spare_health_check_is_retried,
+    test_remote_pending_spare_health_check_is_retried,
+    test_remote_pending_spare_snapshot_resumes_without_reallocation,
+    test_remote_waiting_step_is_not_preempted,
+    test_restart_workload_remote_waiting_is_not_preempted,
+    test_safe_remote_waiting_is_cancelled_before_preemption,
+    test_unclaimed_remote_command_is_cancelled_before_preemption,
+    test_warm_spare_rejects_automatic_node_recovery_before_allocation,
+    test_warm_spare_requires_enabled_coordinator_before_submission,
+)
+from ._node_action_cases_2 import (
+    test_completed_spare_failover_keeps_old_node_safety_hold,
+    test_hyperpod_preflight_credential_error_is_a_configuration_failure,
+    test_hyperpod_preflight_defect_still_propagates,
+    test_hyperpod_preflight_failure_does_not_revoke_agent,
+    test_hyperpod_reboot_auto_confirms_new_ready_agent_incarnation,
+    test_hyperpod_reboot_waits_for_post_reboot_stabilization,
+    test_hyperpod_replace_auto_confirms_and_rebinds_ready_new_instance,
+    test_node_action_adapter_addresses_via_registry_not_static_map,
+    test_node_action_adapter_derives_key_for_version_two_agent,
+    test_node_action_adapter_interprets_dcgm_diagnostic_outcome,
+    test_node_action_adapter_loads_node_secret_directory,
+    test_node_action_adapter_refuses_shared_key_when_derived_required,
+    test_node_action_adapter_uses_explicit_endpoint_and_signature,
+    test_node_action_adapter_uses_prederived_node_secret,
+    test_node_action_adapter_without_registry_uses_static_map,
+    test_node_action_http_rejection_preserves_structured_code,
+    test_node_action_pending_or_transport_timeout_returns_waiting,
+    test_retryable_node_action_failure_returns_waiting,
+)

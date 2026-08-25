@@ -1,0 +1,929 @@
+{
+ "FABRIC_MANAGER_LOG": null,
+ "GPU_INVENTORY": {
+  "cluster_id": "perf-template-cluster",
+  "collected_at": "2026-08-14T17:18:55.139760Z",
+  "devices": [
+   {
+    "gpu_index": 0,
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000001",
+    "pci_bdf": "00000000:59:00.0",
+    "product": "H200"
+   },
+   {
+    "gpu_index": 1,
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000003",
+    "pci_bdf": "00000000:5a:00.0",
+    "product": "H200"
+   },
+   {
+    "gpu_index": 2,
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000a",
+    "pci_bdf": "00000000:72:00.0",
+    "product": "H200"
+   },
+   {
+    "gpu_index": 3,
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000b",
+    "pci_bdf": "00000000:73:00.0",
+    "product": "H200"
+   },
+   {
+    "gpu_index": 4,
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000c",
+    "pci_bdf": "00000000:8b:00.0",
+    "product": "H200"
+   },
+   {
+    "gpu_index": 5,
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000006",
+    "pci_bdf": "00000000:8c:00.0",
+    "product": "H200"
+   },
+   {
+    "gpu_index": 6,
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000004",
+    "pci_bdf": "00000000:a4:00.0",
+    "product": "H200"
+   },
+   {
+    "gpu_index": 7,
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000005",
+    "pci_bdf": "00000000:a5:00.0",
+    "product": "H200"
+   }
+  ],
+  "evidence_ref": "nvidia-smi://perf-node-a/inventory",
+  "expected_gpu_count": 8,
+  "ingested_at": "2026-08-14T17:18:55.396271Z",
+  "node_id": "perf-node-a",
+  "node_instance_id": "00000000-0000-4000-8000-000000000007",
+  "observed_at": "2026-08-14T17:18:55.139760Z",
+  "runtime_profile_version": "hyperpod-v1",
+  "snapshot_id": "gpu-inventory-perf-node-a-1786727935139760",
+  "source": "NVIDIA_SMI",
+  "source_boot_id": "00000000-0000-4000-8000-000000000008"
+ },
+ "GPU_METRICS": {
+  "affected_workload_ids": [],
+  "batch_id": "dcgm-perf-node-a-1786727918903233",
+  "checkpoint_manifest_ref": null,
+  "cluster_id": "perf-template-cluster",
+  "collected_at": "2026-08-14T17:18:38.903233Z",
+  "context_history": [],
+  "cuda_version": "13.0",
+  "driver_branch": 580,
+  "edge_filter_reasons": [
+   "health-summary"
+  ],
+  "evidence_ref": "prometheus://http://127.0.0.1:9400/metrics",
+  "ingested_at": "2026-08-14T17:18:40.459161Z",
+  "node_id": "perf-node-a",
+  "observed_at": "2026-08-14T17:18:38.903233Z",
+  "product": "H200",
+  "runtime_profile_version": "hyperpod-v1",
+  "samples": [
+   {
+    "canonical_name": "sm_clock_mhz",
+    "gpu_index": "0",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000001",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000001",
+     "gpu": "0",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_SM_CLOCK",
+    "pci_bdf": "00000000:59:00.0",
+    "unit": "MHz",
+    "value": 345.0
+   },
+   {
+    "canonical_name": "sm_clock_mhz",
+    "gpu_index": "1",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000003",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000003",
+     "gpu": "1",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_SM_CLOCK",
+    "pci_bdf": "00000000:5A:00.0",
+    "unit": "MHz",
+    "value": 345.0
+   },
+   {
+    "canonical_name": "sm_clock_mhz",
+    "gpu_index": "2",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000a",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000a",
+     "gpu": "2",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_SM_CLOCK",
+    "pci_bdf": "00000000:72:00.0",
+    "unit": "MHz",
+    "value": 345.0
+   },
+   {
+    "canonical_name": "sm_clock_mhz",
+    "gpu_index": "3",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000b",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000b",
+     "gpu": "3",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_SM_CLOCK",
+    "pci_bdf": "00000000:73:00.0",
+    "unit": "MHz",
+    "value": 345.0
+   },
+   {
+    "canonical_name": "sm_clock_mhz",
+    "gpu_index": "4",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000c",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000c",
+     "gpu": "4",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_SM_CLOCK",
+    "pci_bdf": "00000000:8B:00.0",
+    "unit": "MHz",
+    "value": 345.0
+   },
+   {
+    "canonical_name": "sm_clock_mhz",
+    "gpu_index": "5",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000006",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000006",
+     "gpu": "5",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_SM_CLOCK",
+    "pci_bdf": "00000000:8C:00.0",
+    "unit": "MHz",
+    "value": 345.0
+   },
+   {
+    "canonical_name": "sm_clock_mhz",
+    "gpu_index": "6",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000004",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000004",
+     "gpu": "6",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_SM_CLOCK",
+    "pci_bdf": "00000000:A4:00.0",
+    "unit": "MHz",
+    "value": 345.0
+   },
+   {
+    "canonical_name": "sm_clock_mhz",
+    "gpu_index": "7",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000005",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000005",
+     "gpu": "7",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_SM_CLOCK",
+    "pci_bdf": "00000000:A5:00.0",
+    "unit": "MHz",
+    "value": 345.0
+   },
+   {
+    "canonical_name": "memory_clock_mhz",
+    "gpu_index": "0",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000001",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000001",
+     "gpu": "0",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEM_CLOCK",
+    "pci_bdf": "00000000:59:00.0",
+    "unit": "MHz",
+    "value": 3201.0
+   },
+   {
+    "canonical_name": "memory_clock_mhz",
+    "gpu_index": "1",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000003",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000003",
+     "gpu": "1",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEM_CLOCK",
+    "pci_bdf": "00000000:5A:00.0",
+    "unit": "MHz",
+    "value": 3201.0
+   },
+   {
+    "canonical_name": "memory_clock_mhz",
+    "gpu_index": "2",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000a",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000a",
+     "gpu": "2",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEM_CLOCK",
+    "pci_bdf": "00000000:72:00.0",
+    "unit": "MHz",
+    "value": 3201.0
+   },
+   {
+    "canonical_name": "memory_clock_mhz",
+    "gpu_index": "3",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000b",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000b",
+     "gpu": "3",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEM_CLOCK",
+    "pci_bdf": "00000000:73:00.0",
+    "unit": "MHz",
+    "value": 3201.0
+   },
+   {
+    "canonical_name": "memory_clock_mhz",
+    "gpu_index": "4",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000c",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000c",
+     "gpu": "4",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEM_CLOCK",
+    "pci_bdf": "00000000:8B:00.0",
+    "unit": "MHz",
+    "value": 3201.0
+   },
+   {
+    "canonical_name": "memory_clock_mhz",
+    "gpu_index": "5",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000006",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000006",
+     "gpu": "5",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEM_CLOCK",
+    "pci_bdf": "00000000:8C:00.0",
+    "unit": "MHz",
+    "value": 3201.0
+   },
+   {
+    "canonical_name": "memory_clock_mhz",
+    "gpu_index": "6",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000004",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000004",
+     "gpu": "6",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEM_CLOCK",
+    "pci_bdf": "00000000:A4:00.0",
+    "unit": "MHz",
+    "value": 3201.0
+   },
+   {
+    "canonical_name": "memory_clock_mhz",
+    "gpu_index": "7",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000005",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000005",
+     "gpu": "7",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEM_CLOCK",
+    "pci_bdf": "00000000:A5:00.0",
+    "unit": "MHz",
+    "value": 3201.0
+   },
+   {
+    "canonical_name": "clock_throttle_reasons",
+    "gpu_index": "0",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000001",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000001",
+     "gpu": "0",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+    "pci_bdf": "00000000:59:00.0",
+    "unit": "bitmask",
+    "value": 1.0
+   },
+   {
+    "canonical_name": "clock_throttle_reasons",
+    "gpu_index": "1",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000003",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000003",
+     "gpu": "1",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+    "pci_bdf": "00000000:5A:00.0",
+    "unit": "bitmask",
+    "value": 1.0
+   },
+   {
+    "canonical_name": "clock_throttle_reasons",
+    "gpu_index": "2",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000a",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000a",
+     "gpu": "2",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+    "pci_bdf": "00000000:72:00.0",
+    "unit": "bitmask",
+    "value": 1.0
+   },
+   {
+    "canonical_name": "clock_throttle_reasons",
+    "gpu_index": "3",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000b",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000b",
+     "gpu": "3",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+    "pci_bdf": "00000000:73:00.0",
+    "unit": "bitmask",
+    "value": 1.0
+   },
+   {
+    "canonical_name": "clock_throttle_reasons",
+    "gpu_index": "4",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000c",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000c",
+     "gpu": "4",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+    "pci_bdf": "00000000:8B:00.0",
+    "unit": "bitmask",
+    "value": 1.0
+   },
+   {
+    "canonical_name": "clock_throttle_reasons",
+    "gpu_index": "5",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000006",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000006",
+     "gpu": "5",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+    "pci_bdf": "00000000:8C:00.0",
+    "unit": "bitmask",
+    "value": 1.0
+   },
+   {
+    "canonical_name": "clock_throttle_reasons",
+    "gpu_index": "6",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000004",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000004",
+     "gpu": "6",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+    "pci_bdf": "00000000:A4:00.0",
+    "unit": "bitmask",
+    "value": 1.0
+   },
+   {
+    "canonical_name": "clock_throttle_reasons",
+    "gpu_index": "7",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000005",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000005",
+     "gpu": "7",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+    "pci_bdf": "00000000:A5:00.0",
+    "unit": "bitmask",
+    "value": 1.0
+   },
+   {
+    "canonical_name": "memory_temperature_c",
+    "gpu_index": "0",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000001",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000001",
+     "gpu": "0",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEMORY_TEMP",
+    "pci_bdf": "00000000:59:00.0",
+    "unit": "celsius",
+    "value": 33.0
+   },
+   {
+    "canonical_name": "memory_temperature_c",
+    "gpu_index": "1",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000003",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000003",
+     "gpu": "1",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEMORY_TEMP",
+    "pci_bdf": "00000000:5A:00.0",
+    "unit": "celsius",
+    "value": 30.0
+   },
+   {
+    "canonical_name": "memory_temperature_c",
+    "gpu_index": "2",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000a",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000a",
+     "gpu": "2",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEMORY_TEMP",
+    "pci_bdf": "00000000:72:00.0",
+    "unit": "celsius",
+    "value": 33.0
+   },
+   {
+    "canonical_name": "memory_temperature_c",
+    "gpu_index": "3",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000b",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000b",
+     "gpu": "3",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEMORY_TEMP",
+    "pci_bdf": "00000000:73:00.0",
+    "unit": "celsius",
+    "value": 31.0
+   },
+   {
+    "canonical_name": "memory_temperature_c",
+    "gpu_index": "4",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-00000000000c",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-00000000000c",
+     "gpu": "4",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEMORY_TEMP",
+    "pci_bdf": "00000000:8B:00.0",
+    "unit": "celsius",
+    "value": 33.0
+   },
+   {
+    "canonical_name": "memory_temperature_c",
+    "gpu_index": "5",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000006",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000006",
+     "gpu": "5",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEMORY_TEMP",
+    "pci_bdf": "00000000:8C:00.0",
+    "unit": "celsius",
+    "value": 32.0
+   },
+   {
+    "canonical_name": "memory_temperature_c",
+    "gpu_index": "6",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000004",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000004",
+     "gpu": "6",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEMORY_TEMP",
+    "pci_bdf": "00000000:A4:00.0",
+    "unit": "celsius",
+    "value": 33.0
+   },
+   {
+    "canonical_name": "memory_temperature_c",
+    "gpu_index": "7",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000005",
+    "labels": {
+     "UUID": "GPU-00000000-0000-4000-8000-000000000005",
+     "gpu": "7",
+     "modelName": "NVIDIA H200"
+    },
+    "metric_name": "DCGM_FI_DEV_MEMORY_TEMP",
+    "pci_bdf": "00000000:A5:00.0",
+    "unit": "celsius",
+    "value": 31.0
+   }
+  ],
+  "source": "DCGM_EXPORTER",
+  "workload_state": "IDLE"
+ },
+ "HOST_TELEMETRY": {
+  "affected_workload_ids": [],
+  "batch_id": "host-perf-node-b-1786727855386010",
+  "cluster_id": "perf-template-cluster",
+  "collection_errors": [],
+  "edge_filter_reasons": [
+   "threshold:tcp_retransmits_delta"
+  ],
+  "evidence_ref": "host://perf-node-b",
+  "node_id": "perf-node-b",
+  "observed_at": "2026-08-14T17:17:35.386010Z",
+  "runtime_profile_version": "hyperpod-v1",
+  "samples": [
+   {
+    "device": null,
+    "labels": {},
+    "name": "cpu_usage_percent",
+    "unit": "percent",
+    "value": 0.3176748901655979
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "load1",
+    "unit": null,
+    "value": 0.61
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "load1_per_cpu",
+    "unit": null,
+    "value": 0.006354166666666667
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "memory_used_percent",
+    "unit": "percent",
+    "value": 1.7910440871944666
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "memory_available_bytes",
+    "unit": "bytes",
+    "value": 2109015154688.0
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "memory_available_percent",
+    "unit": "percent",
+    "value": 98.20895591280554
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "memory_free_bytes",
+    "unit": "bytes",
+    "value": 2113254219776.0
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "memory_free_percent",
+    "unit": "percent",
+    "value": 98.40635333568014
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "page_cache_bytes",
+    "unit": "bytes",
+    "value": 4485607424.0
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "page_cache_percent",
+    "unit": "percent",
+    "value": 0.2088779783144513
+   },
+   {
+    "device": null,
+    "labels": {},
+    "name": "swap_used_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "/",
+    "labels": {},
+    "name": "filesystem_used_percent",
+    "unit": "percent",
+    "value": 25.617753872227
+   },
+   {
+    "device": "/",
+    "labels": {},
+    "name": "local_filesystem_used_percent",
+    "unit": "percent",
+    "value": 25.617753872227
+   },
+   {
+    "device": "/var",
+    "labels": {},
+    "name": "filesystem_used_percent",
+    "unit": "percent",
+    "value": 25.617753872227
+   },
+   {
+    "device": "/var",
+    "labels": {},
+    "name": "local_filesystem_used_percent",
+    "unit": "percent",
+    "value": 25.617753872227
+   },
+   {
+    "device": "/tmp",
+    "labels": {},
+    "name": "filesystem_used_percent",
+    "unit": "percent",
+    "value": 0.009452465758796602
+   },
+   {
+    "device": "/tmp",
+    "labels": {},
+    "name": "local_filesystem_used_percent",
+    "unit": "percent",
+    "value": 0.009452465758796602
+   },
+   {
+    "device": "nvme0n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme0n1",
+    "labels": {},
+    "name": "disk_io_await_ms",
+    "unit": "milliseconds",
+    "value": 0.9230769230769231
+   },
+   {
+    "device": "nvme0n1p1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme0n1p1",
+    "labels": {},
+    "name": "disk_io_await_ms",
+    "unit": "milliseconds",
+    "value": 0.9230769230769231
+   },
+   {
+    "device": "nvme0n1p127",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme0n1p128",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme1n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme3n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme4n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme2n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme5n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme9n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme8n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme7n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   },
+   {
+    "device": "nvme6n1",
+    "labels": {},
+    "name": "disk_io_util_percent",
+    "unit": "percent",
+    "value": 0.0
+   }
+  ],
+  "workload_state": "IDLE"
+ },
+ "NODE_LOGS": {
+  "affected_workload_ids": [],
+  "batch_id": "logs-perf-node-a-1786727940309153",
+  "cluster_id": "perf-template-cluster",
+  "collected_at": "2026-08-14T17:19:00.309153Z",
+  "entries": [
+   {
+    "entry_id": "s=81ca7dfb041d4e3a98a9c23cd89505fa;i=3ba77;b=ad0a18b78469432ea5e3a96f3aec330f;m=2f94ea6041;t=6590503a2898e;x=6e64538631297734",
+    "fields": {},
+    "message": "{\"level\":\"info\",\"UsedMem\":54950672,\"HeapAlloc\":3928184,\"Frees\":487175,\"AvailableMem\":2042195248,\"ClusterName\":\"perf-template-cluster\",\"Alloc\":3928184,\"MemUsagePercentage\":2.6202598243616735,\"HeapSys\":10911744,\"NumGC\":1674,\"GCCPUFraction\":0.0000016963889028336072,\"CpuUsage\":0.06251302354657318,\"DiskUsage\":24.92573470012662,\"InstanceId\":\"i-00000000000000001\",\"Sys\":22632712,\"TotalMem\":2097145920,\"_aws\":{\"Timestamp\":1786727930956,\"CloudWatchMetrics\":[{\"Namespace\":\"HostAgentMetrics\",\"Dimensions\":[[]],\"Metrics\":[{\"Name\":\"Alloc\",\"Unit\":\"Bytes\"},{\"Name\":\"Sys\",\"Unit\":\"Bytes\"},{\"Name\":\"HeapAlloc\",\"Unit\":\"Bytes\"},{\"Name\":\"HeapSys\",\"Unit\":\"Bytes\"},{\"Name\":\"Frees\",\"Unit\":\"Count\"},{\"Name\":\"NumGC\",\"Unit\":\"Count\"},{\"Name\":\"GCCPUFraction\",\"Unit\":\"None\"},{\"Name\":\"CpuUsage\",\"Unit\":\"None\"},{\"Name\":\"DiskUsage\",\"Unit\":\"None\"},{\"Name\":\"TotalMem\",\"Unit\":\"Kilobytes\"},{\"Name\":\"UsedMem\",\"Unit\":\"Kilobytes\"},{\"Name\":\"AvailableMem\",\"Unit\":\"Kilobytes\"},{\"Name\":\"MemUsagePercentage\",\"Unit\":\"None\"}]}]},\"time\":\"2026-08-14T17:18:50Z\"}",
+    "observed_at": "2026-08-14T17:18:50.956174Z",
+    "priority": 6,
+    "source": "journal",
+    "unit": "hyperpod-host-agent.service"
+   },
+   {
+    "entry_id": "s=81ca7dfb041d4e3a98a9c23cd89505fa;i=3ba78;b=ad0a18b78469432ea5e3a96f3aec330f;m=2f951d6038;t=6590503d58984;x=9b582b790d8eff09",
+    "fields": {},
+    "message": "I0814 17:18:54.298458   62227 prober.go:120] \"Probe failed\" probeType=\"Readiness\" pod=\"training/example-router-0000000000-abcde\" podUID=\"00000000-0000-4000-8000-000000000002\" containerName=\"router\" probeResult=\"failure\" output=\"dial tcp 192.0.2.10:8000: connect: connection refused\"",
+    "observed_at": "2026-08-14T17:18:54.298500Z",
+    "priority": 6,
+    "source": "journal",
+    "unit": "kubelet.service"
+   },
+   {
+    "entry_id": "s=81ca7dfb041d4e3a98a9c23cd89505fa;i=3ba79;b=ad0a18b78469432ea5e3a96f3aec330f;m=2f952d83ad;t=6590503e5acfa;x=c259461f287f63c1",
+    "fields": {},
+    "message": "2026-08-14 17:18:55,356 INFO gpu_fault.collectors delivered GPU inventory gpu-inventory-perf-node-a-1786727935139760 with 8 devices",
+    "observed_at": "2026-08-14T17:18:55.356154Z",
+    "priority": 6,
+    "source": "journal",
+    "unit": "gpu-fault-metrics-collector.service"
+   },
+   {
+    "entry_id": "s=81ca7dfb041d4e3a98a9c23cd89505fa;i=3ba7a;b=ad0a18b78469432ea5e3a96f3aec330f;m=2f9569a8f1;t=659050421d23e;x=977d84c1c10a5293",
+    "fields": {},
+    "message": "I0814 17:18:59.297805   62227 prober.go:120] \"Probe failed\" probeType=\"Readiness\" pod=\"training/example-router-0000000000-abcde\" podUID=\"00000000-0000-4000-8000-000000000002\" containerName=\"router\" probeResult=\"failure\" output=\"dial tcp 192.0.2.10:8000: connect: connection refused\"",
+    "observed_at": "2026-08-14T17:18:59.297854Z",
+    "priority": 6,
+    "source": "journal",
+    "unit": "kubelet.service"
+   },
+   {
+    "entry_id": "e647d2c1f2964de1712ff56e66907d28e0eb5e169509205ba48b5094ad94eaa7",
+    "fields": {
+     "path": "/var/log/pods/aws-hyperpod_health-monitoring-agent-cjtgm_202d2023-c0a3-4501-b412-41c1466df7d8/health-monitoring-agent/6.log"
+    },
+    "message": "2026-08-14T17:18:51.66507641Z stderr F W0814 17:18:51.664992       1 log_watcher.go:124] Unable to parse line: \"Aug 14 17:18:50 perf-node-a unshare[49625]: {\\\"level\\\":\\\"info\\\",\\\"UsedMem\\\":54950672,\\\"HeapAlloc\\\":3928184,\\\"Frees\\\":487175,\\\"AvailableMem\\\":2042195248,\\\"ClusterName\\\":\\\"perf-template-cluster\\\",\\\"Alloc\\\":3928184,\\\"MemUsagePercentage\\\":2.6202598243616735,\\\"HeapSys\\\":10911744,\\\"NumGC\\\":1674,\\\"GCCPUFraction\\\":0.0000016963889028336072,\\\"CpuUsage\\\":0.06251302354657318,\\\"DiskUsage\\\":24.92573470012662,\\\"InstanceId\\\":\\\"i-00000000000000001\\\",\\\"Sys\\\":22632712,\\\"TotalMem\\\":2097145920,\\\"_aws\\\":{\\\"Timestamp\\\":1786727930956,\\\"CloudWatchMetrics\\\":[{\\\"Namespace\\\":\\\"HostAgentMetrics\\\",\\\"Dimensions\\\":[[]],\\\"Metrics\\\":[{\\\"Name\\\":\\\"Alloc\\\",\\\"Unit\\\":\\\"Bytes\\\"},{\\\"Name\\\":\\\"Sys\\\",\\\"Unit\\\":\\\"Bytes\\\"},{\\\"Name\\\":\\\"HeapAlloc\\\",\\\"Unit\\\":\\\"Bytes\\\"},{\\\"Name\\\":\\\"HeapSys\\\",\\\"Unit\\\":\\\"Bytes\\\"},{\\\"Name\\\":\\\"Frees\\\",\\\"Unit\\\":\\\"Count\\\"},{\\\"Name\\\":\\\"NumGC\\\",\\\"Unit\\\":\\\"Count\\\"},{\\\"Name\\\":\\\"GCCPUFraction\\\",\\\"Unit\\\":\\\"None\\\"},{\\\"Name\\\":\\\"CpuUsage\\\",\\\"Unit\\\":\\\"None\\\"},{\\\"Name\\\":\\\"DiskUsage\\\",\\\"Unit\\\":\\\"None\\\"},{\\\"Name\\\":\\\"TotalMem\\\",\\\"Unit\\\":\\\"Kilobytes\\\"},{\\\"Name\\\":\\\"UsedMem\\\",\\\"Unit\\\":\\\"Kilobytes\\\"},{\\\"Name\\\":\\\"AvailableMem\\\",\\\"Unit\\\":\\\"Kilobytes\\\"},{\\\"Name\\\":\\\"MemUsagePercentage\\\",\\\"Unit\\\":\\\"None\\\"}]}]},\\\"time\\\":\\\"2026-08-14T17:18:50Z\\\"}\\n\", no message found in line \"Aug 14 17:18:50 perf-node-a unshare[49625]: {\\\"level\\\":\\\"info\\\",\\\"UsedMem\\\":54950672,\\\"HeapAlloc\\\":3928184,\\\"Frees\\\":487175,\\\"AvailableMem\\\":2042195248,\\\"ClusterName\\\":\\\"perf-template-cluster\\\",\\\"Alloc\\\":3928184,\\\"MemUsagePercentage\\\":2.6202598243616735,\\\"HeapSys\\\":10911744,\\\"NumGC\\\":1674,\\\"GCCPUFraction\\\":0.0000016963889028336072,\\\"CpuUsage\\\":0.06251302354657318,\\\"DiskUsage\\\":24.92573470012662,\\\"InstanceId\\\":\\\"i-00000000000000001\\\",\\\"Sys\\\":22632712,\\\"TotalMem\\\":2097145920,\\\"_aws\\\":{\\\"Timestamp\\\":1786727930956,\\\"CloudWatchMetrics\\\":[{\\\"Namespace\\\":\\\"HostAgentMetrics\\\",\\\"Dimensions\\\":[[]],\\\"Metrics\\\":[{\\\"Name\\\":\\\"Alloc\\\",\\\"Unit\\\":\\\"Bytes\\\"},{\\\"Name\\\":\\\"Sys\\\",\\\"Unit\\\":\\\"Bytes\\\"},{\\\"Name\\\":\\\"HeapAlloc\\\",\\\"Unit\\\":\\\"Bytes\\\"},{\\\"Name\\\":\\\"HeapSys\\\",\\\"Unit\\\":\\\"Bytes\\\"},{\\\"Name\\\":\\\"Frees\\\",\\\"Unit\\\":\\\"Count\\\"},{\\\"Name\\\":\\\"NumGC\\\",\\\"Unit\\\":\\\"Count\\\"},{\\\"Name\\\":\\\"GCCPUFraction\\\",\\\"Unit\\\":\\\"None\\\"},{\\\"Name\\\":\\\"CpuUsage\\\",\\\"Unit\\\":\\\"None\\\"},{\\\"Name\\\":\\\"DiskUsage\\\",\\\"Unit\\\":\\\"None\\\"},{\\\"Name\\\":\\\"TotalMem\\\",\\\"Unit\\\":\\\"Kilobytes\\\"},{\\\"Name\\\":\\\"UsedMem\\\",\\\"Unit\\\":\\\"Kilobytes\\\"},{\\\"Name\\\":\\\"AvailableMem\\\",\\\"Unit\\\":\\\"Kilobytes\\\"},{\\\"Name\\\":\\\"MemUsagePercentage\\\",\\\"Unit\\\":\\\"None\\\"}]}]},\\\"time\\\":\\\"2026-08-14T17:18:50Z\\\"}\" with regular expression kernel: (.*)",
+    "observed_at": "2026-08-14T17:19:00.309153Z",
+    "priority": null,
+    "source": "training-log",
+    "unit": null
+   },
+   {
+    "entry_id": "62a18aa2ae2921cd18dc8ddebb58a07b744a72ed8c8a79a6dd29d6a9796494e1",
+    "fields": {
+     "path": "/var/log/pods/aws-hyperpod_health-monitoring-agent-cjtgm_202d2023-c0a3-4501-b412-41c1466df7d8/health-monitoring-agent/6.log"
+    },
+    "message": "2026-08-14T17:18:54.668541545Z stderr F W0814 17:18:54.668476       1 log_watcher.go:124] Unable to parse line: \"Aug 14 17:18:54 perf-node-a kubelet[62227]: I0814 17:18:54.298458   62227 prober.go:120] \\\"Probe failed\\\" probeType=\\\"Readiness\\\" pod=\\\"training/example-router-0000000000-abcde\\\" podUID=\\\"00000000-0000-4000-8000-000000000002\\\" containerName=\\\"router\\\" probeResult=\\\"failure\\\" output=\\\"dial tcp 192.0.2.10:8000: connect: connection refused\\\"\\n\", no message found in line \"Aug 14 17:18:54 perf-node-a kubelet[62227]: I0814 17:18:54.298458   62227 prober.go:120] \\\"Probe failed\\\" probeType=\\\"Readiness\\\" pod=\\\"training/example-router-0000000000-abcde\\\" podUID=\\\"00000000-0000-4000-8000-000000000002\\\" containerName=\\\"router\\\" probeResult=\\\"failure\\\" output=\\\"dial tcp 192.0.2.10:8000: connect: connection refused\\\"\" with regular expression kernel: (.*)",
+    "observed_at": "2026-08-14T17:19:00.309153Z",
+    "priority": null,
+    "source": "training-log",
+    "unit": null
+   },
+   {
+    "entry_id": "98bd9177b6ee4f6c16858a18278cd60a13b1629107a5f90e5095b0209ca467bf",
+    "fields": {
+     "path": "/var/log/pods/aws-hyperpod_health-monitoring-agent-cjtgm_202d2023-c0a3-4501-b412-41c1466df7d8/health-monitoring-agent/6.log"
+    },
+    "message": "2026-08-14T17:18:55.66970735Z stderr F W0814 17:18:55.669649       1 log_watcher.go:124] Unable to parse line: \"Aug 14 17:18:55 perf-node-a gpu-fault-collector[1946921]: 2026-08-14 17:18:55,356 INFO gpu_fault.collectors delivered GPU inventory gpu-inventory-perf-node-a-1786727935139760 with 8 devices\\n\", no message found in line \"Aug 14 17:18:55 perf-node-a gpu-fault-collector[1946921]: 2026-08-14 17:18:55,356 INFO gpu_fault.collectors delivered GPU inventory gpu-inventory-perf-node-a-1786727935139760 with 8 devices\" with regular expression kernel: (.*)",
+    "observed_at": "2026-08-14T17:19:00.309153Z",
+    "priority": null,
+    "source": "training-log",
+    "unit": null
+   },
+   {
+    "entry_id": "bba1d9e916d0cf50f9de0f6f29029659bdde0aa10971af4068eb7bc83a40dab6",
+    "fields": {
+     "path": "/var/log/pods/aws-hyperpod_health-monitoring-agent-cjtgm_202d2023-c0a3-4501-b412-41c1466df7d8/health-monitoring-agent/6.log"
+    },
+    "message": "2026-08-14T17:18:59.674366275Z stderr F W0814 17:18:59.674286       1 log_watcher.go:124] Unable to parse line: \"Aug 14 17:18:59 perf-node-a kubelet[62227]: I0814 17:18:59.297805   62227 prober.go:120] \\\"Probe failed\\\" probeType=\\\"Readiness\\\" pod=\\\"training/example-router-0000000000-abcde\\\" podUID=\\\"00000000-0000-4000-8000-000000000002\\\" containerName=\\\"router\\\" probeResult=\\\"failure\\\" output=\\\"dial tcp 192.0.2.10:8000: connect: connection refused\\\"\\n\", no message found in line \"Aug 14 17:18:59 perf-node-a kubelet[62227]: I0814 17:18:59.297805   62227 prober.go:120] \\\"Probe failed\\\" probeType=\\\"Readiness\\\" pod=\\\"training/example-router-0000000000-abcde\\\" podUID=\\\"00000000-0000-4000-8000-000000000002\\\" containerName=\\\"router\\\" probeResult=\\\"failure\\\" output=\\\"dial tcp 192.0.2.10:8000: connect: connection refused\\\"\" with regular expression kernel: (.*)",
+    "observed_at": "2026-08-14T17:19:00.309153Z",
+    "priority": null,
+    "source": "training-log",
+    "unit": null
+   }
+  ],
+  "node_id": "perf-node-a",
+  "runtime_profile_version": "hyperpod-v1",
+  "workload_state": "IDLE"
+ },
+ "NVIDIA_KERNEL": {
+  "affected_workload_ids": [],
+  "checkpoint_manifest_ref": null,
+  "cluster_id": "perf-template-cluster",
+  "collected_at": "2026-08-14T05:00:13.138989Z",
+  "cuda_version": "13.0",
+  "driver_branch": 580,
+  "evidence_ref": "kmsg://perf-node-b/00000000-0000-4000-8000-000000000009/5928",
+  "message": "NVRM: Xid (PCI:0000:59:00.0): 79, pid=<unknown>, name=<unknown> marker=q07-wake-20260814T050003.150879078Z",
+  "node_id": "perf-node-b",
+  "observed_at": "2026-08-14T05:00:09.734901Z",
+  "product": "H200",
+  "record_id": "kmsg-00000000-0000-4000-8000-000000000009-5928",
+  "runtime_profile_version": "hyperpod-v1",
+  "source_boot_id": "00000000-0000-4000-8000-000000000009",
+  "source_monotonic_us": 1203140060376,
+  "workload_state": "IDLE"
+ },
+ "WORKLOAD_OBSERVATION": {
+  "attempt_id": "audit-job-0630caf09515-a1",
+  "checkpoint_manifest_ref": null,
+  "cleanup_timeout_seconds": 120,
+  "cluster_id": "audit-order-0630caf09515",
+  "containers": [
+   {
+    "cgroup_path": null,
+    "container_id": null,
+    "container_name": "trainer",
+    "critical": true,
+    "exit_code": null,
+    "fabric_partition": null,
+    "finished_at": null,
+    "gpu_count": 0,
+    "gpu_uuids": [],
+    "host_pid": null,
+    "instance_id": null,
+    "node_id": "audit-node-0630caf09515",
+    "pod_name": "audit-pod-0630caf09515",
+    "pod_uid": "audit-pod-0630caf09515",
+    "rank": 0,
+    "restart_count": 0,
+    "role": "worker",
+    "signal": null,
+    "terminated": false,
+    "workload_log_snapshot": null
+   }
+  ],
+  "environment": "hyperpod-eks",
+  "expected_critical_ranks": 1,
+  "job_id": "audit-job-0630caf09515",
+  "observed_at": "2026-08-14T05:10:01.246401Z",
+  "restart_budget": 0,
+  "runtime_profile_version": "hyperpod-v1",
+  "started_at": "2026-08-14T05:09:02.246401Z",
+  "termination_initiator_incident_id": null,
+  "workload_ids": [
+   "kubernetes/job/audit-0630caf09515"
+  ],
+  "workload_phase": "RUNNING"
+ }
+}

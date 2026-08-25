@@ -1,0 +1,128 @@
+# Render REPLACE_WITH_WHEEL_CONFIGMAP with scripts/e2e/render_manifest.py.
+# Label the selected GPU node gpu-fault.io/e2e-target=true before applying.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-fault-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-api-canary
+  namespace: gpu-fault-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-fault-api-canary
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-api-canary
+    spec:
+      containers:
+        - name: api
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              /artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl &&
+              exec uvicorn gpu_fault.app:create_app --factory
+              --host 0.0.0.0 --port 8080 --no-proxy-headers
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS
+              value: "true"
+            - name: GPU_FAULT_ALLOW_SINGLE_CLUSTER
+              value: "true"
+            - name: GPU_FAULT_DCGM_EXPORTER_PORT
+              value: "9400"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+      volumes:
+        - name: artifact
+          configMap:
+            name: REPLACE_WITH_WHEEL_CONFIGMAP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-fault-api-canary
+  namespace: gpu-fault-system
+spec:
+  selector:
+    app: gpu-fault-api-canary
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-fault-dcgm-exporter-canary
+  namespace: gpu-fault-system
+  labels:
+    app: gpu-fault-dcgm-exporter-canary
+spec:
+  nodeSelector:
+    gpu-fault.io/e2e-target: "true"
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Always
+  containers:
+    - name: exporter
+      image: nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04
+      args: ["-a", "127.0.0.1:9400"]
+      env:
+        - name: DCGM_REMOTE_HOSTENGINE_INFO
+          value: "127.0.0.1:5555"
+        - name: DCGM_EXPORTER_COLLECTORS
+          value: /etc/dcgm-exporter/gpu-fault-counters.csv
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      readinessProbe:
+        httpGet:
+          host: 127.0.0.1
+          path: /metrics
+          port: 9400
+        initialDelaySeconds: 2
+        periodSeconds: 3
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: counters
+          mountPath: /etc/dcgm-exporter/gpu-fault-counters.csv
+          subPath: gpu-fault-counters.csv
+          readOnly: true
+  volumes:
+    - name: counters
+      configMap:
+        name: gpu-fault-dcgm-counters

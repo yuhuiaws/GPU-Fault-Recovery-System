@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-fault-q118-gpu-script-smoke
+  namespace: gpu-fault-system
+  labels:
+    app: gpu-fault-q118-gpu-script-smoke
+spec:
+  restartPolicy: Never
+  volumes:
+    - name: script
+      configMap:
+        name: gpu-fault-q118-gpu-script
+  containers:
+    - name: pytorch
+      image: public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/bash
+        - -lc
+        - |
+          exec torchrun \
+            --standalone \
+            --nnodes=1 \
+            --nproc-per-node=8 \
+            /opt/q118/train.py
+      volumeMounts:
+        - name: script
+          mountPath: /opt/q118
+          readOnly: true
+      resources:
+        requests:
+          cpu: "32"
+          memory: 128Gi
+          nvidia.com/gpu: "8"
+        limits:
+          cpu: "64"
+          memory: 256Gi
+          nvidia.com/gpu: "8"

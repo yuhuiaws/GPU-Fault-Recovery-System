@@ -1,0 +1,19 @@
+[Unit]
+Description=Enable NVIDIA GPU persistence mode
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart=@NVIDIA_SMI@ -pm 1
+RemainAfterExit=yes
+# Resource control: nvidia-smi maps every GPU, so the ceiling is
+# deliberately loose; the point is only to bound a runaway process.
+CPUWeight=10
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

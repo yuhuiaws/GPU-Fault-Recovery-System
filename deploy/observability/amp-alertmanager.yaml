@@ -1,0 +1,14 @@
+alertmanager_config: |
+  route:
+    receiver: gpu-fault-sns
+    group_by: [alertname, severity, control_plane_cluster, region]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+  receivers:
+    - name: gpu-fault-sns
+      sns_configs:
+        - topic_arn: REPLACE_WITH_SNS_TOPIC_ARN
+          sigv4:
+            region: us-west-2
+          send_resolved: true

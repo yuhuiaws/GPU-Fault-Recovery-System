@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-fault-control-plane-sysctl
+  namespace: gpu-fault-system
+  labels:
+    app: gpu-fault-control-plane-sysctl
+  annotations:
+    gpu-fault.io/cleanup-phase: auxiliary
+    gpu-fault.io/cleanup-order: "30"
+spec:
+  selector:
+    matchLabels:
+      app: gpu-fault-control-plane-sysctl
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-control-plane-sysctl
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: apply-sysctls
+          resources:
+            requests:
+              cpu: "5m"
+              memory: 8Mi
+            limits:
+              cpu: "20m"
+              memory: 32Mi
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          securityContext:
+            privileged: true
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              printf '65535\n' > /proc/sys/net/core/somaxconn
+              printf '65535\n' > /proc/sys/net/ipv4/tcp_max_syn_backlog
+              test "$(cat /proc/sys/net/core/somaxconn)" = "65535"
+              test "$(cat /proc/sys/net/ipv4/tcp_max_syn_backlog)" = "65535"
+      containers:
+        - name: hold
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command:
+            - /bin/sh
+            - -ec
+            - sleep infinity
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 20m
+              memory: 32Mi

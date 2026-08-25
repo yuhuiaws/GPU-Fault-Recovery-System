@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-fault-control-plane-capacity-probe
+  namespace: gpu-fault-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: probe
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command:
+            - python
+            - /probe/control_plane_capacity_probe.py
+          args:
+            - --url
+            - $(GPU_FAULT_CONTROL_PLANE_URL)
+            - --ca-certificate
+            - /connection/ca.crt
+            - --requests
+            - "1000"
+            - --concurrency
+            - "32"
+            - --max-error-rate
+            - "0"
+            - --max-p95-seconds
+            - "5"
+          env:
+            - name: GPU_FAULT_CONTROL_PLANE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: control-plane-url
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: probe
+              mountPath: /probe
+              readOnly: true
+            - name: connection
+              mountPath: /connection
+              readOnly: true
+      volumes:
+        - name: probe
+          configMap:
+            name: gpu-fault-control-plane-capacity-probe
+        - name: connection
+          secret:
+            secretName: gpu-fault-regional-connection
+            items:
+              - key: ca.crt
+                path: ca.crt

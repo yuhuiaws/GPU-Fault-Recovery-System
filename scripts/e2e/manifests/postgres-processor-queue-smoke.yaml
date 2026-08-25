@@ -1,0 +1,225 @@
+# Render REPLACE_WITH_WHEEL_CONFIGMAP with scripts/e2e/render_manifest.py.
+# Do not apply this source manifest directly.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-fault-postgres-processor-queue-smoke
+  namespace: gpu-fault-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: smoke
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[postgres]'
+              && python /smoke/smoke.py
+          env:
+            - name: GPU_FAULT_STORE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-aurora
+                  key: postgres-url
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+            - name: smoke
+              mountPath: /smoke
+              readOnly: true
+      volumes:
+        - name: artifact
+          configMap:
+            name: REPLACE_WITH_WHEEL_CONFIGMAP
+        - name: smoke
+          configMap:
+            name: gpu-fault-postgres-processor-queue-smoke
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-fault-postgres-processor-queue-smoke
+  namespace: gpu-fault-system
+data:
+  smoke.py: |
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timedelta, timezone
+    from uuid import uuid4
+
+    import psycopg
+    from psycopg import conninfo, sql
+
+    from gpu_fault.processor import ProcessorRequest
+    from gpu_fault.store import PostgresStore
+
+
+    url = os.environ["GPU_FAULT_STORE_URL"]
+    schema = "gpu_fault_smoke_" + uuid4().hex
+    admin = psycopg.connect(url, autocommit=True)
+    store = None
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("CREATE SCHEMA {}").format(
+                    sql.Identifier(schema)
+                )
+            )
+        isolated_url = conninfo.make_conninfo(
+            url,
+            options=f"-c search_path={schema}",
+        )
+        store = PostgresStore(
+            isolated_url,
+            pool_min_size=1,
+            pool_max_size=4,
+            pool_timeout_seconds=2,
+        )
+        now = datetime.now(timezone.utc)
+
+        def request(cluster_id, suffix):
+            return ProcessorRequest.from_http(
+                method="POST",
+                path="/v1/gpu-events/xid",
+                query="",
+                body=f'{{"event":"{suffix}"}}'.encode(),
+                content_type="application/json",
+                cluster_id=cluster_id,
+            )
+
+        first_a = store.enqueue_processor_request(
+            request("cluster-a", "a1")
+        )
+        second_a = store.enqueue_processor_request(
+            request("cluster-a", "a2")
+        )
+        first_b = store.enqueue_processor_request(
+            request("cluster-b", "b1")
+        )
+        claim_now = datetime.now(timezone.utc)
+        claimed = store.claim_active_processor_requests(
+            "smoke-consumer-a",
+            now=claim_now,
+            lease_duration=timedelta(seconds=30),
+            limit=4,
+        )
+        assert {item.request_id for item in claimed} == {
+            first_a.request_id,
+            first_b.request_id,
+        }
+        claimed_a = next(
+            item for item in claimed if item.cluster_id == "cluster-a"
+        )
+        assert not store.renew_active_processor_request(
+            claimed_a.request_id,
+            "smoke-consumer-b",
+            claimed_a.leader_epoch,
+            claimed_a.lease_token,
+            lease_duration=timedelta(seconds=60),
+        )
+        assert store.renew_active_processor_request(
+            claimed_a.request_id,
+            "smoke-consumer-a",
+            claimed_a.leader_epoch,
+            claimed_a.lease_token,
+            lease_duration=timedelta(seconds=60),
+        )
+        takeover = store.claim_active_processor_requests(
+            "smoke-consumer-b",
+            now=claim_now + timedelta(seconds=31),
+            lease_duration=timedelta(seconds=30),
+            limit=4,
+        )
+        assert claimed_a.request_id not in {
+            item.request_id for item in takeover
+        }
+        store.complete_active_processor_request(
+            claimed_a.request_id,
+            "smoke-consumer-a",
+            claimed_a.leader_epoch,
+            claimed_a.lease_token,
+            response_status=200,
+            response_content_type="application/json",
+            response_body_base64="e30=",
+        )
+        next_claim = store.claim_active_processor_requests(
+            "smoke-consumer-b",
+            now=datetime.now(timezone.utc),
+            lease_duration=timedelta(seconds=30),
+            limit=4,
+        )
+        assert [item.request_id for item in next_claim] == [
+            second_a.request_id
+        ]
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            stats = list(
+                executor.map(
+                    lambda _: store.processor_queue_stats(),
+                    range(8),
+                )
+            )
+        assert all(item["depth"] == 2 for item in stats)
+        assert (
+            store.cleanup_completed_processor_requests(
+                older_than=datetime.now(timezone.utc)
+                + timedelta(minutes=1),
+                limit=100,
+            )
+            == 1
+        )
+        expired_at = datetime.now(timezone.utc) - timedelta(seconds=2)
+        leadership = store.acquire_processor_leadership(
+            "smoke-leader",
+            now=expired_at,
+            lease_duration=timedelta(minutes=1),
+        )
+        expired_request = store.enqueue_processor_request(
+            request("cluster-c", "expired")
+        )
+        expired_claim = store.claim_processor_requests(
+            "smoke-leader",
+            leadership.epoch,
+            now=expired_at,
+            lease_duration=timedelta(seconds=1),
+            limit=1,
+        )[0]
+        try:
+            store.complete_processor_request(
+                expired_request.request_id,
+                "smoke-leader",
+                leadership.epoch,
+                expired_claim.lease_token,
+                response_status=200,
+                response_content_type="application/json",
+                response_body_base64="e30=",
+            )
+        except ValueError as exc:
+            assert "stale processor fencing token" in str(exc)
+        else:
+            raise AssertionError(
+                "expired processor request unexpectedly completed"
+            )
+        print("postgres processor queue smoke passed")
+    finally:
+        if store is not None:
+            store.close()
+        with admin.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema)
+                )
+            )
+        admin.close()

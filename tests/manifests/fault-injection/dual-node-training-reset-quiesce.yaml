@@ -1,0 +1,131 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-fault-training-reset-quiesce-node00
+  namespace: gpu-fault-system
+spec:
+  nodeSelector:
+    gpu-fault.io/e2e-target-a: "true"
+  restartPolicy: Never
+  hostPID: true
+  containers:
+    - name: quiesce
+      resources:
+        requests:
+          cpu: "10m"
+          memory: 32Mi
+        limits:
+          cpu: "200m"
+          memory: 128Mi
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      securityContext:
+        privileged: true
+      command:
+        - /bin/sh
+        - -c
+        - |
+          chroot /host /bin/sh -c '
+            pod_uid=d2e3e9e7_2547_4202_b79f_86e3b9f78108
+            while :; do
+              found=false
+              for cgroup in /proc/[0-9]*/cgroup; do
+                if grep -q "$pod_uid" "$cgroup" 2>/dev/null; then
+                  found=true
+                  break
+                fi
+              done
+              [ "$found" = false ] && break
+              sleep 1
+            done
+            systemd-run \
+              --unit=gpu-fault-training-reset-restore-node00 \
+              --on-active=420s /bin/systemctl start \
+              nvidia-fabricmanager nvidia-dcgm kubelet
+            systemctl stop kubelet
+            systemctl stop nvidia-dcgm
+            systemctl stop nvidia-fabricmanager
+            pkill -TERM -x nv-hostengine || true
+            pkill -TERM -x nvidia-containe || true
+            pkill -TERM -x nvidia-persiste || true
+            pkill -TERM -x nvidia-device-p || true
+            pkill -TERM -x health_monitori || true
+            pkill -TERM -x dcgm-exporter || true
+            sleep 300
+            systemctl start nvidia-fabricmanager
+            systemctl start nvidia-dcgm
+            systemctl start kubelet
+          '
+      volumeMounts:
+        - name: host-root
+          mountPath: /host
+  volumes:
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-fault-training-reset-quiesce-node05
+  namespace: gpu-fault-system
+spec:
+  nodeSelector:
+    gpu-fault.io/e2e-target-b: "true"
+  restartPolicy: Never
+  hostPID: true
+  containers:
+    - name: quiesce
+      resources:
+        requests:
+          cpu: "10m"
+          memory: 32Mi
+        limits:
+          cpu: "200m"
+          memory: 128Mi
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      securityContext:
+        privileged: true
+      command:
+        - /bin/sh
+        - -c
+        - |
+          chroot /host /bin/sh -c '
+            pod_uid=ddc75962_5198_4b8b_8c3e_2644ee3d9b94
+            while :; do
+              found=false
+              for cgroup in /proc/[0-9]*/cgroup; do
+                if grep -q "$pod_uid" "$cgroup" 2>/dev/null; then
+                  found=true
+                  break
+                fi
+              done
+              [ "$found" = false ] && break
+              sleep 1
+            done
+            systemd-run \
+              --unit=gpu-fault-training-reset-restore-node05 \
+              --on-active=420s /bin/systemctl start \
+              nvidia-fabricmanager nvidia-dcgm kubelet
+            systemctl stop kubelet
+            systemctl stop nvidia-dcgm
+            systemctl stop nvidia-fabricmanager
+            pkill -TERM -x nv-hostengine || true
+            pkill -TERM -x nvidia-containe || true
+            pkill -TERM -x nvidia-persiste || true
+            pkill -TERM -x nvidia-device-p || true
+            pkill -TERM -x health_monitori || true
+            pkill -TERM -x dcgm-exporter || true
+            sleep 300
+            systemctl start nvidia-fabricmanager
+            systemctl start nvidia-dcgm
+            systemctl start kubelet
+          '
+      volumeMounts:
+        - name: host-root
+          mountPath: /host
+  volumes:
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory

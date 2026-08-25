@@ -1,0 +1,3137 @@
+# Generated from the NVIDIA Xid Catalog. Do not edit.
+apiVersion: gpu-fault.io/v1alpha1
+kind: NvidiaXidCatalogPolicy
+metadata:
+  name: nvidia-xid-catalog-610
+  generatedFrom: https://docs.nvidia.com/deploy/xid-errors/_downloads/4586dadb59119a55d1e93a181caa4272/Xid-Catalog.xlsx
+  sourceSha256: 7f70ce9684be0c9d98a367770341ccc1d8bca4465cebe42dab7e23d57df5d5a5
+  generatedSha256: ffb82509abb574577db3c5d759cec94df40ea25edaf4691e7bd4ba0a12ba0462
+spec:
+  catalog:
+    version: '610'
+    coverage: FULL_OFFICIAL_ARTIFACT
+    productFamilies:
+    - family: A100
+      modelPrefixes:
+      - A
+    - family: H100
+      modelPrefixes:
+      - H
+      - GH
+    - family: B100
+      modelPrefixes:
+      - B
+    - family: GB200
+      modelPrefixes:
+      - GB
+  defaults:
+    markerTtlSeconds: 3600
+  correlation:
+    companionWindowSeconds: 30
+  catalogRules:
+  - xid: 1
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_FIFO_METHOD
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 2
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_SW_METHOD
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 3
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_UNK_METHOD
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 4
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_CHANNEL_BUSY
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 5
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_RUNOUT_OVERFLOW
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 6
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_PARSE_ERR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 7
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_PTE_ERR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 8
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_IDLE_TIMEOUT
+    description: GPU stopped processing
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 9
+    mnemonic: ROBUST_CHANNEL_GR_ERROR_INSTANCE
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 10
+    mnemonic: ROBUST_CHANNEL_GR_ERROR_SINGLE_STEP
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 11
+    mnemonic: ROBUST_CHANNEL_GR_ERROR_MISSING_HW
+    description: Invalid or corrupted push buffer stream
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CHECK_APP/CUDA
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 12
+    mnemonic: ROBUST_CHANNEL_GR_ERROR_SW_METHOD
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 13
+    mnemonic: 'ROBUST_CHANNEL_GR_EXCEPTION /
+
+      ROBUST_CHANNEL_GR_ERROR_SW_NOTIFY'
+    description: Graphics Engine Exception
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: WORKFLOW_XID_13
+    xid154Linkage: null
+    triggerConditions: "This event is logged for general user application faults. Typically this is an out-of-bounds error where the user has walked past the end of an array, but could also be an illegal instruction, illegal register, or other case.\n\nIn rare cases, it\u2019s possible for a hardware failure or system software bugs to materialize as XID 13.\n\nWhen this event is logged, NVIDIA recommends the following:\n1. Run the application in cuda-gdb or the Compute Sanitizer memcheck tool , or\n2. Run the application with CUDA_DEVICE_WAITS_ON_EXCEPTION=1 and then attach later with cuda-gdb, or\n3. File a bug if the previous two come back inconclusive to eliminate potential NVIDIA driver or hardware bug.\n\nNOTE: The Compute Sanitizer memcheck tool instruments the running application and reports which line of code performed the illegal read."
+  - xid: 14
+    mnemonic: ROBUST_CHANNEL_FAKE_ERROR
+    description: Unused
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: Fake or injected error from userspace
+  - xid: 15
+    mnemonic: ROBUST_CHANNEL_SCANLINE_TIMEOUT
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 16
+    mnemonic: ROBUST_CHANNEL_VBLANK_CALLBACK_TIMEOUT
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 17
+    mnemonic: ROBUST_CHANNEL_PARAMETER_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 18
+    mnemonic: ROBUST_CHANNEL_BUS_MASTER_TIMEOUT_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 19
+    mnemonic: ROBUST_CHANNEL_DISP_MISSED_NOTIFIER
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 20
+    mnemonic: ROBUST_CHANNEL_MPEG_ERROR_SW_METHOD
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 21
+    mnemonic: ROBUST_CHANNEL_ME_ERROR_SW_METHOD
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 22
+    mnemonic: ROBUST_CHANNEL_VP_ERROR_SW_METHOD
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 23
+    mnemonic: ROBUST_CHANNEL_RC_LOGGING_ENABLED
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 24
+    mnemonic: ROBUST_CHANNEL_GR_SEMAPHORE_TIMEOUT
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 25
+    mnemonic: ROBUST_CHANNEL_GR_ILLEGAL_NOTIFY
+    description: Invalid or illegal push buffer stream
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CHECK_APP/CUDA
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 26
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_FBISTATE_TIMEOUT
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 27
+    mnemonic: ROBUST_CHANNEL_VP_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 28
+    mnemonic: ROBUST_CHANNEL_VP2_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 29
+    mnemonic: ROBUST_CHANNEL_BSP_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 30
+    mnemonic: ROBUST_CHANNEL_BAD_ADDR_ACCESS
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 31
+    mnemonic: ROBUST_CHANNEL_FIFO_ERROR_MMU_ERR_FLT
+    description: GPU memory page fault
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: WORKFLOW_XID_31
+    xid154Linkage: null
+    triggerConditions: "This event is logged when a fault is reported by the MMU, such as when an illegal address access is made by an applicable unit on the chip. Typically these are application-level bugs, but can also be driver bugs or hardware bugs. \n\nWhen this event is logged, NVIDIA recommends the following: \n1. Run the application in cuda-gdb or the Compute Sanitizer memcheck tool, or \n2. Run the application with CUDA_DEVICE_WAITS_ON_EXCEPTION=1 and then attach later with cuda-gdb, or \n3. File a bug if the previous two come back inconclusive to eliminate potential NVIDIA driver or hardware bug. \n\nNOTE: The Compute Sanitizer memcheck tool instruments the running application and reports which line of code performed the illegal read."
+  - xid: 32
+    mnemonic: ROBUST_CHANNEL_PBDMA_ERROR
+    description: Invalid or corrupted push buffer stream
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CHECK_APP/CUDA
+    xid154Linkage: null
+    triggerConditions: This event is logged when a fault is reported by the DMA controller which manages the communication stream between the NVIDIA driver and the GPU over the PCI-E bus. These failures primarily involve quality issues on PCI, and are generally not caused by user application actions.
+  - xid: 33
+    mnemonic: ROBUST_CHANNEL_SEC_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 34
+    mnemonic: ROBUST_CHANNEL_MSVLD_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 35
+    mnemonic: ROBUST_CHANNEL_MSPDEC_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 36
+    mnemonic: ROBUST_CHANNEL_MSPPP_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 37
+    mnemonic: ROBUST_CHANNEL_FECS_ERR_UNIMP_FIRMWARE_METHOD
+    description: Driver firmware error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CHECK_APP/CUDA
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 38
+    mnemonic: ROBUST_CHANNEL_FECS_ERR_WATCHDOG_TIMEOUT
+    description: Driver firmware error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 39
+    mnemonic: ROBUST_CHANNEL_CE0_ERROR
+    description: Copy Engine Exception
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 40
+    mnemonic: ROBUST_CHANNEL_CE1_ERROR
+    description: Copy Engine Exception
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 41
+    mnemonic: ROBUST_CHANNEL_CE2_ERROR
+    description: Copy Engine Exception
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 42
+    mnemonic: ROBUST_CHANNEL_VIC_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 43
+    mnemonic: ROBUST_CHANNEL_RESETCHANNEL_VERIF_ERROR
+    description: GPU stopped processing
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: 'This event is logged when a user application hits a software induced fault and must terminate. The GPU remains in a healthy state.
+
+
+      In most cases, this is not indicative of a driver bug but rather a user application error.'
+  - xid: 44
+    mnemonic: ROBUST_CHANNEL_GR_FAULT_DURING_CTXSW
+    description: Graphics Engine fault during context switch
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 45
+    mnemonic: ROBUST_CHANNEL_PREEMPTIVE_REMOVAL
+    description: Preemptive cleanup, due to previous errors -- Most likely to see when running multiple cuda applications and hitting a DBE
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: WORKFLOW_XID_45
+    investigatoryAction: 'Solo: RESTART_FM
+
+      Not Solo: IGNORE (follow other Xid)'
+    xid154Linkage: null
+    triggerConditions: 'This event is logged when the user application aborts and the kernel driver tears down the GPU application running on the GPU. Control-C, GPU resets, sigkill are all examples where the application is aborted and this event is created.
+
+
+      In many cases, this is not indicative of a bug but rather a user or system action.'
+  - xid: 46
+    mnemonic: ROBUST_CHANNEL_GPU_TIMEOUT_ERROR
+    description: GPU stopped processing
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 47
+    mnemonic: ROBUST_CHANNEL_NVENC0_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 48
+    mnemonic: ROBUST_CHANNEL_GPU_ECC_DBE
+    description: Double Bit ECC Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: WORKFLOW_XID_48
+    investigatoryAction: WORKFLOW_XID_48
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: 'This event is logged when the GPU detects that an uncorrectable error occurs on the GPU. This is also reported back to the user application. A GPU reset or node reboot is needed to clear this error.
+
+
+      The tool nvidia-smi can provide a summary of ECC errors.
+
+
+      If the ECC error is reported for SRAM (excludes "framebuffer"), check for SRAM DBE thresholds and follow RMA flow if exceeded - (nvidia-smi <sram_threshold_exceeded> or NSM Msg Type 0x3, Cmd Code 0x7D, bit 0). If flag is set, run field diag.'
+  - xid: 49
+    mnemonic: SILENT_RUNNING_CONSTANT_LEVEL_SET_BY_REGISTRY
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 50
+    mnemonic: SILENT_RUNNING_LEVEL_TRANSITION_DUE_TO_RC_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 51
+    mnemonic: SILENT_RUNNING_STRESS_TEST_FAILURE
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 52
+    mnemonic: SILENT_RUNNING_LEVEL_TRANS_DUE_TO_TEMP_RISE
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 53
+    mnemonic: SILENT_RUNNING_TEMP_REDUCED_CLOCKING
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 54
+    mnemonic: SILENT_RUNNING_PWR_REDUCED_CLOCKING
+    description: Auxiliary power is not connected to the GPU board
+    products:
+    - A100
+    - H100
+    - B100
+    immediateAction: CHECK_MECHANICALS
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 55
+    mnemonic: SILENT_RUNNING_TEMPERATURE_READ_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 56
+    mnemonic: DISPLAY_CHANNEL_EXCEPTION
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 57
+    mnemonic: FB_LINK_TRAINING_FAILURE_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 58
+    mnemonic: FB_MEMORY_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 59
+    mnemonic: PMU_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 60
+    mnemonic: ROBUST_CHANNEL_SEC2_ERROR
+    description: Video processor exception
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: INVESTIGATE_SW
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 61
+    mnemonic: PMU_BREAKPOINT
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 62
+    mnemonic: PMU_HALT_ERROR
+    description: 'Internal micro-controller halt
+
+      (newer drivers)'
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 63
+    mnemonic: INFOROM_DRAM_RETIREMENT_EVENT
+    description: GPU memory remapping event
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: IGNORE
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: "These events are logged when the GPU handles ECC memory errors on the GPU.\n\nOn GPUs that support row remapping, starting with NVIDIA\xAE Ampere archtecture GPUs, these events provide details on row remapper activity. For more information row remapper Xids, refer to https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping.\n\nOn earlier GPUs that support dynamic page retirement, these events provide details on dynamic page retirement activity. For more information on dynamic page retirement Xids, refer to https://docs.nvidia.com/deploy/dynamic-page-retirement/index.html."
+  - xid: 64
+    mnemonic: INFOROM_DRAM_RETIREMENT_FAILURE
+    description: GPU memory remapping failure
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: "These events are logged when the GPU handles ECC memory errors on the GPU. \n\nOn GPUs that support row remapping, starting with NVIDIA\xAE Ampere archtecture GPUs, these events provide details on row remapper activity. For more information row remapper Xids, refer to https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping. \n\nOn earlier GPUs that support dynamic page retirement, these events provide details on dynamic page retirement activity. For more information on dynamic page retirement Xids, refer to https://docs.nvidia.com/deploy/dynamic-page-retirement/index.html."
+  - xid: 65
+    mnemonic: ROBUST_CHANNEL_NVENC1_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 66
+    mnemonic: ROBUST_CHANNEL_FECS_ERR_REG_ACCESS_VIOLATION
+    description: Illegal access by driver
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: INVESTIGATE_SW
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 67
+    mnemonic: ROBUST_CHANNEL_FECS_ERR_VERIF_VIOLATION
+    description: Illegal access by driver
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 68
+    mnemonic: ROBUST_CHANNEL_NVDEC0_ERROR
+    description: NVDEC0 Exception
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 69
+    mnemonic: ROBUST_CHANNEL_GR_CLASS_ERROR
+    description: Graphics Engine class error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CHECK_APP/CUDA
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 70
+    mnemonic: ROBUST_CHANNEL_CE3_ERROR
+    description: 'CE3: Unknown Error'
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 71
+    mnemonic: ROBUST_CHANNEL_CE4_ERROR
+    description: 'CE4: Unknown Error'
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 72
+    mnemonic: ROBUST_CHANNEL_CE5_ERROR
+    description: 'CE5: Unknown Error'
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 73
+    mnemonic: ROBUST_CHANNEL_NVENC2_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 74
+    mnemonic: NVLINK_ERROR
+    description: NVLINK Error
+    products:
+    - A100
+    - H100
+    immediateAction: WORKFLOW_NVLINK_ERR
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: "This event is logged when the GPU detects that a problem with a connection from the GPU to another GPU or NVSwitch over NVLink. A GPU reset or node reboot is needed to clear this error. \n\nThis event may indicate a hardware failure with the link itself, or may indicate a problem with the device at the remote end of the link. For example, if a GPU fails, another GPU connected to it over NVLink may report an Xid 74 simply because the link went down as a result. \n\nThe nvidia-smi nvlink command can provide additional details on NVLink errors, and connection information on the links. \n\nIf this error is seen repeatedly and GPU reset or node reboot fails to clear the condition, contact your hardware vendor for support."
+  - xid: 75
+    mnemonic: ROBUST_CHANNEL_CE6_ERROR
+    description: 'CE6: Unknown Error'
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 76
+    mnemonic: ROBUST_CHANNEL_CE7_ERROR
+    description: 'CE7: Unknown Error'
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 77
+    mnemonic: ROBUST_CHANNEL_CE8_ERROR
+    description: 'CE8: Unknown Error'
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 78
+    mnemonic: VGPU_START_ERROR
+    description: vGPU Start Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: UPDATE_SWFW
+    investigatoryAction: UPDATE_SWFW
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 79
+    mnemonic: ROBUST_CHANNEL_GPU_HAS_FALLEN_OFF_THE_BUS
+    description: GPU has fallen off the bus
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_BM
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: 'This event is logged when the GPU driver attempts to access the GPU over its PCI Express connection and finds that the GPU is not accessible.
+
+
+      This event is often caused by hardware failures on the PCI Express link causing the GPU to be inaccessible due to the link being brought down. Reviewing system event logs and kernel PCI event logs may provide additional indications of the source of the link failures.
+
+
+      This event may also be cause by failing GPU hardware or other driver issues.'
+  - xid: 80
+    mnemonic: PBDMA_PUSHBUFFER_CRC_MISMATCH
+    description: Corrupted data sent to GPU
+    products:
+    - A100
+    - H100
+    immediateAction: RESTART_APP
+    investigatoryAction: CHECK_APP/CUDA
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 81
+    mnemonic: ROBUST_CHANNEL_VGA_SUBSYSTEM_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 82
+    mnemonic: ROBUST_CHANNEL_NVJPG0_ERROR
+    description: NVJPG0 Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 83
+    mnemonic: ROBUST_CHANNEL_NVDEC1_ERROR
+    description: NVDEC1 Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 84
+    mnemonic: ROBUST_CHANNEL_NVDEC2_ERROR
+    description: NVDEC2 Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 85
+    mnemonic: ROBUST_CHANNEL_CE9_ERROR
+    description: 'CE9: Unknown Error'
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 86
+    mnemonic: ROBUST_CHANNEL_OFA0_ERROR
+    description: OFA Exception
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 87
+    mnemonic: NVTELEMETRY_DRIVER_REPORT
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 88
+    mnemonic: ROBUST_CHANNEL_NVDEC3_ERROR
+    description: NVDEC3 Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 89
+    mnemonic: ROBUST_CHANNEL_NVDEC4_ERROR
+    description: NVDEC4 Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 90
+    mnemonic: LTC_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 91
+    mnemonic: RESERVED_XID
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 92
+    mnemonic: EXCESSIVE_SBE_INTERRUPTS
+    description: High single-bit ECC error rate
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 93
+    mnemonic: INFOROM_ERASE_LIMIT_EXCEEDED
+    description: Non-fatal violation of provisioned InfoROM wear limit
+    products:
+    - A100
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: "This event is logged when the GPU driver fails to update the InfoROM due to violation of the provisioned InfoROM wear limit that was set for the GPU using NVFlash using nvflash --=elsessionstart.\n\nIn most cases this is not indicative of a driver or flash failure, but rather the intentional use of the InfoROM wear protection feature as set by NVFlash.\n\nRecovery steps:\nThe GPU can be recovered from Xid 93 by clearing InfoROM erase limit using ./nvflash \u2013-elsessionclear. If clearing the limit using nvflash doesn\u2019t help, report the issue to NVIDIA."
+  - xid: 94
+    mnemonic: ROBUST_CHANNEL_CONTAINED_ERROR
+    description: Contained memory error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: IGNORE (sympathetic)
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: 'These events (94/95) are logged when GPU drivers handle errors in GPUs that support error containment, starting with NVIDIA A100 GPUs.
+
+
+      For Xid 94, these errors are contained to one application, and the application that encountered this error must be restarted. All other applications running at the time of the Xid are unaffected. It is recommended to reset the GPU when convenient. Applications can continue to be run until the reset can be performed.
+
+
+      One possible cause of containment errors is the handling of ECC memory errors. Review the NVIDIA GPU Memory Error Management manual: https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping for coverage of ECC-triggered containment errors.
+
+
+      Xid 45 will be seen in relation to this error.'
+  - xid: 95
+    mnemonic: ROBUST_CHANNEL_UNCONTAINED_ERROR
+    description: Uncontained memory error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: IGNORE (sympathetic)
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: "These events (94/95) are logged when GPU drivers handle errors in GPUs that support error containment, starting with NVIDIA\xAE A100 GPUs.\n\nFor Xid 95, these errors affect multiple applications, and the affected GPU must be reset before applications can restart. Refer https://docs.nvidia.com/deploy/gpu-debug-guidelines/index.html for GPU Reset capabilities & limitations\n\nOne possible cause of containment errors is the handling of ECC memory errors. Review the NVIDIA GPU Memory Error Management manual: https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping for coverage of ECC-triggered containment errors.\n\nXid 45 will be seen in relation to this error."
+  - xid: 96
+    mnemonic: ROBUST_CHANNEL_NVDEC5_ERROR
+    description: NVDEC5 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 97
+    mnemonic: ROBUST_CHANNEL_NVDEC6_ERROR
+    description: NVDEC6 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 98
+    mnemonic: ROBUST_CHANNEL_NVDEC7_ERROR
+    description: NVDEC7 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 99
+    mnemonic: ROBUST_CHANNEL_NVJPG1_ERROR
+    description: NVJPG1 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 100
+    mnemonic: ROBUST_CHANNEL_NVJPG2_ERROR
+    description: NVJPG2 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 101
+    mnemonic: ROBUST_CHANNEL_NVJPG3_ERROR
+    description: NVJPG3 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 102
+    mnemonic: ROBUST_CHANNEL_NVJPG4_ERROR
+    description: NVJPG4 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 103
+    mnemonic: ROBUST_CHANNEL_NVJPG5_ERROR
+    description: NVJPG5 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 104
+    mnemonic: ROBUST_CHANNEL_NVJPG6_ERROR
+    description: NVJPG6 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 105
+    mnemonic: ROBUST_CHANNEL_NVJPG7_ERROR
+    description: NVJPG7 Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 106
+    mnemonic: SMBPBI_TEST_MESSAGE
+    description: SMBPBI Test Message
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: IGNORE
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 107
+    mnemonic: SMBPBI_TEST_MESSAGE_SILENT
+    description: SMBPBI Test Message Silent
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: IGNORE
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 108
+    mnemonic: NVLINK_REMOTE_TRANSLATION_ERROR
+    description: Unused
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: XID_137_FLOW
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 109
+    mnemonic: ROBUST_CHANNEL_CTXSW_TIMEOUT_ERROR
+    description: Context Switch Timeout Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: CUDA 12.7; GPU driver R570
+    triggerConditions: null
+  - xid: 110
+    mnemonic: SEC_FAULT_ERROR
+    description: Security Fault Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: INVESTIGATE_SW
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: This event should be uncommon unless there is a hardware failure. To recover, revert any recent system hardware modifications and cold reset the system. If this fails to correct the issue, contact your hardware vendor for assistance.
+  - xid: 111
+    mnemonic: BUNDLE_ERROR_EVENT
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 112
+    mnemonic: DISP_SUPERVISOR_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 113
+    mnemonic: DP_LT_FAILURE
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 114
+    mnemonic: HEAD_RG_UNDERFLOW
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 115
+    mnemonic: CORE_CHANNEL_REGS
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 116
+    mnemonic: WINDOW_CHANNEL_REGS
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 117
+    mnemonic: CURSOR_CHANNEL_REGS
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 118
+    mnemonic: HEAD_REGS
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 119
+    mnemonic: GSP_RPC_TIMEOUT
+    description: GSP RPC Timeout
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: INVESTIGATE_SW
+    xid154Linkage: null
+    triggerConditions: These events (119/120) may be logged when an error occurs in code running on the GSP core of the GPU and/or a timeout occurs while waiting for the GSP core of the GPU to respond to an RPC message. A GPU reset or node power cycle may be needed if the error persists. If this problem reoccurs after a power cycle, follow the NVIDIA GPU Debug Guidelines document for additional debugging steps.
+  - xid: 120
+    mnemonic: GSP_ERROR
+    description: GSP Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: INVESTIGATE_SW
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: These events (119/120) may be logged when an error occurs in code running on the GSP core of the GPU and/or a timeout occurs while waiting for the GSP core of the GPU to respond to an RPC message. A GPU reset or node power cycle may be needed if the error persists. If this problem reoccurs after a power cycle, follow the NVIDIA GPU Debug Guidelines document for additional debugging steps.
+  - xid: 121
+    mnemonic: C2C_ERROR
+    description: C2C Error
+    products:
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: 'This event may occur when the GPU driver has observed corrected errors on the C2C NVLink connection to a Grace CPU. These errors are corrected by the system and have no operational impact. Resetting the GPU at an available service window will allow the GPU to retrain the link.
+
+      NOTE: repeat errors may be reported; VBIOS 97.00.90.00.00 may provide some relief from that condition'
+  - xid: 122
+    mnemonic: SPI_PMU_RPC_READ_FAIL
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 123
+    mnemonic: SPI_PMU_RPC_WRITE_FAIL
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 124
+    mnemonic: SPI_PMU_RPC_ERASE_FAIL
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 125
+    mnemonic: INFOROM_FS_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 126
+    mnemonic: ROBUST_CHANNEL_CE10_ERROR
+    description: 'CE10: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 127
+    mnemonic: ROBUST_CHANNEL_CE11_ERROR
+    description: 'CE11: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 128
+    mnemonic: ROBUST_CHANNEL_CE12_ERROR
+    description: 'CE12: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 129
+    mnemonic: ROBUST_CHANNEL_CE13_ERROR
+    description: 'CE13: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 130
+    mnemonic: ROBUST_CHANNEL_CE14_ERROR
+    description: 'CE14: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 131
+    mnemonic: ROBUST_CHANNEL_CE15_ERROR
+    description: 'CE15: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 132
+    mnemonic: ROBUST_CHANNEL_CE16_ERROR
+    description: 'CE16: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 133
+    mnemonic: ROBUST_CHANNEL_CE17_ERROR
+    description: 'CE17: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 134
+    mnemonic: ROBUST_CHANNEL_CE18_ERROR
+    description: 'CE18: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 135
+    mnemonic: ROBUST_CHANNEL_CE19_ERROR
+    description: 'CE19: Unknown Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 136
+    mnemonic: ALI_TRAINING_FAIL
+    description: Link Training Failed
+    products:
+    - H100
+    immediateAction: RESET_GPU
+    investigatoryAction: INVESTIGATE_LINK_SI
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 137
+    mnemonic: NVLINK_PRIV_ERR
+    description: NVLink Privilege Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: XID_137_FLOW
+    xid154Linkage: null
+    triggerConditions: 'This event is logged when a fault is reported by the remote MMU, such as when an illegal NVLink peer-to-peer access is made by an applicable unit on the chip. Typically these are application-level bugs, but can also be driver bugs or hardware bugs.
+
+
+      When this event is logged, NVIDIA recommends the following: #. Run the application in cuda-gdb or the Compute Sanitizer memcheck tool , or #. Run the application with CUDA_DEVICE_WAITS_ON_EXCEPTION=1 and then attach later with cuda-gdb, or #. File a bug if the previous two come back inconclusive to eliminate potential NVIDIA driver or hardware bug.'
+  - xid: 138
+    mnemonic: ROBUST_CHANNEL_DLA_ERROR
+    description: Unused
+    products: []
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: N/A; Unused
+  - xid: 139
+    mnemonic: ROBUST_CHANNEL_OFA1_ERROR
+    description: OFA1 Error
+    products:
+    - B100
+    - GB200
+    immediateAction: RESTART_APP
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 140
+    mnemonic: UNRECOVERABLE_ECC_ERROR_ESCAPE
+    description: ECC Unrecovered Error
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: "This event may occur when the GPU driver has observed uncorrectable errors in GPU memory, in such a way as to interrupt the GPU driver\u2019s ability to mark the pages for dynamic page offlining or row remapping. Reset the GPU, and if the problem persists, contact your hardware vendor for support."
+  - xid: 141
+    mnemonic: ROBUST_CHANNEL_FAST_PATH_ERROR
+    description: CUDA Fast Path Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 142
+    mnemonic: ROBUST_CHANNEL_NVENC3_ERROR
+    description: NVENC3 Error
+    products:
+    - GB200
+    immediateAction: CONTACT_SUPPORT
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 143
+    mnemonic: GPU_INIT_ERROR
+    description: GPU Initialization Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: CUDA 12.9; GPU driver R575
+    triggerConditions: null
+  - xid: 144
+    mnemonic: NVLINK_SAW_ERROR
+    description: 'NVLINK: SAW Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: WORKFLOW_NVLINK5_ERR
+    investigatoryAction: WORKFLOW_NVLINK5_ERR
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 145
+    mnemonic: NVLINK_RLW_ERROR
+    description: 'NVLINK: RLW Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: WORKFLOW_NVLINK5_ERR
+    investigatoryAction: WORKFLOW_NVLINK5_ERR
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 146
+    mnemonic: NVLINK_TLW_ERROR
+    description: 'NVLINK: TLW Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: WORKFLOW_NVLINK5_ERR
+    investigatoryAction: WORKFLOW_NVLINK5_ERR
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 147
+    mnemonic: NVLINK_TREX_ERROR
+    description: 'NVLINK: TREX Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: WORKFLOW_NVLINK5_ERR
+    investigatoryAction: WORKFLOW_NVLINK5_ERR
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 148
+    mnemonic: NVLINK_NVLPW_CTRL_ERROR
+    description: 'NVLINK: NVLPW_CTRL Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: WORKFLOW_NVLINK5_ERR
+    investigatoryAction: WORKFLOW_NVLINK5_ERR
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 149
+    mnemonic: NVLINK_NETIR_ERROR
+    description: 'NVLINK: NETIR Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: WORKFLOW_NVLINK5_ERR
+    investigatoryAction: WORKFLOW_NVLINK5_ERR
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 150
+    mnemonic: NVLINK_MSE_ERROR
+    description: 'NVLINK: MSE Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: WORKFLOW_NVLINK5_ERR
+    investigatoryAction: WORKFLOW_NVLINK5_ERR
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 151
+    mnemonic: ROBUST_CHANNEL_KEY_ROTATION_ERROR
+    description: Key rotation Error
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESTART_VM
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 152
+    mnemonic: ROBUST_CHANNEL_DLA_SMMU_ERROR
+    description: DLA SMMU Error
+    products: []
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 153
+    mnemonic: ROBUST_CHANNEL_DLA_TIMEOUT
+    description: DLA timeout Error
+    products: []
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 154
+    mnemonic: GPU_RECOVERY_ACTION_CHANGED
+    description: GPU Recovery Action Changed
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: XID_154
+    investigatoryAction: N/A Informational only regarding another Xid
+    xid154Linkage: null
+    triggerConditions: "\"Xid 154 will be seen in conjunction with other Xids and summarizes the recovery action required for other Xids. \nThe string will be similar to \"\"Xid 154 GPU recovery action changed from 0x0 (None) to 0x2 (Node Reboot Required)\"\" where the expected values of the text are: \"\"None\"\", \"\"Drain P2P\"\", \"\"Drain and Reset\"\", \"\"GPU Reset Required\"\", \"\"Node Reboot Required\"\". \""
+  - xid: 155
+    mnemonic: NVLINK_SW_DEFINED_ERROR
+    description: 'NVLINK: SW Defined Error'
+    products:
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: INVESTIGATE_SW_USER
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: "Link down events which are flagged as \u201Cintentional\u201D (including transitions to SLEEP) will trigger this Xid"
+  - xid: 156
+    mnemonic: RESOURCE_RETIREMENT_EVENT
+    description: Resource Retirement Event
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: IGNORE
+    xid154Linkage: CUDA 12.7; GPU driver R565
+    triggerConditions: null
+  - xid: 157
+    mnemonic: RESOURCE_RETIREMENT_FAILURE
+    description: Resource Retirement Failure
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: null
+    triggerConditions: No possible repairs are possible due to lack of resources. You may still run workloads or Apps, but may experience the same Xid again.
+  - xid: 158
+    mnemonic: GPU_FATAL_TIMEOUT
+    description: GPU Fatal Timeout
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: RESET_GPU
+    investigatoryAction: CONTACT_SUPPORT
+    xid154Linkage: yes; support with Xid introduction
+    triggerConditions: null
+  - xid: 159
+    mnemonic: ROBUST_CHANNEL_CHI_NON_DATA_ERROR
+    description: CHI Non-Data Error
+    products:
+    - B100
+    - GB200
+    immediateAction: CHECK_UVM
+    investigatoryAction: SYMPATHETIC_REPORT_SOLO
+    xid154Linkage: yes; support with Xid introduction
+    triggerConditions: May be seen on any C2C link-connected GPU.
+  - xid: 160
+    mnemonic: CHANNEL_RETIREMENT_EVENT
+    description: Channel Retirement Event
+    products:
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: INVESTIGATE_SW
+    xid154Linkage: CUDA 12.9; GPU driver R575
+    triggerConditions: null
+  - xid: 161
+    mnemonic: CHANNEL_RETIREMENT_FAILURE
+    description: Channel Retirement Failure
+    products:
+    - B100
+    - GB200
+    immediateAction: IGNORE
+    investigatoryAction: INVESTIGATE_SW
+    xid154Linkage: CUDA 12.9; GPU driver R575
+    triggerConditions: null
+  - xid: 162
+    mnemonic: PSHC_REENGAGED
+    description: Power Smoothing HW Circuitry capability reengaged
+    products:
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 163
+    mnemonic: PSHC_DISENGAGED
+    description: Power Smoothing HW Circuitry capability disengaged
+    products:
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: No GPU reset required. If power smoothing functionality is desired, the customer needs to resolve the thermal events. If disabled due to timeout, reload the driver or reset the GPU.
+  - xid: 164
+    mnemonic: PSHC_LOW_LIFETIME
+    description: Power Smoothing HW Circuitry low lifetime reached
+    products:
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: 'Monitor power swings and expect to replace GPUs if power smoothing is desired.
+
+      Power smoothing functionality will be disabled soon. Investigate if power swings are acceptable, and if not, take action.'
+  - xid: 165
+    mnemonic: PSHC_ZERO_LIFETIME
+    description: Power Smoothing HW Circuitry lifetime exhausted
+    products:
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: Replace GPUs if power swings are not acceptable, and power smoothing is desired. Power smoothing will be disabled by the driver and power swings will occur. Analyze datacenter infrastructure to ensure ability to absorb power swings.
+  - xid: 166
+    mnemonic: NVLINK_SECURE_CRYPTO_ERR
+    description: CC traffic seen prior to link properly being configured for encrypted traffic
+    products:
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: Applicable to CC (confidential computing) mode only.
+  - xid: 167
+    mnemonic: PCIE_FATAL_TIMEOUT
+    description: PCIE_FATAL_TIMEOUT
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 168
+    mnemonic: REDUCED_GPU_MEMORY_CAPACITY
+    description: Errors found in WPR (write protected region)
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: "Should only be seen when ECC is disabled. \nEither ECC should be enabled (to enable row-remapping) or boot re-attempted with shifted WPR."
+  - xid: 169
+    mnemonic: SEC2_HALT_ERROR
+    description: Internal micro-controller halt
+    products:
+    - H100
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 170
+    mnemonic: NVLINK_SECURE_OTHER
+    description: Interrupt seen in CC mode
+    products:
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: Applicable to CC (confidential computing) mode only.
+  - xid: 171
+    mnemonic: UNCORRECTABLE_DRAM_ERROR
+    description: Additional to Xid 48 providing more details on particulars of fault to differentiate DRAM/SRAM
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: null
+  - xid: 172
+    mnemonic: UNCORRECTABLE_SRAM_ERROR
+    description: Additional to Xid 48 providing more details on particulars of fault to differentiate DRAM/SRAM
+    products:
+    - A100
+    - H100
+    - B100
+    - GB200
+    immediateAction: null
+    investigatoryAction: null
+    xid154Linkage: null
+    triggerConditions: null
+  nvlink5:
+    driverBoundary: 575
+    decodeRules:
+    - xid: 144
+      subcodeName: SAW_MVB
+      v1Pattern: '------000000----------0000100001'
+      v2Pattern: '------000000-------------0000001'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: Will lead to Xid 48. Will lead to poison or Xid94/95****; \nRemote: none"
+    - xid: 144
+      subcodeName: SAW_MVB
+      v1Pattern: '------000000----------0000100001'
+      v2Pattern: '------000000-------------0000001'
+      errorStatus: '0x00000002'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 144
+      subcodeName: SAW_MVB
+      v1Pattern: '------000000----------0000100001'
+      v2Pattern: '------000000-------------0000001'
+      errorStatus: '0x00000004'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 144
+      subcodeName: SAW_MVB
+      v1Pattern: '------000000----------0000100001'
+      v2Pattern: '------000000-------------0000001'
+      errorStatus: '0x00000008'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: XID 48; \nRemote: Will lead to poison or Xid94****"
+    - xid: 144
+      subcodeName: SAW_MVB
+      v1Pattern: '------000000----------0000100001'
+      v2Pattern: '------000000-------------0000001'
+      errorStatus: '0x00000010'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 144
+      subcodeName: SAW_MVB
+      v1Pattern: '------000000----------0000100001'
+      v2Pattern: '------000000-------------0000001'
+      errorStatus: '0x00000020'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_CTRL
+      v1Pattern: '------000000----------0001100010'
+      v2Pattern: '------000000-------------0000011'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000001'
+      recoveryAction: XID_154_EVAL
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: XC/AppCrash (Xid 45); \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000002'
+      recoveryAction: XID_154_EVAL
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: XC/AppCrash (Xid 45); \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000004'
+      recoveryAction: XID_154_EVAL
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CHECK_NVLINK_FAILURE_FLOW
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: XC/AppCrash (Xid 45); \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000008'
+      recoveryAction: XID_154_EVAL
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CHECK_NVLINK_FAILURE_FLOW
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: XC/AppCrash (Xid 45); \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000010'
+      recoveryAction: XID_154_EVAL
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CHECK_NVLINK_FAILURE_FLOW
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: XC/AppCrash (Xid 45); \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000020'
+      recoveryAction: XID_154_EVAL
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CHECK_NVLINK_FAILURE_FLOW
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: XC/AppCrash (Xid 45); \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000040'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000080'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000100'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x00000200'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_REMAP
+      v1Pattern: '------000000----------0010000010'
+      v2Pattern: '------000000-------------0000100'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_RSPCOL
+      v1Pattern: '------000000----------0010100010'
+      v2Pattern: '------000000-------------0000101'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_RSPCOL
+      v1Pattern: '------000000----------0010100010'
+      v2Pattern: '------000000-------------0000101'
+      errorStatus: '0x00000002'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 145
+      subcodeName: RLW_RSPCOL
+      v1Pattern: '------000000----------0010100010'
+      v2Pattern: '------000000-------------0000101'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_RXPIPE
+      v1Pattern: '------000000---------00011000010'
+      v2Pattern: '------000000------------00000110'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: '------000000---------10011000010'
+      action2V2Pattern: '------000000------------10000110'
+      action2: RESET_GPU
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal*
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: PacketLoss***"
+    - xid: 145
+      subcodeName: RLW_RXPIPE
+      v1Pattern: '------000000---------00011000010'
+      v2Pattern: '------000000------------00000110'
+      errorStatus: '0x00000002'
+      recoveryAction: IGNORE
+      action2V1Pattern: '------000000---------10011000010'
+      action2V2Pattern: '------000000------------10000110'
+      action2: RESET_GPU
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal*
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: PacketLoss***"
+    - xid: 145
+      subcodeName: RLW_RXPIPE
+      v1Pattern: '------000000---------00011000010'
+      v2Pattern: '------000000------------00000110'
+      errorStatus: '0x00000004'
+      recoveryAction: IGNORE
+      action2V1Pattern: '------000000---------10011000010'
+      action2V2Pattern: '------000000------------10000110'
+      action2: RESET_GPU
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal*
+      faultOrigin: SW
+      localRemote: "Local: PacketLoss***; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_RXPIPE
+      v1Pattern: '------000000----------0011000010'
+      v2Pattern: '------000000-------------0000110'
+      errorStatus: '0x00000008'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_RXPIPE
+      v1Pattern: '------000000----------0011000010'
+      v2Pattern: '------000000-------------0000110'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_SRC_TRACK
+      v1Pattern: '------000000----------0011100010'
+      v2Pattern: '------000000-------------0000111'
+      errorStatus: '0x00000001'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 145
+      subcodeName: RLW_SRC_TRACK
+      v1Pattern: '------000000----------0011100010'
+      v2Pattern: '------000000-------------0000111'
+      errorStatus: '0x00000002'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_SRC_TRACK
+      v1Pattern: '------000000----------0011100010'
+      v2Pattern: '------000000-------------0000111'
+      errorStatus: '0x00000004'
+      recoveryAction: XID_154_EVAL
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: XC/AppCrash (Xid 45); \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_SRC_TRACK
+      v1Pattern: '------000000----------0011100010'
+      v2Pattern: '------000000-------------0000111'
+      errorStatus: '0x00000008'
+      recoveryAction: XID_154_EVAL
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: XC/AppCrash (Xid 45); \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_SRC_TRACK
+      v1Pattern: '------000000----------0011100010'
+      v2Pattern: '------000000-------------0000111'
+      errorStatus: '0x00000010'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 145
+      subcodeName: RLW_SRC_TRACK
+      v1Pattern: '------000000----------0011100010'
+      v2Pattern: '------000000-------------0000111'
+      errorStatus: '0x00000020'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 145
+      subcodeName: RLW_SRC_TRACK
+      v1Pattern: '------000000----------0011100010'
+      v2Pattern: '------000000-------------0000111'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_TAGSTATE
+      v1Pattern: '------000000----------0100000010'
+      v2Pattern: '------000000-------------0001000'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_TAGSTATE
+      v1Pattern: '------000000----------0100000010'
+      v2Pattern: '------000000-------------0001000'
+      errorStatus: '0x00000002'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 145
+      subcodeName: RLW_TAGSTATE
+      v1Pattern: '------000000----------0100000010'
+      v2Pattern: '------000000-------------0001000'
+      errorStatus: '0x00010000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 145
+      subcodeName: RLW_TAGSTATE
+      v1Pattern: '------000000----------0100000010'
+      v2Pattern: '------000000-------------0001000'
+      errorStatus: '0x00020000'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 145
+      subcodeName: RLW_TAGSTATE
+      v1Pattern: '------000000----------0100000010'
+      v2Pattern: '------000000-------------0001000'
+      errorStatus: '0x00100000'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: 'Local: Xid 48, AppCrash (Xid 45);
+
+        Remote: PacketLoss***(possible)'
+    - xid: 145
+      subcodeName: RLW_TAGSTATE
+      v1Pattern: '------000000----------0100000010'
+      v2Pattern: '------000000-------------0001000'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_CTRL
+      v1Pattern: '------000000----------0100100011'
+      v2Pattern: '------000000-------------0001001'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_CTRL
+      v1Pattern: '------000000----------0100100011'
+      v2Pattern: '------000000-------------0001001'
+      errorStatus: '0x00000002'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: XID 48; \nRemote: Will lead to poison or Xid94****"
+    - xid: 146
+      subcodeName: TLW_CTRL
+      v1Pattern: '------000000----------0100100011'
+      v2Pattern: '------000000-------------0001001'
+      errorStatus: '0x00000004'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: "Local: XID 48, PacketLoss***(possible); \nRemote: PacketLoss***(possible)"
+    - xid: 146
+      subcodeName: TLW_CTRL
+      v1Pattern: '------000000----------0100100011'
+      v2Pattern: '------000000-------------0001001'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_RX/TLW_RX_PIPE0
+      v1Pattern: '------000000----------0101000011'
+      v2Pattern: '------000000-------------0001010'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_RX/TLW_RX_PIPE0
+      v1Pattern: '------000000----------0101000011'
+      v2Pattern: '------000000-------------0001010'
+      errorStatus: '0x00000002'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: Will lead to Xid 48. Will lead to poison or Xid94/95****; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_RX/TLW_RX_PIPE0
+      v1Pattern: '------000000----------0101000011'
+      v2Pattern: '------000000-------------0001010'
+      errorStatus: '0x00000004'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: "Local: XID 48, PacketLoss***(possible); \nRemote: PacketLoss***(possible)"
+    - xid: 146
+      subcodeName: TLW_RX/TLW_RX_PIPE0
+      v1Pattern: '------000000----------0101000011'
+      v2Pattern: '------000000-------------0001010'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_RX/TLW_RX_PIPE1
+      v1Pattern: '------000000----------0101000011'
+      v2Pattern: '------000000-------------0001011'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_RX/TLW_RX_PIPE1
+      v1Pattern: '------000000----------0101000011'
+      v2Pattern: '------000000-------------0001011'
+      errorStatus: '0x00000002'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: Will lead to Xid 48. Will lead to poison or Xid94/95****; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_RX/TLW_RX_PIPE1
+      v1Pattern: '------000000----------0101000011'
+      v2Pattern: '------000000-------------0001011'
+      errorStatus: '0x00000004'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: "Local: XID 48, PacketLoss***(possible); \nRemote: PacketLoss***(possible)"
+    - xid: 146
+      subcodeName: TLW_RX/TLW_RX_PIPE1
+      v1Pattern: '------000000----------0101000011'
+      v2Pattern: '------000000-------------0001011'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_TX/TLW_TX_PIPE0
+      v1Pattern: '------000000----------0101100011'
+      v2Pattern: '------000000-------------0001100'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_TX/TLW_TX_PIPE0
+      v1Pattern: '------000000----------0101100011'
+      v2Pattern: '------000000-------------0001100'
+      errorStatus: '0x00000002'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: Will lead to Xid 48. Will lead to poison or Xid94/95****; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_TX/TLW_TX_PIPE0
+      v1Pattern: '------000000----------0101100011'
+      v2Pattern: '------000000-------------0001100'
+      errorStatus: '0x00000004'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: "Local: XID 48, PacketLoss***(possible); \nRemote: PacketLoss***(possible)"
+    - xid: 146
+      subcodeName: TLW_TX/TLW_TX_PIPE0
+      v1Pattern: '------000000----------0101100011'
+      v2Pattern: '------000000-------------0001100'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_TX/TLW_TX_PIPE1
+      v1Pattern: '------000000----------0101100011'
+      v2Pattern: '------000000-------------0001101'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_TX/TLW_TX_PIPE1
+      v1Pattern: '------000000----------0101100011'
+      v2Pattern: '------000000-------------0001101'
+      errorStatus: '0x00000002'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: Will lead to Xid 48. Will lead to poison or Xid94/95****; \nRemote: none"
+    - xid: 146
+      subcodeName: TLW_TX/TLW_TX_PIPE1
+      v1Pattern: '------000000----------0101100011'
+      v2Pattern: '------000000-------------0001101'
+      errorStatus: '0x00000004'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: HW
+      localRemote: "Local: XID 48, PacketLoss***(possible); \nRemote: PacketLoss***(possible)"
+    - xid: 146
+      subcodeName: TLW_TX/TLW_TX_PIPE1
+      v1Pattern: '------000000----------0101100011'
+      v2Pattern: '------000000-------------0001101'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 147
+      subcodeName: TREX
+      v1Pattern: '------000000----------0110000100'
+      v2Pattern: '------000000-------------0001110'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: 'NOTE: not in production code, so should not be experienced'
+    - xid: 147
+      subcodeName: TREX
+      v1Pattern: '------000000----------0110000100'
+      v2Pattern: '------000000-------------0001110'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 148
+      subcodeName: NVLPW_CTRL/NVLPW
+      v1Pattern: '------000000----------0000000101'
+      v2Pattern: '------000000-------------0001111'
+      errorStatus: '0x80000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Non-fatal
+      faultOrigin: SW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 149
+      subcodeName: NETIR/NETIR_INT
+      v1Pattern: '------000000----------0000000110'
+      v2Pattern: '------000000-------------0011000'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: SYMPATHETIC_REPORT_SOLO
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------000000----------0111000110'
+      v2Pattern: '------000000-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: SYMPATHETIC_REPORT_SOLO
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------000001----------0111000110'
+      v2Pattern: '------000001-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: REPORT_ISSUE (if seen >1 per day)
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------000010----------0111000110'
+      v2Pattern: '------000010-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_LINK_SI
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------000100----------0111000110'
+      v2Pattern: '------000100-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_LINK_SI
+      severity: Link Fatal
+      faultOrigin: HW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------001010----------0111000110'
+      v2Pattern: '------001010-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_LINK_SI
+      severity: Link Fatal
+      faultOrigin: HW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------001111----------0111000110'
+      v2Pattern: '------001111-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_SW_USER
+      severity: Link Fatal
+      faultOrigin: SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------010000----------0111000110'
+      v2Pattern: '------010000-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_SW_USER_LINK_SI
+      severity: Link Fatal
+      faultOrigin: SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------010001----------0111000110'
+      v2Pattern: '------010001-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_SW_USER
+      severity: Link Fatal
+      faultOrigin: SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------010010----------0111000110'
+      v2Pattern: '------010010-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_SW_USER_LINK_SI
+      severity: Link Fatal
+      faultOrigin: SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------010101----------0111000110'
+      v2Pattern: '------010101-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_PEER_DEVICE
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------010110----------0111000110'
+      v2Pattern: '------010110-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_SW_USER
+      severity: Link Fatal
+      faultOrigin: SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------100000----------0111000110'
+      v2Pattern: '------100000-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_PEER_DEVICE
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(posible/delayed); \nRemote: PacketLoss*** (possible/delayed)\nOther end of link: source of link fatal"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------100001----------0111000110'
+      v2Pattern: '------100001-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_PEER_DEVICE
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(posible/delayed); \nRemote: PacketLoss*** (possible/delayed)\nOther end of link: source of link fatal"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------100010----------0111000110'
+      v2Pattern: '------100010-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_PEER_DEVICE
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(posible/delayed); \nRemote: PacketLoss*** (possible/delayed)\nOther end of link: source of link fatal"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------100011----------0111000110'
+      v2Pattern: '------100011-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_PEER_DEVICE
+      severity: Link Fatal
+      faultOrigin: HW
+      localRemote: "Local: PacketLoss***(posible/delayed); \nRemote: PacketLoss*** (possible/delayed)\nOther end of link: source of link fatal"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------100100----------0111000110'
+      v2Pattern: '------100100-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_PEER_DEVICE
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(posible/delayed); \nRemote: PacketLoss*** (possible/delayed)\nOther end of link: source of link fatal"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------100101----------0111000110'
+      v2Pattern: '------100101-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_PEER_DEVICE
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(posible/delayed); \nRemote: PacketLoss*** (possible/delayed)\nOther end of link: source of link fatal"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------100110----------0111000110'
+      v2Pattern: '------100110-------------0010001'
+      errorStatus: null
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_SW/USER
+      severity: Link Fatal
+      faultOrigin: HW/SW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------101000----------0111000110'
+      v2Pattern: '------101000-------------0010001'
+      errorStatus: null
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_HOST
+      severity: Fatal
+      faultOrigin: SW
+      localRemote: "Local: fatal; \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------101010----------0111000110'
+      v2Pattern: '------101010-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_LINK_SI_AND_CABLES
+      severity: Link Fatal?
+      faultOrigin: HW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_LINK_EVT/NETIR_LINK_DOWN
+      v1Pattern: '------101011----------0111000110'
+      v2Pattern: '------101011-------------0010001'
+      errorStatus: null
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_LINK_SI_AND_CABLES
+      severity: Link Fatal?
+      faultOrigin: HW
+      localRemote: "Local: PacketLoss***(possible/delayed); \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_BER_EVENT
+      v1Pattern: '------000000----------1000100110'
+      v2Pattern: '------000000-------------0010011'
+      errorStatus: '0x00000000'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_LINK_SI_AND_CABLES
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 149
+      subcodeName: NETIR_BER_EVENT
+      v1Pattern: '------000000----------1000100110'
+      v2Pattern: '------000000-------------0010011'
+      errorStatus: '0x00000001'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_LINK_SI_AND_CABLES
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 149
+      subcodeName: NETIR_BER_EVENT
+      v1Pattern: '------000000----------1000100110'
+      v2Pattern: '------000000-------------0010011'
+      errorStatus: '0x00000002'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_LINK_SI_AND_CABLES
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 149
+      subcodeName: NETIR_BER_EVENT
+      v1Pattern: '------000000----------1000100110'
+      v2Pattern: '------000000-------------0010011'
+      errorStatus: '0x00000003'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: INVESTIGATE_LINK_SI_AND_CABLES
+      severity: Non-fatal
+      faultOrigin: HW
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 149
+      subcodeName: NETIR_MFDE_EVENT
+      v1Pattern: '------000000----------1001000110'
+      v2Pattern: '------000000-------------0010100'
+      errorStatus: '0x00000001'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal**
+      faultOrigin: HW/SW
+      localRemote: "Local: fatal; \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_MFDE_EVENT
+      v1Pattern: '------000000----------1001000110'
+      v2Pattern: '------000000-------------0010100'
+      errorStatus: '0x00000003'
+      recoveryAction: IGNORE
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: IGNORE
+      severity: Non-fatal
+      faultOrigin: NA
+      localRemote: "Local: none; \nRemote: none"
+    - xid: 149
+      subcodeName: NETIR_MFDE_EVENT
+      v1Pattern: '------000000----------1001000110'
+      v2Pattern: '------000000-------------0010100'
+      errorStatus: '0x00000004'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal**
+      faultOrigin: HW/SW
+      localRemote: "Local: fatal; \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_MFDE_EVENT
+      v1Pattern: '------000000----------1001000110'
+      v2Pattern: '------000000-------------0010100'
+      errorStatus: '0x00000005'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal**
+      faultOrigin: HW/SW
+      localRemote: "Local: fatal; \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 149
+      subcodeName: NETIR_MFDE_EVENT
+      v1Pattern: '------000000----------1001000110'
+      v2Pattern: '------000000-------------0010100'
+      errorStatus: '0x00000007'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal**
+      faultOrigin: HW/SW
+      localRemote: "Local: fatal; \nRemote: PacketLoss***(possible/delayed)"
+    - xid: 150
+      subcodeName: MSE Degraded
+      v1Pattern: '------000000----------0000000000'
+      v2Pattern: '------000000-------------0000000'
+      errorStatus: 0x00000000/0xFFFFFFFF
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: FW
+      localRemote: "Local: Fatal; \nRemote: None"
+    - xid: 150
+      subcodeName: MSE_WATCHDOG
+      v1Pattern: '------000000----------0000000000'
+      v2Pattern: '------000000-------------0000000'
+      errorStatus: '0x00000000'
+      recoveryAction: RESET_GPU
+      action2V1Pattern: null
+      action2V2Pattern: null
+      action2: null
+      investigatoryAction: CONTACT_SUPPORT
+      severity: Fatal
+      faultOrigin: FW
+      localRemote: "Local: Fatal; \nRemote: None"
+  resolutionBuckets:
+    CONTACT_SUPPORT: Please contact your support organization for further investigation.
+    RESTART_APP: 'The application should be restarted
+
+
+      RESET_GPU or RESTART_BM is not deemed necessary.'
+    IGNORE: No Action required
+    WORKFLOW_XID_45: "Solo: RESTART_FM \nNot Solo: IGNORE (follow guidance in other Xid)"
+    RESET_GPU: 'Refer to https://docs.nvidia.com/deploy/gpu-debug-guidelines/index.html for GPU Reset capabilities & limitations
+
+
+      RESTART_BM is not deemed necessary.'
+    WORKFLOW_XID_48: "Data Center Recovery Action\nSolo: RESET_GPU\nw/ 63 or 64: DRAIN_AND_RESET\n\nInvestagatory Action\nSolo: RUN_FIELDDIAG\nNot Solo: \nString in error would tell us what unit was impacted. \nFB: follow Xid63/64 guidance\nAll other SRAM: check SRAM Error Threshold flag (nvidia-smi <sram_threshold_exceeded> or NSM Msg Type 0x3, Cmd Code 0x7D, bit 0. If set RUN_FIELDDIAG"
+    CHECK_MECHANICALS: Check to ensure that device seating and all applicable connections to it are secure.
+    WORKFLOW_NVLINK_ERR: "Extract the hex strings from the Xid error message. Note that there should be seven fields in the Xid. Unused fields would expect to be 0x0 rather than a full DWORD of 0\u2019s. The first, third, fourth and fifth registers are valid for Hopper-based products. \nEvaluate the populate(d) registers. If bits other than those specifically outlined below are seen, please report a bug. \nFirst register:\nBit 0, 23, 30: Can be safely ignored.\nBits 1, 20: These are generally sympathetic or secondary errors. If seen with other bits set or other Xid/SXid, please follow the resolution for those. If seen solo, please report a bug. \nBits 4 or 5: Likely HW issue with ECC/Parity --> If seen more than 2 times on the same link, report a bug.\nBits 8, 9, 12, 16, 17, 24, 28: Could possibly be a HW issue: Check link mechanical connections and re-seat if a field resolution is required. Run diags if issue persists. If the issue persist, and diagnostics has passed please report a bug.\
+      \ \nBits 21 or 22: Marginal channel SI issue. If other errors accompany this Xid, follow the resolution for those first. Otherwise, check link mechanical connections. Run Field Diags and report a bug. \nBits 27, 29: If seen repeatedly, please report a bug. \nThird register:\nBits 0, 1, 2, 6: Likely HW issue with ECC/Parity --> If seen more than 2 times on the same link, report a bug.\nBit 13: Not expected to be seen in production. If seen, please report a bug. \nBits 16, 19: If seen repeatedly, please run Field Diags and report a bug\nBits 17, 18: If seen repeatedly, please report a bug.\nFourth register:\nBits 16, 17: These are generally sympathetic or secondary errors. If seen with other bits set or other Xid/SXid, please follow the resolution for those. If seen solo, please report a bug. \nBit 18: These are generally sympathetic or secondary errors, though a reset of the fabric is required. If seen with other bits set or other Xid/SXid, please follow the resolution for those. If\
+      \ seen solo, please report a bug.\nFifth register:\nBits 18, 19, 21, 22, 24, 25, 27, 28: Likely HW issue with ECC/Parity --> If seen more than 2 times on the same link, report a bug.\nBits 20, 23, 26, 29: These errors represent a threshold of ECC errors being exceeded. There was no uncorrectable error at this time. Continue operation. If desired, Field Diags can be run to check for link integrity."
+    UPDATE_SWFW: "Update Firmware and Software to latest versions\n\nXID 78: basic issues will keep vGPU functionality from being able to operate; must resolve to progress\n1. Guest driver version is incompatible with the host driver\n* In this case error string should be \u201CGuest driver is incompatible with host driver\"\n2. This vGPU type is not compatible with the guest OS type/GPU type. For example, user is trying to use a compute profile on an old Maxwell GPU on windows guest.\n* In this case error string should be \"vGPU type is not supported\""
+    RESTART_BM: Restart bare metal, system should be restarted
+    WORKFLOW_NVLINK5_ERR: 'Please see the "XID 144-150 Decode" (was "Customer Doc 144-150")tab for further guidance in evaluating these Xids. These errors need decoding of XID message as follows to determine the resolution action:
+
+      Format of the XID error message: Xid (PCI:0000:BB:DF): <Xid Number> <sub component> <fatal vs nonfatal> <Crosscontain> <injected> <link> (<intrInfo> <errorStatus> <errorDebugData[0]> <errorDebugData[1]> <errorDebugData[2]> <errorDebugData[3]> <errorDebugData[4]>)
+
+      From the above message, <intrInfo>, <errorStatus> must be decoded and evaluated using "XID 144-150 Decode" to derive the final resolution.'
+    RESTART_VM: 'VM owning the affected GPU must be restarted
+
+
+      RESET_GPU or RESTART_BM is not deemed necessary.'
+    XID_154: Follow XID 154 reported guidance
+    CHECK_UVM: If UVM/vGPU is being utilized, RESET_GPU; otherwise IGNORE
+    CHECK_APP/CUDA: "Issue likely caused by an application passing bad data or utilizing incorrect methods in communications with GPU. Some errors will contain PID that can be used \nto identify source of the problem. \nIf determined to be a driver issue then REPORT_ISSUE"
+    WORKFLOW_XID_13: 'Repeat TPC and GPC, diff SMs: RUN_DCGMEUD (possible HW issue); if pass RUN_FIELDDIAGS
+
+      Repeat TPC and GPC, single SM: RUN_DCGMEUD (possible HW issue); if pass RUN_FIELDDIAGS
+
+      Solo, no burst: CHECK_APP/CUDA
+
+      Not Repeat TPC and GPC: CHECK_APP/CUDA
+
+      Non-prod environment: CHECK_APP/CUDA
+
+      If known good APP and Solo: REPORT_ISSUE'
+    WORKFLOW_XID_31: 'Multiple runs needed to establish pattern
+
+      Repeat MMU faults to same GPU (via PCI-ID): RUN_DCGMEUD (possible HW issue); if pass RUN_FIELDDIAGS
+
+      Repeat MMU faults to diff GPU (via PCI-ID): CHECK_APP/CUDA
+
+      Solo, no burst: CHECK_APP/CUDA
+
+      If known good APP: REPORT_ISSUE'
+    ? 'Solo: RESTART_FM
+
+      Not Solo: IGNORE (follow other Xid)'
+    : 'Solo: RESTART_FM
+
+      Not Solo: IGNORE (follow other Xid)'
+    INVESTIGATE_SW: "There is a problem with either user or NVIDIA software that needs to be investigated further. In many cases the user software may be making calls to illegal \nareas, poorly structured commands or other issues. \nThis may also be a problem with NVIDIA software in which case an issue should be reported. \nIn many cases there may be a PID that could be tracked back to the offending, originating entity."
+    IGNORE (sympathetic): This is a sympathetic error that is expected to be seen with other conditions. Resolution for the other errors should be undertaken first. If this error was seen independently or all other resolutions aren't suffficient then REPORT_ISSUE.
+    XID_137_FLOW: "This event is logged when a fault is reported by the remote MMU, such as when an illegal NVLink peer-to-peer access is made by an applicable unit on the chip. \nTypically these are application-level bugs.\nWhen this event is logged, NVIDIA recommends the following:\n\u2022 Run the application in cuda-gdb or cuda-memcheck\n\u2022 Note: The cuda-memcheck tool instruments the running application and reports which line of code performed the illegal read.\nor\n\u2022 Run the application with CUDA_DEVICE_WAITS_ON_EXCEPTION=1 and then attach later with cuda-gdb\nFile a bug if the previous two come back inconclusive to eliminate other possible causes."
+    INVESTIGATE_LINK_SI: Refer to GB200 Resiliency Service Flow for appropriate Access or Trunk link telemetry and investigation methods.
+    N/A Informational only regarding another Xid: Other issues need to be addressed. This Xid in informational only and is always expected to be seen with another Xid requiring a recovery action.
+    INVESTIGATE_SW_USER: Investigate SW or user initiated if unexpected
+    SYMPATHETIC_REPORT_SOLO: "This is a sympathetic error that is expected to be seen with other conditions. Resolution for the other errors should be undertaken first. If this error was seen \nindependently or all other resolutions aren't suffficient then REPORT_ISSUE."
+    XID_154_EVAL: "If an XID 154 is seen along with this error, take that action. \nIf no XID 154 present, RESTART_APP"
+    CHECK_NVLINK_FAILURE_FLOW: "Check telemetry to see if the any link went down in the partition within that last 30 seconds. If so, this Xid can be ignored as it was likely a by-product of the \nother conditions which should be investigated. \n\nIf no link down indication is present, REPORT_ISSUE."
+    REPORT_ISSUE (if seen >1 per day): REPORT_ISSUE (if seen >1 per day)
+    INVESTIGATE_SW_USER_LINK_SI: Investigate software or user intervention if not expected; additionally, follow INVESTGATE_LINK_SI if needed
+    INVESTIGATE_PEER_DEVICE: 'A peer device experience the issue as decoded in the Xid144-150 table (Xid 149 in particular). Based upon the note column:
+
+      Received_TS1: will be seen when peer link down reason is unknown
+
+      Peer_side_down_to_sleep_state: investigate peer software and users if unexpected
+
+      Peer_side_down_to_disable_state: investigate peer software and users if unexpected
+
+      Peer_side_down_to_disable_and_port_lock: investigate peer software and users if unexpected
+
+      Peer_side_down_due_to_thermal_event: check switch cooling
+
+      Peer_side_down_due_to_force_event: investigate peer software and users if unexpected
+
+      Peer_side_down_due_to_reset_event: investigate peer software and users if unexpected'
+    INVESTIGATE_HOST: Check other logs as this is likely a secondary indicator of some action or fault (may be OOB).
+    INVESTIGATE_LINK_SI_AND_CABLES: "A more general fault that could be cable, temperature, transceiver or seating condition. Refer to GB200 Resiliency Service Flow for appropriate Access or Trunk \nlink telemetry and investigation methods."

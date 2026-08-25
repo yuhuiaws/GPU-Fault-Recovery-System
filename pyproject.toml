@@ -1,0 +1,118 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-fault-control-plane"
+version = "0.10.0"
+description = "Portable GPU training failure policy and recovery control plane"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<0.142",
+  "pydantic>=2.10,<3",
+  "PyYAML>=6,<7",
+  "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  # build and ruff are used by `make artifact-check` and `make format`;
+  # they were invoked without ever being declared, so a fresh checkout
+  # got "No module named ruff" from a target the README tells you to run.
+  "build>=1.2,<2",
+  "httpx>=0.28,<1",
+  "openpyxl>=3.1,<4",
+  "pathspec>=0.12,<1",
+  "pytest>=8,<10",
+  "pytest-cov>=6,<8",
+  "pytest-xdist>=3.6,<4",
+  "ruff==0.12.11",
+  "mypy>=1.13,<2",
+  "yamllint>=1.35,<2",
+]
+hyperpod = [
+  "boto3>=1.42,<2",
+]
+collectors = [
+  "boto3>=1.42,<2",
+  "kubernetes>=31,<35",
+  "prometheus-client>=0.21,<1",
+]
+postgres = [
+  "psycopg[binary,pool]>=3.2,<4",
+]
+performance = [
+  "httptools>=0.6,<1",
+  "uvloop>=0.21,<1",
+]
+
+[project.scripts]
+gpu-fault-api = "gpu_fault.api:run"
+gpu-fault-hyperpod = "gpu_fault.hyperpod_cli:main"
+gpu-fault-collector = "gpu_fault.collectors_cli:main"
+gpu-fault-node-agent = "gpu_fault.node_agent:run"
+gpu-fault-restore-gpu-services = "gpu_fault.node_agent:restore_gpu_services"
+gpu-fault-agent-config-digest = "gpu_fault.node_agent:print_config_digest"
+gpu-fault-fleet = "gpu_fault.fleet_cli:main"
+gpu-fault-completion-watcher = "gpu_fault.completion_controller:main"
+gpu-fault-cluster-executor = "gpu_fault.cluster_executor:main"
+gpu-fault-cluster-executor-readiness = "gpu_fault.cluster_executor:readiness_probe"
+gpu-fault-node-installer-reconciler = "gpu_fault.node_installer_reconciler:main"
+gpu-fault-store-migrate = "gpu_fault.store_migrate:main"
+gpu-fault-aurora-credential-refresh = "gpu_fault.aurora_credential_refresh:main"
+gpu-fault-config = "gpu_fault.config_cli:main"
+gpu-fault-workload-annotate = "gpu_fault.workload_annotate_cli:main"
+gpu-training-submit = "gpu_fault.training_submit_cli:main"
+
+[project.entry-points."gpu_fault.collector_sinks"]
+http = "gpu_fault.collectors.sinks:HttpEventSink"
+sqs = "gpu_fault.collectors.sinks:SqsEventSink"
+
+[project.entry-points."gpu_fault.workflow_adapters"]
+control-plane-evidence = "gpu_fault.adapters.evidence:ControlPlaneEvidenceAdapter"
+gpu-validation = "gpu_fault.adapters.gpu_validation:GpuValidationAdapter"
+hyperpod = "gpu_fault.adapters.hyperpod.lifecycle:HyperPodLifecycleStepAdapter"
+kubernetes = "gpu_fault.adapters.kubernetes.adapter:KubernetesWorkflowAdapter"
+managed-recovery = "gpu_fault.adapters.managed_recovery:ManagedRecoveryObserverAdapter"
+node-action = "gpu_fault.adapters.node_action.adapter:NodeActionWorkflowAdapter"
+support = "gpu_fault.adapters.support_escalation:SupportEscalationAdapter"
+
+[project.entry-points."gpu_fault.notification_builders"]
+dcgm-diagnostic = "gpu_fault.notifications.dcgm_diagnostic:DcgmDiagnosticEmailBuilder"
+efa-rdma = "gpu_fault.notifications.efa_rdma:EfaRdmaEventEmailBuilder"
+hardware-escalation = "gpu_fault.notifications.hardware_escalation:HardwareEscalationEmailBuilder"
+hardware-inventory = "gpu_fault.notifications.hardware_inventory:HardwareInventoryEmailBuilder"
+host-resource = "gpu_fault.notifications.host_resource:HostResourceEventEmailBuilder"
+hyperpod-advisory = "gpu_fault.notifications.hyperpod_advisory:HyperPodAdvisoryEmailBuilder"
+not-applicable = "gpu_fault.notifications.not_applicable:NotApplicableEmailBuilder"
+nvlink74-mechanical = "gpu_fault.notifications.nvlink74_mechanical:Nvlink74MechanicalEmailBuilder"
+nvlink74-support = "gpu_fault.notifications.nvlink74_support:Nvlink74SupportEmailBuilder"
+restart-guard = "gpu_fault.notifications.restart_guard:RestartGuardEmailBuilder"
+sxid-event = "gpu_fault.notifications.sxid_event:SxidEventEmailBuilder"
+warm-spare = "gpu_fault.notifications.warm_spare:WarmSpareReplacementEmailBuilder"
+xid-investigatory = "gpu_fault.notifications.xid_investigatory:XidInvestigatoryEmailBuilder"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gpu_fault = ["data/*.yaml", "data/*.json"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+follow_imports = "skip"
+ignore_missing_imports = true

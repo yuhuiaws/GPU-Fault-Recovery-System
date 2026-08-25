@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-fault-hma-cloudwatch-consumer
+  namespace: gpu-fault-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-hma-cloudwatch-consumer
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: producer
+    gpu-fault.io/cleanup-order: "50"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gpu-fault-hma-cloudwatch-consumer
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-hma-cloudwatch-consumer
+    spec:
+      serviceAccountName: gpu-fault-hma-cloudwatch-consumer
+      initContainers:
+        - name: install
+          resources:
+            requests:
+              cpu: "25m"
+              memory: 64Mi
+            limits:
+              cpu: "250m"
+              memory: 256Mi
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m venv /venv
+              && /venv/bin/python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors]'
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+            - name: venv
+              mountPath: /venv
+      containers:
+        - name: consumer
+          resources:
+            requests:
+              cpu: "50m"
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/venv/bin/gpu-fault-collector"]
+          args: ["sqs-hma"]
+          env:
+            - name: GPU_FAULT_CONTROL_PLANE_URL
+              value: http://gpu-fault-api-canary:8080
+            - name: GPU_FAULT_HMA_QUEUE_URL
+              value: REPLACE_WITH_QUEUE_URL
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: venv
+              mountPath: /venv
+              readOnly: true
+            # Writable state directory for the durable event outbox.
+            - name: collector-state
+              mountPath: /var/lib/gpu-fault
+      volumes:
+        - name: artifact
+          configMap:
+            name: gpu-fault-control-plane-wheel-0100
+        - name: venv
+          emptyDir: {}
+        - name: collector-state
+          emptyDir:
+            sizeLimit: 256Mi

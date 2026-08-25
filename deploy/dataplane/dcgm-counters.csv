@@ -1,0 +1,34 @@
+# DCGM field, Prometheus type, help text
+DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature in Celsius
+DCGM_FI_DEV_MEMORY_TEMP, gauge, GPU memory temperature in Celsius
+DCGM_FI_DEV_POWER_USAGE, gauge, GPU power usage in watts
+DCGM_FI_DEV_POWER_MGMT_LIMIT, gauge, GPU enforced power limit in watts
+DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization in percent
+DCGM_FI_DEV_MEM_COPY_UTIL, gauge, GPU memory utilization in percent
+DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used in MiB
+DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free in MiB
+DCGM_FI_DEV_SM_CLOCK, gauge, SM clock in MHz
+DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock in MHz
+DCGM_FI_DEV_CLOCK_THROTTLE_REASONS, gauge, Active clock throttle reason bitmask
+DCGM_FI_DEV_XID_ERRORS, gauge, Last XID error code
+DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, counter, Volatile corrected ECC errors
+DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Volatile uncorrected ECC errors
+DCGM_FI_DEV_ECC_SBE_AGG_TOTAL, counter, Aggregate corrected ECC errors
+DCGM_FI_DEV_ECC_DBE_AGG_TOTAL, counter, Aggregate uncorrected ECC errors
+DCGM_FI_DEV_RETIRED_SBE, counter, Pages retired for corrected ECC errors
+DCGM_FI_DEV_RETIRED_DBE, counter, Pages retired for uncorrected ECC errors
+DCGM_FI_DEV_RETIRED_PENDING, gauge, Pages pending retirement
+DCGM_FI_DEV_ROW_REMAP_FAILURE, gauge, Row remap failure status
+DCGM_FI_DEV_ROW_REMAP_PENDING, gauge, Row remap pending status
+DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS, counter, Correctable remapped rows
+DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS, counter, Uncorrectable remapped rows
+DCGM_FI_DEV_PCIE_REPLAY_COUNTER, counter, PCIe replay counter
+DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL, counter, NVLink CRC flit errors
+DCGM_FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL, counter, NVLink CRC data errors
+DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL, counter, NVLink replay errors
+DCGM_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL, counter, NVLink recovery errors
+DCGM_FI_DEV_NVLINK_ERROR_DL_CRC, counter, Aggregate NVLink CRC errors
+DCGM_FI_DEV_NVLINK_ERROR_DL_RECOVERY, counter, Aggregate NVLink recovery errors
+DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY, counter, Aggregate NVLink replay errors
+DCGM_FI_DEV_POWER_VIOLATION, counter, Power violation duration in nanoseconds
+DCGM_FI_DEV_THERMAL_VIOLATION, counter, Thermal violation duration in nanoseconds

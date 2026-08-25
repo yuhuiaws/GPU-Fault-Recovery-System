@@ -1,0 +1,509 @@
+<style>
+  :root {
+    --bg: #f6f8fa;
+    --surface: #ffffff;
+    --surface-alt: #eef3f5;
+    --text: #172126;
+    --muted: #586870;
+    --border: #cdd7dc;
+    --accent: #087f8c;
+    --accent-dark: #075d66;
+    --danger: #b42318;
+    --warning: #9a6700;
+    --code-bg: #10191d;
+    --code-text: #e8f0f2;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 24px;
+  }
+
+  body {
+    max-width: 1720px;
+    margin: 0 auto;
+    padding: 56px 56px 96px 340px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Inter, "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.72;
+    letter-spacing: 0;
+  }
+
+  body > header {
+    padding: 34px 0 24px;
+    border-bottom: 3px solid var(--accent);
+    margin-bottom: 40px;
+  }
+
+  body > header h1.title {
+    margin: 0 0 12px;
+    font-size: 36px;
+    line-height: 1.25;
+    color: var(--text);
+  }
+
+  body > header .subtitle {
+    margin: 0;
+    color: var(--muted);
+    font-size: 18px;
+  }
+
+  body > header .date {
+    margin: 8px 0 0;
+    color: var(--muted);
+  }
+
+  #TOC {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: 300px;
+    padding: 28px 22px 52px;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+    background: #172126;
+    color: #e8f0f2;
+  }
+
+  #TOC::before {
+    display: block;
+    margin-bottom: 18px;
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 18px;
+    content: "文档目录";
+  }
+
+  #TOC ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+
+  #TOC > ul {
+    padding-left: 0;
+  }
+
+  #TOC li {
+    margin: 5px 0;
+  }
+
+  #TOC a {
+    color: #c8d8dd;
+    text-decoration: none;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+
+  #TOC a:hover,
+  #TOC a:focus {
+    color: #63d0d8;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    color: var(--text);
+    line-height: 1.35;
+    letter-spacing: 0;
+  }
+
+  body > h1 {
+    margin: 72px 0 24px;
+    padding: 18px 20px;
+    border-left: 6px solid var(--accent);
+    background: var(--surface-alt);
+    font-size: 28px;
+  }
+
+  h2 {
+    margin: 42px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    font-size: 23px;
+  }
+
+  h3 {
+    margin: 32px 0 12px;
+    font-size: 19px;
+  }
+
+  h4,
+  h5,
+  h6 {
+    margin: 26px 0 10px;
+    color: var(--accent-dark);
+    font-size: 17px;
+    letter-spacing: 0;
+  }
+
+  p,
+  li {
+    overflow-wrap: anywhere;
+  }
+
+  a {
+    color: var(--accent-dark);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+  }
+
+  blockquote {
+    margin: 22px 0;
+    padding: 14px 20px;
+    border-left: 4px solid var(--accent);
+    background: var(--surface);
+    color: var(--muted);
+  }
+
+  table {
+    display: block;
+    width: 100%;
+    margin: 20px 0 30px;
+    overflow-x: auto;
+    border-collapse: collapse;
+    background: var(--surface);
+  }
+
+  th,
+  td {
+    min-width: 120px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    vertical-align: top;
+    text-align: left;
+  }
+
+  th {
+    background: #dce8eb;
+    font-weight: 700;
+  }
+
+  tr:nth-child(even) td {
+    background: #f9fbfc;
+  }
+
+  code {
+    padding: 2px 5px;
+    border-radius: 4px;
+    background: #e7edef;
+    color: #173b43;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 0.9em;
+  }
+
+  pre {
+    max-width: 100%;
+    margin: 20px 0 28px;
+    padding: 18px;
+    overflow: auto;
+    border-radius: 6px;
+    background: var(--code-bg);
+    color: var(--code-text);
+    line-height: 1.48;
+  }
+
+  pre code {
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font-size: 13px;
+  }
+
+  /* 插图：默认按 Mermaid 的自然尺寸渲染，宽图靠容器横向滚动，
+     不再整体缩到容器宽度导致字号不可读。工具条提供缩放与全屏。 */
+  figure.diagram {
+    margin: 26px 0 34px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+  }
+
+  figure.diagram > .diagram-toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-alt);
+  }
+
+  figure.diagram > .diagram-toolbar .diagram-hint {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  figure.diagram > .diagram-toolbar button {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--accent-dark);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  figure.diagram > .diagram-toolbar button:hover {
+    border-color: var(--accent);
+    background: #e7f2f3;
+  }
+
+  pre.mermaid {
+    min-height: 120px;
+    margin: 0;
+    padding: 20px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    text-align: left;
+  }
+
+  figure.diagram > pre.mermaid {
+    border: 0;
+    border-radius: 0;
+  }
+
+  /* 未渲染（无 JS / Mermaid 缺失）时仍按代码块显示，保证可读。 */
+  pre.mermaid:not([data-processed="true"]) {
+    background: var(--code-bg);
+    color: var(--code-text);
+    font-size: 13px;
+  }
+
+  .mermaid svg {
+    max-width: none;
+    height: auto;
+  }
+
+  /* Mermaid 用 id 选择器把时序图的自动编号固定成 12px，圆圈里的数字偏小。 */
+  .mermaid svg text.sequenceNumber {
+    font-size: 14px !important;
+  }
+
+  figure.diagram:fullscreen {
+    display: flex;
+    flex-direction: column;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: var(--surface);
+  }
+
+  figure.diagram:fullscreen > pre.mermaid {
+    flex: 1 1 auto;
+    padding: 28px;
+  }
+
+  hr {
+    margin: 42px 0;
+    border: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .header-section-number {
+    color: var(--accent-dark);
+  }
+
+  @media (max-width: 980px) {
+    body {
+      max-width: none;
+      padding: 28px 24px 72px;
+    }
+
+    #TOC {
+      position: static;
+      width: auto;
+      max-height: 420px;
+      margin: 0 0 34px;
+      border: 0;
+      border-radius: 6px;
+    }
+
+    body > header h1.title {
+      font-size: 30px;
+    }
+  }
+
+  @media print {
+    body {
+      max-width: none;
+      padding: 0;
+      background: #ffffff;
+      color: #000000;
+      font-size: 10pt;
+    }
+
+    #TOC {
+      position: static;
+      width: auto;
+      max-height: none;
+      padding: 16px;
+      border: 1px solid #999999;
+      background: #ffffff;
+      color: #000000;
+      break-after: page;
+    }
+
+    #TOC a {
+      color: #000000;
+    }
+
+    body > h1 {
+      break-before: page;
+      background: #eeeeee;
+    }
+
+    pre,
+    table,
+    blockquote {
+      break-inside: avoid;
+    }
+
+    a {
+      color: #000000;
+      text-decoration: none;
+    }
+  }
+</style>
+<script src="html-assets/mermaid.min.js"></script>
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    if (!window.mermaid) {
+      return;
+    }
+
+    var FONT = '"Noto Sans CJK SC", "Microsoft YaHei", Inter, Arial, sans-serif';
+
+    window.mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: "neutral",
+      fontFamily: FONT,
+      themeVariables: { fontFamily: FONT, fontSize: "17px" },
+      flowchart: {
+        htmlLabels: false,
+        curve: "basis",
+        useMaxWidth: false,
+        nodeSpacing: 46,
+        rankSpacing: 62,
+        padding: 14
+      },
+      sequence: {
+        useMaxWidth: false,
+        wrap: true,
+        width: 200,
+        actorFontSize: 17,
+        messageFontSize: 16,
+        noteFontSize: 15
+      },
+      state: { useMaxWidth: false, nodeSpacing: 46 },
+      er: { useMaxWidth: false },
+      gantt: { useMaxWidth: false }
+    });
+
+    function baseWidth(svg) {
+      var box = svg.viewBox && svg.viewBox.baseVal;
+      if (box && box.width) {
+        return box.width;
+      }
+      var rect = svg.getBoundingClientRect();
+      return rect.width || 900;
+    }
+
+    function decorate(pre) {
+      var svg = pre.querySelector("svg");
+      if (!svg || pre.parentNode.classList.contains("diagram")) {
+        return;
+      }
+
+      var natural = baseWidth(svg);
+      var scale = 1;
+
+      svg.style.maxWidth = "none";
+      svg.style.height = "auto";
+
+      var figure = document.createElement("figure");
+      figure.className = "diagram";
+      pre.parentNode.insertBefore(figure, pre);
+
+      var bar = document.createElement("div");
+      bar.className = "diagram-toolbar";
+      figure.appendChild(bar);
+      figure.appendChild(pre);
+
+      function apply() {
+        svg.style.width = Math.round(natural * scale) + "px";
+      }
+
+      function button(label, title, onClick) {
+        var el = document.createElement("button");
+        el.type = "button";
+        el.textContent = label;
+        el.title = title;
+        el.addEventListener("click", onClick);
+        bar.appendChild(el);
+        return el;
+      }
+
+      button("放大", "放大插图（每次 +25%）", function () {
+        scale = Math.min(scale * 1.25, 6);
+        apply();
+      });
+      button("缩小", "缩小插图（每次 -20%）", function () {
+        scale = Math.max(scale / 1.25, 0.3);
+        apply();
+      });
+      button("原始大小", "恢复 100%（此时字号最接近正文）", function () {
+        scale = 1;
+        apply();
+      });
+      button("适应宽度", "缩放到当前容器宽度", function () {
+        var usable = pre.clientWidth - 40;
+        scale = usable > 0 ? Math.min(usable / natural, 1) : 1;
+        apply();
+      });
+
+      if (document.fullscreenEnabled) {
+        button("全屏", "全屏查看，可继续缩放与拖动", function () {
+          if (document.fullscreenElement === figure) {
+            document.exitFullscreen();
+          } else {
+            figure.requestFullscreen();
+          }
+        });
+      }
+
+      var hint = document.createElement("span");
+      hint.className = "diagram-hint";
+      hint.textContent = "图较宽时可横向滚动";
+      bar.appendChild(hint);
+
+      apply();
+    }
+
+    function decorateAll() {
+      var nodes = document.querySelectorAll("pre.mermaid");
+      for (var i = 0; i < nodes.length; i += 1) {
+        try {
+          decorate(nodes[i]);
+        } catch (error) {
+          /* 单张图装饰失败不影响其余插图。 */
+        }
+      }
+    }
+
+    window.mermaid
+      .run({ querySelector: "pre.mermaid" })
+      .then(decorateAll)
+      .catch(decorateAll);
+  });
+</script>

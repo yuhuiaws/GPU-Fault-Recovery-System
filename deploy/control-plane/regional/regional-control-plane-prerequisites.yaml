@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-fault-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-fault-control-plane
+  namespace: gpu-fault-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-fault-api
+  namespace: gpu-fault-system
+spec:
+  type: ClusterIP
+  selector:
+    app: gpu-fault-api-ha
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

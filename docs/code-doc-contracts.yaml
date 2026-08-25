@@ -1,0 +1,80 @@
+version: 1
+
+coverage:
+  - root: src
+    extensions:
+      - .py
+  - root: tests
+    extensions:
+      - .py
+  - root: scripts
+    extensions:
+      - .sh
+  - root: deploy
+    extensions:
+      - .sh
+      - .py
+      - .yaml
+      - .yml
+      - .json
+
+contracts:
+  - id: source-python
+    description: Runtime and packaged Python behavior.
+    paths:
+      - src/**/*.py
+    documents:
+      - docs/README.md
+      - docs/概要设计.md
+      - docs/概要设计-v2.md
+      - docs/详细设计.md
+      - docs/详细设计-v2.md
+      - docs/部署和运维手册.md
+      - docs/环境变量参考.md
+      - docs/扩展指南.md
+      - docs/components/nvidia-policy.md
+      - docs/validation-limitations.md
+
+  - id: test-python
+    description: Executable test behavior and acceptance contracts.
+    paths:
+      - tests/**/*.py
+    documents:
+      - docs/README.md
+      - docs/概要设计-v2.md
+      - docs/详细设计.md
+      - docs/详细设计-v2.md
+      - docs/区域模式端到端验收测试用例.md
+      - docs/区域用例索引.md
+      - docs/故障模拟测试手册.md
+      - docs/性能压测验收方案.md
+      - docs/validation-limitations.md
+
+  - id: operational-shell
+    description: Operator-facing shell automation and deployment entrypoints.
+    paths:
+      - scripts/**/*.sh
+      - deploy/**/*.sh
+    documents:
+      - docs/README.md
+      - docs/概要设计-v2.md
+      - docs/详细设计-v2.md
+      - docs/部署和运维手册.md
+      - docs/故障模拟测试手册.md
+      - docs/性能压测验收方案.md
+      - docs/区域模式端到端验收测试用例.md
+      - docs/扩展指南.md
+
+  - id: deployment-source
+    description: Production manifests, renderers and cleanup registries.
+    paths:
+      - deploy/**/*.py
+      - deploy/**/*.yaml
+      - deploy/**/*.yml
+      - deploy/**/*.json
+      - scripts/generate-cleanup-inventory.py
+    documents:
+      - deploy/README.md
+      - docs/README.md
+      - docs/部署和运维手册.md
+      - docs/扩展指南.md

@@ -1,0 +1,17 @@
+{
+  "Rules": [
+    {
+      "ID": "gpu-fault-workload-logs-expire",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "gpu-fault/workload-logs/"
+      },
+      "Expiration": {
+        "Days": 30
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 7
+      }
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+# Render REPLACE_WITH_WHEEL_CONFIGMAP with scripts/e2e/render_manifest.py.
+# Do not apply this source manifest directly.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-fault-three-source-e2e
+  namespace: gpu-fault-system
+  labels:
+    app: gpu-fault-three-source-e2e
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-three-source-e2e
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: e2e
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              python -m pip install --no-cache-dir
+              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors]'
+              && exec python
+              /test/run_hyperpod_three_source_fault_e2e.py
+          env:
+            - name: GPU_FAULT_CLUSTER_ID
+              value: three-source-e2e-cluster
+            - name: GPU_FAULT_THREE_SOURCE_E2E_REPORT
+              value: /report/three-source-e2e.json
+            - name: GPU_FAULT_THREE_SOURCE_E2E_DB
+              value: /state/three-source-control-plane.db
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: artifact
+              mountPath: /artifact
+              readOnly: true
+            - name: test
+              mountPath: /test
+              readOnly: true
+            - name: state
+              mountPath: /state
+            - name: report
+              mountPath: /report
+      volumes:
+        - name: artifact
+          configMap:
+            name: REPLACE_WITH_WHEEL_CONFIGMAP
+        - name: test
+          configMap:
+            name: gpu-fault-three-source-e2e-test
+            defaultMode: 0555
+        - name: state
+          emptyDir: {}
+        - name: report
+          emptyDir: {}

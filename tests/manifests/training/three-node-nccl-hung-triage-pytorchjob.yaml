@@ -1,0 +1,249 @@
+# ANNOTATED MANIFEST: ConfigMap + managed PyTorchJob for NCCL-HUNG-001.
+# Apply directly only inside that destructive acceptance procedure.
+# Resource profile assumes p5en-class nodes with 8 GPUs and 16 EFA devices per Pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-fault-nccl-hung-triage-script
+  namespace: gpu-fault-system
+data:
+  train.py: |
+    import os
+    import socket
+    import time
+    from datetime import timedelta
+
+    import torch
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        backend="nccl",
+        timeout=timedelta(minutes=20),
+    )
+    rank = dist.get_rank()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    tensor = torch.ones(
+        16 * 1024 * 1024,
+        dtype=torch.float32,
+        device=local_rank,
+    )
+    for step in range(20):
+        work = dist.all_reduce(tensor, async_op=True)
+        work.wait()
+        # NCCL's ``wait()`` only returns once the collective is enqueued on
+        # the CUDA stream, so without an explicit device sync the loop never
+        # observes whether the collective actually completed.
+        torch.cuda.synchronize()
+        tensor.fill_(1)
+        if local_rank == 0:
+            print(
+                f"ACTIVE rank={rank} step={step} "
+                f"node={socket.gethostname()}",
+                flush=True,
+            )
+        time.sleep(0.25)
+
+    if rank == 0:
+        print(
+            f"CONTROLLED_CULPRIT rank={rank} "
+            f"node={socket.gethostname()}",
+            flush=True,
+        )
+        while True:
+            time.sleep(60)
+
+    print(
+        f"ENTERING_HUNG_COLLECTIVE rank={rank} "
+        f"node={socket.gethostname()}",
+        flush=True,
+    )
+    work = dist.all_reduce(tensor, async_op=True)
+    work.wait()
+    # The device sync is what makes this a real hang: rank 0 stopped
+    # participating, so the collective can never retire and every other rank
+    # blocks here in ``cudaStreamSynchronize`` with a spinning NCCL kernel.
+    torch.cuda.synchronize()
+    raise RuntimeError("controlled NCCL hang unexpectedly completed")
+---
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: gpu-fault-nccl-hung-triage
+  namespace: gpu-fault-system
+  labels:
+    gpu-fault.io/managed: "true"
+    gpu-fault.io/job-id: gpu-fault-nccl-hung-triage
+    gpu-fault.io/attempt-id: gpu-fault-nccl-hung-triage-a001
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: gpu-fault-nccl-hung-triage
+            gpu-fault.io/managed: "true"
+            gpu-fault.io/job-id: gpu-fault-nccl-hung-triage
+            gpu-fault.io/attempt-id: gpu-fault-nccl-hung-triage-a001
+            gpu-fault.io/role: master
+            gpu-fault.io/critical: "true"
+          annotations:
+            gpu-fault.io/expected-critical-ranks: "3"
+            gpu-fault.io/training-container: pytorch
+            gpu-fault.io/runtime-profile-version: hyperpod-v1
+            gpu-fault.io/rank-offset: "0"
+            gpu-fault.io/restart-budget: "0"
+        spec:
+          restartPolicy: Never
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: gpu-fault-nccl-hung-triage
+                topologyKey: kubernetes.io/hostname
+          volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+          - name: script
+            configMap:
+              name: gpu-fault-nccl-hung-triage-script
+          containers:
+          - name: pytorch
+            image: public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38
+            imagePullPolicy: IfNotPresent
+            volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: script
+              mountPath: /opt/gpu-fault-test
+              readOnly: true
+            command:
+            - /bin/bash
+            - -lc
+            - |
+              exec torchrun \
+                --nnodes="${WORLD_SIZE}" \
+                --nproc-per-node=8 \
+                --node-rank="${RANK}" \
+                --master-addr="${MASTER_ADDR}" \
+                --master-port="${MASTER_PORT}" \
+                /opt/gpu-fault-test/train.py
+            env:
+            - name: NCCL_DEBUG
+              value: INFO
+            - name: TORCH_NCCL_TRACE_BUFFER_SIZE
+              value: "20000"
+            - name: TORCH_NCCL_DEBUG_INFO_PIPE_FILE
+              value: /tmp/torch_nccl_debug_pipe_
+            - name: TORCH_NCCL_DEBUG_INFO_TEMP_FILE
+              value: /tmp/nccl_trace_rank_
+            - name: TORCH_NCCL_DUMP_ON_TIMEOUT
+              value: "1"
+            - name: FI_PROVIDER
+              value: efa
+            - name: FI_EFA_USE_DEVICE_RDMA
+              value: "1"
+            - name: FI_EFA_FORK_SAFE
+              value: "1"
+            resources:
+              requests:
+                cpu: "8"
+                memory: 32Gi
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "16"
+              limits:
+                cpu: "16"
+                memory: 64Gi
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "16"
+    Worker:
+      replicas: 2
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: gpu-fault-nccl-hung-triage
+            gpu-fault.io/managed: "true"
+            gpu-fault.io/job-id: gpu-fault-nccl-hung-triage
+            gpu-fault.io/attempt-id: gpu-fault-nccl-hung-triage-a001
+            gpu-fault.io/role: worker
+            gpu-fault.io/critical: "true"
+          annotations:
+            gpu-fault.io/expected-critical-ranks: "3"
+            gpu-fault.io/training-container: pytorch
+            gpu-fault.io/runtime-profile-version: hyperpod-v1
+            gpu-fault.io/rank-offset: "1"
+            gpu-fault.io/restart-budget: "0"
+        spec:
+          restartPolicy: Never
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: gpu-fault-nccl-hung-triage
+                topologyKey: kubernetes.io/hostname
+          volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+          - name: script
+            configMap:
+              name: gpu-fault-nccl-hung-triage-script
+          containers:
+          - name: pytorch
+            image: public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38
+            imagePullPolicy: IfNotPresent
+            volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: script
+              mountPath: /opt/gpu-fault-test
+              readOnly: true
+            command:
+            - /bin/bash
+            - -lc
+            - |
+              exec torchrun \
+                --nnodes="${WORLD_SIZE}" \
+                --nproc-per-node=8 \
+                --node-rank="${RANK}" \
+                --master-addr="${MASTER_ADDR}" \
+                --master-port="${MASTER_PORT}" \
+                /opt/gpu-fault-test/train.py
+            env:
+            - name: NCCL_DEBUG
+              value: INFO
+            - name: TORCH_NCCL_TRACE_BUFFER_SIZE
+              value: "20000"
+            - name: TORCH_NCCL_DEBUG_INFO_PIPE_FILE
+              value: /tmp/torch_nccl_debug_pipe_
+            - name: TORCH_NCCL_DEBUG_INFO_TEMP_FILE
+              value: /tmp/nccl_trace_rank_
+            - name: TORCH_NCCL_DUMP_ON_TIMEOUT
+              value: "1"
+            - name: FI_PROVIDER
+              value: efa
+            - name: FI_EFA_USE_DEVICE_RDMA
+              value: "1"
+            - name: FI_EFA_FORK_SAFE
+              value: "1"
+            resources:
+              requests:
+                cpu: "8"
+                memory: 32Gi
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "16"
+              limits:
+                cpu: "16"
+                memory: 64Gi
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "16"

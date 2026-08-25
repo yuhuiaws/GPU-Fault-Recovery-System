@@ -1,0 +1,538 @@
+from __future__ import annotations
+
+import importlib
+import inspect
+import os
+from datetime import datetime, timedelta, timezone
+from typing import get_type_hints
+from uuid import uuid4
+
+import pytest
+
+from gpu_fault.policy import GpuFaultPolicyEngine, SxidClassification, SxidEvent
+from gpu_fault.schema_migrations import POSTGRES_SCHEMA_MIGRATIONS
+from gpu_fault.store import InMemoryStore, PostgresStore, SqliteStore
+from gpu_fault.store.contracts import (
+    ControlPlaneStore,
+    FleetStore,
+    ProcessorStore,
+    WorkflowStore,
+)
+from gpu_fault.store.memory.fleet import MemoryFleetMixin
+from gpu_fault.store.memory.processor_leases import MemoryProcessorLeaseMixin
+from gpu_fault.store.memory.processor_queue import MemoryProcessorQueueMixin
+from gpu_fault.store.postgres.processor_admin import PostgresProcessorAdminMixin
+from gpu_fault.store.postgres.processor_admission import PostgresProcessorAdmissionMixin
+from gpu_fault.store.postgres.processor_claims import PostgresProcessorClaimsMixin
+from gpu_fault.store.postgres.processor_completion import (
+    PostgresProcessorCompletionMixin,
+)
+from gpu_fault.store.postgres.processor_leases import PostgresProcessorLeaseMixin
+from gpu_fault.store.postgres.processor_storage import PostgresProcessorStorageMixin
+from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflowMixin
+from gpu_fault.store.sqlite.processor_leases import SqliteProcessorLeaseMixin
+from gpu_fault.store.sqlite.processor_queue import SqliteProcessorQueueMixin
+from tests._builders import build_store, processor_request
+
+SQLITE_INHERITED_PUBLIC = frozenset(
+    {
+        "abandon_telemetry_spool_claims",
+        "claim_telemetry_spool",
+        "collector_ingestion_transaction",
+        "complete_active_processor_requests_batch",
+        "complete_telemetry_spool",
+        "efa_traffic_state_key",
+        "get_decision_by_attempt",
+        "get_collector_metrics_snapshot",
+        "get_xid_events",
+        "list_xid_events_for_scopes",
+        "processor_batch_transaction",
+        "processor_queue_count_status",
+        "release_telemetry_spool",
+        "remote_command_cluster_health",
+        "save_attempt_observations_batch",
+        "save_collector_metrics_snapshot",
+        "telemetry_spool_stats",
+        "try_enqueue_processor_requests_batch",
+        "try_spool_telemetry_requests",
+    }
+)
+
+POSTGRES_INHERITED_PUBLIC = frozenset(
+    {
+        "acquire_periodic_task_lease",
+        "acquire_processor_leadership",
+        "add_marker",
+        "apply_efa_traffic_admin_action",
+        "cancel_remote_command",
+        "complete_notification_delivery",
+        "complete_remote_command",
+        "complete_xid_correlation",
+        "create_incident_workflow_if_absent",
+        "delete_regional_cluster",
+        "efa_traffic_state_key",
+        "enqueue_notification_delivery",
+        "ensure_remote_command",
+        "establish_notification_watermark",
+        "get_agent",
+        "get_barrier",
+        "get_decision_by_event",
+        "get_decision_by_attempt",
+        "get_collector_metrics_snapshot",
+        "get_diagnostic",
+        "get_efa_traffic_state",
+        "get_event_by_attempt",
+        "get_fleet_deployment",
+        "get_gpu_inventory_snapshot",
+        "get_hyperpod_node_identity",
+        "get_hyperpod_submission",
+        "get_incident",
+        "get_incident_by_event",
+        "get_notification",
+        "get_notification_result",
+        "get_notification_watermark",
+        "get_plan",
+        "get_processor_leadership",
+        "get_profile",
+        "get_regional_cluster",
+        "get_restart_budget",
+        "get_workflow",
+        "get_xid_correlation",
+        "get_xid_event",
+        "get_xid_policy_decision",
+        "link_event_to_incident",
+        "merge_attempt_fault_workflow",
+        "merge_replacement_workflow",
+        "merge_sxid_workflow",
+        "observe_efa_traffic",
+        "observe_telemetry_metric",
+        "record_xid74_occurrences",
+        "release_job_restart",
+        "release_notification_delivery",
+        "remote_command_cluster_health",
+        "renew_remote_command_lease",
+        "reserve_hyperpod_submission",
+        "reserve_job_restart",
+        "save_agent",
+        "save_barrier",
+        "save_collector_status",
+        "save_collector_metrics_snapshot",
+        "save_decision",
+        "save_diagnostic",
+        "save_fleet_deployment",
+        "save_gpu_inventory_snapshot",
+        "save_hyperpod_node_identity",
+        "save_hyperpod_submission",
+        "save_incident_and_workflow",
+        "save_notification_result",
+        "save_plan",
+        "save_profile",
+        "save_regional_cluster",
+        "save_triage_report",
+        "save_workflow",
+        "save_xid_policy_decision",
+    }
+)
+
+SQLITE_PROCESSOR_QUEUE_PUBLIC = frozenset(
+    {
+        "active_backlog_is_lane_blocked",
+        "claim_active_processor_requests",
+        "claim_processor_requests",
+        "cleanup_completed_processor_requests",
+        "enqueue_processor_request",
+        "get_processor_request",
+        "has_incomplete_processor_requests",
+        "has_incomplete_processor_requests_for_scopes",
+        "processor_fault_backlog_depth",
+        "processor_queue_stats",
+        "try_enqueue_processor_request",
+    }
+)
+
+SQLITE_PROCESSOR_LEASE_PUBLIC = frozenset(
+    {
+        "acquire_periodic_task_lease",
+        "acquire_processor_leadership",
+        "cleanup_processor_lanes",
+        "complete_active_processor_request",
+        "complete_processor_request",
+        "get_processor_leadership",
+        "release_active_processor_request",
+        "release_processor_request",
+        "renew_active_processor_request",
+        "validate_processor_lane",
+    }
+)
+
+POSTGRES_PROCESSOR_PUBLIC = {
+    PostgresProcessorAdminMixin: frozenset(
+        {
+            "backfill_processor_queue_state_columns",
+            "cleanup_completed_processor_requests",
+            "finalize_processor_counter_shards",
+            "listen_processor_queue_notifications",
+            "processor_batch_transaction",
+            "processor_queue_count_status",
+            "processor_queue_state_status",
+            "restore_legacy_processor_counters",
+        }
+    ),
+    PostgresProcessorAdmissionMixin: frozenset(
+        {"try_enqueue_processor_request", "try_enqueue_processor_requests_batch"}
+    ),
+    PostgresProcessorClaimsMixin: frozenset(
+        {
+            "active_backlog_is_lane_blocked",
+            "claim_active_processor_requests",
+            "claim_processor_requests",
+        }
+    ),
+    PostgresProcessorCompletionMixin: frozenset(
+        {
+            "complete_active_processor_request",
+            "complete_active_processor_requests_batch",
+            "complete_processor_request",
+        }
+    ),
+    PostgresProcessorLeaseMixin: frozenset(
+        {
+            "cleanup_processor_lanes",
+            "release_active_processor_request",
+            "release_processor_request",
+            "renew_active_processor_request",
+            "validate_processor_lane",
+        }
+    ),
+    PostgresProcessorStorageMixin: frozenset(
+        {
+            "enqueue_processor_request",
+            "get_processor_request",
+            "has_incomplete_processor_requests",
+            "has_incomplete_processor_requests_for_scopes",
+            "processor_fault_backlog_depth",
+            "processor_queue_stats",
+        }
+    ),
+}
+
+TRANSACTIONAL_WORKFLOW_PUBLIC = frozenset(
+    {
+        "create_incident_workflow_if_absent",
+        "merge_attempt_fault_workflow",
+        "merge_replacement_workflow",
+        "merge_sxid_workflow",
+        "save_incident_and_workflow",
+    }
+)
+
+MEMORY_FLEET_PUBLIC = frozenset(
+    {
+        "cleanup_terminal_fleet_deployments",
+        "delete_regional_cluster",
+        "get_agent",
+        "get_barrier",
+        "get_fleet_deployment",
+        "get_regional_cluster",
+        "list_active_fleet_deployments",
+        "list_agents",
+        "list_barriers",
+        "list_fleet_deployments",
+        "list_regional_clusters",
+        "replace_agent_if_matches",
+        "save_agent",
+        "save_barrier",
+        "save_fleet_deployment",
+        "save_regional_cluster",
+    }
+)
+
+MEMORY_PROCESSOR_QUEUE_PUBLIC = frozenset(
+    {
+        "active_backlog_is_lane_blocked",
+        "claim_active_processor_requests",
+        "claim_processor_requests",
+        "cleanup_completed_processor_requests",
+        "enqueue_processor_request",
+        "get_processor_request",
+        "has_incomplete_processor_requests",
+        "has_incomplete_processor_requests_for_scopes",
+        "processor_fault_backlog_depth",
+        "processor_queue_count_status",
+        "processor_queue_stats",
+        "try_enqueue_processor_request",
+        "try_enqueue_processor_requests_batch",
+    }
+)
+
+MEMORY_PROCESSOR_LEASE_PUBLIC = frozenset(
+    {
+        "acquire_periodic_task_lease",
+        "acquire_processor_leadership",
+        "cleanup_processor_lanes",
+        "complete_active_processor_request",
+        "complete_active_processor_requests_batch",
+        "complete_processor_request",
+        "get_processor_leadership",
+        "processor_batch_transaction",
+        "release_active_processor_request",
+        "release_processor_request",
+        "renew_active_processor_request",
+        "validate_processor_lane",
+    }
+)
+
+
+def _public_methods(cls) -> frozenset[str]:
+    return frozenset(
+        name
+        for name, value in cls.__dict__.items()
+        if not name.startswith("_") and callable(value)
+    )
+
+
+def _protocol_methods(protocol) -> set[str]:
+    methods: set[str] = set()
+    for item in inspect.getmro(protocol):
+        methods.update(_public_methods(item))
+    return methods
+
+
+def _protocol_members(protocol) -> dict[str, object]:
+    members: dict[str, object] = {}
+    for item in reversed(inspect.getmro(protocol)):
+        for name in _public_methods(item):
+            members[name] = getattr(item, name)
+    return members
+
+
+def _declared_attribute(cls, name: str):
+    for item in inspect.getmro(cls):
+        if name in vars(item):
+            return vars(item)[name]
+    raise AttributeError(name)
+
+
+def _resolved_type_hints(member) -> dict[str, object]:
+    namespaces: dict[str, object] = {}
+    for module_name in (
+        "gpu_fault.store.contracts",
+        "gpu_fault.fleet",
+        "gpu_fault.models",
+        "gpu_fault.processor.models",
+        "gpu_fault.regional",
+        "gpu_fault.telemetry",
+        "gpu_fault.telemetry_models",
+        member.__module__,
+    ):
+        namespaces.update(vars(importlib.import_module(module_name)))
+    return get_type_hints(member, globalns=namespaces)
+
+
+def _parameter_shape(member) -> list[tuple[str, object, bool]]:
+    return [
+        (
+            parameter.name,
+            parameter.kind,
+            parameter.default is not inspect.Signature.empty,
+        )
+        for parameter in inspect.signature(member).parameters.values()
+    ]
+
+
+def _mro_public_methods(cls) -> set[str]:
+    methods: set[str] = set()
+    for item in inspect.getmro(cls):
+        methods.update(_public_methods(item))
+    return methods
+
+
+def _layer_public_methods(cls, inherited_from) -> set[str]:
+    methods: set[str] = set()
+    for item in inspect.getmro(cls):
+        if item is inherited_from:
+            break
+        methods.update(_public_methods(item))
+    return methods
+
+
+def test_store_classes_cover_application_protocol() -> None:
+    required: dict[str, object] = {}
+    for protocol in (ControlPlaneStore, ProcessorStore, FleetStore, WorkflowStore):
+        required.update(_protocol_members(protocol))
+
+    for implementation in (InMemoryStore, SqliteStore, PostgresStore):
+        missing = sorted(name for name in required if not hasattr(implementation, name))
+        assert missing == [], f"{implementation.__name__} misses {missing}"
+        for name, protocol_member in required.items():
+            implementation_member = getattr(implementation, name)
+            implementation_parameters = inspect.signature(
+                implementation_member
+            ).parameters.values()
+            if not any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in implementation_parameters
+            ):
+                assert _parameter_shape(implementation_member) == _parameter_shape(
+                    protocol_member
+                ), (
+                    f"{implementation.__name__}.{name} parameter shape "
+                    "does not match the store Protocol"
+                )
+
+            protocol_attribute = _declared_attribute(ControlPlaneStore, name)
+            if isinstance(protocol_attribute, staticmethod):
+                assert isinstance(
+                    _declared_attribute(implementation, name), staticmethod
+                ), f"{implementation.__name__}.{name} must be static"
+
+            protocol_return = _resolved_type_hints(protocol_member).get(
+                "return", inspect.Signature.empty
+            )
+            implementation_return = _resolved_type_hints(implementation_member).get(
+                "return", inspect.Signature.empty
+            )
+            if implementation_return is not inspect.Signature.empty:
+                assert implementation_return == protocol_return, (
+                    f"{implementation.__name__}.{name} returns "
+                    f"{implementation_return!r}; expected {protocol_return!r}"
+                )
+
+
+def test_applied_postgres_migration_checksums_are_immutable() -> None:
+    historical = {
+        migration.version: migration.checksum
+        for migration in POSTGRES_SCHEMA_MIGRATIONS
+        if migration.version <= 5
+    }
+
+    assert historical == {
+        1: "47c2772094d164b8d018d3c8de5d8bf023c9d2b4e9a4c08c1ded51bb112c69f5",
+        2: "39f7a4329cec008640850dcf408a88391e97a055d696156b6a8000fa4ce0f1c4",
+        3: "2a82490502995bac570f3a533c53b899645630f786f260972a72c82641ac0680",
+        4: "9ce8369e79e881c566bc429c72a157a0e7fe6a2557bcf2b4d050f2565db2b947",
+        5: "884820da9fdf5521dad40dffd8a40b1a3acf415de1871f563202eafd083ebb97",
+    }
+    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 6
+
+
+def test_store_inheritance_is_an_explicit_reviewed_contract() -> None:
+    sqlite_inherited = _mro_public_methods(InMemoryStore) - (
+        _layer_public_methods(SqliteStore, InMemoryStore)
+    )
+    postgres_inherited = _mro_public_methods(SqliteStore) - (
+        _layer_public_methods(PostgresStore, SqliteStore)
+    )
+
+    assert sqlite_inherited == SQLITE_INHERITED_PUBLIC
+    assert postgres_inherited == POSTGRES_INHERITED_PUBLIC
+    assert _public_methods(MemoryFleetMixin) == MEMORY_FLEET_PUBLIC
+    assert _public_methods(MemoryProcessorQueueMixin) == MEMORY_PROCESSOR_QUEUE_PUBLIC
+    assert _public_methods(MemoryProcessorLeaseMixin) == MEMORY_PROCESSOR_LEASE_PUBLIC
+    assert _public_methods(SqliteProcessorQueueMixin) == SQLITE_PROCESSOR_QUEUE_PUBLIC
+    assert _public_methods(SqliteProcessorLeaseMixin) == SQLITE_PROCESSOR_LEASE_PUBLIC
+    for mixin, expected in POSTGRES_PROCESSOR_PUBLIC.items():
+        assert _public_methods(mixin) == expected
+    assert _public_methods(TransactionalWorkflowMixin) == TRANSACTIONAL_WORKFLOW_PUBLIC
+
+
+def test_postgres_sxid_workflow_uses_shared_transaction_template() -> None:
+    assert (
+        PostgresStore.merge_sxid_workflow
+        is TransactionalWorkflowMixin.merge_sxid_workflow
+    )
+    assert (
+        PostgresStore.merge_attempt_fault_workflow
+        is TransactionalWorkflowMixin.merge_attempt_fault_workflow
+    )
+
+
+def test_postgres_schema_state_and_ddl_are_distinct_modules() -> None:
+    from gpu_fault.store.postgres.ddl import create_postgres_schema
+    from gpu_fault.store.postgres.schema_state import PostgresSchemaMixin
+
+    assert create_postgres_schema.__module__.endswith(".ddl")
+    assert PostgresSchemaMixin.__module__.endswith(".schema_state")
+
+
+@pytest.fixture(params=["memory", "sqlite", "postgres"])
+def processor_store(request, tmp_path):
+    if request.param == "memory":
+        yield build_store()
+        return
+    store = SqliteStore(str(tmp_path / "contract.db"))
+    if request.param == "sqlite":
+        try:
+            yield store
+        finally:
+            store.close()
+        return
+    store.close()
+    postgres_url = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
+    if not postgres_url:
+        pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    postgres = PostgresStore(postgres_url)
+    try:
+        yield postgres
+    finally:
+        postgres.close()
+
+
+def test_processor_queue_contract(processor_store) -> None:
+    request = processor_request(
+        "/v1/collector-events/nvidia-kernel", body=b'{"node_id":"node-a"}'
+    )
+    accepted, reason = processor_store.try_enqueue_processor_request(
+        request, max_depth=10, max_cluster_depth=10
+    )
+    assert accepted is not None
+    assert reason is None
+    claimed = processor_store.claim_active_processor_requests(
+        "contract-owner",
+        now=datetime.now(timezone.utc),
+        lease_duration=timedelta(seconds=30),
+        limit=1,
+    )
+    assert [item.request_id for item in claimed] == [request.request_id]
+    processor_store.complete_active_processor_request(
+        request.request_id,
+        "contract-owner",
+        claimed[0].leader_epoch,
+        claimed[0].lease_token,
+        response_status=200,
+        response_content_type="application/json",
+        response_body_base64="e30=",
+    )
+    assert processor_store.processor_queue_stats()["depth"] == 0
+
+
+def test_policy_decision_upsert_contract(processor_store) -> None:
+    event_id = f"sxid-store-contract-{uuid4()}"
+    decision = GpuFaultPolicyEngine().evaluate_sxid(
+        SxidEvent(
+            event_id=event_id,
+            cluster_id="cluster-a",
+            node_id="node-a",
+            observed_at=datetime.now(timezone.utc),
+            sxid=11001,
+            classification=SxidClassification.FATAL,
+            classification_source=("NVIDIA_FABRIC_MANAGER_CATALOG"),
+            product="H200",
+            runtime_profile_version="simulated-v1",
+        )
+    )
+    first = decision.model_copy(
+        update={
+            "incident_id": f"inc-{event_id}",
+            "workflow_request_id": f"workflow-{event_id}",
+        }
+    )
+    processor_store.save_xid_policy_decision(first)
+    processor_store.save_xid_policy_decision(first)
+    assert processor_store.get_xid_policy_decision(event_id) == first
+
+    updated = first.model_copy(
+        update={"advisory_notification_id": f"notice-{event_id}"}
+    )
+    processor_store.save_xid_policy_decision(updated)
+    assert processor_store.get_xid_policy_decision(event_id) == updated

@@ -1,0 +1,156 @@
+apiVersion: gpu-fault.io/v1
+kind: NvidiaFabricManagerSxidPolicy
+metadata:
+  name: nvidia-fabric-manager-sxid-2025-11-14
+  generatedFrom: https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html
+  sourceLastUpdated: "2025-11-14"
+  sourceSha256: 1f8a4b4ee5f2ef94897ce9303ef2f4594f95710323bc91540ec4510459d751f6
+spec:
+  coverage: NVIDIA_FM_TABLES_21_24
+  rules:
+    - codes: [11004]
+      classification: NON_FATAL
+      officialAction: RESTART_VM
+      investigatoryAction: VALIDATE_NVSWITCH_FABRIC_ROUTING
+      applicability: SHARED_NVSWITCH_OR_VGPU
+    - codes:
+        - 11012
+        - 11021
+        - 11022
+        - 11023
+        - 12021
+        - 12023
+        - 15008
+        - 15011
+        - 19049
+        - 19055
+        - 19057
+        - 19059
+        - 19062
+        - 19065
+        - 19068
+        - 19071
+        - 24001
+        - 24002
+        - 24003
+      classification: NON_FATAL
+      officialAction: IGNORE
+      investigatoryAction: MONITOR_CORRECTED_ECC
+      applicability: ALL
+    - codes: [20001]
+      classification: NON_FATAL
+      officialAction: IGNORE
+      investigatoryAction: MONITOR_NVLINK_THROUGHPUT
+      applicability: ALL
+    - codes: [12028]
+      classification: NON_FATAL
+      officialAction: RESTART_VM
+      investigatoryAction: NONE
+      applicability: SHARED_NVSWITCH_OR_VGPU
+    - codes: [19084]
+      classification: NON_FATAL
+      officialAction: RESET_ALL_GPUS_AND_NVSWITCHES
+      investigatoryAction: CORRELATE_COMPANION_FATAL_SXID
+      applicability: ALL
+    - codes: [22013]
+      classification: NON_FATAL
+      officialAction: IGNORE
+      investigatoryAction: NONE
+      applicability: ALL
+    - codes: [20012]
+      classification: NON_FATAL
+      officialAction: CHECK_MECHANICALS
+      investigatoryAction: CHECK_LINK_MECHANICAL_CONNECTIONS
+      applicability: ALL
+    - codes:
+        - 11001
+        - 11009
+        - 11013
+        - 11018
+        - 11019
+        - 11020
+        - 12001
+        - 12002
+        - 12022
+        - 12024
+        - 12025
+        - 12026
+        - 12027
+        - 12030
+        - 12031
+        - 12032
+        - 14017
+        - 15001
+        - 15006
+        - 15009
+        - 15010
+        - 15012
+        - 15013
+        - 19047
+        - 19048
+        - 19054
+        - 19056
+        - 19058
+        - 19060
+        - 19061
+        - 19063
+        - 19064
+        - 19066
+        - 19067
+        - 19069
+        - 19070
+        - 20034
+        - 22012
+        - 24004
+        - 24005
+        - 24006
+        - 24007
+      classification: FATAL
+      officialAction: SCOPE_DEPENDENT_RESET
+      investigatoryAction: NONE
+      applicability: ALL
+    - codes:
+        - 12020
+        - 22003
+        - 22011
+        - 23001
+        - 23002
+        - 23003
+        - 23004
+        - 23005
+        - 23006
+        - 23007
+        - 23008
+        - 23009
+        - 23010
+        - 23011
+        - 23012
+        - 23013
+        - 23014
+        - 23015
+        - 23016
+        - 23017
+      classification: ALWAYS_FATAL
+      officialAction: RESTART_HOST_OR_SBR
+      investigatoryAction: NONE
+      applicability: ALL
+    - codes: [10001, 10002]
+      classification: NON_FATAL
+      officialAction: IGNORE
+      investigatoryAction: CORRELATE_FOLLOWING_FATAL_EVENTS
+      applicability: ALL
+    - codes: [10003]
+      classification: FATAL
+      officialAction: RESET_ALL_GPUS_AND_NVSWITCHES
+      investigatoryAction: NONE
+      applicability: ALL
+    - codes: [10004]
+      classification: NON_FATAL
+      officialAction: IGNORE
+      investigatoryAction: CHECK_SYSTEM_COOLING
+      applicability: ALL
+    - codes: [10005]
+      classification: NON_FATAL
+      officialAction: IGNORE
+      investigatoryAction: VERIFY_THERMAL_EVENT_CLEARED
+      applicability: ALL

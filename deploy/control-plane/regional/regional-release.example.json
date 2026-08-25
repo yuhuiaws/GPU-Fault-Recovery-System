@@ -1,0 +1,32 @@
+{
+  "cpu_kubeconfig": "/secure/cpu-control-plane.kubeconfig",
+  "namespace": "gpu-fault-system",
+  "auto_rollback": true,
+  "release": {
+    "manifest": "../../../dist/current-release.json",
+    "agent_config_digest": "REPLACE_WITH_64_HEX_CONFIG_DIGEST"
+  },
+  "nlb": {
+    "public_subnets": "subnet-a,subnet-b",
+    "security_group": "sg-0123456789abcdef0",
+    "certificate_arn": "arn:aws:acm:us-west-2:123456789012:certificate/example"
+  },
+  "clusters": [
+    {
+      "cluster_id": "gpu-prod-a",
+      "context": "arn:aws:eks:us-west-2:123456789012:cluster/gpu-prod-a",
+      "region": "us-west-2",
+      "hyperpod_cluster_name": "gpu-prod-a",
+      "eks_cluster_arn": "arn:aws:eks:us-west-2:123456789012:cluster/gpu-prod-a",
+      "executor_irsa_role_arn": "arn:aws:iam::123456789012:role/gpu-fault-executor",
+      "allowed_namespaces": [
+        "gpu-fault-system",
+        "training"
+      ],
+      "control_plane_url": "https://regional-control-plane.example",
+      "token_file": "/secure/gpu-prod-a.token",
+      "ca_file": "/secure/control-plane-ca.crt",
+      "fleet_master_file": "/secure/fleet-master"
+    }
+  ]
+}

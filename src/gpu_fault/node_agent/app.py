@@ -1,0 +1,470 @@
+from __future__ import annotations
+
+import ipaddress
+import logging
+import os
+import socket
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from threading import Event, RLock, Thread
+from typing import Any
+
+from fastapi import FastAPI, HTTPException
+
+from gpu_fault.env_validation import validate_gpu_fault_environment
+from gpu_fault.node_agent.config import executor_from_environment
+from gpu_fault.node_agent.executor import NodeActionExecutor
+from gpu_fault.node_agent.heartbeat import (
+    AgentHeartbeatReporter,
+    heartbeat_reporter_from_environment,
+)
+from gpu_fault.node_agent.protocol import (
+    RESULT_QUERY_MAX_SKEW_SECONDS,
+    NodeActionCommand,
+    NodeActionExecutionState,
+    NodeActionResult,
+    NodeActionStatus,
+    NodeActionSubmission,
+    SignedNodeAction,
+    verify_result_query,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _validate_unsigned_result_query_migration() -> None:
+    release_id = os.getenv("GPU_FAULT_RELEASE_ID", "").strip()
+    migration_release = os.getenv(
+        "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_RELEASE_ID",
+        "",
+    ).strip()
+    raw_expiry = os.getenv(
+        "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_EXPIRES_AT",
+        "",
+    ).strip()
+    if not release_id or migration_release != release_id:
+        raise RuntimeError(
+            "unsigned result-query migration must be bound to the "
+            "current GPU_FAULT_RELEASE_ID"
+        )
+    try:
+        expires_at = datetime.fromisoformat(raw_expiry.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError(
+            "unsigned result-query migration requires an ISO-8601 expiry"
+        ) from exc
+    if expires_at.tzinfo is None:
+        raise RuntimeError("unsigned result-query migration expiry must include UTC")
+    now = datetime.now(timezone.utc)
+    expires_at = expires_at.astimezone(timezone.utc)
+    if expires_at <= now:
+        raise RuntimeError("unsigned result-query migration has expired")
+    if expires_at > now + timedelta(days=14):
+        raise RuntimeError("unsigned result-query migration cannot exceed 14 days")
+
+
+def _result_query_signature_required() -> bool:
+    required = (
+        os.getenv("GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED", "true")
+        .strip()
+        .lower()
+        != "false"
+    )
+    if not required:
+        _validate_unsigned_result_query_migration()
+    return required
+
+
+def _node_action_rejection(
+    error: ValueError,
+) -> tuple[int, dict[str, Any]]:
+    message = str(error)
+    normalized = message.lower()
+    if "invalid node action signature" in normalized:
+        status, code, retryable, new_command = (
+            401,
+            "INVALID_SIGNATURE",
+            False,
+            False,
+        )
+    elif "targets a different node" in normalized:
+        status, code, retryable, new_command = (
+            422,
+            "TARGET_NODE_MISMATCH",
+            False,
+            False,
+        )
+    elif "different agent generation" in normalized:
+        status, code, retryable, new_command = (
+            409,
+            "STALE_AGENT_GENERATION",
+            True,
+            True,
+        )
+    elif "is not allowed" in normalized:
+        status, code, retryable, new_command = (
+            403,
+            "OPERATION_NOT_ALLOWED",
+            False,
+            False,
+        )
+    elif "issued_at is in the future" in normalized:
+        status, code, retryable, new_command = (
+            422,
+            "INVALID_ISSUED_AT",
+            False,
+            True,
+        )
+    elif "command has expired" in normalized:
+        status, code, retryable, new_command = (
+            410,
+            "COMMAND_EXPIRED",
+            True,
+            True,
+        )
+    elif "ttl exceeds" in normalized:
+        status, code, retryable, new_command = (
+            422,
+            "INVALID_TTL",
+            False,
+            True,
+        )
+    elif "stale node action fencing token" in normalized:
+        status, code, retryable, new_command = (
+            409,
+            "STALE_FENCING_TOKEN",
+            True,
+            True,
+        )
+    else:
+        status, code, retryable, new_command = (
+            409,
+            "ACTION_CONFLICT",
+            False,
+            False,
+        )
+    return (
+        status,
+        {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+            "requires_new_command": new_command,
+        },
+    )
+
+
+def create_node_agent_app(
+    executor: NodeActionExecutor | None = None,
+    heartbeat_reporter: AgentHeartbeatReporter | None = None,
+) -> FastAPI:
+    agent = executor or executor_from_environment()
+    reporter = (
+        heartbeat_reporter
+        if heartbeat_reporter is not None
+        else heartbeat_reporter_from_environment(agent)
+    )
+    action_pool = ThreadPoolExecutor(
+        max_workers=int(os.getenv("GPU_FAULT_NODE_ACTION_WORKERS", "4")),
+        thread_name_prefix="gpu-fault-node-action",
+    )
+    action_futures: dict[str, Any] = {}
+    action_commands: dict[str, NodeActionCommand] = {}
+    action_lock = RLock()
+    require_signed_result_query = _result_query_signature_required()
+    result_query_max_skew_seconds = int(
+        os.getenv(
+            "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_SKEW_SECONDS",
+            str(RESULT_QUERY_MAX_SKEW_SECONDS),
+        )
+    )
+    if not require_signed_result_query:
+        LOGGER.warning(
+            "node action result queries are unauthenticated: anything "
+            "that can reach this port can read every recovery action's "
+            "result; unset "
+            "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED once the "
+            "control plane signs its polls"
+        )
+
+    def submission_state(
+        command_id: str,
+    ) -> NodeActionSubmission | None:
+        result = agent.ledger.get(command_id)
+        if result is not None:
+            with action_lock:
+                action_futures.pop(command_id, None)
+                action_commands.pop(command_id, None)
+            return NodeActionSubmission(
+                command_id=command_id,
+                state=NodeActionExecutionState(result.status.value),
+                result=result,
+            )
+        with action_lock:
+            future = action_futures.get(command_id)
+            command = action_commands.get(command_id)
+        if future is None or command is None:
+            return None
+        if not future.done():
+            return NodeActionSubmission(
+                command_id=command_id,
+                state=NodeActionExecutionState.PENDING,
+            )
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = NodeActionResult(
+                command_id=command_id,
+                operation=command.operation,
+                status=NodeActionStatus.FAILED,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            agent.ledger.save(result)
+        with action_lock:
+            action_futures.pop(command_id, None)
+            action_commands.pop(command_id, None)
+        return NodeActionSubmission(
+            command_id=command_id,
+            state=NodeActionExecutionState(result.status.value),
+            result=result,
+        )
+
+    def finalize_action(
+        command_id: str,
+        command: NodeActionCommand,
+        future: Any,
+    ) -> None:
+        try:
+            result = future.result()
+        except Exception as exc:
+            previous = agent.ledger.get(command_id)
+            result = NodeActionResult(
+                command_id=command_id,
+                operation=command.operation,
+                status=NodeActionStatus.FAILED,
+                error=f"{type(exc).__name__}: {exc}",
+                attempt=(previous.attempt + 1 if previous else 1),
+            )
+            try:
+                agent.ledger.save(result)
+            except Exception:
+                LOGGER.exception(
+                    "failed to persist asynchronous node action failure command_id=%s",
+                    command_id,
+                )
+        finally:
+            with action_lock:
+                action_futures.pop(command_id, None)
+                action_commands.pop(command_id, None)
+
+    @asynccontextmanager
+    async def lifespan(_):
+        stop = Event()
+        worker = None
+        if reporter is not None:
+            worker = Thread(
+                target=reporter.run,
+                args=(stop,),
+                name="gpu-fault-agent-heartbeat",
+                daemon=True,
+            )
+            worker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            if worker is not None:
+                worker.join(timeout=reporter.interval_seconds + 2)
+            action_pool.shutdown(wait=False, cancel_futures=False)
+
+    app = FastAPI(
+        title="GPU Fault Node Action Agent",
+        lifespan=lifespan,
+    )
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, Any]:
+        return {"status": "ok"}
+
+    @app.post("/v1/node-actions", response_model=NodeActionResult)
+    def execute_action(
+        envelope: SignedNodeAction,
+    ) -> NodeActionResult:
+        try:
+            return agent.execute(envelope)
+        except ValueError as exc:
+            status_code, detail = _node_action_rejection(exc)
+            raise HTTPException(status_code=status_code, detail=detail) from exc
+
+    @app.post(
+        "/v1/node-actions/submit",
+        response_model=NodeActionSubmission,
+    )
+    async def submit_action(
+        envelope: SignedNodeAction,
+    ) -> NodeActionSubmission:
+        try:
+            command = agent.validate_submission(envelope)
+        except ValueError as exc:
+            status_code, detail = _node_action_rejection(exc)
+            raise HTTPException(status_code=status_code, detail=detail) from exc
+        existing = submission_state(command.command_id)
+        if existing is not None:
+            return existing
+        with action_lock:
+            future = action_futures.get(command.command_id)
+            if future is None:
+                action_commands[command.command_id] = command
+                future = action_pool.submit(agent.execute, envelope)
+                action_futures[command.command_id] = future
+                future.add_done_callback(
+                    lambda completed,
+                    command_id=command.command_id,
+                    submitted=command: finalize_action(command_id, submitted, completed)
+                )
+        return submission_state(command.command_id) or NodeActionSubmission(
+            command_id=command.command_id,
+            state=NodeActionExecutionState.PENDING,
+        )
+
+    @app.get(
+        "/v1/node-actions/result",
+        response_model=NodeActionSubmission,
+    )
+    async def action_result(
+        command_id: str,
+        issued_at: str | None = None,
+        signature: str | None = None,
+    ) -> NodeActionSubmission:
+        # Set to false only to poll a fleet whose control plane has not
+        # been rolled yet: the signing side ships in the same wheel, so
+        # roll the control plane first, then the node bundle, and this
+        # never has to be touched. An unsigned query is answered either
+        # way when it is false, which is the whole point -- it is a
+        # migration escape hatch, not a mode.
+        if require_signed_result_query or signature is not None:
+            try:
+                verify_result_query(
+                    command_id,
+                    issued_at,
+                    signature,
+                    agent.secret,
+                    max_skew_seconds=result_query_max_skew_seconds,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "code": "INVALID_SIGNATURE",
+                        "message": str(exc),
+                        "retryable": False,
+                        "requires_new_command": False,
+                    },
+                ) from exc
+        state = submission_state(command_id)
+        if state is None:
+            raise HTTPException(
+                status_code=404,
+                detail="node action command is unknown",
+            )
+        return state
+
+    return app
+
+
+def _default_node_agent_host() -> str:
+    for name in (socket.getfqdn(), socket.gethostname()):
+        try:
+            addresses = socket.getaddrinfo(name, None, type=socket.SOCK_STREAM)
+        except socket.gaierror:
+            continue
+        for _family, _kind, _proto, _canon, sockaddr in addresses:
+            address = sockaddr[0]
+            try:
+                parsed = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if (
+                parsed.is_private
+                and not parsed.is_loopback
+                and not parsed.is_unspecified
+                and not parsed.is_link_local
+            ):
+                return address
+    return "127.0.0.1"
+
+
+def run() -> None:
+    """Serve the node action API.
+
+    TLS is the default requirement. A deployment that cannot provision
+    node certificates must opt into cleartext explicitly; the HMAC still
+    authenticates commands, but it does not hide node IDs, GPU UUIDs,
+    process names or diagnostic paths from anything on the network path.
+    """
+    import ssl
+
+    import uvicorn
+
+    validate_gpu_fault_environment(process_name="gpu-fault-node-agent")
+    host = os.getenv("GPU_FAULT_NODE_AGENT_HOST", _default_node_agent_host())
+    port = int(os.getenv("GPU_FAULT_NODE_AGENT_PORT", "9099"))
+    certificate = os.getenv("GPU_FAULT_NODE_AGENT_TLS_CERT", "").strip()
+    private_key = os.getenv("GPU_FAULT_NODE_AGENT_TLS_KEY", "").strip()
+    client_ca = os.getenv("GPU_FAULT_NODE_AGENT_TLS_CLIENT_CA", "").strip()
+    allow_plaintext = (
+        os.getenv("GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT", "false").strip().lower()
+        == "true"
+    )
+    if bool(certificate) != bool(private_key):
+        raise ValueError(
+            "node agent TLS needs both "
+            "GPU_FAULT_NODE_AGENT_TLS_CERT and "
+            "GPU_FAULT_NODE_AGENT_TLS_KEY"
+        )
+    if client_ca and not certificate:
+        raise ValueError(
+            "node agent client certificate verification requires "
+            "GPU_FAULT_NODE_AGENT_TLS_CERT"
+        )
+    options: dict[str, Any] = {}
+    if certificate:
+        options["ssl_certfile"] = certificate
+        options["ssl_keyfile"] = private_key
+        key_password = os.getenv("GPU_FAULT_NODE_AGENT_TLS_KEY_PASSWORD", "")
+        if key_password:
+            options["ssl_keyfile_password"] = key_password
+        if client_ca:
+            options["ssl_ca_certs"] = client_ca
+            options["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+        LOGGER.info(
+            "node agent serving HTTPS on %s:%s (client certificate %s)",
+            host,
+            port,
+            "required" if client_ca else "not requested",
+        )
+    else:
+        if not allow_plaintext:
+            raise RuntimeError(
+                "node agent TLS is required; configure "
+                "GPU_FAULT_NODE_AGENT_TLS_CERT and "
+                "GPU_FAULT_NODE_AGENT_TLS_KEY, or explicitly set "
+                "GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT=true for a "
+                "network-isolated deployment"
+            )
+        LOGGER.warning(
+            "node agent serving plain HTTP on %s:%s: signed commands "
+            "and results travel in cleartext; set "
+            "GPU_FAULT_NODE_AGENT_TLS_CERT and "
+            "GPU_FAULT_NODE_AGENT_TLS_KEY to serve HTTPS, and "
+            "advertise the https:// endpoint",
+            host,
+            port,
+        )
+    uvicorn.run(
+        create_node_agent_app(),
+        host=host,
+        port=port,
+        **options,
+    )

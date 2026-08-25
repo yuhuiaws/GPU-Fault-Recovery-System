@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Forward HyperPod HMA CloudWatch detection events to GPU fault control plane
+Parameters:
+  ArtifactBucket:
+    Type: String
+  ArtifactKey:
+    Type: String
+  HmaLogGroup:
+    Type: String
+  ClusterId:
+    Type: String
+  RuntimeProfileVersion:
+    Type: String
+  NodeRegex:
+    Type: String
+    Default: ""
+  NodePrefix:
+    Type: String
+    Default: ""
+  OidcProviderArn:
+    Type: String
+Resources:
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 5
+  CollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SendHmaEvents
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt EventQueue.Arn
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref OidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                REPLACE_WITH_OIDC_ISSUER:aud: sts.amazonaws.com
+                REPLACE_WITH_OIDC_ISSUER:sub: system:serviceaccount:gpu-fault-system:gpu-fault-hma-cloudwatch-consumer
+      Policies:
+        - PolicyName: ConsumeHmaEvents
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt EventQueue.Arn
+  CollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: gpu_fault.collectors.cloudwatch_lambda_handler
+      Role: !GetAtt CollectorRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      Environment:
+        Variables:
+          GPU_FAULT_HMA_QUEUE_URL: !Ref EventQueue
+          GPU_FAULT_CLUSTER_ID: !Ref ClusterId
+          GPU_FAULT_RUNTIME_PROFILE_VERSION: !Ref RuntimeProfileVersion
+          GPU_FAULT_HMA_NODE_REGEX: !Ref NodeRegex
+          GPU_FAULT_HMA_NODE_PREFIX: !Ref NodePrefix
+  AllowCloudWatchLogsInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CollectorFunction
+      Principal: !Sub logs.${AWS::Region}.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${HmaLogGroup}:*
+  HmaSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: AllowCloudWatchLogsInvoke
+    Properties:
+      DestinationArn: !GetAtt CollectorFunction.Arn
+      FilterPattern: '"HealthMonitoringAgentDetectionEvent"'
+      LogGroupName: !Ref HmaLogGroup
+Outputs:
+  FunctionArn:
+    Value: !GetAtt CollectorFunction.Arn
+  QueueUrl:
+    Value: !Ref EventQueue
+  ConsumerRoleArn:
+    Value: !GetAtt ConsumerRole.Arn

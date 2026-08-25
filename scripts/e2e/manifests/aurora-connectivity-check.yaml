@@ -1,0 +1,34 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-fault-aurora-check
+  namespace: gpu-fault-system
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: psql
+          resources:
+            requests:
+              cpu: "50m"
+              memory: 64Mi
+            limits:
+              cpu: "500m"
+              memory: 256Mi
+          image: public.ecr.aws/docker/library/postgres:16-alpine
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+              -Atc 'select current_database(), current_user;'
+              && psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+              -Atc 'show ssl;'
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-aurora
+                  key: postgres-url

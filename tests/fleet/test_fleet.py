@@ -1,0 +1,42 @@
+"""Stable pytest nodeids for split test_fleet.py cases."""
+
+# ruff: noqa: F401
+from ._fleet_cases_1 import (
+    test_agent_drain_revoke_and_new_incarnation_activation,
+    test_agent_endpoint_can_be_confined_to_the_node_subnets,
+    test_agent_endpoint_cannot_point_the_control_plane_elsewhere,
+    test_agent_registration_is_signed_and_generation_is_fenced,
+    test_deployment_waves_reconcile_from_heartbeats,
+    test_derived_node_key_cannot_sign_for_another_node,
+    test_multi_node_full_fabric_reset_uses_same_barrier,
+    test_multi_node_reset_uses_prepare_barrier_then_commit,
+    test_node_lease_fences_replaced_and_retired_agent,
+    test_node_specific_key_can_rotate_without_changing_peer,
+    test_quiesced_barrier_allows_stale_heartbeat_in_maintenance_window,
+    test_readiness_accepts_explicit_rollout_protocol_and_artifact,
+    test_readiness_blames_the_pin_when_no_agent_runs_it,
+    test_readiness_blames_the_stale_node_when_the_fleet_matches,
+    test_readiness_blocks_legacy_agent_protocol,
+    test_readiness_blocks_stale_and_mixed_agent_versions,
+    test_readiness_ignores_dead_agents_when_blaming_a_pin,
+    test_readiness_rejects_value_outside_rollout_window,
+    test_readiness_still_blames_a_node_when_a_live_peer_matches,
+    test_required_derived_key_rejects_shared_heartbeat,
+    test_revoked_agent_requires_explicit_matching_reactivation,
+    test_terminal_deployment_retention_keeps_open_rolls,
+    test_unknown_collector_unit_is_verified_then_discarded,
+)
+from ._fleet_cases_2 import (
+    test_agent_generation_change_aborts_prepared_barrier,
+    test_agent_heartbeat_reporter_signs_payload,
+    test_barrier_id_cannot_be_reused_for_another_contract,
+    test_collector_readiness_accepts_reported_service_state,
+    test_commit_client_conflict_retries_only_failed_node,
+    test_fleet_api_registers_and_reports_readiness,
+    test_prepare_failure_aborts_without_any_reset,
+    test_quiesced_barrier_rejects_changed_agent_generation,
+    test_quiesced_barrier_rejects_expired_maintenance_window,
+    test_sqlite_persists_agent_deployment_and_barrier,
+    test_unquiesced_reset_rejects_stale_agent_heartbeat,
+    test_verify_gpu_clients_waits_with_fresh_command_id,
+)
