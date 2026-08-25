@@ -1440,7 +1440,7 @@ ensure_node_action_keys() (
 # deploy/node/install-gpu-fault-collector.sh. They feed the config
 # digest, so any change there must be made here too -- or, better,
 # both should read one shared file.
-QUIESCE_SERVICES="${GPU_FAULT_QUIESCE_SERVICES:-nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,gpu-fault-metrics-collector,gpu-fault-host-collector,kubelet}"
+QUIESCE_SERVICES="${GPU_FAULT_QUIESCE_SERVICES:-nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,gpu-fault-gpu-persistence,gpu-fault-metrics-collector,gpu-fault-host-collector,kubelet}"
 QUIESCE_PROCESSES="${GPU_FAULT_QUIESCE_PROCESSES:-}"
 QUIESCE_FAILSAFE_SECONDS="${GPU_FAULT_QUIESCE_FAILSAFE_SECONDS:-420}"
 QUIESCE_RETRY_SECONDS="${GPU_FAULT_QUIESCE_RETRY_SECONDS:-60}"
@@ -1541,7 +1541,7 @@ build_artifacts() {
     # environment the node installer writes -- never by re-listing the
     # payload fields here. A second copy of that list is what let a
     # 3-service quiesce literal drift from the installer's real
-    # 6-service default and fail the fleet consistency gate on every
+    # service list and fail the fleet consistency gate on every
     # node-owned step.
     CONFIG_DIGEST="$(
         GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION="${RUNTIME_PROFILE}" \

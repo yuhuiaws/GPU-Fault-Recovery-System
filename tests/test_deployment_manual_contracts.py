@@ -324,6 +324,29 @@ def test_regional_acceptance_checks_live_amp_alerting() -> None:
     assert 'method="POST"' in section
     assert "NODE_IDS_JSON" in section
     assert "/v1/fleet/readiness?cluster_id=" not in section
+    assert "NLB Security Group 允许的来源" in section
+    assert 'exec -i "${EXECUTOR_POD}" -- python -' in section
+    assert "TLS unexpectedly succeeded without private CA" in section
+
+
+def test_regional_data_plane_validation_uses_private_ca_and_auth() -> None:
+    text = manual()
+    section = text.split("#### REG-7. 从 GPU 数据面验证", 1)[1].split(
+        "#### REG-8.", 1
+    )[0]
+
+    assert "ssl.create_default_context" in section
+    assert 'GPU_FAULT_CONTROL_PLANE_CA_FILE"]' in section
+    assert section.count("X-GPU-Fault-Execution-Token") >= 2
+    assert section.count("GPU_FAULT_EXECUTION_TOKEN") >= 2
+
+
+def test_wheel_consistency_uses_the_source_tree_digest() -> None:
+    text = manual()
+    section = text.split("#### REG-10A.", 1)[1].split("#### REG-11.", 1)[0]
+
+    assert "PYTHONPATH=src python3.12" in section
+    assert "gpu_fault.module_digest()" in section
 
 
 def test_regional_alerting_verifier_accepts_repository_contract(tmp_path: Path) -> None:

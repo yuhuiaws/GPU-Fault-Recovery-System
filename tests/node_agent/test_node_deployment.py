@@ -478,11 +478,36 @@ def test_production_installer_enables_failsafe_quiesce() -> None:
         ROOT / "deploy/node/run-hyperpod-installer-job.sh"
     ).read_text()
     deploy = (ROOT / "deploy/hyperpod/deploy.sh").read_text()
+    manual = (ROOT / "docs/部署和运维手册.md").read_text()
 
     assert "QUIESCE_GPU_SERVICES" in installer
     assert "RESTORE_GPU_SERVICES" in installer
     assert "GPU_FAULT_QUIESCE_FAILSAFE_SECONDS" in installer
-    assert "--allow-service-quiesce" in hyperpod_installer
+    for flag in (
+        "--allow-gpu-reset",
+        "--allow-fabric-reset",
+        "--allow-service-quiesce",
+        "--allow-fabric-manager-restart",
+    ):
+        assert flag in hyperpod_installer
+        assert flag in manual
+    pin_block = manual.split('export REQUIRED_AGENT_CONFIG_DIGEST="$(', 1)[1].split(
+        ')"', 1
+    )[0]
+    for setting in (
+        "GPU_FAULT_NODE_ALLOW_GPU_RESET=true",
+        "GPU_FAULT_NODE_ALLOW_FABRIC_RESET=true",
+        "GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE=true",
+        "GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART=true",
+    ):
+        assert setting in pin_block
+    services = (
+        "nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,"
+        "gpu-fault-gpu-persistence,gpu-fault-metrics-collector,"
+        "gpu-fault-host-collector,kubelet"
+    )
+    assert f'QUIESCE_SERVICES="{services}"' in installer
+    assert f"GPU_FAULT_QUIESCE_SERVICES:-{services}" in deploy
     assert "--allow-driver-remediation" in hyperpod_installer
     assert "--allow-firmware-update" in hyperpod_installer
     assert "--diagnostic-s3-uri" in hyperpod_installer
