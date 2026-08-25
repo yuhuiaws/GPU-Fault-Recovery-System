@@ -385,7 +385,7 @@ spec:
             - name: GPU_FAULT_REQUIRED_POLICY_VERSION
               value: nvidia-xid-catalog-610/sha256:ffb82509abb57457
             - name: GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION
-              value: hyperpod-v1
+              value: REPLACE_WITH_RUNTIME_PROFILE_VERSION
             - name: GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST
               valueFrom:
                 configMapKeyRef:

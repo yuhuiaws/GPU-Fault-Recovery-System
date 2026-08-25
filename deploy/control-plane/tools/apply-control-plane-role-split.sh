@@ -28,6 +28,10 @@ KUBECONFIG_PATH="${KUBECONFIG:-}"
 DEFAULT_RUNTIME_IMAGE="public.ecr.aws/docker/library/python:3.12-slim"
 RUNTIME_IMAGE="${GPU_FAULT_RUNTIME_IMAGE:-${DEFAULT_RUNTIME_IMAGE}}"
 AWS_REGION="${GPU_FAULT_AWS_REGION:?GPU_FAULT_AWS_REGION is required}"
+RUNTIME_PROFILE_VERSION="$(
+    printf '%s' \
+        "${GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION:?GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION is required}"
+)"
 CONTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 
@@ -38,6 +42,10 @@ trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 [[ -n "${RUNTIME_IMAGE}" &&
     "${RUNTIME_IMAGE}" != *[[:space:]#]* ]] || {
     echo "GPU_FAULT_RUNTIME_IMAGE must be a non-empty OCI image reference without whitespace or #" >&2
+    exit 2
+}
+[[ "${RUNTIME_PROFILE_VERSION}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$ ]] || {
+    echo "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION is invalid" >&2
     exit 2
 }
 
@@ -323,6 +331,7 @@ apply_manifest() {
         -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP}/g" \
         -e "s/namespace: gpu-fault-system/namespace: ${NAMESPACE}/g" \
         -e "s/REPLACE_WITH_AWS_REGION/${AWS_REGION}/g" \
+        -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE_VERSION}#g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
         "${GENERATED}/${manifest}.yaml" |
         kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply -f -

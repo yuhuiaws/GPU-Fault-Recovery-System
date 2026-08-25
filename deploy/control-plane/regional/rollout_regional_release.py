@@ -22,9 +22,16 @@ from regional_release_config import (
     render_nlb_manifest,
 )
 from regional_release_preflight import ensure_region_contexts
+from regional_release_reporting import build_release_plan, build_release_status
+from regional_release_rendering import (
+    DEFAULT_RUNTIME_IMAGE,
+    build_cpu_apply_environment,
+    build_reconciler_environment,
+    render_gpu_rollout_manifests,
+)
+from regional_runtime_profile import ensure_runtime_profile
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 EXECUTOR_SAGEMAKER_ACTIONS = frozenset(
     {
@@ -110,6 +117,7 @@ class RegionalRelease:
         self.runner = runner
         self.wheel_sha = self._sha256(config.wheel)
         self.bundle_sha = self._sha256(config.bundle)
+        self.runtime_profile_sha = self._sha256(config.runtime_profile_source)
         self.wheel_cm = "gpu-fault-control-plane-wheel-0100-" + self.wheel_sha[:12]
         self.bundle_cm = "gpu-fault-node-installer-0100-" + self.bundle_sha[:12]
         self.runtime_image = os.getenv("GPU_FAULT_RUNTIME_IMAGE", DEFAULT_RUNTIME_IMAGE)
@@ -202,6 +210,9 @@ class RegionalRelease:
             }
         return {
             "metadata": metadata,
+            "runtime_profile_version": self._config_map_data(
+                "gpu-fault-api-ha-config-core"
+            ).get("GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"),
             "cpu_wheel": self._deployment_wheel(
                 self._cpu(),
                 inventory.CPU_INGRESS_DEPLOYMENT,
@@ -262,6 +273,11 @@ class RegionalRelease:
                 "bundle_sha256": self.bundle_sha,
                 "wheel_config_map": self.wheel_cm,
                 "bundle_config_map": self.bundle_cm,
+                "runtime_profile_version": self.config.runtime_profile_version,
+                "runtime_profile_sha256": self.runtime_profile_sha,
+                "runtime_profile_registration_cluster_id": (
+                    self.config.runtime_profile_registration_cluster_id
+                ),
                 "updated_at_epoch": int(time.time()),
                 **updates,
             }
@@ -459,68 +475,10 @@ class RegionalRelease:
         return not output.strip()
 
     def plan(self, mode: str) -> list[str]:
-        steps = ["validate CPU/GPU contexts and release artifacts"]
-        if mode in {"bootstrap", "deploy"}:
-            steps.extend(
-                [
-                    "apply CPU prerequisites and require durable secrets",
-                    "create/update regional registry and GPU connection secrets",
-                    "initialize PostgreSQL schema",
-                ]
-            )
-        if mode in {
-            "bootstrap",
-            "deploy",
-            "upgrade",
-            "resume",
-        }:
-            steps.extend(
-                [
-                    "capture previous release state",
-                    "upload content-addressed wheel and bundle",
-                    "ensure PostgreSQL schema migration history",
-                    "stage stable required pins plus candidate compatibility",
-                    "roll CPU ingress and workers",
-                    "roll each GPU executor/watcher/collector/reconciler",
-                    "wait for every current node Agent to converge",
-                    "finalize strict pins and verify the fleet",
-                ]
-            )
-        elif mode == "rollback":
-            steps.extend(
-                [
-                    "restore previous required pins",
-                    "restore CPU and GPU Deployment wheels",
-                    "restore previous node installer bundle",
-                    "verify previous fleet readiness",
-                ]
-            )
-        return steps
+        return build_release_plan(mode)
 
     def status(self) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "configured_runtime_image": self.runtime_image,
-            "release_metadata": self._config_map_data("gpu-fault-release-metadata"),
-            "cpu_wheel": self._deployment_wheel(
-                self._cpu(),
-                inventory.CPU_INGRESS_DEPLOYMENT,
-            ),
-            "clusters": {},
-        }
-        for target in self.config.clusters:
-            result["clusters"][target.cluster_id] = {
-                "context": target.context,
-                "executor_wheel": self._deployment_wheel(
-                    self._gpu(target),
-                    inventory.GPU_EXECUTOR_DEPLOYMENT,
-                ),
-                "reconciler_wheel": self._deployment_wheel(
-                    self._gpu(target),
-                    inventory.GPU_RECONCILER_DEPLOYMENT,
-                ),
-                "template": self._deployment_template_name(target),
-            }
-        return result
+        return build_release_status(self)
 
     def _upload_config_map(
         self,
@@ -603,21 +561,6 @@ class RegionalRelease:
             )
 
     def _apply_cpu(self, *, finalize: bool) -> None:
-        environment = {
-            **os.environ,
-            "KUBECONFIG": self.config.cpu_kubeconfig,
-            "GPU_FAULT_AWS_REGION": self.config.aws_region,
-            "GPU_FAULT_NAMESPACE": self.config.namespace,
-            "GPU_FAULT_WHEEL_CONFIGMAP": self.wheel_cm,
-            "GPU_FAULT_WHEEL_SHA256": self.wheel_sha,
-            "GPU_FAULT_RUNTIME_IMAGE": self.runtime_image,
-            "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": self.wheel_sha,
-            "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST": (self.config.agent_config_digest),
-            "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION": "3",
-            "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION": "2",
-            "GPU_FAULT_FINALIZE_AGENT_PIN": str(finalize).lower(),
-            "GPU_FAULT_FINALIZE_DATA_PLANE_PIN": str(finalize).lower(),
-        }
         self.runner.run(
             [
                 "bash",
@@ -626,24 +569,22 @@ class RegionalRelease:
                     / "deploy/control-plane/tools/apply-control-plane-role-split.sh"
                 ),
             ],
-            env=environment,
+            env=build_cpu_apply_environment(self, finalize=finalize),
         )
 
-    def _apply_gpu_deployments(self, target: ClusterTarget, wheel_cm: str) -> None:
-        replacements = {
-            "gpu-fault-control-plane-wheel-0100": wheel_cm,
-            "namespace: gpu-fault-system": (f"namespace: {self.config.namespace}"),
-            DEFAULT_RUNTIME_IMAGE: self.runtime_image,
-            "REPLACE_WITH_AWS_REGION": target.region,
-            "REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN": (target.executor_irsa_role_arn),
-        }
-        for filename, deployment in inventory.GPU_ROLLOUT_DEPLOYMENTS:
-            text = (ROOT / "deploy/dataplane" / filename).read_text(encoding="utf-8")
-            for source, destination in replacements.items():
-                text = text.replace(source, destination)
-            if "REPLACE_WITH" in text:
-                raise ReleaseError(f"{filename} still contains a placeholder")
-            text = self._stamp_gpu_deployments(text)
+    def _apply_gpu_deployments(
+        self,
+        target: ClusterTarget,
+        wheel_cm: str,
+        *,
+        runtime_profile_version: str | None = None,
+    ) -> None:
+        for deployment, text in render_gpu_rollout_manifests(
+            self,
+            target,
+            wheel_cm,
+            runtime_profile_version=runtime_profile_version,
+        ):
             self.runner.run(
                 self._gpu(target, "apply", "-f", "-"),
                 input_text=text,
@@ -695,24 +636,17 @@ class RegionalRelease:
         bundle_cm: str,
         artifact_sha: str,
         config_digest: str,
+        runtime_profile_version: str | None = None,
     ) -> None:
-        environment = {
-            **os.environ,
-            "GPU_FAULT_KUBECTL_CONTEXT": target.context,
-            "GPU_FAULT_NAMESPACE": self.config.namespace,
-            "GPU_FAULT_CLUSTER_ID": target.cluster_id,
-            "GPU_FAULT_HYPERPOD_CLUSTER": target.hyperpod_cluster_name,
-            "GPU_FAULT_INSTALLER_CONFIG_MAP": bundle_cm,
-            "GPU_FAULT_INSTALLER_CONFIG_DIGEST": config_digest,
-            "GPU_FAULT_INSTALLER_ARTIFACT_SHA256": artifact_sha,
-            "GPU_FAULT_WHEEL_CONFIG_MAP": wheel_cm,
-            "GPU_FAULT_RUNTIME_IMAGE": self.runtime_image,
-        }
-        if target.fleet_master_file:
-            environment["GPU_FAULT_FLEET_MASTER_FILE"] = target.fleet_master_file
-            environment["GPU_FAULT_CONTROL_PLANE_KUBECONFIG"] = (
-                self.config.cpu_kubeconfig
-            )
+        environment = build_reconciler_environment(
+            self,
+            target,
+            wheel_cm=wheel_cm,
+            bundle_cm=bundle_cm,
+            artifact_sha=artifact_sha,
+            config_digest=config_digest,
+            runtime_profile_version=runtime_profile_version,
+        )
         self.runner.run(
             [str(ROOT / "deploy/node/deploy-node-installer-reconciler.sh")],
             env=environment,
@@ -807,6 +741,7 @@ class RegionalRelease:
             self._ensure_schema()
             self._save_state("schema-ready")
             self._apply_cpu(finalize=False)
+            ensure_runtime_profile(self)
             self._save_state("cpu-staged")
             for target in self.config.clusters:
                 self._apply_gpu_deployments(target, self.wheel_cm)
@@ -843,6 +778,9 @@ class RegionalRelease:
         cpu_wheel = previous.get("cpu_wheel")
         artifact = metadata.get("required-agent-artifact-sha256")
         config_digest = metadata.get("required-agent-config-digest")
+        runtime_profile_version = (
+            previous.get("runtime_profile_version") or "hyperpod-v1"
+        )
         if not all((cpu_wheel, artifact, config_digest)):
             raise ReleaseError("previous release pins are incomplete")
         cpu_sha = self._config_map_sha(self._cpu(), cpu_wheel, self.config.wheel.name)
@@ -856,6 +794,7 @@ class RegionalRelease:
             "GPU_FAULT_WHEEL_SHA256": cpu_sha,
             "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": artifact,
             "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST": config_digest,
+            "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": (runtime_profile_version),
             "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION": metadata.get(
                 "required-agent-protocol-version", "3"
             ),
@@ -882,7 +821,11 @@ class RegionalRelease:
             old = (previous.get("clusters") or {}).get(target.cluster_id, {})
             wheel = old.get("wheel")
             if wheel:
-                self._apply_gpu_deployments(target, wheel)
+                self._apply_gpu_deployments(
+                    target,
+                    wheel,
+                    runtime_profile_version=runtime_profile_version,
+                )
             if all(old.get(name) for name in ("reconciler_wheel", "bundle")):
                 self._deploy_reconciler(
                     target,
@@ -890,6 +833,7 @@ class RegionalRelease:
                     bundle_cm=old["bundle"],
                     artifact_sha=artifact,
                     config_digest=config_digest,
+                    runtime_profile_version=runtime_profile_version,
                 )
                 self._wait_agents(target, artifact)
         self._save_state("rolled-back", previous=previous)
@@ -959,6 +903,7 @@ class RegionalRelease:
             self._upload_release()
             self._ensure_schema()
             self._apply_cpu(finalize=True)
+            ensure_runtime_profile(self)
             self._apply_nlb()
             for target in self.config.clusters:
                 self._ensure_gpu_namespace(target)
@@ -1114,6 +1059,7 @@ class RegionalRelease:
         self._ensure_contexts()
         self._update_registry(target, remove=False)
         self._roll_cpu_for_registry()
+        ensure_runtime_profile(self)
         self._ensure_gpu_namespace(target)
         self._ensure_connection_secret(target)
         self._upload_config_map(

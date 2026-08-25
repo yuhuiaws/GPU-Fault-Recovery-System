@@ -10,6 +10,11 @@ or kubectl context. Operators must replace the Region placeholders, and the
 regional orchestrator rejects CPU/GPU EKS identities from another Region
 before applying any object.
 
+The regional release config also requires one explicit Runtime Profile source,
+version, and registered-cluster anchor. Bootstrap registers a missing profile;
+upgrade and join accept identical content but reject an in-place policy change
+under the same profile version.
+
 | Deployment surface | Directory | Entry point |
 |---|---|---|
 | Regional CPU control plane | `control-plane/` | `control-plane/regional/rollout-regional-release.sh` or `control-plane/tools/apply-control-plane-role-split.sh` |

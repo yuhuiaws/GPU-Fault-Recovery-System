@@ -5,6 +5,11 @@
   "cpu_hyperpod_cluster_name": "REPLACE_WITH_CPU_HYPERPOD_CLUSTER_NAME",
   "namespace": "gpu-fault-system",
   "auto_rollback": true,
+  "runtime_profile": {
+    "source": "REPLACE_WITH_RUNTIME_PROFILE_PATH",
+    "version": "hyperpod-v1",
+    "registration_cluster_id": "gpu-prod-a"
+  },
   "release": {
     "manifest": "../../../dist/current-release.json",
     "agent_config_digest": "REPLACE_WITH_64_HEX_CONFIG_DIGEST"

@@ -104,7 +104,7 @@ spec:
                   name: gpu-fault-regional-connection
                   key: cluster-token
             - name: GPU_FAULT_RUNTIME_PROFILE_VERSION
-              value: hyperpod-v1
+              value: REPLACE_WITH_RUNTIME_PROFILE_VERSION
             - name: GPU_FAULT_KUBERNETES_RESOURCE_INTERVAL_SECONDS
               value: "15"
             - name: GPU_FAULT_KUBERNETES_EFA_MISMATCH_SAMPLES

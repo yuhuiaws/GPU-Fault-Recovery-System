@@ -158,6 +158,10 @@ done
     printf 'ERROR: GPU_FAULT_CONNECTION_MODE must be local or regional\n' >&2
     exit 2
 }
+[[ "${RUNTIME_PROFILE}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$ ]] || {
+    printf 'ERROR: invalid GPU_FAULT_RUNTIME_PROFILE\n' >&2
+    exit 2
+}
 [[ "${DCGM_METRICS_URL}" =~ ^https?://[^[:space:]]+$ ]] || {
     printf 'ERROR: invalid DCGM metrics URL\n' >&2
     exit 2

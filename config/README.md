@@ -8,21 +8,34 @@ fields.
 
 | Deployment path | Profile terminology | Runtime profile | Required changes | Registration |
 |---|---|---|---|---|
-| Regional CPU control plane with GPU-cluster Executor | `regional-hyperpod-safe` means the fail-closed regional profile for this production path | `runtime-profile.regional-hyperpod-safe.example.yaml` | `cluster_id`; keep `profile_version` aligned with collectors, Watcher and training submission | POST separately for every GPU cluster |
+| Regional CPU control plane with GPU-cluster Executor | `regional-hyperpod-safe` means the fail-closed regional profile for this production path | `runtime-profile.regional-hyperpod-safe.example.yaml` | registration `cluster_id`; keep `profile_version` aligned with collectors, Watcher and training submission | Register once per profile version on the regional control plane |
 
 The API does not accept a `profiles:` wrapper or multiple profiles in one
 request. Historical single-cluster and multi-environment capability examples
 are retained only in the private archive because those deployment modes are
 not public release targets.
 
+Runtime profiles are stored by `profile_version` and shared by every registered
+GPU cluster using that version. The payload `cluster_id` is an explicit
+registration anchor and must name one cluster already present in the regional
+registry; it does not make a second copy of the profile for that cluster. To
+change capability content, use a new profile version instead of overwriting a
+live version.
+
+The regional release orchestrator treats `runtime_profile.version` as the
+single source for the CPU fleet pin, data-plane Resource/HMA collectors, and
+the Node Installer template. Training submission must use the same version in
+its managed Pod annotations; Completion Watcher reads that annotation rather
+than a static environment default.
+
 Example rendering:
 
 ```bash
 PROFILE=config/runtime-profile.regional-hyperpod-safe.example.yaml
-CLUSTER_ID='<stable-regional-cluster-id>'
+REGISTRATION_CLUSTER_ID='<stable-regional-cluster-id>'
 PROFILE_VERSION='hyperpod-v1'
 
-python3 - "${PROFILE}" "${CLUSTER_ID}" "${PROFILE_VERSION}" \
+python3 - "${PROFILE}" "${REGISTRATION_CLUSTER_ID}" "${PROFILE_VERSION}" \
   > /tmp/runtime-profile.json <<'PY'
 import json
 import pathlib

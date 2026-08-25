@@ -1,6 +1,6 @@
 {
   "classes": {
-    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 1188,
+    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 1127,
     "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 946,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1546,
     "src/gpu_fault/fleet.py:FleetRegistry": 848,

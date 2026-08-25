@@ -109,6 +109,8 @@ def test_regional_node_keys_are_derived_before_the_job() -> None:
     assert "GPU_FAULT_INSTALLER_ARTIFACT_SHA256" in installer
     assert "GPU_FAULT_INSTALLER_ARTIFACT_SHA256" in reconciler
     assert "REPLACE_WITH_INSTALLER_ARTIFACT_SHA256" in reconciler
+    assert 'RUNTIME_PROFILE="${GPU_FAULT_RUNTIME_PROFILE:-hyperpod-v1}"' in reconciler
+    assert 'GPU_FAULT_RUNTIME_PROFILE="${RUNTIME_PROFILE}"' in reconciler
     assert 'TEMPLATE_SHA256="$(sha256sum "${MANIFEST}"' in reconciler
     assert "gpu-fault-node-installer-template-${TEMPLATE_SHA256:0:12}" in reconciler
     manifest = (ROOT / "deploy/dataplane/node-installer-reconciler.yaml").read_text()
@@ -120,6 +122,20 @@ def test_regional_node_keys_are_derived_before_the_job() -> None:
     assert 'DERIVE_NODE_ACTION_SECRET="false"' in installer
     assert "node_action_args+=(--node-action-key-version 2)" in installer
     assert "ensure_node_action_keys" in (ROOT / "deploy/hyperpod/deploy.sh").read_text()
+
+
+def test_runtime_profile_placeholder_is_rendered_for_data_plane_collectors() -> None:
+    resource_collector = (
+        ROOT / "deploy/dataplane/kubernetes-node-resource-collector.yaml"
+    ).read_text()
+    hma_watcher = (ROOT / "deploy/dataplane/optional/hma-watcher.yaml").read_text()
+    deploy = (ROOT / "deploy/hyperpod/deploy.sh").read_text()
+
+    assert "REPLACE_WITH_RUNTIME_PROFILE_VERSION" in resource_collector
+    assert "REPLACE_WITH_RUNTIME_PROFILE_VERSION" in hma_watcher
+    assert (
+        deploy.count("s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g") >= 5
+    )
 
 
 def test_node_installer_refuses_second_hostengine() -> None:

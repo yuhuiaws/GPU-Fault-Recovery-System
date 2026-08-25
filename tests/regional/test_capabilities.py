@@ -101,6 +101,7 @@ def test_regional_hyperpod_safe_profile_matches_enabled_adapters() -> None:
             ROOT / "config/runtime-profile.regional-hyperpod-safe.example.yaml"
         ).read_text()
     )
+    assert payload["cluster_id"] == "REPLACE_WITH_CLUSTER_ID"
     profile = RuntimeProfile.model_validate(payload)
 
     effective = compile_runtime_profile(profile)

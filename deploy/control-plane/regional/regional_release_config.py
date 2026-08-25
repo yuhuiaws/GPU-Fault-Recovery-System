@@ -7,9 +7,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_NAMESPACE = "gpu-fault-system"
 AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
+RUNTIME_PROFILE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 EKS_ARN_PATTERN = re.compile(
     r"^arn:[^:]+:eks:(?P<region>[^:]+):(?P<account>[^:]+):"
     r"cluster/(?P<name>[^/]+)$"
@@ -41,6 +44,16 @@ def validate_aws_region(value: object, field: str = "aws_region") -> str:
     if not AWS_REGION_PATTERN.fullmatch(region):
         raise ReleaseError(f"{field} is not a valid AWS Region: {region}")
     return region
+
+
+def validate_runtime_profile_version(
+    value: object,
+    field: str = "runtime_profile.version",
+) -> str:
+    version = required_text(value, field)
+    if not RUNTIME_PROFILE_VERSION_PATTERN.fullmatch(version):
+        raise ReleaseError(f"{field} is not a valid Runtime Profile version")
+    return version
 
 
 def validate_eks_arn(value: object, *, field: str, expected_region: str) -> str:
@@ -157,6 +170,9 @@ class ReleaseConfig:
     wheel: Path
     bundle: Path
     agent_config_digest: str
+    runtime_profile_source: Path
+    runtime_profile_version: str
+    runtime_profile_registration_cluster_id: str
     clusters: tuple[ClusterTarget, ...]
     nlb: dict[str, str]
     auto_rollback: bool = True
@@ -188,6 +204,22 @@ class ReleaseConfig:
         )
         if not clusters:
             raise ReleaseError("config requires at least one GPU cluster")
+        runtime_profile = value.get("runtime_profile") or {}
+        runtime_profile_source = Path(
+            required_text(
+                runtime_profile.get("source"),
+                "runtime_profile.source",
+            )
+        )
+        if not runtime_profile_source.is_absolute():
+            runtime_profile_source = path.parent / runtime_profile_source
+        runtime_profile_version = validate_runtime_profile_version(
+            runtime_profile.get("version"),
+        )
+        runtime_profile_registration_cluster_id = required_text(
+            runtime_profile.get("registration_cluster_id"),
+            "runtime_profile.registration_cluster_id",
+        )
         release_manifest = release.get("manifest")
         manifest: dict[str, Any] | None = None
         if release_manifest:
@@ -236,6 +268,32 @@ class ReleaseConfig:
         ids = [item.cluster_id for item in clusters]
         if len(ids) != len(set(ids)):
             raise ReleaseError("cluster_id values must be unique")
+        if runtime_profile_registration_cluster_id not in set(ids):
+            raise ReleaseError(
+                "runtime_profile.registration_cluster_id must name "
+                "one configured GPU cluster"
+            )
+        if not runtime_profile_source.is_file():
+            raise ReleaseError("runtime_profile.source must be an existing file")
+        try:
+            runtime_profile_document = yaml.safe_load(
+                runtime_profile_source.read_text(encoding="utf-8")
+            )
+        except (OSError, yaml.YAMLError) as exc:
+            raise ReleaseError(f"cannot load runtime_profile.source: {exc}") from exc
+        if not isinstance(runtime_profile_document, dict):
+            raise ReleaseError(
+                "runtime_profile.source must contain one RuntimeProfile mapping"
+            )
+        required_profile_fields = {"cluster_id", "environment", "claims", "observed"}
+        missing_profile_fields = sorted(
+            required_profile_fields - set(runtime_profile_document)
+        )
+        if missing_profile_fields:
+            raise ReleaseError(
+                "runtime_profile.source is missing: "
+                + ", ".join(missing_profile_fields)
+            )
         return cls(
             aws_region=aws_region,
             cpu_kubeconfig=cpu_kubeconfig,
@@ -245,6 +303,11 @@ class ReleaseConfig:
             wheel=wheel.resolve(),
             bundle=bundle.resolve(),
             agent_config_digest=digest,
+            runtime_profile_source=runtime_profile_source.resolve(),
+            runtime_profile_version=runtime_profile_version,
+            runtime_profile_registration_cluster_id=(
+                runtime_profile_registration_cluster_id
+            ),
             clusters=clusters,
             nlb=nlb,
             auto_rollback=bool(value.get("auto_rollback", True)),

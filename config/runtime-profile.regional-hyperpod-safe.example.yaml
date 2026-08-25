@@ -5,7 +5,9 @@
 # 设置 GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true；默认清单为 false，
 # 注册本 profile 前必须先按部署和运维手册"阶段 D"打开它。
 # 校验命令见 docs/部署和运维手册.md 的"区域模式故障排查"小节。
-cluster_id: REPLACE_WITH_HYPERPOD_CLUSTER
+# cluster_id 是已注册稳定集群 ID 形式的注册锚点，不是 HyperPod provider 名。
+# 同一 profile_version 在区域控制面只保存一份，所有引用该版本的集群共享。
+cluster_id: REPLACE_WITH_CLUSTER_ID
 environment: hyperpod-eks
 profile_version: hyperpod-v1
 claims:

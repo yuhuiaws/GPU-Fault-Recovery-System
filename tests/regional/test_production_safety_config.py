@@ -366,6 +366,8 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert "GPU_FAULT_ROLE_SPLIT_GENERATED_DIR:-" in script
     assert "GPU_FAULT_AWS_REGION" in script
     assert "REPLACE_WITH_AWS_REGION" in script
+    assert "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION" in script
+    assert "REPLACE_WITH_RUNTIME_PROFILE_VERSION" in script
     assert "gpu-fault-release-metadata is missing" in script
     assert "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST" in script
     assert "GPU_FAULT_FINALIZE_AGENT_PIN" in script

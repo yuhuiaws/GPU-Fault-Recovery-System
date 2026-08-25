@@ -388,6 +388,10 @@ EOF
     printf 'ERROR: manifests currently require gpu-fault-system namespace\n' >&2
     exit 2
 }
+[[ "${RUNTIME_PROFILE}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$ ]] || {
+    printf 'ERROR: GPU_FAULT_RUNTIME_PROFILE is invalid\n' >&2
+    exit 2
+}
 [[ "${DEFAULT_RESTART_BUDGET}" =~ ^[0-9]+$ ]] || {
     printf 'ERROR: GPU_FAULT_DEFAULT_RESTART_BUDGET must be a non-negative integer\n' >&2
     exit 2
@@ -1786,12 +1790,16 @@ EOF
     fi
     sed \
         -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g" \
+        -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
         "${REPO_DIR}/deploy/control-plane/base/control-plane-deployment.yaml" |
         kubectl apply -f -
     for manifest in \
         "${REPO_DIR}"/deploy/control-plane/regional/generated/gpu-fault-*-config-*.yaml; do
-        kubectl apply -f "${manifest}"
+        sed \
+            -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g" \
+            "${manifest}" |
+            kubectl apply -f -
     done
     # The role split is declarative and applied here, before the env
     # below, so both tiers receive it. It used to run at the end of
@@ -1805,6 +1813,7 @@ EOF
         gpu-fault-telemetry-spool-worker; do
         sed \
             -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g" \
+            -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g" \
             -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
             "${REPO_DIR}/deploy/control-plane/regional/generated/${manifest}.yaml" |
             kubectl apply -f -
@@ -1819,6 +1828,7 @@ EOF
         gpu-fault-api-ha-ingress; do
         sed \
             -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g" \
+            -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g" \
             -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
             "${REPO_DIR}/deploy/control-plane/regional/generated/${manifest}.yaml" |
             kubectl apply -f -
@@ -2636,6 +2646,7 @@ deploy_watcher_and_dcgm() {
         kubectl apply -f -
     sed \
         -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g" \
+        -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
         "${REPO_DIR}/deploy/dataplane/kubernetes-node-resource-collector.yaml" |
         kubectl apply -f -
@@ -2648,6 +2659,7 @@ deploy_watcher_and_dcgm() {
     if [[ "${ENABLE_KUBERNETES_HMA_COLLECTOR}" == "true" ]]; then
         sed \
             -e "s/REPLACE_WITH_CLUSTER_ID/${HYPERPOD_CLUSTER_NAME}/g" \
+            -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g" \
             -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g" \
             -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
             "${REPO_DIR}/deploy/dataplane/optional/hma-watcher.yaml" |

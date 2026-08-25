@@ -9,11 +9,22 @@ from pathlib import Path
 import pytest
 import yaml
 
+from gpu_fault.capabilities import compile_runtime_profile
+from gpu_fault.models import RuntimeProfile
+from gpu_fault.training_submit_cli import render_workload
 from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
 MODULE = lazy_script_module("rollout_regional_release", MODULE_PATH)
+RUNTIME_PROFILE_MODULE = lazy_script_module(
+    "regional_runtime_profile",
+    ROOT / "deploy/control-plane/regional/regional_runtime_profile.py",
+)
+RENDERING_MODULE = lazy_script_module(
+    "regional_release_rendering",
+    ROOT / "deploy/control-plane/regional/regional_release_rendering.py",
+)
 REGION = "us-east-1"
 CPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-fault-control-plane"
 GPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
@@ -28,9 +39,17 @@ def test_upgrade_ensures_schema_before_rolling_cpu() -> None:
     assert source.index("self._ensure_schema()") < source.index(
         "self._apply_cpu(finalize=False)"
     )
+    assert source.index("self._apply_cpu(finalize=False)") < source.index(
+        "ensure_runtime_profile(self)"
+    )
+    assert source.index("ensure_runtime_profile(self)") < source.index(
+        "self._apply_gpu_deployments"
+    )
 
 
-def config_file(tmp_path: Path, *, clusters=None) -> Path:
+def config_file(
+    tmp_path: Path, *, clusters=None, profile_version: str = "hyperpod-v1"
+) -> Path:
     wheel = tmp_path / "release.whl"
     bundle = tmp_path / "bundle.tar.gz"
     wheel.write_bytes(b"wheel")
@@ -41,6 +60,13 @@ def config_file(tmp_path: Path, *, clusters=None) -> Path:
         "cpu_eks_arn": CPU_EKS_ARN,
         "cpu_hyperpod_cluster_name": "gpu-fault-control-plane",
         "namespace": "gpu-fault-system",
+        "runtime_profile": {
+            "source": str(
+                ROOT / "config/runtime-profile.regional-hyperpod-safe.example.yaml"
+            ),
+            "version": profile_version,
+            "registration_cluster_id": "gpu-a",
+        },
         "release": {
             "wheel": str(wheel),
             "bundle": str(bundle),
@@ -87,6 +113,14 @@ def manifest_config_file(tmp_path: Path) -> Path:
                 "cpu_kubeconfig": "/secure/cpu.kubeconfig",
                 "cpu_eks_arn": CPU_EKS_ARN,
                 "cpu_hyperpod_cluster_name": "gpu-fault-control-plane",
+                "runtime_profile": {
+                    "source": str(
+                        ROOT
+                        / "config/runtime-profile.regional-hyperpod-safe.example.yaml"
+                    ),
+                    "version": "hyperpod-v1",
+                    "registration_cluster_id": "gpu-a",
+                },
                 "release": {"manifest": str(manifest), "agent_config_digest": "a" * 64},
                 "clusters": [
                     {
@@ -116,6 +150,46 @@ def test_release_config_requires_unique_clusters(tmp_path) -> None:
 
     with pytest.raises(MODULE.ReleaseError, match="unique"):
         MODULE.ReleaseConfig.load(config_file(tmp_path, clusters=[cluster, cluster]))
+
+
+def test_release_config_requires_runtime_profile_inputs(tmp_path: Path) -> None:
+    path = config_file(tmp_path)
+    value = json.loads(path.read_text())
+    value.pop("runtime_profile")
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(MODULE.ReleaseError, match="runtime_profile.source"):
+        MODULE.ReleaseConfig.load(path)
+
+
+def test_release_config_requires_registered_profile_anchor(tmp_path: Path) -> None:
+    path = config_file(tmp_path)
+    value = json.loads(path.read_text())
+    value["runtime_profile"]["registration_cluster_id"] = "missing"
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(MODULE.ReleaseError, match="configured GPU cluster"):
+        MODULE.ReleaseConfig.load(path)
+
+
+def test_release_config_requires_existing_profile_source(tmp_path: Path) -> None:
+    path = config_file(tmp_path)
+    value = json.loads(path.read_text())
+    value["runtime_profile"]["source"] = str(tmp_path / "missing-profile.yaml")
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(MODULE.ReleaseError, match="existing file"):
+        MODULE.ReleaseConfig.load(path)
+
+
+def test_release_config_rejects_unsafe_profile_version(tmp_path: Path) -> None:
+    path = config_file(tmp_path)
+    value = json.loads(path.read_text())
+    value["runtime_profile"]["version"] = "hyperpod-v2&unexpected"
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(MODULE.ReleaseError, match="Runtime Profile version"):
+        MODULE.ReleaseConfig.load(path)
 
 
 def test_release_config_requires_explicit_matching_region(tmp_path: Path) -> None:
@@ -189,11 +263,98 @@ def test_plan_covers_first_deploy_and_rollback(tmp_path) -> None:
 
     deploy = release.plan("deploy")
     rollback = release.plan("rollback")
+    join = release.plan("join-cluster")
 
     assert any("prerequisites" in step for step in deploy)
     assert any("PostgreSQL schema" in step for step in deploy)
+    assert any("Runtime Profile" in step for step in deploy), (
+        "deploy plan must include Runtime Profile registration"
+    )
     assert any("previous required pins" in step for step in rollback)
     assert any("installer bundle" in step for step in rollback)
+    assert any("Runtime Profile" in step for step in join), (
+        "join plan must verify the shared Runtime Profile"
+    )
+
+
+class RuntimeProfileRunner:
+    dry_run = False
+
+    def __init__(self, existing=None) -> None:
+        self.existing = existing
+        self.posted = []
+
+    @staticmethod
+    def _desired(input_text: str) -> dict:
+        profile = RuntimeProfile.model_validate(json.loads(input_text))
+        return compile_runtime_profile(profile).model_dump(mode="json")
+
+    def run(self, args, **kwargs):
+        command = " ".join(args)
+        if "get pod" in command:
+            return "api-pod"
+        if "compile_runtime_profile" in command:
+            desired = self._desired(kwargs["input_text"])
+            return json.dumps({"desired": desired, "existing": self.existing})
+        if "/v1/runtime-profiles" in command:
+            desired = self._desired(kwargs["input_text"])
+            self.posted.append(json.loads(kwargs["input_text"]))
+            return json.dumps(desired)
+        raise AssertionError(f"unexpected Runtime Profile command: {args}")
+
+
+def test_runtime_profile_payload_uses_declared_identity(tmp_path: Path) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+
+    payload = RUNTIME_PROFILE_MODULE.render_runtime_profile_payload(config)
+
+    assert payload["cluster_id"] == "gpu-a"
+    assert payload["profile_version"] == "hyperpod-v1"
+    assert payload["cluster_id"] != "hp-gpu-a"
+
+
+def test_runtime_profile_is_registered_when_missing(tmp_path: Path) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    runner = RuntimeProfileRunner()
+    release = MODULE.RegionalRelease(config, runner)
+
+    MODULE.ensure_runtime_profile(release)
+
+    assert len(runner.posted) == 1
+    assert runner.posted[0]["cluster_id"] == "gpu-a"
+    assert runner.posted[0]["profile_version"] == "hyperpod-v1"
+
+
+def test_runtime_profile_registration_is_idempotent(tmp_path: Path) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    desired = compile_runtime_profile(
+        RuntimeProfile.model_validate(
+            RUNTIME_PROFILE_MODULE.render_runtime_profile_payload(config)
+        )
+    ).model_dump(mode="json")
+    runner = RuntimeProfileRunner(existing=desired)
+    release = MODULE.RegionalRelease(config, runner)
+
+    MODULE.ensure_runtime_profile(release)
+
+    assert runner.posted == []
+
+
+def test_runtime_profile_drift_requires_a_new_version(tmp_path: Path) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    existing = compile_runtime_profile(
+        RuntimeProfile.model_validate(
+            RUNTIME_PROFILE_MODULE.render_runtime_profile_payload(config)
+        )
+    ).model_dump(mode="json")
+    existing["capabilities"][0]["mode"] = "OBSERVE"
+    runner = RuntimeProfileRunner(existing=existing)
+    release = MODULE.RegionalRelease(config, runner)
+
+    with pytest.raises(MODULE.ReleaseError, match="new profile version"):
+        MODULE.ensure_runtime_profile(release)
+
+    assert runner.posted == []
 
 
 class PreflightRunner:
@@ -411,6 +572,7 @@ def test_release_renders_one_runtime_image_across_gpu_roles(
         config_digest=config.agent_config_digest,
     )
     assert runner.calls[-1][1]["env"]["GPU_FAULT_RUNTIME_IMAGE"] == runtime_image
+    assert runner.calls[-1][1]["env"]["GPU_FAULT_RUNTIME_PROFILE"] == "hyperpod-v1"
     assert runner.calls[-1][1]["env"]["GPU_FAULT_CLUSTER_ID"] == "gpu-a"
     assert runner.calls[-1][1]["env"]["GPU_FAULT_HYPERPOD_CLUSTER"] == "hp-gpu-a"
 
@@ -421,3 +583,134 @@ def test_release_rejects_invalid_runtime_image(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(MODULE.ReleaseError, match="OCI image"):
         MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
+
+
+def test_non_default_runtime_profile_reaches_every_plane(tmp_path: Path) -> None:
+    config = MODULE.ReleaseConfig.load(
+        config_file(tmp_path, profile_version="hyperpod-v2")
+    )
+
+    class RecordingRunner:
+        dry_run = True
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def run(self, args, **kwargs):
+            self.calls.append((args, kwargs))
+            return ""
+
+    runner = RecordingRunner()
+    release = MODULE.RegionalRelease(config, runner)
+    target = config.clusters[0]
+
+    cpu_environment = RENDERING_MODULE.build_cpu_apply_environment(
+        release, finalize=False
+    )
+    assert (
+        cpu_environment["GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"] == "hyperpod-v2"
+    )
+
+    rendered_manifests = [
+        text
+        for _deployment, text in RENDERING_MODULE.render_gpu_rollout_manifests(
+            release, target, release.wheel_cm
+        )
+    ]
+    resources = [
+        document
+        for text in rendered_manifests
+        for document in yaml.safe_load_all(text)
+        if isinstance(document, dict)
+    ]
+    collector = next(
+        item
+        for item in resources
+        if item.get("kind") == "Deployment"
+        and item["metadata"]["name"] == "gpu-fault-kubernetes-node-resource-collector"
+    )
+    collector_env = {
+        item["name"]: item.get("value")
+        for item in collector["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert collector_env["GPU_FAULT_RUNTIME_PROFILE_VERSION"] == "hyperpod-v2"
+    assert all(
+        "REPLACE_WITH_RUNTIME_PROFILE_VERSION" not in item
+        for item in rendered_manifests
+    ), "rendered GPU manifests retained the Runtime Profile placeholder"
+
+    reconciler_environment = RENDERING_MODULE.build_reconciler_environment(
+        release,
+        target,
+        wheel_cm=release.wheel_cm,
+        bundle_cm=release.bundle_cm,
+        artifact_sha=release.wheel_sha,
+        config_digest=config.agent_config_digest,
+    )
+    assert reconciler_environment["GPU_FAULT_RUNTIME_PROFILE"] == "hyperpod-v2"
+
+    workload = render_workload(
+        ROOT / "examples/hyperpod/three-node-pytorchjob.yaml",
+        job_id="profile-v2-job",
+        attempt_id=None,
+        attempt_number=1,
+        runtime_profile_version="hyperpod-v2",
+        expected_critical_ranks=None,
+        training_container="pytorch",
+        restart_budget=1,
+        namespace="training",
+    )
+    document = yaml.safe_load(workload.manifest)
+    for replica in document["spec"]["pytorchReplicaSpecs"].values():
+        annotations = replica["template"]["metadata"]["annotations"]
+        assert annotations["gpu-fault.io/runtime-profile-version"] == "hyperpod-v2"
+
+
+def test_runtime_profile_override_restores_rollback_version(tmp_path: Path) -> None:
+    config = MODULE.ReleaseConfig.load(
+        config_file(tmp_path, profile_version="hyperpod-v2")
+    )
+
+    class RecordingRunner:
+        dry_run = True
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def run(self, args, **kwargs):
+            self.calls.append((args, kwargs))
+            return ""
+
+    release = MODULE.RegionalRelease(config, RecordingRunner())
+    target = config.clusters[0]
+    rendered = RENDERING_MODULE.render_gpu_rollout_manifests(
+        release, target, release.wheel_cm, runtime_profile_version="hyperpod-v1"
+    )
+    resources = [
+        document
+        for _deployment, text in rendered
+        for document in yaml.safe_load_all(text)
+        if isinstance(document, dict)
+    ]
+    collector = next(
+        item
+        for item in resources
+        if item.get("kind") == "Deployment"
+        and item["metadata"]["name"] == "gpu-fault-kubernetes-node-resource-collector"
+    )
+    collector_env = {
+        item["name"]: item.get("value")
+        for item in collector["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert collector_env["GPU_FAULT_RUNTIME_PROFILE_VERSION"] == "hyperpod-v1"
+
+    environment = RENDERING_MODULE.build_reconciler_environment(
+        release,
+        target,
+        wheel_cm=release.wheel_cm,
+        bundle_cm=release.bundle_cm,
+        artifact_sha=release.wheel_sha,
+        config_digest=config.agent_config_digest,
+        runtime_profile_version="hyperpod-v1",
+    )
+    assert environment["GPU_FAULT_RUNTIME_PROFILE"] == "hyperpod-v1"

@@ -93,7 +93,7 @@ spec:
             - name: GPU_FAULT_CLUSTER_ID
               value: REPLACE_WITH_CLUSTER_ID
             - name: GPU_FAULT_RUNTIME_PROFILE_VERSION
-              value: hyperpod-v1
+              value: REPLACE_WITH_RUNTIME_PROFILE_VERSION
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

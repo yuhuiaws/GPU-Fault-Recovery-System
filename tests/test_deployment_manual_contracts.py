@@ -43,6 +43,9 @@ def test_regional_greenfield_orders_required_objects() -> None:
         in text[text.index("##### CPU-4a.") : text.index("##### CPU-4b.")]
     )
     assert node_keys < role_split
+    runtime_profile = text.index("##### CPU-4d.")
+    assert role_split < runtime_profile
+    assert "/v1/runtime-profiles" in text[runtime_profile : text.index("##### CPU-4P.")]
     assert "required-regional-executor-protocol-version=" in text
     assert "CURRENT_AGENT_PROTOCOL_VERSION" in text
     assert "CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION" in text
@@ -67,6 +70,11 @@ def test_regional_region_is_operator_selected_and_fail_closed() -> None:
     assert "AWS_REGION='REPLACE_WITH_AWS_REGION'" in env_template
     assert release_template["aws_region"] == "REPLACE_WITH_AWS_REGION"
     assert release_template["cpu_eks_arn"] == "REPLACE_WITH_CPU_EKS_ARN"
+    assert release_template["runtime_profile"] == {
+        "source": "REPLACE_WITH_RUNTIME_PROFILE_PATH",
+        "version": "hyperpod-v1",
+        "registration_cluster_id": "gpu-prod-a",
+    }
 
 
 def test_manual_forbids_multiple_global_load_balancer_controllers() -> None:
@@ -122,7 +130,10 @@ def test_manual_documents_both_training_submission_paths() -> None:
     assert "gpu-fault-workload-annotate" in text
     assert "apply --dry-run=server" in text
     assert "store.get_profile" in text
-    assert 'profile.cluster_id == os.environ["CLUSTER"]' in text
+    assert "profile.warnings == []" in text
+    assert "registration_cluster_id=" in text
+    assert "`gpu-fault.io/expected-critical-ranks` 为 `3`" in text
+    assert "PyTorch `world_size` 为 `24`" in text
     assert "hyperpod-control-plane-recovery-v1" not in text
 
 
@@ -331,9 +342,9 @@ def test_regional_acceptance_checks_live_amp_alerting() -> None:
 
 def test_regional_data_plane_validation_uses_private_ca_and_auth() -> None:
     text = manual()
-    section = text.split("#### REG-7. 从 GPU 数据面验证", 1)[1].split(
-        "#### REG-8.", 1
-    )[0]
+    section = text.split("#### REG-7. 从 GPU 数据面验证", 1)[1].split("#### REG-8.", 1)[
+        0
+    ]
 
     assert "ssl.create_default_context" in section
     assert 'GPU_FAULT_CONTROL_PLANE_CA_FILE"]' in section
