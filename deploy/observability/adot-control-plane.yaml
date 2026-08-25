@@ -115,7 +115,7 @@ data:
                   replacement: gpu-fault-regional-control-plane
                 - action: replace
                   target_label: region
-                  replacement: us-west-2
+                  replacement: REPLACE_WITH_AWS_REGION
               metric_relabel_configs:
                 # This keep list is the only thing that reaches AMP, so a
                 # metric family missing here is unalertable no matter what
@@ -135,7 +135,7 @@ data:
 
     exporters:
       prometheusremotewrite:
-        endpoint: https://aps-workspaces.us-west-2.amazonaws.com/workspaces/REPLACE_WITH_AMP_WORKSPACE_ID/api/v1/remote_write
+        endpoint: https://aps-workspaces.REPLACE_WITH_AWS_REGION.amazonaws.com/workspaces/REPLACE_WITH_AMP_WORKSPACE_ID/api/v1/remote_write
         add_metric_suffixes: false
         auth:
           authenticator: sigv4auth
@@ -147,7 +147,7 @@ data:
 
     extensions:
       sigv4auth:
-        region: us-west-2
+        region: REPLACE_WITH_AWS_REGION
         service: aps
       exporterhealth:
         port: 8090
@@ -192,7 +192,7 @@ spec:
       serviceAccountName: gpu-fault-adot
       containers:
         - name: collector
-          image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/hyperpod/otel_collector:v1783977775530
+          image: REPLACE_WITH_ADOT_IMAGE
           args:
             - --config=/etc/otel/collector.yaml
           env:

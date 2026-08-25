@@ -4,31 +4,35 @@ set -euo pipefail
 REPO_DIR="$(
     cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd
 )"
-AWS_REGION="${AWS_REGION:-us-west-2}"
+AWS_REGION="${AWS_REGION:?AWS_REGION is required}"
 CPU_EKS_CLUSTER="${CPU_EKS_CLUSTER:?CPU_EKS_CLUSTER is required}"
 CPU_KUBECONFIG="${CPU_KUBECONFIG:-/tmp/gpu-fault-control-plane.kubeconfig}"
 AMP_WORKSPACE_ID="${AMP_WORKSPACE_ID:?AMP_WORKSPACE_ID is required}"
-SNS_TOPIC_NAME="${SNS_TOPIC_NAME:-gpu-fault-control-plane-alerts-us-west-2}"
-IAM_ROLE_NAME="${IAM_ROLE_NAME:-gpu-fault-control-plane-amp-writer-us-west-2}"
+SNS_TOPIC_NAME="${SNS_TOPIC_NAME:-gpu-fault-control-plane-alerts-${AWS_REGION}}"
+IAM_ROLE_NAME="${IAM_ROLE_NAME:-gpu-fault-control-plane-amp-writer-${AWS_REGION}}"
 NAMESPACE="${NAMESPACE:-gpu-fault-system}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-gpu-fault-adot}"
 RULE_NAMESPACE="${RULE_NAMESPACE:-gpu-fault-control-plane-capacity}"
 GPU_FAULT_ENABLE_ADOT="${GPU_FAULT_ENABLE_ADOT:-true}"
 GPU_FAULT_ENABLE_AMP="${GPU_FAULT_ENABLE_AMP:-true}"
 GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION="${GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION:-true}"
-DEFAULT_ADOT_IMAGE="602401143452.dkr.ecr.us-west-2.amazonaws.com/hyperpod/otel_collector:v1783977775530"
-ADOT_IMAGE="${GPU_FAULT_ADOT_IMAGE:-${DEFAULT_ADOT_IMAGE}}"
+ADOT_IMAGE="${GPU_FAULT_ADOT_IMAGE:?GPU_FAULT_ADOT_IMAGE is required}"
 
 if [[ "${GPU_FAULT_ENABLE_AMP}" != "true" ]]; then
     printf 'AMP integration disabled; built-in collector silence alerts remain active.\n'
     exit 0
 fi
+[[ "${AWS_REGION}" =~ ^[a-z0-9]+(-[a-z0-9]+)+-[0-9]+$ ]] || {
+    printf 'ERROR: invalid AWS_REGION: %s\n' "${AWS_REGION}" >&2
+    exit 2
+}
 [[ "${GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION}" == "true" ||
     "${GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION}" == "false" ]] || {
     printf 'ERROR: GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION must be true or false\n' >&2
     exit 2
 }
 [[ -n "${ADOT_IMAGE}" &&
+    "${ADOT_IMAGE}" != REPLACE_* &&
     "${ADOT_IMAGE}" != *[[:space:]#]* ]] || {
     printf 'ERROR: invalid GPU_FAULT_ADOT_IMAGE\n' >&2
     exit 2
@@ -40,6 +44,23 @@ for command in aws jq kubectl sed; do
         exit 1
     }
 done
+
+CPU_EKS_ARN="$(
+    aws eks describe-cluster \
+        --region "${AWS_REGION}" \
+        --name "${CPU_EKS_CLUSTER}" \
+        --query 'cluster.arn' \
+        --output text
+)"
+KUBECONFIG_EKS_ARN="$(
+    kubectl --kubeconfig "${CPU_KUBECONFIG}" config view --minify \
+        -o jsonpath='{.contexts[0].context.cluster}'
+)"
+if [[ "${KUBECONFIG_EKS_ARN}" != "${CPU_EKS_ARN}" ]]; then
+    printf 'ERROR: CPU kubeconfig EKS ARN does not match %s in %s\n' \
+        "${CPU_EKS_CLUSTER}" "${AWS_REGION}" >&2
+    exit 2
+fi
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 WORKSPACE_ARN="arn:aws:aps:${AWS_REGION}:${ACCOUNT_ID}:workspace/${AMP_WORKSPACE_ID}"
@@ -130,7 +151,8 @@ fi
 
 sed \
     -e "s/REPLACE_WITH_AMP_WORKSPACE_ID/${AMP_WORKSPACE_ID}/g" \
-    -e "s#${DEFAULT_ADOT_IMAGE}#${ADOT_IMAGE}#g" \
+    -e "s/REPLACE_WITH_AWS_REGION/${AWS_REGION}/g" \
+    -e "s#REPLACE_WITH_ADOT_IMAGE#${ADOT_IMAGE}#g" \
     "${REPO_DIR}/deploy/observability/adot-control-plane.yaml" \
     >"${TMP_DIR}/adot-control-plane.yaml"
 CURRENT_ADOT_REPLICAS="$(
@@ -198,7 +220,8 @@ else
 fi
 
 sed \
-    "s#REPLACE_WITH_SNS_TOPIC_ARN#${SNS_TOPIC_ARN}#g" \
+    -e "s#REPLACE_WITH_SNS_TOPIC_ARN#${SNS_TOPIC_ARN}#g" \
+    -e "s/REPLACE_WITH_AWS_REGION/${AWS_REGION}/g" \
     "${REPO_DIR}/deploy/observability/amp-alertmanager.yaml" \
     >"${TMP_DIR}/amp-alertmanager.yaml"
 if aws amp describe-alert-manager-definition \

@@ -1,6 +1,6 @@
 {
   "classes": {
-    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 1215,
+    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 1188,
     "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 946,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1546,
     "src/gpu_fault/fleet.py:FleetRegistry": 848,
@@ -12,7 +12,6 @@
   },
   "cycles": [],
   "files": {
-    "deploy/control-plane/regional/rollout_regional_release.py": 1518,
     "src/gpu_fault/completion_controller.py": 1544,
     "src/gpu_fault/execution/executor.py": 1598,
     "src/gpu_fault/gpu_metrics.py": 1536,

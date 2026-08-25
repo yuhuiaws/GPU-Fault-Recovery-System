@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path, PurePosixPath
 import re
 import subprocess
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONTRACTS = ROOT / "docs" / "code-doc-contracts.yaml"
@@ -200,7 +199,7 @@ def _git(
     *arguments: str,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *arguments],
+        ["git", "-c", "core.quotePath=false", *arguments],
         cwd=root,
         text=True,
         capture_output=True,

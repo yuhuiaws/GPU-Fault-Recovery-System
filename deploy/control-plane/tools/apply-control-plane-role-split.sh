@@ -27,9 +27,14 @@ GENERATED="${GPU_FAULT_ROLE_SPLIT_GENERATED_DIR:-${SCRIPT_DIR}/../regional/gener
 KUBECONFIG_PATH="${KUBECONFIG:-}"
 DEFAULT_RUNTIME_IMAGE="public.ecr.aws/docker/library/python:3.12-slim"
 RUNTIME_IMAGE="${GPU_FAULT_RUNTIME_IMAGE:-${DEFAULT_RUNTIME_IMAGE}}"
+AWS_REGION="${GPU_FAULT_AWS_REGION:?GPU_FAULT_AWS_REGION is required}"
 CONTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 
+[[ "${AWS_REGION}" =~ ^[a-z0-9]+(-[a-z0-9]+)+-[0-9]+$ ]] || {
+    echo "GPU_FAULT_AWS_REGION is not a valid AWS Region: ${AWS_REGION}" >&2
+    exit 2
+}
 [[ -n "${RUNTIME_IMAGE}" &&
     "${RUNTIME_IMAGE}" != *[[:space:]#]* ]] || {
     echo "GPU_FAULT_RUNTIME_IMAGE must be a non-empty OCI image reference without whitespace or #" >&2
@@ -317,6 +322,7 @@ apply_manifest() {
     sed \
         -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP}/g" \
         -e "s/namespace: gpu-fault-system/namespace: ${NAMESPACE}/g" \
+        -e "s/REPLACE_WITH_AWS_REGION/${AWS_REGION}/g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
         "${GENERATED}/${manifest}.yaml" |
         kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply -f -

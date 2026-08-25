@@ -202,6 +202,10 @@ def test_worker_and_adot_have_disruption_protection() -> None:
     )
     assert "GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION" in installer
     assert "has no confirmed subscription" in installer
+    assert "KUBECONFIG_EKS_ARN" in installer
+    assert installer.index("aws eks describe-cluster") < installer.index(
+        "aws iam create-role"
+    )
 
 
 def test_ingress_has_one_nonblocking_spread_constraint() -> None:
@@ -324,10 +328,33 @@ def test_regional_environment_template_is_sourceable() -> None:
 
     subprocess.run(["bash", "-n", str(template)], check=True)
     assert "regional_require()" in script
+    assert "AWS_REGION='REPLACE_WITH_AWS_REGION'" in script
     assert "CPU_KUBECONFIG" in script
+    assert "CPU_EKS_ARN" in script
     assert "GPU_EKS_CONTEXT" in script
+    assert "regional_validate_region()" in script
+    assert "regional_assert_eks_arn_region()" in script
     assert "HYPERPOD_CONFIRM_CLUSTER_NAME" in script
     assert "CONTROL_PLANE_URL" in script
+
+
+def test_regional_production_assets_have_no_implicit_region() -> None:
+    paths = (
+        "deploy/control-plane/regional/regional-env.example.sh",
+        "deploy/control-plane/regional/regional-release.example.json",
+        "deploy/control-plane/regional/rollout_regional_release.py",
+        "deploy/control-plane/regional/regional-control-plane-patch.yaml",
+        "deploy/control-plane/regional/regional-control-plane-nlb.yaml",
+        "deploy/control-plane/tools/apply-control-plane-role-split.sh",
+        "deploy/dataplane/cluster-action-executor.yaml",
+        "deploy/observability/adot-control-plane.yaml",
+        "deploy/observability/amp-alertmanager.yaml",
+        "deploy/observability/install-amp-monitoring.sh",
+    )
+
+    for relative in paths:
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        assert "us-west-2" not in text, relative
 
 
 def test_role_split_apply_supports_greenfield_namespace() -> None:
@@ -337,6 +364,8 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
 
     assert "s/namespace: gpu-fault-system/namespace: ${NAMESPACE}/g" in script
     assert "GPU_FAULT_ROLE_SPLIT_GENERATED_DIR:-" in script
+    assert "GPU_FAULT_AWS_REGION" in script
+    assert "REPLACE_WITH_AWS_REGION" in script
     assert "gpu-fault-release-metadata is missing" in script
     assert "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST" in script
     assert "GPU_FAULT_FINALIZE_AGENT_PIN" in script

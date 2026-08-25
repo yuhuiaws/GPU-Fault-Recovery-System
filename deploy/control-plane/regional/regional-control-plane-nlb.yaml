@@ -7,7 +7,7 @@ metadata:
     gpu-fault.io/cleanup-phase: nlb
     gpu-fault.io/cleanup-order: "10"
     gpu-fault.io/cleanup-action: reset
-    service.beta.kubernetes.io/aws-load-balancer-name: gpu-fault-regional-us-west-2
+    service.beta.kubernetes.io/aws-load-balancer-name: REPLACE_WITH_NLB_NAME
     service.beta.kubernetes.io/aws-load-balancer-type: external
     service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
     service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing

@@ -10,16 +10,20 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
 import regional_deployment_inventory as inventory
-
+import yaml
+from regional_release_config import (
+    ClusterTarget,
+    ReleaseConfig,
+    ReleaseError,
+    render_nlb_manifest,
+)
+from regional_release_preflight import ensure_region_contexts
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_NAMESPACE = "gpu-fault-system"
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 EXECUTOR_SAGEMAKER_ACTIONS = frozenset(
@@ -30,10 +34,6 @@ EXECUTOR_SAGEMAKER_ACTIONS = frozenset(
         "sagemaker:batchrebootclusternodes",
     }
 )
-
-
-class ReleaseError(RuntimeError):
-    pass
 
 
 def validate_executor_iam_documents(
@@ -63,123 +63,6 @@ def validate_executor_iam_documents(
         raise ReleaseError(
             f"executor role {role_arn} exceeds the regional "
             "data-plane boundary: " + ", ".join(sorted(set(forbidden)))
-        )
-
-
-@dataclass(frozen=True)
-class ClusterTarget:
-    cluster_id: str
-    context: str
-    executor_irsa_role_arn: str
-    token_file: str | None = None
-    ca_file: str | None = None
-    control_plane_url: str | None = None
-    region: str = "us-west-2"
-    hyperpod_cluster_name: str | None = None
-    eks_cluster_arn: str | None = None
-    allowed_namespaces: tuple[str, ...] = ()
-    fleet_master_file: str | None = None
-
-    @classmethod
-    def from_mapping(cls, value: dict[str, Any]) -> ClusterTarget:
-        required = (
-            "cluster_id",
-            "context",
-            "executor_irsa_role_arn",
-        )
-        missing = [name for name in required if not value.get(name)]
-        if missing:
-            raise ReleaseError("cluster target is missing: " + ", ".join(missing))
-        namespaces = tuple(
-            sorted(
-                {
-                    str(item).strip()
-                    for item in value.get("allowed_namespaces", [])
-                    if str(item).strip()
-                }
-            )
-        )
-        return cls(
-            cluster_id=str(value["cluster_id"]),
-            context=str(value["context"]),
-            executor_irsa_role_arn=str(value["executor_irsa_role_arn"]),
-            token_file=value.get("token_file"),
-            ca_file=value.get("ca_file"),
-            control_plane_url=value.get("control_plane_url"),
-            region=str(value.get("region", "us-west-2")),
-            hyperpod_cluster_name=value.get("hyperpod_cluster_name"),
-            eks_cluster_arn=value.get("eks_cluster_arn"),
-            allowed_namespaces=namespaces,
-            fleet_master_file=value.get("fleet_master_file"),
-        )
-
-
-@dataclass(frozen=True)
-class ReleaseConfig:
-    cpu_kubeconfig: str
-    namespace: str
-    wheel: Path
-    bundle: Path
-    agent_config_digest: str
-    clusters: tuple[ClusterTarget, ...]
-    nlb: dict[str, str]
-    auto_rollback: bool = True
-
-    @classmethod
-    def load(cls, path: Path) -> ReleaseConfig:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        release = value.get("release") or {}
-        clusters = tuple(
-            ClusterTarget.from_mapping(item) for item in value.get("clusters", [])
-        )
-        if not clusters:
-            raise ReleaseError("config requires at least one GPU cluster")
-        release_manifest = release.get("manifest")
-        manifest: dict[str, Any] | None = None
-        if release_manifest:
-            manifest_path = Path(str(release_manifest))
-            if not manifest_path.is_absolute():
-                manifest_path = path.parent / manifest_path
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            wheel = Path(str(manifest["wheel"]))
-            bundle = Path(str(manifest["bundle"]))
-            if not wheel.is_absolute():
-                wheel = ROOT / wheel
-            if not bundle.is_absolute():
-                bundle = ROOT / bundle
-        else:
-            wheel = Path(release.get("wheel", ""))
-            bundle = Path(release.get("bundle", ""))
-            if not wheel.is_absolute():
-                wheel = path.parent / wheel
-            if not bundle.is_absolute():
-                bundle = path.parent / bundle
-        digest = str(release.get("agent_config_digest", ""))
-        if not value.get("cpu_kubeconfig"):
-            raise ReleaseError("cpu_kubeconfig is required")
-        if not wheel.is_file() or not bundle.is_file():
-            raise ReleaseError("release wheel and bundle must exist")
-        if manifest is not None:
-            if RegionalRelease._sha256(wheel) != manifest.get(
-                "wheel_sha256"
-            ) or RegionalRelease._sha256(bundle) != manifest.get("bundle_sha256"):
-                raise ReleaseError("release manifest hashes do not match its artifacts")
-        if len(digest) != 64 or any(
-            character not in "0123456789abcdef" for character in digest
-        ):
-            raise ReleaseError("release.agent_config_digest must be lowercase SHA-256")
-        ids = [item.cluster_id for item in clusters]
-        if len(ids) != len(set(ids)):
-            raise ReleaseError("cluster_id values must be unique")
-        return cls(
-            cpu_kubeconfig=str(value["cpu_kubeconfig"]),
-            namespace=str(value.get("namespace", DEFAULT_NAMESPACE)),
-            wheel=wheel.resolve(),
-            bundle=bundle.resolve(),
-            agent_config_digest=digest,
-            clusters=clusters,
-            nlb=dict(value.get("nlb") or {}),
-            auto_rollback=bool(value.get("auto_rollback", True)),
         )
 
 
@@ -220,6 +103,8 @@ class Runner:
 
 
 class RegionalRelease:
+    _ensure_contexts = ensure_region_contexts
+
     def __init__(self, config: ReleaseConfig, runner: Runner) -> None:
         self.config = config
         self.runner = runner
@@ -372,6 +257,7 @@ class RegionalRelease:
         self.state.update(
             {
                 "phase": phase,
+                "aws_region": self.config.aws_region,
                 "release_id": self.wheel_sha[:12],
                 "wheel_sha256": self.wheel_sha,
                 "bundle_sha256": self.bundle_sha,
@@ -423,15 +309,6 @@ class RegionalRelease:
             raise ReleaseError("regional release state is missing")
         self.state = json.loads(raw)
         return self.state
-
-    def _ensure_contexts(self) -> None:
-        self.runner.run(self._cpu("get", "--raw=/readyz"), capture=True)
-        for target in self.config.clusters:
-            self.runner.run(
-                self._gpu(target, "get", "--raw=/readyz"),
-                capture=True,
-            )
-            self._validate_executor_iam_role(target)
 
     def _validate_executor_iam_role(self, target: ClusterTarget) -> None:
         role_name = target.executor_irsa_role_arn.rsplit("/", 1)[-1]
@@ -730,6 +607,7 @@ class RegionalRelease:
         environment = {
             **os.environ,
             "KUBECONFIG": self.config.cpu_kubeconfig,
+            "GPU_FAULT_AWS_REGION": self.config.aws_region,
             "GPU_FAULT_NAMESPACE": self.config.namespace,
             "GPU_FAULT_WHEEL_CONFIGMAP": self.wheel_cm,
             "GPU_FAULT_WHEEL_SHA256": self.wheel_sha,
@@ -757,6 +635,7 @@ class RegionalRelease:
             "gpu-fault-control-plane-wheel-0100": wheel_cm,
             "namespace: gpu-fault-system": (f"namespace: {self.config.namespace}"),
             DEFAULT_RUNTIME_IMAGE: self.runtime_image,
+            "REPLACE_WITH_AWS_REGION": target.region,
             "REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN": (target.executor_irsa_role_arn),
         }
         for filename, deployment in inventory.GPU_ROLLOUT_DEPLOYMENTS:
@@ -967,19 +846,11 @@ class RegionalRelease:
         if not all((cpu_wheel, artifact, config_digest)):
             raise ReleaseError("previous release pins are incomplete")
         cpu_sha = self._config_map_sha(self._cpu(), cpu_wheel, self.config.wheel.name)
-        rollback_config = ReleaseConfig(
-            cpu_kubeconfig=self.config.cpu_kubeconfig,
-            namespace=self.config.namespace,
-            wheel=self.config.wheel,
-            bundle=self.config.bundle,
-            agent_config_digest=config_digest,
-            clusters=self.config.clusters,
-            nlb=self.config.nlb,
-            auto_rollback=False,
-        )
+        rollback_config = self.config.for_rollback(config_digest)
         environment = {
             **os.environ,
             "KUBECONFIG": rollback_config.cpu_kubeconfig,
+            "GPU_FAULT_AWS_REGION": rollback_config.aws_region,
             "GPU_FAULT_NAMESPACE": rollback_config.namespace,
             "GPU_FAULT_WHEEL_CONFIGMAP": cpu_wheel,
             "GPU_FAULT_WHEEL_SHA256": cpu_sha,
@@ -1156,25 +1027,10 @@ class RegionalRelease:
     def _apply_nlb(self) -> None:
         if not self.config.nlb:
             return
-        required = (
-            "public_subnets",
-            "security_group",
-            "certificate_arn",
-        )
-        missing = [name for name in required if not self.config.nlb.get(name)]
-        if missing:
-            raise ReleaseError("nlb config is missing: " + ", ".join(missing))
         text = (
             ROOT / "deploy/control-plane/regional/regional-control-plane-nlb.yaml"
         ).read_text(encoding="utf-8")
-        replacements = {
-            "REPLACE_WITH_PUBLIC_SUBNETS": self.config.nlb["public_subnets"],
-            "REPLACE_WITH_NLB_SECURITY_GROUP": self.config.nlb["security_group"],
-            "REPLACE_WITH_TLS_CERTIFICATE_ARN": self.config.nlb["certificate_arn"],
-            "namespace: gpu-fault-system": (f"namespace: {self.config.namespace}"),
-        }
-        for source, target in replacements.items():
-            text = text.replace(source, target)
+        text = render_nlb_manifest(self.config, text)
         self.runner.run(self._cpu("apply", "-f", "-"), input_text=text)
 
     def _ensure_gpu_namespace(self, target: ClusterTarget) -> None:

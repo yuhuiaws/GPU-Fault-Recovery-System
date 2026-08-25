@@ -3,11 +3,12 @@
 # Install this file as mode 0600 outside the repository, replace every
 # REPLACE_* value, and source it at the start of each operator session.
 
-export AWS_REGION='us-west-2'
+export AWS_REGION='REPLACE_WITH_AWS_REGION'
 export NAMESPACE='gpu-fault-system'
 
 export CPU_KUBECONFIG='REPLACE_WITH_ABSOLUTE_CPU_KUBECONFIG'
 export CPU_EKS_NAME='REPLACE_WITH_CPU_EKS_NAME'
+export CPU_EKS_ARN='REPLACE_WITH_CPU_EKS_ARN'
 export CPU_HYPERPOD_CLUSTER='REPLACE_WITH_CPU_HYPERPOD_CLUSTER_NAME'
 
 export GPU_EKS_CONTEXT='REPLACE_WITH_GPU_EKS_CONTEXT'
@@ -37,7 +38,7 @@ export EXECUTOR_IRSA_ROLE_ARN='REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN'
 export GPU_FAULT_RUNTIME_IMAGE='public.ecr.aws/docker/library/python:3.12-slim'
 export GPU_FAULT_NODE_INSTALLER_IMAGE='public.ecr.aws/amazonlinux/amazonlinux:2023'
 export GPU_FAULT_DCGM_EXPORTER_IMAGE='nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04'
-export GPU_FAULT_ADOT_IMAGE='602401143452.dkr.ecr.us-west-2.amazonaws.com/hyperpod/otel_collector:v1783977775530'
+export GPU_FAULT_ADOT_IMAGE='REPLACE_WITH_APPROVED_ADOT_IMAGE'
 
 regional_require() {
     local name
@@ -50,4 +51,25 @@ regional_require() {
             return 2
         fi
     done
+}
+
+regional_validate_region() {
+    regional_require AWS_REGION || return
+    if [[ ! "${AWS_REGION}" =~ ^[a-z0-9]+(-[a-z0-9]+)+-[0-9]+$ ]]; then
+        printf 'ERROR: AWS_REGION is not a valid AWS Region: %s\n' \
+            "${AWS_REGION}" >&2
+        return 2
+    fi
+}
+
+regional_assert_eks_arn_region() {
+    local name="$1"
+    local arn="${!name:-}"
+    regional_validate_region || return
+    regional_require "${name}" || return
+    if [[ "${arn}" != arn:*:eks:"${AWS_REGION}":*:cluster/* ]]; then
+        printf 'ERROR: %s does not belong to AWS_REGION %s: %s\n' \
+            "${name}" "${AWS_REGION}" "${arn}" >&2
+        return 2
+    fi
 }

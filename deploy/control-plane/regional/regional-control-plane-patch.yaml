@@ -34,11 +34,12 @@ spec:
             # AWS_DEFAULT_REGION; it is not derived from Pod Identity.
             # Without it every notification fails with botocore
             # NoRegionError while fault handling itself looks healthy.
-            # Replace for a non-Oregon deployment.
+            # The apply path replaces this required placeholder from the
+            # operator-selected regional release configuration.
             - name: AWS_REGION
-              value: us-west-2
+              value: REPLACE_WITH_AWS_REGION
             - name: AWS_DEFAULT_REGION
-              value: us-west-2
+              value: REPLACE_WITH_AWS_REGION
             # In asynchronous delivery mode notifications are written to
             # the outbox and drained by the dispatcher. Enabling email
             # without the dispatcher leaves every notification PENDING

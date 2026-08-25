@@ -116,6 +116,8 @@ deploy/control-plane/regional/rollout-regional-release.sh
 
 部署前必须显式确认目标 Kubernetes context、AWS Region、release metadata、数据库
 连接、集群注册信息和节点安装制品。
+AWS Region 必须由部署操作者填写，不能从当前 shell、kubectl context 或示例文件推断；
+区域编排器会在任何 apply 前校验 CPU/GPU EKS ARN 与 HyperPod 归属。
 
 ## 训练任务提交
 

@@ -220,6 +220,34 @@ def test_git_base_diff_requires_a_related_document_change(tmp_path: Path) -> Non
     assert "source-python" in accepted.stdout
 
 
+def test_git_diff_preserves_unicode_document_paths(tmp_path: Path) -> None:
+    repository = make_repository(tmp_path)
+    design = repository / "docs" / "design.md"
+    unicode_design = repository / "docs" / "设计.md"
+    design.rename(unicode_design)
+    contract = repository / "docs" / "code-doc-contracts.yaml"
+    contract.write_text(
+        CONTRACTS.replace("docs/design.md", "docs/设计.md"), encoding="utf-8"
+    )
+    git(repository, "init")
+    git(repository, "config", "user.email", "tests@example.invalid")
+    git(repository, "config", "user.name", "Documentation Contract Tests")
+    git(repository, "add", ".")
+    git(repository, "commit", "-m", "initial")
+    base = git(repository, "rev-parse", "HEAD")
+
+    runtime = repository / "src" / "package" / "runtime.py"
+    runtime.write_text("VALUE = 2\n", encoding="utf-8")
+    unicode_design.write_text("# 设计\n\nRuntime value changed.\n", encoding="utf-8")
+    git(repository, "add", ".")
+    git(repository, "commit", "-m", "update runtime and unicode documentation")
+
+    result = run_check(repository, "--base", base, "--head", "HEAD")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "source-python" in result.stdout
+
+
 def test_contract_validation_rejects_uncovered_files(tmp_path: Path) -> None:
     repository = make_repository(tmp_path)
     tool = repository / "tools" / "uncovered.py"

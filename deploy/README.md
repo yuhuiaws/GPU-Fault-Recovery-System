@@ -5,6 +5,11 @@ tools. Test, canary, smoke and fault-injection manifests live outside this
 tree so a directory-level apply cannot inject a fault into a production
 cluster.
 
+Regional production inputs never infer an AWS Region from the current shell
+or kubectl context. Operators must replace the Region placeholders, and the
+regional orchestrator rejects CPU/GPU EKS identities from another Region
+before applying any object.
+
 | Deployment surface | Directory | Entry point |
 |---|---|---|
 | Regional CPU control plane | `control-plane/` | `control-plane/regional/rollout-regional-release.sh` or `control-plane/tools/apply-control-plane-role-split.sh` |

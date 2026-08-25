@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -45,6 +46,27 @@ def test_regional_greenfield_orders_required_objects() -> None:
     assert "required-regional-executor-protocol-version=" in text
     assert "CURRENT_AGENT_PROTOCOL_VERSION" in text
     assert "CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION" in text
+
+
+def test_regional_region_is_operator_selected_and_fail_closed() -> None:
+    text = manual()
+    env_template = (
+        ROOT / "deploy/control-plane/regional/regional-env.example.sh"
+    ).read_text(encoding="utf-8")
+    release_template = json.loads(
+        (
+            ROOT / "deploy/control-plane/regional/regional-release.example.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert "不能从当前 shell、默认 kubectl" in text
+    assert "regional_validate_region" in text
+    assert "regional_assert_eks_arn_region CPU_EKS_ARN" in text
+    assert "regional_assert_eks_arn_region GPU_EKS_ARN" in text
+    assert 'test "${GPU_NODE_RECOVERY}" = "None"' in text
+    assert "AWS_REGION='REPLACE_WITH_AWS_REGION'" in env_template
+    assert release_template["aws_region"] == "REPLACE_WITH_AWS_REGION"
+    assert release_template["cpu_eks_arn"] == "REPLACE_WITH_CPU_EKS_ARN"
 
 
 def test_manual_uses_current_regional_rollout_contracts() -> None:

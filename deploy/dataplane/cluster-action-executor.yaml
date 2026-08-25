@@ -110,9 +110,9 @@ spec:
               exec gpu-fault-cluster-executor
           env:
             - name: AWS_REGION
-              value: us-west-2
+              value: REPLACE_WITH_AWS_REGION
             - name: AWS_DEFAULT_REGION
-              value: us-west-2
+              value: REPLACE_WITH_AWS_REGION
             - name: GPU_FAULT_CONTROL_PLANE_URL
               valueFrom:
                 secretKeyRef:

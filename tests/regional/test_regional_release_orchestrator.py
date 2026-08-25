@@ -14,6 +14,9 @@ from tests._script_loader import lazy_script_module
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
 MODULE = lazy_script_module("rollout_regional_release", MODULE_PATH)
+REGION = "us-east-1"
+CPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-fault-control-plane"
+GPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
 
 
 def test_upgrade_ensures_schema_before_rolling_cpu() -> None:
@@ -33,7 +36,10 @@ def config_file(tmp_path: Path, *, clusters=None) -> Path:
     wheel.write_bytes(b"wheel")
     bundle.write_bytes(b"bundle")
     value = {
+        "aws_region": REGION,
         "cpu_kubeconfig": "/secure/cpu.kubeconfig",
+        "cpu_eks_arn": CPU_EKS_ARN,
+        "cpu_hyperpod_cluster_name": "gpu-fault-control-plane",
         "namespace": "gpu-fault-system",
         "release": {
             "wheel": str(wheel),
@@ -46,6 +52,9 @@ def config_file(tmp_path: Path, *, clusters=None) -> Path:
                 "cluster_id": "gpu-a",
                 "context": "gpu-a-context",
                 "executor_irsa_role_arn": "arn:aws:iam::1:role/a",
+                "region": REGION,
+                "hyperpod_cluster_name": "gpu-a",
+                "eks_cluster_arn": GPU_EKS_ARN,
             }
         ],
     }
@@ -74,13 +83,19 @@ def manifest_config_file(tmp_path: Path) -> Path:
     path.write_text(
         json.dumps(
             {
+                "aws_region": REGION,
                 "cpu_kubeconfig": "/secure/cpu.kubeconfig",
+                "cpu_eks_arn": CPU_EKS_ARN,
+                "cpu_hyperpod_cluster_name": "gpu-fault-control-plane",
                 "release": {"manifest": str(manifest), "agent_config_digest": "a" * 64},
                 "clusters": [
                     {
                         "cluster_id": "gpu-a",
                         "context": "gpu-a-context",
                         "executor_irsa_role_arn": ("arn:aws:iam::1:role/a"),
+                        "region": REGION,
+                        "hyperpod_cluster_name": "gpu-a",
+                        "eks_cluster_arn": GPU_EKS_ARN,
                     }
                 ],
             }
@@ -94,10 +109,78 @@ def test_release_config_requires_unique_clusters(tmp_path) -> None:
         "cluster_id": "gpu-a",
         "context": "gpu-a-context",
         "executor_irsa_role_arn": "arn:aws:iam::1:role/a",
+        "region": REGION,
+        "hyperpod_cluster_name": "gpu-a",
+        "eks_cluster_arn": GPU_EKS_ARN,
     }
 
     with pytest.raises(MODULE.ReleaseError, match="unique"):
         MODULE.ReleaseConfig.load(config_file(tmp_path, clusters=[cluster, cluster]))
+
+
+def test_release_config_requires_explicit_matching_region(tmp_path: Path) -> None:
+    path = config_file(tmp_path)
+    value = json.loads(path.read_text())
+    value["aws_region"] = "REPLACE_WITH_AWS_REGION"
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(MODULE.ReleaseError, match="aws_region"):
+        MODULE.ReleaseConfig.load(path)
+
+    value["aws_region"] = REGION
+    value["clusters"][0]["region"] = "us-west-2"
+    path.write_text(json.dumps(value))
+    with pytest.raises(MODULE.ReleaseError, match="does not match aws_region"):
+        MODULE.ReleaseConfig.load(path)
+
+
+def test_release_config_rejects_cross_region_eks_arns(tmp_path: Path) -> None:
+    path = config_file(tmp_path)
+    value = json.loads(path.read_text())
+    value["clusters"][0]["eks_cluster_arn"] = (
+        "arn:aws:eks:us-west-2:123456789012:cluster/gpu-a"
+    )
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(MODULE.ReleaseError, match="eks_cluster_arn Region"):
+        MODULE.ReleaseConfig.load(path)
+
+
+def test_release_config_rejects_cross_region_nlb_certificate(tmp_path: Path) -> None:
+    path = config_file(tmp_path)
+    value = json.loads(path.read_text())
+    value["nlb"] = {
+        "name": "gpu-fault-regional",
+        "public_subnets": "subnet-a,subnet-b",
+        "security_group": "sg-0123456789abcdef0",
+        "certificate_arn": ("arn:aws:acm:us-west-2:123456789012:certificate/example"),
+    }
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(MODULE.ReleaseError, match="certificate_arn Region"):
+        MODULE.ReleaseConfig.load(path)
+
+
+def test_nlb_manifest_uses_explicit_name_and_region_certificate(tmp_path: Path) -> None:
+    path = config_file(tmp_path)
+    value = json.loads(path.read_text())
+    value["nlb"] = {
+        "name": "gpu-fault-regional-test",
+        "public_subnets": "subnet-a,subnet-b",
+        "security_group": "sg-0123456789abcdef0",
+        "certificate_arn": ("arn:aws:acm:us-east-1:123456789012:certificate/example"),
+    }
+    path.write_text(json.dumps(value))
+    config = MODULE.ReleaseConfig.load(path)
+
+    source = (
+        ROOT / "deploy/control-plane/regional/regional-control-plane-nlb.yaml"
+    ).read_text(encoding="utf-8")
+    rendered = MODULE.render_nlb_manifest(config, source)
+
+    assert "gpu-fault-regional-test" in rendered
+    assert "arn:aws:acm:us-east-1:" in rendered
+    assert "REPLACE_WITH" not in rendered
 
 
 def test_plan_covers_first_deploy_and_rollback(tmp_path) -> None:
@@ -111,6 +194,75 @@ def test_plan_covers_first_deploy_and_rollback(tmp_path) -> None:
     assert any("PostgreSQL schema" in step for step in deploy)
     assert any("previous required pins" in step for step in rollback)
     assert any("installer bundle" in step for step in rollback)
+
+
+class PreflightRunner:
+    dry_run = False
+
+    def __init__(
+        self, *, gpu_eks_arn: str = GPU_EKS_ARN, gpu_node_recovery: str = "None"
+    ) -> None:
+        self.gpu_eks_arn = gpu_eks_arn
+        self.gpu_node_recovery = gpu_node_recovery
+
+    def run(self, args, **kwargs):
+        del kwargs
+        if "config" in args and "view" in args:
+            return CPU_EKS_ARN if "--kubeconfig" in args else self.gpu_eks_arn
+        if args[:3] == ["aws", "sagemaker", "describe-cluster"]:
+            cluster_name = args[args.index("--cluster-name") + 1]
+            return json.dumps(
+                {
+                    "EksClusterArn": (
+                        GPU_EKS_ARN if cluster_name == "gpu-a" else CPU_EKS_ARN
+                    ),
+                    "NodeRecovery": (
+                        self.gpu_node_recovery
+                        if cluster_name == "gpu-a"
+                        else "Automatic"
+                    ),
+                }
+            )
+        if "--raw=/readyz" in args:
+            return "ok"
+        raise AssertionError(f"unexpected preflight command: {args}")
+
+
+def test_preflight_binds_contexts_and_hyperpod_to_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, PreflightRunner())
+    monkeypatch.setattr(release, "_validate_executor_iam_role", lambda _target: None)
+
+    MODULE.ensure_region_contexts(release)
+
+
+def test_preflight_rejects_wrong_context_and_managed_gpu_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    wrong_context = MODULE.RegionalRelease(
+        config,
+        PreflightRunner(
+            gpu_eks_arn=("arn:aws:eks:us-east-1:123456789012:cluster/unexpected-gpu")
+        ),
+    )
+    monkeypatch.setattr(
+        wrong_context, "_validate_executor_iam_role", lambda _target: None
+    )
+
+    with pytest.raises(MODULE.ReleaseError, match="does not match"):
+        MODULE.ensure_region_contexts(wrong_context)
+
+    managed_recovery = MODULE.RegionalRelease(
+        config, PreflightRunner(gpu_node_recovery="Automatic")
+    )
+    monkeypatch.setattr(
+        managed_recovery, "_validate_executor_iam_role", lambda _target: None
+    )
+    with pytest.raises(MODULE.ReleaseError, match="NodeRecovery=None"):
+        MODULE.ensure_region_contexts(managed_recovery)
 
 
 def test_join_cluster_requires_current_release_artifact(tmp_path) -> None:
@@ -244,6 +396,12 @@ def test_release_renders_one_runtime_image_across_gpu_roles(
     assert len(rendered) == 3
     assert all(runtime_image in item for item in rendered)
     assert all(MODULE.DEFAULT_RUNTIME_IMAGE not in item for item in rendered)
+    assert any(f"value: {REGION}" in item for item in rendered), (
+        "GPU manifests did not receive the configured Region"
+    )
+    assert all("REPLACE_WITH_AWS_REGION" not in item for item in rendered), (
+        "GPU manifests retained an unresolved Region placeholder"
+    )
 
     release._deploy_reconciler(
         target,

@@ -1,5 +1,8 @@
 {
+  "aws_region": "REPLACE_WITH_AWS_REGION",
   "cpu_kubeconfig": "/secure/cpu-control-plane.kubeconfig",
+  "cpu_eks_arn": "REPLACE_WITH_CPU_EKS_ARN",
+  "cpu_hyperpod_cluster_name": "REPLACE_WITH_CPU_HYPERPOD_CLUSTER_NAME",
   "namespace": "gpu-fault-system",
   "auto_rollback": true,
   "release": {
@@ -7,18 +10,19 @@
     "agent_config_digest": "REPLACE_WITH_64_HEX_CONFIG_DIGEST"
   },
   "nlb": {
-    "public_subnets": "subnet-a,subnet-b",
-    "security_group": "sg-0123456789abcdef0",
-    "certificate_arn": "arn:aws:acm:us-west-2:123456789012:certificate/example"
+    "name": "REPLACE_WITH_NLB_NAME",
+    "public_subnets": "REPLACE_WITH_PUBLIC_SUBNET_IDS",
+    "security_group": "REPLACE_WITH_NLB_SECURITY_GROUP_ID",
+    "certificate_arn": "REPLACE_WITH_ACM_CERTIFICATE_ARN"
   },
   "clusters": [
     {
       "cluster_id": "gpu-prod-a",
-      "context": "arn:aws:eks:us-west-2:123456789012:cluster/gpu-prod-a",
-      "region": "us-west-2",
-      "hyperpod_cluster_name": "gpu-prod-a",
-      "eks_cluster_arn": "arn:aws:eks:us-west-2:123456789012:cluster/gpu-prod-a",
-      "executor_irsa_role_arn": "arn:aws:iam::123456789012:role/gpu-fault-executor",
+      "context": "REPLACE_WITH_GPU_EKS_CONTEXT",
+      "region": "REPLACE_WITH_AWS_REGION",
+      "hyperpod_cluster_name": "REPLACE_WITH_GPU_HYPERPOD_CLUSTER_NAME",
+      "eks_cluster_arn": "REPLACE_WITH_GPU_EKS_ARN",
+      "executor_irsa_role_arn": "REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN",
       "allowed_namespaces": [
         "gpu-fault-system",
         "training"
