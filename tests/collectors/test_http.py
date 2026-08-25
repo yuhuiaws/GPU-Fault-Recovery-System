@@ -211,8 +211,10 @@ def test_http_event_sink_buffers_and_replays_retryable_failures(
     monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", urlopen_probe)
     outbox = tmp_path / "outbox.ndjson"
     sink = HttpEventSink("https://control", max_attempts=1, outbox_path=str(outbox))
-    with pytest.raises(CollectorError):
+    with pytest.raises(CollectorError) as captured:
         sink.post("/events", {"sequence": 1})
+    assert captured.value.buffered is True, "retryable failure was not buffered"
+    assert captured.value.replayable is True, "buffered failure is not replayable"
     buffered = json.loads(outbox.read_text())
     assert buffered["replayable"] is True
 

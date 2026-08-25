@@ -75,7 +75,42 @@ def test_kernel_collector_keeps_identical_unsequenced_events() -> None:
     assert first.delivered == 1
     assert second.delivered == 1
     assert len(sink.requests) == 2
-    assert sink.requests[0][1]["record_id"] != sink.requests[1][1]["record_id"]
+    assert (
+        sink.requests[0][1]["record_id"] != sink.requests[1][1]["record_id"]
+    ), "unsequenced events must receive distinct fallback record IDs"
+
+
+def test_kernel_collector_continues_after_retryable_event_is_buffered() -> None:
+    class BufferedThenHealthySink:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def post(self, path, payload):
+            self.requests.append((path, payload))
+            if len(self.requests) == 1:
+                raise CollectorError(
+                    "network unavailable", buffered=True, replayable=True
+                )
+            return {"accepted": True}
+
+    sink = BufferedThenHealthySink()
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="test-boot", now=lambda: NOW
+    )
+
+    stats = collector.collect_lines(
+        [
+            "3,52011,223456789,-;NVRM: Xid (PCI:0000:59:00): 11, name=first\n",
+            "3,52012,223456790,-;NVRM: Xid (PCI:0000:59:00): 11, name=second\n",
+        ]
+    )
+
+    assert [item[1]["record_id"] for item in sink.requests] == [
+        "kmsg-test-boot-52011",
+        "kmsg-test-boot-52012",
+    ], "collector stopped reading after the first event was buffered"
+    assert stats.observed == 2, "collector did not observe both kmsg records"
+    assert stats.delivered == 1, "only the healthy delivery should count as delivered"
 
 
 def test_kernel_collector_starts_at_live_tail(monkeypatch) -> None:

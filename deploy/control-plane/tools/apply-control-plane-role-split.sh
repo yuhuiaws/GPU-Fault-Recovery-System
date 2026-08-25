@@ -368,6 +368,7 @@ for config in "${GENERATED}"/gpu-fault-*-config-*.yaml; do
     apply_manifest "${name}"
 done
 
+apply_manifest gpu-fault-api-ha-pdb
 apply_manifest gpu-fault-control-worker-pdb
 apply_manifest gpu-fault-telemetry-spool-worker-pdb
 apply_manifest gpu-fault-telemetry-spool-worker

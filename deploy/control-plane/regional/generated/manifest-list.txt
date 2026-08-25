@@ -5,6 +5,7 @@ gpu-fault-api-ha-config-processor.yaml
 gpu-fault-api-ha-config-recovery.yaml
 gpu-fault-api-ha-config-telemetry.yaml
 gpu-fault-api-ha-ingress.yaml
+gpu-fault-api-ha-pdb.yaml
 gpu-fault-control-worker-config-core.yaml
 gpu-fault-control-worker-config-notification.yaml
 gpu-fault-control-worker-config-postgres.yaml

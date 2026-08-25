@@ -107,12 +107,22 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
         item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
     }
     ingress = items["gpu-fault-api-ha"]
+    ingress_pdb = next(
+        item
+        for item in json.loads(result.stdout)["items"]
+        if item["kind"] == "PodDisruptionBudget"
+        and item["metadata"]["name"] == "gpu-fault-api-ha-pdb"
+    )
     worker = items["gpu-fault-control-worker"]
     worker_pdb = items["gpu-fault-control-worker-pdb"]
     spool = items["gpu-fault-telemetry-spool-worker"]
     spool_pdb = items["gpu-fault-telemetry-spool-worker-pdb"]
 
     assert ingress["spec"]["replicas"] == 3
+    assert ingress_pdb["spec"]["minAvailable"] == 2, "ingress PDB lost quorum"
+    assert ingress_pdb["spec"]["selector"]["matchLabels"] == {
+        "app": "gpu-fault-api-ha"
+    }, "ingress PDB selects the wrong pods"
     ingress_env = _effective_env(items, ingress)
     assert ingress_env["GPU_FAULT_TELEMETRY_SPOOL"] == "false"
     assert ingress_env["GPU_FAULT_POSTGRES_POOL_MAX_SIZE"] == "40"

@@ -109,6 +109,38 @@ class Runner:
         return completed.stdout.strip() if capture else ""
 
 
+def agents_converged(
+    items: list[dict[str, Any]],
+    target: ClusterTarget,
+    artifact_sha: str,
+) -> bool:
+    nodes = [
+        item
+        for item in items
+        if (
+            item.get("metadata", {})
+            .get("labels", {})
+            .get("sagemaker.amazonaws.com/cluster-name")
+            == target.hyperpod_cluster_name
+        )
+    ]
+    aligned = [
+        item
+        for item in nodes
+        if (
+            item.get("metadata", {})
+            .get("annotations", {})
+            .get("gpu-fault.io/installer-state")
+            == "Succeeded"
+            and item.get("metadata", {})
+            .get("annotations", {})
+            .get("gpu-fault.io/installer-artifact-sha256")
+            == artifact_sha
+        )
+    ]
+    return bool(nodes) and len(aligned) == len(nodes)
+
+
 class RegionalRelease:
     _ensure_contexts = ensure_region_contexts
 
@@ -663,31 +695,7 @@ class RegionalRelease:
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             value = self._get_json(self._gpu(target, "get", "nodes"))
-            nodes = [
-                item
-                for item in value.get("items", [])
-                if (
-                    item.get("metadata", {})
-                    .get("labels", {})
-                    .get("sagemaker.amazonaws.com/cluster-name")
-                    == target.cluster_id
-                )
-            ]
-            aligned = [
-                item
-                for item in nodes
-                if (
-                    item.get("metadata", {})
-                    .get("annotations", {})
-                    .get("gpu-fault.io/installer-state")
-                    == "Succeeded"
-                    and item.get("metadata", {})
-                    .get("annotations", {})
-                    .get("gpu-fault.io/installer-artifact-sha256")
-                    == artifact_sha
-                )
-            ]
-            if nodes and len(aligned) == len(nodes):
+            if agents_converged(value.get("items", []), target, artifact_sha):
                 return
             if self.runner.dry_run:
                 return

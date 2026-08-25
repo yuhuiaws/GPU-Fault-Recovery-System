@@ -1,6 +1,6 @@
 {
   "classes": {
-    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 1127,
+    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 1103,
     "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 946,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1546,
     "src/gpu_fault/fleet.py:FleetRegistry": 848,
@@ -21,7 +21,7 @@
     "src/gpu_fault/store/postgres/ddl.py": 1514
   },
   "functions": {
-    "deploy/control-plane/tools/render_control_plane_role_split.py:main": 678,
+    "deploy/control-plane/tools/render_control_plane_role_split.py:main": 670,
     "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 255,
     "src/gpu_fault/adapters/hyperpod/lifecycle.py:HyperPodLifecycleStepAdapter.execute": 212,
     "src/gpu_fault/app/factory.py:create_app": 286,

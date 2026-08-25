@@ -260,6 +260,30 @@ def consumer_copy(source: dict, role: str) -> dict:
     return resource
 
 
+def pod_disruption_budget(
+    name: str,
+    namespace: str,
+    app: str,
+    *,
+    min_available: int | None = None,
+    max_unavailable: int | None = None,
+) -> dict:
+    availability = (
+        {"minAvailable": min_available}
+        if min_available is not None
+        else {"maxUnavailable": max_unavailable}
+    )
+    return {
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            **availability,
+            "selector": {"matchLabels": {"app": app}},
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir")
@@ -466,6 +490,12 @@ def main() -> None:
     pod_spec.setdefault("securityContext", {}).pop("sysctls", None)
 
     pod_spec["containers"] = [ingress]
+    ingress_pdb = pod_disruption_budget(
+        "gpu-fault-api-ha-pdb",
+        deployment["metadata"].get("namespace", "gpu-fault-system"),
+        "gpu-fault-api-ha",
+        min_available=2,
+    )
 
     worker_deployment = consumer_copy(source, "control")
     worker_deployment["spec"]["replicas"] = int(
@@ -654,20 +684,12 @@ def main() -> None:
             "labelSelector": {"matchLabels": {"app": "gpu-fault-control-worker"}},
         }
     ]
-    worker_pdb = {
-        "apiVersion": "policy/v1",
-        "kind": "PodDisruptionBudget",
-        "metadata": {
-            "name": "gpu-fault-control-worker-pdb",
-            "namespace": worker_deployment["metadata"].get(
-                "namespace", "gpu-fault-system"
-            ),
-        },
-        "spec": {
-            "maxUnavailable": 1,
-            "selector": {"matchLabels": {"app": "gpu-fault-control-worker"}},
-        },
-    }
+    worker_pdb = pod_disruption_budget(
+        "gpu-fault-control-worker-pdb",
+        worker_deployment["metadata"].get("namespace", "gpu-fault-system"),
+        "gpu-fault-control-worker",
+        max_unavailable=1,
+    )
     spool_deployment = consumer_copy(source, "spool")
     spool_deployment["spec"]["replicas"] = int(
         os.getenv("GPU_FAULT_TELEMETRY_SPOOL_REPLICAS", "0")
@@ -836,20 +858,12 @@ def main() -> None:
             },
         }
     ]
-    spool_pdb = {
-        "apiVersion": "policy/v1",
-        "kind": "PodDisruptionBudget",
-        "metadata": {
-            "name": "gpu-fault-telemetry-spool-worker-pdb",
-            "namespace": spool_deployment["metadata"].get(
-                "namespace", "gpu-fault-system"
-            ),
-        },
-        "spec": {
-            "maxUnavailable": 1,
-            "selector": {"matchLabels": {"app": "gpu-fault-telemetry-spool-worker"}},
-        },
-    }
+    spool_pdb = pod_disruption_budget(
+        "gpu-fault-telemetry-spool-worker-pdb",
+        spool_deployment["metadata"].get("namespace", "gpu-fault-system"),
+        "gpu-fault-telemetry-spool-worker",
+        max_unavailable=1,
+    )
 
     for item in (
         deployment,
@@ -890,6 +904,7 @@ def main() -> None:
                     "items": [
                         *config_maps,
                         deployment,
+                        ingress_pdb,
                         worker_deployment,
                         worker_pdb,
                         spool_deployment,
@@ -912,6 +927,7 @@ def main() -> None:
         written.append(filename)
     for item, filename in (
         (deployment, "gpu-fault-api-ha-ingress.yaml"),
+        (ingress_pdb, "gpu-fault-api-ha-pdb.yaml"),
         (
             worker_deployment,
             "gpu-fault-control-worker.yaml",

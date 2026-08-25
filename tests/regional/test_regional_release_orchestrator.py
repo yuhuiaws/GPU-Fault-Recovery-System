@@ -47,6 +47,33 @@ def test_upgrade_ensures_schema_before_rolling_cpu() -> None:
     )
 
 
+def test_agent_convergence_uses_hyperpod_cluster_name(tmp_path: Path) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    items = [
+        {
+            "metadata": {
+                "labels": {"sagemaker.amazonaws.com/cluster-name": "hp-gpu-a"},
+                "annotations": {
+                    "gpu-fault.io/installer-state": "Succeeded",
+                    "gpu-fault.io/installer-artifact-sha256": hashlib.sha256(
+                        b"wheel"
+                    ).hexdigest(),
+                },
+            }
+        },
+        {
+            "metadata": {
+                "labels": {"sagemaker.amazonaws.com/cluster-name": "another-hyperpod"},
+                "annotations": {},
+            }
+        },
+    ]
+
+    assert MODULE.agents_converged(
+        items, config.clusters[0], hashlib.sha256(b"wheel").hexdigest()
+    ), "agent convergence ignored the configured HyperPod cluster name"
+
+
 def config_file(
     tmp_path: Path, *, clusters=None, profile_version: str = "hyperpod-v1"
 ) -> Path:

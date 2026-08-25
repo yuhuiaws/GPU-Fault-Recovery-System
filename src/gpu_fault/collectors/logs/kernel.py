@@ -90,12 +90,13 @@ class KernelLogCollector:
                 break
             stats = stats.model_copy(update={"observed": stats.observed + 1})
             parsed = self._parse_record(line.rstrip("\n"))
-            if not NVIDIA_EVENT_PATTERN.search(parsed["message"]):
+            message = parsed["message"] or ""
+            if not NVIDIA_EVENT_PATTERN.search(message):
                 stats = stats.model_copy(update={"skipped": stats.skipped + 1})
                 continue
-            if SXID_PATTERN.search(
-                parsed["message"]
-            ) and not SXID_SUMMARY_PATTERN.search(parsed["message"]):
+            if SXID_PATTERN.search(message) and not SXID_SUMMARY_PATTERN.search(
+                message
+            ):
                 stats = stats.model_copy(update={"skipped": stats.skipped + 1})
                 continue
             record_id = self._record_id(parsed)
@@ -105,23 +106,35 @@ class KernelLogCollector:
             collected_at = self.now()
             monotonic = parsed.get("monotonic_us")
             observed_at = self._observed_at(parsed, collected_at=collected_at)
-            self.sink.post(
-                NVIDIA_KERNEL_PATH,
-                {
-                    **self.context.model_dump(mode="json"),
-                    "node_id": self.node_id,
-                    "record_id": record_id,
-                    "observed_at": observed_at.isoformat(),
-                    "source_monotonic_us": (int(monotonic) if monotonic else None),
-                    "source_boot_id": self.boot_id,
-                    "collected_at": collected_at.isoformat(),
-                    "message": parsed["message"],
-                    "evidence_ref": (
-                        f"kmsg://{self.node_id}/{self.boot_id}/"
-                        f"{parsed.get('sequence') or record_id}"
-                    ),
-                },
-            )
+            try:
+                self.sink.post(
+                    NVIDIA_KERNEL_PATH,
+                    {
+                        **self.context.model_dump(mode="json"),
+                        "node_id": self.node_id,
+                        "record_id": record_id,
+                        "observed_at": observed_at.isoformat(),
+                        "source_monotonic_us": (int(monotonic) if monotonic else None),
+                        "source_boot_id": self.boot_id,
+                        "collected_at": collected_at.isoformat(),
+                        "message": message,
+                        "evidence_ref": (
+                            f"kmsg://{self.node_id}/{self.boot_id}/"
+                            f"{parsed.get('sequence') or record_id}"
+                        ),
+                    },
+                )
+            except CollectorError as exc:
+                if not (exc.buffered and exc.replayable):
+                    raise
+                LOGGER.warning(
+                    "kernel event persisted to the collector outbox; "
+                    "continuing live kmsg collection: record=%s error=%s",
+                    record_id,
+                    exc,
+                )
+                self._remember(record_id)
+                continue
             self._remember(record_id)
             stats = stats.model_copy(update={"delivered": stats.delivered + 1})
         return stats

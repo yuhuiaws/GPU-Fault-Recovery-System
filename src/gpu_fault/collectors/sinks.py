@@ -25,9 +25,18 @@ LOGGER = logging.getLogger(__name__)
 
 
 class CollectorError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        buffered: bool = False,
+        replayable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.buffered = buffered
+        self.replayable = replayable
 
 
 class EventSink(Protocol):
@@ -207,8 +216,9 @@ class HttpEventSink:
                 last_error = exc
                 if exc.code < 500 and exc.code != 429:
                     detail = exc.read().decode(errors="replace")
+                    buffered = False
                     if buffer_failure:
-                        self._buffer_event(
+                        buffered = self._buffer_event(
                             path,
                             payload,
                             replayable=False,
@@ -217,6 +227,7 @@ class HttpEventSink:
                     raise CollectorError(
                         f"collector event rejected ({exc.code}): {detail}",
                         status_code=exc.code,
+                        buffered=buffered,
                     ) from exc
                 try:
                     retry_after = float(exc.headers.get("Retry-After", "0"))
@@ -232,9 +243,19 @@ class HttpEventSink:
                     delay = self.jitter(0.0, backoff)
                 self.sleep(delay)
         error = f"control-plane delivery failed after {attempts} attempts: {last_error}"
+        buffered = False
         if buffer_failure:
-            self._buffer_event(path, payload, replayable=True, error=error)
-        raise CollectorError(error)
+            buffered = self._buffer_event(
+                path,
+                payload,
+                replayable=True,
+                error=error,
+            )
+        raise CollectorError(
+            error,
+            buffered=buffered,
+            replayable=buffered,
+        )
 
     @staticmethod
     def _requires_processor_receipt(path: str) -> bool:
@@ -291,9 +312,9 @@ class HttpEventSink:
         *,
         replayable: bool,
         error: str,
-    ) -> None:
+    ) -> bool:
         if self.outbox_path is None:
-            return
+            return False
         record = {
             "path": path,
             "payload": payload,
@@ -306,8 +327,10 @@ class HttpEventSink:
                 records = self._read_outbox()
                 records.append(record)
                 self._write_outbox(records[-self.outbox_max_records :])
+            return True
         except OSError:
             LOGGER.exception("cannot persist collector outbox event")
+            return False
 
     def _read_outbox(self) -> list[dict[str, Any]]:
         if self.outbox_path is None or not self.outbox_path.exists():

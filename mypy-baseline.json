@@ -155,7 +155,6 @@
   "src/gpu_fault/collectors/host/network.py:var-annotated": 3,
   "src/gpu_fault/collectors/host/system_metrics.py:var-annotated": 1,
   "src/gpu_fault/collectors/logs/__init__.py:no-untyped-def": 1,
-  "src/gpu_fault/collectors/logs/kernel.py:arg-type": 3,
   "src/gpu_fault/collectors/logs/node.py:var-annotated": 2,
   "src/gpu_fault/completion_controller.py:assignment": 1,
   "src/gpu_fault/completion_controller.py:misc": 1,

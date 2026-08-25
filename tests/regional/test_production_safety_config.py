@@ -145,7 +145,9 @@ def test_processor_replay_secret_is_separate_and_liveness_is_http() -> None:
     }
 
 
-def test_worker_and_adot_have_disruption_protection() -> None:
+def test_control_plane_roles_and_adot_have_disruption_protection() -> None:
+    ingress = load(GENERATED / "gpu-fault-api-ha-ingress.yaml")
+    ingress_pdb = load(GENERATED / "gpu-fault-api-ha-pdb.yaml")
     worker = load(GENERATED / "gpu-fault-control-worker.yaml")
     worker_pdb = load(GENERATED / "gpu-fault-control-worker-pdb.yaml")
     spool = load(GENERATED / "gpu-fault-telemetry-spool-worker.yaml")
@@ -162,6 +164,11 @@ def test_worker_and_adot_have_disruption_protection() -> None:
         item for item in adot_documents if item.get("kind") == "PodDisruptionBudget"
     )
 
+    assert ingress["spec"]["replicas"] == 3, "ingress HA requires three replicas"
+    assert ingress_pdb["spec"]["minAvailable"] == 2, "ingress PDB lost quorum"
+    assert ingress_pdb["spec"]["selector"]["matchLabels"] == {
+        "app": "gpu-fault-api-ha"
+    }, "ingress PDB selects the wrong pods"
     assert worker["spec"]["replicas"] == 6
     assert worker_pdb["spec"]["maxUnavailable"] == 1
     assert worker_pdb["spec"]["selector"]["matchLabels"] == {

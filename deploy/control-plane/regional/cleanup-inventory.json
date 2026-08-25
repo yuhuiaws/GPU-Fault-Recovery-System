@@ -86,6 +86,14 @@
       },
       {
         "kind": "poddisruptionbudget",
+        "name": "gpu-fault-api-ha-pdb",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "poddisruptionbudget",
         "name": "gpu-fault-control-worker-pdb",
         "scope": "namespaced",
         "phase": "support",
