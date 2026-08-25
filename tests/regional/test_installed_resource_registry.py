@@ -6,7 +6,6 @@ from pathlib import Path
 
 from tests._script_loader import lazy_script_module
 
-
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = lazy_script_module(
     "sync_installed_resource_registry",
@@ -24,50 +23,25 @@ COLLECT_MODULE = lazy_script_module(
 
 class FakeKubectl:
     def __init__(
-        self,
-        *,
-        present: set[tuple[str, str]],
-        existing: dict | None = None,
+        self, *, present: set[tuple[str, str]], existing: dict | None = None
     ) -> None:
         self.present = present
         self.existing = existing
         self.applied: dict | None = None
 
     def run(
-        self,
-        arguments: list[str],
-        *,
-        input_text: str | None = None,
-        check: bool = True,
+        self, arguments: list[str], *, input_text: str | None = None, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
-        if arguments[0:4] == [
-            "-n",
-            "gpu-fault-system",
-            "get",
-            "configmap",
-        ]:
+        if arguments[0:4] == ["-n", "gpu-fault-system", "get", "configmap"]:
             if self.existing is None:
                 return subprocess.CompletedProcess(
-                    arguments,
-                    1,
-                    "",
-                    "Error from server (NotFound)",
+                    arguments, 1, "", "Error from server (NotFound)"
                 )
             value = {"data": {"inventory.json": json.dumps(self.existing)}}
-            return subprocess.CompletedProcess(
-                arguments,
-                0,
-                json.dumps(value),
-                "",
-            )
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(value), "")
         if arguments[0] == "apply":
             self.applied = json.loads(input_text or "{}")
-            return subprocess.CompletedProcess(
-                arguments,
-                0,
-                "",
-                "",
-            )
+            return subprocess.CompletedProcess(arguments, 0, "", "")
         offset = 2 if arguments[0] == "-n" else 0
         kind = arguments[offset + 1]
         name = arguments[offset + 2]
@@ -82,11 +56,7 @@ class FakeKubectl:
 
 class DiscoveryKubectl:
     def run(
-        self,
-        arguments: list[str],
-        *,
-        input_text: str | None = None,
-        check: bool = True,
+        self, arguments: list[str], *, input_text: str | None = None, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
         del input_text, check
         if "-A" in arguments:
@@ -108,23 +78,12 @@ class DiscoveryKubectl:
             ]
         elif "clusterrole" in arguments[1]:
             items = [
-                {
-                    "kind": "ClusterRole",
-                    "metadata": {"name": "gpu-fault-legacy-role"},
-                }
+                {"kind": "ClusterRole", "metadata": {"name": "gpu-fault-legacy-role"}}
             ]
         else:
-            items = [
-                {
-                    "kind": "Namespace",
-                    "metadata": {"name": "gf-regional-old"},
-                }
-            ]
+            items = [{"kind": "Namespace", "metadata": {"name": "gf-regional-old"}}]
         return subprocess.CompletedProcess(
-            arguments,
-            0,
-            json.dumps({"items": items}),
-            "",
+            arguments, 0, json.dumps({"items": items}), ""
         )
 
 
@@ -162,9 +121,7 @@ def write_inventory(tmp_path: Path) -> Path:
     return path
 
 
-def test_first_sync_writes_only_resources_that_exist(
-    tmp_path: Path,
-) -> None:
+def test_first_sync_writes_only_resources_that_exist(tmp_path: Path) -> None:
     kubectl = FakeKubectl(present={("deployment", "gpu-fault-api")})
 
     document = MODULE.synchronize(
@@ -185,9 +142,7 @@ def test_first_sync_writes_only_resources_that_exist(
     assert stored["resources"] == document["resources"]
 
 
-def test_sync_retains_live_legacy_resource_until_deleted(
-    tmp_path: Path,
-) -> None:
+def test_sync_retains_live_legacy_resource_until_deleted(tmp_path: Path) -> None:
     legacy = {
         "kind": "deployment",
         "name": "gpu-fault-legacy",
@@ -197,15 +152,8 @@ def test_sync_retains_live_legacy_resource_until_deleted(
         "clean": "delete",
     }
     kubectl = FakeKubectl(
-        present={
-            ("deployment", "gpu-fault-api"),
-            ("deployment", "gpu-fault-legacy"),
-        },
-        existing={
-            "schema_version": 1,
-            "plane": "cpu",
-            "resources": [legacy],
-        },
+        present={("deployment", "gpu-fault-api"), ("deployment", "gpu-fault-legacy")},
+        existing={"schema_version": 1, "plane": "cpu", "resources": [legacy]},
     )
 
     document = MODULE.synchronize(

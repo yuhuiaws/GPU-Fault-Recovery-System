@@ -155,7 +155,7 @@ class KubernetesWorkloadStopper:
                 )
         for workload_id in dict.fromkeys(workload_ids):
             namespace, kind, name = self._parse(workload_id)
-            body = {
+            body: dict[str, Any] = {
                 "metadata": {
                     "annotations": {
                         "gpu-fault.io/passive-stop-attempt": attempt_id,

@@ -143,14 +143,8 @@ def test_v2_capability_matrix_matches_registered_operations() -> None:
 
     overview = OVERVIEW_V2.read_text(encoding="utf-8")
     detail = DETAIL_V2.read_text(encoding="utf-8")
-    overview_count = re.search(
-        r"`WorkflowOperation` 共 (\d+) 个取值",
-        overview,
-    )
-    detail_count = re.search(
-        r"`WorkflowOperation` \*\*(\d+)\*\* 种",
-        detail,
-    )
+    overview_count = re.search(r"`WorkflowOperation` 共 (\d+) 个取值", overview)
+    detail_count = re.search(r"`WorkflowOperation` \*\*(\d+)\*\* 种", detail)
 
     assert overview_count is not None
     assert detail_count is not None
@@ -205,10 +199,7 @@ def test_v2_node_agent_contract_matches_runtime_models_and_routes() -> None:
         secret = "s" * 32
         ledger = Ledger()
 
-    app = create_node_agent_app(
-        executor=Agent(),
-        heartbeat_reporter=object(),
-    )
+    app = create_node_agent_app(executor=Agent(), heartbeat_reporter=object())
     runtime_routes = {
         (method, route.path)
         for route in app.routes
@@ -218,9 +209,7 @@ def test_v2_node_agent_contract_matches_runtime_models_and_routes() -> None:
     documented_routes = {
         (method, path.split("?", 1)[0])
         for method, path in re.findall(
-            r"^\| (GET|POST) \| `([^`]+)`",
-            route_section,
-            re.MULTILINE,
+            r"^\| (GET|POST) \| `([^`]+)`", route_section, re.MULTILINE
         )
     }
     assert documented_routes == runtime_routes

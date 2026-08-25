@@ -54,10 +54,16 @@ def make_repository(tmp_path: Path) -> Path:
 def run_check(
     root: Path, *arguments: str, environment: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
+    child_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"GPU_FAULT_DOC_IMPACT", "GPU_FAULT_DOC_IMPACT_REASON"}
+    }
+    child_environment.update(environment or {})
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--root", str(root), *arguments],
         cwd=ROOT,
-        env={**os.environ, **(environment or {})},
+        env=child_environment,
         text=True,
         capture_output=True,
         check=False,

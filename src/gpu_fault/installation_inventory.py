@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Annotated, Iterable
+from typing import Annotated, Iterable, Protocol, Self
 
 from pydantic import AfterValidator, BeforeValidator, model_validator
 
@@ -66,8 +66,8 @@ class InstalledUnitReport(StrictModel):
     digest: InventoryDigest
     units: InstalledUnits | None = None
 
-    @model_validator(mode="after")
-    def validate_units_digest(self):
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_units_digest(self) -> Self:
         if self.units is not None and installed_units_digest(self.units) != self.digest:
             raise ValueError("installed unit inventory digest mismatch")
         return self
@@ -77,11 +77,15 @@ class InstalledUnitInventory(StrictModel):
     digest: InventoryDigest
     units: InstalledUnits
 
-    @model_validator(mode="after")
-    def validate_units_digest(self):
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_units_digest(self) -> Self:
         if installed_units_digest(self.units) != self.digest:
             raise ValueError("installed unit inventory digest mismatch")
         return self
+
+
+class AgentInventoryRecord(Protocol):
+    installed_unit_inventory: InstalledUnitInventory | None
 
 
 def installed_unit_report(
@@ -116,7 +120,7 @@ def resolve_installed_unit_inventory(
 
 def resolve_agent_inventory(
     reported: InstalledUnitReport | None,
-    existing_record,
+    existing_record: AgentInventoryRecord | None,
 ) -> tuple[InstalledUnitInventory | None, bool]:
     existing = (
         getattr(

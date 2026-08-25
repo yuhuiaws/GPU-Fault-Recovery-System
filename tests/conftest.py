@@ -17,6 +17,8 @@ from tests._builders import build_context, build_store
 
 @pytest.fixture(autouse=True)
 def processor_replay_secret(monkeypatch) -> None:
+    for name in ("GPU_FAULT_DOC_IMPACT", "GPU_FAULT_DOC_IMPACT_REASON"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(
         "GPU_FAULT_PROCESSOR_REPLAY_SECRET", "test-processor-replay-secret-" + "r" * 32
     )

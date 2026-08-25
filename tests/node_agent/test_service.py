@@ -196,10 +196,7 @@ def test_heartbeat_sends_full_unit_inventory_only_on_change() -> None:
         [
             ["gpu-fault-node-agent.service"],
             ["gpu-fault-node-agent.service"],
-            [
-                "gpu-fault-node-agent.service",
-                "gpu-fault-dcgm-exporter.service",
-            ],
+            ["gpu-fault-node-agent.service", "gpu-fault-dcgm-exporter.service"],
         ]
     )
     reports = []
@@ -278,8 +275,7 @@ def test_control_plane_can_request_full_unit_inventory_again() -> None:
         reports.append(report)
         if len(reports) == 2:
             raise AgentHeartbeatRejected(
-                409,
-                "full installed unit inventory is required when digest changes",
+                409, "full installed unit inventory is required when digest changes"
             )
         return {}
 
@@ -358,7 +354,9 @@ def test_heartbeat_rejection_names_the_reason_and_the_remedy(caplog) -> None:
 
     assert len(attempts) == 2
     messages = [record.getMessage() for record in caplog.records]
-    assert all("Traceback" not in message for message in messages)
+    assert all("Traceback" not in message for message in messages), (
+        f"heartbeat rejection logs leaked tracebacks: {messages}"
+    )
     assert "agent incarnation has been retired" in messages[0]
     assert "reactivate the agent or reboot the node" in messages[0]
     assert "refused 2 time(s) in a row" in messages[1]

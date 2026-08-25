@@ -7,7 +7,6 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY_PATH = (
     ROOT / "deploy" / "control-plane" / "regional" / "cleanup-inventory.json"
@@ -66,16 +65,16 @@ def test_cleanup_inventory_declares_order_and_cluster_scope() -> None:
 
     assert any(
         item["kind"] == "deployment" and item["phase"] == "ingress" for item in cpu
-    )
+    ), "CPU cleanup inventory has no ingress deployment"
     assert any(
         item["kind"] == "deployment" and item["phase"] == "consumer" for item in cpu
-    )
+    ), "CPU cleanup inventory has no consumer deployment"
     assert any(
         item["kind"] == "deployment" and item["phase"] == "producer" for item in gpu
-    )
+    ), "GPU cleanup inventory has no producer deployment"
     assert any(
         item["kind"] == "deployment" and item["phase"] == "executor" for item in gpu
-    )
+    ), "GPU cleanup inventory has no executor deployment"
     for item in gpu:
         if item["scope"] == "cluster":
             assert item["clean"] == "delete", item

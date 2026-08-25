@@ -5,7 +5,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "deploy" / "control-plane" / "regional" / "prepare-clean-redeploy.sh"
 UNINSTALLER = ROOT / "deploy" / "node" / "uninstall-gpu-fault-collector.sh"
@@ -19,14 +18,8 @@ def write_config(tmp_path: Path) -> Path:
                 "cpu_kubeconfig": "/secure/cpu.kubeconfig",
                 "namespace": "gpu-fault-system",
                 "clusters": [
-                    {
-                        "cluster_id": "gpu-a",
-                        "context": "gpu-a-context",
-                    },
-                    {
-                        "cluster_id": "gpu-b",
-                        "context": "gpu-b-context",
-                    },
+                    {"cluster_id": "gpu-a", "context": "gpu-a-context"},
+                    {"cluster_id": "gpu-b", "context": "gpu-b-context"},
                 ],
             }
         ),
@@ -36,21 +29,14 @@ def write_config(tmp_path: Path) -> Path:
 
 
 def run_script(
-    *arguments: str,
-    env: dict[str, str] | None = None,
+    *arguments: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(SCRIPT), *arguments],
-        check=False,
-        text=True,
-        capture_output=True,
-        env=env,
+        [str(SCRIPT), *arguments], check=False, text=True, capture_output=True, env=env
     )
 
 
-def test_clean_redeploy_supports_explicit_offline_dry_run(
-    tmp_path: Path,
-) -> None:
+def test_clean_redeploy_supports_explicit_offline_dry_run(tmp_path: Path) -> None:
     result = run_script(
         "--config",
         str(write_config(tmp_path)),
@@ -86,11 +72,7 @@ def test_clean_redeploy_can_select_one_gpu_cluster(tmp_path: Path) -> None:
 
 
 def test_clean_redeploy_requires_state_file_for_execution(tmp_path: Path) -> None:
-    result = run_script(
-        "--config",
-        str(write_config(tmp_path)),
-        "--execute",
-    )
+    result = run_script("--config", str(write_config(tmp_path)), "--execute")
 
     assert result.returncode != 0
     assert "--state-file is required with --execute" in result.stderr
@@ -98,12 +80,7 @@ def test_clean_redeploy_requires_state_file_for_execution(tmp_path: Path) -> Non
 
 def test_reset_requires_uninstall_and_explicit_confirmation(tmp_path: Path) -> None:
     config = str(write_config(tmp_path))
-    wrong_node_mode = run_script(
-        "--config",
-        config,
-        "--mode",
-        "reset",
-    )
+    wrong_node_mode = run_script("--config", config, "--mode", "reset")
     assert wrong_node_mode.returncode != 0
     assert "--mode reset requires --node-mode uninstall" in wrong_node_mode.stderr
 
@@ -145,7 +122,9 @@ def test_reset_plan_preserves_eks_but_requires_external_aurora_cleanup(
 def test_node_uninstaller_removes_gpu_persistence_unit() -> None:
     text = UNINSTALLER.read_text(encoding="utf-8")
 
-    assert (ROOT / "deploy/systemd/gpu-fault-gpu-persistence.service").is_file()
+    assert (ROOT / "deploy/systemd/gpu-fault-gpu-persistence.service").is_file(), (
+        "GPU persistence systemd unit is missing"
+    )
     assert "/opt/gpu-fault/installed-units.txt" in text
     assert "gpu-fault-*.service" in text
 
@@ -217,12 +196,7 @@ raise SystemExit(0)
             {
                 "cpu_kubeconfig": str(kubeconfig),
                 "namespace": "gpu-fault-system",
-                "clusters": [
-                    {
-                        "cluster_id": "gpu-a",
-                        "context": "gpu-a-context",
-                    }
-                ],
+                "clusters": [{"cluster_id": "gpu-a", "context": "gpu-a-context"}],
             }
         ),
         encoding="utf-8",

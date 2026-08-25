@@ -7,11 +7,9 @@ import pytest
 
 from tests._script_loader import lazy_script_module
 
-
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = lazy_script_module(
-    "cleanup_state",
-    ROOT / "deploy" / "control-plane" / "tools" / "cleanup_state.py",
+    "cleanup_state", ROOT / "deploy" / "control-plane" / "tools" / "cleanup_state.py"
 )
 
 
@@ -22,12 +20,7 @@ def inputs(tmp_path: Path) -> tuple[Path, Path]:
             {
                 "cpu_kubeconfig": "/secure/cpu.kubeconfig",
                 "namespace": "gpu-fault-system",
-                "clusters": [
-                    {
-                        "cluster_id": "gpu-a",
-                        "context": "gpu-a-context",
-                    }
-                ],
+                "clusters": [{"cluster_id": "gpu-a", "context": "gpu-a-context"}],
             }
         ),
         encoding="utf-8",
@@ -35,20 +28,14 @@ def inputs(tmp_path: Path) -> tuple[Path, Path]:
     inventory = tmp_path / "inventory.json"
     inventory.write_text(
         json.dumps(
-            {
-                "schema_version": 1,
-                "cpu": {"resources": []},
-                "gpu": {"resources": []},
-            }
+            {"schema_version": 1, "cpu": {"resources": []}, "gpu": {"resources": []}}
         ),
         encoding="utf-8",
     )
     return config, inventory
 
 
-def test_cleanup_state_is_atomic_hashed_and_mode_0600(
-    tmp_path: Path,
-) -> None:
+def test_cleanup_state_is_atomic_hashed_and_mode_0600(tmp_path: Path) -> None:
     config, inventory = inputs(tmp_path)
     path = tmp_path / "secure" / "cleanup.json"
 
@@ -65,12 +52,12 @@ def test_cleanup_state_is_atomic_hashed_and_mode_0600(
     assert document["inventory_snapshot"]["schema_version"] == 1
     stored = MODULE.read_state(path)
     assert stored["content_sha256"] == MODULE.content_digest(stored)
-    assert not list(path.parent.glob(f".{path.name}.*"))
+    assert not list(path.parent.glob(f".{path.name}.*")), (
+        "atomic cleanup-state write left temporary files behind"
+    )
 
 
-def test_cleanup_state_records_original_resources_and_phases(
-    tmp_path: Path,
-) -> None:
+def test_cleanup_state_records_original_resources_and_phases(tmp_path: Path) -> None:
     config, inventory = inputs(tmp_path)
     path = tmp_path / "cleanup.json"
     document = MODULE.initialize(
@@ -124,9 +111,7 @@ def test_cleanup_state_records_original_resources_and_phases(
     assert stored["status"] == "COMPLETED"
 
 
-def test_aurora_deleted_requires_ready_checkpoint(
-    tmp_path: Path,
-) -> None:
+def test_aurora_deleted_requires_ready_checkpoint(tmp_path: Path) -> None:
     config, inventory = inputs(tmp_path)
     path = tmp_path / "cleanup.json"
     document = MODULE.initialize(
@@ -138,21 +123,13 @@ def test_aurora_deleted_requires_ready_checkpoint(
         node_mode="uninstall",
     )
 
-    with pytest.raises(
-        MODULE.CleanupStateError,
-        match="READY_TO_DELETE_AURORA",
-    ):
+    with pytest.raises(MODULE.CleanupStateError, match="READY_TO_DELETE_AURORA"):
         MODULE.transition(
-            document,
-            phase="AURORA_DELETED",
-            status="COMPLETED",
-            message="too early",
+            document, phase="AURORA_DELETED", status="COMPLETED", message="too early"
         )
 
 
-def test_completed_aurora_state_accepts_additional_audit_event(
-    tmp_path: Path,
-) -> None:
+def test_completed_aurora_state_accepts_additional_audit_event(tmp_path: Path) -> None:
     config, inventory = inputs(tmp_path)
     path = tmp_path / "cleanup.json"
     document = MODULE.initialize(
@@ -164,16 +141,10 @@ def test_completed_aurora_state_accepts_additional_audit_event(
         node_mode="uninstall",
     )
     MODULE.transition(
-        document,
-        phase="READY_TO_DELETE_AURORA",
-        status="COMPLETED",
-        message="ready",
+        document, phase="READY_TO_DELETE_AURORA", status="COMPLETED", message="ready"
     )
     MODULE.transition(
-        document,
-        phase="AURORA_DELETED",
-        status="COMPLETED",
-        message="database deleted",
+        document, phase="AURORA_DELETED", status="COMPLETED", message="database deleted"
     )
     MODULE.transition(
         document,
@@ -198,13 +169,7 @@ def test_cleanup_state_detects_tampering(tmp_path: Path) -> None:
     )
     document = json.loads(path.read_text(encoding="utf-8"))
     document["phase"] = "AURORA_DELETED"
-    path.write_text(
-        json.dumps(document),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(document), encoding="utf-8")
 
-    with pytest.raises(
-        MODULE.CleanupStateError,
-        match="SHA-256",
-    ):
+    with pytest.raises(MODULE.CleanupStateError, match="SHA-256"):
         MODULE.read_state(path)
