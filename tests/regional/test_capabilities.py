@@ -116,11 +116,21 @@ def test_regional_hyperpod_safe_profile_matches_enabled_adapters() -> None:
     assert executable[CapabilityName.WORKLOAD_RESTART] == (
         "gpu-fault-kubernetes-adapter"
     )
-    # The Node Agent is not deployed in this profile, so every capability
-    # that would need an on-node executor stays observation-only.
-    assert CapabilityName.GPU_RESET not in executable
-    assert CapabilityName.FABRIC_MANAGER_RESTART not in executable
+    # Regional production installs the signed Node Agent before registering
+    # the Profile, so catalog actions that require one-GPU reset must have an
+    # executable owner. The remaining unapproved node capabilities stay
+    # observation-only.
+    for capability in (
+        CapabilityName.DIAGNOSTIC_BUNDLE_CAPTURE,
+        CapabilityName.GPU_RESET,
+        CapabilityName.FABRIC_MANAGER_RESTART,
+        CapabilityName.FABRIC_RESET,
+    ):
+        assert executable[capability] == "gpu-fault-node-agent"
+    assert CapabilityName.NVLINK_DIAGNOSTICS not in executable
+    assert CapabilityName.MEMORY_DIAGNOSTICS not in executable
     assert CapabilityName.DRIVER_REMEDIATION not in executable
+    assert CapabilityName.SOFTWARE_FIRMWARE_UPDATE not in executable
     # Node lifecycle is the one mutation class this profile does own: the
     # provider performs it, so it needs no agent on the failed node.
     # GPU_FAULT_ALLOW_HYPERPOD_REBOOT defaults to true in deploy.sh, and

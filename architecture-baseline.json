@@ -1,6 +1,6 @@
 {
   "classes": {
-    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 974,
+    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 980,
     "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 946,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1546,
     "src/gpu_fault/fleet.py:FleetRegistry": 836,
@@ -12,7 +12,7 @@
   },
   "cycles": [],
   "files": {
-    "src/gpu_fault/admin_aws_cleanup.py": 1508,
+    "src/gpu_fault/admin_aws_cleanup.py": 1547,
     "src/gpu_fault/admin_bootstrap.py": 2299,
     "src/gpu_fault/completion_controller.py": 1544,
     "src/gpu_fault/execution/executor.py": 1598,

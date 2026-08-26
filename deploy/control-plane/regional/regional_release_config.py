@@ -465,6 +465,7 @@ class ReleaseConfig:
     component_digests: dict[str, str]
     agent_config_digest: str
     runtime_profile_source: Path
+    runtime_profile_template_source: Path
     runtime_profile_version: str
     runtime_profile_registration_cluster_id: str
     clusters: tuple[ClusterTarget, ...]
@@ -508,6 +509,13 @@ class ReleaseConfig:
         )
         if not runtime_profile_source.is_absolute():
             runtime_profile_source = path.parent / runtime_profile_source
+        runtime_profile_template_source = Path(
+            str(runtime_profile.get("template_source") or runtime_profile_source)
+        )
+        if not runtime_profile_template_source.is_absolute():
+            runtime_profile_template_source = (
+                path.parent / runtime_profile_template_source
+            )
         runtime_profile_version = validate_runtime_profile_version(
             runtime_profile.get("version"),
         )
@@ -547,6 +555,10 @@ class ReleaseConfig:
             raise ReleaseError("cluster_id values must be unique")
         if not runtime_profile_source.is_file():
             raise ReleaseError("runtime_profile.source must be an existing file")
+        if not runtime_profile_template_source.is_file():
+            raise ReleaseError(
+                "runtime_profile.template_source must be an existing file"
+            )
         try:
             runtime_profile_document = yaml.safe_load(
                 runtime_profile_source.read_text(encoding="utf-8")
@@ -584,6 +596,7 @@ class ReleaseConfig:
             component_digests=artifacts.component_digests,
             agent_config_digest=digest,
             runtime_profile_source=runtime_profile_source.resolve(),
+            runtime_profile_template_source=(runtime_profile_template_source.resolve()),
             runtime_profile_version=runtime_profile_version,
             runtime_profile_registration_cluster_id=(
                 runtime_profile_registration_cluster_id

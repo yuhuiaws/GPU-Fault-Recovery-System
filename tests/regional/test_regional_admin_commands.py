@@ -12,8 +12,12 @@ ADMIN = lazy_script_module(
 )
 
 
+def _admin_module():
+    return ADMIN._load()
+
+
 def test_full_status_keeps_health_when_release_summary_is_missing(monkeypatch) -> None:
-    module = ADMIN._load()
+    module = _admin_module()
     release = SimpleNamespace(config=SimpleNamespace(site_name="test-site"))
     monkeypatch.setattr(
         module,
@@ -36,6 +40,35 @@ def test_full_status_keeps_health_when_release_summary_is_missing(monkeypatch) -
     assert report["healthy"] is False
     assert report["release_status_error"] == "deployment is missing"
     assert report["health"]["mode"] == "status"
+
+
+def test_release_summary_does_not_repeat_health_checks(monkeypatch) -> None:
+    module = _admin_module()
+    release = SimpleNamespace(
+        config=SimpleNamespace(site_name="test-site"), _load_state=lambda: {}
+    )
+    monkeypatch.setattr(
+        module,
+        "build_health_report",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("release summary repeated health checks")
+        ),
+    )
+    monkeypatch.setattr(
+        module, "build_release_status", lambda _release: {"site_name": "test-site"}
+    )
+    monkeypatch.setattr(
+        module,
+        "classify_release",
+        lambda _release, _state: SimpleNamespace(
+            as_dict=lambda: {"kind": "NOOP", "changed": []}
+        ),
+    )
+
+    report = module.build_release_summary(release)
+
+    assert report["mode"] == "release-summary"
+    assert report["next_deploy"] == {"kind": "NOOP", "changed": []}
 
 
 def test_failed_release_diff_is_reused_for_resume() -> None:

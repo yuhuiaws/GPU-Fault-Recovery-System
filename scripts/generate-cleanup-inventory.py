@@ -77,7 +77,25 @@ NODE_ANNOTATIONS = [
     "gpu-fault.io/installer-artifact-sha256",
     "gpu-fault.io/installer-node-uid",
     "gpu-fault.io/installer-state",
+    "gpu-fault.io/incident-id",
+    "gpu-fault.io/fencing-token",
+    "gpu-fault.io/previous-unschedulable",
+    "gpu-fault.io/mechanical-inspection-complete",
+    "gpu-fault.io/efa-plugin-restart-operation",
+    "gpu-fault.io/efa-plugin-restart-pod-uid",
+    "gpu-fault.io/efa-plugin-restart-started-at",
+    "gpu-fault.io/gpu-plugin-restart-operation",
+    "gpu-fault.io/gpu-plugin-restart-pod-uid",
+    "gpu-fault.io/gpu-plugin-restart-started-at",
+    "gpu-fault.io/spare-reservation",
+    "gpu-fault.io/spare-pool-state",
+    "gpu-fault.io/spare-health",
+    "gpu-fault.io/spare-health-failures",
+    "gpu-fault.io/spare-health-incident",
+    "gpu-fault.io/spare-health-unavailable-at",
+    "gpu-fault.io/spare-health-last-alert-at",
 ]
+NODE_LABELS = ["gpu-fault.io/spare"]
 
 
 def _documents(
@@ -248,6 +266,7 @@ def generate() -> dict[str, Any]:
             ]
         else:
             section["node_annotations"] = NODE_ANNOTATIONS
+            section["node_labels"] = NODE_LABELS
         section["resources"] = resources
         result[plane] = section
     return result

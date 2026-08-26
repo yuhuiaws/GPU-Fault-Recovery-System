@@ -27,7 +27,7 @@ leftover from the same site; foreign name collisions fail closed.
 
 | Deployment path | Profile terminology | Runtime profile | Required changes | Registration |
 |---|---|---|---|---|
-| Regional CPU control plane with GPU-cluster Executor | `regional-hyperpod-safe` means the fail-closed regional profile for this production path | `runtime-profile.regional-hyperpod-safe.example.yaml` | registration `cluster_id`; keep `profile_version` aligned with collectors, Watcher and training submission | Register once per profile version on the regional control plane |
+| Regional CPU control plane with GPU-cluster Executor | `regional-hyperpod-safe` means the gated regional production profile | `runtime-profile.regional-hyperpod-safe.example.yaml` | registration `cluster_id`; diagnostic bundle, GPU reset and fabric recovery are OWN after signed Node Agent/fleet convergence | Register once per profile version on the regional control plane |
 
 The API does not accept a `profiles:` wrapper or multiple profiles in one
 request. Historical single-cluster and multi-environment capability examples

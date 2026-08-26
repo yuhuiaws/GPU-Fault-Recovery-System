@@ -15,6 +15,10 @@ CHECKS = lazy_script_module(
 )
 
 
+def _checks_module():
+    return CHECKS._load()
+
+
 class Config:
     site_name = "test-site"
     clusters = []
@@ -79,7 +83,7 @@ def test_empty_node_action_keys_are_valid_for_an_empty_gpu_registry(
 
 
 def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
-    module = CHECKS._load()
+    module = _checks_module()
     names = (
         "_check_tools",
         "_check_local_inputs",
@@ -117,6 +121,80 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
         "email_notifications",
         "monitoring",
     }
+
+
+def test_health_report_uses_bounded_parallel_checks(monkeypatch) -> None:
+    module = _checks_module()
+    clusters = [
+        SimpleNamespace(cluster_id="gpu-a"),
+        SimpleNamespace(cluster_id="gpu-b"),
+    ]
+    release = SimpleNamespace(
+        config=SimpleNamespace(site_name="test-site", clusters=clusters)
+    )
+    for name in (
+        "_check_contexts",
+        "check_cpu_secrets",
+        "_check_cpu_workloads",
+        "_check_email_notifications",
+        "_check_aurora_refresh",
+        "_verify_profile",
+        "_run_read_only_verifiers",
+        "_check_control_api",
+        "_check_gpu_cluster",
+        "_check_nlb_runtime",
+        "_check_aurora",
+        "_check_monitoring",
+    ):
+        monkeypatch.setattr(
+            module, name, lambda *_args, name=name, **_kwargs: module.CheckValue(name)
+        )
+
+    worker_counts: list[int] = []
+    submitted: list[str] = []
+
+    class Completed:
+        def __init__(self, value):
+            self.value = value
+
+        def result(self):
+            return self.value
+
+    class RecordingExecutor:
+        def __init__(self, *, max_workers):
+            worker_counts.append(max_workers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def submit(self, function, name, callback):
+            submitted.append(name)
+            return Completed(function(name, callback))
+
+    monkeypatch.setattr(module, "ThreadPoolExecutor", RecordingExecutor)
+
+    report = module.build_health_report(release, mode="verify")
+
+    assert worker_counts == [8]
+    assert submitted == [
+        "regional_contexts",
+        "cpu_secrets",
+        "cpu_workloads",
+        "email_notifications",
+        "aurora_credential_refresh",
+        "runtime_profile",
+        "read_only_verifiers",
+        "control_api",
+        "gpu_cluster:gpu-a",
+        "gpu_cluster:gpu-b",
+        "nlb_runtime",
+        "aurora",
+        "monitoring",
+    ]
+    assert [item["name"] for item in report["checks"]] == submitted
 
 
 def control_api_release() -> SimpleNamespace:

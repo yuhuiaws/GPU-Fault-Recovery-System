@@ -24,6 +24,7 @@ from regional_admin_checks import (
 from regional_admin_commands import (
     bootstrap_cpu_is_current,
     build_full_status,
+    build_release_summary,
     ensure_schema,
     run_deploy,
 )
@@ -79,7 +80,10 @@ from regional_release_state import (
     save_state,
     template_bundle,
 )
-from regional_runtime_profile import ensure_runtime_profile
+from regional_runtime_profile import (
+    ensure_runtime_profile,
+    runtime_profile_policy_digest,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -290,6 +294,12 @@ class RegionalRelease:
         self.node_wheel_sha = self._sha256(config.node_wheel)
         self.bundle_sha = self._sha256(config.bundle)
         self.runtime_profile_sha = self._sha256(config.runtime_profile_source)
+        self.runtime_profile_template_sha = self._sha256(
+            config.runtime_profile_template_source
+        )
+        self.runtime_profile_policy_sha = runtime_profile_policy_digest(
+            config.runtime_profile_source
+        )
         self.notification_digest = notification_digest(config.notifications)
         self.wheel_cm = "gpu-fault-control-plane-wheel-0100-" + self.wheel_sha[:12]
         self.executor_wheel_cm = (
@@ -1243,6 +1253,7 @@ def parser() -> argparse.ArgumentParser:
         choices=(
             "plan",
             "preflight",
+            "release-summary",
             "status",
             "bootstrap",
             "deploy",
@@ -1295,6 +1306,9 @@ def main() -> int:
             report = release.status()
             print(json.dumps(report, indent=2, sort_keys=True))
             exit_code = 0 if report.get("healthy") else 1
+        elif arguments.mode == "release-summary":
+            report = build_release_summary(release)
+            print(json.dumps(report, indent=2, sort_keys=True))
         elif arguments.mode == "bootstrap":
             release.bootstrap()
         elif arguments.mode == "deploy":

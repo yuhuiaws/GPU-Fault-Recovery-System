@@ -11,6 +11,10 @@
 # 同一 profile_version 在区域控制面只保存一份，所有引用该版本的集群共享。
 # 本文件是 templateSource；release-deploy 会忽略这里的 cluster_id/profile_version，
 # 按规范化策略内容生成不可变快照和 regional-hyperpod-<digest12> 版本。
+# 区域生产部署保证 Node Agent、签名 key、fleet readiness 和 node-action adapter
+# 已收敛，因此诊断包、单 GPU reset、Fabric Manager restart 和全 GPU/NVSwitch
+# reset 由本方案 OWN；策略、workload、零 client、fencing 和 post-action validation
+# 仍逐层 fail closed。
 cluster_id: REPLACE_WITH_CLUSTER_ID
 environment: hyperpod-eks
 profile_version: hyperpod-v1
@@ -56,17 +60,21 @@ claims:
     owner: gpu-fault-support-escalation
     adapter: fixed-template-email
   - capability: diagnosticBundleCapture
-    mode: OBSERVE
+    mode: OWN
     owner: gpu-fault-node-agent
+    adapter: node-action
   - capability: gpuReset
-    mode: OBSERVE
+    mode: OWN
     owner: gpu-fault-node-agent
+    adapter: node-action
   - capability: fabricManagerRestart
-    mode: OBSERVE
+    mode: OWN
     owner: gpu-fault-node-agent
+    adapter: node-action
   - capability: fabricReset
-    mode: OBSERVE
+    mode: OWN
     owner: gpu-fault-node-agent
+    adapter: node-action
   - capability: nvlinkDiagnostics
     mode: OBSERVE
     owner: gpu-fault-node-agent
@@ -120,6 +128,22 @@ observed:
     owner: gpu-fault-support-escalation
     available: true
     version: fixed-template-v1
+  - capability: diagnosticBundleCapture
+    owner: gpu-fault-node-agent
+    available: true
+    version: node-action-v1
+  - capability: gpuReset
+    owner: gpu-fault-node-agent
+    available: true
+    version: node-action-v1
+  - capability: fabricManagerRestart
+    owner: gpu-fault-node-agent
+    available: true
+    version: node-action-v1
+  - capability: fabricReset
+    owner: gpu-fault-node-agent
+    available: true
+    version: node-action-v1
   - capability: nodeReboot
     owner: gpu-fault-hyperpod-adapter
     available: true

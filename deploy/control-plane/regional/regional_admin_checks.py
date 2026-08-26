@@ -1298,33 +1298,38 @@ def _check_nlb_runtime(release: Any) -> CheckValue:
 
 
 def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
-    checks = [
-        _check("regional_contexts", lambda: _check_contexts(release)),
-        _check("cpu_secrets", lambda: check_cpu_secrets(release)),
-        _check("cpu_workloads", lambda: _check_cpu_workloads(release)),
-        _check("email_notifications", lambda: _check_email_notifications(release)),
-        _check(
+    specifications = [
+        ("regional_contexts", lambda: _check_contexts(release)),
+        ("cpu_secrets", lambda: check_cpu_secrets(release)),
+        ("cpu_workloads", lambda: _check_cpu_workloads(release)),
+        ("email_notifications", lambda: _check_email_notifications(release)),
+        (
             "aurora_credential_refresh",
             lambda: _check_aurora_refresh(release, require_success=True),
         ),
-        _check("runtime_profile", lambda: _verify_profile(release)),
-        _check("read_only_verifiers", lambda: _run_read_only_verifiers(release)),
-        _check("control_api", lambda: _check_control_api(release)),
+        ("runtime_profile", lambda: _verify_profile(release)),
+        ("read_only_verifiers", lambda: _run_read_only_verifiers(release)),
+        ("control_api", lambda: _check_control_api(release)),
     ]
-    checks.extend(
-        _check(
+    specifications.extend(
+        (
             f"gpu_cluster:{target.cluster_id}",
             lambda target=target: _check_gpu_cluster(release, target),
         )
         for target in release.config.clusters
     )
-    checks.extend(
+    specifications.extend(
         [
-            _check("nlb_runtime", lambda: _check_nlb_runtime(release)),
-            _check("aurora", lambda: _check_aurora(release)),
-            _check("monitoring", lambda: _check_monitoring(release)),
+            ("nlb_runtime", lambda: _check_nlb_runtime(release)),
+            ("aurora", lambda: _check_aurora(release)),
+            ("monitoring", lambda: _check_monitoring(release)),
         ]
     )
+    with ThreadPoolExecutor(max_workers=min(8, len(specifications))) as executor:
+        futures = [
+            executor.submit(_check, name, function) for name, function in specifications
+        ]
+        checks = [future.result() for future in futures]
     return _report(mode, release, checks)
 
 
