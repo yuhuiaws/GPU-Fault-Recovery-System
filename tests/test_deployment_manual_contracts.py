@@ -129,9 +129,10 @@ def test_manual_documents_both_training_submission_paths() -> None:
     assert "gpu-training-submit" in text
     assert "gpu-fault-workload-annotate" in text
     assert "apply --dry-run=server" in text
-    assert "store.get_profile" in text
-    assert "profile.warnings == []" in text
-    assert "registration_cluster_id=" in text
+    assert "gpu-fault-admin verify" in text
+    assert "--site" in text
+    assert "warnings为空" in text
+    assert "注册锚点" in text
     assert "`gpu-fault.io/expected-critical-ranks` 为 `3`" in text
     assert "PyTorch `world_size` 为 `24`" in text
     assert "hyperpod-control-plane-recovery-v1" not in text
@@ -169,6 +170,8 @@ def test_manual_documents_safe_regional_reset_and_retirement() -> None:
     execute = reset.index("--execute", dry_run)
     assert dry_run < execute, "manual must show the dry run before execution"
     assert "--mode reset" in reset
+    assert "gpu-fault-admin uninstall" in reset
+    assert "--cpu-cluster keep" in reset
     assert "--node-mode uninstall" in reset
     assert "--confirm-reset RESET_GPU_FAULT_INSTALLATION" in reset
     assert "CPU EKS 和每个 GPU EKS 必须仍存在" in reset
@@ -180,6 +183,7 @@ def test_manual_documents_safe_regional_reset_and_retirement() -> None:
     assert "--mode clean" in retirement
     assert "CPU_INFRA_DESTROY_COMMAND" in retirement
     assert "不得调用 GPU 集群的 `delete-cluster`" in retirement
+    assert "--cpu-cluster delete" in retirement
 
     inventory = (
         ROOT / "deploy/control-plane/regional/cleanup-inventory.json"
@@ -208,9 +212,10 @@ def test_manual_separates_manifest_developer_and_operator_workflows() -> None:
     assert "本节只面向修改本方案源代码的开发者" in section
     assert "管理员/客户边界：不编写方案 Manifest" in section
     assert "开发者完整变更步骤" in section
-    assert "rollout-regional-release.sh" in section
-    assert "bootstrap --config" in section
-    assert "upgrade --config" in section
+    for command in ("preflight", "deploy", "verify", "status"):
+        assert f"gpu-fault-admin {command} -f" in section
+    assert "site.yaml" in section
+    assert "低层 release JSON" in section
     assert "deployment-contracts-update" in section
     assert "deployment-contracts-check" in section
     assert "make PYTHON=.venv/bin/python check" in section
@@ -224,10 +229,13 @@ def test_manual_requires_external_state_before_aurora_deletion() -> None:
     text = manual()
 
     assert "READY_TO_DELETE_AURORA" in text
+    assert "installation-resources-before.json" in text
+    assert "installation-resources-pre-aurora-delete.json" in text
+    assert "installation_resource" in text
     assert "AURORA_DELETED" in text
     assert "cleanup_state.py verify" in text
     assert "content_sha256" in text
-    assert "Aurora 只承载正常运行期清单" in text
+    assert "Aurora 承载正常运行期的 AWS 注册表" in text
 
 
 def test_manual_separates_solution_and_training_images() -> None:
@@ -282,11 +290,13 @@ def test_legacy_kubernetes_examples_cannot_be_mistaken_for_deployment() -> None:
     assert "恒为 `false`" in detail
 
 
-def test_make_check_rebuilds_wheel_before_full_pytest() -> None:
+def test_make_check_rebuilds_wheel_before_parallel_full_pytest() -> None:
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     check = makefile.split("check:\n", 1)[1].split("\narchitecture-check:", 1)[0]
 
-    assert check.index("$(MAKE) artifact-check") < check.index("$(PYTHON) -m pytest")
+    assert check.index("$(MAKE) artifact-check") < check.index("$(MAKE) test-parallel")
+    parallel = makefile.split("test-parallel:\n", 1)[1].split("\ncoverage:", 1)[0]
+    assert "$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS)" in parallel
 
 
 def test_release_preflight_is_required_and_load_bearing() -> None:
@@ -300,6 +310,24 @@ def test_release_preflight_is_required_and_load_bearing() -> None:
     assert "$(MAKE) artifact-check" in target
     assert "make release-preflight" in section
     assert "不得再次 build" in section
+
+
+def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    developer = (ROOT / "docs/开发者部署实现.md").read_text(encoding="utf-8")
+    target = makefile.split("release-deploy:\n", 1)[1].split("\n# 本地保留策略", 1)[0]
+
+    assert "scripts/release_deploy.py" in target
+    assert "--site" in target
+    assert "--profile-approval" in target
+    assert "make PYTHON=.venv/bin/python release-deploy" in developer
+    assert "PROFILE_APPROVAL=CHG-12345" in developer
+    assert "deploy -> verify -> status" in developer
+    assert "### 9.1 普通代码修改后的build与部署升级" in developer
+    for kind in ("NOOP", "CONTROL_PLANE_ONLY", "DATA_PLANE_COMPATIBLE", "FULL"):
+        assert kind in developer
+    assert "`make check`失败：不修改site或集群" in developer
+    assert "升级失败且`autoRollback=true`" in developer
 
 
 def test_manual_only_builds_through_artifact_check() -> None:
@@ -352,12 +380,13 @@ def test_regional_data_plane_validation_uses_private_ca_and_auth() -> None:
     assert section.count("GPU_FAULT_EXECUTION_TOKEN") >= 2
 
 
-def test_wheel_consistency_uses_the_source_tree_digest() -> None:
+def test_wheel_consistency_uses_the_component_source_digest() -> None:
     text = manual()
     section = text.split("#### REG-10A.", 1)[1].split("#### REG-11.", 1)[0]
 
-    assert "PYTHONPATH=src python3.12" in section
-    assert "gpu_fault.module_digest()" in section
+    assert "PYTHONPATH=src:. python3.12" in section
+    assert 'component_source_digest("control_plane")' in section
+    assert "components.control_plane.module_digest" in section
 
 
 def test_regional_alerting_verifier_accepts_repository_contract(tmp_path: Path) -> None:
@@ -418,13 +447,19 @@ def test_incident_purge_stops_and_restores_every_writer() -> None:
 
 def test_manual_keeps_provider_replace_fail_closed() -> None:
     text = manual()
-    stage = text.split("### 阶段 D：HyperPod reboot（provider replace 恒禁用）", 1)[
+    stage = text.split("### 阶段 D：节点生命周期（provider replace 恒禁用）", 1)[
         1
     ].split("## 11.", 1)[0]
 
     assert "### 2.2 区域生产方案硬约束" in text
+    assert "#### 阶段 D.1：HyperPod reboot" in stage
+    assert "#### 阶段 D.2：warm-spare nodeReplace" in stage
     assert "GPU_FAULT_ALLOW_HYPERPOD_REBOOT=true" in stage
     assert "GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false" in stage
+    assert "GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true" in stage
+    assert "HEALTHY_WARM_SPARE_ONLY" in stage
+    assert "不得部分替换" in stage
+    assert "BatchReplaceClusterNodes" in stage
     assert "unset GPU_FAULT_ALLOW_HYPERPOD_MUTATION" in stage
     assert "只能在独立 reboot 开关缺省时回退给 reboot" in text
     assert "设置为 true 时进程拒绝启动" in text

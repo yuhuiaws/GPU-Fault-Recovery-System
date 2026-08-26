@@ -75,9 +75,9 @@ def test_kernel_collector_keeps_identical_unsequenced_events() -> None:
     assert first.delivered == 1
     assert second.delivered == 1
     assert len(sink.requests) == 2
-    assert (
-        sink.requests[0][1]["record_id"] != sink.requests[1][1]["record_id"]
-    ), "unsequenced events must receive distinct fallback record IDs"
+    assert sink.requests[0][1]["record_id"] != sink.requests[1][1]["record_id"], (
+        "unsequenced events must receive distinct fallback record IDs"
+    )
 
 
 def test_kernel_collector_continues_after_retryable_event_is_buffered() -> None:

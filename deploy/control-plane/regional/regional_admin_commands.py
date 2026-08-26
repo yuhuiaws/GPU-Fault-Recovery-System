@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import regional_deployment_inventory as inventory
+from regional_admin_checks import build_health_report
+from regional_release_config import ReleaseError
+from regional_release_diff import (
+    ReleaseChangeKind,
+    ReleaseDiff,
+    classify_release,
+)
+from regional_release_reporting import build_release_status
+
+STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
+ROOT = Path(__file__).resolve().parents[3]
+RETRY_PHASES = frozenset({"failed", "rolled-back"})
+
+
+def stored_release_diff(state: dict[str, Any]) -> ReleaseDiff | None:
+    value = state.get("release_diff")
+    if not isinstance(value, dict):
+        return None
+    try:
+        kind = ReleaseChangeKind(str(value["kind"]))
+        changed = frozenset(str(item) for item in value["changed"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return ReleaseDiff(kind=kind, changed=changed)
+
+
+def ensure_schema(release: Any) -> None:
+    release.runner.run(
+        [str(ROOT / "deploy/control-plane/tools/ensure-postgres-schema.sh")],
+        env={
+            **os.environ,
+            "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": release.config.cpu_kubeconfig,
+            "GPU_FAULT_NAMESPACE": release.config.namespace,
+            "GPU_FAULT_WHEEL_CONFIGMAP": release.wheel_cm,
+        },
+    )
+
+
+def bootstrap_cpu_is_current(release: Any) -> bool:
+    try:
+        metadata = release._config_map_data("gpu-fault-release-metadata")
+        expected = {
+            "required-agent-artifact-sha256": release.node_wheel_sha,
+            "required-agent-compatibility-digest": (
+                release.config.component_digests.get("node_runtime")
+                or release.node_wheel_sha
+            ),
+            "required-regional-executor-artifact-sha256": (release.executor_wheel_sha),
+            "required-regional-executor-compatibility-digest": (
+                release.config.component_digests.get("executor")
+                or release.executor_wheel_sha
+            ),
+            "required-agent-config-digest": release.config.agent_config_digest,
+        }
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            return False
+        if (
+            release._deployment_wheel(
+                release._cpu(),
+                inventory.CPU_INGRESS_DEPLOYMENT,
+            )
+            != release.wheel_cm
+        ):
+            return False
+        for deployment in inventory.CPU_DEPLOYMENTS:
+            value = release._get_json(
+                release._cpu(
+                    "-n",
+                    release.config.namespace,
+                    "get",
+                    "deployment",
+                    deployment,
+                )
+            )
+            desired = int((value.get("spec") or {}).get("replicas") or 0)
+            status = value.get("status") or {}
+            metadata_value = value.get("metadata") or {}
+            if int(status.get("observedGeneration") or 0) < int(
+                metadata_value.get("generation") or 0
+            ):
+                return False
+            if any(
+                int(status.get(field) or 0) != desired
+                for field in (
+                    "readyReplicas",
+                    "updatedReplicas",
+                    "availableReplicas",
+                )
+            ):
+                return False
+        return True
+    except (ReleaseError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def run_deploy(release: Any) -> None:
+    state_exists = (
+        subprocess.run(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "get",
+                "configmap",
+                STATE_CONFIG_MAP,
+            ),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+    if not state_exists:
+        release.bootstrap()
+        return
+    state = release._load_state()
+    if state.get("phase") in {
+        "bootstrap-started",
+        "bootstrap-cpu-ready",
+        "bootstrap-endpoint-ready",
+        "bootstrap-data-plane-progress",
+        "bootstrap-failed",
+        "bootstrap-cleaned",
+    }:
+        release.bootstrap()
+        return
+    if state.get("phase") in RETRY_PHASES:
+        retry_diff = stored_release_diff(state)
+        if retry_diff is None:
+            release.upgrade(resume=True)
+        else:
+            release.upgrade(resume=True, diff=retry_diff)
+        return
+    diff = classify_release(release, state)
+    if diff.kind == ReleaseChangeKind.NOOP:
+        release.noop(diff)
+        return
+    release.upgrade(diff=diff)
+
+
+def build_full_status(release: Any) -> dict[str, Any]:
+    health = build_health_report(release, mode="status")
+    try:
+        result = build_release_status(release)
+    except Exception as exc:
+        result = {
+            "site_name": release.config.site_name,
+            "release_status_error": str(exc),
+        }
+    result["healthy"] = health["healthy"]
+    result["health"] = health
+    try:
+        state = release._load_state()
+        retry_diff = (
+            stored_release_diff(state) if state.get("phase") in RETRY_PHASES else None
+        )
+        result["next_deploy"] = (
+            {
+                **retry_diff.as_dict(),
+                "resume": True,
+            }
+            if retry_diff is not None
+            else classify_release(release, state).as_dict()
+        )
+    except Exception as exc:
+        result["next_deploy_error"] = str(exc)
+    return result

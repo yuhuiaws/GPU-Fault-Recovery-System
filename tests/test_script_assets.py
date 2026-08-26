@@ -170,6 +170,18 @@ def test_quality_gates_cover_scripts_and_tools() -> None:
     ).read_text(encoding="utf-8")
 
 
+def test_make_redirects_python_caches_outside_the_checkout() -> None:
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+
+    assert "PYTHONPYCACHEPREFIX ?= /tmp/gpu-fault-pycache" in makefile
+    assert "export PYTHONPYCACHEPREFIX" in makefile
+    assert "python-cache-clean:" in makefile
+    assert "$(MAKE) python-cache-clean" in makefile
+    assert "deployment-contracts-check: python-cache-clean" in makefile
+    assert "deploy-check: python-cache-clean" in makefile
+    assert "git ls-files" in makefile
+
+
 def test_yamllint_configuration_is_load_bearing() -> None:
     # yamllint 默认把 .yamllint 里的规则报成 warning 然后 exit 0：
     # 不带 --strict 的话缩进漂移只是打印一行，门禁照样绿。
@@ -343,6 +355,17 @@ def test_perf_tree_contains_only_supported_public_entries() -> None:
         'expected list(perf.glob("*-job.yaml")) to be falsy'
     )
     assert "private archive" in " ".join(readme.split())
+
+
+def test_release_deploy_is_the_supported_developer_entrypoint() -> None:
+    readme = (SCRIPTS / "README.md").read_text(encoding="utf-8")
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+
+    assert (SCRIPTS / "release_deploy.py").is_file(), (
+        "unified developer release entrypoint is missing"
+    )
+    assert "release_deploy.py" in readme
+    assert "release-deploy:" in makefile
 
 
 def test_importable_script_modules_do_not_mutate_sys_path() -> None:

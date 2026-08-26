@@ -1,10 +1,17 @@
 # Contributing
 
-修改代码或部署契约前，先阅读
-[GPU Fault 扩展指南](docs/扩展指南.md)。其中 operation registry、channel
-registry、Node Action handler、通知 builder、生产 Manifest lifecycle annotation、
-systemd installed-unit inventory 和外部清理状态门禁是新增功能的强制入口，不能只在
-调用侧或线上增加字面量。
+修改前按变化类型选择文档：
+
+| 变化 | 必读文档 |
+|---|---|
+| 新增 operation、channel、Store、路由、插件或指标 | [GPU Fault 扩展指南](docs/扩展指南.md) |
+| 修改 Manifest、renderer、systemd、AWS 资源、配置模型或管理员 CLI | [开发者部署实现](docs/开发者部署实现.md) |
+| 同时新增代码能力和生产资源 | 两份都读，两套门禁都执行 |
+| 只部署已有 release | [管理员快速部署](docs/管理员快速部署.md) |
+
+operation/channel registry、显式授权、生产资源生命周期和管理员入口都不能只在调用侧
+或线上增加字面量。扩展指南决定能力登记点，开发者部署实现决定生成、发布、验证、
+回滚和卸载方式。
 
 文档职责和权威顺序见 [docs/README.md](docs/README.md)。历史材料不得作为当前
 实现依据。
@@ -33,10 +40,17 @@ make check
 make check
 ```
 
-`make coverage` 使用 4 个 worker 跑同一套测试，并强制当前 78% 的覆盖率 floor。
-为避免多个 worker 操作同一数据库，该目标不启用外部 PostgreSQL；设置
-`GPU_FAULT_TEST_POSTGRES_URL` 后另跑 `make test-postgres`。覆盖率可以提高，
-不能通过调低 `COVERAGE_FLOOR` 掩盖未测试的新分支。
+需要把当前源码发布到受管站点时，使用统一入口：
+
+```bash
+make release-deploy SITE=/path/to/site.yaml
+```
+
+`make check`的最终全量测试、`make test-parallel`和`make coverage`均使用4个worker；
+coverage同时强制当前78%的覆盖率floor。为避免多个worker操作同一数据库，这些并行
+目标不启用外部PostgreSQL；设置`GPU_FAULT_TEST_POSTGRES_URL`后另跑
+`make test-postgres`。覆盖率可以提高，不能通过调低`COVERAGE_FLOOR`掩盖未测试的
+新分支。
 
 只修改文档时，仍必须运行：
 

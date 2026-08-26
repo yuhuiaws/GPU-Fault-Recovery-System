@@ -1,7 +1,6 @@
 # GPU 多机多卡训练故障自动化处理
 
-本仓库实现面向大规模 GPU 训练集群的故障采集、策略判定、隔离、恢复编排、
-训练任务恢复和验收工具。
+本仓库实现面向大规模 GPU 训练集群的故障采集、策略判定、隔离、恢复编排、训练任务恢复和验收工具。
 
 ## 当前支持范围
 
@@ -63,11 +62,15 @@ Kernel / Fabric Manager / DCGM / Host / Workload
 ## 文档入口
 
 - [文档索引](docs/README.md)
+- [管理员快速部署](docs/管理员快速部署.md)
+- [管理员日常运维](docs/管理员日常运维.md)
+- [安全与参数参考](docs/安全与参数参考.md)
 - [概要设计](docs/概要设计.md)
 - [详细设计](docs/详细设计.md)
 - [NVIDIA 策略供应链与实现](docs/components/nvidia-policy.md)
-- [部署和运维手册](docs/部署和运维手册.md)
+- [部署和运维详细参考](docs/部署和运维手册.md)
 - [部署和运维手册逐章解读](docs/部署和运维手册逐章解读.md)
+- [开发者部署实现](docs/开发者部署实现.md)
 - [环境变量参考](docs/环境变量参考.md)
 - [扩展指南](docs/扩展指南.md)
 - [Collector 说明](COLLECTORS.md)
@@ -88,43 +91,137 @@ python -m pip install '.[dev,collectors,postgres,performance]'
 make check
 ```
 
-常用门禁：
+需要手工逐项执行时，建议按以下顺序：
 
 ```bash
-make docs-check
-make architecture-check
 make mypy-check
-make test-parallel
+make architecture-check
+make docs-check
 make artifact-check
+make test-parallel
 ```
 
-`make artifact-check` 会重新构建唯一 wheel 和节点安装 bundle，并验证二者与
-`src/gpu_fault` 的模块摘要一致。发布时必须使用该次构建产生的同一份内容寻址制品，
-不能在上传或 pin 之间再次构建。
+`make check` 的最终全量测试同样使用4个xdist worker。真实PostgreSQL后端测试不参与
+并行；设置`GPU_FAULT_TEST_POSTGRES_URL`后单独运行`make test-postgres`。
 
-## 部署
+`make artifact-check` 构建三个独立 wheel、Node bundle 和内容寻址
+`dist/current-release.json`，并验证模块边界、摘要与重复构建确定性。
 
-生产部署从[部署和运维手册](docs/部署和运维手册.md)的区域全新部署顺序开始。
-不要直接执行目录级 `kubectl apply -f deploy/`，也不要直接 apply renderer 输入或
-测试清单。
+## 部署：先区分角色
 
-区域发布、升级和回滚入口：
+不要直接 apply `deploy/`。开发者发布和管理员部署使用不同入口：
+
+| 角色 | 事实源 | 唯一正常入口 | 作用 |
+|---|---|---|---|
+| 开发者/发布人员 | 当前 checkout、Profile template、`site.yaml` | `make release-deploy` | 检查、构建制品、准备site并部署升级 |
+| 管理员 | 首次部署的集群ARN；后续为已批准的release和`site.yaml` | `gpu-fault-admin` | 首次建站、预检、升级、验收和资源生命周期管理 |
+
+### 开发者：修改代码或Profile后发布
+
+普通代码修改完成后只执行：
 
 ```bash
-deploy/control-plane/regional/rollout-regional-release.sh
+make PYTHON=.venv/bin/python release-deploy \
+  SITE=/secure/gpu-fault/site.yaml
 ```
 
-部署前必须显式确认目标 Kubernetes context、AWS Region、release metadata、区域共享
-Runtime Profile、数据库连接、集群注册信息和节点安装制品。
-AWS Region 必须由部署操作者填写，不能从当前 shell、kubectl context 或示例文件推断；
-区域编排器会在任何 apply 前校验 CPU/GPU EKS ARN 与 HyperPod 归属。
+修改了 `runtimeProfile.templateSource` 指向的Profile策略时，在同一命令提供已批准的
+变更单引用：
+
+```bash
+PROFILE_APPROVAL=CHG-12345 \
+make PYTHON=.venv/bin/python release-deploy \
+  SITE=/secure/gpu-fault/site.yaml
+```
+
+如果尚未提供审批引用，首次运行只生成
+`<site目录>/release-deploy/profile-plan.json`并停止，不会修改集群。统一入口随后固定
+执行：Profile差异检查、完整`make check`、三个wheel和Node bundle构建、release及
+Agent config digest更新、`deploy -> verify -> status`。普通代码发布不需要
+`PROFILE_APPROVAL`，也不得手工修改generated Manifest、artifact摘要或Profile版本。
+完整实现见[开发者部署实现](docs/开发者部署实现.md)。
+
+### 管理员：首次部署和日常管理
+
+管理员不从源代码手工build，也不编辑Profile版本或artifact摘要。首次自动部署要求：
+
+1. 一个已有且至少有3个Ready节点的CPU EKS/HyperPod集群。
+2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`。
+3. GPU VPC已有NAT出口。
+4. 执行身份具有所需AWS、EKS和Kubernetes管理权限。
+
+Region由管理员选择的集群ARN或`site.yaml`中的`spec.awsRegion`明确给出，不从shell或
+当前kubectl context猜测。完整权限和网络要求见[管理员快速部署](docs/管理员快速部署.md)。
+
+#### 1. 首次部署
+
+不需要手写`site.yaml`，提供已有CPU/GPU集群ARN：
+
+```bash
+gpu-fault-admin deploy \
+  --cpu-cluster-arn <cpu-eks-or-hyperpod-arn> \
+  --gpu-cluster-arn <gpu-eks-or-hyperpod-arn> \
+  --state-dir /secure/gpu-fault \
+  --admin-email <operations-email>
+```
+
+`--gpu-cluster-arn`可重复；`--admin-email`可在账号邮箱可自动发现时省略。命令自动创建
+方案专属Aurora、IAM、NLB/PKI、监控和凭据，在
+`/secure/gpu-fault/site.yaml`生成持久事实源，并完成preflight、deploy和verify。
+
+#### 2. 已有站点的单命令操作
+
+以下每项都是独立的管理员入口：
+
+```bash
+SITE=/secure/gpu-fault/site.yaml
+
+# 预置条件检查：只读，不修改AWS或Kubernetes
+gpu-fault-admin preflight -f "${SITE}"
+
+# 首次应用部署或部署升级：自动preflight并按release差异最小滚动
+gpu-fault-admin deploy -f "${SITE}"
+
+# 独立验收：只读验证CPU/GPU、Profile、TLS/NLB、Agent和Aurora
+gpu-fault-admin verify -f "${SITE}"
+
+# 查看当前健康、release、Profile和各集群状态
+gpu-fault-admin status -f "${SITE}"
+
+# 注册一个已有GPU集群
+gpu-fault-admin join-cluster -f "${SITE}" --gpu-cluster-arn <gpu-arn>
+
+# 注销一个GPU集群；保留该GPU EKS/HyperPod和其他集群
+gpu-fault-admin remove-cluster -f "${SITE}" \
+  --cluster-id <cluster-id> --confirm REMOVE_GPU_CLUSTER
+
+# 卸载整个方案控制面和数据面，但保留底层CPU/GPU集群
+gpu-fault-admin uninstall -f "${SITE}" \
+  --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT
+```
+
+若永久退役并连底层CPU EKS/HyperPod集群一起删除，使用更强确认：
+
+```bash
+gpu-fault-admin uninstall -f "${SITE}" \
+  --cpu-cluster delete \
+  --aurora-final-snapshot retain \
+  --confirm DELETE_CPU_CONTROL_PLANE
+```
+
+GPU EKS/HyperPod始终保留。`deploy`失败或自动回滚后使用相同命令重跑；`join-cluster`和
+`remove-cluster`也通过持久状态幂等续跑。已有site的`deploy -f`不会重新构建当前
+checkout，只应用site声明的release；代码或Profile变更必须先进入开发者发布入口。
+详细升级、排障和退役规则见
+[管理员日常运维](docs/管理员日常运维.md)，逐对象审计和break-glass见
+[部署和运维详细参考](docs/部署和运维手册.md)。
 
 ## 训练任务提交
 
 支持两种受管提交方式：
 
 ```bash
-gpu-training-submit customer-job.yaml \
+gpu-training-submit --site /path/to/site.yaml customer-job.yaml \
   --job-id customer-job-001 \
   --attempt-number 1
 ```
@@ -132,7 +229,7 @@ gpu-training-submit customer-job.yaml \
 或先注入托管元数据，再由客户执行 apply：
 
 ```bash
-gpu-fault-workload-annotate customer-job.yaml \
+gpu-fault-workload-annotate --site /path/to/site.yaml customer-job.yaml \
   --job-id customer-job-001 \
   --attempt-number 1 \
   --training-container trainer \

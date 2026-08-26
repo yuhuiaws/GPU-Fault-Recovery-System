@@ -221,6 +221,7 @@ NOTIFICATION_DELIVER_BACKLOG="$(
 )"
 EMAIL_SECRET_NAME="gpu-fault-email"
 WHEEL_CONFIGMAP_NAME=""
+EXECUTOR_WHEEL_CONFIGMAP_NAME=""
 # Set by ensure_aurora, consumed by deploy_aurora_credential_refresh to scope
 # that job's IAM policy to this one managed secret and its KMS key.
 AURORA_MASTER_SECRET_ARN=""
@@ -1486,18 +1487,39 @@ build_artifacts() {
     WHEEL="$(
         python3.12 \
             "${REPO_DIR}/scripts/release-artifact-path.py" \
-            wheel --manifest "${RELEASE_MANIFEST}"
+            control-plane-wheel --manifest "${RELEASE_MANIFEST}"
+    )"
+    EXECUTOR_WHEEL="$(
+        python3.12 \
+            "${REPO_DIR}/scripts/release-artifact-path.py" \
+            executor-wheel --manifest "${RELEASE_MANIFEST}"
+    )"
+    NODE_WHEEL="$(
+        python3.12 \
+            "${REPO_DIR}/scripts/release-artifact-path.py" \
+            node-runtime-wheel --manifest "${RELEASE_MANIFEST}"
     )"
     BUNDLE="$(
         python3.12 \
             "${REPO_DIR}/scripts/release-artifact-path.py" \
             bundle --manifest "${RELEASE_MANIFEST}"
     )"
-    [[ -f "${WHEEL}" && -f "${BUNDLE}" ]] || {
+    [[ -f "${WHEEL}" && -f "${EXECUTOR_WHEEL}" &&
+        -f "${NODE_WHEEL}" && -f "${BUNDLE}" ]] || {
         printf 'ERROR: build artifacts are missing\n' >&2
         exit 1
     }
     WHEEL_SHA256="$(sha256sum "${WHEEL}" | cut -d' ' -f1)"
+    EXECUTOR_WHEEL_SHA256="$(sha256sum "${EXECUTOR_WHEEL}" | cut -d' ' -f1)"
+    NODE_WHEEL_SHA256="$(sha256sum "${NODE_WHEEL}" | cut -d' ' -f1)"
+    EXECUTOR_COMPATIBILITY_DIGEST="$(
+        jq -er '.components.executor.module_digest // .module_digest' \
+            "${RELEASE_MANIFEST}"
+    )"
+    NODE_COMPATIBILITY_DIGEST="$(
+        jq -er '.components.node_runtime.module_digest // .module_digest' \
+            "${RELEASE_MANIFEST}"
+    )"
     CURRENT_AGENT_PROTOCOL_VERSION="$(
         PYTHONPATH="${REPO_DIR}/src" python3.12 -c \
             'from gpu_fault.fleet import CURRENT_AGENT_PROTOCOL_VERSION; print(CURRENT_AGENT_PROTOCOL_VERSION)'
@@ -1506,12 +1528,19 @@ build_artifacts() {
         PYTHONPATH="${REPO_DIR}/src" python3.12 -c \
             'from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION; print(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION)'
     )"
+    HAD_RELEASE_METADATA=false
     if kubectl -n "${NAMESPACE}" get configmap \
         gpu-fault-release-metadata >/dev/null 2>&1; then
+        HAD_RELEASE_METADATA=true
         PREVIOUS_AGENT_ARTIFACT_SHA256="$(
             kubectl -n "${NAMESPACE}" get configmap \
                 gpu-fault-release-metadata \
                 -o jsonpath='{.data.required-agent-artifact-sha256}'
+        )"
+        PREVIOUS_AGENT_COMPATIBILITY_DIGEST="$(
+            kubectl -n "${NAMESPACE}" get configmap \
+                gpu-fault-release-metadata \
+                -o jsonpath='{.data.required-agent-compatibility-digest}'
         )"
         PREVIOUS_AGENT_PROTOCOL_VERSION="$(
             kubectl -n "${NAMESPACE}" get configmap \
@@ -1528,12 +1557,26 @@ build_artifacts() {
                 gpu-fault-release-metadata \
                 -o jsonpath='{.data.required-regional-executor-protocol-version}'
         )"
+        PREVIOUS_REGIONAL_EXECUTOR_ARTIFACT_SHA256="$(
+            kubectl -n "${NAMESPACE}" get configmap \
+                gpu-fault-release-metadata \
+                -o jsonpath='{.data.required-regional-executor-artifact-sha256}'
+        )"
+        PREVIOUS_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST="$(
+            kubectl -n "${NAMESPACE}" get configmap \
+                gpu-fault-release-metadata \
+                -o jsonpath='{.data.required-regional-executor-compatibility-digest}'
+        )"
     fi
     PREVIOUS_AGENT_PROTOCOL_VERSION="${PREVIOUS_AGENT_PROTOCOL_VERSION:-${GPU_FAULT_EXISTING_AGENT_PROTOCOL_VERSION:-3}}"
     PREVIOUS_REGIONAL_EXECUTOR_PROTOCOL_VERSION="${PREVIOUS_REGIONAL_EXECUTOR_PROTOCOL_VERSION:-${GPU_FAULT_EXISTING_REGIONAL_EXECUTOR_PROTOCOL_VERSION:-1}}"
     WHEEL_CONFIGMAP_NAME="$(
         printf 'gpu-fault-control-plane-wheel-%s-%s' \
             "${VERSION_TAG}" "${WHEEL_SHA256:0:12}"
+    )"
+    EXECUTOR_WHEEL_CONFIGMAP_NAME="$(
+        printf 'gpu-fault-executor-wheel-%s-%s' \
+            "${VERSION_TAG}" "${EXECUTOR_WHEEL_SHA256:0:12}"
     )"
     POLICY_VERSION="$(
         PYTHONPATH="${REPO_DIR}/src" python3.12 -c \
@@ -1589,15 +1632,54 @@ build_artifacts() {
         python3.12 -c \
             'from gpu_fault.node_agent import print_config_digest; print_config_digest()'
     )"
+    STAGED_AGENT_ARTIFACT_SHA256="${NODE_WHEEL_SHA256}"
+    COMPATIBLE_AGENT_ARTIFACT_SHA256S=""
+    if [[ -n "${PREVIOUS_AGENT_ARTIFACT_SHA256:-}" ]] &&
+        [[ "${PREVIOUS_AGENT_ARTIFACT_SHA256}" != "${NODE_WHEEL_SHA256}" ]]; then
+        STAGED_AGENT_ARTIFACT_SHA256="${PREVIOUS_AGENT_ARTIFACT_SHA256}"
+        COMPATIBLE_AGENT_ARTIFACT_SHA256S="${NODE_WHEEL_SHA256}"
+    fi
+    PREVIOUS_AGENT_COMPATIBILITY_DIGEST="$(
+        printf '%s' \
+            "${PREVIOUS_AGENT_COMPATIBILITY_DIGEST:-${PREVIOUS_AGENT_ARTIFACT_SHA256:-}}"
+    )"
+    STAGED_AGENT_COMPATIBILITY_DIGEST="${NODE_COMPATIBILITY_DIGEST}"
+    COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS=""
+    if [[ -n "${PREVIOUS_AGENT_COMPATIBILITY_DIGEST}" ]] &&
+        [[ "${PREVIOUS_AGENT_COMPATIBILITY_DIGEST}" != "${NODE_COMPATIBILITY_DIGEST}" ]]; then
+        STAGED_AGENT_COMPATIBILITY_DIGEST="${PREVIOUS_AGENT_COMPATIBILITY_DIGEST}"
+        COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS="${NODE_COMPATIBILITY_DIGEST}"
+    fi
+    STAGED_EXECUTOR_ARTIFACT_SHA256="${EXECUTOR_WHEEL_SHA256}"
+    STAGED_EXECUTOR_COMPATIBILITY_DIGEST="${EXECUTOR_COMPATIBILITY_DIGEST}"
+    COMPATIBLE_EXECUTOR_ARTIFACT_SHA256S=""
+    COMPATIBLE_EXECUTOR_COMPATIBILITY_DIGESTS=""
+    if [[ "${HAD_RELEASE_METADATA}" == "true" ]] &&
+        [[ -z "${PREVIOUS_REGIONAL_EXECUTOR_ARTIFACT_SHA256:-}" ]]; then
+        # Legacy releases did not pin the Executor artifact. Leave the
+        # staged control plane unpinned, roll the data plane, then establish
+        # the first strict pin in finalize_agent_pin_migration.
+        STAGED_EXECUTOR_ARTIFACT_SHA256=""
+        STAGED_EXECUTOR_COMPATIBILITY_DIGEST=""
+    elif [[ -n "${PREVIOUS_REGIONAL_EXECUTOR_ARTIFACT_SHA256:-}" ]] &&
+        [[ "${PREVIOUS_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" != "${EXECUTOR_WHEEL_SHA256}" ]]; then
+        STAGED_EXECUTOR_ARTIFACT_SHA256="${PREVIOUS_REGIONAL_EXECUTOR_ARTIFACT_SHA256}"
+        COMPATIBLE_EXECUTOR_ARTIFACT_SHA256S="${EXECUTOR_WHEEL_SHA256}"
+        PREVIOUS_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST="$(
+            printf '%s' \
+                "${PREVIOUS_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST:-${PREVIOUS_REGIONAL_EXECUTOR_ARTIFACT_SHA256}}"
+        )"
+        STAGED_EXECUTOR_COMPATIBILITY_DIGEST="${PREVIOUS_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}"
+        if [[ "${PREVIOUS_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" != "${EXECUTOR_COMPATIBILITY_DIGEST}" ]]; then
+            COMPATIBLE_EXECUTOR_COMPATIBILITY_DIGESTS="${EXECUTOR_COMPATIBILITY_DIGEST}"
+        fi
+    fi
     kubectl -n "${NAMESPACE}" create configmap \
         gpu-fault-release-metadata \
-        --from-literal=required-agent-artifact-sha256="${PREVIOUS_AGENT_ARTIFACT_SHA256:-${WHEEL_SHA256}}" \
-        --from-literal=compatible-agent-artifact-sha256s="$(
-            if [[ -n "${PREVIOUS_AGENT_ARTIFACT_SHA256}" ]] &&
-                [[ "${PREVIOUS_AGENT_ARTIFACT_SHA256}" != "${WHEEL_SHA256}" ]]; then
-                printf '%s' "${WHEEL_SHA256}"
-            fi
-        )" \
+        --from-literal=required-agent-artifact-sha256="${STAGED_AGENT_ARTIFACT_SHA256}" \
+        --from-literal=compatible-agent-artifact-sha256s="${COMPATIBLE_AGENT_ARTIFACT_SHA256S}" \
+        --from-literal=required-agent-compatibility-digest="${STAGED_AGENT_COMPATIBILITY_DIGEST}" \
+        --from-literal=compatible-agent-compatibility-digests="${COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS}" \
         --from-literal=required-agent-protocol-version="${PREVIOUS_AGENT_PROTOCOL_VERSION:-${CURRENT_AGENT_PROTOCOL_VERSION}}" \
         --from-literal=compatible-agent-protocol-versions="$(
             if [[ "${PREVIOUS_AGENT_PROTOCOL_VERSION}" != "${CURRENT_AGENT_PROTOCOL_VERSION}" ]]; then
@@ -1610,6 +1692,10 @@ build_artifacts() {
                 printf '%s' "${CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION}"
             fi
         )" \
+        --from-literal=required-regional-executor-artifact-sha256="${STAGED_EXECUTOR_ARTIFACT_SHA256}" \
+        --from-literal=compatible-regional-executor-artifact-sha256s="${COMPATIBLE_EXECUTOR_ARTIFACT_SHA256S}" \
+        --from-literal=required-regional-executor-compatibility-digest="${STAGED_EXECUTOR_COMPATIBILITY_DIGEST}" \
+        --from-literal=compatible-regional-executor-compatibility-digests="${COMPATIBLE_EXECUTOR_COMPATIBILITY_DIGESTS}" \
         --from-literal=required-agent-config-digest="${PREVIOUS_AGENT_CONFIG_DIGEST:-${CONFIG_DIGEST}}" \
         --from-literal=compatible-agent-config-digests="$(
             if [[ -n "${PREVIOUS_AGENT_CONFIG_DIGEST}" ]] &&
@@ -1624,6 +1710,12 @@ build_artifacts() {
         kubectl -n "${NAMESPACE}" create configmap \
             "${WHEEL_CONFIGMAP_NAME}" \
             --from-file="gpu_fault_control_plane-${VERSION}-py3-none-any.whl=${WHEEL}"
+    fi
+    if ! kubectl -n "${NAMESPACE}" get configmap \
+        "${EXECUTOR_WHEEL_CONFIGMAP_NAME}" >/dev/null 2>&1; then
+        kubectl -n "${NAMESPACE}" create configmap \
+            "${EXECUTOR_WHEEL_CONFIGMAP_NAME}" \
+            --from-file="gpu_fault_cluster_executor-${VERSION}-py3-none-any.whl=${EXECUTOR_WHEEL}"
     fi
     if kubectl -n "${NAMESPACE}" get configmap \
         "gpu-fault-node-installer-${VERSION_TAG}" >/dev/null 2>&1; then
@@ -1651,7 +1743,7 @@ build_artifacts() {
     # yet at this point, so reference detection alone would not save it.
     if [[ "${GPU_FAULT_PRUNE_WHEELS:-true}" == "true" ]]; then
         NAMESPACE="${NAMESPACE}" GPU_FAULT_PRUNE_APPLY=true \
-            GPU_FAULT_PRUNE_PROTECT="${WHEEL_CONFIGMAP_NAME}" \
+            GPU_FAULT_PRUNE_PROTECT="${WHEEL_CONFIGMAP_NAME},${EXECUTOR_WHEEL_CONFIGMAP_NAME}" \
             "${REPO_DIR}/deploy/control-plane/tools/prune-wheel-configmaps.sh" ||
             printf 'WARNING: wheel ConfigMap prune failed; continuing\n' >&2
     fi
@@ -2070,7 +2162,8 @@ import json
 import urllib.request
 
 cluster = "'"${HYPERPOD_CLUSTER_NAME}"'"
-artifact = "'"${WHEEL_SHA256}"'"
+artifact = "'"${NODE_WHEEL_SHA256}"'"
+compatibility = "'"${NODE_COMPATIBILITY_DIGEST}"'"
 config = "'"${CONFIG_DIGEST}"'"
 protocol = int("'"${CURRENT_AGENT_PROTOCOL_VERSION}"'")
 now = datetime.datetime.now(datetime.timezone.utc)
@@ -2081,6 +2174,8 @@ print(sum(
     item["lifecycle_state"] == "ACTIVE"
     and item["agent_protocol_version"] == protocol
     and item["artifact_sha256"] == artifact
+    and (item.get("compatibility_digest") or item["artifact_sha256"])
+        == compatibility
     and item["config_digest"] == config
     and datetime.datetime.fromisoformat(
         item["lease_expires_at"].replace("Z", "+00:00")
@@ -2101,12 +2196,18 @@ print(sum(
     }
     kubectl -n "${NAMESPACE}" create configmap \
         gpu-fault-release-metadata \
-        --from-literal=required-agent-artifact-sha256="${WHEEL_SHA256}" \
+        --from-literal=required-agent-artifact-sha256="${NODE_WHEEL_SHA256}" \
         --from-literal=compatible-agent-artifact-sha256s="" \
+        --from-literal=required-agent-compatibility-digest="${NODE_COMPATIBILITY_DIGEST}" \
+        --from-literal=compatible-agent-compatibility-digests="" \
         --from-literal=required-agent-protocol-version="${CURRENT_AGENT_PROTOCOL_VERSION}" \
         --from-literal=compatible-agent-protocol-versions="" \
         --from-literal=required-regional-executor-protocol-version="${CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION}" \
         --from-literal=compatible-regional-executor-protocol-versions="" \
+        --from-literal=required-regional-executor-artifact-sha256="${EXECUTOR_WHEEL_SHA256}" \
+        --from-literal=compatible-regional-executor-artifact-sha256s="" \
+        --from-literal=required-regional-executor-compatibility-digest="${EXECUTOR_COMPATIBILITY_DIGEST}" \
+        --from-literal=compatible-regional-executor-compatibility-digests="" \
         --from-literal=required-agent-config-digest="${CONFIG_DIGEST}" \
         --from-literal=compatible-agent-config-digests="" \
         --from-literal=required-node-action-key-version="2" \
@@ -2640,12 +2741,14 @@ print(json.dumps({
 
 deploy_watcher_and_dcgm() {
     sed \
-        -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g" \
+        -e "s/gpu-fault-executor-wheel-0100/${EXECUTOR_WHEEL_CONFIGMAP_NAME}/g" \
+        -e "s/gpu_fault_cluster_executor-0.10.0/gpu_fault_cluster_executor-${VERSION}/g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
         "${REPO_DIR}/deploy/dataplane/completion-watcher.yaml" |
         kubectl apply -f -
     sed \
-        -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g" \
+        -e "s/gpu-fault-executor-wheel-0100/${EXECUTOR_WHEEL_CONFIGMAP_NAME}/g" \
+        -e "s/gpu_fault_cluster_executor-0.10.0/gpu_fault_cluster_executor-${VERSION}/g" \
         -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
         "${REPO_DIR}/deploy/dataplane/kubernetes-node-resource-collector.yaml" |
@@ -2660,7 +2763,8 @@ deploy_watcher_and_dcgm() {
         sed \
             -e "s/REPLACE_WITH_CLUSTER_ID/${HYPERPOD_CLUSTER_NAME}/g" \
             -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE}#g" \
-            -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g" \
+            -e "s/gpu-fault-executor-wheel-0100/${EXECUTOR_WHEEL_CONFIGMAP_NAME}/g" \
+            -e "s/gpu_fault_cluster_executor-0.10.0/gpu_fault_cluster_executor-${VERSION}/g" \
             -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
             "${REPO_DIR}/deploy/dataplane/optional/hma-watcher.yaml" |
             kubectl apply -f -
@@ -2709,7 +2813,8 @@ run_node_installer_job() {
     GPU_FAULT_VERSION="${VERSION}" \
     GPU_FAULT_INSTALLER_CONFIG_MAP="gpu-fault-node-installer-${VERSION_TAG}" \
     GPU_FAULT_INSTALLER_CONFIG_DIGEST="${CONFIG_DIGEST}" \
-    GPU_FAULT_INSTALLER_ARTIFACT_SHA256="${WHEEL_SHA256}" \
+    GPU_FAULT_INSTALLER_ARTIFACT_SHA256="${NODE_WHEEL_SHA256}" \
+    GPU_FAULT_NODE_COMPATIBILITY_DIGEST="${NODE_COMPATIBILITY_DIGEST}" \
     GPU_FAULT_DIAGNOSTIC_S3_URI="${DIAGNOSTIC_S3_URI}" \
     GPU_FAULT_ENABLE_NODE_FIELD_DIAGNOSTIC="${ENABLE_FIELD_DIAGNOSTIC}" \
     GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND="${FIELD_DIAGNOSTIC_COMMAND}" \
@@ -2808,11 +2913,11 @@ deploy_node_installer_reconciler() {
         -e "s#REPLACE_WITH_CLUSTER_ID#${HYPERPOD_CLUSTER_NAME}#g" \
         -e "s#REPLACE_WITH_INSTALLER_VERSION#${VERSION}#g" \
         -e "s#REPLACE_WITH_INSTALLER_CONFIG_DIGEST#${CONFIG_DIGEST}#g" \
-        -e "s#REPLACE_WITH_INSTALLER_ARTIFACT_SHA256#${WHEEL_SHA256}#g" \
+        -e "s#REPLACE_WITH_INSTALLER_ARTIFACT_SHA256#${NODE_WHEEL_SHA256}#g" \
         -e "s#REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP#${template_config_map}#g" \
         -e "s#REPLACE_WITH_DCGM_METRICS_URL#${DCGM_METRICS_URL_TEMPLATE}#g" \
-        -e "s#gpu-fault-control-plane-wheel-0100#${WHEEL_CONFIGMAP_NAME}#g" \
-        -e "s#gpu_fault_control_plane-0.10.0#gpu_fault_control_plane-${VERSION}#g" \
+        -e "s#gpu-fault-executor-wheel-0100#${EXECUTOR_WHEEL_CONFIGMAP_NAME}#g" \
+        -e "s#gpu_fault_cluster_executor-0.10.0#gpu_fault_cluster_executor-${VERSION}#g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
         "${REPO_DIR}/deploy/dataplane/node-installer-reconciler.yaml" |
         kubectl apply -f -
@@ -2916,7 +3021,8 @@ ready_nodes="$(
 import datetime
 import json, urllib.request
 cluster = "'"${HYPERPOD_CLUSTER_NAME}"'"
-expected_artifact = "'"${WHEEL_SHA256}"'"
+expected_artifact = "'"${NODE_WHEEL_SHA256}"'"
+expected_compatibility = "'"${NODE_COMPATIBILITY_DIGEST}"'"
 expected_config = "'"${CONFIG_DIGEST}"'"
 expected_protocol = int("'"${CURRENT_AGENT_PROTOCOL_VERSION}"'")
 items = json.load(urllib.request.urlopen(
@@ -2944,6 +3050,8 @@ consistent = {
 assert len(consistent) <= 1, "Agent versions/configurations differ"
 assert all(
     item["artifact_sha256"] == expected_artifact
+    and (item.get("compatibility_digest") or item["artifact_sha256"])
+        == expected_compatibility
     and item["config_digest"] == expected_config
     for item in active
 ), "Agent artifact/configuration differs from control-plane requirement"

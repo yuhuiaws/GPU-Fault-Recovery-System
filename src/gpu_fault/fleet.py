@@ -9,24 +9,36 @@ from enum import StrEnum
 from threading import RLock
 from typing import Any
 from uuid import uuid4
+
 from pydantic import Field, field_validator, model_validator
+
 from gpu_fault.collector_requirements import (
     CollectorServices,
     ReportedCollectorServices,
 )
 from gpu_fault.fleet_compatibility import (
     CURRENT_AGENT_PROTOCOL_VERSION as CURRENT_AGENT_PROTOCOL_VERSION,
+)
+from gpu_fault.fleet_compatibility import (
     NODE_ACTION_KEY_VERSION_DERIVED as NODE_ACTION_KEY_VERSION_DERIVED,
+)
+from gpu_fault.fleet_compatibility import (
     NODE_ACTION_KEY_VERSION_SHARED as NODE_ACTION_KEY_VERSION_SHARED,
+)
+from gpu_fault.fleet_compatibility import (
     SHA256_PATTERN,
-    FleetCompatibilityPolicy as FleetCompatibilityPolicy,
     pin_value_is_accepted,
     rollout_compatibility_reasons,
 )
+from gpu_fault.fleet_compatibility import (
+    FleetCompatibilityPolicy as FleetCompatibilityPolicy,
+)
 from gpu_fault.fleet_endpoint import (
     DEFAULT_AGENT_ENDPOINT_PORTS,
-    parse_endpoint_networks as parse_endpoint_networks,
     validate_agent_endpoint,
+)
+from gpu_fault.fleet_endpoint import (
+    parse_endpoint_networks as parse_endpoint_networks,
 )
 from gpu_fault.installation_inventory import (
     InstalledUnitInventory,
@@ -36,7 +48,11 @@ from gpu_fault.installation_inventory import (
 from gpu_fault.models import StrictModel, WorkflowOperation
 from gpu_fault.node_action_keys import (
     derive_node_action_secret as derive_node_action_secret,
+)
+from gpu_fault.node_action_keys import (
     node_action_secrets_from_environment as node_action_secrets_from_environment,
+)
+from gpu_fault.node_action_keys import (
     resolve_node_action_secret,
 )
 from gpu_fault.store import NotFoundError
@@ -56,6 +72,7 @@ class AgentHeartbeat(StrictModel):
     )
     agent_version: str
     artifact_sha256: str
+    compatibility_digest: str | None = None
     policy_version: str
     runtime_profile_version: str
     config_digest: str
@@ -74,9 +91,11 @@ class AgentHeartbeat(StrictModel):
             raise ValueError("agent endpoint must use http or https")
         return value.rstrip("/")
 
-    @field_validator("artifact_sha256", "config_digest")
+    @field_validator("artifact_sha256", "compatibility_digest", "config_digest")
     @classmethod
-    def validate_digest(cls, value: str) -> str:
+    def validate_digest(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         normalized = value.lower()
         if not SHA256_PATTERN.fullmatch(normalized):
             raise ValueError("digest must be a SHA-256 hex value")
@@ -122,6 +141,7 @@ class AgentRecord(StrictModel):
     )
     agent_version: str
     artifact_sha256: str
+    compatibility_digest: str | None = None
     policy_version: str
     runtime_profile_version: str
     config_digest: str
@@ -144,11 +164,12 @@ class AgentRecord(StrictModel):
     @property
     def identity(
         self,
-    ) -> tuple[int, str, str, str, str, str]:
+    ) -> tuple[int, str, str, str, str, str, str]:
         return (
             self.agent_protocol_version,
             self.agent_version,
             self.artifact_sha256,
+            self.compatibility_digest or self.artifact_sha256,
             self.policy_version,
             self.runtime_profile_version,
             self.config_digest,
@@ -200,14 +221,21 @@ class FleetDeploymentRequest(StrictModel):
     node_ids: list[str] = Field(min_length=1)
     desired_agent_version: str
     desired_artifact_sha256: str
+    desired_compatibility_digest: str | None = None
     desired_policy_version: str
     desired_runtime_profile_version: str
     desired_config_digest: str
     max_unavailable: int = Field(default=1, ge=1)
 
-    @field_validator("desired_artifact_sha256", "desired_config_digest")
+    @field_validator(
+        "desired_artifact_sha256",
+        "desired_compatibility_digest",
+        "desired_config_digest",
+    )
     @classmethod
-    def validate_digest(cls, value: str) -> str:
+    def validate_digest(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         normalized = value.lower()
         if not SHA256_PATTERN.fullmatch(normalized):
             raise ValueError("digest must be a SHA-256 hex value")
@@ -234,6 +262,7 @@ class FleetDeployment(StrictModel):
     cluster_id: str
     desired_agent_version: str
     desired_artifact_sha256: str
+    desired_compatibility_digest: str | None = None
     desired_policy_version: str
     desired_runtime_profile_version: str
     desired_config_digest: str
@@ -296,7 +325,29 @@ class MultiNodeBarrier(StrictModel):
     updated_at: datetime
 
 
+def deployment_status(nodes: list[DeploymentNode]) -> DeploymentStatus:
+    statuses = {item.status for item in nodes}
+    if DeploymentNodeStatus.FAILED in statuses:
+        return DeploymentStatus.FAILED
+    if statuses == {DeploymentNodeStatus.READY}:
+        return DeploymentStatus.SUCCEEDED
+    if statuses == {DeploymentNodeStatus.PENDING}:
+        return DeploymentStatus.PLANNED
+    return DeploymentStatus.IN_PROGRESS
+
+
+def active_deployment_wave(deployment: FleetDeployment) -> list[str] | None:
+    by_node = {item.node_id: item.status for item in deployment.nodes}
+    for wave in deployment.waves:
+        if any(by_node[node_id] is not DeploymentNodeStatus.READY for node_id in wave):
+            return wave
+    return None
+
+
 class FleetRegistry:
+    _deployment_status = staticmethod(deployment_status)
+    _active_wave = staticmethod(active_deployment_wave)
+
     def __init__(
         self,
         store: ControlPlaneStore,
@@ -430,6 +481,7 @@ class FleetRegistry:
             heartbeat.agent_protocol_version,
             heartbeat.agent_version,
             heartbeat.artifact_sha256,
+            heartbeat.compatibility_digest or heartbeat.artifact_sha256,
             heartbeat.policy_version,
             heartbeat.runtime_profile_version,
             heartbeat.config_digest,
@@ -465,6 +517,9 @@ class FleetRegistry:
             node_action_key_version=(heartbeat.node_action_key_version),
             agent_version=heartbeat.agent_version,
             artifact_sha256=heartbeat.artifact_sha256,
+            compatibility_digest=(
+                heartbeat.compatibility_digest or heartbeat.artifact_sha256
+            ),
             policy_version=heartbeat.policy_version,
             runtime_profile_version=(heartbeat.runtime_profile_version),
             config_digest=heartbeat.config_digest,
@@ -900,6 +955,7 @@ class FleetRegistry:
             CURRENT_AGENT_PROTOCOL_VERSION,
             request.desired_agent_version,
             request.desired_artifact_sha256,
+            request.desired_compatibility_digest or request.desired_artifact_sha256,
             request.desired_policy_version,
             request.desired_runtime_profile_version,
             request.desired_config_digest,
@@ -931,6 +987,9 @@ class FleetRegistry:
             cluster_id=request.cluster_id,
             desired_agent_version=request.desired_agent_version,
             desired_artifact_sha256=(request.desired_artifact_sha256),
+            desired_compatibility_digest=(
+                request.desired_compatibility_digest or request.desired_artifact_sha256
+            ),
             desired_policy_version=request.desired_policy_version,
             desired_runtime_profile_version=(request.desired_runtime_profile_version),
             desired_config_digest=request.desired_config_digest,
@@ -1106,6 +1165,8 @@ class FleetRegistry:
             CURRENT_AGENT_PROTOCOL_VERSION,
             deployment.desired_agent_version,
             deployment.desired_artifact_sha256,
+            deployment.desired_compatibility_digest
+            or deployment.desired_artifact_sha256,
             deployment.desired_policy_version,
             deployment.desired_runtime_profile_version,
             deployment.desired_config_digest,
@@ -1119,31 +1180,6 @@ class FleetRegistry:
                 DeploymentNodeUpdate(status=DeploymentNodeStatus.READY),
                 from_heartbeat=True,
             )
-
-    @staticmethod
-    def _deployment_status(
-        nodes: list[DeploymentNode],
-    ) -> DeploymentStatus:
-        statuses = {item.status for item in nodes}
-        if DeploymentNodeStatus.FAILED in statuses:
-            return DeploymentStatus.FAILED
-        if statuses == {DeploymentNodeStatus.READY}:
-            return DeploymentStatus.SUCCEEDED
-        if statuses == {DeploymentNodeStatus.PENDING}:
-            return DeploymentStatus.PLANNED
-        return DeploymentStatus.IN_PROGRESS
-
-    @staticmethod
-    def _active_wave(
-        deployment: FleetDeployment,
-    ) -> list[str] | None:
-        by_node = {item.node_id: item.status for item in deployment.nodes}
-        for wave in deployment.waves:
-            if any(
-                by_node[node_id] is not DeploymentNodeStatus.READY for node_id in wave
-            ):
-                return wave
-        return None
 
 
 class BarrierCoordinator:

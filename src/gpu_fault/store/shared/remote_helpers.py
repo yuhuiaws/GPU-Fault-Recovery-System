@@ -6,6 +6,12 @@ from gpu_fault.remote_command_models import RemoteCommandStatus
 
 
 UNCLAIMED_DEADLINE_STATUS_SOURCE = "unclaimed-deadline-exceeded"
+LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS = frozenset(
+    {
+        "ValueError: node is already isolated by another incident/token",
+        "ValueError: node is controlled by a newer workflow generation",
+    }
+)
 
 
 def remote_command_identity(command) -> tuple:
@@ -62,7 +68,10 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
     unclaimed_expired = 0
     for command in commands:
         by_status[command.status.value] = by_status.get(command.status.value, 0) + 1
-        if command.status_source == "executor-internal-error":
+        if (
+            command.status_source == "executor-internal-error"
+            and command.error not in LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS
+        ):
             internal_errors += 1
         if command.status_source == UNCLAIMED_DEADLINE_STATUS_SOURCE:
             unclaimed_expired += 1

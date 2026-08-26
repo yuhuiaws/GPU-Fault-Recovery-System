@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
+from gpu_fault import training_submit_cli
 from gpu_fault.training_submit_cli import TrainingSubmitError, inject_metadata, run
 
 
@@ -189,3 +191,23 @@ def test_dry_run_overrides_manifest_namespace(tmp_path, capsys) -> None:
 
     assert run(args) == 0
     assert yaml.safe_load(capsys.readouterr().out)["metadata"]["namespace"] == "target"
+
+
+def test_site_supplies_runtime_profile_and_rejects_mismatch(
+    tmp_path, monkeypatch
+) -> None:
+    site = tmp_path / "site.yaml"
+    site.write_text("site", encoding="utf-8")
+    monkeypatch.setattr(
+        training_submit_cli,
+        "load_site",
+        lambda _path: SimpleNamespace(
+            release_config={"runtime_profile": {"version": "profile-v2"}}
+        ),
+    )
+    args = argparse.Namespace(site=site, runtime_profile_version=None)
+
+    assert training_submit_cli.resolve_runtime_profile_version(args) == "profile-v2"
+    args.runtime_profile_version = "profile-v1"
+    with pytest.raises(TrainingSubmitError, match="does not match"):
+        training_submit_cli.resolve_runtime_profile_version(args)

@@ -30,6 +30,8 @@ class FleetCompatibilityPolicy(StrictModel):
     required_agent_version: str | None = None
     required_artifact_sha256: str | None = None
     compatible_artifact_sha256s: frozenset[str] = Field(default_factory=frozenset)
+    required_compatibility_digest: str | None = None
+    compatible_compatibility_digests: frozenset[str] = Field(default_factory=frozenset)
     required_policy_version: str | None = None
     required_runtime_profile_version: str | None = None
     required_config_digest: str | None = None
@@ -44,6 +46,7 @@ class FleetCompatibilityPolicy(StrictModel):
 
     @field_validator(
         "required_artifact_sha256",
+        "required_compatibility_digest",
         "required_config_digest",
     )
     @classmethod
@@ -64,6 +67,7 @@ class FleetCompatibilityPolicy(StrictModel):
 
     @field_validator(
         "compatible_artifact_sha256s",
+        "compatible_compatibility_digests",
         "compatible_config_digests",
     )
     @classmethod
@@ -112,6 +116,25 @@ def rollout_compatibility_reasons(
             "artifact SHA-256 mismatch: "
             f"expected {expected}, got {record.artifact_sha256}"
         )
+    accepted_compatibility = {
+        value
+        for value in {
+            policy.required_compatibility_digest,
+            *policy.compatible_compatibility_digests,
+        }
+        if value is not None
+    }
+    actual_compatibility = record.compatibility_digest or record.artifact_sha256
+    if accepted_compatibility and actual_compatibility not in accepted_compatibility:
+        expected = (
+            next(iter(accepted_compatibility))
+            if len(accepted_compatibility) == 1
+            else "one of " + ", ".join(sorted(accepted_compatibility))
+        )
+        reasons.append(
+            "compatibility digest mismatch: "
+            f"expected {expected}, got {actual_compatibility}"
+        )
     accepted_configs = {
         value
         for value in {
@@ -147,5 +170,10 @@ def pin_value_is_accepted(
         return actual in {
             required,
             *policy.compatible_config_digests,
+        }
+    if attribute == "compatibility_digest":
+        return actual in {
+            required,
+            *policy.compatible_compatibility_digests,
         }
     return actual == required

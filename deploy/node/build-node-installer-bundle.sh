@@ -13,7 +13,7 @@ root = pathlib.Path(__import__("sys").argv[1])
 print(tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"])
 ' "${REPO_DIR}"
 )"
-WHEEL="${GPU_FAULT_WHEEL:-}"
+WHEEL="${GPU_FAULT_NODE_WHEEL:-${GPU_FAULT_WHEEL:-}}"
 if [[ -z "${WHEEL}" ]]; then
     WHEEL="$(
         python3 - "${REPO_DIR}" "$(
@@ -26,14 +26,19 @@ import sys
 
 root = pathlib.Path(sys.argv[1])
 manifest = pathlib.Path(sys.argv[2])
-value = json.loads(manifest.read_text(encoding="utf-8"))["wheel"]
+document = json.loads(manifest.read_text(encoding="utf-8"))
+value = (
+    document.get("components", {})
+    .get("node_runtime", {})
+    .get("wheel", document["wheel"])
+)
 path = pathlib.Path(value)
 print(path if path.is_absolute() else root / path)
 PY
     )"
 fi
 [[ -n "${WHEEL}" && -f "${WHEEL}" ]] || {
-    printf 'ERROR: build the %s wheel first\n' "${VERSION}" >&2
+    printf 'ERROR: build the %s node-runtime wheel first\n' "${VERSION}" >&2
     exit 1
 }
 OUTPUT_DIR="${OUTPUT_DIR:-$(dirname "${WHEEL}")}"
@@ -64,5 +69,10 @@ install -m 0644 "${REPO_DIR}/deploy/dataplane/dcgm-counters.csv" \
     "${ROOT}/deploy/dataplane/dcgm-counters.csv"
 install -m 0644 "${WHEEL}" "${ROOT}/dist/"
 install -d "${OUTPUT_DIR}"
-tar -C "${STAGING}" -czf "${OUTPUT_DIR}/${BUNDLE}.tar.gz" "${BUNDLE}"
+tar -C "${STAGING}" \
+    --sort=name \
+    --mtime='UTC 1970-01-01' \
+    --owner=0 --group=0 --numeric-owner \
+    -cf - "${BUNDLE}" |
+    gzip -n >"${OUTPUT_DIR}/${BUNDLE}.tar.gz"
 printf '%s\n' "${OUTPUT_DIR}/${BUNDLE}.tar.gz"

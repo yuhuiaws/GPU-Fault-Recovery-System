@@ -71,7 +71,7 @@ spec:
             - >-
               python -m venv /venv
               && /venv/bin/python -m pip install --no-cache-dir
-              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors]'
+              '/artifact/gpu_fault_cluster_executor-0.10.0-py3-none-any.whl[collectors]'
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -143,7 +143,7 @@ spec:
       volumes:
         - name: artifact
           configMap:
-            name: gpu-fault-control-plane-wheel-0100
+            name: gpu-fault-executor-wheel-0100
         - name: control-plane-ca
           secret:
             secretName: gpu-fault-regional-connection

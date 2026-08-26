@@ -49,16 +49,19 @@ def test_release_artifact_path_verifies_the_release_matches_this_checkout(
     assert MODULE.verify_module_digest(ROOT / "dist/current-release.json") == live
 
     stale = tmp_path / "release.json"
-    stale.write_text(json.dumps({**current, "module_digest": "0" * 64}))
+    stale_document = json.loads(json.dumps(current))
+    stale_document["module_digest"] = "0" * 64
+    stale_document["components"]["control_plane"]["module_digest"] = "0" * 64
+    stale.write_text(json.dumps(stale_document))
     with pytest.raises(RuntimeError, match="built from different code"):
         MODULE.verify_module_digest(stale)
 
     without = tmp_path / "no-digest.json"
-    without.write_text(
-        json.dumps(
-            {key: value for key, value in current.items() if key != "module_digest"}
-        )
-    )
+    without_document = {
+        key: value for key, value in current.items() if key != "module_digest"
+    }
+    without_document["components"]["control_plane"].pop("module_digest", None)
+    without.write_text(json.dumps(without_document))
     with pytest.raises(RuntimeError, match="no module_digest"):
         MODULE.verify_module_digest(without)
 
@@ -70,7 +73,9 @@ def test_release_artifact_path_checks_the_digest_before_printing(
     # MODULE 是 LazyScriptModule 包装器，setattr 只会落在包装器上，main()
     # 查的是脚本自己的 globals。
     monkeypatch.setitem(
-        MODULE.main.__globals__, "verify_module_digest", lambda path: calls.append(path)
+        MODULE.main.__globals__,
+        "verify_module_digest",
+        lambda path, _key="wheel": calls.append(path),
     )
     monkeypatch.setattr("sys.argv", ["release-artifact-path.py", "wheel"])
 

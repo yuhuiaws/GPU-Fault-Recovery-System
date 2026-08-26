@@ -90,6 +90,8 @@ class AgentRegistrySettings:
     required_agent_version: str | None
     required_artifact_sha256: str
     compatible_artifact_sha256s: frozenset[str]
+    required_compatibility_digest: str
+    compatible_compatibility_digests: frozenset[str]
     required_policy_version: str | None
     required_runtime_profile_version: str | None
     required_config_digest: str
@@ -104,6 +106,9 @@ class AgentRegistrySettings:
         enabled = _boolean(values, "GPU_FAULT_ENABLE_AGENT_REGISTRY")
         artifact = values.get("GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256", "").strip()
         config_digest = values.get("GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST", "").strip()
+        compatibility_digest = (
+            values.get("GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST") or artifact
+        ).strip()
         if enabled and (not artifact or not config_digest):
             raise RuntimeError(
                 "agent registry requires non-empty "
@@ -147,6 +152,13 @@ class AgentRegistrySettings:
                 "GPU_FAULT_COMPATIBLE_AGENT_ARTIFACT_SHA256S",
             )
         ) - {artifact.lower()}
+        compatible_compatibility = frozenset(
+            value.lower()
+            for value in _csv(
+                values,
+                "GPU_FAULT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS",
+            )
+        ) - {compatibility_digest.lower()}
         compatible_config_digests = frozenset(
             value.lower()
             for value in _csv(
@@ -177,6 +189,8 @@ class AgentRegistrySettings:
             ),
             required_artifact_sha256=artifact,
             compatible_artifact_sha256s=compatible_artifacts,
+            required_compatibility_digest=compatibility_digest,
+            compatible_compatibility_digests=compatible_compatibility,
             required_policy_version=(
                 values.get("GPU_FAULT_REQUIRED_POLICY_VERSION") or None
             ),
@@ -275,13 +289,13 @@ class ControlPlaneSettings:
                 raise RuntimeError(
                     "GPU_FAULT_REGIONAL_CLUSTERS_JSON is invalid"
                 ) from exc
-            if not isinstance(parsed, list) or not parsed:
-                raise RuntimeError("regional cluster registry must be a non-empty list")
+            if not isinstance(parsed, list):
+                raise RuntimeError("regional cluster registry must be a list")
             if not all(isinstance(item, dict) for item in parsed):
                 raise RuntimeError("regional cluster registry entries must be objects")
             cluster_values = tuple(dict(item) for item in parsed)
         if regional_mode:
-            if not cluster_values:
+            if not raw_clusters:
                 raise RuntimeError(
                     "regional mode requires GPU_FAULT_REGIONAL_CLUSTERS_JSON"
                 )

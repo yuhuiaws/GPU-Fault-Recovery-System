@@ -74,6 +74,39 @@ def test_regional_executor_client_advertises_current_protocol(monkeypatch) -> No
     ]
 
 
+def test_regional_executor_client_advertises_its_artifact(monkeypatch) -> None:
+    artifact = "a" * 64
+    client = RegionalExecutorClient(
+        "https://control-plane.example",
+        "cluster-a",
+        "token-value",
+        executor_artifact_sha256=artifact,
+    )
+    payloads = []
+
+    def post(path, payload):
+        payloads.append((path, payload))
+        return {"commands": []} if path.endswith("/claim") else {"ready": True}
+
+    monkeypatch.setattr(client, "_post", post)
+
+    client.claim("executor-a", max_commands=1, lease_seconds=60)
+    client.readiness(
+        "executor-a",
+        execution_owners=["owner-a"],
+        last_successful_claim_age_seconds=1.0,
+    )
+
+    assert [payload["executor_artifact_sha256"] for _, payload in payloads] == [
+        artifact,
+        artifact,
+    ]
+    assert [payload["executor_compatibility_digest"] for _, payload in payloads] == [
+        artifact,
+        artifact,
+    ]
+
+
 def test_regional_executor_client_scopes_private_ca_to_control_plane(
     monkeypatch,
 ) -> None:

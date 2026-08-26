@@ -2,11 +2,15 @@
 # 每个 OWN/DELEGATE 的 owner 必须由目标 GPU 集群 executor 实际构造的
 # adapter 广告出来，否则该 owner 的 remote command 永远不会被 claim。
 # nodeReboot / nodeReplace 的 gpu-fault-hyperpod-adapter 要求 executor
-# 设置 GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true；默认清单为 false，
-# 注册本 profile 前必须先按部署和运维手册"阶段 D"打开它。
+# 设置 GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true。当前 profile 同时 OWN 两项能力，
+# 注册前必须完成部署和运维手册阶段 D.1/D.2 的独立验收；若只批准 reboot，
+# 应发布新的 profile version 并将 nodeReplace 保持为 OBSERVE。
 # 校验命令见 docs/部署和运维手册.md 的"区域模式故障排查"小节。
-# cluster_id 是已注册稳定集群 ID 形式的注册锚点，不是 HyperPod provider 名。
+# cluster_id 是稳定注册锚点，不是 HyperPod provider 名；可沿用首次集群 ID，
+# 但该集群退役后锚点仍保持不变，不要求属于当前纳管集合。
 # 同一 profile_version 在区域控制面只保存一份，所有引用该版本的集群共享。
+# 本文件是 templateSource；release-deploy 会忽略这里的 cluster_id/profile_version，
+# 按规范化策略内容生成不可变快照和 regional-hyperpod-<digest12> 版本。
 cluster_id: REPLACE_WITH_CLUSTER_ID
 environment: hyperpod-eks
 profile_version: hyperpod-v1

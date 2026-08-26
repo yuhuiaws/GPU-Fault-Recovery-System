@@ -1,0 +1,451 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import tomllib
+from pathlib import Path
+
+import pytest
+import yaml
+
+from gpu_fault import admin_cli
+from gpu_fault.admin_bootstrap_common import BootstrapResult
+from gpu_fault.admin_site import (
+    RegionalSite,
+    SiteConfigError,
+    load_site,
+    materialized_release_config,
+)
+from tests._script_loader import lazy_script_module
+
+REGION = "us-east-1"
+ROOT = Path(__file__).resolve().parents[2]
+RELEASE_CONFIG = lazy_script_module(
+    "admin_site_release_config",
+    ROOT / "deploy/control-plane/regional/regional_release_config.py",
+)
+
+
+def site_file(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    rollout = root / "deploy/control-plane/regional/rollout-regional-release.sh"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    rollout.chmod(0o755)
+    (root / "dist").mkdir()
+    wheel = root / "dist/release.whl"
+    bundle = root / "dist/bundle.tar.gz"
+    wheel.write_bytes(b"wheel")
+    bundle.write_bytes(b"bundle")
+    (root / "dist/current-release.json").write_text(
+        json.dumps(
+            {
+                "wheel": str(wheel),
+                "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                "bundle": str(bundle),
+                "bundle_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "config").mkdir()
+    (root / "config/profile.yaml").write_text(
+        "cluster_id: placeholder\n"
+        "environment: hyperpod-eks\n"
+        "profile_version: hyperpod-v1\n"
+        "claims: []\n"
+        "observed: []\n",
+        encoding="utf-8",
+    )
+    secure = tmp_path / "secure"
+    secure.mkdir()
+    for name, value in (
+        ("cpu.kubeconfig", "kubeconfig"),
+        ("token", "t" * 64),
+        ("ca.crt", "certificate"),
+        ("fleet-master", "f" * 64),
+    ):
+        path = secure / name
+        path.write_text(value, encoding="utf-8")
+        path.chmod(0o600)
+    document = {
+        "apiVersion": "gpu-fault.aws/v1alpha1",
+        "kind": "RegionalSite",
+        "metadata": {"name": "test-site"},
+        "spec": {
+            "repositoryRoot": str(root),
+            "awsRegion": REGION,
+            "cpu": {
+                "kubeconfig": str(secure / "cpu.kubeconfig"),
+                "eksArn": ("arn:aws:eks:us-east-1:123456789012:cluster/control"),
+                "hyperpodClusterName": "control",
+            },
+            "release": {
+                "manifest": "dist/current-release.json",
+                "agentConfigDigest": "a" * 64,
+            },
+            "runtimeProfile": {
+                "source": "config/profile.yaml",
+                "version": "hyperpod-v1",
+                "registrationClusterId": "gpu-a",
+            },
+            "nlb": {
+                "name": "gpu-fault-regional",
+                "publicSubnets": ["subnet-a", "subnet-b"],
+                "securityGroup": "sg-123",
+                "certificateArn": (
+                    "arn:aws:acm:us-east-1:123456789012:certificate/test"
+                ),
+            },
+            "images": {
+                "runtime": "registry.example/runtime@sha256:" + "b" * 64,
+                "nodeInstaller": "registry.example/installer:v1",
+            },
+            "health": {
+                "auroraClusterId": "gpu-fault-aurora",
+                "ampWorkspaceId": "ws-test",
+                "snsTopicArn": ("arn:aws:sns:us-east-1:123456789012:gpu-fault"),
+            },
+            "clusters": [
+                {
+                    "clusterId": "gpu-a",
+                    "context": "gpu-a",
+                    "hyperpodClusterName": "hp-gpu-a",
+                    "eksClusterArn": (
+                        "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
+                    ),
+                    "executorIrsaRoleArn": ("arn:aws:iam::123456789012:role/executor"),
+                    "allowedNamespaces": ["training", "gpu-fault-system"],
+                    "controlPlaneUrl": "https://control.example",
+                    "tokenFile": str(secure / "token"),
+                    "caFile": str(secure / "ca.crt"),
+                    "fleetMasterFile": str(secure / "fleet-master"),
+                }
+            ],
+        },
+    }
+    path = tmp_path / "site.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def test_site_yaml_renders_the_existing_release_contract(tmp_path: Path) -> None:
+    rendered = load_site(site_file(tmp_path))
+
+    assert rendered.release_config["site_name"] == "test-site"
+    assert rendered.release_config["aws_region"] == REGION
+    assert rendered.release_config["runtime_profile"]["version"] == "hyperpod-v1"
+    assert rendered.release_config["nlb"]["public_subnets"] == "subnet-a,subnet-b"
+    assert rendered.release_config["health"]["amp_workspace_id"] == "ws-test"
+    assert rendered.release_config["clusters"][0]["region"] == REGION
+    assert rendered.environment["GPU_FAULT_RUNTIME_IMAGE"].startswith(
+        "registry.example/runtime"
+    )
+
+    with materialized_release_config(rendered) as path:
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert json.loads(path.read_text()) == rendered.release_config
+    assert not path.exists()
+
+
+def test_runtime_profile_template_defaults_to_active_source(tmp_path: Path) -> None:
+    document = yaml.safe_load(site_file(tmp_path).read_text(encoding="utf-8"))
+    profile = RegionalSite.from_value(document).spec.runtime_profile
+
+    assert profile.template_source == profile.source
+    document["spec"]["runtimeProfile"]["templateSource"] = (
+        "config/profile-template.yaml"
+    )
+    profile = RegionalSite.from_value(document).spec.runtime_profile
+    assert profile.template_source == "config/profile-template.yaml"
+
+
+def test_site_email_notification_contract(tmp_path: Path) -> None:
+    path = site_file(tmp_path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["spec"]["notifications"] = {
+        "allowEmail": True,
+        "acknowledgeExternalAlertChannel": False,
+        "adminEmail": "ops@example.com",
+        "emailSender": "sender@example.com",
+    }
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    path.chmod(0o600)
+
+    site = load_site(path)
+
+    assert site.release_config["notifications"] == {
+        "allow_email": True,
+        "acknowledge_external_alert_channel": False,
+        "admin_email": "ops@example.com",
+        "email_sender": "sender@example.com",
+    }
+
+
+def test_admin_cli_exposes_single_cluster_removal(tmp_path, monkeypatch) -> None:
+    path = site_file(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        admin_cli,
+        "remove_cluster",
+        lambda request: calls.append(request) or {"phase": "COMPLETED"},
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "remove-cluster",
+            "-f",
+            str(path),
+            "--cluster-id",
+            "gpu-a",
+            "--confirm",
+            "REMOVE_GPU_CLUSTER",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert calls[0].cluster_id == "gpu-a"
+    assert calls[0].confirmation == "REMOVE_GPU_CLUSTER"
+
+
+def test_admin_cli_exposes_arn_only_cluster_join(tmp_path, monkeypatch) -> None:
+    path = site_file(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        admin_cli,
+        "join_cluster",
+        lambda request: calls.append(request) or {"phase": "COMPLETED"},
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "join-cluster",
+            "-f",
+            str(path),
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert calls[0].gpu_cluster_arn.endswith("cluster/gpu-b"), (
+        "join-cluster did not preserve the requested GPU ARN"
+    )
+    assert calls[0].cluster_id is None
+    assert calls[0].allowed_namespaces == ()
+
+
+def test_generated_release_json_loads_through_the_existing_state_machine(
+    tmp_path: Path,
+) -> None:
+    rendered = load_site(site_file(tmp_path))
+
+    with materialized_release_config(rendered) as path:
+        config = RELEASE_CONFIG.ReleaseConfig.load(path)
+
+    assert config.site_name == "test-site"
+    assert config.aws_region == REGION
+    assert config.health.aurora_cluster_id == "gpu-fault-aurora"
+    assert config.clusters[0].cluster_id == "gpu-a"
+
+
+def test_site_yaml_must_be_private(tmp_path: Path) -> None:
+    path = site_file(tmp_path)
+    path.chmod(0o644)
+
+    with pytest.raises(SiteConfigError, match="group/other"):
+        load_site(path)
+
+
+def test_site_yaml_rejects_cross_region_monitoring(tmp_path: Path) -> None:
+    path = site_file(tmp_path)
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["health"]["snsTopicArn"] = (
+        "arn:aws:sns:us-west-2:123456789012:gpu-fault"
+    )
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    path.chmod(0o600)
+
+    with pytest.raises(SiteConfigError, match="snsTopicArn"):
+        load_site(path)
+
+
+def test_admin_deploy_runs_preflight_before_bootstrap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = site_file(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        calls.append([str(item) for item in command])
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
+    )
+    monkeypatch.setattr(
+        admin_cli,
+        "sync_installation_resource_registry",
+        lambda _site: tmp_path / "installation-resources.json",
+    )
+    arguments = argparse.Namespace(
+        command="deploy", file=path, repo_root=None, show_effective_config=False
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert [call[1] for call in calls] == ["preflight", "deploy"]
+
+
+def test_admin_deploy_stops_when_preflight_fails(tmp_path: Path, monkeypatch) -> None:
+    path = site_file(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        calls.append([str(item) for item in command])
+        return subprocess.CompletedProcess(command, 1)
+
+    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
+    )
+    monkeypatch.setattr(
+        admin_cli,
+        "sync_installation_resource_registry",
+        lambda _site: tmp_path / "installation-resources.json",
+    )
+    arguments = argparse.Namespace(
+        command="deploy", file=path, repo_root=None, show_effective_config=False
+    )
+
+    assert admin_cli.run(arguments) == 1
+    assert [call[1] for call in calls] == ["preflight"]
+
+
+@pytest.mark.parametrize("command", ["preflight", "verify", "status"])
+def test_admin_read_only_commands_map_to_regional_modes(
+    tmp_path: Path, monkeypatch, command: str
+) -> None:
+    path = site_file(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(arguments, **kwargs):
+        del kwargs
+        calls.append([str(item) for item in arguments])
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
+    )
+    arguments = argparse.Namespace(
+        command=command, file=path, repo_root=None, show_effective_config=False
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert [call[1] for call in calls] == [command]
+
+
+def test_console_script_is_published() -> None:
+    project = tomllib.loads(
+        (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text()
+    )
+
+    assert project["project"]["scripts"]["gpu-fault-admin"] == (
+        "gpu_fault.admin_cli:main"
+    )
+
+
+def test_legacy_uninstall_accepts_cluster_arns_without_site_file() -> None:
+    arguments = admin_cli.parser().parse_args(
+        [
+            "uninstall",
+            "--cpu-cluster-arn",
+            "arn:aws:sagemaker:us-west-2:123456789012:cluster/cpu",
+            "--gpu-cluster-arn",
+            "arn:aws:sagemaker:us-west-2:123456789012:cluster/gpu",
+            "--cpu-cluster",
+            "keep",
+            "--confirm",
+            "UNINSTALL_GPU_FAULT",
+        ]
+    )
+
+    assert arguments.file is None, "legacy ARN mode unexpectedly requires a site file"
+    assert arguments.cpu_cluster_arn.endswith("cluster/cpu"), "CPU ARN was not parsed"
+    assert arguments.gpu_cluster_arn == [
+        "arn:aws:sagemaker:us-west-2:123456789012:cluster/gpu"
+    ], "GPU ARN was not parsed"
+
+
+def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = site_file(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        admin_cli,
+        "bootstrap_from_arns",
+        lambda request: BootstrapResult(
+            site_file=path, state_file=request.state_dir / "bootstrap-state.json"
+        ),
+    )
+
+    def fake_run(arguments, **kwargs):
+        del kwargs
+        calls.append([str(item) for item in arguments])
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
+    )
+    monkeypatch.setattr(
+        admin_cli,
+        "sync_installation_resource_registry",
+        lambda _site: tmp_path / "installation-resources.json",
+    )
+    arguments = argparse.Namespace(
+        command="deploy",
+        file=None,
+        cpu_cluster_arn=("arn:aws:sagemaker:us-east-1:123456789012:cluster/cpu"),
+        gpu_cluster_arn=["arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a"],
+        repo_root=tmp_path / "repo",
+        state_dir=tmp_path / "state",
+        alert_email=None,
+        show_effective_config=False,
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert [call[1] for call in calls] == ["preflight", "deploy", "verify"]
+
+
+def test_admin_email_option_keeps_alert_email_compatibility() -> None:
+    preferred = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--cpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
+            "--admin-email",
+            "ops@example.com",
+        ]
+    )
+    legacy = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--cpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
+            "--alert-email",
+            "ops@example.com",
+        ]
+    )
+
+    assert preferred.alert_email == "ops@example.com"
+    assert legacy.alert_email == preferred.alert_email

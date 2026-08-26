@@ -149,11 +149,12 @@ data:
       sigv4auth:
         region: REPLACE_WITH_AWS_REGION
         service: aps
-      exporterhealth:
-        port: 8090
+      health_check:
+        endpoint: 0.0.0.0:8090
+        path: /health
 
     service:
-      extensions: [sigv4auth, exporterhealth]
+      extensions: [sigv4auth, health_check]
       pipelines:
         metrics:
           receivers: [prometheus]

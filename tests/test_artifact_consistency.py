@@ -16,6 +16,8 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -23,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from gpu_fault import module_digest
+from scripts.component_wheels import component_source_digest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PACKAGE = ROOT / "src/gpu_fault"
@@ -70,36 +73,26 @@ def test_module_digest_ignores_caches_and_strays(tmp_path) -> None:
     assert module_digest(copy) == baseline
 
 
-def test_built_wheel_matches_the_source_tree(tmp_path) -> None:
-    """The wheel in dist/ must be built from this checkout.
-
-    This is the gate that was missing: ``deploy.sh`` rebuilds the wheel
-    on every deploy, but nothing ever asserted that a wheel already
-    sitting in dist/ -- the one a manual roll uploads into the wheel
-    ConfigMap -- came from the current source.
-    """
-
+def test_built_component_wheels_match_their_source_closures(tmp_path) -> None:
     manifest = release_manifest()
     wheels = sorted((ROOT / "dist").rglob("*.whl"))
-    assert len(wheels) == 1
-    wheel = ROOT / manifest["wheel"]
-    assert wheels == [wheel]
-    assert wheel.parent.name == manifest["release_id"]
-    assert sha256(wheel) == manifest["wheel_sha256"]
-
-    unpacked = tmp_path / "unpacked"
-    with zipfile.ZipFile(wheel) as archive:
-        archive.extractall(unpacked)
-
-    assert module_digest(unpacked / "gpu_fault") == module_digest(SOURCE_PACKAGE), (
-        f"{wheel.name} was not built from this source tree; rebuild it "
-        "before deploying or the fleet runs code nobody reviewed"
-    )
+    assert len(wheels) == 3
+    for name in ("control_plane", "executor", "node_runtime"):
+        component = manifest["components"][name]
+        wheel = ROOT / component["wheel"]
+        assert wheel in wheels
+        assert wheel.parent.name == manifest["release_id"]
+        assert sha256(wheel) == component["wheel_sha256"]
+        unpacked = tmp_path / name
+        with zipfile.ZipFile(wheel) as archive:
+            archive.extractall(unpacked)
+        assert module_digest(unpacked / "gpu_fault") == component["module_digest"]
+        assert component["module_digest"] == component_source_digest(name)
 
 
 def test_node_bundle_contains_the_exact_release_wheel(tmp_path: Path) -> None:
     manifest = release_manifest()
-    wheel = ROOT / manifest["wheel"]
+    wheel = ROOT / manifest["components"]["node_runtime"]["wheel"]
     bundles = sorted((ROOT / "dist").rglob("gpu-fault-node-installer-*.tar.gz"))
     assert len(bundles) == 1
     bundle = ROOT / manifest["bundle"]
@@ -117,7 +110,60 @@ def test_node_bundle_contains_the_exact_release_wheel(tmp_path: Path) -> None:
     unpacked = tmp_path / "bundle-wheel"
     with zipfile.ZipFile(inner_wheels[0]) as archive:
         archive.extractall(unpacked)
-    assert module_digest(unpacked / "gpu_fault") == module_digest(SOURCE_PACKAGE)
+    assert (
+        module_digest(unpacked / "gpu_fault")
+        == manifest["components"]["node_runtime"]["module_digest"]
+    )
+
+
+def test_component_wheels_expose_only_their_runtime_surfaces(tmp_path: Path) -> None:
+    manifest = release_manifest()
+    expected_imports = {
+        "control_plane": ("gpu_fault.app", "gpu_fault.admin_cli"),
+        "executor": (
+            "gpu_fault.cluster_executor",
+            "gpu_fault.completion_controller",
+            "gpu_fault.node_installer_reconciler",
+        ),
+        "node_runtime": ("gpu_fault.node_agent.app", "gpu_fault.collectors_cli"),
+    }
+    forbidden = {
+        "control_plane": ("gpu_fault.cluster_executor", "gpu_fault.node_agent.app"),
+        "executor": ("gpu_fault.app.factory", "gpu_fault.node_agent.app"),
+        "node_runtime": ("gpu_fault.app.factory", "gpu_fault.cluster_executor"),
+    }
+    for name, imports in expected_imports.items():
+        wheel = ROOT / manifest["components"][name]["wheel"]
+        installed = tmp_path / f"{name}-installed"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "--target",
+                str(installed),
+                str(wheel),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        command = [
+            sys.executable,
+            "-c",
+            ";".join(f"import {module}" for module in imports),
+        ]
+        subprocess.run(
+            command, env={**os.environ, "PYTHONPATH": str(installed)}, check=True
+        )
+        with zipfile.ZipFile(wheel) as archive:
+            names = set(archive.namelist())
+        for module in forbidden[name]:
+            path = module.replace(".", "/")
+            assert f"{path}.py" not in names
+            assert f"{path}/__init__.py" not in names
 
 
 def test_release_manifest_is_complete_and_no_sdist_exists() -> None:
@@ -130,7 +176,7 @@ def test_release_manifest_is_complete_and_no_sdist_exists() -> None:
         json.loads((release_dir / "release.json").read_text(encoding="utf-8"))
         == manifest
     )
-    assert manifest["module_digest"] == module_digest(SOURCE_PACKAGE)
+    assert manifest["module_digest"] == component_source_digest("control_plane")
     assert list((ROOT / "dist").glob("*.whl")) == []
     assert list((ROOT / "dist").glob("*.tar.gz")) == []
     assert not [

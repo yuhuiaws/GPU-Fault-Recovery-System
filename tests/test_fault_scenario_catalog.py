@@ -24,6 +24,7 @@ from tools.run_fault_test_cases import (
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "testcases" / "fault-scenarios.yaml"
 REGIONAL_DOCUMENT = ROOT / "docs" / "区域模式端到端验收测试用例.md"
+FAULT_MANUAL = ROOT / "docs" / "故障模拟测试手册.md"
 REGIONAL_CASE_HEADING = re.compile(
     r"^### (GF-REGIONAL-[A-Z0-9-]+)(?:[：:].*)?$", re.MULTILINE
 )
@@ -481,6 +482,41 @@ def test_document_declares_every_risk_value() -> None:
     declared = set(REGIONAL_RISK_TABLE_ROW.findall(text[start:end]))
 
     assert declared == runner.RISK_VALUES
+
+
+def test_fault_manual_uses_current_catalog_profile_and_evidence_contracts() -> None:
+    text = FAULT_MANUAL.read_text(encoding="utf-8")
+    ids = {case["id"] for case in load_catalog(CATALOG)}
+    references = set(re.findall(r"`(GF-[A-Z0-9][A-Z0-9_.-]*\*?)`", text))
+    missing = sorted(
+        value
+        for value in references
+        if not value.endswith(("*", "-")) and value not in ids
+    )
+
+    assert missing == []
+    assert "hyperpod-control-plane-recovery-v1" not in text
+    assert '--site "${SITE_FILE}"' in text
+    assert "evidence.run_at" not in text
+    assert "| `destructive-provider-replace`" not in text
+    assert "destructive-provider-replace`不是合法risk" in text
+    assert "`manual`、`pytest` 和 `command`" in text
+    assert "结果记录在" not in text
+    assert "历史报告" not in text
+    assert re.findall(r"docs/evidence/fault/[^`\\s]+\\.json", text) == []
+    assert "厂商批准的" not in text
+    assert "硬件厂商批准" not in text
+    assert "### 7.8 真实硬件故障注入未实现" in text
+
+    unavailable = next(
+        case for case in load_catalog(CATALOG) if case["id"] == "GF-LIVE-004"
+    )
+    assert unavailable["risk"] == "non-destructive"
+    assert unavailable["automation"] == "manual"
+    assert unavailable["evidence"]["verdict"] == "BLOCKED"
+    assert unavailable["injection"].startswith("不执行故障注入"), (
+        "unavailable scenarios must remain explicitly non-injecting"
+    )
 
 
 def _regional_case_bodies() -> dict[str, str]:

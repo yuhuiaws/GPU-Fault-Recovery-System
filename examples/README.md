@@ -11,6 +11,13 @@
 `gpu-fault-workload-annotate` 再 `kubectl apply`。直接 apply 会启动一个
 **不受 GPU 故障控制面管理**的训练任务。
 
+两个命令都应通过`--site`读取当前Runtime Profile，而不是依赖默认版本：
+
+```bash
+gpu-training-submit --site /path/to/site.yaml \
+  hyperpod/three-node-pytorchjob.yaml
+```
+
 | 文件 | 类型 | 用途 |
 |---|---|---|
 | `hyperpod/three-node-pytorchjob.yaml` | SOURCE | 客户 YAML 的三节点训练提交示例；`GF-REGIONAL-WORKLOAD-001/002` |

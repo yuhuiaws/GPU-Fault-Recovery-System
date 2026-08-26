@@ -17,6 +17,7 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
+from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.store.shared.errors import NotFoundError
 
 
@@ -26,6 +27,7 @@ class MemoryControlRecordMixin:
     _diagnostics: Any
     _hyperpod_node_identities: Any
     _hyperpod_submissions: Any
+    _installation_resources: dict[str, InstallationResource]
     _markers: Any
     _profiles: Any
     _raw_evidence: Any
@@ -367,6 +369,46 @@ class MemoryControlRecordMixin:
             if profile is None:
                 raise NotFoundError(version)
             return profile
+
+    def save_installation_resource(
+        self,
+        resource: InstallationResource,
+    ) -> InstallationResource:
+        key = f"{resource.site_id}/{resource.resource_key}"
+        with self._lock:
+            existing = self._installation_resources.get(key)
+            if (
+                existing is not None
+                and existing.immutable_identity() != resource.immutable_identity()
+            ):
+                raise ValueError("installation resource identity cannot change")
+            self._installation_resources[key] = resource
+            return resource
+
+    def get_installation_resource(
+        self,
+        site_id: str,
+        resource_key: str,
+    ) -> InstallationResource:
+        with self._lock:
+            resource = self._installation_resources.get(f"{site_id}/{resource_key}")
+            if resource is None:
+                raise NotFoundError(resource_key)
+            return resource
+
+    def list_installation_resources(
+        self,
+        site_id: str | None = None,
+    ) -> list[InstallationResource]:
+        with self._lock:
+            return sorted(
+                (
+                    item
+                    for item in self._installation_resources.values()
+                    if site_id is None or item.site_id == site_id
+                ),
+                key=lambda item: (item.site_id, item.resource_key),
+            )
 
     def get_preempting_successor(
         self, predecessor_workflow_id: str

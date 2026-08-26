@@ -435,6 +435,12 @@ class ApplicationContext:
                     compatible_artifact_sha256s=(
                         agent_settings.compatible_artifact_sha256s
                     ),
+                    required_compatibility_digest=(
+                        agent_settings.required_compatibility_digest
+                    ),
+                    compatible_compatibility_digests=(
+                        agent_settings.compatible_compatibility_digests
+                    ),
                     required_policy_version=(agent_settings.required_policy_version),
                     required_runtime_profile_version=(
                         agent_settings.required_runtime_profile_version

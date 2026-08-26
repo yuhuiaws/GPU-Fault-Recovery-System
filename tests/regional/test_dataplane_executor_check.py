@@ -20,7 +20,8 @@ SCRIPT = ROOT / "deploy/dataplane/tools/verify_dataplane_executor.py"
 CONTROL_PLANE_KUBECONFIG = "/tmp/verify-dataplane-control-plane.kubeconfig"
 
 ROLE_ARN = "arn:aws:iam::111122223333:role/gpu-fault-executor"
-WHEEL = "gpu-fault-control-plane-wheel-0100-abcdef123456"
+EXECUTOR_SHA = "abcdef123456" + "0" * 52
+WHEEL = "gpu-fault-executor-wheel-0100-abcdef123456"
 
 
 def encoded(value: str) -> str:
@@ -173,6 +174,13 @@ def _world(**overrides) -> dict:
             "pods": [_pod()],
         },
         "control_plane": {
+            "configmap": {
+                "gpu-fault-release-metadata": {
+                    "data": {
+                        "required-regional-executor-artifact-sha256": (EXECUTOR_SHA)
+                    }
+                }
+            },
             "deployment": {
                 "gpu-fault-api-ha": {
                     "spec": {
@@ -352,14 +360,9 @@ def test_allowed_namespace_drift_fails(tmp_path) -> None:
 
 def test_wheel_behind_the_control_plane_fails(tmp_path) -> None:
     world = _world()
-    world["control_plane"]["deployment"]["gpu-fault-api-ha"]["spec"]["template"][
-        "spec"
-    ]["volumes"] = [
-        {
-            "name": "artifact",
-            "configMap": {"name": "gpu-fault-control-plane-wheel-0100-999999999999"},
-        }
-    ]
+    world["control_plane"]["configmap"]["gpu-fault-release-metadata"]["data"][
+        "required-regional-executor-artifact-sha256"
+    ] = "9" * 64
 
     result = _run(tmp_path, world)
 

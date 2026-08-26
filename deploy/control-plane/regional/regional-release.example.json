@@ -20,6 +20,23 @@
     "security_group": "REPLACE_WITH_NLB_SECURITY_GROUP_ID",
     "certificate_arn": "REPLACE_WITH_ACM_CERTIFICATE_ARN"
   },
+  "dns": {
+    "hosted_zone_id": "REPLACE_WITH_ROUTE53_HOSTED_ZONE_ID",
+    "hostname": "REPLACE_WITH_CONTROL_PLANE_HOSTNAME"
+  },
+  "health": {
+    "aurora_cluster_id": "gpu-fault-regional-aurora",
+    "amp_workspace_id": "REPLACE_WITH_AMP_WORKSPACE_ID",
+    "amp_rule_namespace": "gpu-fault-control-plane-capacity",
+    "sns_topic_arn": "REPLACE_WITH_SNS_TOPIC_ARN",
+    "certificate_min_validity_days": 30,
+    "remote_command_max_unclaimed_seconds": 300,
+    "require_confirmed_sns_subscription": true
+  },
+  "notifications": {
+    "allow_email": true,
+    "acknowledge_external_alert_channel": false
+  },
   "clusters": [
     {
       "cluster_id": "gpu-prod-a",

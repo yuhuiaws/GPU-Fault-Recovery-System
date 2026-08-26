@@ -69,7 +69,7 @@ def test_regional_alerting_and_agent_pins_fail_closed() -> None:
         env = environment(deployment)
         assert env["GPU_FAULT_ALLOW_EMAIL"]["value"] == "true"
         assert env["GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED"]["value"] == "true"
-        assert "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL" not in env
+        assert env["GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL"]["value"] == "false"
         assert env["GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256"]["valueFrom"][
             "configMapKeyRef"
         ] == {
@@ -375,6 +375,9 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert "REPLACE_WITH_AWS_REGION" in script
     assert "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION" in script
     assert "REPLACE_WITH_RUNTIME_PROFILE_VERSION" in script
+    assert "gpu-fault.io/artifact-sha256: ${WHEEL_SHA256}" in script, (
+        "apply must not toggle the pod template back to the generated source digest"
+    )
     assert "gpu-fault-release-metadata is missing" in script
     assert "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST" in script
     assert "GPU_FAULT_FINALIZE_AGENT_PIN" in script
@@ -384,9 +387,19 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert "compatible-agent-config-digests" in script
     assert "GPU_FAULT_FINALIZE_DATA_PLANE_PIN" in script
     assert "compatible-regional-executor-protocol-versions" in script
-    assert 'PIN_FINALIZATION="true"' in script
+    assert "GPU_FAULT_LEGACY_COMPONENT_PINS" in script
+    assert "remove_legacy_notification_env" in script
+    assert "GPU_FAULT_ALLOW_EMAIL-" in script
+    assert "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL-" in script
+    assert "filter_legacy_release_env.py" in script
+    assert (
+        'CURRENT_EFFECTIVE_AGENT_COMPATIBILITY_DIGEST="'
+        "${CURRENT_REQUIRED_AGENT_COMPATIBILITY_DIGEST:-"
+        '${CURRENT_REQUIRED_AGENT_ARTIFACT_SHA256}}"' in script
+    )
     assert 'PIN_METADATA_CHANGED="true"' in script
-    assert 'RELOAD_RELEASE_METADATA="true"' in script
+    assert 'RELOAD_RELEASE_METADATA="${PIN_METADATA_CHANGED}"' in script
+    assert "PIN_FINALIZATION" not in script
     assert "rollout restart" in script
     assert (
         'name="$(basename "${config}" .yaml)"\n    apply_manifest "${name}"' in script
@@ -416,9 +429,17 @@ def test_hyperpod_deploy_uses_two_phase_agent_pin_migration() -> None:
     assert "compatibility window remains open" in script
     assert (
         '--from-literal=required-agent-artifact-sha256="'
-        '${PREVIOUS_AGENT_ARTIFACT_SHA256:-${WHEEL_SHA256}}"' in script
+        '${STAGED_AGENT_ARTIFACT_SHA256}"' in script
     )
-    assert "printf '%s' \"${WHEEL_SHA256}\"" in script
+    assert 'COMPATIBLE_AGENT_ARTIFACT_SHA256S="${NODE_WHEEL_SHA256}"' in script
+    assert (
+        '--from-literal=required-agent-compatibility-digest="'
+        '${STAGED_AGENT_COMPATIBILITY_DIGEST}"' in script
+    )
+    assert (
+        '--from-literal=required-regional-executor-artifact-sha256="'
+        '${STAGED_EXECUTOR_ARTIFACT_SHA256}"' in script
+    )
     assert 'item["agent_protocol_version"] == 2' not in script
     assert 'item["agent_protocol_version"] == expected_protocol' in script
 

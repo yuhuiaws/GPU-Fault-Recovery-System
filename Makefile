@@ -1,4 +1,8 @@
 PYTHON ?= python3
+# Quality gates import Python modules from deploy/. Keep interpreter caches out
+# of the checkout so a prior gate cannot poison the later deploy layout check.
+PYTHONPYCACHEPREFIX ?= /tmp/gpu-fault-pycache
+export PYTHONPYCACHEPREFIX
 PYTEST_XDIST_WORKERS ?= 4
 COVERAGE_FLOOR ?= 78
 QUALITY_SCRIPTS = scripts tools
@@ -20,13 +24,14 @@ DOCUMENTATION_TESTS = \
 	tests/test_fault_evidence.py \
 	tests/test_doc_impact.py
 
-.PHONY: test test-postgres test-parallel coverage fault-test-cases fault-test-cases-ci run format check html artifact-check release-preflight architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-parallel coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check release-preflight release-deploy architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
 
 test-parallel:
-	$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS)
+	GPU_FAULT_TEST_POSTGRES_URL= \
+		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS)
 
 coverage:
 	GPU_FAULT_TEST_POSTGRES_URL= \
@@ -63,16 +68,28 @@ format:
 		--config 'format.skip-magic-trailing-comma=true' tests
 	$(PYTHON) -m ruff check --select I --fix tests
 
+python-cache-clean:
+	@tracked="$$(git ls-files | \
+		awk '/(^|\/)__pycache__\// || /\.py(c|o)$$/')"; \
+	if [ -n "$$tracked" ]; then \
+		printf 'tracked Python cache artifacts must be removed:\n%s\n' "$$tracked" >&2; \
+		exit 1; \
+	fi
+	find src tests deploy $(QUALITY_SCRIPTS) -type f \
+		\( -name '*.pyc' -o -name '*.pyo' \) -delete
+	find src tests deploy $(QUALITY_SCRIPTS) -depth \
+		-type d -name '__pycache__' -empty -delete
+
 check:
+	$(MAKE) python-cache-clean
 	$(PYTHON) -m ruff format --check src deploy $(QUALITY_SCRIPTS)
 	$(PYTHON) -m ruff format --check \
 		--config 'format.skip-magic-trailing-comma=true' tests
 	$(PYTHON) -m ruff check src tests deploy $(QUALITY_SCRIPTS)
 	$(PYTHON) -m ruff check --select I tests
 	$(MAKE) mypy-check
-	PYTHONPYCACHEPREFIX=/tmp/gpu-fault-pycache \
-		$(PYTHON) -m compileall -q \
-			src tests deploy $(QUALITY_SCRIPTS)
+	$(PYTHON) -m compileall -q \
+		src tests deploy $(QUALITY_SCRIPTS)
 	$(MAKE) architecture-check
 	$(MAKE) mixin-check
 	$(MAKE) private-test-coupling-check
@@ -87,7 +104,8 @@ check:
 	$(MAKE) yaml-check
 	$(MAKE) shell-check
 	$(MAKE) artifact-check
-	$(PYTHON) -m pytest
+	$(MAKE) test-parallel
+	$(MAKE) python-cache-clean
 
 architecture-check:
 	$(PYTHON) scripts/check-python-architecture.py
@@ -157,11 +175,11 @@ deployment-contracts-update:
 	PYTHON="$(PYTHON)" \
 		deploy/control-plane/tools/update-deployment-contracts.sh
 
-deployment-contracts-check:
+deployment-contracts-check: python-cache-clean
 	PYTHON="$(PYTHON)" \
 		deploy/control-plane/tools/update-deployment-contracts.sh --check
 
-deploy-check:
+deploy-check: python-cache-clean
 	$(PYTHON) scripts/check-deploy-layout.py
 
 artifacts-safety-check:
@@ -173,6 +191,12 @@ artifacts-local-safety-check:
 release-preflight:
 	$(MAKE) artifacts-local-safety-check
 	$(MAKE) artifact-check
+
+release-deploy:
+	PYTHONPATH=src $(PYTHON) scripts/release_deploy.py \
+		$(if $(SITE),--site "$(SITE)",) \
+		$(if $(ADMIN_EMAIL),--admin-email "$(ADMIN_EMAIL)",) \
+		$(if $(PROFILE_APPROVAL),--profile-approval "$(PROFILE_APPROVAL)",)
 
 # 本地保留策略（artifacts/README.md「Retention」）。只报告，不删除；真正
 # 删除要人工加 --apply。artifacts/ 在 .gitignore 里，缺失时输出 0 条而不报错，

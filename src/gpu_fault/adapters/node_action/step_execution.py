@@ -8,7 +8,7 @@ from typing import Any
 from gpu_fault.adapters.common import dcgm_result_is_configuration_only
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
-from gpu_fault.node_agent import NodeActionResult, NodeActionStatus
+from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
 from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
 
 

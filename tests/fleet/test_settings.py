@@ -86,6 +86,21 @@ def test_regional_settings_reject_local_mutation_adapters() -> None:
         ControlPlaneSettings.from_mapping(values)
 
 
+def test_regional_settings_allow_an_explicit_empty_cluster_registry() -> None:
+    values = active_values()
+    values.update(
+        {
+            "GPU_FAULT_DEPLOYMENT_MODE": "regional",
+            "GPU_FAULT_REGIONAL_CLUSTERS_JSON": "[]",
+        }
+    )
+
+    settings = ControlPlaneSettings.from_mapping(values)
+
+    assert settings.regional_mode is True
+    assert settings.regional_cluster_values == ()
+
+
 def test_single_cluster_requires_explicit_canary_acknowledgement() -> None:
     values = active_values()
     values.pop("GPU_FAULT_ALLOW_SINGLE_CLUSTER")
@@ -145,7 +160,27 @@ def test_agent_registry_parses_rollout_compatibility_window() -> None:
 
     assert settings.agent_registry.compatible_agent_protocol_versions == frozenset({2})
     assert settings.agent_registry.compatible_artifact_sha256s == frozenset({"b" * 64})
+    assert (
+        settings.agent_registry.required_compatibility_digest
+        == settings.agent_registry.required_artifact_sha256
+    )
     assert settings.agent_registry.compatible_config_digests == frozenset({"d" * 64})
+
+
+def test_empty_agent_compatibility_digest_falls_back_to_artifact() -> None:
+    values = active_values()
+    values.update(
+        {
+            "GPU_FAULT_ENABLE_AGENT_REGISTRY": "true",
+            "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": "a" * 64,
+            "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST": "",
+            "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST": "c" * 64,
+        }
+    )
+
+    settings = ControlPlaneSettings.from_mapping(values)
+
+    assert settings.agent_registry.required_compatibility_digest == "a" * 64
 
 
 def test_agent_registry_protocol_must_be_positive() -> None:

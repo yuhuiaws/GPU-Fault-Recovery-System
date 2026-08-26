@@ -22,6 +22,7 @@ from gpu_fault.models import (
     WorkflowRequest,
     XidMetricBaseline,
 )
+from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.store.shared.errors import (
     EfaTrafficAdminConflict as EfaTrafficAdminConflict,
     NotFoundError as NotFoundError,
@@ -69,6 +70,7 @@ class InMemoryStore(
         self._triage_reports: dict[str, TriageReport] = {}
         self._plans: dict[str, RecoveryPlan] = {}
         self._profiles: dict[str, EffectiveRuntimeProfile] = {}
+        self._installation_resources: dict[str, InstallationResource] = {}
         self._incidents: dict[str, FaultIncident] = {}
         self._incident_by_event: dict[str, str] = {}
         self._workflows: dict[str, WorkflowRequest] = {}

@@ -107,6 +107,20 @@ async def version(
             ).split(",")
             if value.strip()
         ),
+        "required_agent_compatibility_digest": (
+            dependencies.environment.get(
+                "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST"
+            )
+            or None
+        ),
+        "compatible_agent_compatibility_digests": sorted(
+            value.strip()
+            for value in dependencies.environment.get(
+                "GPU_FAULT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS",
+                "",
+            ).split(",")
+            if value.strip()
+        ),
         "required_agent_protocol_version": int(
             dependencies.environment.get(
                 "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION",
@@ -129,6 +143,58 @@ async def version(
             value.strip()
             for value in dependencies.environment.get(
                 "GPU_FAULT_COMPATIBLE_AGENT_CONFIG_DIGESTS",
+                "",
+            ).split(",")
+            if value.strip()
+        ),
+        "required_runtime_profile_version": (
+            dependencies.environment.get("GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION")
+            or None
+        ),
+        "required_node_action_key_version": int(
+            dependencies.environment.get(
+                "GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION",
+                "2",
+            )
+        ),
+        "required_regional_executor_protocol_version": int(
+            dependencies.environment.get(
+                "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION",
+                "2",
+            )
+        ),
+        "compatible_regional_executor_protocol_versions": sorted(
+            int(value.strip())
+            for value in dependencies.environment.get(
+                "GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS",
+                "",
+            ).split(",")
+            if value.strip()
+        ),
+        "required_regional_executor_artifact_sha256": (
+            dependencies.environment.get(
+                "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256"
+            )
+            or None
+        ),
+        "compatible_regional_executor_artifact_sha256s": sorted(
+            value.strip()
+            for value in dependencies.environment.get(
+                "GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S",
+                "",
+            ).split(",")
+            if value.strip()
+        ),
+        "required_regional_executor_compatibility_digest": (
+            dependencies.environment.get(
+                "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST"
+            )
+            or None
+        ),
+        "compatible_regional_executor_compatibility_digests": sorted(
+            value.strip()
+            for value in dependencies.environment.get(
+                "GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS",
                 "",
             ).split(",")
             if value.strip()

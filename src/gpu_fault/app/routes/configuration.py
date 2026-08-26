@@ -3,7 +3,7 @@ from __future__ import annotations
 from gpu_fault.app.authorization import authorization_bucket
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -12,6 +12,10 @@ from gpu_fault.async_store import (
     StoreIoCapacityExceeded,
 )
 from gpu_fault.capabilities import compile_runtime_profile
+from gpu_fault.installation_resources import (
+    InstallationResource,
+    InstallationResourceSnapshot,
+)
 from gpu_fault.models import (
     EffectiveRuntimeProfile,
     NodeMarker,
@@ -93,4 +97,78 @@ async def create_marker(
         dependencies,
         dependencies.context.completion.add_marker,
         marker,
+    )
+
+
+@router.post(  # type: ignore[untyped-decorator]
+    "/v1/installation-resources/sync",
+    response_model=list[InstallationResource],
+)
+@authorization_bucket("execution-token")
+async def sync_installation_resources(
+    snapshot: InstallationResourceSnapshot,
+    dependencies: ConfigurationRouterDependencies = Depends(
+        get_configuration_dependencies
+    ),
+) -> list[InstallationResource]:
+    saved: list[InstallationResource] = []
+    for resource in snapshot.resources:
+        saved.append(
+            cast(
+                InstallationResource,
+                await _store_call(
+                    dependencies,
+                    dependencies.context.store.save_installation_resource,
+                    resource,
+                ),
+            )
+        )
+    return saved
+
+
+@router.get(  # type: ignore[untyped-decorator]
+    "/v1/installation-resources",
+    response_model=list[InstallationResource],
+)
+@authorization_bucket("execution-token")
+async def list_installation_resources(
+    site_id: str | None = None,
+    dependencies: ConfigurationRouterDependencies = Depends(
+        get_configuration_dependencies
+    ),
+) -> list[InstallationResource]:
+    return cast(
+        list[InstallationResource],
+        await _store_call(
+            dependencies,
+            dependencies.context.store.list_installation_resources,
+            site_id,
+        ),
+    )
+
+
+@router.put(  # type: ignore[untyped-decorator]
+    "/v1/installation-resources/{site_id}/{resource_key:path}",
+    response_model=InstallationResource,
+)
+@authorization_bucket("execution-token")
+async def update_installation_resource(
+    site_id: str,
+    resource_key: str,
+    resource: InstallationResource,
+    dependencies: ConfigurationRouterDependencies = Depends(
+        get_configuration_dependencies
+    ),
+) -> InstallationResource:
+    if resource.site_id != site_id or resource.resource_key != resource_key:
+        raise HTTPException(
+            status_code=409, detail="installation resource identity mismatch"
+        )
+    return cast(
+        InstallationResource,
+        await _store_call(
+            dependencies,
+            dependencies.context.store.save_installation_resource,
+            resource,
+        ),
     )

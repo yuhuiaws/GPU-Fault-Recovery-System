@@ -824,6 +824,42 @@ test_cases:
   automation: manual
   procedure: docs/故障模拟测试手册.md#76-kernel-log-sxid-闭环
 
+- id: GF-LIVE-SXID-MULTINODE-LEASE-001
+  title: HyperPod 双节点 SXID quiesce 维护租约
+  category: destructive-acceptance
+  level: staging
+  risk: destructive
+  problem: quiesce停止kubelet后常规heartbeat会过期，双节点barrier必须只在持久化generation和维护窗口仍有效时继续。
+  injection: 在同一训练attempt的两个隔离节点完成quiesce，并分别构造成功、未quiesce、窗口过期和generation变化分支。
+  expected:
+  - quiesce成功且generation不变时允许完成双节点barrier
+  - quiesce未完成或维护窗口过期时不得提交reset
+  - 任一节点generation/incarnation变化或Agent非ACTIVE时整个barrier中止
+  - 不允许部分reset或提前恢复调度
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/故障模拟测试手册.md#77-双节点-sxid-quiesce-租约
+
+- id: GF-LIVE-THREE-CONCURRENT-RESET-001
+  title: HyperPod 三节点训练的三并发聚合与单一reset
+  category: destructive-acceptance
+  level: staging
+  risk: destructive
+  problem: workload observation、XID和SXID并发到达时不得创建多个incident、workflow或物理reset。
+  injection: 对真实三节点24-GPU受管PyTorchJob并发提交observation、XID 95和trusted ACCESS SXID。
+  expected:
+  - 三请求成功且processor没有deadline exceeded
+  - 最终只有一个incident、一个workflow和一个reset command
+  - source和target GPU数量均为24且不使用伪造allocation
+  - 三个旧Pod全部替换，新attempt恢复24-rank NCCL
+  - restart budget只增加一次且节点最终Ready、可调度
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/故障模拟测试手册.md#771-三节点-gpu-训练的三并发聚合与-reset
+  related_pytest: tests/orchestration/test_cross_fault_arbitration.py::test_three_collectors_concurrently_merge_atomically
+
 - id: GF-POL-009
   title: XID 48 单独与伴随事件分支
   category: xid-policy
@@ -1692,7 +1728,7 @@ test_cases:
   level: live
   risk: live-kernel-log-injection
   problem: 验证生产 systemd KernelLogCollector 能从宿主机真实 /dev/kmsg 读取并上报 XID 11。
-  injection: 以 root 向一个无训练任务节点的 /dev/kmsg 写入一条带唯一 test ID 的 NVRM XID 11 消息。
+  injection: 以root向一个无训练任务节点的/dev/kmsg写入一条不含test_id的标准NVRM XID 11消息，并使用Collector生成的boot ID、sequence和时间戳识别新增记录。
   expected:
   - 写入前 Collector 主进程持有 /dev/kmsg 文件描述符
   - 控制面新增一条 NVIDIA_KERNEL status 和 evidence
@@ -2050,7 +2086,7 @@ test_cases:
   - Agent 重新注册
   - validation 通过后恢复调度
   automation: manual
-  procedure: docs/部署和运维手册.md#阶段-dhyperpod-rebootprovider-replace-恒禁用
+  procedure: docs/部署和运维手册.md#阶段-d1hyperpod-reboot
 
 - id: GF-LIVE-003
   title: 隔离节点真实 warm-spare 切换
@@ -2068,19 +2104,20 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-003
 
 - id: GF-LIVE-004
-  title: 驱动真实产生 XID
-  category: destructive-acceptance
+  title: 真实硬件XID故障注入未实现边界
+  category: capability-boundary
   level: staging
-  risk: destructive
-  problem: 验证 NVIDIA driver、/dev/kmsg、KernelLogCollector 和控制面组成的真实信号链路。
-  injection: 使用硬件厂商批准的故障注入方法，在无训练 workload 的隔离 GPU 节点产生指定 XID。
+  risk: non-destructive
+  problem: 当前仓库没有让GPU硬件或NVIDIA driver真实产生指定XID的受检实现，不能把日志重放或诊断工具描述为硬件故障注入。
+  injection: 不执行故障注入；只确认仓库没有公开注入命令、Manifest或管理员入口。
   expected:
-  - XID 首先出现在该节点真实 /dev/kmsg
-  - KernelLogCollector 上报同一 PCI BDF、GPU UUID 和 XID
-  - 控制面决策与固定 NVIDIA Catalog 一致
-  - 测试结束后节点完成 reset/reboot、GPU 和 Fabric validation
+  - synthetic API、FIFO、用户态/dev/kmsg、诊断和恢复动作均不得被表述为真实硬件注入
+  - 管理员不得自行执行未纳入release、未固定摘要或未经过安全审查的外部工具
+  - 只有仓库正式交付实现、权限、维护窗口、回滚和证据契约后才能解除阻塞
+  evidence:
+    verdict: BLOCKED
   automation: manual
-  procedure: docs/故障模拟测试手册.md#7-真实-xid-验证分级
+  procedure: docs/故障模拟测试手册.md#78-真实硬件故障注入未实现
 
 - id: GF-REGIONAL-BOOT-001
   title: 区域模式缺少集群注册表必须启动失败
@@ -3655,7 +3692,7 @@ test_cases:
     verdict: PASS
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-018
-  related_pytest: tests/test_artifact_consistency.py::test_built_wheel_matches_the_source_tree
+  related_pytest: tests/test_artifact_consistency.py::test_built_component_wheels_match_their_source_closures
 - id: GF-REGIONAL-AUTH-015
   title: fleet master 永不进入 GPU 节点
   category: regional-authentication

@@ -154,7 +154,9 @@ async def regional_executor_readiness(
     )
     reasons = []
     protocol_reason = dependencies.executor_compatibility.rejection_reason(
-        probe.executor_protocol_version
+        probe.executor_protocol_version,
+        probe.executor_artifact_sha256,
+        probe.executor_compatibility_digest,
     )
     if protocol_reason is not None:
         reasons.append(protocol_reason)
@@ -186,6 +188,8 @@ async def regional_executor_readiness(
         cluster_id=cluster_id,
         executor_id=probe.executor_id,
         executor_protocol_version=probe.executor_protocol_version,
+        executor_artifact_sha256=probe.executor_artifact_sha256,
+        executor_compatibility_digest=probe.executor_compatibility_digest,
         registered=True,
         execution_owners=sorted(advertised),
         unsupported_execution_owners=unsupported,
@@ -218,7 +222,9 @@ async def claim_remote_commands(
 ) -> RemoteCommandClaim:
     cluster_id = _require_cluster(cluster_id)
     protocol_reason = dependencies.executor_compatibility.rejection_reason(
-        claim.executor_protocol_version
+        claim.executor_protocol_version,
+        claim.executor_artifact_sha256,
+        claim.executor_compatibility_digest,
     )
     if protocol_reason is not None:
         raise HTTPException(

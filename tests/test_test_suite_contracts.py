@@ -139,6 +139,14 @@ def test_tests_are_covered_by_architecture_and_quality_gates() -> None:
     assert "artifacts-local-safety-check:" in makefile
     assert "coverage:" in makefile
     assert "test-parallel:" in makefile
+    parallel = makefile.split("test-parallel:\n", 1)[1].split("\ncoverage:", 1)[0]
+    check = makefile.split("check:\n", 1)[1].split("\narchitecture-check:", 1)[0]
+    assert "GPU_FAULT_TEST_POSTGRES_URL=" in parallel
+    assert "-n $(PYTEST_XDIST_WORKERS)" in parallel
+    assert "$(MAKE) test-parallel" in check
+    assert check.index("$(MAKE) test-parallel") < check.rindex(
+        "$(MAKE) python-cache-clean"
+    )
     assert "pytest-cov" in project
     assert "pytest-xdist" in project
     assert "private-test-coupling-check:" in makefile

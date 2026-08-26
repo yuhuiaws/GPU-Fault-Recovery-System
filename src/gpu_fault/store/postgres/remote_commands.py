@@ -11,6 +11,7 @@ from gpu_fault.remote_command_models import (
 )
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.remote_helpers import (
+    LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS,
     UNCLAIMED_DEADLINE_STATUS_SOURCE,
     unclaimed_expiry_update as _unclaimed_expiry_update,
 )
@@ -62,6 +63,9 @@ class PostgresRemoteCommandMixin:
                     count(*) FILTER (
                         WHERE payload->>'status_source'=
                               'executor-internal-error'
+                          AND NOT (
+                              COALESCE(payload->>'error', '')=ANY(%s)
+                          )
                     ),
                     min(
                         (payload->>'created_at')::timestamptz
@@ -82,7 +86,10 @@ class PostgresRemoteCommandMixin:
                     payload->>'cluster_id',
                     payload->>'status'
                 """,
-                (UNCLAIMED_DEADLINE_STATUS_SOURCE,),
+                (
+                    sorted(LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS),
+                    UNCLAIMED_DEADLINE_STATUS_SOURCE,
+                ),
             )
             rows = cursor.fetchall()
         internal_errors = 0

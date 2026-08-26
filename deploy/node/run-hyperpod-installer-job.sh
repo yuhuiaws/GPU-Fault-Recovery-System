@@ -19,6 +19,7 @@ VERSION_TAG="${VERSION//./}"
 INSTALLER_CONFIG_MAP="${GPU_FAULT_INSTALLER_CONFIG_MAP:-gpu-fault-node-installer-${VERSION_TAG}}"
 INSTALLER_CONFIG_DIGEST="${GPU_FAULT_INSTALLER_CONFIG_DIGEST:-${VERSION}}"
 INSTALLER_ARTIFACT_SHA256="${GPU_FAULT_INSTALLER_ARTIFACT_SHA256:-}"
+NODE_COMPATIBILITY_DIGEST="${GPU_FAULT_NODE_COMPATIBILITY_DIGEST:-${INSTALLER_ARTIFACT_SHA256}}"
 SECRET_NAME="${GPU_FAULT_SECRET_NAME:-gpu-fault-control-plane-active}"
 CONNECTION_MODE="${GPU_FAULT_CONNECTION_MODE:-local}"
 REGIONAL_CONNECTION_SECRET="$(
@@ -148,6 +149,10 @@ done
 }
 [[ "${INSTALLER_ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
     printf 'ERROR: GPU_FAULT_INSTALLER_ARTIFACT_SHA256 must be a SHA-256\n' >&2
+    exit 2
+}
+[[ "${NODE_COMPATIBILITY_DIGEST}" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'ERROR: GPU_FAULT_NODE_COMPATIBILITY_DIGEST must be a SHA-256\n' >&2
     exit 2
 }
 [[ "${DCGM_EXPORTER_MODE}" =~ ^(existing|disabled)$ ]] || {
@@ -393,6 +398,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            - name: NODE_COMPATIBILITY_DIGEST
+              value: "${NODE_COMPATIBILITY_DIGEST}"
             - name: DERIVE_NODE_ACTION_SECRET
               value: "${DERIVE_NODE_ACTION_SECRET}"
 ${CONTROL_PLANE_ENV}
@@ -488,6 +495,7 @@ ${CONTROL_PLANE_ENV}
                 TARGET_NODE_IP="\${TARGET_NODE_IP}" \
                 TARGET_NODE_UID="\${TARGET_NODE_UID}" \
                 INSTALL_RUN_ID="\${INSTALL_RUN_ID}" \
+                GPU_FAULT_NODE_COMPATIBILITY_DIGEST="\${NODE_COMPATIBILITY_DIGEST}" \
                 DERIVE_NODE_ACTION_SECRET="\${DERIVE_NODE_ACTION_SECRET}" \
                 CONTROL_PLANE_URL="\${CONTROL_PLANE_URL}" \
                 CONTROL_PLANE_TOKEN="\${CONTROL_PLANE_TOKEN}" \

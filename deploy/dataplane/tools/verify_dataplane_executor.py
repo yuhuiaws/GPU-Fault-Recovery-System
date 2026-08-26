@@ -138,6 +138,18 @@ def expected_wheel_configmap(
             "current wheel can be read"
         )
         return None
+    metadata = get_json(
+        ["get", "configmap", "gpu-fault-release-metadata"],
+        control_plane=True,
+    )
+    if metadata is not None:
+        executor_sha = (metadata.get("data") or {}).get(
+            "required-regional-executor-artifact-sha256"
+        )
+        if executor_sha:
+            return "gpu-fault-executor-wheel-0100-" + executor_sha[:12]
+
+    # Legacy releases did not publish an independent Executor artifact.
     names = set()
     for name in CONTROL_PLANE_REFERENCE_DEPLOYMENTS:
         item = get_json(["get", "deployment", name], control_plane=True)

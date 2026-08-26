@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_NAMESPACE = "gpu-fault-system"
 AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 RUNTIME_PROFILE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
 EKS_ARN_PATTERN = re.compile(
     r"^arn:[^:]+:eks:(?P<region>[^:]+):(?P<account>[^:]+):"
     r"cluster/(?P<name>[^/]+)$"
@@ -36,6 +37,13 @@ def required_text(value: object, field: str) -> str:
     normalized = str(value or "").strip()
     if not normalized or normalized.startswith("REPLACE_"):
         raise ReleaseError(f"{field} is required and must not be a placeholder")
+    return normalized
+
+
+def required_email(value: object, field: str) -> str:
+    normalized = required_text(value, field)
+    if not EMAIL_PATTERN.fullmatch(normalized):
+        raise ReleaseError(f"{field} must be a valid email address")
     return normalized
 
 
@@ -161,20 +169,309 @@ class ClusterTarget:
 
 
 @dataclass(frozen=True)
+class RegionalHealthConfig:
+    aurora_cluster_id: str | None = None
+    amp_workspace_id: str | None = None
+    amp_rule_namespace: str = "gpu-fault-control-plane-capacity"
+    sns_topic_arn: str | None = None
+    certificate_min_validity_days: int = 30
+    remote_command_max_unclaimed_seconds: int = 300
+    require_confirmed_sns_subscription: bool = True
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: dict[str, Any],
+        *,
+        expected_region: str,
+    ) -> RegionalHealthConfig:
+        if not value:
+            return cls()
+        aurora_cluster_id = (
+            required_text(value.get("aurora_cluster_id"), "health.aurora_cluster_id")
+            if value.get("aurora_cluster_id")
+            else None
+        )
+        amp_workspace_id = (
+            required_text(value.get("amp_workspace_id"), "health.amp_workspace_id")
+            if value.get("amp_workspace_id")
+            else None
+        )
+        amp_rule_namespace = str(
+            value.get(
+                "amp_rule_namespace",
+                "gpu-fault-control-plane-capacity",
+            )
+        ).strip()
+        if not amp_rule_namespace:
+            raise ReleaseError("health.amp_rule_namespace must not be empty")
+        sns_topic_arn = None
+        if value.get("sns_topic_arn"):
+            sns_topic_arn = validate_regional_arn(
+                value.get("sns_topic_arn"),
+                field="health.sns_topic_arn",
+                service="sns",
+                expected_region=expected_region,
+            )
+        try:
+            certificate_days = int(value.get("certificate_min_validity_days", 30))
+            max_unclaimed = int(value.get("remote_command_max_unclaimed_seconds", 300))
+        except (TypeError, ValueError) as exc:
+            raise ReleaseError(
+                "health validity and remote-command thresholds must be integers"
+            ) from exc
+        if not 1 <= certificate_days <= 3650:
+            raise ReleaseError(
+                "health.certificate_min_validity_days must be within 1..3650"
+            )
+        if not 1 <= max_unclaimed <= 86400:
+            raise ReleaseError(
+                "health.remote_command_max_unclaimed_seconds must be within 1..86400"
+            )
+        return cls(
+            aurora_cluster_id=aurora_cluster_id,
+            amp_workspace_id=amp_workspace_id,
+            amp_rule_namespace=amp_rule_namespace,
+            sns_topic_arn=sns_topic_arn,
+            certificate_min_validity_days=certificate_days,
+            remote_command_max_unclaimed_seconds=max_unclaimed,
+            require_confirmed_sns_subscription=bool(
+                value.get("require_confirmed_sns_subscription", True)
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class RegionalNotificationConfig:
+    allow_email: bool = False
+    acknowledge_external_alert_channel: bool = True
+    admin_email: str | None = None
+    email_sender: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> RegionalNotificationConfig:
+        if not value:
+            return cls()
+        allow_email = bool(value.get("allow_email", True))
+        acknowledge = bool(value.get("acknowledge_external_alert_channel", False))
+        admin_email = (
+            required_email(value.get("admin_email"), "notifications.admin_email")
+            if value.get("admin_email")
+            else None
+        )
+        email_sender = (
+            required_email(value.get("email_sender"), "notifications.email_sender")
+            if value.get("email_sender")
+            else None
+        )
+        if not allow_email and not acknowledge:
+            raise ReleaseError(
+                "notifications must allow email or acknowledge an external alert channel"
+            )
+        if allow_email and (admin_email is None or email_sender is None):
+            raise ReleaseError(
+                "email notifications require notifications.admin_email "
+                "and notifications.email_sender"
+            )
+        return cls(
+            allow_email=allow_email,
+            acknowledge_external_alert_channel=acknowledge,
+            admin_email=admin_email,
+            email_sender=email_sender,
+        )
+
+
+@dataclass(frozen=True)
+class RegionalDnsConfig:
+    hosted_zone_id: str | None = None
+    hostname: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> RegionalDnsConfig:
+        if not value:
+            return cls()
+        hosted_zone_id = required_text(
+            value.get("hosted_zone_id"),
+            "dns.hosted_zone_id",
+        )
+        hostname = required_text(value.get("hostname"), "dns.hostname").rstrip(".")
+        if "." not in hostname:
+            raise ReleaseError("dns.hostname must be a DNS name")
+        return cls(hosted_zone_id=hosted_zone_id, hostname=hostname)
+
+
+@dataclass(frozen=True)
+class ReleaseArtifacts:
+    release_id: str
+    wheel: Path
+    executor_wheel: Path
+    node_wheel: Path
+    bundle: Path
+    database_schema_version: int
+    agent_protocol_version: int
+    executor_protocol_version: int
+    component_digests: dict[str, str]
+    manifest: dict[str, Any] | None
+
+
+def _resolved_artifact_paths(
+    values: tuple[Path, Path, Path, Path],
+    *,
+    base: Path,
+) -> tuple[Path, Path, Path, Path]:
+    resolved = tuple(value if value.is_absolute() else base / value for value in values)
+    return resolved[0], resolved[1], resolved[2], resolved[3]
+
+
+def _require_artifact_files(paths: tuple[Path, Path, Path, Path]) -> None:
+    if not all(path.is_file() for path in paths):
+        raise ReleaseError("release component wheels and bundle must exist")
+
+
+def load_release_artifacts(
+    release: dict[str, Any],
+    *,
+    config_path: Path,
+) -> ReleaseArtifacts:
+    release_manifest = release.get("manifest")
+    manifest: dict[str, Any] | None = None
+    if release_manifest:
+        manifest_path = Path(str(release_manifest))
+        if not manifest_path.is_absolute():
+            manifest_path = config_path.parent / manifest_path
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        components = dict(manifest.get("components") or {})
+        control_component = dict(components.get("control_plane") or {})
+        executor_component = dict(components.get("executor") or {})
+        node_component = dict(components.get("node_runtime") or {})
+        wheel, executor_wheel, node_wheel, bundle = _resolved_artifact_paths(
+            (
+                Path(str(control_component.get("wheel") or manifest["wheel"])),
+                Path(str(executor_component.get("wheel") or manifest["wheel"])),
+                Path(str(node_component.get("wheel") or manifest["wheel"])),
+                Path(str(manifest["bundle"])),
+            ),
+            base=ROOT,
+        )
+        _require_artifact_files((wheel, executor_wheel, node_wheel, bundle))
+        release_id = required_text(
+            manifest.get("release_id") or _sha256(wheel)[:12],
+            "release manifest release_id",
+        )
+        database_schema_version = int(manifest.get("database_schema_version", 0))
+        protocols = dict(manifest.get("protocol_versions") or {})
+        agent_protocol_version = int(protocols.get("agent", 3))
+        executor_protocol_version = int(protocols.get("executor", 2))
+        component_digests = {
+            "control_plane": str(
+                control_component.get("module_digest")
+                or manifest.get("module_digest")
+                or ""
+            ),
+            "executor": str(
+                executor_component.get("module_digest")
+                or manifest.get("module_digest")
+                or ""
+            ),
+            "node_runtime": str(
+                node_component.get("module_digest")
+                or manifest.get("module_digest")
+                or ""
+            ),
+        }
+        expected_hashes = {
+            "control_plane": (
+                control_component.get("wheel_sha256") or manifest.get("wheel_sha256")
+            ),
+            "executor": (
+                executor_component.get("wheel_sha256") or manifest.get("wheel_sha256")
+            ),
+            "node_runtime": (
+                node_component.get("wheel_sha256") or manifest.get("wheel_sha256")
+            ),
+            "bundle": manifest.get("bundle_sha256"),
+        }
+        actual_hashes = {
+            "control_plane": _sha256(wheel),
+            "executor": _sha256(executor_wheel),
+            "node_runtime": _sha256(node_wheel),
+            "bundle": _sha256(bundle),
+        }
+        if actual_hashes != expected_hashes:
+            raise ReleaseError("release manifest hashes do not match its artifacts")
+        if int(manifest.get("schema_version", 1)) >= 2 and any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in component_digests.values()
+        ):
+            raise ReleaseError(
+                "release component module digests must be lowercase SHA-256"
+            )
+    else:
+        wheel = Path(release.get("wheel", ""))
+        wheel, executor_wheel, node_wheel, bundle = _resolved_artifact_paths(
+            (
+                wheel,
+                Path(release.get("executor_wheel") or wheel),
+                Path(release.get("node_wheel") or wheel),
+                Path(release.get("bundle", "")),
+            ),
+            base=config_path.parent,
+        )
+        _require_artifact_files((wheel, executor_wheel, node_wheel, bundle))
+        release_id = str(release.get("id") or _sha256(wheel)[:12])
+        database_schema_version = int(release.get("database_schema_version", 0))
+        agent_protocol_version = int(release.get("agent_protocol_version", 3))
+        executor_protocol_version = int(release.get("executor_protocol_version", 2))
+        component_digests = {
+            "control_plane": str(release.get("control_plane_digest") or ""),
+            "executor": str(release.get("executor_digest") or ""),
+            "node_runtime": str(release.get("node_runtime_digest") or ""),
+        }
+    if database_schema_version < 0:
+        raise ReleaseError("release database_schema_version must not be negative")
+    if agent_protocol_version < 1 or executor_protocol_version < 1:
+        raise ReleaseError("release protocol versions must be positive")
+    return ReleaseArtifacts(
+        release_id=release_id,
+        wheel=wheel.resolve(),
+        executor_wheel=executor_wheel.resolve(),
+        node_wheel=node_wheel.resolve(),
+        bundle=bundle.resolve(),
+        database_schema_version=database_schema_version,
+        agent_protocol_version=agent_protocol_version,
+        executor_protocol_version=executor_protocol_version,
+        component_digests=component_digests,
+        manifest=manifest,
+    )
+
+
+@dataclass(frozen=True)
 class ReleaseConfig:
+    site_name: str
+    release_id: str
     aws_region: str
     cpu_kubeconfig: str
     cpu_eks_arn: str
     cpu_hyperpod_cluster_name: str
     namespace: str
     wheel: Path
+    executor_wheel: Path
+    node_wheel: Path
     bundle: Path
+    database_schema_version: int
+    agent_protocol_version: int
+    executor_protocol_version: int
+    component_digests: dict[str, str]
     agent_config_digest: str
     runtime_profile_source: Path
     runtime_profile_version: str
     runtime_profile_registration_cluster_id: str
     clusters: tuple[ClusterTarget, ...]
     nlb: dict[str, str]
+    dns: RegionalDnsConfig
+    health: RegionalHealthConfig
+    notifications: RegionalNotificationConfig
     auto_rollback: bool = True
 
     def for_rollback(self, agent_config_digest: str) -> ReleaseConfig:
@@ -202,8 +499,6 @@ class ReleaseConfig:
             ClusterTarget.from_mapping(item, expected_region=aws_region)
             for item in value.get("clusters", [])
         )
-        if not clusters:
-            raise ReleaseError("config requires at least one GPU cluster")
         runtime_profile = value.get("runtime_profile") or {}
         runtime_profile_source = Path(
             required_text(
@@ -220,26 +515,7 @@ class ReleaseConfig:
             runtime_profile.get("registration_cluster_id"),
             "runtime_profile.registration_cluster_id",
         )
-        release_manifest = release.get("manifest")
-        manifest: dict[str, Any] | None = None
-        if release_manifest:
-            manifest_path = Path(str(release_manifest))
-            if not manifest_path.is_absolute():
-                manifest_path = path.parent / manifest_path
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            wheel = Path(str(manifest["wheel"]))
-            bundle = Path(str(manifest["bundle"]))
-            if not wheel.is_absolute():
-                wheel = ROOT / wheel
-            if not bundle.is_absolute():
-                bundle = ROOT / bundle
-        else:
-            wheel = Path(release.get("wheel", ""))
-            bundle = Path(release.get("bundle", ""))
-            if not wheel.is_absolute():
-                wheel = path.parent / wheel
-            if not bundle.is_absolute():
-                bundle = path.parent / bundle
+        artifacts = load_release_artifacts(release, config_path=path)
         digest = str(release.get("agent_config_digest", ""))
         cpu_kubeconfig = required_text(value.get("cpu_kubeconfig"), "cpu_kubeconfig")
         nlb = dict(value.get("nlb") or {})
@@ -254,13 +530,14 @@ class ReleaseConfig:
             )
             if nlb.get("name"):
                 nlb["name"] = required_text(nlb["name"], "nlb.name")
-        if not wheel.is_file() or not bundle.is_file():
-            raise ReleaseError("release wheel and bundle must exist")
-        if manifest is not None:
-            if _sha256(wheel) != manifest.get("wheel_sha256") or _sha256(
-                bundle
-            ) != manifest.get("bundle_sha256"):
-                raise ReleaseError("release manifest hashes do not match its artifacts")
+        health = RegionalHealthConfig.from_mapping(
+            dict(value.get("health") or {}),
+            expected_region=aws_region,
+        )
+        notifications = RegionalNotificationConfig.from_mapping(
+            dict(value.get("notifications") or {})
+        )
+        dns = RegionalDnsConfig.from_mapping(dict(value.get("dns") or {}))
         if len(digest) != 64 or any(
             character not in "0123456789abcdef" for character in digest
         ):
@@ -268,11 +545,6 @@ class ReleaseConfig:
         ids = [item.cluster_id for item in clusters]
         if len(ids) != len(set(ids)):
             raise ReleaseError("cluster_id values must be unique")
-        if runtime_profile_registration_cluster_id not in set(ids):
-            raise ReleaseError(
-                "runtime_profile.registration_cluster_id must name "
-                "one configured GPU cluster"
-            )
         if not runtime_profile_source.is_file():
             raise ReleaseError("runtime_profile.source must be an existing file")
         try:
@@ -295,13 +567,21 @@ class ReleaseConfig:
                 + ", ".join(missing_profile_fields)
             )
         return cls(
+            site_name=str(value.get("site_name") or path.stem),
+            release_id=artifacts.release_id,
             aws_region=aws_region,
             cpu_kubeconfig=cpu_kubeconfig,
             cpu_eks_arn=cpu_eks_arn,
             cpu_hyperpod_cluster_name=cpu_hyperpod_cluster_name,
             namespace=str(value.get("namespace", DEFAULT_NAMESPACE)),
-            wheel=wheel.resolve(),
-            bundle=bundle.resolve(),
+            wheel=artifacts.wheel,
+            executor_wheel=artifacts.executor_wheel,
+            node_wheel=artifacts.node_wheel,
+            bundle=artifacts.bundle,
+            database_schema_version=artifacts.database_schema_version,
+            agent_protocol_version=artifacts.agent_protocol_version,
+            executor_protocol_version=artifacts.executor_protocol_version,
+            component_digests=artifacts.component_digests,
             agent_config_digest=digest,
             runtime_profile_source=runtime_profile_source.resolve(),
             runtime_profile_version=runtime_profile_version,
@@ -310,6 +590,9 @@ class ReleaseConfig:
             ),
             clusters=clusters,
             nlb=nlb,
+            dns=dns,
+            health=health,
+            notifications=notifications,
             auto_rollback=bool(value.get("auto_rollback", True)),
         )
 

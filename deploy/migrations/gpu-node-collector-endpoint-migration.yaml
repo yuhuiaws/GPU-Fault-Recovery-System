@@ -56,7 +56,7 @@ spec:
               cp "${connection_dir}/ca.crt" \
                 "${host_dir}/control-plane-ca.crt"
               chmod 0644 "${host_dir}/control-plane-ca.crt"
-              artifact_name=gpu_fault_control_plane-0.10.0-py3-none-any.whl
+              artifact_name=gpu_fault_node_runtime-0.10.0-py3-none-any.whl
               host_artifact="/var/lib/gpu-fault/${artifact_name}"
               cp "/artifact/${artifact_name}" \
                 "/host${host_artifact}"
@@ -128,6 +128,9 @@ spec:
                 upsert_env "${node_env}" \
                   GPU_FAULT_NODE_ARTIFACT_SHA256 \
                   REPLACE_WITH_ARTIFACT_SHA256
+                upsert_env "${node_env}" \
+                  GPU_FAULT_NODE_COMPATIBILITY_DIGEST \
+                  REPLACE_WITH_COMPATIBILITY_DIGEST
               fi
 
               chroot /host systemctl disable --now \

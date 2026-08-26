@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from datetime import datetime, timedelta, timezone
 
@@ -17,6 +17,7 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
+from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
@@ -375,6 +376,44 @@ class SqliteControlRecordMixin:
 
     def get_profile(self, version: str) -> EffectiveRuntimeProfile:
         return self._get("profile", version)
+
+    def save_installation_resource(
+        self,
+        resource: InstallationResource,
+    ) -> InstallationResource:
+        key = f"{resource.site_id}/{resource.resource_key}"
+        with self._state_transaction(f"installation_resource/{key}"):
+            existing = self._get_optional("installation_resource", key)
+            if (
+                existing is not None
+                and existing.immutable_identity() != resource.immutable_identity()
+            ):
+                raise ValueError("installation resource identity cannot change")
+            self._put("installation_resource", key, resource)
+        return resource
+
+    def get_installation_resource(
+        self,
+        site_id: str,
+        resource_key: str,
+    ) -> InstallationResource:
+        return cast(
+            InstallationResource,
+            self._get("installation_resource", f"{site_id}/{resource_key}"),
+        )
+
+    def list_installation_resources(
+        self,
+        site_id: str | None = None,
+    ) -> list[InstallationResource]:
+        resources = cast(
+            list[InstallationResource],
+            self._list("installation_resource"),
+        )
+        return sorted(
+            (item for item in resources if site_id is None or item.site_id == site_id),
+            key=lambda item: (item.site_id, item.resource_key),
+        )
 
     def get_preempting_successor(
         self, predecessor_workflow_id: str

@@ -7,6 +7,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
 DETAIL = DOCS / "详细设计.md"
@@ -40,8 +42,12 @@ PUBLIC_RELEASE_DOCUMENTS = (
     "docs/详细设计.md",
     "docs/详细设计-v2.md",
     "docs/components/nvidia-policy.md",
+    "docs/管理员快速部署.md",
+    "docs/管理员日常运维.md",
+    "docs/安全与参数参考.md",
     "docs/部署和运维手册.md",
     "docs/部署和运维手册逐章解读.md",
+    "docs/开发者部署实现.md",
     "docs/区域模式端到端验收测试用例.md",
     "docs/区域用例索引.md",
     "docs/故障模拟测试手册.md",
@@ -247,6 +253,7 @@ def test_docs_map_is_the_human_entrypoint() -> None:
         assert f"components/{document.name}" in index
 
     assert "docs/扩展指南.md" in contributing
+    assert "docs/开发者部署实现.md" in contributing
     assert "docs/README.md" in root_readme
     assert "CONTRIBUTING.md" in root_readme
 
@@ -256,20 +263,69 @@ def test_docs_tree_has_no_vendored_wheels() -> None:
     assert "*.whl" in (ROOT / ".gitignore").read_text(encoding="utf-8")
 
 
-def test_extension_guide_covers_deployment_and_cleanup_extensions() -> None:
+def test_developer_guides_split_code_extensions_from_production_delivery() -> None:
     guide = (DOCS / "扩展指南.md").read_text(encoding="utf-8")
+    developer = (DOCS / "开发者部署实现.md").read_text(encoding="utf-8")
 
     for value in (
+        "OPERATION_REGISTRY",
+        "CHANNEL_REGISTRY",
+        "POSTGRES_SCHEMA_MIGRATIONS",
+        "authorization_bucket",
+        "metric_contributors",
+        "[开发者部署实现](开发者部署实现.md)",
+    ):
+        assert value in guide
+    assert "目前只有" in guide
+    assert "不会自动生效" in guide
+    assert "不再重复" in guide
+    assert guide.count("## 1. 新增 Workflow Operation") == 1
+
+    for value in (
+        "site.yaml",
+        "gpu-fault-admin remove-cluster",
+        "required/compatible",
         "gpu-fault.io/cleanup-phase",
         "deployment-contracts-update",
         "gpu-fault-installed-resources",
         "/opt/gpu-fault/installed-units.txt",
+        "installation_resource",
         "READY_TO_DELETE_AURORA",
-        "tests/regional/test_cleanup_state.py",
+        "tests/admin/test_admin_uninstall.py",
     ):
-        assert value in guide
-    assert "管理员和客户不编写" in guide
-    assert guide.count("## 1. 新增 Workflow Operation") == 1
+        assert value in developer
+    assert "管理员不维护 `regional-release.json`" in developer
+    assert "三层事实源" in developer
+
+
+def test_developer_manual_documents_every_runtime_profile_capability() -> None:
+    developer = (DOCS / "开发者部署实现.md").read_text(encoding="utf-8")
+    profile = yaml.safe_load(
+        (ROOT / "config/runtime-profile.regional-hyperpod-safe.example.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    section = developer.split("### 4.1 Runtime Profile的作用", 1)[1].split("## 5.", 1)[
+        0
+    ]
+
+    for claim in profile["claims"]:
+        capability = claim["capability"]
+        assert f"`{capability}`" in section, (
+            f"developer manual omits Runtime Profile capability {capability}"
+        )
+    for value in ("OWN", "DELEGATE", "AUGMENT", "OBSERVE", "DISABLED"):
+        assert f"`{value}`" in section, (
+            f"developer manual omits Runtime Profile mode {value}"
+        )
+    for value in (
+        "templateSource",
+        "PROFILE_APPROVAL=CHG-12345",
+        "regional-hyperpod-<digest12>",
+        "gpu-training-submit --site",
+        "gpu-fault-workload-annotate --site",
+    ):
+        assert value in section, f"developer manual omits Profile workflow {value}"
 
 
 def test_internal_research_is_ignored_and_not_publicly_referenced() -> None:
@@ -344,11 +400,57 @@ def test_public_specs_do_not_embed_private_execution_history() -> None:
 def test_root_readme_is_a_bounded_public_entrypoint() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert len(readme.splitlines()) <= 220
+    assert len(readme.splitlines()) <= 260
     assert "本方案永不调用 `BatchReplaceClusterNodes`" in readme
     assert "docs/部署和运维手册.md" in readme
+    manual_gates = readme.split("需要手工逐项执行时，建议按以下顺序：", 1)[1].split(
+        "```", 2
+    )[1]
+    expected_order = (
+        "make mypy-check",
+        "make architecture-check",
+        "make docs-check",
+        "make artifact-check",
+        "make test-parallel",
+    )
+    assert tuple(sorted(expected_order, key=manual_gates.index)) == expected_order
     for name in INTERNAL_RESEARCH_DOCUMENTS:
         assert name not in readme
+
+
+def test_root_readme_separates_developer_and_admin_deployment() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    developer = readme.split("### 开发者：修改代码或Profile后发布", 1)[1].split(
+        "### 管理员：首次部署和日常管理", 1
+    )[0]
+    administrator = readme.split("### 管理员：首次部署和日常管理", 1)[1].split(
+        "## 训练任务提交", 1
+    )[0]
+
+    for value in (
+        "make PYTHON=.venv/bin/python release-deploy",
+        "PROFILE_APPROVAL=CHG-12345",
+        "profile-plan.json",
+        "deploy -> verify -> status",
+    ):
+        assert value in developer
+
+    for value in (
+        "--cpu-cluster-arn <cpu-eks-or-hyperpod-arn>",
+        "gpu-fault-admin preflight",
+        "gpu-fault-admin deploy -f",
+        "gpu-fault-admin verify",
+        "gpu-fault-admin status",
+        "gpu-fault-admin join-cluster",
+        "gpu-fault-admin remove-cluster",
+        "--confirm REMOVE_GPU_CLUSTER",
+        "--cpu-cluster keep",
+        "--confirm UNINSTALL_GPU_FAULT",
+        "--cpu-cluster delete",
+        "--confirm DELETE_CPU_CONTROL_PLANE",
+        "不会重新构建当前",
+    ):
+        assert value in administrator
 
 
 def test_public_collector_docs_keep_node_log_disabled() -> None:
@@ -403,7 +505,11 @@ def test_html_build_uses_the_current_authoritative_document_set() -> None:
         "docs/概要设计.md",
         "docs/详细设计.md",
         "docs/components/nvidia-policy.md",
+        "docs/管理员快速部署.md",
+        "docs/管理员日常运维.md",
+        "docs/安全与参数参考.md",
         "docs/部署和运维手册.md",
+        "docs/开发者部署实现.md",
         "docs/区域模式端到端验收测试用例.md",
     ):
         assert path in builder

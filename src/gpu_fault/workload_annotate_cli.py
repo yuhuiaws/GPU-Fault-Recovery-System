@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
 from gpu_fault.training_submit_cli import (
     TrainingSubmitError,
     render_workload,
+    resolve_runtime_profile_version,
 )
 
 
@@ -24,8 +24,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--attempt-id")
     result.add_argument("--attempt-number", type=int, default=1)
     result.add_argument(
+        "--site",
+        type=Path,
+        help="RegionalSite YAML; defaults to GPU_FAULT_SITE_FILE",
+    )
+    result.add_argument(
         "--runtime-profile-version",
-        default=os.getenv("GPU_FAULT_RUNTIME_PROFILE", "hyperpod-v1"),
+        help="explicit override; must match --site when both are provided",
     )
     result.add_argument("--expected-critical-ranks", type=int)
     result.add_argument("--training-container")
@@ -35,12 +40,13 @@ def parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
+    runtime_profile_version = resolve_runtime_profile_version(args)
     rendered = render_workload(
         args.manifest,
         job_id=args.job_id,
         attempt_id=args.attempt_id,
         attempt_number=args.attempt_number,
-        runtime_profile_version=args.runtime_profile_version,
+        runtime_profile_version=runtime_profile_version,
         expected_critical_ranks=args.expected_critical_ranks,
         training_container=args.training_container,
         restart_budget=args.restart_budget,

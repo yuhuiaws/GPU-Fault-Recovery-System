@@ -16,7 +16,7 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStepStatus,
 )
-from gpu_fault.node_agent import (
+from gpu_fault.node_agent.protocol import (
     NodeActionStatus,
 )
 from gpu_fault.operation_registry import (

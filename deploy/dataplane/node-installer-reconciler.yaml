@@ -76,7 +76,7 @@ spec:
           args:
             - >-
               python -m pip install --no-cache-dir
-              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors]'
+              '/artifact/gpu_fault_cluster_executor-0.10.0-py3-none-any.whl[collectors]'
               && touch /tmp/reconciler-ready
               && exec gpu-fault-node-installer-reconciler
           env:
@@ -133,7 +133,7 @@ spec:
       volumes:
         - name: artifact
           configMap:
-            name: gpu-fault-control-plane-wheel-0100
+            name: gpu-fault-executor-wheel-0100
         - name: installer-template
           configMap:
             name: REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP

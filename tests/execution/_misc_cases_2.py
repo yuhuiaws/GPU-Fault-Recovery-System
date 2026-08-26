@@ -498,9 +498,11 @@ def test_storeless_adapter_refuses_live_predecessor() -> None:
     provider = RecordingOwnershipProvider({"incident-dead": False})
     adapter, context = _storeless_isolation_context(core, provider)
 
-    with pytest.raises(ValueError, match="already isolated by another incident"):
-        adapter.execute(context)
+    outcome = adapter.execute(context)
 
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "already isolated by another incident" in (outcome.error or "")
+    assert outcome.details["safety_rejection"] is True
     assert (
         core.node["metadata"]["annotations"]["gpu-fault.io/incident-id"]
         == "incident-dead"
@@ -516,16 +518,22 @@ def test_storeless_adapter_fails_closed_when_control_plane_errors() -> None:
     )
     adapter, context = _storeless_isolation_context(core, provider)
 
-    with pytest.raises(ValueError, match="already isolated by another incident"):
-        adapter.execute(context)
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "already isolated by another incident" in (outcome.error or "")
+    assert outcome.details["safety_rejection"] is True
 
 
 def test_storeless_adapter_without_provider_refuses_takeover() -> None:
     core = FakeCoreApi()
     adapter, context = _storeless_isolation_context(core, None)
 
-    with pytest.raises(ValueError, match="already isolated by another incident"):
-        adapter.execute(context)
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "already isolated by another incident" in (outcome.error or "")
+    assert outcome.details["safety_rejection"] is True
 
 
 def test_same_incident_stale_node_generation_is_always_rejected() -> None:
@@ -539,9 +547,11 @@ def test_same_incident_stale_node_generation_is_always_rejected() -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="newer workflow generation"):
-        adapter.execute(context)
+    outcome = adapter.execute(context)
 
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "newer workflow generation" in (outcome.error or "")
+    assert outcome.details["safety_rejection"] is True
     assert provider.queried == []
 
 

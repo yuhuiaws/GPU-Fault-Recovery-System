@@ -34,6 +34,8 @@ class MemoryFleetMixin:
     def delete_regional_cluster(self, cluster_id: str) -> None:
         with self._lock:
             self._regional_clusters.pop(cluster_id, None)
+            for key in [key for key in self._agents if key[0] == cluster_id]:
+                del self._agents[key]
 
     def list_regional_clusters(self):
         with self._lock:

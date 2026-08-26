@@ -43,8 +43,12 @@ pandoc \
   docs/概要设计.md \
   docs/详细设计.md \
   docs/components/nvidia-policy.md \
+  docs/管理员快速部署.md \
+  docs/管理员日常运维.md \
+  docs/安全与参数参考.md \
   docs/部署和运维手册.md \
   docs/部署和运维手册逐章解读.md \
+  docs/开发者部署实现.md \
   docs/扩展指南.md \
   docs/环境变量参考.md \
   docs/故障模拟测试手册.md \

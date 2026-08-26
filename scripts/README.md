@@ -15,6 +15,10 @@ generic fault-case runner.
 
 ## Directory roles
 
+- `release_deploy.py`: developer-facing build, site preparation, deploy,
+  verify and status pipeline used by `make release-deploy`. `ADMIN_EMAIL`
+  optionally overrides the site administrator address; otherwise the existing
+  site value or AWS account email discovery is used.
 - `scripts/e2e/`: live-cluster drivers and probes.
 - `scripts/e2e/manifests/`: test-only Kubernetes inputs named by procedures.
 - `scripts/perf/`: current capacity suites and reusable performance helpers.

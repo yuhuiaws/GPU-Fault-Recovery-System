@@ -88,6 +88,17 @@ spec:
               key: compatible-agent-artifact-sha256s
               name: gpu-fault-release-metadata
               optional: true
+        - name: GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST
+          valueFrom:
+            configMapKeyRef:
+              key: required-agent-compatibility-digest
+              name: gpu-fault-release-metadata
+        - name: GPU_FAULT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS
+          valueFrom:
+            configMapKeyRef:
+              key: compatible-agent-compatibility-digests
+              name: gpu-fault-release-metadata
+              optional: true
         - name: GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION
           valueFrom:
             configMapKeyRef:
@@ -108,6 +119,30 @@ spec:
           valueFrom:
             configMapKeyRef:
               key: compatible-regional-executor-protocol-versions
+              name: gpu-fault-release-metadata
+              optional: true
+        - name: GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256
+          valueFrom:
+            configMapKeyRef:
+              key: required-regional-executor-artifact-sha256
+              name: gpu-fault-release-metadata
+              optional: true
+        - name: GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S
+          valueFrom:
+            configMapKeyRef:
+              key: compatible-regional-executor-artifact-sha256s
+              name: gpu-fault-release-metadata
+              optional: true
+        - name: GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST
+          valueFrom:
+            configMapKeyRef:
+              key: required-regional-executor-compatibility-digest
+              name: gpu-fault-release-metadata
+              optional: true
+        - name: GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS
+          valueFrom:
+            configMapKeyRef:
+              key: compatible-regional-executor-compatibility-digests
               name: gpu-fault-release-metadata
               optional: true
         - name: GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST

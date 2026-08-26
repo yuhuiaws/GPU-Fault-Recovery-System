@@ -32,6 +32,11 @@ class SqliteFleetMixin:
     def delete_regional_cluster(self, cluster_id: str) -> None:
         with self._state_transaction(f"regional_cluster/{cluster_id}"):
             self._delete("regional_cluster", cluster_id)
+            for agent in self.list_agents(cluster_id):
+                self._delete(
+                    "agent",
+                    self._agent_key(agent.cluster_id, agent.node_id),
+                )
 
     def list_regional_clusters(self):
         return sorted(

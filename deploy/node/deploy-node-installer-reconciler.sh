@@ -11,11 +11,13 @@ VERSION="${GPU_FAULT_VERSION:-0.10.0}"
 RUNTIME_PROFILE="${GPU_FAULT_RUNTIME_PROFILE:-hyperpod-v1}"
 CONFIG_DIGEST="${GPU_FAULT_INSTALLER_CONFIG_DIGEST:-}"
 ARTIFACT_SHA256="${GPU_FAULT_INSTALLER_ARTIFACT_SHA256:-}"
+NODE_COMPATIBILITY_DIGEST="${GPU_FAULT_NODE_COMPATIBILITY_DIGEST:-}"
 INSTALLER_CONFIG_MAP="$(
     printf '%s' \
         "${GPU_FAULT_INSTALLER_CONFIG_MAP:-gpu-fault-node-installer-0100}"
 )"
 WHEEL_CONFIG_MAP="${GPU_FAULT_WHEEL_CONFIG_MAP:-}"
+EXECUTOR_WHEEL_FILENAME="${GPU_FAULT_EXECUTOR_WHEEL_FILENAME:-gpu_fault_cluster_executor-0.10.0-py3-none-any.whl}"
 DCGM_METRICS_URL="${GPU_FAULT_DCGM_METRICS_URL:-http://127.0.0.1:9400/metrics}"
 FLEET_MASTER_FILE="${GPU_FAULT_FLEET_MASTER_FILE:-}"
 NODE_ACTION_KEYS_SECRET="$(
@@ -31,7 +33,7 @@ for command in kubectl sed; do
         exit 1
     }
 done
-for value in KUBECTL_CONTEXT CLUSTER_ID HYPERPOD_CLUSTER RUNTIME_PROFILE CONFIG_DIGEST ARTIFACT_SHA256 WHEEL_CONFIG_MAP; do
+for value in KUBECTL_CONTEXT CLUSTER_ID HYPERPOD_CLUSTER RUNTIME_PROFILE CONFIG_DIGEST ARTIFACT_SHA256 NODE_COMPATIBILITY_DIGEST WHEEL_CONFIG_MAP; do
     [[ -n "${!value}" ]] || {
         printf 'ERROR: %s is required\n' "${value}" >&2
         exit 2
@@ -49,9 +51,17 @@ done
     printf 'ERROR: invalid GPU_FAULT_INSTALLER_ARTIFACT_SHA256\n' >&2
     exit 2
 }
+[[ "${NODE_COMPATIBILITY_DIGEST}" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'ERROR: invalid GPU_FAULT_NODE_COMPATIBILITY_DIGEST\n' >&2
+    exit 2
+}
 [[ -n "${RUNTIME_IMAGE}" &&
     "${RUNTIME_IMAGE}" != *[[:space:]#]* ]] || {
     printf 'ERROR: invalid GPU_FAULT_RUNTIME_IMAGE\n' >&2
+    exit 2
+}
+[[ "${EXECUTOR_WHEEL_FILENAME}" =~ ^[A-Za-z0-9_.-]+\.whl$ ]] || {
+    printf 'ERROR: invalid GPU_FAULT_EXECUTOR_WHEEL_FILENAME\n' >&2
     exit 2
 }
 
@@ -106,6 +116,7 @@ GPU_FAULT_VERSION="${VERSION}" \
 GPU_FAULT_INSTALLER_CONFIG_MAP="${INSTALLER_CONFIG_MAP}" \
 GPU_FAULT_INSTALLER_CONFIG_DIGEST="${CONFIG_DIGEST}" \
 GPU_FAULT_INSTALLER_ARTIFACT_SHA256="${ARTIFACT_SHA256}" \
+GPU_FAULT_NODE_COMPATIBILITY_DIGEST="${NODE_COMPATIBILITY_DIGEST}" \
 GPU_FAULT_DCGM_METRICS_URL="${DCGM_METRICS_URL}" \
     "${SCRIPT_DIR}/run-hyperpod-installer-job.sh" \
     --node "${NODE}" --render-only >"${MANIFEST}"
@@ -126,8 +137,8 @@ sed \
     -e "s#REPLACE_WITH_INSTALLER_ARTIFACT_SHA256#${ARTIFACT_SHA256}#g" \
     -e "s#REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP#${TEMPLATE_CONFIG_MAP}#g" \
     -e "s#REPLACE_WITH_DCGM_METRICS_URL#${DCGM_METRICS_URL}#g" \
-    -e "s#gpu-fault-control-plane-wheel-0100#${WHEEL_CONFIG_MAP}#g" \
-    -e "s#gpu_fault_control_plane-0.10.0#gpu_fault_control_plane-${VERSION}#g" \
+    -e "s#gpu-fault-executor-wheel-0100#${WHEEL_CONFIG_MAP}#g" \
+    -e "s#gpu_fault_cluster_executor-0.10.0-py3-none-any.whl#${EXECUTOR_WHEEL_FILENAME}#g" \
     -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
     "${REPO_DIR}/deploy/dataplane/node-installer-reconciler.yaml" |
     kubectl_context apply -f -

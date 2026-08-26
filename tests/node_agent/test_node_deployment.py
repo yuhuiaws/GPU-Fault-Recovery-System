@@ -404,6 +404,9 @@ def test_node_log_collector_is_disabled_by_production_deploy() -> None:
     assert "GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR:-false" in deploy
     assert "GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR false" in migration
     assert "GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR true" not in migration
+    assert "gpu_fault_node_runtime-0.10.0-py3-none-any.whl" in migration
+    assert "GPU_FAULT_NODE_COMPATIBILITY_DIGEST" in migration
+    assert "REPLACE_WITH_COMPATIBILITY_DIGEST" in migration
 
 
 def test_training_progress_monitor_is_disabled_by_default() -> None:
@@ -625,7 +628,7 @@ def test_installer_finds_the_wheel_in_both_release_layouts(tmp_path: Path) -> No
     assert f"SHA={digest}" in result.stdout
 
     bundle = tmp_path / "bundle"
-    flat = bundle / "dist/gpu_fault_control_plane-0.10.0.whl"
+    flat = bundle / "dist/gpu_fault_node_runtime-0.10.0.whl"
     flat.parent.mkdir(parents=True)
     flat.write_bytes(b"bundle-wheel")
 

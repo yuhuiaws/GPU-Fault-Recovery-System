@@ -9,6 +9,8 @@ from typing import (
     runtime_checkable,
 )
 
+from gpu_fault.installation_resources import InstallationResource
+
 if TYPE_CHECKING:
     from gpu_fault.fleet import (
         AgentRecord,
@@ -163,6 +165,25 @@ class FleetStore(Protocol):
     def get_barrier(self, barrier_id: str) -> MultiNodeBarrier: ...
 
     def list_barriers(self) -> list[MultiNodeBarrier]: ...
+
+
+@runtime_checkable
+class InstallationResourceStore(Protocol):
+    def save_installation_resource(
+        self,
+        resource: InstallationResource,
+    ) -> InstallationResource: ...
+
+    def get_installation_resource(
+        self,
+        site_id: str,
+        resource_key: str,
+    ) -> InstallationResource: ...
+
+    def list_installation_resources(
+        self,
+        site_id: str | None = None,
+    ) -> list[InstallationResource]: ...
 
 
 @runtime_checkable
@@ -427,6 +448,7 @@ class NotificationStore(Protocol):
 class ControlPlaneStore(
     ProcessorStore,
     FleetStore,
+    InstallationResourceStore,
     WorkflowStore,
     CompletionStore,
     TelemetryStore,

@@ -32,6 +32,14 @@ RUNTIME_PROFILE_VERSION="$(
     printf '%s' \
         "${GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION:?GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION is required}"
 )"
+ALLOW_EMAIL="${GPU_FAULT_ALLOW_EMAIL:-true}"
+ACKNOWLEDGE_NO_ALERT_CHANNEL="$(
+    printf '%s' "${GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL:-false}"
+)"
+NOTIFICATION_CONFIG_SHA256="$(
+    printf '%s' "${GPU_FAULT_NOTIFICATION_CONFIG_SHA256:-}"
+)"
+LEGACY_COMPONENT_PINS="${GPU_FAULT_LEGACY_COMPONENT_PINS:-false}"
 CONTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 
@@ -48,6 +56,29 @@ trap 'rm -rf "${CONTRACT_DIR}"' EXIT
     echo "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION is invalid" >&2
     exit 2
 }
+[[ "${ALLOW_EMAIL}" == "true" || "${ALLOW_EMAIL}" == "false" ]] || {
+    echo "GPU_FAULT_ALLOW_EMAIL must be true or false" >&2
+    exit 2
+}
+[[ "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" == "true" ||
+    "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" == "false" ]] || {
+    echo "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL must be true or false" >&2
+    exit 2
+}
+[[ "${NOTIFICATION_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "GPU_FAULT_NOTIFICATION_CONFIG_SHA256 must be a lowercase SHA-256" >&2
+    exit 2
+}
+[[ "${LEGACY_COMPONENT_PINS}" == "true" ||
+    "${LEGACY_COMPONENT_PINS}" == "false" ]] || {
+    echo "GPU_FAULT_LEGACY_COMPONENT_PINS must be true or false" >&2
+    exit 2
+}
+if [[ "${ALLOW_EMAIL}" != "true" &&
+    "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" != "true" ]]; then
+    echo "email must be enabled or the external alert channel acknowledged" >&2
+    exit 2
+fi
 
 kubectl_args=()
 if [[ -n "${KUBECONFIG_PATH}" ]]; then
@@ -94,6 +125,7 @@ fi
 RELEASE_ID="${WHEEL_SHA256:0:12}"
 
 REQUIRED_AGENT_ARTIFACT_SHA256="${GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256:-${WHEEL_SHA256}}"
+REQUIRED_AGENT_COMPATIBILITY_DIGEST="${GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST:-${REQUIRED_AGENT_ARTIFACT_SHA256}}"
 REQUIRED_AGENT_CONFIG_DIGEST="${GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST:-}"
 REQUIRED_NODE_ACTION_KEY_VERSION="${GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION:-2}"
 REQUIRED_AGENT_PROTOCOL_VERSION="$(
@@ -108,22 +140,25 @@ REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION="$(
         'from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION; print(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION)'
 )"
 REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION="${GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION:-${REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION}}"
+REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256="${GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256:-}"
+REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST="${GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST:-${REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}}"
 COMPATIBLE_AGENT_ARTIFACT_SHA256S="${GPU_FAULT_COMPATIBLE_AGENT_ARTIFACT_SHA256S:-}"
+COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS="${GPU_FAULT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS:-}"
 COMPATIBLE_AGENT_PROTOCOL_VERSIONS="${GPU_FAULT_COMPATIBLE_AGENT_PROTOCOL_VERSIONS:-}"
 COMPATIBLE_AGENT_CONFIG_DIGESTS="${GPU_FAULT_COMPATIBLE_AGENT_CONFIG_DIGESTS:-}"
 COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS="${GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS:-}"
+COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S="${GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S:-}"
+COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS="${GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS:-}"
 FINALIZE_AGENT_PIN="${GPU_FAULT_FINALIZE_AGENT_PIN:-false}"
 FINALIZE_DATA_PLANE_PIN="${GPU_FAULT_FINALIZE_DATA_PLANE_PIN:-${FINALIZE_AGENT_PIN}}"
-PIN_FINALIZATION="false"
 PIN_METADATA_CHANGED="false"
-if [[ "${FINALIZE_AGENT_PIN}" == "true" ||
-    "${FINALIZE_DATA_PLANE_PIN}" == "true" ]]; then
-    PIN_FINALIZATION="true"
-fi
 TARGET_AGENT_ARTIFACT_SHA256="${REQUIRED_AGENT_ARTIFACT_SHA256}"
+TARGET_AGENT_COMPATIBILITY_DIGEST="${REQUIRED_AGENT_COMPATIBILITY_DIGEST}"
 TARGET_AGENT_CONFIG_DIGEST="${REQUIRED_AGENT_CONFIG_DIGEST}"
 TARGET_AGENT_PROTOCOL_VERSION="${REQUIRED_AGENT_PROTOCOL_VERSION}"
 TARGET_REGIONAL_EXECUTOR_PROTOCOL_VERSION="${REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION}"
+TARGET_REGIONAL_EXECUTOR_ARTIFACT_SHA256="${REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}"
+TARGET_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST="${REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}"
 
 append_csv_value() {
     local current="$1"
@@ -161,6 +196,16 @@ if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
             gpu-fault-release-metadata \
             -o jsonpath='{.data.compatible-agent-artifact-sha256s}'
     )"
+    CURRENT_REQUIRED_AGENT_COMPATIBILITY_DIGEST="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
+            gpu-fault-release-metadata \
+            -o jsonpath='{.data.required-agent-compatibility-digest}'
+    )"
+    CURRENT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
+            gpu-fault-release-metadata \
+            -o jsonpath='{.data.compatible-agent-compatibility-digests}'
+    )"
     CURRENT_COMPATIBLE_AGENT_PROTOCOL_VERSIONS="$(
         kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
             gpu-fault-release-metadata \
@@ -180,6 +225,26 @@ if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
         kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
             gpu-fault-release-metadata \
             -o jsonpath='{.data.compatible-regional-executor-protocol-versions}'
+    )"
+    CURRENT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
+            gpu-fault-release-metadata \
+            -o jsonpath='{.data.required-regional-executor-artifact-sha256}'
+    )"
+    CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
+            gpu-fault-release-metadata \
+            -o jsonpath='{.data.compatible-regional-executor-artifact-sha256s}'
+    )"
+    CURRENT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
+            gpu-fault-release-metadata \
+            -o jsonpath='{.data.required-regional-executor-compatibility-digest}'
+    )"
+    CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
+            gpu-fault-release-metadata \
+            -o jsonpath='{.data.compatible-regional-executor-compatibility-digests}'
     )"
     CURRENT_REQUIRED_AGENT_PROTOCOL_VERSION="${CURRENT_REQUIRED_AGENT_PROTOCOL_VERSION:-${GPU_FAULT_EXISTING_AGENT_PROTOCOL_VERSION:-3}}"
     if [[ "${FINALIZE_AGENT_PIN}" != "true" ]]; then
@@ -201,6 +266,21 @@ if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
             )"
             REQUIRED_AGENT_ARTIFACT_SHA256="${CURRENT_REQUIRED_AGENT_ARTIFACT_SHA256}"
         fi
+        if [[ -z "${GPU_FAULT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS+x}" ]]; then
+            COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS="${CURRENT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS}"
+        fi
+        CURRENT_EFFECTIVE_AGENT_COMPATIBILITY_DIGEST="${CURRENT_REQUIRED_AGENT_COMPATIBILITY_DIGEST:-${CURRENT_REQUIRED_AGENT_ARTIFACT_SHA256}}"
+        if [[ -n "${CURRENT_EFFECTIVE_AGENT_COMPATIBILITY_DIGEST}" ]] &&
+            [[ "${CURRENT_EFFECTIVE_AGENT_COMPATIBILITY_DIGEST}" != "${TARGET_AGENT_COMPATIBILITY_DIGEST}" ]]; then
+            COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS="$(
+                append_csv_value \
+                    "${COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS}" \
+                    "${TARGET_AGENT_COMPATIBILITY_DIGEST}"
+            )"
+            REQUIRED_AGENT_COMPATIBILITY_DIGEST="${CURRENT_EFFECTIVE_AGENT_COMPATIBILITY_DIGEST}"
+        elif [[ -n "${CURRENT_EFFECTIVE_AGENT_COMPATIBILITY_DIGEST}" ]]; then
+            REQUIRED_AGENT_COMPATIBILITY_DIGEST="${CURRENT_EFFECTIVE_AGENT_COMPATIBILITY_DIGEST}"
+        fi
         if [[ "${CURRENT_REQUIRED_AGENT_PROTOCOL_VERSION}" != "${TARGET_AGENT_PROTOCOL_VERSION}" ]]; then
             COMPATIBLE_AGENT_PROTOCOL_VERSIONS="$(
                 append_csv_value \
@@ -220,6 +300,7 @@ if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
         fi
     else
         COMPATIBLE_AGENT_ARTIFACT_SHA256S=""
+        COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS=""
         COMPATIBLE_AGENT_PROTOCOL_VERSIONS=""
         COMPATIBLE_AGENT_CONFIG_DIGESTS=""
     fi
@@ -236,24 +317,62 @@ if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
             )"
             REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION="${CURRENT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION}"
         fi
+        if [[ -z "${GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S+x}" ]]; then
+            COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S="${CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S}"
+        fi
+        if [[ -n "${CURRENT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" ]] &&
+            [[ "${CURRENT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" != "${TARGET_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" ]]; then
+            COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S="$(
+                append_csv_value \
+                    "${COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S}" \
+                    "${TARGET_REGIONAL_EXECUTOR_ARTIFACT_SHA256}"
+            )"
+            REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256="${CURRENT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}"
+        elif [[ -z "${CURRENT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" ]]; then
+            # Legacy control planes did not pin the executor artifact.
+            # Keep the staged window unpinned, roll the executors, then let
+            # finalize establish the first required artifact.
+            REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256=""
+        fi
+        if [[ -z "${GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS+x}" ]]; then
+            COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS="${CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS}"
+        fi
+        if [[ -n "${CURRENT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" ]] &&
+            [[ "${CURRENT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" != "${TARGET_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" ]]; then
+            COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS="$(
+                append_csv_value \
+                    "${COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS}" \
+                    "${TARGET_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}"
+            )"
+            REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST="${CURRENT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}"
+        elif [[ -z "${CURRENT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" ]]; then
+            REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST=""
+        fi
     else
         COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS=""
+        COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S=""
+        COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS=""
     fi
     if [[ "${CURRENT_REQUIRED_AGENT_ARTIFACT_SHA256}" != "${REQUIRED_AGENT_ARTIFACT_SHA256}" ||
         "${CURRENT_COMPATIBLE_AGENT_ARTIFACT_SHA256S}" != "${COMPATIBLE_AGENT_ARTIFACT_SHA256S}" ||
+        "${CURRENT_REQUIRED_AGENT_COMPATIBILITY_DIGEST}" != "${REQUIRED_AGENT_COMPATIBILITY_DIGEST}" ||
+        "${CURRENT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS}" != "${COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS}" ||
         "${CURRENT_REQUIRED_AGENT_PROTOCOL_VERSION}" != "${REQUIRED_AGENT_PROTOCOL_VERSION}" ||
         "${CURRENT_COMPATIBLE_AGENT_PROTOCOL_VERSIONS}" != "${COMPATIBLE_AGENT_PROTOCOL_VERSIONS}" ||
         "${CURRENT_REQUIRED_AGENT_CONFIG_DIGEST}" != "${REQUIRED_AGENT_CONFIG_DIGEST}" ||
         "${CURRENT_COMPATIBLE_AGENT_CONFIG_DIGESTS}" != "${COMPATIBLE_AGENT_CONFIG_DIGESTS}" ||
         "${CURRENT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION}" != "${REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION}" ||
-        "${CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS}" != "${COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS}" ]]; then
+        "${CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS}" != "${COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS}" ||
+        "${CURRENT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" != "${REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" ||
+        "${CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S}" != "${COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S}" ||
+        "${CURRENT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" != "${REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" ||
+        "${CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS}" != "${COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS}" ]]; then
         PIN_METADATA_CHANGED="true"
     fi
 fi
-RELOAD_RELEASE_METADATA="${PIN_FINALIZATION}"
-if [[ "${PIN_METADATA_CHANGED}" == "true" ]]; then
-    RELOAD_RELEASE_METADATA="true"
-fi
+# ConfigMap consumers need a restart only when the effective pin metadata
+# changed. Re-running an already-finalized release is therefore a no-op.
+RELOAD_RELEASE_METADATA="${PIN_METADATA_CHANGED}"
 if [[ -n "${REQUIRED_AGENT_CONFIG_DIGEST}" ]]; then
     [[ "${REQUIRED_AGENT_ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
         echo "required agent artifact SHA-256 is invalid" >&2
@@ -261,6 +380,11 @@ if [[ -n "${REQUIRED_AGENT_CONFIG_DIGEST}" ]]; then
     }
     [[ "${REQUIRED_AGENT_CONFIG_DIGEST}" =~ ^[0-9a-f]{64}$ ]] || {
         echo "required agent config digest is invalid" >&2
+        exit 1
+    }
+    [[ -z "${REQUIRED_AGENT_COMPATIBILITY_DIGEST}" ||
+        "${REQUIRED_AGENT_COMPATIBILITY_DIGEST}" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "required agent compatibility digest is invalid" >&2
         exit 1
     }
     [[ "${REQUIRED_AGENT_PROTOCOL_VERSION}" =~ ^[1-9][0-9]*$ ]] || {
@@ -271,11 +395,29 @@ if [[ -n "${REQUIRED_AGENT_CONFIG_DIGEST}" ]]; then
         echo "required regional executor protocol version is invalid" >&2
         exit 1
     }
+    [[ -z "${REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" ||
+        "${REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "required regional executor artifact SHA-256 is invalid" >&2
+        exit 1
+    }
+    [[ -z "${REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" ||
+        "${REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "required regional executor compatibility digest is invalid" >&2
+        exit 1
+    }
     IFS=',' read -r -a compatible_artifacts <<< \
         "${COMPATIBLE_AGENT_ARTIFACT_SHA256S}"
     for artifact in "${compatible_artifacts[@]}"; do
         [[ -z "${artifact}" || "${artifact}" =~ ^[0-9a-f]{64}$ ]] || {
             echo "compatible agent artifact SHA-256 is invalid" >&2
+            exit 1
+        }
+    done
+    IFS=',' read -r -a compatible_agent_digests <<< \
+        "${COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS}"
+    for digest in "${compatible_agent_digests[@]}"; do
+        [[ -z "${digest}" || "${digest}" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "compatible agent compatibility digest is invalid" >&2
             exit 1
         }
     done
@@ -303,14 +445,36 @@ if [[ -n "${REQUIRED_AGENT_CONFIG_DIGEST}" ]]; then
             exit 1
         }
     done
+    IFS=',' read -r -a compatible_executor_artifacts <<< \
+        "${COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S}"
+    for artifact in "${compatible_executor_artifacts[@]}"; do
+        [[ -z "${artifact}" || "${artifact}" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "compatible regional executor artifact SHA-256 is invalid" >&2
+            exit 1
+        }
+    done
+    IFS=',' read -r -a compatible_executor_digests <<< \
+        "${COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS}"
+    for digest in "${compatible_executor_digests[@]}"; do
+        [[ -z "${digest}" || "${digest}" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "compatible regional executor compatibility digest is invalid" >&2
+            exit 1
+        }
+    done
     kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" create configmap \
         gpu-fault-release-metadata \
         --from-literal=required-agent-artifact-sha256="${REQUIRED_AGENT_ARTIFACT_SHA256}" \
         --from-literal=compatible-agent-artifact-sha256s="${COMPATIBLE_AGENT_ARTIFACT_SHA256S}" \
+        --from-literal=required-agent-compatibility-digest="${REQUIRED_AGENT_COMPATIBILITY_DIGEST}" \
+        --from-literal=compatible-agent-compatibility-digests="${COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS}" \
         --from-literal=required-agent-protocol-version="${REQUIRED_AGENT_PROTOCOL_VERSION}" \
         --from-literal=compatible-agent-protocol-versions="${COMPATIBLE_AGENT_PROTOCOL_VERSIONS}" \
         --from-literal=required-regional-executor-protocol-version="${REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION}" \
         --from-literal=compatible-regional-executor-protocol-versions="${COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS}" \
+        --from-literal=required-regional-executor-artifact-sha256="${REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256}" \
+        --from-literal=compatible-regional-executor-artifact-sha256s="${COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S}" \
+        --from-literal=required-regional-executor-compatibility-digest="${REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST}" \
+        --from-literal=compatible-regional-executor-compatibility-digests="${COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS}" \
         --from-literal=required-agent-config-digest="${REQUIRED_AGENT_CONFIG_DIGEST}" \
         --from-literal=compatible-agent-config-digests="${COMPATIBLE_AGENT_CONFIG_DIGESTS}" \
         --from-literal=required-node-action-key-version="${REQUIRED_NODE_ACTION_KEY_VERSION}" \
@@ -327,14 +491,39 @@ PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}" python3 -m \
 
 apply_manifest() {
     local manifest="$1"
+    render_manifest "${manifest}" |
+        if [[ "${LEGACY_COMPONENT_PINS}" == "true" ]]; then
+            PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}" python3 \
+                "${SCRIPT_DIR}/filter_legacy_release_env.py"
+        else
+            cat
+        fi |
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply -f -
+}
+
+remove_legacy_notification_env() {
+    local deployment="$1"
+    if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
+        "${deployment}" >/dev/null 2>&1; then
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" set env \
+            "deployment/${deployment}" \
+            GPU_FAULT_ALLOW_EMAIL- \
+            GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL-
+    fi
+}
+
+render_manifest() {
+    local manifest="$1"
     sed \
         -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP}/g" \
         -e "s/namespace: gpu-fault-system/namespace: ${NAMESPACE}/g" \
         -e "s/REPLACE_WITH_AWS_REGION/${AWS_REGION}/g" \
         -e "s#REPLACE_WITH_RUNTIME_PROFILE_VERSION#${RUNTIME_PROFILE_VERSION}#g" \
+        -e "s#gpu-fault.io/artifact-sha256: .*#gpu-fault.io/artifact-sha256: ${WHEEL_SHA256}#g" \
+        -e "s/GPU_FAULT_ALLOW_EMAIL: 'true'/GPU_FAULT_ALLOW_EMAIL: '${ALLOW_EMAIL}'/g" \
+        -e "s/GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: 'false'/GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: '${ACKNOWLEDGE_NO_ALERT_CHANNEL}'/g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
-        "${GENERATED}/${manifest}.yaml" |
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply -f -
+        "${GENERATED}/${manifest}.yaml"
 }
 
 stamp_release() {
@@ -345,6 +534,7 @@ stamp_release() {
                 --arg sha "${WHEEL_SHA256}" \
                 --arg release "${RELEASE_ID}" \
                 --arg runtime_image "${RUNTIME_IMAGE}" \
+                --arg notification "${NOTIFICATION_CONFIG_SHA256}" \
                 '{
                     spec: {
                         template: {
@@ -354,7 +544,8 @@ stamp_release() {
                                     "gpu-fault.io/control-plane-wheel-sha256": $sha,
                                     "gpu-fault.io/release-wheel-sha256": $sha,
                                     "gpu-fault.io/release-rollout": $release,
-                                    "gpu-fault.io/runtime-image": $runtime_image
+                                    "gpu-fault.io/runtime-image": $runtime_image,
+                                    "gpu-fault.io/notification-config-sha256": $notification
                                 }
                             }
                         }
@@ -371,6 +562,7 @@ done
 apply_manifest gpu-fault-api-ha-pdb
 apply_manifest gpu-fault-control-worker-pdb
 apply_manifest gpu-fault-telemetry-spool-worker-pdb
+remove_legacy_notification_env gpu-fault-telemetry-spool-worker
 apply_manifest gpu-fault-telemetry-spool-worker
 stamp_release gpu-fault-telemetry-spool-worker
 if [[ "${RELOAD_RELEASE_METADATA}" == "true" ]]; then
@@ -384,6 +576,7 @@ kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" \
     rollout status deployment/gpu-fault-telemetry-spool-worker \
     --timeout=10m
 
+remove_legacy_notification_env gpu-fault-control-worker
 apply_manifest gpu-fault-control-worker
 stamp_release gpu-fault-control-worker
 if [[ "${RELOAD_RELEASE_METADATA}" == "true" ]]; then
@@ -410,6 +603,7 @@ fi
 kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" \
     rollout status deployment/gpu-fault-control-worker --timeout=10m
 
+remove_legacy_notification_env gpu-fault-api-ha
 apply_manifest gpu-fault-api-ha-ingress
 stamp_release gpu-fault-api-ha
 if [[ "${RELOAD_RELEASE_METADATA}" == "true" ]]; then

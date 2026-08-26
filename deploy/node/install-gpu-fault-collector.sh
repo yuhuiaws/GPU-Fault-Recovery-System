@@ -824,17 +824,18 @@ if [[ -z "${WHEEL}" ]]; then
         MANIFEST_WHEEL="$("${PYTHON_COMMAND}" -c \
             'import json, pathlib, sys
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-wheel = pathlib.Path(str(manifest["wheel"]))
+component = manifest.get("components", {}).get("node_runtime", {})
+wheel = pathlib.Path(str(component.get("wheel", manifest["wheel"])))
 root = pathlib.Path(sys.argv[2])
 print(wheel if wheel.is_absolute() else root / wheel)
-print(manifest["wheel_sha256"])' \
+print(component.get("wheel_sha256", manifest["wheel_sha256"]))' \
             "${RELEASE_MANIFEST}" "${REPO_DIR}")" ||
             die "cannot read release manifest: ${RELEASE_MANIFEST}"
         WHEEL="${MANIFEST_WHEEL%%$'\n'*}"
         EXPECTED_WHEEL_SHA256="${MANIFEST_WHEEL##*$'\n'}"
     else
         WHEEL="$(find "${REPO_DIR}/dist" -maxdepth 1 -type f \
-            -name 'gpu_fault_control_plane-*.whl' -printf '%T@ %p\n' 2>/dev/null |
+            -name 'gpu_fault_node_runtime-*.whl' -printf '%T@ %p\n' 2>/dev/null |
             sort -nr | head -n1 | cut -d' ' -f2-)"
     fi
 fi
@@ -1144,6 +1145,8 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
         write_env GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION \
             "${PROFILE_VERSION}"
         write_env GPU_FAULT_NODE_ARTIFACT_SHA256 "${WHEEL_SHA256}"
+        write_env GPU_FAULT_NODE_COMPATIBILITY_DIGEST \
+            "${GPU_FAULT_NODE_COMPATIBILITY_DIGEST:-${WHEEL_SHA256}}"
         write_env GPU_FAULT_NODE_ADVERTISE_URL \
             "${NODE_AGENT_ADVERTISE_URL}"
         write_env GPU_FAULT_NODE_HEARTBEAT_INTERVAL_SECONDS \

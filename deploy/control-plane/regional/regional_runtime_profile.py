@@ -69,11 +69,9 @@ def render_runtime_profile_payload(config: ReleaseConfig) -> dict[str, Any]:
     return payload
 
 
-def ensure_runtime_profile(release: Any) -> None:
+def inspect_runtime_profile(release: Any) -> dict[str, Any]:
     runner = release.runner
     config = release.config
-    if runner.dry_run:
-        return
     pod = runner.run(
         release._cpu(
             "-n",
@@ -89,10 +87,10 @@ def ensure_runtime_profile(release: Any) -> None:
         capture=True,
     )
     if not pod:
-        raise ReleaseError("cannot register the Runtime Profile: no CPU ingress Pod")
+        raise ReleaseError("cannot inspect the Runtime Profile: no CPU ingress Pod")
     payload = render_runtime_profile_payload(config)
     payload_text = json.dumps(payload, separators=(",", ":"))
-    inspection = json.loads(
+    return json.loads(
         runner.run(
             release._cpu(
                 "-n",
@@ -110,6 +108,12 @@ def ensure_runtime_profile(release: Any) -> None:
             sensitive=True,
         )
     )
+
+
+def _validated_inspection(
+    release: Any,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    inspection = inspect_runtime_profile(release)
     desired = inspection.get("desired")
     existing = inspection.get("existing")
     if not isinstance(desired, dict):
@@ -120,6 +124,30 @@ def ensure_runtime_profile(release: Any) -> None:
             "Runtime Profile has unavailable OWN/DELEGATE capabilities: "
             + "; ".join(str(item) for item in warnings)
         )
+    if existing is not None and not isinstance(existing, dict):
+        raise ReleaseError("Runtime Profile inspection returned invalid existing data")
+    return desired, existing
+
+
+def verify_runtime_profile(release: Any) -> None:
+    desired, existing = _validated_inspection(release)
+    if existing is None:
+        raise ReleaseError(
+            f"Runtime Profile {release.config.runtime_profile_version} is not registered"
+        )
+    if existing != desired:
+        raise ReleaseError(
+            "Runtime Profile "
+            f"{release.config.runtime_profile_version} differs from the declared policy"
+        )
+
+
+def ensure_runtime_profile(release: Any) -> None:
+    runner = release.runner
+    config = release.config
+    if runner.dry_run:
+        return
+    desired, existing = _validated_inspection(release)
     if existing is not None:
         if existing != desired:
             raise ReleaseError(
@@ -129,6 +157,26 @@ def ensure_runtime_profile(release: Any) -> None:
                 "instead of overwriting a live policy"
             )
         return
+    pod = runner.run(
+        release._cpu(
+            "-n",
+            config.namespace,
+            "get",
+            "pod",
+            "-l",
+            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ),
+        capture=True,
+    )
+    if not pod:
+        raise ReleaseError("cannot register the Runtime Profile: no CPU ingress Pod")
+    payload_text = json.dumps(
+        render_runtime_profile_payload(config),
+        separators=(",", ":"),
+    )
     registered = json.loads(
         runner.run(
             release._cpu(

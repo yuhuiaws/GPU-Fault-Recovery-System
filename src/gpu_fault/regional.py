@@ -97,6 +97,18 @@ class RemoteCommandClaimRequest(StrictModel):
         default=LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
         ge=1,
     )
+    executor_artifact_sha256: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    executor_compatibility_digest: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     execution_owners: list[str] = Field(default_factory=list, max_length=32)
     max_commands: int = Field(default=1, ge=1, le=25)
     lease_seconds: int = Field(default=60, ge=10, le=7200)
@@ -135,6 +147,18 @@ class RegionalExecutorReadinessRequest(StrictModel):
         default=LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
         ge=1,
     )
+    executor_artifact_sha256: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    executor_compatibility_digest: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     execution_owners: list[str] = Field(default_factory=list, max_length=32)
     # None means "this executor has not completed a claim cycle yet",
     # which is only acceptable before the first poll interval elapses.
@@ -159,6 +183,8 @@ class RegionalExecutorReadinessReport(StrictModel):
     cluster_id: str
     executor_id: str
     executor_protocol_version: int = Field(ge=1)
+    executor_artifact_sha256: str | None = None
+    executor_compatibility_digest: str | None = None
     registered: bool
     execution_owners: list[str] = Field(default_factory=list)
     # Owners the open backlog needs that this executor did not advertise.

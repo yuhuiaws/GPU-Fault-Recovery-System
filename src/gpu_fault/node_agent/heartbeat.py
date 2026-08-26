@@ -7,13 +7,13 @@ import os
 import socket
 import subprocess
 from datetime import datetime, timezone
-from importlib.metadata import version
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable
 from urllib import request as urllib_request
 from urllib.error import HTTPError
 
+from gpu_fault import __version__
 from gpu_fault.collector_requirements import (
     COLLECTOR_SYSTEMD_UNITS,
     CollectorServiceState,
@@ -85,6 +85,10 @@ def heartbeat_reporter_from_environment(
     if not control_plane_url or not cluster_id:
         raise ValueError("node heartbeat requires control plane URL and cluster ID")
     artifact_sha256 = os.getenv("GPU_FAULT_NODE_ARTIFACT_SHA256", "").strip()
+    compatibility_digest = os.getenv(
+        "GPU_FAULT_NODE_COMPATIBILITY_DIGEST",
+        artifact_sha256,
+    ).strip()
     runtime_profile = os.getenv("GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION", "").strip()
     if not artifact_sha256 or not runtime_profile:
         raise ValueError(
@@ -130,8 +134,9 @@ def heartbeat_reporter_from_environment(
         cluster_id=cluster_id,
         node_id=node_id,
         endpoint=endpoint,
-        agent_version=version("gpu-fault-control-plane"),
+        agent_version=__version__,
         artifact_sha256=artifact_sha256,
+        compatibility_digest=compatibility_digest,
         policy_version=policy_version,
         policy_version_provider=policy_version_provider,
         runtime_profile_version=runtime_profile,
@@ -185,6 +190,7 @@ class AgentHeartbeatReporter:
         endpoint: str,
         agent_version: str,
         artifact_sha256: str,
+        compatibility_digest: str | None = None,
         policy_version: str,
         runtime_profile_version: str,
         config_digest: str,
@@ -212,6 +218,7 @@ class AgentHeartbeatReporter:
         self.endpoint = endpoint
         self.agent_version = agent_version
         self.artifact_sha256 = artifact_sha256
+        self.compatibility_digest = compatibility_digest or artifact_sha256
         self.policy_version = policy_version
         self.policy_version_provider = policy_version_provider
         self.collector_status_provider = collector_status_provider
@@ -267,6 +274,7 @@ class AgentHeartbeatReporter:
             node_action_key_version=self.node_action_key_version,
             agent_version=self.agent_version,
             artifact_sha256=self.artifact_sha256,
+            compatibility_digest=self.compatibility_digest,
             policy_version=policy_version,
             runtime_profile_version=self.runtime_profile_version,
             config_digest=self.config_digest,

@@ -584,3 +584,51 @@ def test_ingress_health_reports_inactive_processor(monkeypatch) -> None:
 
     assert health["service_role"] == "ingress"
     assert health["processor_role"] == "inactive"
+
+
+def test_legacy_release_filter_removes_only_new_component_pins() -> None:
+    deployment = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "legacy"},
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "api",
+                            "env": [
+                                {
+                                    "name": (
+                                        "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST"
+                                    ),
+                                    "value": "a" * 64,
+                                },
+                                {
+                                    "name": "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256",
+                                    "value": "b" * 64,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+        },
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy/control-plane/tools/filter_legacy_release_env.py"),
+        ],
+        input=yaml.safe_dump(deployment),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    rendered = yaml.safe_load(result.stdout)
+    names = {
+        item["name"]
+        for item in rendered["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+
+    assert names == {"GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256"}

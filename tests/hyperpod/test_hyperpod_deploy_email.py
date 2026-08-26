@@ -60,10 +60,21 @@ def test_deploy_uses_content_addressed_wheel_configmap() -> None:
     script = SCRIPT.read_text()
 
     assert 'WHEEL_CONFIGMAP_NAME=""' in script
+    assert 'EXECUTOR_WHEEL_CONFIGMAP_NAME=""' in script
     assert '"${WHEEL_SHA256:0:12}"' in script
+    assert '"${EXECUTOR_WHEEL_SHA256:0:12}"' in script
     assert ("s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g") in script
+    assert (
+        "s/gpu-fault-executor-wheel-0100/${EXECUTOR_WHEEL_CONFIGMAP_NAME}/g"
+    ) in script
     assert 'get configmap \\\n        "${WHEEL_CONFIGMAP_NAME}"' in script
+    assert 'get configmap \\\n        "${EXECUTOR_WHEEL_CONFIGMAP_NAME}"' in script
     assert "get configmap \\\n        gpu-fault-control-plane-wheel-0100" not in script
+    for artifact in ("control-plane-wheel", "executor-wheel", "node-runtime-wheel"):
+        assert artifact in script
+    assert 'GPU_FAULT_INSTALLER_ARTIFACT_SHA256="${NODE_WHEEL_SHA256}"' in script
+    assert "required-agent-compatibility-digest=" in script
+    assert "required-regional-executor-compatibility-digest=" in script
 
 
 def test_deploy_script_configures_email_secret_ses_and_irsa() -> None:

@@ -27,6 +27,7 @@ from gpu_fault.adapters.common import (
     ANNOTATION_INCIDENT,
     ANNOTATION_MECHANICAL_INSPECTION_COMPLETE,
     ANNOTATION_PREVIOUS_UNSCHEDULABLE,
+    NodeIsolationRejected,
     QUARANTINE_TAINT,
     quarantine_taint_value,
 )
@@ -305,7 +306,16 @@ class KubernetesNodeOperationsMixin:
                         absent_nodes.append(node_id)
                         break
                     raise
-                body = self._node_isolation_patch(node, context)
+                try:
+                    body = self._node_isolation_patch(node, context)
+                except NodeIsolationRejected as exc:
+                    return WorkflowStepOutcome.failed(
+                        str(exc),
+                        details={
+                            "safety_rejection": True,
+                            "node_id": node_id,
+                        },
+                    )
                 try:
                     self.core.patch_node(node_id, body)
                     break
@@ -486,7 +496,9 @@ class KubernetesNodeOperationsMixin:
             and existing_fencing_token is not None
         ):
             if context.workflow.fencing_token < existing_fencing_token:
-                raise ValueError("node is controlled by a newer workflow generation")
+                raise NodeIsolationRejected(
+                    "node is controlled by a newer workflow generation"
+                )
             newer_same_incident_generation = (
                 context.workflow.fencing_token > existing_fencing_token
             )
@@ -521,7 +533,9 @@ class KubernetesNodeOperationsMixin:
                 or existing_fencing != str(context.workflow.fencing_token)
             )
         ):
-            raise ValueError("node is already isolated by another incident/token")
+            raise NodeIsolationRejected(
+                "node is already isolated by another incident/token"
+            )
         previous_unschedulable = annotations.get(ANNOTATION_PREVIOUS_UNSCHEDULABLE)
         if previous_unschedulable is None or takeover:
             previous_unschedulable = str(self._unschedulable(node)).lower()

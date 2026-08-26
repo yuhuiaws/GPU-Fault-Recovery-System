@@ -7,19 +7,19 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
+from gpu_fault.adapters.common import NodeActionPending
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
-from gpu_fault.transport.http_client import urlopen
 from gpu_fault.fleet import (
     NODE_ACTION_KEY_VERSION_SHARED,
 )
-from gpu_fault.node_action_keys import (
-    resolve_node_action_secret,
-)
 from gpu_fault.models import (
     WorkflowOperation,
+)
+from gpu_fault.node_action_keys import (
+    resolve_node_action_secret,
 )
 from gpu_fault.node_agent import (
     NodeActionCommand,
@@ -30,9 +30,7 @@ from gpu_fault.node_agent import (
     sign_node_action,
     sign_result_query,
 )
-
-
-from gpu_fault.adapters.common import NodeActionPending
+from gpu_fault.transport.http_client import urlopen
 
 
 class NodeActionTransportMixin:

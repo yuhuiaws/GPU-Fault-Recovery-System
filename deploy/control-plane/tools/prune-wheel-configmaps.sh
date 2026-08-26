@@ -81,7 +81,7 @@ protected_explicit = {
 
 # Only the shape deploy.sh generates. Anything else was pinned by hand.
 generated = re.compile(
-    r"^gpu-fault-control-plane-wheel-[0-9a-z]+-[0-9a-f]{12}$"
+    r"^gpu-fault-(?:control-plane|executor)-wheel-[0-9a-z]+-[0-9a-f]{12}$"
 )
 
 with open(f"{work_dir}/configmaps.json") as handle:
@@ -130,7 +130,10 @@ candidates = []
 protected_manual = []
 for config_map in configmaps:
     name = config_map["metadata"]["name"]
-    if "control-plane-wheel" not in name:
+    if not any(
+        marker in name
+        for marker in ("control-plane-wheel", "executor-wheel")
+    ):
         continue
     if not generated.match(name):
         protected_manual.append(name)

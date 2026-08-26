@@ -12,6 +12,8 @@ from typing import Any, Callable
 
 import yaml
 
+from gpu_fault.admin_site import SiteConfigError, load_site
+
 LABEL_PATTERN = re.compile(r"^(?:[A-Za-z0-9](?:[-_.A-Za-z0-9]*[A-Za-z0-9])?)$")
 MANAGED_LABEL = "gpu-fault.io/managed"
 JOB_LABEL = "gpu-fault.io/job-id"
@@ -24,6 +26,7 @@ RUNTIME_PROFILE_ANNOTATION = "gpu-fault.io/runtime-profile-version"
 RESTART_BUDGET_ANNOTATION = "gpu-fault.io/restart-budget"
 RANK_OFFSET_ANNOTATION = "gpu-fault.io/rank-offset"
 RANK_JOB_STRIDE_ANNOTATION = "gpu-fault.io/rank-job-stride"
+SITE_ENV = "GPU_FAULT_SITE_FILE"
 
 
 class TrainingSubmitError(ValueError):
@@ -49,8 +52,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--attempt-id")
     result.add_argument("--attempt-number", type=int, default=1)
     result.add_argument(
+        "--site",
+        type=Path,
+        help=f"RegionalSite YAML; defaults to {SITE_ENV}",
+    )
+    result.add_argument(
         "--runtime-profile-version",
-        default=os.getenv("GPU_FAULT_RUNTIME_PROFILE", "hyperpod-v1"),
+        help="explicit override; must match --site when both are provided",
     )
     result.add_argument("--expected-critical-ranks", type=int)
     result.add_argument("--training-container")
@@ -64,6 +72,23 @@ def parser() -> argparse.ArgumentParser:
         help="print the rendered manifest without invoking kubectl",
     )
     return result
+
+
+def resolve_runtime_profile_version(args: argparse.Namespace) -> str:
+    explicit = str(getattr(args, "runtime_profile_version", None) or "").strip()
+    raw_site = getattr(args, "site", None) or os.getenv(SITE_ENV)
+    if raw_site:
+        try:
+            site = load_site(Path(raw_site))
+        except (OSError, SiteConfigError, ValueError) as exc:
+            raise TrainingSubmitError(f"cannot load site Profile: {exc}") from exc
+        site_version = str(site.release_config["runtime_profile"]["version"])
+        if explicit and explicit != site_version:
+            raise TrainingSubmitError(
+                "--runtime-profile-version does not match the site Profile"
+            )
+        return site_version
+    return explicit or os.getenv("GPU_FAULT_RUNTIME_PROFILE", "hyperpod-v1")
 
 
 def _positive_int(value: Any, description: str) -> int:
@@ -349,12 +374,13 @@ def run(
     *,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> int:
+    runtime_profile_version = resolve_runtime_profile_version(args)
     rendered = render_workload(
         args.manifest,
         job_id=args.job_id,
         attempt_id=args.attempt_id,
         attempt_number=args.attempt_number,
-        runtime_profile_version=args.runtime_profile_version,
+        runtime_profile_version=runtime_profile_version,
         expected_critical_ranks=args.expected_critical_ranks,
         training_container=args.training_container,
         restart_budget=args.restart_budget,

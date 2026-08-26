@@ -96,7 +96,7 @@ spec:
             - |-
               attempt=1
               until python -m pip install --no-cache-dir --retries 3 --timeout 15 \
-                '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors,postgres]'; do
+                '/artifact/gpu_fault_cluster_executor-0.10.0-py3-none-any.whl[collectors]'; do
                 if [ "${attempt}" -ge 4 ]; then
                   echo "executor dependency installation failed after ${attempt} attempts" >&2
                   exit 1
@@ -155,6 +155,10 @@ spec:
               value: "5"
             - name: GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE
               value: "true"
+            - name: GPU_FAULT_EXECUTOR_ARTIFACT_SHA256
+              value: REPLACE_WITH_EXECUTOR_ARTIFACT_SHA256
+            - name: GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST
+              value: REPLACE_WITH_EXECUTOR_COMPATIBILITY_DIGEST
             # The regional architecture delegates every mutation to the
             # data plane, so all three ENABLE_* switches belong on true
             # here (BOOT-004/005 forbid them on the *control* plane, not
@@ -283,7 +287,7 @@ spec:
                 path: ca.crt
         - name: artifact
           configMap:
-            name: gpu-fault-control-plane-wheel-0100
+            name: gpu-fault-executor-wheel-0100
         - name: node-action-keys
           secret:
             secretName: gpu-fault-node-action-keys

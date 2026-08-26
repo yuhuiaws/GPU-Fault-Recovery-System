@@ -75,7 +75,7 @@ spec:
           args:
             - >-
               python -m pip install --no-cache-dir
-              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors]'
+              '/artifact/gpu_fault_cluster_executor-0.10.0-py3-none-any.whl[collectors]'
               && exec gpu-fault-completion-watcher
           env:
             - name: GPU_FAULT_CONTROL_PLANE_URL
@@ -138,7 +138,7 @@ spec:
       volumes:
         - name: artifact
           configMap:
-            name: gpu-fault-control-plane-wheel-0100
+            name: gpu-fault-executor-wheel-0100
         - name: control-plane-ca
           secret:
             secretName: gpu-fault-regional-connection

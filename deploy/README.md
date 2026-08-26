@@ -15,6 +15,21 @@ version, and registered-cluster anchor. Bootstrap registers a missing profile;
 upgrade and join accept identical content but reject an in-place policy change
 under the same profile version.
 
+The normal administrator entrypoint is:
+
+```bash
+gpu-fault-admin preflight -f /secure/gpu-fault/site.yaml
+gpu-fault-admin deploy -f /secure/gpu-fault/site.yaml
+gpu-fault-admin verify -f /secure/gpu-fault/site.yaml
+gpu-fault-admin status -f /secure/gpu-fault/site.yaml
+gpu-fault-admin join-cluster -f /secure/gpu-fault/site.yaml \
+  --gpu-cluster-arn <existing-gpu-eks-or-hyperpod-arn>
+```
+
+It validates `config/site.example.yaml`, materializes the low-level release
+JSON with mode `0600`, and reuses the regional rollout state machine. Direct
+rollout commands remain available for resume, rollback and break-glass.
+
 | Deployment surface | Directory | Entry point |
 |---|---|---|
 | Regional CPU control plane | `control-plane/` | `control-plane/regional/rollout-regional-release.sh` or `control-plane/tools/apply-control-plane-role-split.sh` |
@@ -52,6 +67,31 @@ under the same profile version.
    Contract checks reject missing annotations or stale generated output.
    Node uninstall uses `/opt/gpu-fault/installed-units.txt`, generated from
    the units actually installed on that host.
+6. AWS resources created or adopted as same-site leftovers by ARN-only deployment are registered in
+   Aurora as `installation_resource` objects. The administrator entry point is
+   `gpu-fault-admin uninstall`; it exports that registry before cleanup,
+   verifies every `DELETE`/`DETACH` entry, preserves all GPU clusters, and
+   deletes the Aurora stack only after the non-Aurora phases are complete.
+   Do not add a second hand-maintained AWS inventory file.
+   Solution-specific resources are never shared across sites; only EKS/VPC
+   foundations that cannot be duplicated are classified as external.
+7. Regional endpoint publication is fail-closed. The rollout must verify the
+   private hosted zone and ACM certificate before creating the NLB Service,
+   then wait for NLB `active`, raw NLB DNS resolution, and all expected healthy
+   targets before changing Route53. It must wait for `INSYNC` and pass DNS/TLS
+   `/healthz` from a GPU-cluster Pod before starting a new Executor.
+8. Finalizing an already-finalized release is idempotent. CPU Deployments are
+   restarted only when the effective required/compatible release metadata
+   changes; repeating the same release does not create a second rollout.
+9. Release manifest schema v2 carries separate `control_plane`, `executor`,
+   `node_runtime`, and `node_bundle` components. CPU workloads mount only the
+   control-plane wheel; GPU Kubernetes workloads mount only the Executor
+   wheel; host systemd services install only the Node Runtime wheel from the
+   bundle. Physical wheel SHA-256 and behavior `module_digest` are both pinned.
+10. Deploy classifies changes as `NOOP`, `CONTROL_PLANE_ONLY`,
+    `DATA_PLANE_COMPATIBLE`, or `FULL`. It uploads and rolls only affected
+    components, runs independent GPU clusters with bounded parallelism, and
+    reuses the persisted diff when a failed or rolled-back release is retried.
 
 Unsupported generic Kubernetes examples were moved to
 `examples/legacy/kubernetes/`. Their presence does not make that topology a

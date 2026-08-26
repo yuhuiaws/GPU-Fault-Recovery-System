@@ -61,6 +61,7 @@ gpu-fault-node-installer-reconciler = "gpu_fault.node_installer_reconciler:main"
 gpu-fault-store-migrate = "gpu_fault.store_migrate:main"
 gpu-fault-aurora-credential-refresh = "gpu_fault.aurora_credential_refresh:main"
 gpu-fault-config = "gpu_fault.config_cli:main"
+gpu-fault-admin = "gpu_fault.admin_cli:main"
 gpu-fault-workload-annotate = "gpu_fault.workload_annotate_cli:main"
 gpu-training-submit = "gpu_fault.training_submit_cli:main"
 

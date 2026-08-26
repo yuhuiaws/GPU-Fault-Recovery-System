@@ -24,7 +24,7 @@ def build_release_plan(mode: str) -> list[str]:
         steps.extend(
             [
                 "capture previous release state",
-                "upload content-addressed wheel and bundle",
+                "upload changed component wheels and the node bundle",
                 "ensure PostgreSQL schema migration history",
                 "stage stable required pins plus candidate compatibility",
                 "roll CPU ingress and workers",
@@ -38,7 +38,7 @@ def build_release_plan(mode: str) -> list[str]:
         steps.extend(
             [
                 "restore previous required pins",
-                "restore CPU and GPU Deployment wheels",
+                "restore the CPU control-plane and GPU Executor wheels",
                 "restore previous node installer bundle",
                 "verify previous fleet readiness",
             ]
@@ -66,12 +66,38 @@ def build_release_plan(mode: str) -> list[str]:
 def build_release_status(release: Any) -> dict[str, Any]:
     config = release.config
     result: dict[str, Any] = {
+        "site_name": config.site_name,
         "configured_runtime_image": release.runtime_image,
+        "configured_release": {
+            "release_id": release.release_id,
+            "control_plane_wheel_sha256": release.wheel_sha,
+            "executor_wheel_sha256": release.executor_wheel_sha,
+            "node_wheel_sha256": release.node_wheel_sha,
+            "node_bundle_sha256": release.bundle_sha,
+            "database_schema_version": config.database_schema_version,
+            "agent_protocol_version": config.agent_protocol_version,
+            "executor_protocol_version": config.executor_protocol_version,
+            "component_digests": config.component_digests,
+            "endpoint_digest": release.endpoint_digest,
+            "dcgm_digest": release.dcgm_digest,
+        },
         "configured_runtime_profile": {
             "source": str(config.runtime_profile_source),
             "version": config.runtime_profile_version,
             "registration_cluster_id": (config.runtime_profile_registration_cluster_id),
             "sha256": release.runtime_profile_sha,
+        },
+        "configured_health": {
+            "aurora_cluster_id": config.health.aurora_cluster_id,
+            "amp_workspace_id": config.health.amp_workspace_id,
+            "amp_rule_namespace": config.health.amp_rule_namespace,
+            "sns_topic_arn": config.health.sns_topic_arn,
+            "certificate_min_validity_days": (
+                config.health.certificate_min_validity_days
+            ),
+            "remote_command_max_unclaimed_seconds": (
+                config.health.remote_command_max_unclaimed_seconds
+            ),
         },
         "release_metadata": release._config_map_data("gpu-fault-release-metadata"),
         "cpu_wheel": release._deployment_wheel(

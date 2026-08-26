@@ -5,9 +5,72 @@ import logging
 from datetime import datetime, timezone
 
 from gpu_fault.app import ApplicationContext, create_app
+from gpu_fault.installation_resources import (
+    InstallationResource,
+    InstallationResourceDeletePolicy,
+    InstallationResourceOwnership,
+    InstallationResourceSnapshot,
+    InstallationResourceStatus,
+)
 from gpu_fault.models import CapabilityMode, CapabilityName, TerminalEvent
 from gpu_fault.watcher import AllocationCompleteness, FailureDetectedEvent
 from tests._builders import asgi_client, build_context, copy_model
+
+
+def test_installation_resource_registry_api_is_execution_token_protected() -> None:
+    token = "installation-registry-token-" + "x" * 32
+    context = ApplicationContext(execution_token=token)
+    context.regional_mode = True
+    resource = InstallationResource(
+        site_id="site-a",
+        resource_key="aws/nlb",
+        resource_type="nlb",
+        resource_id="gpu-fault-site-a",
+        region="us-east-1",
+        account_id="123456789012",
+        ownership=InstallationResourceOwnership.CREATED,
+        delete_policy=InstallationResourceDeletePolicy.DELETE,
+    )
+    snapshot = InstallationResourceSnapshot(site_id="site-a", resources=[resource])
+
+    async def run_scenario() -> None:
+        async with asgi_client(context) as client:
+            forbidden = await client.post(
+                "/v1/installation-resources/sync", json=snapshot.model_dump(mode="json")
+            )
+            assert forbidden.status_code == 403, "registry sync allowed no token"
+
+            synced = await client.post(
+                "/v1/installation-resources/sync",
+                json=snapshot.model_dump(mode="json"),
+                headers={"X-GPU-Fault-Execution-Token": token},
+            )
+            assert synced.status_code == 200, "registry sync failed"
+
+            listed = await client.get(
+                "/v1/installation-resources",
+                params={"site_id": "site-a"},
+                headers={"X-GPU-Fault-Execution-Token": token},
+            )
+            assert listed.status_code == 200, "registry list failed"
+            assert listed.json()[0]["resource_key"] == "aws/nlb", (
+                "registry list returned the wrong resource"
+            )
+
+            pending = resource.model_copy(
+                update={"status": InstallationResourceStatus.DELETE_PENDING}
+            )
+            updated = await client.put(
+                "/v1/installation-resources/site-a/aws/nlb",
+                json=pending.model_dump(mode="json"),
+                headers={"X-GPU-Fault-Execution-Token": token},
+            )
+            assert updated.status_code == 200, "registry status update failed"
+            assert updated.json()["status"] == "DELETE_PENDING", (
+                "registry status was not persisted"
+            )
+
+    asyncio.run(run_scenario())
 
 
 def test_synthetic_replacement_requires_flag_and_execution_token(monkeypatch) -> None:

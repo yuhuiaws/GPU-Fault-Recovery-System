@@ -134,6 +134,7 @@ class PostgresStore(
             RegionalClusterRegistration,
             RemoteActionCommand,
         )
+        from gpu_fault.installation_resources import InstallationResource
         from gpu_fault.processor import (
             PeriodicTaskLease,
             ProcessorLaneLease,
@@ -165,6 +166,7 @@ class PostgresStore(
             "hyperpod_node_identity": HyperPodNodeIdentity,
             "hyperpod_submission": HyperPodSubmissionRecord,
             "regional_cluster": RegionalClusterRegistration,
+            "installation_resource": InstallationResource,
             "remote_command": RemoteActionCommand,
             "processor_leadership": ProcessorLeadership,
             "periodic_task_lease": PeriodicTaskLease,

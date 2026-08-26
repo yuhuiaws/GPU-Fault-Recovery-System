@@ -1,9 +1,9 @@
 {
   "classes": {
-    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 1103,
+    "deploy/control-plane/regional/rollout_regional_release.py:RegionalRelease": 974,
     "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 946,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1546,
-    "src/gpu_fault/fleet.py:FleetRegistry": 848,
+    "src/gpu_fault/fleet.py:FleetRegistry": 836,
     "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 1264,
     "src/gpu_fault/host_health.py:NodeHealthPolicy": 978,
     "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1565,
@@ -12,6 +12,8 @@
   },
   "cycles": [],
   "files": {
+    "src/gpu_fault/admin_aws_cleanup.py": 1508,
+    "src/gpu_fault/admin_bootstrap.py": 2299,
     "src/gpu_fault/completion_controller.py": 1544,
     "src/gpu_fault/execution/executor.py": 1598,
     "src/gpu_fault/gpu_metrics.py": 1536,
@@ -24,7 +26,10 @@
     "deploy/control-plane/tools/render_control_plane_role_split.py:main": 670,
     "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 255,
     "src/gpu_fault/adapters/hyperpod/lifecycle.py:HyperPodLifecycleStepAdapter.execute": 212,
-    "src/gpu_fault/app/factory.py:create_app": 286,
+    "src/gpu_fault/admin_bootstrap.py:_ensure_aurora": 335,
+    "src/gpu_fault/admin_bootstrap.py:bootstrap_from_arns": 230,
+    "src/gpu_fault/admin_legacy_site.py:discover_legacy_site": 291,
+    "src/gpu_fault/app/factory.py:create_app": 287,
     "src/gpu_fault/app/metrics.py:render_prometheus_metrics": 218,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor.execute": 213,
     "src/gpu_fault/node_agent/app.py:create_node_agent_app": 216,
@@ -35,6 +40,6 @@
     "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator.__init__": 246,
     "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator._claim_active_by_pool": 215,
     "src/gpu_fault/service.py:CompletionService.handle_terminal": 203,
-    "src/gpu_fault/store/postgres/store.py:PostgresStore.__init__": 226
+    "src/gpu_fault/store/postgres/store.py:PostgresStore.__init__": 228
   }
 }

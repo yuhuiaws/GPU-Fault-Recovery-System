@@ -120,11 +120,29 @@ class RegionalExecutorClient:
         *,
         timeout_seconds: float = 15,
         ca_file: str | None = None,
+        executor_artifact_sha256: str | None = None,
+        executor_compatibility_digest: str | None = None,
     ) -> None:
         self.base_url = self._clean_value("base_url", base_url).rstrip("/")
         self.cluster_id = self._clean_value("cluster_id", cluster_id)
         self.token = self._clean_value("token", token)
         self.timeout_seconds = timeout_seconds
+        self.executor_artifact_sha256 = (
+            self._clean_value(
+                "executor_artifact_sha256",
+                executor_artifact_sha256,
+            )
+            if executor_artifact_sha256
+            else None
+        )
+        self.executor_compatibility_digest = (
+            self._clean_value(
+                "executor_compatibility_digest",
+                executor_compatibility_digest,
+            )
+            if executor_compatibility_digest
+            else self.executor_artifact_sha256
+        )
         self.ssl_context = (
             ssl.create_default_context(cafile=ca_file) if ca_file else None
         )
@@ -197,6 +215,8 @@ class RegionalExecutorClient:
         payload = RemoteCommandClaimRequest(
             executor_id=executor_id,
             executor_protocol_version=(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION),
+            executor_artifact_sha256=self.executor_artifact_sha256,
+            executor_compatibility_digest=self.executor_compatibility_digest,
             execution_owners=execution_owners or [],
             max_commands=max_commands,
             lease_seconds=lease_seconds,
@@ -228,6 +248,8 @@ class RegionalExecutorClient:
             RegionalExecutorReadinessRequest(
                 executor_id=executor_id,
                 executor_protocol_version=(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION),
+                executor_artifact_sha256=self.executor_artifact_sha256,
+                executor_compatibility_digest=(self.executor_compatibility_digest),
                 execution_owners=execution_owners,
                 last_successful_claim_age_seconds=(last_successful_claim_age_seconds),
             ).model_dump(mode="json"),
@@ -1015,6 +1037,12 @@ def _regional_client_from_environment(
         os.environ["GPU_FAULT_CONTROL_PLANE_TOKEN"],
         timeout_seconds=timeout_seconds,
         ca_file=os.getenv("GPU_FAULT_CONTROL_PLANE_CA_FILE") or None,
+        executor_artifact_sha256=(
+            os.getenv("GPU_FAULT_EXECUTOR_ARTIFACT_SHA256") or None
+        ),
+        executor_compatibility_digest=(
+            os.getenv("GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST") or None
+        ),
     )
 
 

@@ -1,0 +1,75 @@
+apiVersion: gpu-fault.aws/v1alpha1
+kind: RegionalSite
+metadata:
+  name: gpu-fault-production
+spec:
+  repositoryRoot: REPLACE_WITH_ABSOLUTE_REPOSITORY_ROOT
+  gpuKubeconfig: /secure/gpu-fault/gpu-clusters.kubeconfig
+  awsRegion: REPLACE_WITH_AWS_REGION
+  namespace: gpu-fault-system
+  autoRollback: true
+
+  cpu:
+    kubeconfig: /secure/gpu-fault/cpu-control-plane.kubeconfig
+    eksArn: REPLACE_WITH_CPU_EKS_ARN
+    hyperpodClusterName: REPLACE_WITH_CPU_HYPERPOD_CLUSTER_NAME
+
+  release:
+    manifest: dist/current-release.json
+    agentConfigDigest: REPLACE_WITH_64_HEX_CONFIG_DIGEST
+
+  runtimeProfile:
+    source: config/runtime-profile.regional-hyperpod-safe.example.yaml
+    templateSource: config/runtime-profile.regional-hyperpod-safe.example.yaml
+    version: hyperpod-v1
+    registrationClusterId: gpu-prod-a
+
+  nlb:
+    name: REPLACE_WITH_NLB_NAME
+    publicSubnets:
+      - REPLACE_WITH_PUBLIC_SUBNET_A
+      - REPLACE_WITH_PUBLIC_SUBNET_B
+    securityGroup: REPLACE_WITH_NLB_SECURITY_GROUP_ID
+    certificateArn: REPLACE_WITH_ACM_CERTIFICATE_ARN
+
+  # Optional when DNS is managed outside this solution.
+  dns:
+    hostedZoneId: REPLACE_WITH_ROUTE53_HOSTED_ZONE_ID
+    hostname: REPLACE_WITH_CONTROL_PLANE_HOSTNAME
+
+  images:
+    runtime: public.ecr.aws/docker/library/python:3.12-slim
+    nodeInstaller: public.ecr.aws/amazonlinux/amazonlinux:2023
+    dcgmExporter: nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04
+    adot: REPLACE_WITH_APPROVED_ADOT_IMAGE
+
+  health:
+    auroraClusterId: gpu-fault-regional-aurora
+    ampWorkspaceId: REPLACE_WITH_AMP_WORKSPACE_ID
+    ampRuleNamespace: gpu-fault-control-plane-capacity
+    snsTopicArn: REPLACE_WITH_SNS_TOPIC_ARN
+    certificateMinValidityDays: 30
+    remoteCommandMaxUnclaimedSeconds: 300
+    requireConfirmedSnsSubscription: true
+
+  notifications:
+    allowEmail: false
+    acknowledgeExternalAlertChannel: true
+    # ARN-only deploy fills both from --admin-email, or discovers the
+    # current AWS account email when the caller can read it.
+    # adminEmail: gpu-operations@example.com
+    # emailSender: gpu-operations@example.com
+
+  clusters:
+    - clusterId: gpu-prod-a
+      context: REPLACE_WITH_GPU_EKS_CONTEXT
+      hyperpodClusterName: REPLACE_WITH_GPU_HYPERPOD_CLUSTER_NAME
+      eksClusterArn: REPLACE_WITH_GPU_EKS_ARN
+      executorIrsaRoleArn: REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN
+      allowedNamespaces:
+        - gpu-fault-system
+        - training
+      controlPlaneUrl: https://REPLACE_WITH_CONTROL_PLANE_HOSTNAME
+      tokenFile: /secure/gpu-fault/gpu-prod-a.token
+      caFile: /secure/gpu-fault/control-plane-ca.crt
+      fleetMasterFile: /secure/gpu-fault/fleet-master

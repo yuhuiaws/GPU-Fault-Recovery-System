@@ -277,6 +277,8 @@ spec:
                   optional: true
             - name: GPU_FAULT_ALLOW_EMAIL
               value: "true"
+            - name: GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL
+              value: "false"
             - name: GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY
               value: "true"
             - name: GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED
@@ -360,6 +362,17 @@ spec:
                   name: gpu-fault-release-metadata
                   key: compatible-agent-artifact-sha256s
                   optional: true
+            - name: GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: required-agent-compatibility-digest
+            - name: GPU_FAULT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: compatible-agent-compatibility-digests
+                  optional: true
             - name: GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION
               valueFrom:
                 configMapKeyRef:
@@ -381,6 +394,30 @@ spec:
                 configMapKeyRef:
                   name: gpu-fault-release-metadata
                   key: compatible-regional-executor-protocol-versions
+                  optional: true
+            - name: GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: required-regional-executor-artifact-sha256
+                  optional: true
+            - name: GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: compatible-regional-executor-artifact-sha256s
+                  optional: true
+            - name: GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: required-regional-executor-compatibility-digest
+                  optional: true
+            - name: GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS
+              valueFrom:
+                configMapKeyRef:
+                  name: gpu-fault-release-metadata
+                  key: compatible-regional-executor-compatibility-digests
                   optional: true
             - name: GPU_FAULT_REQUIRED_POLICY_VERSION
               value: nvidia-xid-catalog-610/sha256:ffb82509abb57457

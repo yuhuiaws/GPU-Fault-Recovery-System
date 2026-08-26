@@ -814,6 +814,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
 
     processor_paths = (
         "/v1/runtime-profiles",
+        "/v1/installation-resources",
         "/v1/markers",
         "/v1/gpu-events/",
         "/v1/provider-events/",

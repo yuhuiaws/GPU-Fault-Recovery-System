@@ -660,8 +660,10 @@ def test_terminal_quarantine_hold_rejects_automatic_reset_takeover() -> None:
         idempotency_key="reset-after-quarantine/mark",
     )
 
-    with pytest.raises(ValueError, match="already isolated by another incident"):
-        adapter.execute(reset_context)
+    outcome = adapter.execute(reset_context)
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "already isolated by another incident" in (outcome.error or "")
+    assert outcome.details["safety_rejection"] is True
     assert (
         core.node["metadata"]["annotations"]["gpu-fault.io/incident-id"]
         == old_incident.incident_id

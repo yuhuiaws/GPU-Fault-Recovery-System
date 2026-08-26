@@ -55,6 +55,10 @@ LABEL_JOB_ID = "gpu-fault.io/job-id"
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
 
 
+class NodeIsolationRejected(ValueError):
+    """A safety refusal, not an adapter defect."""
+
+
 class NodeActionPending(RuntimeError):
     def __init__(self, command_id: str, details: dict[str, Any] | None = None) -> None:
         super().__init__(f"node action {command_id} is pending")

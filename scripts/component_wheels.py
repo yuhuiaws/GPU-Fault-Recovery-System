@@ -1,0 +1,462 @@
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "src/gpu_fault"
+
+
+@dataclass(frozen=True)
+class Component:
+    distribution: str
+    roots: tuple[str, ...]
+    scripts: dict[str, str]
+    entry_points: dict[str, dict[str, str]]
+    include_globs: tuple[str, ...] = ()
+
+
+COMPONENTS = {
+    "control_plane": Component(
+        distribution="gpu-fault-control-plane",
+        roots=(
+            "gpu_fault.admin_cli",
+            "gpu_fault.api",
+            "gpu_fault.app",
+            "gpu_fault.aurora_credential_refresh",
+            "gpu_fault.config_cli",
+            "gpu_fault.fleet_cli",
+            "gpu_fault.hyperpod_cli",
+            "gpu_fault.store_migrate",
+            "gpu_fault.training_submit_cli",
+            "gpu_fault.workload_annotate_cli",
+        ),
+        scripts={
+            "gpu-fault-admin": "gpu_fault.admin_cli:main",
+            "gpu-fault-api": "gpu_fault.api:run",
+            "gpu-fault-aurora-credential-refresh": (
+                "gpu_fault.aurora_credential_refresh:main"
+            ),
+            "gpu-fault-config": "gpu_fault.config_cli:main",
+            "gpu-fault-fleet": "gpu_fault.fleet_cli:main",
+            "gpu-fault-hyperpod": "gpu_fault.hyperpod_cli:main",
+            "gpu-fault-store-migrate": "gpu_fault.store_migrate:main",
+            "gpu-fault-workload-annotate": ("gpu_fault.workload_annotate_cli:main"),
+            "gpu-training-submit": "gpu_fault.training_submit_cli:main",
+        },
+        entry_points={
+            "gpu_fault.collector_sinks": {
+                "http": "gpu_fault.collectors.sinks:HttpEventSink",
+                "sqs": "gpu_fault.collectors.sinks:SqsEventSink",
+            },
+            "gpu_fault.workflow_adapters": {
+                "control-plane-evidence": (
+                    "gpu_fault.adapters.evidence:ControlPlaneEvidenceAdapter"
+                ),
+                "gpu-validation": (
+                    "gpu_fault.adapters.gpu_validation:GpuValidationAdapter"
+                ),
+                "hyperpod": (
+                    "gpu_fault.adapters.hyperpod.lifecycle:HyperPodLifecycleStepAdapter"
+                ),
+                "kubernetes": (
+                    "gpu_fault.adapters.kubernetes.adapter:KubernetesWorkflowAdapter"
+                ),
+                "managed-recovery": (
+                    "gpu_fault.adapters.managed_recovery:ManagedRecoveryObserverAdapter"
+                ),
+                "node-action": (
+                    "gpu_fault.adapters.node_action.adapter:NodeActionWorkflowAdapter"
+                ),
+                "support": (
+                    "gpu_fault.adapters.support_escalation:SupportEscalationAdapter"
+                ),
+            },
+            "gpu_fault.notification_builders": {
+                "dcgm-diagnostic": (
+                    "gpu_fault.notifications.dcgm_diagnostic:DcgmDiagnosticEmailBuilder"
+                ),
+                "efa-rdma": (
+                    "gpu_fault.notifications.efa_rdma:EfaRdmaEventEmailBuilder"
+                ),
+                "hardware-escalation": (
+                    "gpu_fault.notifications.hardware_escalation:"
+                    "HardwareEscalationEmailBuilder"
+                ),
+                "hardware-inventory": (
+                    "gpu_fault.notifications.hardware_inventory:"
+                    "HardwareInventoryEmailBuilder"
+                ),
+                "host-resource": (
+                    "gpu_fault.notifications.host_resource:"
+                    "HostResourceEventEmailBuilder"
+                ),
+                "hyperpod-advisory": (
+                    "gpu_fault.notifications.hyperpod_advisory:"
+                    "HyperPodAdvisoryEmailBuilder"
+                ),
+                "not-applicable": (
+                    "gpu_fault.notifications.not_applicable:NotApplicableEmailBuilder"
+                ),
+                "nvlink74-mechanical": (
+                    "gpu_fault.notifications.nvlink74_mechanical:"
+                    "Nvlink74MechanicalEmailBuilder"
+                ),
+                "nvlink74-support": (
+                    "gpu_fault.notifications.nvlink74_support:"
+                    "Nvlink74SupportEmailBuilder"
+                ),
+                "restart-guard": (
+                    "gpu_fault.notifications.restart_guard:RestartGuardEmailBuilder"
+                ),
+                "sxid-event": (
+                    "gpu_fault.notifications.sxid_event:SxidEventEmailBuilder"
+                ),
+                "warm-spare": (
+                    "gpu_fault.notifications.warm_spare:"
+                    "WarmSpareReplacementEmailBuilder"
+                ),
+                "xid-investigatory": (
+                    "gpu_fault.notifications.xid_investigatory:"
+                    "XidInvestigatoryEmailBuilder"
+                ),
+            },
+        },
+        include_globs=("store/postgres/ddl*.py",),
+    ),
+    "executor": Component(
+        distribution="gpu-fault-cluster-executor",
+        roots=(
+            "gpu_fault.cluster_executor",
+            "gpu_fault.collectors_cli",
+            "gpu_fault.completion_controller",
+            "gpu_fault.node_installer_reconciler",
+        ),
+        scripts={
+            "gpu-fault-cluster-executor": "gpu_fault.cluster_executor:main",
+            "gpu-fault-cluster-executor-readiness": (
+                "gpu_fault.cluster_executor:readiness_probe"
+            ),
+            "gpu-fault-collector": "gpu_fault.collectors_cli:main",
+            "gpu-fault-completion-watcher": ("gpu_fault.completion_controller:main"),
+            "gpu-fault-node-installer-reconciler": (
+                "gpu_fault.node_installer_reconciler:main"
+            ),
+        },
+        entry_points={
+            "gpu_fault.collector_sinks": {
+                "http": "gpu_fault.collectors.sinks:HttpEventSink",
+                "sqs": "gpu_fault.collectors.sinks:SqsEventSink",
+            }
+        },
+        include_globs=("store/postgres/ddl*.py",),
+    ),
+    "node_runtime": Component(
+        distribution="gpu-fault-node-runtime",
+        roots=(
+            "gpu_fault.collectors_cli",
+            "gpu_fault.node_agent",
+            "gpu_fault.node_agent.app",
+            "gpu_fault.node_agent.config",
+            "gpu_fault.node_agent.quiesce",
+        ),
+        scripts={
+            "gpu-fault-agent-config-digest": (
+                "gpu_fault.node_agent:print_config_digest"
+            ),
+            "gpu-fault-collector": "gpu_fault.collectors_cli:main",
+            "gpu-fault-node-agent": "gpu_fault.node_agent:run",
+            "gpu-fault-restore-gpu-services": (
+                "gpu_fault.node_agent:restore_gpu_services"
+            ),
+        },
+        entry_points={
+            "gpu_fault.collector_sinks": {
+                "http": "gpu_fault.collectors.sinks:HttpEventSink",
+                "sqs": "gpu_fault.collectors.sinks:SqsEventSink",
+            }
+        },
+    ),
+}
+
+
+def _module_map() -> dict[str, Path]:
+    result = {}
+    for path in SOURCE.rglob("*.py"):
+        relative = path.relative_to(SOURCE)
+        if path.name == "__init__.py":
+            parts = relative.parts[:-1]
+        else:
+            parts = (*relative.parts[:-1], path.stem)
+        name = ".".join(("gpu_fault", *parts))
+        result[name] = path
+    return result
+
+
+MODULES = _module_map()
+
+
+def _resolved_relative(module: str, level: int, imported: str | None) -> str:
+    package = (
+        module if MODULES[module].name == "__init__.py" else module.rpartition(".")[0]
+    )
+    parts = package.split(".")
+    if level > len(parts):
+        return ""
+    base = parts[: len(parts) - level + 1]
+    if imported:
+        base.extend(imported.split("."))
+    return ".".join(base)
+
+
+def _lazy_exports(module: str) -> dict[str, str]:
+    tree = ast.parse(MODULES[module].read_text(encoding="utf-8"))
+    exports: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "_EXPORTS"
+            for target in node.targets
+        ):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            continue
+        for key, value in zip(node.value.keys, node.value.values):
+            if (
+                isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and isinstance(value, (ast.Tuple, ast.List))
+                and value.elts
+                and isinstance(value.elts[0], ast.Constant)
+                and isinstance(value.elts[0].value, str)
+                and value.elts[0].value in MODULES
+            ):
+                exports[key.value] = value.elts[0].value
+    return exports
+
+
+def _local_imports(module: str) -> set[str]:
+    tree = ast.parse(MODULES[module].read_text(encoding="utf-8"))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "gpu_fault" or alias.name.startswith("gpu_fault."):
+                    found.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            imported = (
+                _resolved_relative(module, node.level, node.module)
+                if node.level
+                else (node.module or "")
+            )
+            if imported == "gpu_fault" or imported.startswith("gpu_fault."):
+                found.add(imported)
+                lazy = _lazy_exports(imported) if imported in MODULES else {}
+                for alias in node.names:
+                    candidate = f"{imported}.{alias.name}"
+                    if candidate in MODULES:
+                        found.add(candidate)
+                    elif alias.name in lazy:
+                        found.add(lazy[alias.name])
+    return {name for name in found if name in MODULES}
+
+
+def entrypoint_modules(component: Component) -> set[str]:
+    values = [
+        *component.scripts.values(),
+        *(
+            value
+            for entries in component.entry_points.values()
+            for value in entries.values()
+        ),
+    ]
+    return {
+        value.partition(":")[0]
+        for value in values
+        if value.partition(":")[0] in MODULES
+    }
+
+
+def extra_modules(component: Component) -> set[str]:
+    paths = {
+        path
+        for pattern in component.include_globs
+        for path in SOURCE.glob(pattern)
+        if path.is_file()
+    }
+    reverse = {path: module for module, path in MODULES.items()}
+    return {reverse[path] for path in paths}
+
+
+def dependency_closure(roots: Iterable[str]) -> set[str]:
+    missing = sorted(set(roots) - set(MODULES))
+    if missing:
+        raise RuntimeError("unknown component root module(s): " + ", ".join(missing))
+    selected: set[str] = set()
+    pending = list(roots)
+    while pending:
+        module = pending.pop()
+        if module in selected:
+            continue
+        selected.add(module)
+        pending.extend(sorted(_local_imports(module) - selected))
+        parts = module.split(".")
+        for index in range(1, len(parts)):
+            parent = ".".join(parts[:index])
+            if parent in MODULES and parent not in selected:
+                pending.append(parent)
+    selected.add("gpu_fault")
+    return selected
+
+
+def _copy_modules(modules: set[str], destination: Path) -> None:
+    package = destination / "src/gpu_fault"
+    for module in sorted(modules):
+        source = MODULES[module]
+        relative = source.relative_to(SOURCE)
+        target = package / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    data = SOURCE / "data"
+    if data.is_dir():
+        shutil.copytree(data, package / "data")
+
+
+def _toml_array(values: Iterable[str]) -> str:
+    return "[" + ", ".join(json.dumps(value) for value in values) + "]"
+
+
+def _write_project(
+    destination: Path,
+    component: Component,
+) -> None:
+    root = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    project = root["project"]
+    lines = [
+        "[build-system]",
+        'requires = ["setuptools>=75"]',
+        'build-backend = "setuptools.build_meta"',
+        "",
+        "[project]",
+        f"name = {json.dumps(component.distribution)}",
+        f"version = {json.dumps(project['version'])}",
+        f"description = {json.dumps(project['description'])}",
+        f"requires-python = {json.dumps(project['requires-python'])}",
+        f"dependencies = {_toml_array(project['dependencies'])}",
+        "",
+        "[project.optional-dependencies]",
+    ]
+    for name, values in project["optional-dependencies"].items():
+        if name == "dev":
+            continue
+        lines.append(f"{name} = {_toml_array(values)}")
+    lines.extend(["", "[project.scripts]"])
+    for name, value in component.scripts.items():
+        lines.append(f"{json.dumps(name)} = {json.dumps(value)}")
+    for group, entries in component.entry_points.items():
+        lines.extend(["", f"[project.entry-points.{json.dumps(group)}]"])
+        for name, value in entries.items():
+            lines.append(f"{json.dumps(name)} = {json.dumps(value)}")
+    lines.extend(
+        [
+            "",
+            "[tool.setuptools]",
+            'package-dir = {"" = "src"}',
+            "",
+            "[tool.setuptools.packages.find]",
+            'where = ["src"]',
+            "",
+            "[tool.setuptools.package-data]",
+            'gpu_fault = ["data/*.yaml", "data/*.json"]',
+            "",
+        ]
+    )
+    (destination / "pyproject.toml").write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+    )
+
+
+def package_digest(package: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*")):
+        if path.is_dir() or "__pycache__" in path.parts:
+            continue
+        if path.suffix not in {".py", ".yaml", ".yml", ".json"}:
+            continue
+        relative = path.relative_to(package).as_posix()
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def component_source_digest(name: str) -> str:
+    component = COMPONENTS[name]
+    selected = dependency_closure(
+        {
+            *component.roots,
+            *entrypoint_modules(component),
+            *extra_modules(component),
+        }
+    )
+    digest = hashlib.sha256()
+    paths = [MODULES[module] for module in selected]
+    data = SOURCE / "data"
+    paths.extend(
+        path
+        for path in data.rglob("*")
+        if path.is_file() and path.suffix in {".yaml", ".yml", ".json"}
+    )
+    for path in sorted(paths, key=lambda item: item.relative_to(SOURCE).as_posix()):
+        relative = path.relative_to(SOURCE).as_posix()
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def build_component(
+    *,
+    python: str,
+    name: str,
+    build_root: Path,
+    output: Path,
+) -> tuple[Path, str, set[str]]:
+    component = COMPONENTS[name]
+    selected = dependency_closure(
+        {
+            *component.roots,
+            *entrypoint_modules(component),
+            *extra_modules(component),
+        }
+    )
+    project = build_root / name
+    shutil.rmtree(project, ignore_errors=True)
+    project.mkdir(parents=True)
+    _copy_modules(selected, project)
+    _write_project(project, component)
+    before = set(output.glob("*.whl"))
+    subprocess.run(
+        [python, "-m", "build", "--wheel", "--outdir", str(output)],
+        cwd=project,
+        env={**os.environ, "SOURCE_DATE_EPOCH": "315532800"},
+        check=True,
+    )
+    wheels = sorted(set(output.glob("*.whl")) - before)
+    if len(wheels) != 1:
+        raise RuntimeError(f"{name} build produced {len(wheels)} wheels")
+    digest = package_digest(project / "src/gpu_fault")
+    return wheels[0], digest, selected
