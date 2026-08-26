@@ -35,7 +35,7 @@
 ## 核心链路
 
 ```text
-Kernel / Fabric Manager / DCGM / Host / Workload
+Kernel log collector / Fabric Manager log collector / DCGM collector / Host metric collector / Workload watcher
                          |
                          v
               Regional ingress and queue
