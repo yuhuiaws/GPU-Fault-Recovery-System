@@ -13,6 +13,20 @@ BUILD = lazy_script_module(
 )
 
 
+def test_release_builder_resolves_python_from_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "bin/python3"
+    executable.parent.mkdir()
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(executable.parent))
+
+    assert BUILD.resolve_python_executable("python3") == str(executable.resolve())
+    with pytest.raises(RuntimeError, match="was not found"):
+        BUILD.resolve_python_executable("missing-python")
+
+
 def test_failed_release_build_preserves_current_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
