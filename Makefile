@@ -171,7 +171,7 @@ config-check:
 	PYTHONPATH=src $(PYTHON) -m gpu_fault.config_cli validate \
 		deploy/control-plane/regional/generated
 
-deployment-contracts-update:
+deployment-contracts-update: python-cache-clean
 	PYTHON="$(PYTHON)" \
 		deploy/control-plane/tools/update-deployment-contracts.sh
 

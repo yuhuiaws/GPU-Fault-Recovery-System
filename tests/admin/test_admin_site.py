@@ -171,6 +171,8 @@ def test_site_email_notification_contract(tmp_path: Path) -> None:
         "acknowledgeExternalAlertChannel": False,
         "adminEmail": "ops@example.com",
         "emailSender": "sender@example.com",
+        "emailRecipients": ["ops@example.com", "oncall@example.com"],
+        "emailSubjectPrefix": "[PROD]",
     }
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     path.chmod(0o600)
@@ -182,6 +184,8 @@ def test_site_email_notification_contract(tmp_path: Path) -> None:
         "acknowledge_external_alert_channel": False,
         "admin_email": "ops@example.com",
         "email_sender": "sender@example.com",
+        "email_recipients": ["ops@example.com", "oncall@example.com"],
+        "email_subject_prefix": "[PROD]",
     }
 
 
@@ -449,3 +453,29 @@ def test_admin_email_option_keeps_alert_email_compatibility() -> None:
 
     assert preferred.alert_email == "ops@example.com"
     assert legacy.alert_email == preferred.alert_email
+
+
+def test_admin_cli_accepts_independent_email_routing() -> None:
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--cpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
+            "--admin-email",
+            "owner@example.com",
+            "--email-sender",
+            "sender@example.com",
+            "--email-recipient",
+            "ops@example.com",
+            "--email-recipient",
+            "oncall@example.com",
+            "--email-subject-prefix",
+            "[PROD]",
+        ]
+    )
+
+    assert arguments.email_sender == "sender@example.com"
+    assert arguments.email_recipient == ["ops@example.com", "oncall@example.com"]
+    assert arguments.email_subject_prefix == "[PROD]"

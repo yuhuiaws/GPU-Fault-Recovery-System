@@ -86,6 +86,9 @@ class BootstrapRequest:
     repository_root: Path
     state_dir: Path
     alert_email: str | None = None
+    email_sender: str | None = None
+    email_recipients: tuple[str, ...] = ()
+    email_subject_prefix: str = ""
     dry_run: bool = False
 
 

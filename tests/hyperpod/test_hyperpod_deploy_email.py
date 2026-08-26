@@ -101,10 +101,16 @@ def test_control_plane_reads_addresses_from_optional_secret() -> None:
     assert "name: gpu-fault-control-plane-wheel-0100" in manifest
     assert "name: GPU_FAULT_EMAIL_SENDER" in manifest
     assert "name: GPU_FAULT_EMAIL_RECIPIENTS" in manifest
-    assert manifest.count("name: gpu-fault-email") == 2
+    assert "name: GPU_FAULT_EMAIL_SUBJECT_PREFIX" in manifest
+    assert "name: GPU_FAULT_SITE_ID" in manifest
+    assert "name: GPU_FAULT_AWS_ACCOUNT_ID" in manifest
+    assert manifest.count("name: gpu-fault-email") == 5
     assert "key: email-sender" in manifest
     assert "key: email-recipients" in manifest
-    assert manifest.count("optional: true") >= 2
+    assert "key: email-subject-prefix" in manifest
+    assert "key: site-id" in manifest
+    assert "key: aws-account-id" in manifest
+    assert manifest.count("optional: true") >= 5
 
 
 def test_control_watchers_tolerate_solution_quarantine_taint() -> None:

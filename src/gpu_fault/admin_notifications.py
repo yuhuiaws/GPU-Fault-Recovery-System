@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from gpu_fault.admin_bootstrap_common import (
     BootstrapError,
@@ -15,11 +16,47 @@ EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
 EMAIL_SECRET_NAME = "gpu-fault-email"
 
 
+@dataclass(frozen=True)
+class NotificationRouting:
+    sender: str
+    recipients: tuple[str, ...]
+    subject_prefix: str
+
+
 def validate_admin_email(value: str) -> str:
     normalized = value.strip()
     if not EMAIL_PATTERN.fullmatch(normalized):
         raise BootstrapError("administrator email address is invalid")
     return normalized
+
+
+def resolve_notification_routing(
+    *,
+    admin_email: str,
+    sender_email: str | None = None,
+    recipients: Sequence[str] = (),
+    subject_prefix: str = "",
+) -> NotificationRouting:
+    sender = validate_admin_email(sender_email or admin_email)
+    normalized_recipients = tuple(
+        dict.fromkeys(
+            validate_admin_email(item) for item in (recipients or (admin_email,))
+        )
+    )
+    normalized_prefix = subject_prefix.strip()
+    if (
+        len(normalized_prefix) > 64
+        or "\n" in normalized_prefix
+        or "\r" in normalized_prefix
+    ):
+        raise BootstrapError(
+            "email subject prefix must be a single line of at most 64 characters"
+        )
+    return NotificationRouting(
+        sender=sender,
+        recipients=normalized_recipients,
+        subject_prefix=normalized_prefix,
+    )
 
 
 def _optional_aws_json(
@@ -100,7 +137,10 @@ def _apply_email_secret(
     cpu_kubeconfig: Path,
     namespace: str,
     sender: str,
-    recipient: str,
+    recipients: Sequence[str],
+    subject_prefix: str,
+    site_id: str,
+    account_id: str,
 ) -> None:
     rendered = runner.run(
         [
@@ -114,7 +154,10 @@ def _apply_email_secret(
             "generic",
             EMAIL_SECRET_NAME,
             f"--from-literal=email-sender={sender}",
-            f"--from-literal=email-recipients={recipient}",
+            f"--from-literal=email-recipients={','.join(recipients)}",
+            f"--from-literal=email-subject-prefix={subject_prefix}",
+            f"--from-literal=site-id={site_id}",
+            f"--from-literal=aws-account-id={account_id}",
             "--dry-run=client",
             "-o",
             "yaml",
@@ -145,11 +188,20 @@ def ensure_email_notifications(
     namespace: str,
     site_id: str,
     admin_email: str,
+    sender_email: str | None = None,
+    recipients: Sequence[str] = (),
+    subject_prefix: str = "",
 ) -> dict[str, Any]:
+    routing = resolve_notification_routing(
+        admin_email=admin_email,
+        sender_email=sender_email,
+        recipients=recipients,
+        subject_prefix=subject_prefix,
+    )
     identity = _ses_identity(
         runner,
         region=cpu.region,
-        email=admin_email,
+        email=routing.sender,
     )
     created = identity is None
     if created:
@@ -161,7 +213,7 @@ def ensure_email_notifications(
                 "--region",
                 cpu.region,
                 "--email-identity",
-                admin_email,
+                routing.sender,
                 "--tags",
                 f"Key={SITE_TAG_KEY},Value={site_id}",
             ],
@@ -172,7 +224,7 @@ def ensure_email_notifications(
         identity = _ses_identity(
             runner,
             region=cpu.region,
-            email=admin_email,
+            email=routing.sender,
         )
     if identity is None:
         raise BootstrapError("SES email identity could not be inspected")
@@ -181,7 +233,7 @@ def ensure_email_notifications(
     )
     if not verified:
         raise BootstrapError(
-            "SES sent a verification request to the administrator email; "
+            "SES sent a verification request to the configured sender email; "
             "complete verification and rerun the same deploy command"
         )
     account = runner.aws_json(cpu.region, "sesv2", "get-account")
@@ -192,15 +244,20 @@ def ensure_email_notifications(
         runner,
         cpu_kubeconfig=cpu_kubeconfig,
         namespace=namespace,
-        sender=admin_email,
-        recipient=admin_email,
+        sender=routing.sender,
+        recipients=routing.recipients,
+        subject_prefix=routing.subject_prefix,
+        site_id=site_id,
+        account_id=cpu.account_id,
     )
     return {
         "admin_email": admin_email,
-        "sender_email": admin_email,
-        "identity": admin_email,
+        "sender_email": routing.sender,
+        "email_recipients": list(routing.recipients),
+        "email_subject_prefix": routing.subject_prefix,
+        "identity": routing.sender,
         "identity_arn": (
-            f"arn:aws:ses:{cpu.region}:{cpu.account_id}:identity/{admin_email}"
+            f"arn:aws:ses:{cpu.region}:{cpu.account_id}:identity/{routing.sender}"
         ),
         "identity_ownership": "CREATED" if created else "EXTERNAL",
         "verified": True,

@@ -22,6 +22,9 @@ class SesNotificationConfig(StrictModel):
     sender: str
     recipients: list[str] = Field(min_length=1)
     region_name: str | None = None
+    site_id: str | None = None
+    account_id: str | None = None
+    subject_prefix: str = ""
     execution_enabled: bool = False
     configuration_set_name: str | None = None
 
@@ -30,6 +33,14 @@ class SesNotificationConfig(StrictModel):
         addresses = [self.sender, *self.recipients]
         if any("@" not in item or "\n" in item or "\r" in item for item in addresses):
             raise ValueError("invalid email address")
+        if (
+            len(self.subject_prefix) > 64
+            or "\n" in self.subject_prefix
+            or "\r" in self.subject_prefix
+        ):
+            raise ValueError(
+                "email subject prefix must be a single line of at most 64 characters"
+            )
         return self
 
     @classmethod
@@ -48,6 +59,9 @@ class SesNotificationConfig(StrictModel):
             sender=sender,
             recipients=recipients,
             region_name=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
+            site_id=os.getenv("GPU_FAULT_SITE_ID"),
+            account_id=os.getenv("GPU_FAULT_AWS_ACCOUNT_ID"),
+            subject_prefix=os.getenv("GPU_FAULT_EMAIL_SUBJECT_PREFIX", "").strip(),
             execution_enabled=(
                 os.getenv("GPU_FAULT_ALLOW_EMAIL", "").lower() == "true"
             ),
@@ -76,6 +90,44 @@ class SesEmailNotifier:
             raise RuntimeError("install gpu-fault-control-plane[hyperpod]") from exc
         return boto3.client("sesv2", region_name=config.region_name)
 
+    def _subject(self, notification: AdvisoryNotification) -> str:
+        context = [
+            value
+            for value in (
+                self.config.subject_prefix,
+                (f"[site:{self.config.site_id}]" if self.config.site_id else None),
+                (
+                    f"[region:{self.config.region_name}]"
+                    if self.config.region_name
+                    else None
+                ),
+                (
+                    f"[account:{self.config.account_id}]"
+                    if self.config.account_id
+                    else None
+                ),
+            )
+            if value
+        ]
+        return " ".join([*context, notification.subject])
+
+    def _body(self, notification: AdvisoryNotification) -> str:
+        context = [
+            ("Site", self.config.site_id),
+            ("AWS Account", self.config.account_id),
+            ("Region", self.config.region_name),
+            ("Cluster", notification.cluster_name),
+        ]
+        if not any(value for _label, value in context[:-1]):
+            return notification.body_text
+        header = "\n".join(
+            [
+                "通知上下文",
+                *[f"- {label}: {value or 'UNKNOWN'}" for label, value in context],
+            ]
+        )
+        return f"{header}\n\n{notification.body_text}"
+
     def send(self, notification: AdvisoryNotification) -> NotificationResult:
         with self._lock:
             existing = self._results.get(notification.deduplication_key)
@@ -96,12 +148,12 @@ class SesEmailNotifier:
                 "Content": {
                     "Simple": {
                         "Subject": {
-                            "Data": notification.subject,
+                            "Data": self._subject(notification),
                             "Charset": "UTF-8",
                         },
                         "Body": {
                             "Text": {
-                                "Data": notification.body_text,
+                                "Data": self._body(notification),
                                 "Charset": "UTF-8",
                             }
                         },

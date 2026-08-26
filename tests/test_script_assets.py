@@ -177,6 +177,7 @@ def test_make_redirects_python_caches_outside_the_checkout() -> None:
     assert "export PYTHONPYCACHEPREFIX" in makefile
     assert "python-cache-clean:" in makefile
     assert "$(MAKE) python-cache-clean" in makefile
+    assert "deployment-contracts-update: python-cache-clean" in makefile
     assert "deployment-contracts-check: python-cache-clean" in makefile
     assert "deploy-check: python-cache-clean" in makefile
     assert "git ls-files" in makefile

@@ -63,6 +63,30 @@ def _optional_email(value: object, path: str) -> str | None:
     return normalized
 
 
+def _email_list(value: object, path: str) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise SiteConfigError(f"{path} must be a list")
+    normalized = tuple(
+        dict.fromkeys(
+            _optional_email(item, f"{path}[]") for item in cast(Sequence[object], value)
+        )
+    )
+    if not normalized or any(item is None for item in normalized):
+        raise SiteConfigError(f"{path} requires at least one valid email address")
+    return cast(tuple[str, ...], normalized)
+
+
+def _subject_prefix(value: object, path: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise SiteConfigError(f"{path} must be a string")
+    normalized = value.strip()
+    if len(normalized) > 64 or "\n" in normalized or "\r" in normalized:
+        raise SiteConfigError(f"{path} must be a single line of at most 64 characters")
+    return normalized
+
+
 def _boolean(value: object, path: str, *, default: bool) -> bool:
     if value is None:
         return default
@@ -375,6 +399,8 @@ class NotificationSiteConfig:
     acknowledge_external_alert_channel: bool = True
     admin_email: str | None = None
     email_sender: str | None = None
+    email_recipients: tuple[str, ...] = ()
+    email_subject_prefix: str = ""
 
     @classmethod
     def from_value(cls, value: object) -> NotificationSiteConfig:
@@ -386,6 +412,8 @@ class NotificationSiteConfig:
                 "acknowledgeExternalAlertChannel",
                 "adminEmail",
                 "emailSender",
+                "emailRecipients",
+                "emailSubjectPrefix",
             },
         )
         allow_email = _boolean(
@@ -406,20 +434,36 @@ class NotificationSiteConfig:
             data.get("emailSender"),
             "spec.notifications.emailSender",
         )
+        email_recipients = (
+            _email_list(
+                data.get("emailRecipients"),
+                "spec.notifications.emailRecipients",
+            )
+            if data.get("emailRecipients") is not None
+            else ((admin_email,) if admin_email is not None else ())
+        )
+        email_subject_prefix = _subject_prefix(
+            data.get("emailSubjectPrefix"),
+            "spec.notifications.emailSubjectPrefix",
+        )
         if not allow_email and not acknowledge:
             raise SiteConfigError(
                 "notifications must enable email or acknowledge an external alert channel"
             )
-        if allow_email and (admin_email is None or email_sender is None):
+        if allow_email and (
+            admin_email is None or email_sender is None or not email_recipients
+        ):
             raise SiteConfigError(
                 "email notifications require notifications.adminEmail "
-                "and notifications.emailSender"
+                "notifications.emailSender, and at least one recipient"
             )
         return cls(
             allow_email=allow_email,
             acknowledge_external_alert_channel=acknowledge,
             admin_email=admin_email,
             email_sender=email_sender,
+            email_recipients=email_recipients,
+            email_subject_prefix=email_subject_prefix,
         )
 
 
@@ -774,6 +818,8 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             ),
             "admin_email": site.spec.notifications.admin_email,
             "email_sender": site.spec.notifications.email_sender,
+            "email_recipients": list(site.spec.notifications.email_recipients),
+            "email_subject_prefix": (site.spec.notifications.email_subject_prefix),
         },
         "clusters": clusters,
     }

@@ -62,7 +62,9 @@ def test_support_escalation_creates_fixed_ticket_notification() -> None:
     assert outcome.details["hardware_disposition"] == ("OFFLINE_QUARANTINED")
     notification = store.list_notifications()[0]
     assert outcome.details["ticket_id"] in notification.body_text
-    assert "GPU reset、节点 reboot" in notification.body_text
+    assert "实际失败的自动恢复步骤" in notification.body_text
+    assert "NONE_RECORDED" in notification.body_text
+    assert "内部厂商支持升级记录" in notification.body_text
     assert sent == [notification.notification_id]
 
 

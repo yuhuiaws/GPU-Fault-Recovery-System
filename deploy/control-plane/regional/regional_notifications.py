@@ -13,13 +13,15 @@ def notification_digest(config: Any) -> str:
     return hashlib.sha256(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "allow_email": config.allow_email,
                 "acknowledge_external_alert_channel": (
                     config.acknowledge_external_alert_channel
                 ),
                 "admin_email": config.admin_email,
                 "email_sender": config.email_sender,
+                "email_recipients": list(config.email_recipients),
+                "email_subject_prefix": config.email_subject_prefix,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -31,8 +33,9 @@ def ensure_notification_secret(release: Any) -> None:
     config = release.config.notifications
     if not config.allow_email:
         return
-    if not config.admin_email or not config.email_sender:
+    if not config.admin_email or not config.email_sender or not config.email_recipients:
         raise ReleaseError("email notification addresses are missing")
+    account_id = str(release.config.cpu_eks_arn).split(":")[4]
     rendered = release.runner.run(
         release._cpu(
             "-n",
@@ -42,7 +45,10 @@ def ensure_notification_secret(release: Any) -> None:
             "generic",
             EMAIL_SECRET_NAME,
             f"--from-literal=email-sender={config.email_sender}",
-            f"--from-literal=email-recipients={config.admin_email}",
+            ("--from-literal=email-recipients=" + ",".join(config.email_recipients)),
+            f"--from-literal=email-subject-prefix={config.email_subject_prefix}",
+            f"--from-literal=site-id={release.config.site_name}",
+            f"--from-literal=aws-account-id={account_id}",
             "--dry-run=client",
             "-o",
             "yaml",

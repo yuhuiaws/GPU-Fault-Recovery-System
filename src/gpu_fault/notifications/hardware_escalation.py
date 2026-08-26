@@ -19,6 +19,7 @@ class HardwareEscalationEmailBuilder:
         node_ids: list[str],
         workload_ids: list[str],
         reasons: list[str],
+        failed_operations: list[str],
         policy_source: str,
         official_action: str | None,
         ticket_id: str,
@@ -32,6 +33,7 @@ class HardwareEscalationEmailBuilder:
             event_type=event_type,
             event_id=event_id,
             reasons=("\n".join(f"  - {item}" for item in reasons) or "  - UNKNOWN"),
+            failed_operations=(", ".join(failed_operations) or "NONE_RECORDED"),
             ticket_id=ticket_id,
             policy_source=policy_source,
             official_action=official_action or "NONE",
@@ -44,7 +46,10 @@ class HardwareEscalationEmailBuilder:
                 f"Incident: {incident_id}",
                 f"Nodes: {', '.join(node_ids) or 'UNKNOWN'}",
                 "Disposition: HARDWARE_OFFLINE",
-                "Automatic recovery exhausted: reset, reboot, replacement",
+                (
+                    "Failed operations: "
+                    + (", ".join(failed_operations) or "NONE_RECORDED")
+                ),
                 "Reasons:",
                 *[f"- {item}" for item in reasons],
             ]

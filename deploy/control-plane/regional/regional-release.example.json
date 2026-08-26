@@ -35,7 +35,13 @@
   },
   "notifications": {
     "allow_email": true,
-    "acknowledge_external_alert_channel": false
+    "acknowledge_external_alert_channel": false,
+    "admin_email": "gpu-operations@example.com",
+    "email_sender": "gpu-notifications@example.com",
+    "email_recipients": [
+      "gpu-operations@example.com"
+    ],
+    "email_subject_prefix": "[PROD]"
   },
   "clusters": [
     {

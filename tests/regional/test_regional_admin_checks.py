@@ -82,6 +82,50 @@ def test_empty_node_action_keys_are_valid_for_an_empty_gpu_registry(
     assert result.details["node_action_key_count"] == 0
 
 
+def test_email_check_validates_declared_routing_and_site_context(monkeypatch) -> None:
+    module = _checks_module()
+    values = {
+        "email-sender": "sender@example.com",
+        "email-recipients": "ops@example.com,oncall@example.com",
+        "email-subject-prefix": "[PROD]",
+        "site-id": "site-a",
+        "aws-account-id": "123456789012",
+    }
+    secret = {
+        "data": {
+            key: base64.b64encode(value.encode()).decode()
+            for key, value in values.items()
+        }
+    }
+    responses = iter(
+        [
+            {"VerifiedForSendingStatus": True},
+            {"SendingEnabled": True, "ProductionAccessEnabled": True},
+        ]
+    )
+    monkeypatch.setattr(module, "_aws_json", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(module, "_secret", lambda *_args, **_kwargs: secret)
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            site_name="site-a",
+            cpu_eks_arn="arn:aws:eks:us-west-2:123456789012:cluster/cpu",
+            notifications=SimpleNamespace(
+                allow_email=True,
+                acknowledge_external_alert_channel=False,
+                admin_email="owner@example.com",
+                email_sender="sender@example.com",
+                email_recipients=("ops@example.com", "oncall@example.com"),
+                email_subject_prefix="[PROD]",
+            ),
+        )
+    )
+
+    result = module.check_email_notifications(release)
+
+    assert result.details["recipient_count"] == 2
+    assert result.details["site_id"] == "site-a"
+
+
 def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
     module = _checks_module()
     names = (
@@ -95,7 +139,7 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
         "_check_nlb_inputs",
         "_check_aurora",
         "_check_aurora_refresh",
-        "_check_email_notifications",
+        "check_email_notifications",
         "_check_monitoring",
     )
     for name in names:
@@ -136,7 +180,7 @@ def test_health_report_uses_bounded_parallel_checks(monkeypatch) -> None:
         "_check_contexts",
         "check_cpu_secrets",
         "_check_cpu_workloads",
-        "_check_email_notifications",
+        "check_email_notifications",
         "_check_aurora_refresh",
         "_verify_profile",
         "_run_read_only_verifiers",

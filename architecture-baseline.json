@@ -13,7 +13,7 @@
   "cycles": [],
   "files": {
     "src/gpu_fault/admin_aws_cleanup.py": 1547,
-    "src/gpu_fault/admin_bootstrap.py": 2299,
+    "src/gpu_fault/admin_bootstrap.py": 2259,
     "src/gpu_fault/completion_controller.py": 1544,
     "src/gpu_fault/execution/executor.py": 1598,
     "src/gpu_fault/gpu_metrics.py": 1536,
@@ -27,7 +27,7 @@
     "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 255,
     "src/gpu_fault/adapters/hyperpod/lifecycle.py:HyperPodLifecycleStepAdapter.execute": 212,
     "src/gpu_fault/admin_bootstrap.py:_ensure_aurora": 335,
-    "src/gpu_fault/admin_bootstrap.py:bootstrap_from_arns": 230,
+    "src/gpu_fault/admin_bootstrap.py:bootstrap_from_arns": 229,
     "src/gpu_fault/admin_legacy_site.py:discover_legacy_site": 291,
     "src/gpu_fault/app/factory.py:create_app": 287,
     "src/gpu_fault/app/metrics.py:render_prometheus_metrics": 218,

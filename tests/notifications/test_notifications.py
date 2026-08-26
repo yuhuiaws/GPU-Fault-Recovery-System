@@ -19,6 +19,7 @@ from ._notifications_cases_1 import (
     test_not_applicable_xid_creates_and_sends_one_email,
     test_notification_evidence_does_not_scan_all_markers,
     test_restart_guard_uses_a_predefined_template,
+    test_ses_delivery_adds_declared_site_context,
     test_ses_delivery_is_disabled_by_default,
     test_ses_delivery_is_idempotent,
     test_store_labels_drill_notification_from_incident,

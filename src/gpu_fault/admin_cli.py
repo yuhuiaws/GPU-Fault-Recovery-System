@@ -28,6 +28,7 @@ from gpu_fault.admin_legacy_site import LegacySiteRequest, discover_legacy_site
 from gpu_fault.admin_notifications import (
     ensure_email_notifications,
     resolve_admin_email,
+    validate_admin_email,
 )
 from gpu_fault.admin_resource_registry import sync_installation_resource_registry
 from gpu_fault.admin_site import (
@@ -94,6 +95,20 @@ def parser() -> argparse.ArgumentParser:
             "administrator email for SES fault notifications and SNS alerts; "
             "defaults to the AWS account email when discoverable"
         ),
+    )
+    deploy.add_argument(
+        "--email-sender",
+        help="verified SES sender; defaults to the administrator email",
+    )
+    deploy.add_argument(
+        "--email-recipient",
+        action="append",
+        default=[],
+        help="notification recipient; repeat for multiple recipients",
+    )
+    deploy.add_argument(
+        "--email-subject-prefix",
+        help="optional site-specific prefix prepended to every email subject",
     )
     deploy.add_argument("--show-effective-config", action="store_true")
     join = commands.add_parser(
@@ -166,6 +181,9 @@ def _configure_site_notifications(
     site: RenderedSite,
     *,
     configured_email: str | None,
+    configured_sender: str | None,
+    configured_recipients: tuple[str, ...],
+    configured_subject_prefix: str | None,
 ) -> RenderedSite:
     notifications = dict(site.release_config.get("notifications") or {})
     requested = configured_email or notifications.get("admin_email")
@@ -181,6 +199,24 @@ def _configure_site_notifications(
         account_id=cpu.account_id,
         configured=str(requested) if requested else None,
     )
+    sender = validate_admin_email(
+        configured_sender or str(notifications.get("email_sender") or admin_email)
+    )
+    recipients = tuple(
+        dict.fromkeys(
+            validate_admin_email(item)
+            for item in (
+                configured_recipients
+                or tuple(notifications.get("email_recipients") or ())
+                or (admin_email,)
+            )
+        )
+    )
+    subject_prefix = (
+        configured_subject_prefix
+        if configured_subject_prefix is not None
+        else str(notifications.get("email_subject_prefix") or "")
+    ).strip()
     email = ensure_email_notifications(
         runner,
         cpu=cpu,
@@ -188,6 +224,9 @@ def _configure_site_notifications(
         namespace=str(site.release_config["namespace"]),
         site_id=str(site.release_config["site_name"]),
         admin_email=admin_email,
+        sender_email=sender,
+        recipients=recipients,
+        subject_prefix=subject_prefix,
     )
     role = ensure_control_plane_role(
         runner,
@@ -215,6 +254,8 @@ def _configure_site_notifications(
         "acknowledgeExternalAlertChannel": False,
         "adminEmail": admin_email,
         "emailSender": str(email["sender_email"]),
+        "emailRecipients": list(email["email_recipients"]),
+        "emailSubjectPrefix": str(email["email_subject_prefix"]),
     }
     if document["spec"].get("notifications") != desired:
         document["spec"]["notifications"] = desired
@@ -318,6 +359,11 @@ def run(arguments: argparse.Namespace) -> int:
                 repository_root=repository_root,
                 state_dir=(arguments.state_dir or default_state).expanduser(),
                 alert_email=arguments.alert_email,
+                email_sender=getattr(arguments, "email_sender", None),
+                email_recipients=tuple(getattr(arguments, "email_recipient", ()) or ()),
+                email_subject_prefix=(
+                    getattr(arguments, "email_subject_prefix", None) or ""
+                ),
             )
         )
         site_file = bootstrap_result.site_file
@@ -329,6 +375,15 @@ def run(arguments: argparse.Namespace) -> int:
         site = _configure_site_notifications(
             site,
             configured_email=getattr(arguments, "alert_email", None),
+            configured_sender=getattr(arguments, "email_sender", None),
+            configured_recipients=tuple(
+                getattr(arguments, "email_recipient", ()) or ()
+            ),
+            configured_subject_prefix=getattr(
+                arguments,
+                "email_subject_prefix",
+                None,
+            ),
         )
     print(
         json.dumps(

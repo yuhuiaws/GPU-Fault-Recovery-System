@@ -47,6 +47,24 @@ def required_email(value: object, field: str) -> str:
     return normalized
 
 
+def email_list(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ReleaseError(f"{field} must be a list")
+    normalized = tuple(
+        dict.fromkeys(required_email(item, f"{field}[]") for item in value)
+    )
+    if not normalized:
+        raise ReleaseError(f"{field} requires at least one email address")
+    return normalized
+
+
+def email_subject_prefix(value: object, field: str) -> str:
+    normalized = str(value or "").strip()
+    if len(normalized) > 64 or "\n" in normalized or "\r" in normalized:
+        raise ReleaseError(f"{field} must be a single line of at most 64 characters")
+    return normalized
+
+
 def validate_aws_region(value: object, field: str = "aws_region") -> str:
     region = required_text(value, field)
     if not AWS_REGION_PATTERN.fullmatch(region):
@@ -247,6 +265,8 @@ class RegionalNotificationConfig:
     acknowledge_external_alert_channel: bool = True
     admin_email: str | None = None
     email_sender: str | None = None
+    email_recipients: tuple[str, ...] = ()
+    email_subject_prefix: str = ""
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> RegionalNotificationConfig:
@@ -264,20 +284,36 @@ class RegionalNotificationConfig:
             if value.get("email_sender")
             else None
         )
+        email_recipients = (
+            email_list(
+                value.get("email_recipients"),
+                "notifications.email_recipients",
+            )
+            if value.get("email_recipients")
+            else ((admin_email,) if admin_email is not None else ())
+        )
+        subject_prefix = email_subject_prefix(
+            value.get("email_subject_prefix"),
+            "notifications.email_subject_prefix",
+        )
         if not allow_email and not acknowledge:
             raise ReleaseError(
                 "notifications must allow email or acknowledge an external alert channel"
             )
-        if allow_email and (admin_email is None or email_sender is None):
+        if allow_email and (
+            admin_email is None or email_sender is None or not email_recipients
+        ):
             raise ReleaseError(
                 "email notifications require notifications.admin_email "
-                "and notifications.email_sender"
+                "notifications.email_sender, and at least one recipient"
             )
         return cls(
             allow_email=allow_email,
             acknowledge_external_alert_channel=acknowledge,
             admin_email=admin_email,
             email_sender=email_sender,
+            email_recipients=email_recipients,
+            email_subject_prefix=subject_prefix,
         )
 
 

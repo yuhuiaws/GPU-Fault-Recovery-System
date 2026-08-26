@@ -40,8 +40,7 @@ from gpu_fault.admin_bootstrap_common import (
     write_yaml as _write_yaml,
 )
 from gpu_fault.admin_notifications import (
-    ensure_email_notifications,
-    resolve_admin_email,
+    NotificationRouting,
 )
 
 
@@ -1945,7 +1944,7 @@ def _site_document(
     fleet_master_file: Path,
     adot_image: str,
     admin_email: str,
-    email_sender: str,
+    routing: NotificationRouting,
 ) -> dict[str, Any]:
     cluster_documents = []
     for cluster in gpu_clusters:
@@ -2020,50 +2019,12 @@ def _site_document(
                 "allowEmail": True,
                 "acknowledgeExternalAlertChannel": False,
                 "adminEmail": admin_email,
-                "emailSender": email_sender,
+                "emailSender": routing.sender,
+                "emailRecipients": list(routing.recipients),
+                "emailSubjectPrefix": routing.subject_prefix,
             },
             "clusters": cluster_documents,
         },
-    }
-
-
-def _notification_bootstrap_tasks(
-    runner: CommandRunner,
-    *,
-    cpu: ClusterIdentity,
-    cpu_kubeconfig: Path,
-    namespace: str,
-    site_id: str,
-    admin_email: str,
-) -> dict[str, Callable[[], Any]]:
-    from gpu_fault.admin_bootstrap_services import (
-        ensure_control_plane_role,
-        ensure_monitoring_resources,
-    )
-
-    return {
-        "control_plane_role": lambda: ensure_control_plane_role(
-            runner,
-            cpu=cpu,
-            cpu_kubeconfig=cpu_kubeconfig,
-            namespace=namespace,
-            site_id=site_id,
-            email_sender=admin_email,
-        ),
-        "email_notifications": lambda: ensure_email_notifications(
-            runner,
-            cpu=cpu,
-            cpu_kubeconfig=cpu_kubeconfig,
-            namespace=namespace,
-            site_id=site_id,
-            admin_email=admin_email,
-        ),
-        "monitoring_resources": lambda: ensure_monitoring_resources(
-            runner,
-            cpu=cpu,
-            site_id=site_id,
-            alert_email=admin_email,
-        ),
     }
 
 
@@ -2072,6 +2033,10 @@ def bootstrap_from_arns(
     *,
     runner: CommandRunner | None = None,
 ) -> BootstrapResult:
+    from gpu_fault.admin_notification_bootstrap import (
+        notification_bootstrap_tasks,
+        notification_routing,
+    )
     from gpu_fault.admin_bootstrap_services import (
         _ensure_pod_identity_agent,
         ensure_executor_role,
@@ -2109,12 +2074,7 @@ def bootstrap_from_arns(
     state_file = request.state_dir / "bootstrap-state.json"
     state = BootstrapState(state_file, site_id=site_id)
     state.phase("discovered")
-    admin_email, admin_email_source = resolve_admin_email(
-        active_runner,
-        account_id=cpu.account_id,
-        configured=request.alert_email,
-    )
-    state.record("admin_email_source", admin_email_source)
+    admin_email, routing = notification_routing(active_runner, cpu, request, state)
     cpu_kubeconfig, gpu_kubeconfig = _ensure_kubeconfigs(
         active_runner,
         cpu=cpu,
@@ -2204,13 +2164,14 @@ def bootstrap_from_arns(
                 state_dir=request.state_dir,
                 site_id=site_id,
             ),
-            **_notification_bootstrap_tasks(
+            **notification_bootstrap_tasks(
                 active_runner,
                 cpu=cpu,
                 cpu_kubeconfig=cpu_kubeconfig,
                 namespace=namespace,
                 site_id=site_id,
                 admin_email=admin_email,
+                routing=routing,
             ),
             **executor_tasks,
         },
@@ -2225,7 +2186,6 @@ def bootstrap_from_arns(
     release = cast(dict[str, Any], first_phase["release"])
     aurora = cast(dict[str, Any], first_phase["aurora"])
     monitoring = cast(dict[str, Any], first_phase["monitoring_resources"])
-    email_notifications = cast(dict[str, Any], first_phase["email_notifications"])
     second_phase_tasks: dict[str, Callable[[], Any]] = {
         "monitoring_install": lambda: install_monitoring(
             active_runner,
@@ -2291,7 +2251,7 @@ def bootstrap_from_arns(
             fleet_master_file=fleet_master_file,
             adot_image=adot_image,
             admin_email=admin_email,
-            email_sender=str(email_notifications["sender_email"]),
+            routing=routing,
         ),
     )
     state.record("site_file", str(site_file))

@@ -349,7 +349,7 @@ def check_cpu_secrets(release: Any) -> CheckValue:
     )
 
 
-def _check_email_notifications(release: Any) -> CheckValue:
+def check_email_notifications(release: Any) -> CheckValue:
     config = release.config.notifications
     if not config.allow_email:
         if config.acknowledge_external_alert_channel:
@@ -358,7 +358,7 @@ def _check_email_notifications(release: Any) -> CheckValue:
                 {"enabled": False},
             )
         raise ReleaseError("no administrator notification channel is enabled")
-    if not config.admin_email or not config.email_sender:
+    if not config.admin_email or not config.email_sender or not config.email_recipients:
         raise ReleaseError("email notification addresses are missing")
     identity = _aws_json(
         release,
@@ -378,12 +378,32 @@ def _check_email_notifications(release: Any) -> CheckValue:
     if not bool(account.get("SendingEnabled")):
         raise ReleaseError("SES sending is disabled")
     secret = _secret(release, "gpu-fault-email").get("data") or {}
-    required = {"email-sender", "email-recipients"}
+    required = {
+        "email-sender",
+        "email-recipients",
+        "email-subject-prefix",
+        "site-id",
+        "aws-account-id",
+    }
     if missing := sorted(required - set(secret)):
         raise ReleaseError("gpu-fault-email is missing: " + ", ".join(missing))
     sender = _decode_secret(secret["email-sender"]).decode()
-    recipients = _decode_secret(secret["email-recipients"]).decode()
-    if sender != config.email_sender or recipients != config.admin_email:
+    recipients = tuple(
+        item.strip()
+        for item in _decode_secret(secret["email-recipients"]).decode().split(",")
+        if item.strip()
+    )
+    subject_prefix = _decode_secret(secret["email-subject-prefix"]).decode()
+    site_id = _decode_secret(secret["site-id"]).decode()
+    account_id = _decode_secret(secret["aws-account-id"]).decode()
+    expected_account_id = str(release.config.cpu_eks_arn).split(":")[4]
+    if (
+        sender != config.email_sender
+        or recipients != config.email_recipients
+        or subject_prefix != config.email_subject_prefix
+        or site_id != release.config.site_name
+        or account_id != expected_account_id
+    ):
         raise ReleaseError("gpu-fault-email differs from the declared site addresses")
     return CheckValue(
         "SES administrator notification channel is configured",
@@ -392,6 +412,8 @@ def _check_email_notifications(release: Any) -> CheckValue:
             "sender_verified": True,
             "sending_enabled": True,
             "production_access_enabled": bool(account.get("ProductionAccessEnabled")),
+            "recipient_count": len(recipients),
+            "site_id": site_id,
         },
     )
 
@@ -857,7 +879,7 @@ def build_preflight_report(release: Any) -> dict[str, Any]:
         ("nlb_inputs", lambda: _check_nlb_inputs(release)),
         ("aurora", lambda: _check_aurora(release)),
         ("aurora_credential_refresh", lambda: _check_aurora_refresh(release)),
-        ("email_notifications", lambda: _check_email_notifications(release)),
+        ("email_notifications", lambda: check_email_notifications(release)),
         ("monitoring", lambda: _check_monitoring(release)),
     ]
     with ThreadPoolExecutor(max_workers=min(8, len(specifications))) as executor:
@@ -1302,7 +1324,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
         ("regional_contexts", lambda: _check_contexts(release)),
         ("cpu_secrets", lambda: check_cpu_secrets(release)),
         ("cpu_workloads", lambda: _check_cpu_workloads(release)),
-        ("email_notifications", lambda: _check_email_notifications(release)),
+        ("email_notifications", lambda: check_email_notifications(release)),
         (
             "aurora_credential_refresh",
             lambda: _check_aurora_refresh(release, require_success=True),

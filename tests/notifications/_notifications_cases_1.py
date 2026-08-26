@@ -314,7 +314,9 @@ def test_gpu_count_change_email_is_actionable() -> None:
     assert "方案 B：接受 16 张 GPU" in notification.body_text
     assert "world size" in notification.body_text
     assert (
-        "kubectl -n training annotate pytorchjob training-a "
+        'kubectl --context "${GPU_FAULT_KUBE_CONTEXT:'
+        '?set GPU_FAULT_KUBE_CONTEXT for cluster cluster-a}" '
+        "-n training annotate pytorchjob training-a "
         "gpu-fault.io/approve-gpu-count-change='24:16' --overwrite"
         in notification.body_text
     )
@@ -827,6 +829,41 @@ def test_ses_delivery_is_idempotent() -> None:
     assert second.status is NotificationStatus.DUPLICATE
     assert len(client.requests) == 1
     assert client.requests[0]["Destination"]["ToAddresses"] == ["admin@example.com"]
+
+
+def test_ses_delivery_adds_declared_site_context() -> None:
+    client = FakeSesV2Client()
+    notifier = SesEmailNotifier(
+        SesNotificationConfig(
+            sender="sender@example.com",
+            recipients=["ops@example.com", "oncall@example.com"],
+            region_name="us-west-2",
+            site_id="site-a",
+            account_id="123456789012",
+            subject_prefix="[PROD]",
+            execution_enabled=True,
+        ),
+        client=client,
+    )
+    notification = HyperPodAdvisoryEmailBuilder().build(
+        advisory(),
+        cluster_name="cluster-a",
+        incident_id="incident-a",
+        node_ids=["runtime-node-9"],
+        issue_summary="GPU fault",
+    )
+
+    assert notifier.send(notification).status is NotificationStatus.SENT
+    request = client.requests[0]["Content"]["Simple"]
+    assert request["Subject"]["Data"].startswith(
+        "[PROD] [site:site-a] [region:us-west-2] [account:123456789012]"
+    ), "SES subject omitted the declared site context"
+    body = request["Body"]["Text"]["Data"]
+    assert "- Site: site-a" in body
+    assert "- AWS Account: 123456789012" in body
+    assert "- Region: us-west-2" in body
+    assert "- Cluster: cluster-a" in body
+    assert "runtime-node-9" in body
 
 
 def test_dispatch_continues_after_one_delivery_failure() -> None:

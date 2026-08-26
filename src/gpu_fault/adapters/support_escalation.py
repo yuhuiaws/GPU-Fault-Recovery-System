@@ -6,6 +6,7 @@ from gpu_fault.execution import (
     WorkflowStepOutcome,
 )
 from gpu_fault.models import (
+    WorkflowStepStatus,
     WorkflowStepSpec,
 )
 from gpu_fault.operation_registry import (
@@ -58,7 +59,16 @@ class SupportEscalationAdapter:
             official_action=context.incident.official_action,
             ticket_id=ticket_id,
             **(
-                {"event_type": context.incident.event_type}
+                {
+                    "event_type": context.incident.event_type,
+                    "failed_operations": sorted(
+                        {
+                            execution.operation.value
+                            for execution in context.workflow.step_executions
+                            if execution.status is WorkflowStepStatus.FAILED
+                        }
+                    ),
+                }
                 if builder is self.builder
                 else {}
             ),

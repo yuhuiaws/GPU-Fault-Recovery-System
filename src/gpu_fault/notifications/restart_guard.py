@@ -22,16 +22,24 @@ class RestartGuardEmailBuilder:
 
     @staticmethod
     def _approval_commands(
-        workload_ids: list[str], approval_annotation: str
+        cluster_id: str,
+        workload_ids: list[str],
+        approval_annotation: str,
     ) -> list[str]:
         commands = []
+        context_guard = (
+            "${GPU_FAULT_KUBE_CONTEXT:"
+            f"?set GPU_FAULT_KUBE_CONTEXT for cluster {cluster_id}"
+            "}"
+        )
         for workload_id in workload_ids:
             parts = workload_id.split("/", 2)
             if len(parts) != 3 or not all(parts):
                 continue
             namespace, kind, name = parts
             commands.append(
-                f"kubectl -n {namespace} annotate {kind} {name} "
+                f'kubectl --context "{context_guard}" '
+                f"-n {namespace} annotate {kind} {name} "
                 "gpu-fault.io/approve-gpu-count-change="
                 f"'{approval_annotation}' --overwrite"
             )
@@ -52,7 +60,11 @@ class RestartGuardEmailBuilder:
         source = str(source_gpu_count) if source_gpu_count > 0 else "unknown"
         target = str(target_gpu_count) if target_gpu_count is not None else "unknown"
         approval_commands = (
-            self._approval_commands(workload_ids, approval_annotation)
+            self._approval_commands(
+                cluster_id,
+                workload_ids,
+                approval_annotation,
+            )
             if approval_annotation
             else []
         )

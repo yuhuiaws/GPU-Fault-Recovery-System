@@ -23,7 +23,7 @@ from gpu_fault.models import (
 from gpu_fault.models import StrictModel as StrictModel
 
 
-RESTART_GUARD_TEMPLATE_VERSION = "restart-guard-zh-v1"
+RESTART_GUARD_TEMPLATE_VERSION = "restart-guard-zh-v2"
 RESTART_WORKLOAD_TEMPLATE_VERSION = "restart-workload-zh-v1"
 RESTART_NODE_TEMPLATE_VERSION = "restart-node-zh-v1"
 WARM_SPARE_REPLACEMENT_TEMPLATE_VERSION = "warm-spare-replacement-zh-v1"
@@ -33,8 +33,8 @@ FABRIC_RESET_TEMPLATE_VERSION = "fabric-reset-zh-v1"
 NOT_APPLICABLE_TEMPLATE_VERSION = "xid-not-applicable-zh-v2"
 XID_INVESTIGATORY_TEMPLATE_VERSION = "xid-investigatory-zh-v1"
 SXID_EVENT_TEMPLATE_VERSION = "sxid-event-zh-v1"
-HARDWARE_ESCALATION_TEMPLATE_VERSION = "hardware-escalation-zh-v1"
-NVLINK74_SUPPORT_TEMPLATE_VERSION = "xid74-support-zh-v2"
+HARDWARE_ESCALATION_TEMPLATE_VERSION = "hardware-escalation-zh-v2"
+NVLINK74_SUPPORT_TEMPLATE_VERSION = "xid74-support-zh-v3"
 NVLINK74_MECHANICAL_TEMPLATE_VERSION = "xid74-mechanical-zh-v1"
 GPU_MECHANICAL_TEMPLATE_VERSION = "gpu-mechanical-zh-v1"
 DCGM_DIAGNOSTIC_TEMPLATE_VERSION = "dcgm-diagnostic-zh-v2"
@@ -207,10 +207,10 @@ GPU XID 74 NVLink 事件支持通知
 二、系统处理
 - 未执行 XID 74 单 GPU reset。
 - 节点调度和训练任务状态以 Workflow 实际步骤记录为准。
-- 已生成厂商支持记录：{ticket_id}
+- 已生成内部厂商支持升级记录：{ticket_id}
 
 三、工单信息
-- Ticket ID：{ticket_id}
+- Internal Ticket ID：{ticket_id}
 - Workflow operation：ESCALATE_SUPPORT
 
 邮件模板：{template_version}
@@ -278,12 +278,12 @@ GPU 节点自动恢复失败及硬件下线通知
 {reasons}
 
 二、系统处理
-- GPU reset、节点 reboot 和 warm-spare replacement 自动恢复链路已失败。
+- 实际失败的自动恢复步骤：{failed_operations}
 - 故障节点保持 unschedulable 和 quarantine，不会恢复调度。
-- 系统已创建厂商支持工单记录：{ticket_id}
+- 系统已创建内部厂商支持升级记录：{ticket_id}
 
 三、工单信息
-- Ticket ID：{ticket_id}
+- Internal Ticket ID：{ticket_id}
 - Policy source：{policy_source}
 - Official action：{official_action}
 - Workflow operation：ESCALATE_SUPPORT

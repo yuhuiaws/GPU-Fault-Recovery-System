@@ -55,10 +55,14 @@ spec:
   notifications:
     allowEmail: false
     acknowledgeExternalAlertChannel: true
-    # ARN-only deploy fills both from --admin-email, or discovers the
-    # current AWS account email when the caller can read it.
+    # ARN-only deploy defaults these fields from --admin-email, but sender,
+    # recipients and the subject prefix may be configured independently.
     # adminEmail: gpu-operations@example.com
     # emailSender: gpu-operations@example.com
+    # emailRecipients:
+    #   - gpu-operations@example.com
+    #   - gpu-platform-oncall@example.com
+    # emailSubjectPrefix: "[PROD]"
 
   clusters:
     - clusterId: gpu-prod-a

@@ -396,6 +396,9 @@ class NotificationPreviewService:
                     f"{incident.event_type} incident; policy recommends "
                     f"{recommended_action}"
                 ),
+                region_name=(
+                    os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+                ),
             )
             return self.store.save_notification_if_absent(notification)
 

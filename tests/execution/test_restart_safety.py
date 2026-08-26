@@ -160,7 +160,9 @@ def test_gpu_count_change_waits_for_explicit_admin_approval() -> None:
     assert "global batch size" in body
     assert "learning rate" in body
     assert (
-        "kubectl -n training annotate job training-job "
+        'kubectl --context "${GPU_FAULT_KUBE_CONTEXT:'
+        '?set GPU_FAULT_KUBE_CONTEXT for cluster cluster-a}" '
+        "-n training annotate job training-job "
         "gpu-fault.io/approve-gpu-count-change='2:1' --overwrite" in body
     )
 

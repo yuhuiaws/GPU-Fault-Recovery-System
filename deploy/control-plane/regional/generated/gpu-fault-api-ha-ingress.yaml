@@ -77,6 +77,24 @@ spec:
               key: email-recipients
               name: gpu-fault-email
               optional: true
+        - name: GPU_FAULT_EMAIL_SUBJECT_PREFIX
+          valueFrom:
+            secretKeyRef:
+              key: email-subject-prefix
+              name: gpu-fault-email
+              optional: true
+        - name: GPU_FAULT_SITE_ID
+          valueFrom:
+            secretKeyRef:
+              key: site-id
+              name: gpu-fault-email
+              optional: true
+        - name: GPU_FAULT_AWS_ACCOUNT_ID
+          valueFrom:
+            secretKeyRef:
+              key: aws-account-id
+              name: gpu-fault-email
+              optional: true
         - name: GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256
           valueFrom:
             configMapKeyRef:

@@ -12,7 +12,9 @@ fields.
 `make release-deploy` renders an immutable content-addressed profile snapshot,
 updates `runtimeProfile.source/version`, and generates the regional release JSON
 in a private temporary directory; operators do not maintain these derived files.
-`spec.notifications.adminEmail` and `emailSender` are filled by ARN-only deploy.
+`spec.notifications.adminEmail`, `emailSender`, `emailRecipients` and
+`emailSubjectPrefix` are filled by ARN-only deploy. Sender and recipients may be
+configured independently with `--email-sender` and repeated `--email-recipient`.
 For an existing site, `make release-deploy SITE=... ADMIN_EMAIL=...` updates the
 declarative value; omitting `ADMIN_EMAIL` preserves the site value or discovers
 the AWS account email when a legacy site has none.

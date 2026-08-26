@@ -98,15 +98,33 @@ def test_email_notifications_require_verified_ses_and_apply_secret(
         namespace="gpu-fault-system",
         site_id="site-a",
         admin_email="ops@example.com",
+        sender_email="sender@example.com",
+        recipients=("ops@example.com", "oncall@example.com"),
+        subject_prefix="[PROD]",
     )
 
-    assert result["sender_email"] == "ops@example.com"
+    assert result["sender_email"] == "sender@example.com"
+    assert result["email_recipients"] == ["ops@example.com", "oncall@example.com"]
+    assert result["email_subject_prefix"] == "[PROD]"
     assert result["verified"] is True
     assert result["identity_ownership"] == "EXTERNAL"
     assert any(
         command[0] == "run" and "gpu-fault-email" in command[1]
         for command in runner.commands
     ), "email Secret was not applied"
+    secret_command = next(
+        command[1]
+        for command in runner.commands
+        if command[0] == "run" and "gpu-fault-email" in command[1]
+    )
+    assert "--from-literal=email-sender=sender@example.com" in secret_command
+    assert (
+        "--from-literal=email-recipients=ops@example.com,oncall@example.com"
+        in secret_command
+    )
+    assert "--from-literal=email-subject-prefix=[PROD]" in secret_command
+    assert "--from-literal=site-id=site-a" in secret_command
+    assert "--from-literal=aws-account-id=123456789012" in secret_command
 
 
 def test_unverified_ses_identity_blocks_deploy(tmp_path: Path) -> None:
