@@ -26,8 +26,8 @@
 以下约束不是可调默认值：
 
 1. 受管 HyperPod GPU 集群必须设置 `NodeRecovery=None`。
-2. 本方案永不调用 `BatchReplaceClusterNodes`；节点替换只使用已纳管 warm spare。
-3. HyperPod Job Auto Restart、EKS auto-resume 和 Slurm auto-resume 必须禁用。
+2. 本方案永不调用 `BatchReplaceClusterNodes`；节点替换只使用已纳管的健康的 warm spare 节点。
+3. HyperPod Job Auto Restart、EKS auto-resume 必须禁用。
 4. 训练任务恢复由本方案的 Kubernetes Adapter 和 restart budget 独占管理。
 5. 未知策略、缺少证据、版本不一致或 workload 状态未知时，破坏性动作必须
    fail closed。
