@@ -262,6 +262,37 @@ def sync_release_state(release: Any) -> None:
     )
 
 
+def bootstrap_resume_context(
+    state: dict[str, Any],
+    release_id: str,
+) -> tuple[set[str], bool, bool]:
+    loaded_phase = str(state.get("phase") or "")
+    resume_phase = str(state.get("resume_phase") or loaded_phase)
+    same_release = state.get("release_id") in {None, release_id}
+    cleaned = loaded_phase == "bootstrap-cleaned"
+    completed_cluster_ids = (
+        {str(value) for value in state.get("completed_cluster_ids", []) if value}
+        if same_release and not cleaned
+        else set()
+    )
+    cpu_checkpoint = (
+        same_release
+        and not cleaned
+        and resume_phase
+        in {
+            "bootstrap-cpu-ready",
+            "bootstrap-endpoint-ready",
+            "bootstrap-data-plane-progress",
+        }
+    )
+    check_live_cpu = (
+        same_release
+        and not cleaned
+        and resume_phase in {"bootstrap-started", "bootstrap-failed"}
+    )
+    return completed_cluster_ids, cpu_checkpoint, check_live_cpu
+
+
 class RegionalRelease:
     _ensure_contexts = ensure_region_contexts
     _apply_gpu_dcgm_exporter = apply_gpu_dcgm_exporter
@@ -924,31 +955,10 @@ class RegionalRelease:
             self._cpu("apply", "-f", "-"),
             input_text=prerequisites,
         )
-        loaded_phase = str(self.state.get("phase") or "")
-        resume_phase = str(self.state.get("resume_phase") or loaded_phase)
-        same_release = self.state.get("release_id") in {
-            None,
-            self.release_id,
-        }
-        completed_cluster_ids = (
-            {
-                str(value)
-                for value in self.state.get("completed_cluster_ids", [])
-                if value
-            }
-            if same_release
-            else set()
+        completed_cluster_ids, cpu_checkpoint, check_live_cpu = (
+            bootstrap_resume_context(self.state, self.release_id)
         )
-        cpu_checkpoint = same_release and resume_phase in {
-            "bootstrap-cpu-ready",
-            "bootstrap-endpoint-ready",
-            "bootstrap-data-plane-progress",
-        }
-        if (
-            not cpu_checkpoint
-            and same_release
-            and resume_phase in {"bootstrap-started", "bootstrap-failed"}
-        ):
+        if not cpu_checkpoint and check_live_cpu:
             cpu_checkpoint = self._bootstrap_cpu_is_current()
         checkpoint = "bootstrap-started"
         self._save_state(
@@ -1029,7 +1039,12 @@ class RegionalRelease:
                 self._scale_if_present(self._gpu(target), deployment, 0)
         for deployment in inventory.CPU_DEPLOYMENTS:
             self._scale_if_present(self._cpu(), deployment, 0)
-        self._save_state("bootstrap-cleaned", previous=None)
+        self._save_state(
+            "bootstrap-cleaned",
+            previous=None,
+            resume_phase="bootstrap-started",
+            completed_cluster_ids=[],
+        )
 
     def _scale_if_present(
         self,
