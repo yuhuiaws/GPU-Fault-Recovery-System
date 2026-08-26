@@ -44,6 +44,13 @@ def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
     )
 
 
+def resolve_python_executable(value: str) -> str:
+    executable = shutil.which(value)
+    if executable is None:
+        raise RuntimeError(f"Python executable was not found: {value}")
+    return str(Path(executable).resolve())
+
+
 def _write_synced(path: Path, content: str) -> None:
     with path.open("w", encoding="utf-8") as destination:
         destination.write(content)
@@ -116,7 +123,7 @@ def _publish_release(
 
 
 def build(python: str) -> dict[str, object]:
-    python = str(Path(python).resolve())
+    python = resolve_python_executable(python)
     shutil.rmtree(BUILD, ignore_errors=True)
     DIST.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".build-", dir=DIST) as directory:
