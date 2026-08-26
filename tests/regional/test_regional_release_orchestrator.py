@@ -745,7 +745,7 @@ def test_plan_covers_first_deploy_and_rollback(tmp_path) -> None:
 def test_regional_parser_exposes_admin_health_commands() -> None:
     mode = next(action for action in MODULE.parser()._actions if action.dest == "mode")
 
-    assert {"preflight", "verify", "status"} <= set(mode.choices)
+    assert {"preflight", "verify", "release-summary", "status"} <= set(mode.choices)
 
 
 def test_status_keeps_health_report_when_release_summary_is_unavailable(
@@ -805,6 +805,55 @@ def test_runtime_profile_payload_uses_declared_identity(tmp_path: Path) -> None:
     assert payload["cluster_id"] == "gpu-a"
     assert payload["profile_version"] == "hyperpod-v1"
     assert payload["cluster_id"] != "hp-gpu-a"
+
+
+def test_runtime_profile_policy_digest_ignores_identity_and_yaml_order(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.yaml"
+    second = tmp_path / "second.yaml"
+    first.write_text(
+        yaml.safe_dump(
+            {
+                "cluster_id": "placeholder",
+                "environment": "hyperpod-eks",
+                "profile_version": "profile-a",
+                "claims": [
+                    {
+                        "capability": "gpuReset",
+                        "mode": "OBSERVE",
+                        "owner": "gpu-fault-node-agent",
+                    },
+                    {
+                        "capability": "evidenceCapture",
+                        "mode": "OWN",
+                        "owner": "gpu-fault-control-plane",
+                        "adapter": "control-plane-evidence",
+                    },
+                ],
+                "observed": [],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    second.write_text(
+        yaml.safe_dump(
+            {
+                "profile_version": "profile-b",
+                "cluster_id": "gpu-a",
+                "observed": [],
+                "claims": list(reversed(yaml.safe_load(first.read_text())["claims"])),
+                "environment": "hyperpod-eks",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert RUNTIME_PROFILE_MODULE.runtime_profile_policy_digest(
+        first
+    ) == RUNTIME_PROFILE_MODULE.runtime_profile_policy_digest(second)
 
 
 def test_runtime_profile_is_registered_when_missing(tmp_path: Path) -> None:

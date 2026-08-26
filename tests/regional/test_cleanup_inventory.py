@@ -78,6 +78,11 @@ def test_cleanup_inventory_declares_order_and_cluster_scope() -> None:
     for item in gpu:
         if item["scope"] == "cluster":
             assert item["clean"] == "delete", item
+    assert (
+        "gpu-fault.io/gpu-plugin-restart-operation"
+        in document["gpu"]["node_annotations"]
+    )
+    assert document["gpu"]["node_labels"] == ["gpu-fault.io/spare"]
 
 
 def test_cleanup_script_consumes_registry_instead_of_workload_literals() -> None:

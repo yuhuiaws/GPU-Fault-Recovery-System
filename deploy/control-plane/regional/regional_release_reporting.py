@@ -83,9 +83,12 @@ def build_release_status(release: Any) -> dict[str, Any]:
         },
         "configured_runtime_profile": {
             "source": str(config.runtime_profile_source),
+            "template_source": str(config.runtime_profile_template_source),
             "version": config.runtime_profile_version,
             "registration_cluster_id": (config.runtime_profile_registration_cluster_id),
-            "sha256": release.runtime_profile_sha,
+            "source_sha256": release.runtime_profile_sha,
+            "template_sha256": release.runtime_profile_template_sha,
+            "policy_sha256": release.runtime_profile_policy_sha,
         },
         "configured_health": {
             "aurora_cluster_id": config.health.aurora_cluster_id,

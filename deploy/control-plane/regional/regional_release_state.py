@@ -188,6 +188,9 @@ def save_state(release: Any, phase: str, **updates: Any) -> None:
             "component_digests": release.config.component_digests,
             "runtime_profile_version": release.config.runtime_profile_version,
             "runtime_profile_sha256": release.runtime_profile_sha,
+            "runtime_profile_source_sha256": release.runtime_profile_sha,
+            "runtime_profile_template_sha256": release.runtime_profile_template_sha,
+            "runtime_profile_policy_sha256": release.runtime_profile_policy_sha,
             "runtime_profile_registration_cluster_id": (
                 release.config.runtime_profile_registration_cluster_id
             ),

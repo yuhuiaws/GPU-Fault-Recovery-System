@@ -431,7 +431,9 @@ def test_root_readme_separates_developer_and_admin_deployment() -> None:
         "make PYTHON=.venv/bin/python release-deploy",
         "PROFILE_APPROVAL=CHG-12345",
         "profile-plan.json",
-        "deploy -> verify -> status",
+        "deploy -> verify -> release-summary",
+        "verification-report.json",
+        "SKIPPED_NOOP",
     ):
         assert value in developer
 

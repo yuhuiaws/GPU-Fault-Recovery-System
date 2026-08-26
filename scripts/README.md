@@ -16,9 +16,13 @@ generic fault-case runner.
 ## Directory roles
 
 - `release_deploy.py`: developer-facing build, site preparation, deploy,
-  verify and status pipeline used by `make release-deploy`. `ADMIN_EMAIL`
-  optionally overrides the site administrator address; otherwise the existing
-  site value or AWS account email discovery is used.
+  single-pass verify and lightweight release-summary pipeline used by
+  `make release-deploy`. It persists both reports under the release state
+  directory without repeating the live health checks. A proven same-release
+  NOOP skips the mutating deploy path and runs the independent verify checks
+  with bounded parallelism; uncertain classifications fall back to deploy.
+  `ADMIN_EMAIL` optionally overrides the site administrator address; otherwise
+  the existing site value or AWS account email discovery is used.
 - `scripts/e2e/`: live-cluster drivers and probes.
 - `scripts/e2e/manifests/`: test-only Kubernetes inputs named by procedures.
 - `scripts/perf/`: current capacity suites and reusable performance helpers.

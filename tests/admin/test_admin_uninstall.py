@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -7,6 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from gpu_fault import admin_aws_cleanup, admin_aws_commands, admin_uninstall
+from gpu_fault.admin_aws_cleanup import ordered_aurora_instances
 from gpu_fault.admin_bootstrap_common import BootstrapError
 from gpu_fault.admin_site import load_site
 from gpu_fault.admin_uninstall import (
@@ -74,6 +76,87 @@ def test_aws_verification_does_not_treat_access_denied_as_absent(
         cleaner.exists(_resource("aws/nlb/security-group", "security_group", "sg-test"))
 
 
+def test_external_ses_identity_is_supported_and_probed(tmp_path, monkeypatch) -> None:
+    site = load_site(site_file(tmp_path))
+    calls: list[list[str]] = []
+
+    def available(arguments, **kwargs):
+        del kwargs
+        calls.append(list(arguments))
+        return subprocess.CompletedProcess(
+            arguments, 0, stdout='{"IdentityType":"EMAIL_ADDRESS"}', stderr=""
+        )
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", available)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+    identity = _resource(
+        "aws/ses/administrator-email-identity",
+        "ses_email_identity",
+        "ops@example.com",
+        policy=InstallationResourceDeletePolicy.PRESERVE,
+    )
+
+    cleaner.validate_supported([identity])
+
+    assert cleaner.exists(identity) is True
+    assert calls == [
+        [
+            "aws",
+            "sesv2",
+            "get-email-identity",
+            "--region",
+            "us-east-1",
+            "--email-identity",
+            "ops@example.com",
+        ]
+    ]
+
+
+def test_last_sqs_topic_binding_clears_the_policy_attribute(
+    tmp_path, monkeypatch
+) -> None:
+    site = load_site(site_file(tmp_path))
+    calls: list[list[str]] = []
+    topic_arn = "arn:aws:sns:us-east-1:123456789012:test"
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": "sqs:SendMessage",
+                "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}},
+            }
+        ],
+    }
+    queue_reads = iter(
+        ({"Attributes": {"Policy": json.dumps(policy)}}, {"Attributes": {}})
+    )
+
+    def sqs(arguments, **kwargs):
+        del kwargs
+        calls.append(list(arguments))
+        if "get-queue-attributes" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=json.dumps(next(queue_reads)), stderr=""
+            )
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", sqs)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+    binding = _resource(
+        "aws/sqs/topic-policy-binding",
+        "sqs_policy_binding",
+        "https://sqs.us-east-1.amazonaws.com/123456789012/test",
+        policy=InstallationResourceDeletePolicy.DETACH,
+    ).model_copy(update={"attributes": {"topic_arn": topic_arn}})
+
+    cleaner.delete(binding)
+
+    set_call = next(call for call in calls if "set-queue-attributes" in call)
+    attributes = json.loads(set_call[set_call.index("--attributes") + 1])
+    assert attributes == {"Policy": ""}
+
+
 def test_gpu_cleanup_verification_uses_site_kubeconfig_environment(tmp_path) -> None:
     site = load_site(site_file(tmp_path))
     site = replace(
@@ -130,6 +213,29 @@ def test_aurora_cleanup_runs_after_non_aurora_resources(tmp_path) -> None:
     _delete_aurora_last(cleaner, snapshot, request, state)
 
     assert calls == ["aws/nlb", "aws/aurora/cluster"]
+
+
+def test_aurora_instances_are_deleted_readers_before_writer() -> None:
+    database = {
+        "DBClusterMembers": [
+            {"DBInstanceIdentifier": "writer", "IsClusterWriter": True},
+            {"DBInstanceIdentifier": "reader-b", "IsClusterWriter": False},
+            {"DBInstanceIdentifier": "reader-a", "IsClusterWriter": False},
+        ]
+    }
+    instances = [
+        {"DBInstanceIdentifier": "writer"},
+        {"DBInstanceIdentifier": "reader-b"},
+        {"DBInstanceIdentifier": "reader-a"},
+    ]
+
+    ordered = ordered_aurora_instances(database, instances)
+
+    assert [item["DBInstanceIdentifier"] for item in ordered] == [
+        "reader-a",
+        "reader-b",
+        "writer",
+    ]
 
 
 def test_legacy_reused_solution_resource_is_adopted_for_deletion() -> None:

@@ -370,6 +370,13 @@ for plane in ("cpu", "gpu"):
             ):
                 raise SystemExit(f"invalid node annotation: {annotation!r}")
             print("ANNOTATION", annotation, sep="\t")
+        labels = section.get("node_labels")
+        if not isinstance(labels, list) or not labels:
+            raise SystemExit("gpu.node_labels is empty")
+        for label in labels:
+            if not isinstance(label, str) or not label.startswith("gpu-fault.io/"):
+                raise SystemExit(f"invalid node label: {label!r}")
+            print("LABEL", label, sep="\t")
 PY
 )" || exit $?
 
@@ -394,6 +401,7 @@ GPU_EXECUTOR_DEPLOYMENTS=()
 GPU_DAEMONSETS=()
 GPU_DELETE_RESOURCES=()
 GPU_NODE_ANNOTATIONS=()
+GPU_NODE_LABELS=()
 while IFS=$'\t' read -r record first second third fourth fifth sixth; do
     case "${record}" in
         META)
@@ -453,6 +461,9 @@ while IFS=$'\t' read -r record first second third fourth fifth sixth; do
             ;;
         ANNOTATION)
             GPU_NODE_ANNOTATIONS+=("${first}")
+            ;;
+        LABEL)
+            GPU_NODE_LABELS+=("${first}")
             ;;
         *)
             die "unexpected config parser record: ${record}"
@@ -1099,14 +1110,21 @@ print(
         die "${cluster_id}: ${count} node(s) retain gpu-fault.io/quarantined; resolve their health and restore scheduling before reset"
 }
 
-clear_installer_annotations() {
+clear_node_metadata() {
     local context=$1
     local annotation
+    local label
     local arguments=()
     for annotation in "${GPU_NODE_ANNOTATIONS[@]}"; do
         arguments+=("${annotation}-")
     done
     gpu_kubectl "${context}" annotate nodes --all --overwrite \
+        "${arguments[@]}"
+    arguments=()
+    for label in "${GPU_NODE_LABELS[@]}"; do
+        arguments+=("${label}-")
+    done
+    gpu_kubectl "${context}" label nodes --all --overwrite \
         "${arguments[@]}"
 }
 
@@ -1306,7 +1324,7 @@ fi
 
 if [[ "${MODE}" == reset ]]; then
     for context in "${CLUSTER_CONTEXTS[@]}"; do
-        clear_installer_annotations "${context}"
+        clear_node_metadata "${context}"
     done
     transition_state \
         NAMESPACES_DELETED IN_PROGRESS \

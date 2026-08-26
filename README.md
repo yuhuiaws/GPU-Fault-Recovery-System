@@ -109,6 +109,13 @@ make test-parallel
 
 ## 部署：先区分角色
 
+所有生产部署开始前必须满足以下共同前提：
+
+1. 一个已有且至少有3个Ready节点的CPU EKS/HyperPod集群。
+2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`。
+3. GPU VPC已有NAT出口。
+4. 执行身份具有所需AWS、EKS和Kubernetes管理权限。
+
 不要直接 apply `deploy/`。开发者发布和管理员部署使用不同入口：
 
 | 角色 | 事实源 | 唯一正常入口 | 作用 |
@@ -137,21 +144,20 @@ make PYTHON=.venv/bin/python release-deploy \
 如果尚未提供审批引用，首次运行只生成
 `<site目录>/release-deploy/profile-plan.json`并停止，不会修改集群。统一入口随后固定
 执行：Profile差异检查、完整`make check`、三个wheel和Node bundle构建、release及
-Agent config digest更新、`deploy -> verify -> status`。普通代码发布不需要
+Agent config digest更新、`deploy -> verify -> release-summary`。`verify`只执行一次，
+报告保存为`verification-report.json`；`release-summary`只读取release state和制品引用，
+不会重复AWS、Aurora、NLB、AMP和集群健康检查。相同release ID被明确分类为`NOOP`时，
+记录`SKIPPED_NOOP`，跳过deploy内的preflight和NOOP verifier，直接执行一次最多8路
+并行的完整verify；
+分类缺失、异常或非NOOP时自动回退原安全部署路径。普通代码发布不需要
 `PROFILE_APPROVAL`，也不得手工修改generated Manifest、artifact摘要或Profile版本。
 完整实现见[开发者部署实现](docs/开发者部署实现.md)。
 
 ### 管理员：首次部署和日常管理
 
-管理员不从源代码手工build，也不编辑Profile版本或artifact摘要。首次自动部署要求：
-
-1. 一个已有且至少有3个Ready节点的CPU EKS/HyperPod集群。
-2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`。
-3. GPU VPC已有NAT出口。
-4. 执行身份具有所需AWS、EKS和Kubernetes管理权限。
-
-Region由管理员选择的集群ARN或`site.yaml`中的`spec.awsRegion`明确给出，不从shell或
-当前kubectl context猜测。完整权限和网络要求见[管理员快速部署](docs/管理员快速部署.md)。
+管理员不从源代码手工build，也不编辑Profile版本或artifact摘要。Region由管理员选择的
+集群ARN或`site.yaml`中的`spec.awsRegion`明确给出，不从shell或当前kubectl context
+猜测。完整权限和网络要求见[管理员快速部署](docs/管理员快速部署.md)。
 
 #### 1. 首次部署
 

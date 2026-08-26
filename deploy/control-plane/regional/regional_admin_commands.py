@@ -145,8 +145,8 @@ def run_deploy(release: Any) -> None:
     release.upgrade(diff=diff)
 
 
-def build_full_status(release: Any) -> dict[str, Any]:
-    health = build_health_report(release, mode="status")
+def build_release_summary(release: Any) -> dict[str, Any]:
+    result: dict[str, Any]
     try:
         result = build_release_status(release)
     except Exception as exc:
@@ -154,8 +154,7 @@ def build_full_status(release: Any) -> dict[str, Any]:
             "site_name": release.config.site_name,
             "release_status_error": str(exc),
         }
-    result["healthy"] = health["healthy"]
-    result["health"] = health
+    result["mode"] = "release-summary"
     try:
         state = release._load_state()
         retry_diff = (
@@ -171,4 +170,13 @@ def build_full_status(release: Any) -> dict[str, Any]:
         )
     except Exception as exc:
         result["next_deploy_error"] = str(exc)
+    return result
+
+
+def build_full_status(release: Any) -> dict[str, Any]:
+    health = build_health_report(release, mode="status")
+    result = build_release_summary(release)
+    result["mode"] = "status"
+    result["healthy"] = health["healthy"]
+    result["health"] = health
     return result

@@ -205,7 +205,27 @@
       "gpu-fault.io/installer-config-digest",
       "gpu-fault.io/installer-artifact-sha256",
       "gpu-fault.io/installer-node-uid",
-      "gpu-fault.io/installer-state"
+      "gpu-fault.io/installer-state",
+      "gpu-fault.io/incident-id",
+      "gpu-fault.io/fencing-token",
+      "gpu-fault.io/previous-unschedulable",
+      "gpu-fault.io/mechanical-inspection-complete",
+      "gpu-fault.io/efa-plugin-restart-operation",
+      "gpu-fault.io/efa-plugin-restart-pod-uid",
+      "gpu-fault.io/efa-plugin-restart-started-at",
+      "gpu-fault.io/gpu-plugin-restart-operation",
+      "gpu-fault.io/gpu-plugin-restart-pod-uid",
+      "gpu-fault.io/gpu-plugin-restart-started-at",
+      "gpu-fault.io/spare-reservation",
+      "gpu-fault.io/spare-pool-state",
+      "gpu-fault.io/spare-health",
+      "gpu-fault.io/spare-health-failures",
+      "gpu-fault.io/spare-health-incident",
+      "gpu-fault.io/spare-health-unavailable-at",
+      "gpu-fault.io/spare-health-last-alert-at"
+    ],
+    "node_labels": [
+      "gpu-fault.io/spare"
     ],
     "resources": [
       {

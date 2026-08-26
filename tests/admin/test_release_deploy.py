@@ -12,6 +12,26 @@ from scripts import release_deploy
 REGION = "us-east-1"
 
 
+def _verification_report() -> dict[str, object]:
+    return {
+        "mode": "verify",
+        "site_name": "test-site",
+        "healthy": True,
+        "summary": {"PASS": 12, "WARN": 0, "FAIL": 0, "SKIP": 0},
+        "checks": [{"name": "runtime_profile", "status": "PASS"}],
+    }
+
+
+def _release_summary(
+    kind: str = "NOOP", changed: list[str] | None = None
+) -> dict[str, object]:
+    return {
+        "mode": "release-summary",
+        "site_name": "test-site",
+        "next_deploy": {"kind": kind, "changed": changed or []},
+    }
+
+
 def _site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "repo"
     rollout = root / "deploy/control-plane/regional/rollout-regional-release.sh"
@@ -171,30 +191,100 @@ def test_prepare_site_release_updates_declared_release(
     )
 
 
-def test_execute_release_runs_one_ordered_pipeline(
+def test_execute_release_uses_verified_noop_fast_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     site = _site(tmp_path, monkeypatch)
-    calls: list[list[str]] = []
+    calls: list[tuple[str, list[str]]] = []
 
     monkeypatch.setattr(
         release_deploy,
         "_run",
-        lambda arguments, **_kwargs: calls.append(list(arguments)),
+        lambda arguments, **_kwargs: calls.append(("run", list(arguments))),
     )
+
+    def run_json(arguments, **_kwargs):
+        command = list(arguments)
+        calls.append(("json", command))
+        return _verification_report() if "verify" in command else _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
 
     profile = tmp_path / "repo/config/profile.yaml"
     prepared = release_deploy.execute_release(
         site,
         live_state={
-            "runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest()
+            "release_id": "release-a",
+            "runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
         },
     )
 
-    assert calls[0][-1] == "check"
-    assert [item[3] for item in calls[1:]] == ["deploy", "verify", "status"]
+    assert calls[0][1][-1] == "check"
+    assert calls[1][1][1] == "release-summary"
+    assert calls[2][1][3] == "verify"
+    assert len(calls) == 3
+    assert all("deploy" not in command for _kind, command in calls), (
+        "verified NOOP release still invoked the deploy command"
+    )
+    assert all("status" not in command for _kind, command in calls), (
+        "release-deploy repeated the full status command after verify"
+    )
+
+    verification_path = prepared.state_dir / release_deploy.VERIFICATION_REPORT
+    summary_path = prepared.state_dir / release_deploy.RELEASE_SUMMARY_REPORT
+    assert json.loads(verification_path.read_text())["healthy"] is True
+    assert json.loads(summary_path.read_text())["next_deploy"]["kind"] == "NOOP"
     state = json.loads((prepared.state_dir / "state.json").read_text())
     assert state["phase"] == "COMPLETED"
+    assert state["deployment"]["status"] == "SKIPPED_NOOP"
+    assert state["deployment"]["fast_path"] is True
+    assert state["verification"]["status"] == "PASSED"
+    assert state["release_summary"]["status"] == "AVAILABLE"
+    assert state["completion_warnings"] == []
+
+
+def test_execute_release_falls_back_to_deploy_for_non_noop_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    calls: list[tuple[str, list[str]]] = []
+    summaries = iter(
+        (
+            _release_summary("CONTROL_PLANE_ONLY", ["control_plane_wheel"]),
+            _release_summary(),
+        )
+    )
+    monkeypatch.setattr(
+        release_deploy,
+        "_run",
+        lambda arguments, **_kwargs: calls.append(("run", list(arguments))),
+    )
+
+    def run_json(arguments, **_kwargs):
+        command = list(arguments)
+        calls.append(("json", command))
+        return _verification_report() if "verify" in command else next(summaries)
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    prepared = release_deploy.execute_release(
+        site,
+        run_checks=False,
+        live_state={
+            "release_id": "release-a",
+            "runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
+        },
+    )
+
+    assert calls[0][1][1] == "release-summary"
+    assert calls[1][1][3] == "deploy"
+    assert calls[2][1][3] == "verify"
+    assert calls[3][1][1] == "release-summary"
+    state = json.loads((prepared.state_dir / "state.json").read_text())
+    assert state["deployment"]["status"] == "APPLIED"
+    assert state["deployment"]["fast_path"] is False
+    assert state["release_summary"]["next_deploy"]["kind"] == "NOOP"
 
 
 def test_execute_release_passes_admin_email_to_deploy(
@@ -207,6 +297,13 @@ def test_execute_release_passes_admin_email_to_deploy(
         "_run",
         lambda arguments, **_kwargs: calls.append(list(arguments)),
     )
+    monkeypatch.setattr(
+        release_deploy,
+        "_run_json",
+        lambda arguments, **_kwargs: (
+            _verification_report() if "verify" in arguments else _release_summary()
+        ),
+    )
     profile = tmp_path / "repo/config/profile.yaml"
 
     release_deploy.execute_release(
@@ -214,7 +311,8 @@ def test_execute_release_passes_admin_email_to_deploy(
         admin_email="ops@example.com",
         run_checks=False,
         live_state={
-            "runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest()
+            "release_id": "release-a",
+            "runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
         },
     )
 
@@ -228,11 +326,14 @@ def test_execute_release_records_failure(
 ) -> None:
     site = _site(tmp_path, monkeypatch)
 
+    monkeypatch.setattr(release_deploy, "_run", lambda *_args, **_kwargs: None)
+
     def fail_verify(arguments, **_kwargs):
         if "verify" in arguments:
             raise release_deploy.ReleaseDeployError("verify failed")
+        return _release_summary()
 
-    monkeypatch.setattr(release_deploy, "_run", fail_verify)
+    monkeypatch.setattr(release_deploy, "_run_json", fail_verify)
 
     with pytest.raises(release_deploy.ReleaseDeployError, match="verify failed"):
         profile = tmp_path / "repo/config/profile.yaml"
@@ -252,9 +353,39 @@ def test_execute_release_records_failure(
     assert "verify failed" in state["error"]
 
 
+def test_release_summary_failure_does_not_fail_verified_deployment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    monkeypatch.setattr(release_deploy, "_run", lambda *_args, **_kwargs: None)
+
+    def run_json(arguments, **_kwargs):
+        if "verify" in arguments:
+            return _verification_report()
+        raise release_deploy.ReleaseDeployError("summary endpoint unavailable")
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    prepared = release_deploy.execute_release(
+        site,
+        run_checks=False,
+        live_state={
+            "runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest()
+        },
+    )
+
+    state = json.loads((prepared.state_dir / "state.json").read_text())
+    assert state["phase"] == "COMPLETED"
+    assert state["verification"]["status"] == "PASSED"
+    assert state["release_summary"]["status"] == "UNAVAILABLE"
+    assert "summary endpoint unavailable" in state["completion_warnings"][0]
+
+
 def test_profile_change_requires_approval_and_generates_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv(release_deploy.PROFILE_APPROVAL_ENV, raising=False)
     site = _site(tmp_path, monkeypatch)
     profile = tmp_path / "repo/config/profile.yaml"
     initial = release_deploy.plan_runtime_profile(

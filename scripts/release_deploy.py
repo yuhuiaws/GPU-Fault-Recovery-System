@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -17,7 +18,11 @@ from gpu_fault.admin_bootstrap_common import (
     CommandRunner,
     compute_agent_config_digest,
 )
-from gpu_fault.admin_site import load_site
+from gpu_fault.admin_site import (
+    effective_environment,
+    load_site,
+    materialized_release_config,
+)
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.models import CapabilityMode, RuntimeProfile
 
@@ -26,6 +31,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SITE_ENV = "GPU_FAULT_SITE_FILE"
 PROFILE_APPROVAL_ENV = "PROFILE_APPROVAL"
 ADMIN_EMAIL_ENV = "GPU_FAULT_ADMIN_EMAIL"
+VERIFICATION_REPORT = "verification-report.json"
+RELEASE_SUMMARY_REPORT = "release-summary.json"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 APPROVAL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
@@ -580,6 +587,119 @@ def _run(
         )
 
 
+def _run_json(
+    arguments: Sequence[str], *, cwd: Path, environment: Mapping[str, str]
+) -> dict[str, Any]:
+    print("+ " + " ".join(arguments), file=sys.stderr, flush=True)
+    completed = subprocess.run(
+        list(arguments),
+        cwd=cwd,
+        env=dict(environment),
+        check=False,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    output = completed.stdout or ""
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n", flush=True)
+    if completed.returncode:
+        raise ReleaseDeployError(
+            f"command failed ({completed.returncode}): {arguments[0]}"
+        )
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ReleaseDeployError(
+            f"command returned invalid JSON: {arguments[0]}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ReleaseDeployError(
+            f"command returned a non-object JSON document: {arguments[0]}"
+        )
+    return value
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _verification_metadata(path: Path, report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "PASSED",
+        "path": str(path),
+        "sha256": _sha256(path),
+        "verified_at": _utc_now(),
+        "summary": report.get("summary"),
+    }
+
+
+def _validate_verification_report(report: dict[str, Any]) -> None:
+    if report.get("mode") != "verify":
+        raise ReleaseDeployError("verification command returned the wrong report mode")
+    if report.get("healthy") is not True:
+        raise ReleaseDeployError("verification report is not healthy")
+    summary = report.get("summary")
+    if not isinstance(summary, dict) or summary.get("FAIL") != 0:
+        raise ReleaseDeployError("verification report has an invalid summary")
+    if not isinstance(report.get("checks"), list):
+        raise ReleaseDeployError("verification report has no check evidence")
+
+
+def _collect_release_summary(
+    site_file: Path,
+    *,
+    root: Path,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    site = load_site(site_file, repository_root=root)
+    summary_environment = {
+        **effective_environment(site),
+        **environment,
+        **site.environment,
+        "GPU_FAULT_REPO_ROOT": str(root),
+    }
+    rollout = root / "deploy/control-plane/regional/rollout-regional-release.sh"
+    with materialized_release_config(site) as config:
+        return _run_json(
+            [
+                str(rollout),
+                "release-summary",
+                "--config",
+                str(config),
+            ],
+            cwd=root,
+            environment=summary_environment,
+        )
+
+
+def _release_summary_warnings(report: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    for field in ("release_status_error", "next_deploy_error"):
+        if report.get(field):
+            warnings.append(f"{field}: {report[field]}")
+    next_deploy = report.get("next_deploy")
+    if not isinstance(next_deploy, dict):
+        warnings.append("release summary has no next_deploy classification")
+    elif next_deploy.get("kind") != "NOOP":
+        warnings.append(
+            "release summary reports a non-NOOP next deploy: "
+            + json.dumps(next_deploy, sort_keys=True)
+        )
+    return warnings
+
+
+def _is_clean_noop_summary(report: dict[str, Any]) -> bool:
+    next_deploy = report.get("next_deploy")
+    return (
+        report.get("mode") == "release-summary"
+        and isinstance(next_deploy, dict)
+        and next_deploy.get("kind") == "NOOP"
+        and next_deploy.get("changed") == []
+        and not _release_summary_warnings(report)
+    )
+
+
 def _update_phase(prepared: PreparedRelease, phase: str, **values: Any) -> None:
     state_path = prepared.state_dir / "state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -629,6 +749,7 @@ def execute_release(
         profile_plan=profile_plan,
     )
     try:
+        effective_admin_email = admin_email or os.getenv(ADMIN_EMAIL_ENV)
         deploy_command = [
             sys.executable,
             "-m",
@@ -637,16 +758,66 @@ def execute_release(
             "-f",
             str(site_file),
         ]
-        effective_admin_email = admin_email or os.getenv(ADMIN_EMAIL_ENV)
         if effective_admin_email:
             deploy_command.extend(["--admin-email", effective_admin_email])
-        _run(
-            deploy_command,
-            cwd=root,
-            environment=environment,
-        )
-        _update_phase(prepared, "DEPLOYED")
-        _run(
+
+        summary_report: dict[str, Any] | None = None
+        summary_generated_at: str | None = None
+        deployment: dict[str, Any]
+        same_release = current_state.get("release_id") == prepared.release_id
+        if same_release and not effective_admin_email:
+            try:
+                candidate_summary = _collect_release_summary(
+                    site_file,
+                    root=root,
+                    environment=environment,
+                )
+            except Exception as exc:
+                deployment = {
+                    "status": "APPLIED",
+                    "fast_path": False,
+                    "reason": (
+                        "NOOP classification unavailable; used full deploy path: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+            else:
+                if _is_clean_noop_summary(candidate_summary):
+                    summary_report = candidate_summary
+                    summary_generated_at = _utc_now()
+                    deployment = {
+                        "status": "SKIPPED_NOOP",
+                        "fast_path": True,
+                        "reason": "live release summary classified desired state as NOOP",
+                        "next_deploy": candidate_summary["next_deploy"],
+                    }
+                else:
+                    deployment = {
+                        "status": "APPLIED",
+                        "fast_path": False,
+                        "reason": "live release summary requires deployment",
+                        "next_deploy": candidate_summary.get("next_deploy"),
+                    }
+        else:
+            reason = (
+                "administrator email override requires reconciliation"
+                if effective_admin_email
+                else "live release ID differs from the desired release"
+            )
+            deployment = {
+                "status": "APPLIED",
+                "fast_path": False,
+                "reason": reason,
+            }
+
+        if not deployment["fast_path"]:
+            _run(
+                deploy_command,
+                cwd=root,
+                environment=environment,
+            )
+        _update_phase(prepared, "DEPLOYED", deployment=deployment)
+        verification_report = _run_json(
             [
                 sys.executable,
                 "-m",
@@ -658,20 +829,52 @@ def execute_release(
             cwd=root,
             environment=environment,
         )
-        _update_phase(prepared, "VERIFIED")
-        _run(
-            [
-                sys.executable,
-                "-m",
-                "gpu_fault.admin_cli",
-                "status",
-                "-f",
-                str(site_file),
-            ],
-            cwd=root,
-            environment=environment,
+        _validate_verification_report(verification_report)
+        verification_path = prepared.state_dir / VERIFICATION_REPORT
+        _write_json_atomic(verification_path, verification_report)
+        verification = _verification_metadata(
+            verification_path,
+            verification_report,
         )
-        _update_phase(prepared, "COMPLETED")
+        _update_phase(prepared, "VERIFIED", verification=verification)
+
+        completion_warnings: list[str] = []
+        try:
+            if summary_report is None:
+                summary_report = _collect_release_summary(
+                    site_file,
+                    root=root,
+                    environment=environment,
+                )
+                summary_generated_at = _utc_now()
+            summary_path = prepared.state_dir / RELEASE_SUMMARY_REPORT
+            _write_json_atomic(summary_path, summary_report)
+            completion_warnings.extend(_release_summary_warnings(summary_report))
+            release_summary = {
+                "status": (
+                    "AVAILABLE_WITH_WARNINGS" if completion_warnings else "AVAILABLE"
+                ),
+                "path": str(summary_path),
+                "sha256": _sha256(summary_path),
+                "generated_at": summary_generated_at or _utc_now(),
+                "next_deploy": summary_report.get("next_deploy"),
+            }
+        except Exception as exc:
+            warning = f"release summary unavailable: {type(exc).__name__}: {exc}"
+            completion_warnings.append(warning)
+            release_summary = {
+                "status": "UNAVAILABLE",
+                "generated_at": _utc_now(),
+                "error": warning,
+            }
+            print(f"release-deploy: warning: {warning}", file=sys.stderr)
+        _update_phase(
+            prepared,
+            "COMPLETED",
+            verification=verification,
+            release_summary=release_summary,
+            completion_warnings=completion_warnings,
+        )
     except Exception as exc:
         _update_phase(
             prepared,
@@ -723,6 +926,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ReleaseDeployError, subprocess.SubprocessError, ValueError) as exc:
         print(f"release-deploy: {exc}", file=sys.stderr)
         return 2
+    state = json.loads((prepared.state_dir / "state.json").read_text(encoding="utf-8"))
     print(
         json.dumps(
             {
@@ -734,7 +938,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "agent_config_digest": prepared.agent_config_digest,
                 "site_changed": prepared.site_changed,
                 "state_dir": str(prepared.state_dir),
-                "phase": "COMPLETED",
+                "phase": state.get("phase"),
+                "deployment": state.get("deployment"),
+                "verification": state.get("verification"),
+                "release_summary": state.get("release_summary"),
+                "completion_warnings": state.get("completion_warnings", []),
             },
             indent=2,
             sort_keys=True,

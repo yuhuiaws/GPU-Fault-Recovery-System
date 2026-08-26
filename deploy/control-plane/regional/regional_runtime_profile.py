@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 import regional_deployment_inventory as inventory
@@ -67,6 +69,35 @@ def render_runtime_profile_payload(config: ReleaseConfig) -> dict[str, Any]:
     payload["cluster_id"] = config.runtime_profile_registration_cluster_id
     payload["profile_version"] = config.runtime_profile_version
     return payload
+
+
+def runtime_profile_policy_digest(path: Path) -> str:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ReleaseError("runtime profile source must contain one mapping")
+    policy = {
+        key: value
+        for key, value in document.items()
+        if key not in {"cluster_id", "profile_version"}
+    }
+    for field in ("claims", "observed"):
+        values = policy.get(field)
+        if isinstance(values, list):
+            policy[field] = sorted(
+                values,
+                key=lambda item: json.dumps(
+                    item,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+    return hashlib.sha256(
+        json.dumps(
+            policy,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 def inspect_runtime_profile(release: Any) -> dict[str, Any]:

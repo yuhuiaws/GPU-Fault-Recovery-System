@@ -696,6 +696,10 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
     cpu_kubeconfig = _resolve(root, site.spec.cpu.kubeconfig).resolve()
     release_manifest = _resolve(root, site.spec.release.manifest).resolve()
     profile_source = _resolve(root, site.spec.runtime_profile.source).resolve()
+    profile_template_source = _resolve(
+        root,
+        site.spec.runtime_profile.template_source,
+    ).resolve()
     clusters = []
     for cluster in site.spec.clusters:
         clusters.append(
@@ -726,6 +730,7 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
         "auto_rollback": site.spec.auto_rollback,
         "runtime_profile": {
             "source": str(profile_source),
+            "template_source": str(profile_template_source),
             "version": site.spec.runtime_profile.version,
             "registration_cluster_id": (
                 site.spec.runtime_profile.registration_cluster_id

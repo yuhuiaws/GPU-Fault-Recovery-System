@@ -322,7 +322,11 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "--profile-approval" in target
     assert "make PYTHON=.venv/bin/python release-deploy" in developer
     assert "PROFILE_APPROVAL=CHG-12345" in developer
-    assert "deploy -> verify -> status" in developer
+    assert "deploy -> verify -> release-summary" in developer
+    assert "verification-report.json" in developer
+    assert "release-summary.json" in developer
+    assert "SKIPPED_NOOP" in developer
+    assert "最多8路并行" in developer
     assert "### 9.1 普通代码修改后的build与部署升级" in developer
     for kind in ("NOOP", "CONTROL_PLANE_ONLY", "DATA_PLANE_COMPATIBLE", "FULL"):
         assert kind in developer

@@ -46,6 +46,7 @@ SUPPORTED_RESOURCE_TYPES = frozenset(
         "route53_record",
         "route53_vpc_association",
         "route53_zone",
+        "ses_email_identity",
         "secretsmanager_secret",
         "security_group",
         "sns_subscription",
@@ -71,6 +72,7 @@ DELETE_PRIORITY = {
     "sqs_queue": 60,
     "acm_certificate": 60,
     "secretsmanager_secret": 60,
+    "ses_email_identity": 60,
     "iam_role": 70,
     "iam_policy": 80,
     "iam_oidc_provider": 80,
@@ -90,6 +92,24 @@ AURORA_RESOURCE_TYPES = frozenset(
         "rds_managed_secret",
     }
 )
+
+
+def ordered_aurora_instances(
+    database: dict[str, Any],
+    instances: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    writers = {
+        str(member.get("DBInstanceIdentifier") or "")
+        for member in database.get("DBClusterMembers", [])
+        if member.get("IsClusterWriter")
+    }
+    return sorted(
+        instances,
+        key=lambda instance: (
+            str(instance.get("DBInstanceIdentifier") or "") in writers,
+            str(instance.get("DBInstanceIdentifier") or ""),
+        ),
+    )
 
 
 class ResourceProbe:
@@ -351,6 +371,16 @@ class ResourceProbe:
                     arn,
                 ),
                 not_found=("NotFound", "NotFoundException"),
+            )
+        if resource_type == "ses_email_identity":
+            return self._exists_command(
+                self._aws(
+                    "sesv2",
+                    "get-email-identity",
+                    "--email-identity",
+                    identifier,
+                ),
+                not_found=("NotFoundException",),
             )
         if resource_type in {"sqs_queue", "sqs_policy_binding"}:
             document = _json(
@@ -674,6 +704,7 @@ class ResourceDeletion(ResourceProbe):
             if topic_arn not in json.dumps(statement, sort_keys=True)
         ]
         policy["Statement"] = statements
+        policy_value = json.dumps(policy, separators=(",", ":")) if statements else ""
         _checked(
             self._aws(
                 "sqs",
@@ -682,12 +713,7 @@ class ResourceDeletion(ResourceProbe):
                 resource.resource_id,
                 "--attributes",
                 json.dumps(
-                    {
-                        "Policy": json.dumps(
-                            policy,
-                            separators=(",", ":"),
-                        )
-                    },
+                    {"Policy": policy_value},
                     separators=(",", ":"),
                 ),
             ),
@@ -1007,6 +1033,16 @@ class ResourceDeletion(ResourceProbe):
                     "--force-delete-without-recovery",
                 ),
                 not_found=("ResourceNotFoundException",),
+            )
+        elif resource_type == "ses_email_identity":
+            _checked(
+                self._aws(
+                    "sesv2",
+                    "delete-email-identity",
+                    "--email-identity",
+                    identifier,
+                ),
+                not_found=("NotFoundException",),
             )
         else:
             return False
@@ -1388,9 +1424,12 @@ class ClusterDeletion(ResourceDeletion):
                 f"Name=db-cluster-id,Values={cluster.resource_id}",
             )
         )
-        for instance in cast(
-            list[dict[str, Any]],
-            (document or {}).get("DBInstances", []),
+        for instance in ordered_aurora_instances(
+            database,
+            cast(
+                list[dict[str, Any]],
+                (document or {}).get("DBInstances", []),
+            ),
         ):
             instance_id = instance["DBInstanceIdentifier"]
             if str(instance.get("DBInstanceStatus") or "") != "deleting":
