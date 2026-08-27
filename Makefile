@@ -25,7 +25,7 @@ DOCUMENTATION_TESTS = \
 	tests/test_fault_evidence.py \
 	tests/test_doc_impact.py
 
-.PHONY: test test-postgres test-parallel coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check release-preflight release-deploy architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-parallel coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check release-preflight release-deploy architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
@@ -51,6 +51,11 @@ test-postgres:
 		tests/store/test_postgres_processor_claim.py \
 		tests/store/test_postgres_reconnect.py \
 		tests/store/test_store_contracts.py
+
+test-postgres-stress:
+	GPU_FAULT_POSTGRES_LOCK_STRESS_WORKERS=8 \
+	GPU_FAULT_POSTGRES_LOCK_STRESS_ROUNDS=40 \
+		$(MAKE) test-postgres PYTHON="$(PYTHON)"
 
 fault-test-cases:
 	$(PYTHON) tools/run_fault_test_cases.py

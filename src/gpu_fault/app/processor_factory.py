@@ -123,6 +123,18 @@ class ProcessorFactory:
                     "300",
                 )
             ),
+            "retry_backoff_seconds": float(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS",
+                    "1",
+                )
+            ),
+            "retry_backoff_max_seconds": float(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS",
+                    "30",
+                )
+            ),
             "idle_backoff_max_seconds": float(
                 os.getenv("GPU_FAULT_PROCESSOR_IDLE_BACKOFF_MAX_SECONDS", "2")
             ),

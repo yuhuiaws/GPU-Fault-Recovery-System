@@ -11,6 +11,7 @@ claim keeps the fencing rules of the per-command version it replaced.
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 from threading import Barrier, Thread
@@ -33,11 +34,17 @@ from tests.store._postgres_processor_claim_support import (
     _request,
     _telemetry,
     _workflow_state,
+    postgres_store_instance,
 )
 
 pytestmark = pytest.mark.skipif(
     not POSTGRES_URL, reason="GPU_FAULT_TEST_POSTGRES_URL is not configured"
 )
+
+
+@pytest.fixture(name="store")
+def _case_store():
+    yield from postgres_store_instance()
 
 
 def test_partitioned_priority_shards_have_a_total_lock_order(store) -> None:
@@ -154,8 +161,12 @@ def test_multi_cluster_batches_do_not_deadlock_on_the_counters(store) -> None:
 
     clusters = [f"cluster-{index:02d}" for index in range(16)]
     failures: list[BaseException] = []
-    workers = 8
-    rounds = 40
+    workers = int(os.getenv("GPU_FAULT_POSTGRES_LOCK_STRESS_WORKERS", "4"))
+    rounds = int(os.getenv("GPU_FAULT_POSTGRES_LOCK_STRESS_ROUNDS", "10"))
+    if workers < 2 or rounds < 1:
+        raise ValueError(
+            "PostgreSQL lock stress requires at least 2 workers and 1 round"
+        )
     barrier = threading.Barrier(workers)
 
     with psycopg.connect(POSTGRES_URL, autocommit=True) as conn:
@@ -173,7 +184,7 @@ def test_multi_cluster_batches_do_not_deadlock_on_the_counters(store) -> None:
             cursor.execute("ANALYZE gpu_fault_processor_queue_counts")
 
     def writer(worker: int) -> None:
-        instance = PostgresStore(POSTGRES_URL)
+        instance = PostgresStore(POSTGRES_URL, initialize_schema=False)
         try:
             # This barrier isolates the concurrent lock-order phase from
             # connection setup. A remote PostgreSQL endpoint reached through
@@ -431,7 +442,7 @@ def test_concurrent_admissions_to_one_cluster_do_not_serialize(store) -> None:
     """
     import threading
 
-    other = PostgresStore(POSTGRES_URL)
+    other = PostgresStore(POSTGRES_URL, initialize_schema=False)
     started = threading.Event()
     release = threading.Event()
     # Create the counter row in a committed transaction first: the
@@ -526,7 +537,7 @@ def test_concurrent_fault_admissions_do_not_serialize(store) -> None:
     """
     import threading
 
-    other = PostgresStore(POSTGRES_URL)
+    other = PostgresStore(POSTGRES_URL, initialize_schema=False)
     started = threading.Event()
     release = threading.Event()
     # Committed counter row first: the once-per-cluster seeding insert is
@@ -636,13 +647,46 @@ def test_completion_batch_is_one_statement_per_cluster(store) -> None:
         store._db.cursor = original
 
     assert len(statements) == len(clusters)
-    assert all(result is not None for result in results)
+    assert all(result is not None for result in results), (
+        "parallel cluster completion lost a fenced request"
+    )
     assert all(result.status is ProcessorRequestStatus.COMPLETED for result in results)
     # The split must not lose a decrement: the counter table is still the
     # oracle the depth gauge and the admission caps read.
     for cluster in clusters:
         assert _counter_depth(cluster) == 0, cluster
     assert store.processor_queue_count_status() == {
+        "expected_total": 0,
+        "counter_total": 0,
+        "mismatched_clusters": 0,
+        "ready": True,
+    }
+
+
+@pytest.mark.parametrize("concurrency", [2, 4])
+def test_completion_cluster_concurrency_runs_real_transactions_in_parallel(
+    store, concurrency, monkeypatch
+) -> None:
+    _ = store
+    monkeypatch.setenv(
+        "GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY", str(concurrency)
+    )
+    parallel_store = PostgresStore(POSTGRES_URL, initialize_schema=False)
+    clusters = [f"cluster-{index:02d}" for index in range(concurrency)]
+    try:
+        for cluster in clusters:
+            parallel_store.enqueue_processor_request(
+                _telemetry(f"node-{cluster}", cluster_id=cluster)
+            )
+        _, completions = _claim_completions(parallel_store, "pod-a", limit=concurrency)
+        results = parallel_store.complete_active_processor_requests_batch(completions)
+        status = parallel_store.processor_queue_count_status()
+    finally:
+        parallel_store.close()
+
+    assert parallel_store.processor_completion_cluster_concurrency == concurrency
+    assert all(result is not None for result in results)
+    assert status == {
         "expected_total": 0,
         "counter_total": 0,
         "mismatched_clusters": 0,

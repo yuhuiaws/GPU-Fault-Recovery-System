@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib
 import inspect
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import get_type_hints
 from uuid import uuid4
@@ -26,6 +29,9 @@ from gpu_fault.store.postgres.processor_admission import PostgresProcessorAdmiss
 from gpu_fault.store.postgres.processor_claims import PostgresProcessorClaimsMixin
 from gpu_fault.store.postgres.processor_completion import (
     PostgresProcessorCompletionMixin,
+)
+from gpu_fault.store.postgres.processor_completion_runtime import (
+    complete_cluster_groups,
 )
 from gpu_fault.store.postgres.processor_leases import PostgresProcessorLeaseMixin
 from gpu_fault.store.postgres.processor_storage import PostgresProcessorStorageMixin
@@ -413,7 +419,36 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
         4: "9ce8369e79e881c566bc429c72a157a0e7fe6a2557bcf2b4d050f2565db2b947",
         5: "884820da9fdf5521dad40dffd8a40b1a3acf415de1871f563202eafd083ebb97",
     }
-    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 6
+    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 7
+
+
+def test_completion_cluster_groups_use_bounded_parallelism() -> None:
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    started = threading.Barrier(2)
+
+    def complete(batch):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        started.wait(timeout=2)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return {batch[0]: batch[0]}
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        completed = complete_cluster_groups(
+            {"cluster-a": ["a"], "cluster-b": ["b"]},
+            concurrency=2,
+            executor=executor,
+            complete=complete,
+        )
+
+    assert completed == {"a": "a", "b": "b"}
+    assert max_active == 2
 
 
 def test_store_inheritance_is_an_explicit_reviewed_contract() -> None:

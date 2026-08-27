@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import logging
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from enum import StrEnum
 from uuid import uuid4
@@ -27,6 +28,11 @@ class ProcessorRequestStatus(StrEnum):
     PENDING = "PENDING"
     LEASED = "LEASED"
     COMPLETED = "COMPLETED"
+
+
+class ProcessorLanePolicy(StrEnum):
+    STRICT = "STRICT"
+    REORDERABLE = "REORDERABLE"
 
 
 class ProcessorLeadership(StrictModel):
@@ -80,6 +86,9 @@ class ProcessorRequest(StrictModel):
     response_status: int | None = None
     response_content_type: str | None = None
     response_body_base64: str | None = None
+    not_before: datetime | None = None
+    retry_count: int = Field(default=0, ge=0)
+    lane_policy: ProcessorLanePolicy = ProcessorLanePolicy.STRICT
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     _ordering_key_cache: tuple[str, str, str, str] | None = PrivateAttr(default=None)
@@ -154,6 +163,13 @@ class ProcessorRequest(StrictModel):
                         separators=(",", ":"),
                     )
                 )
+        lane_policy = ProcessorLanePolicy.STRICT
+        if (
+            channel is not None
+            and channel.latest_wins
+            and channel.priority(payload) == 100
+        ):
+            lane_policy = ProcessorLanePolicy.REORDERABLE
         return cls(
             method=method,
             path=path,
@@ -164,6 +180,7 @@ class ProcessorRequest(StrictModel):
             correlation_key=correlation_key,
             correlation_scope_keys=correlation_scope_keys,
             execution_authorized=execution_authorized,
+            lane_policy=lane_policy,
         )
 
     def body(self) -> bytes:
@@ -173,6 +190,16 @@ class ProcessorRequest(StrictModel):
         if self.response_body_base64 is None:
             return b""
         return base64.b64decode(self.response_body_base64)
+
+    def available_for_claim(self, now: datetime) -> bool:
+        return self.not_before is None or self.not_before <= now
+
+    def is_strict_retry_barrier(self, now: datetime) -> bool:
+        return (
+            self.status is ProcessorRequestStatus.PENDING
+            and self.lane_policy is ProcessorLanePolicy.STRICT
+            and not self.available_for_claim(now)
+        )
 
     def ordering_key(self) -> str:
         # ``model_copy`` carries private attributes over, so the cache is
@@ -439,3 +466,31 @@ class ProcessorRequest(StrictModel):
                 self.correlation_scope_keys
             )
         )
+
+
+def deferred_strict_processor_lanes(
+    requests: Iterable[ProcessorRequest],
+    now: datetime,
+) -> set[str]:
+    return {
+        request.ordering_key()
+        for request in requests
+        if request.is_strict_retry_barrier(now)
+    }
+
+
+def processor_request_claimable(
+    request: ProcessorRequest,
+    *,
+    now: datetime,
+    deferred_strict_lanes: set[str],
+) -> bool:
+    if request.status is ProcessorRequestStatus.PENDING:
+        if not request.available_for_claim(now):
+            return False
+    elif not (
+        request.status is ProcessorRequestStatus.LEASED
+        and (request.lease_expires_at is None or request.lease_expires_at <= now)
+    ):
+        return False
+    return request.ordering_key() not in deferred_strict_lanes

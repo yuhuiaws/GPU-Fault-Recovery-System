@@ -62,6 +62,18 @@ WITH claim_window AS MATERIALIZED (
         )
     )
       AND (
+          candidate.not_before IS NULL
+          OR candidate.not_before <= %s
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM gpu_fault_processor_queue AS retry_barrier
+          WHERE retry_barrier.ordering_key=candidate.ordering_key
+            AND retry_barrier.status='PENDING'
+            AND retry_barrier.lane_policy='STRICT'
+            AND retry_barrier.not_before > %s
+      )
+      AND (
           %s
           OR candidate.payload->>'path'=ANY(%s)
       )
@@ -242,6 +254,9 @@ updated AS (
         queue.response_status,
         queue.response_content_type,
         queue.response_body_base64,
+        queue.not_before,
+        queue.retry_count,
+        queue.lane_policy,
         queue.updated_at
 )
 SELECT {{effective_payload}}
@@ -337,6 +352,20 @@ class PostgresProcessorClaimsMixin:
                                 AND candidate.lease_expires_at <= %s
                             )
                         )
+                          AND (
+                              candidate.not_before IS NULL
+                              OR candidate.not_before <= %s
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM gpu_fault_processor_queue
+                                   AS retry_barrier
+                              WHERE retry_barrier.ordering_key
+                                    = candidate.ordering_key
+                                AND retry_barrier.status='PENDING'
+                                AND retry_barrier.lane_policy='STRICT'
+                                AND retry_barrier.not_before > %s
+                          )
                           AND NOT (
                               candidate.payload->>'path' IN (
 {_fault_path_list_sql(34)}
@@ -390,7 +419,7 @@ class PostgresProcessorClaimsMixin:
                     LIMIT %s
                     FOR UPDATE OF queue SKIP LOCKED
                     """,
-                    (now, now, limit),
+                    (now, now, now, now, limit),
                 )
                 rows = cursor.fetchall()
             claimed = []
@@ -467,6 +496,8 @@ class PostgresProcessorClaimsMixin:
                     (
                         routine_starvation_before,
                         now,
+                        now,
+                        now,
                         not included,
                         included,
                         not excluded,
@@ -520,6 +551,19 @@ class PostgresProcessorClaimsMixin:
                         )
                     )
                       AND (
+                          candidate.not_before IS NULL
+                          OR candidate.not_before <= %s
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gpu_fault_processor_queue AS retry_barrier
+                          WHERE retry_barrier.ordering_key
+                                = candidate.ordering_key
+                            AND retry_barrier.status='PENDING'
+                            AND retry_barrier.lane_policy='STRICT'
+                            AND retry_barrier.not_before > %s
+                      )
+                      AND (
                           %s
                           OR candidate.payload->>'path'=ANY(%s)
                       )
@@ -534,6 +578,8 @@ class PostgresProcessorClaimsMixin:
                 )
                 """,
                 (
+                    now,
+                    now,
                     now,
                     not included,
                     included,

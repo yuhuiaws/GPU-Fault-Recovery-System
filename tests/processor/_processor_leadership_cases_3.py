@@ -13,6 +13,7 @@ import pytest
 from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.processor import (
     ProcessorCoordinator,
+    ProcessorLanePolicy,
     ProcessorRequest,
     ProcessorRequestStatus,
     processor_partition_id,
@@ -403,6 +404,8 @@ def test_processor_retries_fresh_5xx_but_bounds_old_requests(
         internal_token="processor-token",
         active_consumers=True,
         retryable_response_max_age_seconds=300,
+        retry_backoff_seconds=2,
+        retry_backoff_max_seconds=10,
     )
 
     class Response:
@@ -428,8 +431,97 @@ def test_processor_retries_fresh_5xx_but_bounds_old_requests(
     assert current.status is expected_status
     if expected_status is ProcessorRequestStatus.PENDING:
         assert current.response_status is None
+        assert current.retry_count == 1
+        assert current.not_before is not None
+        assert current.not_before > datetime.now(timezone.utc)
+        assert current.lane_policy is ProcessorLanePolicy.REORDERABLE
+        assert (
+            store.claim_active_processor_requests(
+                "pod-b:1",
+                now=datetime.now(timezone.utc),
+                lease_duration=REQUEST_LEASE,
+                limit=1,
+            )
+            == []
+        )
+        retried = store.claim_active_processor_requests(
+            "pod-b:1",
+            now=current.not_before + timedelta(milliseconds=1),
+            lease_duration=REQUEST_LEASE,
+            limit=1,
+        )
+        assert [item.request_id for item in retried] == [request.request_id]
+        metrics = processor.metrics_snapshot()
+        assert metrics["retry_rescheduled_total"] == 1
+        assert metrics["retry_delay_seconds_max"] == pytest.approx(2)
     else:
         assert current.response_status == 503
+
+
+def test_deferred_strict_retry_blocks_lane_but_reorderable_retry_does_not(
+    stores,
+) -> None:
+    first, _ = stores
+    now = datetime.now(timezone.utc)
+    strict = copy_model(
+        processor_request(
+            "/v1/collector-events/host-telemetry",
+            body=b'{"node_id":"node-a","edge_filter_reasons":["threshold:cpu"]}',
+        ),
+        not_before=now + timedelta(seconds=30),
+        lane_policy=ProcessorLanePolicy.STRICT,
+    )
+    later = processor_request(
+        "/v1/collector-events/host-telemetry",
+        body=b'{"node_id":"node-a","edge_filter_reasons":["recovered"]}',
+    )
+    first.enqueue_processor_request(strict)
+    first.enqueue_processor_request(later)
+
+    assert (
+        first.claim_active_processor_requests(
+            "pod-a:1", now=now, lease_duration=REQUEST_LEASE, limit=2
+        )
+        == []
+    )
+
+    first = build_store()
+    reorderable = copy_model(
+        strict,
+        request_id="processor-reorderable",
+        lane_policy=ProcessorLanePolicy.REORDERABLE,
+    )
+    first.enqueue_processor_request(reorderable)
+    first.enqueue_processor_request(later)
+    claimed = first.claim_active_processor_requests(
+        "pod-a:1", now=now, lease_duration=REQUEST_LEASE, limit=2
+    )
+    assert [item.request_id for item in claimed] == [later.request_id]
+
+
+def test_graceful_shutdown_releases_claimed_not_started_request() -> None:
+    store = build_store()
+    request = store.enqueue_processor_request(
+        processor_request("/v1/collector-events/host-telemetry")
+    )
+    claimed = store.claim_active_processor_requests(
+        "pod-a:1", now=datetime.now(timezone.utc), lease_duration=REQUEST_LEASE, limit=1
+    )[0]
+    processor = ProcessorCoordinator(
+        store,
+        owner_id="pod-a:1",
+        internal_token="processor-token",
+        active_consumers=True,
+    )
+
+    processor.register_claimed_requests([claimed])
+    processor.release_unstarted_claims()
+
+    current = store.get_processor_request(request.request_id)
+    assert current.status is ProcessorRequestStatus.PENDING
+    metrics = processor.metrics_snapshot()
+    assert metrics["claimed_not_started"] == 0
+    assert metrics["claimed_not_started_released_total"] == 1
 
 
 def test_processor_releases_after_completion_retries_fail(monkeypatch) -> None:
@@ -502,11 +594,13 @@ def test_processor_reports_in_flight_phase() -> None:
     snapshot = processor.in_flight_snapshot()
     runtime = processor.metrics_snapshot()
     processor._request_finished(claimed.request_id)
+    completed_runtime = processor.metrics_snapshot()
 
     assert snapshot[0]["request_id"] == request.request_id
     assert snapshot[0]["phase"] == "replay_http"
     assert snapshot[0]["phase_elapsed_seconds"] >= 0
     assert runtime["in_flight_by_phase"]["replay_http"]["count"] == 1
+    assert completed_runtime["lane_holder_by_path"]["/v1/gpu-events/xid"]["count"] == 1
 
 
 def test_idle_streams_back_off_with_a_short_fault_ceiling() -> None:

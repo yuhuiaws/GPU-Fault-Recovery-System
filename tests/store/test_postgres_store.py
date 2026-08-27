@@ -55,9 +55,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _store() -> PostgresStore:
+@pytest.fixture(scope="module", autouse=True)
+def initialized_postgres_schema():
+    if POSTGRES_URL is None:
+        yield
+        return
+    store = PostgresStore(POSTGRES_URL)
+    store.close()
+    yield
+
+
+def _store(*, initialize_schema: bool = False) -> PostgresStore:
     assert POSTGRES_URL is not None
-    return PostgresStore(POSTGRES_URL)
+    return PostgresStore(POSTGRES_URL, initialize_schema=initialize_schema)
 
 
 def test_latest_migration_is_derived_from_current_ddl() -> None:
@@ -109,6 +119,42 @@ def test_postgres_processor_queue_has_no_virtual_partition_state() -> None:
     assert column_exists is False
     assert obsolete_indexes == []
     assert "'partition'" not in notify_function
+
+
+def test_postgres_processor_retry_schedule_schema_is_present() -> None:
+    store = _store()
+    store.close()
+    assert POSTGRES_URL is not None
+    import psycopg
+
+    with psycopg.connect(POSTGRES_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema=current_schema()
+                  AND table_name='gpu_fault_processor_queue'
+                  AND column_name IN (
+                      'not_before',
+                      'retry_count',
+                      'lane_policy'
+                  )
+                ORDER BY column_name
+                """
+            )
+            columns = [row[0] for row in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT to_regclass(
+                    'gpu_fault_processor_queue_available'
+                )
+                """
+            )
+            available_index = cursor.fetchone()[0]
+
+    assert columns == ["lane_policy", "not_before", "retry_count"]
+    assert available_index == "gpu_fault_processor_queue_available"
 
 
 def test_postgres_schema_migration_apply_callback_runs() -> None:
@@ -179,7 +225,7 @@ def test_postgres_schema_version_fails_closed() -> None:
         with pytest.raises(RuntimeError, match="schema version mismatch"):
             PostgresStore(POSTGRES_URL, initialize_schema=False)
     finally:
-        repaired = _store()
+        repaired = _store(initialize_schema=True)
         repaired.close()
 
 
@@ -234,7 +280,7 @@ def test_postgres_missing_spool_path_index_fails_closed() -> None:
         with pytest.raises(RuntimeError, match="schema is not initialized"):
             PostgresStore(POSTGRES_URL, initialize_schema=False)
     finally:
-        repaired = _store()
+        repaired = _store(initialize_schema=True)
         repaired.close()
 
 
@@ -257,7 +303,7 @@ def test_postgres_missing_processor_notify_trigger_fails_closed() -> None:
         with pytest.raises(RuntimeError, match="notification trigger is missing"):
             PostgresStore(POSTGRES_URL, initialize_schema=False)
     finally:
-        repaired = _store()
+        repaired = _store(initialize_schema=True)
         repaired.close()
 
 
@@ -281,7 +327,7 @@ def test_postgres_missing_spool_notify_trigger_fails_closed() -> None:
         ):
             PostgresStore(POSTGRES_URL, initialize_schema=False)
     finally:
-        repaired = _store()
+        repaired = _store(initialize_schema=True)
         repaired.close()
 
 
@@ -305,7 +351,7 @@ def test_postgres_missing_fault_counter_trigger_fails_closed() -> None:
         ):
             PostgresStore(POSTGRES_URL, initialize_schema=False)
     finally:
-        repaired = _store()
+        repaired = _store(initialize_schema=True)
         repaired.close()
 
 

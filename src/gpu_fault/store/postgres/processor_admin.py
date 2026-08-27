@@ -124,11 +124,31 @@ class PostgresProcessorAdminMixin:
                         response_body_base64=coalesce(
                             response_body_base64,
                             payload->>'response_body_base64'
+                        ),
+                        not_before=coalesce(
+                            not_before,
+                            nullif(payload->>'not_before', '')::timestamptz
+                        ),
+                        retry_count=coalesce(
+                            nullif(payload->>'retry_count', '')::integer,
+                            retry_count
+                        ),
+                        lane_policy=coalesce(
+                            nullif(payload->>'lane_policy', ''),
+                            lane_policy
                         )
                     WHERE
                         response_status IS NULL
                         OR response_content_type IS NULL
                         OR response_body_base64 IS NULL
+                        OR (
+                            not_before IS NULL
+                            AND nullif(payload->>'not_before', '') IS NOT NULL
+                        )
+                        OR nullif(payload->>'retry_count', '')::integer
+                           IS DISTINCT FROM retry_count
+                        OR coalesce(payload->>'lane_policy', 'STRICT')
+                           IS DISTINCT FROM lane_policy
                     """
                 )
                 return cursor.rowcount
@@ -190,7 +210,22 @@ class PostgresProcessorAdminMixin:
                           AND payload->>'response_body_base64'
                               IS DISTINCT FROM
                                   response_body_base64
-                    ) AS response_body_mismatch
+                    ) AS response_body_mismatch,
+                    count(*) FILTER (
+                        WHERE nullif(payload->>'not_before', '')::timestamptz
+                              IS DISTINCT FROM not_before
+                    ) AS not_before_mismatch,
+                    count(*) FILTER (
+                        WHERE coalesce(
+                                  nullif(payload->>'retry_count', '')::integer,
+                                  0
+                              )
+                              IS DISTINCT FROM retry_count
+                    ) AS retry_count_mismatch,
+                    count(*) FILTER (
+                        WHERE coalesce(payload->>'lane_policy', 'STRICT')
+                              IS DISTINCT FROM lane_policy
+                    ) AS lane_policy_mismatch
                 FROM gpu_fault_processor_queue
                 """
             )
@@ -206,6 +241,9 @@ class PostgresProcessorAdminMixin:
             "response_status_mismatch",
             "response_content_type_mismatch",
             "response_body_mismatch",
+            "not_before_mismatch",
+            "retry_count_mismatch",
+            "lane_policy_mismatch",
         ]
         result = {name: int(value) for name, value in zip(names, row, strict=True)}
         result["ready"] = all(result[name] == 0 for name in names[1:])

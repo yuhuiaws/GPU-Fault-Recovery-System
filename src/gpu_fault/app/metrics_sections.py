@@ -48,6 +48,13 @@ def render_processor_metrics_1(
             "# HELP gpu_fault_processor_in_flight Processor replay calls currently executing.",
             "# TYPE gpu_fault_processor_in_flight gauge",
             f"gpu_fault_processor_in_flight {runtime['in_flight']}",
+            "# HELP gpu_fault_processor_claimed_not_started Claimed processor requests waiting for an execution worker.",
+            "# TYPE gpu_fault_processor_claimed_not_started gauge",
+            f"gpu_fault_processor_claimed_not_started {runtime.get('claimed_not_started', 0)}",
+            "# HELP gpu_fault_processor_claimed_not_started_released_total Claimed requests released during graceful processor shutdown before execution began.",
+            "# TYPE gpu_fault_processor_claimed_not_started_released_total counter",
+            "gpu_fault_processor_claimed_not_started_released_total "
+            f"{runtime.get('claimed_not_started_released_total', 0)}",
             "# HELP gpu_fault_processor_oldest_in_flight_seconds Elapsed time of the oldest executing replay call.",
             "# TYPE gpu_fault_processor_oldest_in_flight_seconds gauge",
             f"gpu_fault_processor_oldest_in_flight_seconds {runtime['oldest_in_flight_seconds']:.6f}",
@@ -107,6 +114,14 @@ def render_processor_metrics_2(
             "# HELP gpu_fault_processor_completion_failures_total Queue completions released after exhausting retries.",
             "# TYPE gpu_fault_processor_completion_failures_total counter",
             f"gpu_fault_processor_completion_failures_total {runtime['completion_failures_total']}",
+            "# HELP gpu_fault_processor_retry_rescheduled_total Retryable responses rescheduled with a future not-before time.",
+            "# TYPE gpu_fault_processor_retry_rescheduled_total counter",
+            f"gpu_fault_processor_retry_rescheduled_total {runtime.get('retry_rescheduled_total', 0)}",
+            "# HELP gpu_fault_processor_retry_delay_seconds_max Longest retry delay scheduled by this processor.",
+            "# TYPE gpu_fault_processor_retry_delay_seconds_max gauge",
+            f"gpu_fault_processor_retry_delay_seconds_max {runtime.get('retry_delay_seconds_max', 0.0):.6f}",
+            "# HELP gpu_fault_processor_retry_rescheduled_by_path_total Retryable responses rescheduled by normalized request path.",
+            "# TYPE gpu_fault_processor_retry_rescheduled_by_path_total counter",
             "# HELP gpu_fault_processor_stale_superseded_total Stale periodic context requests completed without executing their business handler.",
             "# TYPE gpu_fault_processor_stale_superseded_total counter",
             f"gpu_fault_processor_stale_superseded_total {runtime['stale_superseded_total']}",
@@ -162,6 +177,31 @@ def render_processor_metrics_2(
             "# HELP gpu_fault_processor_admission_batch_shed_total Requests rejected on arrival because the projected batch wait exceeded their deadline.",
         ]
     )
+    for path, count in sorted(runtime.get("retry_rescheduled_by_path", {}).items()):
+        lines.append(
+            "gpu_fault_processor_retry_rescheduled_by_path_total"
+            f'{{path="{_metrics_label_value(path)}"}} {count}'
+        )
+    lines.extend(
+        [
+            "# HELP gpu_fault_processor_lane_holder_seconds Time processor requests held an ordering lane, by normalized path.",
+            "# TYPE gpu_fault_processor_lane_holder_seconds summary",
+        ]
+    )
+    for path, values in sorted(runtime.get("lane_holder_by_path", {}).items()):
+        escaped_path = _metrics_label_value(path)
+        lines.append(
+            "gpu_fault_processor_lane_holder_seconds_count"
+            f'{{path="{escaped_path}"}} {values["count"]}'
+        )
+        lines.append(
+            "gpu_fault_processor_lane_holder_seconds_sum"
+            f'{{path="{escaped_path}"}} {values["sum"]:.6f}'
+        )
+        lines.append(
+            "gpu_fault_processor_lane_holder_seconds_max"
+            f'{{path="{escaped_path}"}} {values["max"]:.6f}'
+        )
 
 
 def render_processor_metrics_3(

@@ -37,6 +37,7 @@ import yaml
 # because `kubectl set env` on both tiers is how they got there.
 PROCESSOR_POOL_ENV = (
     "GPU_FAULT_PROCESSOR_WORKERS",
+    "GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY",
     "GPU_FAULT_PROCESSOR_FAULT_WORKERS",
     "GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS",
     "GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS",
@@ -168,6 +169,19 @@ def unset_env(container: dict, name: str) -> None:
     container["env"] = [item for item in env if item.get("name") != name]
 
 
+def configure_processor_retry(container: dict) -> None:
+    set_env(container, "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS", "1")
+    set_env(container, "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS", "30")
+
+
+def configure_worker_queue_coordination(worker: dict) -> None:
+    set_env(worker, "GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS", "5")
+    set_env(worker, "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS", "24")
+    set_env(worker, "GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY", "1")
+    set_env(worker, "GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS", "30")
+    set_env(worker, "GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS", "1")
+
+
 def replace_uvicorn_args(
     container: dict,
     *,
@@ -296,6 +310,7 @@ def main() -> None:
     containers = pod_spec["containers"]
     api = next(item for item in containers if item["name"] == "api")
     base = copy.deepcopy(api)
+    configure_processor_retry(base)
 
     ingress = copy.deepcopy(base)
     ingress["name"] = "api"
@@ -588,26 +603,7 @@ def main() -> None:
         "GPU_FAULT_PROCESSOR_FAULT_BUSY_BACKOFF_MAX_SECONDS",
         "0.1",
     )
-    set_env(
-        worker,
-        "GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS",
-        "5",
-    )
-    set_env(
-        worker,
-        "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS",
-        "24",
-    )
-    set_env(
-        worker,
-        "GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS",
-        "30",
-    )
-    set_env(
-        worker,
-        "GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS",
-        "1",
-    )
+    configure_worker_queue_coordination(worker)
     set_env(
         worker,
         "GPU_FAULT_PROCESSOR_THREAD_DUMP_SIGNAL",

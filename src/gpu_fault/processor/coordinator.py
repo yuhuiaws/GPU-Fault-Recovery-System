@@ -33,6 +33,7 @@ from gpu_fault.processor.batching import (
     HOST_TELEMETRY_BATCH_SIZE,
     telemetry_batch_size,
 )
+from gpu_fault.processor.lane_runtime import ProcessorLaneRuntimeMixin
 from gpu_fault.processor.replay_completion import (
     finalize_replay_response,
 )
@@ -55,7 +56,11 @@ class _InFlightRequest:
     phase_started: float
 
 
-class ProcessorCoordinator(ProcessorMetricsMixin, TelemetrySpoolCoordinatorMixin):
+class ProcessorCoordinator(
+    ProcessorLaneRuntimeMixin,
+    ProcessorMetricsMixin,
+    TelemetrySpoolCoordinatorMixin,
+):
     _OBSERVATION_PATHS = paths_for_pool(ChannelPool.OBSERVATION)
     _GPU_INVENTORY_PATH = GPU_INVENTORY_PATH
     _GPU_METRICS_PATH = GPU_METRICS_PATH
@@ -83,6 +88,8 @@ class ProcessorCoordinator(ProcessorMetricsMixin, TelemetrySpoolCoordinatorMixin
         request_renew_seconds: float = 5,
         request_max_execution_seconds: float = 30,
         retryable_response_max_age_seconds: float = 300,
+        retry_backoff_seconds: float = 1,
+        retry_backoff_max_seconds: float = 30,
         poll_seconds: float = 0.1,
         idle_backoff_max_seconds: float = 2.0,
         busy_backoff_max_seconds: float = 0.4,
@@ -155,6 +162,10 @@ class ProcessorCoordinator(ProcessorMetricsMixin, TelemetrySpoolCoordinatorMixin
         self.request_renew_seconds = request_renew_seconds
         self.request_max_execution_seconds = request_max_execution_seconds
         self._retry_max_age = retryable_response_max_age_seconds
+        self._configure_retry_backoff(
+            retry_backoff_seconds,
+            retry_backoff_max_seconds,
+        )
         self.gpu_inventory_stale_seconds = gpu_inventory_stale_seconds
         self.health_summary_stale_seconds = health_summary_stale_seconds
         self.observation_stale_seconds = observation_stale_seconds
@@ -397,6 +408,7 @@ class ProcessorCoordinator(ProcessorMetricsMixin, TelemetrySpoolCoordinatorMixin
             for scope in ("attempt", "node", "cluster")
         }
         self._in_flight: dict[str, _InFlightRequest] = {}
+        self._initialize_lane_runtime_state()
         self._deadline_exceeded_requests: set[str] = set()
         self._deadline_exceeded_total = 0
         self._completion_retries_total = 0
@@ -682,6 +694,7 @@ class ProcessorCoordinator(ProcessorMetricsMixin, TelemetrySpoolCoordinatorMixin
                             limit=total_available,
                         )
                         self._claim_saturated = len(requests) >= total_available
+                    self.register_claimed_requests(requests)
                     observation_requests = []
                     telemetry_requests: dict[
                         tuple[str, str], list[ProcessorRequest]
@@ -767,6 +780,7 @@ class ProcessorCoordinator(ProcessorMetricsMixin, TelemetrySpoolCoordinatorMixin
         finally:
             for pool in pools.values():
                 pool.shutdown(wait=True, cancel_futures=True)
+            self.release_unstarted_claims()
 
     def _telemetry_spool_batch_bytes(self, items: list) -> int:
         return 16 + sum(self._telemetry_spool_item_bytes(item) + 1 for item in items)
@@ -1523,31 +1537,6 @@ class ProcessorCoordinator(ProcessorMetricsMixin, TelemetrySpoolCoordinatorMixin
             started=started,
         )
 
-    def _release(self, item: ProcessorRequest) -> None:
-        if self.active_consumers:
-            self.store.release_active_processor_request(
-                item.request_id,
-                self.owner_id,
-                item.leader_epoch,
-                item.lease_token,
-            )
-        else:
-            self.store.release_processor_request(
-                item.request_id,
-                self.owner_id,
-                item.leader_epoch,
-                item.lease_token,
-            )
-        LOGGER.warning(
-            "processor request released request_id=%s path=%s lane=%s "
-            "owner=%s epoch=%s",
-            item.request_id,
-            item.path,
-            item.ordering_key(),
-            self.owner_id,
-            item.leader_epoch,
-        )
-
     def _request_started(self, item: ProcessorRequest) -> float:
         started = time.monotonic()
         deadline = started + self.request_max_execution_seconds
@@ -1564,6 +1553,7 @@ class ProcessorCoordinator(ProcessorMetricsMixin, TelemetrySpoolCoordinatorMixin
             else "cluster"
         )
         with self._state_lock:
+            self._mark_request_started(item.request_id)
             lane = self._lane_wait[scope]
             lane["count"] += 1
             lane["sum"] += wait_seconds
@@ -1607,10 +1597,6 @@ class ProcessorCoordinator(ProcessorMetricsMixin, TelemetrySpoolCoordinatorMixin
             }
             for state in states
         ]
-
-    def _request_finished(self, request_id: str) -> None:
-        with self._state_lock:
-            self._in_flight.pop(request_id, None)
 
     def _check_execution_deadlines(self) -> None:
         observed = time.monotonic()

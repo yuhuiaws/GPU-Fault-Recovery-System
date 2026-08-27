@@ -13,6 +13,9 @@ class PostgresCoreMixin:
     _models: Any
 
     def close(self) -> None:
+        executor = getattr(self, "_processor_completion_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         self._db.close()
 
     def pool_metrics(self) -> dict:

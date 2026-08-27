@@ -565,6 +565,42 @@ def _regional_case_bodies() -> dict[str, str]:
     return bodies
 
 
+def test_cap005_uses_the_postgres_stress_runner_consistently() -> None:
+    case = next(
+        case for case in load_catalog(CATALOG) if case["id"] == "GF-REGIONAL-CAP-005"
+    )
+    command = ["python3", "scripts/e2e/regional/run_cap005_postgres_suite.py"]
+
+    assert case["automation"] == "command"
+    assert case["command"] == command
+    assert "make test-postgres-stress" in case["injection"]
+    assert "8×40" in case["injection"]
+    assert any("concurrency" in item and "2与4" in item for item in case["expected"]), (
+        "CAP-005 must require real PostgreSQL completion concurrency at 2 and 4"
+    )
+
+    runner_path = ROOT / command[1]
+    runner_text = runner_path.read_text(encoding="utf-8")
+    tree = ast.parse(runner_text)
+    literal_commands = [
+        [element.value for element in node.elts]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.List)
+        and all(
+            isinstance(element, ast.Constant) and isinstance(element.value, str)
+            for element in node.elts
+        )
+    ]
+    assert ["make", "test-postgres-stress", "PYTHON=python3"] in literal_commands
+    assert "GPU_FAULT_CAP005_WORKDIR" in runner_text
+    assert '"/work"' not in runner_text
+
+    body = _regional_case_bodies()["GF-REGIONAL-CAP-005"]
+    assert command[1] in body
+    assert "make test-postgres-stress" in body
+    assert "`2` 与 `4`" in body
+
+
 def test_every_documented_execution_record_is_reflected_in_the_catalog() -> None:
     # 公开规格不得重新混入执行结果。若某段仍以执行记录措辞出现，
     # catalog 必须至少具有机器 verdict，避免它成为无法判读的散文结论。

@@ -58,6 +58,10 @@ spec:
               value: "20"
             - name: GPU_FAULT_PROCESSOR_RETRYABLE_RESPONSE_MAX_AGE_SECONDS
               value: "300"
+            - name: GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS
+              value: "1"
+            - name: GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS
+              value: "30"
             - name: GPU_FAULT_PROCESSOR_RESPONSE_TIMEOUT_SECONDS
               value: "115"
             - name: GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE

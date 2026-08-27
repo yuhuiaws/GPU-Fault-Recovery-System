@@ -139,6 +139,8 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_PROJECTION_MARGIN"] == "0"
     assert ingress_env["GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_SIZE"] == "32"
     assert ingress_env["GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_GROUPS"] == "4"
+    assert ingress_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS"] == "1"
+    assert ingress_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS"] == "30"
     assert ingress_env["GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS"] == "30"
     assert (
         "--workers 4"
@@ -203,6 +205,9 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert worker_env["GPU_FAULT_PROCESSOR_FAULT_BUSY_BACKOFF_MAX_SECONDS"] == "0.1"
     assert worker_env["GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS"] == "5"
     assert worker_env["GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS"] == "24"
+    assert worker_env["GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY"] == "1"
+    assert worker_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS"] == "1"
+    assert worker_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS"] == "30"
     assert worker_env["GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS"] == "30"
     assert worker_env["GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS"] == "1"
     assert worker_env["GPU_FAULT_PROCESSOR_THREAD_DUMP_SIGNAL"] == "SIGUSR2"

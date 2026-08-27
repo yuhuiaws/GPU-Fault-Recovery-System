@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Callable, TypedDict
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Event as ThreadEvent
 
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
+)
+from gpu_fault.store.postgres.processor_completion_runtime import (
+    complete_cluster_groups,
 )
 
 
@@ -27,11 +31,13 @@ class PostgresProcessorCompletionMixin:
     _lock_processor_queue_row: Callable[..., Any]
     _persist_processor_state: Callable[..., Any]
     _processor_completion_condition: Any
+    _processor_completion_executor: ThreadPoolExecutor | None
     _processor_completion_queue: list[_CompletionEntry]
     _processor_queue_effective_payload: Callable[..., Any]
     _state_transaction: Callable[..., Any]
     get_processor_leadership: Callable[..., Any]
     processor_queue_state_mode: Any
+    processor_completion_cluster_concurrency: int
 
     def complete_active_processor_request(
         self,
@@ -144,8 +150,6 @@ class PostgresProcessorCompletionMixin:
         groups = self._completions_by_counter_scope(batch)
         if len(groups) == 1:
             return self._complete_processor_batch_scope(next(iter(groups.values())))
-        completed: dict[str, object] = {}
-        failure: Exception | None = None
         # One statement per cluster, each in its own transaction. Sharing
         # a transaction would accumulate every group's counter row lock
         # until the last one committed, which is the shape being fixed.
@@ -153,15 +157,12 @@ class PostgresProcessorCompletionMixin:
         # blocked on this table and the longest waiter at 40.1s, while
         # Aurora sat at 3.8% CPU and 28.5 ACU - the queue was waiting on
         # itself, not on the database.
-        for scope in sorted(groups):
-            try:
-                completed.update(self._complete_processor_batch_scope(groups[scope]))
-            except Exception as exc:
-                if failure is None:
-                    failure = exc
-        if failure is not None:
-            raise failure
-        return completed
+        return complete_cluster_groups(
+            groups,
+            concurrency=self.processor_completion_cluster_concurrency,
+            executor=self._processor_completion_executor,
+            complete=self._complete_processor_batch_scope,
+        )
 
     def _complete_processor_batch_scope(self, batch) -> dict[str, object]:
         now = datetime.now(timezone.utc)
@@ -298,6 +299,9 @@ class PostgresProcessorCompletionMixin:
                             queue.response_status,
                             queue.response_content_type,
                             queue.response_body_base64,
+                            queue.not_before,
+                            queue.retry_count,
+                            queue.lane_policy,
                             queue.updated_at
                     )
                     SELECT

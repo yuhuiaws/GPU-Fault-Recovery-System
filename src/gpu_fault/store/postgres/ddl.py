@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from gpu_fault.store.postgres.ddl_processor_retry import (
+    upgrade_processor_retry_schedule,
+)
 from gpu_fault.store.postgres.ddl_spool import _create_telemetry_spool
 
 
@@ -606,6 +609,11 @@ def _create_processor_tables(cursor) -> None:
             response_status INTEGER,
             response_content_type TEXT,
             response_body_base64 TEXT,
+            not_before TIMESTAMPTZ,
+            retry_count INTEGER NOT NULL DEFAULT 0
+                CHECK (retry_count >= 0),
+            lane_policy TEXT NOT NULL DEFAULT 'STRICT'
+                CHECK (lane_policy IN ('STRICT', 'REORDERABLE')),
             created_at TIMESTAMPTZ NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL,
             payload JSONB NOT NULL
@@ -630,6 +638,7 @@ def _create_processor_tables(cursor) -> None:
         ADD COLUMN IF NOT EXISTS response_body_base64 TEXT
         """
     )
+    upgrade_processor_retry_schedule(cursor)
     cursor.execute(
         """
         CREATE OR REPLACE FUNCTION

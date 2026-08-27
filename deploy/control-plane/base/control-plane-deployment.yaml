@@ -142,6 +142,10 @@ spec:
               value: "128"
             - name: GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS
               value: "2"
+            - name: GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS
+              value: "1"
+            - name: GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS
+              value: "30"
             - name: GPU_FAULT_PROCESSOR_MAX_REQUEST_BYTES
               value: "16777216"
             - name: GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD

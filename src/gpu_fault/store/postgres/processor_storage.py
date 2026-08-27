@@ -30,6 +30,9 @@ class PostgresProcessorStorageMixin:
         "response_status",
         "response_content_type",
         "response_body_base64",
+        "not_before",
+        "retry_count",
+        "lane_policy",
         "created_at",
         "updated_at",
         "payload",
@@ -51,6 +54,9 @@ class PostgresProcessorStorageMixin:
             request.response_status,
             request.response_content_type,
             request.response_body_base64,
+            request.not_before,
+            request.retry_count,
+            request.lane_policy.value,
             request.created_at,
             request.updated_at,
             request.model_dump_json(),
@@ -85,7 +91,7 @@ class PostgresProcessorStorageMixin:
         if len({row[0] for row in rows}) != len(rows):
             raise ValueError("processor queue batch has duplicate request ids")
         columns = ", ".join(self._PROCESSOR_QUEUE_COLUMNS)
-        placeholder = "(" + ", ".join(["%s"] * 15) + ", %s::jsonb)"
+        placeholder = "(" + ", ".join(["%s"] * 18) + ", %s::jsonb)"
         values = ", ".join([placeholder] * len(rows))
         payload_update = ", payload=excluded.payload" if update_payload else ""
         parameters: list[object] = []
@@ -112,6 +118,9 @@ class PostgresProcessorStorageMixin:
                     response_content_type=excluded.response_content_type,
                     response_body_base64=
                         excluded.response_body_base64,
+                    not_before=excluded.not_before,
+                    retry_count=excluded.retry_count,
+                    lane_policy=excluded.lane_policy,
                     created_at=excluded.created_at,
                     updated_at=excluded.updated_at
                     {payload_update}
@@ -155,6 +164,9 @@ class PostgresProcessorStorageMixin:
                         {prefix}payload->'response_body_base64',
                         'null'::jsonb
                     ),
+                'not_before', to_jsonb({prefix}not_before),
+                'retry_count', to_jsonb({prefix}retry_count),
+                'lane_policy', to_jsonb({prefix}lane_policy),
                 'updated_at', to_jsonb({prefix}updated_at)
             )
         """

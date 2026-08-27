@@ -111,6 +111,17 @@ class ProcessorStore(Protocol):
         path: str | None = None,
     ) -> ProcessorRequest: ...
 
+    def release_active_processor_request(
+        self,
+        request_id: str,
+        owner_id: str,
+        lane_epoch: int,
+        lease_token: str,
+        *,
+        not_before: datetime | None = None,
+        retry_count: int | None = None,
+    ) -> None: ...
+
     def processor_queue_stats(
         self, *, now: datetime | None = None
     ) -> ProcessorQueueStats: ...

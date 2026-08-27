@@ -32,6 +32,9 @@ from gpu_fault.store.postgres.processor_claims import PostgresProcessorClaimsMix
 from gpu_fault.store.postgres.processor_completion import (
     PostgresProcessorCompletionMixin,
 )
+from gpu_fault.store.postgres.processor_completion_runtime import (
+    configure_processor_completion_runtime,
+)
 from gpu_fault.store.postgres.processor_leases import PostgresProcessorLeaseMixin
 from gpu_fault.store.postgres.processor_storage import PostgresProcessorStorageMixin
 from gpu_fault.store.postgres.remote_commands import PostgresRemoteCommandMixin
@@ -285,6 +288,7 @@ class PostgresStore(
             **pool_kwargs,
         )
         self._db = PooledPostgresDatabase(self._pool)
+        configure_processor_completion_runtime(self, pool_max_size)
         self._processor_completion_condition = Condition()
         self._processor_completion_queue = []
         self._attempt_observation_condition = Condition()
@@ -295,5 +299,10 @@ class PostgresStore(
         try:
             self._initialize_schema_state(initialize_schema)
         except Exception:
+            if self._processor_completion_executor is not None:
+                self._processor_completion_executor.shutdown(
+                    wait=True,
+                    cancel_futures=True,
+                )
             self._pool.close()
             raise

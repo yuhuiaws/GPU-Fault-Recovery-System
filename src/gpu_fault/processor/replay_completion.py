@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 from typing import Any
@@ -34,17 +34,31 @@ def finalize_replay_response(
     if (status in {408, 425, 429} or status >= 500) and (
         response_age_seconds <= coordinator._retry_max_age
     ):
+        retry_count = item.retry_count + 1
+        delay_seconds = min(
+            coordinator.retry_backoff_max_seconds,
+            coordinator.retry_backoff_seconds * (2 ** min(item.retry_count, 16)),
+        )
+        not_before = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
         LOGGER.warning(
             "processor replay returned a retryable response; "
-            "releasing request request_id=%s path=%s status=%s "
-            "age_seconds=%.3f retry_max_age_seconds=%.3f",
+            "rescheduling request request_id=%s path=%s status=%s "
+            "age_seconds=%.3f retry_count=%s not_before=%s "
+            "retry_max_age_seconds=%.3f",
             item.request_id,
             item.path,
             status,
             response_age_seconds,
+            retry_count,
+            not_before.isoformat(),
             coordinator._retry_max_age,
         )
-        coordinator._release(item)
+        coordinator._release(
+            item,
+            not_before=not_before,
+            retry_count=retry_count,
+        )
+        coordinator._observe_retry_schedule(item.path, delay_seconds)
         coordinator._observe_processing(outcome, time.monotonic() - started)
         return
 

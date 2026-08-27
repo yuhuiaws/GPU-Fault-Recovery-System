@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 import pytest
 
@@ -22,6 +24,8 @@ from tests._builders import (
 POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
 
 REQUEST_LEASE = timedelta(seconds=120)
+_SCHEMA_LOCK = Lock()
+_SCHEMA_READY = False
 
 
 def _truncate() -> None:
@@ -44,15 +48,33 @@ def _truncate() -> None:
                 cursor.execute(f"TRUNCATE {', '.join(tables)}")
 
 
-@pytest.fixture
-def store():
+def _ensure_postgres_schema() -> None:
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
     assert POSTGRES_URL is not None
-    instance = PostgresStore(POSTGRES_URL)
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY:
+            return
+        instance = PostgresStore(POSTGRES_URL)
+        instance.close()
+        _SCHEMA_READY = True
+
+
+def postgres_store_instance() -> Iterator[PostgresStore]:
+    assert POSTGRES_URL is not None
+    _ensure_postgres_schema()
+    instance = PostgresStore(POSTGRES_URL, initialize_schema=False)
     _truncate()
     try:
         yield instance
     finally:
         instance.close()
+
+
+@pytest.fixture
+def store():
+    yield from postgres_store_instance()
 
 
 def _request(

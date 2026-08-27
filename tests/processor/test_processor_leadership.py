@@ -62,7 +62,9 @@ from ._processor_leadership_cases_2 import (
 from ._processor_leadership_cases_3 import (
     test_active_consumer_replay_accepts_the_claiming_process_owner,
     test_claimed_stream_resets_its_idle_backoff,
+    test_deferred_strict_retry_blocks_lane_but_reorderable_retry_does_not,
     test_event_loop_lag_monitor_advances,
+    test_graceful_shutdown_releases_claimed_not_started_request,
     test_idle_queue_keeps_the_full_claim_backoff,
     test_idle_streams_back_off_with_a_short_fault_ceiling,
     test_lane_blocked_backlog_caps_the_claim_backoff,

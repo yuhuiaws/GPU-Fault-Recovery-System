@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from gpu_fault.processor import (
     ProcessorLaneLease,
     ProcessorRequestStatus,
+    deferred_strict_processor_lanes,
+    processor_request_claimable,
 )
 from gpu_fault.store.contracts import ProcessorQueueStats
 from gpu_fault.store.shared.processor_helpers import (
@@ -205,6 +207,7 @@ class SqliteProcessorQueueMixin:
             ):
                 return []
             items = self._list("processor_request")
+            deferred_strict_lanes = deferred_strict_processor_lanes(items, now)
             busy_clusters = {
                 item.ordering_key()
                 for item in items
@@ -215,11 +218,10 @@ class SqliteProcessorQueueMixin:
             eligible_items = [
                 item
                 for item in items
-                if item.status is ProcessorRequestStatus.PENDING
-                or (
-                    item.status is ProcessorRequestStatus.LEASED
-                    and item.lease_expires_at is not None
-                    and item.lease_expires_at <= now
+                if processor_request_claimable(
+                    item,
+                    now=now,
+                    deferred_strict_lanes=deferred_strict_lanes,
                 )
             ]
             observation_scope_keys = _incomplete_observation_scope_keys(items)
@@ -281,13 +283,14 @@ class SqliteProcessorQueueMixin:
         with self._state_transaction("processor_lane/claims"):
             items = self._list("processor_request")
             lanes = {item.ordering_key: item for item in self._list("processor_lane")}
+            deferred_strict_lanes = deferred_strict_processor_lanes(items, now)
             eligible_items = [
                 item
                 for item in items
-                if item.status is ProcessorRequestStatus.PENDING
-                or (
-                    item.status is ProcessorRequestStatus.LEASED
-                    and (item.lease_expires_at is None or item.lease_expires_at <= now)
+                if processor_request_claimable(
+                    item,
+                    now=now,
+                    deferred_strict_lanes=deferred_strict_lanes,
                 )
             ]
             observation_scope_keys = _incomplete_observation_scope_keys(items)
@@ -390,19 +393,15 @@ class SqliteProcessorQueueMixin:
         include_paths: set[str] | None = None,
         exclude_paths: set[str] | None = None,
     ) -> bool:
-        from gpu_fault.processor import (
-            ProcessorRequestStatus,
-        )
-
         lanes = {item.ordering_key: item for item in self._list("processor_lane")}
-        for item in self._list("processor_request"):
-            if item.status is ProcessorRequestStatus.PENDING:
-                pass
-            elif item.status is ProcessorRequestStatus.LEASED and (
-                item.lease_expires_at is None or item.lease_expires_at <= now
+        items = self._list("processor_request")
+        deferred_strict_lanes = deferred_strict_processor_lanes(items, now)
+        for item in items:
+            if not processor_request_claimable(
+                item,
+                now=now,
+                deferred_strict_lanes=deferred_strict_lanes,
             ):
-                pass
-            else:
                 continue
             if include_paths is not None and item.path not in include_paths:
                 continue

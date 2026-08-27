@@ -13,6 +13,9 @@ import psycopg
 from psycopg import sql
 
 
+ROOT = Path(__file__).resolve().parents[3]
+
+
 def _database_url(base_url: str, database: str) -> str:
     parsed = urlsplit(base_url)
     return urlunsplit(
@@ -56,7 +59,7 @@ def main() -> None:
     production_database = urlsplit(base_url).path.lstrip("/")
     database = f"gpu_fault_cap005_{uuid4().hex[:12]}"
     test_url = _database_url(base_url, database)
-    workdir = Path(os.getenv("GPU_FAULT_CAP005_WORKDIR", "/work"))
+    workdir = Path(os.getenv("GPU_FAULT_CAP005_WORKDIR", str(ROOT)))
     postgres_xml = workdir / "postgres.xml"
     contract_xml = workdir / "contract.xml"
     started = time.monotonic()
@@ -74,7 +77,7 @@ def main() -> None:
             "GPU_FAULT_TEST_POSTGRES_URL": test_url,
         }
         subprocess.run(
-            ["make", "test-postgres", "PYTHON=python3"],
+            ["make", "test-postgres-stress", "PYTHON=python3"],
             cwd=workdir,
             env={
                 **environment,

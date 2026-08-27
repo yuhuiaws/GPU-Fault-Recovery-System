@@ -5,11 +5,15 @@ from typing import Any
 import time
 from threading import RLock
 
+from gpu_fault.processor.models import ProcessorRequest
+
 
 class ProcessorMetricsMixin:
     # Attributes supplied by the composed concrete implementation.
     _completion_failures_total: Any
     _completion_retries_total: Any
+    _claimed_not_started: dict[str, ProcessorRequest]
+    _claimed_not_started_released_total: int
     _deadline_exceeded_total: Any
     _duration_buckets: tuple[float, ...]
     _duration_count: int
@@ -17,12 +21,16 @@ class ProcessorMetricsMixin:
     _duration_sum: float
     _in_flight: Any
     _lane_wait: dict[str, dict[str, float | int]]
+    _lane_holder_by_path: dict[str, dict[str, float | int]]
     _notification_reconnects_total: Any
     _notification_shard: Any
     _notifications_enabled: Any
     _notifications_filtered_total: Any
     _notifications_received_total: Any
     _processed: dict[str, int]
+    _retry_delay_seconds_max: float
+    _retry_rescheduled_by_path: dict[str, int]
+    _retry_rescheduled_total: int
     _processor_fault_pressure_activations_total: Any
     _processor_fault_pressure_active: Any
     _spool_consumer_running: Any
@@ -116,11 +124,18 @@ class ProcessorMetricsMixin:
                 "worker_count": self.worker_count,
                 "active_consumer": int(self.active_consumers),
                 "in_flight": len(self._in_flight),
+                "claimed_not_started": len(self._claimed_not_started),
+                "claimed_not_started_released_total": (
+                    self._claimed_not_started_released_total
+                ),
                 "oldest_in_flight_seconds": (oldest_in_flight_seconds),
                 "in_flight_by_phase": in_flight_by_phase,
                 "deadline_exceeded_total": (self._deadline_exceeded_total),
                 "completion_retries_total": (self._completion_retries_total),
                 "completion_failures_total": (self._completion_failures_total),
+                "retry_rescheduled_total": self._retry_rescheduled_total,
+                "retry_rescheduled_by_path": dict(self._retry_rescheduled_by_path),
+                "retry_delay_seconds_max": self._retry_delay_seconds_max,
                 "notifications_enabled": int(self._notifications_enabled),
                 "notifications_received_total": (self._notifications_received_total),
                 "notification_reconnects_total": (self._notification_reconnects_total),
@@ -142,6 +157,10 @@ class ProcessorMetricsMixin:
                 "stale_superseded_by_path": dict(self._stale_superseded_by_path),
                 "lane_wait": {
                     scope: dict(values) for scope, values in self._lane_wait.items()
+                },
+                "lane_holder_by_path": {
+                    path: dict(values)
+                    for path, values in self._lane_holder_by_path.items()
                 },
                 # Written from the single consumer loop, read here - the
                 # claim counters are what tell a drain tail ("empty claims

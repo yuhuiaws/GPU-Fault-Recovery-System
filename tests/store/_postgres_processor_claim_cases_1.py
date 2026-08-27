@@ -18,7 +18,7 @@ from threading import Event, Thread
 
 import pytest
 
-from gpu_fault.processor import ProcessorRequestStatus
+from gpu_fault.processor import ProcessorLanePolicy, ProcessorRequestStatus
 from gpu_fault.store import PostgresStore
 from tests._builders import processor_request
 from tests.store._postgres_processor_claim_support import (
@@ -28,11 +28,17 @@ from tests.store._postgres_processor_claim_support import (
     _fault,
     _request,
     _telemetry,
+    postgres_store_instance,
 )
 
 pytestmark = pytest.mark.skipif(
     not POSTGRES_URL, reason="GPU_FAULT_TEST_POSTGRES_URL is not configured"
 )
+
+
+@pytest.fixture(name="store")
+def _case_store():
+    yield from postgres_store_instance()
 
 
 def test_postgres_spool_claim_respects_payload_byte_budget(store) -> None:
@@ -558,6 +564,68 @@ def test_completed_request_is_not_reclaimed(store) -> None:
     )
     stored = store.get_processor_request(item.request_id)
     assert stored.status is ProcessorRequestStatus.COMPLETED
+
+
+def test_postgres_release_persists_retry_schedule(store) -> None:
+    now = datetime.now(timezone.utc)
+    request = _telemetry("node-retry")
+    store.enqueue_processor_request(request)
+    claimed = store.claim_active_processor_requests(
+        "pod-a", now=now, lease_duration=REQUEST_LEASE, limit=1
+    )[0]
+    not_before = now + timedelta(seconds=30)
+
+    store.release_active_processor_request(
+        claimed.request_id,
+        "pod-a",
+        claimed.leader_epoch,
+        claimed.lease_token,
+        not_before=not_before,
+        retry_count=1,
+    )
+
+    stored = store.get_processor_request(request.request_id)
+    assert stored.not_before == not_before
+    assert stored.retry_count == 1
+    assert (
+        store.claim_active_processor_requests(
+            "pod-b", now=now, lease_duration=REQUEST_LEASE, limit=1
+        )
+        == []
+    )
+    retried = store.claim_active_processor_requests(
+        "pod-b",
+        now=not_before + timedelta(milliseconds=1),
+        lease_duration=REQUEST_LEASE,
+        limit=1,
+    )
+    assert [item.request_id for item in retried] == [request.request_id]
+
+
+def test_postgres_deferred_strict_retry_is_a_lane_barrier(store) -> None:
+    now = datetime.now(timezone.utc)
+    strict = _evidence("node-strict").model_copy(
+        update={
+            "not_before": now + timedelta(seconds=30),
+            "lane_policy": ProcessorLanePolicy.STRICT,
+        }
+    )
+    later_strict_lane = _evidence("node-strict")
+    reorderable = _evidence("node-reorderable").model_copy(
+        update={
+            "not_before": now + timedelta(seconds=30),
+            "lane_policy": ProcessorLanePolicy.REORDERABLE,
+        }
+    )
+    later_reorderable_lane = _evidence("node-reorderable")
+    for request in (strict, later_strict_lane, reorderable, later_reorderable_lane):
+        store.enqueue_processor_request(request)
+
+    claimed = store.claim_active_processor_requests(
+        "pod-a", now=now, lease_duration=REQUEST_LEASE, limit=4
+    )
+
+    assert [item.request_id for item in claimed] == [later_reorderable_lane.request_id]
 
 
 def test_queue_counters_track_bulk_statements(store) -> None:

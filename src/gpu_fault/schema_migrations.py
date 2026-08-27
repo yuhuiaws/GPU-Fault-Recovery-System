@@ -7,6 +7,10 @@ import inspect
 from pathlib import Path
 from typing import Protocol
 
+from gpu_fault.store.postgres.ddl_processor_retry import (
+    upgrade_processor_retry_schedule,
+)
+
 
 class MigrationCursor(Protocol):
     def execute(
@@ -43,6 +47,12 @@ def _apply_freeze_migration_history_v6(
     cursor: MigrationCursor,
 ) -> None:
     cursor.execute("SELECT 1")
+
+
+def _apply_processor_retry_schedule_v7(
+    cursor: MigrationCursor,
+) -> None:
+    upgrade_processor_retry_schedule(cursor)
 
 
 def _apply_registry_v3(cursor: MigrationCursor) -> None:
@@ -127,6 +137,12 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="freeze-applied-history-and-refresh-current-ddl",
         ddl_checksum="165e3b14bc187c877d4cede53a2c3e6c9ae27072fd9db8cea7e6553937e247de",
         apply=_apply_freeze_migration_history_v6,
+    ),
+    SchemaMigration(
+        version=7,
+        name="processor-retry-schedule-and-lane-policy",
+        ddl_checksum="4efa9f9838dff7df19006e02b371522accff8574a1e13c24531835636a971e08",
+        apply=_apply_processor_retry_schedule_v7,
     ),
 )
 

@@ -2,6 +2,7 @@
 
 # ruff: noqa: F401
 from ._postgres_processor_claim_cases_1 import (
+    _case_store,
     pytestmark,
     test_claim_keeps_one_request_per_lane,
     test_claim_prefers_faults_over_telemetry_across_the_window,
@@ -15,8 +16,10 @@ from ._postgres_processor_claim_cases_1 import (
     test_partitioned_evidence_and_routine_shards_do_not_block,
     test_partitioned_fault_admission_ignores_locked_evidence_shard,
     test_path_filters_still_scope_the_window,
+    test_postgres_deferred_strict_retry_is_a_lane_barrier,
     test_postgres_enqueue_notifies_waiting_consumers,
     test_postgres_notification_shard_has_one_owner,
+    test_postgres_release_persists_retry_schedule,
     test_postgres_reports_priority_zero_backlog,
     test_postgres_routine_aging_prevents_starvation,
     test_postgres_spool_abandon_preserves_retry_budget,
@@ -32,6 +35,7 @@ from ._postgres_processor_claim_cases_2 import (
     test_cluster_cap_stays_exact_at_the_boundary,
     test_completion_batch_is_one_statement_per_cluster,
     test_completion_batch_still_fences_each_request,
+    test_completion_cluster_concurrency_runs_real_transactions_in_parallel,
     test_completion_holds_one_cluster_counter_row_at_a_time,
     test_concurrent_admissions_to_one_cluster_do_not_serialize,
     test_concurrent_fault_admissions_do_not_serialize,
@@ -48,4 +52,3 @@ from ._postgres_processor_claim_cases_2 import (
     test_single_cluster_completion_batch_stays_one_statement,
     test_workflow_cancellation_only_touches_its_own_commands,
 )
-from ._postgres_processor_claim_support import store

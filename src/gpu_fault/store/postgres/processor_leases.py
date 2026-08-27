@@ -127,6 +127,9 @@ class PostgresProcessorLeaseMixin:
         owner_id: str,
         lane_epoch: int,
         lease_token: str,
+        *,
+        not_before: datetime | None = None,
+        retry_count: int | None = None,
     ) -> None:
         from gpu_fault.processor import (
             ProcessorRequestStatus,
@@ -181,6 +184,10 @@ class PostgresProcessorLeaseMixin:
                         "leader_epoch": None,
                         "lease_token": None,
                         "lease_expires_at": None,
+                        "not_before": not_before,
+                        "retry_count": (
+                            current.retry_count if retry_count is None else retry_count
+                        ),
                         "updated_at": now,
                     }
                 )
@@ -192,6 +199,9 @@ class PostgresProcessorLeaseMixin:
         owner_id: str,
         leader_epoch: int,
         lease_token: str,
+        *,
+        not_before: datetime | None = None,
+        retry_count: int | None = None,
     ) -> None:
         from gpu_fault.processor import (
             ProcessorRequestStatus,
@@ -213,6 +223,10 @@ class PostgresProcessorLeaseMixin:
                         "leader_epoch": None,
                         "lease_token": None,
                         "lease_expires_at": None,
+                        "not_before": not_before,
+                        "retry_count": (
+                            current.retry_count if retry_count is None else retry_count
+                        ),
                         "updated_at": datetime.now(timezone.utc),
                     }
                 )

@@ -3906,16 +3906,20 @@ test_cases:
   problem: >-
     生产使用 Aurora PostgreSQL，但默认 pytest 在没有 GPU_FAULT_TEST_POSTGRES_URL 时会跳过全部 PostgreSQL store/claim 测试。
   injection: >-
-    CI 创建独立 PostgreSQL 16 database，设置 GPU_FAULT_TEST_POSTGRES_URL， 执行 make test-postgres 和相关 processor/notification/fleet contract。
+    CI 设置 GPU_FAULT_STORE_URL 并执行 python3 scripts/e2e/regional/run_cap005_postgres_suite.py；runner 创建隔离 PostgreSQL 16 database，设置 GPU_FAULT_TEST_POSTGRES_URL，并通过 make test-postgres-stress 执行8×40锁竞争压力档和 store contract。
   expected:
   - PostgreSQL 专属用例零 skip、零失败
   - 测试数据库与生产数据库隔离
   - claim、lease renewal、reconnect、cleanup 和 schema migration 均执行
+  - completion cluster concurrency在真实PostgreSQL事务上覆盖2与4两档，counter一致、fencing不回退且deadlock为0
   - 测试结束无数据库对象残留
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cap-005
+  command:
+  - python3
+  - scripts/e2e/regional/run_cap005_postgres_suite.py
 - id: GF-REGIONAL-PREEMPT-001
   title: 抢占开关关闭时保持原串行语义
   category: regional-preemption
