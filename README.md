@@ -21,6 +21,12 @@
 - HyperPod Slurm 编排当前不支持。
 - GPU 节点上的 systemd Agent 属于区域数据面，不是独立部署架构。
 
+## 部署建议与已验证环境
+
+- **集群创建**：建议使用 AWS 管理控制台的 SageMaker HyperPod UI 分别创建 GPU 数据集群和 CPU 控制面集群；创建完成后再用 `gpu-fault-admin` 部署本方案。
+- **测试基线**：当前故障采集、策略、隔离、恢复和验收主要在 AWS `ml.p5en.48xlarge` H200 GPU 实例上完成；其他实例类型需重新验证 GPU/EFA、驱动、DCGM 和互联拓扑。
+- **训练性能**：当前配置通常不影响已有训练性能，组件不使用 GPU 算力且 CPU/内存占用较少；节点默认每 15 秒进行 GPU/Host 轻量采样、每 60 秒上报 GPU inventory、每 5 秒增量检查 Fabric Manager 日志。仍应按[性能压测验收方案](docs/性能压测验收方案.md)在目标规模复核少量系统开销。
+
 ## 方案硬约束
 
 以下约束不是可调默认值：
@@ -35,19 +41,9 @@
 ## 核心链路
 
 ```text
-Kernel log collector / Fabric Manager log collector / DCGM collector / Host metric collector / Workload watcher
-                         |
-                         v
-              Regional ingress and queue
-                         |
-                         v
-          Policy + Incident + Workflow orchestration
-                         |
-                         v
-       Per-cluster Executor + signed Node Action Agent
-                         |
-                         v
-          Validation + scheduling/workload recovery
+Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workflow
+                     -> Per-cluster Executor / signed Node Agent
+                     -> Validation / scheduling and workload recovery
 ```
 
 主要能力：
@@ -71,7 +67,8 @@ Kernel log collector / Fabric Manager log collector / DCGM collector / Host metr
 - [部署和运维详细参考](docs/部署和运维手册.md)
 - [部署和运维手册逐章解读](docs/部署和运维手册逐章解读.md)
 - [开发者部署实现](docs/开发者部署实现.md)
-- [环境变量参考](docs/环境变量参考.md)
+- [环境变量参考](docs/管理员环境变量参考.md)
+- [性能压测验收方案](docs/性能压测验收方案.md)
 - [扩展指南](docs/扩展指南.md)
 - [Collector 说明](COLLECTORS.md)
 - [训练任务示例](examples/README.md)

@@ -1,0 +1,447 @@
+schema_version: 1
+categories:
+  - title: 部署形态、角色与稳定身份
+    description: >-
+      这些变量决定进程属于哪个部署形态、角色和站点。区域生产值应由 site.yaml、
+      renderer 和发布状态生成，管理员不应在线临时覆盖。
+    variables:
+      - name: GPU_FAULT_DEPLOYMENT_MODE
+        production: regional（唯一生产形态）
+        description: "部署形态。生产固定为 regional；single-cluster 只用于历史迁移和本地测试。"
+      - name: GPU_FAULT_SERVICE_ROLE
+        description: "控制面角色：ingress 只入队，worker 消费与编排，spool-worker 只重放 spool。"
+      - name: GPU_FAULT_SITE_ID
+        description: "站点稳定标识，用于资源 ownership、通知上下文和跨发布关联；创建后不要改名。"
+      - name: GPU_FAULT_AWS_REGION
+        production: 由 site.yaml 的 spec.awsRegion 注入
+        description: "AWS Region。CPU/GPU ARN、Aurora、NLB、SES 和监控资源必须位于该 Region。"
+      - name: GPU_FAULT_CLUSTER_ID
+        production: 每个 GPU 集群由连接 Secret/节点安装器注入
+        description: "受管 GPU 集群稳定 ID；参与所有资源、事件、租约和动作的隔离键。"
+      - name: GPU_FAULT_RUNTIME_PROFILE_VERSION
+        production: 由 release-deploy 生成的内容寻址版本
+        description: "Runtime Profile 不可变版本；Collector、Watcher、Agent 和控制面必须一致。"
+      - name: GPU_FAULT_RELEASE_ID
+        production: 由 dist/current-release.json 注入
+        description: "发布标识，仅用于发布追踪；实际代码身份以 wheel SHA 和 module_digest 为准。"
+      - name: GPU_FAULT_REGIONAL_CLUSTERS_JSON
+        production: 由区域 registry ConfigMap/Secret 生成
+        description: "区域集群注册表。包含集群身份与 token 摘要来源；不得手工覆盖其他集群条目。"
+      - name: GPU_FAULT_UNKNOWN_ENV_POLICY
+        description: "发现未知 GPU_FAULT_* 变量时的策略。生产保持 error，避免拼写错误静默生效。"
+      - name: GPU_FAULT_ALLOW_SINGLE_CLUSTER
+        production: false（生产不得开启）
+        description: "允许历史单集群 active executor 的显式确认开关；区域生产不得设置。"
+
+  - title: 凭据、TLS 与网络边界
+    description: >-
+      凭据只通过 Secret、Secrets Manager 或受控文件注入。任何明文、跨集群复用、
+      curl -k 或代理伪造 loopback 都会破坏信任边界。
+    variables:
+      - name: GPU_FAULT_EXECUTION_TOKEN
+        production: CPU Secret；至少 32 字符
+        description: "管理员和控制面内部 operator 凭据；禁止下发到 GPU 数据面。"
+      - name: GPU_FAULT_PROCESSOR_REPLAY_SECRET
+        production: CPU Secret；至少 32 字符且必须不同于 execution token
+        description: "Processor 回环 replay 凭据，只接受直接 loopback 对端。"
+      - name: GPU_FAULT_CONTROL_PLANE_URL
+        production: 每集群连接 Secret 和节点安装器注入 HTTPS URL
+        description: "GPU 数据面访问区域控制面的稳定 URL；必须验证 DNS、SAN 和 CA。"
+      - name: GPU_FAULT_CONTROL_PLANE_TOKEN
+        production: 每集群独立 Secret/节点 env
+        description: "Collector、Watcher、Executor 和 Agent 使用的 cluster token；不得跨集群复用。"
+      - name: GPU_FAULT_CONTROL_PLANE_CA_FILE
+        production: GPU 数据面只读 CA 公钥文件
+        description: "控制面 TLS 信任根；禁止使用 curl -k 或 verify=false 绕过。"
+      - name: GPU_FAULT_NODE_ACTION_KEYS_JSON
+        production: CPU/GPU 节点 key map Secret
+        default: GPU_FAULT_NODE_ACTION_SECRETS_JSON，未设置时为空
+        description: "节点专属 HMAC key map；每个节点只使用自己的派生 key。"
+      - name: GPU_FAULT_NODE_ACTION_KEY_VERSION
+        production: 节点安装器写入当前 key version
+        description: "节点动作密钥版本；轮换时与 required version 和 Agent generation 一起推进。"
+      - name: GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION
+        default: 2（启用 Agent Registry 时）
+        description: "控制面接受的节点动作密钥版本；Fleet 未收敛前不要提前提升。"
+      - name: GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT
+        production: 当前区域节点安装显式 true；仅节点私网 HTTP
+        description: "Node Agent 无 TLS 证书时的显式开关。后续启用 TLS 后应恢复 false。"
+      - name: GPU_FAULT_NODE_AGENT_TLS_CERT
+        production: 节点 TLS 模式由受控证书文件注入
+        description: "Node Agent 服务端证书；必须与 TLS key 成对。"
+      - name: GPU_FAULT_NODE_AGENT_TLS_KEY
+        production: 节点 0600 私钥文件
+        description: "Node Agent 服务端私钥；不得进入 ConfigMap、日志或构建制品。"
+      - name: GPU_FAULT_NODE_AGENT_TLS_CLIENT_CA
+        description: "配置后要求 Node Agent mTLS；为空时仍依赖 HMAC 和网络边界。"
+      - name: GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS
+        description: "Agent 宣告 endpoint 的允许网段。生产应收口为 GPU 节点子网，填错会拒绝全队 heartbeat。"
+
+  - title: Store、Aurora 与 PostgreSQL
+    description: >-
+      区域生产使用 Aurora PostgreSQL writer。Schema 由独立 ensure Job 管理，
+      业务 Pod 只读校验；连接池数值按每个 Uvicorn 进程计算。
+    variables:
+      - name: GPU_FAULT_STORE_URL
+        production: gpu-fault-aurora Secret 的 writer DSN
+        description: "状态库连接。区域生产必须是 PostgreSQL/Aurora writer，不能使用每 Pod SQLite。"
+      - name: GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT
+        description: "业务进程是否自行 DDL。区域三角色固定 false；仅开发环境可使用 true。"
+      - name: GPU_FAULT_POSTGRES_HOT_STATE_MODE
+        description: "热状态读写模式。生产为 dedicated；迁移期间按 legacy→dual→dedicated 推进。"
+      - name: GPU_FAULT_POSTGRES_POOL_MIN_SIZE
+        description: "每进程最小连接数；总连接预算还要乘 Uvicorn 进程数和 Pod 副本数。"
+      - name: GPU_FAULT_POSTGRES_POOL_MAX_SIZE
+        default: 8（PostgresStore）；配置预检裸默认 4
+        description: "每进程最大连接数；必须满足 Aurora 上限和 completion concurrency。"
+      - name: GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS
+        description: "连接池 checkout 超时；超时进入容量错误而不是阻塞 event loop。"
+      - name: GPU_FAULT_POSTGRES_POOL_MAX_IDLE_SECONDS
+        description: "空闲连接回收时间，用于限制长时间闲置连接。"
+      - name: GPU_FAULT_POSTGRES_POOL_MAX_LIFETIME_SECONDS
+        description: "连接最长寿命，支持凭据轮换和网络状态刷新。"
+      - name: GPU_FAULT_POSTGRES_BOOTSTRAP_TIMEOUT_SECONDS
+        description: "Schema ensure 的总 statement timeout；只作用于迁移 Job。"
+      - name: GPU_FAULT_POSTGRES_BOOTSTRAP_LOCK_TIMEOUT_SECONDS
+        description: "Schema ensure 等待 relation/advisory lock 的上限。"
+      - name: GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET
+        description: "区域控制面全部进程的数据库连接预算门禁；扩副本或 worker 前必须重算。"
+
+  - title: Processor 容量、队列与线程池
+    description: >-
+      这些值决定区域队列容量和每进程并发。生产值按角色不同；不能只按 Pod 数估算，
+      必须乘每 Pod Uvicorn 进程数。
+    variables:
+      - name: GPU_FAULT_PROCESSOR_MODE
+        description: "Processor 模式。区域生产为 active-active；direct 只用于本地路径。"
+      - name: GPU_FAULT_PROCESSOR_WORKERS
+        description: "每个 active worker 进程的总处理槽位；区域 worker 为 24。"
+      - name: GPU_FAULT_PROCESSOR_FAULT_WORKERS
+        default: max(1, PROCESSOR_WORKERS // 4)
+        description: "priority 0 故障池 worker 数，保障 XID/SXID 和控制请求。"
+      - name: GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS
+        default: max(1, PROCESSOR_WORKERS // 4)
+        description: "GPU inventory/metrics 池 worker 数。"
+      - name: GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS
+        default: max(1, PROCESSOR_WORKERS // 4)
+        description: "Host telemetry/node-log 池 worker 数。"
+      - name: GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS
+        default: max(1, PROCESSOR_WORKERS // 4)
+        description: "Workload observation/training progress 池 worker 数。"
+      - name: GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH
+        description: "区域未完成请求总上限；例行流量达到保留线后先返回 429。"
+      - name: GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH
+        description: "单集群未完成请求上限，防止一个 GPU 集群拖垮整个 Region。"
+      - name: GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH
+        default: PROCESSOR_MAX_QUEUE_DEPTH 的 2/5
+        description: "全局为 priority 0 保留的容量。"
+      - name: GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH
+        default: PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH 的 2/5
+        description: "单集群为 priority 0 保留的容量。"
+      - name: GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD
+        default: min(256, PROCESSOR_MAX_QUEUE_DEPTH)
+        description: "跨请求并发准入闸门；不得大于全局队列深度。"
+      - name: GPU_FAULT_PROCESSOR_MAX_REQUEST_BYTES
+        default: 16777216（16 MiB）
+        description: "单个入队请求体硬上限；超出返回 413。"
+      - name: GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS
+        description: "例行 P100 请求等待超过该时间后获得临时优先级提升。"
+      - name: GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS
+        description: "PostgreSQL queue 通知 advisory-lock 分片数；区域值匹配 24 个 worker 进程。"
+      - name: GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS
+        description: "LISTEN/NOTIFY 正常时的兜底 polling 上限。"
+      - name: GPU_FAULT_PROCESSOR_CLEANUP_INTERVAL_SECONDS
+        description: "Processor 墓碑、evidence 和 remote command 清理周期。"
+      - name: GPU_FAULT_PROCESSOR_CLEANUP_BATCH_SIZE
+        description: "每轮清理最大记录数；需与产生速率一起做容量计算。"
+      - name: GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS
+        description: "已完成请求保留时间；期间客户端重投可拿到相同响应。"
+
+  - title: Processor 租约、重试与退出
+    description: >-
+      这些值共同约束请求 deadline、lane 接管和 retryable 回放。worker 与 ingress/
+      spool 的 lease/deadline 不同，禁止跨角色复制。
+    variables:
+      - name: GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS
+        description: "请求 lane lease。区域 worker 为 150s，ingress/spool 为 30s。"
+      - name: GPU_FAULT_PROCESSOR_REQUEST_RENEW_SECONDS
+        description: "请求 lease 续期间隔。区域 worker 为 10s，ingress/spool 为 5s。"
+      - name: GPU_FAULT_PROCESSOR_REQUEST_MAX_EXECUTION_SECONDS
+        description: "业务 handler 硬 deadline。区域 worker 为 120s，ingress/spool 为 20s。"
+      - name: GPU_FAULT_PROCESSOR_RESPONSE_TIMEOUT_SECONDS
+        description: "同步入口等待 Processor 响应的上限；超时后用 request ID 查询，不代表请求丢失。"
+      - name: GPU_FAULT_PROCESSOR_RETRYABLE_RESPONSE_MAX_AGE_SECONDS
+        description: "408/425/429/5xx 可重试的最大事件年龄，超龄后终结毒队列。"
+      - name: GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS
+        description: "429/503 返回给客户端的建议退避秒数。"
+      - name: GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS
+        description: "持久化 retry 的初始延迟，写入 not_before。"
+      - name: GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS
+        description: "指数退避上限；STRICT lane 等待时仍保持顺序。"
+      - name: GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY
+        description: "不同 cluster completion 事务并行度。生产为 1；2/4 必须先通过 CAP-005。"
+      - name: GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS
+        description: "聚合 workflow 等待同集群 Processor 请求排空的上限。"
+      - name: GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE
+        description: "请求 deadline 失控时是否让进程退出并由 Kubernetes 重建。生产保持 true。"
+      - name: GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS
+        description: "unhealthy 进程硬退出前的收尾时间。"
+      - name: GPU_FAULT_PROCESSOR_THREAD_DUMP_SIGNAL
+        description: "现场采集 Processor 线程栈的信号，区域生产为 SIGUSR2。"
+
+  - title: Workflow、执行器与远端命令
+    description: >-
+      Workflow 负责持久状态机，Cluster Executor 负责 GPU 集群内执行。管理员主要调整
+      扫描频率、并发和超时，不应绕过 Runtime Profile 或 operation allowlist。
+    variables:
+      - name: GPU_FAULT_EXECUTOR_MODE
+        description: "执行模式。active 才执行真实动作；simulation 只用于开发和演练。"
+      - name: GPU_FAULT_ALLOWED_OPERATIONS
+        production: 由生成清单和 Runtime Profile 共同约束
+        description: "控制面 operation 白名单；有枚举不等于已授权，仍需唯一 owner 和下游 allowlist。"
+      - name: GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER
+        description: "是否启动 workflow dispatcher；关闭后只保存状态不推进动作。"
+      - name: GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION
+        description: "允许更高 recovery rank 在安全边界抢占较弱 workflow。"
+      - name: GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS
+        description: "Workflow execution lease；过期后其他 worker 递增 epoch 接管。"
+      - name: GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS
+        description: "整条 workflow 执行总上限。"
+      - name: GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS
+        description: "持久 workflow 兜底扫描间隔；事件完成也会主动唤醒。"
+      - name: GPU_FAULT_WORKFLOW_BATCH_SIZE
+        description: "每轮扫描的 workflow 上限。"
+      - name: GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS
+        description: "每个 worker 进程的 workflow 执行线程数。"
+      - name: GPU_FAULT_DEFAULT_RESTART_BUDGET
+        description: "任务未声明时的默认自动重启预算；按 cluster/job 持久化。"
+      - name: GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS
+        description: "PENDING remote command 长期无人领取后的死信时间。"
+      - name: GPU_FAULT_REMOTE_COMMAND_RETENTION_SECONDS
+        description: "终态 remote command 保留时间。"
+
+  - title: Fleet、Agent 兼容性与 Cluster Executor
+    description: >-
+      required/compatible pin 是滚动升级的核心。候选版本先进入 compatible，全部收敛后
+      才提升 required；不要手工提前清空兼容窗口。
+    variables:
+      - name: GPU_FAULT_ENABLE_AGENT_REGISTRY
+        description: "启用 Agent heartbeat registry 和兼容性门禁；区域生产必须开启。"
+      - name: GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS
+        description: "Agent heartbeat 最大年龄；超过后节点不能执行动作。"
+      - name: GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS
+        description: "quiesce 后允许同 generation 暂停 heartbeat 的维护窗口。"
+      - name: GPU_FAULT_REQUIRED_AGENT_VERSION
+        description: "稳态要求的 Agent 版本；实际发布还同时校验 artifact/config/protocol。"
+      - name: GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256
+        description: "稳态 Node Runtime wheel SHA-256。"
+      - name: GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST
+        description: "Agent 行为兼容摘要。"
+      - name: GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST
+        description: "节点实际安装配置摘要。"
+      - name: GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION
+        description: "控制面要求的 Agent 协议版本。"
+      - name: GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256
+        description: "稳态 Cluster Executor wheel SHA-256。"
+      - name: GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST
+        description: "Cluster Executor 行为兼容摘要。"
+      - name: GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION
+        description: "控制面要求的区域 Executor 协议版本。"
+      - name: GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS
+        description: "单个 Executor 同时处理的命令上限；不是集群级修复并发上限。"
+      - name: GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS
+        description: "Executor 领取 remote command 的 lease 时长。"
+      - name: GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS
+        description: "无命令或控制面短暂不可达时的轮询间隔。"
+
+  - title: Collector、DCGM 与 inventory
+    description: >-
+      节点默认启用 kernel、Fabric Manager、GPU metrics 和 host 四个 systemd Collector；
+      NodeLog 和 nvidia-smi fallback 默认关闭。
+    variables:
+      - name: GPU_FAULT_COLLECTOR_HTTP_TIMEOUT_SECONDS
+        description: "Collector 向控制面发送单次 HTTP 请求的超时。"
+      - name: GPU_FAULT_COLLECTOR_OUTBOX_MAX_RECORDS
+        description: "每个 Collector 本地 NDJSON outbox 最大记录数；不是无限期队列。"
+      - name: GPU_FAULT_COLLECTOR_OUTBOX_REPLAY_BUDGET_SECONDS
+        description: "每轮用于补交积压的时间预算，实时事件优先。"
+      - name: GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS
+        description: "节点启动后首次采样错峰窗口，避免全队同时打控制面。"
+      - name: GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR
+        production: false（当前生产保持禁用）
+        description: "启用通用 journal/训练日志 Collector；需独立容量和隐私验收。"
+      - name: GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR
+        production: false（仅 DCGM 不可用时的受限 fallback）
+        description: "允许 nvidia-smi 替代 GPU metrics；缺少完整 PCIe/NVLink/throttle 信号。"
+      - name: GPU_FAULT_DCGM_METRICS_URL
+        production: 节点 systemd 默认 http://127.0.0.1:9400/metrics
+        description: "GPU metrics Collector 读取的 DCGM Exporter endpoint。"
+      - name: GPU_FAULT_DCGM_EDGE_FILTER_ENABLED
+        description: "只发送基线、健康摘要、异常边沿/恢复和错误 delta，降低稳态流量。"
+      - name: GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS
+        description: "无变化时 GPU 完整健康摘要周期。"
+      - name: GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES
+        description: "候选异常连续确认样本数。"
+      - name: GPU_FAULT_HOST_EDGE_FILTER_ENABLED
+        description: "Host telemetry 是否在节点侧做基线/边沿压缩。"
+      - name: GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS
+        description: "Host 无变化健康摘要周期。"
+      - name: GPU_FAULT_EXPECTED_GPU_COUNT
+        production: 节点安装器按实例类型写入
+        description: "该节点期望 GPU 数；未知机型必须显式配置，不能静默跳过。"
+      - name: GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT
+        production: 节点安装器按实例类型写入
+        description: "该节点期望 EFA device 数。"
+      - name: GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS
+        description: "GPU inventory 独立上报周期。"
+      - name: GPU_FAULT_GPU_INVENTORY_MAX_AGE_SECONDS
+        description: "控制面可用于恢复验证的 GPU inventory 最大年龄。"
+
+  - title: Telemetry spool
+    description: >-
+      spool 是可选洪峰泄压旁路。基础区域清单默认不让 ingress 写 spool，专用
+      spool-worker 虽配置启用但副本为 0；启用时必须同时调整两端。
+    variables:
+      - name: GPU_FAULT_TELEMETRY_SPOOL
+        default: false
+        description: "是否启用 routine telemetry spool；只扩 spool-worker 不会产生新 spool 数据。"
+      - name: GPU_FAULT_TELEMETRY_SPOOL_WORKERS
+        default: 2 × Processor 默认子池
+        description: "单个 spool-worker 进程的正常 replay 线程数。"
+      - name: GPU_FAULT_TELEMETRY_SPOOL_MAX_DEPTH
+        default: PROCESSOR_MAX_QUEUE_DEPTH
+        description: "spool 全局 admission 深度上限。"
+      - name: GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH
+        default: PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH
+        description: "单集群 spool 深度上限。"
+      - name: GPU_FAULT_TELEMETRY_SPOOL_MAX_ITEM_BYTES
+        description: "单条 routine telemetry 进入 spool 的字节上限。"
+      - name: GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_BYTES
+        description: "单次内部 replay batch 的总字节上限。"
+      - name: GPU_FAULT_TELEMETRY_SPOOL_MAX_IN_FLIGHT_BYTES
+        description: "单进程全部 replay future 的总在飞字节上限。"
+      - name: GPU_FAULT_TELEMETRY_SPOOL_RETRY_BACKOFF_SECONDS
+        description: "spool replay 失败后的基础退避秒数。"
+
+  - title: Node Agent、破坏性动作与诊断
+    description: >-
+      节点动作需要控制面 allowlist、Runtime Profile、Node Agent allowlist、签名和
+      fencing 同时通过。打开节点开关不等于自动获得执行授权。
+    variables:
+      - name: GPU_FAULT_NODE_AGENT_PORT
+        description: "Node Agent 监听端口，区域默认 9099。"
+      - name: GPU_FAULT_NODE_ALLOWED_OPERATIONS
+        production: 节点安装器按已审批能力生成
+        description: "Node Agent 最终 operation allowlist；缺一项即拒绝对应动作。"
+      - name: GPU_FAULT_NODE_ALLOW_GPU_RESET
+        production: 当前区域安装显式 true
+        default: false
+        description: "允许签名 GPU reset；仍需无客户端、quiesce、fencing 和动作后验证。"
+      - name: GPU_FAULT_NODE_ALLOW_FABRIC_RESET
+        production: 当前区域安装显式 true
+        default: false
+        description: "允许全 GPU/NVSwitch reset；必须有完整 inventory 和 barrier。"
+      - name: GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE
+        production: 当前区域安装显式 true
+        default: false
+        description: "允许静默/恢复 GPU 服务；失败由 fail-safe timer 自动恢复。"
+      - name: GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART
+        production: 当前区域安装显式 true
+        default: false
+        description: "允许受控重启 Fabric Manager 并验证新 PID/active 状态。"
+      - name: GPU_FAULT_QUIESCE_FAILSAFE_SECONDS
+        description: "服务静默后自动恢复的 fail-safe 上限，防止 Agent/控制面失联留下停服节点。"
+      - name: GPU_FAULT_DEVICE_SWEEP_TIMEOUT_SECONDS
+        description: "扫描 GPU client 和进程树的总超时。"
+      - name: GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR
+        description: "节点诊断包和命令输出目录。"
+      - name: GPU_FAULT_DIAGNOSTIC_S3_URI
+        description: "可选诊断对象存储前缀；为空时 file:// 证据只在故障节点本地可读。"
+      - name: GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND
+        description: "站点批准的 Field Diagnostic 绝对路径命令；为空表示禁用。"
+      - name: GPU_FAULT_FIELD_DIAGNOSTIC_SHA256
+        description: "Field Diagnostic 命令/工具固定 SHA-256。"
+      - name: GPU_FAULT_DRIVER_REMEDIATION_COMMAND
+        description: "站点批准的驱动修复命令；必须与目标版本和 SHA 一起配置。"
+      - name: GPU_FAULT_DRIVER_REMEDIATION_SHA256
+        description: "驱动修复命令固定 SHA-256。"
+
+  - title: HyperPod、reboot 与 warm spare
+    description: >-
+      Provider replace 永久禁止。nodeReplace 只代表 HEALTHY_WARM_SPARE_ONLY；
+      reboot 与 warm-spare 必须分别审批和验收。
+    variables:
+      - name: GPU_FAULT_ENABLE_HYPERPOD_ADAPTER
+        description: "启用 HyperPod lifecycle adapter；区域数据面 Executor 使用。"
+      - name: GPU_FAULT_HYPERPOD_CLUSTER
+        production: 每集群连接 Secret 注入真实 HyperPod 名
+        description: "Provider cluster name；不同于稳定 cluster_id。"
+      - name: GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER
+        production: 必须与真实 HyperPod 名完全一致
+        description: "破坏性 provider 动作的二次集群确认。"
+      - name: GPU_FAULT_ALLOW_HYPERPOD_REBOOT
+        production: true（阶段 D.1 审批后）
+        description: "允许 BatchRebootClusterNodes，不销毁实例。"
+      - name: GPU_FAULT_ALLOW_HYPERPOD_REPLACE
+        production: false（方案不变量；true 时启动失败）
+        default: false
+        description: "Provider replace 总开关；必须恒 false，warm-spare 不依赖它。"
+      - name: GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY
+        production: false（方案不变量）
+        description: "禁止在 NodeRecovery=Automatic 下执行 mutation。"
+      - name: GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER
+        description: "只读观察 HyperPod 节点状态和 provider outcome。"
+      - name: GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER
+        production: true（仅 HEALTHY_WARM_SPARE_ONLY 路径）
+        description: "启用客户自备 warm-spare 本地切换；不是 provider replace 授权。"
+      - name: GPU_FAULT_HYPERPOD_SPARE_LABEL
+        description: "标识 warm-spare 节点的 Kubernetes label key。"
+      - name: GPU_FAULT_HYPERPOD_SPARE_LABEL_VALUE
+        description: "warm-spare label 的期望值。"
+      - name: GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS
+        description: "reboot 后等待 device plugin/Agent 稳定再验证的时间。"
+      - name: GPU_FAULT_HYPERPOD_MAX_BATCH_SIZE
+        description: "单次 provider mutation 最大节点数。"
+      - name: GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS
+        description: "HyperPod NodeLogicalId/实例身份刷新周期。"
+
+  - title: 通知、证据与保留
+    description: >-
+      业务通知走 Aurora outbox + SES；AMP/SNS 是控制面自身指标告警。notification 已
+      QUEUED 不等于已送达，必须看到 SENT 和 provider message ID。
+    variables:
+      - name: GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL
+        production: false（生产不得开启）
+        description: "无外发通知通道时是否仅记录。只允许应急兼容，生产保持 false。"
+      - name: GPU_FAULT_ALLOW_EMAIL
+        description: "是否允许本方案通过 SES 实际发送邮件。"
+      - name: GPU_FAULT_EMAIL_SENDER
+        production: 由 site.yaml 的已验证 SES identity 注入
+        description: "SES 发件身份；与管理员联系人和接收列表是三个独立概念。"
+      - name: GPU_FAULT_EMAIL_RECIPIENTS
+        production: 由 site.yaml 的 emailRecipients 注入
+        description: "逗号分隔的业务通知接收人列表。"
+      - name: GPU_FAULT_EMAIL_SUBJECT_PREFIX
+        description: "邮件环境/站点前缀，不替代正文中的 site、Region、account 和 cluster。"
+      - name: GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY
+        description: "是否把投递放入持久化 outbox；区域生产为 true。"
+      - name: GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED
+        description: "是否启动通知 dispatcher；关闭时只入库不外发。"
+      - name: GPU_FAULT_NOTIFICATION_LEASE_SECONDS
+        description: "通知 delivery lease，旧 epoch 不得完成新 lease。"
+      - name: GPU_FAULT_NOTIFICATION_BATCH_SIZE
+        description: "每轮领取的通知上限。"
+      - name: GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS
+        description: "单条通知最大投递尝试数。"
+      - name: GPU_FAULT_NOTIFICATION_TTL_SECONDS
+        description: "通用通知保质期；category 可用动态变量族单独覆盖。"
+      - name: GPU_FAULT_EVIDENCE_RETENTION_HOURS
+        description: "控制面 raw evidence 默认保留小时数。"
+      - name: GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE
+        description: "每节点 raw evidence 数量上限。"
+      - name: GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS
+        description: "incident/workflow archive-first 保留天数；0 表示不自动归档删除。"
+      - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI
+        description: "archive-first 目标 S3 URI；配置后先写归档并校验 SHA，再删 live rows。"
+      - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS
+        description: "控制记录归档扫描周期。"

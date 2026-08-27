@@ -44,6 +44,7 @@ PUBLIC_RELEASE_DOCUMENTS = (
     "docs/components/nvidia-policy.md",
     "docs/管理员快速部署.md",
     "docs/管理员日常运维.md",
+    "docs/管理员环境变量参考.md",
     "docs/安全与参数参考.md",
     "docs/部署和运维手册.md",
     "docs/部署和运维手册逐章解读.md",

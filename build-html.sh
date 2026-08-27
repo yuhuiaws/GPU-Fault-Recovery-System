@@ -50,6 +50,7 @@ pandoc \
   docs/部署和运维手册逐章解读.md \
   docs/开发者部署实现.md \
   docs/扩展指南.md \
+  docs/管理员环境变量参考.md \
   docs/环境变量参考.md \
   docs/故障模拟测试手册.md \
   docs/区域用例索引.md \
