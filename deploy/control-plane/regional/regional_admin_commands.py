@@ -13,6 +13,7 @@ from regional_release_diff import (
     ReleaseChangeKind,
     ReleaseDiff,
     classify_release,
+    diff_from_changed,
 )
 from regional_release_reporting import build_release_status
 
@@ -31,6 +32,42 @@ def stored_release_diff(state: dict[str, Any]) -> ReleaseDiff | None:
     except (KeyError, TypeError, ValueError):
         return None
     return ReleaseDiff(kind=kind, changed=changed)
+
+
+def retry_release_diff(release: Any, state: dict[str, Any]) -> ReleaseDiff:
+    persisted = stored_release_diff(state)
+    changed = set(persisted.changed if persisted is not None else ())
+    changed.update(classify_release(release, state).changed)
+    previous = state.get("previous")
+    if not isinstance(previous, dict):
+        return diff_from_changed(changed)
+
+    metadata = previous.get("metadata") or {}
+    if previous.get("cpu_wheel") != release.wheel_cm:
+        changed.add("control_plane_wheel")
+    if (
+        metadata.get("required-agent-artifact-sha256")
+        and metadata.get("required-agent-artifact-sha256") != release.node_wheel_sha
+    ):
+        changed.add("node_runtime_wheel")
+    if (
+        metadata.get("required-regional-executor-artifact-sha256")
+        and metadata.get("required-regional-executor-artifact-sha256")
+        != release.executor_wheel_sha
+    ):
+        changed.add("executor_wheel")
+
+    clusters = previous.get("clusters") or {}
+    for target in release.config.clusters:
+        old = clusters.get(target.cluster_id) or {}
+        if any(
+            old.get(name) and old.get(name) != release.executor_wheel_cm
+            for name in ("wheel", "reconciler_wheel")
+        ):
+            changed.add("executor_wheel")
+        if old.get("bundle") and old.get("bundle") != release.bundle_cm:
+            changed.add("node_bundle")
+    return diff_from_changed(changed)
 
 
 def ensure_schema(release: Any) -> None:
@@ -132,11 +169,10 @@ def run_deploy(release: Any) -> None:
         release.bootstrap()
         return
     if state.get("phase") in RETRY_PHASES:
-        retry_diff = stored_release_diff(state)
-        if retry_diff is None:
-            release.upgrade(resume=True)
-        else:
-            release.upgrade(resume=True, diff=retry_diff)
+        release.upgrade(
+            resume=True,
+            diff=retry_release_diff(release, state),
+        )
         return
     diff = classify_release(release, state)
     if diff.kind == ReleaseChangeKind.NOOP:
@@ -158,7 +194,9 @@ def build_release_summary(release: Any) -> dict[str, Any]:
     try:
         state = release._load_state()
         retry_diff = (
-            stored_release_diff(state) if state.get("phase") in RETRY_PHASES else None
+            retry_release_diff(release, state)
+            if state.get("phase") in RETRY_PHASES
+            else None
         )
         result["next_deploy"] = (
             {

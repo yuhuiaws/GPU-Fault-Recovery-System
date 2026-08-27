@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import regional_deployment_inventory as inventory
-import yaml
+from gpu_fault.regional_compatibility import RegionalExecutorCompatibilityPolicy
 from regional_admin_checks import (
     build_health_report,
     build_preflight_report,
@@ -64,6 +64,7 @@ from regional_release_rendering import (
     build_cpu_apply_environment,
     build_reconciler_environment,
     render_gpu_rollout_manifests,
+    stamp_gpu_deployments,
 )
 from regional_release_reporting import build_release_plan
 from regional_release_state import (
@@ -86,6 +87,7 @@ from regional_runtime_profile import (
 )
 
 ROOT = Path(__file__).resolve().parents[3]
+FAST_ROLLOUT_TIMEOUT = "5m"
 
 
 class Runner:
@@ -154,6 +156,117 @@ def agents_converged(
         )
     ]
     return bool(nodes) and len(aligned) == len(nodes)
+
+
+def executor_pin_rejection(
+    metadata: dict[str, str],
+    *,
+    protocol_version: int,
+    artifact_sha: str,
+    compatibility_digest: str,
+) -> str | None:
+    policy = RegionalExecutorCompatibilityPolicy.from_mapping(
+        {
+            "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION": metadata.get(
+                "required-regional-executor-protocol-version",
+                str(protocol_version),
+            ),
+            "GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS": metadata.get(
+                "compatible-regional-executor-protocol-versions",
+                "",
+            ),
+            "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": metadata.get(
+                "required-regional-executor-artifact-sha256",
+                "",
+            ),
+            "GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S": metadata.get(
+                "compatible-regional-executor-artifact-sha256s",
+                "",
+            ),
+            "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST": metadata.get(
+                "required-regional-executor-compatibility-digest",
+                "",
+            ),
+            "GPU_FAULT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS": (
+                metadata.get(
+                    "compatible-regional-executor-compatibility-digests",
+                    "",
+                )
+            ),
+        }
+    )
+    return policy.rejection_reason(
+        protocol_version,
+        artifact_sha,
+        compatibility_digest,
+    )
+
+
+def require_executor_pin(
+    release: Any,
+    *,
+    artifact_sha: str,
+    compatibility_digest: str,
+) -> None:
+    metadata = release._config_map_data("gpu-fault-release-metadata")
+    try:
+        reason = executor_pin_rejection(
+            metadata,
+            protocol_version=release.config.executor_protocol_version,
+            artifact_sha=artifact_sha,
+            compatibility_digest=compatibility_digest,
+        )
+    except ValueError as exc:
+        raise ReleaseError(f"invalid regional executor pin metadata: {exc}") from exc
+    if reason:
+        raise ReleaseError(f"executor pin preflight rejected rollout: {reason}")
+
+
+def apply_gpu_deployments(
+    release: Any,
+    target: ClusterTarget,
+    wheel_cm: str,
+    *,
+    runtime_profile_version: str | None = None,
+    executor_wheel_filename: str | None = None,
+    executor_artifact_sha: str | None = None,
+    executor_compatibility_digest: str | None = None,
+) -> None:
+    artifact_sha = executor_artifact_sha or release.executor_wheel_sha
+    compatibility_digest = (
+        executor_compatibility_digest
+        or release.config.component_digests.get("executor")
+        or artifact_sha
+    )
+    require_executor_pin(
+        release,
+        artifact_sha=artifact_sha,
+        compatibility_digest=compatibility_digest,
+    )
+    for deployment, text in render_gpu_rollout_manifests(
+        release,
+        target,
+        wheel_cm,
+        runtime_profile_version=runtime_profile_version,
+        executor_wheel_filename=executor_wheel_filename,
+        executor_artifact_sha=artifact_sha,
+        executor_compatibility_digest=compatibility_digest,
+    ):
+        release.runner.run(
+            release._gpu(target, "apply", "-f", "-"),
+            input_text=text,
+        )
+        release.runner.run(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "rollout",
+                "status",
+                f"deployment/{deployment}",
+                f"--timeout={FAST_ROLLOUT_TIMEOUT}",
+            )
+        )
 
 
 def upgrade_gpu_target(
@@ -296,6 +409,7 @@ def bootstrap_resume_context(
 class RegionalRelease:
     _ensure_contexts = ensure_region_contexts
     _apply_gpu_dcgm_exporter = apply_gpu_dcgm_exporter
+    _apply_gpu_deployments = apply_gpu_deployments
     _apply_nlb = apply_control_plane_nlb
     _bootstrap_cpu_is_current = bootstrap_cpu_is_current
     _capture_previous = capture_previous
@@ -311,6 +425,7 @@ class RegionalRelease:
     _quiesce_gpu_executor = quiesce_gpu_executor
     _retry_failed_installer_jobs = retry_failed_installer_jobs
     _save_state = save_state
+    _stamp_gpu_deployments = stamp_gpu_deployments
     _template_bundle = template_bundle
     _upgrade_gpu_target = upgrade_gpu_target
     _validate_executor_iam_role = validate_executor_iam_role
@@ -608,68 +723,6 @@ class RegionalRelease:
             env=build_cpu_apply_environment(self, finalize=finalize),
         )
 
-    def _apply_gpu_deployments(
-        self,
-        target: ClusterTarget,
-        wheel_cm: str,
-        *,
-        runtime_profile_version: str | None = None,
-        executor_wheel_filename: str | None = None,
-    ) -> None:
-        for deployment, text in render_gpu_rollout_manifests(
-            self,
-            target,
-            wheel_cm,
-            runtime_profile_version=runtime_profile_version,
-            executor_wheel_filename=executor_wheel_filename,
-        ):
-            self.runner.run(
-                self._gpu(target, "apply", "-f", "-"),
-                input_text=text,
-            )
-            self.runner.run(
-                self._gpu(
-                    target,
-                    "-n",
-                    self.config.namespace,
-                    "rollout",
-                    "status",
-                    f"deployment/{deployment}",
-                    "--timeout=10m",
-                )
-            )
-
-    def _stamp_gpu_deployments(self, text: str) -> str:
-        documents = list(yaml.safe_load_all(text))
-        for document in documents:
-            if not isinstance(document, dict) or document.get("kind") != "Deployment":
-                continue
-            annotations = (
-                document.setdefault("spec", {})
-                .setdefault("template", {})
-                .setdefault("metadata", {})
-                .setdefault("annotations", {})
-            )
-            annotations.update(
-                {
-                    "gpu-fault.io/artifact-sha256": self.executor_wheel_sha,
-                    "gpu-fault.io/release-rollout": self.release_id,
-                    "gpu-fault.io/release-sha256": self.executor_wheel_sha,
-                    "gpu-fault.io/release-wheel-sha256": (self.executor_wheel_sha),
-                    "gpu-fault.io/executor-wheel-sha256": (self.executor_wheel_sha),
-                    "gpu-fault.io/executor-compatibility-digest": (
-                        self.config.component_digests.get("executor")
-                        or self.executor_wheel_sha
-                    ),
-                    "gpu-fault.io/runtime-image": (self.runtime_image),
-                }
-            )
-        return yaml.safe_dump_all(
-            documents,
-            sort_keys=False,
-            width=72,
-        )
-
     def _deploy_reconciler(
         self,
         target: ClusterTarget,
@@ -680,6 +733,7 @@ class RegionalRelease:
         config_digest: str,
         runtime_profile_version: str | None = None,
         executor_wheel_filename: str | None = None,
+        node_compatibility_digest: str | None = None,
     ) -> None:
         self._retry_failed_installer_jobs(target)
         environment = build_reconciler_environment(
@@ -691,6 +745,7 @@ class RegionalRelease:
             config_digest=config_digest,
             runtime_profile_version=runtime_profile_version,
             executor_wheel_filename=executor_wheel_filename,
+            node_compatibility_digest=node_compatibility_digest,
         )
         self.runner.run(
             [str(ROOT / "deploy/node/deploy-node-installer-reconciler.sh")],
@@ -862,6 +917,17 @@ class RegionalRelease:
         runtime_profile_version = (
             previous.get("runtime_profile_version") or "hyperpod-v1"
         )
+        executor_artifact = metadata.get(
+            "required-regional-executor-artifact-sha256",
+            "",
+        )
+        executor_compatibility = (
+            metadata.get("required-regional-executor-compatibility-digest")
+            or executor_artifact
+        )
+        node_compatibility = (
+            metadata.get("required-agent-compatibility-digest") or artifact
+        )
         if not all((cpu_wheel, artifact, config_digest)):
             raise ReleaseError("previous release pins are incomplete")
         cpu_sha = self._config_map_sha(self._cpu(), cpu_wheel, self.config.wheel.name)
@@ -889,6 +955,11 @@ class RegionalRelease:
             old = (previous.get("clusters") or {}).get(target.cluster_id, {})
             wheel = old.get("wheel")
             if wheel:
+                rollback_executor_artifact = executor_artifact or self._config_map_sha(
+                    self._gpu(target),
+                    wheel,
+                    old.get("wheel_key") or self.config.executor_wheel.name,
+                )
                 self._verify_gpu_control_plane_endpoint(target)
                 self._apply_gpu_dcgm_exporter(target)
                 self._apply_gpu_deployments(
@@ -896,6 +967,10 @@ class RegionalRelease:
                     wheel,
                     runtime_profile_version=runtime_profile_version,
                     executor_wheel_filename=old.get("wheel_key"),
+                    executor_artifact_sha=rollback_executor_artifact,
+                    executor_compatibility_digest=(
+                        executor_compatibility or rollback_executor_artifact
+                    ),
                 )
             if all(old.get(name) for name in ("reconciler_wheel", "bundle")):
                 self._deploy_reconciler(
@@ -906,6 +981,7 @@ class RegionalRelease:
                     config_digest=config_digest,
                     runtime_profile_version=runtime_profile_version,
                     executor_wheel_filename=old.get("reconciler_wheel_key"),
+                    node_compatibility_digest=node_compatibility,
                 )
                 self._wait_agents(target, artifact)
         self._save_state("rolled-back", previous=previous)
@@ -1254,7 +1330,7 @@ class RegionalRelease:
                     "rollout",
                     "status",
                     f"deployment/{deployment}",
-                    "--timeout=10m",
+                    f"--timeout={FAST_ROLLOUT_TIMEOUT}",
                 )
             )
 

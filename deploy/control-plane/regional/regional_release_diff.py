@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Iterable
 
 
 class ReleaseChangeKind(StrEnum):
@@ -51,20 +51,34 @@ def _current_profile_digest(release: Any, state: dict[str, Any]) -> Any:
     return legacy
 
 
+def diff_from_changed(changed: Iterable[str]) -> ReleaseDiff:
+    normalized = frozenset(changed)
+    if not normalized:
+        kind = ReleaseChangeKind.NOOP
+    elif normalized.issubset({"control_plane_wheel", "notifications"}):
+        kind = ReleaseChangeKind.CONTROL_PLANE_ONLY
+    elif not normalized.intersection(
+        {
+            "database_schema",
+            "agent_protocol",
+            "executor_protocol",
+            "agent_config",
+            "runtime_profile",
+            "runtime_profile_version",
+            "clusters",
+        }
+    ):
+        kind = ReleaseChangeKind.DATA_PLANE_COMPATIBLE
+    else:
+        kind = ReleaseChangeKind.FULL
+    return ReleaseDiff(kind=kind, changed=normalized)
+
+
 def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
-    current_digests = dict(state.get("component_digests") or {})
     desired = {
-        "control_plane_wheel": (
-            release.config.component_digests.get("control_plane") or release.wheel_sha
-        ),
-        "executor_wheel": (
-            release.config.component_digests.get("executor")
-            or release.executor_wheel_sha
-        ),
-        "node_runtime_wheel": (
-            release.config.component_digests.get("node_runtime")
-            or release.node_wheel_sha
-        ),
+        "control_plane_wheel": release.wheel_sha,
+        "executor_wheel": release.executor_wheel_sha,
+        "node_runtime_wheel": release.node_wheel_sha,
         "node_bundle": release.bundle_sha,
         "database_schema": release.config.database_schema_version,
         "agent_protocol": release.config.agent_protocol_version,
@@ -78,17 +92,9 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "clusters": tuple(sorted(item.cluster_id for item in release.config.clusters)),
     }
     current = {
-        "control_plane_wheel": (
-            current_digests.get("control_plane") or state.get("wheel_sha256")
-        ),
-        "executor_wheel": (
-            current_digests.get("executor")
-            or _legacy_value(state, "executor_wheel_sha256")
-        ),
-        "node_runtime_wheel": (
-            current_digests.get("node_runtime")
-            or _legacy_value(state, "node_wheel_sha256")
-        ),
+        "control_plane_wheel": state.get("wheel_sha256"),
+        "executor_wheel": _legacy_value(state, "executor_wheel_sha256"),
+        "node_runtime_wheel": _legacy_value(state, "node_wheel_sha256"),
         "node_bundle": state.get("bundle_sha256"),
         "database_schema": int(state.get("database_schema_version") or 0),
         "agent_protocol": int(state.get("agent_protocol_version") or 0),
@@ -104,22 +110,4 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
     changed = frozenset(
         name for name, value in desired.items() if current.get(name) != value
     )
-    if not changed:
-        kind = ReleaseChangeKind.NOOP
-    elif changed.issubset({"control_plane_wheel", "notifications"}):
-        kind = ReleaseChangeKind.CONTROL_PLANE_ONLY
-    elif not changed.intersection(
-        {
-            "database_schema",
-            "agent_protocol",
-            "executor_protocol",
-            "agent_config",
-            "runtime_profile",
-            "runtime_profile_version",
-            "clusters",
-        }
-    ):
-        kind = ReleaseChangeKind.DATA_PLANE_COMPATIBLE
-    else:
-        kind = ReleaseChangeKind.FULL
-    return ReleaseDiff(kind=kind, changed=changed)
+    return diff_from_changed(changed)

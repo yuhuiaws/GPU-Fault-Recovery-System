@@ -5,12 +5,54 @@ from pathlib import Path
 from typing import Any
 
 import regional_deployment_inventory as inventory
+import yaml
 from regional_notifications import notification_digest
 from regional_release_config import ClusterTarget, ReleaseError
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 DEFAULT_DCGM_EXPORTER_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
+
+
+def stamp_gpu_deployments(
+    release: Any,
+    text: str,
+    *,
+    executor_artifact_sha: str | None = None,
+    executor_compatibility_digest: str | None = None,
+) -> str:
+    artifact_sha = executor_artifact_sha or release.executor_wheel_sha
+    compatibility_digest = (
+        executor_compatibility_digest
+        or release.config.component_digests.get("executor")
+        or artifact_sha
+    )
+    documents = list(yaml.safe_load_all(text))
+    for document in documents:
+        if not isinstance(document, dict) or document.get("kind") != "Deployment":
+            continue
+        annotations = (
+            document.setdefault("spec", {})
+            .setdefault("template", {})
+            .setdefault("metadata", {})
+            .setdefault("annotations", {})
+        )
+        annotations.update(
+            {
+                "gpu-fault.io/artifact-sha256": artifact_sha,
+                "gpu-fault.io/release-rollout": release.release_id,
+                "gpu-fault.io/release-sha256": artifact_sha,
+                "gpu-fault.io/release-wheel-sha256": artifact_sha,
+                "gpu-fault.io/executor-wheel-sha256": artifact_sha,
+                "gpu-fault.io/executor-compatibility-digest": compatibility_digest,
+                "gpu-fault.io/runtime-image": release.runtime_image,
+            }
+        )
+    return yaml.safe_dump_all(
+        documents,
+        sort_keys=False,
+        width=72,
+    )
 
 
 def build_cpu_apply_environment(
@@ -65,9 +107,17 @@ def render_gpu_rollout_manifests(
     *,
     runtime_profile_version: str | None = None,
     executor_wheel_filename: str | None = None,
+    executor_artifact_sha: str | None = None,
+    executor_compatibility_digest: str | None = None,
 ) -> list[tuple[str, str]]:
     config = release.config
     profile_version = runtime_profile_version or config.runtime_profile_version
+    artifact_sha = executor_artifact_sha or release.executor_wheel_sha
+    compatibility_digest = (
+        executor_compatibility_digest
+        or config.component_digests.get("executor")
+        or artifact_sha
+    )
     replacements = {
         "gpu-fault-executor-wheel-0100": wheel_cm,
         "gpu_fault_cluster_executor-0.10.0-py3-none-any.whl": (
@@ -78,10 +128,8 @@ def render_gpu_rollout_manifests(
         "REPLACE_WITH_AWS_REGION": target.region,
         "REPLACE_WITH_RUNTIME_PROFILE_VERSION": profile_version,
         "REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN": target.executor_irsa_role_arn,
-        "REPLACE_WITH_EXECUTOR_ARTIFACT_SHA256": (release.executor_wheel_sha),
-        "REPLACE_WITH_EXECUTOR_COMPATIBILITY_DIGEST": (
-            config.component_digests.get("executor") or release.executor_wheel_sha
-        ),
+        "REPLACE_WITH_EXECUTOR_ARTIFACT_SHA256": artifact_sha,
+        "REPLACE_WITH_EXECUTOR_COMPATIBILITY_DIGEST": compatibility_digest,
     }
     rendered = []
     for filename, deployment in inventory.GPU_ROLLOUT_DEPLOYMENTS:
@@ -90,7 +138,17 @@ def render_gpu_rollout_manifests(
             text = text.replace(source, destination)
         if "REPLACE_WITH" in text:
             raise ReleaseError(f"{filename} still contains a placeholder")
-        rendered.append((deployment, release._stamp_gpu_deployments(text)))
+        rendered.append(
+            (
+                deployment,
+                stamp_gpu_deployments(
+                    release,
+                    text,
+                    executor_artifact_sha=artifact_sha,
+                    executor_compatibility_digest=compatibility_digest,
+                ),
+            )
+        )
     return rendered
 
 
@@ -104,6 +162,7 @@ def build_reconciler_environment(
     config_digest: str,
     runtime_profile_version: str | None = None,
     executor_wheel_filename: str | None = None,
+    node_compatibility_digest: str | None = None,
 ) -> dict[str, str]:
     config = release.config
     environment = {
@@ -116,7 +175,9 @@ def build_reconciler_environment(
         "GPU_FAULT_INSTALLER_CONFIG_DIGEST": config_digest,
         "GPU_FAULT_INSTALLER_ARTIFACT_SHA256": artifact_sha,
         "GPU_FAULT_NODE_COMPATIBILITY_DIGEST": (
-            config.component_digests.get("node_runtime") or release.node_wheel_sha
+            node_compatibility_digest
+            or config.component_digests.get("node_runtime")
+            or artifact_sha
         ),
         "GPU_FAULT_WHEEL_CONFIG_MAP": wheel_cm,
         "GPU_FAULT_EXECUTOR_WHEEL_FILENAME": (

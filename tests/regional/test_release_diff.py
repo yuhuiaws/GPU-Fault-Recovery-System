@@ -66,10 +66,7 @@ def test_release_diff_classifies_noop_and_component_scopes() -> None:
     state = _state()
 
     assert DIFF.classify_release(release, state).kind is DIFF.ReleaseChangeKind.NOOP
-    state["component_digests"] = {
-        **state["component_digests"],
-        "control_plane": "9" * 64,
-    }
+    state["wheel_sha256"] = "9" * 64
     assert (
         DIFF.classify_release(release, state).kind
         is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
@@ -81,7 +78,7 @@ def test_release_diff_classifies_noop_and_component_scopes() -> None:
         is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
     )
     state = _state()
-    state["component_digests"] = {**state["component_digests"], "executor": "9" * 64}
+    state["executor_wheel_sha256"] = "9" * 64
     assert (
         DIFF.classify_release(release, state).kind
         is DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE
@@ -89,6 +86,29 @@ def test_release_diff_classifies_noop_and_component_scopes() -> None:
     state = _state()
     state["agent_protocol_version"] = 2
     assert DIFF.classify_release(release, state).kind is DIFF.ReleaseChangeKind.FULL
+
+
+def test_packaging_only_artifact_changes_are_not_classified_as_noop() -> None:
+    release = _release()
+    state = _state()
+    state.update(
+        {
+            "wheel_sha256": "6" * 64,
+            "executor_wheel_sha256": "7" * 64,
+            "node_wheel_sha256": "8" * 64,
+            "bundle_sha256": "9" * 64,
+        }
+    )
+
+    diff = DIFF.classify_release(release, state)
+
+    assert diff.kind is DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE
+    assert diff.changed == {
+        "control_plane_wheel",
+        "executor_wheel",
+        "node_runtime_wheel",
+        "node_bundle",
+    }
 
 
 def test_profile_path_only_migration_is_not_a_release_change() -> None:

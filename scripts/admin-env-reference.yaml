@@ -9,7 +9,7 @@ categories:
         production: regional（唯一生产形态）
         description: "部署形态。生产固定为 regional；single-cluster 只用于历史迁移和本地测试。"
       - name: GPU_FAULT_SERVICE_ROLE
-        description: "控制面角色：ingress 只入队，worker 消费与编排，spool-worker 只重放 spool。"
+        description: "控制面角色：ingress 只入队，worker 消费与编排，spool-worker 专门针对遥测数据消费的 spool。"
       - name: GPU_FAULT_SITE_ID
         description: "站点稳定标识，用于资源 ownership、通知上下文和跨发布关联；创建后不要改名。"
       - name: GPU_FAULT_AWS_REGION

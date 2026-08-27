@@ -461,6 +461,8 @@ def test_role_split_stages_candidate_without_replacing_stable_pin() -> None:
         'REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION="'
         '${CURRENT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION}"' in script
     )
+    assert 'FAST_ROLLOUT_TIMEOUT="5m"' in script
+    assert '--timeout="${FAST_ROLLOUT_TIMEOUT}"' in script
 
 
 def test_aurora_rotation_restarts_every_database_consumer() -> None:

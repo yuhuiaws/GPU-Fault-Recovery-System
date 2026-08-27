@@ -27,6 +27,7 @@ GENERATED="${GPU_FAULT_ROLE_SPLIT_GENERATED_DIR:-${SCRIPT_DIR}/../regional/gener
 KUBECONFIG_PATH="${KUBECONFIG:-}"
 DEFAULT_RUNTIME_IMAGE="public.ecr.aws/docker/library/python:3.12-slim"
 RUNTIME_IMAGE="${GPU_FAULT_RUNTIME_IMAGE:-${DEFAULT_RUNTIME_IMAGE}}"
+FAST_ROLLOUT_TIMEOUT="5m"
 AWS_REGION="${GPU_FAULT_AWS_REGION:?GPU_FAULT_AWS_REGION is required}"
 RUNTIME_PROFILE_VERSION="$(
     printf '%s' \
@@ -574,7 +575,7 @@ fi
 # consumer tier is proven ready.
 kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" \
     rollout status deployment/gpu-fault-telemetry-spool-worker \
-    --timeout=10m
+    --timeout="${FAST_ROLLOUT_TIMEOUT}"
 
 remove_legacy_notification_env gpu-fault-control-worker
 apply_manifest gpu-fault-control-worker
@@ -601,7 +602,8 @@ if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
 fi
 
 kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" \
-    rollout status deployment/gpu-fault-control-worker --timeout=10m
+    rollout status deployment/gpu-fault-control-worker \
+    --timeout="${FAST_ROLLOUT_TIMEOUT}"
 
 remove_legacy_notification_env gpu-fault-api-ha
 apply_manifest gpu-fault-api-ha-ingress
@@ -611,7 +613,8 @@ if [[ "${RELOAD_RELEASE_METADATA}" == "true" ]]; then
         deployment/gpu-fault-api-ha
 fi
 kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" \
-    rollout status deployment/gpu-fault-api-ha --timeout=10m
+    rollout status deployment/gpu-fault-api-ha \
+    --timeout="${FAST_ROLLOUT_TIMEOUT}"
 
 GPU_FAULT_NAMESPACE="${NAMESPACE}" \
 GPU_FAULT_RUNTIME_IMAGE="${RUNTIME_IMAGE}" \

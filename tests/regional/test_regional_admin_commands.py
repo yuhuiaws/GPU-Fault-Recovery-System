@@ -87,3 +87,48 @@ def test_failed_release_diff_is_reused_for_resume() -> None:
         "kind": "DATA_PLANE_COMPATIBLE",
         "changed": ["executor_wheel"],
     }
+
+
+def test_retry_diff_restores_physical_artifact_changes(monkeypatch) -> None:
+    module = _admin_module()
+    release = SimpleNamespace(
+        wheel_cm="new-control",
+        executor_wheel_cm="new-executor",
+        bundle_cm="new-bundle",
+        node_wheel_sha="n" * 64,
+        executor_wheel_sha="e" * 64,
+        config=SimpleNamespace(clusters=(SimpleNamespace(cluster_id="gpu-a"),)),
+    )
+    state = {
+        "phase": "failed",
+        "release_diff": {"kind": "DATA_PLANE_COMPATIBLE", "changed": ["node_bundle"]},
+        "previous": {
+            "cpu_wheel": "old-control",
+            "metadata": {
+                "required-agent-artifact-sha256": "a" * 64,
+                "required-regional-executor-artifact-sha256": "b" * 64,
+            },
+            "clusters": {
+                "gpu-a": {
+                    "wheel": "old-executor",
+                    "reconciler_wheel": "old-executor",
+                    "bundle": "old-bundle",
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(
+        module,
+        "classify_release",
+        lambda _release, _state: module.diff_from_changed(()),
+    )
+
+    diff = module.retry_release_diff(release, state)
+
+    assert diff.kind is module.ReleaseChangeKind.DATA_PLANE_COMPATIBLE
+    assert diff.changed == {
+        "control_plane_wheel",
+        "executor_wheel",
+        "node_runtime_wheel",
+        "node_bundle",
+    }

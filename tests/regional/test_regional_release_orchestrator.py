@@ -1339,7 +1339,6 @@ def test_release_renders_one_runtime_image_across_gpu_roles(
     assert all("REPLACE_WITH_AWS_REGION" not in item for item in rendered), (
         "GPU manifests retained an unresolved Region placeholder"
     )
-
     release._deploy_reconciler(
         target,
         wheel_cm=release.wheel_cm,
