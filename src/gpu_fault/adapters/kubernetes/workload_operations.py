@@ -45,6 +45,7 @@ from gpu_fault.adapters.common import (
 class _WorkloadMutation:
     workloads: list[tuple[str, str, str, str, Any]]
     parsed: list[tuple[str, str, str, str]]
+    absent_workload_ids: list[str] = field(default_factory=list)
     terminating_pods: list[tuple[str, str]] = field(default_factory=list)
     log_evidence: list[dict[str, Any]] = field(default_factory=list)
     log_errors: list[dict[str, str]] = field(default_factory=list)
@@ -154,6 +155,15 @@ class KubernetesWorkloadOperationsMixin:
         prepared = self._prepare_workload_mutation(context, suspend)
         if isinstance(prepared, WorkflowStepOutcome):
             return prepared
+        if suspend and not prepared.workloads:
+            return WorkflowStepOutcome.succeeded(
+                operation_id=context.idempotency_key,
+                details={
+                    "workloads": context.step.workload_ids,
+                    "suspended": True,
+                    "already_absent_workloads": (prepared.absent_workload_ids),
+                },
+            )
         self._apply_workload_mutation(context, prepared, suspend)
         if suspend:
             self._delete_terminating_pods(prepared.terminating_pods)
@@ -162,6 +172,14 @@ class KubernetesWorkloadOperationsMixin:
                 return outcome
         notification_id, notification_context = self._restart_notification(
             context, prepared, suspend
+        )
+        restarted_workload_ids = list(
+            dict.fromkeys(
+                [
+                    *prepared.retry_workload_ids,
+                    *prepared.created_retry_ids,
+                ]
+            )
         )
         return WorkflowStepOutcome.succeeded(
             operation_id=context.idempotency_key,
@@ -184,8 +202,8 @@ class KubernetesWorkloadOperationsMixin:
                     else {}
                 ),
                 **(
-                    {"restarted_workload_ids": (prepared.created_retry_ids)}
-                    if prepared.created_retry_ids
+                    {"restarted_workload_ids": restarted_workload_ids}
+                    if restarted_workload_ids
                     else {}
                 ),
             },
@@ -207,22 +225,24 @@ class KubernetesWorkloadOperationsMixin:
             )
             for workload_id in context.step.workload_ids
         ]
-        workloads = [
-            (
-                namespace,
-                kind,
-                name,
-                workload_id,
-                self._read_workload(namespace, kind, name),
-            )
-            for namespace, kind, name, workload_id in parsed_workloads
-        ]
+        workloads = []
+        absent_workload_ids = []
+        for namespace, kind, name, workload_id in parsed_workloads:
+            try:
+                workload = self._read_workload(namespace, kind, name)
+            except Exception as exc:
+                if suspend and getattr(exc, "status", None) == 404:
+                    absent_workload_ids.append(workload_id)
+                    continue
+                raise
+            workloads.append((namespace, kind, name, workload_id, workload))
         conflict = self._managed_job_recovery_conflict(workloads)
         if conflict is not None:
             return conflict
         state = _WorkloadMutation(
             workloads=workloads,
             parsed=parsed_workloads,
+            absent_workload_ids=absent_workload_ids,
         )
         if suspend:
             initiator = context.step.parameters.get("termination_initiator_incident_id")
@@ -406,6 +426,7 @@ class KubernetesWorkloadOperationsMixin:
                     ],
                     "workload_log_evidence": state.log_evidence,
                     "workload_log_errors": state.log_errors,
+                    "already_absent_workloads": (state.absent_workload_ids),
                 },
             )
         if (
@@ -420,6 +441,7 @@ class KubernetesWorkloadOperationsMixin:
                     "attempt_pods_absent": True,
                     "workload_log_evidence": state.log_evidence,
                     "workload_log_errors": state.log_errors,
+                    "already_absent_workloads": (state.absent_workload_ids),
                 },
             )
         active = []
@@ -431,10 +453,15 @@ class KubernetesWorkloadOperationsMixin:
             workload_id,
             workload,
         ) in state.workloads:
-            state = self._workload_active(namespace, kind, name, workload)
-            if state is True:
+            active_state = self._workload_active(
+                namespace,
+                kind,
+                name,
+                workload,
+            )
+            if active_state is True:
                 active.append(workload_id)
-            elif state is None:
+            elif active_state is None:
                 unknown.append(workload_id)
         if active or unknown:
             return WorkflowStepOutcome.waiting(
@@ -444,6 +471,7 @@ class KubernetesWorkloadOperationsMixin:
                     "suspended": True,
                     "waiting_for_active_workloads": active,
                     "unknown_stop_state": unknown,
+                    "already_absent_workloads": (state.absent_workload_ids),
                 },
             )
         return None

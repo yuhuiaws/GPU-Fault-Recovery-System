@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: regional-isolation-gpu-job
+  namespace: training
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              python - <<'PY'
+              import time
+
+              import torch
+
+              assert torch.cuda.is_available()
+              print(torch.cuda.get_device_name(0), flush=True)
+              time.sleep(900)
+              PY
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: 4Gi
+              nvidia.com/gpu: "1"

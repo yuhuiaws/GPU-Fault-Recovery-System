@@ -202,6 +202,42 @@ def test_kubernetes_stop_retries_workload_patch_conflict() -> None:
     assert batch.suspend_patches == [True]
 
 
+def test_kubernetes_stop_treats_missing_workload_as_already_stopped() -> None:
+    class MissingBatch(FakeBatchApi):
+        def read_namespaced_job(self, name, namespace):
+            error = KeyError((namespace, name))
+            error.status = 404
+            raise error
+
+    store = build_store()
+    _, workflow = workflow_state(store, [WorkflowOperation.STOP_WORKLOADS])
+    batch = MissingBatch()
+    adapter = KubernetesWorkflowAdapter(
+        core_api=UnusedApi(), batch_api=batch, custom_api=UnusedApi(), store=store
+    )
+    step = copy_model(
+        workflow.official_steps[0],
+        execution_owner=adapter.owner,
+        workload_ids=["gpu-fault-system/job/training-job"],
+    )
+    workflow = copy_model(workflow, official_steps=[step])
+    store.save_workflow(workflow)
+
+    result = execute_workflow(
+        active_workflow_executor(store, [adapter], {WorkflowOperation.STOP_WORKLOADS}),
+        workflow.request_id,
+    )
+
+    assert result.status is WorkflowStatus.SUCCEEDED
+    persisted = store.get_workflow(workflow.request_id)
+    execution = persisted.step_executions[-1]
+    assert execution.status is WorkflowStepStatus.SUCCEEDED
+    assert execution.details["already_absent_workloads"] == [
+        "gpu-fault-system/job/training-job"
+    ]
+    assert batch.suspend_patches == []
+
+
 @pytest.mark.parametrize(
     "previous_status",
     [WorkflowStatus.BLOCKED, WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED],
@@ -350,6 +386,10 @@ def test_kubernetes_restart_clones_terminal_job_idempotently() -> None:
         "gpu-fault.io/attempt-id"
     ].startswith("attempt-a-r-")
     retry_name = restarted["metadata"]["name"]
+    persisted = store.get_workflow(workflow.request_id)
+    assert persisted.step_executions[-1].details["restarted_workload_ids"] == [
+        f"gpu-fault-system/job/{retry_name}"
+    ]
     assert (
         restarted["spec"]["template"]["metadata"]["annotations"][
             "gpu-fault.io/workload-ids"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import argparse
 import os
-import sys
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -16,7 +16,19 @@ from gpu_fault.store import PostgresStore
 
 
 def main() -> None:
-    incident_id, node_id, reason = sys.argv[1:4]
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create a validation-first workflow that restores scheduling "
+            "for one quarantined node."
+        )
+    )
+    parser.add_argument("incident_id")
+    parser.add_argument("node_id")
+    parser.add_argument("reason")
+    arguments = parser.parse_args()
+    incident_id = arguments.incident_id
+    node_id = arguments.node_id
+    reason = arguments.reason
     store = PostgresStore(
         os.environ["GPU_FAULT_STORE_URL"],
         pool_min_size=1,

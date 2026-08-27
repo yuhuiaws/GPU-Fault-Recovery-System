@@ -37,6 +37,10 @@ Driver/manifest pairs:
 | `hyperpod-efa-traffic-e2e.yaml` | `../run_hyperpod_efa_traffic_e2e.py` |
 | `hyperpod-three-source-fault-e2e.yaml` | `../run_hyperpod_three_source_fault_e2e.py` |
 
+`regional-isolation-gpu-job.yaml` is a long-running single-GPU source Job for
+logical multi-cluster identity tests. Render it with `gpu-training-submit`
+into separate namespaces; do not apply the source file directly.
+
 The procedure must create the driver ConfigMap from the file in the same row;
 it must also include
 `--from-file=isolated_api.py=scripts/e2e/isolated_api.py`. Changing the

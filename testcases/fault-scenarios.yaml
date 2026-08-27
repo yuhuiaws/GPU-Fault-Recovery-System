@@ -2135,17 +2135,17 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-001
 - id: GF-REGIONAL-BOOT-002
-  title: 非法或空的集群注册表必须启动失败
+  title: 非法注册表必须失败且显式空列表保持健康
   category: regional-startup-guard
   level: live
   risk: non-destructive
-  problem: 注册表 JSON 截断、空数组或非数组时都不能被静默接受。
-  injection: 依次用截断 JSON、[] 和 {} 三种内容滚动一次性验证 Deployment。
+  problem: 注册表必须拒绝非法结构，同时允许注销最后一个GPU集群后的显式空列表稳态。
+  injection: 依次用截断JSON、{}、[1]和[]滚动一次性验证Deployment。
   expected:
   - 截断 JSON 报 GPU_FAULT_REGIONAL_CLUSTERS_JSON is invalid
-  - 空数组报 regional cluster registry must be a non-empty list
-  - 非数组走同一非空列表分支并启动失败
-  - 截断 JSON 与非空列表两类错误文本可区分（[] 与 {} 同分支同文本，不可区分）
+  - 非数组报 regional cluster registry must be a list
+  - 含非对象元素的数组报 regional cluster registry entries must be objects
+  - 显式空数组启动成功且管理员集群清单返回空数组
   evidence:
     verdict: PASS
   automation: manual
@@ -2377,20 +2377,19 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-015
 - id: GF-REGIONAL-BOOT-016
-  title: 首次部署的空注册表引导路径必须可运行
+  title: ARN-only首次部署先生成完整registry且零集群稳态可运行
   category: regional-deployability
   level: live
   risk: non-destructive
-  problem: 部署和运维手册的 greenfield 流程先创建 [] 空注册表再部署控制面，而控制面在区域模式下拒绝以空注册表启动，两步互相矛盾导致新 revision 无法 Ready。
-  injection: 在全新命名空间严格按部署和运维手册第 3 至 5 步顺序执行不跳步，观察 rollout 结果，再注册一个真实集群条目重新滚动。
+  problem: 首次自动部署必须在启动工作负载前生成至少一个完整GPU注册条目，同时部署后的零集群稳态必须允许显式空列表。
+  injection: 在全新state-dir使用CPU/GPU ARN执行管理员单命令部署，原样重跑验证幂等，并负向省略GPU ARN；另由BOOT-002验证显式空列表。
   expected:
-  - 按手册顺序执行时 rollout status 成功
-  - 若必须先注册集群才能启动则判定手册步骤顺序错误并 FAIL
-  - 日志中的 regional cluster registry must be a non-empty list 被记录
-  - 修法采用把注册第一个 GPU 集群提到部署控制面之前而不是引入新的降级开关
-  - 注册真实条目后 Ready 且 BOOT-010 全部通过
-  - 反向验证：把 registry 改回 [] 后新副本必须 Ready=false、rollout 停滞且日志出现该守卫报错；uvicorn supervisor 下不强制要求容器 CrashLoopBackOff
-  - 生产 gpu-fault-system 副本不得因本测试重启，且所有重启必须逐条归因
+  - 首次bootstrap生成0600的site.yaml且spec.clusters非空
+  - registry Secret与site cluster ID集合一致后才启动CPU/GPU工作负载
+  - bootstrap state为site-ready且release verify通过
+  - 原命令重跑幂等或NOOP，不创建第二套AWS资源
+  - 缺少GPU ARN在修改AWS或Kubernetes前失败
+  - 显式空registry仅用于部署后的零集群稳态并保持控制面健康
   evidence:
     verdict: PASS
   automation: manual

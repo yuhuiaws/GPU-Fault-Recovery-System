@@ -175,7 +175,12 @@ def test_multi_cluster_batches_do_not_deadlock_on_the_counters(store) -> None:
     def writer(worker: int) -> None:
         instance = PostgresStore(POSTGRES_URL)
         try:
-            barrier.wait(timeout=30)
+            # This barrier isolates the concurrent lock-order phase from
+            # connection setup. A remote PostgreSQL endpoint reached through
+            # a Kubernetes port-forward can legitimately take longer than 30
+            # seconds to initialize eight independent pools; timing that out
+            # does not exercise the deadlock invariant this test owns.
+            barrier.wait(timeout=120)
             for round_index in range(rounds):
                 # A different permutation per statement, so the lock
                 # order of two overlapping batches differs.

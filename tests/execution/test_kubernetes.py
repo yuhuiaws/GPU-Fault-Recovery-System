@@ -31,6 +31,7 @@ from ._kubernetes_cases_2 import (
     test_kubernetes_stop_rejects_active_incident_takeover,
     test_kubernetes_stop_retries_workload_patch_conflict,
     test_kubernetes_stop_takes_over_terminal_incident,
+    test_kubernetes_stop_treats_missing_workload_as_already_stopped,
     test_kubernetes_stops_workload_without_hyperpod_auto_resume,
     test_pytorch_restart_rebinds_node_placement_to_spare,
     test_workload_log_s3_upload_is_gzipped,

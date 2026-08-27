@@ -6,12 +6,12 @@ import tempfile
 from email.message import Message
 from urllib.error import HTTPError
 
-import gpu_fault.collectors as collectors
+import gpu_fault.collectors.sinks as collector_sinks
 from gpu_fault.collectors import CollectorError, HttpEventSink
 
 
 def main() -> None:
-    original = collectors.urlopen
+    original = collector_sinks.urlopen
     with tempfile.TemporaryDirectory() as directory:
         outbox = f"{directory}/events.ndjson"
         calls = []
@@ -33,7 +33,7 @@ def main() -> None:
                 raise OSError("network unavailable")
             return Response()
 
-        collectors.urlopen = probe
+        collector_sinks.urlopen = probe
         sink = HttpEventSink(
             "https://control",
             max_attempts=1,
@@ -45,7 +45,10 @@ def main() -> None:
             pass
         available[0] = True
         sink.post("/events", {"sequence": 2})
-        assert [item["sequence"] for item in calls] == [1, 1, 2]
+        # The live event must not wait behind a potentially large replay
+        # backlog. The first "1" is the failed live attempt, "2" is the
+        # next live event, and the final "1" is the bounded replay.
+        assert [item["sequence"] for item in calls] == [1, 2, 1]
         assert open(outbox).read() == ""
 
         def permanent(*_args, **_kwargs):
@@ -57,7 +60,7 @@ def main() -> None:
                 io.BytesIO(b"invalid schema"),
             )
 
-        collectors.urlopen = permanent
+        collector_sinks.urlopen = permanent
         try:
             sink.post("/events", {"sequence": 3})
         except CollectorError:
@@ -67,12 +70,12 @@ def main() -> None:
         print(
             "PASS",
             {
-                "replay_order": [1, 1, 2],
+                "replay_order": [1, 2, 1],
                 "dead_letter_replayable": dead["replayable"],
                 "dead_letter_error": dead["error"],
             },
         )
-    collectors.urlopen = original
+    collector_sinks.urlopen = original
 
 
 if __name__ == "__main__":
