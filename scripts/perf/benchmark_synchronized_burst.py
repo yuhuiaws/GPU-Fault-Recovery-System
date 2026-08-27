@@ -7,6 +7,7 @@ import ssl
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from http.client import HTTPConnection, HTTPSConnection
 from pathlib import Path
 from urllib import error as urllib_error
@@ -18,6 +19,11 @@ if __package__:
     from .benchmark_mixed_control_plane import PATHS, stamp
 else:
     from benchmark_mixed_control_plane import PATHS, stamp
+
+EVENT_PATHS = {
+    **PATHS,
+    "TRAINING_PROGRESS": "/v1/training-progress",
+}
 
 
 def percentile(values: list[float], ratio: float) -> float:
@@ -95,12 +101,32 @@ def build_events(
     gpu_evidence_total: int,
     host_evidence_total: int,
     include_telemetry: bool,
+    training_heartbeat_total: int = 0,
+    workload_observation_total: int = 0,
+    correlate_attempt_faults: bool = False,
 ) -> list[tuple[str, str, int]]:
     def local_fault_count(total: int) -> int:
         base, remainder = divmod(total, cluster_count)
         return base + (1 if cluster_offset < remainder else 0)
 
     events: list[tuple[str, str, int]] = []
+    local_observations = local_fault_count(workload_observation_total)
+    for index in range(local_observations):
+        events.append(
+            (
+                "WORKLOAD_OBSERVATION",
+                "WORKLOAD_OBSERVATION",
+                (index * 2) % nodes_per_cluster,
+            )
+        )
+    for index in range(local_fault_count(training_heartbeat_total)):
+        events.append(
+            (
+                "TRAINING_PROGRESS",
+                "TRAINING_PROGRESS",
+                index % nodes_per_cluster,
+            )
+        )
     if include_telemetry:
         for node_index in range(nodes_per_cluster):
             events.extend(
@@ -110,21 +136,112 @@ def build_events(
                     ("HOST_TELEMETRY", "HOST_TELEMETRY", node_index),
                 )
             )
-    for kind, template_kind, total in (
-        ("NVIDIA_KERNEL", "NVIDIA_KERNEL", xid_total),
-        ("FABRIC_MANAGER_LOG", "FABRIC_MANAGER_LOG", sxid_total),
-        ("GPU_METRICS_EVIDENCE", "GPU_METRICS", gpu_evidence_total),
-        ("HOST_TELEMETRY_EVIDENCE", "HOST_TELEMETRY", host_evidence_total),
+    for kind, template_kind, total, attempt_node_offset in (
+        ("NVIDIA_KERNEL", "NVIDIA_KERNEL", xid_total, 0),
+        ("FABRIC_MANAGER_LOG", "FABRIC_MANAGER_LOG", sxid_total, 1),
+        ("GPU_METRICS_EVIDENCE", "GPU_METRICS", gpu_evidence_total, None),
+        ("HOST_TELEMETRY_EVIDENCE", "HOST_TELEMETRY", host_evidence_total, None),
     ):
+        local_count = local_fault_count(total)
         events.extend(
             (
                 kind,
                 template_kind,
-                index % nodes_per_cluster,
+                (
+                    (2 * (index % local_observations) + int(attempt_node_offset))
+                    % nodes_per_cluster
+                    if correlate_attempt_faults
+                    and local_observations
+                    and attempt_node_offset is not None
+                    else index % nodes_per_cluster
+                ),
             )
-            for index in range(local_fault_count(total))
+            for index in range(local_count)
         )
     return events
+
+
+def attempt_identity(node_index: int) -> dict[str, str | int]:
+    attempt_index = node_index // 2
+    suffix = f"{attempt_index:04d}"
+    return {
+        "attempt_index": attempt_index,
+        "job_id": f"burst-job-{suffix}",
+        "attempt_id": f"burst-attempt-{suffix}",
+        "workload_id": f"kubernetes/job/burst-{suffix}",
+    }
+
+
+def build_event_payload(
+    *,
+    templates: dict,
+    kind: str,
+    template_kind: str,
+    cluster_id: str,
+    node_index: int,
+    sequence: int,
+    correlate_attempt_faults: bool,
+) -> dict:
+    node_id = f"burst-node-{node_index:04d}"
+    identity = attempt_identity(node_index)
+    now = datetime.now(timezone.utc).isoformat()
+    if kind == "TRAINING_PROGRESS":
+        return {
+            "heartbeat_id": f"burst-progress-{sequence}",
+            "cluster_id": cluster_id,
+            "attempt_id": identity["attempt_id"],
+            "rank": node_index % 2,
+            "observed_at": now,
+            "node_id": node_id,
+            "pod_uid": f"burst-pod-{node_index:04d}",
+            "container_name": "trainer",
+            "step": 1,
+            "samples_per_second": 1.0,
+            "loss": 1.0,
+            "labels": {"drill_id": "perf-burst"},
+        }
+    payload = stamp(
+        templates.get(template_kind) or {},
+        template_kind,
+        cluster_id,
+        node_id,
+        sequence,
+    )
+    if kind == "WORKLOAD_OBSERVATION":
+        payload.pop("node_id", None)
+        first_node = int(identity["attempt_index"]) * 2
+        payload.update(
+            {
+                "job_id": identity["job_id"],
+                "attempt_id": identity["attempt_id"],
+                "workload_phase": "RUNNING",
+                "observed_at": now,
+                "started_at": now,
+                "expected_critical_ranks": 2,
+                "workload_ids": [identity["workload_id"]],
+                "restart_budget": 0,
+                "containers": [
+                    {
+                        "pod_uid": f"burst-pod-{first_node + rank:04d}",
+                        "pod_name": f"burst-pod-{first_node + rank:04d}",
+                        "container_name": "trainer",
+                        "role": "worker",
+                        "rank": rank,
+                        "node_id": f"burst-node-{first_node + rank:04d}",
+                        "gpu_count": 8,
+                        "terminated": False,
+                    }
+                    for rank in range(2)
+                ],
+            }
+        )
+    elif correlate_attempt_faults and kind in {
+        "NVIDIA_KERNEL",
+        "FABRIC_MANAGER_LOG",
+    }:
+        payload["affected_workload_ids"] = [identity["workload_id"]]
+        payload["workload_state"] = "ACTIVE"
+    return payload
 
 
 def build_output(
@@ -244,6 +361,24 @@ def wait_for_synchronized_start() -> tuple[float, float]:
     return start_epoch, time.time()
 
 
+def open_connection(parsed_base, connection_port: int, ssl_context) -> HTTPConnection:
+    if parsed_base.scheme == "https":
+        connection = HTTPSConnection(
+            parsed_base.hostname,
+            connection_port,
+            timeout=60,
+            context=ssl_context,
+        )
+    else:
+        connection = HTTPConnection(
+            parsed_base.hostname,
+            connection_port,
+            timeout=60,
+        )
+    connection.connect()
+    return connection
+
+
 def main() -> None:
     base_url = os.environ["GPU_FAULT_CONTROL_PLANE_URL"].rstrip("/")
     clusters = json.loads(Path(os.environ["CLUSTERS_FILE"]).read_text())
@@ -255,6 +390,11 @@ def main() -> None:
     sxid_total = int(os.environ["SXID_TOTAL"])
     gpu_evidence_total = int(os.getenv("GPU_EVIDENCE_TOTAL", "0"))
     host_evidence_total = int(os.getenv("HOST_EVIDENCE_TOTAL", "0"))
+    training_heartbeat_total = int(os.getenv("TRAINING_HEARTBEAT_TOTAL", "0"))
+    workload_observation_total = int(os.getenv("WORKLOAD_OBSERVATION_TOTAL", "0"))
+    correlate_attempt_faults = (
+        os.getenv("CORRELATE_ATTEMPT_FAULTS", "false").lower() == "true"
+    )
     workers = int(os.getenv("WORKERS", "128"))
     include_telemetry = os.getenv("INCLUDE_TELEMETRY", "true").lower() == "true"
     prewarm_connections = os.getenv("PREWARM_CONNECTIONS", "false").lower() == "true"
@@ -265,23 +405,6 @@ def main() -> None:
     base_path = parsed_base.path.rstrip("/")
     connection_port = parsed_base.port or (443 if parsed_base.scheme == "https" else 80)
 
-    def new_connection() -> HTTPConnection:
-        if parsed_base.scheme == "https":
-            connection = HTTPSConnection(
-                parsed_base.hostname,
-                connection_port,
-                timeout=60,
-                context=ssl_context,
-            )
-        else:
-            connection = HTTPConnection(
-                parsed_base.hostname,
-                connection_port,
-                timeout=60,
-            )
-        connection.connect()
-        return connection
-
     events = build_events(
         cluster_count=cluster_count,
         cluster_offset=cluster_offset,
@@ -291,13 +414,20 @@ def main() -> None:
         gpu_evidence_total=gpu_evidence_total,
         host_evidence_total=host_evidence_total,
         include_telemetry=include_telemetry,
+        training_heartbeat_total=training_heartbeat_total,
+        workload_observation_total=workload_observation_total,
+        correlate_attempt_faults=correlate_attempt_faults,
     )
 
     connections, prewarm_errors, prewarm_seconds = prewarm_connection_pool(
         events,
         workers=workers,
         enabled=prewarm_connections,
-        connection_factory=new_connection,
+        connection_factory=lambda: open_connection(
+            parsed_base,
+            connection_port,
+            ssl_context,
+        ),
     )
     start_epoch, actual_start = wait_for_synchronized_start()
     latencies: dict[str, list[float]] = {}
@@ -310,14 +440,15 @@ def main() -> None:
     def send(indexed_event: tuple[int, tuple[str, str, int]]):
         index, (kind, template_kind, node_index) = indexed_event
         sequence = cluster_offset * 1_000_000 + index
-        node_id = f"burst-node-{node_index:04d}"
         try:
-            payload = stamp(
-                templates.get(template_kind) or {},
-                template_kind,
-                registration["cluster_id"],
-                node_id,
-                sequence,
+            payload = build_event_payload(
+                templates=templates,
+                kind=kind,
+                template_kind=template_kind,
+                cluster_id=registration["cluster_id"],
+                node_index=node_index,
+                sequence=sequence,
+                correlate_attempt_faults=correlate_attempt_faults,
             )
         except Exception as exc:
             return kind, 0, 0.0, type(exc).__name__, {}
@@ -343,7 +474,7 @@ def main() -> None:
                 if connection is not None:
                     connection.request(
                         "POST",
-                        base_path + PATHS[template_kind],
+                        base_path + EVENT_PATHS[template_kind],
                         body=body,
                         headers=headers,
                     )
@@ -353,7 +484,7 @@ def main() -> None:
                     timing = server_timing(response.headers)
                 else:
                     request = urllib_request.Request(
-                        base_url + PATHS[template_kind],
+                        base_url + EVENT_PATHS[template_kind],
                         data=body,
                         headers=headers,
                         method="POST",

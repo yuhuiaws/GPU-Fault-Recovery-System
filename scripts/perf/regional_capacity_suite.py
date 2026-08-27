@@ -565,6 +565,9 @@ def build_job(
     sxid_total: int,
     gpu_evidence_total: int,
     host_evidence_total: int,
+    training_heartbeat_total: int,
+    workload_observation_total: int,
+    correlate_attempt_faults: bool,
     start_epoch: float,
     workers: int,
     duration_seconds: int,
@@ -587,6 +590,9 @@ def build_job(
         sxid_total=sxid_total,
         gpu_evidence_total=gpu_evidence_total,
         host_evidence_total=host_evidence_total,
+        training_heartbeat_total=training_heartbeat_total,
+        workload_observation_total=workload_observation_total,
+        correlate_attempt_faults=correlate_attempt_faults,
         start_epoch=start_epoch,
         workers=workers,
         duration_seconds=duration_seconds,
@@ -982,6 +988,9 @@ def execute_case(
     sxid_total: int,
     gpu_evidence_total: int,
     host_evidence_total: int,
+    training_heartbeat_total: int,
+    workload_observation_total: int,
+    correlate_attempt_faults: bool,
     workers: int,
     duration_seconds: int,
     lead_seconds: int,
@@ -1031,6 +1040,9 @@ def execute_case(
         sxid_total=sxid_total,
         gpu_evidence_total=gpu_evidence_total,
         host_evidence_total=host_evidence_total,
+        training_heartbeat_total=training_heartbeat_total,
+        workload_observation_total=workload_observation_total,
+        correlate_attempt_faults=correlate_attempt_faults,
         start_epoch=start_epoch,
         workers=workers,
         duration_seconds=duration_seconds,
@@ -1103,6 +1115,9 @@ def execute_case(
             "nodes_per_cluster": nodes_per_cluster,
             "xid_total": xid_total,
             "sxid_total": sxid_total,
+            "training_heartbeat_total": training_heartbeat_total,
+            "workload_observation_total": workload_observation_total,
+            "correlate_attempt_faults": correlate_attempt_faults,
             "job_status": status,
             "release_id": release_id(),
             "window_start_epoch": window_start,
@@ -1283,6 +1298,9 @@ def main() -> int:
     parser.add_argument("--sxid-total", type=int, default=None)
     parser.add_argument("--gpu-evidence-total", type=int, default=0)
     parser.add_argument("--host-evidence-total", type=int, default=0)
+    parser.add_argument("--training-heartbeat-total", type=int, default=0)
+    parser.add_argument("--workload-observation-total", type=int, default=0)
+    parser.add_argument("--correlate-attempt-faults", action="store_true")
     parser.add_argument("--workers", type=int, default=256)
     parser.add_argument("--duration-seconds", type=int, default=60)
     parser.add_argument(
@@ -1368,6 +1386,9 @@ def main() -> int:
                 "sxid_total": sxid_total,
                 "gpu_evidence_total": args.gpu_evidence_total,
                 "host_evidence_total": (args.host_evidence_total),
+                "training_heartbeat_total": (args.training_heartbeat_total),
+                "workload_observation_total": (args.workload_observation_total),
+                "correlate_attempt_faults": (args.correlate_attempt_faults),
                 "workers": args.workers,
                 "duration_seconds": args.duration_seconds,
                 "fault_only": args.fault_only,
@@ -1398,6 +1419,9 @@ def main() -> int:
             sxid_total=sxid_total,
             gpu_evidence_total=args.gpu_evidence_total,
             host_evidence_total=args.host_evidence_total,
+            training_heartbeat_total=args.training_heartbeat_total,
+            workload_observation_total=args.workload_observation_total,
+            correlate_attempt_faults=args.correlate_attempt_faults,
             workers=args.workers,
             duration_seconds=args.duration_seconds,
             lead_seconds=args.lead_seconds,

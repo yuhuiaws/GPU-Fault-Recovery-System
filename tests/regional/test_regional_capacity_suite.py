@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from gpu_fault.hma import FabricManagerLogEvent
+from gpu_fault.training_models import TrainingProgressHeartbeat
+from gpu_fault.watcher import AttemptObservation
+from scripts.perf import benchmark_synchronized_burst as burst
 from scripts.perf import regional_capacity_suite as suite
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -108,6 +112,9 @@ def test_burst_job_keeps_indexed_start_gate_contract() -> None:
         sxid_total=500,
         gpu_evidence_total=0,
         host_evidence_total=0,
+        training_heartbeat_total=0,
+        workload_observation_total=0,
+        correlate_attempt_faults=False,
         start_epoch=1234.0,
         workers=128,
         duration_seconds=60,
@@ -130,6 +137,90 @@ def test_burst_job_keeps_indexed_start_gate_contract() -> None:
     assert environment["CLUSTER_OFFSET"]["valueFrom"]["fieldRef"]["fieldPath"] == (
         "metadata.annotations['batch.kubernetes.io/job-completion-index']"
     )
+
+
+def test_complete_single_cluster_burst_covers_attempt_context() -> None:
+    events = burst.build_events(
+        cluster_count=1,
+        cluster_offset=0,
+        nodes_per_cluster=1000,
+        xid_total=500,
+        sxid_total=500,
+        gpu_evidence_total=500,
+        host_evidence_total=500,
+        include_telemetry=True,
+        training_heartbeat_total=1000,
+        workload_observation_total=500,
+        correlate_attempt_faults=True,
+    )
+    counts = {
+        kind: sum(item[0] == kind for item in events)
+        for kind in {item[0] for item in events}
+    }
+
+    assert counts == {
+        "FABRIC_MANAGER_LOG": 500,
+        "GPU_INVENTORY": 1000,
+        "GPU_METRICS": 1000,
+        "GPU_METRICS_EVIDENCE": 500,
+        "HOST_TELEMETRY": 1000,
+        "HOST_TELEMETRY_EVIDENCE": 500,
+        "NVIDIA_KERNEL": 500,
+        "TRAINING_PROGRESS": 1000,
+        "WORKLOAD_OBSERVATION": 500,
+    }
+    xid_nodes = [node for kind, _template, node in events if kind == "NVIDIA_KERNEL"]
+    sxid_nodes = [
+        node for kind, _template, node in events if kind == "FABRIC_MANAGER_LOG"
+    ]
+    assert xid_nodes == list(range(0, 1000, 2))
+    assert sxid_nodes == list(range(1, 1000, 2))
+
+
+def test_complete_burst_payloads_share_two_node_attempt_identity() -> None:
+    templates = json.loads(
+        (ROOT / "scripts/perf/payload-templates.json").read_text(encoding="utf-8")
+    )
+    observation = burst.build_event_payload(
+        templates=templates,
+        kind="WORKLOAD_OBSERVATION",
+        template_kind="WORKLOAD_OBSERVATION",
+        cluster_id="cluster-a",
+        node_index=24,
+        sequence=1,
+        correlate_attempt_faults=True,
+    )
+    heartbeat = burst.build_event_payload(
+        templates=templates,
+        kind="TRAINING_PROGRESS",
+        template_kind="TRAINING_PROGRESS",
+        cluster_id="cluster-a",
+        node_index=25,
+        sequence=2,
+        correlate_attempt_faults=True,
+    )
+    fault = burst.build_event_payload(
+        templates=templates,
+        kind="FABRIC_MANAGER_LOG",
+        template_kind="FABRIC_MANAGER_LOG",
+        cluster_id="cluster-a",
+        node_index=25,
+        sequence=3,
+        correlate_attempt_faults=True,
+    )
+
+    assert observation["attempt_id"] == "burst-attempt-0012"
+    assert [item["node_id"] for item in observation["containers"]] == [
+        "burst-node-0024",
+        "burst-node-0025",
+    ]
+    assert heartbeat["attempt_id"] == observation["attempt_id"]
+    assert heartbeat["rank"] == 1
+    assert fault["affected_workload_ids"] == observation["workload_ids"]
+    assert fault["workload_state"] == "ACTIVE"
+    AttemptObservation(**observation)
+    TrainingProgressHeartbeat(**heartbeat)
+    FabricManagerLogEvent(**fault)
 
 
 def test_result_aggregation_preserves_fault_latency_summary() -> None:
