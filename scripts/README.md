@@ -23,8 +23,10 @@ generic fault-case runner.
   with bounded parallelism; uncertain classifications fall back to deploy.
   `ADMIN_EMAIL` optionally overrides the site administrator address; otherwise
   the existing site value or AWS account email discovery is used.
-- `scripts/e2e/`: live-cluster drivers and probes.
-- `scripts/e2e/manifests/`: test-only Kubernetes inputs named by procedures.
+- `scripts/e2e/regional/`: regional acceptance drivers, probes, boot guards,
+  recovery helpers and test-only Kubernetes inputs.
+- `scripts/e2e/hyperpod/`: focused HyperPod scenario runners.
+- `scripts/e2e/`: shared rendering and isolated-API utilities only.
 - `scripts/perf/`: current capacity suites and reusable performance helpers.
 - `scripts/perf/legacy/`: superseded one-off Job/benchmark pairs, retained only
   for historical comparison.

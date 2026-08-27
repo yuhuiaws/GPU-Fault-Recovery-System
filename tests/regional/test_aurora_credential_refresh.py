@@ -26,27 +26,55 @@ def _encode(value: str) -> str:
 
 
 class FakeCore:
-    def __init__(self, data: dict[str, str]):
+    def __init__(
+        self, data: dict[str, str], *, annotations: dict[str, str] | None = None
+    ):
         self.data = dict(data)
+        self.annotations = dict(annotations or {})
         self.patches: list[dict] = []
 
     def read_namespaced_secret(self, name, namespace):
         self.name = name
         self.namespace = namespace
-        return SimpleNamespace(data=dict(self.data))
+        return SimpleNamespace(
+            data=dict(self.data),
+            metadata=SimpleNamespace(annotations=dict(self.annotations)),
+        )
 
     def patch_namespaced_secret(self, name, namespace, body):
         self.patches.append(body)
         self.data.update(body["data"])
+        self.annotations.update((body.get("metadata") or {}).get("annotations") or {})
 
 
 class FakeApps:
-    def __init__(self):
+    def __init__(self, *, fail_once: str | None = None):
         self.patches: list[dict] = []
+        self.patched_names: list[str] = []
+        self.annotations: dict[str, dict[str, str]] = {}
+        self.fail_once = fail_once
+
+    def read_namespaced_deployment(self, name, namespace):
+        self.namespace = namespace
+        annotations = self.annotations.setdefault(name, {})
+        return SimpleNamespace(
+            spec=SimpleNamespace(
+                template=SimpleNamespace(
+                    metadata=SimpleNamespace(annotations=dict(annotations))
+                )
+            )
+        )
 
     def patch_namespaced_deployment(self, name, namespace, body):
+        if self.fail_once == name:
+            self.fail_once = None
+            raise RuntimeError(f"temporary patch failure for {name}")
         self.name = name
+        self.patched_names.append(name)
         self.patches.append(body)
+        self.annotations.setdefault(name, {}).update(
+            body["spec"]["template"]["metadata"]["annotations"]
+        )
 
 
 def _refresh(
@@ -57,6 +85,7 @@ def _refresh(
     verify=None,
     expected_secret_arn=None,
     deployments=None,
+    timestamp="2026-08-04T12:00:00+00:00",
 ):
     verified: list[str] = []
 
@@ -72,7 +101,7 @@ def _refresh(
         deployment="gpu-fault-api-ha",
         deployments=deployments,
         region_name="us-west-2",
-        timestamp="2026-08-04T12:00:00+00:00",
+        timestamp=timestamp,
         expected_secret_arn=expected_secret_arn,
         verify=verify or default_verify,
         fetch_password=lambda arn, region: password,
@@ -104,9 +133,13 @@ def test_rotation_updates_secret_and_restarts_deployment() -> None:
     assert "newpw" in stored
     # The candidate is proven against the database before it is written.
     assert verified == [stored]
+    assert core.annotations[RESTART_ANNOTATION] == "2026-08-04T12:00:00+00:00"
     assert apps.patches[0]["spec"]["template"]["metadata"]["annotations"] == {
         RESTART_ANNOTATION: "2026-08-04T12:00:00+00:00"
     }
+    assert apps.annotations["gpu-fault-api-ha"][RESTART_ANNOTATION] == (
+        "2026-08-04T12:00:00+00:00"
+    )
 
 
 def test_rotation_restarts_every_configured_consumer() -> None:
@@ -117,8 +150,73 @@ def test_rotation_restarts_every_configured_consumer() -> None:
 
     _refresh(core, apps, deployments=("gpu-fault-api-ha", "gpu-fault-active-executor"))
 
-    assert len(apps.patches) == 2
-    assert apps.name == "gpu-fault-active-executor"
+    assert apps.patched_names == ["gpu-fault-api-ha", "gpu-fault-active-executor"]
+
+
+def test_partial_rollout_resumes_after_secret_write() -> None:
+    targets = (
+        "gpu-fault-api-ha",
+        "gpu-fault-control-worker",
+        "gpu-fault-telemetry-spool-worker",
+    )
+    core = FakeCore(
+        {"postgres-url": _encode(DSN), "master-secret-arn": _encode(SECRET_ARN)}
+    )
+    apps = FakeApps(fail_once="gpu-fault-control-worker")
+
+    with pytest.raises(RuntimeError, match="temporary patch failure"):
+        _refresh(core, apps, deployments=targets)
+
+    stored = base64.b64decode(core.data["postgres-url"]).decode()
+    rollout_token = core.annotations[RESTART_ANNOTATION]
+    assert "newpw" in stored
+    assert apps.patched_names == ["gpu-fault-api-ha"]
+    assert len(core.patches) == 1
+
+    result, verified = _refresh(
+        core,
+        apps,
+        password="newpw",
+        deployments=targets,
+        timestamp="2026-08-04T12:05:00+00:00",
+    )
+
+    assert result.rotated is False
+    assert result.restarted is True
+    assert result.reason == "deployment rollout resumed for current credentials"
+    assert verified == []
+    assert len(core.patches) == 1
+    assert apps.patched_names == list(targets)
+    assert {
+        name: annotations[RESTART_ANNOTATION]
+        for name, annotations in apps.annotations.items()
+    } == {name: rollout_token for name in targets}
+
+
+def test_current_secret_and_completed_rollout_are_noop() -> None:
+    targets = ("gpu-fault-api-ha", "gpu-fault-control-worker")
+    core = FakeCore(
+        {"postgres-url": _encode(DSN), "master-secret-arn": _encode(SECRET_ARN)}
+    )
+    apps = FakeApps()
+    _refresh(core, apps, deployments=targets)
+    secret_patches = len(core.patches)
+    deployment_patches = len(apps.patches)
+
+    result, verified = _refresh(
+        core,
+        apps,
+        password="newpw",
+        deployments=targets,
+        timestamp="2026-08-04T12:05:00+00:00",
+    )
+
+    assert result.rotated is False
+    assert result.restarted is False
+    assert "already carry current credentials" in result.reason
+    assert verified == []
+    assert len(core.patches) == secret_patches
+    assert len(apps.patches) == deployment_patches
 
 
 def test_unchanged_password_touches_nothing() -> None:

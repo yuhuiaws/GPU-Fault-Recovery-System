@@ -100,7 +100,7 @@ def check(deploy: Path) -> list[str]:
         # There is no ``kind: Pod`` document anywhere under deploy -- the tree
         # is Deployments, DaemonSets, Jobs and ConfigMaps -- so the old
         # kind-scoped form never reached its append. The injection manifests it
-        # is meant to keep out (tests/manifests/fault-injection/*.yaml) would
+        # is meant to keep out (scripts/e2e/regional/manifests/fault-injection/*.yaml) would
         # still be caught, but so would the same payload pasted into a
         # DaemonSet template or a Job, which is the likelier way it arrives.
         # No false positive to trade away: the production kmsg consumer is a

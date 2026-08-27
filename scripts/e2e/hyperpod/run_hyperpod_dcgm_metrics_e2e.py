@@ -12,7 +12,7 @@ from typing import Any
 from urllib.request import urlopen
 
 if __package__:
-    from .isolated_api import (
+    from scripts.e2e.isolated_api import (
         launch_isolated_api,
         random_execution_token,
         require_assertions_enabled,

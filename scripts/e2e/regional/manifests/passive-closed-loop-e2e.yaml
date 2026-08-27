@@ -21,10 +21,10 @@ spec:
         gpu-fault.io/training-container: trainer
         # Must name a profile that is actually registered on the control
         # plane; deploy.sh registers exactly one, named by
-        # ${GPU_FAULT_RUNTIME_PROFILE} (default hyperpod-v1). Naming an
+        # the current site Profile. Naming an
         # unregistered profile makes the watcher's
         # POST /v1/attempts/terminal fail 404 forever.
-        gpu-fault.io/runtime-profile-version: hyperpod-v1
+        gpu-fault.io/runtime-profile-version: REPLACE_WITH_RUNTIME_PROFILE_VERSION
         gpu-fault.io/restart-budget: "1"
     spec:
       restartPolicy: Never

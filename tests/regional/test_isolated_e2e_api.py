@@ -22,9 +22,9 @@ from scripts.e2e.isolated_api import (
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNERS = (
-    ROOT / "scripts/e2e/run_hyperpod_dcgm_metrics_e2e.py",
-    ROOT / "scripts/e2e/run_hyperpod_efa_traffic_e2e.py",
-    ROOT / "scripts/e2e/run_hyperpod_three_source_fault_e2e.py",
+    ROOT / "scripts/e2e/hyperpod/run_hyperpod_dcgm_metrics_e2e.py",
+    ROOT / "scripts/e2e/hyperpod/run_hyperpod_efa_traffic_e2e.py",
+    ROOT / "scripts/e2e/hyperpod/run_hyperpod_three_source_fault_e2e.py",
 )
 
 

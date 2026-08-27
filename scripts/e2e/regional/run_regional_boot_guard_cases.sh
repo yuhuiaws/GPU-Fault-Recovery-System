@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-FIXTURE_DIR="${ROOT}/scripts/boot-guard-probe"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+FIXTURE_DIR="${ROOT}/scripts/e2e/regional/boot_guard"
 PYTHON="${PYTHON:-${ROOT}/.venv/bin/python}"
 
 : "${CPU_KUBECONFIG:?}"

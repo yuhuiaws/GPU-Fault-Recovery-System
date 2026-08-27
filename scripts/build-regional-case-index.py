@@ -136,7 +136,7 @@ def render() -> str:
             lines.append("")
         elif window == "分级":
             lines.append(
-                "> **维护窗口按用例分级**：本阶段混有破坏性用例，逐条看「等级」列。"
+                "> **维护窗口按用例分级**：本阶段用例副作用不同，逐条看「等级」列。"
             )
             lines.append("")
         elif window == "建议":

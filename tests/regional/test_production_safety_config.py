@@ -472,6 +472,7 @@ def test_aurora_rotation_restarts_every_database_consumer() -> None:
         )
     )
     cronjob = next(item for item in documents if item.get("kind") == "CronJob")
+    role = next(item for item in documents if item.get("kind") == "Role")
     env = {
         item["name"]: item.get("value")
         for item in cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"][
@@ -487,6 +488,13 @@ def test_aurora_rotation_restarts_every_database_consumer() -> None:
         "gpu-fault-control-worker",
         "gpu-fault-telemetry-spool-worker",
     }
+    deployment_rule = next(
+        item
+        for item in role["rules"]
+        if item["apiGroups"] == ["apps"] and item["resources"] == ["deployments"]
+    )
+    assert set(deployment_rule["resourceNames"]) == targets
+    assert set(deployment_rule["verbs"]) == {"get", "patch"}
 
 
 def test_cluster_executor_dependency_install_has_bounded_retry() -> None:
@@ -688,7 +696,9 @@ def test_regional_migration_removes_legacy_execution_token() -> None:
 
 
 def test_boot_guard_probe_is_small_and_uses_isolated_schema() -> None:
-    derive = (ROOT / "scripts/boot-guard-probe/derive.sh").read_text(encoding="utf-8")
+    derive = (ROOT / "scripts/e2e/regional/boot_guard/derive.sh").read_text(
+        encoding="utf-8"
+    )
     manual = (ROOT / "docs/区域模式端到端验收测试用例.md").read_text(encoding="utf-8")
     section = manual.split("### 4.0 一次性探针的准备", 1)[1].split(
         "### GF-REGIONAL-BOOT-001", 1

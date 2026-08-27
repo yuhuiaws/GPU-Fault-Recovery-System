@@ -3106,7 +3106,7 @@ run_e2e() {
         -e "s/passive-aurora-e2e-a1/${attempt}/g" \
         -e "s/passive-aurora-e2e/${job}/g" \
         -e "s|\(gpu-fault.io/runtime-profile-version:\).*|\1 ${RUNTIME_PROFILE}|" \
-        "${REPO_DIR}/scripts/e2e/manifests/passive-aurora-e2e.yaml" |
+        "${REPO_DIR}/scripts/e2e/regional/manifests/passive-aurora-e2e.yaml" |
         kubectl apply -f -
     kubectl -n "${NAMESPACE}" wait \
         --for=jsonpath='{.spec.suspend}'=true \

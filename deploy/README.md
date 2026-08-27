@@ -45,8 +45,8 @@ rollout commands remain available for resume, rollback and break-glass.
 ## Hard rules
 
 1. Never place E2E, canary, smoke, probe or fault-injection manifests under
-   `deploy/`. E2E manifests belong in `scripts/e2e/manifests/`; destructive
-   injection manifests belong in `tests/manifests/fault-injection/`.
+   `deploy/`. E2E manifests belong in `scripts/e2e/regional/manifests/`; destructive
+   injection manifests belong in `scripts/e2e/regional/manifests/fault-injection/`.
 2. `control-plane/base/control-plane-deployment.yaml` and
    `control-plane/base/role-split-input.kustomization.yaml` are renderer
    inputs, not apply targets. The repository intentionally has no deployable

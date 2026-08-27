@@ -7,9 +7,9 @@ ordering_rule: >-
 phases:
   - sequence: 0
     name: 可部署性
-    maintenance_window: 否
+    maintenance_window: 分级
     entries:
-      - range: {prefix: BOOT, start: 11, end: 18}
+      - range: {prefix: BOOT, start: 11, end: 22}
   - sequence: 1
     name: 启动配置守卫
     maintenance_window: 否
@@ -17,61 +17,66 @@ phases:
       - range: {prefix: BOOT, start: 1, end: 10}
   - sequence: 2
     name: 身份边界
-    maintenance_window: 否
+    maintenance_window: 分级
     entries:
       - range: {prefix: AUTH, start: 1, end: 15}
   - sequence: 3
+    name: 训练工作负载基线
+    maintenance_window: 是
+    entries:
+      - range: {prefix: WORKLOAD, start: 1, end: 2}
+  - sequence: 4
     name: 单集群状态隔离
-    maintenance_window: 否
+    maintenance_window: 分级
     entries:
       - range: {prefix: ISO, start: 1, end: 5}
-  - sequence: 4
+  - sequence: 5
     name: Remote command 协议
-    maintenance_window: 否
+    maintenance_window: 建议
     entries:
       - range: {prefix: CMD, start: 1, end: 16}
-  - sequence: 5
+    notes:
+      - 优先使用隔离逻辑集群或测试控制面；不得在无维护窗口时把生产 Executor 缩容到 0。
+      - CMD-011 使用 Executor 本地夹具，不依赖控制面注入畸形 command。
+  - sequence: 6
     name: Workflow 抢占与 DAG
     maintenance_window: 分级
     entries:
       - range: {prefix: PREEMPT, start: 1, end: 31}
-  - sequence: 6
+  - sequence: 7
+    name: 单集群闭环
+    maintenance_window: 是
+    entries:
+      - case: GF-REGIONAL-E2E-001
+  - sequence: 8
     name: 爆炸半径
     maintenance_window: 否
     entries:
       - range: {prefix: BLAST, start: 1, end: 4}
-  - sequence: 7
-    name: 单集群闭环
-    maintenance_window: 否
-    entries:
-      - case: GF-REGIONAL-E2E-001
-  - sequence: 8
+  - sequence: 9
     name: 通知
     maintenance_window: 否
     entries:
       - range: {prefix: NOTIFY, start: 1, end: 6}
-  - sequence: 9
+    notes:
+      - NOTIFY-001/002 复用已批准动作或隔离通知夹具，不为邮件验收重复执行 GPU reset。
+  - sequence: 10
     name: 容量
     maintenance_window: 否
     entries:
       - range: {prefix: CAP, start: 1, end: 5}
-  - sequence: 10
+  - sequence: 11
     name: 网络中断与补交
     maintenance_window: 建议
     entries:
-      - range: {prefix: NET, start: 1, end: 4}
-  - sequence: 11
+      - range: {prefix: NET, start: 1, end: 5}
+  - sequence: 12
     name: 非破坏性 HA
     maintenance_window: 建议
     entries:
       - case: GF-REGIONAL-HA-001
       - case: GF-REGIONAL-HA-002
-      - range: {prefix: HA, start: 5, end: 8}
-  - sequence: 12
-    name: 训练工作负载基线
-    maintenance_window: 是
-    entries:
-      - range: {prefix: WORKLOAD, start: 1, end: 2}
+      - range: {prefix: HA, start: 5, end: 9}
   - sequence: 13
     name: 破坏性动作（非 warm spare）
     maintenance_window: 是

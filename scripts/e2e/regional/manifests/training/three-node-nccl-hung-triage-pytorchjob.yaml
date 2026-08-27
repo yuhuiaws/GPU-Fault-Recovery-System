@@ -94,7 +94,7 @@ spec:
           annotations:
             gpu-fault.io/expected-critical-ranks: "3"
             gpu-fault.io/training-container: pytorch
-            gpu-fault.io/runtime-profile-version: hyperpod-v1
+            gpu-fault.io/runtime-profile-version: REPLACE_WITH_RUNTIME_PROFILE_VERSION
             gpu-fault.io/rank-offset: "0"
             gpu-fault.io/restart-budget: "0"
         spec:
@@ -178,7 +178,7 @@ spec:
           annotations:
             gpu-fault.io/expected-critical-ranks: "3"
             gpu-fault.io/training-container: pytorch
-            gpu-fault.io/runtime-profile-version: hyperpod-v1
+            gpu-fault.io/runtime-profile-version: REPLACE_WITH_RUNTIME_PROFILE_VERSION
             gpu-fault.io/rank-offset: "1"
             gpu-fault.io/restart-budget: "0"
         spec:

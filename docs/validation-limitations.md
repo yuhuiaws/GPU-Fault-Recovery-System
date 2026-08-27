@@ -1,13 +1,13 @@
 # Validation limitations
 
 The following cases are not claimed as fully validated by the current
-staging environment as of 2026-08-20:
+staging environment as of 2026-08-27:
 
-- The Kubernetes shutdown budget is checked arithmetically, but no test holds a
-  legal long-running processor request while a control-worker Pod terminates.
-  The application currently waits only ten seconds per processor thread in
-  lifespan shutdown. Exactly-once completion or explicit lease release during
-  a rolling update is not proven (`GF-REGIONAL-HA-007`).
+- The Kubernetes shutdown budget is checked arithmetically, but the revised
+  `GF-REGIONAL-HA-007` still needs a staging run that holds legal 30/70/110
+  second requests while a control-worker terminates. The current worker uses a
+  130-second lifespan budget and a 240-second Kubernetes termination grace;
+  exactly-once completion or explicit lease release must be proven live.
 - The fatal processor deadline callback has not been run in a subprocess that
   verifies exit code 70, lease release, and takeover by a replacement worker
   (`GF-REGIONAL-HA-008`).
@@ -15,10 +15,10 @@ staging environment as of 2026-08-20:
   service-role/lifespan wiring that starts the production worker dispatcher
   has not been exercised end to end. Restart takeover while the provider is
   throttling is also unverified (`GF-REGIONAL-NOTIFY-006`).
-- Fifty PostgreSQL-specific tests are skipped when
-  `GPU_FAULT_TEST_POSTGRES_URL` is absent: 17 store tests and 33 processor
-  claim tests. The default local suite therefore does not constitute a
-  production Aurora Store gate (`GF-REGIONAL-CAP-005`).
+- PostgreSQL-specific test count is intentionally not pinned in this document.
+  Any test skipped because `GPU_FAULT_TEST_POSTGRES_URL` is absent means the
+  default local suite is not a production Aurora Store gate
+  (`GF-REGIONAL-CAP-005`).
 - Remote commands have no command-level `max_waiting_rounds` or deadline.
   `GF-REGIONAL-CMD-013` successfully reclaimed the same command after each
   of 20 consecutive WAITING results, carrying the prior result details every
@@ -30,13 +30,11 @@ staging environment as of 2026-08-20:
   remained behind the old 120-second command lease and reached terminal state
   125.981 seconds after the kill. This is expected by the current lease model
   but remains a recovery-latency limitation for time-critical actions.
-- `GF-REGIONAL-HA-005` observed zero loss during a 33.042-second ingress
-  rollout: 150/150 telemetry POSTs returned 202 and every returned processor
-  request completed internally with HTTP 200. This does not remove the
-  structural limitation that `HttpEventSink` has bounded in-memory retries
-  and no disk spool. An outage longer than its retry window can still lose
-  one-shot metric batches; log-derived events rely on their separate durable
-  cursor behavior.
+- `HttpEventSink` now has a per-collector bounded disk outbox. Network errors,
+  429 and exhausted 5xx retries are replayable; permanent 4xx records remain
+  non-replayable. The residual limitation is bounded capacity, unwritable or
+  damaged local storage, and replay being triggered only after a later live
+  post succeeds. Completion Watcher still has no equivalent durable outbox.
 
 - `COLLECT-004` debounce was validated through the documented safe substitute:
   expected GPU count was temporarily set to 9, the first mismatch established

@@ -53,7 +53,7 @@ PUBLIC_RELEASE_DOCUMENTS = (
     "docs/故障模拟测试手册.md",
     "docs/性能压测验收方案.md",
     "deploy/hyperpod/README.md",
-    "scripts/boot-guard-probe/README.md",
+    "scripts/e2e/regional/boot_guard/README.md",
 )
 
 

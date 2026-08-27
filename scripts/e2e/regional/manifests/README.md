@@ -23,23 +23,27 @@ source file directly:
 
 ```bash
 python3 scripts/e2e/render_manifest.py \
-  scripts/e2e/manifests/<manifest>.yaml \
+  scripts/e2e/regional/manifests/<manifest>.yaml \
   --wheel-configmap "${WHEEL_CONFIG_MAP}" \
+  --runtime-profile "${RUNTIME_PROFILE_VERSION}" \
   -o /tmp/<manifest>.yaml
 kubectl apply -f /tmp/<manifest>.yaml
 ```
+
+Pass only the options required by placeholders present in the selected source
+manifest. A source containing `REPLACE_WITH_RUNTIME_PROFILE_VERSION` must never
+be applied directly.
 
 Driver/manifest pairs:
 
 | Manifest | Driver mounted into `/test` |
 |---|---|
-| `hyperpod-dcgm-metrics-e2e.yaml` | `../run_hyperpod_dcgm_metrics_e2e.py` |
-| `hyperpod-efa-traffic-e2e.yaml` | `../run_hyperpod_efa_traffic_e2e.py` |
-| `hyperpod-three-source-fault-e2e.yaml` | `../run_hyperpod_three_source_fault_e2e.py` |
+| `hyperpod-dcgm-metrics-e2e.yaml` | `scripts/e2e/hyperpod/run_hyperpod_dcgm_metrics_e2e.py` |
+| `hyperpod-efa-traffic-e2e.yaml` | `scripts/e2e/hyperpod/run_hyperpod_efa_traffic_e2e.py` |
+| `hyperpod-three-source-fault-e2e.yaml` | `scripts/e2e/hyperpod/run_hyperpod_three_source_fault_e2e.py` |
 
-`regional-isolation-gpu-job.yaml` is a long-running single-GPU source Job for
-logical multi-cluster identity tests. Render it with `gpu-training-submit`
-into separate namespaces; do not apply the source file directly.
+The regional isolation source Job moved to
+`scripts/e2e/regional/manifests/regional-isolation-gpu-job.yaml`.
 
 The procedure must create the driver ConfigMap from the file in the same row;
 it must also include

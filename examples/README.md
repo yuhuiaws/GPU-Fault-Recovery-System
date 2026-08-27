@@ -33,5 +33,5 @@ GPU/EFA 数量、CPU、内存和 `--nproc-per-node`，否则 Pod 可能长期 Pe
 ## 相关 E2E 夹具
 
 故障注入、hung、warm-spare、已注解任务和 q118 场景均属于测试资产，位于
-`tests/manifests/training/` 或 `scripts/e2e/manifests/`。它们只能从对应测试步骤
+`scripts/e2e/regional/manifests/training/` 或 `scripts/e2e/regional/manifests/`。它们只能从对应测试步骤
 使用，不属于客户示例。

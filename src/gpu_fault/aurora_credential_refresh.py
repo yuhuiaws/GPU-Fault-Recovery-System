@@ -10,10 +10,10 @@ process authenticates with the stale password and dies, which surfaces as
 every replica in ``CrashLoopBackOff`` hours or days after the rotation.
 
 This module closes that gap. It reads ``AWSCURRENT`` from Secrets Manager,
-splices the password into the existing DSN, and — only when the two actually
-differ — writes the Secret and restarts the Deployment so the new password
-reaches ``GPU_FAULT_STORE_URL`` (an ``env`` from ``secretKeyRef`` is not
-hot-reloaded).
+splices the password into the existing DSN, writes the Secret when the two
+actually differ, and reconciles every database-consuming Deployment so the
+new password reaches ``GPU_FAULT_STORE_URL`` (an ``env`` from
+``secretKeyRef`` is not hot-reloaded).
 
 Two properties matter for running this unattended in production:
 
@@ -21,8 +21,12 @@ Two properties matter for running this unattended in production:
   database first. A refresher that cannot tell a good password from a bad one
   is free to replace a working Secret with a broken one, turning a rotation
   into an outage of its own making.
-* **Do nothing when nothing changed.** Restarting replicas is the only step
-  here that can disrupt serving, so it happens only after a real write.
+* **Resume partial rollouts.** The Secret and Deployment pod templates carry
+  the same refresh token. If a Kubernetes API failure interrupts the rollout
+  after the Secret write, the next attempt restarts only the missing targets.
+* **Do nothing when converged.** Restarting replicas is the only disruptive
+  step, so an already-current Secret whose targets carry the same refresh
+  token produces no patch.
 
 Discovered as ``GF-REGIONAL-BOOT-016`` 附带发现 2.
 """
@@ -34,6 +38,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 LOGGER = logging.getLogger(__name__)
@@ -49,10 +54,10 @@ RESTART_ANNOTATION = "gpu-fault.aws/aurora-credential-refreshed-at"
 class RefreshResult:
     """Outcome of one refresh attempt.
 
-    ``rotated`` is the only field that implies a write happened; the
-    ``reason`` is carried for logging so an operator reading CronJob output
-    can tell "already current" apart from "no managed secret configured"
-    without correlating timestamps.
+    ``rotated`` means the Secret changed, while ``restarted`` means at least
+    one Deployment pod template changed. The ``reason`` is carried for
+    logging so an operator can distinguish a converged no-op from a resumed
+    rollout without correlating timestamps.
     """
 
     rotated: bool
@@ -127,6 +132,40 @@ def verify_dsn(dsn: str, connect_timeout: int = 10) -> None:
             cursor.fetchone()
 
 
+def _annotations(value: Any) -> dict[str, str]:
+    metadata = getattr(value, "metadata", None)
+    return dict(getattr(metadata, "annotations", None) or {})
+
+
+def _reconcile_deployments(
+    apps: Any,
+    *,
+    namespace: str,
+    targets: tuple[str, ...],
+    rollout_token: str,
+) -> tuple[str, ...]:
+    restarted = []
+    for target in targets:
+        deployment = apps.read_namespaced_deployment(target, namespace)
+        template = getattr(getattr(deployment, "spec", None), "template", None)
+        if _annotations(template).get(RESTART_ANNOTATION) == rollout_token:
+            continue
+        apps.patch_namespaced_deployment(
+            target,
+            namespace,
+            {
+                "spec": {
+                    "template": {
+                        "metadata": {"annotations": {RESTART_ANNOTATION: rollout_token}}
+                    }
+                }
+            },
+        )
+        restarted.append(target)
+        LOGGER.info("restarted deployment %s/%s", namespace, target)
+    return tuple(restarted)
+
+
 def refresh_once(
     core,
     apps,
@@ -167,10 +206,12 @@ def refresh_once(
     stored_secret_arn = base64.b64decode(encoded_arn).decode().strip()
     secret_arn = expected_secret_arn or stored_secret_arn
     arn_changed = secret_arn != stored_secret_arn
+    rollout_token = _annotations(secret).get(RESTART_ANNOTATION)
 
     candidate = replace_password(current_dsn, fetch_password(secret_arn, region_name))
     password_changed = candidate != current_dsn
-    if not password_changed and not arn_changed:
+    targets = deployments or (deployment,)
+    if not password_changed and not arn_changed and rollout_token is None:
         return RefreshResult(
             rotated=False,
             restarted=False,
@@ -191,38 +232,46 @@ def refresh_once(
     updates = {"master-secret-arn": base64.b64encode(secret_arn.encode()).decode()}
     if password_changed:
         updates[secret_key] = base64.b64encode(candidate.encode()).decode()
-    core.patch_namespaced_secret(
-        secret_name,
-        namespace,
-        {"data": updates},
-    )
+        rollout_token = timestamp
+    if password_changed or arn_changed:
+        patch: dict[str, object] = {"data": updates}
+        if password_changed:
+            patch["metadata"] = {"annotations": {RESTART_ANNOTATION: rollout_token}}
+        core.patch_namespaced_secret(
+            secret_name,
+            namespace,
+            patch,
+        )
 
     # GPU_FAULT_STORE_URL comes from a secretKeyRef, so the running replicas
     # keep the old value until their pods are replaced. maxUnavailable=1 plus
     # the PodDisruptionBudget keeps a quorum serving through the rollout.
-    targets = deployments or (deployment,)
+    restarted_targets = (
+        _reconcile_deployments(
+            apps,
+            namespace=namespace,
+            targets=targets,
+            rollout_token=rollout_token,
+        )
+        if rollout_token is not None
+        else ()
+    )
+    rotated = password_changed or arn_changed
+    restarted = bool(restarted_targets)
     if password_changed:
-        for target in targets:
-            apps.patch_namespaced_deployment(
-                target,
-                namespace,
-                {
-                    "spec": {
-                        "template": {
-                            "metadata": {"annotations": {RESTART_ANNOTATION: timestamp}}
-                        }
-                    }
-                },
-            )
-            LOGGER.info("restarted deployment %s/%s", namespace, target)
+        reason = "credentials updated and deployments reconciled"
+    elif arn_changed and restarted:
+        reason = "managed secret ARN updated and deployment rollout resumed"
+    elif arn_changed:
+        reason = "managed secret ARN updated"
+    elif restarted:
+        reason = "deployment rollout resumed for current credentials"
+    else:
+        reason = "secret and database consumers already carry current credentials"
     return RefreshResult(
-        rotated=True,
-        restarted=password_changed,
-        reason=(
-            "credentials updated and deployment restarted"
-            if password_changed
-            else "managed secret ARN updated"
-        ),
+        rotated=rotated,
+        restarted=restarted,
+        reason=reason,
     )
 
 

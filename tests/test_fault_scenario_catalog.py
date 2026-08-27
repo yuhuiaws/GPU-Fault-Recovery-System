@@ -401,13 +401,41 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
         case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
     ]
 
-    assert len(regional) == 147
+    assert len(regional) == 153
     assert all((case.get("evidence") or {}).get("verdict") for case in regional)
     assert {(case["evidence"]["verdict"]) for case in regional} == {
-        "PASS",
+        "NOT_RUN",
         "BLOCKED",
         "SUPERSEDED",
     }
+
+
+def test_regional_cases_use_their_maximum_side_effect_risk() -> None:
+    cases = {
+        case["id"]: case
+        for case in load_catalog(CATALOG)
+        if case["id"].startswith("GF-REGIONAL-")
+    }
+
+    expected = {
+        "GF-REGIONAL-AUTH-007": "live-service-action",
+        "GF-REGIONAL-AUTH-012": "live-service-action",
+        "GF-REGIONAL-E2E-001": "live-workload-restart",
+        "GF-REGIONAL-E2E-002": "live-workload-restart",
+        "GF-REGIONAL-COLLECT-008": "destructive",
+        "GF-REGIONAL-COLLECT-016": "destructive",
+    }
+    assert {case_id: cases[case_id]["risk"] for case_id in expected} == expected
+
+
+def test_regional_runtime_inputs_do_not_hardcode_the_legacy_profile() -> None:
+    for case in load_catalog(CATALOG):
+        if not case["id"].startswith("GF-REGIONAL-"):
+            continue
+        runtime_text = "\n".join(
+            [str(case.get("injection") or ""), *case.get("expected", [])]
+        )
+        assert "hyperpod-v1" not in runtime_text, case["id"]
 
 
 def test_catalog_has_only_structured_json_safe_evidence() -> None:

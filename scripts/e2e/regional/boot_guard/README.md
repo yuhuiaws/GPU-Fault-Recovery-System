@@ -37,7 +37,7 @@ aws eks update-kubeconfig --region us-west-2 \
   --name "${CPU_EKS_CLUSTER_NAME}" \
   --kubeconfig "${CPU_KUBECONFIG}"
 
-cd scripts/boot-guard-probe
+cd scripts/e2e/regional/boot_guard
 ./derive.sh                       # P4
 ./reset.sh                        # 每个用例之前
 python3 mutate.py del GPU_FAULT_REGIONAL_CLUSTERS_JSON \

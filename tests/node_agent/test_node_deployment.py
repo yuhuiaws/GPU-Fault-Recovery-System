@@ -31,7 +31,7 @@ def test_node_deployment_scripts_are_valid_bash() -> None:
 def test_hyperpod_canary_env_values_are_complete() -> None:
     documents = list(
         yaml.safe_load_all(
-            (ROOT / "scripts/e2e/manifests/hyperpod-canary.yaml").read_text()
+            (ROOT / "scripts/e2e/regional/manifests/hyperpod-canary.yaml").read_text()
         )
     )
     deployment = next(item for item in documents if item["kind"] == "Deployment")
@@ -424,7 +424,7 @@ def test_training_progress_monitor_is_disabled_by_default() -> None:
     assert "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR must be true or false" in deploy
     for manifest in (
         ROOT / "deploy/control-plane/base/control-plane-deployment.yaml",
-        ROOT / "scripts/e2e/manifests/xid45-correlation-canary.yaml",
+        ROOT / "scripts/e2e/regional/manifests/xid45-correlation-canary.yaml",
     ):
         content = manifest.read_text()
         setting = content.split("- name: GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR", 1)[

@@ -37,7 +37,7 @@
 
 | 文档 | 类型 | 维护规则 |
 |---|---|---|
-| [区域模式端到端验收测试用例](区域模式端到端验收测试用例.md) | 规格 | 只追加；标题锚点被测试目录引用 |
+| [区域模式端到端验收测试用例](区域模式端到端验收测试用例.md) | 规格 | 随当前实现修订；用例 ID 和标题锚点保持稳定 |
 | [区域用例索引](区域用例索引.md) | 生成物 | 只展示执行顺序与规格入口，不包含内部执行状态 |
 | [故障模拟测试手册](故障模拟测试手册.md) | 操作手册 | 与故障目录和注入清单同步 |
 | [性能压测验收方案](性能压测验收方案.md) | 容量验收 | 只定义模型、门槛和证据格式；真实结果保存在私有证据库 |
@@ -93,7 +93,9 @@ Documentation-Impact-Reason: 仅重构内部实现，公共行为、命令和验
   保存在仓库外的私有证据库，不属于公开文档集。
 - `evidence/`：需要长期保留的精简测试证据。
   故障证据的规范索引见
-  [evidence/fault/README.md](evidence/fault/README.md)。
+  [evidence/fault/README.md](evidence/fault/README.md)；从公共规格迁出的
+  非权威历史叙述见
+  [evidence/regional-history/README.md](evidence/regional-history/README.md)。
 - `reference/`：不能直接提交给运行时 API 的说明性参考材料。
 
 ## 机器守卫

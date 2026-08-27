@@ -49,6 +49,7 @@ def insert_request(cursor, request: ProcessorRequest) -> None:
 
 def main() -> None:
     url = os.environ["GPU_FAULT_STORE_URL"]
+    runtime_profile_version = os.environ["GPU_FAULT_RUNTIME_PROFILE_VERSION"]
     suffix = uuid4().hex[:12]
     cluster_id = f"audit-order-{suffix}"
     node_id = f"audit-node-{suffix}"
@@ -69,7 +70,7 @@ def main() -> None:
                 "product": "H200",
                 "driver_branch": 580,
                 "cuda_version": "13.0",
-                "runtime_profile_version": "hyperpod-v1",
+                "runtime_profile_version": runtime_profile_version,
             },
             separators=(",", ":"),
         ).encode(),
@@ -102,7 +103,7 @@ def main() -> None:
                     }
                 ],
                 "workload_ids": [f"kubernetes/job/audit-{suffix}"],
-                "runtime_profile_version": "hyperpod-v1",
+                "runtime_profile_version": runtime_profile_version,
                 "restart_budget": 0,
             },
             separators=(",", ":"),

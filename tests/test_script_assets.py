@@ -8,12 +8,16 @@ from pathlib import Path
 
 import yaml
 
-from scripts.e2e.render_manifest import WHEEL_CONFIGMAP_PLACEHOLDER, render_manifest
+from scripts.e2e.render_manifest import (
+    RUNTIME_PROFILE_PLACEHOLDER,
+    WHEEL_CONFIGMAP_PLACEHOLDER,
+    render_manifest,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 TOOLS = ROOT / "tools"
-E2E_MANIFESTS = SCRIPTS / "e2e/manifests"
+E2E_MANIFESTS = SCRIPTS / "e2e/regional/manifests"
 
 
 def _walk(value):
@@ -329,6 +333,23 @@ def test_e2e_wheel_manifests_require_rendering(tmp_path: Path) -> None:
     )
 
 
+def test_e2e_runtime_profile_manifests_require_rendering() -> None:
+    candidates = []
+    for path in E2E_MANIFESTS.rglob("*.yaml"):
+        text = path.read_text(encoding="utf-8")
+        if RUNTIME_PROFILE_PLACEHOLDER not in text:
+            continue
+        candidates.append(path)
+        rendered = render_manifest(
+            path, runtime_profile="regional-hyperpod-deadbeefcafe"
+        )
+        assert RUNTIME_PROFILE_PLACEHOLDER not in rendered
+        assert "regional-hyperpod-deadbeefcafe" in rendered
+        assert list(yaml.safe_load_all(rendered)), path
+
+    assert candidates, "expected runtime-profile manifest candidates"
+
+
 def test_scripts_have_no_environment_specific_aws_or_node_defaults() -> None:
     text = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
@@ -376,6 +397,12 @@ def test_importable_script_modules_do_not_mutate_sys_path() -> None:
     assert (SCRIPTS / "e2e/__init__.py").is_file(), (
         'expected (SCRIPTS / "e2e/__init__.py").is_file() to be truthy'
     )
+    assert (SCRIPTS / "e2e/regional/__init__.py").is_file(), (
+        "regional E2E package marker is missing"
+    )
+    assert (SCRIPTS / "e2e/hyperpod/__init__.py").is_file(), (
+        "HyperPod E2E package marker is missing"
+    )
     assert (SCRIPTS / "perf/__init__.py").is_file(), (
         'expected (SCRIPTS / "perf/__init__.py").is_file() to be truthy'
     )
@@ -409,14 +436,24 @@ def test_e2e_driver_manifest_pairs_are_explicit() -> None:
         assert (E2E_MANIFESTS / manifest_name).is_file(), (
             "expected (E2E_MANIFESTS / manifest_name).is_file() to be truthy"
         )
-        assert (SCRIPTS / "e2e" / driver_name).is_file(), (
-            'expected (SCRIPTS / "e2e" / driver_name).is_file() to be truthy'
+        assert (SCRIPTS / "e2e/hyperpod" / driver_name).is_file(), (
+            'expected (SCRIPTS / "e2e/hyperpod" / driver_name).is_file() to be truthy'
         )
         manifest = (E2E_MANIFESTS / manifest_name).read_text(encoding="utf-8")
         assert driver_name in manifest
         assert manifest_name in readme
         assert driver_name in readme
     assert "isolated_api.py" in readme
+
+
+def test_regional_manifests_do_not_hardcode_runtime_profile() -> None:
+    manifests = list(E2E_MANIFESTS.rglob("*.yaml"))
+    assert manifests, "expected regional E2E manifests"
+    for path in manifests:
+        text = path.read_text(encoding="utf-8")
+        assert "gpu-fault.io/runtime-profile-version: hyperpod-v1" not in text
+        if "gpu-fault.io/runtime-profile-version:" in text:
+            assert "REPLACE_WITH_RUNTIME_PROFILE_VERSION" in text
 
 
 def test_python_shebang_matches_executable_mode() -> None:

@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-import scripts.e2e.run_hyperpod_xid74_case as live_tool
-from scripts.e2e.run_hyperpod_xid74_case import (
+import scripts.e2e.hyperpod.run_hyperpod_xid74_case as live_tool
+from scripts.e2e.hyperpod.run_hyperpod_xid74_case import (
     CASES,
     evaluate_assertions,
     injection_manifest,

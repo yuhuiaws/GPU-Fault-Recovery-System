@@ -32,7 +32,8 @@ VERDICT_LABEL = re.compile(
 
 def _phase_section(text: str) -> tuple[int, int]:
     start = text.index(PHASE_SECTION_HEADING)
-    return start, text.index("\n## ", start + 1)
+    next_section = text.find("\n## ", start + len(PHASE_SECTION_HEADING))
+    return start, len(text) if next_section < 0 else next_section
 
 
 def _documented_phases(text: str) -> list[tuple[int, str, str]]:
@@ -84,7 +85,7 @@ def test_regional_execution_order_covers_every_documented_case() -> None:
     indexed = [*ordered, *do_not_run]
     assert len(indexed) == len(set(indexed))
     assert set(indexed) == set(document_cases)
-    assert len(indexed) == len(document_cases) == 147
+    assert len(indexed) == len(document_cases) == 153
 
 
 def test_do_not_run_matches_regional_superseded_cases() -> None:
@@ -114,6 +115,12 @@ def test_regional_execution_order_pins_special_dependencies() -> None:
     ordered = _ordered_cases(value)
     position = {case: index for index, case in enumerate(ordered)}
     assert position["GF-REGIONAL-BOOT-011"] < position["GF-REGIONAL-BOOT-001"]
+    assert position["GF-REGIONAL-WORKLOAD-001"] < position["GF-REGIONAL-ISO-001"]
+    assert position["GF-REGIONAL-WORKLOAD-001"] < position["GF-REGIONAL-CMD-015"]
+    assert position["GF-REGIONAL-WORKLOAD-001"] < position["GF-REGIONAL-PREEMPT-012"]
+    assert position["GF-REGIONAL-WORKLOAD-001"] < position["GF-REGIONAL-E2E-001"]
+    assert position["GF-REGIONAL-E2E-001"] < position["GF-REGIONAL-BLAST-001"]
+    assert position["GF-REGIONAL-E2E-001"] < position["GF-REGIONAL-NOTIFY-001"]
     assert position["GF-REGIONAL-DESTR-011"] < position["GF-REGIONAL-DESTR-001"]
     assert position["GF-REGIONAL-DESTR-009"] < position["GF-REGIONAL-DESTR-012"]
     assert position["GF-REGIONAL-HA-003"] < position["GF-REGIONAL-DESTR-013"]

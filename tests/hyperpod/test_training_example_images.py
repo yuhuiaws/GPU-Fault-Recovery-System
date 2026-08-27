@@ -29,7 +29,7 @@ def _training_manifests() -> list[tuple[Path, dict[str, Any]]]:
     manifests = []
     for root in (
         ROOT / "examples/hyperpod",
-        ROOT / "tests/manifests/training",
+        ROOT / "scripts/e2e/regional/manifests/training",
         ROOT / "scripts/e2e",
     ):
         for path in root.rglob("*.yaml"):
@@ -107,7 +107,7 @@ def test_hyperpod_examples_declare_managed_or_source_semantics() -> None:
 
 
 def test_p5en_sized_manifests_publish_the_resource_assumption() -> None:
-    # 门禁原来只看 examples/hyperpod/，而 scripts/e2e/manifests/ 下同样有请求
+    # 门禁同时覆盖 examples/hyperpod/ 和统一的区域 E2E manifest 目录。
     # 8 GPU / 16 EFA 的夹具（q118-gpu-intensive-3n、q118-log-snapshot-8gpu）。
     # 它们跑在同一批 p5en 节点上，却因为路径被 continue 掉而从来不用声明机型，
     # 于是「哪些清单需要 p5en」这件事只在一半的树上成立。
@@ -128,7 +128,7 @@ def test_p5en_sized_manifests_publish_the_resource_assumption() -> None:
             assert "p5en" in header, path
 
     roots = {str(path.relative_to(ROOT)).split("/", 1)[0] for path in sized}
-    assert roots == {"examples", "scripts", "tests"}, sorted(roots)
+    assert roots == {"examples", "scripts"}, sorted(roots)
 
 
 def test_examples_index_points_to_related_e2e_training_fixtures() -> None:
@@ -137,13 +137,16 @@ def test_examples_index_points_to_related_e2e_training_fixtures() -> None:
         path
         for path, _job in _training_manifests()
         if str(path).startswith(
-            (str(ROOT / "scripts/e2e"), str(ROOT / "tests/manifests/training"))
+            (
+                str(ROOT / "scripts/e2e"),
+                str(ROOT / "scripts/e2e/regional/manifests/training"),
+            )
         )
     ]
 
     assert fixtures
-    assert "`scripts/e2e/manifests/`" in readme
-    assert "`tests/manifests/training/`" in readme
+    assert "`scripts/e2e/regional/manifests/`" in readme
+    assert "`scripts/e2e/regional/manifests/training/`" in readme
 
 
 def test_current_manuals_use_the_same_training_digest() -> None:

@@ -27,6 +27,13 @@ from gpu_fault.regional import (
     RemoteActionCommand,
 )
 
+AUDITED_CASE_IDS = tuple(
+    [
+        *(f"GF-REGIONAL-CMD-{number:03d}" for number in range(1, 11)),
+        *(f"GF-REGIONAL-CMD-{number:03d}" for number in range(12, 17)),
+    ]
+)
+
 
 class LiveProtocolAudit:
     def __init__(
@@ -216,7 +223,7 @@ class LiveProtocolAudit:
             if value in {1, 25}:
                 assert status == 200 and len(body["commands"]) <= int(value)
             elif value == "5":
-                assert status in {200, 422}
+                assert status == 200 and len(body["commands"]) <= 5
             else:
                 assert status == 422
         self.record("GF-REGIONAL-CMD-001", statuses=observed)
@@ -710,23 +717,11 @@ class LiveProtocolAudit:
         run_hyperpod_submission_case(self)
 
     def run(self) -> dict[str, Any]:
-        for method in (
-            self.run_001,
-            self.run_002,
-            self.run_003,
-            self.run_004,
-            self.run_005,
-            self.run_006,
-            self.run_007,
-            self.run_008,
-            self.run_009,
-            self.run_010,
-            self.run_012,
-            self.run_013,
-            self.run_014,
-            self.run_015,
-            self.run_016,
-        ):
+        methods = tuple(
+            getattr(self, f"run_{case_id.rsplit('-', 1)[1]}")
+            for case_id in AUDITED_CASE_IDS
+        )
+        for method in methods:
             commands_before = set(self.created_commands)
             workflows_before = set(self.created_workflows)
             incidents_before = set(self.created_incidents)

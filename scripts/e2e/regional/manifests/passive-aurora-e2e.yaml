@@ -20,14 +20,12 @@ spec:
         gpu-fault.io/expected-critical-ranks: "2"
         gpu-fault.io/training-container: trainer
         # Must name a profile that is actually registered on the control
-        # plane. deploy.sh registers exactly one profile, named by
-        # ${GPU_FAULT_RUNTIME_PROFILE} (default hyperpod-v1), so this
-        # default matches an out-of-the-box deployment. run_e2e rewrites
-        # it to ${RUNTIME_PROFILE} when that default is overridden;
+        # plane. Render this placeholder from site.yaml before apply;
+        # release-deploy uses a content-addressed profile version.
         # naming an unregistered profile makes the watcher's
         # POST /v1/attempts/terminal fail 404 forever (the terminal
         # event is never marked delivered, so it retries indefinitely).
-        gpu-fault.io/runtime-profile-version: hyperpod-v1
+        gpu-fault.io/runtime-profile-version: REPLACE_WITH_RUNTIME_PROFILE_VERSION
         gpu-fault.io/restart-budget: "1"
     spec:
       restartPolicy: Never

@@ -22,6 +22,11 @@ def main() -> None:
             "for one quarantined node."
         )
     )
+    parser.add_argument(
+        "--runtime-profile-version",
+        required=True,
+        help="content-addressed Runtime Profile used by the incident site",
+    )
     parser.add_argument("incident_id")
     parser.add_argument("node_id")
     parser.add_argument("reason")
@@ -61,7 +66,7 @@ def main() -> None:
         workflow = WorkflowRequest(
             request_id=f"workflow-validated-restore-{uuid4()}",
             incident_id=incident.incident_id,
-            runtime_profile_version="hyperpod-v1",
+            runtime_profile_version=arguments.runtime_profile_version,
             status=WorkflowStatus.PENDING,
             official_action="RESTORE_SCHEDULING",
             fencing_token=incident.fencing_token,

@@ -157,7 +157,7 @@ def main() -> None:
         else:
             raise AssertionError("Fabric Manager restart did not fail closed")
 
-        payload = agent_config_payload(diagnostic_executor, "hyperpod-v1")
+        payload = agent_config_payload(diagnostic_executor, "audit-profile-v1")
         for field in (
             "diagnostic_retention_seconds",
             "diagnostic_max_archives",
