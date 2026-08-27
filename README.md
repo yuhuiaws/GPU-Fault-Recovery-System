@@ -254,3 +254,7 @@ checkpoint 和训练命令要求。
 - 测试、Canary、probe 和 fault-injection 清单不属于生产部署资产。
 - 任何节点动作都必须经过目标节点、boot/incarnation、fencing token、workload
   和维护窗口门禁。
+
+## License
+
+本项目采用 [Apache License 2.0](LICENSE) 开源许可证。

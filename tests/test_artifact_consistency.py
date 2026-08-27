@@ -86,6 +86,21 @@ def test_built_component_wheels_match_their_source_closures(tmp_path) -> None:
         unpacked = tmp_path / name
         with zipfile.ZipFile(wheel) as archive:
             archive.extractall(unpacked)
+            metadata_name = next(
+                path
+                for path in archive.namelist()
+                if path.endswith(".dist-info/METADATA")
+            )
+            metadata = archive.read(metadata_name).decode("utf-8")
+            license_names = [
+                path
+                for path in archive.namelist()
+                if path.endswith(".dist-info/licenses/LICENSE")
+            ]
+            assert "License-Expression: Apache-2.0" in metadata
+            assert "License-File: LICENSE" in metadata
+            assert len(license_names) == 1
+            assert archive.read(license_names[0]) == (ROOT / "LICENSE").read_bytes()
         assert module_digest(unpacked / "gpu_fault") == component["module_digest"]
         assert component["module_digest"] == component_source_digest(name)
 

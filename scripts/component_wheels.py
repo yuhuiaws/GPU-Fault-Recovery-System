@@ -344,13 +344,15 @@ def _write_project(
     project = root["project"]
     lines = [
         "[build-system]",
-        'requires = ["setuptools>=75"]',
+        'requires = ["setuptools>=77"]',
         'build-backend = "setuptools.build_meta"',
         "",
         "[project]",
         f"name = {json.dumps(component.distribution)}",
         f"version = {json.dumps(project['version'])}",
         f"description = {json.dumps(project['description'])}",
+        f"license = {json.dumps(project['license'])}",
+        f"license-files = {_toml_array(project['license-files'])}",
         f"requires-python = {json.dumps(project['requires-python'])}",
         f"dependencies = {_toml_array(project['dependencies'])}",
         "",
@@ -385,6 +387,7 @@ def _write_project(
         "\n".join(lines),
         encoding="utf-8",
     )
+    shutil.copy2(ROOT / "LICENSE", destination / "LICENSE")
 
 
 def package_digest(package: Path) -> str:
