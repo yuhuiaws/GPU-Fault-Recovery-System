@@ -168,13 +168,24 @@ def test_replace_env_is_rejected_by_the_design_invariant(monkeypatch) -> None:
         HyperPodAdapterConfig.from_environment()
 
 
+def test_programmatic_replace_enable_is_rejected() -> None:
+    with pytest.raises(ValueError, match="provider node replacement is prohibited"):
+        HyperPodAdapterConfig(cluster_name="hp-cluster", replace_enabled=True)
+
+
+def test_automatic_node_recovery_override_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("GPU_FAULT_HYPERPOD_CLUSTER", "hp-cluster")
+    monkeypatch.setenv("GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY", "true")
+
+    with pytest.raises(ValueError, match="must remain false"):
+        HyperPodAdapterConfig.from_environment()
+
+
 def adapter(
     *,
     execution_enabled: bool = False,
-    provider_replace_enabled: bool = False,
     cluster_status: str = "InService",
     node_recovery: str = "None",
-    allow_when_automatic: bool = False,
 ) -> tuple[HyperPodLifecycleAdapter, FakeHyperPodClient]:
     client = FakeHyperPodClient(
         cluster_status=cluster_status, node_recovery=node_recovery
@@ -184,8 +195,6 @@ def adapter(
             cluster_name="hp-cluster",
             region_name="us-east-1",
             execution_enabled=execution_enabled,
-            replace_enabled=provider_replace_enabled,
-            allow_when_node_recovery_automatic=(allow_when_automatic),
         ),
         client=client,
     )
@@ -460,24 +469,21 @@ def test_reboot_submission_is_idempotent() -> None:
     }
 
 
-def test_replace_preserves_provider_partial_failure() -> None:
-    hp, client = adapter(execution_enabled=True, provider_replace_enabled=True)
+def test_provider_replace_submission_is_code_level_unreachable() -> None:
+    hp, client = adapter(execution_enabled=True)
 
-    result = hp.submit(
-        HyperPodAction.REPLACE,
-        ["worker-group-2"],
-        isolation_verified_nodes=["worker-group-2"],
-        confirm_cluster_name="hp-cluster",
-        workflow_fencing_token=4,
-        expected_fencing_token=4,
-        idempotency_key="workflow-2/replace-node/0",
-    )
+    with pytest.raises(HyperPodAdapterError, match="provider node replacement"):
+        hp.submit(
+            HyperPodAction.REPLACE,
+            ["worker-group-2"],
+            isolation_verified_nodes=["worker-group-2"],
+            confirm_cluster_name="hp-cluster",
+            workflow_fencing_token=4,
+            expected_fencing_token=4,
+            idempotency_key="workflow-2/replace-node/0",
+        )
 
-    assert not result.successful_node_logical_ids, (
-        "expected result.successful_node_logical_ids to be falsy"
-    )
-    assert result.failures[0].error_code == "Conflict"
-    assert len(client.replace_requests) == 1
+    assert not client.replace_requests, "provider replacement API was called"
 
 
 def test_workflow_step_dispatches_only_supported_operations() -> None:
@@ -615,10 +621,8 @@ def test_durable_submission_rejects_reused_key_for_other_request() -> None:
 
     second_adapter, second_client = durable_adapter(store)
     with pytest.raises(HyperPodAdapterError, match="already used for a different"):
-        second_adapter.submit(HyperPodAction.REPLACE, ["worker-group-2"], **SUBMIT_ARGS)
-    assert not second_client.replace_requests, (
-        "expected second_client.replace_requests to be falsy"
-    )
+        second_adapter.submit(HyperPodAction.REBOOT, ["worker-group-2"], **SUBMIT_ARGS)
+    assert not second_client.reboot_requests, "conflicting request reached provider"
 
 
 def test_interrupted_submission_fails_closed_instead_of_resubmitting() -> None:

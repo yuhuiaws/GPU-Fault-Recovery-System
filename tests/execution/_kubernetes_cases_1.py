@@ -461,9 +461,9 @@ def test_kubernetes_adapter_preserves_initial_schedulability_across_isolation_st
     )
 
 
-@pytest.mark.parametrize("initial_unschedulable", [True, False])
+@pytest.mark.parametrize("intermediate_unschedulable", [True, False])
 def test_kubernetes_adapter_takes_over_terminal_isolation(
-    initial_unschedulable: bool,
+    intermediate_unschedulable: bool,
 ) -> None:
     core = FakeCoreApi()
     store = build_store()
@@ -487,7 +487,7 @@ def test_kubernetes_adapter_takes_over_terminal_isolation(
         "gpu-fault.io/fencing-token": "1",
         "gpu-fault.io/previous-unschedulable": "false",
     }
-    core.node["spec"]["unschedulable"] = initial_unschedulable
+    core.node["spec"]["unschedulable"] = intermediate_unschedulable
     core.node["spec"]["taints"].append(
         {
             "key": "gpu-fault.io/quarantined",
@@ -515,10 +515,7 @@ def test_kubernetes_adapter_takes_over_terminal_isolation(
     assert result.status is WorkflowStatus.SUCCEEDED
     annotations = core.node["metadata"]["annotations"]
     assert annotations["gpu-fault.io/incident-id"] == (incident.incident_id)
-    assert (
-        annotations["gpu-fault.io/previous-unschedulable"]
-        == str(initial_unschedulable).lower()
-    )
+    assert annotations["gpu-fault.io/previous-unschedulable"] == "false"
     quarantine = [
         item
         for item in core.node["spec"]["taints"]
@@ -528,6 +525,76 @@ def test_kubernetes_adapter_takes_over_terminal_isolation(
         {
             "key": "gpu-fault.io/quarantined",
             "value": quarantine_taint_value(incident.incident_id),
+            "effect": "NoSchedule",
+        }
+    ]
+
+
+def test_terminal_isolation_takeover_restores_original_schedulability() -> None:
+    core = FakeCoreApi()
+    store = build_store()
+    incident, workflow = workflow_state(
+        store,
+        [WorkflowOperation.MARK_UNSCHEDULABLE, WorkflowOperation.RESTORE_SCHEDULING],
+    )
+    old_incident = copy_model(
+        incident,
+        incident_id="incident-terminal",
+        workflow_request_id="workflow-terminal",
+        state=IncidentState.RECOVERED,
+    )
+    old_workflow = copy_model(
+        workflow,
+        request_id="workflow-terminal",
+        incident_id=old_incident.incident_id,
+        status=WorkflowStatus.SUCCEEDED,
+    )
+    store.save_incident(old_incident)
+    store.save_workflow(old_workflow)
+    core.node["metadata"]["annotations"] = {
+        "gpu-fault.io/incident-id": old_incident.incident_id,
+        "gpu-fault.io/fencing-token": "1",
+        "gpu-fault.io/previous-unschedulable": "false",
+    }
+    core.node["spec"]["unschedulable"] = True
+    core.node["spec"]["taints"].append(
+        {
+            "key": "gpu-fault.io/quarantined",
+            "value": quarantine_taint_value(old_incident.incident_id),
+            "effect": "NoSchedule",
+        }
+    )
+    adapter = KubernetesWorkflowAdapter(
+        core_api=core, batch_api=UnusedApi(), custom_api=UnusedApi(), store=store
+    )
+    workflow = copy_model(
+        workflow,
+        official_steps=[
+            copy_model(step, execution_owner=adapter.owner)
+            for step in workflow.official_steps
+        ],
+    )
+    store.save_workflow(workflow)
+
+    result = execute_workflow(
+        active_workflow_executor(
+            store,
+            [adapter],
+            {
+                WorkflowOperation.MARK_UNSCHEDULABLE,
+                WorkflowOperation.RESTORE_SCHEDULING,
+            },
+        ),
+        workflow.request_id,
+    )
+
+    assert result.status is WorkflowStatus.SUCCEEDED
+    assert core.node["spec"]["unschedulable"] is False
+    assert core.node["metadata"]["annotations"] == {}
+    assert core.node["spec"]["taints"] == [
+        {
+            "key": "sagemaker.amazonaws.com/node-health-status",
+            "value": "Unschedulable",
             "effect": "NoSchedule",
         }
     ]
@@ -581,6 +648,7 @@ def test_storeless_adapter_takes_over_terminal_node_isolation() -> None:
     # workflow that died before RESTORE_SCHEDULING was refused forever
     # and no later incident could ever isolate it again.
     core = FakeCoreApi()
+    core.node["spec"]["unschedulable"] = True
     provider = RecordingOwnershipProvider({"incident-dead": True})
     adapter, context = _storeless_isolation_context(core, provider)
 
@@ -591,6 +659,7 @@ def test_storeless_adapter_takes_over_terminal_node_isolation() -> None:
     annotations = core.node["metadata"]["annotations"]
     assert annotations["gpu-fault.io/incident-id"] == "incident-active"
     assert annotations["gpu-fault.io/fencing-token"] == "3"
+    assert annotations["gpu-fault.io/previous-unschedulable"] == "false"
     quarantine = [
         item
         for item in core.node["spec"]["taints"]

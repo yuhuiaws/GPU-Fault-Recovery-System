@@ -9,7 +9,11 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
-from gpu_fault.store.shared.errors import WorkflowLeaseError
+from gpu_fault.store.shared.errors import RemediationBudgetError, WorkflowLeaseError
+from gpu_fault.store.shared.remediation_budgets import (
+    apply_remediation_budget,
+    blocked_by_remediation_budget,
+)
 
 
 class SqliteWorkflowMixin:
@@ -202,9 +206,11 @@ class SqliteWorkflowMixin:
         *,
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
+        remediation_budget_claims: dict[str, int] | None = None,
     ) -> WorkflowRequest:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
+            budget_error: RemediationBudgetError | None = None
             try:
                 workflow = self._get("workflow", request_id)
                 if workflow.fencing_token != fencing_token:
@@ -220,6 +226,25 @@ class SqliteWorkflowMixin:
                     and lease_active
                 ):
                     raise WorkflowLeaseError("workflow is leased by another executor")
+                if remediation_budget_claims is not None:
+                    try:
+                        workflow = apply_remediation_budget(
+                            workflow,
+                            self._list("workflow"),
+                            remediation_budget_claims,
+                            now=claimed_at,
+                        )
+                    except RemediationBudgetError as exc:
+                        workflow = blocked_by_remediation_budget(
+                            workflow,
+                            str(exc),
+                            now=claimed_at,
+                        )
+                        self._put("workflow", request_id, workflow)
+                        self._db.execute("COMMIT")
+                        budget_error = exc
+                if budget_error is not None:
+                    raise budget_error
                 new_epoch = (
                     workflow.execution_owner_id != executor_id or not lease_active
                 )
@@ -232,13 +257,19 @@ class SqliteWorkflowMixin:
                             else max(workflow.execution_epoch, 1)
                         ),
                         "execution_lease_expires_at": (claimed_at + lease_duration),
+                        **(
+                            {"status": WorkflowStatus.RUNNING}
+                            if remediation_budget_claims is not None
+                            else {}
+                        ),
                     }
                 )
                 self._put("workflow", request_id, workflow)
                 self._db.execute("COMMIT")
                 return workflow
             except Exception:
-                self._db.execute("ROLLBACK")
+                if budget_error is None:
+                    self._db.execute("ROLLBACK")
                 raise
 
     def renew_workflow_lease(

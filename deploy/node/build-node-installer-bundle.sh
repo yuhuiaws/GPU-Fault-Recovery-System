@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 0022
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -47,7 +48,7 @@ STAGING="$(mktemp -d)"
 trap 'rm -rf "${STAGING}"' EXIT
 BUNDLE="gpu-fault-node-installer-${VERSION}"
 ROOT="${STAGING}/${BUNDLE}"
-install -d \
+install -d -m 0755 \
     "${ROOT}/deploy/control-plane/regional" \
     "${ROOT}/deploy/control-plane/tools" \
     "${ROOT}/deploy/node" \

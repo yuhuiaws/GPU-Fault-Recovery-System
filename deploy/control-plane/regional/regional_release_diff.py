@@ -89,7 +89,7 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "endpoint": release.endpoint_digest,
         "dcgm": release.dcgm_digest,
         "notifications": release.notification_digest,
-        "clusters": tuple(sorted(item.cluster_id for item in release.config.clusters)),
+        "clusters": release.cluster_registry_digest,
     }
     current = {
         "control_plane_wheel": state.get("wheel_sha256"),
@@ -105,7 +105,7 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "endpoint": state.get("endpoint_digest"),
         "dcgm": state.get("dcgm_digest"),
         "notifications": state.get("notification_digest"),
-        "clusters": tuple(sorted(state.get("cluster_ids") or ())),
+        "clusters": state.get("cluster_registry_digest"),
     }
     changed = frozenset(
         name for name, value in desired.items() if current.get(name) != value

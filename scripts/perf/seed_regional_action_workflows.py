@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.fleet import AgentLifecycleState, AgentRecord
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
@@ -18,6 +19,35 @@ from gpu_fault.models import (
 KUBERNETES_OWNER = "gpu-fault-kubernetes-adapter"
 NODE_OWNER = "gpu-fault-node-agent"
 HYPERPOD_OWNER = "gpu-fault-hyperpod-adapter"
+
+
+def synthetic_agent(
+    template: AgentRecord,
+    *,
+    cluster_id: str,
+    node_id: str,
+    run_id: str,
+    now: datetime,
+) -> AgentRecord:
+    return template.model_copy(
+        update={
+            "cluster_id": cluster_id,
+            "node_id": node_id,
+            "endpoint": "http://127.0.0.1:9",
+            "boot_id": f"boot-{run_id}-{node_id}",
+            "node_instance_id": f"instance-{run_id}-{node_id}",
+            "agent_incarnation_id": f"incarnation-{run_id}-{node_id}",
+            "retired_incarnation_ids": [],
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "lease_expires_at": now + timedelta(minutes=30),
+            "generation": 1,
+            "lifecycle_state": AgentLifecycleState.ACTIVE,
+            "transition_id": None,
+            "transition_reason": None,
+            "transition_started_at": None,
+        }
+    )
 
 
 def workflow_steps(
@@ -108,8 +138,22 @@ def main() -> None:
     nodes_per_workflow = int(os.environ["ACTION_NODES_PER_WORKFLOW"])
     context = ApplicationContext.from_environment()
     created = 0
+    agents_created = 0
     now = datetime.now(timezone.utc)
     try:
+        live_agents = [
+            agent
+            for agent in context.store.list_agents()
+            if not agent.cluster_id.startswith("perf-cap-")
+            and agent.lifecycle_state is AgentLifecycleState.ACTIVE
+            and agent.lease_expires_at is not None
+            and agent.lease_expires_at > now
+        ]
+        if not live_agents:
+            raise RuntimeError(
+                "action capacity seed requires one live production Agent identity"
+            )
+        agent_template = max(live_agents, key=lambda item: item.last_seen_at)
         for cluster_index in range(clusters):
             cluster_id = f"perf-cap-{cluster_index:03d}"
             for workflow_index in range(workflows_per_cluster):
@@ -121,6 +165,17 @@ def main() -> None:
                 nodes = [
                     f"{scope}-node-{index:02d}" for index in range(nodes_per_workflow)
                 ]
+                for node_id in nodes:
+                    context.store.save_agent(
+                        synthetic_agent(
+                            agent_template,
+                            cluster_id=cluster_id,
+                            node_id=node_id,
+                            run_id=run_id,
+                            now=now,
+                        )
+                    )
+                    agents_created += 1
                 workload_id = f"training/PyTorchJob/{scope}"
                 workflow = WorkflowRequest(
                     request_id=request_id,
@@ -167,6 +222,7 @@ def main() -> None:
                 "nodes_per_workflow": nodes_per_workflow,
                 "steps_per_workflow": 10,
                 "workflows_created": created,
+                "agents_created": agents_created,
             },
             sort_keys=True,
         )

@@ -138,7 +138,7 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
         "_check_load_balancer_controller",
         "_check_nlb_inputs",
         "_check_aurora",
-        "_check_aurora_refresh",
+        "check_aurora_refresh",
         "check_email_notifications",
         "_check_monitoring",
     )
@@ -167,6 +167,121 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
     }
 
 
+def test_aurora_refresh_check_rejects_rbac_target_drift() -> None:
+    module = _checks_module()
+    cronjob = {
+        "spec": {
+            "jobTemplate": {
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "env": [
+                                        {
+                                            "name": (
+                                                "GPU_FAULT_AURORA_RESTART_DEPLOYMENTS"
+                                            ),
+                                            "value": (
+                                                "gpu-fault-api-ha,"
+                                                "gpu-fault-control-worker"
+                                            ),
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        "status": {},
+    }
+    role = {
+        "rules": [
+            {
+                "apiGroups": ["apps"],
+                "resources": ["deployments"],
+                "resourceNames": ["gpu-fault-api-ha"],
+                "verbs": ["get", "patch"],
+            }
+        ]
+    }
+
+    class AuroraRelease:
+        config = SimpleNamespace(namespace="gpu-fault-system")
+
+        @staticmethod
+        def _cpu(*args):
+            return args
+
+        @staticmethod
+        def _get_json(command):
+            return role if "role" in command else cronjob
+
+    with pytest.raises(module.ReleaseError, match="RBAC differs"):
+        module.check_aurora_refresh(AuroraRelease())
+
+
+def test_aurora_refresh_check_reports_converged_targets() -> None:
+    module = _checks_module()
+    targets = ["gpu-fault-api-ha", "gpu-fault-control-worker"]
+    cronjob = {
+        "spec": {
+            "jobTemplate": {
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "env": [
+                                        {
+                                            "name": (
+                                                "GPU_FAULT_AURORA_RESTART_DEPLOYMENTS"
+                                            ),
+                                            "value": ",".join(targets),
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        "status": {},
+    }
+    role = {
+        "rules": [
+            {
+                "apiGroups": ["apps"],
+                "resources": ["deployments"],
+                "resourceNames": targets,
+                "verbs": ["get", "patch"],
+            }
+        ]
+    }
+
+    class AuroraRelease:
+        config = SimpleNamespace(namespace="gpu-fault-system")
+
+        @staticmethod
+        def _cpu(*args):
+            return args
+
+        @staticmethod
+        def _get_json(command):
+            if "role" in command:
+                return role
+            if "job" in command:
+                return {"items": []}
+            return cronjob
+
+    value = module.check_aurora_refresh(AuroraRelease())
+
+    assert value.details["deployment_targets"] == targets
+
+
 def test_health_report_uses_bounded_parallel_checks(monkeypatch) -> None:
     module = _checks_module()
     clusters = [
@@ -181,7 +296,7 @@ def test_health_report_uses_bounded_parallel_checks(monkeypatch) -> None:
         "check_cpu_secrets",
         "_check_cpu_workloads",
         "check_email_notifications",
-        "_check_aurora_refresh",
+        "check_aurora_refresh",
         "_verify_profile",
         "_run_read_only_verifiers",
         "_check_control_api",

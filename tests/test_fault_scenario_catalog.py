@@ -244,6 +244,22 @@ def test_include_live_does_not_execute_an_unselected_command() -> None:
     assert all(case["automation"] != "command" for case in selected)
 
 
+def test_explicit_case_selection_preserves_requested_order() -> None:
+    cases = load_catalog(CATALOG)
+    requested = ["GF-REGIONAL-NET-005", "GF-REGIONAL-BOOT-022"]
+
+    selected = select_cases(
+        cases,
+        case_ids=requested,
+        categories=set(),
+        levels=set(),
+        include_manual=False,
+        include_live=True,
+    )
+
+    assert [case["id"] for case in selected] == requested
+
+
 def test_superseded_manual_case_reports_its_replacement() -> None:
     cases = load_catalog(CATALOG)
     case = next(

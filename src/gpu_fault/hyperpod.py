@@ -8,7 +8,7 @@ from threading import RLock
 from typing import Any, Protocol
 from uuid import uuid4
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from gpu_fault.models import (
     CapabilityClaim,
@@ -38,8 +38,6 @@ class SageMakerHyperPodClient(Protocol):
     def describe_cluster_node(self, **kwargs) -> dict[str, Any]: ...
 
     def batch_reboot_cluster_nodes(self, **kwargs) -> dict[str, Any]: ...
-
-    def batch_replace_cluster_nodes(self, **kwargs) -> dict[str, Any]: ...
 
 
 class HyperPodAction(StrEnum):
@@ -169,7 +167,22 @@ class HyperPodAdapterConfig(StrictModel):
     )
     max_batch_size: int = Field(default=25, ge=1, le=25)
 
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def enforce_recovery_invariants(self) -> HyperPodAdapterConfig:
+        if self.replace_enabled:
+            raise ValueError(
+                "provider node replacement is prohibited; "
+                "replace_enabled must remain false"
+            )
+        if self.allow_when_node_recovery_automatic:
+            raise ValueError(
+                "GPU fault mutation with HyperPod NodeRecovery=Automatic is prohibited"
+            )
+        return self
+
     def action_enabled(self, action: HyperPodAction) -> bool:
+        if action is HyperPodAction.REPLACE:
+            return False
         override = (
             self.reboot_enabled
             if action is HyperPodAction.REBOOT
@@ -197,6 +210,16 @@ class HyperPodAdapterConfig(StrictModel):
                 "GPU_FAULT_ALLOW_HYPERPOD_REPLACE must remain false; "
                 "provider replacement is outside the supported design"
             )
+        if (
+            os.getenv(
+                "GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY",
+                "",
+            ).lower()
+            == "true"
+        ):
+            raise ValueError(
+                "GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY must remain false"
+            )
         return cls(
             cluster_name=cluster_name,
             region_name=region_name
@@ -209,13 +232,7 @@ class HyperPodAdapterConfig(StrictModel):
                 else reboot_value.lower() == "true"
             ),
             replace_enabled=False,
-            allow_when_node_recovery_automatic=(
-                os.getenv(
-                    "GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY",
-                    "",
-                ).lower()
-                == "true"
-            ),
+            allow_when_node_recovery_automatic=False,
             max_batch_size=int(os.getenv("GPU_FAULT_HYPERPOD_MAX_BATCH_SIZE", "25")),
         )
 
@@ -300,7 +317,7 @@ class HyperPodSubmissionRecord(StrictModel):
     executor Pod that submits the batch is frequently the same Pod that
     the mutation restarts, and a control-plane failover moves the retry
     to a different replica entirely. Both cases lose the in-memory dict
-    and re-submit BatchReboot/BatchReplaceClusterNodes for a step that
+    and re-submit a provider lifecycle mutation for a step that
     already ran. The record is written INTENDED before the provider call
     and updated to SUBMITTED/FAILED after, so a crash in between is
     recoverable as "unknown outcome" rather than silently retried.
@@ -698,6 +715,11 @@ class HyperPodLifecycleAdapter:
         expected_fencing_token: int,
         idempotency_key: str,
     ) -> HyperPodSubmissionResult:
+        if action is HyperPodAction.REPLACE:
+            raise HyperPodAdapterError(
+                "provider node replacement is prohibited; "
+                "use the healthy warm-spare coordinator"
+            )
         with self._lock:
             reserved_record = None
             if self.store is not None:
@@ -771,10 +793,7 @@ class HyperPodLifecycleAdapter:
                 "NodeLogicalIds": logical_ids,
             }
             try:
-                if action is HyperPodAction.REBOOT:
-                    response = self.client.batch_reboot_cluster_nodes(**request)
-                else:
-                    response = self.client.batch_replace_cluster_nodes(**request)
+                response = self.client.batch_reboot_cluster_nodes(**request)
             except Exception as exc:
                 # The provider call may still have taken effect, so the
                 # record must not go back to a state that permits a

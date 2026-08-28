@@ -28,6 +28,7 @@ KUBECONFIG_PATH="${KUBECONFIG:-}"
 DEFAULT_RUNTIME_IMAGE="public.ecr.aws/docker/library/python:3.12-slim"
 RUNTIME_IMAGE="${GPU_FAULT_RUNTIME_IMAGE:-${DEFAULT_RUNTIME_IMAGE}}"
 FAST_ROLLOUT_TIMEOUT="5m"
+FAST_ROLLOUT_TIMEOUT_SECONDS=$((10#${FAST_ROLLOUT_TIMEOUT%m} * 60))
 AWS_REGION="${GPU_FAULT_AWS_REGION:?GPU_FAULT_AWS_REGION is required}"
 RUNTIME_PROFILE_VERSION="$(
     printf '%s' \
@@ -41,6 +42,8 @@ NOTIFICATION_CONFIG_SHA256="$(
     printf '%s' "${GPU_FAULT_NOTIFICATION_CONFIG_SHA256:-}"
 )"
 LEGACY_COMPONENT_PINS="${GPU_FAULT_LEGACY_COMPONENT_PINS:-false}"
+PRESERVE_ROLE_CONFIG_MAPS="${GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS:-false}"
+FORCE_ROLE_RESTART="${GPU_FAULT_FORCE_ROLE_RESTART:-false}"
 CONTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 
@@ -73,6 +76,16 @@ trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 [[ "${LEGACY_COMPONENT_PINS}" == "true" ||
     "${LEGACY_COMPONENT_PINS}" == "false" ]] || {
     echo "GPU_FAULT_LEGACY_COMPONENT_PINS must be true or false" >&2
+    exit 2
+}
+[[ "${PRESERVE_ROLE_CONFIG_MAPS}" == "true" ||
+    "${PRESERVE_ROLE_CONFIG_MAPS}" == "false" ]] || {
+    echo "GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS must be true or false" >&2
+    exit 2
+}
+[[ "${FORCE_ROLE_RESTART}" == "true" ||
+    "${FORCE_ROLE_RESTART}" == "false" ]] || {
+    echo "GPU_FAULT_FORCE_ROLE_RESTART must be true or false" >&2
     exit 2
 }
 if [[ "${ALLOW_EMAIL}" != "true" &&
@@ -555,10 +568,115 @@ stamp_release() {
         )"
 }
 
-for config in "${GENERATED}"/gpu-fault-*-config-*.yaml; do
-    name="$(basename "${config}" .yaml)"
-    apply_manifest "${name}"
-done
+startup_failure_reason() {
+    local deployment="$1"
+    local deployment_uid
+    local revision
+    local template_hash
+    local pod
+    local logs
+    deployment_uid="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
+            "${deployment}" -o jsonpath='{.metadata.uid}'
+    )"
+    revision="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
+            "${deployment}" \
+            -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}'
+    )"
+    template_hash="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get replicasets \
+            -l "app=${deployment}" -o json |
+            jq -r \
+                --arg uid "${deployment_uid}" \
+                --arg revision "${revision}" \
+                '.items[] |
+                 select(
+                   (.metadata.ownerReferences // []) |
+                   any(.uid == $uid)
+                 ) |
+                 select(
+                   (.metadata.annotations["deployment.kubernetes.io/revision"] // "") ==
+                   $revision
+                 ) |
+                 .metadata.labels["pod-template-hash"]' |
+            head -n 1
+    )"
+    [[ -n "${template_hash}" ]] || return 1
+    while IFS= read -r pod; do
+        [[ -n "${pod}" ]] || continue
+        logs="$(
+            kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" logs \
+                "pod/${pod}" --all-containers=true --tail=200 --since=10m \
+                2>/dev/null || true
+        )"
+        if grep -Fq \
+            "received unknown GPU_FAULT_* environment variable(s)" \
+            <<<"${logs}"; then
+            printf 'unknown GPU_FAULT environment variable'
+            return 0
+        fi
+        if grep -Fq \
+            "regional cluster registrations require agent_endpoint_allowed_cidrs" \
+            <<<"${logs}"; then
+            printf 'regional cluster registry is missing Agent endpoint CIDRs'
+            return 0
+        fi
+        if grep -Fq \
+            "enabled regional cluster requires agent endpoint CIDRs" \
+            <<<"${logs}"; then
+            printf 'durable regional cluster records require CIDR migration'
+            return 0
+        fi
+        if grep -Fq "validation error for RegionalClusterRegistration" \
+            <<<"${logs}" &&
+            grep -Fq "Extra inputs are not permitted" <<<"${logs}"; then
+            printf 'regional cluster registry is incompatible with the target wheel'
+            return 0
+        fi
+    done < <(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get pods \
+            -l "app=${deployment}" -o json |
+            jq -r \
+                --arg release "${RELEASE_ID}" \
+                --arg template_hash "${template_hash}" \
+                '.items[] |
+                 select(
+                   (.metadata.annotations["gpu-fault.io/release-rollout"] // "") ==
+                   $release
+                 ) |
+                 select(
+                   (.metadata.labels["pod-template-hash"] // "") == $template_hash
+                 ) |
+                 .metadata.name'
+    )
+    return 1
+}
+
+wait_for_rollout() {
+    local deployment="$1"
+    local deadline=$((SECONDS + FAST_ROLLOUT_TIMEOUT_SECONDS))
+    local reason
+    while ((SECONDS < deadline)); do
+        if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout status \
+            "deployment/${deployment}" --timeout=5s >/dev/null 2>&1; then
+            return 0
+        fi
+        if reason="$(startup_failure_reason "${deployment}")"; then
+            echo "deployment ${deployment} failed fast: ${reason}" >&2
+            return 1
+        fi
+    done
+    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout status \
+        "deployment/${deployment}" --timeout=1s
+}
+
+if [[ "${PRESERVE_ROLE_CONFIG_MAPS}" != "true" ]]; then
+    for config in "${GENERATED}"/gpu-fault-*-config-*.yaml; do
+        name="$(basename "${config}" .yaml)"
+        apply_manifest "${name}"
+    done
+fi
 
 apply_manifest gpu-fault-api-ha-pdb
 apply_manifest gpu-fault-control-worker-pdb
@@ -566,21 +684,21 @@ apply_manifest gpu-fault-telemetry-spool-worker-pdb
 remove_legacy_notification_env gpu-fault-telemetry-spool-worker
 apply_manifest gpu-fault-telemetry-spool-worker
 stamp_release gpu-fault-telemetry-spool-worker
-if [[ "${RELOAD_RELEASE_METADATA}" == "true" ]]; then
+if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
+    "${FORCE_ROLE_RESTART}" == "true" ]]; then
     kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
         deployment/gpu-fault-telemetry-spool-worker
 fi
 
 # Admission remains off on the running ingress revision until a live
 # consumer tier is proven ready.
-kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" \
-    rollout status deployment/gpu-fault-telemetry-spool-worker \
-    --timeout="${FAST_ROLLOUT_TIMEOUT}"
+wait_for_rollout gpu-fault-telemetry-spool-worker
 
 remove_legacy_notification_env gpu-fault-control-worker
 apply_manifest gpu-fault-control-worker
 stamp_release gpu-fault-control-worker
-if [[ "${RELOAD_RELEASE_METADATA}" == "true" ]]; then
+if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
+    "${FORCE_ROLE_RESTART}" == "true" ]]; then
     kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
         deployment/gpu-fault-control-worker
 fi
@@ -601,20 +719,17 @@ if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
         GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS-
 fi
 
-kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" \
-    rollout status deployment/gpu-fault-control-worker \
-    --timeout="${FAST_ROLLOUT_TIMEOUT}"
+wait_for_rollout gpu-fault-control-worker
 
 remove_legacy_notification_env gpu-fault-api-ha
 apply_manifest gpu-fault-api-ha-ingress
 stamp_release gpu-fault-api-ha
-if [[ "${RELOAD_RELEASE_METADATA}" == "true" ]]; then
+if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
+    "${FORCE_ROLE_RESTART}" == "true" ]]; then
     kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
         deployment/gpu-fault-api-ha
 fi
-kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" \
-    rollout status deployment/gpu-fault-api-ha \
-    --timeout="${FAST_ROLLOUT_TIMEOUT}"
+wait_for_rollout gpu-fault-api-ha
 
 GPU_FAULT_NAMESPACE="${NAMESPACE}" \
 GPU_FAULT_RUNTIME_IMAGE="${RUNTIME_IMAGE}" \

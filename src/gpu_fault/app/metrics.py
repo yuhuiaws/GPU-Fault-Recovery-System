@@ -7,6 +7,7 @@ from fastapi.responses import Response
 
 from gpu_fault.app.authorization import authorization_bucket
 from gpu_fault.app.builtin_metric_contributors import (
+    closed_loop_metric_lines,
     orchestration_metric_lines,
     policy_metric_lines,
     remote_command_metric_lines,
@@ -276,6 +277,7 @@ METRIC_CONTRIBUTORS.register(
     "orchestration",
     orchestration_metric_lines,
 )
+METRIC_CONTRIBUTORS.register("closed-loop", closed_loop_metric_lines)
 METRIC_CONTRIBUTORS.register(
     "collector-silence",
     collector_silence_lines,

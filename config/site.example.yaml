@@ -73,6 +73,10 @@ spec:
       allowedNamespaces:
         - gpu-fault-system
         - training
+      # Required production boundary for signed Agent endpoint registration.
+      # Use only the GPU node subnet CIDRs, not the whole VPC.
+      agentEndpointAllowedCidrs:
+        - REPLACE_WITH_GPU_NODE_SUBNET_CIDR
       controlPlaneUrl: https://REPLACE_WITH_CONTROL_PLANE_HOSTNAME
       tokenFile: /secure/gpu-fault/gpu-prod-a.token
       caFile: /secure/gpu-fault/control-plane-ca.crt

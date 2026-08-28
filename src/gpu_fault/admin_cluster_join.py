@@ -539,6 +539,7 @@ def _cluster_document(
         "eksClusterArn": target.eks_arn,
         "executorIrsaRoleArn": role_arn,
         "allowedNamespaces": list(namespaces),
+        "agentEndpointAllowedCidrs": list(target.subnet_cidrs),
         "controlPlaneUrl": _control_plane_url(request.site),
         "tokenFile": str(token_file),
         "caFile": str(ca_file),

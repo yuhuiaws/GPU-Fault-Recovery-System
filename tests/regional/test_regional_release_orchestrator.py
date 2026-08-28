@@ -48,9 +48,7 @@ def test_upgrade_ensures_schema_before_rolling_cpu() -> None:
     assert source.index("self._upload_release(active_diff)") < source.index(
         "self._ensure_schema()"
     )
-    assert source.index("self._ensure_schema()") < source.index(
-        "self._apply_cpu(finalize=False)"
-    )
+    assert source.index("self._ensure_schema()") < source.index("self._apply_cpu(")
 
 
 def test_control_plane_only_upgrade_skips_schema_and_gpu(
@@ -79,6 +77,7 @@ def test_control_plane_only_upgrade_skips_schema_and_gpu(
     monkeypatch.setattr(
         release, "_apply_cpu", lambda *, finalize: calls.append(("cpu", finalize))
     )
+    monkeypatch.setattr(release, "_stage_registry", lambda: False)
     monkeypatch.setattr(
         release,
         "_upgrade_gpu_target",
@@ -534,6 +533,7 @@ def config_file(
                 "region": REGION,
                 "hyperpod_cluster_name": "hp-gpu-a",
                 "eks_cluster_arn": GPU_EKS_ARN,
+                "agent_endpoint_allowed_cidrs": ["10.0.0.0/16"],
             }
         ],
     }
@@ -938,9 +938,7 @@ def test_release_config_loads_health_targets(tmp_path: Path) -> None:
 class PreflightRunner:
     dry_run = False
 
-    def __init__(
-        self, *, gpu_eks_arn: str = GPU_EKS_ARN, gpu_node_recovery: str = "None"
-    ) -> None:
+    def __init__(self, *, gpu_eks_arn=GPU_EKS_ARN, gpu_node_recovery="None") -> None:
         self.gpu_eks_arn = gpu_eks_arn
         self.gpu_node_recovery = gpu_node_recovery
 
@@ -964,6 +962,11 @@ class PreflightRunner:
             )
         if "--raw=/readyz" in args:
             return "ok"
+        if "get" in args and "nodes" in args:
+            return (
+                '{"items":[{"metadata":{"name":"gpu-node-a"},"status":'
+                '{"addresses":[{"type":"InternalIP","address":"10.0.1.10"}]}}]}'
+            )
         raise AssertionError(f"unexpected preflight command: {args}")
 
 

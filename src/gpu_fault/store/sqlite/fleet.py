@@ -20,11 +20,22 @@ class SqliteFleetMixin:
     def save_regional_cluster(self, registration):
         key = registration.cluster_id
         with self._state_transaction(f"regional_cluster/{key}"):
-            existing = self._get_optional("regional_cluster", key)
-            if existing is not None and existing.region != registration.region:
+            existing_region = self._regional_cluster_region(key)
+            if existing_region is not None and existing_region != registration.region:
                 raise ValueError("regional cluster cannot move between regions")
             self._put("regional_cluster", key, registration)
             return registration
+
+    def _regional_cluster_region(self, cluster_id: str) -> str | None:
+        row = self._db.execute(
+            """
+            SELECT json_extract(payload, '$.region')
+            FROM objects
+            WHERE kind='regional_cluster' AND key=?
+            """,
+            (cluster_id,),
+        ).fetchone()
+        return str(row[0]) if row and row[0] is not None else None
 
     def get_regional_cluster(self, cluster_id: str):
         return self._get("regional_cluster", cluster_id)
@@ -43,6 +54,17 @@ class SqliteFleetMixin:
             self._list("regional_cluster"),
             key=lambda item: item.cluster_id,
         )
+
+    def list_regional_cluster_ids(self) -> list[str]:
+        rows = self._db.execute(
+            """
+            SELECT key
+            FROM objects
+            WHERE kind='regional_cluster'
+            ORDER BY key
+            """
+        ).fetchall()
+        return [str(row[0]) for row in rows]
 
     @staticmethod
     def _agent_key(cluster_id: str, node_id: str) -> str:

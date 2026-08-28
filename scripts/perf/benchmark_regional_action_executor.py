@@ -7,6 +7,7 @@ import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Event, Lock, Thread
 from urllib import error, request
 
 
@@ -27,6 +28,18 @@ DELAYS = {
     "RESTART_NODE": 0.20,
     "RESTORE_SCHEDULING": 0.04,
 }
+
+
+def claim_payload(executor_id: str, max_commands: int) -> dict:
+    return {
+        "executor_id": executor_id,
+        "executor_protocol_version": int(os.environ["EXECUTOR_PROTOCOL_VERSION"]),
+        "executor_artifact_sha256": os.environ["EXECUTOR_ARTIFACT_SHA256"],
+        "executor_compatibility_digest": os.environ["EXECUTOR_COMPATIBILITY_DIGEST"],
+        "execution_owners": OWNERS,
+        "max_commands": max_commands,
+        "lease_seconds": int(os.getenv("ACTION_LEASE_SECONDS", "120")),
+    }
 
 
 def percentile(values: list[float], ratio: float) -> float:
@@ -79,6 +92,16 @@ def main() -> None:
     expected = int(os.environ["EXPECTED_COMMANDS"])
     workers = int(os.getenv("ACTION_EXECUTOR_WORKERS", "8"))
     delay_scale = float(os.getenv("ACTION_DELAY_SCALE", "1"))
+    lease_seconds = int(os.getenv("ACTION_LEASE_SECONDS", "120"))
+    renewal_interval = float(
+        os.getenv(
+            "ACTION_RENEWAL_INTERVAL_SECONDS",
+            str(max(1.0, min(30.0, lease_seconds / 3))),
+        )
+    )
+    inject_renew_failure = (
+        os.getenv("ACTION_INJECT_RENEW_FAILURE_ONCE", "false").lower() == "true"
+    )
     max_seconds = float(os.getenv("ACTION_MAX_SECONDS", "900"))
     executor_id = f"action-executor-{offset:03d}"
     client = Client(
@@ -91,18 +114,74 @@ def main() -> None:
     duplicate_claims = 0
     claim_errors = 0
     result_errors = 0
+    renewals = 0
+    renewal_errors = 0
+    injected_renewal_failures = 0
+    long_commands = 0
+    active_commands = 0
+    max_active_commands = 0
+    inject_renew_failure_pending = inject_renew_failure
+    counters_lock = Lock()
     latencies: list[float] = []
     by_operation: dict[str, list[float]] = {}
     started = time.monotonic()
 
     def execute(command: dict) -> tuple[str, str, float, str | None]:
+        nonlocal active_commands
+        nonlocal inject_renew_failure_pending
+        nonlocal injected_renewal_failures
+        nonlocal long_commands
+        nonlocal max_active_commands
+        nonlocal renewal_errors
+        nonlocal renewals
         command_id = command["command_id"]
         operation = command["step"]["operation"]
         node_count = len(command["step"].get("node_ids") or [])
         delay = (DELAYS.get(operation, 0.05) + 0.01 * max(1, node_count)) * delay_scale
+        with counters_lock:
+            active_commands += 1
+            max_active_commands = max(max_active_commands, active_commands)
+            if delay >= lease_seconds:
+                long_commands += 1
+        stop_renewal = Event()
+
+        def renew() -> None:
+            nonlocal inject_renew_failure_pending
+            nonlocal injected_renewal_failures
+            nonlocal renewal_errors
+            nonlocal renewals
+            while not stop_renewal.wait(renewal_interval):
+                with counters_lock:
+                    if inject_renew_failure_pending:
+                        inject_renew_failure_pending = False
+                        injected_renewal_failures += 1
+                        renewal_errors += 1
+                        continue
+                try:
+                    client.post(
+                        f"/v1/regional/executors/{command_id}/renew",
+                        {
+                            "executor_id": executor_id,
+                            "lease_token": command["lease_token"],
+                            "lease_seconds": lease_seconds,
+                        },
+                    )
+                except Exception:
+                    with counters_lock:
+                        renewal_errors += 1
+                else:
+                    with counters_lock:
+                        renewals += 1
+
+        renewal_thread = Thread(
+            target=renew,
+            name=f"renew-{command_id}",
+            daemon=True,
+        )
+        renewal_thread.start()
         begin = time.monotonic()
-        time.sleep(delay)
         try:
+            time.sleep(delay)
             client.post(
                 f"/v1/regional/executors/{command_id}/result",
                 {
@@ -124,23 +203,18 @@ def main() -> None:
                 time.monotonic() - begin,
                 type(exc).__name__,
             )
-        return (
-            command_id,
-            operation,
-            time.monotonic() - begin,
-            None,
-        )
+        finally:
+            stop_renewal.set()
+            renewal_thread.join(timeout=max(1.0, renewal_interval + 1))
+            with counters_lock:
+                active_commands -= 1
+        return command_id, operation, time.monotonic() - begin, None
 
     while len(completed_ids) < expected and time.monotonic() - started < max_seconds:
         try:
             claim = client.post(
                 "/v1/regional/executors/claim",
-                {
-                    "executor_id": executor_id,
-                    "execution_owners": OWNERS,
-                    "max_commands": min(25, workers),
-                    "lease_seconds": 120,
-                },
+                claim_payload(executor_id, min(25, workers)),
             )
             commands = claim.get("commands") or []
         except (error.HTTPError, error.URLError, OSError):
@@ -173,6 +247,13 @@ def main() -> None:
         "duplicate_claims": duplicate_claims,
         "claim_errors": claim_errors,
         "result_errors": result_errors,
+        "lease_seconds": lease_seconds,
+        "renewal_interval_seconds": renewal_interval,
+        "renewals": renewals,
+        "renewal_errors": renewal_errors,
+        "injected_renewal_failures": injected_renewal_failures,
+        "long_commands": long_commands,
+        "max_concurrent_commands": max_active_commands,
         "wall_seconds": wall,
         "command_p50_ms": statistics.median(latencies) * 1000 if latencies else 0.0,
         "command_p95_ms": percentile(latencies, 0.95) * 1000,
@@ -186,7 +267,17 @@ def main() -> None:
         },
     }
     print(json.dumps(output, indent=2, sort_keys=True), flush=True)
-    if len(completed_ids) != expected or duplicate_claims or result_errors:
+    if (
+        len(completed_ids) != expected
+        or duplicate_claims
+        or result_errors
+        or max_active_commands < min(workers, expected)
+        or (long_commands and renewals == 0)
+        or (
+            inject_renew_failure
+            and (injected_renewal_failures != 1 or renewal_errors < 1)
+        )
+    ):
         raise SystemExit(1)
 
 

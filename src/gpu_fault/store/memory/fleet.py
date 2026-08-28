@@ -44,6 +44,10 @@ class MemoryFleetMixin:
                 key=lambda item: item.cluster_id,
             )
 
+    def list_regional_cluster_ids(self) -> list[str]:
+        with self._lock:
+            return sorted(self._regional_clusters)
+
     def save_agent(self, agent) -> None:
         with self._lock:
             self._agents[(agent.cluster_id, agent.node_id)] = agent

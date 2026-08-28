@@ -14,12 +14,16 @@ from threading import RLock, Timer
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from gpu_fault.collectors import EventSink, HttpEventSink
+from gpu_fault.collectors import EventSink
 from gpu_fault.completion_observation import (
     completion_list_arguments,
     is_unknown_profile_rejection,
     list_completion_pods,
     ObservationOnlyTracker,
+)
+from gpu_fault.completion_outbox import (
+    completion_sink_from_environment,
+    replay_completion_outbox,
 )
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.models import Environment
@@ -547,6 +551,7 @@ class KubernetesCompletionController:
         *,
         attempt_filter: set[str] | None = None,
     ) -> list[dict[str, Any]]:
+        replay_completion_outbox(self.sink, LOGGER)
         grouped = self.observation_only.group(self, pods, self.serializer)
 
         if attempt_filter is None:
@@ -1445,23 +1450,7 @@ def controller_from_environment() -> KubernetesCompletionController:
     fallback_seconds = float(fallback_value) if fallback_value else None
     return KubernetesCompletionController(
         core_api,
-        HttpEventSink(
-            os.environ["GPU_FAULT_CONTROL_PLANE_URL"],
-            bearer_token=os.getenv("GPU_FAULT_CONTROL_PLANE_TOKEN"),
-            timeout_seconds=10,
-            processor_receipt_timeout_seconds=float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_RECEIPT_TIMEOUT_SECONDS",
-                    "120",
-                )
-            ),
-            processor_receipt_poll_seconds=float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_RECEIPT_POLL_SECONDS",
-                    "0.25",
-                )
-            ),
-        ),
+        completion_sink_from_environment(core_api),
         cluster_id=os.environ["GPU_FAULT_CLUSTER_ID"],
         environment=Environment(
             os.getenv(

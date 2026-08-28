@@ -20,6 +20,7 @@ from ._kubernetes_cases_1 import (
     test_same_incident_stale_workload_generation_is_rejected,
     test_storeless_adapter_takes_over_terminal_node_isolation,
     test_successful_quarantine_keeps_incident_quarantined,
+    test_terminal_isolation_takeover_restores_original_schedulability,
     test_terminal_quarantine_hold_rejects_automatic_reset_takeover,
 )
 from ._kubernetes_cases_2 import (

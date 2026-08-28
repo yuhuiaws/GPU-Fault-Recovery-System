@@ -327,9 +327,13 @@ def _copy_modules(modules: set[str], destination: Path) -> None:
         target = package / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
+        target.chmod(0o644)
     data = SOURCE / "data"
     if data.is_dir():
         shutil.copytree(data, package / "data")
+        for path in (package / "data").rglob("*"):
+            if path.is_file():
+                path.chmod(0o644)
 
 
 def _toml_array(values: Iterable[str]) -> str:
@@ -344,7 +348,7 @@ def _write_project(
     project = root["project"]
     lines = [
         "[build-system]",
-        'requires = ["setuptools>=77"]',
+        f"requires = {_toml_array(root['build-system']['requires'])}",
         'build-backend = "setuptools.build_meta"',
         "",
         "[project]",
@@ -387,7 +391,9 @@ def _write_project(
         "\n".join(lines),
         encoding="utf-8",
     )
-    shutil.copy2(ROOT / "LICENSE", destination / "LICENSE")
+    license_path = destination / "LICENSE"
+    shutil.copy2(ROOT / "LICENSE", license_path)
+    license_path.chmod(0o644)
 
 
 def package_digest(package: Path) -> str:
@@ -452,12 +458,16 @@ def build_component(
     _copy_modules(selected, project)
     _write_project(project, component)
     before = set(output.glob("*.whl"))
-    subprocess.run(
-        [python, "-m", "build", "--wheel", "--outdir", str(output)],
-        cwd=project,
-        env={**os.environ, "SOURCE_DATE_EPOCH": "315532800"},
-        check=True,
-    )
+    previous_umask = os.umask(0o022)
+    try:
+        subprocess.run(
+            [python, "-m", "build", "--wheel", "--outdir", str(output)],
+            cwd=project,
+            env={**os.environ, "SOURCE_DATE_EPOCH": "315532800"},
+            check=True,
+        )
+    finally:
+        os.umask(previous_umask)
     wheels = sorted(set(output.glob("*.whl")) - before)
     if len(wheels) != 1:
         raise RuntimeError(f"{name} build produced {len(wheels)} wheels")

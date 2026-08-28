@@ -62,6 +62,7 @@ def registration(cluster_id: str, token: str):
         eks_cluster_arn=(f"arn:aws:eks:us-west-2:123456789012:cluster/{cluster_id}"),
         token_sha256=cluster_token_sha256(token),
         allowed_namespaces=["training", "gpu-fault-system"],
+        agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
     )
 
 
@@ -139,6 +140,7 @@ def regional_environment(monkeypatch, tmp_path) -> None:
                         "arn:aws:eks:us-west-2:123456789012:cluster/cluster-a"
                     ),
                     "token": TOKEN_A,
+                    "agent_endpoint_allowed_cidrs": ["10.0.0.0/16"],
                 }
             ]
         ),

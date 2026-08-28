@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib import error as urllib_error
@@ -110,6 +111,15 @@ class NodeActionTransportMixin:
             return WorkflowStepOutcome.failed(str(exc))
         if not endpoint:
             return WorkflowStepOutcome.failed(f"no node action endpoint for {node_id}")
+        endpoint = str(endpoint)
+        try:
+            ssl_context = self._ssl_context(
+                context.incident.cluster_id,
+                node_id,
+                endpoint,
+            )
+        except ValueError as exc:
+            return WorkflowStepOutcome.failed(str(exc))
         now = datetime.now(timezone.utc)
         command = NodeActionCommand(
             command_id=(
@@ -134,7 +144,12 @@ class NodeActionTransportMixin:
         try:
             if self.sender is not None:
                 return self.sender(endpoint, envelope)
-            return self._send(endpoint, envelope, secret=action_secret)
+            return self._send(
+                endpoint,
+                envelope,
+                secret=action_secret,
+                ssl_context=ssl_context,
+            )
         except NodeActionPending as exc:
             return WorkflowStepOutcome.waiting(
                 operation_id=context.idempotency_key,
@@ -221,6 +236,7 @@ class NodeActionTransportMixin:
         envelope: SignedNodeAction,
         *,
         secret: str,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> NodeActionResult:
         command_id = envelope.command.command_id
         # The result carries the same operational detail as the command,
@@ -244,7 +260,11 @@ class NodeActionTransportMixin:
             method="GET",
         )
         try:
-            with urlopen(poll, timeout=self.poll_timeout_seconds) as response:
+            with urlopen(
+                poll,
+                timeout=self.poll_timeout_seconds,
+                ssl_context=ssl_context,
+            ) as response:
                 state = NodeActionSubmission.model_validate_json(response.read())
         except urllib_error.HTTPError as exc:
             if exc.code != 404:
@@ -260,7 +280,11 @@ class NodeActionTransportMixin:
                 },
                 method="POST",
             )
-            with urlopen(request, timeout=self.submit_timeout_seconds) as response:
+            with urlopen(
+                request,
+                timeout=self.submit_timeout_seconds,
+                ssl_context=ssl_context,
+            ) as response:
                 state = NodeActionSubmission.model_validate_json(response.read())
         if state.state is NodeActionExecutionState.PENDING:
             raise NodeActionPending(
@@ -272,3 +296,21 @@ class NodeActionTransportMixin:
         if state.result is None:
             raise RuntimeError("node action completed without a result")
         return state.result
+
+    def _ssl_context(
+        self,
+        cluster_id: str,
+        node_id: str,
+        endpoint: str,
+    ) -> ssl.SSLContext | None:
+        if not endpoint.startswith("https://"):
+            return None
+        if self.registry is None:
+            return ssl.create_default_context()
+        record = self.registry.store.get_agent(cluster_id, node_id)
+        certificate = getattr(record, "tls_certificate_pem", None)
+        if not certificate:
+            raise ValueError(f"agent TLS certificate is unavailable for {node_id}")
+        context = ssl.create_default_context(cadata=certificate)
+        context.check_hostname = False
+        return context

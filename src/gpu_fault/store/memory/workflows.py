@@ -13,7 +13,12 @@ from gpu_fault.models import (
 )
 from gpu_fault.store.shared.errors import (
     NotFoundError,
+    RemediationBudgetError,
     WorkflowLeaseError,
+)
+from gpu_fault.store.shared.remediation_budgets import (
+    apply_remediation_budget,
+    blocked_by_remediation_budget,
 )
 
 
@@ -314,6 +319,7 @@ class MemoryWorkflowMixin:
         *,
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
+        remediation_budget_claims: dict[str, int] | None = None,
     ) -> WorkflowRequest:
         with self._lock:
             workflow = self.get_workflow(request_id)
@@ -330,6 +336,21 @@ class MemoryWorkflowMixin:
                 and lease_active
             ):
                 raise WorkflowLeaseError("workflow is leased by another executor")
+            if remediation_budget_claims is not None:
+                try:
+                    workflow = apply_remediation_budget(
+                        workflow,
+                        list(self._workflows.values()),
+                        remediation_budget_claims,
+                        now=claimed_at,
+                    )
+                except RemediationBudgetError as exc:
+                    self._workflows[request_id] = blocked_by_remediation_budget(
+                        workflow,
+                        str(exc),
+                        now=claimed_at,
+                    )
+                    raise
             new_epoch = workflow.execution_owner_id != executor_id or not lease_active
             workflow = workflow.model_copy(
                 update={
@@ -340,6 +361,11 @@ class MemoryWorkflowMixin:
                         else max(workflow.execution_epoch, 1)
                     ),
                     "execution_lease_expires_at": (claimed_at + lease_duration),
+                    **(
+                        {"status": WorkflowStatus.RUNNING}
+                        if remediation_budget_claims is not None
+                        else {}
+                    ),
                 }
             )
             self._workflows[request_id] = workflow

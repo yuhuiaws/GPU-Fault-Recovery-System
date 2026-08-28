@@ -476,6 +476,7 @@ class GpuClusterSiteConfig:
     eks_cluster_arn: str
     executor_irsa_role_arn: str
     allowed_namespaces: tuple[str, ...]
+    agent_endpoint_allowed_cidrs: tuple[str, ...]
     control_plane_url: str
     token_file: str
     ca_file: str
@@ -495,6 +496,7 @@ class GpuClusterSiteConfig:
                 "eksClusterArn",
                 "executorIrsaRoleArn",
                 "allowedNamespaces",
+                "agentEndpointAllowedCidrs",
                 "controlPlaneUrl",
                 "tokenFile",
                 "caFile",
@@ -530,6 +532,11 @@ class GpuClusterSiteConfig:
                 data.get("allowedNamespaces"),
                 f"{path}.allowedNamespaces",
                 minimum=1,
+            ),
+            agent_endpoint_allowed_cidrs=_text_list(
+                data.get("agentEndpointAllowedCidrs") or [],
+                f"{path}.agentEndpointAllowedCidrs",
+                minimum=0,
             ),
             control_plane_url=url,
             token_file=_required_text(
@@ -755,6 +762,9 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
                 "eks_cluster_arn": cluster.eks_cluster_arn,
                 "executor_irsa_role_arn": cluster.executor_irsa_role_arn,
                 "allowed_namespaces": list(cluster.allowed_namespaces),
+                "agent_endpoint_allowed_cidrs": list(
+                    cluster.agent_endpoint_allowed_cidrs
+                ),
                 "control_plane_url": cluster.control_plane_url,
                 "token_file": str(_resolve(root, cluster.token_file).resolve()),
                 "ca_file": str(_resolve(root, cluster.ca_file).resolve()),

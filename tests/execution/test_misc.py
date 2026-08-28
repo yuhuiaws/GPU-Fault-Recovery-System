@@ -9,6 +9,7 @@ from ._misc_cases_1 import (
     test_hung_triage_tolerates_unreachable_node,
     test_knows_node_prefers_registry_over_stale_endpoint_map,
     test_managed_recovery_observer_never_submits_mutation,
+    test_managed_recovery_rejects_warm_spare_replacement,
     test_post_reboot_handoff_restore_uses_fresh_agent_generation,
     test_predecessor_terminal_save_preserves_successor_incident_pointer,
     test_queued_successor_does_not_fence_running_predecessor,

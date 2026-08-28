@@ -10,6 +10,7 @@ from gpu_fault.models import (
     WorkflowOperation,
 )
 from gpu_fault.execution.models import WorkflowExecutionError
+from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
 
 
 LOGGER = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ class ProductionExecutorConfig:
     lease_duration_seconds: int = 180
     workflow_execution_timeout_seconds: int = 3600
     workflow_preemption_enabled: bool = True
+    remediation_budget: RemediationBudgetPolicy = RemediationBudgetPolicy()
 
     @classmethod
     def from_environment(cls) -> ProductionExecutorConfig:
@@ -72,6 +74,7 @@ class ProductionExecutorConfig:
                 .lower()
                 == "true"
             ),
+            remediation_budget=RemediationBudgetPolicy.from_mapping(values),
         )
 
 

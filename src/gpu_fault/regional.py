@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import secrets
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from gpu_fault.execution import (
     WorkflowStepContext,
@@ -43,8 +44,24 @@ class RegionalClusterRegistration(StrictModel):
     token_sha256: str = Field(min_length=64, max_length=64)
     enabled: bool = True
     allowed_namespaces: list[str] = Field(default_factory=list)
+    agent_endpoint_allowed_cidrs: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator(  # type: ignore[untyped-decorator]
+        "agent_endpoint_allowed_cidrs"
+    )
+    @classmethod
+    def validate_agent_endpoint_cidrs(cls, values: list[str]) -> list[str]:
+        try:
+            networks = {
+                str(ipaddress.ip_network(value.strip(), strict=False))
+                for value in values
+                if value.strip()
+            }
+        except ValueError as exc:
+            raise ValueError("agent endpoint CIDRs must be valid networks") from exc
+        return sorted(networks)
 
     @model_validator(mode="after")
     def validate_token_digest(self) -> RegionalClusterRegistration:
@@ -52,6 +69,8 @@ class RegionalClusterRegistration(StrictModel):
             bytes.fromhex(self.token_sha256)
         except ValueError as exc:
             raise ValueError("token_sha256 must be hexadecimal") from exc
+        if self.enabled and not self.agent_endpoint_allowed_cidrs:
+            raise ValueError("enabled regional cluster requires agent endpoint CIDRs")
         return self
 
     def authenticates(self, token: str) -> bool:

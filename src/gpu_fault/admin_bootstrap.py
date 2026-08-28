@@ -42,6 +42,11 @@ from gpu_fault.admin_bootstrap_common import (
 from gpu_fault.admin_notifications import (
     NotificationRouting,
 )
+from gpu_fault.admin_bootstrap_site import (
+    discover_bootstrap_scope,
+    discover_subnet_cidrs,
+    preserve_existing_site_contract,
+)
 
 
 DEFAULT_ADOT_IMAGE_AMD64 = (
@@ -147,6 +152,12 @@ def discover_cluster(
     if eks.get("status") != "ACTIVE":
         raise BootstrapError(f"EKS cluster {eks_name} is not ACTIVE")
     vpc = eks.get("resourcesVpcConfig") or {}
+    subnet_ids = tuple(vpc.get("subnetIds") or ())
+    subnet_cidrs = discover_subnet_cidrs(
+        runner,
+        region=eks_parsed.region,
+        subnet_ids=subnet_ids,
+    )
     node_recovery = str(hyperpod.get("NodeRecovery") or "")
     if role == "gpu" and node_recovery != "None":
         raise BootstrapError(
@@ -162,9 +173,10 @@ def discover_cluster(
         eks_arn=eks_arn,
         eks_name=eks_name,
         vpc_id=str(vpc.get("vpcId") or ""),
-        subnet_ids=tuple(vpc.get("subnetIds") or ()),
+        subnet_ids=subnet_ids,
         node_recovery=node_recovery,
         context=context,
+        subnet_cidrs=subnet_cidrs,
     )
 
 
@@ -1957,6 +1969,7 @@ def _site_document(
                 "eksClusterArn": cluster.eks_arn,
                 "executorIrsaRoleArn": executor_roles[cluster_id],
                 "allowedNamespaces": ["gpu-fault-system", "training"],
+                "agentEndpointAllowedCidrs": list(cluster.subnet_cidrs),
                 "controlPlaneUrl": f"https://{pki['hostname']}",
                 "tokenFile": str(token_files[cluster_id]),
                 "caFile": pki["ca_file"],
@@ -2048,25 +2061,12 @@ def bootstrap_from_arns(
 
     _bootstrap_dependencies()
     active_runner = runner or CommandRunner(dry_run=request.dry_run)
-    cpu = discover_cluster(
-        active_runner,
-        cluster_arn=request.cpu_cluster_arn,
-        role="cpu",
-        context=_cluster_alias(request.cpu_cluster_arn, "cpu", 0),
+    existing_site, cpu, gpu_clusters = discover_bootstrap_scope(
+        request=request,
+        runner=active_runner,
+        discover=discover_cluster,
+        alias=_cluster_alias,
     )
-    gpu_clusters = []
-    with ThreadPoolExecutor(max_workers=min(8, len(request.gpu_cluster_arns))) as pool:
-        futures = [
-            pool.submit(
-                discover_cluster,
-                active_runner,
-                cluster_arn=value,
-                role="gpu",
-                context=_cluster_alias(value, "gpu", index),
-            )
-            for index, value in enumerate(request.gpu_cluster_arns, 1)
-        ]
-        gpu_clusters = [future.result() for future in futures]
     _require_same_scope(cpu, gpu_clusters)
     site_id = _site_identifier(cpu, gpu_clusters)
     request.state_dir.mkdir(parents=True, exist_ok=True)
@@ -2232,27 +2232,28 @@ def bootstrap_from_arns(
     _run_parallel(second_phase_tasks, state=state)
     state.phase("platform-prerequisites-ready")
     site_file = request.state_dir / "site.yaml"
+    generated_site = _site_document(
+        request=request,
+        site_id=site_id,
+        cpu=cpu,
+        gpu_clusters=gpu_clusters,
+        cpu_kubeconfig=cpu_kubeconfig,
+        gpu_kubeconfig=gpu_kubeconfig,
+        release=release,
+        nlb=cast(dict[str, Any], first_phase["nlb_network"]),
+        pki=cast(dict[str, Any], first_phase["pki"]),
+        aurora=aurora,
+        monitoring=monitoring,
+        executor_roles=executor_roles,
+        token_files=token_files,
+        fleet_master_file=fleet_master_file,
+        adot_image=adot_image,
+        admin_email=admin_email,
+        routing=routing,
+    )
     _write_yaml(
         site_file,
-        _site_document(
-            request=request,
-            site_id=site_id,
-            cpu=cpu,
-            gpu_clusters=gpu_clusters,
-            cpu_kubeconfig=cpu_kubeconfig,
-            gpu_kubeconfig=gpu_kubeconfig,
-            release=release,
-            nlb=cast(dict[str, Any], first_phase["nlb_network"]),
-            pki=cast(dict[str, Any], first_phase["pki"]),
-            aurora=aurora,
-            monitoring=monitoring,
-            executor_roles=executor_roles,
-            token_files=token_files,
-            fleet_master_file=fleet_master_file,
-            adot_image=adot_image,
-            admin_email=admin_email,
-            routing=routing,
-        ),
+        preserve_existing_site_contract(generated_site, existing_site),
     )
     state.record("site_file", str(site_file))
     state.phase("site-ready")

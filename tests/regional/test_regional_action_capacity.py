@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from gpu_fault.fleet import AgentRecord
 from gpu_fault.models import WorkflowOperation
+from scripts.perf import benchmark_regional_action_executor as benchmark
+from scripts.perf import regional_action_capacity_suite as suite
 from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 PATH = ROOT / "scripts/perf/seed_regional_action_workflows.py"
 MODULE = lazy_script_module("seed_regional_action_workflows", PATH)
+NOW = datetime(2026, 8, 28, tzinfo=timezone.utc)
 
 
 def test_action_capacity_workflow_is_multinode_dag() -> None:
@@ -33,3 +38,106 @@ def test_action_capacity_workflow_is_multinode_dag() -> None:
         WorkflowOperation.RESTART_NODE,
         WorkflowOperation.RESTORE_SCHEDULING,
     ]
+
+
+def test_action_capacity_seed_clones_current_agent_identity() -> None:
+    template = AgentRecord(
+        cluster_id="production",
+        node_id="node-a",
+        endpoint="http://node-a:9099",
+        agent_protocol_version=3,
+        node_action_key_version=2,
+        agent_version="0.10.0",
+        artifact_sha256="a" * 64,
+        compatibility_digest="b" * 64,
+        policy_version="catalog-v1",
+        runtime_profile_version="hyperpod-v1",
+        config_digest="c" * 64,
+        allowed_operations=[WorkflowOperation.RESET_GPU],
+        first_seen_at=NOW - timedelta(minutes=1),
+        last_seen_at=NOW,
+        lease_expires_at=NOW + timedelta(minutes=1),
+    )
+
+    agent = MODULE.synthetic_agent(
+        template,
+        cluster_id="perf-cap-000",
+        node_id="synthetic-node",
+        run_id="run-a",
+        now=NOW,
+    )
+
+    assert agent.cluster_id == "perf-cap-000"
+    assert agent.node_id == "synthetic-node"
+    assert agent.endpoint == "http://127.0.0.1:9"
+    assert agent.identity == template.identity
+    assert agent.lease_expires_at == NOW + timedelta(minutes=30)
+
+
+def test_action_capacity_claim_carries_live_executor_pins(monkeypatch) -> None:
+    monkeypatch.setenv("EXECUTOR_PROTOCOL_VERSION", "2")
+    monkeypatch.setenv("EXECUTOR_ARTIFACT_SHA256", "a" * 64)
+    monkeypatch.setenv("EXECUTOR_COMPATIBILITY_DIGEST", "b" * 64)
+    monkeypatch.setenv("ACTION_LEASE_SECONDS", "10")
+
+    payload = benchmark.claim_payload("executor-a", 5)
+
+    assert payload["executor_protocol_version"] == 2
+    assert payload["executor_artifact_sha256"] == "a" * 64
+    assert payload["executor_compatibility_digest"] == "b" * 64
+    assert payload["max_commands"] == 5
+    assert payload["lease_seconds"] == 10
+
+
+def test_action_capacity_job_injects_live_executor_pins() -> None:
+    manifest = suite.executor_job(
+        clusters=1,
+        expected_commands=10,
+        workers=5,
+        delay_scale=1,
+        lease_seconds=10,
+        inject_renew_failure_once=True,
+        executor_protocol_version=2,
+        executor_artifact_sha256="a" * 64,
+        executor_compatibility_digest="b" * 64,
+    )
+    environment = {
+        item["name"]: item["value"]
+        for item in manifest["spec"]["template"]["spec"]["containers"][0]["env"]
+        if "value" in item
+    }
+
+    assert environment["EXECUTOR_PROTOCOL_VERSION"] == "2"
+    assert environment["EXECUTOR_ARTIFACT_SHA256"] == "a" * 64
+    assert environment["EXECUTOR_COMPATIBILITY_DIGEST"] == "b" * 64
+    assert environment["ACTION_LEASE_SECONDS"] == "10"
+    assert environment["ACTION_INJECT_RENEW_FAILURE_ONCE"] == "true"
+
+
+def test_action_capacity_summary_keeps_renewal_and_concurrency_evidence() -> None:
+    summary = suite.aggregate_executor_documents(
+        [
+            {
+                "wall_seconds": 10.0,
+                "renewals": 8,
+                "renewal_errors": 1,
+                "injected_renewal_failures": 1,
+                "long_commands": 3,
+                "max_concurrent_commands": 4,
+            },
+            {
+                "wall_seconds": 12.0,
+                "renewals": 9,
+                "renewal_errors": 0,
+                "injected_renewal_failures": 0,
+                "long_commands": 2,
+                "max_concurrent_commands": 5,
+            },
+        ]
+    )
+
+    assert summary["renewals"] == 17
+    assert summary["renewal_errors"] == 1
+    assert summary["injected_renewal_failures"] == 1
+    assert summary["long_commands"] == 5
+    assert summary["max_concurrent_commands"] == 5

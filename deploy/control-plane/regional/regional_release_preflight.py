@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 from typing import Any
 
@@ -65,6 +66,53 @@ def _validate_hyperpod_cluster(
         )
 
 
+def _validate_agent_endpoint_cidrs(
+    runner: Any,
+    kubectl: list[str],
+    *,
+    cluster_id: str,
+    hyperpod_cluster_name: str,
+    configured_cidrs: tuple[str, ...],
+) -> None:
+    networks = tuple(
+        ipaddress.ip_network(value, strict=False) for value in configured_cidrs
+    )
+    if not networks:
+        raise ReleaseError(f"{cluster_id} requires Agent endpoint CIDRs")
+    raw = runner.run(
+        kubectl
+        + [
+            "get",
+            "nodes",
+            "-l",
+            f"sagemaker.amazonaws.com/cluster-name={hyperpod_cluster_name}",
+            "-o",
+            "json",
+        ],
+        capture=True,
+    )
+    nodes = json.loads(raw).get("items") or []
+    if not nodes:
+        raise ReleaseError(f"{cluster_id} has no Kubernetes nodes")
+    uncovered: list[str] = []
+    for node in nodes:
+        addresses = [
+            item.get("address")
+            for item in node.get("status", {}).get("addresses", [])
+            if item.get("type") == "InternalIP"
+        ]
+        if not addresses or any(
+            not any(ipaddress.ip_address(value) in network for network in networks)
+            for value in addresses
+        ):
+            uncovered.append(str(node.get("metadata", {}).get("name") or "unknown"))
+    if uncovered:
+        raise ReleaseError(
+            f"{cluster_id} Agent endpoint CIDRs do not cover nodes: "
+            + ", ".join(sorted(uncovered))
+        )
+
+
 def ensure_region_contexts(release: Any) -> None:
     config = release.config
     runner = release.runner
@@ -102,4 +150,11 @@ def ensure_region_contexts(release: Any) -> None:
             require_node_recovery_none=True,
         )
         runner.run(gpu_command(target, "get", "--raw=/readyz"), capture=True)
+        _validate_agent_endpoint_cidrs(
+            runner,
+            gpu_command(target),
+            cluster_id=target.cluster_id,
+            hyperpod_cluster_name=target.hyperpod_cluster_name,
+            configured_cidrs=target.agent_endpoint_allowed_cidrs,
+        )
         release._validate_executor_iam_role(target)

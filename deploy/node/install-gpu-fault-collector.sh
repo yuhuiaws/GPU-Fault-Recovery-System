@@ -592,6 +592,41 @@ print(
         )"
         NODE_ACTION_KEY_VERSION="2"
     fi
+    if [[ -z "${NODE_AGENT_HOST}" ]]; then
+        NODE_AGENT_HOST="${NODE_ID}"
+    fi
+    if [[ -z "${NODE_AGENT_TLS_CERT}" &&
+        -z "${NODE_AGENT_TLS_KEY}" &&
+        "${NODE_AGENT_ALLOW_PLAINTEXT}" != "true" ]]; then
+        command -v openssl >/dev/null 2>&1 ||
+            die "automatic node-agent TLS requires openssl"
+        mkdir -p /etc/gpu-fault
+        NODE_AGENT_TLS_CERT="/etc/gpu-fault/node-agent.crt"
+        NODE_AGENT_TLS_KEY="/etc/gpu-fault/node-agent.key"
+        node_agent_san="$(
+            "${PYTHON_COMMAND}" - "${NODE_ID}" "${NODE_AGENT_HOST}" <<'PY'
+import ipaddress
+import sys
+
+node_id, host = sys.argv[1:]
+try:
+    ipaddress.ip_address(host)
+except ValueError:
+    print(f"DNS:{node_id},DNS:{host}")
+else:
+    print(f"DNS:{node_id},IP:{host}")
+PY
+        )"
+        openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+            -days 397 \
+            -subj "/CN=${NODE_ID}" \
+            -addext "subjectAltName=${node_agent_san}" \
+            -keyout "${NODE_AGENT_TLS_KEY}" \
+            -out "${NODE_AGENT_TLS_CERT}" >/dev/null 2>&1 ||
+            die "cannot generate node-agent TLS certificate"
+        chmod 0600 "${NODE_AGENT_TLS_KEY}"
+        chmod 0644 "${NODE_AGENT_TLS_CERT}"
+    fi
     # The agent serves HTTPS only when it has a certificate, so the
     # advertised scheme has to follow the certificate, not the other way
     # round: a control plane calling https:// against a plain-HTTP
@@ -616,9 +651,6 @@ print(
         else
             NODE_AGENT_ADVERTISE_URL="http://${NODE_ID}:${NODE_AGENT_PORT}"
         fi
-    fi
-    if [[ -z "${NODE_AGENT_HOST}" ]]; then
-        NODE_AGENT_HOST="${NODE_ID}"
     fi
     [[ "${NODE_AGENT_ADVERTISE_URL}" =~ ^https?:// ]] ||
         die "--node-agent-advertise-url must use http or https"

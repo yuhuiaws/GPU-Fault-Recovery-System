@@ -15,6 +15,7 @@ def active_values() -> dict[str, str]:
         "GPU_FAULT_STORE_URL": "postgresql://db/gpu_fault",
         "GPU_FAULT_EXECUTION_TOKEN": "x" * 32,
         "GPU_FAULT_ALLOW_SINGLE_CLUSTER": "true",
+        "GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS": "10.0.0.0/16",
     }
 
 
@@ -140,6 +141,33 @@ def test_agent_registry_protocol_defaults_to_current_version() -> None:
     settings = ControlPlaneSettings.from_mapping(values)
 
     assert settings.agent_registry.required_agent_protocol_version == 3
+    assert settings.agent_registry.endpoint_require_tls is True
+
+
+def test_agent_registry_requires_endpoint_cidrs() -> None:
+    values = active_values()
+    values.update(
+        {
+            "GPU_FAULT_DEPLOYMENT_MODE": "regional",
+            "GPU_FAULT_ENABLE_AGENT_REGISTRY": "true",
+            "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": "a" * 64,
+            "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST": "c" * 64,
+            "GPU_FAULT_REGIONAL_CLUSTERS_JSON": json.dumps(
+                [
+                    {
+                        "cluster_id": "cluster-a",
+                        "region": "us-west-2",
+                        "hyperpod_cluster_name": "hp-a",
+                        "eks_cluster_arn": "arn:aws:eks:::cluster/a",
+                        "token": "a" * 32,
+                    }
+                ]
+            ),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="agent_endpoint_allowed_cidrs"):
+        ControlPlaneSettings.from_mapping(values)
 
 
 def test_agent_registry_parses_rollout_compatibility_window() -> None:

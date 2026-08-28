@@ -16,6 +16,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.store import NotFoundError
 from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.execution.remediation_budget import remediation_budget_claims
 
 
 LOGGER = logging.getLogger(__name__)
@@ -147,11 +148,18 @@ def prepare_claimed_workflow(
 ) -> ClaimedWorkflowPreparation:
     """Claim a workflow and finish every no-mutation preflight gate."""
 
+    steps = workflow.safety_steps if is_safety else workflow.official_steps
     workflow = executor.store.claim_workflow(
         request_id,
         executor.config.executor_id,
         request.expected_fencing_token,
         lease_duration=executor._lease_duration,
+        remediation_budget_claims=remediation_budget_claims(
+            executor.config.remediation_budget,
+            workflow,
+            incident,
+            steps,
+        ),
     ).model_copy(
         update={
             "status": WorkflowStatus.RUNNING,

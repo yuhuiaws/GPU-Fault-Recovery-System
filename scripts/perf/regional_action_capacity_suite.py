@@ -63,6 +63,11 @@ def executor_job(
     expected_commands: int,
     workers: int,
     delay_scale: float,
+    lease_seconds: int,
+    inject_renew_failure_once: bool,
+    executor_protocol_version: int,
+    executor_artifact_sha256: str,
+    executor_compatibility_digest: str,
 ) -> dict:
     return {
         "apiVersion": "batch/v1",
@@ -131,6 +136,26 @@ def executor_job(
                                     "name": "ACTION_DELAY_SCALE",
                                     "value": str(delay_scale),
                                 },
+                                {
+                                    "name": "ACTION_LEASE_SECONDS",
+                                    "value": str(lease_seconds),
+                                },
+                                {
+                                    "name": "ACTION_INJECT_RENEW_FAILURE_ONCE",
+                                    "value": str(inject_renew_failure_once).lower(),
+                                },
+                                {
+                                    "name": "EXECUTOR_PROTOCOL_VERSION",
+                                    "value": str(executor_protocol_version),
+                                },
+                                {
+                                    "name": "EXECUTOR_ARTIFACT_SHA256",
+                                    "value": executor_artifact_sha256,
+                                },
+                                {
+                                    "name": "EXECUTOR_COMPATIBILITY_DIGEST",
+                                    "value": executor_compatibility_digest,
+                                },
                             ],
                             "resources": {
                                 "requests": {
@@ -186,6 +211,47 @@ def executor_job(
                 }
             },
         },
+    }
+
+
+def executor_identity() -> dict:
+    state = json.loads(
+        control(
+            "get",
+            "configmap",
+            "gpu-fault-regional-release-state",
+            "-o",
+            "jsonpath={.data.state\\.json}",
+        )
+    )
+    deployment = json.loads(
+        dataplane(
+            "get",
+            "deployment",
+            "gpu-fault-cluster-executor",
+            "-o",
+            "json",
+        )
+    )
+    environment = {
+        item["name"]: item.get("value")
+        for item in deployment["spec"]["template"]["spec"]["containers"][0].get(
+            "env", []
+        )
+    }
+    expected_artifact = str(state["executor_wheel_sha256"])
+    expected_compatibility = str(state["component_digests"]["executor"])
+    if environment.get("GPU_FAULT_EXECUTOR_ARTIFACT_SHA256") != expected_artifact:
+        raise RuntimeError("live executor artifact pin differs from release state")
+    if (
+        environment.get("GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST")
+        != expected_compatibility
+    ):
+        raise RuntimeError("live executor compatibility pin differs from release state")
+    return {
+        "executor_protocol_version": int(state["executor_protocol_version"]),
+        "executor_artifact_sha256": expected_artifact,
+        "executor_compatibility_digest": expected_compatibility,
     }
 
 
@@ -380,6 +446,28 @@ def collect_executor_logs(target: Path) -> list[dict]:
     return documents
 
 
+def aggregate_executor_documents(documents: list[dict]) -> dict:
+    walls = [item.get("wall_seconds", 0.0) for item in documents]
+    return {
+        "executor_pods": len(documents),
+        "executor_wall_p50": statistics.median(walls) if walls else None,
+        "executor_wall_max": max(walls) if walls else None,
+        "duplicate_claims": sum(item.get("duplicate_claims", 0) for item in documents),
+        "claim_errors": sum(item.get("claim_errors", 0) for item in documents),
+        "result_errors": sum(item.get("result_errors", 0) for item in documents),
+        "renewals": sum(item.get("renewals", 0) for item in documents),
+        "renewal_errors": sum(item.get("renewal_errors", 0) for item in documents),
+        "injected_renewal_failures": sum(
+            item.get("injected_renewal_failures", 0) for item in documents
+        ),
+        "long_commands": sum(item.get("long_commands", 0) for item in documents),
+        "max_concurrent_commands": max(
+            (item.get("max_concurrent_commands", 0) for item in documents),
+            default=0,
+        ),
+    }
+
+
 def execute_capacity_run(
     args,
     *,
@@ -406,11 +494,15 @@ def execute_capacity_run(
         "--wait=true",
         check=False,
     )
+    identity = executor_identity()
     manifest = executor_job(
         clusters=args.clusters,
         expected_commands=expected_commands_per_cluster,
         workers=args.executor_workers,
         delay_scale=args.delay_scale,
+        lease_seconds=args.lease_seconds,
+        inject_renew_failure_once=args.inject_renew_failure_once,
+        **identity,
     )
     (artifacts / "job.json").write_text(json.dumps(manifest, indent=2) + "\n")
     dataplane("apply", "-f", "-", stdin=json.dumps(manifest).encode())
@@ -469,6 +561,9 @@ def execute_capacity_run(
         if terminal == expected_workflows:
             break
         time.sleep(2)
+    job_succeeded = ""
+    job_failed = ""
+    job_completions = ""
     job_deadline = time.time() + 120
     while time.time() < job_deadline:
         state = dataplane(
@@ -479,10 +574,12 @@ def execute_capacity_run(
             "jsonpath={.status.succeeded}|{.status.failed}|{.spec.completions}",
             check=False,
         )
-        succeeded, failed, completions = (state.split("|") + ["", "", ""])[:3]
-        if succeeded and succeeded == completions:
+        job_succeeded, job_failed, job_completions = (state.split("|") + ["", "", ""])[
+            :3
+        ]
+        if job_succeeded and job_succeeded == job_completions:
             break
-        if failed and failed != "0":
+        if job_failed and job_failed != "0":
             break
         time.sleep(2)
     after_metrics = scrape_metrics(pods)
@@ -492,28 +589,32 @@ def execute_capacity_run(
     (artifacts / "history.json").write_text(json.dumps(history, indent=2) + "\n")
     final = history[-1] if history else {}
     details = database_details(run_id)
-    executor_walls = [item.get("wall_seconds", 0.0) for item in documents]
+    executor_metrics = aggregate_executor_documents(documents)
+    workflows_succeeded = (
+        final.get("workflows", {}).get("SUCCEEDED", 0) == expected_workflows
+    )
+    executor_job_succeeded = (
+        bool(job_succeeded)
+        and job_succeeded == job_completions
+        and not (job_failed and job_failed != "0")
+    )
     summary = {
         **seeded,
         **details,
+        **executor_metrics,
         "job_status": (
             "Complete"
-            if final.get("workflows", {}).get("SUCCEEDED", 0) == expected_workflows
+            if workflows_succeeded and executor_job_succeeded
             else "Incomplete"
         ),
+        "executor_job_succeeded": int(job_succeeded or 0),
+        "executor_job_failed": int(job_failed or 0),
+        "executor_job_completions": int(job_completions or 0),
         "workflow_elapsed_seconds": (
             history[-1]["elapsed_seconds"] if history else None
         ),
         "workflow_statuses": final.get("workflows", {}),
         "command_statuses": final.get("commands", {}),
-        "executor_pods": len(documents),
-        "executor_wall_p50": (
-            statistics.median(executor_walls) if executor_walls else None
-        ),
-        "executor_wall_max": max(executor_walls) if executor_walls else None,
-        "duplicate_claims": sum(item.get("duplicate_claims", 0) for item in documents),
-        "claim_errors": sum(item.get("claim_errors", 0) for item in documents),
-        "result_errors": sum(item.get("result_errors", 0) for item in documents),
         "postgres_deltas": {
             key: (after_postgres.get(key) or 0) - (before_postgres.get(key) or 0)
             for key in ("deadlocks", "xact_commit", "xact_rollback")
@@ -552,6 +653,8 @@ def main() -> int:
     parser.add_argument("--nodes-per-workflow", type=int, default=4)
     parser.add_argument("--executor-workers", type=int, default=8)
     parser.add_argument("--delay-scale", type=float, default=1.0)
+    parser.add_argument("--lease-seconds", type=int, default=120)
+    parser.add_argument("--inject-renew-failure-once", action="store_true")
     parser.add_argument("--timeout-seconds", type=int, default=900)
     parser.add_argument(
         "--artifact-root",
@@ -581,6 +684,8 @@ def main() -> int:
                 "nodes_per_workflow": args.nodes_per_workflow,
                 "executor_workers": args.executor_workers,
                 "delay_scale": args.delay_scale,
+                "lease_seconds": args.lease_seconds,
+                "inject_renew_failure_once": args.inject_renew_failure_once,
                 "suite_id": args.suite_id or run_id,
                 **identity,
                 "started_at": datetime.now(timezone.utc).isoformat(),

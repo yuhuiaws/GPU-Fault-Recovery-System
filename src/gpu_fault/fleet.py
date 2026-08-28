@@ -35,6 +35,7 @@ from gpu_fault.fleet_compatibility import (
 )
 from gpu_fault.fleet_endpoint import (
     DEFAULT_AGENT_ENDPOINT_PORTS,
+    endpoint_networks_for_cluster,
     validate_agent_endpoint,
 )
 from gpu_fault.fleet_endpoint import (
@@ -64,6 +65,7 @@ class AgentHeartbeat(StrictModel):
     cluster_id: str
     node_id: str
     endpoint: str
+    tls_certificate_pem: str | None = None
     agent_protocol_version: int = Field(default=1, ge=1)
     node_action_key_version: int = Field(
         default=NODE_ACTION_KEY_VERSION_SHARED,
@@ -90,6 +92,20 @@ class AgentHeartbeat(StrictModel):
         if not value.startswith(("http://", "https://")):
             raise ValueError("agent endpoint must use http or https")
         return value.rstrip("/")
+
+    @field_validator("tls_certificate_pem")  # type: ignore[untyped-decorator]
+    @classmethod
+    def validate_tls_certificate(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if (
+            not normalized.startswith("-----BEGIN CERTIFICATE-----")
+            or not normalized.endswith("-----END CERTIFICATE-----")
+            or len(normalized) > 65536
+        ):
+            raise ValueError("agent TLS certificate must be one PEM certificate")
+        return normalized + "\n"
 
     @field_validator("artifact_sha256", "compatibility_digest", "config_digest")
     @classmethod
@@ -123,6 +139,19 @@ def sign_agent_heartbeat(heartbeat: AgentHeartbeat, secret: str) -> str:
     ).hexdigest()
 
 
+def validate_agent_tls_policy(
+    policy: FleetCompatibilityPolicy,
+    heartbeat: AgentHeartbeat,
+) -> None:
+    if policy.require_tls and (
+        not heartbeat.endpoint.startswith("https://")
+        or heartbeat.tls_certificate_pem is None
+    ):
+        raise ValueError(
+            "agent endpoint must use HTTPS and publish its signed TLS certificate"
+        )
+
+
 class AgentLifecycleState(StrEnum):
     ACTIVE = "ACTIVE"
     DRAINING = "DRAINING"
@@ -133,6 +162,7 @@ class AgentRecord(StrictModel):
     cluster_id: str
     node_id: str
     endpoint: str
+    tls_certificate_pem: str | None = None
     agent_protocol_version: int = Field(default=1, ge=1)
     node_action_key_version: int = Field(
         default=NODE_ACTION_KEY_VERSION_SHARED,
@@ -361,6 +391,11 @@ class FleetRegistry:
             ipaddress.IPv4Network | ipaddress.IPv6Network,
             ...,
         ] = (),
+        endpoint_allowed_networks_by_cluster: dict[
+            str,
+            tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+        ]
+        | None = None,
         node_secrets: dict[str, str] | None = None,
     ) -> None:
         if len(secret) < 32:
@@ -373,6 +408,9 @@ class FleetRegistry:
         self.endpoint_allowed_ports = endpoint_allowed_ports
         self.endpoint_allowed_host_suffixes = endpoint_allowed_host_suffixes
         self.endpoint_allowed_networks = endpoint_allowed_networks
+        self.endpoint_allowed_networks_by_cluster = dict(
+            endpoint_allowed_networks_by_cluster or {}
+        )
         self.policy = policy or FleetCompatibilityPolicy()
         self.now = now or (lambda: datetime.now(timezone.utc))
         self._lock = RLock()
@@ -411,8 +449,13 @@ class FleetRegistry:
             heartbeat.endpoint,
             allowed_ports=self.endpoint_allowed_ports,
             allowed_host_suffixes=(self.endpoint_allowed_host_suffixes),
-            allowed_networks=self.endpoint_allowed_networks,
+            allowed_networks=endpoint_networks_for_cluster(
+                heartbeat.cluster_id,
+                self.endpoint_allowed_networks_by_cluster,
+                self.endpoint_allowed_networks,
+            ),
         )
+        validate_agent_tls_policy(self.policy, heartbeat)
         now = self.now()
         if heartbeat.observed_at > now + timedelta(seconds=30):
             raise ValueError("agent heartbeat is from the future")
@@ -494,6 +537,7 @@ class FleetRegistry:
             or existing.identity != identity
             or existing.node_action_key_version != heartbeat.node_action_key_version
             or existing.endpoint != heartbeat.endpoint
+            or existing.tls_certificate_pem != heartbeat.tls_certificate_pem
             or existing.boot_id != heartbeat.boot_id
             or existing.node_instance_id != heartbeat.node_instance_id
             or inventory_changed
@@ -513,6 +557,7 @@ class FleetRegistry:
             cluster_id=heartbeat.cluster_id,
             node_id=heartbeat.node_id,
             endpoint=heartbeat.endpoint,
+            tls_certificate_pem=heartbeat.tls_certificate_pem,
             agent_protocol_version=heartbeat.agent_protocol_version,
             node_action_key_version=(heartbeat.node_action_key_version),
             agent_version=heartbeat.agent_version,

@@ -6,6 +6,10 @@ class WorkflowLeaseError(ValueError):
     pass
 
 
+class RemediationBudgetError(WorkflowLeaseError):
+    pass
+
+
 class EfaTrafficAdminConflict(ValueError):
     pass
 

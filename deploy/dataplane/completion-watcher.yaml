@@ -4,6 +4,14 @@ metadata:
   name: gpu-fault-completion-watcher
   namespace: gpu-fault-system
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-fault-completion-watcher-outbox
+  namespace: gpu-fault-system
+data:
+  events.json: "[]"
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -27,6 +35,10 @@ rules:
   - apiGroups: ["jobset.x-k8s.io"]
     resources: ["jobsets"]
     verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["gpu-fault-completion-watcher-outbox"]
+    verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -18,6 +18,7 @@ def test_silent_collector_notifications_are_deduplicated() -> None:
             hyperpod_cluster_name="hp-a",
             eks_cluster_arn="arn:aws:eks:us-west-2:1:cluster/a",
             token_sha256="a" * 64,
+            agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
         )
     )
     store.save_agent(
@@ -84,6 +85,7 @@ def test_expired_active_agent_is_not_reported_silent() -> None:
             hyperpod_cluster_name="hp-a",
             eks_cluster_arn="arn:aws:eks:us-west-2:1:cluster/a",
             token_sha256="a" * 64,
+            agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
         )
     )
     store.save_agent(

@@ -77,6 +77,7 @@ class ClusterIdentity:
     subnet_ids: tuple[str, ...]
     node_recovery: str
     context: str
+    subnet_cidrs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

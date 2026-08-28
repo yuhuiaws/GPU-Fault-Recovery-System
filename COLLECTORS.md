@@ -106,7 +106,7 @@ sudo deploy/node/install-gpu-fault-collector.sh \
   --enable-node-agent \
   --node-action-secret "${NODE_ACTION_SECRET}" \
   --node-instance-id "${EC2_INSTANCE_ID}" \
-  --node-agent-advertise-url "http://${NODE_PRIVATE_IP}:9099"
+  --node-agent-advertise-url "https://${NODE_PRIVATE_IP}:9099"
 ```
 
 生成可上传到 S3、SSM Distributor 或节点镜像流水线的自包含安装包：
@@ -161,6 +161,9 @@ heartbeat 响应取得 generation；动作命令 generation 不一致时 fail-cl
 优先使用显式 `--node-instance-id`，否则读取 DMI product UUID 或 machine-id。
 HyperPod installer Job 自动传入 Kubernetes Node UID。`--node-agent-advertise-url`
 必须是控制面实际可达地址；不要依赖 Pod 无法解析的节点本地主机名。
+未显式提供 cert/key 时安装器会在节点生成本地 TLS cert/key；签名 heartbeat
+携带服务端证书，控制面按证书 pin 访问。生产不得传
+`--allow-node-agent-plaintext`。
 
 节点 reboot/replace 不依赖 Agent 自己注销。控制面先用受 execution token 保护的
 `/drain` 与 `/revoke` 接口提升 generation、终止 lease 并退休旧 incarnation。新 Agent

@@ -86,6 +86,15 @@ def test_built_component_wheels_match_their_source_closures(tmp_path) -> None:
         unpacked = tmp_path / name
         with zipfile.ZipFile(wheel) as archive:
             archive.extractall(unpacked)
+            file_modes = {
+                path.filename: (path.external_attr >> 16) & 0o777
+                for path in archive.infolist()
+                if not path.is_dir()
+            }
+            assert all(
+                mode == 0o644 or (path.endswith(".dist-info/RECORD") and mode == 0o664)
+                for path, mode in file_modes.items()
+            ), f"wheel contains caller-umask-dependent modes: {file_modes}"
             metadata_name = next(
                 path
                 for path in archive.namelist()
@@ -117,6 +126,20 @@ def test_node_bundle_contains_the_exact_release_wheel(tmp_path: Path) -> None:
 
     extracted = tmp_path / "bundle"
     with tarfile.open(bundle, "r:gz") as archive:
+        modes = {member.name: member.mode for member in archive.getmembers()}
+        assert set(modes.values()).issubset({0o644, 0o755}), (
+            f"node bundle contains non-canonical modes: {modes}"
+        )
+        assert all(
+            mode == (0o755 if name.endswith(".sh") else 0o644)
+            for name, mode in modes.items()
+            if not name.endswith("/")
+            and (
+                name.endswith(".sh")
+                or "/dist/" in name
+                or name.endswith((".json", ".service", ".timer", ".csv"))
+            )
+        ), f"node bundle file modes do not match file roles: {modes}"
         archive.extractall(extracted, filter="data")
     inner_wheels = sorted(extracted.rglob("*.whl"))
     assert len(inner_wheels) == 1

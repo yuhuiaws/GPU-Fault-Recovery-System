@@ -10,7 +10,7 @@ import platform
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Iterable
 
 import yaml
 
@@ -328,15 +328,17 @@ def load_catalog(path: Path) -> list[dict[str, Any]]:
 def select_cases(
     cases: list[dict[str, Any]],
     *,
-    case_ids: set[str],
+    case_ids: Iterable[str],
     categories: set[str],
     levels: set[str],
     include_manual: bool,
     include_live: bool,
 ) -> list[dict[str, Any]]:
+    requested_ids = list(case_ids)
+    requested = set(requested_ids)
     selected = []
     for case in cases:
-        if case_ids and case["id"] not in case_ids:
+        if requested and case["id"] not in requested:
             continue
         if categories and case["category"] not in categories:
             continue
@@ -347,12 +349,15 @@ def select_cases(
         if case["automation"] == "command":
             if not include_live:
                 continue
-            if case["id"] not in case_ids:
+            if case["id"] not in requested:
                 continue
         selected.append(case)
-    unknown = case_ids.difference(case["id"] for case in cases)
+    unknown = requested.difference(case["id"] for case in cases)
     if unknown:
         raise ValueError(f"unknown test case IDs: {sorted(unknown)}")
+    if requested_ids and not isinstance(case_ids, (set, frozenset)):
+        position = {case_id: index for index, case_id in enumerate(requested_ids)}
+        selected.sort(key=lambda case: position[case["id"]])
     return selected
 
 
@@ -502,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
     cases = load_catalog(args.catalog)
     selected = select_cases(
         cases,
-        case_ids=set(args.case_ids),
+        case_ids=args.case_ids,
         categories=set(args.category),
         levels=set(args.level),
         include_manual=args.include_manual,

@@ -229,9 +229,9 @@ def test_v2_node_agent_transport_names_the_production_plaintext_exception() -> N
     )
 
     assert "当前区域生产安装" in detail
-    assert "`GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT=true`" in detail
-    assert "--allow-node-agent-plaintext" in installer
-    assert '"http://\\${TARGET_NODE_IP}:9099"' in installer
+    assert "自动生成" in detail
+    assert "--allow-node-agent-plaintext" not in installer
+    assert '"https://\\${TARGET_NODE_IP}:9099"' in installer
 
 
 def test_v2_device_identity_is_cluster_scoped() -> None:

@@ -147,6 +147,8 @@ class FleetStore(Protocol):
         self,
     ) -> list[RegionalClusterRegistration]: ...
 
+    def list_regional_cluster_ids(self) -> list[str]: ...
+
     def save_agent(self, agent: AgentRecord) -> None: ...
 
     def get_agent(self, cluster_id: str, node_id: str) -> AgentRecord: ...
@@ -258,6 +260,7 @@ class WorkflowStore(Protocol):
         *,
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
+        remediation_budget_claims: dict[str, int] | None = None,
     ) -> WorkflowRequest: ...
 
     def renew_workflow_lease(

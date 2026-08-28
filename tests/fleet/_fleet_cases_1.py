@@ -315,6 +315,61 @@ def test_agent_endpoint_can_be_confined_to_the_node_subnets() -> None:
         parse_endpoint_networks("10.0.0.0/16,not-a-cidr")
 
 
+def test_production_policy_requires_https_and_signed_certificate() -> None:
+    fleet = FleetRegistry(
+        build_store(),
+        SECRET,
+        FleetCompatibilityPolicy(require_tls=True),
+        now=lambda: NOW,
+    )
+    plain = heartbeat("node-a")
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        fleet.register(signed(plain))
+
+    secure = copy_model(
+        plain,
+        endpoint="https://node-a:9099",
+        tls_certificate_pem=(
+            "-----BEGIN CERTIFICATE-----\n"
+            "dGVzdC1jZXJ0aWZpY2F0ZQ==\n"
+            "-----END CERTIFICATE-----\n"
+        ),
+    )
+    assert fleet.register(signed(secure)).tls_certificate_pem, (
+        "signed HTTPS heartbeat did not retain the pinned certificate"
+    )
+
+
+def test_agent_endpoint_cidrs_are_bound_to_cluster_identity() -> None:
+    fleet = FleetRegistry(
+        build_store(),
+        SECRET,
+        endpoint_allowed_networks_by_cluster={
+            "cluster-a": parse_endpoint_networks("10.0.0.0/16"),
+            "cluster-b": parse_endpoint_networks("10.1.0.0/16"),
+        },
+        now=lambda: NOW,
+    )
+    cluster_a = copy_model(heartbeat("node-a"), endpoint="http://10.0.1.5:9099")
+    cluster_b = copy_model(
+        heartbeat("node-b"), cluster_id="cluster-b", endpoint="http://10.1.1.5:9099"
+    )
+
+    assert fleet.register(signed(cluster_a)).cluster_id == "cluster-a"
+    assert fleet.register(signed(cluster_b)).cluster_id == "cluster-b"
+
+    wrong_network = copy_model(
+        cluster_a,
+        heartbeat_id="heartbeat-wrong-cluster-network",
+        endpoint="http://10.1.1.5:9099",
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    with pytest.raises(
+        ValueError, match="outside GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS"
+    ):
+        fleet.register(signed(wrong_network))
+
+
 def test_agent_registration_is_signed_and_generation_is_fenced() -> None:
     fleet = registry()
     value = heartbeat("node-a")

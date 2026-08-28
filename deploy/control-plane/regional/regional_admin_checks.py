@@ -800,7 +800,7 @@ def _check_monitoring(release: Any) -> CheckValue:
     )
 
 
-def _check_aurora_refresh(
+def check_aurora_refresh(
     release: Any,
     *,
     require_success: bool = False,
@@ -816,6 +816,55 @@ def _check_aurora_refresh(
     )
     if cronjob.get("spec", {}).get("suspend") is True:
         raise ReleaseError("Aurora credential refresh CronJob is suspended")
+    containers = (
+        cronjob.get("spec", {})
+        .get("jobTemplate", {})
+        .get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    environment = {
+        item.get("name"): item.get("value")
+        for container in containers
+        for item in container.get("env", [])
+        if item.get("name")
+    }
+    targets = tuple(
+        item.strip()
+        for item in str(
+            environment.get("GPU_FAULT_AURORA_RESTART_DEPLOYMENTS") or ""
+        ).split(",")
+        if item.strip()
+    )
+    if not targets:
+        raise ReleaseError(
+            "Aurora credential refresh declares no database consumer deployments"
+        )
+    role = release._get_json(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "role",
+            "gpu-fault-aurora-credential-refresh",
+        )
+    )
+    deployment_rules = [
+        rule
+        for rule in role.get("rules", [])
+        if "apps" in (rule.get("apiGroups") or [])
+        and "deployments" in (rule.get("resources") or [])
+        and {"get", "patch"}.issubset(set(rule.get("verbs") or []))
+    ]
+    allowed_targets = {
+        name for rule in deployment_rules for name in (rule.get("resourceNames") or [])
+    }
+    if allowed_targets != set(targets):
+        raise ReleaseError(
+            "Aurora credential refresh deployment RBAC differs from targets: "
+            f"targets={sorted(targets)}, allowed={sorted(allowed_targets)}"
+        )
     last_successful = cronjob.get("status", {}).get("lastSuccessfulTime")
     if require_success and not last_successful:
         raise ReleaseError("Aurora credential refresh has never completed successfully")
@@ -860,6 +909,7 @@ def _check_aurora_refresh(
             "schedule": cronjob.get("spec", {}).get("schedule"),
             "last_schedule_time": cronjob.get("status", {}).get("lastScheduleTime"),
             "last_successful_time": last_successful,
+            "deployment_targets": list(targets),
         },
     )
 
@@ -878,7 +928,7 @@ def build_preflight_report(release: Any) -> dict[str, Any]:
         ),
         ("nlb_inputs", lambda: _check_nlb_inputs(release)),
         ("aurora", lambda: _check_aurora(release)),
-        ("aurora_credential_refresh", lambda: _check_aurora_refresh(release)),
+        ("aurora_credential_refresh", lambda: check_aurora_refresh(release)),
         ("email_notifications", lambda: check_email_notifications(release)),
         ("monitoring", lambda: _check_monitoring(release)),
     ]
@@ -1327,7 +1377,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
         ("email_notifications", lambda: check_email_notifications(release)),
         (
             "aurora_credential_refresh",
-            lambda: _check_aurora_refresh(release, require_success=True),
+            lambda: check_aurora_refresh(release, require_success=True),
         ),
         ("runtime_profile", lambda: _verify_profile(release)),
         ("read_only_verifiers", lambda: _run_read_only_verifiers(release)),

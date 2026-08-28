@@ -694,9 +694,8 @@ ${CONTROL_PLANE_ENV}
                     --allow-service-quiesce \
                     --allow-fabric-manager-restart \
                     --node-agent-host "\${TARGET_NODE_IP}" \
-                    --allow-node-agent-plaintext \
                     --node-agent-advertise-url \
-                      "http://\${TARGET_NODE_IP}:9099" \
+                      "https://\${TARGET_NODE_IP}:9099" \
                     --node-instance-id "\${TARGET_NODE_UID}"
                   /opt/gpu-fault/verify
                 '

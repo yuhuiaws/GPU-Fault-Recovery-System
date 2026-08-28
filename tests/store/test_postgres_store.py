@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -32,11 +33,17 @@ from gpu_fault.models import (
     WorkflowStatus,
 )
 from gpu_fault.policy import GpuFaultPolicyEngine, XidEvent
+from gpu_fault.regional import RegionalClusterRegistration
 from gpu_fault.schema_migrations import (
     POSTGRES_SCHEMA_MIGRATIONS,
     postgres_ddl_source_checksum,
 )
-from gpu_fault.store import POSTGRES_SCHEMA_VERSION, PostgresStore, WorkflowLeaseError
+from gpu_fault.store import (
+    POSTGRES_SCHEMA_VERSION,
+    PostgresStore,
+    RemediationBudgetError,
+    WorkflowLeaseError,
+)
 from gpu_fault.telemetry import EvidenceKind, EvidenceService
 from gpu_fault.training_health import TrainingProgressHeartbeat
 from gpu_fault.xid_correlation import XidCorrelationCoordinator
@@ -47,6 +54,7 @@ from tests._builders import (
     fault_incident,
     gpu_metric_batch,
     workflow_request,
+    workflow_step,
 )
 
 POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
@@ -74,6 +82,55 @@ def test_latest_migration_is_derived_from_current_ddl() -> None:
     latest = POSTGRES_SCHEMA_MIGRATIONS[-1]
     assert latest.ddl_checksum == postgres_ddl_source_checksum()
     assert latest.apply is not None
+
+
+def test_postgres_registry_sync_migrates_legacy_record_before_model_decode() -> None:
+    import psycopg
+
+    assert POSTGRES_URL is not None
+    cluster_id = f"legacy-registry-{uuid4().hex}"
+    payload = {
+        "cluster_id": cluster_id,
+        "region": "us-west-2",
+        "hyperpod_cluster_name": f"hyperpod-{cluster_id}",
+        "eks_cluster_arn": (f"arn:aws:eks:us-west-2:123456789012:cluster/{cluster_id}"),
+        "token_sha256": "a" * 64,
+        "enabled": True,
+        "allowed_namespaces": ["training"],
+    }
+    with psycopg.connect(POSTGRES_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO gpu_fault_objects(kind, key, payload)
+                VALUES ('regional_cluster', %s, %s::jsonb)
+                """,
+                (cluster_id, json.dumps(payload)),
+            )
+
+    store = _store()
+    try:
+        configured = store.save_regional_cluster(
+            RegionalClusterRegistration(
+                cluster_id=cluster_id,
+                region="us-west-2",
+                hyperpod_cluster_name=f"hyperpod-{cluster_id}",
+                eks_cluster_arn=(
+                    f"arn:aws:eks:us-west-2:123456789012:cluster/{cluster_id}"
+                ),
+                token_sha256="b" * 64,
+                allowed_namespaces=["training"],
+                agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
+            )
+        )
+
+        assert configured.agent_endpoint_allowed_cidrs == ["10.0.0.0/16"]
+        assert store.get_regional_cluster(cluster_id).agent_endpoint_allowed_cidrs == [
+            "10.0.0.0/16"
+        ]
+    finally:
+        store.delete_regional_cluster(cluster_id)
+        store.close()
 
 
 def test_postgres_processor_queue_has_no_virtual_partition_state() -> None:
@@ -448,6 +505,59 @@ def test_postgres_lease_takeover_fences_stale_writer() -> None:
         )
         assert first.get_workflow(request_id).status is WorkflowStatus.SUCCEEDED
         assert first.get_incident(incident_id).state is IncidentState.RECOVERED
+    finally:
+        first.close()
+        second.close()
+
+
+def test_postgres_remediation_budget_claim_is_atomic() -> None:
+    first = _store()
+    second = _store()
+    suffix = uuid4().hex
+    now = datetime.now(timezone.utc)
+
+    def save(store, name):
+        incident = fault_incident(
+            f"incident-budget-{name}-{suffix}",
+            f"event-budget-{name}-{suffix}",
+            state=IncidentState.ACTION_PENDING,
+            fencing_token=3,
+            created_at=now,
+            updated_at=now,
+        )
+        workflow = workflow_request(
+            f"workflow-budget-{name}-{suffix}",
+            incident.incident_id,
+            WorkflowStatus.PENDING,
+            fencing_token=3,
+            official_steps=[workflow_step(WorkflowOperation.RESTART_NODE)],
+            created_at=now,
+            updated_at=now,
+        )
+        incident = incident.model_copy(
+            update={"workflow_request_id": workflow.request_id}
+        )
+        store.save_incident_and_workflow(incident, workflow)
+        return workflow
+
+    try:
+        left = save(first, "left")
+        right = save(second, "right")
+        claims = {"region": 1, "cluster:cluster-a": 1}
+        first.claim_workflow(
+            left.request_id,
+            "executor-left",
+            left.fencing_token,
+            remediation_budget_claims=claims,
+        )
+        with pytest.raises(RemediationBudgetError, match="cluster:cluster-a"):
+            second.claim_workflow(
+                right.request_id,
+                "executor-right",
+                right.fencing_token,
+                remediation_budget_claims=claims,
+            )
+        assert second.get_workflow(right.request_id).remediation_budget_wait_count == 1
     finally:
         first.close()
         second.close()

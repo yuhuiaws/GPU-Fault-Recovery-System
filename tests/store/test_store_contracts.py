@@ -244,6 +244,7 @@ MEMORY_FLEET_PUBLIC = frozenset(
         "list_agents",
         "list_barriers",
         "list_fleet_deployments",
+        "list_regional_cluster_ids",
         "list_regional_clusters",
         "replace_agent_if_matches",
         "save_agent",

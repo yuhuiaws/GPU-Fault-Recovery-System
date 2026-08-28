@@ -421,6 +421,7 @@ class ApplicationContext:
                 context.store,
                 agent_settings.registration_secret,
                 FleetCompatibilityPolicy(
+                    require_tls=agent_settings.endpoint_require_tls,
                     required_agent_protocol_version=(
                         agent_settings.required_agent_protocol_version
                     ),
@@ -472,6 +473,12 @@ class ApplicationContext:
                 endpoint_allowed_networks=parse_endpoint_networks(
                     agent_settings.endpoint_allowed_cidrs
                 ),
+                endpoint_allowed_networks_by_cluster={
+                    registration.cluster_id: parse_endpoint_networks(
+                        ",".join(registration.agent_endpoint_allowed_cidrs)
+                    )
+                    for registration in context.store.list_regional_clusters()
+                },
                 node_secrets=node_action_secrets_from_environment(),
             )
             context.barrier_coordinator = BarrierCoordinator(context.store)

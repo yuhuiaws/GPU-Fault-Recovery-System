@@ -34,6 +34,27 @@ def parse_endpoint_networks(
     )
 
 
+def endpoint_networks_for_cluster(
+    cluster_id: str,
+    configured: dict[
+        str,
+        tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+    ],
+    fallback: tuple[
+        ipaddress.IPv4Network | ipaddress.IPv6Network,
+        ...,
+    ],
+) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    if not configured:
+        return fallback
+    try:
+        return configured[cluster_id]
+    except KeyError as exc:
+        raise ValueError(
+            f"agent endpoint CIDRs are unavailable for cluster {cluster_id}"
+        ) from exc
+
+
 def _routable_private_address(
     host: str,
     allowed_networks: tuple[

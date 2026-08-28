@@ -91,6 +91,18 @@ def test_registry_baseline_artifact_carries_digests_not_tokens() -> None:
     assert entries[0]["token"] == token
 
 
+def test_capacity_cleanup_removes_action_workflows_without_cluster_payload() -> None:
+    statements = {
+        name: (sql, pattern) for name, sql, pattern in suite.AUDIT_PURGE_STATEMENTS
+    }
+
+    sql, pattern = statements["gpu_fault_action_workflows"]
+
+    assert "kind='workflow'" in sql
+    assert "key LIKE %s" in sql
+    assert pattern == "action_workflow"
+
+
 def test_repository_registry_baselines_are_redacted() -> None:
     offenders = [
         path.relative_to(ROOT).as_posix()

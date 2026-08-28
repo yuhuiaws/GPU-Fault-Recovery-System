@@ -15,6 +15,7 @@ NODE_ACTION_KEY_VERSION_DERIVED = 2
 
 
 class FleetCompatibilityPolicy(StrictModel):
+    require_tls: bool = False
     required_agent_protocol_version: int = Field(
         default=CURRENT_AGENT_PROTOCOL_VERSION,
         ge=1,

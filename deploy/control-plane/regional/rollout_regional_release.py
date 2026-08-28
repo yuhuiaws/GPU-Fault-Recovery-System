@@ -8,7 +8,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -67,6 +66,18 @@ from regional_release_rendering import (
     stamp_gpu_deployments,
 )
 from regional_release_reporting import build_release_plan
+from regional_release_registry import (
+    commit_registry_update,
+    desired_registry,
+    registry,
+    registry_config_digest,
+    registry_entry,
+    registry_payloads,
+    restore_registry_backup,
+    stage_registry,
+    update_registry,
+    write_registry,
+)
 from regional_release_state import (
     STATE_CONFIG_MAP as STATE_CONFIG_MAP,
 )
@@ -88,6 +99,13 @@ from regional_runtime_profile import (
 
 ROOT = Path(__file__).resolve().parents[3]
 FAST_ROLLOUT_TIMEOUT = "5m"
+SENSITIVE_CONFIG_MARKERS = (
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "CREDENTIAL",
+    "PRIVATE_KEY",
+)
 
 
 class Runner:
@@ -316,6 +334,7 @@ def build_rollback_environment(
     artifact: str,
     config_digest: str,
     runtime_profile_version: str,
+    preserve_role_config_maps: bool = False,
 ) -> dict[str, str]:
     legacy_component_pins = not any(
         metadata.get(name)
@@ -359,6 +378,8 @@ def build_rollback_environment(
             rollback_config.notifications
         ),
         "GPU_FAULT_LEGACY_COMPONENT_PINS": str(legacy_component_pins).lower(),
+        "GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS": str(preserve_role_config_maps).lower(),
+        "GPU_FAULT_FORCE_ROLE_RESTART": "true",
         "GPU_FAULT_FINALIZE_AGENT_PIN": "true",
         "GPU_FAULT_FINALIZE_DATA_PLANE_PIN": "true",
     }
@@ -423,13 +444,22 @@ class RegionalRelease:
     _get_json = get_json
     _load_state = load_state
     _quiesce_gpu_executor = quiesce_gpu_executor
+    _registry = registry
+    _registry_entry = staticmethod(registry_entry)
+    _registry_payloads = registry_payloads
     _retry_failed_installer_jobs = retry_failed_installer_jobs
+    _restore_registry_backup = restore_registry_backup
     _save_state = save_state
+    _stage_registry = stage_registry
     _stamp_gpu_deployments = stamp_gpu_deployments
     _template_bundle = template_bundle
+    _update_registry = update_registry
     _upgrade_gpu_target = upgrade_gpu_target
     _validate_executor_iam_role = validate_executor_iam_role
     _verify_gpu_control_plane_endpoint = verify_gpu_control_plane_endpoint
+    _write_registry = write_registry
+    _desired_registry = desired_registry
+    _commit_registry_update = commit_registry_update
 
     def __init__(self, config: ReleaseConfig, runner: Runner) -> None:
         self.config = config
@@ -447,6 +477,7 @@ class RegionalRelease:
             config.runtime_profile_source
         )
         self.notification_digest = notification_digest(config.notifications)
+        self.cluster_registry_digest = registry_config_digest(config.clusters)
         self.wheel_cm = "gpu-fault-control-plane-wheel-0100-" + self.wheel_sha[:12]
         self.executor_wheel_cm = (
             "gpu-fault-executor-wheel-0100-" + self.executor_wheel_sha[:12]
@@ -548,46 +579,53 @@ class RegionalRelease:
             )
 
     def _remote_commands_are_idle(self) -> bool:
-        pod = self.runner.run(
-            self._cpu(
-                "-n",
-                self.config.namespace,
-                "get",
-                "pod",
-                "-l",
-                f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-                "-o",
-                "jsonpath={.items[0].metadata.name}",
-            ),
-            capture=True,
-        )
-        if not pod:
-            return True
         script = (
-            "import urllib.request;"
-            "t=urllib.request.urlopen("
-            "'http://127.0.0.1:8080/metrics',timeout=10).read().decode();"
-            "bad=[];"
-            "\nfor s in ('PENDING','LEASED','WAITING'):\n"
-            " line=next((x for x in t.splitlines() if "
-            "x.startswith('gpu_fault_remote_command_total{status=\"'+s+'\"}')),None);"
-            "\n if line and float(line.rsplit(' ',1)[1])!=0: bad.append(line)\n"
-            "print('\\n'.join(bad))"
+            "from gpu_fault.app import ApplicationContext;"
+            "stats=ApplicationContext.from_environment()"
+            ".store.remote_command_stats();"
+            "bad={name:int(stats['by_status'].get(name,0)) "
+            "for name in ('PENDING','LEASED','WAITING') "
+            "if int(stats['by_status'].get(name,0))};"
+            "print(bad if bad else '')"
         )
-        output = self.runner.run(
-            self._cpu(
-                "-n",
-                self.config.namespace,
-                "exec",
-                pod,
-                "--",
-                "python",
-                "-c",
-                script,
-            ),
-            capture=True,
-        )
-        return not output.strip()
+        for attempt in range(3):
+            pod = self.runner.run(
+                self._cpu(
+                    "-n",
+                    self.config.namespace,
+                    "get",
+                    "pod",
+                    "-l",
+                    f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
+                    "--field-selector=status.phase=Running",
+                    "-o",
+                    "jsonpath={.items[0].metadata.name}",
+                ),
+                capture=True,
+            )
+            if not pod:
+                return True
+            try:
+                output = self.runner.run(
+                    self._cpu(
+                        "-n",
+                        self.config.namespace,
+                        "exec",
+                        pod,
+                        "--",
+                        "python",
+                        "-c",
+                        script,
+                    ),
+                    capture=True,
+                )
+            except ReleaseError:
+                if attempt == 2:
+                    raise
+                time.sleep(2)
+                continue
+            return not output.strip()
+        raise ReleaseError("remote command idle check exhausted retries")
 
     def plan(self, mode: str) -> list[str]:
         steps = build_release_plan(mode)
@@ -710,8 +748,16 @@ class RegionalRelease:
                     self.bundle_sha,
                 )
 
-    def _apply_cpu(self, *, finalize: bool) -> None:
+    def _apply_cpu(
+        self,
+        *,
+        finalize: bool,
+        force_restart: bool = False,
+    ) -> None:
         ensure_notification_secret(self)
+        environment = build_cpu_apply_environment(self, finalize=finalize)
+        if force_restart:
+            environment["GPU_FAULT_FORCE_ROLE_RESTART"] = "true"
         self.runner.run(
             [
                 "bash",
@@ -720,8 +766,51 @@ class RegionalRelease:
                     / "deploy/control-plane/tools/apply-control-plane-role-split.sh"
                 ),
             ],
-            env=build_cpu_apply_environment(self, finalize=finalize),
+            env=environment,
         )
+
+    def _restore_cpu_role_config_maps(
+        self,
+        snapshots: object,
+    ) -> bool:
+        if not snapshots:
+            return False
+        if not isinstance(snapshots, dict):
+            raise ReleaseError("previous CPU role ConfigMap snapshot is invalid")
+        for name, raw_data in sorted(snapshots.items()):
+            if (
+                not isinstance(name, str)
+                or not name.startswith("gpu-fault-")
+                or "-config-" not in name
+                or not isinstance(raw_data, dict)
+            ):
+                raise ReleaseError("previous CPU role ConfigMap snapshot is invalid")
+            data = {str(key): str(value) for key, value in raw_data.items()}
+            sensitive = sorted(
+                key
+                for key in data
+                if any(marker in key for marker in SENSITIVE_CONFIG_MARKERS)
+            )
+            if sensitive:
+                raise ReleaseError(
+                    f"previous role ConfigMap {name} contains "
+                    "sensitive-looking keys: " + ", ".join(sensitive)
+                )
+            document = {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": name,
+                    "namespace": self.config.namespace,
+                },
+                "data": data,
+            }
+            self.runner.run(
+                self._cpu("apply", "-f", "-"),
+                input_text=json.dumps(document),
+                sensitive=True,
+            )
+        return True
 
     def _deploy_reconciler(
         self,
@@ -859,8 +948,13 @@ class RegionalRelease:
             )
             control_changed = active_diff.has("control_plane_wheel", "notifications")
             full = active_diff.kind == ReleaseChangeKind.FULL
+            cpu_rollout = pin_changed or full or control_changed
+            registry_staged = self._stage_registry() if cpu_rollout else False
             if pin_changed or full:
-                self._apply_cpu(finalize=False)
+                self._apply_cpu(
+                    finalize=False,
+                    force_restart=registry_staged,
+                )
                 self._save_state("cpu-staged")
             if full or active_diff.has(
                 "runtime_profile",
@@ -886,9 +980,11 @@ class RegionalRelease:
                                 f"{futures[future]} rollout failed: {exc}"
                             ) from exc
             self._save_state("data-converged")
-            if pin_changed or full or control_changed:
+            if cpu_rollout:
                 self._apply_cpu(finalize=True)
             self._validate_release()
+            if registry_staged:
+                self._commit_registry_update()
             self._save_state(
                 "complete",
                 release_diff=active_diff.as_dict(),
@@ -932,6 +1028,10 @@ class RegionalRelease:
             raise ReleaseError("previous release pins are incomplete")
         cpu_sha = self._config_map_sha(self._cpu(), cpu_wheel, self.config.wheel.name)
         rollback_config = self.config.for_rollback(config_digest)
+        self._restore_registry_backup()
+        preserve_role_config_maps = self._restore_cpu_role_config_maps(
+            previous.get("cpu_role_config_maps")
+        )
         environment = build_rollback_environment(
             rollback_config=rollback_config,
             metadata=metadata,
@@ -940,6 +1040,7 @@ class RegionalRelease:
             artifact=artifact,
             config_digest=config_digest,
             runtime_profile_version=runtime_profile_version,
+            preserve_role_config_maps=preserve_role_config_maps,
         )
         self.runner.run(
             [
@@ -1217,100 +1318,6 @@ class RegionalRelease:
             if target.cluster_id == cluster_id:
                 return target
         raise ReleaseError(f"unknown cluster_id: {cluster_id}")
-
-    def _registry(self) -> list[dict[str, Any]]:
-        exists = (
-            subprocess.run(
-                self._cpu(
-                    "-n",
-                    self.config.namespace,
-                    "get",
-                    "secret",
-                    "gpu-fault-regional-clusters",
-                ),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode
-            == 0
-        )
-        if not exists:
-            return []
-        value = self._get_json(
-            self._cpu(
-                "-n",
-                self.config.namespace,
-                "get",
-                "secret",
-                "gpu-fault-regional-clusters",
-            )
-        )
-        encoded = (value.get("data") or {}).get("clusters.json")
-        if not encoded:
-            return []
-        return json.loads(base64.b64decode(encoded))
-
-    def _update_registry(self, target: ClusterTarget, *, remove: bool) -> None:
-        registrations = self._registry()
-        remaining = [
-            item
-            for item in registrations
-            if item.get("cluster_id") != target.cluster_id
-        ]
-        if remove:
-            registrations = remaining
-        else:
-            if not all(
-                (
-                    target.token_file,
-                    target.hyperpod_cluster_name,
-                    target.eks_cluster_arn,
-                )
-            ):
-                raise ReleaseError(
-                    "join-cluster requires token_file, hyperpod_cluster_name, and eks_cluster_arn"
-                )
-            token = Path(target.token_file).read_text().strip()
-            if len(token) < 32:
-                raise ReleaseError("cluster token is too short")
-            registrations = [
-                *remaining,
-                {
-                    "cluster_id": target.cluster_id,
-                    "region": target.region,
-                    "hyperpod_cluster_name": (target.hyperpod_cluster_name),
-                    "eks_cluster_arn": target.eks_cluster_arn,
-                    "token": token,
-                    "allowed_namespaces": list(target.allowed_namespaces),
-                },
-            ]
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "clusters.json"
-            path.write_text(
-                json.dumps(registrations, indent=2),
-                encoding="utf-8",
-            )
-            path.chmod(0o600)
-            rendered = self.runner.run(
-                self._cpu(
-                    "-n",
-                    self.config.namespace,
-                    "create",
-                    "secret",
-                    "generic",
-                    "gpu-fault-regional-clusters",
-                    f"--from-file=clusters.json={path}",
-                    "--dry-run=client",
-                    "-o",
-                    "yaml",
-                ),
-                capture=True,
-                sensitive=True,
-            )
-            self.runner.run(
-                self._cpu("apply", "-f", "-"),
-                input_text=rendered,
-                sensitive=True,
-            )
 
     def _roll_cpu_for_registry(self) -> None:
         for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:

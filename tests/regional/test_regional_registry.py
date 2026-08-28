@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+
 import pytest
 
 from gpu_fault.regional import RegionalClusterRegistration
@@ -16,6 +19,7 @@ def _registration(cluster_id: str) -> RegionalClusterRegistration:
         eks_cluster_arn=(f"arn:aws:eks:us-west-2:123456789012:cluster/{cluster_id}"),
         token_sha256="a" * 64,
         allowed_namespaces=["training"],
+        agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
     )
 
 
@@ -40,6 +44,7 @@ def test_registry_sync_prunes_stale_durable_identity(kind: str, tmp_path) -> Non
                 ),
                 "token": "a" * 32,
                 "allowed_namespaces": ["training"],
+                "agent_endpoint_allowed_cidrs": ["10.0.0.0/16"],
             }
         ],
     )
@@ -51,3 +56,57 @@ def test_registry_sync_prunes_stale_durable_identity(kind: str, tmp_path) -> Non
     store.delete_regional_cluster("cluster-stale")
     if hasattr(store, "close"):
         store.close()
+
+
+def test_registry_sync_migrates_legacy_sqlite_record_before_model_decode(
+    tmp_path,
+) -> None:
+    path = tmp_path / "legacy-registry.db"
+    SqliteStore(str(path)).close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO objects(kind, key, payload)
+            VALUES ('regional_cluster', ?, ?)
+            """,
+            (
+                "cluster-a",
+                json.dumps(
+                    {
+                        "cluster_id": "cluster-a",
+                        "region": "us-west-2",
+                        "hyperpod_cluster_name": "hyperpod-a",
+                        "eks_cluster_arn": (
+                            "arn:aws:eks:us-west-2:123456789012:cluster/cluster-a"
+                        ),
+                        "token_sha256": "a" * 64,
+                        "enabled": True,
+                        "allowed_namespaces": ["training"],
+                    }
+                ),
+            ),
+        )
+
+    store = SqliteStore(str(path))
+    configured = sync_regional_cluster_registry(
+        store,
+        [
+            {
+                "cluster_id": "cluster-a",
+                "region": "us-west-2",
+                "hyperpod_cluster_name": "hyperpod-a",
+                "eks_cluster_arn": (
+                    "arn:aws:eks:us-west-2:123456789012:cluster/cluster-a"
+                ),
+                "token": "a" * 32,
+                "allowed_namespaces": ["training"],
+                "agent_endpoint_allowed_cidrs": ["10.0.0.0/16"],
+            }
+        ],
+    )
+
+    assert configured[0].agent_endpoint_allowed_cidrs == ["10.0.0.0/16"]
+    assert store.get_regional_cluster("cluster-a").agent_endpoint_allowed_cidrs == [
+        "10.0.0.0/16"
+    ]
+    store.close()

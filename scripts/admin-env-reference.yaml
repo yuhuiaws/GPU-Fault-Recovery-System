@@ -64,18 +64,22 @@ categories:
         default: 2（启用 Agent Registry 时）
         description: "控制面接受的节点动作密钥版本；Fleet 未收敛前不要提前提升。"
       - name: GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT
-        production: 当前区域节点安装显式 true；仅节点私网 HTTP
-        description: "Node Agent 无 TLS 证书时的显式开关。后续启用 TLS 后应恢复 false。"
+        production: "false；区域生产禁止"
+        description: "仅隔离开发环境的兼容开关；生产安装器自动生成 TLS cert/key。"
       - name: GPU_FAULT_NODE_AGENT_TLS_CERT
-        production: 节点 TLS 模式由受控证书文件注入
-        description: "Node Agent 服务端证书；必须与 TLS key 成对。"
+        production: 节点安装器自动生成并由签名 heartbeat 发布公钥证书
+        description: "Node Agent 服务端证书；控制面按 heartbeat 中的证书 pin 验证。"
       - name: GPU_FAULT_NODE_AGENT_TLS_KEY
         production: 节点 0600 私钥文件
         description: "Node Agent 服务端私钥；不得进入 ConfigMap、日志或构建制品。"
       - name: GPU_FAULT_NODE_AGENT_TLS_CLIENT_CA
         description: "配置后要求 Node Agent mTLS；为空时仍依赖 HMAC 和网络边界。"
       - name: GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS
-        description: "Agent 宣告 endpoint 的允许网段。生产应收口为 GPU 节点子网，填错会拒绝全队 heartbeat。"
+        production: 仅单集群/Canary兼容路径；区域模式使用每集群注册字段
+        description: "单集群 Agent endpoint 网段；区域模式按 cluster_id 读取 agentEndpointAllowedCidrs。"
+      - name: GPU_FAULT_AGENT_ENDPOINT_REQUIRE_TLS
+        production: "true"
+        description: "要求 Agent endpoint 使用 HTTPS 且签名 heartbeat 携带服务端证书。"
 
   - title: Store、Aurora 与 PostgreSQL
     description: >-

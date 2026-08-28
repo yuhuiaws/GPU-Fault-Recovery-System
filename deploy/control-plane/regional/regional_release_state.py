@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ import yaml
 from regional_release_config import ClusterTarget, ReleaseError
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
+SENSITIVE_CONFIG_KEY = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
 
 
 def get_json(release: Any, args: list[str]) -> dict[str, Any]:
@@ -75,6 +77,45 @@ def config_map_binary_key(
     return keys[0] if len(keys) == 1 else None
 
 
+def cpu_role_config_maps(release: Any) -> dict[str, dict[str, str]]:
+    names: set[str] = set()
+    for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
+        value = release._get_json(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+                deployment,
+            )
+        )
+        pod_spec = value.get("spec", {}).get("template", {}).get("spec", {})
+        for container in [
+            *pod_spec.get("initContainers", []),
+            *pod_spec.get("containers", []),
+        ]:
+            for source in container.get("envFrom", []):
+                name = (source.get("configMapRef") or {}).get("name")
+                if (
+                    isinstance(name, str)
+                    and name.startswith("gpu-fault-")
+                    and "-config-" in name
+                ):
+                    names.add(name)
+
+    snapshots: dict[str, dict[str, str]] = {}
+    for name in sorted(names):
+        data = release._config_map_data(name)
+        sensitive = sorted(key for key in data if SENSITIVE_CONFIG_KEY.search(key))
+        if sensitive:
+            raise ReleaseError(
+                f"role ConfigMap {name} contains sensitive-looking keys: "
+                + ", ".join(sensitive)
+            )
+        snapshots[name] = data
+    return snapshots
+
+
 def capture_previous(release: Any) -> dict[str, Any]:
     metadata = release._config_map_data("gpu-fault-release-metadata")
     clusters = {}
@@ -113,6 +154,7 @@ def capture_previous(release: Any) -> dict[str, Any]:
             release._cpu(),
             inventory.CPU_INGRESS_DEPLOYMENT,
         ),
+        "cpu_role_config_maps": cpu_role_config_maps(release),
         "clusters": clusters,
     }
 
@@ -199,6 +241,7 @@ def save_state(release: Any, phase: str, **updates: Any) -> None:
             "dcgm_digest": release.dcgm_digest,
             "notification_digest": release.notification_digest,
             "cluster_ids": sorted(item.cluster_id for item in release.config.clusters),
+            "cluster_registry_digest": release.cluster_registry_digest,
             "updated_at_epoch": int(time.time()),
             **updates,
         }

@@ -6,11 +6,29 @@ from types import SimpleNamespace
 import pytest
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.app.builtin_metric_contributors import orchestration_metric_lines
+from gpu_fault.app.builtin_metric_contributors import (
+    closed_loop_metric_lines,
+    orchestration_metric_lines,
+)
 from gpu_fault.app.collector_metrics import CollectorMetricsSnapshot
 from gpu_fault.app.metric_contributors import MetricContributorRegistry
 from gpu_fault.app.metrics import collector_silence_lines
-from tests._builders import build_store
+from gpu_fault.models import (
+    AdvisoryNotification,
+    IncidentState,
+    NotificationResult,
+    NotificationStatus,
+    WorkflowOperation,
+    WorkflowStatus,
+    WorkflowStepStatus,
+)
+from tests._builders import (
+    build_store,
+    fault_incident,
+    workflow_request,
+    workflow_step,
+    workflow_step_execution,
+)
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
 
@@ -50,6 +68,77 @@ def test_ambiguous_attempt_metric_is_exported(monkeypatch) -> None:
     lines = orchestration_metric_lines(SimpleNamespace(context=context))
 
     assert lines[-1] == ("gpu_fault_ambiguous_attempt_ownership_total 3")
+
+
+def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
+    store = build_store()
+    incident = fault_incident(
+        "incident-metrics",
+        "event-metrics",
+        state=IncidentState.RECOVERED,
+        created_at=NOW,
+        updated_at=NOW + timedelta(seconds=30),
+    )
+    workflow = workflow_request(
+        "workflow-metrics",
+        incident.incident_id,
+        WorkflowStatus.SUCCEEDED,
+        official_steps=[
+            workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE),
+            workflow_step(WorkflowOperation.RESTORE_SCHEDULING),
+        ],
+        step_executions=[
+            workflow_step_execution(
+                0,
+                WorkflowOperation.MARK_UNSCHEDULABLE,
+                WorkflowStepStatus.SUCCEEDED,
+                updated_at=NOW + timedelta(seconds=5),
+            ),
+            workflow_step_execution(
+                1,
+                WorkflowOperation.RESTORE_SCHEDULING,
+                WorkflowStepStatus.SUCCEEDED,
+                updated_at=NOW + timedelta(seconds=20),
+            ),
+        ],
+        remediation_budget_claims=["region", "cluster:cluster-a"],
+        remediation_budget_wait_count=2,
+        created_at=NOW,
+        updated_at=NOW + timedelta(seconds=30),
+    )
+    incident = incident.model_copy(update={"workflow_request_id": workflow.request_id})
+    store.save_incident_and_workflow(incident, workflow)
+    notification = store.save_notification_if_absent(
+        AdvisoryNotification(
+            notification_id="notification-metrics",
+            deduplication_key="notification-metrics",
+            cluster_name="cluster-a",
+            incident_id=incident.incident_id,
+            subject="subject",
+            body_text="body",
+            support_case_draft="body",
+            created_at=NOW,
+        )
+    )
+    store.save_notification_result(
+        NotificationResult(
+            notification_id=notification.notification_id, status=NotificationStatus.SENT
+        )
+    )
+
+    lines = closed_loop_metric_lines(
+        SimpleNamespace(context=ApplicationContext(store=store))
+    )
+
+    assert 'gpu_fault_workflow_total{status="SUCCEEDED"} 1' in lines
+    assert (
+        'gpu_fault_closed_loop_milestone_seconds_count{milestone="containment"} 1'
+    ) in lines
+    assert (
+        'gpu_fault_closed_loop_milestone_seconds_count{milestone="readmission"} 1'
+    ) in lines
+    assert "gpu_fault_remediation_budget_wait_total 2" in lines
+    assert 'gpu_fault_notification_total{status="SENT"} 1' in lines
 
 
 def test_collector_metrics_top_n_is_bounded() -> None:

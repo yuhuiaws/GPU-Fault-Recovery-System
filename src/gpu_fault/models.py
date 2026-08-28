@@ -634,6 +634,10 @@ class WorkflowRequest(StrictModel):
     execution_epoch: int = Field(default=0, ge=0)
     execution_lease_expires_at: datetime | None = None
     execution_deadline: datetime | None = None
+    remediation_budget_claims: list[str] = Field(default_factory=list)
+    remediation_budget_limits: dict[str, int] = Field(default_factory=dict)
+    remediation_budget_wait_count: int = Field(default=0, ge=0)
+    remediation_budget_last_blocked_reason: str | None = None
     not_before: datetime | None = None
     aggregation_max_deadline: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

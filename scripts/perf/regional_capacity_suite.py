@@ -102,6 +102,59 @@ CONTROL_DEPLOYMENTS = (
 )
 PERF_CLUSTER_PREFIX = "perf-cap-"
 
+AUDIT_PURGE_STATEMENTS = (
+    (
+        "gpu_fault_processor_queue",
+        "DELETE FROM gpu_fault_processor_queue WHERE cluster_id LIKE %s",
+        "cluster",
+    ),
+    (
+        "gpu_fault_processor_lanes",
+        "DELETE FROM gpu_fault_processor_lanes WHERE ordering_key LIKE %s",
+        "cluster",
+    ),
+    (
+        "gpu_fault_processor_queue_counts",
+        "DELETE FROM gpu_fault_processor_queue_counts WHERE cluster_id LIKE %s",
+        "cluster",
+    ),
+    (
+        "gpu_fault_gpu_metric_latest",
+        "DELETE FROM gpu_fault_gpu_metric_latest WHERE cluster_id LIKE %s",
+        "cluster",
+    ),
+    (
+        "gpu_fault_gpu_metrics_batches",
+        "DELETE FROM gpu_fault_gpu_metrics_batches WHERE cluster_id LIKE %s",
+        "cluster",
+    ),
+    (
+        "gpu_fault_attempt_observations",
+        "DELETE FROM gpu_fault_attempt_observations WHERE cluster_id LIKE %s",
+        "cluster",
+    ),
+    (
+        "gpu_fault_training_progress",
+        "DELETE FROM gpu_fault_training_progress WHERE cluster_id LIKE %s",
+        "cluster",
+    ),
+    (
+        "gpu_fault_action_workflows",
+        "DELETE FROM gpu_fault_objects WHERE kind='workflow' AND key LIKE %s",
+        "action_workflow",
+    ),
+    (
+        "gpu_fault_regional_clusters",
+        "DELETE FROM gpu_fault_objects WHERE kind='regional_cluster' AND key LIKE %s",
+        "cluster",
+    ),
+    (
+        "gpu_fault_objects",
+        "DELETE FROM gpu_fault_objects WHERE payload->>'cluster_id' LIKE %s",
+        "cluster",
+    ),
+)
+
 CASES = {
     "burst": {
         "script": "benchmark_synchronized_burst.py",
@@ -1185,34 +1238,16 @@ def purge_audit_rows() -> None:
     script = f"""
 import os, psycopg
 prefix = {PERF_CLUSTER_PREFIX!r} + '%'
-statements = [
-    ("gpu_fault_processor_queue",
-     "DELETE FROM gpu_fault_processor_queue WHERE cluster_id LIKE %s"),
-    ("gpu_fault_processor_lanes",
-     "DELETE FROM gpu_fault_processor_lanes WHERE ordering_key LIKE %s"),
-    ("gpu_fault_processor_queue_counts",
-     "DELETE FROM gpu_fault_processor_queue_counts "
-     "WHERE cluster_id LIKE %s"),
-    ("gpu_fault_gpu_metric_latest",
-     "DELETE FROM gpu_fault_gpu_metric_latest WHERE cluster_id LIKE %s"),
-    ("gpu_fault_gpu_metrics_batches",
-     "DELETE FROM gpu_fault_gpu_metrics_batches WHERE cluster_id LIKE %s"),
-    ("gpu_fault_attempt_observations",
-     "DELETE FROM gpu_fault_attempt_observations WHERE cluster_id LIKE %s"),
-    ("gpu_fault_training_progress",
-     "DELETE FROM gpu_fault_training_progress WHERE cluster_id LIKE %s"),
-    ("gpu_fault_regional_clusters",
-     "DELETE FROM gpu_fault_objects "
-     "WHERE kind='regional_cluster' AND key LIKE %s"),
-    ("gpu_fault_objects",
-     "DELETE FROM gpu_fault_objects "
-     "WHERE payload->>'cluster_id' LIKE %s"),
-]
+patterns = {{
+    "cluster": prefix,
+    "action_workflow": "workflow-actionperf-%",
+}}
+statements = {AUDIT_PURGE_STATEMENTS!r}
 with psycopg.connect(os.environ['GPU_FAULT_STORE_URL'], autocommit=True) as conn:
     cur = conn.cursor()
-    for table, sql in statements:
+    for table, sql, pattern_name in statements:
         try:
-            cur.execute(sql, (prefix,))
+            cur.execute(sql, (patterns[pattern_name],))
             print(f'{{table}} deleted={{cur.rowcount}}')
         except Exception as exc:
             print(f'{{table}} skipped: {{exc}}')

@@ -203,7 +203,7 @@
   "src/gpu_fault/host_health.py:var-annotated": 1,
   "src/gpu_fault/hyperpod.py:arg-type": 1,
   "src/gpu_fault/hyperpod.py:no-any-return": 2,
-  "src/gpu_fault/hyperpod.py:no-untyped-def": 6,
+  "src/gpu_fault/hyperpod.py:no-untyped-def": 5,
   "src/gpu_fault/hyperpod.py:union-attr": 1,
   "src/gpu_fault/hyperpod_spares.py:no-untyped-def": 2,
   "src/gpu_fault/hyperpod_spares.py:union-attr": 1,

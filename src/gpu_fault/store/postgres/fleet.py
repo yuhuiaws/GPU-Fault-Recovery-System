@@ -18,6 +18,32 @@ class PostgresFleetMixin:
     _put: Callable[..., Any]
     _state_transaction: Callable[..., Any]
 
+    def _regional_cluster_region(self, cluster_id: str) -> str | None:
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload->>'region'
+                FROM gpu_fault_objects
+                WHERE kind='regional_cluster' AND key=%s
+                """,
+                (cluster_id,),
+            )
+            row = cursor.fetchone()
+        return str(row[0]) if row and row[0] is not None else None
+
+    def list_regional_cluster_ids(self) -> list[str]:
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT key
+                FROM gpu_fault_objects
+                WHERE kind='regional_cluster'
+                ORDER BY key
+                """
+            )
+            rows = cursor.fetchall()
+        return [str(row[0]) for row in rows]
+
     def list_regional_clusters(self):
         with self._db.cursor() as cursor:
             cursor.execute(

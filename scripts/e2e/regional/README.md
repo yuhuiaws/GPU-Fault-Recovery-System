@@ -11,6 +11,7 @@ probes under `scripts/`, `tests/manifests/`, or the `scripts/e2e/` root.
 - `run_regional_boot_guard_cases.sh`
 - `run_cap005_postgres_suite.py`
 - `run_ha008_processor_exit_probe.py`
+- `run_ha007_control_worker_shutdown.py`
 - `run_boot019_admin_lifecycle.py`
 - `run_boot020_release_rolling.py`
 

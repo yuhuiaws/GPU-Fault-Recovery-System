@@ -27,22 +27,23 @@ def sync_regional_cluster_registry(
         if token:
             item["token_sha256"] = cluster_token_sha256(str(token))
         registration = RegionalClusterRegistration(**item)
-        store.save_regional_cluster(registration)
         configured.append(registration)
         configured_ids.add(registration.cluster_id)
 
-    removed = []
-    for registration in store.list_regional_clusters():
-        if registration.cluster_id in configured_ids:
+    removed: list[str] = []
+    for cluster_id in store.list_regional_cluster_ids():
+        if cluster_id in configured_ids:
             continue
-        store.delete_regional_cluster(registration.cluster_id)
-        removed.append(registration.cluster_id)
+        store.delete_regional_cluster(cluster_id)
+        removed.append(cluster_id)
     if removed:
         LOGGER.warning(
             "removed regional cluster registrations absent from "
             "the declarative registry: %s",
             ", ".join(sorted(removed)),
         )
+    for registration in configured:
+        store.save_regional_cluster(registration)
     return sorted(
         configured,
         key=lambda item: item.cluster_id,

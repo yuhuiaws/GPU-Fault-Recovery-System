@@ -19,6 +19,10 @@ from gpu_fault.admin_bootstrap_common import (
     ClusterIdentity,
     run_parallel,
 )
+from gpu_fault.admin_bootstrap_site import (
+    existing_gpu_context,
+    preserve_existing_site_contract,
+)
 
 
 def test_cluster_arn_parser_accepts_eks_and_hyperpod() -> None:
@@ -223,3 +227,73 @@ def test_site_identifier_is_independent_of_gpu_membership() -> None:
     assert _site_identifier(cpu, [gpu_a]) == _site_identifier(cpu, [gpu_a, gpu_b]), (
         "adding a GPU cluster changed the control-plane site ID"
     )
+
+
+def test_existing_site_preserves_release_profile_and_cluster_context() -> None:
+    generated = {
+        "spec": {
+            "release": {"manifest": "/repo/dist/current-release.json"},
+            "runtimeProfile": {
+                "source": "/repo/config/profile.yaml",
+                "version": "hyperpod-v1",
+            },
+            "clusters": [
+                {
+                    "clusterId": "gpu-a",
+                    "context": "new-context",
+                    "allowedNamespaces": ["training"],
+                }
+            ],
+        }
+    }
+    existing = {
+        "spec": {
+            "release": {"manifest": "dist/current-release.json"},
+            "runtimeProfile": {
+                "source": "/secure/profiles/hyperpod-v1.yaml",
+                "templateSource": "/repo/config/profile.yaml",
+                "version": "hyperpod-v1",
+                "registrationClusterId": "gpu-a",
+            },
+            "clusters": [
+                {
+                    "clusterId": "gpu-a",
+                    "context": "stable-context",
+                    "allowedNamespaces": ["gpu-fault-system", "training"],
+                }
+            ],
+        }
+    }
+
+    result = preserve_existing_site_contract(generated, existing)
+
+    assert result["spec"]["release"] == existing["spec"]["release"]
+    assert result["spec"]["runtimeProfile"] == existing["spec"]["runtimeProfile"]
+    assert result["spec"]["clusters"][0]["context"] == "stable-context"
+    assert result["spec"]["clusters"][0]["allowedNamespaces"] == [
+        "gpu-fault-system",
+        "training",
+    ]
+
+
+def test_existing_gpu_context_matches_discovered_identity() -> None:
+    cluster = replace(
+        _cluster(),
+        role="gpu",
+        hyperpod_name="hp-gpu-a",
+        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+    )
+    site = {
+        "spec": {
+            "clusters": [
+                {
+                    "clusterId": "hp-gpu-a",
+                    "context": "stable-context",
+                    "hyperpodClusterName": "hp-gpu-a",
+                    "eksClusterArn": cluster.eks_arn,
+                }
+            ]
+        }
+    }
+
+    assert existing_gpu_context(site, cluster) == "stable-context"

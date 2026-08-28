@@ -98,7 +98,15 @@ def heartbeat_reporter_from_environment(
     port = int(os.getenv("GPU_FAULT_NODE_AGENT_PORT", "9099"))
     endpoint = os.getenv(
         "GPU_FAULT_NODE_ADVERTISE_URL",
-        f"http://{socket.getfqdn()}:{port}",
+        (
+            f"https://{socket.getfqdn()}:{port}"
+            if os.getenv("GPU_FAULT_NODE_AGENT_TLS_CERT")
+            else f"http://{socket.getfqdn()}:{port}"
+        ),
+    )
+    certificate_path = os.getenv("GPU_FAULT_NODE_AGENT_TLS_CERT", "").strip()
+    tls_certificate_pem = (
+        Path(certificate_path).read_text(encoding="ascii") if certificate_path else None
     )
     policy_path = os.getenv("GPU_FAULT_XID_POLICY_PATH", "").strip() or None
 
@@ -134,6 +142,7 @@ def heartbeat_reporter_from_environment(
         cluster_id=cluster_id,
         node_id=node_id,
         endpoint=endpoint,
+        tls_certificate_pem=tls_certificate_pem,
         agent_version=__version__,
         artifact_sha256=artifact_sha256,
         compatibility_digest=compatibility_digest,
@@ -188,6 +197,7 @@ class AgentHeartbeatReporter:
         cluster_id: str,
         node_id: str,
         endpoint: str,
+        tls_certificate_pem: str | None = None,
         agent_version: str,
         artifact_sha256: str,
         compatibility_digest: str | None = None,
@@ -216,6 +226,7 @@ class AgentHeartbeatReporter:
         self.cluster_id = cluster_id
         self.node_id = node_id
         self.endpoint = endpoint
+        self.tls_certificate_pem = tls_certificate_pem
         self.agent_version = agent_version
         self.artifact_sha256 = artifact_sha256
         self.compatibility_digest = compatibility_digest or artifact_sha256
@@ -270,6 +281,7 @@ class AgentHeartbeatReporter:
             cluster_id=self.cluster_id,
             node_id=self.node_id,
             endpoint=self.endpoint,
+            tls_certificate_pem=self.tls_certificate_pem,
             agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
             node_action_key_version=self.node_action_key_version,
             agent_version=self.agent_version,

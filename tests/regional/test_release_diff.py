@@ -23,6 +23,7 @@ def _release() -> SimpleNamespace:
         endpoint_digest="f" * 64,
         dcgm_digest="1" * 64,
         notification_digest="3" * 64,
+        cluster_registry_digest="6" * 64,
         config=SimpleNamespace(
             database_schema_version=6,
             agent_protocol_version=3,
@@ -57,6 +58,7 @@ def _state() -> dict:
         "endpoint_digest": release.endpoint_digest,
         "dcgm_digest": release.dcgm_digest,
         "notification_digest": release.notification_digest,
+        "cluster_registry_digest": release.cluster_registry_digest,
         "cluster_ids": ["gpu-a"],
     }
 
@@ -85,6 +87,9 @@ def test_release_diff_classifies_noop_and_component_scopes() -> None:
     )
     state = _state()
     state["agent_protocol_version"] = 2
+    assert DIFF.classify_release(release, state).kind is DIFF.ReleaseChangeKind.FULL
+    state = _state()
+    state["cluster_registry_digest"] = "7" * 64
     assert DIFF.classify_release(release, state).kind is DIFF.ReleaseChangeKind.FULL
 
 

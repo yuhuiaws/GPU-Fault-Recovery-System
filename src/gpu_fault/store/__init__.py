@@ -7,6 +7,10 @@ _EXPORTS = {
     ),
     "InMemoryStore": ("gpu_fault.store.memory.store", "InMemoryStore"),
     "NotFoundError": ("gpu_fault.store.shared.errors", "NotFoundError"),
+    "RemediationBudgetError": (
+        "gpu_fault.store.shared.errors",
+        "RemediationBudgetError",
+    ),
     "POSTGRES_SCHEMA_VERSION": (
         "gpu_fault.store.postgres.store",
         "POSTGRES_SCHEMA_VERSION",

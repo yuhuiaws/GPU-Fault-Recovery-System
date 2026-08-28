@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import os
 import subprocess
@@ -10,10 +11,18 @@ from pathlib import Path
 import pytest
 
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
+from scripts.e2e.regional.audit_auth_boundary import validate_matrix
 from scripts.e2e.regional.audit_executor_readiness import validate_readiness_matrix
-from scripts.e2e.regional.audit_regional_command_protocol_live import AUDITED_CASE_IDS
+from scripts.e2e.regional.audit_regional_command_protocol_live import (
+    AUDITED_CASE_IDS,
+    LiveProtocolAudit,
+)
 from scripts.e2e.regional.run_boot019_admin_lifecycle import run_admin_lifecycle
-from scripts.e2e.regional.run_boot020_release_rolling import run_release_rolling
+from scripts.e2e.regional.run_boot020_release_rolling import (
+    configure_gpu_kubeconfig,
+    run_release_rolling,
+)
+from scripts.e2e.regional.run_ha007_control_worker_shutdown import run_probe
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -86,6 +95,48 @@ def test_command_protocol_fixtures_cover_every_cmd_case() -> None:
     assert set(AUDITED_CASE_IDS).isdisjoint(local), (
         "CMD-011 must remain owned by the Executor-local fixture"
     )
+
+
+def test_cmd006_fixture_waits_for_the_documented_lease_expiry() -> None:
+    source = inspect.getsource(LiveProtocolAudit.run_006)
+
+    assert "time.sleep(15)" in source
+
+
+def test_auth_boundary_fixture_validates_precise_results() -> None:
+    statuses = {
+        "AUTH-001": 401,
+        "AUTH-002-no-auth": 401,
+        "AUTH-002-basic": 401,
+        "AUTH-002-empty-bearer": 403,
+        "AUTH-003": 403,
+        "AUTH-004-zero": 403,
+        "AUTH-004-near": 403,
+        "AUTH-005": 403,
+        "AUTH-006": 403,
+        "AUTH-008-A-normal": 200,
+        "AUTH-008-A-fake-executor": 200,
+        "AUTH-008-B-header-A-token": 403,
+        "AUTH-008-A-header-B-token": 403,
+        "AUTH-009 /v1/gpu-events/xid": 403,
+        "AUTH-011-health": 200,
+        "AUTH-011-metrics": 403,
+        "AUTH-011-clusters-anon": 403,
+        "AUTH-011-clusters-cluster-token": 403,
+    }
+    results = {
+        name: {"status": status, "body": {}} for name, status in statuses.items()
+    }
+    for name in ("AUTH-004-zero", "AUTH-004-near"):
+        results[name]["body"]["detail"] = "regional cluster authentication failed"
+    for name in ("AUTH-008-A-normal", "AUTH-008-A-fake-executor"):
+        results[name]["body"]["commands"] = [{"cluster_id": "cluster-a"}]
+
+    validate_matrix(results, cluster_a="cluster-a")
+
+    results["AUTH-004-near"]["body"]["detail"] = "token mismatch"
+    with pytest.raises(AssertionError):
+        validate_matrix(results, cluster_a="cluster-a")
 
 
 def test_collector_outbox_fixture_covers_current_delivery_contract() -> None:
@@ -377,3 +428,24 @@ def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
         == (result["stages"]["full_before"]["live"])
     )
     assert evidence.stat().st_mode & 0o777 == 0o600
+
+
+def test_boot020_configures_explicit_gpu_kubeconfig(
+    tmp_path: Path, monkeypatch
+) -> None:
+    kubeconfig = tmp_path / "gpu.kubeconfig"
+    kubeconfig.write_text("apiVersion: v1\n", encoding="utf-8")
+    monkeypatch.delenv("KUBECONFIG", raising=False)
+
+    result = configure_gpu_kubeconfig(kubeconfig)
+
+    assert result == kubeconfig.resolve()
+    assert os.environ["KUBECONFIG"] == str(kubeconfig.resolve())
+
+
+def test_ha007_runner_waits_for_in_flight_requests(tmp_path: Path) -> None:
+    report = run_probe(tmp_path, [0.01, 0.02])
+
+    assert report["status"] == "PASS"
+    assert [item["completed"] for item in report["runs"]] == [1, 1]
+    assert all(not item["shutdown_failures"] for item in report["runs"]), report

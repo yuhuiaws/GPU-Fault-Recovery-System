@@ -481,6 +481,30 @@ def test_managed_recovery_observer_never_submits_mutation() -> None:
     assert completed.status is WorkflowStatus.SUCCEEDED
 
 
+def test_managed_recovery_rejects_warm_spare_replacement() -> None:
+    store = build_store()
+    _, workflow = workflow_state(store, [WorkflowOperation.REPLACE_NODE])
+    owner = "hyperpod-managed-node-recovery"
+    step = copy_model(
+        workflow.official_steps[0],
+        execution_owner=owner,
+        parameters={"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"},
+    )
+    store.save_workflow(copy_model(workflow, official_steps=[step]))
+    adapter = ManagedRecoveryObserverAdapter({owner})
+    active = active_workflow_executor(
+        store, [adapter], {WorkflowOperation.REPLACE_NODE}
+    )
+
+    result = execute_workflow(active, workflow.request_id)
+
+    assert result.status is WorkflowStatus.FAILED
+    assert result.error == (
+        "healthy warm-spare replacement cannot be delegated "
+        "to managed/provider node recovery"
+    )
+
+
 @pytest.mark.parametrize(
     ("operation", "expected_status", "expected_sends"),
     [

@@ -276,9 +276,7 @@ def test_role_split_deploy_waits_for_spool_before_ingress() -> None:
         ROOT / "deploy/control-plane/tools/apply-control-plane-role-split.sh"
     ).read_text(encoding="utf-8")
     spool_apply = standalone.index("apply_manifest gpu-fault-telemetry-spool-worker\n")
-    spool_ready = standalone.index(
-        "rollout status deployment/gpu-fault-telemetry-spool-worker"
-    )
+    spool_ready = standalone.index("wait_for_rollout gpu-fault-telemetry-spool-worker")
     ingress_apply = standalone.index("apply_manifest gpu-fault-api-ha-ingress")
     assert spool_apply < spool_ready < ingress_apply
 
@@ -388,6 +386,8 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert "GPU_FAULT_FINALIZE_DATA_PLANE_PIN" in script
     assert "compatible-regional-executor-protocol-versions" in script
     assert "GPU_FAULT_LEGACY_COMPONENT_PINS" in script
+    assert "GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS" in script
+    assert "GPU_FAULT_FORCE_ROLE_RESTART" in script
     assert "remove_legacy_notification_env" in script
     assert "GPU_FAULT_ALLOW_EMAIL-" in script
     assert "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL-" in script
@@ -401,9 +401,9 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert 'RELOAD_RELEASE_METADATA="${PIN_METADATA_CHANGED}"' in script
     assert "PIN_FINALIZATION" not in script
     assert "rollout restart" in script
-    assert (
-        'name="$(basename "${config}" .yaml)"\n    apply_manifest "${name}"' in script
-    )
+    assert 'PRESERVE_ROLE_CONFIG_MAPS}" != "true"' in script
+    assert 'name="$(basename "${config}" .yaml)"' in script
+    assert 'apply_manifest "${name}"' in script
     ingress_exists = script.index(
         "get deployment \\\n    gpu-fault-api-ha >/dev/null 2>&1"
     )
@@ -462,7 +462,30 @@ def test_role_split_stages_candidate_without_replacing_stable_pin() -> None:
         '${CURRENT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION}"' in script
     )
     assert 'FAST_ROLLOUT_TIMEOUT="5m"' in script
-    assert '--timeout="${FAST_ROLLOUT_TIMEOUT}"' in script
+    assert "startup_failure_reason()" in script
+    assert "wait_for_rollout()" in script
+    assert 'metadata.labels["pod-template-hash"]' in script
+    assert "received unknown GPU_FAULT_* environment variable(s)" in script
+    assert (
+        "regional cluster registrations require agent_endpoint_allowed_cidrs" in script
+    )
+    assert "enabled regional cluster requires agent endpoint CIDRs" in script
+
+
+def test_completion_watcher_outbox_defaults_are_rollback_compatible() -> None:
+    documents = list(
+        yaml.safe_load_all(
+            (ROOT / "deploy/dataplane/completion-watcher.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    deployment = next(item for item in documents if item.get("kind") == "Deployment")
+    names = {item["name"] for item in container(deployment).get("env", [])}
+
+    assert "GPU_FAULT_COMPLETION_OUTBOX_MAX_RECORDS" not in names
+    assert "GPU_FAULT_COMPLETION_OUTBOX_MAX_BYTES" not in names
+    assert "GPU_FAULT_COMPLETION_OUTBOX_REPLAY_BATCH_SIZE" not in names
 
 
 def test_aurora_rotation_restarts_every_database_consumer() -> None:

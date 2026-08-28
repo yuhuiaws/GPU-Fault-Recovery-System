@@ -161,7 +161,18 @@ def test_rollback_uses_previous_executor_and_node_pins(
     previous_agent_compatibility = "d" * 64
     gpu_calls = []
     reconciler_calls = []
+    restore_calls = []
     monkeypatch.setattr(release, "_config_map_sha", lambda *_args: "e" * 64)
+    monkeypatch.setattr(
+        release,
+        "_restore_registry_backup",
+        lambda: restore_calls.append("registry") or True,
+    )
+    monkeypatch.setattr(
+        release,
+        "_restore_cpu_role_config_maps",
+        lambda snapshots: restore_calls.append(("config-maps", snapshots)) or True,
+    )
     monkeypatch.setattr(release, "_verify_gpu_control_plane_endpoint", lambda *_: None)
     monkeypatch.setattr(release, "_apply_gpu_dcgm_exporter", lambda *_: None)
     monkeypatch.setattr(
@@ -180,6 +191,9 @@ def test_rollback_uses_previous_executor_and_node_pins(
     previous = {
         "cpu_wheel": "old-control-wheel",
         "runtime_profile_version": "hyperpod-v1",
+        "cpu_role_config_maps": {
+            "gpu-fault-control-worker-config-core": {"GPU_FAULT_SERVICE_ROLE": "worker"}
+        },
         "metadata": {
             "required-agent-artifact-sha256": previous_agent,
             "required-agent-compatibility-digest": previous_agent_compatibility,
@@ -202,6 +216,17 @@ def test_rollback_uses_previous_executor_and_node_pins(
 
     release.rollback(state=previous)
 
+    assert restore_calls == [
+        "registry",
+        ("config-maps", previous["cpu_role_config_maps"]),
+    ]
+    cpu_apply = next(
+        kwargs
+        for args, kwargs in release.runner.calls
+        if args[0] == "bash" and "apply-control-plane-role-split.sh" in args[1]
+    )
+    assert cpu_apply["env"]["GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS"] == "true"
+    assert cpu_apply["env"]["GPU_FAULT_FORCE_ROLE_RESTART"] == "true"
     assert gpu_calls[0][1]["executor_artifact_sha"] == previous_executor
     assert (
         gpu_calls[0][1]["executor_compatibility_digest"]

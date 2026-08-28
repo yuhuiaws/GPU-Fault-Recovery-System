@@ -9,7 +9,11 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
-from gpu_fault.store.shared.errors import WorkflowLeaseError
+from gpu_fault.store.shared.errors import RemediationBudgetError, WorkflowLeaseError
+from gpu_fault.store.shared.remediation_budgets import (
+    apply_remediation_budget,
+    blocked_by_remediation_budget,
+)
 
 
 class PostgresWorkflowMixin:
@@ -190,7 +194,9 @@ class PostgresWorkflowMixin:
         *,
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
+        remediation_budget_claims: dict[str, int] | None = None,
     ) -> WorkflowRequest:
+        budget_error: RemediationBudgetError | None = None
         with self._db.transaction():
             workflow = self._get_for_update("workflow", request_id)
             if workflow.fencing_token != fencing_token:
@@ -206,20 +212,86 @@ class PostgresWorkflowMixin:
                 and lease_active
             ):
                 raise WorkflowLeaseError("workflow is leased by another executor")
-            new_epoch = workflow.execution_owner_id != executor_id or not lease_active
-            workflow = workflow.model_copy(
-                update={
-                    "execution_owner_id": executor_id,
-                    "execution_epoch": (
-                        workflow.execution_epoch + 1
-                        if new_epoch
-                        else max(workflow.execution_epoch, 1)
-                    ),
-                    "execution_lease_expires_at": (claimed_at + lease_duration),
-                }
-            )
-            self._put("workflow", request_id, workflow)
-            return workflow
+            if remediation_budget_claims is not None:
+                scopes = sorted(remediation_budget_claims)
+                if scopes:
+                    with self._db.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            SELECT pg_advisory_xact_lock(
+                                hashtextextended(
+                                    'remediation_budget/' || scope, 0
+                                )
+                            )
+                            FROM (
+                                SELECT unnest(%s::text[]) AS scope
+                                ORDER BY scope
+                            ) AS ordered
+                            """,
+                            (scopes,),
+                        )
+                        cursor.execute(
+                            """
+                            SELECT payload
+                            FROM gpu_fault_objects
+                            WHERE kind='workflow'
+                              AND key<>%s
+                              AND payload->>'status'='RUNNING'
+                              AND (payload->>'execution_lease_expires_at')
+                                  ::timestamptz > %s
+                              AND coalesce(
+                                  payload->'remediation_budget_claims',
+                                  '[]'::jsonb
+                              ) ?| %s
+                            """,
+                            (request_id, claimed_at, scopes),
+                        )
+                        active = [
+                            self._decode("workflow", row[0])
+                            for row in cursor.fetchall()
+                        ]
+                else:
+                    active = []
+                try:
+                    workflow = apply_remediation_budget(
+                        workflow,
+                        active,
+                        remediation_budget_claims,
+                        now=claimed_at,
+                    )
+                except RemediationBudgetError as exc:
+                    workflow = blocked_by_remediation_budget(
+                        workflow,
+                        str(exc),
+                        now=claimed_at,
+                    )
+                    budget_error = exc
+            if budget_error is not None:
+                self._put("workflow", request_id, workflow)
+            else:
+                new_epoch = (
+                    workflow.execution_owner_id != executor_id or not lease_active
+                )
+                workflow = workflow.model_copy(
+                    update={
+                        "execution_owner_id": executor_id,
+                        "execution_epoch": (
+                            workflow.execution_epoch + 1
+                            if new_epoch
+                            else max(workflow.execution_epoch, 1)
+                        ),
+                        "execution_lease_expires_at": (claimed_at + lease_duration),
+                        **(
+                            {"status": WorkflowStatus.RUNNING}
+                            if remediation_budget_claims is not None
+                            else {}
+                        ),
+                    }
+                )
+                self._put("workflow", request_id, workflow)
+        if budget_error is not None:
+            raise budget_error
+        return workflow
 
     def renew_workflow_lease(
         self,

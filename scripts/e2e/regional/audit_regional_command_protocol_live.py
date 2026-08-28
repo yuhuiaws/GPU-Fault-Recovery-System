@@ -375,7 +375,7 @@ class LiveProtocolAudit:
             payload={"lease_token": token_one, "status": "SUCCEEDED"},
         )
         assert stale_one == 409
-        time.sleep(11)
+        time.sleep(15)
         stale_two, _ = self.complete(
             command.command_id,
             payload={"lease_token": token_two, "status": "SUCCEEDED"},

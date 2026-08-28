@@ -4,6 +4,7 @@ import argparse
 from dataclasses import replace
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any, Protocol
@@ -25,6 +26,21 @@ EXPECTED_KINDS = {
     "data_plane": "DATA_PLANE_COMPATIBLE",
     "full": "FULL",
 }
+
+
+def configure_gpu_kubeconfig(value: Path | None) -> Path:
+    candidate = value or (
+        Path(os.environ["KUBECONFIG"]) if os.getenv("KUBECONFIG") else None
+    )
+    if candidate is None:
+        raise SystemExit(
+            "--execute requires --gpu-kubeconfig or an existing KUBECONFIG"
+        )
+    resolved = candidate.expanduser().resolve()
+    if not resolved.is_file():
+        raise SystemExit(f"GPU kubeconfig does not exist: {resolved}")
+    os.environ["KUBECONFIG"] = str(resolved)
+    return resolved
 
 
 class InjectedAcceptanceFailure(RuntimeError):
@@ -338,6 +354,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--data-plane-config", required=True, type=Path)
     value.add_argument("--full-config", required=True, type=Path)
     value.add_argument("--run-dir", required=True, type=Path)
+    value.add_argument("--gpu-kubeconfig", type=Path)
     value.add_argument("--execute", action="store_true")
     value.add_argument("--confirm")
     return value
@@ -361,6 +378,11 @@ def main() -> int:
     plan = {
         "case_id": CASE_ID,
         "run_dir": str(arguments.run_dir),
+        "gpu_kubeconfig": (
+            str(arguments.gpu_kubeconfig.resolve())
+            if arguments.gpu_kubeconfig is not None
+            else os.getenv("KUBECONFIG")
+        ),
         "configs": {name: str(path) for name, path in configs.items()},
         "stages": [
             "verify NOOP makes no live artifact change",
@@ -375,8 +397,12 @@ def main() -> int:
         return 0
     if arguments.confirm != CONFIRMATION:
         raise SystemExit(f"--execute requires --confirm {CONFIRMATION}")
+    gpu_kubeconfig = configure_gpu_kubeconfig(arguments.gpu_kubeconfig)
     arguments.run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    inputs = {"configs": {name: str(path) for name, path in configs.items()}}
+    inputs = {
+        "configs": {name: str(path) for name, path in configs.items()},
+        "gpu_kubeconfig": str(gpu_kubeconfig),
+    }
     recorder = EvidenceRecorder(
         arguments.run_dir / f"{CASE_ID}.json",
         case_id=CASE_ID,

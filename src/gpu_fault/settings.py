@@ -100,6 +100,7 @@ class AgentRegistrySettings:
     endpoint_allowed_ports: frozenset[int]
     endpoint_allowed_host_suffixes: tuple[str, ...]
     endpoint_allowed_cidrs: str
+    endpoint_require_tls: bool
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> AgentRegistrySettings:
@@ -216,6 +217,11 @@ class AgentRegistrySettings:
             ),
             endpoint_allowed_cidrs=values.get(
                 "GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS", ""
+            ).strip(),
+            endpoint_require_tls=_boolean(
+                values,
+                "GPU_FAULT_AGENT_ENDPOINT_REQUIRE_TLS",
+                True,
             ),
         )
 
@@ -304,6 +310,17 @@ class ControlPlaneSettings:
                     "regional mode uses the cluster registry; "
                     "GPU_FAULT_HYPERPOD_CLUSTER must be unset"
                 )
+            if registry.enabled:
+                missing_cidrs = sorted(
+                    str(item.get("cluster_id") or "<unknown>")
+                    for item in cluster_values
+                    if not item.get("agent_endpoint_allowed_cidrs")
+                )
+                if missing_cidrs:
+                    raise RuntimeError(
+                        "regional cluster registrations require "
+                        "agent_endpoint_allowed_cidrs: " + ", ".join(missing_cidrs)
+                    )
         else:
             if len(cluster_values) > 1:
                 raise RuntimeError(

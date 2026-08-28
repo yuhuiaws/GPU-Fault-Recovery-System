@@ -125,6 +125,7 @@ class ClusterTarget:
     ca_file: str | None = None
     control_plane_url: str | None = None
     allowed_namespaces: tuple[str, ...] = ()
+    agent_endpoint_allowed_cidrs: tuple[str, ...] = ()
     fleet_master_file: str | None = None
 
     @classmethod
@@ -165,6 +166,15 @@ class ClusterTarget:
                 }
             )
         )
+        endpoint_cidrs = tuple(
+            sorted(
+                {
+                    str(item).strip()
+                    for item in value.get("agent_endpoint_allowed_cidrs", [])
+                    if str(item).strip()
+                }
+            )
+        )
         return cls(
             cluster_id=required_text(value["cluster_id"], "cluster target cluster_id"),
             context=required_text(value["context"], "cluster target context"),
@@ -182,6 +192,7 @@ class ClusterTarget:
             ca_file=value.get("ca_file"),
             control_plane_url=value.get("control_plane_url"),
             allowed_namespaces=namespaces,
+            agent_endpoint_allowed_cidrs=endpoint_cidrs,
             fleet_master_file=value.get("fleet_master_file"),
         )
 

@@ -24,6 +24,7 @@ def test_deleting_a_regional_cluster_removes_its_stale_agents(
             hyperpod_cluster_name="hp-a",
             eks_cluster_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
             token_sha256="a" * 64,
+            agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
         )
     )
     store.save_agent(

@@ -537,7 +537,11 @@ class KubernetesNodeOperationsMixin:
                 "node is already isolated by another incident/token"
             )
         previous_unschedulable = annotations.get(ANNOTATION_PREVIOUS_UNSCHEDULABLE)
-        if previous_unschedulable is None or takeover:
+        # This annotation is the scheduling baseline from before the first
+        # isolation. A successor incident takes over an already cordoned node,
+        # so resampling here would turn that intermediate state into the new
+        # baseline and make validation-first restore leave the node cordoned.
+        if previous_unschedulable is None:
             previous_unschedulable = str(self._unschedulable(node)).lower()
         taints = self._taints(node)
         if takeover:
