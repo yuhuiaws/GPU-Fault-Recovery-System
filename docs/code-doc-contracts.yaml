@@ -17,6 +17,8 @@ coverage:
       - .yaml
       - .yml
       - .json
+      - .tf
+      - .hcl
 
 contracts:
   - id: source-python
@@ -49,6 +51,7 @@ contracts:
       - docs/详细设计-v2.md
       - docs/区域模式端到端验收测试用例.md
       - docs/区域用例索引.md
+      - docs/变更影响与测试选择.md
       - docs/故障模拟测试手册.md
       - docs/性能压测验收方案.md
       - docs/validation-limitations.md
@@ -79,6 +82,8 @@ contracts:
       - deploy/**/*.yaml
       - deploy/**/*.yml
       - deploy/**/*.json
+      - deploy/**/*.tf
+      - deploy/**/*.hcl
       - scripts/generate-cleanup-inventory.py
     documents:
       - deploy/README.md

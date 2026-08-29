@@ -25,6 +25,7 @@ spec:
     registrationClusterId: gpu-prod-a
 
   nlb:
+    # Values come from deploy/aws/regional-foundation Terraform outputs.
     name: REPLACE_WITH_NLB_NAME
     publicSubnets:
       - REPLACE_WITH_PUBLIC_SUBNET_A
@@ -38,10 +39,11 @@ spec:
     hostname: REPLACE_WITH_CONTROL_PLANE_HOSTNAME
 
   images:
-    runtime: public.ecr.aws/docker/library/python:3.12-slim
-    nodeInstaller: public.ecr.aws/amazonlinux/amazonlinux:2023
-    dcgmExporter: nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04
-    adot: REPLACE_WITH_APPROVED_ADOT_IMAGE
+    # release-deploy synchronizes these fields from signed Manifest v3.
+    runtime: REPLACE_WITH_RUNTIME_IMAGE_AT_SHA256
+    nodeInstaller: REPLACE_WITH_NODE_INSTALLER_IMAGE_AT_SHA256
+    dcgmExporter: nvcr.io/nvidia/k8s/dcgm-exporter@sha256:d22403c31e5f17d089f909a3d9f0e4e5114258ea063a81f9268c55d5ab663cf1
+    adot: public.ecr.aws/aws-observability/aws-otel-collector@sha256:bb72328152c72fb9662056759b275f7cc85e115db12bbb114fbea9f68dc4816c
 
   health:
     auroraClusterId: gpu-fault-regional-aurora

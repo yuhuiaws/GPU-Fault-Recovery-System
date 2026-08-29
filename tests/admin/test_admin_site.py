@@ -420,11 +420,31 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
         repo_root=tmp_path / "repo",
         state_dir=tmp_path / "state",
         alert_email=None,
+        allow_legacy_python_foundation=True,
         show_effective_config=False,
     )
 
     assert admin_cli.run(arguments) == 0
     assert [call[1] for call in calls] == ["preflight", "deploy", "verify"]
+
+
+def test_arn_only_deploy_requires_explicit_legacy_foundation_opt_in(
+    tmp_path: Path,
+) -> None:
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--cpu-cluster-arn",
+            "arn:aws:sagemaker:us-east-1:123456789012:cluster/cpu",
+            "--gpu-cluster-arn",
+            "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a",
+            "--repo-root",
+            str(tmp_path),
+        ]
+    )
+
+    with pytest.raises(SiteConfigError, match="disabled by default"):
+        admin_cli.run(arguments)
 
 
 def test_admin_email_option_keeps_alert_email_compatibility() -> None:

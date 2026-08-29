@@ -12,6 +12,23 @@ class ReleaseChangeKind(StrEnum):
     FULL = "FULL"
 
 
+class ReleaseComponent(StrEnum):
+    SCHEMA = "schema"
+    REGISTRY = "registry"
+    CPU_STAGE = "cpu-stage"
+    RUNTIME_PROFILE = "runtime-profile"
+    ENDPOINT = "endpoint"
+    OBSERVABILITY = "observability"
+    DCGM = "dcgm"
+    EXECUTOR = "executor"
+    WATCHER = "watcher"
+    COLLECTOR = "collector"
+    RECONCILER = "reconciler"
+    AGENT = "agent"
+    CPU_FINALIZE = "cpu-finalize"
+    VERIFY = "verify"
+
+
 @dataclass(frozen=True)
 class ReleaseDiff:
     kind: ReleaseChangeKind
@@ -25,6 +42,146 @@ class ReleaseDiff:
             "kind": self.kind.value,
             "changed": sorted(self.changed),
         }
+
+
+@dataclass(frozen=True)
+class ReleaseExecutionPlan:
+    nodes: tuple[ReleaseComponent, ...]
+
+    def has(self, *components: ReleaseComponent) -> bool:
+        return bool(set(components).intersection(self.nodes))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"nodes": [item.value for item in self.nodes]}
+
+
+PLAN_ORDER = tuple(ReleaseComponent)
+
+
+def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
+    changed = diff.changed
+    selected = {ReleaseComponent.VERIFY}
+    schema = bool(changed & {"database_schema", "schema_manifests"})
+    profile = bool(changed & {"runtime_profile", "runtime_profile_version"})
+    endpoint = bool(
+        changed
+        & {
+            "endpoint",
+            "endpoint_manifests",
+            "clusters",
+        }
+    )
+    observability = bool(
+        changed
+        & {
+            "observability_manifests",
+            "adot_image",
+        }
+    )
+    dcgm = bool(changed & {"dcgm", "dcgm_manifests", "dcgm_image"})
+    executor = bool(
+        changed
+        & {
+            "executor_wheel",
+            "executor_protocol",
+            "executor_manifests",
+            "runtime_image",
+            "clusters",
+        }
+    )
+    watcher = bool(
+        changed
+        & {
+            "executor_wheel",
+            "watcher_manifests",
+            "runtime_image",
+            "clusters",
+        }
+    )
+    collector = bool(
+        changed
+        & {
+            "executor_wheel",
+            "collector_manifests",
+            "runtime_image",
+            "runtime_profile_version",
+            "clusters",
+        }
+    )
+    agent = bool(
+        changed
+        & {
+            "node_runtime_wheel",
+            "node_bundle",
+            "node_template",
+            "node_manifests",
+            "node_installer_image",
+            "agent_config",
+            "agent_protocol",
+            "runtime_profile",
+            "runtime_profile_version",
+        }
+    )
+    reconciler = bool(
+        changed
+        & {
+            "executor_wheel",
+            "node_manifests",
+            "node_installer_image",
+            "runtime_image",
+            "runtime_profile",
+            "runtime_profile_version",
+            "agent_config",
+            "agent_protocol",
+            "node_runtime_wheel",
+            "node_bundle",
+            "node_template",
+        }
+    )
+    pin_changed = bool(
+        changed
+        & {
+            "executor_wheel",
+            "node_runtime_wheel",
+            "agent_protocol",
+            "executor_protocol",
+            "agent_config",
+        }
+    )
+    cpu_changed = bool(
+        changed
+        & {
+            "control_plane_wheel",
+            "cpu_manifests",
+            "runtime_image",
+            "notifications",
+            "clusters",
+        }
+    )
+    cpu_stage = pin_changed or profile or bool(changed & {"clusters"})
+    cpu_finalize = cpu_changed or cpu_stage
+    registry = cpu_finalize or bool(changed & {"clusters"})
+
+    for enabled, component in (
+        (schema, ReleaseComponent.SCHEMA),
+        (registry, ReleaseComponent.REGISTRY),
+        (cpu_stage, ReleaseComponent.CPU_STAGE),
+        (profile, ReleaseComponent.RUNTIME_PROFILE),
+        (endpoint, ReleaseComponent.ENDPOINT),
+        (observability, ReleaseComponent.OBSERVABILITY),
+        (dcgm, ReleaseComponent.DCGM),
+        (executor, ReleaseComponent.EXECUTOR),
+        (watcher, ReleaseComponent.WATCHER),
+        (collector, ReleaseComponent.COLLECTOR),
+        (reconciler, ReleaseComponent.RECONCILER),
+        (agent, ReleaseComponent.AGENT),
+        (cpu_finalize, ReleaseComponent.CPU_FINALIZE),
+    ):
+        if enabled:
+            selected.add(component)
+    return ReleaseExecutionPlan(
+        nodes=tuple(item for item in PLAN_ORDER if item in selected)
+    )
 
 
 def _legacy_value(state: dict[str, Any], name: str) -> Any:
@@ -53,13 +210,23 @@ def _current_profile_digest(release: Any, state: dict[str, Any]) -> Any:
 
 def diff_from_changed(changed: Iterable[str]) -> ReleaseDiff:
     normalized = frozenset(changed)
-    if not normalized:
+    scoped = normalized - {"release_delivery", "rendered_manifests"}
+    if not scoped:
         kind = ReleaseChangeKind.NOOP
-    elif normalized.issubset({"control_plane_wheel", "notifications"}):
+    elif scoped.issubset(
+        {
+            "control_plane_wheel",
+            "notifications",
+            "cpu_manifests",
+            "observability_manifests",
+            "adot_image",
+        }
+    ):
         kind = ReleaseChangeKind.CONTROL_PLANE_ONLY
-    elif not normalized.intersection(
+    elif not scoped.intersection(
         {
             "database_schema",
+            "schema_manifests",
             "agent_protocol",
             "executor_protocol",
             "agent_config",
@@ -90,6 +257,26 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "dcgm": release.dcgm_digest,
         "notifications": release.notification_digest,
         "clusters": release.cluster_registry_digest,
+        "release_delivery": release.config.release_delivery_sha256,
+        "cpu_manifests": release.config.delivery_component_digests.get("cpu"),
+        "executor_manifests": release.config.delivery_component_digests.get("executor"),
+        "watcher_manifests": release.config.delivery_component_digests.get("watcher"),
+        "collector_manifests": release.config.delivery_component_digests.get(
+            "collector"
+        ),
+        "dcgm_manifests": release.config.delivery_component_digests.get("dcgm"),
+        "node_manifests": release.config.delivery_component_digests.get("node"),
+        "observability_manifests": (
+            release.config.delivery_component_digests.get("observability")
+        ),
+        "schema_manifests": release.config.delivery_component_digests.get("schema"),
+        "endpoint_manifests": release.config.delivery_component_digests.get("endpoint"),
+        "rendered_manifests": release.rendered_manifest_digest,
+        "node_template": release.node_template_sha,
+        "runtime_image": release.runtime_image,
+        "node_installer_image": release.node_installer_image,
+        "dcgm_image": release.dcgm_exporter_image,
+        "adot_image": release.adot_image,
     }
     current = {
         "control_plane_wheel": state.get("wheel_sha256"),
@@ -106,6 +293,22 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "dcgm": state.get("dcgm_digest"),
         "notifications": state.get("notification_digest"),
         "clusters": state.get("cluster_registry_digest"),
+        "release_delivery": state.get("release_delivery_sha256"),
+        "cpu_manifests": state.get("cpu_manifest_sha256"),
+        "executor_manifests": state.get("executor_manifest_sha256"),
+        "watcher_manifests": state.get("watcher_manifest_sha256"),
+        "collector_manifests": state.get("collector_manifest_sha256"),
+        "dcgm_manifests": state.get("dcgm_manifest_sha256"),
+        "node_manifests": state.get("node_manifest_sha256"),
+        "observability_manifests": state.get("observability_manifest_sha256"),
+        "schema_manifests": state.get("schema_manifest_sha256"),
+        "endpoint_manifests": state.get("endpoint_manifest_sha256"),
+        "rendered_manifests": state.get("rendered_manifest_sha256"),
+        "node_template": state.get("node_template_sha256"),
+        "runtime_image": state.get("runtime_image"),
+        "node_installer_image": state.get("node_installer_image"),
+        "dcgm_image": state.get("dcgm_image"),
+        "adot_image": state.get("adot_image"),
     }
     changed = frozenset(
         name for name, value in desired.items() if current.get(name) != value

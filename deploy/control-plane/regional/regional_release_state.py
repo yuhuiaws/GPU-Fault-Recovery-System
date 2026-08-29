@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import tempfile
@@ -10,9 +11,12 @@ from typing import Any
 import regional_deployment_inventory as inventory
 import yaml
 from regional_release_config import ClusterTarget, ReleaseError
+from regional_release_legacy import AGENT_IDENTITY_FIELDS
+from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 SENSITIVE_CONFIG_KEY = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
+DIGEST_IMAGE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 
 
 def get_json(release: Any, args: list[str]) -> dict[str, Any]:
@@ -54,6 +58,98 @@ def deployment_wheel(
         if volume.get("name") == "artifact":
             return (volume.get("configMap") or {}).get("name")
     return None
+
+
+def deployment_image(
+    release: Any,
+    args: list[str],
+    deployment: str,
+    *,
+    container_name: str | None = None,
+) -> str | None:
+    value = release._get_json(
+        args
+        + [
+            "-n",
+            release.config.namespace,
+            "get",
+            "deployment",
+            deployment,
+        ]
+    )
+    containers = (
+        value.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    )
+    for container in containers:
+        if container_name is None or container.get("name") == container_name:
+            image = str(container.get("image") or "").strip()
+            return image or None
+    return None
+
+
+def deployment_env_value(
+    release: Any,
+    args: list[str],
+    deployment: str,
+    name: str,
+) -> str | None:
+    value = release._get_json(
+        args
+        + [
+            "-n",
+            release.config.namespace,
+            "get",
+            "deployment",
+            deployment,
+        ]
+    )
+    containers = (
+        value.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    )
+    for container in containers:
+        for environment in container.get("env", []):
+            if environment.get("name") == name:
+                result = str(environment.get("value") or "").strip()
+                return result or None
+    return None
+
+
+def template_container_image(
+    text: str,
+    *,
+    container_name: str,
+) -> str | None:
+    for document in yaml.safe_load_all(text):
+        containers = (
+            (document or {})
+            .get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("containers", [])
+        )
+        for container in containers:
+            if container.get("name") == container_name:
+                image = str(container.get("image") or "").strip()
+                return image or None
+    return None
+
+
+def require_consistent_images(
+    description: str,
+    images: dict[str, str | None],
+) -> str:
+    missing = sorted(name for name, image in images.items() if not image)
+    if missing:
+        raise ReleaseError(
+            f"cannot capture previous {description} image from: " + ", ".join(missing)
+        )
+    distinct = {str(image) for image in images.values()}
+    if len(distinct) != 1:
+        raise ReleaseError(
+            f"previous {description} images are inconsistent across: "
+            + ", ".join(sorted(images))
+        )
+    return distinct.pop()
 
 
 def config_map_binary_key(
@@ -116,9 +212,110 @@ def cpu_role_config_maps(release: Any) -> dict[str, dict[str, str]]:
     return snapshots
 
 
+def capture_agent_identities(release: Any) -> dict[str, dict[str, Any]]:
+    pod = release.runner.run(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "pod",
+            "-l",
+            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ),
+        capture=True,
+    )
+    if not pod:
+        raise ReleaseError("cannot capture previous Agent identity without CPU ingress")
+    script = """
+import json
+from datetime import datetime, timezone
+
+from gpu_fault.app import ApplicationContext
+
+now = datetime.now(timezone.utc)
+records = [
+    item
+    for item in ApplicationContext.from_environment().store.list_agents()
+    if getattr(item.lifecycle_state, "value", item.lifecycle_state) == "ACTIVE"
+    and item.lease_expires_at is not None
+    and item.lease_expires_at > now
+]
+print(json.dumps([
+    {
+        "cluster_id": item.cluster_id,
+        "node_id": item.node_id,
+        "agent_protocol_version": item.agent_protocol_version,
+        "agent_version": item.agent_version,
+        "artifact_sha256": item.artifact_sha256,
+        "compatibility_digest": (
+            item.compatibility_digest or item.artifact_sha256
+        ),
+        "installer_bundle_sha256": getattr(
+            item, "installer_bundle_sha256", None
+        ),
+        "installer_template_sha256": getattr(
+            item, "installer_template_sha256", None
+        ),
+        "policy_version": item.policy_version,
+        "runtime_profile_version": item.runtime_profile_version,
+        "config_digest": item.config_digest,
+        "node_action_key_version": item.node_action_key_version,
+    }
+    for item in records
+], sort_keys=True))
+"""
+    raw = release.runner.run(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "exec",
+            "-i",
+            pod,
+            "--",
+            CONTROL_PLANE_PYTHON,
+            "-c",
+            script,
+        ),
+        capture=True,
+    )
+    records = json.loads(raw)
+    result: dict[str, dict[str, Any]] = {}
+    for target in release.config.clusters:
+        selected = [
+            item for item in records if item.get("cluster_id") == target.cluster_id
+        ]
+        if not selected:
+            raise ReleaseError(
+                f"{target.cluster_id} has no active Agent identity to capture"
+            )
+        identities = {
+            tuple(item.get(field) for field in AGENT_IDENTITY_FIELDS)
+            for item in selected
+        }
+        if len(identities) != 1:
+            raise ReleaseError(f"{target.cluster_id} active Agent identities differ")
+        identity = dict(zip(AGENT_IDENTITY_FIELDS, identities.pop(), strict=True))
+        identity["node_ids"] = sorted(str(item["node_id"]) for item in selected)
+        result[target.cluster_id] = identity
+    return result
+
+
 def capture_previous(release: Any) -> dict[str, Any]:
+    live_state = dict(release.state) if release.state else release._load_state()
     metadata = release._config_map_data("gpu-fault-release-metadata")
     clusters = {}
+    runtime_images = {
+        f"cpu/{deployment}": deployment_image(
+            release,
+            release._cpu(),
+            deployment,
+        )
+        for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
+    }
+    node_installer_images: dict[str, str | None] = {}
     for target in release.config.clusters:
         template = release._deployment_template_name(target)
         executor_wheel = release._deployment_wheel(
@@ -128,6 +325,58 @@ def capture_previous(release: Any) -> dict[str, Any]:
         reconciler_wheel = release._deployment_wheel(
             release._gpu(target),
             inventory.GPU_RECONCILER_DEPLOYMENT,
+        )
+        bundle_name = release._template_bundle(target, template) if template else None
+        template_sha256 = deployment_env_value(
+            release,
+            release._gpu(target),
+            inventory.GPU_RECONCILER_DEPLOYMENT,
+            "GPU_FAULT_INSTALLER_TEMPLATE_SHA256",
+        )
+        template_text = None
+        if template:
+            template_value = release._get_json(
+                release._gpu(
+                    target,
+                    "-n",
+                    release.config.namespace,
+                    "get",
+                    "configmap",
+                    template,
+                )
+            )
+            template_text = (template_value.get("data") or {}).get("job.yaml")
+            if template_text and not template_sha256:
+                template_sha256 = hashlib.sha256(template_text.encode()).hexdigest()
+        node_installer_images[target.cluster_id] = (
+            template_container_image(
+                template_text,
+                container_name="installer",
+            )
+            if template_text
+            else None
+        )
+        for deployment in (
+            *inventory.DEPLOYMENTS,
+            inventory.GPU_RECONCILER_DEPLOYMENT,
+        ):
+            runtime_images[f"{target.cluster_id}/{deployment}"] = deployment_image(
+                release,
+                release._gpu(target),
+                deployment,
+            )
+        bundle_key = release._config_map_binary_key(
+            release._gpu(target),
+            bundle_name,
+        )
+        bundle_sha256 = (
+            release._config_map_sha(
+                release._gpu(target),
+                bundle_name,
+                bundle_key or release.config.bundle.name,
+            )
+            if bundle_name
+            else None
         )
         clusters[target.cluster_id] = {
             "wheel": executor_wheel,
@@ -141,12 +390,74 @@ def capture_previous(release: Any) -> dict[str, Any]:
                 reconciler_wheel,
             ),
             "template": template,
-            "bundle": (
-                release._template_bundle(target, template) if template else None
+            "template_sha256": template_sha256,
+            "bundle": bundle_name,
+            "bundle_key": bundle_key,
+            "bundle_sha256": bundle_sha256,
+            "dcgm_image": (
+                release._get_json(
+                    release._gpu(
+                        target,
+                        "-n",
+                        release.config.namespace,
+                        "get",
+                        "daemonset",
+                        "gpu-fault-dcgm-exporter",
+                    )
+                )
+                .get("spec", {})
+                .get("template", {})
+                .get("spec", {})
+                .get("containers", [{}])[0]
+                .get("image")
             ),
         }
+    live_runtime_image = require_consistent_images("runtime", runtime_images)
+    runtime_image = live_runtime_image
+    adopted_live_runtime_image = str(
+        live_state.get("adopted_live_runtime_image") or ""
+    ).strip()
+    rollback_runtime_image = str(live_state.get("runtime_image") or "").strip()
+    if adopted_live_runtime_image:
+        if live_runtime_image != adopted_live_runtime_image:
+            raise ReleaseError(
+                "live runtime image drifted after legacy release-state adoption"
+            )
+        if not DIGEST_IMAGE.fullmatch(rollback_runtime_image):
+            raise ReleaseError(
+                "legacy release-state adoption has no immutable rollback runtime image"
+            )
+        runtime_image = rollback_runtime_image
+    node_installer_image = require_consistent_images(
+        "Node Installer",
+        node_installer_images,
+    )
+    adot_image = deployment_image(
+        release,
+        release._cpu(),
+        "gpu-fault-adot",
+        container_name="collector",
+    )
+    if not adot_image:
+        raise ReleaseError(
+            "cannot capture previous ADOT image from deployment/gpu-fault-adot"
+        )
+    capture_identities = getattr(release, "_capture_agent_identities", None)
+    agent_identities = (
+        capture_identities()
+        if capture_identities is not None
+        else capture_agent_identities(release)
+    )
+    for target in release.config.clusters:
+        expected_nodes = set(release._target_node_names(target))
+        captured_nodes = set(agent_identities[target.cluster_id]["node_ids"])
+        if expected_nodes != captured_nodes:
+            raise ReleaseError(
+                f"{target.cluster_id} active Agent set does not match HyperPod nodes"
+            )
     return {
         "metadata": metadata,
+        "agent_identities": agent_identities,
         "runtime_profile_version": release._config_map_data(
             "gpu-fault-api-ha-config-core"
         ).get("GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"),
@@ -155,6 +466,13 @@ def capture_previous(release: Any) -> dict[str, Any]:
             inventory.CPU_INGRESS_DEPLOYMENT,
         ),
         "cpu_role_config_maps": cpu_role_config_maps(release),
+        "release_delivery_sha256": live_state.get("release_delivery_sha256"),
+        "rendered_manifest_sha256": live_state.get("rendered_manifest_sha256"),
+        "node_template_sha256": live_state.get("node_template_sha256"),
+        "live_runtime_image": live_runtime_image,
+        "runtime_image": runtime_image,
+        "node_installer_image": node_installer_image,
+        "adot_image": adot_image,
         "clusters": clusters,
     }
 
@@ -213,6 +531,8 @@ def template_bundle(
 
 
 def save_state(release: Any, phase: str, **updates: Any) -> None:
+    if release.state.get("release_id") not in {None, release.release_id}:
+        release.state.pop("adopted_live_runtime_image", None)
     release.state.update(
         {
             "phase": phase,
@@ -242,6 +562,43 @@ def save_state(release: Any, phase: str, **updates: Any) -> None:
             "notification_digest": release.notification_digest,
             "cluster_ids": sorted(item.cluster_id for item in release.config.clusters),
             "cluster_registry_digest": release.cluster_registry_digest,
+            "release_manifest_schema_version": (
+                release.config.release_manifest_schema_version
+            ),
+            "release_delivery_sha256": (release.config.release_delivery_sha256),
+            "cpu_manifest_sha256": (
+                release.config.delivery_component_digests.get("cpu")
+            ),
+            "executor_manifest_sha256": (
+                release.config.delivery_component_digests.get("executor")
+            ),
+            "watcher_manifest_sha256": (
+                release.config.delivery_component_digests.get("watcher")
+            ),
+            "collector_manifest_sha256": (
+                release.config.delivery_component_digests.get("collector")
+            ),
+            "dcgm_manifest_sha256": (
+                release.config.delivery_component_digests.get("dcgm")
+            ),
+            "node_manifest_sha256": (
+                release.config.delivery_component_digests.get("node")
+            ),
+            "observability_manifest_sha256": (
+                release.config.delivery_component_digests.get("observability")
+            ),
+            "schema_manifest_sha256": (
+                release.config.delivery_component_digests.get("schema")
+            ),
+            "endpoint_manifest_sha256": (
+                release.config.delivery_component_digests.get("endpoint")
+            ),
+            "rendered_manifest_sha256": release.rendered_manifest_digest,
+            "node_template_sha256": release.node_template_sha,
+            "runtime_image": release.runtime_image,
+            "node_installer_image": release.node_installer_image,
+            "dcgm_image": release.dcgm_exporter_image,
+            "adot_image": release.adot_image,
             "updated_at_epoch": int(time.time()),
             **updates,
         }

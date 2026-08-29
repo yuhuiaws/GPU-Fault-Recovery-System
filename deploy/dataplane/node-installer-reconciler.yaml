@@ -75,11 +75,12 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - >-
-              python -m pip install --no-cache-dir
-              '/artifact/gpu_fault_cluster_executor-0.10.0-py3-none-any.whl[collectors]'
-              && touch /tmp/reconciler-ready
+              touch /tmp/reconciler-ready
               && exec gpu-fault-node-installer-reconciler
           env:
+            - name: PATH
+              value: >-
+                /opt/gpu-fault/executor/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: GPU_FAULT_NAMESPACE
               value: gpu-fault-system
             - name: GPU_FAULT_CLUSTER_ID
@@ -92,6 +93,10 @@ spec:
               value: REPLACE_WITH_INSTALLER_CONFIG_DIGEST
             - name: GPU_FAULT_INSTALLER_ARTIFACT_SHA256
               value: REPLACE_WITH_INSTALLER_ARTIFACT_SHA256
+            - name: GPU_FAULT_INSTALLER_BUNDLE_SHA256
+              value: REPLACE_WITH_INSTALLER_BUNDLE_SHA256
+            - name: GPU_FAULT_INSTALLER_TEMPLATE_SHA256
+              value: REPLACE_WITH_INSTALLER_TEMPLATE_SHA256
             - name: GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP
               value: REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP
             - name: GPU_FAULT_INSTALLER_TEMPLATE_PATH
@@ -104,6 +109,12 @@ spec:
               value: "15"
             - name: GPU_FAULT_INSTALL_RETRY_SECONDS
               value: "300"
+            - name: GPU_FAULT_INSTALLER_MAX_UNAVAILABLE
+              value: "REPLACE_WITH_INSTALLER_MAX_UNAVAILABLE"
+            - name: GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS
+              value: "REPLACE_WITH_INSTALLER_ACTIVE_DEADLINE_SECONDS"
+            - name: GPU_FAULT_INSTALLER_ALLOWED_NODES
+              value: "REPLACE_WITH_INSTALLER_ALLOWED_NODES"
           resources:
             requests:
               cpu: 50m

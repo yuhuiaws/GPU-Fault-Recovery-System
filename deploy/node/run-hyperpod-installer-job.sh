@@ -19,6 +19,15 @@ VERSION_TAG="${VERSION//./}"
 INSTALLER_CONFIG_MAP="${GPU_FAULT_INSTALLER_CONFIG_MAP:-gpu-fault-node-installer-${VERSION_TAG}}"
 INSTALLER_CONFIG_DIGEST="${GPU_FAULT_INSTALLER_CONFIG_DIGEST:-${VERSION}}"
 INSTALLER_ARTIFACT_SHA256="${GPU_FAULT_INSTALLER_ARTIFACT_SHA256:-}"
+INSTALLER_BUNDLE_SHA256="$(
+    printf '%s' \
+        "${GPU_FAULT_INSTALLER_BUNDLE_SHA256:-${INSTALLER_ARTIFACT_SHA256}}"
+)"
+INSTALLER_TEMPLATE_SHA256="$(
+    printf '%s' "${GPU_FAULT_INSTALLER_TEMPLATE_SHA256:-$(
+        sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}'
+    )}"
+)"
 NODE_COMPATIBILITY_DIGEST="${GPU_FAULT_NODE_COMPATIBILITY_DIGEST:-${INSTALLER_ARTIFACT_SHA256}}"
 SECRET_NAME="${GPU_FAULT_SECRET_NAME:-gpu-fault-control-plane-active}"
 CONNECTION_MODE="${GPU_FAULT_CONNECTION_MODE:-local}"
@@ -31,6 +40,12 @@ NODE_ACTION_KEYS_SECRET="$(
 RUNTIME_PROFILE="${GPU_FAULT_RUNTIME_PROFILE:-hyperpod-v1}"
 DEFAULT_NODE_INSTALLER_IMAGE="public.ecr.aws/amazonlinux/amazonlinux:2023"
 NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-${DEFAULT_NODE_INSTALLER_IMAGE}}"
+INSTALLER_ACTIVE_DEADLINE_SECONDS="$(
+    printf '%s' "${GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS:-840}"
+)"
+INSTALLER_LOCK_TIMEOUT_SECONDS="$(
+    printf '%s' "${GPU_FAULT_INSTALLER_LOCK_TIMEOUT_SECONDS:-30}"
+)"
 NODE_NAME=""
 RENDER_ONLY="false"
 DIAGNOSTIC_S3_URI="${GPU_FAULT_DIAGNOSTIC_S3_URI:-}"
@@ -80,6 +95,24 @@ ENABLE_NVIDIA_SMI_METRICS_COLLECTOR="$(
 [[ -n "${NODE_INSTALLER_IMAGE}" &&
     "${NODE_INSTALLER_IMAGE}" != *[[:space:]#]* ]] || {
     printf 'ERROR: invalid GPU_FAULT_NODE_INSTALLER_IMAGE\n' >&2
+    exit 2
+}
+[[ "${INSTALLER_BUNDLE_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'ERROR: invalid GPU_FAULT_INSTALLER_BUNDLE_SHA256\n' >&2
+    exit 2
+}
+[[ "${INSTALLER_TEMPLATE_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'ERROR: invalid GPU_FAULT_INSTALLER_TEMPLATE_SHA256\n' >&2
+    exit 2
+}
+for value in INSTALLER_ACTIVE_DEADLINE_SECONDS INSTALLER_LOCK_TIMEOUT_SECONDS; do
+    [[ "${!value}" =~ ^[1-9][0-9]*$ ]] || {
+        printf 'ERROR: invalid %s\n' "${value}" >&2
+        exit 2
+    }
+done
+((INSTALLER_ACTIVE_DEADLINE_SECONDS >= 60)) || {
+    printf 'ERROR: installer active deadline must be at least 60 seconds\n' >&2
     exit 2
 }
 
@@ -373,6 +406,7 @@ metadata:
   namespace: ${NAMESPACE}
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: ${INSTALLER_ACTIVE_DEADLINE_SECONDS}
   ttlSecondsAfterFinished: 3600
   template:
     spec:
@@ -398,6 +432,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            - name: INSTALLER_LOCK_TIMEOUT_SECONDS
+              value: "${INSTALLER_LOCK_TIMEOUT_SECONDS}"
             - name: NODE_COMPATIBILITY_DIGEST
               value: "${NODE_COMPATIBILITY_DIGEST}"
             - name: DERIVE_NODE_ACTION_SECRET
@@ -495,6 +531,9 @@ ${CONTROL_PLANE_ENV}
                 TARGET_NODE_IP="\${TARGET_NODE_IP}" \
                 TARGET_NODE_UID="\${TARGET_NODE_UID}" \
                 INSTALL_RUN_ID="\${INSTALL_RUN_ID}" \
+                INSTALLER_LOCK_TIMEOUT_SECONDS="\${INSTALLER_LOCK_TIMEOUT_SECONDS}" \
+                GPU_FAULT_INSTALLER_BUNDLE_SHA256="${INSTALLER_BUNDLE_SHA256}" \
+                GPU_FAULT_INSTALLER_TEMPLATE_SHA256="${INSTALLER_TEMPLATE_SHA256}" \
                 GPU_FAULT_NODE_COMPATIBILITY_DIGEST="\${NODE_COMPATIBILITY_DIGEST}" \
                 DERIVE_NODE_ACTION_SECRET="\${DERIVE_NODE_ACTION_SECRET}" \
                 CONTROL_PLANE_URL="\${CONTROL_PLANE_URL}" \
@@ -544,6 +583,12 @@ ${CONTROL_PLANE_ENV}
               node_action_secret="/tmp/gpu-fault-node-action-secret-\${INSTALL_RUN_ID}"
               control_plane_ca="/tmp/gpu-fault-control-plane-ca-\${INSTALL_RUN_ID}.crt"
               trap "rm -f \${node_action_secret} \${control_plane_ca}" EXIT
+                  install -d -m 0755 /var/lock
+                  exec 9>/var/lock/gpu-fault-installer.lock
+                  flock -w "\${INSTALLER_LOCK_TIMEOUT_SECONDS}" 9 || {
+                    echo "another GPU fault installer owns the node lock" >&2
+                    exit 1
+                  }
                   rm -rf /tmp/gpu-fault-node-installer-${VERSION}
                   tar -xzf \
                     /tmp/gpu-fault-node-installer-${VERSION}.tar.gz \
@@ -744,5 +789,7 @@ kubectl annotate node "${NODE_NAME}" --overwrite \
     "gpu-fault.io/installer-version=${VERSION}" \
     "gpu-fault.io/installer-config-digest=${INSTALLER_CONFIG_DIGEST}" \
     "gpu-fault.io/installer-artifact-sha256=${INSTALLER_ARTIFACT_SHA256}" \
+    "gpu-fault.io/installer-bundle-sha256=${INSTALLER_BUNDLE_SHA256}" \
+    "gpu-fault.io/installer-template-sha256=${INSTALLER_TEMPLATE_SHA256}" \
     "gpu-fault.io/installer-node-uid=${NODE_UID}" \
     "gpu-fault.io/installer-state=Succeeded"

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from tests._script_loader import lazy_script_module
 
@@ -132,3 +135,64 @@ def test_retry_diff_restores_physical_artifact_changes(monkeypatch) -> None:
         "node_runtime_wheel",
         "node_bundle",
     }
+
+
+@pytest.mark.parametrize(
+    ("state_exists", "phase"),
+    [
+        (False, None),
+        (True, "bootstrap-cleaned"),
+        (True, "bootstrap-data-plane-progress"),
+    ],
+)
+def test_deploy_rejects_empty_cluster_set_during_bootstrap(
+    monkeypatch, state_exists: bool, phase: str | None
+) -> None:
+    module = _admin_module()
+    calls: list[str] = []
+    release = SimpleNamespace(
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=()),
+        _cpu=lambda *args: ["kubectl", *args],
+        _load_state=lambda: {"phase": phase},
+        bootstrap=lambda: calls.append("bootstrap"),
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0 if state_exists else 1
+        ),
+    )
+
+    with pytest.raises(
+        module.ReleaseError,
+        match="initial regional bootstrap requires at least one GPU cluster",
+    ):
+        module.run_deploy(release)
+
+    assert calls == []
+
+
+def test_deploy_allows_empty_cluster_set_after_completed_state(monkeypatch) -> None:
+    module = _admin_module()
+    calls: list[str] = []
+    release = SimpleNamespace(
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=()),
+        _cpu=lambda *args: ["kubectl", *args],
+        _load_state=lambda: {"phase": "complete"},
+        noop=lambda _diff: calls.append("noop"),
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
+    )
+    monkeypatch.setattr(
+        module,
+        "classify_release",
+        lambda _release, _state: module.diff_from_changed(()),
+    )
+
+    module.run_deploy(release)
+
+    assert calls == ["noop"]

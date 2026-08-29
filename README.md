@@ -117,37 +117,39 @@ make test-parallel
 
 | 角色 | 事实源 | 唯一正常入口 | 作用 |
 |---|---|---|---|
-| 开发者/发布人员 | 当前 checkout、Profile template、`site.yaml` | `make release-deploy` | 检查、构建制品、准备site并部署升级 |
-| 管理员 | 首次部署的集群ARN；后续为已批准的release和`site.yaml` | `gpu-fault-admin` | 首次建站、预检、升级、验收和资源生命周期管理 |
+| CI/发布人员 | 当前 checkout、Profile template | `make release-build` | 检查、构建并推送不可变OCI、生成Manifest v3和签名attestation |
+| 管理员 | 已批准的release和`site.yaml` | `make release-deploy`、`gpu-fault-admin` | 验签、应用升级、验收和资源生命周期管理 |
 
 ### 开发者：修改代码或Profile后发布
 
-普通代码修改完成后只执行：
+CI先构建并推送runtime image；部署机只消费签名后的release bundle：
 
 ```bash
+make PYTHON=.venv/bin/python release-build \
+  RUNTIME_IMAGE_REPOSITORY=<registry/repository>
+
 make PYTHON=.venv/bin/python release-deploy \
-  SITE=/secure/gpu-fault/site.yaml
+  SITE=/secure/gpu-fault/site.yaml \
+  PREBUILT_ATTESTATION=/secure/release/current-attestation.json \
+  PREBUILT_BUNDLE=/secure/release/current-attestation.bundle.json \
+  COSIGN_KEY=/secure/release/cosign.pub
 ```
 
-修改了 `runtimeProfile.templateSource` 指向的Profile策略时，在同一命令提供已批准的
-变更单引用：
+修改Profile策略时，在上述`release-deploy`命令前追加审批引用：
 
 ```bash
 PROFILE_APPROVAL=CHG-12345 \
-make PYTHON=.venv/bin/python release-deploy \
-  SITE=/secure/gpu-fault/site.yaml
+make PYTHON=.venv/bin/python release-deploy ...
 ```
 
 如果尚未提供审批引用，首次运行只生成
-`<site目录>/release-deploy/profile-plan.json`并停止，不会修改集群。统一入口随后固定
-执行：Profile差异检查、完整`make check`、三个wheel和Node bundle构建、release及
-Agent config digest更新、`deploy -> verify -> release-summary`。`verify`只执行一次，
-报告保存为`verification-report.json`；`release-summary`只读取release state和制品引用，
-不会重复AWS、Aurora、NLB、AMP和集群健康检查。相同release ID被明确分类为`NOOP`时，
-记录`SKIPPED_NOOP`，跳过deploy内的preflight和NOOP verifier，直接执行一次最多8路
-并行的完整verify；
-分类缺失、异常或非NOOP时自动回退原安全部署路径。普通代码发布不需要
-`PROFILE_APPROVAL`，也不得手工修改generated Manifest、artifact摘要或Profile版本。
+`<site目录>/release-deploy/profile-plan.json`并停止。CI已完成`make check`、OCI构建、
+Manifest v3、attestation和签名；部署机验签后执行
+`deploy -> verify -> stability -> release-summary`，保存`verification-report.json`和
+`stability-report.json`，不重新build或跑全量pytest。
+实际变更按组件DAG滚动；Node Runtime使用Fleet waves。Profile变化在finalize前若仍有
+旧Profile workload/workflow会fail closed。`NOOP`记录`SKIPPED_NOOP`并跳过稳定窗口。
+普通代码发布不需要`PROFILE_APPROVAL`，也不得手工修改generated Manifest、artifact摘要或Profile版本。
 完整实现见[开发者部署实现](docs/开发者部署实现.md)。
 
 ### 管理员：首次部署和日常管理
@@ -158,19 +160,16 @@ Agent config digest更新、`deploy -> verify -> release-summary`。`verify`只�
 
 #### 1. 首次部署
 
-不需要手写`site.yaml`，提供已有CPU/GPU集群ARN：
+先用`deploy/aws/regional-foundation/` Terraform模块创建Aurora、AMP/SNS/SQS、
+runtime ECR和方案安全组，再根据输出准备`site.yaml`：
 
 ```bash
-gpu-fault-admin deploy \
-  --cpu-cluster-arn <cpu-eks-or-hyperpod-arn> \
-  --gpu-cluster-arn <gpu-eks-or-hyperpod-arn> \
-  --state-dir /secure/gpu-fault \
-  --admin-email <operations-email>
+terraform -chdir=deploy/aws/regional-foundation apply
+gpu-fault-admin deploy -f /secure/gpu-fault/site.yaml
 ```
 
-`--gpu-cluster-arn`可重复；`--admin-email`可在账号邮箱可自动发现时省略。命令自动创建
-方案专属Aurora、IAM、NLB/PKI、监控和凭据，在
-`/secure/gpu-fault/site.yaml`生成持久事实源，并完成preflight、deploy和verify。
+ARN-only Python foundation bootstrap只用于迁移，必须显式追加
+`--allow-legacy-python-foundation`；它也只接受CI已生成的deployable Manifest v3。
 
 #### 2. 已有站点的单命令操作
 

@@ -17,6 +17,12 @@ from urllib.parse import urlsplit
 
 import regional_deployment_inventory as inventory
 from regional_release_config import ReleaseError
+from regional_release_runtime_identity import (
+    CONTROL_PLANE_PYTHON,
+    EXECUTOR_PYTHON,
+    EXECUTOR_READINESS,
+    validate_runtime_component_identity,
+)
 from regional_runtime_profile import verify_runtime_profile
 
 
@@ -1100,7 +1106,7 @@ def _control_api_report(release: Any) -> dict[str, Any]:
                 ),
                 "ADMIN_EXPECTED_NODES_JSON="
                 + json.dumps(expected_nodes, separators=(",", ":")),
-                "python",
+                CONTROL_PLANE_PYTHON,
                 "-c",
                 CONTROL_API_SCRIPT,
             ),
@@ -1263,7 +1269,7 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
             "exec",
             "deployment/gpu-fault-cluster-executor",
             "--",
-            "gpu-fault-cluster-executor-readiness",
+            EXECUTOR_READINESS,
         ),
         capture=True,
         sensitive=True,
@@ -1277,7 +1283,7 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
                 "exec",
                 "deployment/gpu-fault-cluster-executor",
                 "--",
-                "python",
+                EXECUTOR_PYTHON,
                 "-c",
                 EXECUTOR_TLS_SCRIPT,
             ),
@@ -1290,6 +1296,13 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
     details["executor_readiness"] = readiness
     details["tls"] = tls
     return CheckValue(f"{target.cluster_id} data plane is healthy", details)
+
+
+def _check_runtime_component_identity(release: Any) -> CheckValue:
+    return CheckValue(
+        "Every runtime Pod loads its declared component wheel",
+        validate_runtime_component_identity(release),
+    )
 
 
 def _check_nlb_runtime(release: Any) -> CheckValue:
@@ -1381,6 +1394,10 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
         ),
         ("runtime_profile", lambda: _verify_profile(release)),
         ("read_only_verifiers", lambda: _run_read_only_verifiers(release)),
+        (
+            "runtime_component_identity",
+            lambda: _check_runtime_component_identity(release),
+        ),
         ("control_api", lambda: _check_control_api(release)),
     ]
     specifications.extend(

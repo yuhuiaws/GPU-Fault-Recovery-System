@@ -146,6 +146,12 @@ def heartbeat_reporter_from_environment(
         agent_version=__version__,
         artifact_sha256=artifact_sha256,
         compatibility_digest=compatibility_digest,
+        installer_bundle_sha256=(
+            os.getenv("GPU_FAULT_NODE_INSTALLER_BUNDLE_SHA256") or None
+        ),
+        installer_template_sha256=(
+            os.getenv("GPU_FAULT_NODE_INSTALLER_TEMPLATE_SHA256") or None
+        ),
         policy_version=policy_version,
         policy_version_provider=policy_version_provider,
         runtime_profile_version=runtime_profile,
@@ -201,6 +207,8 @@ class AgentHeartbeatReporter:
         agent_version: str,
         artifact_sha256: str,
         compatibility_digest: str | None = None,
+        installer_bundle_sha256: str | None = None,
+        installer_template_sha256: str | None = None,
         policy_version: str,
         runtime_profile_version: str,
         config_digest: str,
@@ -230,6 +238,8 @@ class AgentHeartbeatReporter:
         self.agent_version = agent_version
         self.artifact_sha256 = artifact_sha256
         self.compatibility_digest = compatibility_digest or artifact_sha256
+        self.installer_bundle_sha256 = installer_bundle_sha256
+        self.installer_template_sha256 = installer_template_sha256
         self.policy_version = policy_version
         self.policy_version_provider = policy_version_provider
         self.collector_status_provider = collector_status_provider
@@ -287,6 +297,8 @@ class AgentHeartbeatReporter:
             agent_version=self.agent_version,
             artifact_sha256=self.artifact_sha256,
             compatibility_digest=self.compatibility_digest,
+            installer_bundle_sha256=self.installer_bundle_sha256,
+            installer_template_sha256=self.installer_template_sha256,
             policy_version=policy_version,
             runtime_profile_version=self.runtime_profile_version,
             config_digest=self.config_digest,

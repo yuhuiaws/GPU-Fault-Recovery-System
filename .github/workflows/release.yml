@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gpu_fault
+          POSTGRES_PASSWORD: gpu_fault
+          POSTGRES_DB: gpu_fault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gpu_fault -d gpu_fault_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      GPU_FAULT_TEST_POSTGRES_URL: >-
+        postgresql://gpu_fault:gpu_fault@127.0.0.1:5432/gpu_fault_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: hashicorp/setup-terraform@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.RELEASE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - run: python -m pip install --upgrade pip
+      - run: >-
+          python -m pip install
+          '.[dev,collectors,postgres,performance]'
+      - name: Select immutable runtime repository
+        env:
+          REPOSITORY: ${{ vars.RUNTIME_IMAGE_REPOSITORY }}
+        run: |
+          test -n "${REPOSITORY}"
+          case "${REPOSITORY}" in
+            *.dkr.ecr.*.amazonaws.com/*) ;;
+            *) echo "RUNTIME_IMAGE_REPOSITORY must be an ECR URI" >&2; exit 2 ;;
+          esac
+          printf 'RUNTIME_IMAGE_REPOSITORY=%s\n' "${REPOSITORY}" >> "${GITHUB_ENV}"
+      - run: make release-build PYTHON=python
+      - name: Sign release attestation
+        run: >-
+          cosign sign-blob --yes
+          --bundle dist/current-attestation.bundle.json
+          dist/current-attestation.json
+      - name: Upload signed release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-fault-release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

@@ -88,6 +88,14 @@ def parser() -> argparse.ArgumentParser:
     deploy.add_argument("--repo-root", type=Path)
     deploy.add_argument("--state-dir", type=Path)
     deploy.add_argument(
+        "--allow-legacy-python-foundation",
+        action="store_true",
+        help=(
+            "allow the deprecated ARN-only Python AWS foundation bootstrap; "
+            "new sites must provision AWS resources through IaC"
+        ),
+    )
+    deploy.add_argument(
         "--admin-email",
         "--alert-email",
         dest="alert_email",
@@ -345,6 +353,13 @@ def run(arguments: argparse.Namespace) -> int:
                 "deploy requires -f site.yaml, or --cpu-cluster-arn "
                 "with at least one --gpu-cluster-arn"
             )
+        if not getattr(arguments, "allow_legacy_python_foundation", False):
+            raise SiteConfigError(
+                "ARN-only Python foundation bootstrap is disabled by default; "
+                "provision deploy/aws/regional-foundation with Terraform and "
+                "deploy its site.yaml, or explicitly set "
+                "--allow-legacy-python-foundation for migration"
+            )
         repository_root = (arguments.repo_root or Path.cwd()).resolve()
         identity = arguments.cpu_cluster_arn
         default_state = (
@@ -372,19 +387,19 @@ def run(arguments: argparse.Namespace) -> int:
         raise SiteConfigError(f"{arguments.command} requires -f site.yaml")
     site = load_site(site_file, repository_root=arguments.repo_root)
     if arguments.command == "deploy":
-        site = _configure_site_notifications(
-            site,
-            configured_email=getattr(arguments, "alert_email", None),
-            configured_sender=getattr(arguments, "email_sender", None),
-            configured_recipients=tuple(
-                getattr(arguments, "email_recipient", ()) or ()
-            ),
-            configured_subject_prefix=getattr(
-                arguments,
-                "email_subject_prefix",
-                None,
-            ),
+        notification_override = any(
+            (
+                getattr(arguments, "alert_email", None),
+                getattr(arguments, "email_sender", None),
+                tuple(getattr(arguments, "email_recipient", ()) or ()),
+                getattr(arguments, "email_subject_prefix", None),
+            )
         )
+        if notification_override and not automatic:
+            raise SiteConfigError(
+                "notification AWS changes must be applied through IaC and "
+                "site.yaml before application deployment"
+            )
     print(
         json.dumps(
             {"gpu_fault_admin": site.audit_summary},

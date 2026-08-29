@@ -48,12 +48,14 @@ def _deployment() -> dict:
                         {
                             "name": "api",
                             "args": [
-                                "python -m pip install --no-cache-dir "
-                                "'/artifact/"
-                                "gpu_fault_control_plane-0.10.0-"
-                                "py3-none-any.whl"
-                                "[collectors,postgres]' && "
-                                "exec uvicorn "
+                                "if [ -x /opt/gpu-fault/control-plane/bin/python ]; "
+                                "then\n"
+                                "  set -- /opt/gpu-fault/control-plane/bin/python "
+                                "-m uvicorn\n"
+                                "else\n"
+                                "  set -- uvicorn\n"
+                                "fi\n"
+                                'exec "$@" '
                                 "gpu_fault.app:create_app --factory "
                                 "--host 0.0.0.0 --port 8080"
                             ],
@@ -133,6 +135,9 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert ingress_env["GPU_FAULT_TELEMETRY_SPOOL_BATCH_GROUPS"] == "8"
     assert ingress_env["GPU_FAULT_FAULT_STORE_IO_WORKERS"] == "8"
     assert ingress_env["GPU_FAULT_EVIDENCE_STORE_IO_WORKERS"] == "4"
+    assert ingress_env["PATH"].startswith("/opt/gpu-fault/control-plane/bin:"), (
+        "ingress does not select the control-plane component venv"
+    )
     assert ingress_env["GPU_FAULT_LIFESPAN_SHUTDOWN_MAX_SECONDS"] == "20"
     assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_SIZE"] == "64"
     assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_GROUPS"] == "8"
@@ -155,14 +160,25 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
         in (ingress["spec"]["template"]["spec"]["containers"][0]["args"][0])
     )
     assert (
-        "[collectors,postgres,performance]"
-        in (ingress["spec"]["template"]["spec"]["containers"][0]["args"][0])
+        "pip install"
+        not in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    )
+    assert (
+        "set -- /opt/gpu-fault/control-plane/bin/python -m uvicorn"
+        in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    )
+    assert (
+        "set -- uvicorn"
+        in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
     )
     assert (
         ingress["spec"]["template"]["spec"].get("securityContext", {}).get("sysctls")
         is None
     )
     assert worker["spec"]["replicas"] == 6
+    assert _effective_env(items, worker)["PATH"].startswith(
+        "/opt/gpu-fault/control-plane/bin:"
+    ), "worker does not select the control-plane component venv"
     assert worker["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 240
     container = worker["spec"]["template"]["spec"]["containers"][0]
     assert container["name"] == "control-worker"
@@ -179,6 +195,9 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
         "app": "gpu-fault-control-worker"
     }
     assert spool["spec"]["replicas"] == 0
+    assert _effective_env(items, spool)["PATH"].startswith(
+        "/opt/gpu-fault/control-plane/bin:"
+    ), "spool worker does not select the control-plane component venv"
     spool_container = spool["spec"]["template"]["spec"]["containers"][0]
     assert spool_container["name"] == "telemetry-spool-worker"
     assert "--port 8082" in spool_container["args"][0]

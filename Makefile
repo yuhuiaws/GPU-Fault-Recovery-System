@@ -5,6 +5,7 @@ PYTHONPYCACHEPREFIX ?= /tmp/gpu-fault-pycache
 export PYTHONPYCACHEPREFIX
 PYTEST_XDIST_WORKERS ?= 4
 COVERAGE_FLOOR ?= 78
+BASE ?= origin/main
 QUALITY_SCRIPTS = scripts tools
 QUALITY_SHELL_ROOTS = deploy scripts tools
 YAMLLINT_CONFIG = .yamllint
@@ -23,9 +24,10 @@ DOCUMENTATION_TESTS = \
 	tests/test_env_reference.py \
 	tests/regional/test_regional_case_index.py \
 	tests/test_fault_evidence.py \
-	tests/test_doc_impact.py
+	tests/test_doc_impact.py \
+	tests/test_change_impact.py
 
-.PHONY: test test-postgres test-postgres-stress test-parallel coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check release-preflight release-deploy architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check runtime-image-check release-build release-preflight release-deploy architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check terraform-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
@@ -33,6 +35,19 @@ test:
 test-parallel:
 	GPU_FAULT_TEST_POSTGRES_URL= \
 		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS)
+
+test-impact:
+	$(PYTHON) scripts/select-affected-tests.py \
+		--base "$(BASE)" \
+		--execute
+
+regional-impact-plan:
+	$(PYTHON) scripts/select-affected-tests.py \
+		--base "$(BASE)" \
+		--regional-only
+
+impact-check:
+	$(PYTHON) scripts/select-affected-tests.py --check
 
 coverage:
 	GPU_FAULT_TEST_POSTGRES_URL= \
@@ -106,6 +121,7 @@ check:
 	$(MAKE) docs-check
 	$(MAKE) config-check
 	$(MAKE) deploy-check
+	$(MAKE) terraform-check
 	$(MAKE) artifacts-safety-check
 	$(MAKE) yaml-check
 	$(MAKE) shell-check
@@ -145,6 +161,7 @@ public-release-check:
 
 docs-check:
 	$(MAKE) doc-impact-check
+	$(MAKE) impact-check
 	$(MAKE) env-doc-check
 	$(MAKE) case-index-check
 	$(MAKE) manual-command-order-check
@@ -188,6 +205,19 @@ deployment-contracts-check: python-cache-clean
 deploy-check: python-cache-clean
 	$(PYTHON) scripts/check-deploy-layout.py
 
+terraform-check:
+	@command -v terraform >/dev/null || \
+		(printf 'terraform is required\n' >&2; exit 2)
+	@data_dir="$$(mktemp -d)"; \
+		trap 'rm -rf "$$data_dir"' EXIT; \
+		TF_DATA_DIR="$$data_dir" terraform fmt -check -recursive \
+			deploy/aws/regional-foundation; \
+		TF_DATA_DIR="$$data_dir" terraform \
+			-chdir=deploy/aws/regional-foundation \
+			init -backend=false -input=false >/dev/null; \
+		TF_DATA_DIR="$$data_dir" terraform \
+			-chdir=deploy/aws/regional-foundation validate
+
 artifacts-safety-check:
 	$(PYTHON) scripts/check-artifacts.py
 
@@ -198,11 +228,74 @@ release-preflight:
 	$(MAKE) artifacts-local-safety-check
 	$(MAKE) artifact-check
 
+runtime-image-check:
+	@tmp_dir="$$(mktemp -d)"; trap 'rm -rf "$$tmp_dir"' EXIT; \
+		$(PYTHON) scripts/build-release-runtime-image.py \
+			--repository gpu-fault-runtime-local \
+			--output "$$tmp_dir/descriptor.json"; \
+		tag="$$(jq -r '.tag' "$$tmp_dir/descriptor.json")"; \
+		control_digest="$$(jq -r '.components.control_plane.module_digest' \
+			"$$tmp_dir/descriptor.json")"; \
+		executor_digest="$$(jq -r '.components.executor.module_digest' \
+			"$$tmp_dir/descriptor.json")"; \
+		docker run --rm "$$tag" /bin/sh -c \
+			'! python -c "import gpu_fault" >/dev/null 2>&1 && \
+			/opt/gpu-fault/control-plane/bin/python -c "import pydantic" && \
+			/opt/gpu-fault/executor/bin/python -c "import pydantic" && \
+			test -x /opt/gpu-fault/control-plane/bin/gpu-fault-api && \
+			test -x /opt/gpu-fault/control-plane/bin/gpu-fault-store-migrate && \
+			test -x /opt/gpu-fault/executor/bin/gpu-fault-cluster-executor && \
+			test -x /opt/gpu-fault/executor/bin/gpu-fault-completion-watcher && \
+			test -x /opt/gpu-fault/executor/bin/gpu-fault-collector && \
+			test -x /opt/gpu-fault/executor/bin/gpu-fault-node-installer-reconciler'; \
+		test "$$control_digest" = "$$(docker run --rm "$$tag" \
+			/opt/gpu-fault/control-plane/bin/python -c \
+			'from gpu_fault import module_digest; print(module_digest())')"; \
+		test "$$executor_digest" = "$$(docker run --rm "$$tag" \
+			/opt/gpu-fault/executor/bin/python -c \
+			'from gpu_fault import module_digest; print(module_digest())')"
+
+release-build:
+	@test -n "$(RUNTIME_IMAGE_REPOSITORY)" || \
+		(printf 'RUNTIME_IMAGE_REPOSITORY is required\n' >&2; exit 2)
+	@test -n "$${GPU_FAULT_TEST_POSTGRES_URL}" || \
+		(printf 'GPU_FAULT_TEST_POSTGRES_URL is required\n' >&2; exit 2)
+	$(MAKE) check PYTHON="$(PYTHON)"
+	$(MAKE) test-postgres-stress PYTHON="$(PYTHON)"
+	$(PYTHON) scripts/build-release-runtime-image.py \
+		--repository "$(RUNTIME_IMAGE_REPOSITORY)" \
+		--platform "$(or $(RUNTIME_IMAGE_PLATFORM),linux/amd64)" \
+		--push
+	$(PYTHON) scripts/build-release-artifacts.py \
+		--python "$(PYTHON)" \
+		--runtime-image-descriptor dist/release-runtime-image.json
+	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
+		$(PYTHON) -m pytest tests/test_artifact_consistency.py
+	$(PYTHON) scripts/build-release-attestation.py
+
 release-deploy:
+	@test -n "$(PREBUILT_ATTESTATION)" || \
+		(printf 'PREBUILT_ATTESTATION is required\n' >&2; exit 2)
+	@if [ -z "$(PREBUILT_SIGNATURE)" ] && [ -z "$(PREBUILT_BUNDLE)" ]; then \
+		printf 'PREBUILT_SIGNATURE or PREBUILT_BUNDLE is required\n' >&2; \
+		exit 2; \
+	fi
+	@if [ -z "$(COSIGN_KEY)" ]; then \
+		( test -n "$(PREBUILT_BUNDLE)" || test -n "$(PREBUILT_CERTIFICATE)" ) && \
+		test -n "$(CERTIFICATE_IDENTITY)" && \
+		test -n "$(CERTIFICATE_OIDC_ISSUER)" || \
+		(printf 'keyless verification requires PREBUILT_BUNDLE or PREBUILT_CERTIFICATE, plus CERTIFICATE_IDENTITY and CERTIFICATE_OIDC_ISSUER\n' >&2; exit 2); \
+	fi
 	PYTHONPATH=src $(PYTHON) scripts/release_deploy.py \
 		$(if $(SITE),--site "$(SITE)",) \
-		$(if $(ADMIN_EMAIL),--admin-email "$(ADMIN_EMAIL)",) \
-		$(if $(PROFILE_APPROVAL),--profile-approval "$(PROFILE_APPROVAL)",)
+		$(if $(PROFILE_APPROVAL),--profile-approval "$(PROFILE_APPROVAL)",) \
+		--prebuilt-attestation "$(PREBUILT_ATTESTATION)" \
+		$(if $(PREBUILT_SIGNATURE),--prebuilt-signature "$(PREBUILT_SIGNATURE)",) \
+		$(if $(PREBUILT_BUNDLE),--prebuilt-bundle "$(PREBUILT_BUNDLE)",) \
+		$(if $(PREBUILT_CERTIFICATE),--prebuilt-certificate "$(PREBUILT_CERTIFICATE)",) \
+		$(if $(COSIGN_KEY),--cosign-key "$(COSIGN_KEY)",) \
+		$(if $(CERTIFICATE_IDENTITY),--certificate-identity "$(CERTIFICATE_IDENTITY)",) \
+		$(if $(CERTIFICATE_OIDC_ISSUER),--certificate-oidc-issuer "$(CERTIFICATE_OIDC_ISSUER)",)
 
 # 本地保留策略（artifacts/README.md「Retention」）。只报告，不删除；真正
 # 删除要人工加 --apply。artifacts/ 在 .gitignore 里，缺失时输出 0 条而不报错，

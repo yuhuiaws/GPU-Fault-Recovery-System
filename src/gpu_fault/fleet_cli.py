@@ -54,10 +54,14 @@ def parser() -> argparse.ArgumentParser:
 
     create = commands.add_parser("create-deployment")
     create.add_argument("--execution-token", required=True)
+    create.add_argument("--deployment-id")
     create.add_argument("--cluster-id", required=True)
     create.add_argument("--nodes", required=True, type=_nodes)
     create.add_argument("--agent-version", required=True)
     create.add_argument("--artifact-sha256", required=True)
+    create.add_argument("--compatibility-digest")
+    create.add_argument("--bundle-sha256")
+    create.add_argument("--template-sha256")
     create.add_argument("--policy-version", required=True)
     create.add_argument("--runtime-profile-version", required=True)
     create.add_argument("--config-digest", required=True)
@@ -332,10 +336,14 @@ def main() -> None:
             "/v1/fleet/deployments",
             token=args.execution_token,
             payload={
+                "deployment_id": args.deployment_id,
                 "cluster_id": args.cluster_id,
                 "node_ids": args.nodes,
                 "desired_agent_version": args.agent_version,
                 "desired_artifact_sha256": args.artifact_sha256,
+                "desired_compatibility_digest": args.compatibility_digest,
+                "desired_bundle_sha256": args.bundle_sha256,
+                "desired_template_sha256": args.template_sha256,
                 "desired_policy_version": args.policy_version,
                 "desired_runtime_profile_version": (args.runtime_profile_version),
                 "desired_config_digest": args.config_digest,

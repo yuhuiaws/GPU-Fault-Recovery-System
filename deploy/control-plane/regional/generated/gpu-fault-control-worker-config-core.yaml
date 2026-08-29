@@ -55,3 +55,4 @@ data:
   GPU_FAULT_VALIDATION_REQUIRE_RDMA: 'true'
   GPU_FAULT_XID_CORRELATION_LEASE_SECONDS: '30'
   GPU_FAULT_XID_CORRELATION_POLL_SECONDS: '1'
+  PATH: /opt/gpu-fault/control-plane/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

@@ -1,0 +1,12 @@
+.codex/
+.git/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+artifacts/
+build/
+dist/
+gpu-fault-*.html
+**/__pycache__/
+**/*.py[cod]

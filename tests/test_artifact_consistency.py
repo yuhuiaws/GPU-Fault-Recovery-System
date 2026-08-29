@@ -26,6 +26,7 @@ import pytest
 
 from gpu_fault import module_digest
 from scripts.component_wheels import component_source_digest
+from scripts.release_identity import canonical_sha256
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PACKAGE = ROOT / "src/gpu_fault"
@@ -215,6 +216,46 @@ def test_release_manifest_is_complete_and_no_sdist_exists() -> None:
         == manifest
     )
     assert manifest["module_digest"] == component_source_digest("control_plane")
+    assert manifest["schema_version"] == 3
+    delivery = dict(manifest["delivery"])
+    delivery_sha256 = delivery.pop("sha256")
+    assert canonical_sha256(delivery) == delivery_sha256
+    assert manifest["delivery"]["rendered_manifests"]["file_count"] >= 3
+    assert (
+        manifest["components"]["node_bundle"]["template_sha256"]
+        == (manifest["delivery"]["node_template_inputs"]["sha256"])
+    )
+    hashes = {
+        "control_plane": manifest["components"]["control_plane"]["wheel_sha256"],
+        "executor": manifest["components"]["executor"]["wheel_sha256"],
+        "node_runtime": manifest["components"]["node_runtime"]["wheel_sha256"],
+        "node_bundle": manifest["bundle_sha256"],
+    }
+    assert (
+        manifest["release_id"]
+        == hashlib.sha256(
+            json.dumps(
+                {"artifacts": hashes, "delivery": delivery_sha256},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:12]
+    )
+    assert all(
+        "@sha256:" in item["reference"]
+        for item in manifest["delivery"]["images"].values()
+    ), "release delivery contains a mutable image reference"
+    if manifest["deployable"]:
+        runtime_components = manifest["delivery"]["images"]["runtime"]["components"]
+        for name in ("control_plane", "executor"):
+            assert (
+                runtime_components[name]["wheel_sha256"]
+                == (manifest["components"][name]["wheel_sha256"])
+            )
+            assert (
+                runtime_components[name]["module_digest"]
+                == (manifest["components"][name]["module_digest"])
+            )
     assert list((ROOT / "dist").glob("*.whl")) == []
     assert list((ROOT / "dist").glob("*.tar.gz")) == []
     assert not [

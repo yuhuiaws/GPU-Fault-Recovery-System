@@ -197,6 +197,40 @@ def test_running_pod_does_not_submit_terminal() -> None:
     assert sink.posts == []
 
 
+def test_disappeared_running_attempt_emits_stopped_tombstone_after_grace() -> None:
+    clock = Clock()
+    core = FakeCoreApi([pod(0)])
+    sink = FakeSink()
+    subject = KubernetesCompletionController(
+        core,
+        sink,
+        cluster_id="hp-cluster",
+        cleanup_timeout_seconds=30,
+        now=clock,
+        publish_observations=True,
+    )
+
+    subject.run_once()
+    core.pods = []
+    subject.run_once()
+    clock.value += timedelta(seconds=29)
+    subject.run_once()
+    clock.value += timedelta(seconds=2)
+    subject.run_once()
+
+    observations = [
+        payload for path, payload in sink.posts if path == "/v1/workload-observations"
+    ]
+    assert observations[-2]["workload_phase"] == "RUNNING"
+    assert observations[-1]["workload_phase"] == "STOPPED"
+    assert observations[-1]["containers"] == []
+    terminal = next(
+        payload for path, payload in sink.posts if path == "/v1/attempts/terminal"
+    )
+    assert terminal["terminal_status"] == "STOPPED"
+    assert [item["rank"] for item in terminal["allocation"]] == [0]
+
+
 def test_observation_uses_earliest_pod_start_with_creation_fallback() -> None:
     subject = controller(FakeCoreApi([]), FakeSink())
     pods = [

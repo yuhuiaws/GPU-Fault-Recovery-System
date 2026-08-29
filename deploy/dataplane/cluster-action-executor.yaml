@@ -94,21 +94,12 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |-
-              attempt=1
-              until python -m pip install --no-cache-dir --retries 3 --timeout 15 \
-                '/artifact/gpu_fault_cluster_executor-0.10.0-py3-none-any.whl[collectors]'; do
-                if [ "${attempt}" -ge 4 ]; then
-                  echo "executor dependency installation failed after ${attempt} attempts" >&2
-                  exit 1
-                fi
-                delay=$((attempt * 5))
-                echo "executor dependency installation failed; retrying in ${delay}s" >&2
-                sleep "${delay}"
-                attempt=$((attempt + 1))
-              done
               touch /tmp/executor-ready
               exec gpu-fault-cluster-executor
           env:
+            - name: PATH
+              value: >-
+                /opt/gpu-fault/executor/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: AWS_REGION
               value: REPLACE_WITH_AWS_REGION
             - name: AWS_DEFAULT_REGION
@@ -234,8 +225,8 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 120
-          # The marker file only proves pip install ran, and the previous
-          # probe only fetched the anonymous /healthz -- which answers 200
+          # The marker proves the immutable image reached process startup.
+          # The previous probe only fetched anonymous /healthz -- which answers 200
           # for a completely misconfigured executor, because it is not
           # bound to this executor's identity in any way. A wrong or
           # revoked per-cluster token, a broken trust chain, and a backlog
@@ -253,7 +244,9 @@ spec:
               command:
                 - /bin/sh
                 - -c
-                - test -f /tmp/executor-ready && gpu-fault-cluster-executor-readiness
+                - >-
+                  test -f /tmp/executor-ready
+                  && gpu-fault-cluster-executor-readiness
             periodSeconds: 15
             timeoutSeconds: 10
             failureThreshold: 4

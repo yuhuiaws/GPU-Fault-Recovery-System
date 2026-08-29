@@ -11,6 +11,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_NAMESPACE = "gpu-fault-system"
+DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 RUNTIME_PROFILE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
@@ -22,6 +23,16 @@ EKS_ARN_PATTERN = re.compile(
 
 class ReleaseError(RuntimeError):
     pass
+
+
+def canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 def _sha256(path: Path) -> str:
@@ -359,6 +370,13 @@ class ReleaseArtifacts:
     executor_protocol_version: int
     component_digests: dict[str, str]
     manifest: dict[str, Any] | None
+    manifest_schema_version: int
+    delivery_identity: dict[str, Any]
+    delivery_sha256: str
+    delivery_component_digests: dict[str, str]
+    locked_images: dict[str, str]
+    node_template_sha256: str
+    schema_rollback_compatible: bool
 
 
 def _resolved_artifact_paths(
@@ -375,6 +393,90 @@ def _require_artifact_files(paths: tuple[Path, Path, Path, Path]) -> None:
         raise ReleaseError("release component wheels and bundle must exist")
 
 
+def _parse_delivery_identity(
+    manifest: dict[str, Any],
+    components: dict[str, Any],
+) -> tuple[
+    dict[str, Any],
+    str,
+    dict[str, str],
+    dict[str, str],
+    str,
+    bool,
+]:
+    delivery = dict(manifest.get("delivery") or {})
+    delivery_sha256 = str(delivery.get("sha256") or "")
+    unsigned = dict(delivery)
+    unsigned.pop("sha256", None)
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", delivery_sha256)
+        or canonical_sha256(unsigned) != delivery_sha256
+    ):
+        raise ReleaseError("release delivery identity digest is invalid")
+    if (
+        manifest.get("deployable") is not True
+        or delivery.get("runtime_prebuilt") is not True
+    ):
+        raise ReleaseError(
+            "schema v3 release requires a prebuilt deployable runtime image"
+        )
+    raw_components = dict(delivery.get("components") or {})
+    expected_components = {
+        "collector",
+        "cpu",
+        "dcgm",
+        "endpoint",
+        "executor",
+        "node",
+        "observability",
+        "schema",
+        "watcher",
+    }
+    if set(raw_components) != expected_components:
+        raise ReleaseError("release delivery components are incomplete")
+    component_digests = {
+        name: str((raw_components[name] or {}).get("sha256") or "")
+        for name in sorted(raw_components)
+    }
+    if any(
+        not re.fullmatch(r"[0-9a-f]{64}", value) for value in component_digests.values()
+    ):
+        raise ReleaseError("release delivery component digests are invalid")
+    raw_images = dict(delivery.get("images") or {})
+    expected_images = {
+        "runtime",
+        "node_installer",
+        "dcgm_exporter",
+        "adot",
+    }
+    if set(raw_images) != expected_images:
+        raise ReleaseError("release image identity is incomplete")
+    locked_images = {
+        name: str((raw_images[name] or {}).get("reference") or "")
+        for name in sorted(raw_images)
+    }
+    if any(
+        not DIGEST_IMAGE_PATTERN.fullmatch(value) for value in locked_images.values()
+    ):
+        raise ReleaseError("release images must use immutable sha256 references")
+    node_template_sha256 = str(
+        (components.get("node_bundle") or {}).get("template_sha256")
+        or (delivery.get("node_template_inputs") or {}).get("sha256")
+        or ""
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", node_template_sha256):
+        raise ReleaseError("release node template digest is invalid")
+    database = dict(manifest.get("database") or {})
+    return (
+        delivery,
+        delivery_sha256,
+        component_digests,
+        locked_images,
+        node_template_sha256,
+        bool(database.get("rollback_compatible", False)),
+    )
+
+
 def load_release_artifacts(
     release: dict[str, Any],
     *,
@@ -382,11 +484,19 @@ def load_release_artifacts(
 ) -> ReleaseArtifacts:
     release_manifest = release.get("manifest")
     manifest: dict[str, Any] | None = None
+    manifest_schema_version = 1
+    delivery_identity: dict[str, Any] = {}
+    delivery_sha256 = ""
+    delivery_component_digests: dict[str, str] = {}
+    locked_images: dict[str, str] = {}
+    node_template_sha256 = ""
+    schema_rollback_compatible = False
     if release_manifest:
         manifest_path = Path(str(release_manifest))
         if not manifest_path.is_absolute():
             manifest_path = config_path.parent / manifest_path
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_schema_version = int(manifest.get("schema_version", 1))
         components = dict(manifest.get("components") or {})
         control_component = dict(components.get("control_plane") or {})
         executor_component = dict(components.get("executor") or {})
@@ -446,13 +556,25 @@ def load_release_artifacts(
         }
         if actual_hashes != expected_hashes:
             raise ReleaseError("release manifest hashes do not match its artifacts")
-        if int(manifest.get("schema_version", 1)) >= 2 and any(
+        if manifest_schema_version >= 2 and any(
             len(value) != 64
             or any(character not in "0123456789abcdef" for character in value)
             for value in component_digests.values()
         ):
             raise ReleaseError(
                 "release component module digests must be lowercase SHA-256"
+            )
+        if manifest_schema_version >= 3:
+            (
+                delivery_identity,
+                delivery_sha256,
+                delivery_component_digests,
+                locked_images,
+                node_template_sha256,
+                schema_rollback_compatible,
+            ) = _parse_delivery_identity(
+                manifest,
+                components,
             )
     else:
         wheel = Path(release.get("wheel", ""))
@@ -490,6 +612,13 @@ def load_release_artifacts(
         executor_protocol_version=executor_protocol_version,
         component_digests=component_digests,
         manifest=manifest,
+        manifest_schema_version=manifest_schema_version,
+        delivery_identity=delivery_identity,
+        delivery_sha256=delivery_sha256,
+        delivery_component_digests=delivery_component_digests,
+        locked_images=locked_images,
+        node_template_sha256=node_template_sha256,
+        schema_rollback_compatible=schema_rollback_compatible,
     )
 
 
@@ -510,6 +639,13 @@ class ReleaseConfig:
     agent_protocol_version: int
     executor_protocol_version: int
     component_digests: dict[str, str]
+    release_manifest_schema_version: int
+    release_delivery_identity: dict[str, Any]
+    release_delivery_sha256: str
+    delivery_component_digests: dict[str, str]
+    locked_images: dict[str, str]
+    node_template_sha256: str
+    schema_rollback_compatible: bool
     agent_config_digest: str
     runtime_profile_source: Path
     runtime_profile_template_source: Path
@@ -641,6 +777,13 @@ class ReleaseConfig:
             agent_protocol_version=artifacts.agent_protocol_version,
             executor_protocol_version=artifacts.executor_protocol_version,
             component_digests=artifacts.component_digests,
+            release_manifest_schema_version=(artifacts.manifest_schema_version),
+            release_delivery_identity=artifacts.delivery_identity,
+            release_delivery_sha256=artifacts.delivery_sha256,
+            delivery_component_digests=(artifacts.delivery_component_digests),
+            locked_images=artifacts.locked_images,
+            node_template_sha256=artifacts.node_template_sha256,
+            schema_rollback_compatible=(artifacts.schema_rollback_compatible),
             agent_config_digest=digest,
             runtime_profile_source=runtime_profile_source.resolve(),
             runtime_profile_template_source=(runtime_profile_template_source.resolve()),

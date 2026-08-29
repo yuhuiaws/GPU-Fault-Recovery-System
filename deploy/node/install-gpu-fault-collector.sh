@@ -1177,6 +1177,14 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
         write_env GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION \
             "${PROFILE_VERSION}"
         write_env GPU_FAULT_NODE_ARTIFACT_SHA256 "${WHEEL_SHA256}"
+        if [[ -n "${GPU_FAULT_INSTALLER_BUNDLE_SHA256:-}" ]]; then
+            write_env GPU_FAULT_NODE_INSTALLER_BUNDLE_SHA256 \
+                "${GPU_FAULT_INSTALLER_BUNDLE_SHA256}"
+        fi
+        if [[ -n "${GPU_FAULT_INSTALLER_TEMPLATE_SHA256:-}" ]]; then
+            write_env GPU_FAULT_NODE_INSTALLER_TEMPLATE_SHA256 \
+                "${GPU_FAULT_INSTALLER_TEMPLATE_SHA256}"
+        fi
         write_env GPU_FAULT_NODE_COMPATIBILITY_DIGEST \
             "${GPU_FAULT_NODE_COMPATIBILITY_DIGEST:-${WHEEL_SHA256}}"
         write_env GPU_FAULT_NODE_ADVERTISE_URL \

@@ -83,13 +83,11 @@ spec:
       containers:
         - name: watcher
           image: public.ecr.aws/docker/library/python:3.12-slim
-          command: ["/bin/sh", "-c"]
-          args:
-            - >-
-              python -m pip install --no-cache-dir
-              '/artifact/gpu_fault_cluster_executor-0.10.0-py3-none-any.whl[collectors]'
-              && exec gpu-fault-completion-watcher
+          command: ["gpu-fault-completion-watcher"]
           env:
+            - name: PATH
+              value: >-
+                /opt/gpu-fault/executor/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: GPU_FAULT_CONTROL_PLANE_URL
               valueFrom:
                 secretKeyRef:

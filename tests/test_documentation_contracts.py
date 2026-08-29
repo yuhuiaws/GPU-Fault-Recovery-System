@@ -430,16 +430,19 @@ def test_root_readme_separates_developer_and_admin_deployment() -> None:
 
     for value in (
         "make PYTHON=.venv/bin/python release-deploy",
+        "make PYTHON=.venv/bin/python release-build",
         "PROFILE_APPROVAL=CHG-12345",
         "profile-plan.json",
-        "deploy -> verify -> release-summary",
+        "deploy -> verify -> stability -> release-summary",
         "verification-report.json",
+        "stability-report.json",
         "SKIPPED_NOOP",
     ):
         assert value in developer
 
     for value in (
-        "--cpu-cluster-arn <cpu-eks-or-hyperpod-arn>",
+        "terraform -chdir=deploy/aws/regional-foundation apply",
+        "--allow-legacy-python-foundation",
         "gpu-fault-admin preflight",
         "gpu-fault-admin deploy -f",
         "gpu-fault-admin verify",

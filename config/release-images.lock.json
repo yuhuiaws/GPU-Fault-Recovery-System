@@ -1,0 +1,21 @@
+{
+  "images": {
+    "adot": {
+      "reference": "public.ecr.aws/aws-observability/aws-otel-collector@sha256:bb72328152c72fb9662056759b275f7cc85e115db12bbb114fbea9f68dc4816c",
+      "source": "public.ecr.aws/aws-observability/aws-otel-collector"
+    },
+    "dcgm_exporter": {
+      "reference": "nvcr.io/nvidia/k8s/dcgm-exporter@sha256:d22403c31e5f17d089f909a3d9f0e4e5114258ea063a81f9268c55d5ab663cf1",
+      "source": "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
+    },
+    "node_installer": {
+      "reference": "public.ecr.aws/amazonlinux/amazonlinux@sha256:5d271dd33b628252c31c15f5449e50d7c4e9f93badf9342f9b1e2a8d326fbe84",
+      "source": "public.ecr.aws/amazonlinux/amazonlinux:2023"
+    },
+    "runtime": {
+      "reference": "registry.access.redhat.com/ubi9/python-312-minimal@sha256:ddf83888de3388bce2fc9c3d66f917bf683790d4db9f956644a3e1b9b6fd15e7",
+      "source": "registry.access.redhat.com/ubi9/python-312-minimal:latest"
+    }
+  },
+  "schema_version": 1
+}

@@ -23,14 +23,12 @@ spec:
               cpu: "1"
               memory: 1Gi
           image: public.ecr.aws/docker/library/python:3.12-slim
-          command: ["/bin/sh", "-c"]
-          args:
-            - >-
-              python -m pip install --no-cache-dir
-              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[postgres]'
-              && exec gpu-fault-store-migrate
-              --sqlite-path /source/control-plane.db
+          command: ["gpu-fault-store-migrate"]
+          args: ["--sqlite-path", "/source/control-plane.db"]
           env:
+            - name: PATH
+              value: >-
+                /opt/gpu-fault/control-plane/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: GPU_FAULT_STORE_URL
               valueFrom:
                 secretKeyRef:

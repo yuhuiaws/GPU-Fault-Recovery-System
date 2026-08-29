@@ -26,12 +26,17 @@ from gpu_fault.admin_site import (
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.models import CapabilityMode, RuntimeProfile
 
+if __package__:
+    from scripts.release_attestation import verify_attestation
+else:
+    from release_attestation import verify_attestation
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE_ENV = "GPU_FAULT_SITE_FILE"
 PROFILE_APPROVAL_ENV = "PROFILE_APPROVAL"
-ADMIN_EMAIL_ENV = "GPU_FAULT_ADMIN_EMAIL"
 VERIFICATION_REPORT = "verification-report.json"
+STABILITY_REPORT = "stability-report.json"
 RELEASE_SUMMARY_REPORT = "release-summary.json"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -478,11 +483,12 @@ def prepare_site_release(
         raise ReleaseDeployError(
             "site repositoryRoot changed during release preparation"
         )
-    _manifest, release_id = _release_manifest(rendered.repository_root)
+    manifest, release_id = _release_manifest(rendered.repository_root)
     document = _read_site_document(site_file)
     spec = _mapping(document.get("spec"), "site spec")
     release = _mapping(spec.get("release"), "site spec.release")
     profile = _mapping(spec.get("runtimeProfile"), "site spec.runtimeProfile")
+    images = _mapping(spec.setdefault("images", {}), "site spec.images")
     if profile_plan.approval_required and not profile_plan.approval:
         raise ReleaseDeployError(
             "Runtime Profile changed; set PROFILE_APPROVAL to an approved change ID"
@@ -510,6 +516,7 @@ def prepare_site_release(
         "runtime_profile_source": profile.get("source"),
         "runtime_profile_template_source": profile.get("templateSource"),
         "runtime_profile_version": profile.get("version"),
+        "images": dict(images),
     }
     _write_profile_snapshot(profile_plan)
     release["manifest"] = "dist/current-release.json"
@@ -517,6 +524,23 @@ def prepare_site_release(
     profile["source"] = str(profile_plan.snapshot_file)
     profile["templateSource"] = profile_plan.template_reference
     profile["version"] = desired_profile
+    if int(manifest.get("schema_version", 0)) >= 3:
+        release_images = dict((manifest.get("delivery") or {}).get("images") or {})
+        image_fields = {
+            "runtime": "runtime",
+            "nodeInstaller": "node_installer",
+            "dcgmExporter": "dcgm_exporter",
+            "adot": "adot",
+        }
+        for site_field, release_field in image_fields.items():
+            reference = str(
+                (release_images.get(release_field) or {}).get("reference") or ""
+            )
+            if not reference:
+                raise ReleaseDeployError(
+                    f"release manifest has no {release_field} image"
+                )
+            images[site_field] = reference
     candidate = state_dir / "site.candidate.yaml"
     _write_yaml_atomic(candidate, document)
     load_site(candidate, repository_root=rendered.repository_root)
@@ -527,6 +551,7 @@ def prepare_site_release(
         "runtime_profile_source": profile["source"],
         "runtime_profile_template_source": profile["templateSource"],
         "runtime_profile_version": desired_profile,
+        "images": dict(images),
     }
     if changed:
         _write_yaml_atomic(site_file, document)
@@ -542,6 +567,7 @@ def prepare_site_release(
             "runtime_profile_source": profile["source"],
             "runtime_profile_template_source": profile["templateSource"],
             "runtime_profile_version": desired_profile,
+            "images": dict(images),
         },
         "profile_change": {
             "kind": profile_plan.change_kind,
@@ -646,6 +672,13 @@ def _validate_verification_report(report: dict[str, Any]) -> None:
         raise ReleaseDeployError("verification report has no check evidence")
 
 
+def _validate_stability_report(report: dict[str, Any]) -> None:
+    if report.get("mode") != "stability" or report.get("healthy") is not True:
+        raise ReleaseDeployError("release stability report is not healthy")
+    if int(report.get("window_seconds") or 0) < 120:
+        raise ReleaseDeployError("release stability report has an invalid window")
+
+
 def _collect_release_summary(
     site_file: Path,
     *,
@@ -670,6 +703,61 @@ def _collect_release_summary(
             ],
             cwd=root,
             environment=summary_environment,
+        )
+
+
+def _collect_stability_report(
+    site_file: Path,
+    *,
+    root: Path,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    site = load_site(site_file, repository_root=root)
+    stability_environment = {
+        **effective_environment(site),
+        **environment,
+        **site.environment,
+        "GPU_FAULT_REPO_ROOT": str(root),
+    }
+    rollout = root / "deploy/control-plane/regional/rollout-regional-release.sh"
+    with materialized_release_config(site) as config:
+        return _run_json(
+            [
+                str(rollout),
+                "stability",
+                "--config",
+                str(config),
+            ],
+            cwd=root,
+            environment=stability_environment,
+        )
+
+
+def _run_release_mode(
+    site_file: Path,
+    *,
+    mode: str,
+    root: Path,
+    environment: Mapping[str, str],
+) -> None:
+    site = load_site(site_file, repository_root=root)
+    rollout_environment = {
+        **effective_environment(site),
+        **environment,
+        **site.environment,
+        "GPU_FAULT_REPO_ROOT": str(root),
+    }
+    rollout = root / "deploy/control-plane/regional/rollout-regional-release.sh"
+    with materialized_release_config(site) as config:
+        _run(
+            [
+                str(rollout),
+                mode,
+                "--config",
+                str(config),
+            ],
+            cwd=root,
+            environment=rollout_environment,
         )
 
 
@@ -707,6 +795,57 @@ def _update_phase(prepared: PreparedRelease, phase: str, **values: Any) -> None:
     _write_json_atomic(state_path, state)
 
 
+def _complete_release(
+    prepared: PreparedRelease,
+    *,
+    site_file: Path,
+    root: Path,
+    environment: Mapping[str, str],
+    verification: dict[str, Any],
+    stability: dict[str, Any],
+    summary_report: dict[str, Any] | None,
+    summary_generated_at: str | None,
+) -> None:
+    completion_warnings: list[str] = []
+    try:
+        if summary_report is None:
+            summary_report = _collect_release_summary(
+                site_file,
+                root=root,
+                environment=environment,
+            )
+            summary_generated_at = _utc_now()
+        summary_path = prepared.state_dir / RELEASE_SUMMARY_REPORT
+        _write_json_atomic(summary_path, summary_report)
+        completion_warnings.extend(_release_summary_warnings(summary_report))
+        release_summary = {
+            "status": (
+                "AVAILABLE_WITH_WARNINGS" if completion_warnings else "AVAILABLE"
+            ),
+            "path": str(summary_path),
+            "sha256": _sha256(summary_path),
+            "generated_at": summary_generated_at or _utc_now(),
+            "next_deploy": summary_report.get("next_deploy"),
+        }
+    except Exception as exc:
+        warning = f"release summary unavailable: {type(exc).__name__}: {exc}"
+        completion_warnings.append(warning)
+        release_summary = {
+            "status": "UNAVAILABLE",
+            "generated_at": _utc_now(),
+            "error": warning,
+        }
+        print(f"release-deploy: warning: {warning}", file=sys.stderr)
+    _update_phase(
+        prepared,
+        "COMPLETED",
+        verification=verification,
+        stability=stability,
+        release_summary=release_summary,
+        completion_warnings=completion_warnings,
+    )
+
+
 def execute_release(
     site_file: Path,
     *,
@@ -715,6 +854,10 @@ def execute_release(
     run_checks: bool = True,
     live_state: dict[str, Any] | None = None,
 ) -> PreparedRelease:
+    if admin_email:
+        raise ReleaseDeployError(
+            "administrator email changes must be applied through IaC and site.yaml"
+        )
     root = repository_root_from_site(site_file)
     environment = {
         **os.environ,
@@ -748,8 +891,8 @@ def execute_release(
         site_file,
         profile_plan=profile_plan,
     )
+    deployment_succeeded = False
     try:
-        effective_admin_email = admin_email or os.getenv(ADMIN_EMAIL_ENV)
         deploy_command = [
             sys.executable,
             "-m",
@@ -758,14 +901,12 @@ def execute_release(
             "-f",
             str(site_file),
         ]
-        if effective_admin_email:
-            deploy_command.extend(["--admin-email", effective_admin_email])
 
         summary_report: dict[str, Any] | None = None
         summary_generated_at: str | None = None
         deployment: dict[str, Any]
         same_release = current_state.get("release_id") == prepared.release_id
-        if same_release and not effective_admin_email:
+        if same_release:
             try:
                 candidate_summary = _collect_release_summary(
                     site_file,
@@ -799,15 +940,10 @@ def execute_release(
                         "next_deploy": candidate_summary.get("next_deploy"),
                     }
         else:
-            reason = (
-                "administrator email override requires reconciliation"
-                if effective_admin_email
-                else "live release ID differs from the desired release"
-            )
             deployment = {
                 "status": "APPLIED",
                 "fast_path": False,
-                "reason": reason,
+                "reason": "live release ID differs from the desired release",
             }
 
         if not deployment["fast_path"]:
@@ -816,6 +952,7 @@ def execute_release(
                 cwd=root,
                 environment=environment,
             )
+            deployment_succeeded = True
         _update_phase(prepared, "DEPLOYED", deployment=deployment)
         verification_report = _run_json(
             [
@@ -837,50 +974,76 @@ def execute_release(
             verification_report,
         )
         _update_phase(prepared, "VERIFIED", verification=verification)
+        if deployment["fast_path"]:
+            stability = {
+                "status": "SKIPPED_NOOP",
+                "reason": "no release mutation occurred",
+            }
+        else:
+            stability_report = _collect_stability_report(
+                site_file,
+                root=root,
+                environment=environment,
+            )
+            _validate_stability_report(stability_report)
+            stability_path = prepared.state_dir / STABILITY_REPORT
+            _write_json_atomic(stability_path, stability_report)
+            stability = _verification_metadata(
+                stability_path,
+                stability_report,
+            )
+            _update_phase(
+                prepared,
+                "STABLE",
+                verification=verification,
+                stability=stability,
+            )
+        _run_release_mode(
+            site_file,
+            mode="commit",
+            root=root,
+            environment=environment,
+        )
 
-        completion_warnings: list[str] = []
-        try:
-            if summary_report is None:
-                summary_report = _collect_release_summary(
+        _complete_release(
+            prepared,
+            site_file=site_file,
+            root=root,
+            environment=environment,
+            verification=verification,
+            stability=stability,
+            summary_report=summary_report,
+            summary_generated_at=summary_generated_at,
+        )
+    except Exception as exc:
+        rollback: dict[str, Any] | None = None
+        if deployment_succeeded:
+            try:
+                _run_release_mode(
                     site_file,
+                    mode="rollback",
                     root=root,
                     environment=environment,
                 )
-                summary_generated_at = _utc_now()
-            summary_path = prepared.state_dir / RELEASE_SUMMARY_REPORT
-            _write_json_atomic(summary_path, summary_report)
-            completion_warnings.extend(_release_summary_warnings(summary_report))
-            release_summary = {
-                "status": (
-                    "AVAILABLE_WITH_WARNINGS" if completion_warnings else "AVAILABLE"
-                ),
-                "path": str(summary_path),
-                "sha256": _sha256(summary_path),
-                "generated_at": summary_generated_at or _utc_now(),
-                "next_deploy": summary_report.get("next_deploy"),
-            }
-        except Exception as exc:
-            warning = f"release summary unavailable: {type(exc).__name__}: {exc}"
-            completion_warnings.append(warning)
-            release_summary = {
-                "status": "UNAVAILABLE",
-                "generated_at": _utc_now(),
-                "error": warning,
-            }
-            print(f"release-deploy: warning: {warning}", file=sys.stderr)
-        _update_phase(
-            prepared,
-            "COMPLETED",
-            verification=verification,
-            release_summary=release_summary,
-            completion_warnings=completion_warnings,
-        )
-    except Exception as exc:
+            except Exception as rollback_exc:
+                rollback = {
+                    "status": "FAILED",
+                    "error": (f"{type(rollback_exc).__name__}: {rollback_exc}"),
+                }
+            else:
+                rollback = {"status": "PASSED"}
         _update_phase(
             prepared,
             "FAILED",
             error=f"{type(exc).__name__}: {exc}",
+            rollback=rollback,
         )
+        if rollback is not None and rollback["status"] == "FAILED":
+            raise ReleaseDeployError(
+                "release validation failed and rollback also failed: "
+                f"validation={type(exc).__name__}: {exc}; "
+                f"rollback={rollback['error']}"
+            ) from exc
         raise
     return prepared
 
@@ -898,19 +1061,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"RegionalSite YAML; defaults to {SITE_ENV}",
     )
     parser.add_argument(
-        "--admin-email",
-        help=(
-            "administrator email for SES and SNS; defaults to "
-            f"{ADMIN_EMAIL_ENV}, then the site/AWS account email"
-        ),
-    )
-    parser.add_argument(
         "--profile-approval",
         help=(
             "approved change ID for a Runtime Profile policy change; defaults to "
             f"{PROFILE_APPROVAL_ENV}"
         ),
     )
+    parser.add_argument(
+        "--prebuilt-attestation",
+        type=Path,
+        help=(
+            "verified CI attestation for a prebuilt schema v3 release; "
+            "when set, the deployment host does not rerun make check"
+        ),
+    )
+    parser.add_argument("--prebuilt-signature", type=Path)
+    parser.add_argument("--prebuilt-bundle", type=Path)
+    parser.add_argument("--prebuilt-certificate", type=Path)
+    parser.add_argument("--cosign-key")
+    parser.add_argument("--certificate-identity")
+    parser.add_argument("--certificate-oidc-issuer")
     return parser
 
 
@@ -918,10 +1088,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
         site_file = resolve_site_file(arguments.site, os.environ)
+        if arguments.prebuilt_attestation is None:
+            raise ReleaseDeployError(
+                "release-deploy requires a signed prebuilt attestation"
+            )
+        attestation = verify_attestation(
+            ROOT,
+            arguments.prebuilt_attestation.resolve(),
+            signature=(
+                arguments.prebuilt_signature.resolve()
+                if arguments.prebuilt_signature is not None
+                else None
+            ),
+            bundle=(
+                arguments.prebuilt_bundle.resolve()
+                if arguments.prebuilt_bundle is not None
+                else None
+            ),
+            cosign_key=arguments.cosign_key,
+            certificate=(
+                arguments.prebuilt_certificate.resolve()
+                if arguments.prebuilt_certificate is not None
+                else None
+            ),
+            certificate_identity=arguments.certificate_identity,
+            certificate_oidc_issuer=(arguments.certificate_oidc_issuer),
+        )
+        _manifest, current_release_id = _release_manifest(ROOT)
+        subject = dict(attestation.get("subject") or {})
+        current_manifest = ROOT / "dist/current-release.json"
+        if subject.get("release_id") != current_release_id or subject.get(
+            "manifest_sha256"
+        ) != _sha256(current_manifest):
+            raise ReleaseDeployError(
+                "verified attestation does not bind dist/current-release.json"
+            )
         prepared = execute_release(
             site_file,
             profile_approval=arguments.profile_approval,
-            admin_email=arguments.admin_email,
+            run_checks=False,
         )
     except (OSError, ReleaseDeployError, subprocess.SubprocessError, ValueError) as exc:
         print(f"release-deploy: {exc}", file=sys.stderr)
@@ -941,6 +1146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "phase": state.get("phase"),
                 "deployment": state.get("deployment"),
                 "verification": state.get("verification"),
+                "stability": state.get("stability"),
                 "release_summary": state.get("release_summary"),
                 "completion_warnings": state.get("completion_warnings", []),
             },

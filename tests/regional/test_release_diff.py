@@ -24,6 +24,12 @@ def _release() -> SimpleNamespace:
         dcgm_digest="1" * 64,
         notification_digest="3" * 64,
         cluster_registry_digest="6" * 64,
+        rendered_manifest_digest="7" * 64,
+        node_template_sha="8" * 64,
+        runtime_image="runtime@sha256:" + "1" * 64,
+        node_installer_image="installer@sha256:" + "2" * 64,
+        dcgm_exporter_image="dcgm@sha256:" + "3" * 64,
+        adot_image="adot@sha256:" + "4" * 64,
         config=SimpleNamespace(
             database_schema_version=6,
             agent_protocol_version=3,
@@ -34,6 +40,18 @@ def _release() -> SimpleNamespace:
                 "control_plane": "a" * 64,
                 "executor": "b" * 64,
                 "node_runtime": "c" * 64,
+            },
+            release_delivery_sha256="9" * 64,
+            delivery_component_digests={
+                "cpu": "a" * 64,
+                "dcgm": "b" * 64,
+                "endpoint": "c" * 64,
+                "executor": "d" * 64,
+                "watcher": "1" * 64,
+                "collector": "2" * 64,
+                "node": "e" * 64,
+                "observability": "f" * 64,
+                "schema": "0" * 64,
             },
             clusters=[SimpleNamespace(cluster_id="gpu-a")],
         ),
@@ -60,6 +78,32 @@ def _state() -> dict:
         "notification_digest": release.notification_digest,
         "cluster_registry_digest": release.cluster_registry_digest,
         "cluster_ids": ["gpu-a"],
+        "release_delivery_sha256": release.config.release_delivery_sha256,
+        "cpu_manifest_sha256": release.config.delivery_component_digests["cpu"],
+        "dcgm_manifest_sha256": release.config.delivery_component_digests["dcgm"],
+        "endpoint_manifest_sha256": (
+            release.config.delivery_component_digests["endpoint"]
+        ),
+        "executor_manifest_sha256": (
+            release.config.delivery_component_digests["executor"]
+        ),
+        "watcher_manifest_sha256": (
+            release.config.delivery_component_digests["watcher"]
+        ),
+        "collector_manifest_sha256": (
+            release.config.delivery_component_digests["collector"]
+        ),
+        "node_manifest_sha256": release.config.delivery_component_digests["node"],
+        "observability_manifest_sha256": (
+            release.config.delivery_component_digests["observability"]
+        ),
+        "schema_manifest_sha256": (release.config.delivery_component_digests["schema"]),
+        "rendered_manifest_sha256": release.rendered_manifest_digest,
+        "node_template_sha256": release.node_template_sha,
+        "runtime_image": release.runtime_image,
+        "node_installer_image": release.node_installer_image,
+        "dcgm_image": release.dcgm_exporter_image,
+        "adot_image": release.adot_image,
     }
 
 
@@ -137,6 +181,86 @@ def test_profile_policy_change_remains_full() -> None:
 
     assert diff.kind is DIFF.ReleaseChangeKind.FULL
     assert "runtime_profile" in diff.changed
+
+
+def test_delivery_component_changes_drive_component_scope() -> None:
+    release = _release()
+
+    state = _state()
+    state["cpu_manifest_sha256"] = "1" * 64
+    diff = DIFF.classify_release(release, state)
+    assert diff.kind is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
+    assert "cpu_manifests" in diff.changed
+
+    state = _state()
+    state["node_template_sha256"] = "2" * 64
+    diff = DIFF.classify_release(release, state)
+    assert diff.kind is DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE
+    assert "node_template" in diff.changed
+
+    state = _state()
+    state["schema_manifest_sha256"] = "3" * 64
+    diff = DIFF.classify_release(release, state)
+    assert diff.kind is DIFF.ReleaseChangeKind.FULL
+    assert "schema_manifests" in diff.changed
+
+    state = _state()
+    state["watcher_manifest_sha256"] = "4" * 64
+    diff = DIFF.classify_release(release, state)
+    assert diff.kind is DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE
+    assert diff.changed == {"watcher_manifests"}
+
+    state = _state()
+    state["collector_manifest_sha256"] = "5" * 64
+    diff = DIFF.classify_release(release, state)
+    assert diff.kind is DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE
+    assert diff.changed == {"collector_manifests"}
+
+
+def test_execution_plan_selects_only_changed_component_dependencies() -> None:
+    endpoint = DIFF.build_execution_plan(
+        DIFF.ReleaseDiff(
+            kind=DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+            changed=frozenset({"endpoint", "endpoint_manifests"}),
+        )
+    )
+    assert endpoint.nodes == (
+        DIFF.ReleaseComponent.ENDPOINT,
+        DIFF.ReleaseComponent.VERIFY,
+    )
+
+    node = DIFF.build_execution_plan(
+        DIFF.ReleaseDiff(
+            kind=DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+            changed=frozenset({"node_bundle", "node_template"}),
+        )
+    )
+    assert node.has(
+        DIFF.ReleaseComponent.REGISTRY,
+        DIFF.ReleaseComponent.CPU_STAGE,
+        DIFF.ReleaseComponent.RECONCILER,
+        DIFF.ReleaseComponent.AGENT,
+        DIFF.ReleaseComponent.CPU_FINALIZE,
+        DIFF.ReleaseComponent.VERIFY,
+    ), "node identity changes did not select the required DAG dependencies"
+    assert not node.has(
+        DIFF.ReleaseComponent.ENDPOINT,
+        DIFF.ReleaseComponent.DCGM,
+        DIFF.ReleaseComponent.EXECUTOR,
+        DIFF.ReleaseComponent.WATCHER,
+        DIFF.ReleaseComponent.COLLECTOR,
+    ), "node-only change unnecessarily selected unrelated GPU components"
+
+    watcher = DIFF.build_execution_plan(
+        DIFF.ReleaseDiff(
+            kind=DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+            changed=frozenset({"watcher_manifests"}),
+        )
+    )
+    assert watcher.nodes == (
+        DIFF.ReleaseComponent.WATCHER,
+        DIFF.ReleaseComponent.VERIFY,
+    )
 
 
 def test_component_dependency_closures_are_runtime_specific() -> None:

@@ -1,0 +1,104 @@
+schema_version: 1
+schema_rollback_compatible: false
+dependency_lock: uv.lock
+images_lock: config/release-images.lock.json
+manifest_inputs:
+  - .dockerignore
+  - deploy/image/Dockerfile
+  - deploy/aws/regional-foundation/*.tf
+  - deploy/aws/regional-foundation/.terraform.lock.hcl
+  - requirements/build.in
+  - requirements/build.lock
+  - requirements/runtime.lock
+  - deploy/control-plane/base/control-plane-deployment.yaml
+  - deploy/control-plane/base/role-split-input.kustomization.yaml
+  - deploy/control-plane/regional/aurora-credential-refresh.yaml
+  - deploy/control-plane/regional/control-plane-sysctl.yaml
+  - deploy/control-plane/regional/processor-alerts.yaml
+  - deploy/control-plane/regional/regional-control-plane-nlb.yaml
+  - deploy/control-plane/regional/regional-control-plane-patch.yaml
+  - deploy/control-plane/regional/regional-control-plane-prerequisites.yaml
+  - deploy/dataplane/cluster-action-executor.yaml
+  - deploy/dataplane/completion-watcher.yaml
+  - deploy/dataplane/dcgm-counters.csv
+  - deploy/dataplane/hyperpod-dcgm-exporter.yaml
+  - deploy/dataplane/kubernetes-node-resource-collector.yaml
+  - deploy/dataplane/node-installer-reconciler.yaml
+  - deploy/migrations/*.yaml
+  - deploy/observability/adot-control-plane.yaml
+  - deploy/observability/amp-alertmanager.yaml
+  - deploy/observability/amp-rules.yaml
+renderer_inputs:
+  - deploy/image/Dockerfile
+  - deploy/control-plane/regional/regional_release_*.py
+  - deploy/control-plane/tools/apply-control-plane-role-split.sh
+  - deploy/control-plane/tools/render-control-plane-role-split.sh
+  - deploy/control-plane/tools/render_control_plane_role_split.py
+  - deploy/control-plane/regional/regional_dns.py
+  - deploy/control-plane/regional/regional_gpu_bootstrap.py
+  - deploy/control-plane/regional/regional_release_rendering.py
+  - deploy/control-plane/regional/rollout_regional_release.py
+  - deploy/node/deploy-node-installer-reconciler.sh
+  - scripts/build-release-artifacts.py
+  - scripts/component_wheels.py
+rendered_manifest_inputs:
+  - deploy/control-plane/regional/generated/*.yaml
+  - deploy/control-plane/regional/generated/manifest-list.txt
+runtime_image_inputs:
+  - pyproject.toml
+  - README.md
+  - LICENSE
+  - deploy/image/Dockerfile
+  - requirements/build.lock
+  - requirements/runtime.lock
+  - scripts/build-release-runtime-image.py
+  - scripts/component_wheels.py
+  - scripts/release_image.py
+  - src/**/*.py
+  - src/**/*.json
+  - src/**/*.yaml
+node_template_inputs:
+  - deploy/control-plane/regional/cleanup-inventory.json
+  - deploy/control-plane/tools/sync_installed_resource_registry.py
+  - deploy/dataplane/dcgm-counters.csv
+  - deploy/node/*.sh
+  - deploy/systemd/*.service
+  - deploy/systemd/*.timer
+component_inputs:
+  cpu:
+    - deploy/control-plane/base/control-plane-deployment.yaml
+    - deploy/control-plane/base/role-split-input.kustomization.yaml
+    - deploy/control-plane/regional/regional-control-plane-patch.yaml
+    - deploy/control-plane/regional/regional-control-plane-prerequisites.yaml
+    - deploy/control-plane/tools/apply-control-plane-role-split.sh
+    - deploy/control-plane/tools/render-control-plane-role-split.sh
+    - deploy/control-plane/tools/render_control_plane_role_split.py
+  dcgm:
+    - deploy/dataplane/dcgm-counters.csv
+    - deploy/dataplane/hyperpod-dcgm-exporter.yaml
+    - deploy/control-plane/regional/regional_gpu_bootstrap.py
+  endpoint:
+    - deploy/control-plane/regional/regional-control-plane-nlb.yaml
+    - deploy/control-plane/regional/regional_dns.py
+  executor:
+    - deploy/dataplane/cluster-action-executor.yaml
+    - deploy/control-plane/regional/regional_release_rendering.py
+  watcher:
+    - deploy/dataplane/completion-watcher.yaml
+    - deploy/control-plane/regional/regional_release_rendering.py
+  collector:
+    - deploy/dataplane/kubernetes-node-resource-collector.yaml
+    - deploy/control-plane/regional/regional_release_rendering.py
+  node:
+    - deploy/control-plane/regional/cleanup-inventory.json
+    - deploy/control-plane/tools/sync_installed_resource_registry.py
+    - deploy/dataplane/node-installer-reconciler.yaml
+    - deploy/node/*.sh
+    - deploy/systemd/*.service
+    - deploy/systemd/*.timer
+  observability:
+    - deploy/observability/adot-control-plane.yaml
+    - deploy/observability/amp-alertmanager.yaml
+    - deploy/observability/amp-rules.yaml
+  schema:
+    - deploy/migrations/*.yaml

@@ -113,10 +113,27 @@ def test_regional_node_keys_are_derived_before_the_job() -> None:
     assert 'GPU_FAULT_RUNTIME_PROFILE="${RUNTIME_PROFILE}"' in reconciler
     assert 'TEMPLATE_SHA256="$(sha256sum "${MANIFEST}"' in reconciler
     assert "gpu-fault-node-installer-template-${TEMPLATE_SHA256:0:12}" in reconciler
+    assert (
+        'GPU_FAULT_INSTALLER_TEMPLATE_SHA256="${TEMPLATE_SOURCE_SHA256}"' in reconciler
+    )
+    assert "GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP" in reconciler
+    assert 'if [[ -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]' in reconciler
+    assert (
+        "REPLACE_WITH_INSTALLER_TEMPLATE_SHA256#${TEMPLATE_SOURCE_SHA256}" in reconciler
+    )
+    assert 'INSTALLER_TEMPLATE_SHA256="$(' in installer
+    assert "invalid GPU_FAULT_INSTALLER_TEMPLATE_SHA256" in installer
+    assert 'INSTALLER_TEMPLATE_SHA256="$(sha256sum "${MANIFEST}"' not in installer
     manifest = (ROOT / "deploy/dataplane/node-installer-reconciler.yaml").read_text()
     assert "GPU_FAULT_INSTALLER_TEMPLATE_PATH" in manifest
     assert "REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP" in manifest
     assert "REPLACE_WITH_HYPERPOD_CLUSTER" in manifest
+    for placeholder in (
+        "REPLACE_WITH_INSTALLER_MAX_UNAVAILABLE",
+        "REPLACE_WITH_INSTALLER_ACTIVE_DEADLINE_SECONDS",
+        "REPLACE_WITH_INSTALLER_ALLOWED_NODES",
+    ):
+        assert f'value: "{placeholder}"' in manifest
     assert 'NODE_ACTION_SECRET_NAME="${NODE_ACTION_KEYS_SECRET}"' in installer
     assert 'NODE_ACTION_SECRET_KEY="${NODE_NAME}"' in installer
     assert 'DERIVE_NODE_ACTION_SECRET="false"' in installer

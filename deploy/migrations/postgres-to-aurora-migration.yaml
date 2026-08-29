@@ -21,11 +21,12 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - >-
-              python -m pip install --no-cache-dir
-              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[postgres]'
-              && exec gpu-fault-store-migrate
+              exec gpu-fault-store-migrate
               --source-postgres-url "$SOURCE_POSTGRES_URL"
           env:
+            - name: PATH
+              value: >-
+                /opt/gpu-fault/control-plane/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: SOURCE_POSTGRES_URL
               valueFrom:
                 secretKeyRef:

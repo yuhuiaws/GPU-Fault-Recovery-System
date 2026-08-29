@@ -19,6 +19,7 @@ import json
 import sys
 
 ACCOUNT = "000000000000"
+TEST_AGENT_ENDPOINT_CIDR = "192.0.2.0/24"
 
 
 def main() -> None:
@@ -32,6 +33,8 @@ def main() -> None:
         "eks_cluster_arn": f"arn:aws:eks:us-west-2:{ACCOUNT}:cluster/guardprobe-fake",
         "token": "g" * n,
         "allowed_namespaces": ["default"],
+        # RFC 5737 TEST-NET-1 cannot overlap a real VPC or node subnet.
+        "agent_endpoint_allowed_cidrs": [TEST_AGENT_ENDPOINT_CIDR],
     }
     if len(sys.argv) > 2 and sys.argv[2] == "disabled":
         entry["enabled"] = False

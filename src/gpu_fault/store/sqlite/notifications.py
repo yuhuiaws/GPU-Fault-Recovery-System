@@ -77,6 +77,23 @@ class SqliteNotificationMixin:
             key=lambda item: item.created_at,
         )
 
+    def notification_status_counts(self) -> dict[NotificationStatus, int]:
+        with self._lock:
+            notification_ids = {
+                item.notification_id for item in self._list("notification")
+            }
+            results = {
+                item.notification_id: item
+                for item in self._list("notification_result")
+                if item.notification_id in notification_ids
+            }
+        counts = {status: 0 for status in NotificationStatus}
+        for notification_id in notification_ids:
+            result = results.get(notification_id)
+            status = result.status if result is not None else NotificationStatus.QUEUED
+            counts[status] += 1
+        return counts
+
     def save_notification_result(self, result: NotificationResult) -> None:
         with self._lock:
             self._put(

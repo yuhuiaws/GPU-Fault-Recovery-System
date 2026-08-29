@@ -12,6 +12,11 @@ from uuid import uuid4
 
 import pytest
 
+from gpu_fault.models import (
+    AdvisoryNotification,
+    NotificationResult,
+    NotificationStatus,
+)
 from gpu_fault.policy import GpuFaultPolicyEngine, SxidClassification, SxidEvent
 from gpu_fault.schema_migrations import POSTGRES_SCHEMA_MIGRATIONS
 from gpu_fault.store import InMemoryStore, PostgresStore, SqliteStore
@@ -540,6 +545,46 @@ def test_processor_queue_contract(processor_store) -> None:
         response_body_base64="e30=",
     )
     assert processor_store.processor_queue_stats()["depth"] == 0
+
+
+def test_notification_status_counts_contract(processor_store) -> None:
+    before = processor_store.notification_status_counts()
+    assert set(before) == set(NotificationStatus)
+    suffix = uuid4().hex
+    notifications = []
+    for index in range(3):
+        notifications.append(
+            processor_store.save_notification_if_absent(
+                AdvisoryNotification(
+                    notification_id=f"notification-status-{suffix}-{index}",
+                    deduplication_key=f"notification-status-{suffix}-{index}",
+                    cluster_name="cluster-a",
+                    incident_id=f"incident-status-{suffix}",
+                    subject="subject",
+                    body_text="body",
+                    support_case_draft="body",
+                )
+            )
+        )
+    processor_store.save_notification_result(
+        NotificationResult(
+            notification_id=notifications[0].notification_id,
+            status=NotificationStatus.SENT,
+        )
+    )
+    processor_store.save_notification_result(
+        NotificationResult(
+            notification_id=notifications[1].notification_id,
+            status=NotificationStatus.FAILED,
+        )
+    )
+
+    after = processor_store.notification_status_counts()
+
+    assert set(after) == set(NotificationStatus)
+    assert after[NotificationStatus.SENT] == before[NotificationStatus.SENT] + 1
+    assert after[NotificationStatus.FAILED] == before[NotificationStatus.FAILED] + 1
+    assert after[NotificationStatus.QUEUED] == before[NotificationStatus.QUEUED] + 1
 
 
 def test_policy_decision_upsert_contract(processor_store) -> None:

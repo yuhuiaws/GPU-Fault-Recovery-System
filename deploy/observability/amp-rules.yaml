@@ -166,12 +166,25 @@ groups:
   - name: gpu-fault-orchestration-invariants
     rules:
       - alert: GpuFaultExclusiveNodeOwnershipInvariantViolation
-        expr: increase(gpu_fault_ambiguous_attempt_ownership_total[15m]) > 0
+        expr: gpu_fault_ambiguous_attempt_ownership_current > 1
         labels:
           severity: critical
         annotations:
-          summary: Multiple active attempts claim the same GPU node
+          summary: Multiple fresh active attempts claim the same GPU node
           description: >-
-            Recovery failed closed because workload ownership was
-            ambiguous. Remove the overlapping assignment or stale
-            observation before retrying node mutation.
+            Recovery is currently fail-closed for cluster
+            {{ $labels.cluster_id }} GPU node {{ $labels.gpu_node }} because
+            {{ $value }} fresh attempts claim it. Stale observations are
+            excluded from ownership and alerted separately.
+      - alert: GpuFaultStaleAttemptObservation
+        expr: gpu_fault_stale_attempt_observations > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Stale active attempt observations remain
+          description: >-
+            Cluster {{ $labels.cluster_id }} GPU node
+            {{ $labels.gpu_node }} retains {{ $value }} active-phase
+            observations older than the ownership freshness window. They are
+            not eligible for node mutation ownership and should be
+            terminalized or cleaned.

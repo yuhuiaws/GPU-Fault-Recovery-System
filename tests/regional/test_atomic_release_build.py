@@ -55,3 +55,25 @@ def test_release_builder_never_deletes_published_dist() -> None:
 
     assert "shutil.rmtree(DIST" not in source
     assert 'os.replace(staged_current, DIST / "current-release.json")' in source
+
+
+def test_runtime_component_identity_must_match_release_artifacts() -> None:
+    descriptor = {
+        "components": {
+            "control_plane": {"wheel_sha256": "a" * 64, "module_digest": "b" * 64},
+            "executor": {"wheel_sha256": "c" * 64, "module_digest": "d" * 64},
+        }
+    }
+    BUILD.validate_runtime_components(
+        descriptor,
+        hashes={"control_plane": "a" * 64, "executor": "c" * 64},
+        module_digests={"control_plane": "b" * 64, "executor": "d" * 64},
+    )
+
+    descriptor["components"]["executor"]["module_digest"] = "e" * 64
+    with pytest.raises(RuntimeError, match="executor module digest"):
+        BUILD.validate_runtime_components(
+            descriptor,
+            hashes={"control_plane": "a" * 64, "executor": "c" * 64},
+            module_digests={"control_plane": "b" * 64, "executor": "d" * 64},
+        )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -28,11 +29,19 @@ class FakeKubectl:
         self.present = present
         self.existing = existing
         self.applied: dict | None = None
+        self.calls: list[list[str]] = []
 
     def run(
         self, arguments: list[str], *, input_text: str | None = None, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
-        if arguments[0:4] == ["-n", "gpu-fault-system", "get", "configmap"]:
+        self.calls.append(arguments)
+        if arguments[0:5] == [
+            "-n",
+            "gpu-fault-system",
+            "get",
+            "configmap",
+            MODULE.REGISTRY_NAME,
+        ]:
             if self.existing is None:
                 return subprocess.CompletedProcess(
                     arguments, 1, "", "Error from server (NotFound)"
@@ -44,13 +53,13 @@ class FakeKubectl:
             return subprocess.CompletedProcess(arguments, 0, "", "")
         offset = 2 if arguments[0] == "-n" else 0
         kind = arguments[offset + 1]
-        name = arguments[offset + 2]
-        exists = (kind, name) in self.present
+        items = [
+            {"metadata": {"name": name}}
+            for present_kind, name in sorted(self.present)
+            if present_kind == kind
+        ]
         return subprocess.CompletedProcess(
-            arguments,
-            0 if exists else 1,
-            f"{kind}/{name}\n" if exists else "",
-            "" if exists else "Error from server (NotFound)",
+            arguments, 0, json.dumps({"items": items}), ""
         )
 
 
@@ -140,6 +149,15 @@ def test_first_sync_writes_only_resources_that_exist(tmp_path: Path) -> None:
     stored = json.loads(kubectl.applied["data"]["inventory.json"])
     assert stored["release_id"] == "release-a"
     assert stored["resources"] == document["resources"]
+    discovery = [
+        call
+        for call in kubectl.calls
+        if "get" in call and MODULE.REGISTRY_NAME not in call
+    ]
+    assert [call[call.index("get") + 1] for call in discovery] == [
+        "deployment",
+        "daemonset",
+    ]
 
 
 def test_sync_retains_live_legacy_resource_until_deleted(tmp_path: Path) -> None:
@@ -169,6 +187,101 @@ def test_sync_retains_live_legacy_resource_until_deleted(tmp_path: Path) -> None
         ("deployment", "gpu-fault-api"),
         ("deployment", "gpu-fault-legacy"),
     }
+    assert sum(call.count("deployment") for call in kubectl.calls) == 1
+
+
+def test_kubectl_reuses_one_exec_credential() -> None:
+    calls: list[list[str]] = []
+    session_files: list[Path] = []
+
+    def runner(arguments: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(arguments)
+        if "config" in arguments and "view" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                json.dumps(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Config",
+                        "current-context": "gpu",
+                        "clusters": [
+                            {
+                                "name": "gpu",
+                                "cluster": {
+                                    "server": "https://example.invalid",
+                                    "certificate-authority-data": "Y2E=",
+                                },
+                            }
+                        ],
+                        "contexts": [
+                            {
+                                "name": "gpu",
+                                "context": {"cluster": "gpu", "user": "gpu"},
+                            }
+                        ],
+                        "users": [
+                            {
+                                "name": "gpu",
+                                "user": {
+                                    "exec": {
+                                        "command": "aws",
+                                        "args": ["eks", "get-token"],
+                                        "env": [
+                                            {"name": "AWS_REGION", "value": "test"}
+                                        ],
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                ),
+                "",
+            )
+        if arguments[:2] == ["aws", "eks"]:
+            return subprocess.CompletedProcess(
+                arguments, 0, json.dumps({"status": {"token": "private-token"}}), ""
+            )
+        path = Path(arguments[arguments.index("--kubeconfig") + 1])
+        session_files.append(path)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        assert document["users"][0]["user"] == {"token": "private-token"}
+        assert path.stat().st_mode & 0o777 == 0o600
+        return subprocess.CompletedProcess(arguments, 0, json.dumps({"items": []}), "")
+
+    kubectl = MODULE.Kubectl(
+        kubeconfig=None, context="gpu", reuse_exec_credential=True, runner=runner
+    )
+
+    kubectl.run(["get", "nodes", "-o", "json"])
+    kubectl.run(["get", "deployments", "-o", "json"])
+
+    assert sum(call[:2] == ["aws", "eks"] for call in calls) == 1
+    assert len(session_files) == 2
+    assert all("private-token" not in " ".join(call) for call in calls), (
+        "reused exec credential leaked into a subprocess argument"
+    )
+    assert os.environ.get("AWS_REGION") != "test"
+
+
+def test_kubectl_falls_back_when_config_view_is_not_json() -> None:
+    calls: list[list[str]] = []
+
+    def runner(arguments: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    kubectl = MODULE.Kubectl(
+        kubeconfig="/secure/test.kubeconfig",
+        context=None,
+        reuse_exec_credential=True,
+        runner=runner,
+    )
+    kubectl.run(["get", "nodes", "-o", "json"])
+
+    assert calls[-1][:3] == ["kubectl", "--kubeconfig", "/secure/test.kubeconfig"]
 
 
 def test_deployment_entrypoints_refresh_runtime_registry() -> None:

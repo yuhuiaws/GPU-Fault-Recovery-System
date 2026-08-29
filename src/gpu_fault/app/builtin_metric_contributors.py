@@ -85,14 +85,38 @@ def orchestration_metric_lines(
     runtime: AppRuntime,
 ) -> list[str]:
     evidence = runtime.context.orchestrator._evidence_operations
-    return [
+    snapshot = evidence.ownership_metric_snapshot()
+    lines = [
         "# HELP gpu_fault_ambiguous_attempt_ownership_total "
         "Events rejected because more than one active attempt owned "
         "the target node.",
         "# TYPE gpu_fault_ambiguous_attempt_ownership_total counter",
         "gpu_fault_ambiguous_attempt_ownership_total "
         f"{evidence.ambiguous_attempt_ownership_total()}",
+        "# HELP gpu_fault_ambiguous_attempt_ownership_current "
+        "Fresh active attempts currently claiming one GPU node.",
+        "# TYPE gpu_fault_ambiguous_attempt_ownership_current gauge",
     ]
+    for (cluster_id, node_id), count in snapshot["current"].items():
+        lines.append(
+            "gpu_fault_ambiguous_attempt_ownership_current"
+            f'{{cluster_id="{_escape_label(cluster_id)}",'
+            f'gpu_node="{_escape_label(node_id)}"}} {count}'
+        )
+    lines.extend(
+        [
+            "# HELP gpu_fault_stale_attempt_observations "
+            "Stale active attempt observations retained for one GPU node.",
+            "# TYPE gpu_fault_stale_attempt_observations gauge",
+        ]
+    )
+    for (cluster_id, node_id), count in snapshot["stale"].items():
+        lines.append(
+            "gpu_fault_stale_attempt_observations"
+            f'{{cluster_id="{_escape_label(cluster_id)}",'
+            f'gpu_node="{_escape_label(node_id)}"}} {count}'
+        )
+    return lines
 
 
 def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
@@ -232,15 +256,10 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         ]
     )
 
-    notifications = store.list_notifications()
-    notification_statuses: Counter[str] = Counter()
-    for notification in notifications:
-        result = store.get_notification_result(notification.notification_id)
-        notification_statuses[
-            result.status.value
-            if result is not None
-            else NotificationStatus.QUEUED.value
-        ] += 1
+    notification_statuses = {
+        status.value: count
+        for status, count in store.notification_status_counts().items()
+    }
     lines.extend(
         [
             "# HELP gpu_fault_notification_total Persisted business notifications by delivery result.",

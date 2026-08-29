@@ -32,6 +32,15 @@ def _release_summary(
     }
 
 
+def _stability_report() -> dict[str, object]:
+    return {
+        "mode": "stability",
+        "healthy": True,
+        "window_seconds": 120,
+        "sample_count": 5,
+    }
+
+
 def _site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "repo"
     rollout = root / "deploy/control-plane/regional/rollout-regional-release.sh"
@@ -222,7 +231,8 @@ def test_execute_release_uses_verified_noop_fast_path(
     assert calls[0][1][-1] == "check"
     assert calls[1][1][1] == "release-summary"
     assert calls[2][1][3] == "verify"
-    assert len(calls) == 3
+    assert calls[3][1][1] == "commit"
+    assert len(calls) == 4
     assert all("deploy" not in command for _kind, command in calls), (
         "verified NOOP release still invoked the deploy command"
     )
@@ -239,6 +249,7 @@ def test_execute_release_uses_verified_noop_fast_path(
     assert state["deployment"]["status"] == "SKIPPED_NOOP"
     assert state["deployment"]["fast_path"] is True
     assert state["verification"]["status"] == "PASSED"
+    assert state["stability"]["status"] == "SKIPPED_NOOP"
     assert state["release_summary"]["status"] == "AVAILABLE"
     assert state["completion_warnings"] == []
 
@@ -263,7 +274,11 @@ def test_execute_release_falls_back_to_deploy_for_non_noop_change(
     def run_json(arguments, **_kwargs):
         command = list(arguments)
         calls.append(("json", command))
-        return _verification_report() if "verify" in command else next(summaries)
+        if "verify" in command:
+            return _verification_report()
+        if "stability" in command:
+            return _stability_report()
+        return next(summaries)
 
     monkeypatch.setattr(release_deploy, "_run_json", run_json)
     profile = tmp_path / "repo/config/profile.yaml"
@@ -280,45 +295,26 @@ def test_execute_release_falls_back_to_deploy_for_non_noop_change(
     assert calls[0][1][1] == "release-summary"
     assert calls[1][1][3] == "deploy"
     assert calls[2][1][3] == "verify"
-    assert calls[3][1][1] == "release-summary"
+    assert calls[3][1][1] == "stability"
+    assert calls[4][0] == "run"
+    assert calls[4][1][1] == "commit"
+    assert calls[5][1][1] == "release-summary"
     state = json.loads((prepared.state_dir / "state.json").read_text())
     assert state["deployment"]["status"] == "APPLIED"
     assert state["deployment"]["fast_path"] is False
+    assert state["stability"]["status"] == "PASSED"
     assert state["release_summary"]["next_deploy"]["kind"] == "NOOP"
 
 
-def test_execute_release_passes_admin_email_to_deploy(
+def test_execute_release_rejects_out_of_band_admin_email_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     site = _site(tmp_path, monkeypatch)
-    calls: list[list[str]] = []
-    monkeypatch.setattr(
-        release_deploy,
-        "_run",
-        lambda arguments, **_kwargs: calls.append(list(arguments)),
-    )
-    monkeypatch.setattr(
-        release_deploy,
-        "_run_json",
-        lambda arguments, **_kwargs: (
-            _verification_report() if "verify" in arguments else _release_summary()
-        ),
-    )
-    profile = tmp_path / "repo/config/profile.yaml"
 
-    release_deploy.execute_release(
-        site,
-        admin_email="ops@example.com",
-        run_checks=False,
-        live_state={
-            "release_id": "release-a",
-            "runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
-        },
-    )
-
-    deploy = calls[0]
-    assert deploy[3] == "deploy"
-    assert deploy[-2:] == ["--admin-email", "ops@example.com"]
+    with pytest.raises(release_deploy.ReleaseDeployError, match="IaC and site.yaml"):
+        release_deploy.execute_release(
+            site, admin_email="ops@example.com", run_checks=False, live_state={}
+        )
 
 
 def test_execute_release_records_failure(
@@ -351,6 +347,50 @@ def test_execute_release_records_failure(
     state = json.loads(state_path.read_text())
     assert state["phase"] == "FAILED"
     assert "verify failed" in state["error"]
+    assert state["rollback"]["status"] == "PASSED"
+
+
+def test_execute_release_rolls_back_after_stability_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    commands = []
+    summaries = iter((_release_summary("CONTROL_PLANE_ONLY", ["control_plane_wheel"]),))
+    monkeypatch.setattr(
+        release_deploy,
+        "_run",
+        lambda arguments, **_kwargs: commands.append(list(arguments)),
+    )
+
+    def run_json(arguments, **_kwargs):
+        if "verify" in arguments:
+            return _verification_report()
+        if "stability" in arguments:
+            return {"mode": "stability", "healthy": False, "window_seconds": 120}
+        return next(summaries)
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    with pytest.raises(release_deploy.ReleaseDeployError, match="stability report"):
+        release_deploy.execute_release(
+            site,
+            run_checks=False,
+            live_state={
+                "release_id": "release-a",
+                "runtime_profile_sha256": hashlib.sha256(
+                    profile.read_bytes()
+                ).hexdigest(),
+            },
+        )
+
+    assert any(command[1] == "rollback" for command in commands), (
+        "stability failure did not invoke the low-level rollback"
+    )
+    state = json.loads(
+        (site.parent / "release-deploy/release-a/state.json").read_text()
+    )
+    assert state["rollback"]["status"] == "PASSED"
 
 
 def test_release_summary_failure_does_not_fail_verified_deployment(
@@ -362,6 +402,8 @@ def test_release_summary_failure_does_not_fail_verified_deployment(
     def run_json(arguments, **_kwargs):
         if "verify" in arguments:
             return _verification_report()
+        if "stability" in arguments:
+            return _stability_report()
         raise release_deploy.ReleaseDeployError("summary endpoint unavailable")
 
     monkeypatch.setattr(release_deploy, "_run_json", run_json)

@@ -1,0 +1,594 @@
+version: 1
+max_domains_before_full: 3
+safe_regional_risks:
+  - non-destructive
+  - read-only-signal-replay
+full:
+  checks:
+    - check
+  postgres_command:
+    - make
+    - test-postgres-stress
+
+rules:
+  - id: impact-matrix
+    description: Test selection policy and its machine implementation.
+    paths:
+      - testcases/change-impact.yaml
+      - scripts/select-affected-tests.py
+      - tests/test_change_impact.py
+      - docs/变更影响与测试选择.md
+    pytest:
+      - tests/test_change_impact.py
+      - tests/test_fault_scenario_catalog.py
+      - tests/regional/test_regional_execution_order.py
+    regional_cases: []
+    checks:
+      - impact-check
+      - docs-check
+    full: true
+    counts_as_domain: false
+
+  - id: acceptance-catalog
+    description: Regional case catalog, ordering, runner, and generated index.
+    paths:
+      - testcases/fault-scenarios.yaml
+      - testcases/regional-execution-order.yaml
+      - tools/run_fault_test_cases.py
+      - scripts/build-regional-case-index.py
+      - scripts/build-fault-evidence-index.py
+      - docs/区域模式端到端验收测试用例.md
+    pytest:
+      - tests/test_fault_scenario_catalog.py
+      - tests/regional/test_regional_execution_order.py
+      - tests/regional/test_regional_case_index.py
+    regional_cases: []
+    checks:
+      - case-index-check
+      - docs-check
+    full: true
+    counts_as_domain: false
+
+  - id: shared-contracts
+    description: Shared models and registries with cross-domain behavior.
+    paths:
+      - src/gpu_fault/models.py
+      - src/gpu_fault/operation_registry.py
+      - src/gpu_fault/channel_registry.py
+      - src/gpu_fault/fleet.py
+      - src/gpu_fault/fleet_deployment.py
+      - src/gpu_fault/fleet_compatibility.py
+      - src/gpu_fault/store/contracts.py
+      - src/gpu_fault/app/authorization.py
+      - src/gpu_fault/app/cluster_binding.py
+      - tests/regional/test_authorization_registry.py
+      - tests/store/test_store_contracts.py
+    pytest:
+      - tests/store/test_store_contracts.py
+      - tests/regional/test_authorization_registry.py
+      - tests/test_operation_registry.py
+    regional_cases: []
+    checks:
+      - architecture-check
+      - mypy-check
+    full: true
+
+  - id: runtime-foundation
+    description: Python, dependency lock, runtime image, and release identity.
+    paths:
+      - pyproject.toml
+      - .dockerignore
+      - uv.lock
+      - requirements/**
+      - deploy/image/**
+      - config/release-identity.yaml
+      - config/release-images.lock.json
+      - scripts/release_identity.py
+      - scripts/release_image.py
+      - scripts/release_attestation.py
+      - scripts/component_wheels.py
+      - scripts/release-artifact-path.py
+      - scripts/build-release-runtime-image.py
+      - scripts/build-release-artifacts.py
+      - scripts/build-release-attestation.py
+      - scripts/verify-release-attestation.py
+      - src/gpu_fault/__init__.py
+    pytest:
+      - tests/test_release_identity.py
+      - tests/test_release_image.py
+      - tests/test_release_attestation.py
+      - tests/test_artifact_consistency.py
+    regional_cases:
+      - GF-REGIONAL-BOOT-018..022
+      - GF-REGIONAL-HA-005
+      - GF-REGIONAL-HA-007..009
+    checks:
+      - artifact-check
+      - runtime-image-check
+    full: true
+
+  - id: schema-transaction
+    description: PostgreSQL schema, transactional claims, leases, and fencing.
+    paths:
+      - src/gpu_fault/schema_migrations.py
+      - src/gpu_fault/store_migrate.py
+      - src/gpu_fault/store/postgres/**
+      - src/gpu_fault/store/shared/transactional_workflows.py
+      - src/gpu_fault/store/shared/processor_helpers.py
+      - tests/store/test_postgres_*.py
+      - deploy/migrations/**
+      - scripts/postgres/**
+    pytest:
+      - tests/store/test_store_contracts.py
+      - tests/store/test_postgres_processor_claim.py
+      - tests/store/test_postgres_reconnect.py
+    regional_cases:
+      - GF-REGIONAL-CAP-001..005
+      - GF-REGIONAL-HA-003
+      - GF-REGIONAL-HA-008..009
+      - GF-REGIONAL-CMD-001..016
+      - GF-REGIONAL-PREEMPT-001..031
+    checks:
+      - config-check
+    full: true
+    postgres: true
+
+  - id: release-rollout
+    description: Release, renderer, manifests, pins, resume, and rollback.
+    paths:
+      - deploy/control-plane/base/**
+      - deploy/control-plane/regional/**
+      - deploy/control-plane/tools/**
+      - src/gpu_fault/admin_release_artifacts.py
+      - src/gpu_fault/admin_site.py
+      - src/gpu_fault/fleet_deployment.py
+      - scripts/capture_release_evidence.py
+      - scripts/release_deploy.py
+      - tests/admin/test_release_deploy.py
+      - tests/regional/test_*release*.py
+      - tests/test_artifact_consistency.py
+    pytest:
+      - tests/admin/test_release_deploy.py
+      - tests/regional/test_regional_release_orchestrator.py
+      - tests/regional/test_regional_release_resume.py
+      - tests/regional/test_release_diff.py
+      - tests/regional/test_release_rollback_state.py
+      - tests/test_artifact_consistency.py
+    regional_cases:
+      - GF-REGIONAL-BOOT-018..022
+      - GF-REGIONAL-HA-005
+      - GF-REGIONAL-HA-007..009
+    approval_cases:
+      - GF-REGIONAL-BOOT-019..020
+      - GF-REGIONAL-HA-005
+      - GF-REGIONAL-HA-009
+    checks:
+      - config-check
+      - deployment-contracts-check
+      - artifact-check
+
+  - id: lifecycle-registry
+    description: Bootstrap, join/remove, cleanup registry, and installation resources.
+    paths:
+      - src/gpu_fault/admin_bootstrap*.py
+      - src/gpu_fault/admin_cluster_*.py
+      - src/gpu_fault/admin_uninstall.py
+      - src/gpu_fault/admin_resource_registry.py
+      - src/gpu_fault/installation_*.py
+      - deploy/aws/**
+      - config/site.example.yaml
+      - deploy/control-plane/regional/cleanup-inventory.json
+      - deploy/control-plane/tools/*installed_resource_registry.py
+      - scripts/generate-cleanup-inventory.py
+      - tests/admin/test_admin_bootstrap.py
+      - tests/admin/test_admin_cluster_*.py
+      - tests/regional/test_installed_resource_registry.py
+      - tests/regional/test_cleanup_*.py
+    pytest:
+      - tests/admin/test_admin_bootstrap.py
+      - tests/admin/test_admin_cluster_join.py
+      - tests/admin/test_admin_cluster_removal.py
+      - tests/regional/test_installed_resource_registry.py
+      - tests/regional/test_cleanup_inventory.py
+      - tests/regional/test_cleanup_state.py
+    regional_cases:
+      - GF-REGIONAL-BOOT-016
+      - GF-REGIONAL-BOOT-019
+      - GF-REGIONAL-ISO-001..006
+      - GF-REGIONAL-E2E-002
+    approval_cases:
+      - GF-REGIONAL-BOOT-019
+      - GF-REGIONAL-ISO-006
+      - GF-REGIONAL-E2E-002
+    checks:
+      - deployment-contracts-check
+
+  - id: runtime-profile
+    description: Runtime Profile, capability ownership, and adapter registration.
+    paths:
+      - src/gpu_fault/capabilities.py
+      - src/gpu_fault/runtime_adapters.py
+      - src/gpu_fault/admin_release_artifacts.py
+      - config/runtime-profile*.yaml
+      - tests/regional/test_capabilities.py
+    pytest:
+      - tests/regional/test_capabilities.py
+      - tests/admin/test_release_deploy.py
+    regional_cases:
+      - GF-REGIONAL-BOOT-015
+      - GF-REGIONAL-BOOT-022
+    checks:
+      - config-check
+
+  - id: authorization
+    description: Authentication, tokens, TLS, route buckets, and cluster binding.
+    paths:
+      - src/gpu_fault/app/authorization.py
+      - src/gpu_fault/app/cluster_binding.py
+      - src/gpu_fault/app/middleware/auth.py
+      - src/gpu_fault/app/routes/admin.py
+      - src/gpu_fault/app/routes/configuration.py
+      - src/gpu_fault/node_action_keys.py
+      - src/gpu_fault/regional_registry.py
+      - tests/regional/test_authorization_registry.py
+      - tests/regional/test_regional_control_plane.py
+    pytest:
+      - tests/regional/test_authorization_registry.py
+      - tests/regional/test_regional_control_plane.py
+      - tests/regional/test_production_safety_config.py
+    regional_cases:
+      - GF-REGIONAL-AUTH-001..015
+      - GF-REGIONAL-BLAST-002..004
+    checks:
+      - config-check
+
+  - id: remote-command
+    description: Remote command protocol, leases, Executor, and receipts.
+    paths:
+      - src/gpu_fault/cluster_executor.py
+      - src/gpu_fault/remote_command_models.py
+      - src/gpu_fault/store/**/remote_commands.py
+      - src/gpu_fault/app/routes/regional.py
+      - src/gpu_fault/app/routes/completion.py
+      - deploy/dataplane/cluster-action-executor.yaml
+      - deploy/dataplane/tools/verify-dataplane-executor.sh
+      - deploy/dataplane/tools/verify_dataplane_executor.py
+      - tests/hyperpod/test_cluster_executor.py
+      - tests/regional/test_regional_control_plane.py
+      - tests/execution/**
+    pytest:
+      - tests/hyperpod/test_cluster_executor.py
+      - tests/regional/test_regional_control_plane.py
+      - tests/execution
+    regional_cases:
+      - GF-REGIONAL-CMD-001..016
+      - GF-REGIONAL-HA-004
+      - GF-REGIONAL-HA-006
+      - GF-REGIONAL-NET-002..003
+    checks:
+      - config-check
+
+  - id: workflow
+    description: Workflow DAG, preemption, arbitration, and resource claims.
+    paths:
+      - src/gpu_fault/orchestration/**
+      - src/gpu_fault/execution/**
+      - src/gpu_fault/orchestrator.py
+      - src/gpu_fault/planner.py
+      - src/gpu_fault/fleet.py
+      - src/gpu_fault/fleet_cli.py
+      - src/gpu_fault/fleet_compatibility.py
+      - src/gpu_fault/fleet_endpoint.py
+      - tests/orchestration/**
+      - tests/execution/**
+    pytest:
+      - tests/orchestration
+      - tests/execution
+    regional_cases:
+      - GF-REGIONAL-PREEMPT-001..031
+    checks:
+      - architecture-check
+
+  - id: store-processor
+    description: Store implementations, Processor queues, concurrency, and counters.
+    paths:
+      - src/gpu_fault/store/**
+      - src/gpu_fault/processor/**
+      - src/gpu_fault/processor_diagnostics.py
+      - src/gpu_fault/async_store.py
+      - tests/store/**
+      - tests/processor/**
+    pytest:
+      - tests/store/test_store_contracts.py
+      - tests/processor
+    regional_cases:
+      - GF-REGIONAL-CAP-001..005
+      - GF-REGIONAL-HA-003
+      - GF-REGIONAL-HA-008..009
+    postgres: true
+
+  - id: completion-workload
+    description: Completion Watcher, workload ownership, stop, and restart.
+    paths:
+      - src/gpu_fault/watcher.py
+      - src/gpu_fault/completion_*.py
+      - src/gpu_fault/training_*.py
+      - src/gpu_fault/workload_annotate_cli.py
+      - src/gpu_fault/completion/**
+      - src/gpu_fault/adapters/kubernetes/**
+      - deploy/dataplane/completion-watcher.yaml
+      - tests/completion/**
+      - tests/hyperpod/test_training_*.py
+    pytest:
+      - tests/completion
+      - tests/hyperpod/test_training_submit_cli.py
+      - tests/hyperpod/test_workload_annotate_cli.py
+    regional_cases:
+      - GF-REGIONAL-WORKLOAD-001..002
+      - GF-REGIONAL-CMD-015
+      - GF-REGIONAL-DESTR-009
+      - GF-REGIONAL-DESTR-012
+      - GF-REGIONAL-E2E-001
+    checks:
+      - config-check
+
+  - id: collectors-policy
+    description: Collector channels, XID/SXID, GPU, host, and policy decisions.
+    paths:
+      - src/gpu_fault/collectors/**
+      - src/gpu_fault/collector_requirements.py
+      - src/gpu_fault/collectors_cli.py
+      - src/gpu_fault/policy/**
+      - src/gpu_fault/hma.py
+      - src/gpu_fault/xid_*.py
+      - src/gpu_fault/dcgm_*.py
+      - src/gpu_fault/gpu_*.py
+      - src/gpu_fault/host_health.py
+      - src/gpu_fault/control_record_archive.py
+      - src/gpu_fault/efa_traffic_state.py
+      - src/gpu_fault/log_rules.py
+      - src/gpu_fault/data/nvidia-*.yaml
+      - tools/generate_nvidia_xid_policy.py
+      - scripts/render_xid_catalog_summary.py
+      - deploy/dataplane/dcgm-counters.csv
+      - deploy/dataplane/gpu-metrics-collector.yaml
+      - deploy/dataplane/hyperpod-dcgm-exporter.yaml
+      - deploy/dataplane/kubernetes-node-resource-collector.yaml
+      - deploy/dataplane/optional/**
+      - tests/collectors/**
+      - tests/policy/**
+      - tests/hma/**
+    pytest:
+      - tests/collectors
+      - tests/policy
+      - tests/hma
+    regional_cases:
+      - GF-REGIONAL-COLLECT-001..017
+    checks:
+      - xid-catalog-check
+
+  - id: node-agent
+    description: Node Agent, installer, quiesce, diagnostics, and reset.
+    paths:
+      - src/gpu_fault/node_agent/**
+      - src/gpu_fault/node_installer_reconciler.py
+      - src/gpu_fault/adapters/node_action/**
+      - deploy/node/**
+      - deploy/systemd/**
+      - deploy/dataplane/node-installer-reconciler.yaml
+      - tests/node_agent/**
+    pytest:
+      - tests/node_agent
+      - tests/regional/test_production_safety_config.py
+    regional_cases:
+      - GF-REGIONAL-AUTH-015
+      - GF-REGIONAL-CMD-011
+      - GF-REGIONAL-DESTR-001
+      - GF-REGIONAL-DESTR-010
+      - GF-REGIONAL-COLLECT-013..014
+    checks:
+      - config-check
+      - deployment-contracts-check
+
+  - id: hyperpod-lifecycle
+    description: HyperPod reboot, warm spare, provider guards, and replacement.
+    paths:
+      - src/gpu_fault/hyperpod*.py
+      - src/gpu_fault/spare_health.py
+      - src/gpu_fault/adapters/hyperpod/**
+      - deploy/hyperpod/**
+      - tests/hyperpod/test_hyperpod*.py
+    pytest:
+      - tests/hyperpod
+    regional_cases:
+      - GF-REGIONAL-DESTR-002..003
+      - GF-REGIONAL-DESTR-005..008
+      - GF-REGIONAL-DESTR-011
+      - GF-REGIONAL-DESTR-013
+      - GF-REGIONAL-ISO-004
+
+  - id: notifications
+    description: Notification outbox, SES, templates, and deduplication.
+    paths:
+      - src/gpu_fault/notifications/**
+      - src/gpu_fault/notification_*.py
+      - src/gpu_fault/admin_notifications.py
+      - tests/notifications/**
+      - tests/admin/test_admin_notifications.py
+    pytest:
+      - tests/notifications
+      - tests/admin/test_admin_notifications.py
+    regional_cases:
+      - GF-REGIONAL-NOTIFY-001..006
+      - GF-REGIONAL-BOOT-013..014
+
+  - id: network-retry
+    description: HTTP transport, retries, offline buffering, and connectivity.
+    paths:
+      - src/gpu_fault/transport/**
+      - src/gpu_fault/transport_errors.py
+      - src/gpu_fault/telemetry.py
+      - src/gpu_fault/telemetry_models.py
+      - src/gpu_fault/processor/telemetry_spool.py
+      - tests/regional/test_http_client.py
+      - tests/regional/test_transport_errors.py
+      - tests/processor/test_telemetry_spool.py
+    pytest:
+      - tests/regional/test_http_client.py
+      - tests/regional/test_transport_errors.py
+      - tests/processor/test_telemetry_spool.py
+    regional_cases:
+      - GF-REGIONAL-NET-001..005
+      - GF-REGIONAL-HA-005
+      - GF-REGIONAL-AUTH-013..014
+    approval_cases:
+      - GF-REGIONAL-HA-005
+
+  - id: metrics-capacity
+    description: Metrics, queues, connection pools, capacity, and alert rules.
+    paths:
+      - src/gpu_fault/app/*metric*.py
+      - src/gpu_fault/app/builtin_metric_contributors.py
+      - src/gpu_fault/gpu_metrics.py
+      - deploy/observability/**
+      - scripts/verify-regional-alerting.py
+      - scripts/perf/**
+      - tests/metrics/**
+      - tests/regional/test_*capacity*.py
+      - tests/regional/test_performance_defaults.py
+    pytest:
+      - tests/metrics
+      - tests/regional/test_capacity_probe.py
+      - tests/regional/test_regional_capacity_suite.py
+      - tests/regional/test_performance_defaults.py
+    regional_cases:
+      - GF-REGIONAL-CAP-001..005
+      - GF-REGIONAL-HA-005..009
+    approval_cases:
+      - GF-REGIONAL-HA-005..007
+      - GF-REGIONAL-HA-009
+
+  - id: docs-only
+    description: Documentation with no executable behavior change.
+    paths:
+      - README.md
+      - CONTRIBUTING.md
+      - config/README.md
+      - deploy/README.md
+      - docs/**
+      - scripts/README.md
+      - scripts/**/README.md
+      - scripts/admin-env-reference.yaml
+      - scripts/generate-env-reference.py
+      - src/gpu_fault/data/env-inventory.json
+    pytest:
+      - tests/test_documentation_contracts.py
+      - tests/test_doc_impact.py
+    regional_cases: []
+    checks:
+      - docs-check
+    counts_as_domain: false
+
+  - id: ci-tooling
+    description: CI and developer-only quality tooling.
+    paths:
+      - .github/**
+      - Makefile
+      - scripts/check-*.py
+      - scripts/audit-*.py
+      - scripts/prune_artifacts.py
+      - scripts/__init__.py
+      - tools/__init__.py
+      - architecture-baseline.json
+      - mypy-baseline.json
+      - assert-message-baseline.json
+    pytest:
+      - tests/test_doc_impact.py
+    regional_cases: []
+    checks:
+      - docs-check
+    counts_as_domain: false
+
+  - id: control-plane-api
+    description: General API factory, lifecycle, middleware, and routes.
+    paths:
+      - src/gpu_fault/api.py
+      - src/gpu_fault/config_cli.py
+      - src/gpu_fault/env_validation.py
+      - src/gpu_fault/lifecycle.py
+      - src/gpu_fault/ports.py
+      - src/gpu_fault/regional.py
+      - src/gpu_fault/regional_compatibility.py
+      - src/gpu_fault/service.py
+      - src/gpu_fault/settings.py
+      - src/gpu_fault/plugins.py
+      - src/gpu_fault/app/**
+    pytest:
+      - tests/regional/test_api.py
+      - tests/regional/test_api_entrypoint.py
+      - tests/regional/test_app_structure.py
+      - tests/regional/test_plugins.py
+    regional_cases:
+      - GF-REGIONAL-BOOT-001..015
+      - GF-REGIONAL-AUTH-001..015
+      - GF-REGIONAL-BLAST-001..004
+    checks:
+      - config-check
+    fallback: true
+
+  - id: admin-operations
+    description: Administrator CLI and AWS integration not owned by a narrower domain.
+    paths:
+      - src/gpu_fault/admin_*.py
+      - src/gpu_fault/aws_errors.py
+      - src/gpu_fault/aurora_credential_refresh.py
+      - tests/admin/**
+      - tests/regional/test_regional_admin_*.py
+    pytest:
+      - tests/admin
+      - tests/regional/test_regional_admin_checks.py
+      - tests/regional/test_regional_admin_commands.py
+    regional_cases:
+      - GF-REGIONAL-BOOT-011..019
+      - GF-REGIONAL-ISO-001..006
+    approval_cases:
+      - GF-REGIONAL-BOOT-019
+      - GF-REGIONAL-ISO-006
+    fallback: true
+
+  - id: adapter-core
+    description: Shared adapters not owned by node, HyperPod, or Kubernetes domains.
+    paths:
+      - src/gpu_fault/adapters/**
+      - src/gpu_fault/managed_recovery.py
+      - src/gpu_fault/passive.py
+      - src/gpu_fault/diagnostics.py
+    pytest:
+      - tests/execution
+      - tests/orchestration
+    regional_cases:
+      - GF-REGIONAL-PREEMPT-001..031
+      - GF-REGIONAL-E2E-001
+    fallback: true
+
+  - id: changed-tests
+    description: Tests not owned by a more specific implementation domain.
+    paths:
+      - tests/**
+    pytest: []
+    regional_cases: []
+    counts_as_domain: false
+    fallback: true
+
+  - id: unclassified-runtime
+    description: Fail-closed fallback for unmapped implementation files.
+    paths:
+      - src/**
+      - deploy/**
+      - scripts/**
+      - tools/**
+      - config/**
+    pytest: []
+    regional_cases: []
+    full: true
+    fallback: true

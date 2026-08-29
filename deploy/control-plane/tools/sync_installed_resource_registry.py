@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import hashlib
 import json
+import os
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -29,14 +32,74 @@ class Kubectl:
         *,
         kubeconfig: str | None,
         context: str | None,
+        reuse_exec_credential: bool = False,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
         if kubeconfig and context:
             raise RegistryError("--kubeconfig and --context are mutually exclusive")
+        self.runner = runner
+        self.session_directory: tempfile.TemporaryDirectory[str] | None = None
         self.prefix = ["kubectl"]
         if kubeconfig:
             self.prefix.extend(["--kubeconfig", kubeconfig])
         elif context:
             self.prefix.extend(["--context", str(context)])
+        if reuse_exec_credential:
+            self._reuse_exec_credential()
+
+    def _reuse_exec_credential(self) -> None:
+        completed = self.runner(
+            [*self.prefix, "config", "view", "--raw", "--minify", "-o", "json"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode:
+            raise RegistryError(
+                completed.stderr.strip() or "cannot read the selected kubeconfig"
+            )
+        try:
+            document = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return
+        users = document.get("users") or []
+        if len(users) != 1:
+            return
+        user = users[0].get("user") or {}
+        command = user.get("exec")
+        if not isinstance(command, dict):
+            return
+        executable = str(command.get("command") or "").strip()
+        if not executable:
+            raise RegistryError("kubeconfig exec credential has no command")
+        environment = dict(os.environ)
+        for item in command.get("env") or []:
+            name = str(item.get("name") or "")
+            if name:
+                environment[name] = str(item.get("value") or "")
+        credential = self.runner(
+            [executable, *[str(item) for item in command.get("args") or []]],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if credential.returncode:
+            raise RegistryError(
+                credential.stderr.strip() or "kubeconfig exec credential failed"
+            )
+        value = json.loads(credential.stdout)
+        token = str((value.get("status") or {}).get("token") or "")
+        if not token:
+            raise RegistryError("kubeconfig exec credential returned no token")
+        users[0]["user"] = {"token": token}
+        self.session_directory = tempfile.TemporaryDirectory(
+            prefix="gpu-fault-kube-session-"
+        )
+        path = Path(self.session_directory.name) / "config"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        path.chmod(0o600)
+        self.prefix = ["kubectl", "--kubeconfig", str(path)]
 
     def run(
         self,
@@ -45,7 +108,7 @@ class Kubectl:
         input_text: str | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        completed = subprocess.run(
+        completed = self.runner(
             [*self.prefix, *arguments],
             input=input_text,
             text=True,
@@ -89,31 +152,51 @@ def _registry(
     return value
 
 
-def _exists(
+def _listed_names(
     kubectl: Kubectl,
     namespace: str,
-    resource: dict[str, Any],
-) -> bool:
-    arguments = []
-    if resource["scope"] == "namespaced":
+    *,
+    scope: str,
+    kind: str,
+) -> set[str]:
+    arguments: list[str] = []
+    if scope == "namespaced":
         arguments.extend(["-n", namespace])
-    arguments.extend(
-        [
-            "get",
-            resource["kind"],
-            resource["name"],
-            "-o",
-            "name",
-        ]
-    )
+    arguments.extend(["get", kind, "-o", "json"])
     completed = kubectl.run(arguments, check=False)
-    if completed.returncode == 0:
-        return True
-    if "NotFound" in completed.stderr:
-        return False
-    if "the server doesn't have a resource type" in completed.stderr:
-        return False
-    raise RegistryError(completed.stderr.strip())
+    if completed.returncode:
+        if "the server doesn't have a resource type" in completed.stderr:
+            return set()
+        raise RegistryError(completed.stderr.strip())
+    value = json.loads(completed.stdout)
+    if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+        raise RegistryError(f"kubectl list {kind} returned an invalid JSON document")
+    return {
+        str((item.get("metadata") or {}).get("name") or "")
+        for item in value.get("items", [])
+    }
+
+
+def _live_identities(
+    kubectl: Kubectl,
+    namespace: str,
+    resources: list[dict[str, Any]],
+) -> set[tuple[str, str]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for resource in resources:
+        grouped[(resource["scope"], resource["kind"])].append(resource)
+    live: set[tuple[str, str]] = set()
+    for (scope, kind), members in grouped.items():
+        names = _listed_names(
+            kubectl,
+            namespace,
+            scope=scope,
+            kind=kind,
+        )
+        live.update(
+            _identity(resource) for resource in members if resource["name"] in names
+        )
+    return live
 
 
 def _identity(resource: dict[str, Any]) -> tuple[str, str]:
@@ -145,11 +228,11 @@ def synchronize(
         *candidates,
         *sorted(set(existing) - set(candidates)),
     ]
-    installed = []
-    for identity in identities:
-        resource = candidates.get(identity) or existing[identity]
-        if _exists(kubectl, namespace, resource):
-            installed.append(resource)
+    resources = [
+        candidates.get(identity) or existing[identity] for identity in identities
+    ]
+    live = _live_identities(kubectl, namespace, resources)
+    installed = [resource for resource in resources if _identity(resource) in live]
     document = {
         "schema_version": 1,
         "plane": plane,
@@ -208,6 +291,7 @@ def main() -> int:
         Kubectl(
             kubeconfig=args.kubeconfig,
             context=args.context,
+            reuse_exec_credential=True,
         ),
         plane=args.plane,
         namespace=args.namespace,

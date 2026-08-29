@@ -26,6 +26,8 @@ def test_create_deployment_cli_parses_rollout_contract() -> None:
             "create-deployment",
             "--execution-token",
             "token",
+            "--deployment-id",
+            "release-a-cluster-a",
             "--cluster-id",
             "cluster-a",
             "--nodes",
@@ -34,6 +36,12 @@ def test_create_deployment_cli_parses_rollout_contract() -> None:
             "0.9.0",
             "--artifact-sha256",
             "a" * 64,
+            "--compatibility-digest",
+            "b" * 64,
+            "--bundle-sha256",
+            "d" * 64,
+            "--template-sha256",
+            "e" * 64,
             "--policy-version",
             "catalog-a",
             "--runtime-profile-version",
@@ -47,6 +55,8 @@ def test_create_deployment_cli_parses_rollout_contract() -> None:
 
     assert args.nodes == ["node-a", "node-b"]
     assert args.max_unavailable == 1
+    assert args.deployment_id == "release-a-cluster-a"
+    assert args.bundle_sha256 == "d" * 64
 
 
 def test_run_deployment_waits_for_heartbeat_readiness() -> None:

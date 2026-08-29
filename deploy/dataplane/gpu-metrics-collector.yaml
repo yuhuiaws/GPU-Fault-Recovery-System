@@ -39,6 +39,9 @@ spec:
                 name: gpu-fault-collector
                 optional: true
           env:
+            - name: PATH
+              value: >-
+                /opt/gpu-fault/executor/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: NODE_NAME
               valueFrom:
                 fieldRef:

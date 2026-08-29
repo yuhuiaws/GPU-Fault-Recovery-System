@@ -9,7 +9,6 @@ import re
 import secrets
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,9 +17,6 @@ from typing import Any, Callable, Mapping, Sequence, cast
 from urllib.parse import quote
 
 from gpu_fault.admin_bootstrap_common import (
-    DEFAULT_DCGM_IMAGE,
-    DEFAULT_NODE_INSTALLER_IMAGE,
-    DEFAULT_RUNTIME_IMAGE,
     Arn,
     BootstrapError,
     BootstrapRequest,
@@ -30,7 +26,6 @@ from gpu_fault.admin_bootstrap_common import (
     CommandRunner,
     SITE_TAG_KEY,
     assert_site_tag,
-    compute_agent_config_digest,
     ensure_namespace as _ensure_namespace,
     kubectl_apply as _kubectl_apply,
     run_parallel as _run_parallel,
@@ -41,6 +36,9 @@ from gpu_fault.admin_bootstrap_common import (
 )
 from gpu_fault.admin_notifications import (
     NotificationRouting,
+)
+from gpu_fault.admin_release_artifacts import (
+    load_prebuilt_release as _build_release,
 )
 from gpu_fault.admin_bootstrap_site import (
     discover_bootstrap_scope,
@@ -115,7 +113,7 @@ def discover_cluster(
             "sagemaker",
             "describe-cluster",
             "--cluster-name",
-            arn.resource_name,
+            cluster_arn,
         )
     elif arn.service == "eks":
         hyperpod = _find_hyperpod_for_eks(
@@ -367,34 +365,6 @@ def _discover_adot_image(
             "uniformly amd64; set GPU_FAULT_ADOT_IMAGE"
         )
     return sorted(candidates)[0]
-
-
-def _build_release(
-    runner: CommandRunner,
-    *,
-    repository_root: Path,
-    runtime_profile: str,
-) -> dict[str, Any]:
-    runner.run(
-        ["make", f"PYTHON={sys.executable}", "artifact-check"],
-        cwd=repository_root,
-        mutate=True,
-        capture=False,
-    )
-    manifest = repository_root / "dist/current-release.json"
-    if runner.dry_run:
-        return {
-            "manifest": str(manifest),
-            "agent_config_digest": "0" * 64,
-        }
-    return {
-        "manifest": str(manifest),
-        "agent_config_digest": compute_agent_config_digest(
-            runner,
-            repository_root=repository_root,
-            runtime_profile_version=runtime_profile,
-        ),
-    }
 
 
 def _describe_subnets(
@@ -2014,10 +1984,10 @@ def _site_document(
                 "hostname": pki["hostname"],
             },
             "images": {
-                "runtime": DEFAULT_RUNTIME_IMAGE,
-                "nodeInstaller": DEFAULT_NODE_INSTALLER_IMAGE,
-                "dcgmExporter": DEFAULT_DCGM_IMAGE,
-                "adot": adot_image,
+                "runtime": release["images"]["runtime"],
+                "nodeInstaller": release["images"]["node_installer"],
+                "dcgmExporter": release["images"]["dcgm_exporter"],
+                "adot": release["images"].get("adot") or adot_image,
             },
             "health": {
                 "auroraClusterId": aurora["cluster_id"],
@@ -2206,7 +2176,7 @@ def bootstrap_from_arns(
             namespace=namespace,
             site_id=site_id,
             release_manifest=Path(release["manifest"]),
-            runtime_image=DEFAULT_RUNTIME_IMAGE,
+            runtime_image=str(release["images"]["runtime"]),
             aurora=aurora,
         ),
     }

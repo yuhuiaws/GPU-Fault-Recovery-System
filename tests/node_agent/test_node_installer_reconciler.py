@@ -5,15 +5,19 @@ from types import SimpleNamespace
 
 from gpu_fault.node_installer_reconciler import (
     INSTALLER_ARTIFACT_ANNOTATION,
+    INSTALLER_BUNDLE_ANNOTATION,
     INSTALLER_DIGEST_ANNOTATION,
     INSTALLER_NODE_UID_ANNOTATION,
     INSTALLER_STATE_ANNOTATION,
+    INSTALLER_TEMPLATE_ANNOTATION,
     INSTALLER_VERSION_ANNOTATION,
     NodeInstallerReconciler,
 )
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
 ARTIFACT = "a" * 64
+BUNDLE = "c" * 64
+TEMPLATE = "d" * 64
 
 
 class ApiError(Exception):
@@ -140,6 +144,8 @@ def reconciler(core, batch):
         version="0.10.0",
         config_digest="config-sha",
         artifact_sha256=ARTIFACT,
+        bundle_sha256=BUNDLE,
+        template_sha256=TEMPLATE,
         job_template=template(),
         dcgm_metrics_url_template="http://{node_ip}:9400/metrics",
         retry_seconds=300,
@@ -152,6 +158,8 @@ def test_current_node_is_not_reinstalled():
         INSTALLER_VERSION_ANNOTATION: "0.10.0",
         INSTALLER_DIGEST_ANNOTATION: "config-sha",
         INSTALLER_ARTIFACT_ANNOTATION: ARTIFACT,
+        INSTALLER_BUNDLE_ANNOTATION: BUNDLE,
+        INSTALLER_TEMPLATE_ANNOTATION: TEMPLATE,
         INSTALLER_NODE_UID_ANNOTATION: "node-uid",
         INSTALLER_STATE_ANNOTATION: "Succeeded",
     }
@@ -171,6 +179,13 @@ def test_missing_installation_creates_node_bound_job():
     namespace, body = batch.created[0]
     assert namespace == "gpu-fault-system"
     assert body["spec"]["template"]["spec"]["nodeName"] == "hyperpod-i-123"
+    assert body["spec"]["activeDeadlineSeconds"] == 840
+    assert body["metadata"]["annotations"] == {
+        INSTALLER_DIGEST_ANNOTATION: "config-sha",
+        INSTALLER_ARTIFACT_ANNOTATION: ARTIFACT,
+        INSTALLER_BUNDLE_ANNOTATION: BUNDLE,
+        INSTALLER_TEMPLATE_ANNOTATION: TEMPLATE,
+    }
     env = {
         item["name"]: item["value"]
         for item in body["spec"]["template"]["spec"]["containers"][0]["env"]
@@ -198,6 +213,8 @@ def test_artifact_change_reinstalls_even_when_config_is_unchanged():
         INSTALLER_VERSION_ANNOTATION: "0.10.0",
         INSTALLER_DIGEST_ANNOTATION: "config-sha",
         INSTALLER_ARTIFACT_ANNOTATION: "b" * 64,
+        INSTALLER_BUNDLE_ANNOTATION: BUNDLE,
+        INSTALLER_TEMPLATE_ANNOTATION: TEMPLATE,
         INSTALLER_NODE_UID_ANNOTATION: "node-uid",
         INSTALLER_STATE_ANNOTATION: "Succeeded",
     }
@@ -209,7 +226,16 @@ def test_artifact_change_reinstalls_even_when_config_is_unchanged():
 
 
 def test_completed_job_marks_node_current():
-    core = CoreApi([node()])
+    annotations = {
+        INSTALLER_VERSION_ANNOTATION: "0.10.0",
+        INSTALLER_DIGEST_ANNOTATION: "config-sha",
+        INSTALLER_ARTIFACT_ANNOTATION: ARTIFACT,
+        INSTALLER_BUNDLE_ANNOTATION: BUNDLE,
+        INSTALLER_TEMPLATE_ANNOTATION: TEMPLATE,
+        INSTALLER_NODE_UID_ANNOTATION: "node-uid",
+        INSTALLER_STATE_ANNOTATION: "Installing",
+    }
+    core = CoreApi([node(annotations=annotations)])
     batch = BatchApi(job(condition="Complete"))
 
     assert reconciler(core, batch).reconcile_once()["succeeded"] == 1
@@ -217,6 +243,97 @@ def test_completed_job_marks_node_current():
     assert annotations[INSTALLER_STATE_ANNOTATION] == "Succeeded"
     assert annotations[INSTALLER_DIGEST_ANNOTATION] == "config-sha"
     assert annotations[INSTALLER_ARTIFACT_ANNOTATION] == ARTIFACT
+    assert annotations[INSTALLER_BUNDLE_ANNOTATION] == BUNDLE
+    assert annotations[INSTALLER_TEMPLATE_ANNOTATION] == TEMPLATE
+
+
+def test_completed_job_is_replayed_after_rollback():
+    annotations = {
+        INSTALLER_VERSION_ANNOTATION: "0.10.0",
+        INSTALLER_DIGEST_ANNOTATION: "previous-config",
+        INSTALLER_ARTIFACT_ANNOTATION: "b" * 64,
+        INSTALLER_BUNDLE_ANNOTATION: "e" * 64,
+        INSTALLER_TEMPLATE_ANNOTATION: "f" * 64,
+        INSTALLER_NODE_UID_ANNOTATION: "node-uid",
+        INSTALLER_STATE_ANNOTATION: "Succeeded",
+    }
+    current_node = node(annotations=annotations)
+    core = CoreApi([current_node])
+    batch = BatchApi(job(condition="Complete"))
+    active = reconciler(core, batch)
+
+    assert active.reconcile_once()["running"] == 1
+    assert len(batch.deleted) == 1
+    replay_annotations = core.patches[-1][1]["metadata"]["annotations"]
+    assert replay_annotations[INSTALLER_STATE_ANNOTATION] == "Retrying"
+    assert replay_annotations[INSTALLER_DIGEST_ANNOTATION] == "config-sha"
+    assert replay_annotations[INSTALLER_ARTIFACT_ANNOTATION] == ARTIFACT
+    assert replay_annotations[INSTALLER_BUNDLE_ANNOTATION] == BUNDLE
+    assert replay_annotations[INSTALLER_TEMPLATE_ANNOTATION] == TEMPLATE
+
+    current_node.metadata.annotations = replay_annotations
+    assert active.reconcile_once()["running"] == 1
+    assert len(batch.deleted) == 2
+
+    batch.existing = None
+    assert active.reconcile_once()["created"] == 1
+    assert len(batch.created) == 1
+    assert (
+        core.patches[-1][1]["metadata"]["annotations"][INSTALLER_STATE_ANNOTATION]
+        == "Installing"
+    )
+
+
+def test_bundle_or_template_change_reinstalls_node():
+    annotations = {
+        INSTALLER_VERSION_ANNOTATION: "0.10.0",
+        INSTALLER_DIGEST_ANNOTATION: "config-sha",
+        INSTALLER_ARTIFACT_ANNOTATION: ARTIFACT,
+        INSTALLER_BUNDLE_ANNOTATION: "e" * 64,
+        INSTALLER_TEMPLATE_ANNOTATION: TEMPLATE,
+        INSTALLER_NODE_UID_ANNOTATION: "node-uid",
+        INSTALLER_STATE_ANNOTATION: "Succeeded",
+    }
+    core = CoreApi([node(annotations=annotations)])
+    batch = BatchApi()
+
+    assert reconciler(core, batch).reconcile_once()["created"] == 1
+
+
+def test_reconcile_limits_new_jobs_to_max_unavailable():
+    core = CoreApi(
+        [
+            node(name="hyperpod-i-001", uid="node-1"),
+            node(name="hyperpod-i-002", uid="node-2"),
+        ]
+    )
+    batch = BatchApi()
+
+    result = reconciler(core, batch).reconcile_once()
+
+    assert result["created"] == 1
+    assert result["deferred"] == 1
+    assert len(batch.created) == 1
+
+
+def test_reconcile_limits_nodes_to_the_active_fleet_wave():
+    core = CoreApi(
+        [
+            node(name="hyperpod-i-001", uid="node-1"),
+            node(name="hyperpod-i-002", uid="node-2"),
+        ]
+    )
+    batch = BatchApi()
+    active = reconciler(core, batch)
+    active.allowed_node_names = frozenset({"hyperpod-i-002"})
+
+    result = active.reconcile_once()
+
+    assert result["created"] == 1
+    assert len(batch.created) == 1
+    assert batch.created[0][1]["spec"]["template"]["spec"]["nodeName"] == (
+        "hyperpod-i-002"
+    )
 
 
 def test_failed_job_is_deleted_after_retry_delay():

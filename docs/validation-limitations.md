@@ -59,8 +59,9 @@ staging environment as of 2026-08-27:
 
 No longer limitations after the 2026-08-11 rerun:
 
-- BOOT-018 now compares source, wheel, node bundle, every running control/data
-  plane process, release pins, and every live Agent by content digest.
+- BOOT-018 compares source, wheel, node bundle, runtime image component venvs,
+  every running control/data plane process, release pins, and every live Agent
+  by content digest.
 - AUTH-015 now provisions per-node keys on the trusted deployment host. The
   GPU cluster contains no fleet master; installer Jobs and Cluster Executor
   mount only node-scoped keys, cross-node forgeries fail, and one node key was

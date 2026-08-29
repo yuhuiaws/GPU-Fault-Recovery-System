@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         NodeMarker,
         NotificationDelivery,
         NotificationResult,
+        NotificationStatus,
         RecoveryPlan,
         TerminalEvent,
         TriageReport,
@@ -412,6 +413,8 @@ class NotificationStore(Protocol):
     def list_notifications(
         self,
     ) -> list[AdvisoryNotification]: ...
+
+    def notification_status_counts(self) -> dict[NotificationStatus, int]: ...
 
     def save_notification_result(self, result: NotificationResult) -> None: ...
 

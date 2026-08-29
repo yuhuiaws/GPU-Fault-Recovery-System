@@ -23,32 +23,6 @@ spec:
         app: gpu-fault-hma-cloudwatch-consumer
     spec:
       serviceAccountName: gpu-fault-hma-cloudwatch-consumer
-      initContainers:
-        - name: install
-          resources:
-            requests:
-              cpu: "25m"
-              memory: 64Mi
-            limits:
-              cpu: "250m"
-              memory: 256Mi
-          image: public.ecr.aws/docker/library/python:3.12-slim
-          command: ["/bin/sh", "-c"]
-          args:
-            - >-
-              python -m venv /venv
-              && /venv/bin/python -m pip install --no-cache-dir
-              '/artifact/gpu_fault_cluster_executor-0.10.0-py3-none-any.whl[collectors]'
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-          volumeMounts:
-            - name: artifact
-              mountPath: /artifact
-              readOnly: true
-            - name: venv
-              mountPath: /venv
       containers:
         - name: consumer
           resources:
@@ -59,9 +33,12 @@ spec:
               cpu: "500m"
               memory: 512Mi
           image: public.ecr.aws/docker/library/python:3.12-slim
-          command: ["/venv/bin/gpu-fault-collector"]
+          command: ["gpu-fault-collector"]
           args: ["sqs-hma"]
           env:
+            - name: PATH
+              value: >-
+                /opt/gpu-fault/executor/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: GPU_FAULT_CONTROL_PLANE_URL
               value: http://gpu-fault-api-canary:8080
             - name: GPU_FAULT_HMA_QUEUE_URL
@@ -73,9 +50,6 @@ spec:
             runAsNonRoot: true
             runAsUser: 65532
           volumeMounts:
-            - name: venv
-              mountPath: /venv
-              readOnly: true
             # Writable state directory for the durable event outbox.
             - name: collector-state
               mountPath: /var/lib/gpu-fault
@@ -83,8 +57,6 @@ spec:
         - name: artifact
           configMap:
             name: gpu-fault-executor-wheel-0100
-        - name: venv
-          emptyDir: {}
         - name: collector-state
           emptyDir:
             sizeLimit: 256Mi

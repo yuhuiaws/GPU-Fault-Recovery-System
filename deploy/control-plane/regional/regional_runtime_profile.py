@@ -8,6 +8,7 @@ from typing import Any
 import regional_deployment_inventory as inventory
 import yaml
 from regional_release_config import ReleaseConfig, ReleaseError
+from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
 
 
 INSPECT_SCRIPT = """
@@ -130,7 +131,7 @@ def inspect_runtime_profile(release: Any) -> dict[str, Any]:
                 "-i",
                 pod,
                 "--",
-                "python",
+                CONTROL_PLANE_PYTHON,
                 "-c",
                 INSPECT_SCRIPT,
             ),
@@ -217,7 +218,7 @@ def ensure_runtime_profile(release: Any) -> None:
                 "-i",
                 pod,
                 "--",
-                "python",
+                CONTROL_PLANE_PYTHON,
                 "-c",
                 REGISTER_SCRIPT,
             ),

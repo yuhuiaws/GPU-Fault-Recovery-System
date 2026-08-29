@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -254,14 +255,16 @@ def test_processor_counter_shard_jobs_are_bounded_and_explicit() -> None:
         assert pod["restartPolicy"] == "Never"
         migrate = pod["containers"][0]
         assert expected_flag in migrate["args"][0]
-        assert migrate["env"] == [
-            {
-                "name": "GPU_FAULT_STORE_URL",
-                "valueFrom": {
-                    "secretKeyRef": {"name": "gpu-fault-aurora", "key": "postgres-url"}
-                },
-            }
-        ]
+        env = {item["name"]: item for item in migrate["env"]}
+        assert env["PATH"]["value"].startswith("/opt/gpu-fault/control-plane/bin:"), (
+            f"{filename} does not select the control-plane component venv"
+        )
+        assert env["GPU_FAULT_STORE_URL"] == {
+            "name": "GPU_FAULT_STORE_URL",
+            "valueFrom": {
+                "secretKeyRef": {"name": "gpu-fault-aurora", "key": "postgres-url"}
+            },
+        }
         assert migrate["securityContext"] == {
             "allowPrivilegeEscalation": False,
             "capabilities": {"drop": ["ALL"]},
@@ -522,7 +525,7 @@ def test_aurora_rotation_restarts_every_database_consumer() -> None:
     assert set(deployment_rule["verbs"]) == {"get", "patch"}
 
 
-def test_cluster_executor_dependency_install_has_bounded_retry() -> None:
+def test_cluster_executor_uses_prebuilt_runtime_image() -> None:
     documents = [
         item
         for item in yaml.safe_load_all(
@@ -533,17 +536,71 @@ def test_cluster_executor_dependency_install_has_bounded_retry() -> None:
         if item
     ]
     deployment = next(item for item in documents if item["kind"] == "Deployment")
-    command = deployment["spec"]["template"]["spec"]["containers"][0]["args"][0]
-    assert "until python -m pip install" in command
-    assert "--retries 3 --timeout 15" in command
-    assert '[ "${attempt}" -ge 4 ]' in command
-    assert command.index("touch /tmp/executor-ready") > command.index(
-        "until python -m pip install"
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    command = container["args"][0]
+    assert "pip install" not in command
+    assert command.index("touch /tmp/executor-ready") < command.index(
+        "exec gpu-fault-cluster-executor"
+    )
+    path = next(item["value"] for item in container["env"] if item["name"] == "PATH")
+    assert path.startswith("/opt/gpu-fault/executor/bin:"), (
+        "executor does not select the executor component venv"
     )
     result = subprocess.run(
         ["/bin/sh", "-n"], input=command, text=True, capture_output=True, check=False
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_gpu_runtime_deployments_select_executor_component() -> None:
+    for relative in (
+        "deploy/dataplane/cluster-action-executor.yaml",
+        "deploy/dataplane/completion-watcher.yaml",
+        "deploy/dataplane/kubernetes-node-resource-collector.yaml",
+        "deploy/dataplane/node-installer-reconciler.yaml",
+    ):
+        documents = [
+            item
+            for item in yaml.safe_load_all(
+                (ROOT / relative).read_text(encoding="utf-8")
+            )
+            if item
+        ]
+        deployment = next(item for item in documents if item["kind"] == "Deployment")
+        env = {
+            item["name"]: item.get("value")
+            for item in container(deployment).get("env", [])
+        }
+        assert env["PATH"].startswith("/opt/gpu-fault/executor/bin:"), relative
+
+
+def test_control_plane_jobs_select_control_plane_component() -> None:
+    for relative in (
+        "deploy/control-plane/regional/aurora-credential-refresh.yaml",
+        "deploy/migrations/postgres-schema-ensure-job.yaml",
+        "deploy/migrations/postgres-counter-shards-finalize-job.yaml",
+        "deploy/migrations/postgres-counter-shards-rollback-job.yaml",
+    ):
+        documents = [
+            item
+            for item in yaml.safe_load_all(
+                (ROOT / relative).read_text(encoding="utf-8")
+            )
+            if item
+        ]
+        workload = next(
+            item for item in documents if item["kind"] in {"CronJob", "Job"}
+        )
+        template = (
+            workload["spec"]["jobTemplate"]["spec"]["template"]
+            if workload["kind"] == "CronJob"
+            else workload["spec"]["template"]
+        )
+        env = {
+            item["name"]: item.get("value")
+            for item in template["spec"]["containers"][0].get("env", [])
+        }
+        assert env["PATH"].startswith("/opt/gpu-fault/control-plane/bin:"), relative
 
 
 def test_cluster_executor_private_ca_does_not_replace_aws_trust() -> None:
@@ -602,9 +659,12 @@ def test_ambiguous_attempt_ownership_has_a_prometheus_alert() -> None:
         if "alert" in rule
     }
     alert = rules["GpuFaultExclusiveNodeOwnershipInvariantViolation"]
+    stale = rules["GpuFaultStaleAttemptObservation"]
 
-    assert "gpu_fault_ambiguous_attempt_ownership_total" in alert["expr"]
+    assert alert["expr"] == "gpu_fault_ambiguous_attempt_ownership_current > 1"
     assert alert["labels"]["severity"] == "critical"
+    assert stale["expr"] == "gpu_fault_stale_attempt_observations > 0"
+    assert stale["labels"]["severity"] == "warning"
 
 
 def test_amp_rules_cover_prometheus_rules_and_kept_metrics() -> None:
@@ -736,6 +796,32 @@ def test_boot_guard_probe_is_small_and_uses_isolated_schema() -> None:
     assert "gpu-fault-aurora-guardprobe" in derive
     assert "PostgresStore(" in section
     assert 'path="/gpu_fault_guardprobe"' in section
+
+
+def test_boot_guard_registry_matches_current_regional_schema() -> None:
+    script = ROOT / "scripts/e2e/regional/boot_guard/registry.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "32"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    entries = json.loads(result.stdout)
+
+    assert entries[0]["agent_endpoint_allowed_cidrs"] == ["192.0.2.0/24"]
+
+
+def test_boot_guard_resume_requires_prior_pass_evidence() -> None:
+    path = ROOT / "scripts/e2e/regional/run_regional_boot_guard_cases.sh"
+    runner = path.read_text(encoding="utf-8")
+
+    assert path.stat().st_mode & 0o111
+    assert 'BOOT_GUARD_START_CASE}" != "1"' in runner
+    assert 'BOOT_GUARD_START_CASE}" != "7"' in runner
+    assert 'BOOT_GUARD_START_CASE}" != "8"' in runner
+    assert "printf -v case_id 'GF-REGIONAL-BOOT-%03d'" in runner
+    assert 'grep -qx "PASS" "${evidence}"' in runner
 
 
 def test_boot008_uses_a_real_cluster_token_route() -> None:

@@ -43,6 +43,30 @@ class PostgresNotificationMixin:
             rows = cursor.fetchall()
         return [self._decode("notification", row[0]) for row in rows]
 
+    def notification_status_counts(self) -> dict[NotificationStatus, int]:
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    COALESCE(
+                        result.payload->>'status',
+                        'QUEUED'
+                    ) AS status,
+                    COUNT(*)
+                FROM gpu_fault_objects AS notification
+                LEFT JOIN gpu_fault_objects AS result
+                  ON result.kind='notification_result'
+                 AND result.key=notification.key
+                WHERE notification.kind='notification'
+                GROUP BY status
+                """
+            )
+            rows = cursor.fetchall()
+        counts = {status: 0 for status in NotificationStatus}
+        for status, count in rows:
+            counts[NotificationStatus(status)] = int(count)
+        return counts
+
     def claim_notification_deliveries(
         self,
         owner_id: str,

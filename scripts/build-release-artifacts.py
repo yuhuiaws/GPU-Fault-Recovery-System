@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from component_wheels import build_component
+from release_identity import bind_runtime_image, build_release_identity
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,29 @@ def sha256(path: Path) -> str:
 def project_version() -> str:
     document = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     return str(document["project"]["version"])
+
+
+def validate_runtime_components(
+    descriptor: dict[str, object],
+    *,
+    hashes: dict[str, str],
+    module_digests: dict[str, str],
+) -> None:
+    raw_components = descriptor.get("components")
+    if not isinstance(raw_components, dict):
+        raise RuntimeError("runtime image descriptor has no component identities")
+    for name in ("control_plane", "executor"):
+        value = raw_components.get(name)
+        if not isinstance(value, dict):
+            raise RuntimeError(f"runtime image descriptor has no {name} identity")
+        if value.get("wheel_sha256") != hashes[name]:
+            raise RuntimeError(
+                f"runtime image {name} wheel does not match release artifact"
+            )
+        if value.get("module_digest") != module_digests[name]:
+            raise RuntimeError(
+                f"runtime image {name} module digest does not match release artifact"
+            )
 
 
 def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
@@ -63,6 +87,7 @@ def _existing_release(
     *,
     release_id: str,
     hashes: dict[str, str],
+    delivery_sha256: str,
 ) -> tuple[dict[str, object], str] | None:
     manifest_path = release_dir / "release.json"
     if not manifest_path.is_file():
@@ -82,6 +107,8 @@ def _existing_release(
         raise RuntimeError(f"content-addressed release collision: {release_id}")
     if manifest.get("bundle_sha256") != hashes["node_bundle"]:
         raise RuntimeError(f"content-addressed bundle collision: {release_id}")
+    if (manifest.get("delivery") or {}).get("sha256") != delivery_sha256:
+        raise RuntimeError(f"content-addressed delivery collision: {release_id}")
     for name, digest in expected.items():
         wheel = ROOT / str((components[name] or {})["wheel"])
         if not wheel.is_file() or sha256(wheel) != digest:
@@ -97,6 +124,7 @@ def _publish_release(
     *,
     release_id: str,
     hashes: dict[str, str],
+    delivery_sha256: str,
     manifest: dict[str, object],
     content: str,
 ) -> tuple[dict[str, object], str]:
@@ -105,6 +133,7 @@ def _publish_release(
         release_dir,
         release_id=release_id,
         hashes=hashes,
+        delivery_sha256=delivery_sha256,
     )
     staged_release = staging / release_id
     if existing is None:
@@ -122,8 +151,19 @@ def _publish_release(
     return manifest, content
 
 
-def build(python: str) -> dict[str, object]:
+def build(
+    python: str,
+    *,
+    runtime_image_descriptor: Path | None = None,
+) -> dict[str, object]:
     python = resolve_python_executable(python)
+    delivery = build_release_identity(ROOT)
+    runtime_descriptor: dict[str, object] | None = None
+    if runtime_image_descriptor is not None:
+        runtime_descriptor = json.loads(
+            runtime_image_descriptor.read_text(encoding="utf-8")
+        )
+        delivery = bind_runtime_image(ROOT, delivery, runtime_descriptor)
     shutil.rmtree(BUILD, ignore_errors=True)
     DIST.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".build-", dir=DIST) as directory:
@@ -170,8 +210,26 @@ def build(python: str) -> dict[str, object]:
             "node_runtime": sha256(node_wheel),
             "node_bundle": sha256(bundle),
         }
+        module_digests = {
+            "control_plane": control_digest,
+            "executor": executor_digest,
+            "node_runtime": node_digest,
+        }
+        if runtime_descriptor is not None:
+            validate_runtime_components(
+                runtime_descriptor,
+                hashes=hashes,
+                module_digests=module_digests,
+            )
         release_id = hashlib.sha256(
-            json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(
+                {
+                    "artifacts": hashes,
+                    "delivery": delivery["sha256"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
         ).hexdigest()[:12]
         release_dir = staging / release_id
         release_dir.mkdir()
@@ -224,7 +282,8 @@ def build(python: str) -> dict[str, object]:
         )
         published = Path("dist") / release_id
         manifest: dict[str, object] = {
-            "schema_version": 2,
+            "schema_version": 3,
+            "deployable": bool(delivery["runtime_prebuilt"]),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "version": project_version(),
             "release_id": release_id,
@@ -236,6 +295,11 @@ def build(python: str) -> dict[str, object]:
             "module_digest": control_digest,
             "database_schema_version": int(schema_version),
             "protocol_versions": protocols,
+            "delivery": delivery,
+            "database": {
+                "schema_version": int(schema_version),
+                "rollback_compatible": delivery["schema_rollback_compatible"],
+            },
             "components": {
                 "control_plane": {
                     "wheel": (published / control_wheel.name).as_posix(),
@@ -258,6 +322,7 @@ def build(python: str) -> dict[str, object]:
                 "node_bundle": {
                     "bundle": (published / bundle.name).as_posix(),
                     "bundle_sha256": hashes["node_bundle"],
+                    "template_sha256": delivery["node_template_inputs"]["sha256"],
                 },
             },
         }
@@ -267,6 +332,7 @@ def build(python: str) -> dict[str, object]:
             staging,
             release_id=release_id,
             hashes=hashes,
+            delivery_sha256=str(delivery["sha256"]),
             manifest=manifest,
             content=content,
         )
@@ -280,8 +346,19 @@ def main() -> int:
         "--python",
         default=sys.executable,
     )
+    parser.add_argument(
+        "--runtime-image-descriptor",
+        type=Path,
+    )
     args = parser.parse_args()
-    manifest = build(args.python)
+    manifest = build(
+        args.python,
+        runtime_image_descriptor=(
+            args.runtime_image_descriptor.resolve()
+            if args.runtime_image_descriptor is not None
+            else None
+        ),
+    )
     print(
         "release_id={release_id}\n"
         "control_plane_wheel={wheel}\n"

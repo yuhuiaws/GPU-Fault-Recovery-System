@@ -6,8 +6,9 @@ from dataclasses import replace
 
 import pytest
 
-from gpu_fault import admin_bootstrap
+from gpu_fault import admin_bootstrap, admin_release_artifacts
 from gpu_fault.admin_bootstrap import (
+    _build_release,
     _ensure_security_group,
     _site_identifier,
     _unused_subnet_cidrs,
@@ -33,6 +34,51 @@ def test_cluster_arn_parser_accepts_eks_and_hyperpod() -> None:
     assert eks.resource_name == "gpu-a"
     assert hyperpod.service == "sagemaker"
     assert hyperpod.resource_name == "gpu-a"
+
+
+def test_hyperpod_discovery_uses_the_complete_input_arn(monkeypatch) -> None:
+    hyperpod_arn = "arn:aws:sagemaker:us-east-1:123456789012:cluster/internal-id"
+    calls: list[tuple[str, str, tuple[str, ...]]] = []
+
+    class Runner:
+        def aws_json(self, region, service, operation, *arguments, **_kwargs):
+            calls.append((service, operation, arguments))
+            if service == "sagemaker":
+                return {
+                    "ClusterArn": hyperpod_arn,
+                    "ClusterName": "gpu-a",
+                    "NodeRecovery": "None",
+                    "Orchestrator": {
+                        "Eks": {
+                            "ClusterArn": (
+                                "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
+                            )
+                        }
+                    },
+                }
+            return {
+                "cluster": {
+                    "status": "ACTIVE",
+                    "resourcesVpcConfig": {"vpcId": "vpc-a", "subnetIds": ["subnet-a"]},
+                }
+            }
+
+    monkeypatch.setattr(
+        admin_bootstrap,
+        "discover_subnet_cidrs",
+        lambda *_args, **_kwargs: ("10.0.0.0/24",),
+    )
+
+    discovered = admin_bootstrap.discover_cluster(
+        Runner(), cluster_arn=hyperpod_arn, role="gpu", context="gpu-a"
+    )
+
+    assert discovered.hyperpod_name == "gpu-a"
+    assert calls[0] == (
+        "sagemaker",
+        "describe-cluster",
+        ("--cluster-name", hyperpod_arn),
+    )
 
 
 def test_public_subnet_allocator_avoids_existing_ranges() -> None:
@@ -78,6 +124,70 @@ def test_parallel_bootstrap_persists_successes_when_another_task_fails(
     reloaded = BootstrapState(tmp_path / "state.json", site_id="test")
     assert reloaded.value["completed_tasks"] == ["pki"]
     assert reloaded.value["resources"]["pki"] == {"certificate_arn": "arn:certificate"}
+
+
+def test_legacy_foundation_consumes_prebuilt_release(tmp_path, monkeypatch) -> None:
+    manifest = tmp_path / "dist/current-release.json"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "deployable": True,
+                "release_id": "release-a",
+                "delivery": {
+                    "images": {
+                        name: {
+                            "reference": f"registry.example/{name}@sha256:"
+                            + character * 64
+                        }
+                        for name, character in {
+                            "runtime": "1",
+                            "node_installer": "2",
+                            "dcgm_exporter": "3",
+                            "adot": "4",
+                        }.items()
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "compute_agent_config_digest",
+        lambda *_args, **_kwargs: "a" * 64,
+    )
+
+    result = _build_release(
+        type("Runner", (), {"dry_run": False})(),
+        repository_root=tmp_path,
+        runtime_profile="profile-a",
+    )
+
+    assert result["manifest"] == str(manifest)
+    assert result["agent_config_digest"] == "a" * 64
+    assert result["images"]["runtime"].endswith("1" * 64), (
+        "legacy bootstrap did not preserve the signed runtime image digest"
+    )
+
+
+def test_legacy_foundation_rejects_source_only_release(tmp_path) -> None:
+    manifest = tmp_path / "dist/current-release.json"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        json.dumps(
+            {"schema_version": 3, "deployable": False, "release_id": "release-a"}
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BootstrapError, match="deployable schema v3"):
+        _build_release(
+            type("Runner", (), {"dry_run": False})(),
+            repository_root=tmp_path,
+            runtime_profile="profile-a",
+        )
 
 
 def test_legacy_bootstrap_state_revalidates_exclusive_resources(tmp_path) -> None:

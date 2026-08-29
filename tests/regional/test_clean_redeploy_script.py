@@ -138,6 +138,7 @@ def test_execute_path_compiles_database_probe_and_preserves_stop_order(
     fake_kubectl = fake_bin / "kubectl"
     fake_kubectl.write_text(
         """#!/usr/bin/env python3
+import json
 import os
 import sys
 
@@ -165,11 +166,27 @@ if (
     and "-o" in args
     and "json" in args
     and (
-        any("," in argument for argument in args)
+        args.index("-o") == args.index("get") + 2
+        or any("," in argument for argument in args)
         or "namespace" in args
     )
 ):
-    print('{"items":[]}')
+    items = []
+    kind = args[args.index("get") + 1]
+    if "," not in kind and kind == "deployment":
+        items = [
+            {"metadata": {"name": "gpu-fault-api-ha"}},
+            {"metadata": {"name": "gpu-fault-control-worker"}},
+            {"metadata": {"name": "gpu-fault-cluster-executor"}},
+            {"metadata": {"name": "gpu-fault-completion-watcher"}},
+            {
+                "metadata": {
+                    "name": "gpu-fault-kubernetes-node-resource-collector"
+                }
+            },
+            {"metadata": {"name": "gpu-fault-node-installer-reconciler"}},
+        ]
+    print(json.dumps({"items": items}))
     raise SystemExit(0)
 if "get" in args and "pod" in args:
     print("fake-database-pod", end="")

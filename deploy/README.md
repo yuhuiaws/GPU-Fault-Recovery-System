@@ -30,6 +30,20 @@ It validates `config/site.example.yaml`, materializes the low-level release
 JSON with mode `0600`, and reuses the regional rollout state machine. Direct
 rollout commands remain available for resume, rollback and break-glass.
 
+CI builds and pushes the immutable runtime image before the deployment host
+verifies and applies the signed release:
+
+```bash
+make PYTHON=.venv/bin/python release-build \
+  RUNTIME_IMAGE_REPOSITORY=<account>.dkr.ecr.<region>.amazonaws.com/<repository>
+
+make PYTHON=.venv/bin/python release-deploy \
+  SITE=/secure/gpu-fault/site.yaml \
+  PREBUILT_ATTESTATION=/secure/release/current-attestation.json \
+  PREBUILT_BUNDLE=/secure/release/current-attestation.bundle.json \
+  COSIGN_KEY=/secure/release/cosign.pub
+```
+
 | Deployment surface | Directory | Entry point |
 |---|---|---|
 | Regional CPU control plane | `control-plane/` | `control-plane/regional/rollout-regional-release.sh` or `control-plane/tools/apply-control-plane-role-split.sh` |
@@ -38,8 +52,9 @@ rollout commands remain available for resume, rollback and break-glass.
 | GPU node installation | `node/` and `systemd/` | `node/build-node-installer-bundle.sh` and `node/install-gpu-fault-collector.sh` |
 | Observability | `observability/` | `observability/install-amp-monitoring.sh` |
 | Database and endpoint migrations | `migrations/` | Apply only the named runbook manifest |
+| AWS foundation | `aws/regional-foundation/` | Terraform; apply before application deployment |
 | AWS supporting resources | `aws/{s3,iam,lambda}/` | Use from the matching operations runbook |
-| Runtime image | `image/Dockerfile` | Build with the repository root as context |
+| Runtime image | `image/Dockerfile` | CI builds from `uv.lock`-derived hashed requirements and pushes by digest |
 | Historical single-cluster automation | `hyperpod/` | Compatibility and migration only; not the production topology |
 
 ## Hard rules
@@ -67,8 +82,11 @@ rollout commands remain available for resume, rollback and break-glass.
    Contract checks reject missing annotations or stale generated output.
    Node uninstall uses `/opt/gpu-fault/installed-units.txt`, generated from
    the units actually installed on that host.
-6. AWS resources created or adopted as same-site leftovers by ARN-only deployment are registered in
-   Aurora as `installation_resource` objects. The administrator entry point is
+6. New AWS foundation resources are managed by
+   `aws/regional-foundation/` Terraform and treated as external/PRESERVE by
+   the application lifecycle. The legacy ARN-only Python foundation path
+   requires explicit opt-in. Application-owned or adopted resources are
+   registered in Aurora as `installation_resource` objects. The administrator entry point is
    `gpu-fault-admin uninstall`; it exports that registry before cleanup,
    verifies every `DELETE`/`DETACH` entry, preserves all GPU clusters, and
    deletes the Aurora stack only after the non-Aurora phases are complete.
@@ -83,15 +101,22 @@ rollout commands remain available for resume, rollback and break-glass.
 8. Finalizing an already-finalized release is idempotent. CPU Deployments are
    restarted only when the effective required/compatible release metadata
    changes; repeating the same release does not create a second rollout.
-9. Release manifest schema v2 carries separate `control_plane`, `executor`,
-   `node_runtime`, and `node_bundle` components. CPU workloads mount only the
-   control-plane wheel; GPU Kubernetes workloads mount only the Executor
-   wheel; host systemd services install only the Node Runtime wheel from the
-   bundle. Physical wheel SHA-256 and behavior `module_digest` are both pinned.
-10. Deploy classifies changes as `NOOP`, `CONTROL_PLANE_ONLY`,
-    `DATA_PLANE_COMPATIBLE`, or `FULL`. It uploads and rolls only affected
-    components, runs independent GPU clusters with bounded parallelism, and
-    reuses the persisted diff when a failed or rolled-back release is retried.
+9. Release manifest schema v3 carries wheel/bundle identities, rendered
+   Manifest digests, renderer and dependency locks, node template identity,
+   and immutable runtime/installer/DCGM/ADOT image digests. Runtime Pods start
+   preinstalled commands; they never install dependencies at startup. The
+   shared runtime image contains isolated `/opt/gpu-fault/control-plane` and
+   `/opt/gpu-fault/executor` virtual environments built from the exact
+   component wheels recorded in the runtime image descriptor.
+10. The four public change classes remain summary labels. Execution uses a
+    component DAG for schema, CPU, endpoint, observability, DCGM, Executor,
+    Watcher, Collector, Reconciler and Agent. Node Runtime uses persisted
+    FleetDeployment waves; upgrade and rollback reuse phase/cluster
+    checkpoints.
+11. Deployment hosts accept only a signed deployable Manifest v3 attestation.
+    CI runs `make check`, builds and pushes OCI, then signs the attestation.
+    Post-change validation is quick gate, one full verify, then a 120-300
+    second restart/queue/alert stability window.
 
 Unsupported generic Kubernetes examples were moved to
 `examples/legacy/kubernetes/`. Their presence does not make that topology a

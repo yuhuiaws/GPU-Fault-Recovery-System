@@ -30,6 +30,13 @@ from pathlib import Path
 import yaml
 
 
+CONTROL_PLANE_RUNTIME_PATH = (
+    "/opt/gpu-fault/control-plane/bin:/opt/app-root/bin:"
+    "/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:"
+    "/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+
 # Everything that sizes the processor's own thread pools. These belong
 # to whichever tier claims from the queue; on an ingress-only replica
 # they are inert. verify_control_plane_role_split.py
@@ -170,6 +177,7 @@ def unset_env(container: dict, name: str) -> None:
 
 
 def configure_processor_retry(container: dict) -> None:
+    set_env(container, "PATH", CONTROL_PLANE_RUNTIME_PATH)
     set_env(container, "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS", "1")
     set_env(container, "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS", "30")
 
@@ -194,7 +202,7 @@ def replace_uvicorn_args(
     if not args or len(args) != 1:
         raise ValueError("API container must use one shell args entry")
     command = args[0]
-    marker = "exec uvicorn gpu_fault.app:create_app --factory"
+    marker = 'exec "$@" gpu_fault.app:create_app --factory'
     if marker not in command:
         raise ValueError("API container does not launch gpu_fault.app:create_app")
     prefix = command.split(marker, 1)[0].replace(

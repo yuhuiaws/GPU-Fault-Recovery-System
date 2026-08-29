@@ -159,6 +159,8 @@ def test_rollback_uses_previous_executor_and_node_pins(
     previous_executor_compatibility = "b" * 64
     previous_agent = "c" * 64
     previous_agent_compatibility = "d" * 64
+    previous_runtime_image = "registry.example/runtime@sha256:" + "1" * 64
+    previous_installer_image = "registry.example/installer@sha256:" + "2" * 64
     gpu_calls = []
     reconciler_calls = []
     restore_calls = []
@@ -182,14 +184,15 @@ def test_rollback_uses_previous_executor_and_node_pins(
     )
     monkeypatch.setattr(
         release,
-        "_deploy_reconciler",
+        "_roll_node_runtime",
         lambda *args, **kwargs: reconciler_calls.append((args, kwargs)),
     )
-    monkeypatch.setattr(release, "_wait_agents", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(release, "_save_state", lambda *_args, **_kwargs: None)
     target = config.clusters[0]
     previous = {
         "cpu_wheel": "old-control-wheel",
+        "runtime_image": previous_runtime_image,
+        "node_installer_image": previous_installer_image,
         "runtime_profile_version": "hyperpod-v1",
         "cpu_role_config_maps": {
             "gpu-fault-control-worker-config-core": {"GPU_FAULT_SERVICE_ROLE": "worker"}
@@ -198,10 +201,27 @@ def test_rollback_uses_previous_executor_and_node_pins(
             "required-agent-artifact-sha256": previous_agent,
             "required-agent-compatibility-digest": previous_agent_compatibility,
             "required-agent-config-digest": "f" * 64,
+            "required-agent-protocol-version": "3",
+            "required-node-action-key-version": "2",
             "required-regional-executor-artifact-sha256": previous_executor,
             "required-regional-executor-compatibility-digest": (
                 previous_executor_compatibility
             ),
+        },
+        "agent_identities": {
+            target.cluster_id: {
+                "agent_protocol_version": 3,
+                "agent_version": "0.9.0",
+                "artifact_sha256": previous_agent,
+                "compatibility_digest": previous_agent_compatibility,
+                "installer_bundle_sha256": None,
+                "installer_template_sha256": None,
+                "policy_version": "catalog-a",
+                "runtime_profile_version": "hyperpod-v1",
+                "config_digest": "f" * 64,
+                "node_action_key_version": 2,
+                "node_ids": ["node-a"],
+            }
         },
         "clusters": {
             target.cluster_id: {
@@ -218,21 +238,47 @@ def test_rollback_uses_previous_executor_and_node_pins(
 
     assert restore_calls == [
         "registry",
+        "registry",
         ("config-maps", previous["cpu_role_config_maps"]),
     ]
-    cpu_apply = next(
+    cpu_applies = [
         kwargs
         for args, kwargs in release.runner.calls
         if args[0] == "bash" and "apply-control-plane-role-split.sh" in args[1]
-    )
-    assert cpu_apply["env"]["GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS"] == "true"
-    assert cpu_apply["env"]["GPU_FAULT_FORCE_ROLE_RESTART"] == "true"
+    ]
+    assert len(cpu_applies) == 2
+    assert all(
+        item["env"]["GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS"] == "true"
+        for item in cpu_applies
+    ), "rollback CPU stages did not preserve the selected role ConfigMaps"
+    assert all(
+        item["env"]["GPU_FAULT_FORCE_ROLE_RESTART"] == "true" for item in cpu_applies
+    ), "rollback CPU stages did not force a restart"
+    assert cpu_applies[0]["env"]["GPU_FAULT_RUNTIME_IMAGE"] == release.runtime_image
+    assert cpu_applies[1]["env"]["GPU_FAULT_RUNTIME_IMAGE"] == previous_runtime_image
+    core_patches = [
+        args
+        for args, _kwargs in release.runner.calls
+        if "patch" in args and "configmap" in args and "--type=merge" in args
+    ]
+    assert len(core_patches) == 3
+    patch = json.loads(core_patches[0][-1])
+    assert patch["data"] == {
+        "GPU_FAULT_REQUIRED_AGENT_VERSION": "0.9.0",
+        "GPU_FAULT_REQUIRED_POLICY_VERSION": "catalog-a",
+        "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": "hyperpod-v1",
+    }
     assert gpu_calls[0][1]["executor_artifact_sha"] == previous_executor
     assert (
         gpu_calls[0][1]["executor_compatibility_digest"]
         == previous_executor_compatibility
     )
+    assert gpu_calls[0][1]["runtime_image"] == previous_runtime_image
     assert (
         reconciler_calls[0][1]["node_compatibility_digest"]
         == previous_agent_compatibility
     )
+    assert reconciler_calls[0][1]["phase"] == "rollback"
+    assert reconciler_calls[0][1]["runtime_image"] == release.runtime_image
+    assert reconciler_calls[0][1]["steady_runtime_image"] == previous_runtime_image
+    assert reconciler_calls[0][1]["node_installer_image"] == previous_installer_image

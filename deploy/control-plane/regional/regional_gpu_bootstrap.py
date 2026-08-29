@@ -16,7 +16,12 @@ from regional_release_rendering import DEFAULT_DCGM_EXPORTER_IMAGE
 ROOT = Path(__file__).resolve().parents[3]
 
 
-def apply_gpu_dcgm_exporter(release: Any, target: ClusterTarget) -> None:
+def apply_gpu_dcgm_exporter(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    image: str | None = None,
+) -> None:
     counters = ROOT / "deploy/dataplane/dcgm-counters.csv"
     rendered_config_map = release.runner.run(
         release._gpu(
@@ -45,7 +50,7 @@ def apply_gpu_dcgm_exporter(release: Any, target: ClusterTarget) -> None:
         f"namespace: {release.config.namespace}",
     ).replace(
         DEFAULT_DCGM_EXPORTER_IMAGE,
-        release.dcgm_exporter_image,
+        image or release.dcgm_exporter_image,
     )
     release.runner.run(
         release._gpu(target, "apply", "-f", "-"),
@@ -83,6 +88,43 @@ def retry_failed_installer_jobs(release: Any, target: ClusterTarget) -> None:
             for condition in conditions
         )
         if not failed:
+            continue
+        name = str((item.get("metadata") or {}).get("name") or "")
+        if not name:
+            continue
+        release.runner.run(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "delete",
+                "job",
+                name,
+                "--wait=true",
+            )
+        )
+
+
+def cancel_active_installer_jobs(release: Any, target: ClusterTarget) -> None:
+    jobs = release._get_json(
+        release._gpu(
+            target,
+            "-n",
+            release.config.namespace,
+            "get",
+            "jobs",
+            "-l",
+            "gpu-fault.io/node-installer=true",
+        )
+    ).get("items", [])
+    for item in jobs:
+        conditions = (item.get("status") or {}).get("conditions") or []
+        terminal = any(
+            condition.get("type") in {"Complete", "Failed"}
+            and condition.get("status") == "True"
+            for condition in conditions
+        )
+        if terminal:
             continue
         name = str((item.get("metadata") or {}).get("name") or "")
         if not name:

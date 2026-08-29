@@ -791,6 +791,57 @@ def test_deployment_waves_reconcile_from_heartbeats() -> None:
     assert {item.status for item in completed.nodes} == {DeploymentNodeStatus.READY}
 
 
+def test_fleet_accepts_legacy_agent_identity_without_optional_digests() -> None:
+    fleet = registry()
+    fleet.register(signed(heartbeat("node-a")))
+
+    deployment = fleet.create_deployment(
+        FleetDeploymentRequest(
+            cluster_id="cluster-a",
+            node_ids=["node-a"],
+            desired_agent_protocol_version=3,
+            desired_agent_version="0.9.0",
+            desired_artifact_sha256=ARTIFACT,
+            desired_compatibility_digest=ARTIFACT,
+            desired_bundle_sha256=None,
+            desired_template_sha256=None,
+            desired_policy_version="catalog-a",
+            desired_runtime_profile_version="profile-a",
+            desired_config_digest=CONFIG,
+        )
+    )
+
+    assert deployment.status is DeploymentStatus.SUCCEEDED
+    assert deployment.desired_bundle_sha256 is None
+    assert deployment.desired_template_sha256 is None
+    assert deployment.desired_agent_protocol_version == 3
+
+
+def test_deployment_id_is_idempotent_and_contract_bound() -> None:
+    fleet = registry()
+    request = FleetDeploymentRequest(
+        deployment_id="release-a-cluster-a",
+        cluster_id="cluster-a",
+        node_ids=["node-a"],
+        desired_agent_version="0.9.0",
+        desired_artifact_sha256=ARTIFACT,
+        desired_bundle_sha256="d" * 64,
+        desired_template_sha256="e" * 64,
+        desired_policy_version="catalog-a",
+        desired_runtime_profile_version="profile-a",
+        desired_config_digest=CONFIG,
+    )
+
+    created = fleet.create_deployment(request)
+    repeated = fleet.create_deployment(request)
+
+    assert repeated == created
+    with pytest.raises(ValueError, match="different rollout"):
+        fleet.create_deployment(
+            request.model_copy(update={"desired_bundle_sha256": "f" * 64})
+        )
+
+
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_terminal_deployment_retention_keeps_open_rolls(tmp_path, backend) -> None:
     """Retention must not touch a roll an agent could still be in.

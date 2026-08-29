@@ -69,10 +69,13 @@ spec:
                 command: ["/bin/sh", "-c", "sleep 20"]
           command: ["/bin/sh", "-c"]
           args:
-            - >-
-              python -m pip install --no-cache-dir
-              '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors,postgres,performance]'
-              && exec uvicorn gpu_fault.app:create_app --factory
+            - |-
+              if [ -x /opt/gpu-fault/control-plane/bin/python ]; then
+                set -- /opt/gpu-fault/control-plane/bin/python -m uvicorn
+              else
+                set -- uvicorn
+              fi
+              exec "$@" gpu_fault.app:create_app --factory
               --host 0.0.0.0 --port 8080
               --workers 4 --loop uvloop --http httptools
               --backlog 8192 --limit-concurrency 4096
@@ -83,6 +86,9 @@ spec:
               --limit-max-requests-jitter 2000
               --no-access-log
           env:
+            - name: PATH
+              value: >-
+                /opt/gpu-fault/control-plane/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: POD_UID
               valueFrom:
                 fieldRef:

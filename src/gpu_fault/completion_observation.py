@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from typing import Any, cast
 
+from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 
 LOGGER = logging.getLogger(__name__)
 
@@ -17,6 +20,76 @@ PYTORCH_JOB_LABELS = (
     "training.kubeflow.org/job-name",
     "pytorch-job-name",
 )
+
+
+class MissingAttemptTracker:
+    def __init__(self) -> None:
+        self.since: dict[str, datetime] = {}
+
+    def clear(self, attempt_id: str) -> None:
+        self.since.pop(attempt_id, None)
+
+    def observe_missing(
+        self,
+        attempt_id: str,
+        observation: AttemptObservation,
+        observed_at: datetime,
+    ) -> AttemptObservation:
+        missing_since = self.since.setdefault(attempt_id, observed_at)
+        if (
+            observed_at - missing_since
+        ).total_seconds() < observation.cleanup_timeout_seconds:
+            return observation
+        return cast(
+            AttemptObservation,
+            observation.model_copy(
+                update={
+                    "workload_phase": WorkloadPhase.STOPPED,
+                    "observed_at": observed_at,
+                    "containers": [],
+                }
+            ),
+        )
+
+
+def reconcile_attempt_observation(
+    controller: Any,
+    attempt_id: str,
+    attempt_pods: list[dict[str, Any]],
+    observed_at: datetime,
+) -> AttemptObservation | None:
+    terminal = cast(
+        AttemptObservation | None,
+        controller._terminal_observations.get(attempt_id),
+    )
+    if terminal is not None:
+        controller._missing_attempts.clear(attempt_id)
+        return terminal
+    if attempt_pods:
+        controller._missing_attempts.clear(attempt_id)
+        return cast(
+            AttemptObservation,
+            controller._observation(attempt_id, attempt_pods, observed_at),
+        )
+    previous = cast(
+        AttemptObservation | None,
+        controller._last_observations.get(attempt_id),
+    )
+    if previous is None:
+        return None
+    if attempt_id in controller._failure_events:
+        return cast(
+            AttemptObservation,
+            previous.model_copy(update={"observed_at": observed_at}),
+        )
+    return cast(
+        AttemptObservation,
+        controller._missing_attempts.observe_missing(
+            attempt_id,
+            previous,
+            observed_at,
+        ),
+    )
 
 
 class ObservationOnlyTracker:
@@ -211,6 +284,7 @@ def _clear_attempt(controller, attempt_id: str) -> None:
     controller._attempt_specs.pop(attempt_id, None)
     controller._last_observations.pop(attempt_id, None)
     controller._terminal_observations.pop(attempt_id, None)
+    controller._missing_attempts.clear(attempt_id)
     controller._failure_events.pop(attempt_id, None)
     controller._failure_sent.discard(attempt_id)
     controller._failure_delivery_started.pop(attempt_id, None)

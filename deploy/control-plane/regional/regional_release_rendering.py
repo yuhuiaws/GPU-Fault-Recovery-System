@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -7,11 +9,154 @@ from typing import Any
 import regional_deployment_inventory as inventory
 import yaml
 from regional_notifications import notification_digest
-from regional_release_config import ClusterTarget, ReleaseError
+from regional_release_config import (
+    ClusterTarget,
+    ReleaseError,
+    render_nlb_manifest,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 DEFAULT_DCGM_EXPORTER_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
+
+
+def _documents(text: str) -> list[dict[str, Any]]:
+    return [
+        document for document in yaml.safe_load_all(text) if isinstance(document, dict)
+    ]
+
+
+def rendered_release_manifest_sha256(release: Any) -> str:
+    config = release.config
+    generated = ROOT / "deploy/control-plane/regional/generated"
+    manifest_names = [
+        item.strip()
+        for item in (generated / "manifest-list.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if item.strip() and not item.startswith("#")
+    ]
+    cpu_documents: dict[str, list[dict[str, Any]]] = {}
+    for filename in manifest_names:
+        text = (generated / filename).read_text(encoding="utf-8")
+        replacements = {
+            "gpu-fault-control-plane-wheel-0100": release.wheel_cm,
+            "namespace: gpu-fault-system": f"namespace: {config.namespace}",
+            "REPLACE_WITH_AWS_REGION": config.aws_region,
+            "REPLACE_WITH_RUNTIME_PROFILE_VERSION": (config.runtime_profile_version),
+            DEFAULT_RUNTIME_IMAGE: release.runtime_image,
+            "GPU_FAULT_ALLOW_EMAIL: 'true'": (
+                "GPU_FAULT_ALLOW_EMAIL: "
+                f"'{str(config.notifications.allow_email).lower()}'"
+            ),
+            "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: 'false'": (
+                "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: "
+                f"'{str(config.notifications.acknowledge_external_alert_channel).lower()}'"
+            ),
+        }
+        for source, destination in replacements.items():
+            text = text.replace(source, destination)
+        text = text.replace(
+            "gpu-fault.io/artifact-sha256: "
+            "209840015cc3057e191931f113d35dff733cf1b7483d68dd6b6b26a7de9a112b",
+            f"gpu-fault.io/artifact-sha256: {release.wheel_sha}",
+        )
+        cpu_documents[filename] = _documents(text)
+
+    gpu_documents = {
+        target.cluster_id: {
+            deployment: _documents(text)
+            for deployment, text in render_gpu_rollout_manifests(
+                release,
+                target,
+                release.executor_wheel_cm,
+            )
+        }
+        for target in config.clusters
+    }
+    schema_text = (
+        ROOT / "deploy/migrations/postgres-schema-ensure-job.yaml"
+    ).read_text(encoding="utf-8")
+    for source, destination in {
+        "namespace: gpu-fault-system": f"namespace: {config.namespace}",
+        "REPLACE_WITH_WHEEL_CONFIGMAP": release.wheel_cm,
+        DEFAULT_RUNTIME_IMAGE: release.runtime_image,
+    }.items():
+        schema_text = schema_text.replace(source, destination)
+    refresh_text = (
+        ROOT / "deploy/control-plane/regional/aurora-credential-refresh.yaml"
+    ).read_text(encoding="utf-8")
+    refresh_text = refresh_text.replace(
+        "namespace: gpu-fault-system",
+        f"namespace: {config.namespace}",
+    ).replace(
+        DEFAULT_RUNTIME_IMAGE,
+        release.runtime_image,
+    )
+
+    nlb_documents = (
+        _documents(
+            render_nlb_manifest(
+                config,
+                (
+                    ROOT
+                    / "deploy/control-plane/regional/regional-control-plane-nlb.yaml"
+                ).read_text(encoding="utf-8"),
+            )
+        )
+        if config.nlb
+        else []
+    )
+    dcgm_text = (ROOT / "deploy/dataplane/hyperpod-dcgm-exporter.yaml").read_text(
+        encoding="utf-8"
+    )
+    dcgm_text = dcgm_text.replace(
+        "namespace: gpu-fault-system",
+        f"namespace: {config.namespace}",
+    ).replace(
+        DEFAULT_DCGM_EXPORTER_IMAGE,
+        release.dcgm_exporter_image,
+    )
+    observability_text = (
+        ROOT / "deploy/observability/adot-control-plane.yaml"
+    ).read_text(encoding="utf-8")
+    observability_text = observability_text.replace(
+        "namespace: gpu-fault-system",
+        f"namespace: {config.namespace}",
+    ).replace(
+        "REPLACE_WITH_ADOT_IMAGE",
+        release.adot_image,
+    )
+    payload = {
+        "cpu": cpu_documents,
+        "gpu": gpu_documents,
+        "schema": _documents(schema_text),
+        "aurora_refresh": _documents(refresh_text),
+        "nlb": nlb_documents,
+        "dcgm": _documents(dcgm_text),
+        "observability": _documents(observability_text),
+        "reconciler": {
+            target.cluster_id: {
+                "wheel_config_map": release.executor_wheel_cm,
+                "bundle_config_map": release.bundle_cm,
+                "artifact_sha256": release.node_wheel_sha,
+                "bundle_sha256": release.bundle_sha,
+                "template_source_sha256": release.node_template_sha,
+                "config_digest": config.agent_config_digest,
+                "runtime_profile_version": config.runtime_profile_version,
+                "runtime_image": release.runtime_image,
+                "node_installer_image": release.node_installer_image,
+            }
+            for target in config.clusters
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 def stamp_gpu_deployments(
@@ -20,6 +165,7 @@ def stamp_gpu_deployments(
     *,
     executor_artifact_sha: str | None = None,
     executor_compatibility_digest: str | None = None,
+    runtime_image: str | None = None,
 ) -> str:
     artifact_sha = executor_artifact_sha or release.executor_wheel_sha
     compatibility_digest = (
@@ -45,7 +191,7 @@ def stamp_gpu_deployments(
                 "gpu-fault.io/release-wheel-sha256": artifact_sha,
                 "gpu-fault.io/executor-wheel-sha256": artifact_sha,
                 "gpu-fault.io/executor-compatibility-digest": compatibility_digest,
-                "gpu-fault.io/runtime-image": release.runtime_image,
+                "gpu-fault.io/runtime-image": (runtime_image or release.runtime_image),
             }
         )
     return yaml.safe_dump_all(
@@ -105,6 +251,8 @@ def render_gpu_rollout_manifests(
     target: ClusterTarget,
     wheel_cm: str,
     *,
+    deployment_names: frozenset[str] | None = None,
+    runtime_image: str | None = None,
     runtime_profile_version: str | None = None,
     executor_wheel_filename: str | None = None,
     executor_artifact_sha: str | None = None,
@@ -124,7 +272,7 @@ def render_gpu_rollout_manifests(
             executor_wheel_filename or release.config.executor_wheel.name
         ),
         "namespace: gpu-fault-system": f"namespace: {config.namespace}",
-        DEFAULT_RUNTIME_IMAGE: release.runtime_image,
+        DEFAULT_RUNTIME_IMAGE: runtime_image or release.runtime_image,
         "REPLACE_WITH_AWS_REGION": target.region,
         "REPLACE_WITH_RUNTIME_PROFILE_VERSION": profile_version,
         "REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN": target.executor_irsa_role_arn,
@@ -133,6 +281,8 @@ def render_gpu_rollout_manifests(
     }
     rendered = []
     for filename, deployment in inventory.GPU_ROLLOUT_DEPLOYMENTS:
+        if deployment_names is not None and deployment not in deployment_names:
+            continue
         text = (ROOT / "deploy/dataplane" / filename).read_text(encoding="utf-8")
         for source, destination in replacements.items():
             text = text.replace(source, destination)
@@ -146,6 +296,7 @@ def render_gpu_rollout_manifests(
                     text,
                     executor_artifact_sha=artifact_sha,
                     executor_compatibility_digest=compatibility_digest,
+                    runtime_image=runtime_image,
                 ),
             )
         )
@@ -163,6 +314,12 @@ def build_reconciler_environment(
     runtime_profile_version: str | None = None,
     executor_wheel_filename: str | None = None,
     node_compatibility_digest: str | None = None,
+    bundle_sha256: str | None = None,
+    template_sha256: str | None = None,
+    template_config_map: str | None = None,
+    allowed_node_names: tuple[str, ...] | None = None,
+    runtime_image: str | None = None,
+    node_installer_image: str | None = None,
 ) -> dict[str, str]:
     config = release.config
     environment = {
@@ -174,6 +331,10 @@ def build_reconciler_environment(
         "GPU_FAULT_INSTALLER_CONFIG_MAP": bundle_cm,
         "GPU_FAULT_INSTALLER_CONFIG_DIGEST": config_digest,
         "GPU_FAULT_INSTALLER_ARTIFACT_SHA256": artifact_sha,
+        "GPU_FAULT_INSTALLER_BUNDLE_SHA256": (bundle_sha256 or release.bundle_sha),
+        "GPU_FAULT_INSTALLER_TEMPLATE_SHA256": (
+            template_sha256 or release.node_template_sha
+        ),
         "GPU_FAULT_NODE_COMPATIBILITY_DIGEST": (
             node_compatibility_digest
             or config.component_digests.get("node_runtime")
@@ -183,7 +344,13 @@ def build_reconciler_environment(
         "GPU_FAULT_EXECUTOR_WHEEL_FILENAME": (
             executor_wheel_filename or config.executor_wheel.name
         ),
-        "GPU_FAULT_RUNTIME_IMAGE": release.runtime_image,
+        "GPU_FAULT_RUNTIME_IMAGE": runtime_image or release.runtime_image,
+        "GPU_FAULT_NODE_INSTALLER_IMAGE": (
+            node_installer_image or release.node_installer_image
+        ),
+        "GPU_FAULT_INSTALLER_ALLOWED_NODES": (
+            "*" if allowed_node_names is None else ",".join(sorted(allowed_node_names))
+        ),
         "GPU_FAULT_RUNTIME_PROFILE": (
             runtime_profile_version or config.runtime_profile_version
         ),
@@ -191,4 +358,6 @@ def build_reconciler_environment(
     if target.fleet_master_file:
         environment["GPU_FAULT_FLEET_MASTER_FILE"] = target.fleet_master_file
         environment["GPU_FAULT_CONTROL_PLANE_KUBECONFIG"] = config.cpu_kubeconfig
+    if template_config_map:
+        environment["GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP"] = template_config_map
     return environment

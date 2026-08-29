@@ -2317,11 +2317,11 @@ test_cases:
   level: live
   risk: non-destructive
   problem: SES client 的 region 只来自 AWS_REGION 或 AWS_DEFAULT_REGION，不会从 Pod Identity 推导；区域清单与区域 patch 都未注入该变量，部署和运维手册也只在 shell 层 export，导致故障处理成功但通知静默失败。
-  injection: 在三个 API Pod 内读取实际环境变量，用 SesEmailNotifier._create_client 构造 client 并以空 Destination 探测（零邮件），再在子进程中临时移除 AWS_REGION 与 AWS_DEFAULT_REGION 验证 NoRegionError；仅在需要验收真实投递时才触发一次 advisory notification。
+  injection: 在三个 API Pod 内读取实际环境变量，用 SesEmailNotifier._create_client 构造 client 并以类型非法的空 Destination 触发本地参数校验（零网络、零邮件），再在子进程中临时移除 AWS_REGION 与 AWS_DEFAULT_REGION 验证 NoRegionError；仅在需要验收真实投递时才触发一次 advisory notification。
   expected:
   - 三个 Pod 都输出 AWS_REGION 或 AWS_DEFAULT_REGION
   - SesNotificationConfig.region_name 与 client.meta.region_name 均为目标 region
-  - 空 Destination 探测返回 BadRequestException 或 ParamValidationError，未投递邮件
+  - 类型非法的空 Destination 在本地返回 ParamValidationError，未访问 SES、未投递邮件且不依赖发送额度
   - 正向路径不出现 botocore NoRegionError，移除两个 region 变量的负向路径必须出现 NoRegionError
   - execution_enabled 与声明式 GPU_FAULT_ALLOW_EMAIL 一致，不硬编码要求邮件开关关闭
   - AWS_REGION 被写入声明式清单而不是依赖手工 set env
@@ -2356,13 +2356,14 @@ test_cases:
   level: live
   risk: non-destructive
   problem: 控制面按 profile 的 owner 生成 step，executor 只 claim 本地已注册 adapter 的 owner；两边不一致时 command 永远停在 PENDING，且当前实现没有未领取超时、没有 dead-letter、没有告警，比直接失败更危险。
-  injection: 先用 GPU_FAULT_REMOTE_EXECUTION_OWNERS 把 profile 的 OWN/DELEGATE owner 收窄为真正远端下发的集合，与 executor_from_environment().execution_owners 逐副本对照；再向控制面注入一条 owner 不存在的 remote_command（created_at 回拨 700 秒）观察指标，最后删除该记录。
+  injection: 先用 GPU_FAULT_REMOTE_EXECUTION_OWNERS 把 profile 的 OWN/DELEGATE owner 收窄为真正远端下发的集合，与 executor_from_environment().execution_owners 逐副本对照；再向控制面注入一条 owner 不存在的 remote_command（created_at 回拨 610 秒，越过告警阈值且为默认 claim deadline 保留评估余量）观察指标，最后删除该记录。
   expected:
   - profile 的 owner 与 REMOTE_EXECUTION_OWNERS 的交集是 executor execution_owners 的子集
   - 判据不得使用 profile 的全部 OWN/DELEGATE owner，因为控制面本地 adapter 的 owner 永不出现在 executor 侧
   - executor owner 集合必须逐副本读取且各副本一致
   - 必须直接读 execution_owners 而非从 ENABLE_* 开关反推，以覆盖 OWNER 覆写与 owner 唯一性守卫
   - 注入后同时出现 remote_command_total{status=PENDING} 与 oldest_unclaimed_seconds 且数值单调增长
+  - /metrics 在 ADOT 的 5 秒 scrape timeout 内返回上述指标，不能用超时后的最终结果冒充可观测
   - 注入的命令始终 lease_owner 为空且 executor 日志无任何相关记录，证明 owner 过滤是静默 continue
   - 必须先分清两条独立通知路径：路径 A 管理员邮件走 SES 不经过 AMP，路径 B 指标告警走 ADOT 到 AMP；本用例的失效模式只能由路径 B 覆盖
   - 告警必须写在真正生效的告警路径里（区域控制面的路径 B 为 amp-rules.yaml 而非 PrometheusRule）
@@ -2377,19 +2378,20 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-015
 - id: GF-REGIONAL-BOOT-016
-  title: ARN-only首次部署先生成完整registry且零集群稳态可运行
+  title: site.yaml首次部署先生成完整registry且零集群稳态可运行
   category: regional-deployability
   level: live
-  risk: non-destructive
-  problem: 首次自动部署必须在启动工作负载前生成至少一个完整GPU注册条目，同时部署后的零集群稳态必须允许显式空列表。
-  injection: 在全新state-dir使用CPU/GPU ARN执行管理员单命令部署，原样重跑验证幂等，并负向省略GPU ARN；另由BOOT-002验证显式空列表。
+  risk: live-non-destructive
+  problem: Terraform与site.yaml首次应用部署必须在启动工作负载前生成至少一个完整GPU注册条目，同时部署后的零集群稳态必须允许显式空列表。
+  injection: 在隔离站点使用Terraform输出、非空spec.clusters和签名Manifest v3执行release-deploy，原样重跑验证NOOP；再用无live release state且spec.clusters为空的site验证首次bootstrap在首个Kubernetes apply前失败。
   expected:
-  - 首次bootstrap生成0600的site.yaml且spec.clusters非空
+  - Terraform与site.yaml使用独立site ID且site文件为0600，首次spec.clusters非空
+  - 签名attestation、Manifest v3与delivery identity通过后才进入应用部署
   - registry Secret与site cluster ID集合一致后才启动CPU/GPU工作负载
-  - bootstrap state为site-ready且release verify通过
-  - 原命令重跑幂等或NOOP，不创建第二套AWS资源
-  - 缺少GPU ARN在修改AWS或Kubernetes前失败
-  - 显式空registry仅用于部署后的零集群稳态并保持控制面健康
+  - release state为COMPLETED，独立verify与stability通过
+  - 原命令重跑为NOOP，不滚动CPU/GPU且不创建第二套AWS资源
+  - 无live release state时空spec.clusters在创建namespace或其他Kubernetes对象前失败
+  - 显式空registry仅由已部署站点的正式remove流程产生并保持控制面健康
   evidence:
     verdict: NOT_RUN
   automation: manual
@@ -3713,9 +3715,10 @@ test_cases:
   problem: >-
     版本号、ConfigMap 名和 annotation 只能表达发布意图，不能证明源码、 wheel、node installer bundle 和所有运行副本实际加载同一份代码。
   injection: >-
-    在不可变 checkout 重新构建制品，解包计算 module_digest，并逐副本调用 /v1/version、读取 lease 未过期的 ACTIVE Agent 心跳和 release metadata pin 做机械比较。
+    在不可变 checkout 重新构建制品，验证runtime image内隔离的control-plane/executor venv与descriptor，再解包计算module_digest，并逐副本调用/v1/version、读取lease未过期的ACTIVE Agent心跳和release metadata pin做机械比较。
   expected:
   - control_plane、executor、node_runtime分别与各自source closure和对应运行副本的module_digest一致，三个组件之间不要求相同
+  - runtime image descriptor中的control-plane/executor wheel SHA和module digest与Manifest一致，系统Python不含完整项目包
   - node bundle内wheel与node_runtime wheel及其module_digest一致
   - 所有 lifecycle_state=ACTIVE 且 lease 未过期的 Agent，其 artifact/config/key-version 与 release metadata pin 完全相同
   - 任一不一致都在 rollout 前失败
@@ -3756,6 +3759,7 @@ test_cases:
   - DATA_PLANE_COMPATIBLE只滚动变化的数据面组件并保持required/compatible两阶段Pin
   - FULL按schema、控制面、数据面和Agent顺序收敛
   - 失败时恢复previous artifact、Pin和Profile；重跑从持久状态续跑且不重复已完成动作
+  - FULL回滚后再次应用同一候选时必须删除并重建旧completed Installer Job，Agent heartbeat须真实收敛，不能只把节点annotation标成Succeeded
   evidence:
     verdict: NOT_RUN
   automation: manual

@@ -41,11 +41,12 @@ spec:
                   app: gpu-fault-telemetry-spool-worker
       containers:
       - args:
-        - python -m pip install --no-cache-dir '/artifact/gpu_fault_control_plane-0.10.0-py3-none-any.whl[collectors,postgres,performance]'
-          && exec uvicorn gpu_fault.app:create_app --factory --host 0.0.0.0
-          --port 8082 --workers 1 --loop uvloop --http httptools --backlog
-          1024 --timeout-keep-alive 5 --no-proxy-headers --timeout-graceful-shutdown
-          60 --timeout-worker-healthcheck 20 --no-access-log
+        - "if [ -x /opt/gpu-fault/control-plane/bin/python ]; then\n  set\
+          \ -- /opt/gpu-fault/control-plane/bin/python -m uvicorn\nelse\n\
+          \  set -- uvicorn\nfi\nexec \"$@\" gpu_fault.app:create_app --factory\
+          \ --host 0.0.0.0 --port 8082 --workers 1 --loop uvloop --http httptools\
+          \ --backlog 1024 --timeout-keep-alive 5 --no-proxy-headers --timeout-graceful-shutdown\
+          \ 60 --timeout-worker-healthcheck 20 --no-access-log"
         command:
         - /bin/sh
         - -c

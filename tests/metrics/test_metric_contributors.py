@@ -64,10 +64,26 @@ def test_ambiguous_attempt_metric_is_exported(monkeypatch) -> None:
         "ambiguous_attempt_ownership_total",
         lambda: 3,
     )
+    monkeypatch.setattr(
+        context.orchestrator._evidence_operations,
+        "ownership_metric_snapshot",
+        lambda: {
+            "current": {("cluster-a", "node-a"): 2},
+            "stale": {("cluster-a", "node-a"): 1},
+        },
+    )
 
     lines = orchestration_metric_lines(SimpleNamespace(context=context))
 
-    assert lines[-1] == ("gpu_fault_ambiguous_attempt_ownership_total 3")
+    assert "gpu_fault_ambiguous_attempt_ownership_total 3" in lines
+    assert (
+        "gpu_fault_ambiguous_attempt_ownership_current"
+        '{cluster_id="cluster-a",gpu_node="node-a"} 2'
+    ) in lines
+    assert (
+        "gpu_fault_stale_attempt_observations"
+        '{cluster_id="cluster-a",gpu_node="node-a"} 1'
+    ) in lines
 
 
 def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
@@ -139,6 +155,25 @@ def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
     ) in lines
     assert "gpu_fault_remediation_budget_wait_total 2" in lines
     assert 'gpu_fault_notification_total{status="SENT"} 1' in lines
+
+
+def test_closed_loop_metrics_use_aggregate_notification_counts(monkeypatch) -> None:
+    store = build_store()
+    counts = {status: 0 for status in NotificationStatus}
+    counts[NotificationStatus.SKIPPED] = 30_000
+    monkeypatch.setattr(store, "notification_status_counts", lambda: counts)
+    monkeypatch.setattr(
+        store,
+        "list_notifications",
+        lambda: pytest.fail("metrics must not scan notifications individually"),
+    )
+
+    lines = closed_loop_metric_lines(
+        SimpleNamespace(context=ApplicationContext(store=store))
+    )
+
+    assert 'gpu_fault_notification_total{status="SKIPPED"} 30000' in lines
+    assert "gpu_fault_notification_outbox_depth 0" in lines
 
 
 def test_collector_metrics_top_n_is_bounded() -> None:

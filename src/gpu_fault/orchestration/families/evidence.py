@@ -8,9 +8,11 @@ from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.policy import SxidEvent, XidEvent
+from gpu_fault.watcher import AttemptObservation
 
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_ACTIVE_OBSERVATION_MAX_AGE_SECONDS = 120.0
 
 
 class EvidenceOperationService:
@@ -18,15 +20,81 @@ class EvidenceOperationService:
         self,
         store,
         active_node_exclusive_workflow: Callable,
+        *,
+        active_observation_max_age_seconds: float = (
+            DEFAULT_ACTIVE_OBSERVATION_MAX_AGE_SECONDS
+        ),
     ) -> None:
+        if active_observation_max_age_seconds <= 0:
+            raise ValueError("active observation max age must be positive")
         self.store = store
         self.active_node_exclusive_workflow = active_node_exclusive_workflow
+        self.active_observation_max_age_seconds = active_observation_max_age_seconds
         self._metrics_lock = Lock()
         self._ambiguous_attempt_ownership_total = 0
 
     def ambiguous_attempt_ownership_total(self) -> int:
         with self._metrics_lock:
             return self._ambiguous_attempt_ownership_total
+
+    def observation_is_fresh(
+        self,
+        observation: AttemptObservation,
+        reference: datetime,
+    ) -> bool:
+        age = (self.utc(reference) - self.utc(observation.observed_at)).total_seconds()
+        return -30 <= age <= self.active_observation_max_age_seconds
+
+    def event_freshness_reference(
+        self,
+        event: XidEvent | SxidEvent | NodeHealthFinding,
+    ) -> datetime:
+        observed_at = self.utc(event.observed_at)
+        ingested_at = getattr(event, "ingested_at", None)
+        return (
+            max(observed_at, self.utc(ingested_at))
+            if ingested_at is not None
+            else observed_at
+        )
+
+    def ownership_metric_snapshot(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, dict[tuple[str, str], int]]:
+        observed_at = now or datetime.now(timezone.utc)
+        fresh: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        stale: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        keys: set[tuple[str, str]] = set()
+        for agent in self.store.list_agents():
+            if agent.cluster_id and agent.node_id:
+                keys.add((agent.cluster_id, agent.node_id))
+        for state in self.store.list_attempt_observation_states():
+            observation = state.observation
+            if observation.workload_phase.value not in {"PENDING", "RUNNING"}:
+                continue
+            identities = {
+                (observation.job_id, observation.attempt_id)
+                for container in observation.containers
+                if container.node_id and not container.terminated
+            }
+            if not identities:
+                continue
+            target = (
+                fresh if self.observation_is_fresh(observation, observed_at) else stale
+            )
+            for container in observation.containers:
+                if not container.node_id or container.terminated:
+                    continue
+                key = (observation.cluster_id, container.node_id)
+                keys.add(key)
+                target.setdefault(key, set()).add(
+                    (observation.job_id, observation.attempt_id)
+                )
+        return {
+            "current": {key: len(fresh.get(key, set())) for key in sorted(keys)},
+            "stale": {key: len(stale.get(key, set())) for key in sorted(keys)},
+        }
 
     @staticmethod
     def utc(value: datetime) -> datetime:
@@ -95,6 +163,7 @@ class EvidenceOperationService:
         host_pid = getattr(event, "host_pid", None)
         cgroup_path = getattr(event, "cgroup_path", None)
         ingested_at = getattr(event, "ingested_at", None)
+        freshness_reference = self.event_freshness_reference(event)
 
         def container_id_matches(left: str, right: str) -> bool:
             return (
@@ -113,6 +182,11 @@ class EvidenceOperationService:
 
         candidates = []
         for observation in self.store.list_attempt_observations(event.cluster_id):
+            if not self.observation_is_fresh(
+                observation,
+                freshness_reference,
+            ):
+                continue
             age = (
                 self.utc(event.observed_at) - self.utc(observation.observed_at)
             ).total_seconds()
@@ -230,6 +304,10 @@ class EvidenceOperationService:
             for observation in self.store.list_attempt_observations(event.cluster_id)
             if observation.job_id == incident.job_id
             and observation.attempt_id == incident.attempt_id
+            and self.observation_is_fresh(
+                observation,
+                self.event_freshness_reference(event),
+            )
             and any(
                 container.node_id == event.node_id
                 and (

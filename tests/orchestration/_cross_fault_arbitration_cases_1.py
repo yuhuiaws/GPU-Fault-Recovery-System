@@ -8,6 +8,7 @@ import pytest
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
 from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.policy import XidEvent
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 from tests._builders import (
     asgi_client,
@@ -531,6 +532,34 @@ def test_multiple_active_attempts_disable_cross_type_grouping(caplog) -> None:
         )
         == 2
     )
+
+
+def test_stale_observation_is_excluded_from_attempt_ownership() -> None:
+    context = build_context()
+    stale = copy_model(
+        observation(job_id="stale-job", attempt_id="stale-a001"),
+        observed_at=NOW - timedelta(minutes=10),
+    )
+    fresh = observation()
+    context.store.save_attempt_observation(stale)
+    context.store.save_attempt_observation(fresh)
+    event = XidEvent.model_validate(
+        {**xid_payload(11, "freshness-xid"), "ingested_at": NOW.isoformat()}
+    )
+
+    selected = context.orchestrator._evidence_operations.attempt_observation(event)
+    snapshot = context.orchestrator._evidence_operations.ownership_metric_snapshot(
+        now=NOW
+    )
+
+    assert selected is not None
+    assert selected.attempt_id == fresh.attempt_id
+    assert (
+        context.orchestrator._evidence_operations.ambiguous_attempt_ownership_total()
+        == 0
+    )
+    assert snapshot["current"][("cluster-a", "node-a")] == 1
+    assert snapshot["stale"][("cluster-a", "node-a")] == 1
 
 
 def test_gpu_ownership_disambiguates_multiple_active_attempts() -> None:

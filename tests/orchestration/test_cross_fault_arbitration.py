@@ -16,6 +16,7 @@ from ._cross_fault_arbitration_cases_1 import (
     test_running_workflow_widens_scope_before_reset_is_submitted,
     test_running_xid_workflow_adds_terminal_quarantine_branch,
     test_same_rank_incompatible_actions_do_not_absorb,
+    test_stale_observation_is_excluded_from_attempt_ownership,
     test_three_collectors_concurrently_merge_atomically,
     test_xid_and_sxid_share_one_attempt_workflow,
 )

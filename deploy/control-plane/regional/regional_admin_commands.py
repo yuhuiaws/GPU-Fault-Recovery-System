@@ -20,6 +20,16 @@ from regional_release_reporting import build_release_status
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 ROOT = Path(__file__).resolve().parents[3]
 RETRY_PHASES = frozenset({"failed", "rolled-back"})
+BOOTSTRAP_PHASES = frozenset(
+    {
+        "bootstrap-started",
+        "bootstrap-cpu-ready",
+        "bootstrap-endpoint-ready",
+        "bootstrap-data-plane-progress",
+        "bootstrap-failed",
+        "bootstrap-cleaned",
+    }
+)
 
 
 def stored_release_diff(state: dict[str, Any]) -> ReleaseDiff | None:
@@ -78,6 +88,7 @@ def ensure_schema(release: Any) -> None:
             "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": release.config.cpu_kubeconfig,
             "GPU_FAULT_NAMESPACE": release.config.namespace,
             "GPU_FAULT_WHEEL_CONFIGMAP": release.wheel_cm,
+            "GPU_FAULT_RUNTIME_IMAGE": release.runtime_image,
         },
     )
 
@@ -154,20 +165,19 @@ def run_deploy(release: Any) -> None:
         ).returncode
         == 0
     )
-    if not state_exists:
+    state = release._load_state() if state_exists else None
+    bootstrap_required = not state_exists or (
+        state is not None and state.get("phase") in BOOTSTRAP_PHASES
+    )
+    if bootstrap_required:
+        if not release.config.clusters:
+            raise ReleaseError(
+                "initial regional bootstrap requires at least one GPU cluster; "
+                "an empty cluster set is only valid after a completed deployment"
+            )
         release.bootstrap()
         return
-    state = release._load_state()
-    if state.get("phase") in {
-        "bootstrap-started",
-        "bootstrap-cpu-ready",
-        "bootstrap-endpoint-ready",
-        "bootstrap-data-plane-progress",
-        "bootstrap-failed",
-        "bootstrap-cleaned",
-    }:
-        release.bootstrap()
-        return
+    assert state is not None
     if state.get("phase") in RETRY_PHASES:
         release.upgrade(
             resume=True,

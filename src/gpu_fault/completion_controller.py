@@ -7,19 +7,21 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import RLock, Timer
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 from gpu_fault.collectors import EventSink
 from gpu_fault.completion_observation import (
+    MissingAttemptTracker,
+    ObservationOnlyTracker,
     completion_list_arguments,
     is_unknown_profile_rejection,
     list_completion_pods,
-    ObservationOnlyTracker,
+    reconcile_attempt_observation,
 )
 from gpu_fault.completion_outbox import (
     completion_sink_from_environment,
@@ -34,7 +36,6 @@ from gpu_fault.watcher import (
     WorkloadPhase,
     failure_containment_ids,
 )
-
 
 LOGGER = logging.getLogger(__name__)
 MANAGED_LABEL = "gpu-fault.io/managed"
@@ -525,6 +526,7 @@ class KubernetesCompletionController:
         self._attempt_specs: dict[str, AttemptSpec] = {}
         self._last_observations: dict[str, AttemptObservation] = {}
         self._terminal_observations: dict[str, AttemptObservation] = {}
+        self._missing_attempts = MissingAttemptTracker()
         self._terminal_sent: set[str] = set()
         self._workloads_stopped: set[str] = set()
         self._failure_events = {}
@@ -582,23 +584,14 @@ class KubernetesCompletionController:
         for attempt_id in sorted(attempt_ids):
             attempt_pods = grouped.get(attempt_id, [])
             try:
-                terminal_observation = self._terminal_observations.get(attempt_id)
-                if terminal_observation is not None:
-                    observation = terminal_observation
-                elif attempt_pods:
-                    observation = self._observation(
-                        attempt_id, attempt_pods, observed_at
-                    )
-                else:
-                    observation = self._last_observations.get(attempt_id)
-                    if observation is None:
-                        continue
-                    if attempt_id in self._failure_events:
-                        observation = observation.model_copy(
-                            update={"observed_at": observed_at}
-                        )
+                observation = reconcile_attempt_observation(
+                    self, attempt_id, attempt_pods, observed_at
+                )
+                if observation is None:
+                    continue
                 result = self.watcher.observe(observation)
                 if result.terminal_event is not None:
+                    self._missing_attempts.clear(attempt_id)
                     observation = self._terminal_observations.setdefault(
                         attempt_id, observation
                     )
@@ -1084,6 +1077,7 @@ class KubernetesCompletionController:
             current.runtime_profile_version,
         )
         self.watcher.reset_attempt(attempt_id)
+        self._missing_attempts.clear(attempt_id)
         self._last_observations.pop(attempt_id, None)
         self._terminal_observations.pop(attempt_id, None)
         self._failure_events.pop(attempt_id, None)

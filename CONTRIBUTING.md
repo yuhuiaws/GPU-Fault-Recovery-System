@@ -34,16 +34,36 @@ GPU_FAULT_DOC_IMPACT_REASON='仅重构内部实现，公共行为和命令未变
 make check
 ```
 
-提交前至少运行：
+日常开发先按相对目标分支的实际差异运行反向影响选择：
 
 ```bash
-make check
+make test-impact BASE=origin/main
+make regional-impact-plan BASE=origin/main
 ```
 
-需要把当前源码发布到受管站点时，使用统一入口：
+`test-impact`执行相关静态检查和pytest；`regional-impact-plan`只输出受影响的区域用例，
+不会自动执行live或destructive case。无法匹配的文件、共享契约、Python/依赖/runtime
+image、schema/事务变化或跨越三个以上影响域时会fail closed并升级为完整门禁。
+版本候选和正式发布仍必须运行`make check`；完整区域验收只跟随首次上线、重大架构变化
+或影响计划明确要求执行。规则与说明见
+[变更影响与测试选择](docs/变更影响与测试选择.md)。
+
+发布分成 CI 构建和站点应用两步。CI 构建、测试并推送不可变 runtime image：
 
 ```bash
-make release-deploy SITE=/path/to/site.yaml
+make release-build \
+  RUNTIME_IMAGE_REPOSITORY=<registry/repository>
+```
+
+签名后的 `dist/current-attestation.json`、signature 和 release bundle 交给部署机；部署机
+只验证签名和摘要，不重新运行全量测试或构建：
+
+```bash
+make release-deploy \
+  SITE=/path/to/site.yaml \
+  PREBUILT_ATTESTATION=/path/to/current-attestation.json \
+  PREBUILT_BUNDLE=/path/to/current-attestation.bundle.json \
+  COSIGN_KEY=/path/to/cosign.pub
 ```
 
 `make check`的最终全量测试、`make test-parallel`和`make coverage`均使用4个worker；

@@ -125,6 +125,7 @@ def collect(
     cpu_kubectl = Kubectl(
         kubeconfig=config["cpu_kubeconfig"],
         context=None,
+        reuse_exec_credential=True,
     )
     cpu = synchronize(
         cpu_kubectl,
@@ -146,6 +147,7 @@ def collect(
         gpu_kubectl = Kubectl(
             kubeconfig=None,
             context=cluster["context"],
+            reuse_exec_credential=True,
         )
         document = synchronize(
             gpu_kubectl,

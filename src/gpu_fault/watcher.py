@@ -313,7 +313,9 @@ class CompletionWatcher:
                 and all(item.exit_code == 0 for item in critical)
             ):
                 terminal_status = TerminalStatus.SUCCEEDED
-            elif observation.workload_phase is WorkloadPhase.STOPPED and all_terminal:
+            elif observation.workload_phase is WorkloadPhase.STOPPED and (
+                all_terminal or not observation.containers
+            ):
                 terminal_status = TerminalStatus.STOPPED
 
             if terminal_status is not None:

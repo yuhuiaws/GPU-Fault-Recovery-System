@@ -21,6 +21,10 @@ ROLLOUT_MODULE = lazy_script_module(
     "rollout_regional_release_retry_safety",
     ROOT / "deploy/control-plane/regional/rollout_regional_release.py",
 )
+ORCHESTRATION_MODULE = lazy_script_module(
+    "regional_release_orchestration_registry_safety",
+    ROOT / "deploy/control-plane/regional/regional_release_orchestration.py",
+)
 
 
 def cluster_target(tmp_path: Path, *, cidrs: tuple[str, ...]):
@@ -74,7 +78,7 @@ def test_remote_command_idle_check_has_bounded_retries() -> None:
 
 
 def test_registry_stage_forces_cpu_secret_reload() -> None:
-    source = inspect.getsource(ROLLOUT_MODULE.RegionalRelease.upgrade)
+    source = inspect.getsource(ORCHESTRATION_MODULE.run_upgrade_phases)
 
     assert "force_restart=registry_staged" in source
 

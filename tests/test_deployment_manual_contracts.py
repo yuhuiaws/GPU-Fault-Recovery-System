@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 MANUAL = ROOT / "docs/部署和运维手册.md"
 
@@ -320,17 +322,22 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "scripts/release_deploy.py" in target
     assert "--site" in target
     assert "--profile-approval" in target
+    assert "--prebuilt-attestation" in target
+    assert "--prebuilt-signature" in target
+    assert "--prebuilt-certificate" in target
+    assert "make PYTHON=.venv/bin/python release-build" in developer
     assert "make PYTHON=.venv/bin/python release-deploy" in developer
     assert "PROFILE_APPROVAL=CHG-12345" in developer
-    assert "deploy -> verify -> release-summary" in developer
+    assert "deploy -> verify -> stability -> release-summary" in developer
     assert "verification-report.json" in developer
+    assert "stability-report.json" in developer
     assert "release-summary.json" in developer
     assert "SKIPPED_NOOP" in developer
     assert "最多8路并行" in developer
     assert "### 9.1 普通代码修改后的build与部署升级" in developer
     for kind in ("NOOP", "CONTROL_PLANE_ONLY", "DATA_PLANE_COMPATIBLE", "FULL"):
         assert kind in developer
-    assert "`make check`失败：不修改site或集群" in developer
+    assert "CI门禁、OCI push、attestation或签名失败" in developer
     assert "升级失败且`autoRollback=true`" in developer
 
 
@@ -428,6 +435,19 @@ def test_regional_alerting_verifier_accepts_repository_contract(tmp_path: Path) 
     assert "UNREACHABLE_ALERT_DEFECTS= 0" in result.stdout
     assert "gpu-fault-remote-command" in result.stdout
     assert "ALERTMANAGER_SNS_RECEIVERS= gpu-fault-sns" in (result.stdout)
+    alertmanager = yaml.safe_load(manager.read_text(encoding="utf-8"))[
+        "alertmanager_config"
+    ]
+    config = yaml.safe_load(alertmanager)
+    ownership_route = next(
+        route
+        for route in config["route"]["routes"]
+        if any(
+            "GpuFaultExclusiveNodeOwnershipInvariantViolation" in matcher
+            for matcher in route["matchers"]
+        )
+    )
+    assert ownership_route["group_wait"] == "5s"
 
 
 def test_incident_purge_stops_and_restores_every_writer() -> None:

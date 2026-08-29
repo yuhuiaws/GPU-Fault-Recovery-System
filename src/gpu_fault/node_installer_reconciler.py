@@ -18,6 +18,8 @@ LOGGER = logging.getLogger(__name__)
 INSTALLER_VERSION_ANNOTATION = "gpu-fault.io/installer-version"
 INSTALLER_DIGEST_ANNOTATION = "gpu-fault.io/installer-config-digest"
 INSTALLER_ARTIFACT_ANNOTATION = "gpu-fault.io/installer-artifact-sha256"
+INSTALLER_BUNDLE_ANNOTATION = "gpu-fault.io/installer-bundle-sha256"
+INSTALLER_TEMPLATE_ANNOTATION = "gpu-fault.io/installer-template-sha256"
 INSTALLER_NODE_UID_ANNOTATION = "gpu-fault.io/installer-node-uid"
 INSTALLER_STATE_ANNOTATION = "gpu-fault.io/installer-state"
 INSTALLER_JOB_LABEL = "gpu-fault.io/node-installer"
@@ -102,10 +104,15 @@ class NodeInstallerReconciler:
         version: str,
         config_digest: str,
         artifact_sha256: str,
+        bundle_sha256: str | None = None,
+        template_sha256: str | None = None,
         job_template: dict[str, Any],
         dcgm_metrics_url_template: str,
         node_action_keys_secret: str = ("gpu-fault-node-action-keys"),
         retry_seconds: int = 300,
+        max_unavailable: int = 1,
+        job_active_deadline_seconds: int = 840,
+        allowed_node_names: frozenset[str] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.core = core_api
@@ -119,10 +126,29 @@ class NodeInstallerReconciler:
                 "installer artifact SHA-256 must be 64 lowercase hex characters"
             )
         self.artifact_sha256 = artifact_sha256
+        self.bundle_sha256 = bundle_sha256 or artifact_sha256
+        self.template_sha256 = (
+            template_sha256 or hashlib.sha256(config_digest.encode()).hexdigest()
+        )
+        for name, digest in (
+            ("bundle", self.bundle_sha256),
+            ("template", self.template_sha256),
+        ):
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError(
+                    f"installer {name} SHA-256 must be 64 lowercase hex characters"
+                )
         self.job_template = job_template
         self.dcgm_metrics_url_template = dcgm_metrics_url_template
         self.node_action_keys_secret = node_action_keys_secret
         self.retry_seconds = retry_seconds
+        if max_unavailable < 1:
+            raise ValueError("installer max_unavailable must be positive")
+        if job_active_deadline_seconds < 60:
+            raise ValueError("installer active deadline must be at least 60 seconds")
+        self.max_unavailable = max_unavailable
+        self.job_active_deadline_seconds = job_active_deadline_seconds
+        self.allowed_node_names = allowed_node_names
         self.now = now or (lambda: datetime.now(UTC))
 
     @property
@@ -136,16 +162,32 @@ class NodeInstallerReconciler:
             "running": 0,
             "succeeded": 0,
             "failed": 0,
+            "deferred": 0,
             "not_ready": 0,
             "unsupported": 0,
         }
         response = self.core.list_node(label_selector=self.node_selector)
-        for node in _value(response, "items", []) or []:
-            outcome = self._reconcile_node(node)
+        in_flight = 0
+        nodes = sorted(
+            (
+                item
+                for item in (_value(response, "items", []) or [])
+                if self.allowed_node_names is None
+                or str(_value(_metadata(item), "name")) in self.allowed_node_names
+            ),
+            key=lambda item: str(_value(_metadata(item), "name")),
+        )
+        for node in nodes:
+            outcome = self._reconcile_node(
+                node,
+                allow_create=in_flight < self.max_unavailable,
+            )
             result[outcome] += 1
+            if outcome in {"created", "running"}:
+                in_flight += 1
         return result
 
-    def _reconcile_node(self, node: Any) -> str:
+    def _reconcile_node(self, node: Any, *, allow_create: bool = True) -> str:
         metadata = _metadata(node)
         node_name = str(_value(metadata, "name"))
         node_uid = str(_value(metadata, "uid"))
@@ -153,25 +195,33 @@ class NodeInstallerReconciler:
         if not _is_ready(node):
             LOGGER.info("node %s is not Ready; installation deferred", node_name)
             return "not_ready"
-        if (
+        identity_matches = (
             annotations.get(INSTALLER_VERSION_ANNOTATION) == self.version
             and annotations.get(INSTALLER_DIGEST_ANNOTATION) == self.config_digest
             and annotations.get(INSTALLER_ARTIFACT_ANNOTATION) == self.artifact_sha256
+            and annotations.get(INSTALLER_BUNDLE_ANNOTATION) == self.bundle_sha256
+            and annotations.get(INSTALLER_TEMPLATE_ANNOTATION) == self.template_sha256
             and annotations.get(INSTALLER_NODE_UID_ANNOTATION) == node_uid
-            and annotations.get(INSTALLER_STATE_ANNOTATION) == "Succeeded"
-        ):
+        )
+        installer_state = annotations.get(INSTALLER_STATE_ANNOTATION)
+        if identity_matches and installer_state == "Succeeded":
             return "current"
 
         name = _job_name(
             node_name,
             node_uid,
-            f"{self.config_digest}:{self.artifact_sha256}",
+            (
+                f"{self.config_digest}:{self.artifact_sha256}:"
+                f"{self.bundle_sha256}:{self.template_sha256}"
+            ),
         )
         try:
             job = self.batch.read_namespaced_job(name, self.namespace)
         except Exception as error:
             if _api_status(error) != 404:
                 raise
+            if not allow_create:
+                return "deferred"
             try:
                 body = self._build_job(node, name)
             except ValueError as build_error:
@@ -187,6 +237,18 @@ class NodeInstallerReconciler:
             return "created"
 
         if _job_condition(job, "Complete"):
+            if not identity_matches or installer_state == "Retrying":
+                self.batch.delete_namespaced_job(
+                    name,
+                    self.namespace,
+                    propagation_policy="Background",
+                )
+                self._mark_node(node_name, node_uid, "Retrying")
+                LOGGER.warning(
+                    "deleted stale completed installer Job %s for replay",
+                    name,
+                )
+                return "running"
             self._mark_node(node_name, node_uid, "Succeeded")
             return "succeeded"
         if _job_condition(job, "Failed"):
@@ -216,6 +278,8 @@ class NodeInstallerReconciler:
             INSTALLER_VERSION_ANNOTATION: self.version,
             INSTALLER_DIGEST_ANNOTATION: self.config_digest,
             INSTALLER_ARTIFACT_ANNOTATION: self.artifact_sha256,
+            INSTALLER_BUNDLE_ANNOTATION: self.bundle_sha256,
+            INSTALLER_TEMPLATE_ANNOTATION: self.template_sha256,
             INSTALLER_NODE_UID_ANNOTATION: node_uid,
             INSTALLER_STATE_ANNOTATION: state,
         }
@@ -239,6 +303,12 @@ class NodeInstallerReconciler:
 
         body.setdefault("metadata", {})["name"] = job_name
         body["metadata"]["namespace"] = self.namespace
+        body["metadata"]["annotations"] = {
+            INSTALLER_DIGEST_ANNOTATION: self.config_digest,
+            INSTALLER_ARTIFACT_ANNOTATION: self.artifact_sha256,
+            INSTALLER_BUNDLE_ANNOTATION: self.bundle_sha256,
+            INSTALLER_TEMPLATE_ANNOTATION: self.template_sha256,
+        }
         body["metadata"]["labels"] = {
             INSTALLER_JOB_LABEL: "true",
             "gpu-fault.io/node-uid": node_uid,
@@ -246,6 +316,7 @@ class NodeInstallerReconciler:
                 self.config_digest.encode()
             ).hexdigest()[:16],
         }
+        body["spec"]["activeDeadlineSeconds"] = self.job_active_deadline_seconds
         pod_template = body["spec"]["template"]
         pod_template.setdefault("metadata", {})["labels"] = dict(
             body["metadata"]["labels"]
@@ -312,6 +383,21 @@ def main() -> None:
     )
     poll_seconds = int(os.environ.get("GPU_FAULT_RECONCILE_SECONDS", "15"))
     retry_seconds = int(os.environ.get("GPU_FAULT_INSTALL_RETRY_SECONDS", "300"))
+    max_unavailable = int(os.environ.get("GPU_FAULT_INSTALLER_MAX_UNAVAILABLE", "1"))
+    active_deadline_seconds = int(
+        os.environ.get("GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS", "840")
+    )
+    allowed_nodes_value = os.environ.get(
+        "GPU_FAULT_INSTALLER_ALLOWED_NODES",
+        "*",
+    ).strip()
+    allowed_nodes = (
+        None
+        if allowed_nodes_value == "*"
+        else frozenset(
+            item.strip() for item in allowed_nodes_value.split(",") if item.strip()
+        )
+    )
     config.load_incluster_config()
     core = client.CoreV1Api()
     batch = client.BatchV1Api()
@@ -331,6 +417,8 @@ def main() -> None:
         version=_required_env("GPU_FAULT_INSTALLER_VERSION"),
         config_digest=_required_env("GPU_FAULT_INSTALLER_CONFIG_DIGEST"),
         artifact_sha256=_required_env("GPU_FAULT_INSTALLER_ARTIFACT_SHA256"),
+        bundle_sha256=os.getenv("GPU_FAULT_INSTALLER_BUNDLE_SHA256") or None,
+        template_sha256=os.getenv("GPU_FAULT_INSTALLER_TEMPLATE_SHA256") or None,
         job_template=yaml.safe_load(template_text),
         dcgm_metrics_url_template=os.environ.get(
             "GPU_FAULT_DCGM_METRICS_URL",
@@ -341,6 +429,9 @@ def main() -> None:
             "gpu-fault-node-action-keys",
         ),
         retry_seconds=retry_seconds,
+        max_unavailable=max_unavailable,
+        job_active_deadline_seconds=active_deadline_seconds,
+        allowed_node_names=allowed_nodes,
     )
     while True:
         try:
