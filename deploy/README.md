@@ -30,19 +30,22 @@ It validates `config/site.example.yaml`, materializes the low-level release
 JSON with mode `0600`, and reuses the regional rollout state machine. Direct
 rollout commands remain available for resume, rollback and break-glass.
 
-CI builds and pushes the immutable runtime image before the deployment host
-verifies and applies the signed release:
+The supported release lifecycle always has two commands. The first validates,
+reuses or builds the immutable runtime image, and signs the release. The second
+verifies the fixed `dist/current-*` outputs and applies them:
 
 ```bash
+COSIGN_SIGNING_KEY=/secure/release/cosign.key \
 make PYTHON=.venv/bin/python release-build \
   RUNTIME_IMAGE_REPOSITORY=<account>.dkr.ecr.<region>.amazonaws.com/<repository>
 
 make PYTHON=.venv/bin/python release-deploy \
   SITE=/secure/gpu-fault/site.yaml \
-  PREBUILT_ATTESTATION=/secure/release/current-attestation.json \
-  PREBUILT_BUNDLE=/secure/release/current-attestation.bundle.json \
   COSIGN_KEY=/secure/release/cosign.pub
 ```
+
+When duties are separated, release CI runs the first command on behalf of the
+administrator. The command model and signed artifact paths do not change.
 
 | Deployment surface | Directory | Entry point |
 |---|---|---|

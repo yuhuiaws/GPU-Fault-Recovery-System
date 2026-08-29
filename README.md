@@ -98,7 +98,7 @@ make artifact-check
 make test-parallel
 ```
 
-`make check` 的最终全量测试同样使用4个xdist worker。真实PostgreSQL后端测试不参与
+`make check` 的最终全量测试同样使用4个xdist worker。隔离PostgreSQL 16测试库不参与
 并行；设置`GPU_FAULT_TEST_POSTGRES_URL`后单独运行`make test-postgres`。
 
 `make artifact-check` 构建三个独立 wheel、Node bundle 和内容寻址
@@ -113,27 +113,27 @@ make test-parallel
 3. GPU VPC已有NAT出口。
 4. 执行身份具有所需AWS、EKS和Kubernetes管理权限。
 
-不要直接 apply `deploy/`。开发者发布和管理员部署使用不同入口：
-
-| 角色 | 事实源 | 唯一正常入口 | 作用 |
-|---|---|---|---|
-| CI/发布人员 | 当前 checkout、Profile template | `make release-build` | 检查、构建并推送不可变OCI、生成Manifest v3和签名attestation |
-| 管理员 | 已批准的release和`site.yaml` | `make release-deploy`、`gpu-fault-admin` | 验签、应用升级、验收和资源生命周期管理 |
+不要直接 apply `deploy/`。正式入口只有`make release-build`和
+`make release-deploy`两个连续步骤。
 
 ### 开发者：修改代码或Profile后发布
 
-CI先构建并推送runtime image；部署机只消费签名后的release bundle：
+无论由同一操作者执行，还是由CI代执行第一步，正式入口都只有以下两步：
 
 ```bash
+COSIGN_SIGNING_KEY=/secure/release/cosign.key \
 make PYTHON=.venv/bin/python release-build \
   RUNTIME_IMAGE_REPOSITORY=<registry/repository>
 
 make PYTHON=.venv/bin/python release-deploy \
   SITE=/secure/gpu-fault/site.yaml \
-  PREBUILT_ATTESTATION=/secure/release/current-attestation.json \
-  PREBUILT_BUNDLE=/secure/release/current-attestation.bundle.json \
   COSIGN_KEY=/secure/release/cosign.pub
 ```
+
+`release-build`以Dockerfile、固定base digest、runtime lock、platform、build args、
+wheel SHA和module digest计算image input digest；registry平台和labels完全匹配才复用
+OCI，否则build/push。远端cache只加速layer。它签名固定的`dist/current-*`制品，
+`release-deploy`默认读取；CI keyless签名时改用固定certificate identity和issuer。
 
 修改Profile策略时，在上述`release-deploy`命令前追加审批引用：
 
@@ -154,14 +154,15 @@ Manifest v3、attestation和签名；部署机验签后执行
 
 ### 管理员：首次部署和日常管理
 
-管理员不从源代码手工build，也不编辑Profile版本或artifact摘要。Region由管理员选择的
-集群ARN或`site.yaml`中的`spec.awsRegion`明确给出，不从shell或当前kubectl context
-猜测。完整权限和网络要求见[管理员快速部署](docs/管理员快速部署.md)。
+管理员仍按上述`release-build -> release-deploy`两步执行；职责分离时第一步可由受信
+Release CI代执行。管理员不编辑Profile版本或artifact摘要。Region由管理员选择的集群
+ARN或`site.yaml`中的`spec.awsRegion`明确给出，不从shell或当前kubectl context猜测。
+完整权限和网络要求见[管理员快速部署](docs/管理员快速部署.md)。
 
 #### 1. 首次部署
 
 先用`deploy/aws/regional-foundation/` Terraform模块创建Aurora、AMP/SNS/SQS、
-runtime ECR和方案安全组，再根据输出准备`site.yaml`：
+runtime/cache ECR和方案安全组，再根据输出准备`site.yaml`：
 
 ```bash
 terraform -chdir=deploy/aws/regional-foundation apply

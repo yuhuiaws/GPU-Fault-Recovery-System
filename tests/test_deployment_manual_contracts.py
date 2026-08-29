@@ -316,15 +316,29 @@ def test_release_preflight_is_required_and_load_bearing() -> None:
 
 def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
     developer = (ROOT / "docs/开发者部署实现.md").read_text(encoding="utf-8")
+    build_target = makefile.split("release-build:\n", 1)[1].split(
+        "\nrelease-deploy:", 1
+    )[0]
     target = makefile.split("release-deploy:\n", 1)[1].split("\n# 本地保留策略", 1)[0]
 
+    assert "git status --porcelain" in build_target
+    assert "--cache-from" in build_target
+    assert "--cache-to" in build_target
+    assert "--force-rebuild" in build_target
+    assert "scripts/build-release-attestation.py" in build_target
+    assert "$(COSIGN) sign-blob --yes" in build_target
     assert "scripts/release_deploy.py" in target
     assert "--site" in target
     assert "--profile-approval" in target
     assert "--prebuilt-attestation" in target
     assert "--prebuilt-signature" in target
     assert "--prebuilt-certificate" in target
+    assert "PREBUILT_ATTESTATION ?= $(RELEASE_ATTESTATION)" in makefile
+    assert "PREBUILT_BUNDLE ?= $(RELEASE_ATTESTATION_BUNDLE)" in makefile
+    assert "RUNTIME_IMAGE_CACHE_REPOSITORY" in workflow
+    assert "cosign sign-blob" not in workflow
     assert "make PYTHON=.venv/bin/python release-build" in developer
     assert "make PYTHON=.venv/bin/python release-deploy" in developer
     assert "PROFILE_APPROVAL=CHG-12345" in developer

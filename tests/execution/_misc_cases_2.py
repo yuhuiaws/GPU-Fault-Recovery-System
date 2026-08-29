@@ -666,6 +666,7 @@ def test_active_environment_requires_an_alert_channel(monkeypatch, tmp_path) -> 
     monkeypatch.setenv("GPU_FAULT_STORE_URL", f"sqlite:///{tmp_path / 'alerting.db'}")
     monkeypatch.setenv("GPU_FAULT_EXECUTION_TOKEN", "t" * 32)
     monkeypatch.setenv("GPU_FAULT_ALLOWED_OPERATIONS", "FREEZE_EVIDENCE")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-west-2")
     monkeypatch.delenv("GPU_FAULT_EMAIL_SENDER", raising=False)
     monkeypatch.delenv("GPU_FAULT_EMAIL_RECIPIENTS", raising=False)
     monkeypatch.delenv("GPU_FAULT_ALLOW_EMAIL", raising=False)

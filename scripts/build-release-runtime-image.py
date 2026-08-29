@@ -10,11 +10,27 @@ from release_image import build_runtime_image
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def build_arguments(values: list[str]) -> dict[str, str]:
+    result = {}
+    for value in values:
+        name, separator, argument = value.partition("=")
+        if not separator or not name or name in result:
+            raise ValueError(
+                "runtime image build args must be unique NAME=VALUE entries"
+            )
+        result[name] = argument
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
     parser.add_argument("--platform", default="linux/amd64")
     parser.add_argument("--push", action="store_true")
+    parser.add_argument("--build-arg", action="append", default=[])
+    parser.add_argument("--cache-from", action="append", default=[])
+    parser.add_argument("--cache-to", action="append", default=[])
+    parser.add_argument("--force-rebuild", action="store_true")
     parser.add_argument(
         "--output",
         type=Path,
@@ -26,6 +42,10 @@ def main() -> None:
         repository=arguments.repository,
         platform=arguments.platform,
         push=arguments.push,
+        build_args=build_arguments(arguments.build_arg),
+        cache_from=tuple(arguments.cache_from),
+        cache_to=tuple(arguments.cache_to),
+        reuse_registry_image=not arguments.force_rebuild,
     )
     output = arguments.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)

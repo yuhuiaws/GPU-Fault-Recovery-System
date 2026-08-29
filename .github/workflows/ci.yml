@@ -24,6 +24,7 @@ jobs:
     env:
       GPU_FAULT_TEST_POSTGRES_URL: >-
         postgresql://gpu_fault:gpu_fault@127.0.0.1:5432/gpu_fault_test
+      PYTHONPYCACHEPREFIX: /tmp/gpu-fault-pycache
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,7 +52,6 @@ jobs:
       - run: python scripts/check-assert-messages.py
       - run: python scripts/check-public-release.py
       - run: >-
-          PYTHONPYCACHEPREFIX=/tmp/gpu-fault-pycache
           python -m compileall -q src tests deploy scripts tools
       - run: python scripts/check-python-architecture.py
       - run: >-
@@ -86,15 +86,7 @@ jobs:
           deploy/control-plane/regional/generated
       - run: make artifact-check
       - name: Run full suite with coverage floor
-        run: >-
-          GPU_FAULT_TEST_POSTGRES_URL=
-          python -m pytest -n 4
-          --cov=src/gpu_fault
-          --cov-branch
-          --cov-fail-under=78
-          --cov-report=term-missing
-      - name: Run PostgreSQL backend tests serially
-        run: make test-postgres
+        run: make coverage PYTHON=python
       - name: Run unit and component fault scenario catalog runner
         run: make fault-test-cases-ci
       - name: Upload fault test report

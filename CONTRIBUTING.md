@@ -48,29 +48,30 @@ image、schema/事务变化或跨越三个以上影响域时会fail closed并升
 或影响计划明确要求执行。规则与说明见
 [变更影响与测试选择](docs/变更影响与测试选择.md)。
 
-发布分成 CI 构建和站点应用两步。CI 构建、测试并推送不可变 runtime image：
+发布统一为两个命令。第一步检查、复用或构建不可变runtime image并签名：
 
 ```bash
+COSIGN_SIGNING_KEY=/secure/release/cosign.key \
 make release-build \
   RUNTIME_IMAGE_REPOSITORY=<registry/repository>
 ```
 
-签名后的 `dist/current-attestation.json`、signature 和 release bundle 交给部署机；部署机
-只验证签名和摘要，不重新运行全量测试或构建：
+第二步默认消费第一步生成的`dist/current-attestation.json`和
+`dist/current-attestation.bundle.json`，验签后部署：
 
 ```bash
 make release-deploy \
   SITE=/path/to/site.yaml \
-  PREBUILT_ATTESTATION=/path/to/current-attestation.json \
-  PREBUILT_BUNDLE=/path/to/current-attestation.bundle.json \
   COSIGN_KEY=/path/to/cosign.pub
 ```
 
-`make check`的最终全量测试、`make test-parallel`和`make coverage`均使用4个worker；
-coverage同时强制当前78%的覆盖率floor。为避免多个worker操作同一数据库，这些并行
-目标不启用外部PostgreSQL；设置`GPU_FAULT_TEST_POSTGRES_URL`后另跑
-`make test-postgres`。覆盖率可以提高，不能通过调低`COVERAGE_FLOOR`掩盖未测试的
-新分支。
+职责分离时Release CI代执行第一步；管理员仍使用相同的第二步入口。`release-build`
+内部执行`make check`和PostgreSQL stress，不把`make check`作为正式发布的第三步。
+
+`make check`的最终全量测试和`make test-parallel`使用4个worker且不连接外部
+PostgreSQL。`make coverage`要求设置`GPU_FAULT_TEST_POSTGRES_URL`：先由4个worker
+采集非PostgreSQL覆盖率，再串行追加隔离PostgreSQL 16测试库覆盖率，最后统一强制当前
+78%的floor。覆盖率可以提高，不能通过调低`COVERAGE_FLOOR`掩盖未测试的新分支。
 
 只修改文档时，仍必须运行：
 

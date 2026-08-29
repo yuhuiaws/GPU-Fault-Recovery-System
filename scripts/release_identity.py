@@ -232,6 +232,41 @@ def bind_runtime_image(
             raise ReleaseIdentityError(
                 f"runtime image descriptor {field} does not match the checkout"
             )
+    image_inputs = descriptor.get("image_inputs")
+    image_input_sha256 = str(descriptor.get("image_input_sha256") or "")
+    if (
+        not isinstance(image_inputs, dict)
+        or image_inputs.get("schema_version") != 1
+        or not SHA256_PATTERN.fullmatch(image_input_sha256)
+        or canonical_sha256(image_inputs) != image_input_sha256
+    ):
+        raise ReleaseIdentityError(
+            "runtime image descriptor image input identity is invalid"
+        )
+    if (
+        image_inputs.get("dockerfile_sha256") != descriptor.get("dockerfile_sha256")
+        or image_inputs.get("dependency_lock_sha256")
+        != descriptor.get("dependency_lock_sha256")
+        or image_inputs.get("platform") != descriptor.get("platform")
+        or image_inputs.get("components") != descriptor.get("components")
+    ):
+        raise ReleaseIdentityError(
+            "runtime image descriptor image inputs do not match its metadata"
+        )
+    base_images = image_inputs.get("base_images")
+    if (
+        not isinstance(base_images, list)
+        or not base_images
+        or any(
+            not isinstance(item, str) or not DIGEST_IMAGE_PATTERN.fullmatch(item)
+            for item in base_images
+        )
+    ):
+        raise ReleaseIdentityError(
+            "runtime image descriptor base images are not immutable"
+        )
+    if not isinstance(image_inputs.get("build_args"), dict):
+        raise ReleaseIdentityError("runtime image descriptor build args are invalid")
     if descriptor.get("deployable") is not True:
         raise ReleaseIdentityError(
             "runtime image descriptor is local-only and cannot back a release"
@@ -271,6 +306,7 @@ def bind_runtime_image(
         "source": str(descriptor.get("repository") or ""),
         "digest": digest,
         "source_identity_sha256": source_identity,
+        "image_input_sha256": image_input_sha256,
         "components": components,
     }
     bound["runtime_prebuilt"] = True

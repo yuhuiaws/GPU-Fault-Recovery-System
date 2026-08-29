@@ -10,6 +10,7 @@ from scripts.release_identity import (
     ReleaseIdentityError,
     bind_runtime_image,
     build_release_identity,
+    canonical_sha256,
     sha256_bytes,
 )
 
@@ -74,6 +75,57 @@ def identity_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def runtime_descriptor(
+    root: Path,
+    identity: dict,
+    *,
+    deployable: bool = True,
+    components: dict | None = None,
+) -> dict:
+    component_identities = (
+        components
+        if components is not None
+        else {
+            "control_plane": {
+                "distribution": "gpu-fault-control-plane",
+                "wheel_sha256": "b" * 64,
+                "module_digest": "c" * 64,
+            },
+            "executor": {
+                "distribution": "gpu-fault-cluster-executor",
+                "wheel_sha256": "d" * 64,
+                "module_digest": "e" * 64,
+            },
+        }
+    )
+    image_inputs = {
+        "schema_version": 1,
+        "platform": "linux/amd64",
+        "build_args": {},
+        "base_images": ["registry.example/python@sha256:" + "f" * 64],
+        "dockerfile_sha256": sha256_bytes(
+            (root / "deploy/image/Dockerfile").read_bytes()
+        ),
+        "dependency_lock_sha256": sha256_bytes(
+            (root / "requirements/runtime.lock").read_bytes()
+        ),
+        "components": component_identities,
+    }
+    return {
+        "schema_version": 2,
+        "deployable": deployable,
+        "repository": "registry.example/gpu-fault-runtime",
+        "reference": "registry.example/gpu-fault-runtime@sha256:" + "a" * 64,
+        "platform": "linux/amd64",
+        "source_identity_sha256": identity["sha256"],
+        "image_input_sha256": canonical_sha256(image_inputs),
+        "image_inputs": image_inputs,
+        "dockerfile_sha256": image_inputs["dockerfile_sha256"],
+        "dependency_lock_sha256": image_inputs["dependency_lock_sha256"],
+        "components": component_identities,
+    }
+
+
 def test_release_identity_changes_with_component_inputs(tmp_path: Path) -> None:
     root = identity_root(tmp_path)
     before = build_release_identity(root)
@@ -122,31 +174,7 @@ def test_release_identity_rejects_mutable_images(tmp_path: Path) -> None:
 def test_runtime_image_descriptor_binds_deployable_identity(tmp_path: Path) -> None:
     root = identity_root(tmp_path)
     identity = build_release_identity(root)
-    descriptor = {
-        "schema_version": 2,
-        "deployable": True,
-        "repository": "registry.example/gpu-fault-runtime",
-        "reference": "registry.example/gpu-fault-runtime@sha256:" + "a" * 64,
-        "source_identity_sha256": identity["sha256"],
-        "dockerfile_sha256": sha256_bytes(
-            (root / "deploy/image/Dockerfile").read_bytes()
-        ),
-        "dependency_lock_sha256": sha256_bytes(
-            (root / "requirements/runtime.lock").read_bytes()
-        ),
-        "components": {
-            "control_plane": {
-                "distribution": "gpu-fault-control-plane",
-                "wheel_sha256": "b" * 64,
-                "module_digest": "c" * 64,
-            },
-            "executor": {
-                "distribution": "gpu-fault-cluster-executor",
-                "wheel_sha256": "d" * 64,
-                "module_digest": "e" * 64,
-            },
-        },
-    }
+    descriptor = runtime_descriptor(root, identity)
 
     bound = bind_runtime_image(root, identity, descriptor)
 
@@ -159,31 +187,7 @@ def test_runtime_image_descriptor_binds_deployable_identity(tmp_path: Path) -> N
 def test_runtime_image_descriptor_rejects_local_only_build(tmp_path: Path) -> None:
     root = identity_root(tmp_path)
     identity = build_release_identity(root)
-    descriptor = {
-        "schema_version": 2,
-        "deployable": False,
-        "repository": "registry.example/gpu-fault-runtime",
-        "reference": "registry.example/gpu-fault-runtime@sha256:" + "a" * 64,
-        "source_identity_sha256": identity["sha256"],
-        "dockerfile_sha256": sha256_bytes(
-            (root / "deploy/image/Dockerfile").read_bytes()
-        ),
-        "dependency_lock_sha256": sha256_bytes(
-            (root / "requirements/runtime.lock").read_bytes()
-        ),
-        "components": {
-            "control_plane": {
-                "distribution": "gpu-fault-control-plane",
-                "wheel_sha256": "b" * 64,
-                "module_digest": "c" * 64,
-            },
-            "executor": {
-                "distribution": "gpu-fault-cluster-executor",
-                "wheel_sha256": "d" * 64,
-                "module_digest": "e" * 64,
-            },
-        },
-    }
+    descriptor = runtime_descriptor(root, identity, deployable=False)
 
     with pytest.raises(ReleaseIdentityError, match="local-only"):
         bind_runtime_image(root, identity, descriptor)
@@ -192,20 +196,17 @@ def test_runtime_image_descriptor_rejects_local_only_build(tmp_path: Path) -> No
 def test_runtime_image_descriptor_requires_component_identities(tmp_path: Path) -> None:
     root = identity_root(tmp_path)
     identity = build_release_identity(root)
-    descriptor = {
-        "schema_version": 2,
-        "deployable": True,
-        "repository": "registry.example/gpu-fault-runtime",
-        "reference": "registry.example/gpu-fault-runtime@sha256:" + "a" * 64,
-        "source_identity_sha256": identity["sha256"],
-        "dockerfile_sha256": sha256_bytes(
-            (root / "deploy/image/Dockerfile").read_bytes()
-        ),
-        "dependency_lock_sha256": sha256_bytes(
-            (root / "requirements/runtime.lock").read_bytes()
-        ),
-        "components": {},
-    }
+    descriptor = runtime_descriptor(root, identity, components={})
 
     with pytest.raises(ReleaseIdentityError, match="component identities"):
+        bind_runtime_image(root, identity, descriptor)
+
+
+def test_runtime_image_descriptor_rejects_modified_image_inputs(tmp_path: Path) -> None:
+    root = identity_root(tmp_path)
+    identity = build_release_identity(root)
+    descriptor = runtime_descriptor(root, identity)
+    descriptor["image_inputs"]["platform"] = "linux/arm64"
+
+    with pytest.raises(ReleaseIdentityError, match="input identity"):
         bind_runtime_image(root, identity, descriptor)

@@ -203,10 +203,10 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
         (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     )
     steps = workflow["jobs"]["test"]["steps"]
-    pytest_index = next(
+    coverage_index = next(
         index
         for index, step in enumerate(steps)
-        if "--cov=src/gpu_fault" in step.get("run", "")
+        if step.get("name") == "Run full suite with coverage floor"
     )
     runner_index = next(
         index
@@ -220,7 +220,8 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
     )
     upload = steps[upload_index]
 
-    assert pytest_index < runner_index < upload_index
+    assert coverage_index < runner_index < upload_index
+    assert steps[coverage_index]["run"] == "make coverage PYTHON=python"
     assert steps[runner_index]["run"] == "make fault-test-cases-ci"
     assert upload["if"] == "always()"
     assert upload["uses"] == "actions/upload-artifact@v4"
@@ -238,12 +239,10 @@ def test_coverage_floor_is_wired_into_make_and_ci() -> None:
 
     assert "COVERAGE_FLOOR ?= 78" in makefile
     assert "GPU_FAULT_TEST_POSTGRES_URL=" in makefile
+    assert "--cov-append" in makefile
     assert "--cov-fail-under=$(COVERAGE_FLOOR)" in makefile
-    assert "GPU_FAULT_TEST_POSTGRES_URL=" in workflow
-    assert "--cov-fail-under=78" in workflow
     assert "Run full suite with coverage floor" in workflow
-    assert "Run PostgreSQL backend tests serially" in workflow
-    assert "make test-postgres" in workflow
+    assert "make coverage PYTHON=python" in workflow
     assert "make coverage" in (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
 
 

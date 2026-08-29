@@ -10,6 +10,10 @@ output "runtime_image_repository" {
   value = aws_ecr_repository.runtime.repository_url
 }
 
+output "runtime_image_cache_repository" {
+  value = aws_ecr_repository.runtime_cache.repository_url
+}
+
 output "public_subnet_ids" {
   value = var.public_subnet_ids
 }

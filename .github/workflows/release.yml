@@ -53,6 +53,7 @@ jobs:
       - name: Select immutable runtime repository
         env:
           REPOSITORY: ${{ vars.RUNTIME_IMAGE_REPOSITORY }}
+          CACHE_REPOSITORY: ${{ vars.RUNTIME_IMAGE_CACHE_REPOSITORY }}
         run: |
           test -n "${REPOSITORY}"
           case "${REPOSITORY}" in
@@ -60,12 +61,17 @@ jobs:
             *) echo "RUNTIME_IMAGE_REPOSITORY must be an ECR URI" >&2; exit 2 ;;
           esac
           printf 'RUNTIME_IMAGE_REPOSITORY=%s\n' "${REPOSITORY}" >> "${GITHUB_ENV}"
+          if [ -n "${CACHE_REPOSITORY}" ]; then
+            case "${CACHE_REPOSITORY}" in
+              *.dkr.ecr.*.amazonaws.com/*) ;;
+              *) echo "RUNTIME_IMAGE_CACHE_REPOSITORY must be an ECR URI" >&2; exit 2 ;;
+            esac
+            printf 'RUNTIME_IMAGE_CACHE_FROM=type=registry,ref=%s:buildcache-linux-amd64\n' \
+              "${CACHE_REPOSITORY}" >> "${GITHUB_ENV}"
+            printf 'RUNTIME_IMAGE_CACHE_TO=type=registry,ref=%s:buildcache-linux-amd64,mode=max,image-manifest=true,oci-mediatypes=true\n' \
+              "${CACHE_REPOSITORY}" >> "${GITHUB_ENV}"
+          fi
       - run: make release-build PYTHON=python
-      - name: Sign release attestation
-        run: >-
-          cosign sign-blob --yes
-          --bundle dist/current-attestation.bundle.json
-          dist/current-attestation.json
       - name: Upload signed release bundle
         uses: actions/upload-artifact@v4
         with:

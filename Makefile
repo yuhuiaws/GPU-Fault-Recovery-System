@@ -6,6 +6,12 @@ export PYTHONPYCACHEPREFIX
 PYTEST_XDIST_WORKERS ?= 4
 COVERAGE_FLOOR ?= 78
 BASE ?= origin/main
+COSIGN ?= cosign
+RUNTIME_IMAGE_PLATFORM ?= linux/amd64
+RELEASE_ATTESTATION := dist/current-attestation.json
+RELEASE_ATTESTATION_BUNDLE := dist/current-attestation.bundle.json
+PREBUILT_ATTESTATION ?= $(RELEASE_ATTESTATION)
+PREBUILT_BUNDLE ?= $(RELEASE_ATTESTATION_BUNDLE)
 QUALITY_SCRIPTS = scripts tools
 QUALITY_SHELL_ROOTS = deploy scripts tools
 YAMLLINT_CONFIG = .yamllint
@@ -26,6 +32,11 @@ DOCUMENTATION_TESTS = \
 	tests/test_fault_evidence.py \
 	tests/test_doc_impact.py \
 	tests/test_change_impact.py
+POSTGRES_TESTS = \
+	tests/store/test_postgres_store.py \
+	tests/store/test_postgres_processor_claim.py \
+	tests/store/test_postgres_reconnect.py \
+	tests/store/test_store_contracts.py
 
 .PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check runtime-image-check release-build release-preflight release-deploy architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check terraform-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
@@ -50,10 +61,19 @@ impact-check:
 	$(PYTHON) scripts/select-affected-tests.py --check
 
 coverage:
+	@test -n "$${GPU_FAULT_TEST_POSTGRES_URL}" || \
+		(printf 'GPU_FAULT_TEST_POSTGRES_URL is required\n' >&2; exit 2)
+	$(MAKE) python-cache-clean
+	$(PYTHON) -m coverage erase
 	GPU_FAULT_TEST_POSTGRES_URL= \
 	$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \
 		--cov=src/gpu_fault \
 		--cov-branch \
+		--cov-report=
+	$(PYTHON) -m pytest $(POSTGRES_TESTS) \
+		--cov=src/gpu_fault \
+		--cov-branch \
+		--cov-append \
 		--cov-fail-under=$(COVERAGE_FLOOR) \
 		--cov-report=term-missing \
 		--cov-report=html
@@ -61,11 +81,7 @@ coverage:
 test-postgres:
 	@test -n "$${GPU_FAULT_TEST_POSTGRES_URL}" || \
 		(printf 'GPU_FAULT_TEST_POSTGRES_URL is required\n' >&2; exit 2)
-	$(PYTHON) -m pytest \
-		tests/store/test_postgres_store.py \
-		tests/store/test_postgres_processor_claim.py \
-		tests/store/test_postgres_reconnect.py \
-		tests/store/test_store_contracts.py
+	$(PYTHON) -m pytest $(POSTGRES_TESTS)
 
 test-postgres-stress:
 	GPU_FAULT_POSTGRES_LOCK_STRESS_WORKERS=8 \
@@ -260,11 +276,19 @@ release-build:
 		(printf 'RUNTIME_IMAGE_REPOSITORY is required\n' >&2; exit 2)
 	@test -n "$${GPU_FAULT_TEST_POSTGRES_URL}" || \
 		(printf 'GPU_FAULT_TEST_POSTGRES_URL is required\n' >&2; exit 2)
+	@test -z "$$(git status --porcelain --untracked-files=normal)" || \
+		(printf 'release-build requires a clean source tree\n' >&2; exit 2)
+	@command -v "$(COSIGN)" >/dev/null || \
+		(printf 'cosign is required\n' >&2; exit 2)
 	$(MAKE) check PYTHON="$(PYTHON)"
 	$(MAKE) test-postgres-stress PYTHON="$(PYTHON)"
 	$(PYTHON) scripts/build-release-runtime-image.py \
 		--repository "$(RUNTIME_IMAGE_REPOSITORY)" \
-		--platform "$(or $(RUNTIME_IMAGE_PLATFORM),linux/amd64)" \
+		--platform "$(RUNTIME_IMAGE_PLATFORM)" \
+		$(foreach arg,$(RUNTIME_IMAGE_BUILD_ARGS),--build-arg "$(arg)") \
+		$(if $(RUNTIME_IMAGE_CACHE_FROM),--cache-from "$(RUNTIME_IMAGE_CACHE_FROM)",) \
+		$(if $(RUNTIME_IMAGE_CACHE_TO),--cache-to "$(RUNTIME_IMAGE_CACHE_TO)",) \
+		$(if $(filter true yes 1,$(RUNTIME_IMAGE_FORCE_REBUILD)),--force-rebuild,) \
 		--push
 	$(PYTHON) scripts/build-release-artifacts.py \
 		--python "$(PYTHON)" \
@@ -272,13 +296,26 @@ release-build:
 	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
 		$(PYTHON) -m pytest tests/test_artifact_consistency.py
 	$(PYTHON) scripts/build-release-attestation.py
+	$(COSIGN) sign-blob --yes \
+		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
+		"$(RELEASE_ATTESTATION)" >/dev/null
 
 release-deploy:
-	@test -n "$(PREBUILT_ATTESTATION)" || \
-		(printf 'PREBUILT_ATTESTATION is required\n' >&2; exit 2)
+	@test -f "$(PREBUILT_ATTESTATION)" || \
+		(printf 'PREBUILT_ATTESTATION does not exist: %s\n' \
+			"$(PREBUILT_ATTESTATION)" >&2; exit 2)
 	@if [ -z "$(PREBUILT_SIGNATURE)" ] && [ -z "$(PREBUILT_BUNDLE)" ]; then \
 		printf 'PREBUILT_SIGNATURE or PREBUILT_BUNDLE is required\n' >&2; \
 		exit 2; \
+	fi
+	@if [ -n "$(PREBUILT_SIGNATURE)" ] && [ ! -f "$(PREBUILT_SIGNATURE)" ]; then \
+		printf 'PREBUILT_SIGNATURE does not exist: %s\n' \
+			"$(PREBUILT_SIGNATURE)" >&2; exit 2; \
+	fi
+	@if [ -n "$(PREBUILT_BUNDLE)" ] && [ ! -f "$(PREBUILT_BUNDLE)" ]; then \
+		printf 'PREBUILT_BUNDLE does not exist: %s\n' \
+			"$(PREBUILT_BUNDLE)" >&2; exit 2; \
 	fi
 	@if [ -z "$(COSIGN_KEY)" ]; then \
 		( test -n "$(PREBUILT_BUNDLE)" || test -n "$(PREBUILT_CERTIFICATE)" ) && \

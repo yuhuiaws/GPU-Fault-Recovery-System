@@ -27,6 +27,23 @@ resource "aws_ecr_repository" "runtime" {
   tags = local.tags
 }
 
+resource "aws_ecr_repository" "runtime_cache" {
+  name                 = "${local.name}-runtime-cache"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = false
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  tags = merge(local.tags, {
+    "gpu-fault:resource-role" = "build-cache"
+  })
+}
+
 resource "aws_prometheus_workspace" "this" {
   alias = local.name
   tags  = local.tags
