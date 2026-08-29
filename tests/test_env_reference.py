@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +18,17 @@ DEPLOY_ENV_SOURCES = (
     ROOT / "deploy" / "node" / "verify-gpu-fault-collector.sh",
     *(ROOT / "deploy" / "systemd").glob("*"),
 )
+
+
+def test_environment_expression_fstrings_are_patch_version_stable() -> None:
+    generator = runpy.run_path(str(ROOT / "scripts/generate-env-reference.py"))
+    value = ast.parse(
+        "f\"{os.environ['GPU_FAULT_CLUSTER_ID']}/{socket.gethostname()}\"", mode="eval"
+    ).body
+
+    assert generator["expression"](value) == (
+        "f\"{os.environ['GPU_FAULT_CLUSTER_ID']}/{socket.gethostname()}\""
+    )
 
 
 def test_environment_reference_matches_source() -> None:

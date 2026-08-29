@@ -58,9 +58,41 @@ def deployment_source_name(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
 
 
+def _fstring_literal(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("{", "{{")
+        .replace("}", "}}")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+
+
+def _fstring_body(node: ast.JoinedStr) -> str:
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(_fstring_literal(value.value))
+            continue
+        if not isinstance(value, ast.FormattedValue):
+            parts.append(ast.unparse(value))
+            continue
+        formatted = "{" + ast.unparse(value.value)
+        if value.conversion != -1:
+            formatted += f"!{chr(value.conversion)}"
+        if value.format_spec is not None:
+            formatted += ":" + _fstring_body(value.format_spec)
+        parts.append(formatted + "}")
+    return "".join(parts)
+
+
 def expression(node: ast.AST | None) -> str:
     if node is None:
         return ""
+    if isinstance(node, ast.JoinedStr):
+        return f'f"{_fstring_body(node)}"'
     try:
         return ast.unparse(node).replace("\n", " ")
     except Exception:
