@@ -33,10 +33,13 @@ staging environment as of 2026-08-27:
 - `HttpEventSink` now has a per-collector bounded disk outbox. Network errors,
   429 and exhausted 5xx retries are replayable; permanent 4xx records remain
   non-replayable. The residual limitation is bounded capacity, unwritable or
-  damaged local storage, and replay being triggered only after a later live
-  post succeeds. Completion Watcher critical failure/terminal events now use a
-  ConfigMap-backed write-ahead outbox and replay independently after restart;
-  its residual bound is the configured ConfigMap record/byte limit.
+  damaged local storage, and needing one successful live post to wake replay.
+  After that wake-up a single background worker continues bounded batches
+  without waiting for another collection cycle; it stops on a zero-progress
+  round and a later successful live post wakes it again. Completion Watcher
+  critical failure/terminal events now use a ConfigMap-backed write-ahead
+  outbox and replay independently after restart; its residual bound is the
+  configured ConfigMap record/byte limit.
 
 - `COLLECT-004` debounce was validated through the documented safe substitute:
   expected GPU count was temporarily set to 9, the first mismatch established

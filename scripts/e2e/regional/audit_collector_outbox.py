@@ -49,6 +49,28 @@ def main() -> None:
             assert [item["sequence"] for item in calls] == [1, 2, 1]
             assert open(outbox).read() == ""
 
+            available[0] = False
+            background_path = f"{directory}/background.ndjson"
+            background = HttpEventSink(
+                "https://control",
+                max_attempts=1,
+                outbox_path=background_path,
+                outbox_replay_batch_size=2,
+                outbox_replay_background_interval_seconds=0,
+            )
+            for sequence in range(30, 37):
+                try:
+                    background.post("/events", {"sequence": sequence})
+                except CollectorError:
+                    pass
+            calls.clear()
+            available[0] = True
+            background.post("/events", {"sequence": 99})
+            assert background.wait_for_outbox_replay(2)
+            background_replay_order = [item["sequence"] for item in calls]
+            assert background_replay_order == [99, *range(30, 37)]
+            assert open(background_path).read() == ""
+
             def permanent(*_args, **_kwargs):
                 raise HTTPError(
                     "https://control/events",
@@ -112,6 +134,8 @@ def main() -> None:
                 "PASS",
                 {
                     "replay_order": [1, 2, 1],
+                    "background_replay_order": background_replay_order,
+                    "background_drained_without_new_live_event": True,
                     "bounded_sequences": [12, 13, 14],
                     "unwritable_buffered": False,
                     "dead_letter_replayable": dead["replayable"],

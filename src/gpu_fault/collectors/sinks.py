@@ -6,9 +6,10 @@ import logging
 import os
 import random
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError
 from urllib.request import (
@@ -43,6 +44,13 @@ class EventSink(Protocol):
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
+@dataclass(frozen=True)
+class _OutboxReplayResult:
+    attempted: int = 0
+    delivered: int = 0
+    replayable_remaining: int = 0
+
+
 class HttpEventSink:
     """Small dependency-free JSON client with bounded retry."""
 
@@ -59,6 +67,7 @@ class HttpEventSink:
         outbox_max_records: int = 1000,
         outbox_replay_batch_size: int = 10,
         outbox_replay_budget_seconds: float | None = None,
+        outbox_replay_background_interval_seconds: float = 0.25,
         processor_receipt_timeout_seconds: float = 120,
         processor_receipt_poll_seconds: float = 0.25,
         gzip_min_bytes: int | None = None,
@@ -73,6 +82,8 @@ class HttpEventSink:
         self.jitter = jitter
         self.outbox_path = Path(outbox_path) if outbox_path else None
         self.outbox_max_records = outbox_max_records
+        if outbox_replay_batch_size <= 0:
+            raise ValueError("collector outbox replay batch size must be positive")
         self.outbox_replay_batch_size = outbox_replay_batch_size
         # Replaying the backlog is best-effort catch-up work and must
         # never become the reason a live fault is late, so it runs under
@@ -89,6 +100,13 @@ class HttpEventSink:
         )
         if self.outbox_replay_budget_seconds <= 0:
             raise ValueError("collector outbox replay budget must be positive")
+        if outbox_replay_background_interval_seconds < 0:
+            raise ValueError(
+                "collector outbox background replay interval cannot be negative"
+            )
+        self.outbox_replay_background_interval_seconds = (
+            outbox_replay_background_interval_seconds
+        )
         if (
             processor_receipt_timeout_seconds <= 0
             or processor_receipt_poll_seconds <= 0
@@ -109,6 +127,10 @@ class HttpEventSink:
         if self.gzip_min_bytes < 0:
             raise ValueError("collector gzip threshold must not be negative")
         self._outbox_lock = Lock()
+        self._outbox_replay_state_lock = Lock()
+        self._outbox_replay_active = False
+        self._outbox_replay_requested = False
+        self._outbox_replay_thread: Thread | None = None
 
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Deliver ``payload``, then catch the backlog up if there is time.
@@ -126,8 +148,85 @@ class HttpEventSink:
         """
 
         result = self._post_with_retry(path, payload, buffer_failure=True)
-        self._replay_outbox()
+        self._kick_outbox_replay()
         return result
+
+    def wait_for_outbox_replay(self, timeout_seconds: float = 5) -> bool:
+        """Wait for an already-started background replay worker.
+
+        Collectors do not call this on their hot path. It exists for
+        acceptance probes and orderly embedders that need to prove the
+        durable queue has converged before they exit.
+        """
+
+        if timeout_seconds < 0:
+            raise ValueError("outbox replay wait timeout cannot be negative")
+        with self._outbox_replay_state_lock:
+            active = self._outbox_replay_active
+            thread = self._outbox_replay_thread
+        if not active:
+            return True
+        if thread is None:
+            return False
+        thread.join(timeout=timeout_seconds)
+        with self._outbox_replay_state_lock:
+            return not self._outbox_replay_active
+
+    def _kick_outbox_replay(self) -> None:
+        if self.outbox_path is None:
+            return
+        with self._outbox_replay_state_lock:
+            if self._outbox_replay_active:
+                self._outbox_replay_requested = True
+                return
+            self._outbox_replay_active = True
+            self._outbox_replay_requested = False
+        try:
+            outcome = self._replay_outbox()
+        except Exception:
+            with self._outbox_replay_state_lock:
+                self._outbox_replay_active = False
+            raise
+        if not self._continue_outbox_replay(outcome):
+            return
+        thread = Thread(
+            target=self._background_outbox_replay,
+            name="gpu-fault-collector-outbox-replay",
+            daemon=True,
+        )
+        with self._outbox_replay_state_lock:
+            self._outbox_replay_thread = thread
+        try:
+            thread.start()
+        except Exception:
+            with self._outbox_replay_state_lock:
+                self._outbox_replay_active = False
+                self._outbox_replay_thread = None
+            raise
+
+    def _continue_outbox_replay(self, outcome: _OutboxReplayResult) -> bool:
+        with self._outbox_replay_state_lock:
+            requested = self._outbox_replay_requested
+            self._outbox_replay_requested = False
+            if outcome.replayable_remaining and (outcome.delivered or requested):
+                return True
+            self._outbox_replay_active = False
+            self._outbox_replay_thread = None
+            return False
+
+    def _background_outbox_replay(self) -> None:
+        try:
+            while True:
+                if self.outbox_replay_background_interval_seconds:
+                    time.sleep(self.outbox_replay_background_interval_seconds)
+                outcome = self._replay_outbox()
+                if not self._continue_outbox_replay(outcome):
+                    return
+        except Exception:
+            LOGGER.exception("collector background outbox replay failed")
+            with self._outbox_replay_state_lock:
+                self._outbox_replay_active = False
+                self._outbox_replay_thread = None
 
     def _post_with_retry(
         self,
@@ -361,20 +460,21 @@ class HttpEventSink:
         )
         os.replace(temporary, self.outbox_path)
 
-    def _replay_outbox(self) -> None:
+    def _replay_outbox(self) -> _OutboxReplayResult:
         if self.outbox_path is None:
-            return
+            return _OutboxReplayResult()
         with self._outbox_lock:
             records = self._read_outbox()
             if not records:
-                return
+                return _OutboxReplayResult()
             kept = []
-            replayed = 0
+            attempted = 0
+            delivered = 0
             deadline = time.monotonic() + self.outbox_replay_budget_seconds
             for record in records:
                 if (
                     not record.get("replayable")
-                    or replayed >= self.outbox_replay_batch_size
+                    or attempted >= self.outbox_replay_batch_size
                     or time.monotonic() >= deadline
                 ):
                     kept.append(record)
@@ -395,14 +495,25 @@ class HttpEventSink:
                 except Exception as exc:
                     record["error"] = f"{type(exc).__name__}: {exc}"
                     kept.append(record)
-                replayed += 1
-            if replayed:
+                else:
+                    delivered += 1
+                attempted += 1
+            replayable_remaining = sum(1 for record in kept if record.get("replayable"))
+            if attempted:
                 LOGGER.info(
-                    "collector outbox replay: %d attempted, %d still buffered",
-                    replayed,
+                    "collector outbox replay: %d attempted, %d delivered, "
+                    "%d replayable and %d total still buffered",
+                    attempted,
+                    delivered,
+                    replayable_remaining,
                     len(kept),
                 )
             self._write_outbox(kept)
+            return _OutboxReplayResult(
+                attempted=attempted,
+                delivered=delivered,
+                replayable_remaining=replayable_remaining,
+            )
 
 
 class SqsEventSink:

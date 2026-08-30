@@ -150,6 +150,10 @@ def test_collector_outbox_fixture_covers_current_delivery_contract() -> None:
     )
 
     assert "'replay_order': [1, 2, 1]" in result.stdout
+    assert "'background_drained_without_new_live_event': True" in result.stdout
+    assert "'background_replay_order': [99, 30, 31, 32, 33, 34, 35, 36]" in (
+        result.stdout
+    )
     assert "'bounded_sequences': [12, 13, 14]" in result.stdout
     assert "'unwritable_buffered': False" in result.stdout
 
