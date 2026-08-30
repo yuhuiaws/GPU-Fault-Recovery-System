@@ -66,7 +66,7 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 - [NVIDIA 策略供应链与实现](docs/components/nvidia-policy.md)
 - [部署和运维详细参考](docs/部署和运维手册.md)
 - [部署和运维手册逐章解读](docs/部署和运维手册逐章解读.md)
-- [开发者部署实现](docs/开发者部署实现.md)
+- [开发者发布与测试流程](docs/开发者发布测试流程.md) / [CI 发布流程](docs/CI发布流程.md) / [开发者部署实现](docs/开发者部署实现.md)
 - [环境变量参考](docs/管理员环境变量参考.md)
 - [性能压测验收方案](docs/性能压测验收方案.md)
 - [扩展指南](docs/扩展指南.md)

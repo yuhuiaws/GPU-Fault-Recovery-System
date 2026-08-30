@@ -6,6 +6,8 @@
 |---|---|
 | 新增 operation、channel、Store、路由、插件或指标 | [GPU Fault 扩展指南](docs/扩展指南.md) |
 | 修改 Manifest、renderer、systemd、AWS 资源、配置模型或管理员 CLI | [开发者部署实现](docs/开发者部署实现.md) |
+| 修改 Release CI、签名、`dist/`制品或部署机离线bundle | [CI 发布流程](docs/CI发布流程.md)、[开发者部署实现](docs/开发者部署实现.md)和[部署机初始化](docs/部署机初始化.md) |
+| 完成代码修改并部署到staging或生产验证 | [开发者发布与测试流程](docs/开发者发布测试流程.md) |
 | 同时新增代码能力和生产资源 | 两份都读，两套门禁都执行 |
 | 只部署已有 release | [管理员快速部署](docs/管理员快速部署.md) |
 
@@ -65,6 +67,11 @@ COSIGN_SIGNING_KEY=/secure/release/cosign.key \
 make release-build \
   RUNTIME_IMAGE_REPOSITORY=<registry/repository>
 ```
+
+GitHub Actions从触发、OIDC/ECR、质量门禁、制品签名到`gpu-fault-release` artifact
+交付的完整顺序见[CI 发布流程](docs/CI发布流程.md)。
+开发者修改代码后的最短测试、staging部署和同制品生产晋级顺序见
+[开发者发布与测试流程](docs/开发者发布测试流程.md)。
 
 最后默认消费build生成的`dist/current-attestation.json`和
 `dist/current-attestation.bundle.json`，验签后部署：

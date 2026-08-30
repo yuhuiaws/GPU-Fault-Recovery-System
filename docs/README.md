@@ -26,6 +26,8 @@
 | [详细设计](详细设计.md) | 当前代码模块、协议和状态机如何实现 |
 | [详细设计 v2（可编码视角）](详细设计-v2.md) | 每个模块怎么跑、数据怎么流、异常怎么处理，够据此编码联调 |
 | [NVIDIA 策略供应链与实现](components/nvidia-policy.md) | Catalog 固定来源、生成摘要、动作语义和运行时门禁 |
+| [CI 发布流程](CI发布流程.md) | Release workflow如何构建、签名、上传并交付部署制品 |
+| [开发者发布与测试流程](开发者发布测试流程.md) | 修改代码后如何验证、部署staging并复用同一制品晋级生产 |
 | [部署机初始化](部署机初始化.md) | 如何从签名离线bundle创建锁定venv并检查系统工具 |
 | [管理员快速部署](管理员快速部署.md) | 如何用一个 `site.yaml` 执行 preflight、deploy、verify、status |
 | [管理员日常运维](管理员日常运维.md) | 按任务或症状选择升级、集群变更、轮换、排障和退役入口 |
@@ -85,6 +87,10 @@ Documentation-Impact-Reason: 仅重构内部实现，公共行为、命令和验
 
 ## 开发规范
 
+- [CI 发布流程](CI发布流程.md)：GitHub Release workflow、签名制品、artifact交付和
+  部署消费边界。
+- [开发者发布与测试流程](开发者发布测试流程.md)：代码修改后的最短验证、staging部署、
+  非破坏性测试和生产晋级闭环。
 - [开发者部署实现](开发者部署实现.md)：`site.yaml`、生产 Manifest、renderer、
   release pin、三层资源注册表和管理员接口要求。
 - [扩展指南](扩展指南.md)：新增 operation、channel、Store、adapter、handler 或
