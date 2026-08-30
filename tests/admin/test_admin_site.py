@@ -190,7 +190,7 @@ def test_site_email_notification_contract(tmp_path: Path) -> None:
 
 
 def test_admin_cli_exposes_single_cluster_removal(tmp_path, monkeypatch) -> None:
-    path = site_file(tmp_path)
+    site_file(tmp_path)
     calls = []
     monkeypatch.setattr(
         admin_cli,
@@ -200,8 +200,8 @@ def test_admin_cli_exposes_single_cluster_removal(tmp_path, monkeypatch) -> None
     arguments = admin_cli.parser().parse_args(
         [
             "remove-cluster",
-            "-f",
-            str(path),
+            "--state-dir",
+            str(tmp_path),
             "--cluster-id",
             "gpu-a",
             "--confirm",
@@ -215,7 +215,7 @@ def test_admin_cli_exposes_single_cluster_removal(tmp_path, monkeypatch) -> None
 
 
 def test_admin_cli_exposes_arn_only_cluster_join(tmp_path, monkeypatch) -> None:
-    path = site_file(tmp_path)
+    site_file(tmp_path)
     calls = []
     monkeypatch.setattr(
         admin_cli,
@@ -225,8 +225,8 @@ def test_admin_cli_exposes_arn_only_cluster_join(tmp_path, monkeypatch) -> None:
     arguments = admin_cli.parser().parse_args(
         [
             "join-cluster",
-            "-f",
-            str(path),
+            "--state-dir",
+            str(tmp_path),
             "--gpu-cluster-arn",
             "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
         ]
@@ -333,7 +333,7 @@ def test_admin_deploy_stops_when_preflight_fails(tmp_path: Path, monkeypatch) ->
 def test_admin_read_only_commands_map_to_regional_modes(
     tmp_path: Path, monkeypatch, command: str
 ) -> None:
-    path = site_file(tmp_path)
+    site_file(tmp_path)
     calls: list[list[str]] = []
 
     def fake_run(arguments, **kwargs):
@@ -346,7 +346,11 @@ def test_admin_read_only_commands_map_to_regional_modes(
         admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
     )
     arguments = argparse.Namespace(
-        command=command, file=path, repo_root=None, show_effective_config=False
+        command=command,
+        file=None,
+        state_dir=tmp_path,
+        repo_root=None,
+        show_effective_config=False,
     )
 
     assert admin_cli.run(arguments) == 0
@@ -383,6 +387,31 @@ def test_legacy_uninstall_accepts_cluster_arns_without_site_file() -> None:
     assert arguments.gpu_cluster_arn == [
         "arn:aws:sagemaker:us-west-2:123456789012:cluster/gpu"
     ], "GPU ARN was not parsed"
+
+
+def test_uninstall_resolves_site_from_state_dir(tmp_path: Path, monkeypatch) -> None:
+    site_file(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        admin_cli,
+        "uninstall",
+        lambda request: calls.append(request) or {"phase": "COMPLETED"},
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "uninstall",
+            "--state-dir",
+            str(tmp_path),
+            "--cpu-cluster",
+            "keep",
+            "--confirm",
+            "UNINSTALL_GPU_FAULT",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert calls[0].cpu_disposition == "keep"
+    assert calls[0].confirmation == "UNINSTALL_GPU_FAULT"
 
 
 def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
@@ -506,6 +535,38 @@ def test_public_deploy_help_only_exposes_four_inputs(capsys) -> None:
         "--email-sender",
     ):
         assert value not in help_text
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    (
+        ("preflight", ()),
+        ("verify", ()),
+        ("status", ()),
+        ("join-cluster", ("--gpu-cluster-arn",)),
+        ("remove-cluster", ("--cluster-id", "--confirm")),
+        ("uninstall", ("--cpu-cluster", "--confirm")),
+    ),
+)
+def test_managed_admin_help_uses_state_dir_not_site_file(
+    capsys, command: str, expected: tuple[str, ...]
+) -> None:
+    with pytest.raises(SystemExit, match="0"):
+        admin_cli.parser().parse_args([command, "--help"])
+
+    help_text = capsys.readouterr().out
+    assert "--state-dir" in help_text
+    assert "--file" not in help_text
+    assert "--repo-root" not in help_text
+    for value in expected:
+        assert value in help_text
+
+
+def test_managed_admin_command_requires_existing_state_site(tmp_path: Path) -> None:
+    arguments = admin_cli.parser().parse_args(["status", "--state-dir", str(tmp_path)])
+
+    with pytest.raises(SiteConfigError, match="no managed site"):
+        admin_cli.run(arguments)
 
 
 def test_arn_only_deploy_requires_private_state_dir(tmp_path: Path) -> None:

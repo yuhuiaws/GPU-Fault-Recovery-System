@@ -7,7 +7,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml  # type: ignore[import-untyped]
 
@@ -49,6 +49,58 @@ COMMANDS = {
 }
 
 
+def _add_managed_site_arguments(
+    command: argparse.ArgumentParser,
+    *,
+    show_effective_config: bool = False,
+) -> None:
+    command.add_argument(
+        "--state-dir",
+        type=Path,
+        metavar="STATE_DIR",
+        help="private state directory containing the managed site",
+    )
+    command.add_argument(
+        "-f",
+        "--file",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    command.add_argument(
+        "--repo-root",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    if show_effective_config:
+        command.add_argument(
+            "--show-effective-config",
+            action="store_true",
+            help="print the redacted generated release configuration",
+        )
+
+
+def _managed_site_file(
+    arguments: argparse.Namespace,
+    *,
+    command: str,
+    allow_missing: bool = False,
+) -> Path | None:
+    explicit = cast(Path | None, getattr(arguments, "file", None))
+    if explicit is not None:
+        return explicit
+    state_dir = cast(Path | None, getattr(arguments, "state_dir", None))
+    if state_dir is None:
+        if allow_missing:
+            return None
+        raise SiteConfigError(f"{command} requires --state-dir")
+    site_file = state_dir.expanduser().resolve() / "site.yaml"
+    if site_file.is_file():
+        return site_file
+    if allow_missing:
+        return None
+    raise SiteConfigError(f"{command} found no managed site under --state-dir")
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="gpu-fault-admin",
@@ -56,23 +108,13 @@ def parser() -> argparse.ArgumentParser:
     )
     commands = result.add_subparsers(dest="command", required=True)
     for name in ("preflight", "verify", "status"):
-        command = commands.add_parser(name)
-        command.add_argument(
-            "-f",
-            "--file",
-            required=True,
-            type=Path,
-            help="RegionalSite YAML",
+        command = commands.add_parser(
+            name,
+            usage=f"gpu-fault-admin {name} --state-dir STATE_DIR",
         )
-        command.add_argument(
-            "--repo-root",
-            type=Path,
-            help="override spec.repositoryRoot",
-        )
-        command.add_argument(
-            "--show-effective-config",
-            action="store_true",
-            help="print the redacted generated release configuration",
+        _add_managed_site_arguments(
+            command,
+            show_effective_config=True,
         )
     deploy = commands.add_parser(
         "deploy",
@@ -167,10 +209,14 @@ def parser() -> argparse.ArgumentParser:
     )
     join = commands.add_parser(
         "join-cluster",
+        usage=(
+            "gpu-fault-admin join-cluster --state-dir STATE_DIR "
+            "--gpu-cluster-arn GPU_ARN"
+        ),
         help="discover and attach one existing GPU EKS/HyperPod cluster",
     )
-    join.add_argument("-f", "--file", required=True, type=Path)
-    join.add_argument("--gpu-cluster-arn", required=True)
+    _add_managed_site_arguments(join)
+    join.add_argument("--gpu-cluster-arn", required=True, metavar="GPU_ARN")
     join.add_argument("--cluster-id")
     join.add_argument(
         "--allowed-namespace",
@@ -178,33 +224,44 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         help="additional workload namespace; may be repeated",
     )
-    join.add_argument("--state-dir", type=Path)
-    join.add_argument("--repo-root", type=Path)
     detach = commands.add_parser(
         "remove-cluster",
+        usage=(
+            "gpu-fault-admin remove-cluster --state-dir STATE_DIR "
+            "--cluster-id CLUSTER_ID --confirm REMOVE_GPU_CLUSTER"
+        ),
         help="uninstall one managed GPU data plane and keep the CPU control plane",
     )
-    detach.add_argument("-f", "--file", required=True, type=Path)
+    _add_managed_site_arguments(detach)
     detach.add_argument("--cluster-id", required=True)
     detach.add_argument(
         "--confirm",
         required=True,
         help="must be REMOVE_GPU_CLUSTER",
     )
-    detach.add_argument("--repo-root", type=Path)
-    remove = commands.add_parser("uninstall")
-    remove.add_argument("-f", "--file", type=Path)
+    remove = commands.add_parser(
+        "uninstall",
+        usage=(
+            "gpu-fault-admin uninstall --state-dir STATE_DIR "
+            "--cpu-cluster {keep,delete} --confirm CONFIRM"
+        ),
+    )
+    _add_managed_site_arguments(remove)
+    remove.add_argument(
+        "--show-effective-config",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     remove.add_argument(
         "--cpu-cluster-arn",
-        help="existing online CPU EKS or HyperPod cluster ARN",
+        help=argparse.SUPPRESS,
     )
     remove.add_argument(
         "--gpu-cluster-arn",
         action="append",
         default=[],
-        help="existing online GPU EKS or HyperPod cluster ARN; repeat as needed",
+        help=argparse.SUPPRESS,
     )
-    remove.add_argument("--state-dir", type=Path)
     remove.add_argument(
         "--cpu-cluster",
         choices=("keep", "delete"),
@@ -217,8 +274,6 @@ def parser() -> argparse.ArgumentParser:
         default="retain",
         help="retain a final Aurora cluster snapshot, or skip it",
     )
-    remove.add_argument("--repo-root", type=Path)
-    remove.add_argument("--show-effective-config", action="store_true")
     return result
 
 
@@ -359,75 +414,93 @@ def _run_automatic_release(
     return 0
 
 
+def _run_join_cluster(arguments: argparse.Namespace) -> int:
+    site_file = _managed_site_file(arguments, command="join-cluster")
+    assert site_file is not None
+    site = load_site(
+        site_file,
+        repository_root=arguments.repo_root,
+    )
+    result = join_cluster(
+        JoinClusterRequest(
+            site=site,
+            gpu_cluster_arn=arguments.gpu_cluster_arn,
+            cluster_id=arguments.cluster_id,
+            allowed_namespaces=tuple(arguments.allowed_namespace),
+            state_dir=arguments.state_dir,
+        )
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _run_remove_cluster(arguments: argparse.Namespace) -> int:
+    site_file = _managed_site_file(arguments, command="remove-cluster")
+    assert site_file is not None
+    site = load_site(
+        site_file,
+        repository_root=arguments.repo_root,
+    )
+    result = remove_cluster(
+        RemoveClusterRequest(
+            site=site,
+            cluster_id=arguments.cluster_id,
+            confirmation=arguments.confirm,
+        )
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _run_uninstall(arguments: argparse.Namespace) -> int:
+    site_file = _managed_site_file(
+        arguments,
+        command="uninstall",
+        allow_missing=True,
+    )
+    if site_file is not None:
+        site = load_site(
+            site_file,
+            repository_root=arguments.repo_root,
+        )
+    else:
+        if not arguments.cpu_cluster_arn or not arguments.gpu_cluster_arn:
+            raise SiteConfigError("uninstall found no managed site under --state-dir")
+        repository_root = (arguments.repo_root or Path.cwd()).resolve()
+        identity = "|".join([arguments.cpu_cluster_arn, *arguments.gpu_cluster_arn])
+        default_state = (
+            Path.home()
+            / ".gpu-fault/legacy-uninstall"
+            / hashlib.sha256(identity.encode()).hexdigest()[:12]
+        )
+        site = discover_legacy_site(
+            LegacySiteRequest(
+                cpu_cluster_arn=arguments.cpu_cluster_arn,
+                gpu_cluster_arns=tuple(arguments.gpu_cluster_arn),
+                repository_root=repository_root,
+                state_dir=(arguments.state_dir or default_state).expanduser(),
+            )
+        )
+    uninstall_result = uninstall(
+        UninstallRequest(
+            site=site,
+            cpu_disposition=arguments.cpu_cluster,
+            confirmation=arguments.confirm,
+            final_snapshot_policy=arguments.aurora_final_snapshot,
+        )
+    )
+    print(json.dumps(uninstall_result, indent=2, sort_keys=True))
+    return 0
+
+
 def run(arguments: argparse.Namespace) -> int:
     if arguments.command == "join-cluster":
-        site = load_site(
-            arguments.file,
-            repository_root=arguments.repo_root,
-        )
-        result = join_cluster(
-            JoinClusterRequest(
-                site=site,
-                gpu_cluster_arn=arguments.gpu_cluster_arn,
-                cluster_id=arguments.cluster_id,
-                allowed_namespaces=tuple(arguments.allowed_namespace),
-                state_dir=arguments.state_dir,
-            )
-        )
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
+        return _run_join_cluster(arguments)
     if arguments.command == "remove-cluster":
-        site = load_site(
-            arguments.file,
-            repository_root=arguments.repo_root,
-        )
-        result = remove_cluster(
-            RemoveClusterRequest(
-                site=site,
-                cluster_id=arguments.cluster_id,
-                confirmation=arguments.confirm,
-            )
-        )
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
+        return _run_remove_cluster(arguments)
     if arguments.command == "uninstall":
-        if arguments.file is not None:
-            site = load_site(
-                arguments.file,
-                repository_root=arguments.repo_root,
-            )
-        else:
-            if not arguments.cpu_cluster_arn or not arguments.gpu_cluster_arn:
-                raise SiteConfigError(
-                    "uninstall requires -f site.yaml, or --cpu-cluster-arn "
-                    "with at least one --gpu-cluster-arn"
-                )
-            repository_root = (arguments.repo_root or Path.cwd()).resolve()
-            identity = "|".join([arguments.cpu_cluster_arn, *arguments.gpu_cluster_arn])
-            default_state = (
-                Path.home()
-                / ".gpu-fault/legacy-uninstall"
-                / hashlib.sha256(identity.encode()).hexdigest()[:12]
-            )
-            site = discover_legacy_site(
-                LegacySiteRequest(
-                    cpu_cluster_arn=arguments.cpu_cluster_arn,
-                    gpu_cluster_arns=tuple(arguments.gpu_cluster_arn),
-                    repository_root=repository_root,
-                    state_dir=(arguments.state_dir or default_state).expanduser(),
-                )
-            )
-        uninstall_result = uninstall(
-            UninstallRequest(
-                site=site,
-                cpu_disposition=arguments.cpu_cluster,
-                confirmation=arguments.confirm,
-                final_snapshot_policy=arguments.aurora_final_snapshot,
-            )
-        )
-        print(json.dumps(uninstall_result, indent=2, sort_keys=True))
-        return 0
-    site_file = arguments.file
+        return _run_uninstall(arguments)
+    site_file = getattr(arguments, "file", None)
     automatic = False
     if arguments.command == "deploy" and site_file is None:
         if not arguments.cpu_cluster_arn or not arguments.gpu_cluster_arn:
@@ -471,6 +544,11 @@ def run(arguments: argparse.Namespace) -> int:
         )
         site_file = bootstrap_result.site_file
         automatic = True
+    if arguments.command in ("preflight", "verify", "status"):
+        site_file = _managed_site_file(
+            arguments,
+            command=arguments.command,
+        )
     if site_file is None:
         raise SiteConfigError(f"{arguments.command} requires -f site.yaml")
     if automatic:

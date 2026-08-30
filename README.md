@@ -171,22 +171,22 @@ gpu-fault-admin deploy \
 
 ```bash
 # 注册一个已有GPU集群
-gpu-fault-admin join-cluster -f /secure/gpu-fault/site.yaml \
+gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
   --gpu-cluster-arn <gpu-arn>
 
 # 注销一个GPU集群；保留该GPU EKS/HyperPod和其他集群
-gpu-fault-admin remove-cluster -f /secure/gpu-fault/site.yaml \
+gpu-fault-admin remove-cluster --state-dir /secure/gpu-fault \
   --cluster-id <cluster-id> --confirm REMOVE_GPU_CLUSTER
 
 # 卸载整个方案控制面和数据面，但保留底层CPU/GPU集群
-gpu-fault-admin uninstall -f /secure/gpu-fault/site.yaml \
+gpu-fault-admin uninstall --state-dir /secure/gpu-fault \
   --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT
 ```
 
 若永久退役并连底层CPU EKS/HyperPod集群一起删除，使用更强确认：
 
 ```bash
-gpu-fault-admin uninstall -f /secure/gpu-fault/site.yaml \
+gpu-fault-admin uninstall --state-dir /secure/gpu-fault \
   --cpu-cluster delete \
   --aurora-final-snapshot retain \
   --confirm DELETE_CPU_CONTROL_PLANE
