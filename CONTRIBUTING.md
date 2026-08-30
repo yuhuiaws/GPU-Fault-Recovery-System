@@ -71,6 +71,20 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 ```
 
+Runtime Profile策略变化时，首次deploy生成
+`<state-dir>/release-deploy/profile-plan.json`并停止。审核后运行：
+
+```bash
+gpu-fault-admin approve-profile \
+  --state-dir /secure/gpu-fault-staging \
+  --plan-sha256 "$(jq -er '.plan_sha256' \
+    /secure/gpu-fault-staging/release-deploy/profile-plan.json)" \
+  --reference CHG-12345
+```
+
+随后重跑原四参数deploy。不得通过隐藏参数或环境变量注入审批引用。
+完整管理员流程见[Runtime Profile变更审批](docs/管理员Profile变更审批.md)。
+
 GitHub Actions从触发、OIDC/ECR、质量门禁、制品签名到`gpu-fault-release` artifact
 交付的完整顺序见[CI 发布流程](docs/CI发布流程.md)。
 开发者修改代码后的最短测试、staging部署和同制品生产晋级顺序见

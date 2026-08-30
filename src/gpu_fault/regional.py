@@ -43,6 +43,9 @@ class RegionalClusterRegistration(StrictModel):
     eks_cluster_arn: str
     token_sha256: str = Field(min_length=64, max_length=64)
     enabled: bool = True
+    synthetic: bool = False
+    synthetic_run_id: str | None = Field(default=None, min_length=1, max_length=128)
+    synthetic_expires_at: datetime | None = None
     allowed_namespaces: list[str] = Field(default_factory=list)
     agent_endpoint_allowed_cidrs: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -71,11 +74,34 @@ class RegionalClusterRegistration(StrictModel):
             raise ValueError("token_sha256 must be hexadecimal") from exc
         if self.enabled and not self.agent_endpoint_allowed_cidrs:
             raise ValueError("enabled regional cluster requires agent endpoint CIDRs")
+        if self.synthetic:
+            if self.synthetic_run_id is None or self.synthetic_expires_at is None:
+                raise ValueError(
+                    "synthetic regional cluster requires run ID and expiration"
+                )
+            if self.synthetic_expires_at.tzinfo is None:
+                raise ValueError("synthetic expiration must include timezone")
+        elif self.synthetic_run_id is not None or self.synthetic_expires_at is not None:
+            raise ValueError(
+                "non-synthetic regional cluster cannot declare synthetic metadata"
+            )
         return self
+
+    def is_active(self, now: datetime | None = None) -> bool:
+        observed = now or datetime.now(timezone.utc)
+        if observed.tzinfo is None:
+            raise ValueError("regional cluster activity check requires timezone")
+        return self.enabled and (
+            not self.synthetic
+            or (
+                self.synthetic_expires_at is not None
+                and self.synthetic_expires_at > observed
+            )
+        )
 
     def authenticates(self, token: str) -> bool:
         digest = hashlib.sha256(token.encode()).hexdigest()
-        return self.enabled and secrets.compare_digest(digest, self.token_sha256)
+        return self.is_active() and secrets.compare_digest(digest, self.token_sha256)
 
 
 def cluster_token_sha256(token: str) -> str:

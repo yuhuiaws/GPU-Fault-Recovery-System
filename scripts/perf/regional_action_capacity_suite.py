@@ -4,12 +4,16 @@ import argparse
 import json
 import statistics
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from gpu_fault.models import WorkflowOperation
+
 if __package__:
+    from .regional_capacity_registry import validate_registry_target
     from .regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
+        CONNECTION_SECRET,
         NAMESPACE,
         TOKEN_SECRET,
         artifact_dir,
@@ -26,8 +30,10 @@ if __package__:
         write_status,
     )
 else:
+    from regional_capacity_registry import validate_registry_target
     from regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
+        CONNECTION_SECRET,
         NAMESPACE,
         TOKEN_SECRET,
         artifact_dir,
@@ -50,6 +56,22 @@ JOB_NAME = "gpu-fault-action-capacity-executors"
 TERMINAL = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PERF_DIR = REPO_ROOT / "scripts" / "perf"
+AGENT_IDENTITY_ENV_KEYS = (
+    "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION",
+    "GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION",
+    "GPU_FAULT_REQUIRED_AGENT_VERSION",
+    "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256",
+    "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST",
+    "GPU_FAULT_REQUIRED_POLICY_VERSION",
+    "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION",
+    "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST",
+    "GPU_FAULT_ALLOWED_OPERATIONS",
+)
+EXECUTOR_IDENTITY_ENV_KEYS = (
+    "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION",
+    "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256",
+    "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST",
+)
 
 
 def log(message: str) -> None:
@@ -68,6 +90,7 @@ def executor_job(
     executor_protocol_version: int,
     executor_artifact_sha256: str,
     executor_compatibility_digest: str,
+    connection_secret: str = CONNECTION_SECRET,
 ) -> dict:
     return {
         "apiVersion": "batch/v1",
@@ -99,7 +122,7 @@ def executor_job(
                                     "name": ("GPU_FAULT_CONTROL_PLANE_URL"),
                                     "valueFrom": {
                                         "secretKeyRef": {
-                                            "name": ("gpu-fault-regional-connection"),
+                                            "name": connection_secret,
                                             "key": "control-plane-url",
                                         }
                                     },
@@ -198,7 +221,7 @@ def executor_job(
                         {
                             "name": "tls",
                             "secret": {
-                                "secretName": ("gpu-fault-regional-connection"),
+                                "secretName": connection_secret,
                                 "items": [
                                     {
                                         "key": "ca.crt",
@@ -214,7 +237,7 @@ def executor_job(
     }
 
 
-def executor_identity() -> dict:
+def _release_state() -> dict[str, object]:
     state = json.loads(
         control(
             "get",
@@ -224,32 +247,176 @@ def executor_identity() -> dict:
             "jsonpath={.data.state\\.json}",
         )
     )
-    deployment = json.loads(
-        dataplane(
-            "get",
-            "deployment",
-            "gpu-fault-cluster-executor",
-            "-o",
-            "json",
-        )
+    if not isinstance(state, dict):
+        raise RuntimeError("regional release state is not a JSON object")
+    return state
+
+
+def _control_environment(keys: tuple[str, ...]) -> dict[str, str]:
+    pod = control(
+        "get",
+        "pod",
+        "-l",
+        "app=gpu-fault-api-ha",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ).strip()
+    if not pod:
+        raise RuntimeError("no control-plane API Pod available for release pin checks")
+    script = (
+        "import json, os\n"
+        f"keys={json.dumps(list(keys))}\n"
+        "print(json.dumps({key: os.environ.get(key, '') for key in keys}, "
+        "sort_keys=True))"
     )
-    environment = {
-        item["name"]: item.get("value")
-        for item in deployment["spec"]["template"]["spec"]["containers"][0].get(
-            "env", []
+    output = control(
+        "exec",
+        pod,
+        "--",
+        "python3",
+        "-c",
+        script,
+    )
+    document = json.loads(output.splitlines()[-1])
+    if not isinstance(document, dict):
+        raise RuntimeError("control-plane release pin environment is not an object")
+    values = {str(key): str(value or "") for key, value in document.items()}
+    missing = [key for key in keys if not values.get(key)]
+    if missing:
+        raise RuntimeError(
+            "control-plane release pin environment is incomplete: "
+            + ", ".join(sorted(missing))
         )
-    }
-    expected_artifact = str(state["executor_wheel_sha256"])
-    expected_compatibility = str(state["component_digests"]["executor"])
-    if environment.get("GPU_FAULT_EXECUTOR_ARTIFACT_SHA256") != expected_artifact:
-        raise RuntimeError("live executor artifact pin differs from release state")
-    if (
-        environment.get("GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST")
-        != expected_compatibility
-    ):
-        raise RuntimeError("live executor compatibility pin differs from release state")
+    return values
+
+
+def _state_value(state: dict[str, object], key: str) -> str:
+    value = str(state.get(key) or "").strip()
+    if not value:
+        raise RuntimeError(f"regional release state is missing {key}")
+    return value
+
+
+def _component_digest(state: dict[str, object], component: str) -> str:
+    raw = state.get("component_digests")
+    if not isinstance(raw, dict):
+        raise RuntimeError("regional release state is missing component digests")
+    value = str(raw.get(component) or "").strip()
+    if not value:
+        raise RuntimeError(
+            f"regional release state is missing {component} component digest"
+        )
+    return value
+
+
+def _verify_environment_pins(
+    environment: dict[str, str],
+    expected: dict[str, str],
+) -> None:
+    mismatches = [
+        key for key, value in expected.items() if environment.get(key) != value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "control-plane release pins differ from release state: "
+            + ", ".join(sorted(mismatches))
+        )
+
+
+def release_agent_identity() -> dict[str, object]:
+    state = _release_state()
+    environment = _control_environment(AGENT_IDENTITY_ENV_KEYS)
+    protocol = _state_value(state, "agent_protocol_version")
+    artifact = _state_value(state, "node_wheel_sha256")
+    compatibility = _component_digest(state, "node_runtime")
+    profile = _state_value(state, "runtime_profile_version")
+    config_digest = _state_value(state, "agent_config_digest")
+    _verify_environment_pins(
+        environment,
+        {
+            "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION": protocol,
+            "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": artifact,
+            "GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST": compatibility,
+            "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": profile,
+            "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST": config_digest,
+        },
+    )
+    allowed_operations = sorted(
+        {
+            WorkflowOperation(item.strip()).value
+            for item in environment["GPU_FAULT_ALLOWED_OPERATIONS"].split(",")
+            if item.strip()
+        }
+    )
+    if not allowed_operations:
+        raise RuntimeError("control-plane release allows no workflow operations")
     return {
-        "executor_protocol_version": int(state["executor_protocol_version"]),
+        "agent_protocol_version": int(protocol),
+        "node_action_key_version": int(
+            environment["GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION"]
+        ),
+        "agent_version": environment["GPU_FAULT_REQUIRED_AGENT_VERSION"],
+        "artifact_sha256": artifact,
+        "compatibility_digest": compatibility,
+        "installer_bundle_sha256": _state_value(state, "bundle_sha256"),
+        "policy_version": environment["GPU_FAULT_REQUIRED_POLICY_VERSION"],
+        "runtime_profile_version": profile,
+        "config_digest": config_digest,
+        "allowed_operations": allowed_operations,
+    }
+
+
+def executor_identity(
+    *,
+    require_dataplane_deployment: bool = True,
+) -> dict[str, object]:
+    state = _release_state()
+    expected_protocol = _state_value(state, "executor_protocol_version")
+    expected_artifact = _state_value(state, "executor_wheel_sha256")
+    expected_compatibility = _component_digest(state, "executor")
+    environment = _control_environment(EXECUTOR_IDENTITY_ENV_KEYS)
+    _verify_environment_pins(
+        environment,
+        {
+            "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION": (
+                expected_protocol
+            ),
+            "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": (expected_artifact),
+            "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST": (
+                expected_compatibility
+            ),
+        },
+    )
+    if require_dataplane_deployment:
+        deployment = json.loads(
+            dataplane(
+                "get",
+                "deployment",
+                "gpu-fault-cluster-executor",
+                "-o",
+                "json",
+            )
+        )
+        live_environment = {
+            item["name"]: item.get("value")
+            for item in deployment["spec"]["template"]["spec"]["containers"][0].get(
+                "env", []
+            )
+        }
+        if (
+            live_environment.get("GPU_FAULT_EXECUTOR_ARTIFACT_SHA256")
+            != expected_artifact
+        ):
+            raise RuntimeError("live executor artifact pin differs from release state")
+        if (
+            live_environment.get("GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST")
+            != expected_compatibility
+        ):
+            raise RuntimeError(
+                "live executor compatibility pin differs from release state"
+            )
+    return {
+        "executor_protocol_version": int(expected_protocol),
         "executor_artifact_sha256": expected_artifact,
         "executor_compatibility_digest": expected_compatibility,
     }
@@ -261,6 +428,7 @@ def seed(
     clusters: int,
     workflows_per_cluster: int,
     nodes_per_workflow: int,
+    agent_identity: dict[str, object] | None,
 ) -> dict:
     pod = control(
         "get",
@@ -271,16 +439,24 @@ def seed(
         "jsonpath={.items[0].metadata.name}",
     ).strip()
     script = (PERF_DIR / "seed_regional_action_workflows.py").read_bytes()
+    environment = [
+        f"ACTION_RUN_ID={run_id}",
+        f"ACTION_CLUSTERS={clusters}",
+        f"ACTION_WORKFLOWS_PER_CLUSTER={workflows_per_cluster}",
+        f"ACTION_NODES_PER_WORKFLOW={nodes_per_workflow}",
+    ]
+    if agent_identity is not None:
+        environment.append(
+            "ACTION_AGENT_IDENTITY_JSON="
+            + json.dumps(agent_identity, separators=(",", ":"), sort_keys=True)
+        )
     output = control(
         "exec",
         "-i",
         pod,
         "--",
         "env",
-        f"ACTION_RUN_ID={run_id}",
-        f"ACTION_CLUSTERS={clusters}",
-        (f"ACTION_WORKFLOWS_PER_CLUSTER={workflows_per_cluster}"),
-        f"ACTION_NODES_PER_WORKFLOW={nodes_per_workflow}",
+        *environment,
         "python3",
         "-",
         stdin=script,
@@ -476,8 +652,19 @@ def execute_capacity_run(
     expected_workflows: int,
     expected_commands_per_cluster: int,
     started: float,
+    registry_scope: str,
 ) -> int:
-    register(args.clusters, artifacts)
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=args.synthetic_ttl_seconds
+    )
+    register(
+        args.clusters,
+        artifacts,
+        run_id=run_id,
+        expires_at=expires_at,
+        allow_live_registry=args.allow_live_registry,
+        live_registry_confirmation=args.confirm_live_registry,
+    )
     upsert_configmap(
         SCRIPT_CONFIGMAP,
         text={
@@ -494,7 +681,9 @@ def execute_capacity_run(
         "--wait=true",
         check=False,
     )
-    identity = executor_identity()
+    identity = executor_identity(
+        require_dataplane_deployment=registry_scope == "live",
+    )
     manifest = executor_job(
         clusters=args.clusters,
         expected_commands=expected_commands_per_cluster,
@@ -544,6 +733,9 @@ def execute_capacity_run(
         clusters=args.clusters,
         workflows_per_cluster=args.workflows_per_cluster,
         nodes_per_workflow=args.nodes_per_workflow,
+        agent_identity=(
+            release_agent_identity() if registry_scope == "isolated" else None
+        ),
     )
     log(f"seeded {seeded['workflows_created']} workflows")
 
@@ -634,16 +826,7 @@ def execute_capacity_run(
             json.dumps(value, indent=2, sort_keys=True) + "\n"
         )
     print(json.dumps(summary, indent=2, sort_keys=True))
-    if summary["job_status"] == "Complete":
-        write_status(artifacts, status="ok")
-        return 0
-    write_status(
-        artifacts,
-        status="aborted",
-        reason=f"job status: {summary['job_status']}",
-    )
-    move_to_aborted(args.artifact_root, artifacts)
-    return 1
+    return 0 if summary["job_status"] == "Complete" else 1
 
 
 def main() -> int:
@@ -663,8 +846,20 @@ def main() -> int:
     )
     parser.add_argument("--label", default=None)
     parser.add_argument("--suite-id")
+    parser.add_argument("--allow-live-registry", action="store_true")
+    parser.add_argument("--confirm-live-registry")
+    parser.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
     args = parser.parse_args()
-    run_id = datetime.now(timezone.utc).strftime("act%Y%m%dT%H%M%S")
+    if args.synthetic_ttl_seconds < 300:
+        parser.error("--synthetic-ttl-seconds must be at least 300")
+    try:
+        registry_scope = validate_registry_target(
+            allow_live_registry=args.allow_live_registry,
+            confirmation=args.confirm_live_registry,
+        )
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    run_id = args.suite_id or datetime.now(timezone.utc).strftime("act%Y%m%dT%H%M%S")
     label = args.label or f"actions-{args.clusters}c"
     identity = release_identity()
     artifacts = artifact_dir(
@@ -686,7 +881,11 @@ def main() -> int:
                 "delay_scale": args.delay_scale,
                 "lease_seconds": args.lease_seconds,
                 "inject_renew_failure_once": args.inject_renew_failure_once,
-                "suite_id": args.suite_id or run_id,
+                "suite_id": run_id,
+                "registry_scope": registry_scope,
+                "agent_identity_source": (
+                    "release-state" if registry_scope == "isolated" else "live-agent"
+                ),
                 **identity,
                 "started_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -696,39 +895,72 @@ def main() -> int:
     )
     write_status(artifacts, status="running")
     started = time.time()
+    failure: BaseException | None = None
+    result = 1
     try:
-        return execute_capacity_run(
+        result = execute_capacity_run(
             args,
             run_id=run_id,
             artifacts=artifacts,
             expected_workflows=expected_workflows,
             expected_commands_per_cluster=expected_commands_per_cluster,
             started=started,
+            registry_scope=registry_scope,
         )
     except BaseException as exc:
+        failure = exc
+    finally:
+        try:
+            dataplane(
+                "delete",
+                "job",
+                JOB_NAME,
+                "--ignore-not-found",
+                check=False,
+            )
+            dataplane(
+                "delete",
+                "configmap",
+                SCRIPT_CONFIGMAP,
+                "--ignore-not-found",
+                check=False,
+            )
+            teardown(
+                purge=True,
+                deregister_clusters=True,
+                allow_live_registry=args.allow_live_registry,
+                live_registry_confirmation=args.confirm_live_registry,
+                artifacts=artifacts,
+                run_id=run_id,
+            )
+        except Exception as cleanup_error:
+            if failure is not None:
+                failure.add_note(
+                    f"action capacity teardown also failed: {cleanup_error}"
+                )
+            else:
+                failure = cleanup_error
+
+    if failure is not None:
         write_status(
             artifacts,
             status="aborted",
-            reason=f"{type(exc).__name__}: {exc}",
+            reason=f"{type(failure).__name__}: {failure}",
         )
-        move_to_aborted(args.artifact_root, artifacts)
-        raise
-    finally:
-        dataplane(
-            "delete",
-            "job",
-            JOB_NAME,
-            "--ignore-not-found",
-            check=False,
+        moved = move_to_aborted(args.artifact_root, artifacts)
+        log(f"aborted artifacts: {moved}")
+        raise failure.with_traceback(failure.__traceback__)
+    if result:
+        write_status(
+            artifacts,
+            status="aborted",
+            reason="action capacity job did not complete",
         )
-        dataplane(
-            "delete",
-            "configmap",
-            SCRIPT_CONFIGMAP,
-            "--ignore-not-found",
-            check=False,
-        )
-        teardown(purge=True, deregister_clusters=True)
+        moved = move_to_aborted(args.artifact_root, artifacts)
+        log(f"aborted artifacts: {moved}")
+        return result
+    write_status(artifacts, status="ok")
+    return 0
 
 
 if __name__ == "__main__":

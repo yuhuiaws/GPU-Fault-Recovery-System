@@ -369,6 +369,13 @@ def test_perf_tree_contains_only_supported_public_entries() -> None:
 
     assert "regional_capacity_suite.py" in readme
     assert "regional_action_capacity_suite.py" in readme
+    assert "regional_correlated_action_suite.py" in readme
+    assert (perf / "regional_correlated_action_suite.py").is_file(), (
+        "correlated action suite is documented but missing"
+    )
+    assert (perf / "benchmark_correlated_action_scenario.py").is_file(), (
+        "correlated action benchmark is documented but missing"
+    )
     assert not (perf / "legacy").exists(), (
         'expected (perf / "legacy").exists() to be falsy'
     )
@@ -408,6 +415,7 @@ def test_importable_script_modules_do_not_mutate_sys_path() -> None:
 
     for relative in (
         "tests/regional/test_regional_capacity_suite.py",
+        "tests/regional/test_regional_correlated_action.py",
         "tests/notifications/test_notifications.py",
     ):
         text = (ROOT / relative).read_text(encoding="utf-8")

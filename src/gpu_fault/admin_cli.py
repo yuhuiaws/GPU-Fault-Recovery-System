@@ -30,6 +30,7 @@ from gpu_fault.admin_notifications import (
     resolve_admin_email,
     validate_admin_email,
 )
+from gpu_fault.admin_profile_approval import approve_profile
 from gpu_fault.admin_resource_registry import sync_installation_resource_registry
 from gpu_fault.admin_site import (
     RenderedSite,
@@ -170,10 +171,6 @@ def parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     deploy.add_argument(
-        "--profile-approval",
-        help=argparse.SUPPRESS,
-    )
-    deploy.add_argument(
         "--staging-only-release",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -206,6 +203,33 @@ def parser() -> argparse.ArgumentParser:
         "--show-effective-config",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    approve = commands.add_parser(
+        "approve-profile",
+        usage=(
+            "gpu-fault-admin approve-profile --state-dir STATE_DIR "
+            "--plan-sha256 SHA256 --reference REFERENCE"
+        ),
+        help="approve the pending Runtime Profile plan recorded in private state",
+    )
+    approve.add_argument(
+        "--state-dir",
+        required=True,
+        type=Path,
+        metavar="STATE_DIR",
+        help="private state directory containing profile-plan.json",
+    )
+    approve.add_argument(
+        "--plan-sha256",
+        required=True,
+        metavar="SHA256",
+        help="exact plan_sha256 recorded from the reviewed profile-plan.json",
+    )
+    approve.add_argument(
+        "--reference",
+        required=True,
+        metavar="REFERENCE",
+        help="approved change or maintenance-window reference",
     )
     join = commands.add_parser(
         "join-cluster",
@@ -383,7 +407,6 @@ def _run_automatic_release(
     repository_root: Path,
     site_file: Path,
     state_dir: Path,
-    profile_approval: str | None,
     staging_only_release: bool,
 ) -> int:
     command = [
@@ -398,8 +421,6 @@ def _run_automatic_release(
         "--cosign-key",
         str(state_dir / "release-signing/cosign.pub"),
     ]
-    if profile_approval:
-        command.extend(("--profile-approval", profile_approval))
     if staging_only_release:
         command.append("--allow-staging-release")
     completed = subprocess.run(
@@ -493,7 +514,34 @@ def _run_uninstall(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _run_profile_approval(arguments: argparse.Namespace) -> int:
+    record = approve_profile(
+        arguments.state_dir,
+        reference=arguments.reference,
+        expected_plan_sha256=arguments.plan_sha256,
+    )
+    print(
+        json.dumps(
+            {
+                "status": "APPROVED",
+                "site_identity": record["site_identity"],
+                "site_identity_sha256": record["site_identity_sha256"],
+                "desired_version": record["desired_version"],
+                "change_kind": record["change_kind"],
+                "plan_sha256": record["plan_sha256"],
+                "reference": record["reference"],
+                "approved_at": record["approved_at"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def run(arguments: argparse.Namespace) -> int:
+    if arguments.command == "approve-profile":
+        return _run_profile_approval(arguments)
     if arguments.command == "join-cluster":
         return _run_join_cluster(arguments)
     if arguments.command == "remove-cluster":
@@ -517,7 +565,6 @@ def run(arguments: argparse.Namespace) -> int:
                 gpu_cluster_arns=tuple(arguments.gpu_cluster_arn),
                 state_dir=arguments.state_dir,
                 admin_email=arguments.alert_email,
-                profile_approval=getattr(arguments, "profile_approval", None),
                 impact_base=getattr(arguments, "impact_base", "origin/main"),
                 current_directory=Path.cwd(),
             )
@@ -556,7 +603,6 @@ def run(arguments: argparse.Namespace) -> int:
             repository_root=repository_root,
             site_file=site_file,
             state_dir=arguments.state_dir,
-            profile_approval=getattr(arguments, "profile_approval", None),
             staging_only_release=getattr(
                 arguments,
                 "staging_only_release",

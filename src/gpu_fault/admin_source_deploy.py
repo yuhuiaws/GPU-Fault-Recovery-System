@@ -91,7 +91,6 @@ def run_source_deploy(
     gpu_cluster_arns: Sequence[str],
     state_dir: Path,
     admin_email: str,
-    profile_approval: str | None,
     impact_base: str,
     current_directory: Path,
 ) -> int:
@@ -121,8 +120,6 @@ def run_source_deploy(
             "--quiet",
         )
     )
-    if profile_approval:
-        command.extend(("--profile-approval", profile_approval))
     completed = subprocess.run(
         command,
         cwd=repository_root,

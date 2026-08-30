@@ -363,7 +363,6 @@ release-deploy:
 		fi; \
 		PYTHONPATH=src $(PYTHON) scripts/release_deploy.py \
 			$(if $(SITE),--site "$(SITE)",) \
-			$(if $(PROFILE_APPROVAL),--profile-approval "$(PROFILE_APPROVAL)",) \
 			--prebuilt-attestation "$(PREBUILT_ATTESTATION)" \
 			$(if $(PREBUILT_SIGNATURE),--prebuilt-signature "$(PREBUILT_SIGNATURE)",) \
 			$(if $(PREBUILT_BUNDLE),--prebuilt-bundle "$(PREBUILT_BUNDLE)",) \

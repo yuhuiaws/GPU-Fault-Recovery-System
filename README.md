@@ -68,7 +68,7 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 ## 文档入口
 
 - [文档索引](docs/README.md) / [贡献指南](CONTRIBUTING.md)
-- [管理员快速部署](docs/管理员快速部署.md) / [管理员日常运维](docs/管理员日常运维.md) / [安全与参数参考](docs/安全与参数参考.md)
+- [管理员快速部署](docs/管理员快速部署.md) / [Runtime Profile变更审批](docs/管理员Profile变更审批.md) / [管理员日常运维](docs/管理员日常运维.md) / [安全与参数参考](docs/安全与参数参考.md)
 - [概要设计](docs/概要设计.md) / [概要设计 v2](docs/概要设计-v2.md)
 - [详细设计](docs/详细设计.md) / [详细设计 v2](docs/详细设计-v2.md)
 - [NVIDIA 策略供应链与实现](docs/components/nvidia-policy.md) / [部署和运维详细参考](docs/部署和运维手册.md) / [逐章解读](docs/部署和运维手册逐章解读.md)
@@ -144,6 +144,19 @@ gpu-fault-admin deploy \
 dirty工作区由内部准备器转成隔离的`staging_only`快照并执行影响测试；clean commit执行
 完整生产门禁。用户不提供release-ref、artifact、site、bundle或venv路径。完整流程见
 [EC2源码统一部署流程](docs/EC2源码Staging复现流程.md)。
+
+若Runtime Profile策略变化，首次deploy会生成私有计划并停止。审核后执行：
+
+```bash
+gpu-fault-admin approve-profile \
+  --state-dir /secure/gpu-fault-staging \
+  --plan-sha256 "$(jq -er '.plan_sha256' \
+    /secure/gpu-fault-staging/release-deploy/profile-plan.json)" \
+  --reference CHG-12345
+```
+
+再重跑原四参数deploy。审批绑定计划和live baseline，成功后一次性消费；计划漂移必须
+重新审批。
 
 ### 管理员：首次部署和日常管理
 

@@ -159,8 +159,21 @@ git status --short
 工作区变为clean后，再重复同一四参数命令。此时内部自动切换到完整production门禁，不会
 复用此前的staging-only attestation。
 
-真实Runtime Profile变化仍必须经过独立审批。普通四参数接口不把审批引用、profile plan
-或内部release参数暴露给日常操作者；缺少批准时流程停止，不会降低门禁。
+真实Runtime Profile变化仍必须经过独立审批。首次四参数命令会写出
+`STATE_DIR/release-deploy/profile-plan.json`并停止；审核计划和变更单后执行：
+
+```bash
+gpu-fault-admin approve-profile \
+  --state-dir "${STATE_DIR}" \
+  --plan-sha256 "$(jq -er '.plan_sha256' \
+    "${STATE_DIR}/release-deploy/profile-plan.json")" \
+  --reference CHG-12345
+```
+
+然后重新执行原四参数`gpu-fault-admin deploy`。审批记录绑定具体计划摘要和live
+Profile baseline，不通过隐藏deploy参数注入。发布失败且计划未变化时保留审批用于续跑；
+模板或live baseline漂移时旧审批归档失效；verify、stability和commit全部成功后才消费
+审批并删除活动记录。
 
 ## 10. 成功和失败
 

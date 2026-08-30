@@ -28,7 +28,7 @@ def notify_silent_collectors(
         else {collector: silent_after_seconds for collector in defaults}
     )
     for registration in context.store.list_regional_clusters():
-        if not registration.enabled:
+        if not registration.is_active(observed_at):
             continue
         statuses = {
             (item.node_id, item.collector): item

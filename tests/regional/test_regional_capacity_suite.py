@@ -3,17 +3,22 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from gpu_fault.hma import FabricManagerLogEvent
+from gpu_fault.regional import RegionalClusterRegistration
 from gpu_fault.training_models import TrainingProgressHeartbeat
 from gpu_fault.watcher import AttemptObservation
 from scripts.perf import benchmark_synchronized_burst as burst
+from scripts.perf import regional_capacity_registry as registry_module
 from scripts.perf import regional_capacity_suite as suite
 
 ROOT = Path(__file__).resolve().parents[2]
+NOW = datetime(2026, 8, 30, tzinfo=timezone.utc)
 
 
 def test_drain_targets_preserve_clean_environment_threshold() -> None:
@@ -69,31 +74,186 @@ def test_dataplane_context_must_be_explicit(monkeypatch) -> None:
 
 
 def test_capacity_run_refuses_drill_email_delivery(monkeypatch) -> None:
-    monkeypatch.setattr(suite, "control_pods", lambda: ["pod-a", "pod-b"])
+    monkeypatch.setattr(registry_module, "control_pods", lambda: ["pod-a", "pod-b"])
 
     def fake_control(*args, **_kwargs):
         pod = args[1]
         return "true\n" if pod == "pod-b" else "false\n"
 
-    monkeypatch.setattr(suite, "control", fake_control)
+    monkeypatch.setattr(registry_module, "control", fake_control)
 
     with pytest.raises(
         RuntimeError, match="capacity runs must not deliver drill notifications"
     ):
-        suite.validate_notification_safety()
+        registry_module.validate_notification_safety()
 
 
 def test_capacity_run_allows_suppressed_drills(monkeypatch) -> None:
-    monkeypatch.setattr(suite, "control_pods", lambda: ["pod-a", "pod-b"])
-    monkeypatch.setattr(suite, "control", lambda *_args, **_kwargs: "false\n")
+    monkeypatch.setattr(registry_module, "control_pods", lambda: ["pod-a", "pod-b"])
+    monkeypatch.setattr(registry_module, "control", lambda *_args, **_kwargs: "false\n")
 
-    suite.validate_notification_safety()
+    registry_module.validate_notification_safety()
 
 
 def test_synthetic_registry_uses_placeholder_aws_account() -> None:
-    entry = suite.perf_cluster_entries(1)[0]
+    entry = registry_module.perf_cluster_entries(
+        1, run_id="run-a", expires_at=NOW + timedelta(days=1)
+    )[0]
 
     assert ":000000000000:cluster/" in entry["eks_cluster_arn"]
+    assert entry["synthetic"] is True
+    assert entry["synthetic_run_id"] == "run-a"
+    assert entry["synthetic_expires_at"] == (NOW + timedelta(days=1)).isoformat()
+    assert entry["agent_endpoint_allowed_cidrs"] == ["127.0.0.1/32"]
+
+
+def test_synthetic_registry_metadata_passes_runtime_model() -> None:
+    entry = registry_module.perf_cluster_entries(
+        1, run_id="run-a", expires_at=NOW + timedelta(days=1)
+    )[0]
+    token = entry.pop("token")
+    entry["token_sha256"] = hashlib.sha256(token.encode()).hexdigest()
+
+    registration = RegionalClusterRegistration(**entry)
+
+    assert registration.is_active(NOW), "synthetic registration was inactive before TTL"
+    assert registration.authenticates(token), (
+        "active synthetic registration rejected its token"
+    )
+
+
+def test_live_registry_requires_double_confirmation(monkeypatch) -> None:
+    monkeypatch.setattr(
+        registry_module,
+        "CONTROL_NAMESPACE",
+        registry_module.PRODUCTION_CONTROL_NAMESPACE,
+    )
+
+    with pytest.raises(RuntimeError, match="production control plane"):
+        registry_module.validate_registry_target(
+            allow_live_registry=False, confirmation=None
+        )
+
+    assert (
+        registry_module.validate_registry_target(
+            allow_live_registry=True,
+            confirmation=registry_module.LIVE_REGISTRY_CONFIRMATION,
+        )
+        == "live"
+    )
+
+
+def test_preflight_cleanup_removes_legacy_synthetic_entries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    entries = [{"cluster_id": "production"}, {"cluster_id": "perf-cap-000"}]
+    restarts = []
+    monkeypatch.setattr(registry_module, "load_registry", lambda: list(entries))
+    monkeypatch.setattr(
+        registry_module,
+        "write_registry",
+        lambda values: entries.__setitem__(slice(None), values),
+    )
+    monkeypatch.setattr(
+        registry_module, "restart_control_plane", lambda: restarts.append(True)
+    )
+
+    removed = registry_module.cleanup_registry_residuals(
+        scope="isolated", artifacts=tmp_path, phase="preflight", force=False
+    )
+
+    assert removed == 1
+    assert entries == [{"cluster_id": "production"}]
+    assert restarts == [True]
+    audit = json.loads((tmp_path / "registry-preflight.json").read_text())
+    assert audit["removed"] == 1
+    assert audit["synthetic_entries"][0]["legacy_prefix_only"] is True
+
+
+def test_preflight_refuses_another_active_synthetic_run(monkeypatch) -> None:
+    monkeypatch.setattr(
+        registry_module,
+        "load_registry",
+        lambda: [
+            {
+                "cluster_id": "perf-cap-000",
+                "synthetic": True,
+                "synthetic_run_id": "other-run",
+                "synthetic_expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            }
+        ],
+    )
+    with pytest.raises(RuntimeError, match="other-run"):
+        registry_module.cleanup_registry_residuals(
+            scope="isolated", artifacts=None, phase="preflight", force=False, now=NOW
+        )
+
+
+def test_teardown_retries_idempotently(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(suite, "validate_registry_target", lambda **_kwargs: "isolated")
+    monkeypatch.setattr(suite.time, "sleep", lambda _seconds: None)
+
+    def teardown_once(**_kwargs):
+        calls.append(True)
+        if len(calls) < 3:
+            raise RuntimeError("transient")
+
+    monkeypatch.setattr(suite, "_teardown_once", teardown_once)
+
+    suite.teardown(purge=True, deregister_clusters=True)
+
+    assert len(calls) == 3
+
+
+def test_capacity_exception_still_runs_teardown(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    args = SimpleNamespace(
+        command="all",
+        clusters=1,
+        keep_registration=False,
+        allow_live_registry=False,
+        confirm_live_registry=None,
+        no_purge=False,
+        case="burst",
+        nodes_per_cluster=1,
+        gpu_evidence_total=0,
+        host_evidence_total=0,
+        training_heartbeat_total=0,
+        workload_observation_total=0,
+        correlate_attempt_faults=False,
+        workers=1,
+        duration_seconds=1,
+        lead_seconds=1,
+        cpu_request="1",
+        cpu_limit="1",
+        label="test",
+        fault_only=False,
+        prewarm_connections=False,
+        artifact_root=tmp_path,
+    )
+    monkeypatch.setattr(suite, "register", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        suite,
+        "execute_case",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("failed")),
+    )
+    monkeypatch.setattr(suite, "teardown", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(suite, "move_to_aborted", lambda _root, path: path)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        suite.execute_capacity_command(
+            args,
+            artifacts=tmp_path,
+            suite_id="run-a",
+            expires_at=NOW + timedelta(hours=1),
+            scope="isolated",
+            xid_total=1,
+            sxid_total=1,
+        )
+
+    assert calls[0]["run_id"] == "run-a"
+    assert calls[0]["deregister_clusters"] is True
 
 
 def test_registry_baseline_artifact_carries_digests_not_tokens() -> None:
@@ -104,7 +264,7 @@ def test_registry_baseline_artifact_carries_digests_not_tokens() -> None:
     token = "3f9c1a04be27d5610872ef4bc93d0a6f5e18720b4dcaf3961e05b8d2740cae63"
     entries = [{"cluster_id": "hp-a", "region": "us-east-2", "token": token}]
 
-    redacted = suite.redacted_registry_entries(entries)
+    redacted = registry_module.redacted_registry_entries(entries)
 
     assert "token" not in redacted[0]
     assert redacted[0]["token_sha256"] == hashlib.sha256(token.encode()).hexdigest()

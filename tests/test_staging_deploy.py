@@ -232,7 +232,6 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
         cpu_cluster_arn="arn:aws:eks:us-east-1:123456789012:cluster/cpu",
         gpu_cluster_arn=["arn:aws:eks:us-east-1:123456789012:cluster/gpu"],
         admin_email="operations@example.com",
-        profile_approval="CHG-12345",
         base="origin/main",
     )
 
@@ -244,7 +243,6 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
     deploy_call = next(item for item in calls if item[0] == "deploy")
     assert deploy_call[1]["state_dir"] == state
     assert deploy_call[1]["gpu_cluster_arns"] == tuple(arguments.gpu_cluster_arn)
-    assert deploy_call[1]["profile_approval"] == "CHG-12345"
     assert deploy_call[1]["staging_only_release"] is False
     assert deploy_call[1]["impact_base"] == "origin/main"
     state_value = json.loads(
@@ -263,7 +261,6 @@ def test_staging_state_must_be_outside_repository(tmp_path: Path) -> None:
         cpu_cluster_arn="cpu",
         gpu_cluster_arn=["gpu"],
         admin_email="operations@example.com",
-        profile_approval=None,
         base="origin/main",
     )
 
@@ -282,7 +279,6 @@ def test_staging_impact_base_must_not_be_empty(tmp_path: Path) -> None:
         cpu_cluster_arn="cpu",
         gpu_cluster_arn=["gpu"],
         admin_email="operations@example.com",
-        profile_approval=None,
         base=" ",
     )
 
@@ -347,7 +343,6 @@ def test_source_scan_runs_before_snapshot_and_bundle(
             cpu_cluster_arn="cpu",
             gpu_cluster_arn=["gpu"],
             admin_email="operations@example.com",
-            profile_approval=None,
             base="origin/main",
         )
     )
@@ -374,12 +369,11 @@ def test_staging_snapshot_authorization_is_passed_to_admin(
         cpu_cluster_arn="cpu",
         gpu_cluster_arns=("gpu",),
         admin_email="operations@example.com",
-        profile_approval="CHG-12345",
         staging_only_release=True,
         impact_base="origin/release",
     )
 
-    assert "--profile-approval" in commands[0]
+    assert "--profile-approval" not in commands[0]
     assert "--staging-only-release" in commands[0]
     assert "--prepared-source-release" in commands[0]
     assert commands[0][commands[0].index("--impact-base") + 1] == "origin/release"

@@ -456,7 +456,6 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
         repo_root=tmp_path / "repo",
         state_dir=tmp_path / "state",
         alert_email="operations@example.com",
-        profile_approval="CHG-12345",
         staging_only_release=True,
         impact_base="origin/release",
         prepared_source_release=True,
@@ -471,8 +470,7 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
     assert "--prebuilt-attestation" in calls[0]
     assert "--prebuilt-bundle" in calls[0]
     assert "--cosign-key" in calls[0]
-    assert "--profile-approval" in calls[0]
-    assert "CHG-12345" in calls[0]
+    assert "--profile-approval" not in calls[0]
     assert "--allow-staging-release" in calls[0]
     assert requests[0].gpu_cluster_arns == (
         "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a",
@@ -535,6 +533,63 @@ def test_public_deploy_help_only_exposes_four_inputs(capsys) -> None:
         "--email-sender",
     ):
         assert value not in help_text
+
+
+def test_approve_profile_command_records_pending_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[tuple[Path, str, str]] = []
+
+    def approve(state_dir: Path, *, reference: str, expected_plan_sha256: str):
+        calls.append((state_dir, reference, expected_plan_sha256))
+        return {
+            "site_identity": {
+                "site_name": "test-site",
+                "aws_region": REGION,
+                "cpu_eks_arn": ("arn:aws:eks:us-east-1:123456789012:cluster/control"),
+            },
+            "site_identity_sha256": "b" * 64,
+            "desired_version": "profile-v2",
+            "change_kind": "EXPANSIVE",
+            "plan_sha256": "a" * 64,
+            "reference": reference,
+            "approved_at": "2026-08-30T12:00:00+00:00",
+        }
+
+    monkeypatch.setattr(admin_cli, "approve_profile", approve)
+    state_dir = tmp_path / "state"
+    arguments = admin_cli.parser().parse_args(
+        [
+            "approve-profile",
+            "--state-dir",
+            str(state_dir),
+            "--plan-sha256",
+            "a" * 64,
+            "--reference",
+            "CHG-12345",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert calls == [(state_dir, "CHG-12345", "a" * 64)]
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "APPROVED"
+    assert output["plan_sha256"] == "a" * 64
+    assert output["site_identity"]["cpu_eks_arn"].endswith("/control"), (
+        "approve-profile output omitted the readable CPU control-plane identity"
+    )
+
+
+def test_approve_profile_help_exposes_reviewed_plan_sha(capsys) -> None:
+    with pytest.raises(SystemExit, match="0"):
+        admin_cli.parser().parse_args(["approve-profile", "--help"])
+
+    help_text = capsys.readouterr().out
+    assert "--state-dir" in help_text
+    assert "--plan-sha256" in help_text
+    assert "--reference" in help_text
+    assert "--file" not in help_text
+    assert "--repo-root" not in help_text
 
 
 @pytest.mark.parametrize(

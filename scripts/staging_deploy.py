@@ -543,7 +543,6 @@ def run_admin_deploy(
     cpu_cluster_arn: str,
     gpu_cluster_arns: Sequence[str],
     admin_email: str,
-    profile_approval: str | None,
     staging_only_release: bool,
     impact_base: str,
 ) -> None:
@@ -568,8 +567,6 @@ def run_admin_deploy(
             "--prepared-source-release",
         )
     )
-    if profile_approval:
-        command.extend(("--profile-approval", profile_approval))
     if staging_only_release:
         command.append("--staging-only-release")
     _run(command, cwd=repository_root)
@@ -628,7 +625,6 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
         cpu_cluster_arn=arguments.cpu_cluster_arn,
         gpu_cluster_arns=tuple(arguments.gpu_cluster_arn),
         admin_email=arguments.admin_email,
-        profile_approval=arguments.profile_approval,
         staging_only_release=source.snapshot,
         impact_base=arguments.base.strip(),
     )
@@ -661,7 +657,6 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument("--state-dir", required=True, type=Path)
     value.add_argument("--admin-email", required=True)
-    value.add_argument("--profile-approval")
     value.add_argument("--base", default="origin/main")
     value.add_argument("--repo-root", type=Path, default=ROOT)
     value.add_argument("--quiet", action="store_true")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -9,6 +11,8 @@ from gpu_fault.regional import RegionalClusterRegistration
 from gpu_fault.regional_registry import sync_regional_cluster_registry
 from gpu_fault.store import NotFoundError, SqliteStore
 from tests._builders import build_store
+
+NOW = datetime(2026, 8, 30, tzinfo=timezone.utc)
 
 
 def _registration(cluster_id: str) -> RegionalClusterRegistration:
@@ -21,6 +25,57 @@ def _registration(cluster_id: str) -> RegionalClusterRegistration:
         allowed_namespaces=["training"],
         agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
     )
+
+
+def test_synthetic_registration_expires_and_stops_authenticating() -> None:
+    token = "t" * 32
+    registration = RegionalClusterRegistration(
+        cluster_id="perf-cap-000",
+        region="us-west-2",
+        hyperpod_cluster_name="perf-cap-000",
+        eks_cluster_arn=("arn:aws:eks:us-west-2:000000000000:cluster/perf-cap-000"),
+        token_sha256=hashlib.sha256(token.encode()).hexdigest(),
+        synthetic=True,
+        synthetic_run_id="run-a",
+        synthetic_expires_at=NOW + timedelta(days=1),
+        agent_endpoint_allowed_cidrs=["127.0.0.1/32"],
+    )
+
+    assert registration.is_active(NOW), "synthetic registration was inactive before TTL"
+    assert not registration.is_active(NOW + timedelta(days=2)), (
+        "synthetic registration remained active after TTL"
+    )
+    assert registration.authenticates(token), (
+        "active synthetic registration rejected its token"
+    )
+
+
+def test_registry_sync_prunes_expired_synthetic_registration() -> None:
+    store = build_store()
+    store.save_regional_cluster(_registration("cluster-stale"))
+
+    configured = sync_regional_cluster_registry(
+        store,
+        [
+            {
+                "cluster_id": "perf-cap-000",
+                "region": "us-west-2",
+                "hyperpod_cluster_name": "perf-cap-000",
+                "eks_cluster_arn": (
+                    "arn:aws:eks:us-west-2:000000000000:cluster/perf-cap-000"
+                ),
+                "token": "t" * 32,
+                "synthetic": True,
+                "synthetic_run_id": "run-a",
+                "synthetic_expires_at": (NOW - timedelta(seconds=1)).isoformat(),
+                "agent_endpoint_allowed_cidrs": ["127.0.0.1/32"],
+            }
+        ],
+        now=NOW,
+    )
+
+    assert configured == []
+    assert store.list_regional_clusters() == []
 
 
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])

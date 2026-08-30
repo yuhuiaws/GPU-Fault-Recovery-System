@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from gpu_fault import admin_profile_approval
 from scripts import release_deploy
 
 REGION = "us-east-1"
@@ -163,9 +164,7 @@ def test_prepare_site_release_updates_declared_release(
     original = site.read_bytes()
     profile = tmp_path / "repo/config/profile.yaml"
     profile_plan = release_deploy.plan_runtime_profile(
-        site,
-        live_profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest(),
-        approval=None,
+        site, live_profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest()
     )
 
     prepared = release_deploy.prepare_site_release(site, profile_plan=profile_plan)
@@ -190,13 +189,53 @@ def test_prepare_site_release_updates_declared_release(
 
     snapshot = Path(runtime_profile["source"])
     repeated_plan = release_deploy.plan_runtime_profile(
-        site,
-        live_profile_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
-        approval=None,
+        site, live_profile_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest()
     )
     repeated = release_deploy.prepare_site_release(site, profile_plan=repeated_plan)
     assert repeated.site_changed is False, (
         "identical release preparation was not idempotent"
+    )
+
+
+def test_profile_plan_site_identity_uses_stable_cpu_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    profile = tmp_path / "repo/config/profile.yaml"
+    live_sha = hashlib.sha256(profile.read_bytes()).hexdigest()
+    original = release_deploy.plan_runtime_profile(site, live_profile_sha256=live_sha)
+    document = yaml.safe_load(site.read_text(encoding="utf-8"))
+    added = dict(document["spec"]["clusters"][0])
+    added.update(
+        {
+            "clusterId": "gpu-b",
+            "context": "gpu-b",
+            "hyperpodClusterName": "hp-gpu-b",
+            "eksClusterArn": ("arn:aws:eks:us-east-1:123456789012:cluster/gpu-b"),
+        }
+    )
+    document["spec"]["clusters"].append(added)
+    site.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    expanded = release_deploy.plan_runtime_profile(site, live_profile_sha256=live_sha)
+
+    assert expanded.site_identity == {
+        "site_name": "test-site",
+        "aws_region": REGION,
+        "cpu_eks_arn": "arn:aws:eks:us-east-1:123456789012:cluster/control",
+    }
+    assert expanded.site_identity_sha256 == original.site_identity_sha256
+
+    document["spec"]["cpu"]["eksArn"] = (
+        "arn:aws:eks:us-east-1:123456789012:cluster/control-replacement"
+    )
+    site.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    replaced_control_plane = release_deploy.plan_runtime_profile(
+        site, live_profile_sha256=live_sha
+    )
+
+    assert replaced_control_plane.site_identity_sha256 != (
+        original.site_identity_sha256
     )
 
 
@@ -427,13 +466,10 @@ def test_release_summary_failure_does_not_fail_verified_deployment(
 def test_profile_change_requires_approval_and_generates_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv(release_deploy.PROFILE_APPROVAL_ENV, raising=False)
     site = _site(tmp_path, monkeypatch)
     profile = tmp_path / "repo/config/profile.yaml"
     initial = release_deploy.plan_runtime_profile(
-        site,
-        live_profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest(),
-        approval=None,
+        site, live_profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest()
     )
     prepared_initial = release_deploy.prepare_site_release(site, profile_plan=initial)
     active_profile = Path(
@@ -448,25 +484,148 @@ def test_profile_change_requires_approval_and_generates_version(
     ]
     profile.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
 
-    plan = release_deploy.plan_runtime_profile(
-        site, live_profile_sha256=live_sha, approval=None
-    )
+    plan = release_deploy.plan_runtime_profile(site, live_profile_sha256=live_sha)
 
     assert plan.approval_required is True, "Profile change did not require approval"
     assert plan.change_kind == "EXPANSIVE"
     assert plan.desired_version.startswith("regional-hyperpod-"), (
         "Profile version was not derived from the normalized policy digest"
     )
-    with pytest.raises(release_deploy.ReleaseDeployError, match="PROFILE_APPROVAL"):
+    with pytest.raises(release_deploy.ReleaseDeployError, match="approve-profile"):
         release_deploy.execute_release(
             site, run_checks=False, live_state={"runtime_profile_sha256": live_sha}
         )
 
-    approved = release_deploy.plan_runtime_profile(
-        site, live_profile_sha256=live_sha, approval="CHG-12345"
+    pending = json.loads(
+        admin_profile_approval.profile_plan_path(site.parent).read_text(
+            encoding="utf-8"
+        )
     )
-    prepared = release_deploy.prepare_site_release(site, profile_plan=approved)
+    assert pending["plan_sha256"] == release_deploy.profile_plan_sha256(pending)
+    assert pending["site_identity"] == {
+        "site_name": "test-site",
+        "aws_region": REGION,
+        "cpu_eks_arn": "arn:aws:eks:us-east-1:123456789012:cluster/control",
+    }
+    assert len(pending["site_identity_sha256"]) == 64
+    approval = admin_profile_approval.approve_profile(
+        site.parent,
+        reference="CHG-12345",
+        expected_plan_sha256=str(pending["plan_sha256"]),
+    )
+    assert approval["plan_sha256"] == pending["plan_sha256"]
+
+    monkeypatch.setattr(release_deploy, "_run", lambda *_args, **_kwargs: None)
+
+    def run_json(arguments, **_kwargs):
+        if "verify" in arguments:
+            return _verification_report()
+        if "stability" in arguments:
+            return _stability_report()
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    prepared = release_deploy.execute_release(
+        site, run_checks=False, live_state={"runtime_profile_sha256": live_sha}
+    )
     document = yaml.safe_load(site.read_text(encoding="utf-8"))
-    assert document["spec"]["runtimeProfile"]["version"] == (approved.desired_version)
+    assert document["spec"]["runtimeProfile"]["version"] == plan.desired_version
     assert prepared.profile_approval == "CHG-12345"
     assert prepared_initial.runtime_profile_version == "profile-v1"
+    assert not admin_profile_approval.profile_plan_path(site.parent).exists(), (
+        "successful release retained its active Profile plan"
+    )
+    assert not admin_profile_approval.profile_approval_path(site.parent).exists(), (
+        "successful release retained its active Profile approval"
+    )
+    archive = admin_profile_approval.profile_approval_archive_path(
+        site.parent, pending["plan_sha256"]
+    )
+    consumed = json.loads((archive / "consumed.json").read_text(encoding="utf-8"))
+    assert consumed["status"] == "CONSUMED"
+    assert consumed["relation"] == "EXACT"
+
+
+def test_profile_approval_survives_failed_release_and_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    profile = tmp_path / "repo/config/profile.yaml"
+    initial = release_deploy.plan_runtime_profile(
+        site, live_profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest()
+    )
+    release_deploy.prepare_site_release(site, profile_plan=initial)
+    active_profile = Path(
+        yaml.safe_load(site.read_text(encoding="utf-8"))["spec"]["runtimeProfile"][
+            "source"
+        ]
+    )
+    live_sha = hashlib.sha256(active_profile.read_bytes()).hexdigest()
+    value = yaml.safe_load(profile.read_text(encoding="utf-8"))
+    value["claims"] = [
+        {"capability": "gpuReset", "mode": "OBSERVE", "owner": "gpu-fault-node-agent"}
+    ]
+    profile.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(release_deploy.ReleaseDeployError, match="approve-profile"):
+        release_deploy.execute_release(
+            site, run_checks=False, live_state={"runtime_profile_sha256": live_sha}
+        )
+    pending = json.loads(
+        admin_profile_approval.profile_plan_path(site.parent).read_text()
+    )
+    admin_profile_approval.approve_profile(
+        site.parent,
+        reference="CHG-12345",
+        expected_plan_sha256=str(pending["plan_sha256"]),
+    )
+    monkeypatch.setattr(release_deploy, "_run", lambda *_args, **_kwargs: None)
+
+    def fail_verify(arguments, **_kwargs):
+        if "verify" in arguments:
+            raise release_deploy.ReleaseDeployError("verify failed")
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", fail_verify)
+    with pytest.raises(release_deploy.ReleaseDeployError, match="verify failed"):
+        release_deploy.execute_release(
+            site, run_checks=False, live_state={"runtime_profile_sha256": live_sha}
+        )
+
+    assert admin_profile_approval.profile_approval_path(site.parent).is_file(), (
+        "failed release discarded the resumable Profile approval"
+    )
+    assert admin_profile_approval.profile_plan_path(site.parent).is_file(), (
+        "failed release discarded the approved Profile plan"
+    )
+    failed_state = json.loads(
+        (site.parent / "release-deploy/release-a/state.json").read_text()
+    )
+    assert (
+        failed_state["profile_change"]["approval_plan_sha256"]
+        == (pending["plan_sha256"])
+    )
+    assert failed_state["profile_change"]["approval_relation"] == "EXACT"
+
+    def succeed(arguments, **_kwargs):
+        if "verify" in arguments:
+            return _verification_report()
+        if "stability" in arguments:
+            return _stability_report()
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", succeed)
+    prepared = release_deploy.execute_release(
+        site, run_checks=False, live_state={"runtime_profile_sha256": live_sha}
+    )
+
+    state = json.loads((prepared.state_dir / "state.json").read_text())
+    assert state["phase"] == "COMPLETED"
+    assert state["profile_change"]["approval_plan_sha256"] == pending["plan_sha256"]
+    assert state["profile_change"]["approval_relation"] == "PREPARED_RESUME"
+    assert state["profile_approval_audit"]["relation"] == "PREPARED_RESUME"
+    archive = admin_profile_approval.profile_approval_archive_path(
+        site.parent, str(pending["plan_sha256"])
+    )
+    consumed = json.loads((archive / "consumed.json").read_text())
+    assert consumed["relation"] == "PREPARED_RESUME"

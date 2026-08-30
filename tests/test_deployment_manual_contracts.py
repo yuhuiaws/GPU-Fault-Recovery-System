@@ -344,7 +344,7 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "$(COSIGN) sign-blob --yes" in build_target
     assert "scripts/release_deploy.py" in target
     assert "--site" in target
-    assert "--profile-approval" in target
+    assert "--profile-approval" not in target
     assert "--prebuilt-attestation" in target
     assert "--prebuilt-signature" in target
     assert "--prebuilt-certificate" in target
@@ -363,7 +363,11 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "make deploy-host-bundle PYTHON=python" in workflow
     assert "make PYTHON=.venv/bin/python release-build" in developer
     assert "make PYTHON=.venv/bin/python release-deploy" in developer
-    assert "PROFILE_APPROVAL=CHG-12345" in developer
+    assert "gpu-fault-admin approve-profile" in developer
+    assert "--plan-sha256" in developer
+    assert "site_identity" in developer
+    assert "cpu_eks_arn" in developer
+    assert "profile-plan.json" in developer
     assert "deploy -> verify -> stability -> release-summary" in developer
     assert "verification-report.json" in developer
     assert "stability-report.json" in developer

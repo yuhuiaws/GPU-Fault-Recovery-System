@@ -77,7 +77,6 @@ def test_source_deploy_hides_release_and_artifact_paths(
         gpu_cluster_arns=("gpu-a", "gpu-b"),
         state_dir=tmp_path / "state",
         admin_email="operations@example.com",
-        profile_approval=None,
         impact_base="origin/main",
         current_directory=source,
     )
@@ -92,4 +91,5 @@ def test_source_deploy_hides_release_and_artifact_paths(
     assert "--release-ref" not in command
     assert "--site" not in command
     assert "--prebuilt-attestation" not in command
+    assert "--profile-approval" not in command
     assert options["cwd"] == source

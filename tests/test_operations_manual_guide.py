@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MANUAL = ROOT / "docs/部署和运维手册.md"
 GUIDE = ROOT / "docs/部署和运维手册逐章解读.md"
 QUICKSTART = ROOT / "docs/管理员快速部署.md"
+PROFILE_APPROVAL = ROOT / "docs/管理员Profile变更审批.md"
 DAILY_OPS = ROOT / "docs/管理员日常运维.md"
 SAFETY = ROOT / "docs/安全与参数参考.md"
 DEVELOPER = ROOT / "docs/开发者部署实现.md"
@@ -37,7 +38,7 @@ def test_operator_document_layers_publish_a_single_normal_path() -> None:
     safety = SAFETY.read_text(encoding="utf-8")
     developer = DEVELOPER.read_text(encoding="utf-8")
 
-    for path in (QUICKSTART, DAILY_OPS, SAFETY, DEVELOPER):
+    for path in (QUICKSTART, PROFILE_APPROVAL, DAILY_OPS, SAFETY, DEVELOPER):
         assert path.is_file(), f"missing operator document: {path.name}"
         assert path.name in manual
 
@@ -54,6 +55,7 @@ def test_operator_document_layers_publish_a_single_normal_path() -> None:
     assert "config/site.example.yaml" not in quickstart
     assert "## 10. 后续运维入口" in quickstart
     assert "[管理员日常运维](管理员日常运维.md)" in quickstart
+    assert "[Runtime Profile变更审批](管理员Profile变更审批.md)" in quickstart
     assert len(quickstart.splitlines()) <= 300
     for value in (
         "gpu-fault-admin remove-cluster",

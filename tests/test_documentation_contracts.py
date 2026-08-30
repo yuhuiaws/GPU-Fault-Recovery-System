@@ -43,6 +43,7 @@ PUBLIC_RELEASE_DOCUMENTS = (
     "docs/详细设计-v2.md",
     "docs/components/nvidia-policy.md",
     "docs/管理员快速部署.md",
+    "docs/管理员Profile变更审批.md",
     "docs/管理员日常运维.md",
     "docs/管理员环境变量参考.md",
     "docs/安全与参数参考.md",
@@ -321,7 +322,12 @@ def test_developer_manual_documents_every_runtime_profile_capability() -> None:
         )
     for value in (
         "templateSource",
-        "PROFILE_APPROVAL=CHG-12345",
+        "gpu-fault-admin approve-profile",
+        "--plan-sha256",
+        "profile-plan.json",
+        "site_identity",
+        "cpu_eks_arn",
+        "plan_sha256",
         "regional-hyperpod-<digest12>",
         "gpu-training-submit --site",
         "gpu-fault-workload-annotate --site",
@@ -435,6 +441,7 @@ def test_root_readme_separates_developer_and_admin_deployment() -> None:
         "--state-dir /secure/gpu-fault-staging",
         "--admin-email <operations-email>",
         "`staging_only`",
+        "--plan-sha256",
         "release-ref",
         "不提供",
         "完整生产门禁",
@@ -458,6 +465,35 @@ def test_root_readme_separates_developer_and_admin_deployment() -> None:
     ):
         assert value in administrator
     assert "gpu-fault-admin deploy -f" not in administrator
+
+
+def test_admin_profile_approval_guide_closes_the_review_loop() -> None:
+    guide = (DOCS / "管理员Profile变更审批.md").read_text(encoding="utf-8")
+    builder = (ROOT / "build-html.sh").read_text(encoding="utf-8")
+    index = (DOCS / "README.md").read_text(encoding="utf-8")
+
+    for value in (
+        "## 1. 最短操作路径",
+        "## 7. 完整命令模板",
+        "site_identity.cpu_eks_arn",
+        "site_identity_sha256",
+        "--plan-sha256",
+        "profile-approvals/<plan_sha256>/",
+        "UNKNOWN_BASELINE",
+        "SUPERSEDED",
+        "CONSUMED",
+        "ALREADY_APPLIED",
+        "不手工创建",
+        "GPU_CLUSTER_ARNS=(",
+        "APPROVED_PLAN_SHA256",
+        "Stop: approve this plan externally",
+        'test -f "${PLAN_FILE}" || exit "${DEPLOY_RC}"',
+    ):
+        assert value in guide, f"Profile approval guide omits {value}"
+    assert "PROFILE_APPROVAL=" not in guide
+    assert "--profile-approval" not in guide
+    assert "docs/管理员Profile变更审批.md" in builder
+    assert "[Runtime Profile变更审批](管理员Profile变更审批.md)" in index
 
 
 def test_public_collector_docs_keep_node_log_disabled() -> None:

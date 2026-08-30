@@ -16,8 +16,10 @@ Examples
     scripts/perf/regional_capacity_suite.py all --case burst --clusters 32
 
     # keep the registration between runs
-    scripts/perf/regional_capacity_suite.py register --clusters 50
-    scripts/perf/regional_capacity_suite.py run --case burst --clusters 50
+    scripts/perf/regional_capacity_suite.py register --clusters 50 \
+        --suite-id run-a --keep-registration
+    scripts/perf/regional_capacity_suite.py run --case burst --clusters 50 \
+        --suite-id run-a
     scripts/perf/regional_capacity_suite.py teardown --clusters 50
 """
 
@@ -26,16 +28,14 @@ from __future__ import annotations
 import argparse
 import base64
 import gzip
-import hashlib
 import json
 import os
 import re
 import secrets
-import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 if __package__:
@@ -50,6 +50,24 @@ if __package__:
         processor_priority_latency as _processor_priority_latency,
     )
     from .regional_capacity_job import build_job as _build_job
+    from .regional_capacity_registry import (
+        AWS_REGION,
+        CONNECTION_SECRET,
+        CONTROL_NAMESPACE,
+        DATAPLANE_CONTEXT,
+        NAMESPACE,
+        PERF_CLUSTER_PREFIX,
+        REGISTRY_SECRET,
+        TOKEN_SECRET,
+        control,
+        control_pods,
+        dataplane,
+        deregister,
+        register,
+        run,
+        validate_registered_synthetic_run,
+        validate_registry_target,
+    )
     from .regional_capacity_results import (
         aggregate,
         artifact_dir,
@@ -69,6 +87,24 @@ else:
         processor_priority_latency as _processor_priority_latency,
     )
     from regional_capacity_job import build_job as _build_job
+    from regional_capacity_registry import (
+        AWS_REGION,
+        CONNECTION_SECRET,
+        CONTROL_NAMESPACE,
+        DATAPLANE_CONTEXT,
+        NAMESPACE,
+        PERF_CLUSTER_PREFIX,
+        REGISTRY_SECRET,
+        TOKEN_SECRET,
+        control,
+        control_pods,
+        dataplane,
+        deregister,
+        register,
+        run,
+        validate_registered_synthetic_run,
+        validate_registry_target,
+    )
     from regional_capacity_results import (
         aggregate,
         artifact_dir,
@@ -81,37 +117,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PERF_DIR = REPO_ROOT / "scripts" / "perf"
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "artifacts" / "perf"
 
-NAMESPACE = "gpu-fault-system"
-CONTROL_KUBECONFIG = os.getenv(
-    "GPU_FAULT_CONTROL_KUBECONFIG",
-    "/tmp/gpu-fault-control-plane.kubeconfig",
-)
-DATAPLANE_CONTEXT = os.getenv(
-    "GPU_FAULT_DATAPLANE_CONTEXT",
-    "",
-)
 AURORA_INSTANCE = os.getenv("GPU_FAULT_AURORA_INSTANCE", "gpu-fault-aurora-writer")
-# The deployment's region, not the operator's. Reading AWS_REGION here
-# would register the audit clusters in whatever region the shell that
-# launched the harness happens to point at and would sample CloudWatch
-# there too -- which returns an empty datapoint list rather than an
-# error, so the Aurora section of the report would just look idle.
-AWS_REGION = os.getenv("GPU_FAULT_PERF_AWS_REGION", "us-west-2")
-
-REGISTRY_SECRET = "gpu-fault-regional-clusters"
-TOKEN_SECRET = "gpu-fault-perf-clusters"
 SCRIPT_CONFIGMAP = "gpu-fault-perf-suite-scripts"
 TEMPLATE_CONFIGMAP = "gpu-fault-perf-suite-templates"
 START_GATE_CONFIGMAP = "gpu-fault-perf-start-gate"
 START_GATE_ROLE = "gpu-fault-perf-start-gate-reader"
 START_GATE_ROLE_BINDING = "gpu-fault-perf-start-gate-reader"
-CONTROL_DEPLOYMENTS = (
-    "gpu-fault-api-ha",
-    "gpu-fault-control-worker",
-    "gpu-fault-telemetry-spool-worker",
-)
-PERF_CLUSTER_PREFIX = "perf-cap-"
-
 CASES = {
     "burst": {
         "script": "benchmark_synchronized_burst.py",
@@ -136,305 +147,6 @@ SUPPORT_SCRIPTS = ("benchmark_mixed_control_plane.py",)
 def log(message: str) -> None:
     stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{stamp}] {message}", flush=True)
-
-
-def run(
-    argv: list[str],
-    *,
-    stdin: bytes | None = None,
-    check: bool = True,
-    timeout: int = 300,
-) -> subprocess.CompletedProcess:
-    result = subprocess.run(
-        argv,
-        input=stdin,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
-    if check and result.returncode != 0:
-        raise RuntimeError(
-            f"command failed ({result.returncode}): "
-            f"{' '.join(argv)}\n{result.stderr.decode()}"
-        )
-    return result
-
-
-def control(
-    *args: str,
-    stdin: bytes | None = None,
-    check: bool = True,
-    timeout: int = 300,
-) -> str:
-    env_kubectl = [
-        "kubectl",
-        "--kubeconfig",
-        CONTROL_KUBECONFIG,
-    ]
-    result = run(
-        [*env_kubectl, "-n", NAMESPACE, *args],
-        stdin=stdin,
-        check=check,
-        timeout=timeout,
-    )
-    return result.stdout.decode()
-
-
-def dataplane(
-    *args: str,
-    stdin: bytes | None = None,
-    check: bool = True,
-    timeout: int = 300,
-) -> str:
-    result = run(
-        [
-            "kubectl",
-            "--context",
-            DATAPLANE_CONTEXT,
-            "-n",
-            NAMESPACE,
-            *args,
-        ],
-        stdin=stdin,
-        check=check,
-        timeout=timeout,
-    )
-    return result.stdout.decode()
-
-
-# --------------------------------------------------------------------------
-# registration
-# --------------------------------------------------------------------------
-
-
-def load_registry() -> list[dict]:
-    raw = control(
-        "get",
-        "secret",
-        REGISTRY_SECRET,
-        "-o",
-        "jsonpath={.data.clusters\\.json}",
-    )
-    return json.loads(base64.b64decode(raw))
-
-
-def validate_registry(entries: list[dict]) -> None:
-    """Parse the rows with the control plane's own model.
-
-    The registry is read in create_app(), so a malformed row does not
-    surface as a failed request -- every replica crash-loops on start
-    and the only way back is another patch. Checking here costs
-    nothing and keeps a bad row out of the live Secret.
-    """
-    sys.path.insert(0, str(REPO_ROOT / "src"))
-    try:
-        from gpu_fault.regional import (  # noqa: PLC0415
-            RegionalClusterRegistration,
-            cluster_token_sha256,
-        )
-    except ImportError as exc:
-        log(f"registry pre-validation skipped: {exc}")
-        return
-    for entry in entries:
-        item = dict(entry)
-        token = item.pop("token", None)
-        if token:
-            item["token_sha256"] = cluster_token_sha256(str(token))
-        RegionalClusterRegistration(**item)
-
-
-def write_registry(entries: list[dict]) -> None:
-    validate_registry(entries)
-    payload = base64.b64encode(json.dumps(entries, indent=1).encode()).decode()
-    patch = json.dumps({"data": {"clusters.json": payload}})
-    control("patch", "secret", REGISTRY_SECRET, "-p", patch)
-
-
-def validate_notification_safety() -> None:
-    """Refuse a capacity run that can mail synthetic drill notifications."""
-    pods = control_pods()
-    for pod in pods:
-        value = (
-            control(
-                "exec",
-                pod,
-                "--",
-                "python3",
-                "-c",
-                (
-                    "import os; print("
-                    "os.environ.get('GPU_FAULT_NOTIFICATION_DELIVER_DRILLS','false')"
-                    ")"
-                ),
-            )
-            .strip()
-            .lower()
-        )
-        if value not in {"", "false", "0", "no", "off"}:
-            raise RuntimeError(
-                "capacity runs must not deliver drill notifications: "
-                f"{pod} has GPU_FAULT_NOTIFICATION_DELIVER_DRILLS={value}"
-            )
-
-
-def restart_control_plane() -> None:
-    for deployment in CONTROL_DEPLOYMENTS:
-        replicas = control(
-            "get",
-            "deploy",
-            deployment,
-            "-o",
-            "jsonpath={.spec.replicas}",
-        ).strip()
-        if replicas in {"", "0"}:
-            log(f"skip restart of {deployment} (replicas={replicas})")
-            continue
-        log(f"rollout restart {deployment}")
-        control("rollout", "restart", f"deploy/{deployment}")
-    for deployment in CONTROL_DEPLOYMENTS:
-        replicas = control(
-            "get",
-            "deploy",
-            deployment,
-            "-o",
-            "jsonpath={.spec.replicas}",
-        ).strip()
-        if replicas in {"", "0"}:
-            continue
-        log(f"waiting for {deployment}")
-        control(
-            "rollout",
-            "status",
-            f"deploy/{deployment}",
-            "--timeout=600s",
-            timeout=700,
-        )
-
-
-def perf_cluster_entries(count: int) -> list[dict]:
-    """Build registry rows for the synthetic audit clusters.
-
-    RegionalClusterRegistration is strict: hyperpod_cluster_name and
-    eks_cluster_arn are required, and an unknown key is rejected
-    outright. A row missing either one does not fail the request that
-    uses it -- it fails create_app(), so every replica crash-loops the
-    moment the registry is patched. The identifiers are per-cluster
-    and deliberately synthetic: nothing on the ingest path resolves
-    them, and sharing one real name across 32 rows would point 32
-    managed-recovery observers at the same live HyperPod cluster.
-    """
-    account = "000000000000"
-    entries = []
-    for index in range(count):
-        cluster_id = f"{PERF_CLUSTER_PREFIX}{index:03d}"
-        entries.append(
-            {
-                "cluster_id": cluster_id,
-                "region": AWS_REGION,
-                "hyperpod_cluster_name": cluster_id,
-                "eks_cluster_arn": (
-                    f"arn:aws:eks:{AWS_REGION}:{account}:cluster/{cluster_id}"
-                ),
-                "token": secrets.token_urlsafe(48),
-                "allowed_namespaces": [
-                    "default",
-                    NAMESPACE,
-                    "kubeflow",
-                    "training",
-                ],
-            }
-        )
-    return entries
-
-
-def redacted_registry_entries(entries: list[dict]) -> list[dict]:
-    """Swap every live cluster token for its digest before it hits artifacts/.
-
-    The baseline rows come straight out of the production registry Secret,
-    so they carry the real regional cluster token. The artifact only ever
-    has to answer "which rows did the run preserve, and did it put the same
-    ones back", and a sha256 answers that as well as the token does. Same
-    digest helper the API uses (``gpu_fault.regional.cluster_token_sha256``),
-    inlined so redaction cannot be skipped by an import failure the way
-    ``validate_registry`` legitimately is.
-    """
-    redacted = []
-    for entry in entries:
-        item = dict(entry)
-        token = item.pop("token", None)
-        if token is not None:
-            item["token_sha256"] = hashlib.sha256(str(token).encode()).hexdigest()
-        redacted.append(item)
-    return redacted
-
-
-def register(count: int, artifacts: Path) -> list[dict]:
-    validate_notification_safety()
-    existing = load_registry()
-    baseline = [
-        entry
-        for entry in existing
-        if not str(entry.get("cluster_id", "")).startswith(PERF_CLUSTER_PREFIX)
-    ]
-    (artifacts / "registry-baseline.json").write_text(
-        json.dumps(redacted_registry_entries(baseline), indent=1) + "\n"
-    )
-    perf = perf_cluster_entries(count)
-    log(
-        f"registering {len(perf)} audit clusters "
-        f"(keeping {len(baseline)} production entries)"
-    )
-    write_registry(baseline + perf)
-    restart_control_plane()
-    tokens = [
-        {
-            "cluster_id": entry["cluster_id"],
-            "token": entry["token"],
-        }
-        for entry in perf
-    ]
-    upsert_secret(
-        TOKEN_SECRET,
-        {"clusters.json": json.dumps(tokens, indent=1).encode()},
-    )
-    return tokens
-
-
-def deregister() -> None:
-    existing = load_registry()
-    baseline = [
-        entry
-        for entry in existing
-        if not str(entry.get("cluster_id", "")).startswith(PERF_CLUSTER_PREFIX)
-    ]
-    if len(baseline) == len(existing):
-        log("no audit clusters registered; nothing to deregister")
-        return
-    log(f"deregistering {len(existing) - len(baseline)} audit clusters")
-    write_registry(baseline)
-    restart_control_plane()
-
-
-# --------------------------------------------------------------------------
-# data-plane fixtures
-# --------------------------------------------------------------------------
-
-
-def upsert_secret(name: str, files: dict[str, bytes]) -> None:
-    data = {key: base64.b64encode(value).decode() for key, value in files.items()}
-    manifest = {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {"name": name, "namespace": NAMESPACE},
-        "type": "Opaque",
-        "data": data,
-    }
-    dataplane(
-        "apply",
-        "-f",
-        "-",
-        stdin=json.dumps(manifest).encode(),
-    )
 
 
 def upsert_configmap(
@@ -638,46 +350,13 @@ def build_job(
         cpu_limit=cpu_limit,
         include_telemetry=include_telemetry,
         prewarm_connections=prewarm_connections,
+        connection_secret=CONNECTION_SECRET,
     )
 
 
 # --------------------------------------------------------------------------
 # control-plane observation
 # --------------------------------------------------------------------------
-
-
-def control_pods() -> list[str]:
-    raw = control(
-        "get",
-        "pod",
-        "-l",
-        (
-            "app in (gpu-fault-api-ha,gpu-fault-control-worker,"
-            "gpu-fault-telemetry-spool-worker)"
-        ),
-        "-o",
-        "jsonpath={range .items[*]}{.metadata.name} {end}",
-    )
-    names = [name for name in raw.split() if name]
-    if names:
-        return names
-    raw = control(
-        "get",
-        "pod",
-        "-o",
-        "jsonpath={range .items[*]}{.metadata.name} {end}",
-    )
-    return [
-        name
-        for name in raw.split()
-        if name.startswith(
-            (
-                "gpu-fault-api-ha-",
-                "gpu-fault-control-worker-",
-                "gpu-fault-telemetry-spool-worker-",
-            )
-        )
-    ]
 
 
 # Anything matched here lands in the artifacts; anything else is
@@ -1251,7 +930,14 @@ with psycopg.connect(os.environ['GPU_FAULT_STORE_URL'], autocommit=True) as conn
     print(output)
 
 
-def teardown(*, purge: bool, deregister_clusters: bool) -> None:
+def _teardown_once(
+    *,
+    purge: bool,
+    deregister_clusters: bool,
+    scope: str,
+    artifacts: Path | None,
+    run_id: str | None,
+) -> None:
     for spec in CASES.values():
         dataplane(
             "delete",
@@ -1294,7 +980,146 @@ def teardown(*, purge: bool, deregister_clusters: bool) -> None:
     if purge:
         purge_audit_rows()
     if deregister_clusters:
-        deregister()
+        deregister(
+            scope=scope,
+            artifacts=artifacts,
+            run_id=run_id,
+        )
+
+
+def teardown(
+    *,
+    purge: bool,
+    deregister_clusters: bool,
+    allow_live_registry: bool = False,
+    live_registry_confirmation: str | None = None,
+    artifacts: Path | None = None,
+    run_id: str | None = None,
+    attempts: int = 3,
+) -> None:
+    scope = validate_registry_target(
+        allow_live_registry=allow_live_registry,
+        confirmation=live_registry_confirmation,
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            _teardown_once(
+                purge=purge,
+                deregister_clusters=deregister_clusters,
+                scope=scope,
+                artifacts=artifacts,
+                run_id=run_id,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                log(f"teardown attempt {attempt} failed; retrying")
+                time.sleep(attempt)
+    raise RuntimeError(
+        f"capacity teardown failed after {attempts} attempts: {last_error}"
+    ) from last_error
+
+
+def execute_capacity_command(
+    args: argparse.Namespace,
+    *,
+    artifacts: Path,
+    suite_id: str,
+    expires_at: datetime,
+    scope: str,
+    xid_total: int,
+    sxid_total: int,
+) -> int:
+    failure: BaseException | None = None
+    result = 0
+    aborted_reason: str | None = None
+    try:
+        if args.command in {"register", "all"}:
+            register(
+                args.clusters,
+                artifacts,
+                run_id=suite_id,
+                expires_at=expires_at,
+                allow_live_registry=args.allow_live_registry,
+                live_registry_confirmation=args.confirm_live_registry,
+            )
+        elif args.command == "run":
+            validate_registered_synthetic_run(
+                count=args.clusters,
+                run_id=suite_id,
+                artifacts=artifacts,
+                scope=scope,
+            )
+        if args.command == "register":
+            write_status(artifacts, status="ok")
+            return 0
+
+        summary = execute_case(
+            args.case,
+            clusters=args.clusters,
+            nodes_per_cluster=args.nodes_per_cluster,
+            xid_total=xid_total,
+            sxid_total=sxid_total,
+            gpu_evidence_total=args.gpu_evidence_total,
+            host_evidence_total=args.host_evidence_total,
+            training_heartbeat_total=args.training_heartbeat_total,
+            workload_observation_total=args.workload_observation_total,
+            correlate_attempt_faults=args.correlate_attempt_faults,
+            workers=args.workers,
+            duration_seconds=args.duration_seconds,
+            lead_seconds=args.lead_seconds,
+            cpu_request=args.cpu_request,
+            cpu_limit=args.cpu_limit,
+            artifacts=artifacts,
+            label=args.label or f"{args.case}-{args.clusters}c",
+            include_telemetry=not args.fault_only,
+            prewarm_connections=args.prewarm_connections,
+        )
+        print(json.dumps(summary, indent=1, sort_keys=True))
+        if summary.get("job_status") != "Complete":
+            result = 1
+            aborted_reason = f"job status: {summary.get('job_status')}"
+    except BaseException as exc:
+        failure = exc
+    finally:
+        if args.command in {"all", "run"} and not args.keep_registration:
+            try:
+                teardown(
+                    purge=not args.no_purge,
+                    deregister_clusters=True,
+                    allow_live_registry=args.allow_live_registry,
+                    live_registry_confirmation=args.confirm_live_registry,
+                    artifacts=artifacts,
+                    run_id=suite_id,
+                )
+            except Exception as cleanup_error:
+                if failure is not None:
+                    failure.add_note(f"capacity teardown also failed: {cleanup_error}")
+                else:
+                    failure = cleanup_error
+
+    if failure is not None:
+        write_status(
+            artifacts,
+            status="aborted",
+            reason=f"{type(failure).__name__}: {failure}",
+        )
+        moved = move_to_aborted(args.artifact_root, artifacts)
+        log(f"aborted artifacts: {moved}")
+        raise failure.with_traceback(failure.__traceback__)
+    if result:
+        write_status(
+            artifacts,
+            status="aborted",
+            reason=aborted_reason or "capacity run aborted",
+        )
+        moved = move_to_aborted(args.artifact_root, artifacts)
+        log(f"aborted artifacts: {moved}")
+        return result
+    write_status(artifacts, status="ok")
+    return 0
 
 
 def main() -> int:
@@ -1359,9 +1184,25 @@ def main() -> int:
     )
     parser.add_argument("--keep-registration", action="store_true")
     parser.add_argument("--no-purge", action="store_true")
+    parser.add_argument("--allow-live-registry", action="store_true")
+    parser.add_argument("--confirm-live-registry")
+    parser.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
     args = parser.parse_args()
     if not DATAPLANE_CONTEXT:
         parser.error("GPU_FAULT_DATAPLANE_CONTEXT is required")
+    if args.synthetic_ttl_seconds < 300:
+        parser.error("--synthetic-ttl-seconds must be at least 300")
+    if args.command == "register" and not args.keep_registration:
+        parser.error("register requires --keep-registration")
+    if args.command == "run" and not args.suite_id:
+        parser.error("run requires the --suite-id used by register")
+    try:
+        scope = validate_registry_target(
+            allow_live_registry=args.allow_live_registry,
+            confirmation=args.confirm_live_registry,
+        )
+    except RuntimeError as exc:
+        parser.error(str(exc))
 
     # 32 clusters carry 500 XID and 500 SXID; every other scale keeps the
     # same per-cluster fault rate so request totals stay linear.
@@ -1384,6 +1225,8 @@ def main() -> int:
         teardown(
             purge=not args.no_purge,
             deregister_clusters=not args.keep_registration,
+            allow_live_registry=args.allow_live_registry,
+            live_registry_confirmation=args.confirm_live_registry,
         )
         return 0
 
@@ -1396,6 +1239,9 @@ def main() -> int:
     )
     log(f"artifacts: {artifacts}")
     started_at = datetime.now(timezone.utc).isoformat()
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=args.synthetic_ttl_seconds
+    )
     (artifacts / "run.json").write_text(
         json.dumps(
             {
@@ -1415,6 +1261,12 @@ def main() -> int:
                 "prewarm_connections": (args.prewarm_connections),
                 "command": args.command,
                 "suite_id": suite_id,
+                "registry_scope": scope,
+                "control_namespace": CONTROL_NAMESPACE,
+                "dataplane_namespace": NAMESPACE,
+                "registry_secret": REGISTRY_SECRET,
+                "connection_secret": CONNECTION_SECRET,
+                "synthetic_expires_at": expires_at.isoformat(),
                 **identity,
                 "started_at": started_at,
             },
@@ -1423,62 +1275,15 @@ def main() -> int:
         + "\n"
     )
     write_status(artifacts, status="running")
-
-    try:
-        if args.command in {"register", "all"}:
-            register(args.clusters, artifacts)
-        if args.command == "register":
-            write_status(artifacts, status="ok")
-            return 0
-
-        summary = execute_case(
-            args.case,
-            clusters=args.clusters,
-            nodes_per_cluster=args.nodes_per_cluster,
-            xid_total=xid_total,
-            sxid_total=sxid_total,
-            gpu_evidence_total=args.gpu_evidence_total,
-            host_evidence_total=args.host_evidence_total,
-            training_heartbeat_total=args.training_heartbeat_total,
-            workload_observation_total=args.workload_observation_total,
-            correlate_attempt_faults=args.correlate_attempt_faults,
-            workers=args.workers,
-            duration_seconds=args.duration_seconds,
-            lead_seconds=args.lead_seconds,
-            cpu_request=args.cpu_request,
-            cpu_limit=args.cpu_limit,
-            artifacts=artifacts,
-            label=label,
-            include_telemetry=not args.fault_only,
-            prewarm_connections=args.prewarm_connections,
-        )
-        print(json.dumps(summary, indent=1, sort_keys=True))
-
-        if args.command == "all" and not args.keep_registration:
-            teardown(
-                purge=not args.no_purge,
-                deregister_clusters=True,
-            )
-        if summary.get("job_status") == "Complete":
-            write_status(artifacts, status="ok")
-            return 0
-        write_status(
-            artifacts,
-            status="aborted",
-            reason=f"job status: {summary.get('job_status')}",
-        )
-        moved = move_to_aborted(args.artifact_root, artifacts)
-        log(f"aborted artifacts: {moved}")
-        return 1
-    except BaseException as exc:
-        write_status(
-            artifacts,
-            status="aborted",
-            reason=f"{type(exc).__name__}: {exc}",
-        )
-        moved = move_to_aborted(args.artifact_root, artifacts)
-        log(f"aborted artifacts: {moved}")
-        raise
+    return execute_capacity_command(
+        args,
+        artifacts=artifacts,
+        suite_id=suite_id,
+        expires_at=expires_at,
+        scope=scope,
+        xid_total=xid_total,
+        sxid_total=sxid_total,
+    )
 
 
 if __name__ == "__main__":

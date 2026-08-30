@@ -20,13 +20,14 @@ def _job_environment(
     duration_seconds: int,
     include_telemetry: bool,
     prewarm_connections: bool,
+    connection_secret: str,
 ) -> list[dict]:
     return [
         {
             "name": "GPU_FAULT_CONTROL_PLANE_URL",
             "valueFrom": {
                 "secretKeyRef": {
-                    "name": "gpu-fault-regional-connection",
+                    "name": connection_secret,
                     "key": "control-plane-url",
                 }
             },
@@ -111,6 +112,7 @@ def build_job(
     cpu_limit: str,
     include_telemetry: bool,
     prewarm_connections: bool,
+    connection_secret: str = "gpu-fault-regional-connection",
 ) -> dict:
     container = {
         "name": "load",
@@ -134,6 +136,7 @@ def build_job(
             duration_seconds=duration_seconds,
             include_telemetry=include_telemetry,
             prewarm_connections=prewarm_connections,
+            connection_secret=connection_secret,
         ),
         "resources": {
             "requests": {"cpu": cpu_request, "memory": "1Gi"},
@@ -202,7 +205,7 @@ def build_job(
                         {
                             "name": "tls",
                             "secret": {
-                                "secretName": "gpu-fault-regional-connection",
+                                "secretName": connection_secret,
                                 "items": [{"key": "ca.crt", "path": "ca.crt"}],
                             },
                         },

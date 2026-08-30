@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -17,6 +17,18 @@ import yaml
 from gpu_fault.admin_bootstrap_common import (
     CommandRunner,
     compute_agent_config_digest,
+)
+from gpu_fault.admin_profile_approval import (
+    ProfileApprovalError,
+    StaleProfileApprovalError,
+    clear_profile_plan,
+    consume_profile_approval,
+    profile_approval_lock,
+    profile_plan_sha256,
+    profile_site_identity_sha256,
+    resolve_profile_approval,
+    supersede_profile_approval,
+    write_profile_plan,
 )
 from gpu_fault.admin_site import (
     effective_environment,
@@ -34,13 +46,11 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE_ENV = "GPU_FAULT_SITE_FILE"
-PROFILE_APPROVAL_ENV = "PROFILE_APPROVAL"
 VERIFICATION_REPORT = "verification-report.json"
 STABILITY_REPORT = "stability-report.json"
 RELEASE_SUMMARY_REPORT = "release-summary.json"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-APPROVAL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 
 
 class ReleaseDeployError(RuntimeError):
@@ -61,19 +71,35 @@ class PreparedRelease:
 
 @dataclass(frozen=True)
 class ProfilePlan:
+    site_identity: dict[str, str]
+    site_identity_sha256: str
+    registration_cluster_id: str
     template_source: Path
     template_reference: str
     active_source: Path
     current_version: str
     desired_version: str
+    current_policy_digest: str | None
     policy_digest: str
+    live_profile_sha256: str | None
+    active_source_sha256: str | None
     source_sha256: str
+    snapshot_sha256: str
     change_kind: str
     changes: tuple[str, ...]
     approval: str | None
+    approval_plan_sha256: str | None
+    approval_relation: str | None
     approval_required: bool
     snapshot_file: Path
     snapshot_document: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ProfileApprovalResolution:
+    profile_plan: ProfilePlan
+    plan_sha256: str
+    relation: str | None
 
 
 def _mapping(value: object, description: str) -> dict[str, Any]:
@@ -305,7 +331,6 @@ def plan_runtime_profile(
     site_file: Path,
     *,
     live_profile_sha256: str | None,
-    approval: str | None,
 ) -> ProfilePlan:
     site = load_site(site_file)
     document = _read_site_document(site_file)
@@ -366,25 +391,38 @@ def plan_runtime_profile(
         change_kind, changes = _classify_profile_change(current, candidate)
         desired_version = f"regional-hyperpod-{policy_digest[:12]}"
 
-    normalized_approval = (approval or "").strip() or None
     approval_required = change_kind != "UNCHANGED"
-    if normalized_approval is not None and not APPROVAL_PATTERN.fullmatch(
-        normalized_approval
-    ):
-        raise ReleaseDeployError("PROFILE_APPROVAL has an invalid format")
     snapshot_document["profile_version"] = desired_version
     snapshot_document["cluster_id"] = registration_cluster_id
+    snapshot_sha = hashlib.sha256(
+        yaml.safe_dump(snapshot_document, sort_keys=False).encode()
+    ).hexdigest()
+    site_identity = {
+        "site_name": str(site.release_config["site_name"]),
+        "aws_region": str(site.release_config["aws_region"]),
+        "cpu_eks_arn": str(site.release_config["cpu_eks_arn"]),
+    }
+    site_identity_sha = profile_site_identity_sha256(site_identity)
     return ProfilePlan(
+        site_identity=site_identity,
+        site_identity_sha256=site_identity_sha,
+        registration_cluster_id=registration_cluster_id,
         template_source=template_source,
         template_reference=template_reference,
         active_source=active_source,
         current_version=current_version,
         desired_version=desired_version,
+        current_policy_digest=current_digest,
         policy_digest=policy_digest,
+        live_profile_sha256=live_profile_sha256,
+        active_source_sha256=active_sha,
         source_sha256=source_sha,
+        snapshot_sha256=snapshot_sha,
         change_kind=change_kind,
         changes=changes,
-        approval=normalized_approval,
+        approval=None,
+        approval_plan_sha256=None,
+        approval_relation=None,
         approval_required=approval_required,
         snapshot_file=site_file.parent / "profiles" / f"{desired_version}.yaml",
         snapshot_document=snapshot_document,
@@ -392,20 +430,28 @@ def plan_runtime_profile(
 
 
 def _profile_plan_payload(plan: ProfilePlan) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": 1,
+        "site_identity": dict(plan.site_identity),
+        "site_identity_sha256": plan.site_identity_sha256,
+        "registration_cluster_id": plan.registration_cluster_id,
         "template_source": str(plan.template_source),
         "active_source": str(plan.active_source),
         "snapshot_file": str(plan.snapshot_file),
         "current_version": plan.current_version,
         "desired_version": plan.desired_version,
+        "current_policy_digest": plan.current_policy_digest,
         "policy_digest": plan.policy_digest,
+        "live_profile_sha256": plan.live_profile_sha256,
+        "active_source_sha256": plan.active_source_sha256,
         "source_sha256": plan.source_sha256,
+        "snapshot_sha256": plan.snapshot_sha256,
         "change_kind": plan.change_kind,
         "changes": list(plan.changes),
         "approval_required": plan.approval_required,
-        "approval": plan.approval,
     }
+    payload["plan_sha256"] = profile_plan_sha256(payload)
+    return payload
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -491,7 +537,7 @@ def prepare_site_release(
     images = _mapping(spec.setdefault("images", {}), "site spec.images")
     if profile_plan.approval_required and not profile_plan.approval:
         raise ReleaseDeployError(
-            "Runtime Profile changed; set PROFILE_APPROVAL to an approved change ID"
+            "Runtime Profile changed without a matching state approval"
         )
     desired_profile = profile_plan.desired_version
     digest = compute_agent_config_digest(
@@ -575,6 +621,8 @@ def prepare_site_release(
             "policy_digest": profile_plan.policy_digest,
             "source_sha256": profile_plan.source_sha256,
             "approval": profile_plan.approval,
+            "approval_plan_sha256": profile_plan.approval_plan_sha256,
+            "approval_relation": profile_plan.approval_relation,
         },
     }
     _write_json_atomic(state_dir / "plan.json", plan)
@@ -846,10 +894,100 @@ def _complete_release(
     )
 
 
-def execute_release(
+def _resolve_profile_approval_state(
+    site_file: Path,
+    profile_plan: ProfilePlan,
+) -> ProfileApprovalResolution:
+    profile_plan_payload = _profile_plan_payload(profile_plan)
+    profile_plan_digest = str(profile_plan_payload["plan_sha256"])
+    try:
+        resolved = resolve_profile_approval(
+            site_file.parent,
+            current_plan=profile_plan_payload,
+        )
+    except StaleProfileApprovalError as exc:
+        supersede_profile_approval(
+            site_file.parent,
+            replacement_plan=(
+                profile_plan_payload if profile_plan.approval_required else None
+            ),
+            reason=str(exc),
+        )
+        if profile_plan.approval_required:
+            raise ReleaseDeployError(
+                "Runtime Profile plan or live baseline changed; the previous "
+                "approval was archived. Review the new "
+                "release-deploy/profile-plan.json and run "
+                "gpu-fault-admin approve-profile again"
+            ) from exc
+        resolved = None
+    if resolved is not None:
+        return ProfileApprovalResolution(
+            profile_plan=replace(
+                profile_plan,
+                approval=resolved.reference,
+                approval_plan_sha256=resolved.plan_sha256,
+                approval_relation=resolved.relation,
+            ),
+            plan_sha256=resolved.plan_sha256,
+            relation=resolved.relation,
+        )
+    if profile_plan.approval_required:
+        write_profile_plan(site_file.parent, profile_plan_payload)
+        raise ReleaseDeployError(
+            "Runtime Profile policy changed; review release-deploy/profile-plan.json "
+            "and run gpu-fault-admin approve-profile --state-dir ... "
+            "--plan-sha256 <plan_sha256> --reference ..."
+        )
+    clear_profile_plan(site_file.parent)
+    return ProfileApprovalResolution(
+        profile_plan=profile_plan,
+        plan_sha256=profile_plan_digest,
+        relation=None,
+    )
+
+
+def _consume_profile_approval_state(
+    site_file: Path,
+    prepared: PreparedRelease,
+    resolution: ProfileApprovalResolution,
+) -> None:
+    if resolution.relation is None:
+        return
+    try:
+        archive = consume_profile_approval(
+            site_file.parent,
+            expected_plan_sha256=resolution.plan_sha256,
+            release_id=prepared.release_id,
+            relation=resolution.relation,
+        )
+    except ProfileApprovalError as exc:
+        _update_phase(
+            prepared,
+            "COMPLETED",
+            profile_approval_audit={
+                "status": "FAILED",
+                "error": str(exc),
+            },
+        )
+        raise ReleaseDeployError(
+            "release completed but Profile approval archival failed: " + str(exc)
+        ) from exc
+    _update_phase(
+        prepared,
+        "COMPLETED",
+        profile_approval_audit={
+            "status": "CONSUMED",
+            "plan_sha256": resolution.plan_sha256,
+            "relation": resolution.relation,
+            "archive": str(archive),
+        },
+    )
+
+
+def _execute_release_locked(
     site_file: Path,
     *,
-    profile_approval: str | None = None,
     admin_email: str | None = None,
     run_checks: bool = True,
     live_state: dict[str, Any] | None = None,
@@ -870,17 +1008,9 @@ def execute_release(
         site_file,
         live_profile_sha256=str(current_state.get("runtime_profile_sha256") or "")
         or None,
-        approval=profile_approval or os.getenv(PROFILE_APPROVAL_ENV),
     )
-    if profile_plan.approval_required and not profile_plan.approval:
-        _write_json_atomic(
-            site_file.parent / "release-deploy/profile-plan.json",
-            _profile_plan_payload(profile_plan),
-        )
-        raise ReleaseDeployError(
-            "Runtime Profile policy changed; review release-deploy/profile-plan.json "
-            f"and set {PROFILE_APPROVAL_ENV} to the approved change ID"
-        )
+    approval = _resolve_profile_approval_state(site_file, profile_plan)
+    profile_plan = approval.profile_plan
     if run_checks:
         _run(
             ["make", f"PYTHON={sys.executable}", "check"],
@@ -1045,7 +1175,27 @@ def execute_release(
                 f"rollback={rollback['error']}"
             ) from exc
         raise
+    _consume_profile_approval_state(site_file, prepared, approval)
     return prepared
+
+
+def execute_release(
+    site_file: Path,
+    *,
+    admin_email: str | None = None,
+    run_checks: bool = True,
+    live_state: dict[str, Any] | None = None,
+) -> PreparedRelease:
+    try:
+        with profile_approval_lock(site_file.parent):
+            return _execute_release_locked(
+                site_file,
+                admin_email=admin_email,
+                run_checks=run_checks,
+                live_state=live_state,
+            )
+    except ProfileApprovalError as exc:
+        raise ReleaseDeployError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1059,13 +1209,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--site",
         type=Path,
         help=f"RegionalSite YAML; defaults to {SITE_ENV}",
-    )
-    parser.add_argument(
-        "--profile-approval",
-        help=(
-            "approved change ID for a Runtime Profile policy change; defaults to "
-            f"{PROFILE_APPROVAL_ENV}"
-        ),
     )
     parser.add_argument(
         "--prebuilt-attestation",
@@ -1131,7 +1274,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         prepared = execute_release(
             site_file,
-            profile_approval=arguments.profile_approval,
             run_checks=False,
         )
     except (OSError, ReleaseDeployError, subprocess.SubprocessError, ValueError) as exc:
