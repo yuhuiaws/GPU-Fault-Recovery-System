@@ -342,6 +342,7 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "--force-rebuild" in build_target
     assert "scripts/build-release-attestation.py" in build_target
     assert "$(COSIGN) sign-blob --yes" in build_target
+    assert build_target.count("env -u COSIGN_PASSWORD") >= 7
     assert "scripts/release_deploy.py" in target
     assert "--site" in target
     assert "--profile-approval" not in target
@@ -357,6 +358,7 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "RUNTIME_IMAGE_CACHE_REPOSITORY" in workflow
     assert "cosign sign-blob" not in workflow
     assert "scripts/build-deploy-host-bundle.py" in host_bundle
+    assert "env -u COSIGN_PASSWORD" in host_bundle
     assert "$(COSIGN) sign-blob --yes" in host_bundle
     assert "scripts/setup-deploy-host.sh" in host_setup
     assert "--signature-bundle" in host_setup
