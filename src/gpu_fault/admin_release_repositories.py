@@ -325,6 +325,8 @@ def prepare_signed_release(
         cosign_signing_key=request.cosign_signing_key,
         cosign_public_key=request.cosign_public_key,
         cosign_password_file=request.cosign_password_file,
+        staging_only=request.staging_only_release,
+        impact_base=request.impact_base,
     )
     state.record("release", release)
     state.complete("release")

@@ -38,6 +38,7 @@ from gpu_fault.admin_site import (
     load_site,
     materialized_release_config,
 )
+from gpu_fault.admin_source_deploy import run_source_deploy
 from gpu_fault.admin_uninstall import UninstallRequest, uninstall
 
 COMMANDS = {
@@ -73,26 +74,42 @@ def parser() -> argparse.ArgumentParser:
             action="store_true",
             help="print the redacted generated release configuration",
         )
-    deploy = commands.add_parser("deploy")
-    deploy.add_argument("-f", "--file", type=Path, help="existing RegionalSite YAML")
+    deploy = commands.add_parser(
+        "deploy",
+        usage=(
+            "gpu-fault-admin deploy --cpu-cluster-arn CPU_ARN "
+            "--gpu-cluster-arn GPU_ARN --state-dir STATE_DIR "
+            "--admin-email EMAIL"
+        ),
+        description=(
+            "Bootstrap a new site or upgrade the existing site recorded under "
+            "STATE_DIR using the same command"
+        ),
+    )
+    deploy.add_argument(
+        "-f",
+        "--file",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     deploy.add_argument(
         "--cpu-cluster-arn",
+        metavar="CPU_ARN",
         help="existing CPU EKS or HyperPod cluster ARN",
     )
     deploy.add_argument(
         "--gpu-cluster-arn",
         action="append",
         default=[],
+        metavar="GPU_ARN",
         help="existing GPU EKS or HyperPod cluster ARN; repeat for more clusters",
     )
-    deploy.add_argument("--repo-root", type=Path)
+    deploy.add_argument("--repo-root", type=Path, help=argparse.SUPPRESS)
     deploy.add_argument(
         "--state-dir",
         type=Path,
-        help=(
-            "private bootstrap state directory; required with cluster ARNs and "
-            "must contain release-signing/cosign.key and cosign.pub"
-        ),
+        metavar="STATE_DIR",
+        help=("private state directory used for both first deployment and upgrades"),
     )
     deploy.add_argument(
         "--allow-legacy-python-foundation",
@@ -101,28 +118,53 @@ def parser() -> argparse.ArgumentParser:
     )
     deploy.add_argument(
         "--admin-email",
+        dest="alert_email",
+        metavar="EMAIL",
+        help="administrator email for SES fault notifications and SNS alerts",
+    )
+    deploy.add_argument(
         "--alert-email",
         dest="alert_email",
-        help=(
-            "administrator email for SES fault notifications and SNS alerts; "
-            "defaults to the AWS account email when discoverable"
-        ),
+        help=argparse.SUPPRESS,
+    )
+    deploy.add_argument(
+        "--profile-approval",
+        help=argparse.SUPPRESS,
+    )
+    deploy.add_argument(
+        "--staging-only-release",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    deploy.add_argument(
+        "--impact-base",
+        default="origin/main",
+        help=argparse.SUPPRESS,
     )
     deploy.add_argument(
         "--email-sender",
-        help="verified SES sender; defaults to the administrator email",
+        help=argparse.SUPPRESS,
     )
     deploy.add_argument(
         "--email-recipient",
         action="append",
         default=[],
-        help="notification recipient; repeat for multiple recipients",
+        help=argparse.SUPPRESS,
     )
     deploy.add_argument(
         "--email-subject-prefix",
-        help="optional site-specific prefix prepended to every email subject",
+        help=argparse.SUPPRESS,
     )
-    deploy.add_argument("--show-effective-config", action="store_true")
+    deploy.add_argument(
+        "--prepared-source-release",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    deploy.add_argument(
+        "--show-effective-config",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     join = commands.add_parser(
         "join-cluster",
         help="discover and attach one existing GPU EKS/HyperPod cluster",
@@ -286,6 +328,8 @@ def _run_automatic_release(
     repository_root: Path,
     site_file: Path,
     state_dir: Path,
+    profile_approval: str | None,
+    staging_only_release: bool,
 ) -> int:
     command = [
         sys.executable,
@@ -299,6 +343,10 @@ def _run_automatic_release(
         "--cosign-key",
         str(state_dir / "release-signing/cosign.pub"),
     ]
+    if profile_approval:
+        command.extend(("--profile-approval", profile_approval))
+    if staging_only_release:
+        command.append("--allow-staging-release")
     completed = subprocess.run(
         command,
         cwd=repository_root,
@@ -384,12 +432,21 @@ def run(arguments: argparse.Namespace) -> int:
     if arguments.command == "deploy" and site_file is None:
         if not arguments.cpu_cluster_arn or not arguments.gpu_cluster_arn:
             raise SiteConfigError(
-                "deploy requires -f site.yaml, or --cpu-cluster-arn "
-                "with at least one --gpu-cluster-arn"
+                "deploy requires --cpu-cluster-arn and at least one --gpu-cluster-arn"
             )
         if arguments.state_dir is None:
-            raise SiteConfigError(
-                "ARN deploy requires --state-dir for private state and signing keys"
+            raise SiteConfigError("deploy requires --state-dir")
+        if not arguments.alert_email:
+            raise SiteConfigError("deploy requires --admin-email")
+        if not getattr(arguments, "prepared_source_release", False):
+            return run_source_deploy(
+                cpu_cluster_arn=arguments.cpu_cluster_arn,
+                gpu_cluster_arns=tuple(arguments.gpu_cluster_arn),
+                state_dir=arguments.state_dir,
+                admin_email=arguments.alert_email,
+                profile_approval=getattr(arguments, "profile_approval", None),
+                impact_base=getattr(arguments, "impact_base", "origin/main"),
+                current_directory=Path.cwd(),
             )
         repository_root = (arguments.repo_root or Path.cwd()).resolve()
         bootstrap_result = bootstrap_from_arns(
@@ -404,6 +461,12 @@ def run(arguments: argparse.Namespace) -> int:
                 email_subject_prefix=(
                     getattr(arguments, "email_subject_prefix", None) or ""
                 ),
+                staging_only_release=getattr(
+                    arguments,
+                    "staging_only_release",
+                    False,
+                ),
+                impact_base=getattr(arguments, "impact_base", "origin/main"),
             )
         )
         site_file = bootstrap_result.site_file
@@ -415,6 +478,12 @@ def run(arguments: argparse.Namespace) -> int:
             repository_root=repository_root,
             site_file=site_file,
             state_dir=arguments.state_dir,
+            profile_approval=getattr(arguments, "profile_approval", None),
+            staging_only_release=getattr(
+                arguments,
+                "staging_only_release",
+                False,
+            ),
         )
     site = load_site(site_file, repository_root=arguments.repo_root)
     if arguments.command == "deploy":

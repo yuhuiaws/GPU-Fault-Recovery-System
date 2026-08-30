@@ -42,7 +42,6 @@ PUBLIC_RELEASE_DOCUMENTS = (
     "docs/详细设计.md",
     "docs/详细设计-v2.md",
     "docs/components/nvidia-policy.md",
-    "docs/部署机初始化.md",
     "docs/管理员快速部署.md",
     "docs/管理员日常运维.md",
     "docs/管理员环境变量参考.md",
@@ -430,14 +429,15 @@ def test_root_readme_separates_developer_and_admin_deployment() -> None:
     )[0]
 
     for value in (
-        "make PYTHON=.venv/bin/python release-deploy",
-        "make PYTHON=.venv/bin/python release-build",
-        "PROFILE_APPROVAL=CHG-12345",
-        "profile-plan.json",
-        "deploy -> verify -> stability -> release-summary",
-        "verification-report.json",
-        "stability-report.json",
-        "SKIPPED_NOOP",
+        "gpu-fault-admin deploy",
+        "--cpu-cluster-arn <cpu-arn>",
+        "--gpu-cluster-arn <gpu-arn>",
+        "--state-dir /secure/gpu-fault-staging",
+        "--admin-email <operations-email>",
+        "`staging_only`",
+        "release-ref",
+        "不提供",
+        "完整生产门禁",
     ):
         assert value in developer
 
@@ -446,10 +446,8 @@ def test_root_readme_separates_developer_and_admin_deployment() -> None:
         "--gpu-cluster-arn",
         "--state-dir /secure/gpu-fault",
         "--admin-email",
-        "gpu-fault-admin preflight",
-        "gpu-fault-admin deploy -f",
-        "gpu-fault-admin verify",
-        "gpu-fault-admin status",
+        "完全相同的命令",
+        "CPU/GPU身份集合未变化",
         "gpu-fault-admin join-cluster",
         "gpu-fault-admin remove-cluster",
         "--confirm REMOVE_GPU_CLUSTER",
@@ -457,9 +455,9 @@ def test_root_readme_separates_developer_and_admin_deployment() -> None:
         "--confirm UNINSTALL_GPU_FAULT",
         "--cpu-cluster delete",
         "--confirm DELETE_CPU_CONTROL_PLANE",
-        "不会重新构建当前",
     ):
         assert value in administrator
+    assert "gpu-fault-admin deploy -f" not in administrator
 
 
 def test_public_collector_docs_keep_node_log_disabled() -> None:

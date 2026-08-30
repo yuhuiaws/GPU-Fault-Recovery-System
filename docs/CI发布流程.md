@@ -7,7 +7,10 @@
 [管理员快速部署](管理员快速部署.md)、[管理员日常运维](管理员日常运维.md)和
 [开发者部署实现](开发者部署实现.md)定义的受检入口。
 开发者修改代码后需要一条可直接执行的测试与上线主路径时，使用
-[开发者发布与测试流程](开发者发布测试流程.md)。
+[EC2源码统一部署流程](EC2源码Staging复现流程.md)。
+单EC2上的dirty源码验证使用
+[EC2源码Staging统一部署流程](EC2源码Staging复现流程.md)中的四参数
+`gpu-fault-admin deploy`，不属于Release CI。
 
 当前流程的实现事实源是：
 
@@ -39,6 +42,16 @@ workflow_dispatch 或 v* tag
        -> 生成 SHA-256 并签名
   -> 上传 dist/ 为 gpu-fault-release artifact
 ```
+
+Release CI只接受checkout得到的clean commit，并且只调用`release-build`。因此它生成：
+
+- Manifest中的`staging_only=false`；
+- attestation中的`release_tier=production`；
+- 完整`make check`和PostgreSQL stress门禁记录。
+
+`release-build-staging`只供统一CLI的内部源码准备器处理dirty隔离快照。该等级执行影响
+选择并在不确定时升级全量门禁，但其Manifest固定为`staging_only=true`，普通生产验签
+默认拒绝；GitHub Release workflow不会构建或上传该等级。
 
 该 workflow：
 
@@ -221,6 +234,7 @@ attestation 绑定：
 - `dist/current-release.json` 的 SHA-256；
 - delivery identity SHA；
 - Git commit 和干净工作树状态；
+- `release_tier=production`；
 - `make check` 与 `make test-postgres-stress` 的 PASS 结论。
 
 随后 `cosign sign-blob` 对 `dist/current-attestation.json` 执行 keyless 签名并生成：
@@ -345,31 +359,27 @@ make deploy-host-setup \
 ```
 
 setup 会在安装前验证签名、archive 内容、平台兼容性、源码 commit 和当前 checkout。
-详细规则见[部署机初始化](部署机初始化.md)。
+bundle Manifest绑定OS、CPU架构、Python实现/3.12 ABI cache tag、sysconfig platform和
+libc实现；任一不匹配都fail closed。生产bundle还要求clean源码且Git commit与当前
+checkout一致。依赖安装始终使用`--no-index`，在同目录临时venv中完成全部依赖和系统
+工具检查后才原子替换目标venv；相同bundle重复执行只验证并复用。初始化器不调用系统
+包管理器，报告和venv不得包含AWS凭据、token、私钥、数据库密码或kubeconfig。
 
 ### 6.3 消费签名 release
 
-把同一 CI artifact 的 release 文件恢复到当前 checkout 的 `dist/` 后，已有站点执行：
+受控制品同步自动化把同一CI artifact恢复到受信checkout后，管理员仍执行统一四参数命令：
 
 ```bash
-make PYTHON=.venv/bin/python release-deploy \
-  SITE=/secure/gpu-fault/site.yaml \
-  CERTIFICATE_IDENTITY=<approved-release-identity> \
-  CERTIFICATE_OIDC_ISSUER=<approved-release-issuer>
+gpu-fault-admin deploy \
+  --cpu-cluster-arn <cpu-arn> \
+  --gpu-cluster-arn <gpu-arn> \
+  --state-dir /secure/gpu-fault \
+  --admin-email <operations-email>
 ```
 
-默认会读取：
-
-```text
-dist/current-attestation.json
-dist/current-attestation.bundle.json
-dist/current-release.json
-dist/<release-id>/*
-```
-
-`release-deploy` 只验签并消费 CI 预构建制品，不运行 `make check`、Docker build 或依赖
-下载。实际 Kubernetes/AWS mutation 从这里才开始，并继续受 site、Profile、维护窗口、
-回滚和 fail-closed 门禁约束。
+CLI内部解析并验签attestation、Manifest和OCI digest；artifact、certificate identity、
+site和低层`release-deploy`参数不进入普通管理员命令。实际Kubernetes/AWS mutation继续
+受Profile、维护窗口、回滚和fail-closed门禁约束。
 
 ## 7. 失败与重跑
 
@@ -419,8 +429,9 @@ make PYTHON=.venv/bin/python deploy-host-bundle
 |---|---|
 | workflow trigger、权限、Runner 或 GitHub variables | 本文第 2、3 节 |
 | `release-build` 顺序或质量门禁 | 本文第 3.3 节、开发者部署实现和运维手册 |
+| `release-build-staging`或两级attestation边界 | EC2源码Staging流程、安全参考和本文第 1 节 |
 | Manifest、wheel、Node bundle、attestation | 本文第 4、5 节及对应制品测试 |
-| deploy-host bundle、平台或 lock | 本文第 3.4、6.2 节和部署机初始化 |
+| deploy-host bundle、平台或 lock | 本文第 3.4、6.2 节和开发者部署实现 |
 | artifact 名称、路径或保留期 | 本文第 3.5、4、6.1 节 |
 | CI 与实际部署职责边界 | 本文第 1、6.3 节和管理员文档 |
 

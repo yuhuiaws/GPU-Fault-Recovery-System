@@ -18,6 +18,7 @@ def main() -> None:
     parser.add_argument("--certificate", type=Path)
     parser.add_argument("--certificate-identity")
     parser.add_argument("--certificate-oidc-issuer")
+    parser.add_argument("--allow-staging-release", action="store_true")
     args = parser.parse_args()
     value = verify_attestation(
         ROOT,
@@ -30,6 +31,7 @@ def main() -> None:
         ),
         certificate_identity=args.certificate_identity,
         certificate_oidc_issuer=args.certificate_oidc_issuer,
+        allow_staging=args.allow_staging_release,
     )
     print(value["subject"]["release_id"])
 

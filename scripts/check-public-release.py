@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-
-import pathspec
-
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT_SUFFIXES = {
@@ -100,19 +98,53 @@ class Violation:
     value: str
 
 
-def public_text_files(root: Path) -> list[Path]:
-    ignore_path = root / ".gitignore"
-    ignore = pathspec.GitIgnoreSpec.from_lines(
-        ignore_path.read_text(encoding="utf-8").splitlines()
-        if ignore_path.is_file()
-        else ()
+def _git_public_files(root: Path) -> list[Path] | None:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        check=False,
+        capture_output=True,
     )
+    if completed.returncode:
+        return None
+    return [
+        root / Path(item.decode(errors="surrogateescape"))
+        for item in completed.stdout.split(b"\0")
+        if item
+    ]
+
+
+def public_text_files(root: Path) -> list[Path]:
+    candidates = _git_public_files(root)
+    if candidates is None:
+        import pathspec
+
+        ignore_path = root / ".gitignore"
+        ignore = pathspec.GitIgnoreSpec.from_lines(
+            ignore_path.read_text(encoding="utf-8").splitlines()
+            if ignore_path.is_file()
+            else ()
+        )
+        candidates = [
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and not ignore.match_file(path.relative_to(root).as_posix())
+        ]
     result = []
-    for path in root.rglob("*"):
+    for path in candidates:
         if not path.is_file():
             continue
         relative = path.relative_to(root).as_posix()
-        if relative.startswith(".git/") or ignore.match_file(relative):
+        if relative.startswith(".git/"):
             continue
         if relative in SCANNER_SOURCES:
             continue

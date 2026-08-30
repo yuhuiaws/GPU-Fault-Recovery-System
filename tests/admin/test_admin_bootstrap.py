@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from dataclasses import replace
 
@@ -23,6 +24,7 @@ from gpu_fault.admin_bootstrap_common import (
 from gpu_fault.admin_bootstrap_site import (
     existing_gpu_context,
     preserve_existing_site_contract,
+    validate_existing_cluster_identity,
 )
 from gpu_fault.admin_bootstrap_site import site_identifier as _site_identifier
 from gpu_fault.admin_release_repositories import ensure_release_repositories
@@ -247,6 +249,59 @@ def test_legacy_foundation_rejects_source_only_release(tmp_path) -> None:
         )
 
 
+def test_staging_release_requires_explicit_bootstrap_authorization(
+    tmp_path, monkeypatch
+) -> None:
+    manifest = tmp_path / "dist/current-release.json"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "deployable": True,
+                "staging_only": True,
+                "release_id": "release-a",
+                "delivery": {
+                    "images": {
+                        name: {
+                            "reference": f"registry.example/{name}@sha256:"
+                            + character * 64
+                        }
+                        for name, character in {
+                            "runtime": "1",
+                            "node_installer": "2",
+                            "dcgm_exporter": "3",
+                            "adot": "4",
+                        }.items()
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "compute_agent_config_digest",
+        lambda *_args, **_kwargs: "a" * 64,
+    )
+
+    with pytest.raises(BootstrapError, match="staging-only"):
+        admin_release_artifacts.load_prebuilt_release(
+            type("Runner", (), {"dry_run": False})(),
+            repository_root=tmp_path,
+            runtime_profile="profile-a",
+        )
+
+    result = admin_release_artifacts.load_prebuilt_release(
+        type("Runner", (), {"dry_run": False})(),
+        repository_root=tmp_path,
+        runtime_profile="profile-a",
+        allow_staging=True,
+    )
+
+    assert result["staging_only"] is True
+
+
 def test_release_repositories_are_created_with_separate_mutability(monkeypatch) -> None:
     calls = []
 
@@ -439,8 +494,12 @@ def test_cache_repository_rejects_lifecycle_policy_drift(monkeypatch) -> None:
         ensure_release_repositories(Runner(), cpu=_cluster(), site_id=site_id)
 
 
+@pytest.mark.parametrize(
+    ("staging_only", "target"),
+    ((False, "release-build"), (True, "release-build-staging")),
+)
 def test_admin_release_build_uses_ecr_and_state_signing_material(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, staging_only, target
 ) -> None:
     signing = tmp_path / "release-signing"
     signing.mkdir()
@@ -455,6 +514,7 @@ def test_admin_release_build_uses_ecr_and_state_signing_material(
     monkeypatch.setenv(
         "GPU_FAULT_TEST_POSTGRES_URL", "postgresql://postgres@127.0.0.1:5432/postgres"
     )
+    monkeypatch.setattr(admin_release_artifacts, "_git_output", lambda *_args: "")
     commands = []
 
     class Runner:
@@ -494,20 +554,232 @@ def test_admin_release_build_uses_ecr_and_state_signing_material(
             "123456789012.dkr.ecr.us-east-1.amazonaws.com/gpu-fault/runtime-cache-a"
         ),
         runtime_profile="profile-a",
+        staging_only=staging_only,
+        impact_base="origin/release",
     )
 
     make_command, make_options = next(
         item for item in commands if item[0] and item[0][0] == "make"
     )
-    assert "release-build" in make_command
+    assert target in make_command
     assert any(item.startswith("RUNTIME_IMAGE_REPOSITORY=") for item in make_command), (
         "admin release build did not receive the created runtime ECR repository"
     )
+    if staging_only:
+        assert "BASE=origin/release" in make_command
+    else:
+        assert all(not item.startswith("BASE=") for item in make_command), (
+            "production release build unexpectedly received a staging impact base"
+        )
     assert any(item.startswith("RUNTIME_IMAGE_CACHE_FROM=") for item in make_command), (
         "admin release build did not receive the created cache ECR repository"
     )
     assert make_options["env"]["COSIGN_PASSWORD"] == "password"
     assert result["release_id"] == "release-a"
+    assert result["release_reused"] is False
+
+
+@pytest.mark.parametrize("staging_only", (False, True))
+def test_admin_release_reuses_signed_release_for_same_commit(
+    tmp_path, monkeypatch, staging_only
+) -> None:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    for name, value in (
+        (
+            "current-release.json",
+            json.dumps(
+                {"schema_version": 3, "deployable": True, "staging_only": staging_only}
+            ),
+        ),
+        (
+            "current-attestation.json",
+            json.dumps(
+                {
+                    "source": {"git_commit": "a" * 40, "dirty": False},
+                    **({"impact_base": "origin/release"} if staging_only else {}),
+                }
+            ),
+        ),
+        ("current-attestation.bundle.json", "{}"),
+    ):
+        (dist / name).write_text(value, encoding="utf-8")
+    commands = []
+
+    class Runner:
+        dry_run = False
+
+        def run(self, arguments, **kwargs):
+            commands.append((list(arguments), kwargs))
+            return ""
+
+    def git_output(_root, *arguments):
+        if arguments[0] == "status":
+            return ""
+        return "a" * 40
+
+    runtime_repository = (
+        "123456789012.dkr.ecr.us-east-1.amazonaws.com/gpu-fault/runtime-a"
+    )
+    monkeypatch.setattr(admin_release_artifacts, "_git_output", git_output)
+    monkeypatch.setattr(
+        admin_release_artifacts, "runtime_image_exists", lambda **_kwargs: True
+    )
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "verify_prebuilt_release",
+        lambda *args, **kwargs: commands.append((["verify"], kwargs)),
+    )
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "load_prebuilt_release",
+        lambda *args, **kwargs: {
+            "manifest": "dist/current-release.json",
+            "release_id": "release-a",
+            "images": {"runtime": runtime_repository + "@sha256:" + "b" * 64},
+            "agent_config_digest": "a" * 64,
+        },
+    )
+
+    result = admin_release_artifacts.build_signed_release(
+        Runner(),
+        repository_root=tmp_path,
+        state_dir=tmp_path,
+        region="us-east-1",
+        runtime_repository=runtime_repository,
+        cache_repository=None,
+        runtime_profile="profile-a",
+        staging_only=staging_only,
+        impact_base="origin/release",
+    )
+
+    assert result["release_reused"] is True
+    assert [item[0] for item in commands] == [["verify"]]
+    assert commands[0][1]["staging_only"] is staging_only, (
+        "release verification did not preserve the requested tier"
+    )
+
+
+def test_source_only_release_is_not_reused(tmp_path, monkeypatch) -> None:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "current-release.json").write_text(
+        json.dumps({"schema_version": 3, "deployable": False}), encoding="utf-8"
+    )
+    (dist / "current-attestation.json").write_text(
+        json.dumps({"source": {"git_commit": "a" * 40, "dirty": False}}),
+        encoding="utf-8",
+    )
+    (dist / "current-attestation.bundle.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "verify_prebuilt_release",
+        lambda *_args, **_kwargs: pytest.fail("source-only release was verified"),
+    )
+
+    assert (
+        admin_release_artifacts.load_reusable_signed_release(
+            type("Runner", (), {"dry_run": False})(),
+            repository_root=tmp_path,
+            state_dir=tmp_path,
+            region="us-east-1",
+            runtime_repository="repository",
+            runtime_profile="profile-a",
+            staging_only=False,
+            impact_base="origin/main",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    (
+        (0, "", True),
+        (254, "ImageNotFoundException", False),
+        (254, "RepositoryNotFoundException", False),
+    ),
+)
+def test_runtime_image_existence_is_checked(
+    monkeypatch, returncode, stderr, expected
+) -> None:
+    monkeypatch.setattr(
+        admin_release_artifacts.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, returncode, "", stderr
+        ),
+    )
+
+    assert (
+        admin_release_artifacts.runtime_image_exists(
+            region="us-east-1",
+            reference=(
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com/"
+                "gpu-fault/runtime@sha256:" + "a" * 64
+            ),
+        )
+        is expected
+    )
+
+
+def test_admin_release_rejects_dirty_source_before_reuse(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        admin_release_artifacts, "_git_output", lambda *_args: " M src/gpu_fault/api.py"
+    )
+
+    with pytest.raises(BootstrapError, match="clean source tree"):
+        admin_release_artifacts.build_signed_release(
+            type("Runner", (), {"dry_run": False})(),
+            repository_root=tmp_path,
+            state_dir=tmp_path,
+            region="us-east-1",
+            runtime_repository="repository",
+            cache_repository=None,
+            runtime_profile="profile-a",
+        )
+
+
+def test_staging_release_is_not_reused_for_a_different_impact_base(
+    tmp_path, monkeypatch
+) -> None:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "current-release.json").write_text(
+        json.dumps({"schema_version": 3, "deployable": True, "staging_only": True}),
+        encoding="utf-8",
+    )
+    (dist / "current-attestation.json").write_text(
+        json.dumps(
+            {
+                "source": {"git_commit": "a" * 40, "dirty": False},
+                "impact_base": "origin/old",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (dist / "current-attestation.bundle.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "verify_prebuilt_release",
+        lambda *_args, **_kwargs: pytest.fail(
+            "release with a different impact base was verified"
+        ),
+    )
+
+    assert (
+        admin_release_artifacts.load_reusable_signed_release(
+            type("Runner", (), {"dry_run": False})(),
+            repository_root=tmp_path,
+            state_dir=tmp_path,
+            region="us-east-1",
+            runtime_repository="repository",
+            runtime_profile="profile-a",
+            staging_only=True,
+            impact_base="origin/new",
+        )
+        is None
+    )
 
 
 def test_legacy_bootstrap_state_revalidates_exclusive_resources(tmp_path) -> None:
@@ -727,3 +999,36 @@ def test_existing_gpu_context_matches_discovered_identity() -> None:
     }
 
     assert existing_gpu_context(site, cluster) == "stable-context"
+
+
+def test_existing_site_rejects_cluster_identity_changes() -> None:
+    cpu = _cluster()
+    gpu = replace(
+        _cluster(),
+        role="gpu",
+        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+        hyperpod_name="gpu-a",
+    )
+    existing = {
+        "spec": {
+            "cpu": {"eksArn": cpu.eks_arn, "hyperpodClusterName": cpu.hyperpod_name},
+            "clusters": [
+                {"eksClusterArn": gpu.eks_arn, "hyperpodClusterName": gpu.hyperpod_name}
+            ],
+        }
+    }
+
+    validate_existing_cluster_identity(existing, cpu=cpu, gpu_clusters=[gpu])
+
+    with pytest.raises(BootstrapError, match="cluster identity differs"):
+        validate_existing_cluster_identity(
+            existing,
+            cpu=cpu,
+            gpu_clusters=[
+                replace(
+                    gpu,
+                    eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
+                    hyperpod_name="gpu-b",
+                )
+            ],
+        )

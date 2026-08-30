@@ -107,6 +107,48 @@ def preserve_existing_site_contract(
     return generated
 
 
+def validate_existing_cluster_identity(
+    site: Mapping[str, Any] | None,
+    *,
+    cpu: ClusterIdentity,
+    gpu_clusters: Sequence[ClusterIdentity],
+) -> None:
+    if not site:
+        return
+    spec = site.get("spec")
+    if not isinstance(spec, dict):
+        raise BootstrapError("existing site has no valid cluster identity")
+    cpu_value = spec.get("cpu")
+    clusters_value = spec.get("clusters")
+    if not isinstance(cpu_value, dict) or not isinstance(clusters_value, list):
+        raise BootstrapError("existing site has no valid cluster identity")
+    existing_cpu = (
+        str(cpu_value.get("eksArn") or ""),
+        str(cpu_value.get("hyperpodClusterName") or ""),
+    )
+    requested_cpu = (cpu.eks_arn, cpu.hyperpod_name)
+    existing_gpu = sorted(
+        (
+            str(item.get("eksClusterArn") or ""),
+            str(item.get("hyperpodClusterName") or ""),
+        )
+        for item in clusters_value
+        if isinstance(item, dict)
+    )
+    requested_gpu = sorted(
+        (cluster.eks_arn, cluster.hyperpod_name) for cluster in gpu_clusters
+    )
+    if (
+        existing_cpu != requested_cpu
+        or len(existing_gpu) != len(clusters_value)
+        or existing_gpu != requested_gpu
+    ):
+        raise BootstrapError(
+            "requested cluster identity differs from the existing site; "
+            "use join-cluster or remove-cluster for topology changes"
+        )
+
+
 def discover_bootstrap_scope(
     *,
     request: BootstrapRequest,
@@ -146,6 +188,11 @@ def discover_bootstrap_scope(
                 1,
             )
         ]
+    validate_existing_cluster_identity(
+        existing,
+        cpu=cpu,
+        gpu_clusters=gpu_clusters,
+    )
     return existing, cpu, gpu_clusters
 
 

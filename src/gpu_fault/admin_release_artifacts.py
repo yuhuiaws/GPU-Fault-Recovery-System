@@ -35,6 +35,124 @@ def _private_file(path: Path, description: str) -> Path:
     return resolved
 
 
+def _git_output(root: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", *arguments],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode:
+        raise BootstrapError(
+            f"git command failed while checking release source: "
+            f"{(completed.stderr or '').strip()}"
+        )
+    return (completed.stdout or "").strip()
+
+
+def load_reusable_signed_release(
+    runner: CommandRunner,
+    *,
+    repository_root: Path,
+    state_dir: Path,
+    region: str,
+    runtime_repository: str,
+    runtime_profile: str,
+    staging_only: bool,
+    impact_base: str,
+    cosign_public_key: Path | None = None,
+) -> dict[str, Any] | None:
+    manifest = repository_root / "dist/current-release.json"
+    attestation = repository_root / "dist/current-attestation.json"
+    bundle = repository_root / "dist/current-attestation.bundle.json"
+    required = (manifest, attestation, bundle)
+    if not all(path.is_file() for path in required):
+        return None
+    try:
+        manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+        value = json.loads(attestation.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    manifest_tier = (
+        manifest_value.get("staging_only", False)
+        if isinstance(manifest_value, dict)
+        else None
+    )
+    if (
+        not isinstance(manifest_value, dict)
+        or int(manifest_value.get("schema_version", 0)) < 3
+        or manifest_value.get("deployable") is not True
+        or not isinstance(manifest_tier, bool)
+        or manifest_tier is not staging_only
+    ):
+        return None
+    source = value.get("source") if isinstance(value, dict) else None
+    if not isinstance(source, dict) or source.get("dirty") is not False:
+        return None
+    if staging_only and value.get("impact_base") != impact_base:
+        return None
+    current_commit = _git_output(repository_root, "rev-parse", "HEAD")
+    if str(source.get("git_commit") or "") != current_commit:
+        return None
+    verify_prebuilt_release(
+        runner,
+        repository_root=repository_root,
+        state_dir=state_dir,
+        cosign_public_key=cosign_public_key,
+        staging_only=staging_only,
+    )
+    release = load_prebuilt_release(
+        runner,
+        repository_root=repository_root,
+        runtime_profile=runtime_profile,
+        allow_staging=staging_only,
+    )
+    runtime_reference = str(release["images"]["runtime"])
+    if not runtime_reference.startswith(runtime_repository.rstrip("/") + "@sha256:"):
+        return None
+    if not runtime_image_exists(region=region, reference=runtime_reference):
+        return None
+    return {**release, "release_reused": True}
+
+
+def runtime_image_exists(*, region: str, reference: str) -> bool:
+    repository_uri, separator, digest = reference.partition("@")
+    registry, slash, repository_name = repository_uri.partition("/")
+    if (
+        not separator
+        or not slash
+        or not registry
+        or not repository_name
+        or not digest.startswith("sha256:")
+    ):
+        raise BootstrapError("signed runtime image reference is invalid")
+    completed = subprocess.run(
+        [
+            "aws",
+            "ecr",
+            "describe-images",
+            "--region",
+            region,
+            "--repository-name",
+            repository_name,
+            "--image-ids",
+            f"imageDigest={digest}",
+            "--output",
+            "json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode == 0:
+        return True
+    error = (completed.stderr or "").strip()
+    if "ImageNotFoundException" in error or "RepositoryNotFoundException" in error:
+        return False
+    raise BootstrapError(f"cannot verify signed runtime image: {error}")
+
+
 @contextmanager
 def isolated_postgres_url(runner: CommandRunner) -> Iterator[str]:
     configured = os.getenv("GPU_FAULT_TEST_POSTGRES_URL", "").strip()
@@ -97,6 +215,7 @@ def verify_prebuilt_release(
     repository_root: Path,
     state_dir: Path,
     cosign_public_key: Path | None = None,
+    staging_only: bool = False,
 ) -> None:
     if runner.dry_run:
         return
@@ -122,6 +241,7 @@ def verify_prebuilt_release(
             str(bundle),
             "--cosign-key",
             str(public_key),
+            *(["--allow-staging-release"] if staging_only else []),
         ],
         cwd=repository_root,
     )
@@ -139,13 +259,38 @@ def build_signed_release(
     cosign_signing_key: Path | None = None,
     cosign_public_key: Path | None = None,
     cosign_password_file: Path | None = None,
+    staging_only: bool = False,
+    impact_base: str = "origin/main",
 ) -> dict[str, Any]:
+    if staging_only and not impact_base.strip():
+        raise BootstrapError("staging release requires a non-empty impact base")
     if runner.dry_run:
         return load_prebuilt_release(
             runner,
             repository_root=repository_root,
             runtime_profile=runtime_profile,
+            allow_staging=staging_only,
         )
+    if _git_output(
+        repository_root,
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+    ):
+        raise BootstrapError("release build requires a clean source tree")
+    reusable = load_reusable_signed_release(
+        runner,
+        repository_root=repository_root,
+        state_dir=state_dir,
+        region=region,
+        runtime_repository=runtime_repository,
+        runtime_profile=runtime_profile,
+        staging_only=staging_only,
+        impact_base=impact_base,
+        cosign_public_key=cosign_public_key,
+    )
+    if reusable is not None:
+        return reusable
     signing_dir = state_dir / "release-signing"
     signing_key = _private_file(
         cosign_signing_key or signing_dir / "cosign.key",
@@ -189,10 +334,12 @@ def build_signed_release(
     command = [
         "make",
         f"PYTHON={sys.executable}",
-        "release-build",
+        "release-build-staging" if staging_only else "release-build",
         f"RUNTIME_IMAGE_REPOSITORY={runtime_repository}",
         f"COSIGN_SIGNING_KEY={signing_key}",
     ]
+    if staging_only:
+        command.append(f"BASE={impact_base}")
     if cache_repository:
         cache_ref = f"{cache_repository}:buildcache-linux-amd64"
         command.extend(
@@ -224,12 +371,15 @@ def build_signed_release(
         repository_root=repository_root,
         state_dir=state_dir,
         cosign_public_key=cosign_public_key,
+        staging_only=staging_only,
     )
-    return load_prebuilt_release(
+    release = load_prebuilt_release(
         runner,
         repository_root=repository_root,
         runtime_profile=runtime_profile,
+        allow_staging=staging_only,
     )
+    return {**release, "release_reused": False}
 
 
 def load_prebuilt_release(
@@ -237,6 +387,7 @@ def load_prebuilt_release(
     *,
     repository_root: Path,
     runtime_profile: str,
+    allow_staging: bool = False,
 ) -> dict[str, Any]:
     manifest = repository_root / "dist/current-release.json"
     if runner.dry_run:
@@ -250,6 +401,7 @@ def load_prebuilt_release(
                 "adot": DEFAULT_ADOT_IMAGE_AMD64,
             },
             "agent_config_digest": "0" * 64,
+            "staging_only": allow_staging,
         }
     if not manifest.is_file():
         raise BootstrapError(
@@ -264,6 +416,14 @@ def load_prebuilt_release(
         or release.get("deployable") is not True
     ):
         raise BootstrapError("ARN bootstrap requires a deployable schema v3 release")
+    tier = release.get("staging_only", False)
+    if not isinstance(tier, bool):
+        raise BootstrapError("release manifest staging_only must be a boolean")
+    staging_only = tier
+    if staging_only and not allow_staging:
+        raise BootstrapError(
+            "staging-only release requires explicit staging authorization"
+        )
     images = dict((release.get("delivery") or {}).get("images") or {})
     required_images = {
         name: str((images.get(name) or {}).get("reference") or "")
@@ -280,4 +440,5 @@ def load_prebuilt_release(
             repository_root=repository_root,
             runtime_profile_version=runtime_profile,
         ),
+        "staging_only": staging_only,
     }

@@ -426,7 +426,11 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
         ],
         repo_root=tmp_path / "repo",
         state_dir=tmp_path / "state",
-        alert_email=None,
+        alert_email="operations@example.com",
+        profile_approval="CHG-12345",
+        staging_only_release=True,
+        impact_base="origin/release",
+        prepared_source_release=True,
         show_effective_config=False,
     )
 
@@ -438,10 +442,70 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
     assert "--prebuilt-attestation" in calls[0]
     assert "--prebuilt-bundle" in calls[0]
     assert "--cosign-key" in calls[0]
+    assert "--profile-approval" in calls[0]
+    assert "CHG-12345" in calls[0]
+    assert "--allow-staging-release" in calls[0]
     assert requests[0].gpu_cluster_arns == (
         "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a",
         "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-b",
     )
+    assert requests[0].staging_only_release is True
+    assert requests[0].impact_base == "origin/release"
+
+
+def test_public_arn_deploy_delegates_to_internal_source_preparation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        admin_cli, "run_source_deploy", lambda **kwargs: calls.append(kwargs) or 0
+    )
+    monkeypatch.chdir(tmp_path)
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--cpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--admin-email",
+            "operations@example.com",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert calls[0]["state_dir"] == tmp_path / "state"
+    assert calls[0]["admin_email"] == "operations@example.com"
+    assert calls[0]["gpu_cluster_arns"] == (
+        "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
+    )
+
+
+def test_public_deploy_help_only_exposes_four_inputs(capsys) -> None:
+    with pytest.raises(SystemExit, match="0"):
+        admin_cli.parser().parse_args(["deploy", "--help"])
+
+    help_text = capsys.readouterr().out
+    for value in (
+        "--cpu-cluster-arn",
+        "--gpu-cluster-arn",
+        "--state-dir",
+        "--admin-email",
+    ):
+        assert value in help_text
+    for value in (
+        "--file",
+        "--repo-root",
+        "--release-ref",
+        "--profile-approval",
+        "--staging-only-release",
+        "--impact-base",
+        "--prepared-source-release",
+        "--email-sender",
+    ):
+        assert value not in help_text
 
 
 def test_arn_only_deploy_requires_private_state_dir(tmp_path: Path) -> None:
@@ -458,6 +522,23 @@ def test_arn_only_deploy_requires_private_state_dir(tmp_path: Path) -> None:
     )
 
     with pytest.raises(SiteConfigError, match="requires --state-dir"):
+        admin_cli.run(arguments)
+
+
+def test_arn_only_deploy_requires_admin_email(tmp_path: Path) -> None:
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--cpu-cluster-arn",
+            "arn:aws:sagemaker:us-east-1:123456789012:cluster/cpu",
+            "--gpu-cluster-arn",
+            "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ]
+    )
+
+    with pytest.raises(SiteConfigError, match="requires --admin-email"):
         admin_cli.run(arguments)
 
 

@@ -72,7 +72,7 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 - [概要设计](docs/概要设计.md) / [概要设计 v2](docs/概要设计-v2.md)
 - [详细设计](docs/详细设计.md) / [详细设计 v2](docs/详细设计-v2.md)
 - [NVIDIA 策略供应链与实现](docs/components/nvidia-policy.md) / [部署和运维详细参考](docs/部署和运维手册.md) / [逐章解读](docs/部署和运维手册逐章解读.md)
-- [开发者发布与测试流程](docs/开发者发布测试流程.md) / [CI 发布流程](docs/CI发布流程.md) / [开发者部署实现](docs/开发者部署实现.md)
+- [EC2源码统一部署流程](docs/EC2源码Staging复现流程.md) / [CI 发布流程](docs/CI发布流程.md) / [开发者部署实现](docs/开发者部署实现.md)
 - [环境变量参考](docs/管理员环境变量参考.md) / [性能压测验收方案](docs/性能压测验收方案.md) / [扩展指南](docs/扩展指南.md)
 - [Collector说明](COLLECTORS.md) / [训练任务示例](examples/README.md) / [部署目录](deploy/README.md) / [脚本与工具](scripts/README.md)
 
@@ -83,10 +83,10 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 ```bash
 scripts/setup-deploy-host.sh --venv .venv --allow-network
 . .venv/bin/activate
-make check
+make PYTHON=.venv/bin/python check
 ```
 
-生产部署机必须使用签名离线bundle，见[部署机初始化](docs/部署机初始化.md)。
+生产部署机必须使用CI生成并验签的离线bundle，见[CI 发布流程](docs/CI发布流程.md)。
 
 需要手工逐项执行时，建议按以下顺序：
 
@@ -106,6 +106,9 @@ make test-parallel
 
 ## 部署：先区分角色
 
+单EC2源码staging、首次建站、失败续跑和后续升级统一使用四参数
+`gpu-fault-admin deploy`，具体见文档入口。
+
 所有生产部署开始前必须满足以下共同前提：
 
 1. 一个已有且至少有3个Ready节点的CPU EKS/HyperPod集群。
@@ -123,92 +126,74 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 ```
 
-多个GPU集群重复传`--gpu-cluster-arn`。命令自动创建/复用ECR和站点AWS资源、运行release build并push/sign、生成`site.yaml`，随后preflight、deploy和verify。
+多个GPU集群重复传`--gpu-cluster-arn`。命令自动判断首次或后续部署，内部管理release、
+签名、bundle、venv和site，并完成preflight、deploy/upgrade、verify与stability。
 
 ### 开发者：修改代码或Profile后发布
 
-已有站点的代码候选仍可显式执行build和签名release升级：
+源码staging首次部署、dirty迭代、失败续跑和clean commit验证统一使用：
 
 ```bash
-COSIGN_SIGNING_KEY=/secure/release/cosign.key \
-make PYTHON=.venv/bin/python release-build \
-  RUNTIME_IMAGE_REPOSITORY=<registry/repository>
-
-make PYTHON=.venv/bin/python release-deploy \
-  SITE=/secure/gpu-fault/site.yaml \
-  COSIGN_KEY=/secure/release/cosign.pub
+gpu-fault-admin deploy \
+  --cpu-cluster-arn <cpu-arn> \
+  --gpu-cluster-arn <gpu-arn> \
+  --state-dir /secure/gpu-fault-staging \
+  --admin-email <operations-email>
 ```
 
-`release-build`按完整image input digest复用或build/push OCI并签名`dist/current-*`；
-`release-deploy`只消费签名制品。CI keyless签名时使用固定certificate identity和issuer。
-
-修改Profile策略时，在上述`release-deploy`命令前追加审批引用：
-
-```bash
-PROFILE_APPROVAL=CHG-12345 \
-make PYTHON=.venv/bin/python release-deploy ...
-```
-
-未提供审批时首次运行只生成`profile-plan.json`并停止。部署机验签后执行
-`deploy -> verify -> stability -> release-summary`，保存`verification-report.json`和
-`stability-report.json`；`NOOP`记录`SKIPPED_NOOP`并跳过稳定窗口。普通代码发布不需要
-`PROFILE_APPROVAL`，且不得手工修改generated Manifest、artifact摘要或Profile版本。
-完整实现见[开发者部署实现](docs/开发者部署实现.md)。
+dirty工作区由内部准备器转成隔离的`staging_only`快照并执行影响测试；clean commit执行
+完整生产门禁。用户不提供release-ref、artifact、site、bundle或venv路径。完整流程见
+[EC2源码统一部署流程](docs/EC2源码Staging复现流程.md)。
 
 ### 管理员：首次部署和日常管理
 
-管理员使用`gpu-fault-admin deploy --cpu-cluster-arn ... --gpu-cluster-arn ...`
-`--state-dir /secure/gpu-fault --admin-email ...`；`make release-deploy
-CPU_CLUSTER_ARN=...`是同一入口的包装。Region由集群ARN推导并要求全部一致。
+管理员首次和后续部署都重复同一条四参数命令。Region由集群ARN推导并要求全部一致；
+已有站点会先验证CPU/GPU身份集合未变化，再验签并执行upgrade。
 
 #### 1. 首次部署
 
-`/secure/gpu-fault/release-signing/`必须预置权限受控的cosign key、password和public
-key。首次站点基础资源统一由ARN管理员入口创建和纳管。
+签名材料由内部准备器在私有state中生成或复用，不进入公共参数。首次站点基础资源统一
+由ARN管理员入口创建和纳管。
 
-#### 2. 已有站点的单命令操作
+#### 2. 已有站点升级
 
-以下每项都是独立的管理员入口：
+继续使用与首次部署完全相同的命令，不提供内部生成的site路径：
 
 ```bash
-SITE=/secure/gpu-fault/site.yaml
+gpu-fault-admin deploy \
+  --cpu-cluster-arn <cpu-arn> \
+  --gpu-cluster-arn <gpu-arn> \
+  --state-dir /secure/gpu-fault \
+  --admin-email <operations-email>
+```
 
-# 预置条件检查：只读，不修改AWS或Kubernetes
-gpu-fault-admin preflight -f "${SITE}"
+其他生命周期操作仍使用受检管理员子命令：
 
-# 首次应用部署或部署升级：自动preflight并按release差异最小滚动
-gpu-fault-admin deploy -f "${SITE}"
-
-# 独立验收：只读验证CPU/GPU、Profile、TLS/NLB、Agent和Aurora
-gpu-fault-admin verify -f "${SITE}"
-
-# 查看当前健康、release、Profile和各集群状态
-gpu-fault-admin status -f "${SITE}"
-
+```bash
 # 注册一个已有GPU集群
-gpu-fault-admin join-cluster -f "${SITE}" --gpu-cluster-arn <gpu-arn>
+gpu-fault-admin join-cluster -f /secure/gpu-fault/site.yaml \
+  --gpu-cluster-arn <gpu-arn>
 
 # 注销一个GPU集群；保留该GPU EKS/HyperPod和其他集群
-gpu-fault-admin remove-cluster -f "${SITE}" \
+gpu-fault-admin remove-cluster -f /secure/gpu-fault/site.yaml \
   --cluster-id <cluster-id> --confirm REMOVE_GPU_CLUSTER
 
 # 卸载整个方案控制面和数据面，但保留底层CPU/GPU集群
-gpu-fault-admin uninstall -f "${SITE}" \
+gpu-fault-admin uninstall -f /secure/gpu-fault/site.yaml \
   --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT
 ```
 
 若永久退役并连底层CPU EKS/HyperPod集群一起删除，使用更强确认：
 
 ```bash
-gpu-fault-admin uninstall -f "${SITE}" \
+gpu-fault-admin uninstall -f /secure/gpu-fault/site.yaml \
   --cpu-cluster delete \
   --aurora-final-snapshot retain \
   --confirm DELETE_CPU_CONTROL_PLANE
 ```
 
-GPU EKS/HyperPod始终保留。`deploy`失败或自动回滚后使用相同命令重跑；`join-cluster`和
-`remove-cluster`也通过持久状态幂等续跑。已有site的`deploy -f`不会重新构建当前
-checkout，只应用site声明的release；代码或Profile变更必须先进入开发者发布入口。
+GPU EKS/HyperPod始终保留。`deploy`失败或自动回滚后使用相同四参数命令重跑；
+`join-cluster`和`remove-cluster`也通过持久状态幂等续跑。
 详细升级、排障和退役规则见
 [管理员日常运维](docs/管理员日常运维.md)，逐对象审计和break-glass见
 [部署和运维详细参考](docs/部署和运维手册.md)。

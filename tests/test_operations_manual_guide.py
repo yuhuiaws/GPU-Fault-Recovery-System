@@ -41,9 +41,17 @@ def test_operator_document_layers_publish_a_single_normal_path() -> None:
         assert path.is_file(), f"missing operator document: {path.name}"
         assert path.name in manual
 
-    for command in ("preflight", "deploy", "verify", "status"):
-        assert f"gpu-fault-admin {command} -f" in quickstart
-    assert "config/site.example.yaml" in quickstart
+    for value in (
+        "gpu-fault-admin deploy",
+        "--cpu-cluster-arn",
+        "--gpu-cluster-arn",
+        "--state-dir",
+        "--admin-email",
+        "不提供release-ref、artifact、site",
+    ):
+        assert value in quickstart
+    assert "gpu-fault-admin deploy -f" not in quickstart
+    assert "config/site.example.yaml" not in quickstart
     assert "## 10. 后续运维入口" in quickstart
     assert "[管理员日常运维](管理员日常运维.md)" in quickstart
     assert len(quickstart.splitlines()) <= 300

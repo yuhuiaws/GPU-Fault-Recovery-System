@@ -12,6 +12,18 @@ class ReleaseAttestationError(ValueError):
     pass
 
 
+PRODUCTION_QUALITY_GATES = (
+    "make check",
+    "make test-postgres-stress",
+)
+STAGING_QUALITY_GATES = (
+    "make public-release-check",
+    "make test-impact",
+    "make regional-impact-plan",
+    "pytest tests/test_artifact_consistency.py",
+)
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -46,7 +58,11 @@ def source_state(root: Path) -> dict[str, Any]:
     }
 
 
-def load_manifest(path: Path) -> dict[str, Any]:
+def load_manifest(
+    path: Path,
+    *,
+    allow_staging: bool = False,
+) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or int(value.get("schema_version", 0)) < 3:
         raise ReleaseAttestationError(
@@ -59,14 +75,40 @@ def load_manifest(path: Path) -> dict[str, Any]:
     release_id = str(value.get("release_id") or "")
     if not release_id:
         raise ReleaseAttestationError("release manifest has no release_id")
+    tier = value.get("staging_only", False)
+    if not isinstance(tier, bool):
+        raise ReleaseAttestationError("release manifest staging_only must be a boolean")
+    if tier and not allow_staging:
+        raise ReleaseAttestationError(
+            "staging-only release requires explicit staging authorization"
+        )
     return value
 
 
-def build_attestation(root: Path, manifest_path: Path) -> dict[str, Any]:
-    manifest = load_manifest(manifest_path)
+def build_attestation(
+    root: Path,
+    manifest_path: Path,
+    *,
+    staging_only: bool = False,
+    impact_base: str | None = None,
+) -> dict[str, Any]:
+    manifest = load_manifest(manifest_path, allow_staging=staging_only)
+    if manifest.get("staging_only", False) is not staging_only:
+        raise ReleaseAttestationError(
+            "release manifest tier does not match attestation mode"
+        )
+    if staging_only and not impact_base:
+        raise ReleaseAttestationError(
+            "staging attestation requires an impact test base"
+        )
+    if not staging_only and impact_base is not None:
+        raise ReleaseAttestationError(
+            "production attestation must not declare an impact test base"
+        )
     state = source_state(root)
-    return {
+    result = {
         "schema_version": 1,
+        "release_tier": "staging" if staging_only else "production",
         "subject": {
             "release_id": manifest["release_id"],
             "manifest": str(manifest_path.relative_to(root)),
@@ -75,16 +117,15 @@ def build_attestation(root: Path, manifest_path: Path) -> dict[str, Any]:
         },
         "source": state,
         "quality_gates": [
-            {
-                "command": "make check",
-                "status": "PASSED",
-            },
-            {
-                "command": "make test-postgres-stress",
-                "status": "PASSED",
-            },
+            {"command": command, "status": "PASSED"}
+            for command in (
+                STAGING_QUALITY_GATES if staging_only else PRODUCTION_QUALITY_GATES
+            )
         ],
     }
+    if impact_base is not None:
+        result["impact_base"] = impact_base
+    return result
 
 
 def verify_attestation(
@@ -97,6 +138,7 @@ def verify_attestation(
     certificate: Path | None,
     certificate_identity: str | None,
     certificate_oidc_issuer: str | None,
+    allow_staging: bool = False,
 ) -> dict[str, Any]:
     value = json.loads(attestation_path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or value.get("schema_version") != 1:
@@ -107,18 +149,32 @@ def verify_attestation(
         manifest_path.relative_to(root)
     except ValueError as exc:
         raise ReleaseAttestationError("attested manifest leaves repository") from exc
-    manifest = load_manifest(manifest_path)
+    manifest = load_manifest(manifest_path, allow_staging=allow_staging)
     if sha256(manifest_path) != subject.get("manifest_sha256"):
         raise ReleaseAttestationError("release manifest SHA-256 does not match")
     if manifest["release_id"] != subject.get("release_id"):
         raise ReleaseAttestationError("attested release_id does not match")
     if manifest["delivery"]["sha256"] != subject.get("delivery_sha256"):
         raise ReleaseAttestationError("attested delivery identity does not match")
+    staging_only = manifest.get("staging_only") is True
+    expected_tier = "staging" if staging_only else "production"
+    if value.get("release_tier", "production") != expected_tier:
+        raise ReleaseAttestationError("attestation release tier does not match")
+    impact_base = value.get("impact_base")
+    if staging_only and (not isinstance(impact_base, str) or not impact_base.strip()):
+        raise ReleaseAttestationError("staging attestation has no impact test base")
+    if not staging_only and impact_base is not None:
+        raise ReleaseAttestationError(
+            "production attestation declares a staging impact test base"
+        )
+    expected_commands = set(
+        STAGING_QUALITY_GATES if staging_only else PRODUCTION_QUALITY_GATES
+    )
     gates = value.get("quality_gates")
     if (
         not isinstance(gates, list)
         or {str(item.get("command")) for item in gates if isinstance(item, dict)}
-        != {"make check", "make test-postgres-stress"}
+        != expected_commands
         or any(
             not isinstance(item, dict) or item.get("status") != "PASSED"
             for item in gates

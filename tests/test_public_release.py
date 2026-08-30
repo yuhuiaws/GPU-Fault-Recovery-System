@@ -34,6 +34,31 @@ def test_repository_public_tree_contains_no_site_identity() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_public_release_scan_uses_git_without_python_pathspec(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / ".gitignore").write_text("/ignored/\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("public documentation\n", encoding="utf-8")
+    ignored = tmp_path / "ignored"
+    ignored.mkdir()
+    (ignored / "live.md").write_text("node i-0305bbcc538883eb6\n", encoding="utf-8")
+
+    command = (
+        "import runpy,sys;"
+        "sys.modules['pathspec']=None;"
+        f"sys.argv=['check-public-release.py','--root',{str(tmp_path)!r}];"
+        f"runpy.run_path({str(SCRIPT)!r},run_name='__main__')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     ("content", "message"),
     [

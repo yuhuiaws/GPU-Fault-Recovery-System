@@ -88,6 +88,7 @@ def _existing_release(
     release_id: str,
     hashes: dict[str, str],
     delivery_sha256: str,
+    staging_only: bool,
 ) -> tuple[dict[str, object], str] | None:
     manifest_path = release_dir / "release.json"
     if not manifest_path.is_file():
@@ -109,6 +110,8 @@ def _existing_release(
         raise RuntimeError(f"content-addressed bundle collision: {release_id}")
     if (manifest.get("delivery") or {}).get("sha256") != delivery_sha256:
         raise RuntimeError(f"content-addressed delivery collision: {release_id}")
+    if manifest.get("staging_only", False) is not staging_only:
+        raise RuntimeError(f"content-addressed release tier collision: {release_id}")
     for name, digest in expected.items():
         wheel = ROOT / str((components[name] or {})["wheel"])
         if not wheel.is_file() or sha256(wheel) != digest:
@@ -125,6 +128,7 @@ def _publish_release(
     release_id: str,
     hashes: dict[str, str],
     delivery_sha256: str,
+    staging_only: bool,
     manifest: dict[str, object],
     content: str,
 ) -> tuple[dict[str, object], str]:
@@ -134,6 +138,7 @@ def _publish_release(
         release_id=release_id,
         hashes=hashes,
         delivery_sha256=delivery_sha256,
+        staging_only=staging_only,
     )
     staged_release = staging / release_id
     if existing is None:
@@ -155,6 +160,7 @@ def build(
     python: str,
     *,
     runtime_image_descriptor: Path | None = None,
+    staging_only: bool = False,
 ) -> dict[str, object]:
     python = resolve_python_executable(python)
     delivery = build_release_identity(ROOT)
@@ -221,12 +227,15 @@ def build(
                 hashes=hashes,
                 module_digests=module_digests,
             )
+        release_identity = {
+            "artifacts": hashes,
+            "delivery": delivery["sha256"],
+        }
+        if staging_only:
+            release_identity["staging_only"] = True
         release_id = hashlib.sha256(
             json.dumps(
-                {
-                    "artifacts": hashes,
-                    "delivery": delivery["sha256"],
-                },
+                release_identity,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
@@ -284,6 +293,7 @@ def build(
         manifest: dict[str, object] = {
             "schema_version": 3,
             "deployable": bool(delivery["runtime_prebuilt"]),
+            "staging_only": staging_only,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "version": project_version(),
             "release_id": release_id,
@@ -333,6 +343,7 @@ def build(
             release_id=release_id,
             hashes=hashes,
             delivery_sha256=str(delivery["sha256"]),
+            staging_only=staging_only,
             manifest=manifest,
             content=content,
         )
@@ -350,6 +361,7 @@ def main() -> int:
         "--runtime-image-descriptor",
         type=Path,
     )
+    parser.add_argument("--staging-only", action="store_true")
     args = parser.parse_args()
     manifest = build(
         args.python,
@@ -358,6 +370,7 @@ def main() -> int:
             if args.runtime_image_descriptor is not None
             else None
         ),
+        staging_only=args.staging_only,
     )
     print(
         "release_id={release_id}\n"

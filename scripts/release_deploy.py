@@ -1081,6 +1081,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cosign-key")
     parser.add_argument("--certificate-identity")
     parser.add_argument("--certificate-oidc-issuer")
+    parser.add_argument(
+        "--allow-staging-release",
+        action="store_true",
+        help="allow a staging-only signed release; never use for production",
+    )
     return parser
 
 
@@ -1113,6 +1118,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             certificate_identity=arguments.certificate_identity,
             certificate_oidc_issuer=(arguments.certificate_oidc_issuer),
+            allow_staging=arguments.allow_staging_release,
         )
         _manifest, current_release_id = _release_manifest(ROOT)
         subject = dict(attestation.get("subject") or {})

@@ -140,15 +140,21 @@ rules:
       - deploy/control-plane/regional/**
       - deploy/control-plane/tools/**
       - src/gpu_fault/admin_release_artifacts.py
+      - src/gpu_fault/admin_source_deploy.py
       - src/gpu_fault/admin_site.py
       - src/gpu_fault/fleet_deployment.py
       - scripts/capture_release_evidence.py
       - scripts/release_deploy.py
+      - scripts/staging_deploy.py
+      - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
+      - tests/test_staging_deploy.py
       - tests/regional/test_*release*.py
       - tests/test_artifact_consistency.py
     pytest:
+      - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
+      - tests/test_staging_deploy.py
       - tests/regional/test_regional_release_orchestrator.py
       - tests/regional/test_regional_release_resume.py
       - tests/regional/test_release_diff.py
@@ -171,6 +177,7 @@ rules:
     description: Bootstrap, join/remove, cleanup registry, and installation resources.
     paths:
       - src/gpu_fault/admin_bootstrap*.py
+      - src/gpu_fault/admin_source_deploy.py
       - src/gpu_fault/admin_cluster_*.py
       - src/gpu_fault/admin_uninstall.py
       - src/gpu_fault/admin_resource_registry.py
@@ -180,14 +187,19 @@ rules:
       - deploy/control-plane/regional/cleanup-inventory.json
       - deploy/control-plane/tools/*installed_resource_registry.py
       - scripts/generate-cleanup-inventory.py
+      - scripts/staging_deploy.py
       - tests/admin/test_admin_bootstrap.py
+      - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_admin_cluster_*.py
+      - tests/test_staging_deploy.py
       - tests/regional/test_installed_resource_registry.py
       - tests/regional/test_cleanup_*.py
     pytest:
       - tests/admin/test_admin_bootstrap.py
+      - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_admin_cluster_join.py
       - tests/admin/test_admin_cluster_removal.py
+      - tests/test_staging_deploy.py
       - tests/regional/test_installed_resource_registry.py
       - tests/regional/test_cleanup_inventory.py
       - tests/regional/test_cleanup_state.py

@@ -42,7 +42,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_reconnect.py \
 	tests/store/test_store_contracts.py
 
-.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check runtime-image-check release-build release-preflight release-deploy deploy-host-bundle deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
@@ -286,6 +286,40 @@ release-build:
 	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
 		$(PYTHON) -m pytest tests/test_artifact_consistency.py
 	$(PYTHON) scripts/build-release-attestation.py
+	$(COSIGN) sign-blob --yes \
+		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
+		"$(RELEASE_ATTESTATION)" >/dev/null
+
+release-build-staging:
+	@test -n "$(RUNTIME_IMAGE_REPOSITORY)" || \
+		(printf 'RUNTIME_IMAGE_REPOSITORY is required\n' >&2; exit 2)
+	@test -n "$${GPU_FAULT_TEST_POSTGRES_URL}" || \
+		(printf 'GPU_FAULT_TEST_POSTGRES_URL is required\n' >&2; exit 2)
+	@test -z "$$(git status --porcelain --untracked-files=normal)" || \
+		(printf 'release-build-staging requires a clean source tree\n' >&2; exit 2)
+	@command -v "$(COSIGN)" >/dev/null || \
+		(printf 'cosign is required\n' >&2; exit 2)
+	$(MAKE) public-release-check PYTHON="$(PYTHON)"
+	$(MAKE) test-impact BASE="$(BASE)" PYTHON="$(PYTHON)"
+	$(MAKE) regional-impact-plan BASE="$(BASE)" PYTHON="$(PYTHON)"
+	$(PYTHON) scripts/build-release-runtime-image.py \
+		--repository "$(RUNTIME_IMAGE_REPOSITORY)" \
+		--platform "$(RUNTIME_IMAGE_PLATFORM)" \
+		$(foreach arg,$(RUNTIME_IMAGE_BUILD_ARGS),--build-arg "$(arg)") \
+		$(if $(RUNTIME_IMAGE_CACHE_FROM),--cache-from "$(RUNTIME_IMAGE_CACHE_FROM)",) \
+		$(if $(RUNTIME_IMAGE_CACHE_TO),--cache-to "$(RUNTIME_IMAGE_CACHE_TO)",) \
+		$(if $(filter true yes 1,$(RUNTIME_IMAGE_FORCE_REBUILD)),--force-rebuild,) \
+		--push
+	$(PYTHON) scripts/build-release-artifacts.py \
+		--python "$(PYTHON)" \
+		--runtime-image-descriptor dist/release-runtime-image.json \
+		--staging-only
+	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
+		$(PYTHON) -m pytest tests/test_artifact_consistency.py
+	$(PYTHON) scripts/build-release-attestation.py \
+		--staging-only \
+		--impact-base "$(BASE)"
 	$(COSIGN) sign-blob --yes \
 		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \

@@ -93,6 +93,8 @@ class BootstrapRequest:
     cosign_signing_key: Path | None = None
     cosign_public_key: Path | None = None
     cosign_password_file: Path | None = None
+    staging_only_release: bool = False
+    impact_base: str = "origin/main"
     dry_run: bool = False
 
 

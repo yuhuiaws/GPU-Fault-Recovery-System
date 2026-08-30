@@ -18,6 +18,10 @@ generic fault-case runner.
 - `build-deploy-host-bundle.py`, `deploy_host_bundle.py`,
   `setup_deploy_host.py` and `setup-deploy-host.sh`: build, verify and install
   the signed offline deployment-host Python environment.
+- `staging_deploy.py`: private source preparation invoked by
+  `gpu-fault-admin deploy`; it creates or reuses signing material, isolated
+  dirty-worktree commits, commit-bound deploy-host bundles and the internal
+  deployment venv. It is not a public command.
 - `release_deploy.py`: developer-facing build, site preparation, deploy,
   single-pass verify and lightweight release-summary pipeline used by
   `make release-deploy`. It persists both reports under the release state

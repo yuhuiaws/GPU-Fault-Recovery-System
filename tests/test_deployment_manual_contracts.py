@@ -214,10 +214,17 @@ def test_manual_separates_manifest_developer_and_operator_workflows() -> None:
     assert "本节只面向修改本方案源代码的开发者" in section
     assert "管理员/客户边界：不编写方案 Manifest" in section
     assert "开发者完整变更步骤" in section
-    for command in ("preflight", "deploy", "verify", "status"):
-        assert f"gpu-fault-admin {command} -f" in section
+    for value in (
+        "gpu-fault-admin deploy",
+        "--cpu-cluster-arn <cpu-arn>",
+        "--gpu-cluster-arn <gpu-arn>",
+        "--state-dir /secure/gpu-fault",
+        "--admin-email <operations-email>",
+    ):
+        assert value in section
+    assert "gpu-fault-admin deploy -f" not in section
     assert "site.yaml" in section
-    assert "低层 release JSON" in section
+    assert "低层release JSON" in section
     assert "deployment-contracts-update" in section
     assert "deployment-contracts-check" in section
     assert "make PYTHON=.venv/bin/python check" in section

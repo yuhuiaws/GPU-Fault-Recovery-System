@@ -15,25 +15,7 @@ version, and registered-cluster anchor. Bootstrap registers a missing profile;
 upgrade and join accept identical content but reject an in-place policy change
 under the same profile version.
 
-The normal administrator entrypoint is:
-
-```bash
-gpu-fault-admin preflight -f /secure/gpu-fault/site.yaml
-gpu-fault-admin deploy -f /secure/gpu-fault/site.yaml
-gpu-fault-admin verify -f /secure/gpu-fault/site.yaml
-gpu-fault-admin status -f /secure/gpu-fault/site.yaml
-gpu-fault-admin join-cluster -f /secure/gpu-fault/site.yaml \
-  --gpu-cluster-arn <existing-gpu-eks-or-hyperpod-arn>
-```
-
-Prepare the host first through the signed offline workflow in
-`docs/部署机初始化.md`; deployment commands validate but never install host tools.
-
-It validates `config/site.example.yaml`, materializes the low-level release
-JSON with mode `0600`, and reuses the regional rollout state machine. Direct
-rollout commands remain available for resume, rollback and break-glass.
-
-The supported first-install lifecycle is one ARN-driven command:
+The normal administrator deployment entrypoint is:
 
 ```bash
 gpu-fault-admin deploy \
@@ -43,10 +25,17 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 ```
 
-Repeat `--gpu-cluster-arn` for multiple GPU clusters. The command creates or
-reuses site-tagged AWS resources, builds/pushes/signs the release, writes the
-private `site.yaml`, and runs preflight/deploy/verify. `make release-deploy`
-with ARN variables delegates to the same CLI.
+Prepare the host first through the signed offline workflow documented in
+`docs/CI发布流程.md`; deployment commands validate but never install host tools.
+
+It validates `config/site.example.yaml`, materializes the low-level release
+JSON with mode `0600`, and reuses the regional rollout state machine. Direct
+rollout commands remain available for resume, rollback and break-glass.
+
+Repeat `--gpu-cluster-arn` for multiple GPU clusters. The same command handles
+first install and upgrades, creates or reuses site-tagged AWS resources,
+builds/pushes/signs the release, maintains the private internal site, and runs
+preflight/deploy/verify/stability.
 
 | Deployment surface | Directory | Entry point |
 |---|---|---|

@@ -13,6 +13,8 @@ manifest_inputs:
   - scripts/deploy_host_bundle.py
   - scripts/setup-deploy-host.sh
   - scripts/setup_deploy_host.py
+  - scripts/staging_deploy.py
+  - src/gpu_fault/admin_source_deploy.py
   - src/gpu_fault/data/deploy-host-tools.json
   - deploy/control-plane/base/control-plane-deployment.yaml
   - deploy/control-plane/base/role-split-input.kustomization.yaml
