@@ -21,11 +21,21 @@
 - HyperPod Slurm 编排当前不支持。
 - GPU 节点上的 systemd Agent 属于区域数据面，不是独立部署架构。
 
-## 部署建议与已验证环境
+## 部署建议、EC2部署机与已验证环境
 
-- **集群创建**：建议使用 AWS 管理控制台的 SageMaker HyperPod UI 分别创建 GPU 数据面集群和 CPU 控制面集群；创建完成后再用 `gpu-fault-admin` 部署本方案。
-- **测试基线**：当前故障采集、策略、隔离、恢复和验收主要在 AWS `ml.p5en.48xlarge` H200 GPU 实例上完成；其他实例类型需重新验证 GPU/EFA、驱动、DCGM 和互联拓扑。
-- **训练性能**：当前配置通常不影响已有训练性能，组件不使用 GPU 算力且 CPU/内存占用较少；节点默认每 15 秒进行 GPU/Host 轻量采样、每 60 秒上报 GPU inventory、每 5 秒检查 Fabric Manager 日志。
+- **集群创建**：建议从 SageMaker HyperPod UI 分别创建 GPU 数据面和 CPU 控制面集群，再用 `gpu-fault-admin` 部署本方案。
+- **职责分离**：推荐链路为“开发者/Codex工作区 -> GitHub Release CI构建和签名 -> 受控EC2部署机验签、部署和运维”。生产部署机不重新build签名release，也不作为日常源码开发机。
+- **EC2部署机**：使用专用CPU EC2，放在私有子网且无公网IP；通过SSM Session Manager访问，并启用IMDSv2、加密EBS、系统审计和受控出口。Python、Docker/Buildx、AWS CLI、Cosign、kubectl、Helm及可选Codex CLI应来自固定AMI或审核安装流程。
+- **IAM**：不要给EC2长期绑定`AdministratorAccess`。实例profile只承担SSM和受控制品读取；CI使用GitHub OIDC build角色，部署和运维通过STS临时承担独立的最小权限角色。首次bootstrap所需权限较广，也必须限制账号、Region、集群和方案资源，并保留break-glass审计。
+- **Codex边界**：Codex CLI是可选的开发、审阅和runbook助手，不是生产信任根。不得向其提示、日志或工作区写入token、私钥、数据库密码或kubeconfig内容；任何AWS/Kubernetes mutation仍需人工确认、维护窗口、停止条件和回滚方案。一台EC2合并开发/build/deploy只允许用于可销毁的隔离staging验证。
+- **Codex安装**：按[官方Codex CLI文档](https://developers.openai.com/codex/cli)安装。认证、endpoint和模型映射由组织批准的OpenAI、AWS Bedrock或内部网关配置决定，README不固定provider或模型命令。
+
+  ```bash
+  npm install -g @openai/codex
+  ```
+
+  不要把特定provider或模型名作为发布门禁；发布事实仍来自Git commit、测试、Manifest和签名。
+- **测试基线**：主要在 AWS `ml.p5en.48xlarge` H200 上验证；其他实例类型需重新验证 GPU/EFA、驱动、DCGM 和互联拓扑。组件不使用GPU算力，节点默认每15秒轻量采样、每60秒上报inventory、每5秒检查Fabric Manager日志。
 
 ## 方案硬约束
 
@@ -57,24 +67,14 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 
 ## 文档入口
 
-- [文档索引](docs/README.md)
-- [管理员快速部署](docs/管理员快速部署.md)
-- [管理员日常运维](docs/管理员日常运维.md)
-- [安全与参数参考](docs/安全与参数参考.md)
+- [文档索引](docs/README.md) / [贡献指南](CONTRIBUTING.md)
+- [管理员快速部署](docs/管理员快速部署.md) / [管理员日常运维](docs/管理员日常运维.md) / [安全与参数参考](docs/安全与参数参考.md)
 - [概要设计](docs/概要设计.md) / [概要设计 v2](docs/概要设计-v2.md)
 - [详细设计](docs/详细设计.md) / [详细设计 v2](docs/详细设计-v2.md)
-- [NVIDIA 策略供应链与实现](docs/components/nvidia-policy.md)
-- [部署和运维详细参考](docs/部署和运维手册.md)
-- [部署和运维手册逐章解读](docs/部署和运维手册逐章解读.md)
+- [NVIDIA 策略供应链与实现](docs/components/nvidia-policy.md) / [部署和运维详细参考](docs/部署和运维手册.md) / [逐章解读](docs/部署和运维手册逐章解读.md)
 - [开发者发布与测试流程](docs/开发者发布测试流程.md) / [CI 发布流程](docs/CI发布流程.md) / [开发者部署实现](docs/开发者部署实现.md)
-- [环境变量参考](docs/管理员环境变量参考.md)
-- [性能压测验收方案](docs/性能压测验收方案.md)
-- [扩展指南](docs/扩展指南.md)
-- [Collector 说明](COLLECTORS.md)
-- [训练任务示例](examples/README.md)
-- [部署目录](deploy/README.md)
-- [脚本与工具](scripts/README.md)
-- [贡献指南](CONTRIBUTING.md)
+- [环境变量参考](docs/管理员环境变量参考.md) / [性能压测验收方案](docs/性能压测验收方案.md) / [扩展指南](docs/扩展指南.md)
+- [Collector说明](COLLECTORS.md) / [训练任务示例](examples/README.md) / [部署目录](deploy/README.md) / [脚本与工具](scripts/README.md)
 
 ## 构建和验证
 
@@ -139,10 +139,8 @@ make PYTHON=.venv/bin/python release-deploy \
   COSIGN_KEY=/secure/release/cosign.pub
 ```
 
-`release-build`以Dockerfile、固定base digest、runtime lock、platform、build args、
-wheel SHA和module digest计算image input digest；registry平台和labels完全匹配才复用
-OCI，否则build/push。远端cache只加速layer。它签名固定的`dist/current-*`制品，
-`release-deploy`默认读取；CI keyless签名时改用固定certificate identity和issuer。
+`release-build`按完整image input digest复用或build/push OCI并签名`dist/current-*`；
+`release-deploy`只消费签名制品。CI keyless签名时使用固定certificate identity和issuer。
 
 修改Profile策略时，在上述`release-deploy`命令前追加审批引用：
 
@@ -151,14 +149,10 @@ PROFILE_APPROVAL=CHG-12345 \
 make PYTHON=.venv/bin/python release-deploy ...
 ```
 
-如果尚未提供审批引用，首次运行只生成
-`<site目录>/release-deploy/profile-plan.json`并停止。CI已完成`make check`、OCI构建、
-Manifest v3、attestation和签名；部署机验签后执行
+未提供审批时首次运行只生成`profile-plan.json`并停止。部署机验签后执行
 `deploy -> verify -> stability -> release-summary`，保存`verification-report.json`和
-`stability-report.json`，不重新build或跑全量pytest。
-实际变更按组件DAG滚动；Node Runtime使用Fleet waves。Profile变化在finalize前若仍有
-旧Profile workload/workflow会fail closed。`NOOP`记录`SKIPPED_NOOP`并跳过稳定窗口。
-普通代码发布不需要`PROFILE_APPROVAL`，也不得手工修改generated Manifest、artifact摘要或Profile版本。
+`stability-report.json`；`NOOP`记录`SKIPPED_NOOP`并跳过稳定窗口。普通代码发布不需要
+`PROFILE_APPROVAL`，且不得手工修改generated Manifest、artifact摘要或Profile版本。
 完整实现见[开发者部署实现](docs/开发者部署实现.md)。
 
 ### 管理员：首次部署和日常管理
