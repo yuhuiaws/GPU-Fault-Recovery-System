@@ -30,6 +30,7 @@ REGIONAL_ROLE_FILES = {
 }
 NAME_PATTERN = re.compile(r"\bGPU_FAULT_[A-Z0-9_]+\b")
 DYNAMIC_PREFIXES = ("GPU_FAULT_NOTIFICATION_TTL_SECONDS_",)
+NON_RUNTIME_PREFIXES = ("GPU_FAULT_TEST_", "GPU_FAULT_PERF_")
 DYNAMIC_VARIABLES = tuple(
     f"GPU_FAULT_PROCESSOR_{prefix}ADMISSION_{suffix}"
     for prefix in ("", "FAULT_", "EVIDENCE_")
@@ -43,7 +44,11 @@ DYNAMIC_VARIABLES = tuple(
 
 
 def concrete_name(name: str) -> bool:
-    return bool(NAME_PATTERN.fullmatch(name)) and not name.endswith("_")
+    return (
+        bool(NAME_PATTERN.fullmatch(name))
+        and not name.endswith("_")
+        and not name.startswith(NON_RUNTIME_PREFIXES)
+    )
 
 
 def module_name(path: Path) -> str:

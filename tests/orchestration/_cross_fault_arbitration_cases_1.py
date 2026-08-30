@@ -23,6 +23,7 @@ from tests.orchestration._cross_fault_support import (
     arbitration_workflow,
     dcgm_pcie_batch,
     fabric_sxid12020_collector_event,
+    freeze_fault_ingestion_time,
     kernel_xid11_collector_event,
     observation,
     post_faults,
@@ -211,8 +212,9 @@ def test_running_workflow_absorbs_same_action_and_scope() -> None:
 
 @pytest.mark.parametrize("metric_first", [True, False])
 def test_dcgm_kernel_and_fabric_manager_share_attempt_workflow(
-    metric_first: bool,
+    metric_first: bool, monkeypatch
 ) -> None:
+    freeze_fault_ingestion_time(monkeypatch)
     context = build_context()
     context.store.save_attempt_observation(observation())
 
@@ -315,7 +317,8 @@ def test_dcgm_kernel_and_fabric_manager_share_attempt_workflow(
     assert workflow.not_before is not None
 
 
-def test_three_collectors_concurrently_merge_atomically() -> None:
+def test_three_collectors_concurrently_merge_atomically(monkeypatch) -> None:
+    freeze_fault_ingestion_time(monkeypatch)
     context = build_context()
     context.store.save_attempt_observation(observation())
 

@@ -5,11 +5,15 @@ images_lock: config/release-images.lock.json
 manifest_inputs:
   - .dockerignore
   - deploy/image/Dockerfile
-  - deploy/aws/regional-foundation/*.tf
-  - deploy/aws/regional-foundation/.terraform.lock.hcl
   - requirements/build.in
   - requirements/build.lock
+  - requirements/deploy-host.lock
   - requirements/runtime.lock
+  - scripts/build-deploy-host-bundle.py
+  - scripts/deploy_host_bundle.py
+  - scripts/setup-deploy-host.sh
+  - scripts/setup_deploy_host.py
+  - src/gpu_fault/data/deploy-host-tools.json
   - deploy/control-plane/base/control-plane-deployment.yaml
   - deploy/control-plane/base/role-split-input.kustomization.yaml
   - deploy/control-plane/regional/aurora-credential-refresh.yaml

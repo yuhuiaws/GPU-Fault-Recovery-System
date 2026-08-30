@@ -322,6 +322,12 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
         "\nrelease-deploy:", 1
     )[0]
     target = makefile.split("release-deploy:\n", 1)[1].split("\n# 本地保留策略", 1)[0]
+    host_bundle = makefile.split("deploy-host-bundle:\n", 1)[1].split(
+        "\ndeploy-host-setup:", 1
+    )[0]
+    host_setup = makefile.split("deploy-host-setup:\n", 1)[1].split(
+        "\ndeploy-host-setup-online:", 1
+    )[0]
 
     assert "git status --porcelain" in build_target
     assert "--cache-from" in build_target
@@ -337,8 +343,17 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "--prebuilt-certificate" in target
     assert "PREBUILT_ATTESTATION ?= $(RELEASE_ATTESTATION)" in makefile
     assert "PREBUILT_BUNDLE ?= $(RELEASE_ATTESTATION_BUNDLE)" in makefile
+    assert "gpu_fault.admin_cli deploy" in target
+    assert "CPU_CLUSTER_ARN" in target
+    assert "GPU_CLUSTER_ARNS" in target
+    assert "STATE_DIR" in target
     assert "RUNTIME_IMAGE_CACHE_REPOSITORY" in workflow
     assert "cosign sign-blob" not in workflow
+    assert "scripts/build-deploy-host-bundle.py" in host_bundle
+    assert "$(COSIGN) sign-blob --yes" in host_bundle
+    assert "scripts/setup-deploy-host.sh" in host_setup
+    assert "--signature-bundle" in host_setup
+    assert "make deploy-host-bundle PYTHON=python" in workflow
     assert "make PYTHON=.venv/bin/python release-build" in developer
     assert "make PYTHON=.venv/bin/python release-deploy" in developer
     assert "PROFILE_APPROVAL=CHG-12345" in developer

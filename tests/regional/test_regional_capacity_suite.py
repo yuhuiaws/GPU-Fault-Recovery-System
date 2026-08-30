@@ -68,6 +68,28 @@ def test_dataplane_context_must_be_explicit(monkeypatch) -> None:
         suite.main()
 
 
+def test_capacity_run_refuses_drill_email_delivery(monkeypatch) -> None:
+    monkeypatch.setattr(suite, "control_pods", lambda: ["pod-a", "pod-b"])
+
+    def fake_control(*args, **_kwargs):
+        pod = args[1]
+        return "true\n" if pod == "pod-b" else "false\n"
+
+    monkeypatch.setattr(suite, "control", fake_control)
+
+    with pytest.raises(
+        RuntimeError, match="capacity runs must not deliver drill notifications"
+    ):
+        suite.validate_notification_safety()
+
+
+def test_capacity_run_allows_suppressed_drills(monkeypatch) -> None:
+    monkeypatch.setattr(suite, "control_pods", lambda: ["pod-a", "pod-b"])
+    monkeypatch.setattr(suite, "control", lambda *_args, **_kwargs: "false\n")
+
+    suite.validate_notification_safety()
+
+
 def test_synthetic_registry_uses_placeholder_aws_account() -> None:
     entry = suite.perf_cluster_entries(1)[0]
 
@@ -101,6 +123,21 @@ def test_capacity_cleanup_removes_action_workflows_without_cluster_payload() -> 
     assert "kind='workflow'" in sql
     assert "key LIKE %s" in sql
     assert pattern == "action_workflow"
+
+
+def test_capacity_cleanup_removes_synthetic_notification_chain() -> None:
+    statements = {
+        name: (sql, pattern) for name, sql, pattern in suite.AUDIT_PURGE_STATEMENTS
+    }
+
+    for name in (
+        "gpu_fault_notification_results",
+        "gpu_fault_notification_deliveries",
+        "gpu_fault_notifications",
+    ):
+        sql, pattern = statements[name]
+        assert "cluster_name" in sql
+        assert pattern == "cluster"
 
 
 def test_repository_registry_baselines_are_redacted() -> None:

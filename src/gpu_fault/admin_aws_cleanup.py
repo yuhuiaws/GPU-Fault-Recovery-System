@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Iterable, cast
 
 from gpu_fault.admin_aws_commands import (
@@ -13,6 +12,10 @@ from gpu_fault.admin_aws_commands import (
     wait_until as _wait_until,
 )
 from gpu_fault.admin_bootstrap_common import BootstrapError
+from gpu_fault.admin_aws_cleanup_helpers import (
+    ordered_aurora_instances,
+    write_json_atomic as write_json_atomic,
+)
 from gpu_fault.admin_site import RenderedSite
 from gpu_fault.installation_resources import InstallationResource
 
@@ -28,6 +31,7 @@ SUPPORTED_RESOURCE_TYPES = frozenset(
         "ec2_route_table",
         "ec2_route_table_association",
         "ec2_subnet",
+        "ecr_repository",
         "eks_addon",
         "eks_pod_identity_association",
         "gpu_eks",
@@ -73,6 +77,7 @@ DELETE_PRIORITY = {
     "acm_certificate": 60,
     "secretsmanager_secret": 60,
     "ses_email_identity": 60,
+    "ecr_repository": 60,
     "iam_role": 70,
     "iam_policy": 80,
     "iam_oidc_provider": 80,
@@ -92,24 +97,6 @@ AURORA_RESOURCE_TYPES = frozenset(
         "rds_managed_secret",
     }
 )
-
-
-def ordered_aurora_instances(
-    database: dict[str, Any],
-    instances: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    writers = {
-        str(member.get("DBInstanceIdentifier") or "")
-        for member in database.get("DBClusterMembers", [])
-        if member.get("IsClusterWriter")
-    }
-    return sorted(
-        instances,
-        key=lambda instance: (
-            str(instance.get("DBInstanceIdentifier") or "") in writers,
-            str(instance.get("DBInstanceIdentifier") or ""),
-        ),
-    )
 
 
 class ResourceProbe:
@@ -475,6 +462,16 @@ class ResourceProbe:
                 return False
             raise BootstrapError(
                 f"Helm release verification failed: {result.stderr.strip()}"
+            )
+        if resource_type == "ecr_repository":
+            return self._exists_command(
+                self._aws(
+                    "ecr",
+                    "describe-repositories",
+                    "--repository-names",
+                    identifier,
+                ),
+                not_found=("RepositoryNotFoundException",),
             )
         return None
 
@@ -1044,6 +1041,17 @@ class ResourceDeletion(ResourceProbe):
                 ),
                 not_found=("NotFoundException",),
             )
+        elif resource_type == "ecr_repository":
+            _checked(
+                self._aws(
+                    "ecr",
+                    "delete-repository",
+                    "--repository-name",
+                    identifier,
+                    "--force",
+                ),
+                not_found=("RepositoryNotFoundException",),
+            )
         else:
             return False
         return True
@@ -1534,14 +1542,3 @@ def is_aurora_resource(resource: InstallationResource) -> bool:
         resource.resource_type in AURORA_RESOURCE_TYPES
         or resource.resource_key.startswith("aws/aurora/")
     )
-
-
-def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    temporary.chmod(0o600)
-    temporary.replace(path)

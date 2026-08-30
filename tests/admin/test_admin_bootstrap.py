@@ -6,13 +6,13 @@ from dataclasses import replace
 
 import pytest
 
-from gpu_fault import admin_bootstrap, admin_release_artifacts
-from gpu_fault.admin_bootstrap import (
-    _build_release,
-    _ensure_security_group,
-    _site_identifier,
-    _unused_subnet_cidrs,
+from gpu_fault import (
+    admin_bootstrap,
+    admin_bootstrap_dependencies,
+    admin_release_artifacts,
+    admin_release_repositories,
 )
+from gpu_fault.admin_bootstrap import _ensure_security_group, _unused_subnet_cidrs
 from gpu_fault.admin_bootstrap_common import (
     Arn,
     BootstrapError,
@@ -24,6 +24,63 @@ from gpu_fault.admin_bootstrap_site import (
     existing_gpu_context,
     preserve_existing_site_contract,
 )
+from gpu_fault.admin_bootstrap_site import site_identifier as _site_identifier
+from gpu_fault.admin_release_repositories import ensure_release_repositories
+
+
+def _cache_lifecycle_policy(*, retention_days: int = 7) -> dict:
+    return {
+        "rules": [
+            {
+                "rulePriority": 1,
+                "description": (
+                    "Expire untagged BuildKit cache artifacts after "
+                    f"{retention_days} days"
+                ),
+                "selection": {
+                    "tagStatus": "untagged",
+                    "countType": "sinceImagePushed",
+                    "countUnit": "days",
+                    "countNumber": retention_days,
+                },
+                "action": {"type": "expire"},
+            }
+        ]
+    }
+
+
+def test_bootstrap_dependencies_require_docker_buildx(monkeypatch) -> None:
+    commands = []
+    monkeypatch.setattr(
+        admin_bootstrap_dependencies,
+        "load_deploy_host_tool_manifest",
+        lambda: {
+            "schema_version": 1,
+            "python": {"major": 3, "minor": 12},
+            "tools": [
+                {
+                    "name": "docker-buildx",
+                    "executable": "docker",
+                    "command": ["docker", "buildx", "version"],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        admin_bootstrap_dependencies.shutil, "which", lambda _name: "/usr/bin/tool"
+    )
+
+    def missing_buildx(arguments, **_kwargs):
+        commands.append(arguments)
+        return __import__("subprocess").CompletedProcess(arguments, 1, "", "missing")
+
+    monkeypatch.setattr(admin_bootstrap_dependencies.subprocess, "run", missing_buildx)
+
+    with pytest.raises(BootstrapError, match="docker-buildx"):
+        admin_bootstrap_dependencies.validate_bootstrap_dependencies()
+    assert commands == [["docker", "buildx", "version"]], (
+        "bootstrap dependency validation did not probe Docker Buildx"
+    )
 
 
 def test_cluster_arn_parser_accepts_eks_and_hyperpod() -> None:
@@ -159,7 +216,7 @@ def test_legacy_foundation_consumes_prebuilt_release(tmp_path, monkeypatch) -> N
         lambda *_args, **_kwargs: "a" * 64,
     )
 
-    result = _build_release(
+    result = admin_release_artifacts.load_prebuilt_release(
         type("Runner", (), {"dry_run": False})(),
         repository_root=tmp_path,
         runtime_profile="profile-a",
@@ -183,11 +240,274 @@ def test_legacy_foundation_rejects_source_only_release(tmp_path) -> None:
     )
 
     with pytest.raises(BootstrapError, match="deployable schema v3"):
-        _build_release(
+        admin_release_artifacts.load_prebuilt_release(
             type("Runner", (), {"dry_run": False})(),
             repository_root=tmp_path,
             runtime_profile="profile-a",
         )
+
+
+def test_release_repositories_are_created_with_separate_mutability(monkeypatch) -> None:
+    calls = []
+
+    class Runner:
+        dry_run = False
+
+        def aws_json(self, region, service, operation, *arguments, **kwargs):
+            calls.append((region, service, operation, arguments, kwargs))
+            assert service == "ecr"
+            if operation == "create-repository":
+                name = arguments[arguments.index("--repository-name") + 1]
+                mutability = arguments[arguments.index("--image-tag-mutability") + 1]
+                scan = arguments[
+                    arguments.index("--image-scanning-configuration") + 1
+                ].endswith("true")
+                return {
+                    "repository": {
+                        "repositoryArn": (
+                            f"arn:aws:ecr:us-east-1:123456789012:repository/{name}"
+                        ),
+                        "repositoryUri": (
+                            f"123456789012.dkr.ecr.us-east-1.amazonaws.com/{name}"
+                        ),
+                        "imageTagMutability": mutability,
+                        "imageScanningConfiguration": {"scanOnPush": scan},
+                        "encryptionConfiguration": {"encryptionType": "AES256"},
+                    }
+                }
+            assert operation == "put-lifecycle-policy"
+            policy = arguments[arguments.index("--lifecycle-policy-text") + 1]
+            return {"lifecyclePolicyText": policy}
+
+    def missing(arguments, **_kwargs):
+        error = (
+            "LifecyclePolicyNotFoundException"
+            if "get-lifecycle-policy" in arguments
+            else "RepositoryNotFoundException"
+        )
+        return __import__("subprocess").CompletedProcess(arguments, 254, "", error)
+
+    monkeypatch.setattr(admin_release_repositories.subprocess, "run", missing)
+
+    repositories = ensure_release_repositories(
+        Runner(), cpu=_cluster(), site_id="site-a"
+    )
+
+    assert repositories["runtime"]["repository_name"].startswith(
+        "gpu-fault/runtime-"
+    ), "runtime ECR repository name is not site-content-addressed"
+    assert repositories["cache"]["repository_name"].startswith(
+        "gpu-fault/runtime-cache-"
+    ), "cache ECR repository name is not site-content-addressed"
+    create_calls = [call for call in calls if call[2] == "create-repository"]
+    assert create_calls[0][3][
+        create_calls[0][3].index("--image-tag-mutability") + 1
+    ] == ("IMMUTABLE")
+    assert (
+        create_calls[1][3][create_calls[1][3].index("--image-tag-mutability") + 1]
+        == "MUTABLE"
+    )
+    policy_call = next(call for call in calls if call[2] == "put-lifecycle-policy")
+    policy = json.loads(
+        policy_call[3][policy_call[3].index("--lifecycle-policy-text") + 1]
+    )
+    assert policy["rules"][0]["selection"] == {
+        "tagStatus": "untagged",
+        "countType": "sinceImagePushed",
+        "countUnit": "days",
+        "countNumber": 7,
+    }
+    assert repositories["cache"]["untagged_retention_days"] == "7"
+    assert len(repositories["cache"]["lifecycle_policy_sha256"]) == 64
+
+
+def test_release_repositories_reuse_matching_site_resources(monkeypatch) -> None:
+    site_id = "site-a"
+
+    def describe(arguments, **kwargs):
+        del kwargs
+        if "get-lifecycle-policy" in arguments:
+            return __import__("subprocess").CompletedProcess(
+                arguments,
+                0,
+                json.dumps(
+                    {"lifecyclePolicyText": json.dumps(_cache_lifecycle_policy())}
+                ),
+                "",
+            )
+        name = arguments[arguments.index("--repository-names") + 1]
+        cache = "runtime-cache-" in name
+        return __import__("subprocess").CompletedProcess(
+            arguments,
+            0,
+            json.dumps(
+                {
+                    "repositories": [
+                        {
+                            "repositoryArn": (
+                                f"arn:aws:ecr:us-east-1:123456789012:repository/{name}"
+                            ),
+                            "repositoryUri": (
+                                "123456789012.dkr.ecr.us-east-1.amazonaws.com/" + name
+                            ),
+                            "imageTagMutability": ("MUTABLE" if cache else "IMMUTABLE"),
+                            "imageScanningConfiguration": {"scanOnPush": not cache},
+                            "encryptionConfiguration": {"encryptionType": "AES256"},
+                        }
+                    ]
+                }
+            ),
+            "",
+        )
+
+    class Runner:
+        dry_run = False
+
+        def aws_json(self, _region, service, operation, *_arguments, **_kwargs):
+            assert service == "ecr"
+            assert operation == "list-tags-for-resource"
+            return {
+                "tags": [
+                    {"Key": "gpu-fault:site-id", "Value": site_id},
+                    {"Key": "gpu-fault:owner", "Value": "release-bootstrap"},
+                ]
+            }
+
+    monkeypatch.setattr(admin_release_repositories.subprocess, "run", describe)
+
+    first = ensure_release_repositories(Runner(), cpu=_cluster(), site_id=site_id)
+    second = ensure_release_repositories(Runner(), cpu=_cluster(), site_id=site_id)
+
+    assert first == second
+    assert first["cache"]["untagged_retention_days"] == "7"
+
+
+def test_cache_repository_rejects_lifecycle_policy_drift(monkeypatch) -> None:
+    site_id = "site-a"
+
+    def describe(arguments, **kwargs):
+        del kwargs
+        if "get-lifecycle-policy" in arguments:
+            policy = _cache_lifecycle_policy(retention_days=30)
+            return __import__("subprocess").CompletedProcess(
+                arguments,
+                0,
+                json.dumps({"lifecyclePolicyText": json.dumps(policy)}),
+                "",
+            )
+        name = arguments[arguments.index("--repository-names") + 1]
+        cache = "runtime-cache-" in name
+        return __import__("subprocess").CompletedProcess(
+            arguments,
+            0,
+            json.dumps(
+                {
+                    "repositories": [
+                        {
+                            "repositoryArn": (
+                                f"arn:aws:ecr:us-east-1:123456789012:repository/{name}"
+                            ),
+                            "repositoryUri": (
+                                "123456789012.dkr.ecr.us-east-1.amazonaws.com/" + name
+                            ),
+                            "imageTagMutability": ("MUTABLE" if cache else "IMMUTABLE"),
+                            "imageScanningConfiguration": {"scanOnPush": not cache},
+                            "encryptionConfiguration": {"encryptionType": "AES256"},
+                        }
+                    ]
+                }
+            ),
+            "",
+        )
+
+    class Runner:
+        dry_run = False
+
+        def aws_json(self, _region, service, operation, *_arguments, **_kwargs):
+            assert service == "ecr"
+            assert operation == "list-tags-for-resource"
+            return {
+                "tags": [
+                    {"Key": "gpu-fault:site-id", "Value": site_id},
+                    {"Key": "gpu-fault:owner", "Value": "release-bootstrap"},
+                ]
+            }
+
+    monkeypatch.setattr(admin_release_repositories.subprocess, "run", describe)
+
+    with pytest.raises(BootstrapError, match="lifecycle policy differs"):
+        ensure_release_repositories(Runner(), cpu=_cluster(), site_id=site_id)
+
+
+def test_admin_release_build_uses_ecr_and_state_signing_material(
+    tmp_path, monkeypatch
+) -> None:
+    signing = tmp_path / "release-signing"
+    signing.mkdir()
+    for name, value in (
+        ("cosign.key", "private"),
+        ("cosign.pub", "public"),
+        ("cosign.password", "password"),
+    ):
+        path = signing / name
+        path.write_text(value, encoding="utf-8")
+        path.chmod(0o600)
+    monkeypatch.setenv(
+        "GPU_FAULT_TEST_POSTGRES_URL", "postgresql://postgres@127.0.0.1:5432/postgres"
+    )
+    commands = []
+
+    class Runner:
+        dry_run = False
+
+        def run(self, arguments, **kwargs):
+            commands.append((list(arguments), kwargs))
+            if arguments[:3] == ["aws", "ecr", "get-login-password"]:
+                return "login-password"
+            return ""
+
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "verify_prebuilt_release",
+        lambda *args, **kwargs: commands.append((["verify"], kwargs)),
+    )
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "load_prebuilt_release",
+        lambda *args, **kwargs: {
+            "manifest": "dist/current-release.json",
+            "release_id": "release-a",
+            "images": {},
+            "agent_config_digest": "a" * 64,
+        },
+    )
+
+    result = admin_release_artifacts.build_signed_release(
+        Runner(),
+        repository_root=tmp_path,
+        state_dir=tmp_path,
+        region="us-east-1",
+        runtime_repository=(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/gpu-fault/runtime-a"
+        ),
+        cache_repository=(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/gpu-fault/runtime-cache-a"
+        ),
+        runtime_profile="profile-a",
+    )
+
+    make_command, make_options = next(
+        item for item in commands if item[0] and item[0][0] == "make"
+    )
+    assert "release-build" in make_command
+    assert any(item.startswith("RUNTIME_IMAGE_REPOSITORY=") for item in make_command), (
+        "admin release build did not receive the created runtime ECR repository"
+    )
+    assert any(item.startswith("RUNTIME_IMAGE_CACHE_FROM=") for item in make_command), (
+        "admin release build did not receive the created cache ECR repository"
+    )
+    assert make_options["env"]["COSIGN_PASSWORD"] == "password"
+    assert result["release_id"] == "release-a"
 
 
 def test_legacy_bootstrap_state_revalidates_exclusive_resources(tmp_path) -> None:

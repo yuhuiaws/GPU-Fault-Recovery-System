@@ -1,19 +1,35 @@
 from __future__ import annotations
 
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import yaml  # type: ignore[import-untyped]
 
 from gpu_fault.admin_bootstrap_common import (
+    Arn,
     BootstrapError,
     BootstrapRequest,
     ClusterIdentity,
     CommandRunner,
+    safe_name,
 )
+
+
+def cluster_alias(value: str, role: str, index: int) -> str:
+    parsed = Arn.parse(value)
+    return safe_name(f"gpu-fault-{role}-{index}-{parsed.resource_name}")
+
+
+def site_identifier(
+    cpu: ClusterIdentity,
+    _gpu_clusters: Sequence[ClusterIdentity],
+) -> str:
+    digest = hashlib.sha256(cpu.hyperpod_arn.encode()).hexdigest()[:8]
+    return safe_name(f"{cpu.region}-{cpu.hyperpod_name}-{digest}", maximum=48)
 
 
 def load_existing_site(state_dir: Path) -> dict[str, Any] | None:

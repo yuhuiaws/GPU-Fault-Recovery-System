@@ -12,6 +12,10 @@ RELEASE_ATTESTATION := dist/current-attestation.json
 RELEASE_ATTESTATION_BUNDLE := dist/current-attestation.bundle.json
 PREBUILT_ATTESTATION ?= $(RELEASE_ATTESTATION)
 PREBUILT_BUNDLE ?= $(RELEASE_ATTESTATION_BUNDLE)
+DEPLOY_HOST_PLATFORM ?= $(shell $(PYTHON) -c "from scripts.deploy_host_bundle import bundle_platform_id; print(bundle_platform_id())")
+DEPLOY_HOST_ARCHIVE ?= dist/gpu-fault-deploy-host-$(DEPLOY_HOST_PLATFORM).tar.gz
+DEPLOY_HOST_SIGNATURE_BUNDLE ?= dist/gpu-fault-deploy-host-$(DEPLOY_HOST_PLATFORM).sigstore.json
+DEPLOY_HOST_VENV ?= .venv
 QUALITY_SCRIPTS = scripts tools
 QUALITY_SHELL_ROOTS = deploy scripts tools
 YAMLLINT_CONFIG = .yamllint
@@ -38,7 +42,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_reconnect.py \
 	tests/store/test_store_contracts.py
 
-.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check runtime-image-check release-build release-preflight release-deploy architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check terraform-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check runtime-image-check release-build release-preflight release-deploy deploy-host-bundle deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
@@ -137,7 +141,6 @@ check:
 	$(MAKE) docs-check
 	$(MAKE) config-check
 	$(MAKE) deploy-check
-	$(MAKE) terraform-check
 	$(MAKE) artifacts-safety-check
 	$(MAKE) yaml-check
 	$(MAKE) shell-check
@@ -221,19 +224,6 @@ deployment-contracts-check: python-cache-clean
 deploy-check: python-cache-clean
 	$(PYTHON) scripts/check-deploy-layout.py
 
-terraform-check:
-	@command -v terraform >/dev/null || \
-		(printf 'terraform is required\n' >&2; exit 2)
-	@data_dir="$$(mktemp -d)"; \
-		trap 'rm -rf "$$data_dir"' EXIT; \
-		TF_DATA_DIR="$$data_dir" terraform fmt -check -recursive \
-			deploy/aws/regional-foundation; \
-		TF_DATA_DIR="$$data_dir" terraform \
-			-chdir=deploy/aws/regional-foundation \
-			init -backend=false -input=false >/dev/null; \
-		TF_DATA_DIR="$$data_dir" terraform \
-			-chdir=deploy/aws/regional-foundation validate
-
 artifacts-safety-check:
 	$(PYTHON) scripts/check-artifacts.py
 
@@ -302,37 +292,83 @@ release-build:
 		"$(RELEASE_ATTESTATION)" >/dev/null
 
 release-deploy:
-	@test -f "$(PREBUILT_ATTESTATION)" || \
-		(printf 'PREBUILT_ATTESTATION does not exist: %s\n' \
-			"$(PREBUILT_ATTESTATION)" >&2; exit 2)
-	@if [ -z "$(PREBUILT_SIGNATURE)" ] && [ -z "$(PREBUILT_BUNDLE)" ]; then \
-		printf 'PREBUILT_SIGNATURE or PREBUILT_BUNDLE is required\n' >&2; \
-		exit 2; \
+	@if [ -n "$(CPU_CLUSTER_ARN)$(GPU_CLUSTER_ARNS)" ]; then \
+		test -n "$(CPU_CLUSTER_ARN)" || \
+			(printf 'CPU_CLUSTER_ARN is required\n' >&2; exit 2); \
+		test -n "$(GPU_CLUSTER_ARNS)" || \
+			(printf 'GPU_CLUSTER_ARNS is required\n' >&2; exit 2); \
+		test -n "$(STATE_DIR)" || \
+			(printf 'STATE_DIR is required\n' >&2; exit 2); \
+		PYTHONPATH=src $(PYTHON) -m gpu_fault.admin_cli deploy \
+			--cpu-cluster-arn "$(CPU_CLUSTER_ARN)" \
+			$(foreach arn,$(GPU_CLUSTER_ARNS),--gpu-cluster-arn "$(arn)") \
+			--state-dir "$(STATE_DIR)" \
+			$(if $(ADMIN_EMAIL),--admin-email "$(ADMIN_EMAIL)",) \
+			$(if $(REPO_ROOT),--repo-root "$(REPO_ROOT)",); \
+	else \
+		test -f "$(PREBUILT_ATTESTATION)" || \
+			(printf 'PREBUILT_ATTESTATION does not exist: %s\n' \
+				"$(PREBUILT_ATTESTATION)" >&2; exit 2); \
+		if [ -z "$(PREBUILT_SIGNATURE)" ] && [ -z "$(PREBUILT_BUNDLE)" ]; then \
+			printf 'PREBUILT_SIGNATURE or PREBUILT_BUNDLE is required\n' >&2; \
+			exit 2; \
+		fi; \
+		if [ -n "$(PREBUILT_SIGNATURE)" ] && [ ! -f "$(PREBUILT_SIGNATURE)" ]; then \
+			printf 'PREBUILT_SIGNATURE does not exist: %s\n' \
+				"$(PREBUILT_SIGNATURE)" >&2; exit 2; \
+		fi; \
+		if [ -n "$(PREBUILT_BUNDLE)" ] && [ ! -f "$(PREBUILT_BUNDLE)" ]; then \
+			printf 'PREBUILT_BUNDLE does not exist: %s\n' \
+				"$(PREBUILT_BUNDLE)" >&2; exit 2; \
+		fi; \
+		if [ -z "$(COSIGN_KEY)" ]; then \
+			( test -n "$(PREBUILT_BUNDLE)" || test -n "$(PREBUILT_CERTIFICATE)" ) && \
+			test -n "$(CERTIFICATE_IDENTITY)" && \
+			test -n "$(CERTIFICATE_OIDC_ISSUER)" || \
+			(printf 'keyless verification requires bundle/certificate identity and issuer\n' >&2; exit 2); \
+		fi; \
+		PYTHONPATH=src $(PYTHON) scripts/release_deploy.py \
+			$(if $(SITE),--site "$(SITE)",) \
+			$(if $(PROFILE_APPROVAL),--profile-approval "$(PROFILE_APPROVAL)",) \
+			--prebuilt-attestation "$(PREBUILT_ATTESTATION)" \
+			$(if $(PREBUILT_SIGNATURE),--prebuilt-signature "$(PREBUILT_SIGNATURE)",) \
+			$(if $(PREBUILT_BUNDLE),--prebuilt-bundle "$(PREBUILT_BUNDLE)",) \
+			$(if $(PREBUILT_CERTIFICATE),--prebuilt-certificate "$(PREBUILT_CERTIFICATE)",) \
+			$(if $(COSIGN_KEY),--cosign-key "$(COSIGN_KEY)",) \
+			$(if $(CERTIFICATE_IDENTITY),--certificate-identity "$(CERTIFICATE_IDENTITY)",) \
+			$(if $(CERTIFICATE_OIDC_ISSUER),--certificate-oidc-issuer "$(CERTIFICATE_OIDC_ISSUER)",); \
 	fi
-	@if [ -n "$(PREBUILT_SIGNATURE)" ] && [ ! -f "$(PREBUILT_SIGNATURE)" ]; then \
-		printf 'PREBUILT_SIGNATURE does not exist: %s\n' \
-			"$(PREBUILT_SIGNATURE)" >&2; exit 2; \
-	fi
-	@if [ -n "$(PREBUILT_BUNDLE)" ] && [ ! -f "$(PREBUILT_BUNDLE)" ]; then \
-		printf 'PREBUILT_BUNDLE does not exist: %s\n' \
-			"$(PREBUILT_BUNDLE)" >&2; exit 2; \
-	fi
-	@if [ -z "$(COSIGN_KEY)" ]; then \
-		( test -n "$(PREBUILT_BUNDLE)" || test -n "$(PREBUILT_CERTIFICATE)" ) && \
-		test -n "$(CERTIFICATE_IDENTITY)" && \
-		test -n "$(CERTIFICATE_OIDC_ISSUER)" || \
-		(printf 'keyless verification requires PREBUILT_BUNDLE or PREBUILT_CERTIFICATE, plus CERTIFICATE_IDENTITY and CERTIFICATE_OIDC_ISSUER\n' >&2; exit 2); \
-	fi
-	PYTHONPATH=src $(PYTHON) scripts/release_deploy.py \
-		$(if $(SITE),--site "$(SITE)",) \
-		$(if $(PROFILE_APPROVAL),--profile-approval "$(PROFILE_APPROVAL)",) \
-		--prebuilt-attestation "$(PREBUILT_ATTESTATION)" \
-		$(if $(PREBUILT_SIGNATURE),--prebuilt-signature "$(PREBUILT_SIGNATURE)",) \
-		$(if $(PREBUILT_BUNDLE),--prebuilt-bundle "$(PREBUILT_BUNDLE)",) \
-		$(if $(PREBUILT_CERTIFICATE),--prebuilt-certificate "$(PREBUILT_CERTIFICATE)",) \
-		$(if $(COSIGN_KEY),--cosign-key "$(COSIGN_KEY)",) \
-		$(if $(CERTIFICATE_IDENTITY),--certificate-identity "$(CERTIFICATE_IDENTITY)",) \
-		$(if $(CERTIFICATE_OIDC_ISSUER),--certificate-oidc-issuer "$(CERTIFICATE_OIDC_ISSUER)",)
+
+deploy-host-bundle:
+	$(PYTHON) scripts/build-deploy-host-bundle.py \
+		--python "$(PYTHON)" \
+		--output "$(DEPLOY_HOST_ARCHIVE)" $(if $(DEPLOY_HOST_WHEELHOUSE),--wheelhouse "$(DEPLOY_HOST_WHEELHOUSE)",) $(if $(DEPLOY_HOST_TOOLS_DIR),--tools-dir "$(DEPLOY_HOST_TOOLS_DIR)",) $(if $(filter true yes 1,$(DEPLOY_HOST_ALLOW_DIRTY)),--allow-dirty,)
+	$(COSIGN) sign-blob --yes \
+		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+		--bundle "$(DEPLOY_HOST_SIGNATURE_BUNDLE)" \
+		"$(DEPLOY_HOST_ARCHIVE)" >/dev/null
+
+deploy-host-setup:
+	@test -f "$(DEPLOY_HOST_ARCHIVE)" || \
+		(printf 'DEPLOY_HOST_ARCHIVE does not exist: %s\n' \
+			"$(DEPLOY_HOST_ARCHIVE)" >&2; exit 2)
+	@test -f "$(DEPLOY_HOST_SIGNATURE_BUNDLE)" || \
+		(printf 'DEPLOY_HOST_SIGNATURE_BUNDLE does not exist: %s\n' \
+			"$(DEPLOY_HOST_SIGNATURE_BUNDLE)" >&2; exit 2)
+	PYTHON=python3.12 scripts/setup-deploy-host.sh \
+		--venv "$(DEPLOY_HOST_VENV)" \
+		--bundle "$(DEPLOY_HOST_ARCHIVE)" \
+		--signature-bundle "$(DEPLOY_HOST_SIGNATURE_BUNDLE)" $(if $(DEPLOY_HOST_COSIGN_KEY),--cosign-key "$(DEPLOY_HOST_COSIGN_KEY)",) $(if $(CERTIFICATE_IDENTITY),--certificate-identity "$(CERTIFICATE_IDENTITY)",) $(if $(CERTIFICATE_OIDC_ISSUER),--certificate-oidc-issuer "$(CERTIFICATE_OIDC_ISSUER)",)
+
+deploy-host-setup-online:
+	PYTHON=python3.12 scripts/setup-deploy-host.sh \
+		--venv "$(DEPLOY_HOST_VENV)" \
+		--allow-network
+
+deploy-host-check:
+	PYTHON=python3.12 scripts/setup-deploy-host.sh \
+		--venv "$(DEPLOY_HOST_VENV)" \
+		--check
 
 # 本地保留策略（artifacts/README.md「Retention」）。只报告，不删除；真正
 # 删除要人工加 --apply。artifacts/ 在 .gitignore 里，缺失时输出 0 条而不报错，

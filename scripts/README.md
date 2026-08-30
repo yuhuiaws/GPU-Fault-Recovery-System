@@ -15,6 +15,9 @@ generic fault-case runner.
 
 ## Directory roles
 
+- `build-deploy-host-bundle.py`, `deploy_host_bundle.py`,
+  `setup_deploy_host.py` and `setup-deploy-host.sh`: build, verify and install
+  the signed offline deployment-host Python environment.
 - `release_deploy.py`: developer-facing build, site preparation, deploy,
   single-pass verify and lightweight release-summary pipeline used by
   `make release-deploy`. It persists both reports under the release state

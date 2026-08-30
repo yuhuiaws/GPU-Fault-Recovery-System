@@ -25,7 +25,7 @@ spec:
     registrationClusterId: gpu-prod-a
 
   nlb:
-    # Values come from deploy/aws/regional-foundation Terraform outputs.
+    # Values are discovered or created by the ARN-driven administrator bootstrap.
     name: REPLACE_WITH_NLB_NAME
     publicSubnets:
       - REPLACE_WITH_PUBLIC_SUBNET_A

@@ -83,6 +83,27 @@ def test_store_labels_drill_notification_from_incident() -> None:
     assert "Drill ID：maintenance-42" in saved.body_text
 
 
+def test_store_labels_performance_notification_without_incident() -> None:
+    store = build_store()
+
+    saved = store.save_notification_if_absent(
+        AdvisoryNotification(
+            deduplication_key="perf-cap-000/collector-silent",
+            cluster_name="perf-cap-000",
+            incident_id="incident-not-persisted",
+            subject="[GPU fault] collector silent",
+            body_text="collector silent",
+            support_case_draft="",
+        )
+    )
+
+    assert saved.drill_id == "perf-capacity"
+    assert saved.subject.startswith("[DRILL:perf-capacity]"), (
+        "performance notification subject was not labeled as a drill"
+    )
+    assert "演练通知 / DRILL - 非真实故障" in saved.body_text
+
+
 def test_warm_spare_replacement_email_lists_rebinding() -> None:
     notification = WarmSpareReplacementEmailBuilder().build(
         cluster_id="cluster-a",

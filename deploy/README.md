@@ -26,26 +26,27 @@ gpu-fault-admin join-cluster -f /secure/gpu-fault/site.yaml \
   --gpu-cluster-arn <existing-gpu-eks-or-hyperpod-arn>
 ```
 
+Prepare the host first through the signed offline workflow in
+`docs/部署机初始化.md`; deployment commands validate but never install host tools.
+
 It validates `config/site.example.yaml`, materializes the low-level release
 JSON with mode `0600`, and reuses the regional rollout state machine. Direct
 rollout commands remain available for resume, rollback and break-glass.
 
-The supported release lifecycle always has two commands. The first validates,
-reuses or builds the immutable runtime image, and signs the release. The second
-verifies the fixed `dist/current-*` outputs and applies them:
+The supported first-install lifecycle is one ARN-driven command:
 
 ```bash
-COSIGN_SIGNING_KEY=/secure/release/cosign.key \
-make PYTHON=.venv/bin/python release-build \
-  RUNTIME_IMAGE_REPOSITORY=<account>.dkr.ecr.<region>.amazonaws.com/<repository>
-
-make PYTHON=.venv/bin/python release-deploy \
-  SITE=/secure/gpu-fault/site.yaml \
-  COSIGN_KEY=/secure/release/cosign.pub
+gpu-fault-admin deploy \
+  --cpu-cluster-arn <cpu-eks-or-hyperpod-arn> \
+  --gpu-cluster-arn <gpu-eks-or-hyperpod-arn> \
+  --state-dir /secure/gpu-fault \
+  --admin-email <operations-email>
 ```
 
-When duties are separated, release CI runs the first command on behalf of the
-administrator. The command model and signed artifact paths do not change.
+Repeat `--gpu-cluster-arn` for multiple GPU clusters. The command creates or
+reuses site-tagged AWS resources, builds/pushes/signs the release, writes the
+private `site.yaml`, and runs preflight/deploy/verify. `make release-deploy`
+with ARN variables delegates to the same CLI.
 
 | Deployment surface | Directory | Entry point |
 |---|---|---|
@@ -55,7 +56,6 @@ administrator. The command model and signed artifact paths do not change.
 | GPU node installation | `node/` and `systemd/` | `node/build-node-installer-bundle.sh` and `node/install-gpu-fault-collector.sh` |
 | Observability | `observability/` | `observability/install-amp-monitoring.sh` |
 | Database and endpoint migrations | `migrations/` | Apply only the named runbook manifest |
-| AWS foundation | `aws/regional-foundation/` | Terraform; apply before application deployment |
 | AWS supporting resources | `aws/{s3,iam,lambda}/` | Use from the matching operations runbook |
 | Runtime image | `image/Dockerfile` | CI builds from `uv.lock`-derived hashed requirements and pushes by digest |
 | Historical single-cluster automation | `hyperpod/` | Compatibility and migration only; not the production topology |
@@ -85,10 +85,9 @@ administrator. The command model and signed artifact paths do not change.
    Contract checks reject missing annotations or stale generated output.
    Node uninstall uses `/opt/gpu-fault/installed-units.txt`, generated from
    the units actually installed on that host.
-6. New AWS foundation resources are managed by
-   `aws/regional-foundation/` Terraform and treated as external/PRESERVE by
-   the application lifecycle. The legacy ARN-only Python foundation path
-   requires explicit opt-in. Application-owned or adopted resources are
+6. The ARN bootstrap is the only supported writer for solution-owned AWS
+   foundation resources and records them in the application lifecycle
+   registry. Application-owned or adopted resources are
    registered in Aurora as `installation_resource` objects. The administrator entry point is
    `gpu-fault-admin uninstall`; it exports that registry before cleanup,
    verifies every `DELETE`/`DETACH` entry, preserves all GPU clusters, and

@@ -23,6 +23,7 @@ from ._notifications_cases_1 import (
     test_ses_delivery_is_disabled_by_default,
     test_ses_delivery_is_idempotent,
     test_store_labels_drill_notification_from_incident,
+    test_store_labels_performance_notification_without_incident,
     test_unrelated_incidents_do_not_share_one_notification_lock,
     test_warm_spare_replacement_email_lists_rebinding,
     test_workload_restart_email_is_a_field_only_template,

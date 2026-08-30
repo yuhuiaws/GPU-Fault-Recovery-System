@@ -7,7 +7,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import subprocess
 import tempfile
 import time
@@ -34,16 +33,19 @@ from gpu_fault.admin_bootstrap_common import (
     write_secret as _write_secret,
     write_yaml as _write_yaml,
 )
+from gpu_fault.admin_bootstrap_dependencies import validate_bootstrap_dependencies
 from gpu_fault.admin_notifications import (
     NotificationRouting,
 )
-from gpu_fault.admin_release_artifacts import (
-    load_prebuilt_release as _build_release,
+from gpu_fault.admin_release_repositories import (
+    prepare_signed_release,
 )
 from gpu_fault.admin_bootstrap_site import (
+    cluster_alias as _cluster_alias,
     discover_bootstrap_scope,
     discover_subnet_cidrs,
     preserve_existing_site_contract,
+    site_identifier as _site_identifier,
 )
 
 
@@ -1862,35 +1864,6 @@ def _ensure_aurora(
     }
 
 
-def _bootstrap_dependencies() -> None:
-    required = (
-        "aws",
-        "kubectl",
-        "helm",
-        "curl",
-        "jq",
-        "openssl",
-        "sha256sum",
-        "make",
-    )
-    missing = [name for name in required if shutil.which(name) is None]
-    if missing:
-        raise BootstrapError("missing bootstrap tools: " + ", ".join(missing))
-
-
-def _cluster_alias(value: str, role: str, index: int) -> str:
-    parsed = Arn.parse(value)
-    return _safe_name(f"gpu-fault-{role}-{index}-{parsed.resource_name}")
-
-
-def _site_identifier(
-    cpu: ClusterIdentity,
-    _gpu_clusters: Sequence[ClusterIdentity],
-) -> str:
-    digest = hashlib.sha256(cpu.hyperpod_arn.encode()).hexdigest()[:8]
-    return _safe_name(f"{cpu.region}-{cpu.hyperpod_name}-{digest}", maximum=48)
-
-
 def _initial_secure_files(
     *,
     state_dir: Path,
@@ -2029,7 +2002,7 @@ def bootstrap_from_arns(
         provision_node_action_keys,
     )
 
-    _bootstrap_dependencies()
+    validate_bootstrap_dependencies()
     active_runner = runner or CommandRunner(dry_run=request.dry_run)
     existing_site, cpu, gpu_clusters = discover_bootstrap_scope(
         request=request,
@@ -2044,6 +2017,9 @@ def bootstrap_from_arns(
     state_file = request.state_dir / "bootstrap-state.json"
     state = BootstrapState(state_file, site_id=site_id)
     state.phase("discovered")
+    release = prepare_signed_release(
+        active_runner, request=request, cpu=cpu, site_id=site_id, state=state
+    )
     admin_email, routing = notification_routing(active_runner, cpu, request, state)
     cpu_kubeconfig, gpu_kubeconfig = _ensure_kubeconfigs(
         active_runner,
@@ -2102,11 +2078,6 @@ def bootstrap_from_arns(
     }
     first_phase = _run_parallel(
         {
-            "release": lambda: _build_release(
-                active_runner,
-                repository_root=request.repository_root,
-                runtime_profile="hyperpod-v1",
-            ),
             "nlb_network": lambda: _ensure_nlb_network(
                 active_runner,
                 cpu=cpu,
@@ -2153,7 +2124,6 @@ def bootstrap_from_arns(
         for name, value in first_phase.items()
         if name.startswith("executor_role:")
     }
-    release = cast(dict[str, Any], first_phase["release"])
     aurora = cast(dict[str, Any], first_phase["aurora"])
     monitoring = cast(dict[str, Any], first_phase["monitoring_resources"])
     second_phase_tasks: dict[str, Callable[[], Any]] = {

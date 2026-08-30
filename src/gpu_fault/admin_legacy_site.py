@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Sequence, cast
 
 from gpu_fault.admin_bootstrap import (
-    _cluster_alias,
     _ensure_kubeconfigs,
     _require_same_scope,
     discover_cluster,
@@ -23,6 +22,7 @@ from gpu_fault.admin_bootstrap_common import (
     safe_name,
     write_yaml,
 )
+from gpu_fault.admin_bootstrap_site import cluster_alias
 from gpu_fault.admin_site import RenderedSite, load_site
 
 
@@ -414,7 +414,7 @@ def discover_legacy_site(
         active_runner,
         cluster_arn=request.cpu_cluster_arn,
         role="cpu",
-        context=_cluster_alias(request.cpu_cluster_arn, "cpu", 0),
+        context=cluster_alias(request.cpu_cluster_arn, "cpu", 0),
     )
     with ThreadPoolExecutor(max_workers=min(8, len(request.gpu_cluster_arns))) as pool:
         futures = [
@@ -423,7 +423,7 @@ def discover_legacy_site(
                 active_runner,
                 cluster_arn=value,
                 role="gpu",
-                context=_cluster_alias(value, "gpu", index),
+                context=cluster_alias(value, "gpu", index),
             )
             for index, value in enumerate(request.gpu_cluster_arns, 1)
         ]

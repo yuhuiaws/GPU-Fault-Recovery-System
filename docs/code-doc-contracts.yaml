@@ -17,8 +17,6 @@ coverage:
       - .yaml
       - .yml
       - .json
-      - .tf
-      - .hcl
 
 contracts:
   - id: source-python
@@ -46,6 +44,7 @@ contracts:
       - tests/**/*.py
     documents:
       - docs/README.md
+      - docs/部署机初始化.md
       - docs/概要设计-v2.md
       - docs/详细设计.md
       - docs/详细设计-v2.md
@@ -82,8 +81,6 @@ contracts:
       - deploy/**/*.yaml
       - deploy/**/*.yml
       - deploy/**/*.json
-      - deploy/**/*.tf
-      - deploy/**/*.hcl
       - scripts/generate-cleanup-inventory.py
     documents:
       - deploy/README.md

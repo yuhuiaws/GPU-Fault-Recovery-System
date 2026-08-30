@@ -81,12 +81,12 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 要求 Python 3.12。
 
 ```bash
-python3.12 -m venv .venv
+scripts/setup-deploy-host.sh --venv .venv --allow-network
 . .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install '.[dev,collectors,postgres,performance]'
 make check
 ```
+
+生产部署机必须使用签名离线bundle，见[部署机初始化](docs/部署机初始化.md)。
 
 需要手工逐项执行时，建议按以下顺序：
 
@@ -112,13 +112,22 @@ make test-parallel
 2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`。
 3. GPU VPC已有NAT出口。
 4. 执行身份具有所需AWS、EKS和Kubernetes管理权限。
+5. 部署机已安装Python 3.12项目环境以及`aws`、`cosign`、Docker Buildx、`kubectl`、`helm`、`curl`、`jq`、`openssl`、`sha256sum`和`make`；命令只验证这些前置，不自动安装系统工具。
+不要直接 apply `deploy/`。首次部署只使用ARN单命令入口：
 
-不要直接 apply `deploy/`。正式入口只有`make release-build`和
-`make release-deploy`两个连续步骤。
+```bash
+gpu-fault-admin deploy \
+  --cpu-cluster-arn <cpu-eks-or-hyperpod-arn> \
+  --gpu-cluster-arn <gpu-eks-or-hyperpod-arn> \
+  --state-dir /secure/gpu-fault \
+  --admin-email <operations-email>
+```
+
+多个GPU集群重复传`--gpu-cluster-arn`。命令自动创建/复用ECR和站点AWS资源、运行release build并push/sign、生成`site.yaml`，随后preflight、deploy和verify。
 
 ### 开发者：修改代码或Profile后发布
 
-无论由同一操作者执行，还是由CI代执行第一步，正式入口都只有以下两步：
+已有站点的代码候选仍可显式执行build和签名release升级：
 
 ```bash
 COSIGN_SIGNING_KEY=/secure/release/cosign.key \
@@ -154,23 +163,14 @@ Manifest v3、attestation和签名；部署机验签后执行
 
 ### 管理员：首次部署和日常管理
 
-管理员仍按上述`release-build -> release-deploy`两步执行；职责分离时第一步可由受信
-Release CI代执行。管理员不编辑Profile版本或artifact摘要。Region由管理员选择的集群
-ARN或`site.yaml`中的`spec.awsRegion`明确给出，不从shell或当前kubectl context猜测。
-完整权限和网络要求见[管理员快速部署](docs/管理员快速部署.md)。
+管理员使用`gpu-fault-admin deploy --cpu-cluster-arn ... --gpu-cluster-arn ...`
+`--state-dir /secure/gpu-fault --admin-email ...`；`make release-deploy
+CPU_CLUSTER_ARN=...`是同一入口的包装。Region由集群ARN推导并要求全部一致。
 
 #### 1. 首次部署
 
-先用`deploy/aws/regional-foundation/` Terraform模块创建Aurora、AMP/SNS/SQS、
-runtime/cache ECR和方案安全组，再根据输出准备`site.yaml`：
-
-```bash
-terraform -chdir=deploy/aws/regional-foundation apply
-gpu-fault-admin deploy -f /secure/gpu-fault/site.yaml
-```
-
-ARN-only Python foundation bootstrap只用于迁移，必须显式追加
-`--allow-legacy-python-foundation`；它也只接受CI已生成的deployable Manifest v3。
+`/secure/gpu-fault/release-signing/`必须预置权限受控的cosign key、password和public
+key。首次站点基础资源统一由ARN管理员入口创建和纳管。
 
 #### 2. 已有站点的单命令操作
 

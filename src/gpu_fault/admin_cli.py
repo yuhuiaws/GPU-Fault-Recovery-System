@@ -86,14 +86,18 @@ def parser() -> argparse.ArgumentParser:
         help="existing GPU EKS or HyperPod cluster ARN; repeat for more clusters",
     )
     deploy.add_argument("--repo-root", type=Path)
-    deploy.add_argument("--state-dir", type=Path)
+    deploy.add_argument(
+        "--state-dir",
+        type=Path,
+        help=(
+            "private bootstrap state directory; required with cluster ARNs and "
+            "must contain release-signing/cosign.key and cosign.pub"
+        ),
+    )
     deploy.add_argument(
         "--allow-legacy-python-foundation",
         action="store_true",
-        help=(
-            "allow the deprecated ARN-only Python AWS foundation bootstrap; "
-            "new sites must provision AWS resources through IaC"
-        ),
+        help=argparse.SUPPRESS,
     )
     deploy.add_argument(
         "--admin-email",
@@ -277,6 +281,36 @@ def _configure_site_notifications(
     return load_site(site.source, repository_root=site.repository_root)
 
 
+def _run_automatic_release(
+    *,
+    repository_root: Path,
+    site_file: Path,
+    state_dir: Path,
+) -> int:
+    command = [
+        sys.executable,
+        str(repository_root / "scripts/release_deploy.py"),
+        "--site",
+        str(site_file),
+        "--prebuilt-attestation",
+        str(repository_root / "dist/current-attestation.json"),
+        "--prebuilt-bundle",
+        str(repository_root / "dist/current-attestation.bundle.json"),
+        "--cosign-key",
+        str(state_dir / "release-signing/cosign.pub"),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=repository_root,
+        check=False,
+    )
+    if completed.returncode:
+        return completed.returncode
+    site = load_site(site_file, repository_root=repository_root)
+    sync_installation_resource_registry(site)
+    return 0
+
+
 def run(arguments: argparse.Namespace) -> int:
     if arguments.command == "join-cluster":
         site = load_site(
@@ -353,26 +387,17 @@ def run(arguments: argparse.Namespace) -> int:
                 "deploy requires -f site.yaml, or --cpu-cluster-arn "
                 "with at least one --gpu-cluster-arn"
             )
-        if not getattr(arguments, "allow_legacy_python_foundation", False):
+        if arguments.state_dir is None:
             raise SiteConfigError(
-                "ARN-only Python foundation bootstrap is disabled by default; "
-                "provision deploy/aws/regional-foundation with Terraform and "
-                "deploy its site.yaml, or explicitly set "
-                "--allow-legacy-python-foundation for migration"
+                "ARN deploy requires --state-dir for private state and signing keys"
             )
         repository_root = (arguments.repo_root or Path.cwd()).resolve()
-        identity = arguments.cpu_cluster_arn
-        default_state = (
-            Path.home()
-            / ".gpu-fault/bootstrap"
-            / hashlib.sha256(identity.encode()).hexdigest()[:12]
-        )
         bootstrap_result = bootstrap_from_arns(
             BootstrapRequest(
                 cpu_cluster_arn=arguments.cpu_cluster_arn,
                 gpu_cluster_arns=tuple(arguments.gpu_cluster_arn),
                 repository_root=repository_root,
-                state_dir=(arguments.state_dir or default_state).expanduser(),
+                state_dir=arguments.state_dir.expanduser(),
                 alert_email=arguments.alert_email,
                 email_sender=getattr(arguments, "email_sender", None),
                 email_recipients=tuple(getattr(arguments, "email_recipient", ()) or ()),
@@ -385,6 +410,12 @@ def run(arguments: argparse.Namespace) -> int:
         automatic = True
     if site_file is None:
         raise SiteConfigError(f"{arguments.command} requires -f site.yaml")
+    if automatic:
+        return _run_automatic_release(
+            repository_root=repository_root,
+            site_file=site_file,
+            state_dir=arguments.state_dir,
+        )
     site = load_site(site_file, repository_root=arguments.repo_root)
     if arguments.command == "deploy":
         notification_override = any(
@@ -447,14 +478,6 @@ def run(arguments: argparse.Namespace) -> int:
         if arguments.command != "deploy":
             return 0
         sync_installation_resource_registry(site)
-        if automatic:
-            verification = subprocess.run(
-                [str(rollout), "verify", "--config", str(config)],
-                cwd=site.repository_root,
-                env=environment,
-                check=False,
-            )
-            return verification.returncode
         return 0
 
 

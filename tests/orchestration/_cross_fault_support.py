@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from gpu_fault.app import ApplicationContext, create_app
+from gpu_fault.app.ingest import faults as fault_ingest
 from gpu_fault.models import WorkflowOperation, WorkflowRequest, WorkflowStatus
 from gpu_fault.watcher import AttemptObservation
 from tests._builders import (
@@ -19,6 +20,15 @@ from tests._builders import (
 NOW = datetime.now(timezone.utc)
 
 WORKLOAD_ID = "training/pytorchjob/train"
+
+
+def freeze_fault_ingestion_time(monkeypatch) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is not None else NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(fault_ingest, "datetime", FrozenDateTime)
 
 
 def observation(

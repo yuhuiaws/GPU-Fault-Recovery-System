@@ -26,6 +26,34 @@ def _bootstrap_state() -> dict:
     return {
         "site_id": "test-site",
         "resources": {
+            "release_repositories": {
+                "runtime": {
+                    "repository_name": "gpu-fault/runtime-test",
+                    "repository_arn": (
+                        "arn:aws:ecr:us-east-1:123456789012:"
+                        "repository/gpu-fault/runtime-test"
+                    ),
+                    "repository_uri": (
+                        "123456789012.dkr.ecr.us-east-1.amazonaws.com/"
+                        "gpu-fault/runtime-test"
+                    ),
+                    "ownership": "CREATED",
+                    "purpose": "runtime",
+                },
+                "cache": {
+                    "repository_name": "gpu-fault/runtime-cache-test",
+                    "repository_arn": (
+                        "arn:aws:ecr:us-east-1:123456789012:"
+                        "repository/gpu-fault/runtime-cache-test"
+                    ),
+                    "repository_uri": (
+                        "123456789012.dkr.ecr.us-east-1.amazonaws.com/"
+                        "gpu-fault/runtime-cache-test"
+                    ),
+                    "ownership": "CREATED",
+                    "purpose": "build-cache",
+                },
+            },
             "nlb_network": {
                 "security_group": "sg-created",
                 "security_group_ownership": "CREATED",
@@ -166,6 +194,10 @@ def test_registry_records_ownership_dependencies_and_delete_policy(tmp_path) -> 
         "aws/aurora/security-group",
         "aws/aurora/subnet-group",
     ]
+    assert by_key["aws/ecr/runtime"].delete_policy is (
+        InstallationResourceDeletePolicy.DELETE
+    )
+    assert by_key["aws/ecr/cache"].attributes["purpose"] == "build-cache"
     assert (
         by_key["aws/ses/administrator-email-identity"].delete_policy
         is InstallationResourceDeletePolicy.PRESERVE

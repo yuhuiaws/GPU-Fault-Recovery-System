@@ -31,6 +31,20 @@ def test_environment_expression_fstrings_are_patch_version_stable() -> None:
     )
 
 
+def test_test_and_performance_variables_are_not_runtime_configuration() -> None:
+    generator = runpy.run_path(str(ROOT / "scripts/generate-env-reference.py"))
+
+    assert generator["concrete_name"]("GPU_FAULT_TEST_POSTGRES_URL") is False, (
+        "test-only variables entered the production runtime inventory"
+    )
+    assert generator["concrete_name"]("GPU_FAULT_PERF_RUN_ID") is False, (
+        "performance-only variables entered the production runtime inventory"
+    )
+    assert generator["concrete_name"]("GPU_FAULT_STORE_URL") is True, (
+        "production runtime variables were excluded from the inventory"
+    )
+
+
 def test_environment_reference_matches_source() -> None:
     result = subprocess.run(
         [sys.executable, str(ROOT / "scripts/generate-env-reference.py"), "--check"],

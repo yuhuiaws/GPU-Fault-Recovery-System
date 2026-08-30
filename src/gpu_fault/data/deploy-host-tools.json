@@ -1,0 +1,104 @@
+{
+  "python": {
+    "major": 3,
+    "minor": 12
+  },
+  "schema_version": 1,
+  "tools": [
+    {
+      "command": [
+        "aws",
+        "--version"
+      ],
+      "executable": "aws",
+      "name": "aws"
+    },
+    {
+      "command": [
+        "cosign",
+        "version",
+        "--json"
+      ],
+      "executable": "cosign",
+      "name": "cosign",
+      "version_json_field": "gitVersion"
+    },
+    {
+      "command": [
+        "docker",
+        "info",
+        "--format",
+        "{{.ServerVersion}}"
+      ],
+      "executable": "docker",
+      "name": "docker-daemon"
+    },
+    {
+      "command": [
+        "docker",
+        "buildx",
+        "version"
+      ],
+      "executable": "docker",
+      "name": "docker-buildx"
+    },
+    {
+      "command": [
+        "kubectl",
+        "version",
+        "--client"
+      ],
+      "executable": "kubectl",
+      "name": "kubectl"
+    },
+    {
+      "command": [
+        "helm",
+        "version",
+        "--short"
+      ],
+      "executable": "helm",
+      "name": "helm"
+    },
+    {
+      "command": [
+        "curl",
+        "--version"
+      ],
+      "executable": "curl",
+      "name": "curl"
+    },
+    {
+      "command": [
+        "jq",
+        "--version"
+      ],
+      "executable": "jq",
+      "name": "jq"
+    },
+    {
+      "command": [
+        "openssl",
+        "version"
+      ],
+      "executable": "openssl",
+      "name": "openssl"
+    },
+    {
+      "command": [
+        "sha256sum",
+        "--version"
+      ],
+      "executable": "sha256sum",
+      "name": "sha256sum"
+    },
+    {
+      "command": [
+        "make",
+        "--version"
+      ],
+      "executable": "make",
+      "name": "make"
+    }
+  ]
+}

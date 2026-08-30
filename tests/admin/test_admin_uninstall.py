@@ -112,6 +112,33 @@ def test_external_ses_identity_is_supported_and_probed(tmp_path, monkeypatch) ->
     ]
 
 
+def test_created_ecr_repository_is_deleted_and_verified(tmp_path, monkeypatch) -> None:
+    site = load_site(site_file(tmp_path))
+    calls: list[list[str]] = []
+
+    def ecr(arguments, **kwargs):
+        del kwargs
+        calls.append(list(arguments))
+        if "describe-repositories" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 254, stdout="", stderr="RepositoryNotFoundException"
+            )
+        return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", ecr)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+    repository = _resource(
+        "aws/ecr/runtime", "ecr_repository", "gpu-fault/runtime-test"
+    )
+
+    cleaner.validate_supported([repository])
+    cleaner.delete(repository)
+
+    delete = next(call for call in calls if "delete-repository" in call)
+    assert "--force" in delete
+    assert delete[delete.index("--repository-name") + 1] == ("gpu-fault/runtime-test")
+
+
 def test_last_sqs_topic_binding_clears_the_policy_attribute(
     tmp_path, monkeypatch
 ) -> None:

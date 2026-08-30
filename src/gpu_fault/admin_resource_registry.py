@@ -6,9 +6,8 @@ import hashlib
 import json
 import subprocess
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, cast
+from typing import Any, Mapping, cast
 
 from gpu_fault.admin_bootstrap_common import (
     SITE_TAG_KEY,
@@ -17,12 +16,18 @@ from gpu_fault.admin_bootstrap_common import (
     tag_map,
 )
 from gpu_fault.admin_site import RenderedSite
+from gpu_fault.admin_resource_records import (
+    foundation_ownership as _foundation_ownership,
+    ownership as _ownership,
+    policy as _policy,
+    record as _record,
+    release_repository_resources as _release_repository_resources,
+)
 from gpu_fault.installation_resources import (
     InstallationResource,
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
     InstallationResourceSnapshot,
-    InstallationResourceStatus,
 )
 
 SYNC_SCRIPT = r"""
@@ -107,81 +112,6 @@ print(len(resources["resources"]))
 
 class LegacyInstallationRegistryMissing(BootstrapError):
     pass
-
-
-def _ownership(
-    value: object,
-    *,
-    default: InstallationResourceOwnership = InstallationResourceOwnership.EXTERNAL,
-) -> InstallationResourceOwnership:
-    try:
-        ownership = InstallationResourceOwnership(str(value))
-    except ValueError:
-        return default
-    if ownership is InstallationResourceOwnership.REUSED:
-        return InstallationResourceOwnership.CREATED
-    return ownership
-
-
-def _foundation_ownership(value: object) -> InstallationResourceOwnership:
-    try:
-        ownership = InstallationResourceOwnership(str(value))
-    except ValueError:
-        return InstallationResourceOwnership.EXTERNAL
-    if ownership is InstallationResourceOwnership.REUSED:
-        return InstallationResourceOwnership.EXTERNAL
-    return ownership
-
-
-def _policy(
-    ownership: InstallationResourceOwnership,
-    *,
-    created: InstallationResourceDeletePolicy = (
-        InstallationResourceDeletePolicy.DELETE
-    ),
-) -> InstallationResourceDeletePolicy:
-    if ownership is InstallationResourceOwnership.CREATED:
-        return created
-    return InstallationResourceDeletePolicy.PRESERVE
-
-
-def _record(
-    *,
-    site_id: str,
-    resource_key: str,
-    resource_type: str,
-    resource_id: str,
-    ownership: InstallationResourceOwnership,
-    delete_policy: InstallationResourceDeletePolicy,
-    provider: str = "aws",
-    resource_arn: str | None = None,
-    region: str | None = None,
-    account_id: str | None = None,
-    dependencies: Iterable[str] = (),
-    attributes: Mapping[str, object] | None = None,
-) -> InstallationResource:
-    now = datetime.now(timezone.utc)
-    return InstallationResource(
-        site_id=site_id,
-        resource_key=resource_key,
-        provider=provider,
-        resource_type=resource_type,
-        resource_id=resource_id,
-        resource_arn=resource_arn,
-        region=region,
-        account_id=account_id,
-        ownership=ownership,
-        delete_policy=delete_policy,
-        status=InstallationResourceStatus.ACTIVE,
-        dependencies=list(dependencies),
-        attributes={
-            str(key): str(value)
-            for key, value in (attributes or {}).items()
-            if value is not None and str(value)
-        },
-        created_at=now,
-        updated_at=now,
-    )
 
 
 def _external_clusters(
@@ -984,6 +914,14 @@ def build_installation_snapshot(
         site_id=site_id,
         region=region,
         account_id=account_id,
+    )
+    resources.extend(
+        _release_repository_resources(
+            site_id=site_id,
+            region=region,
+            account_id=account_id,
+            state=state,
+        )
     )
     resources.extend(
         _network_resources(

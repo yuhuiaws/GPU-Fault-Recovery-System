@@ -24,26 +24,6 @@ VALIDATION_MODULE = lazy_script_module(
 )
 
 
-def test_foundation_separates_immutable_runtime_and_mutable_build_cache() -> None:
-    foundation = (ROOT / "deploy/aws/regional-foundation/main.tf").read_text(
-        encoding="utf-8"
-    )
-    outputs = (ROOT / "deploy/aws/regional-foundation/outputs.tf").read_text(
-        encoding="utf-8"
-    )
-
-    runtime = foundation.split('resource "aws_ecr_repository" "runtime" {', 1)[1].split(
-        "}\n\n", 1
-    )[0]
-    cache = foundation.split('resource "aws_ecr_repository" "runtime_cache" {', 1)[
-        1
-    ].split("}\n\n", 1)[0]
-
-    assert 'image_tag_mutability = "IMMUTABLE"' in runtime
-    assert 'image_tag_mutability = "MUTABLE"' in cache
-    assert 'output "runtime_image_cache_repository"' in outputs
-
-
 def test_node_runtime_rollout_uses_fleet_waves(tmp_path: Path, monkeypatch) -> None:
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))

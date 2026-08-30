@@ -90,6 +90,9 @@ class BootstrapRequest:
     email_sender: str | None = None
     email_recipients: tuple[str, ...] = ()
     email_subject_prefix: str = ""
+    cosign_signing_key: Path | None = None
+    cosign_public_key: Path | None = None
+    cosign_password_file: Path | None = None
     dry_run: bool = False
 
 

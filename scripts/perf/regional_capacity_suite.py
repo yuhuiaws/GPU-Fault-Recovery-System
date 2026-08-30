@@ -39,9 +39,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 if __package__:
+    from .regional_capacity_cleanup import AUDIT_PURGE_STATEMENTS
     from .regional_capacity_database import (
         aurora_window as _aurora_window,
+    )
+    from .regional_capacity_database import (
         postgres_counters as _postgres_counters,
+    )
+    from .regional_capacity_database import (
         processor_priority_latency as _processor_priority_latency,
     )
     from .regional_capacity_job import build_job as _build_job
@@ -53,9 +58,14 @@ if __package__:
         write_status,
     )
 else:
+    from regional_capacity_cleanup import AUDIT_PURGE_STATEMENTS
     from regional_capacity_database import (
         aurora_window as _aurora_window,
+    )
+    from regional_capacity_database import (
         postgres_counters as _postgres_counters,
+    )
+    from regional_capacity_database import (
         processor_priority_latency as _processor_priority_latency,
     )
     from regional_capacity_job import build_job as _build_job
@@ -101,59 +111,6 @@ CONTROL_DEPLOYMENTS = (
     "gpu-fault-telemetry-spool-worker",
 )
 PERF_CLUSTER_PREFIX = "perf-cap-"
-
-AUDIT_PURGE_STATEMENTS = (
-    (
-        "gpu_fault_processor_queue",
-        "DELETE FROM gpu_fault_processor_queue WHERE cluster_id LIKE %s",
-        "cluster",
-    ),
-    (
-        "gpu_fault_processor_lanes",
-        "DELETE FROM gpu_fault_processor_lanes WHERE ordering_key LIKE %s",
-        "cluster",
-    ),
-    (
-        "gpu_fault_processor_queue_counts",
-        "DELETE FROM gpu_fault_processor_queue_counts WHERE cluster_id LIKE %s",
-        "cluster",
-    ),
-    (
-        "gpu_fault_gpu_metric_latest",
-        "DELETE FROM gpu_fault_gpu_metric_latest WHERE cluster_id LIKE %s",
-        "cluster",
-    ),
-    (
-        "gpu_fault_gpu_metrics_batches",
-        "DELETE FROM gpu_fault_gpu_metrics_batches WHERE cluster_id LIKE %s",
-        "cluster",
-    ),
-    (
-        "gpu_fault_attempt_observations",
-        "DELETE FROM gpu_fault_attempt_observations WHERE cluster_id LIKE %s",
-        "cluster",
-    ),
-    (
-        "gpu_fault_training_progress",
-        "DELETE FROM gpu_fault_training_progress WHERE cluster_id LIKE %s",
-        "cluster",
-    ),
-    (
-        "gpu_fault_action_workflows",
-        "DELETE FROM gpu_fault_objects WHERE kind='workflow' AND key LIKE %s",
-        "action_workflow",
-    ),
-    (
-        "gpu_fault_regional_clusters",
-        "DELETE FROM gpu_fault_objects WHERE kind='regional_cluster' AND key LIKE %s",
-        "cluster",
-    ),
-    (
-        "gpu_fault_objects",
-        "DELETE FROM gpu_fault_objects WHERE payload->>'cluster_id' LIKE %s",
-        "cluster",
-    ),
-)
 
 CASES = {
     "burst": {
@@ -293,6 +250,33 @@ def write_registry(entries: list[dict]) -> None:
     control("patch", "secret", REGISTRY_SECRET, "-p", patch)
 
 
+def validate_notification_safety() -> None:
+    """Refuse a capacity run that can mail synthetic drill notifications."""
+    pods = control_pods()
+    for pod in pods:
+        value = (
+            control(
+                "exec",
+                pod,
+                "--",
+                "python3",
+                "-c",
+                (
+                    "import os; print("
+                    "os.environ.get('GPU_FAULT_NOTIFICATION_DELIVER_DRILLS','false')"
+                    ")"
+                ),
+            )
+            .strip()
+            .lower()
+        )
+        if value not in {"", "false", "0", "no", "off"}:
+            raise RuntimeError(
+                "capacity runs must not deliver drill notifications: "
+                f"{pod} has GPU_FAULT_NOTIFICATION_DELIVER_DRILLS={value}"
+            )
+
+
 def restart_control_plane() -> None:
     for deployment in CONTROL_DEPLOYMENTS:
         replicas = control(
@@ -385,6 +369,7 @@ def redacted_registry_entries(entries: list[dict]) -> list[dict]:
 
 
 def register(count: int, artifacts: Path) -> list[dict]:
+    validate_notification_safety()
     existing = load_registry()
     baseline = [
         entry

@@ -42,6 +42,7 @@ PUBLIC_RELEASE_DOCUMENTS = (
     "docs/详细设计.md",
     "docs/详细设计-v2.md",
     "docs/components/nvidia-policy.md",
+    "docs/部署机初始化.md",
     "docs/管理员快速部署.md",
     "docs/管理员日常运维.md",
     "docs/管理员环境变量参考.md",
@@ -441,8 +442,10 @@ def test_root_readme_separates_developer_and_admin_deployment() -> None:
         assert value in developer
 
     for value in (
-        "terraform -chdir=deploy/aws/regional-foundation apply",
-        "--allow-legacy-python-foundation",
+        "--cpu-cluster-arn",
+        "--gpu-cluster-arn",
+        "--state-dir /secure/gpu-fault",
+        "--admin-email",
         "gpu-fault-admin preflight",
         "gpu-fault-admin deploy -f",
         "gpu-fault-admin verify",

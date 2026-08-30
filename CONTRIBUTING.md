@@ -48,7 +48,17 @@ image、schema/事务变化或跨越三个以上影响域时会fail closed并升
 或影响计划明确要求执行。规则与说明见
 [变更影响与测试选择](docs/变更影响与测试选择.md)。
 
-发布统一为两个命令。第一步检查、复用或构建不可变runtime image并签名：
+管理员首次部署由一个ARN命令完成基础资源、release build和应用部署：
+
+```bash
+gpu-fault-admin deploy \
+  --cpu-cluster-arn <cpu-arn> \
+  --gpu-cluster-arn <gpu-arn> \
+  --state-dir /secure/gpu-fault \
+  --admin-email <operations-email>
+```
+
+开发者或Release CI仍可独立构建签名候选：
 
 ```bash
 COSIGN_SIGNING_KEY=/secure/release/cosign.key \
@@ -56,7 +66,7 @@ make release-build \
   RUNTIME_IMAGE_REPOSITORY=<registry/repository>
 ```
 
-第二步默认消费第一步生成的`dist/current-attestation.json`和
+最后默认消费build生成的`dist/current-attestation.json`和
 `dist/current-attestation.bundle.json`，验签后部署：
 
 ```bash
@@ -65,8 +75,8 @@ make release-deploy \
   COSIGN_KEY=/path/to/cosign.pub
 ```
 
-职责分离时Release CI代执行第一步；管理员仍使用相同的第二步入口。`release-build`
-内部执行`make check`和PostgreSQL stress，不把`make check`作为正式发布的第三步。
+ARN首次部署内部复用同一`release-build`和持久化部署状态机；已有站点仍可显式执行
+`release-build -> release-deploy`。
 
 `make check`的最终全量测试和`make test-parallel`使用4个worker且不连接外部
 PostgreSQL。`make coverage`要求设置`GPU_FAULT_TEST_POSTGRES_URL`：先由4个worker

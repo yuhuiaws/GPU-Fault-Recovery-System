@@ -2378,18 +2378,19 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-015
 - id: GF-REGIONAL-BOOT-016
-  title: site.yaml首次部署先生成完整registry且零集群稳态可运行
+  title: ARN单命令首次部署先生成完整registry且零集群稳态可运行
   category: regional-deployability
   level: live
   risk: live-non-destructive
-  problem: Terraform与site.yaml首次应用部署必须在启动工作负载前生成至少一个完整GPU注册条目，同时部署后的零集群稳态必须允许显式空列表。
-  injection: 在隔离站点使用Terraform输出、非空spec.clusters和签名Manifest v3执行release-deploy，原样重跑验证NOOP；再用无live release state且spec.clusters为空的site验证首次bootstrap在首个Kubernetes apply前失败。
+  problem: ARN单命令首次部署必须先创建或复用ECR、构建并验签release、生成至少一个完整GPU注册条目，再启动工作负载；部署后的零集群稳态仍必须允许显式空列表。
+  injection: 在隔离站点使用CPU ARN、一个或多个GPU ARN、私有state-dir和签名密钥执行gpu-fault-admin deploy，原样重跑验证资源创建跳过、runtime image复用和NOOP；再用无live release state且spec.clusters为空的site验证首次bootstrap在首个Kubernetes apply前失败。
   expected:
-  - Terraform与site.yaml使用独立site ID且site文件为0600，首次spec.clusters非空
-  - 签名attestation、Manifest v3与delivery identity通过后才进入应用部署
+  - ARN推导的Region和账号完全一致，state-dir为0700、site文件为0600，首次spec.clusters非空
+  - runtime/cache ECR使用确定性名称和site tag；runtime immutable、cache mutable
+  - release build和签名验证通过后才创建Aurora、AMP、PKI/IAM等其余资源
   - registry Secret与site cluster ID集合一致后才启动CPU/GPU工作负载
   - release state为COMPLETED，独立verify与stability通过
-  - 原命令重跑为NOOP，不滚动CPU/GPU且不创建第二套AWS资源
+  - 原命令重跑时已有AWS资源通过state/tag验证后跳过创建，image input未变化时复用OCI digest，rollout为NOOP
   - 无live release state时空spec.clusters在创建namespace或其他Kubernetes对象前失败
   - 显式空registry仅由已部署站点的正式remove流程产生并保持控制面健康
   evidence:

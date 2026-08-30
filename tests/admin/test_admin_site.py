@@ -378,7 +378,7 @@ def test_legacy_uninstall_accepts_cluster_arns_without_site_file() -> None:
         ]
     )
 
-    assert arguments.file is None, "legacy ARN mode unexpectedly requires a site file"
+    assert arguments.file is None, "ARN uninstall unexpectedly requires a site file"
     assert arguments.cpu_cluster_arn.endswith("cluster/cpu"), "CPU ARN was not parsed"
     assert arguments.gpu_cluster_arn == [
         "arn:aws:sagemaker:us-west-2:123456789012:cluster/gpu"
@@ -390,11 +390,15 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
 ) -> None:
     path = site_file(tmp_path)
     calls: list[list[str]] = []
+    requests = []
     monkeypatch.setattr(
         admin_cli,
         "bootstrap_from_arns",
-        lambda request: BootstrapResult(
-            site_file=path, state_file=request.state_dir / "bootstrap-state.json"
+        lambda request: (
+            requests.append(request)
+            or BootstrapResult(
+                site_file=path, state_file=request.state_dir / "bootstrap-state.json"
+            )
         ),
     )
 
@@ -416,21 +420,31 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
         command="deploy",
         file=None,
         cpu_cluster_arn=("arn:aws:sagemaker:us-east-1:123456789012:cluster/cpu"),
-        gpu_cluster_arn=["arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a"],
+        gpu_cluster_arn=[
+            "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a",
+            "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-b",
+        ],
         repo_root=tmp_path / "repo",
         state_dir=tmp_path / "state",
         alert_email=None,
-        allow_legacy_python_foundation=True,
         show_effective_config=False,
     )
 
     assert admin_cli.run(arguments) == 0
-    assert [call[1] for call in calls] == ["preflight", "deploy", "verify"]
+    assert len(calls) == 1
+    assert calls[0][1].endswith("scripts/release_deploy.py"), (
+        "ARN deploy did not delegate to the signed release state machine"
+    )
+    assert "--prebuilt-attestation" in calls[0]
+    assert "--prebuilt-bundle" in calls[0]
+    assert "--cosign-key" in calls[0]
+    assert requests[0].gpu_cluster_arns == (
+        "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a",
+        "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-b",
+    )
 
 
-def test_arn_only_deploy_requires_explicit_legacy_foundation_opt_in(
-    tmp_path: Path,
-) -> None:
+def test_arn_only_deploy_requires_private_state_dir(tmp_path: Path) -> None:
     arguments = admin_cli.parser().parse_args(
         [
             "deploy",
@@ -443,7 +457,7 @@ def test_arn_only_deploy_requires_explicit_legacy_foundation_opt_in(
         ]
     )
 
-    with pytest.raises(SiteConfigError, match="disabled by default"):
+    with pytest.raises(SiteConfigError, match="requires --state-dir"):
         admin_cli.run(arguments)
 
 
