@@ -239,6 +239,32 @@ def test_profile_plan_site_identity_uses_stable_cpu_anchor(
     )
 
 
+def test_profile_plan_recovers_live_baseline_from_matching_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    template = tmp_path / "repo/config/profile.yaml"
+    initial = release_deploy.plan_runtime_profile(
+        site, live_profile_sha256=hashlib.sha256(template.read_bytes()).hexdigest()
+    )
+    release_deploy.prepare_site_release(site, profile_plan=initial)
+    document = yaml.safe_load(site.read_text(encoding="utf-8"))
+    snapshot = Path(document["spec"]["runtimeProfile"]["source"])
+    live_sha = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    document["spec"]["runtimeProfile"]["source"] = str(template)
+    site.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    recovered = release_deploy.plan_runtime_profile(site, live_profile_sha256=live_sha)
+
+    assert recovered.change_kind == "UNCHANGED"
+    assert recovered.approval_required is False
+    assert recovered.active_source == snapshot
+    prepared = release_deploy.prepare_site_release(site, profile_plan=recovered)
+    repaired = yaml.safe_load(site.read_text(encoding="utf-8"))
+    assert repaired["spec"]["runtimeProfile"]["source"] == str(snapshot)
+    assert prepared.site_changed is True, "matching live snapshot did not repair site"
+
+
 def test_execute_release_uses_verified_noop_fast_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

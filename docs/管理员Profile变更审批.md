@@ -303,7 +303,8 @@ superseded.json
 | deploy失败但没有`profile-plan.json` | 不是审批暂停；按原错误修复，不执行审批 |
 | `--plan-sha256`不匹配 | 计划在审核后发生变化；重新读取、重新审核并更新变更单 |
 | `site_identity`或其摘要不匹配 | 停止；确认state-dir和CPU控制面身份 |
-| `UNKNOWN_BASELINE` | 不审批；先恢复可信live Profile证据 |
+| site `source`路径漂移，但本地版本快照SHA与live SHA一致 | deploy自动使用该不可变快照恢复baseline并修正site |
+| `UNKNOWN_BASELINE` | 本地快照缺失或SHA不一致；不审批，先恢复可信live Profile证据 |
 | 发布失败，审批仍活动且计划未变 | 修复发布问题，重跑原四参数deploy，无需重复审批 |
 | 旧审批标记为`SUPERSEDED` | 审核新`profile-plan.json`并重新审批 |
 | 发布已完成但归档收尾失败 | 重跑原四参数deploy；系统以`ALREADY_APPLIED`完成消费 |

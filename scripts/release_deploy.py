@@ -368,6 +368,17 @@ def plan_runtime_profile(
     current_document: dict[str, Any] | None = None
     active_sha = _sha256(active_source) if active_source.is_file() else None
     active_is_live = live_profile_sha256 is None or active_sha == live_profile_sha256
+    if not active_is_live and live_profile_sha256 is not None:
+        recovered_source = (
+            site_file.parent / "profiles" / f"{current_version}.yaml"
+        ).resolve()
+        recovered_sha = (
+            _sha256(recovered_source) if recovered_source.is_file() else None
+        )
+        if recovered_sha == live_profile_sha256:
+            active_source = recovered_source
+            active_sha = recovered_sha
+            active_is_live = True
     if active_source.is_file() and active_is_live:
         current, current_digest, _source_sha, current_document = _profile_definition(
             active_source,
