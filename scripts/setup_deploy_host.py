@@ -142,6 +142,13 @@ def _python_path(venv: Path) -> Path:
     return venv / "bin/python"
 
 
+def _isolated_python_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    return environment
+
+
 def _pip_install(
     python: Path,
     *,
@@ -152,7 +159,7 @@ def _pip_install(
     if wheelhouse is not None:
         command.extend(["--no-index", "--find-links", str(wheelhouse)])
     command.extend(["--require-hashes", "--requirement", str(requirements)])
-    _run(command)
+    _run(command, env=_isolated_python_environment())
 
 
 def _install_bundled_tools(bundle_root: Path, venv: Path) -> None:
@@ -175,7 +182,8 @@ def _install_bundled_tools(bundle_root: Path, venv: Path) -> None:
 
 
 def _dependency_report(venv: Path) -> dict[str, Any]:
-    env = {**os.environ, "PATH": f"{venv / 'bin'}:{os.environ.get('PATH', '')}"}
+    env = _isolated_python_environment()
+    env["PATH"] = f"{venv / 'bin'}:{env.get('PATH', '')}"
     output = _run(
         [
             str(_python_path(venv)),
@@ -244,12 +252,14 @@ def _install_from_bundle(
             "-m",
             "pip",
             "install",
+            "--force-reinstall",
             "--no-index",
             "--find-links",
             str(wheelhouse),
             "--no-deps",
             str(project_wheel),
-        ]
+        ],
+        env=_isolated_python_environment(),
     )
     _install_bundled_tools(bundle_root, venv)
     return manifest
@@ -276,7 +286,8 @@ def _install_online(
             "--no-deps",
             "--editable",
             str(repo_root),
-        ]
+        ],
+        env=_isolated_python_environment(),
     )
     commit = _run(
         ["git", "rev-parse", "HEAD"],
@@ -382,9 +393,14 @@ def setup_deploy_host(
                         repo_root=repo_root,
                         allow_source_mismatch=allow_source_mismatch,
                     )
-                    result = _check_venv(venv)
-                    result["reused"] = True
-                    return result
+                    try:
+                        result = _check_venv(venv)
+                    except DeployHostSetupError as exc:
+                        if "deployment-host venv is incomplete" not in str(exc):
+                            raise
+                    else:
+                        result["reused"] = True
+                        return result
     versions = venv.parent / f".{venv.name}.versions"
     versions.mkdir(mode=0o700, parents=True, exist_ok=True)
     if archive_sha is not None:

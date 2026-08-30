@@ -90,7 +90,8 @@ Documentation-Impact-Reason: 仅重构内部实现，公共行为、命令和验
 ## 开发规范
 
 - [CI 发布流程](CI发布流程.md)：GitHub Release workflow、签名制品、artifact交付和
-  部署消费边界。
+  部署消费边界。离线deploy-host安装隔离工作区Python路径、强制安装bundle项目wheel，
+  并自动重建同摘要但不完整的venv。
 - [EC2源码统一部署流程](EC2源码Staging复现流程.md)：代码修改后的最短验证、
   staging部署、非破坏性测试和生产晋级闭环。
 - [开发者部署实现](开发者部署实现.md)：内部site、生产 Manifest、renderer、

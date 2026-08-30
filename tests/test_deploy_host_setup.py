@@ -123,6 +123,15 @@ def test_setup_requires_signed_bundle_or_explicit_network(tmp_path: Path) -> Non
         )
 
 
+def test_bundle_setup_reinstalls_project_wheel_without_source_path_leakage() -> None:
+    source = (ROOT / "scripts/setup_deploy_host.py").read_text(encoding="utf-8")
+
+    assert '"--force-reinstall"' in source
+    assert 'environment.pop("PYTHONPATH", None)' in source
+    assert 'environment.pop("PYTHONHOME", None)' in source
+    assert '"deployment-host venv is incomplete" not in str(exc)' in source
+
+
 def test_bundle_signature_verification_uses_cosign(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
