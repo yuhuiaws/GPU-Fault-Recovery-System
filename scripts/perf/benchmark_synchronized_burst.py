@@ -8,6 +8,7 @@ import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from functools import partial
 from http.client import HTTPConnection, HTTPSConnection
 from pathlib import Path
 from urllib import error as urllib_error
@@ -24,6 +25,12 @@ EVENT_PATHS = {
     **PATHS,
     "TRAINING_PROGRESS": "/v1/training-progress",
 }
+INTEGRATED_ACTION_KINDS = (
+    "RESET_GPU",
+    "RESET_GPU",
+    "RESTART_NODE",
+    "FABRIC_RESET",
+)
 
 
 def percentile(values: list[float], ratio: float) -> float:
@@ -172,6 +179,23 @@ def attempt_identity(node_index: int) -> dict[str, str | int]:
     }
 
 
+def integrated_action_identity(
+    run_id: str,
+    cluster_offset: int,
+    workflow_index: int,
+) -> dict[str, str]:
+    suffix = f"{run_id}-c{cluster_offset:03d}-w{workflow_index:02d}"
+    return {
+        "job_id": f"integrated-job-{suffix}",
+        "attempt_id": f"integrated-attempt-{suffix}",
+        "workload_id": f"training/PyTorchJob/integrated-{suffix}",
+        "node_id": f"integrated-node-{suffix}",
+        "gpu_uuid": f"GPU-integrated-{cluster_offset:03d}-{workflow_index:02d}",
+        "event_id": f"integrated-{suffix}",
+        "action_kind": INTEGRATED_ACTION_KINDS[workflow_index],
+    }
+
+
 def build_event_payload(
     *,
     templates: dict,
@@ -181,10 +205,61 @@ def build_event_payload(
     node_index: int,
     sequence: int,
     correlate_attempt_faults: bool,
+    action_identity: dict[str, str] | None = None,
+    runtime_profile_version: str = "hyperpod-v1",
 ) -> dict:
-    node_id = f"burst-node-{node_index:04d}"
+    node_id = (
+        action_identity["node_id"]
+        if action_identity is not None
+        else f"burst-node-{node_index:04d}"
+    )
     identity = attempt_identity(node_index)
     now = datetime.now(timezone.utc).isoformat()
+    if action_identity is not None:
+        if action_identity["action_kind"] == "FABRIC_RESET":
+            return {
+                "event_id": action_identity["event_id"],
+                "cluster_id": cluster_id,
+                "node_id": action_identity["node_id"],
+                "observed_at": now,
+                "source_event_time": now,
+                "ingested_at": now,
+                "event_source": "PERF_INTEGRATED",
+                "sxid": 11001,
+                "classification": "FATAL",
+                "classification_source": "NVIDIA_FABRIC_MANAGER_CATALOG",
+                "link_scope": "TRUNK",
+                "link_scope_source": "TRUSTED_NVSWITCH_TOPOLOGY",
+                "product": "H200",
+                "fabric_partition": (
+                    f"{cluster_id}/{action_identity['node_id']}/local-nvswitch"
+                ),
+                "participating_gpu_uuids": [action_identity["gpu_uuid"]],
+                "runtime_profile_version": runtime_profile_version,
+                "workload_state": "ACTIVE",
+                "affected_workload_ids": [action_identity["workload_id"]],
+                "drill_id": action_identity["event_id"],
+                "synthetic": True,
+            }
+        return {
+            "event_id": action_identity["event_id"],
+            "cluster_id": cluster_id,
+            "node_id": action_identity["node_id"],
+            "observed_at": now,
+            "source_event_time": now,
+            "ingested_at": now,
+            "event_source": "PERF_INTEGRATED",
+            "xid": (79 if action_identity["action_kind"] == "RESTART_NODE" else 48),
+            "gpu_uuid": action_identity["gpu_uuid"],
+            "product": "H100",
+            "driver_branch": 575,
+            "cuda_version": "12.9",
+            "runtime_profile_version": runtime_profile_version,
+            "workload_state": "ACTIVE",
+            "affected_workload_ids": [action_identity["workload_id"]],
+            "drill_id": action_identity["event_id"],
+            "synthetic": True,
+        }
     if kind == "TRAINING_PROGRESS":
         return {
             "heartbeat_id": f"burst-progress-{sequence}",
@@ -242,6 +317,180 @@ def build_event_payload(
         payload["affected_workload_ids"] = [identity["workload_id"]]
         payload["workload_state"] = "ACTIVE"
     return payload
+
+
+def action_context_payloads(
+    *,
+    cluster_id: str,
+    run_id: str,
+    cluster_offset: int,
+    workflows_per_cluster: int,
+    runtime_profile_version: str,
+) -> list[tuple[str, dict]]:
+    observed_at = datetime.now(timezone.utc).isoformat()
+    payloads = []
+    for workflow_index in range(workflows_per_cluster):
+        identity = integrated_action_identity(
+            run_id,
+            cluster_offset,
+            workflow_index,
+        )
+        payloads.extend(
+            [
+                (
+                    "/v1/workload-observations",
+                    {
+                        "cluster_id": cluster_id,
+                        "environment": "hyperpod-eks",
+                        "job_id": identity["job_id"],
+                        "attempt_id": identity["attempt_id"],
+                        "workload_phase": "RUNNING",
+                        "observed_at": observed_at,
+                        "started_at": observed_at,
+                        "expected_critical_ranks": 1,
+                        "workload_ids": [identity["workload_id"]],
+                        "restart_budget": 1,
+                        "runtime_profile_version": runtime_profile_version,
+                        "containers": [
+                            {
+                                "pod_uid": f"pod-{identity['attempt_id']}",
+                                "pod_name": f"pod-{identity['attempt_id']}",
+                                "container_name": "trainer",
+                                "role": "worker",
+                                "rank": 0,
+                                "node_id": identity["node_id"],
+                                "gpu_count": 8,
+                                "gpu_uuids": [identity["gpu_uuid"]],
+                                "terminated": False,
+                            }
+                        ],
+                    },
+                ),
+                (
+                    "/v1/training-progress",
+                    {
+                        "heartbeat_id": f"heartbeat-{identity['attempt_id']}",
+                        "cluster_id": cluster_id,
+                        "attempt_id": identity["attempt_id"],
+                        "rank": 0,
+                        "observed_at": observed_at,
+                        "node_id": identity["node_id"],
+                        "pod_uid": f"pod-{identity['attempt_id']}",
+                        "container_name": "trainer",
+                        "gpu_uuids": [identity["gpu_uuid"]],
+                        "step": 1,
+                        "samples_per_second": 1.0,
+                        "loss": 1.0,
+                        "labels": {"drill_id": run_id},
+                    },
+                ),
+            ]
+        )
+    return payloads
+
+
+def submit_setup_context(
+    *,
+    base_url: str,
+    registration: dict,
+    ssl_context: ssl.SSLContext,
+    path: str,
+    payload: dict,
+    timeout_seconds: float = 120,
+) -> None:
+    headers = {
+        "Authorization": f"Bearer {registration['token']}",
+        "X-GPU-Fault-Cluster-ID": registration["cluster_id"],
+        "Content-Type": "application/json",
+    }
+    value = urllib_request.Request(
+        base_url + path,
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        headers=headers,
+        method="POST",
+    )
+    with urllib_request.urlopen(
+        value,
+        timeout=30,
+        context=ssl_context,
+    ) as response:
+        body = json.loads(response.read() or b"{}")
+    request_id = body.get("processor_request_id")
+    if not request_id:
+        return
+    deadline = time.monotonic() + timeout_seconds
+    status_path = f"/v1/processor/requests/{quote(str(request_id), safe='')}"
+    while time.monotonic() < deadline:
+        status_request = urllib_request.Request(
+            base_url + status_path,
+            headers=headers,
+            method="GET",
+        )
+        try:
+            with urllib_request.urlopen(
+                status_request,
+                timeout=30,
+                context=ssl_context,
+            ) as response:
+                response.read()
+                if response.status != 202:
+                    return
+        except urllib_error.HTTPError as exc:
+            exc.read()
+            if exc.code != 202:
+                raise
+        time.sleep(0.2)
+    raise TimeoutError(f"setup processor request did not complete: {request_id}")
+
+
+def prepare_integrated_actions(
+    *,
+    base_url: str,
+    registration: dict,
+    ssl_context: ssl.SSLContext,
+    events: list[tuple[str, str, int]],
+    cluster_offset: int,
+) -> tuple[str, str, dict[int, int], int]:
+    workflows = int(os.getenv("ACTION_WORKFLOWS_PER_CLUSTER", "0"))
+    run_id = os.getenv("ACTION_RUN_ID", "")
+    profile = os.getenv("RUNTIME_PROFILE_VERSION", "hyperpod-v1")
+    if workflows < 0:
+        raise ValueError("ACTION_WORKFLOWS_PER_CLUSTER cannot be negative")
+    if workflows and not run_id:
+        raise ValueError("ACTION_RUN_ID is required for action-bearing P0")
+    candidates = {
+        kind: [
+            event_index for event_index, event in enumerate(events) if event[0] == kind
+        ]
+        for kind in ("NVIDIA_KERNEL", "FABRIC_MANAGER_LOG")
+    }
+    indexes = {}
+    for workflow_index in range(workflows):
+        action_kind = INTEGRATED_ACTION_KINDS[workflow_index]
+        source_kind = (
+            "FABRIC_MANAGER_LOG" if action_kind == "FABRIC_RESET" else "NVIDIA_KERNEL"
+        )
+        if not candidates[source_kind]:
+            break
+        indexes[candidates[source_kind].pop(0)] = workflow_index
+    if len(indexes) != workflows:
+        raise ValueError("local XID allocation is below ACTION_WORKFLOWS_PER_CLUSTER")
+    payloads = action_context_payloads(
+        cluster_id=registration["cluster_id"],
+        run_id=run_id,
+        cluster_offset=cluster_offset,
+        workflows_per_cluster=workflows,
+        runtime_profile_version=profile,
+    )
+    for path, payload in payloads:
+        submit_setup_context(
+            base_url=base_url,
+            registration=registration,
+            ssl_context=ssl_context,
+            path=path,
+            payload=payload,
+        )
+    return run_id, profile, indexes, len(payloads)
 
 
 def build_output(
@@ -379,6 +628,131 @@ def open_connection(parsed_base, connection_port: int, ssl_context) -> HTTPConne
     return connection
 
 
+def send_event(
+    indexed_event: tuple[int, tuple[str, str, int]],
+    *,
+    templates: dict,
+    registration: dict,
+    cluster_offset: int,
+    correlate_attempt_faults: bool,
+    action_event_indexes: dict[int, int],
+    action_run_id: str,
+    runtime_profile_version: str,
+    connections: list[HTTPConnection | None],
+    prewarm_connections: bool,
+    base_url: str,
+    base_path: str,
+    ssl_context: ssl.SSLContext,
+) -> tuple[str, int, float, str | None, dict[str, float]]:
+    index, (kind, template_kind, node_index) = indexed_event
+    sequence = cluster_offset * 1_000_000 + index
+    workflow_index = action_event_indexes.get(index)
+    action_identity = (
+        integrated_action_identity(
+            action_run_id,
+            cluster_offset,
+            workflow_index,
+        )
+        if workflow_index is not None
+        else None
+    )
+    try:
+        payload = build_event_payload(
+            templates=templates,
+            kind=kind,
+            template_kind=template_kind,
+            cluster_id=registration["cluster_id"],
+            node_index=node_index,
+            sequence=sequence,
+            correlate_attempt_faults=correlate_attempt_faults,
+            action_identity=action_identity,
+            runtime_profile_version=runtime_profile_version,
+        )
+    except Exception as exc:
+        return kind, 0, 0.0, type(exc).__name__, {}
+    if kind.endswith("_EVIDENCE"):
+        payload["edge_filter_reasons"] = ["threshold:synthetic-priority-50"]
+        payload["collection_errors"] = []
+        payload["context_history"] = []
+    event_path = EVENT_PATHS[template_kind]
+    if action_identity is not None:
+        event_path = (
+            "/v1/gpu-events/sxid"
+            if action_identity["action_kind"] == "FABRIC_RESET"
+            else "/v1/gpu-events/xid"
+        )
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    compressed = len(body) >= 64 * 1024
+    if compressed:
+        body = gzip.compress(body, compresslevel=6)
+    begin = time.perf_counter()
+    for attempt in range(2):
+        try:
+            headers = {
+                "Authorization": f"Bearer {registration['token']}",
+                "X-GPU-Fault-Cluster-ID": registration["cluster_id"],
+                "Content-Type": "application/json",
+                "Connection": ("keep-alive" if prewarm_connections else "close"),
+                **({"Content-Encoding": "gzip"} if compressed else {}),
+            }
+            connection = connections[index]
+            if connection is not None:
+                connection.request(
+                    "POST",
+                    base_path + event_path,
+                    body=body,
+                    headers=headers,
+                )
+                response = connection.getresponse()
+                response.read()
+                status = response.status
+                timing = server_timing(response.headers)
+            else:
+                value = urllib_request.Request(
+                    base_url + event_path,
+                    data=body,
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib_request.urlopen(
+                    value,
+                    timeout=60,
+                    context=ssl_context,
+                ) as response:
+                    status = response.status
+                    timing = server_timing(response.headers)
+            return (
+                kind,
+                status,
+                (time.perf_counter() - begin) * 1000,
+                None,
+                timing,
+            )
+        except urllib_error.HTTPError as exc:
+            return (
+                kind,
+                exc.code,
+                (time.perf_counter() - begin) * 1000,
+                None,
+                server_timing(exc.headers),
+            )
+        except (urllib_error.URLError, TimeoutError, OSError) as exc:
+            connection = connections[index]
+            if connection is not None:
+                connection.close()
+                connections[index] = None
+            if attempt == 0:
+                continue
+            return (
+                kind,
+                0,
+                (time.perf_counter() - begin) * 1000,
+                type(exc).__name__,
+                {},
+            )
+    raise AssertionError("unreachable send retry state")
+
+
 def main() -> None:
     base_url = os.environ["GPU_FAULT_CONTROL_PLANE_URL"].rstrip("/")
     clusters = json.loads(Path(os.environ["CLUSTERS_FILE"]).read_text())
@@ -418,6 +792,18 @@ def main() -> None:
         workload_observation_total=workload_observation_total,
         correlate_attempt_faults=correlate_attempt_faults,
     )
+    (
+        action_run_id,
+        runtime_profile_version,
+        action_event_indexes,
+        setup_request_count,
+    ) = prepare_integrated_actions(
+        base_url=base_url,
+        registration=registration,
+        ssl_context=ssl_context,
+        events=events,
+        cluster_offset=cluster_offset,
+    )
 
     connections, prewarm_errors, prewarm_seconds = prewarm_connection_pool(
         events,
@@ -437,99 +823,25 @@ def main() -> None:
     statuses: dict[str, dict[int, int]] = {}
     errors: dict[str, dict[str, int]] = {}
 
-    def send(indexed_event: tuple[int, tuple[str, str, int]]):
-        index, (kind, template_kind, node_index) = indexed_event
-        sequence = cluster_offset * 1_000_000 + index
-        try:
-            payload = build_event_payload(
-                templates=templates,
-                kind=kind,
-                template_kind=template_kind,
-                cluster_id=registration["cluster_id"],
-                node_index=node_index,
-                sequence=sequence,
-                correlate_attempt_faults=correlate_attempt_faults,
-            )
-        except Exception as exc:
-            return kind, 0, 0.0, type(exc).__name__, {}
-        if kind.endswith("_EVIDENCE"):
-            payload["edge_filter_reasons"] = ["threshold:synthetic-priority-50"]
-            payload["collection_errors"] = []
-            payload["context_history"] = []
-        body = json.dumps(payload, separators=(",", ":")).encode()
-        compressed = len(body) >= 64 * 1024
-        if compressed:
-            body = gzip.compress(body, compresslevel=6)
-        begin = time.perf_counter()
-        for attempt in range(2):
-            try:
-                headers = {
-                    "Authorization": (f"Bearer {registration['token']}"),
-                    "X-GPU-Fault-Cluster-ID": (registration["cluster_id"]),
-                    "Content-Type": "application/json",
-                    "Connection": ("keep-alive" if prewarm_connections else "close"),
-                    **({"Content-Encoding": "gzip"} if compressed else {}),
-                }
-                connection = connections[index]
-                if connection is not None:
-                    connection.request(
-                        "POST",
-                        base_path + EVENT_PATHS[template_kind],
-                        body=body,
-                        headers=headers,
-                    )
-                    response = connection.getresponse()
-                    response.read()
-                    status = response.status
-                    timing = server_timing(response.headers)
-                else:
-                    request = urllib_request.Request(
-                        base_url + EVENT_PATHS[template_kind],
-                        data=body,
-                        headers=headers,
-                        method="POST",
-                    )
-                    with urllib_request.urlopen(
-                        request,
-                        timeout=60,
-                        context=ssl_context,
-                    ) as response:
-                        status = response.status
-                        timing = server_timing(response.headers)
-                return (
-                    kind,
-                    status,
-                    (time.perf_counter() - begin) * 1000,
-                    None,
-                    timing,
-                )
-            except urllib_error.HTTPError as exc:
-                return (
-                    kind,
-                    exc.code,
-                    (time.perf_counter() - begin) * 1000,
-                    None,
-                    server_timing(exc.headers),
-                )
-            except (urllib_error.URLError, TimeoutError, OSError) as exc:
-                connection = connections[index]
-                if connection is not None:
-                    connection.close()
-                    connections[index] = None
-                if attempt == 0:
-                    continue
-                return (
-                    kind,
-                    0,
-                    (time.perf_counter() - begin) * 1000,
-                    type(exc).__name__,
-                    {},
-                )
-
+    sender = partial(
+        send_event,
+        templates=templates,
+        registration=registration,
+        cluster_offset=cluster_offset,
+        correlate_attempt_faults=correlate_attempt_faults,
+        action_event_indexes=action_event_indexes,
+        action_run_id=action_run_id,
+        runtime_profile_version=runtime_profile_version,
+        connections=connections,
+        prewarm_connections=prewarm_connections,
+        base_url=base_url,
+        base_path=base_path,
+        ssl_context=ssl_context,
+    )
     cpu_started = time.process_time()
     wall_started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(send, item) for item in enumerate(events)]
+        futures = [executor.submit(sender, item) for item in enumerate(events)]
         for future in as_completed(futures):
             kind, status, latency, error, timing = future.result()
             latencies.setdefault(kind, []).append(latency)
@@ -570,6 +882,13 @@ def main() -> None:
         network_overheads=network_overheads,
         stage_durations=stage_durations,
     )
+    action_workflows = len(action_event_indexes)
+    output["action_workflows_per_cluster"] = action_workflows
+    output["action_context_requests"] = setup_request_count
+    output["action_event_ids"] = [
+        integrated_action_identity(action_run_id, cluster_offset, index)["event_id"]
+        for index in range(action_workflows)
+    ]
     print(json.dumps(output, indent=2, sort_keys=True))
 
 

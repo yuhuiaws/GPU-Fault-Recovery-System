@@ -228,6 +228,9 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert worker_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS"] == "1"
     assert worker_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS"] == "30"
     assert worker_env["GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS"] == "30"
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] == "20"
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER"] == "5"
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"] == "2"
     assert worker_env["GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS"] == "1"
     assert worker_env["GPU_FAULT_PROCESSOR_THREAD_DUMP_SIGNAL"] == "SIGUSR2"
     assert spool_env["GPU_FAULT_POSTGRES_STATEMENT_TIMEOUT_SECONDS"] == "20"
@@ -247,6 +250,45 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
         "--timeout-graceful-shutdown 60"
         in (ingress_pod_spec["containers"][0]["args"][0])
     )
+
+
+def test_role_split_accepts_formal_capacity_overrides() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy/control-plane/tools/render_control_plane_role_split.py"),
+            "--json",
+        ],
+        input=json.dumps(_deployment()),
+        text=True,
+        capture_output=True,
+        check=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            "GPU_FAULT_CONTROL_WORKER_REPLICAS": "6",
+            "GPU_FAULT_TELEMETRY_SPOOL": "true",
+            "GPU_FAULT_TELEMETRY_SPOOL_REPLICAS": "3",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "128",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": "4",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": "4",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": "1",
+        },
+    )
+    items = {
+        item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
+    }
+    ingress_env = _effective_env(items, items["gpu-fault-api-ha"])
+    worker_env = _effective_env(items, items["gpu-fault-control-worker"])
+
+    assert ingress_env["GPU_FAULT_TELEMETRY_SPOOL"] == "true"
+    assert items["gpu-fault-telemetry-spool-worker"]["spec"]["replicas"] == 3
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] == "128"
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER"] == "4"
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"] == "4"
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE"] == "1"
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"] == "1"
 
 
 POOL_ENV = (

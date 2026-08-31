@@ -158,7 +158,15 @@ def save_synthetic_agent(
         )
     else:
         raise RuntimeError("synthetic Agent identity source is missing")
+    lease_seconds = int(os.getenv("ACTION_AGENT_LEASE_SECONDS", "1800"))
+    record = record.model_copy(
+        update={"lease_expires_at": now + timedelta(seconds=lease_seconds)}
+    )
     context.store.save_agent(record)
+
+
+def integrated_node_id(run_id: str, cluster_index: int, workflow_index: int) -> str:
+    return f"integrated-node-{run_id}-c{cluster_index:03d}-w{workflow_index:02d}"
 
 
 def workflow_steps(
@@ -260,11 +268,27 @@ def main() -> None:
             runtime_profile_version = ""
         if not runtime_profile_version:
             raise RuntimeError("synthetic Agent runtime Profile is missing")
-        if seed_mode == "correlated-agents":
+        if seed_mode in {"correlated-agents", "integrated-agents"}:
+            workflows_per_cluster = int(os.getenv("ACTION_WORKFLOWS_PER_CLUSTER", "2"))
             for cluster_index in range(clusters):
                 cluster_id = f"perf-cap-{cluster_index:03d}"
-                for lane in ("preempt", "reset"):
-                    node_id = f"corr-node-{run_id}-c{cluster_index:03d}-{lane}"
+                lanes = (
+                    ("preempt", "reset")
+                    if seed_mode == "correlated-agents"
+                    else tuple(
+                        f"w{index:02d}" for index in range(workflows_per_cluster)
+                    )
+                )
+                for lane in lanes:
+                    node_id = (
+                        f"corr-node-{run_id}-c{cluster_index:03d}-{lane}"
+                        if seed_mode == "correlated-agents"
+                        else integrated_node_id(
+                            run_id,
+                            cluster_index,
+                            int(lane.removeprefix("w")),
+                        )
+                    )
                     save_synthetic_agent(
                         context,
                         template=agent_template,

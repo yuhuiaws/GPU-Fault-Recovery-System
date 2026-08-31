@@ -6,6 +6,7 @@ import ssl
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock, Thread
 from urllib import error, request
@@ -15,18 +16,23 @@ OWNERS = [
     "gpu-fault-kubernetes-adapter",
     "gpu-fault-node-agent",
     "gpu-fault-hyperpod-adapter",
+    "gpu-fault-validation-adapter",
 ]
 DELAYS = {
-    "MARK_UNSCHEDULABLE": 0.03,
-    "CHECKPOINT_WORKLOADS": 0.08,
-    "STOP_WORKLOADS": 0.08,
-    "COLLECT_DIAGNOSTIC_BUNDLE": 0.15,
-    "QUIESCE_GPU_SERVICES": 0.12,
-    "VERIFY_NO_GPU_CLIENTS": 0.08,
-    "RESET_GPU": 0.15,
-    "RESTORE_GPU_SERVICES": 0.10,
-    "RESTART_NODE": 0.20,
-    "RESTORE_SCHEDULING": 0.04,
+    "MARK_UNSCHEDULABLE": 0.5,
+    "CHECKPOINT_WORKLOADS": 3.0,
+    "STOP_WORKLOADS": 2.0,
+    "COLLECT_DIAGNOSTIC_BUNDLE": 4.0,
+    "QUIESCE_GPU_SERVICES": 2.0,
+    "VERIFY_NO_GPU_CLIENTS": 1.0,
+    "RESET_GPU": 8.0,
+    "RESTORE_GPU_SERVICES": 2.0,
+    "RESTART_NODE": 120.0,
+    "VALIDATE_GPU": 3.0,
+    "VALIDATE_HOST": 2.0,
+    "VALIDATE_FABRIC": 3.0,
+    "RESTART_WORKLOAD": 2.0,
+    "RESTORE_SCHEDULING": 0.5,
 }
 
 
@@ -84,6 +90,115 @@ class Client:
             return json.loads(response.read() or b"{}")
 
 
+@dataclass
+class SimulationState:
+    client: Client
+    executor_id: str
+    operation_delays: dict[str, float]
+    delay_scale: float
+    lease_seconds: int
+    renewal_interval: float
+    inject_renew_failure_pending: bool
+    counters_lock: Lock = field(default_factory=Lock)
+    renewals: int = 0
+    renewal_errors: int = 0
+    injected_renewal_failures: int = 0
+    long_commands: int = 0
+    active_commands: int = 0
+    max_active_commands: int = 0
+
+    def execute(self, command: dict) -> tuple[str, str, float, str | None]:
+        command_id = command["command_id"]
+        operation = command["step"]["operation"]
+        node_count = len(command["step"].get("node_ids") or [])
+        delay = (
+            self.operation_delays.get(operation, 0.5) + 0.01 * max(1, node_count)
+        ) * self.delay_scale
+        with self.counters_lock:
+            self.active_commands += 1
+            self.max_active_commands = max(
+                self.max_active_commands,
+                self.active_commands,
+            )
+            if delay >= self.lease_seconds:
+                self.long_commands += 1
+        stop_renewal = Event()
+
+        def renew() -> None:
+            while not stop_renewal.wait(self.renewal_interval):
+                with self.counters_lock:
+                    if self.inject_renew_failure_pending:
+                        self.inject_renew_failure_pending = False
+                        self.injected_renewal_failures += 1
+                        self.renewal_errors += 1
+                        continue
+                try:
+                    self.client.post(
+                        f"/v1/regional/executors/{command_id}/renew",
+                        {
+                            "executor_id": self.executor_id,
+                            "lease_token": command["lease_token"],
+                            "lease_seconds": self.lease_seconds,
+                        },
+                    )
+                except Exception:
+                    with self.counters_lock:
+                        self.renewal_errors += 1
+                else:
+                    with self.counters_lock:
+                        self.renewals += 1
+
+        renewal_thread = Thread(
+            target=renew,
+            name=f"renew-{command_id}",
+            daemon=True,
+        )
+        renewal_thread.start()
+        begin = time.monotonic()
+        try:
+            time.sleep(delay)
+            self.client.post(
+                f"/v1/regional/executors/{command_id}/result",
+                {
+                    "lease_token": command["lease_token"],
+                    "status": "SUCCEEDED",
+                    "status_source": "action-capacity-simulator",
+                    "details": {
+                        "simulated": True,
+                        "operation": operation,
+                        "node_count": node_count,
+                        "executor_id": self.executor_id,
+                        "simulated_delay_seconds": delay,
+                    },
+                },
+            )
+        except Exception as exc:
+            return (
+                command_id,
+                operation,
+                time.monotonic() - begin,
+                type(exc).__name__,
+            )
+        finally:
+            stop_renewal.set()
+            renewal_thread.join(timeout=max(1.0, self.renewal_interval + 1))
+            with self.counters_lock:
+                self.active_commands -= 1
+        return command_id, operation, time.monotonic() - begin, None
+
+
+def operation_delays() -> dict[str, float]:
+    return {
+        **DELAYS,
+        **{
+            str(name): float(value)
+            for name, value in json.loads(
+                os.getenv("ACTION_OPERATION_DELAYS_JSON", "{}")
+            ).items()
+        },
+    }
+
+
 def main() -> None:
     registrations = json.loads(Path(os.environ["CLUSTERS_FILE"]).read_text())
     offset = int(os.environ["CLUSTER_OFFSET"])
@@ -103,6 +218,7 @@ def main() -> None:
         os.getenv("ACTION_INJECT_RENEW_FAILURE_ONCE", "false").lower() == "true"
     )
     max_seconds = float(os.getenv("ACTION_MAX_SECONDS", "900"))
+    idle_exit_seconds = float(os.getenv("ACTION_IDLE_EXIT_SECONDS", "0"))
     executor_id = f"action-executor-{offset:03d}"
     client = Client(
         base_url=os.environ["GPU_FAULT_CONTROL_PLANE_URL"],
@@ -114,103 +230,23 @@ def main() -> None:
     duplicate_claims = 0
     claim_errors = 0
     result_errors = 0
-    renewals = 0
-    renewal_errors = 0
-    injected_renewal_failures = 0
-    long_commands = 0
-    active_commands = 0
-    max_active_commands = 0
-    inject_renew_failure_pending = inject_renew_failure
-    counters_lock = Lock()
+    state = SimulationState(
+        client=client,
+        executor_id=executor_id,
+        operation_delays=operation_delays(),
+        delay_scale=delay_scale,
+        lease_seconds=lease_seconds,
+        renewal_interval=renewal_interval,
+        inject_renew_failure_pending=inject_renew_failure,
+    )
     latencies: list[float] = []
     by_operation: dict[str, list[float]] = {}
     started = time.monotonic()
+    last_activity = started
 
-    def execute(command: dict) -> tuple[str, str, float, str | None]:
-        nonlocal active_commands
-        nonlocal inject_renew_failure_pending
-        nonlocal injected_renewal_failures
-        nonlocal long_commands
-        nonlocal max_active_commands
-        nonlocal renewal_errors
-        nonlocal renewals
-        command_id = command["command_id"]
-        operation = command["step"]["operation"]
-        node_count = len(command["step"].get("node_ids") or [])
-        delay = (DELAYS.get(operation, 0.05) + 0.01 * max(1, node_count)) * delay_scale
-        with counters_lock:
-            active_commands += 1
-            max_active_commands = max(max_active_commands, active_commands)
-            if delay >= lease_seconds:
-                long_commands += 1
-        stop_renewal = Event()
-
-        def renew() -> None:
-            nonlocal inject_renew_failure_pending
-            nonlocal injected_renewal_failures
-            nonlocal renewal_errors
-            nonlocal renewals
-            while not stop_renewal.wait(renewal_interval):
-                with counters_lock:
-                    if inject_renew_failure_pending:
-                        inject_renew_failure_pending = False
-                        injected_renewal_failures += 1
-                        renewal_errors += 1
-                        continue
-                try:
-                    client.post(
-                        f"/v1/regional/executors/{command_id}/renew",
-                        {
-                            "executor_id": executor_id,
-                            "lease_token": command["lease_token"],
-                            "lease_seconds": lease_seconds,
-                        },
-                    )
-                except Exception:
-                    with counters_lock:
-                        renewal_errors += 1
-                else:
-                    with counters_lock:
-                        renewals += 1
-
-        renewal_thread = Thread(
-            target=renew,
-            name=f"renew-{command_id}",
-            daemon=True,
-        )
-        renewal_thread.start()
-        begin = time.monotonic()
-        try:
-            time.sleep(delay)
-            client.post(
-                f"/v1/regional/executors/{command_id}/result",
-                {
-                    "lease_token": command["lease_token"],
-                    "status": "SUCCEEDED",
-                    "status_source": "action-capacity-simulator",
-                    "details": {
-                        "simulated": True,
-                        "operation": operation,
-                        "node_count": node_count,
-                        "executor_id": executor_id,
-                    },
-                },
-            )
-        except Exception as exc:
-            return (
-                command_id,
-                operation,
-                time.monotonic() - begin,
-                type(exc).__name__,
-            )
-        finally:
-            stop_renewal.set()
-            renewal_thread.join(timeout=max(1.0, renewal_interval + 1))
-            with counters_lock:
-                active_commands -= 1
-        return command_id, operation, time.monotonic() - begin, None
-
-    while len(completed_ids) < expected and time.monotonic() - started < max_seconds:
+    while (
+        expected <= 0 or len(completed_ids) < expected
+    ) and time.monotonic() - started < max_seconds:
         try:
             claim = client.post(
                 "/v1/regional/executors/claim",
@@ -222,13 +258,21 @@ def main() -> None:
             time.sleep(0.1)
             continue
         if not commands:
+            if (
+                expected <= 0
+                and completed_ids
+                and idle_exit_seconds > 0
+                and time.monotonic() - last_activity >= idle_exit_seconds
+            ):
+                break
             time.sleep(0.05)
             continue
+        last_activity = time.monotonic()
         for command in commands:
             if command["command_id"] in completed_ids:
                 duplicate_claims += 1
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(execute, item) for item in commands]
+            futures = [pool.submit(state.execute, item) for item in commands]
             for future in as_completed(futures):
                 command_id, operation, elapsed, failure = future.result()
                 latencies.append(elapsed)
@@ -243,17 +287,18 @@ def main() -> None:
         "cluster_id": cluster_id,
         "executor_id": executor_id,
         "expected_commands": expected,
+        "idle_exit_seconds": idle_exit_seconds,
         "completed_commands": len(completed_ids),
         "duplicate_claims": duplicate_claims,
         "claim_errors": claim_errors,
         "result_errors": result_errors,
         "lease_seconds": lease_seconds,
         "renewal_interval_seconds": renewal_interval,
-        "renewals": renewals,
-        "renewal_errors": renewal_errors,
-        "injected_renewal_failures": injected_renewal_failures,
-        "long_commands": long_commands,
-        "max_concurrent_commands": max_active_commands,
+        "renewals": state.renewals,
+        "renewal_errors": state.renewal_errors,
+        "injected_renewal_failures": state.injected_renewal_failures,
+        "long_commands": state.long_commands,
+        "max_concurrent_commands": state.max_active_commands,
         "wall_seconds": wall,
         "command_p50_ms": statistics.median(latencies) * 1000 if latencies else 0.0,
         "command_p95_ms": percentile(latencies, 0.95) * 1000,
@@ -268,14 +313,15 @@ def main() -> None:
     }
     print(json.dumps(output, indent=2, sort_keys=True), flush=True)
     if (
-        len(completed_ids) != expected
+        (expected > 0 and len(completed_ids) != expected)
+        or (expected <= 0 and not completed_ids)
         or duplicate_claims
         or result_errors
-        or max_active_commands < min(workers, expected)
-        or (long_commands and renewals == 0)
+        or state.max_active_commands < min(workers, expected or 1)
+        or (state.long_commands and state.renewals == 0)
         or (
             inject_renew_failure
-            and (injected_renewal_failures != 1 or renewal_errors < 1)
+            and (state.injected_renewal_failures != 1 or state.renewal_errors < 1)
         )
     ):
         raise SystemExit(1)

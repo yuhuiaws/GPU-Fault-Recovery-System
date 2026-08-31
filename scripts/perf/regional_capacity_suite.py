@@ -7,8 +7,8 @@ ConfigMap, job rendering, durable log collection, control-plane metric and
 Aurora sampling, database purge and deregistration.
 
 The load generators run in the GPU data-plane cluster (it has the spare
-CPU); registration happens in the regional control-plane cluster because
-regional cluster tokens are read from a Secret at process start.
+CPU). Registration updates the bootstrap Secret and publishes one durable
+registry revision, then waits for every CPU process to ACK it.
 
 Examples
 --------
@@ -486,10 +486,15 @@ class TopSampler(threading.Thread):
         self._done.set()
 
 
-def aurora_window(start: float, end: float) -> dict:
+def aurora_window(
+    start: float,
+    end: float,
+    *,
+    aurora_instance: str | None = None,
+) -> dict:
     return _aurora_window(
         run,
-        aurora_instance=AURORA_INSTANCE,
+        aurora_instance=aurora_instance or AURORA_INSTANCE,
         aws_region=AWS_REGION,
         start=start,
         end=end,
@@ -904,6 +909,7 @@ import os, psycopg
 prefix = {PERF_CLUSTER_PREFIX!r} + '%'
 patterns = {{
     "cluster": prefix,
+    "cluster_contains": "%" + prefix,
     "action_workflow": "workflow-actionperf-%",
 }}
 statements = {AUDIT_PURGE_STATEMENTS!r}

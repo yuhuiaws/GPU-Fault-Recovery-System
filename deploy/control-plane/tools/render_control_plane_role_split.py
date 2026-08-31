@@ -306,6 +306,37 @@ def pod_disruption_budget(
     }
 
 
+def boolean_environment(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{name} must be true or false")
+    return value
+
+
+def configure_ingress_spool(container: dict) -> None:
+    set_env(
+        container,
+        "GPU_FAULT_TELEMETRY_SPOOL",
+        boolean_environment("GPU_FAULT_TELEMETRY_SPOOL", "false"),
+    )
+
+
+def configure_worker_capacity(container: dict) -> None:
+    set_env(container, "GPU_FAULT_PROCESSOR_WORKERS", "24")
+    defaults = {
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "20",
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": "5",
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1",
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": "1",
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": "2",
+    }
+    for name, default in defaults.items():
+        value = os.getenv(name, default).strip()
+        if int(value) < 1:
+            raise ValueError(f"{name} must be positive")
+        set_env(container, name, value)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir")
@@ -442,7 +473,7 @@ def main() -> None:
         "GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS",
         "30",
     )
-    set_env(ingress, "GPU_FAULT_TELEMETRY_SPOOL", "false")
+    configure_ingress_spool(ingress)
     set_env(
         ingress,
         "GPU_FAULT_TELEMETRY_SPOOL_MAX_DEPTH",
@@ -599,7 +630,7 @@ def main() -> None:
     # than inherited from the base manifest: this is the only tier the
     # pools exist on, so the value has to be visible next to the four
     # pools it sizes the defaults for.
-    set_env(worker, "GPU_FAULT_PROCESSOR_WORKERS", "24")
+    configure_worker_capacity(worker)
     set_env(worker, "GPU_FAULT_PROCESSOR_FAULT_WORKERS", "4")
     set_env(
         worker,

@@ -150,7 +150,7 @@ def test_preflight_cleanup_removes_legacy_synthetic_entries(
     tmp_path: Path, monkeypatch
 ) -> None:
     entries = [{"cluster_id": "production"}, {"cluster_id": "perf-cap-000"}]
-    restarts = []
+    published = []
     monkeypatch.setattr(registry_module, "load_registry", lambda: list(entries))
     monkeypatch.setattr(
         registry_module,
@@ -158,7 +158,9 @@ def test_preflight_cleanup_removes_legacy_synthetic_entries(
         lambda values: entries.__setitem__(slice(None), values),
     )
     monkeypatch.setattr(
-        registry_module, "restart_control_plane", lambda: restarts.append(True)
+        registry_module,
+        "publish_registry_revision",
+        lambda values, **kwargs: published.append((list(values), kwargs)),
     )
 
     removed = registry_module.cleanup_registry_residuals(
@@ -167,10 +169,59 @@ def test_preflight_cleanup_removes_legacy_synthetic_entries(
 
     assert removed == 1
     assert entries == [{"cluster_id": "production"}]
-    assert restarts == [True]
+    assert published == [
+        ([{"cluster_id": "production"}], {"reason": "capacity cleanup all-synthetic"})
+    ]
     audit = json.loads((tmp_path / "registry-preflight.json").read_text())
     assert audit["removed"] == 1
     assert audit["synthetic_entries"][0]["legacy_prefix_only"] is True
+
+
+def test_register_publishes_one_online_revision(tmp_path: Path, monkeypatch) -> None:
+    baseline = [{"cluster_id": "production", "token": "p" * 32}]
+    written = []
+    published = []
+    token_secrets = []
+    monkeypatch.setattr(
+        registry_module, "validate_registry_target", lambda **_kwargs: "isolated"
+    )
+    monkeypatch.setattr(registry_module, "validate_notification_safety", lambda: None)
+    monkeypatch.setattr(
+        registry_module, "cleanup_registry_residuals", lambda **_kwargs: 0
+    )
+    monkeypatch.setattr(registry_module, "load_registry", lambda: list(baseline))
+    monkeypatch.setattr(
+        registry_module, "write_registry", lambda values: written.append(list(values))
+    )
+    monkeypatch.setattr(
+        registry_module,
+        "publish_registry_revision",
+        lambda values, **kwargs: published.append((list(values), kwargs)),
+    )
+    monkeypatch.setattr(
+        registry_module,
+        "upsert_secret",
+        lambda name, files: token_secrets.append((name, files)),
+    )
+
+    tokens = registry_module.register(
+        2,
+        tmp_path,
+        run_id="run-a",
+        expires_at=NOW + timedelta(hours=1),
+        allow_live_registry=False,
+        live_registry_confirmation=None,
+    )
+
+    assert len(tokens) == 2
+    assert len(written) == 1
+    assert len(published) == 1
+    assert published[0][1] == {"reason": "capacity register run-a"}
+    assert [item["cluster_id"] for item in published[0][0][-2:]] == [
+        "perf-cap-000",
+        "perf-cap-001",
+    ]
+    assert token_secrets[0][0] == registry_module.TOKEN_SECRET
 
 
 def test_preflight_refuses_another_active_synthetic_run(monkeypatch) -> None:
@@ -311,9 +362,22 @@ def test_capacity_cleanup_removes_synthetic_links() -> None:
     sql, pattern = statements["gpu_fault_links"]
 
     assert "DELETE FROM gpu_fault_links" in sql
+    assert "rtrim(%s, '%%')" in sql
     assert "strpos(link.key, pattern.prefix)" in sql
     assert "strpos(link.value, pattern.prefix)" in sql
     assert pattern == "cluster"
+
+
+def test_capacity_cleanup_removes_markers_with_nested_cluster_scope() -> None:
+    statements = {
+        name: (sql, pattern) for name, sql, pattern in suite.AUDIT_PURGE_STATEMENTS
+    }
+
+    sql, pattern = statements["gpu_fault_markers"]
+
+    assert "kind='marker'" in sql
+    assert "payload::text LIKE %s" in sql
+    assert pattern == "cluster_contains"
 
 
 def test_repository_registry_baselines_are_redacted() -> None:

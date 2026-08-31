@@ -37,13 +37,28 @@ CONNECTION_SECRET = os.getenv(
     "gpu-fault-regional-connection",
 )
 TOKEN_SECRET = "gpu-fault-perf-clusters"
-CONTROL_DEPLOYMENTS = (
-    "gpu-fault-api-ha",
-    "gpu-fault-control-worker",
-    "gpu-fault-telemetry-spool-worker",
-)
 PERF_CLUSTER_PREFIX = "perf-cap-"
 LIVE_REGISTRY_CONFIRMATION = "ALLOW_PERF_CAPACITY_LIVE_REGISTRY"
+REGISTRY_API_CLIENT = r"""
+import json
+import os
+import sys
+import urllib.request
+
+method, path = sys.argv[1:]
+body = sys.stdin.buffer.read()
+request = urllib.request.Request(
+    "http://127.0.0.1:8080" + path,
+    data=body or None,
+    method=method,
+    headers={
+        "Content-Type": "application/json",
+        "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"],
+    },
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    print(json.dumps(json.load(response), separators=(",", ":")))
+"""
 
 
 def log(message: str) -> None:
@@ -227,38 +242,69 @@ def validate_registry_target(
     return "live" if live else "isolated"
 
 
-def restart_control_plane() -> None:
-    for deployment in CONTROL_DEPLOYMENTS:
-        replicas = control(
-            "get",
-            "deploy",
-            deployment,
-            "-o",
-            "jsonpath={.spec.replicas}",
-        ).strip()
-        if replicas in {"", "0"}:
-            log(f"skip restart of {deployment} (replicas={replicas})")
-            continue
-        log(f"rollout restart {deployment}")
-        control("rollout", "restart", f"deploy/{deployment}")
-    for deployment in CONTROL_DEPLOYMENTS:
-        replicas = control(
-            "get",
-            "deploy",
-            deployment,
-            "-o",
-            "jsonpath={.spec.replicas}",
-        ).strip()
-        if replicas in {"", "0"}:
-            continue
-        log(f"waiting for {deployment}")
-        control(
-            "rollout",
-            "status",
-            f"deploy/{deployment}",
-            "--timeout=600s",
-            timeout=700,
-        )
+def registry_api(
+    method: str,
+    path: str,
+    payload: dict | None = None,
+) -> dict:
+    pod = control(
+        "get",
+        "pod",
+        "-l",
+        "app=gpu-fault-api-ha",
+        "--field-selector=status.phase=Running",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ).strip()
+    if not pod:
+        raise RuntimeError("no Running gpu-fault-api-ha Pod for registry update")
+    output = control(
+        "exec",
+        "-i",
+        pod,
+        "--",
+        "python3",
+        "-c",
+        REGISTRY_API_CLIENT,
+        method,
+        path,
+        stdin=json.dumps(payload or {}, separators=(",", ":")).encode(),
+    )
+    value = json.loads(output)
+    if not isinstance(value, dict):
+        raise RuntimeError("regional registry API returned a non-object")
+    return value
+
+
+def publish_registry_revision(
+    entries: list[dict],
+    *,
+    reason: str,
+    timeout_seconds: int = 300,
+) -> dict:
+    current = registry_api("GET", "/v1/regional/registry/status")
+    published = registry_api(
+        "POST",
+        "/v1/regional/registry/revisions",
+        {
+            "expected_generation": int(current["generation"]),
+            "registrations": redacted_registry_entries(entries),
+            "reason": reason,
+        },
+    )
+    generation = int(published["generation"])
+    digest = str(published["content_sha256"])
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        status = registry_api("GET", "/v1/regional/registry/status")
+        if (
+            int(status["generation"]) == generation
+            and str(status["content_sha256"]) == digest
+            and status.get("converged") is True
+        ):
+            return status
+        time.sleep(1)
+    raise RuntimeError(f"regional registry generation {generation} did not converge")
 
 
 def perf_cluster_entries(
@@ -415,7 +461,10 @@ def cleanup_registry_residuals(
     for attempt in range(1, attempts + 1):
         try:
             write_registry(baseline)
-            restart_control_plane()
+            publish_registry_revision(
+                baseline,
+                reason=f"capacity cleanup {run_id or 'all-synthetic'}",
+            )
             persisted = load_registry()
             remaining = [
                 entry
@@ -539,7 +588,10 @@ def register(
         f"(keeping {len(baseline)} production entries)"
     )
     write_registry(baseline + perf)
-    restart_control_plane()
+    publish_registry_revision(
+        baseline + perf,
+        reason=f"capacity register {run_id}",
+    )
     tokens = [
         {
             "cluster_id": entry["cluster_id"],

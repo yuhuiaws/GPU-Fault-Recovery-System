@@ -598,13 +598,17 @@ print(json.dumps(out))
     return json.loads(output.splitlines()[-1])
 
 
-def collect_executor_logs(target: Path) -> list[dict]:
+def collect_executor_logs(
+    target: Path,
+    *,
+    job_name: str = JOB_NAME,
+) -> list[dict]:
     target.mkdir(parents=True, exist_ok=True)
     raw = dataplane(
         "get",
         "pod",
         "-l",
-        f"batch.kubernetes.io/job-name={JOB_NAME}",
+        f"batch.kubernetes.io/job-name={job_name}",
         "-o",
         "jsonpath={range .items[*]}{.metadata.name} "
         "{.metadata.annotations.batch\\.kubernetes\\.io/"
@@ -626,6 +630,12 @@ def aggregate_executor_documents(documents: list[dict]) -> dict:
     walls = [item.get("wall_seconds", 0.0) for item in documents]
     return {
         "executor_pods": len(documents),
+        "expected_commands": sum(
+            item.get("expected_commands", 0) for item in documents
+        ),
+        "completed_commands": sum(
+            item.get("completed_commands", 0) for item in documents
+        ),
         "executor_wall_p50": statistics.median(walls) if walls else None,
         "executor_wall_max": max(walls) if walls else None,
         "duplicate_claims": sum(item.get("duplicate_claims", 0) for item in documents),

@@ -84,10 +84,19 @@ AUDIT_PURGE_STATEMENTS = (
         "cluster",
     ),
     (
+        "gpu_fault_markers",
+        """
+        DELETE FROM gpu_fault_objects
+        WHERE kind='marker'
+          AND payload::text LIKE %s
+        """,
+        "cluster_contains",
+    ),
+    (
         "gpu_fault_links",
         """
         WITH pattern AS (
-            SELECT rtrim(%s, '%') AS prefix
+            SELECT rtrim(%s, '%%') AS prefix
         )
         DELETE FROM gpu_fault_links AS link
         USING pattern

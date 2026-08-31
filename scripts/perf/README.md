@@ -36,12 +36,17 @@ Mutating the production `gpu-fault-system` registry requires both
 
 Synthetic registrations carry a run ID and expiration. `all`, `run`, and the
 action-capacity suite always execute idempotent teardown in `finally`; registry
-cleanup is retried and verified by rereading the Secret. A standalone
+updates publish one CAS revision and wait for all CPU process ACKs without
+restarting CPU Deployments. Cleanup is retried and verified against both the
+bootstrap Secret and runtime registry. A standalone
 `register` command requires `--keep-registration`, a shared `--suite-id`, and
 must be followed by `run` or `teardown`.
 
 Supported entry points:
 
+- `regional_integrated_workflow_capacity_suite.py`: formal live CPU-control-plane
+  run combining the fixed 26,576-request matrix with four causally linked
+  action workflows per synthetic cluster and simulated destructive execution.
 - `regional_capacity_suite.py`: registration, mixed/burst/multicluster load,
   metrics, Aurora sampling, teardown and artifacts.
 - `regional_action_capacity_suite.py`: regional action execution capacity.
@@ -62,6 +67,31 @@ points.
 `benchmark_correlated_action_scenario.py` is likewise an implementation input
 for `regional_correlated_action_suite.py`. It must not be launched without the
 suite's synthetic registry, token, TLS, cleanup and evidence guards.
+
+The formal integrated run is:
+
+```bash
+scripts/perf/regional_integrated_workflow_capacity_suite.py \
+  --clusters 32 \
+  --spool-mode disabled \
+  --aurora-cluster-id <aurora-cluster-id> \
+  --configure-aurora-capacity \
+  --confirm-aurora-scaling SET_AURORA_MIN_124_MAX_128 \
+  --workflows-per-cluster 4 \
+  --allow-live-registry \
+  --confirm-live-registry ALLOW_PERF_CAPACITY_LIVE_REGISTRY
+```
+
+It targets the live CPU ingress/worker/Aurora path. Synthetic cluster identity,
+Agent records and the executor isolate GPU mutations; reset and reboot commands
+sleep for configured representative durations and return simulated results.
+Before registration it first records the current Aurora scaling range, sets
+`Min=124, Max=128` when needed, then requires two available `db.serverless`
+instances with observed capacity at least 124 ACU and exact live remediation
+budgets for the selected 32/50-cluster matrix.
+The formal matrix contains four runs: 32/50 clusters crossed with
+`--spool-mode disabled/enabled`. The runner verifies every live ingress Pod and
+the dedicated spool-worker replica count before registering synthetic clusters.
 
 The supported CLI remains in `regional_capacity_suite.py`; its implementation
 is split by responsibility:
