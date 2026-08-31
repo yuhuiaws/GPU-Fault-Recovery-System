@@ -42,6 +42,9 @@ if TYPE_CHECKING:
     )
     from gpu_fault.regional import (
         RegionalClusterRegistration,
+        RegionalRegistryHead,
+        RegionalRegistryMember,
+        RegionalRegistryRevision,
         RemoteActionCommand,
     )
     from gpu_fault.telemetry_models import (
@@ -149,6 +152,28 @@ class FleetStore(Protocol):
     ) -> list[RegionalClusterRegistration]: ...
 
     def list_regional_cluster_ids(self) -> list[str]: ...
+
+    def get_regional_registry_head(self) -> RegionalRegistryHead: ...
+
+    def get_regional_registry_revision(
+        self, generation: int
+    ) -> RegionalRegistryRevision: ...
+
+    def publish_regional_registry_revision(
+        self,
+        revision: RegionalRegistryRevision,
+        *,
+        expected_generation: int,
+    ) -> RegionalRegistryHead: ...
+
+    def save_regional_registry_member(
+        self,
+        member: RegionalRegistryMember,
+    ) -> RegionalRegistryMember: ...
+
+    def list_regional_registry_members(
+        self,
+    ) -> list[RegionalRegistryMember]: ...
 
     def save_agent(self, agent: AgentRecord) -> None: ...
 

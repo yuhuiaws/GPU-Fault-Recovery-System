@@ -18,6 +18,7 @@ class AdminRouterDependencies:
     processor_mode: str
     service_role: str
     environment: Mapping[str, str]
+    regional_registry_runtime: Any | None
 
 
 def get_admin_dependencies() -> AdminRouterDependencies:
@@ -43,8 +44,12 @@ async def healthz(
     processor_healthy = (
         processor is None or processor.is_healthy()
     ) and spool_consumer_alive
+    registry_ready = (
+        dependencies.regional_registry_runtime is None
+        or dependencies.regional_registry_runtime.is_ready()
+    )
     payload = {
-        "status": "ok" if processor_healthy else "unhealthy",
+        "status": "ok" if processor_healthy and registry_ready else "unhealthy",
         "executor": ctx.executor_mode,
         "dispatcher": ("enabled" if ctx.dispatcher.config.enabled else "disabled"),
         "agent_registry": ("enabled" if ctx.fleet_registry is not None else "disabled"),
@@ -73,8 +78,13 @@ async def healthz(
         "service_role": (
             dependencies.environment.get("GPU_FAULT_SERVICE_ROLE") or "combined"
         ),
+        "regional_registry": (
+            dependencies.regional_registry_runtime.status()
+            if dependencies.regional_registry_runtime is not None
+            else None
+        ),
     }
-    if not processor_healthy:
+    if not processor_healthy or not registry_ready:
         return JSONResponse(status_code=503, content=payload)
     return payload
 

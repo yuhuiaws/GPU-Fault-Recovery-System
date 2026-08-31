@@ -13,6 +13,7 @@ from gpu_fault.app.lifespan_workers import (
     start_nonprocessor_workers,
     start_notification_worker,
     start_processor_threads,
+    start_regional_registry_worker,
     start_spool_threads,
 )
 from gpu_fault.lifecycle import ShutdownCoordinator
@@ -47,6 +48,7 @@ class LifespanDependencies:
     telemetry_spool_batcher: Any
     event_loop_lag: EventLoopLag
     collector_metrics_snapshot: Any
+    regional_registry_runtime: Any | None
 
 
 def create_lifespan(dependencies: LifespanDependencies):
@@ -99,6 +101,10 @@ def create_lifespan(dependencies: LifespanDependencies):
         identity_worker = None
         notification_worker = None
         training_stop = Event()
+        registry_worker = start_regional_registry_worker(
+            dependencies.regional_registry_runtime,
+            training_stop,
+        )
         collector_metrics_worker = Thread(
             target=collector_metrics_snapshot.run,
             args=(training_stop,),
@@ -217,6 +223,7 @@ def create_lifespan(dependencies: LifespanDependencies):
                 collector_metrics_worker,
                 "collector metrics snapshot",
             )
+            shutdown.join(registry_worker, "regional registry watcher")
             shutdown.join(
                 diagnostics_worker,
                 "processor diagnostics publisher",

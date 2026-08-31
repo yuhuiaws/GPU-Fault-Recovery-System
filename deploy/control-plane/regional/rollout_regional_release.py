@@ -107,6 +107,13 @@ from regional_release_registry import (
     update_registry,
     write_registry,
 )
+from regional_release_online_registry import (
+    activate_join_registry,
+    drain_registry_cluster,
+    prepare_join_registry,
+    purge_registry_cluster,
+    revoke_registry_cluster,
+)
 from regional_release_state import (
     STATE_CONFIG_MAP as STATE_CONFIG_MAP,
 )
@@ -951,7 +958,7 @@ class RegionalRelease:
         target = join_target(self, cluster_id)
         self._ensure_contexts()
         self._update_registry(target, remove=False)
-        self._roll_cpu_for_registry()
+        prepare_join_registry(self, cluster_id)
         ensure_runtime_profile(self)
         self._ensure_gpu_namespace(target)
         self._ensure_connection_secret(target)
@@ -991,18 +998,18 @@ class RegionalRelease:
             artifact_sha=self.node_wheel_sha,
             config_digest=self.config.agent_config_digest,
         )
+        activate_join_registry(self, cluster_id)
 
     def remove_cluster(self, cluster_id: str) -> None:
         target = self._target(cluster_id)
-        if not self._remote_commands_are_idle():
-            raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
+        revoke_registry_cluster(self, cluster_id)
         for deployment in (
             *inventory.DEPLOYMENTS,
             inventory.GPU_RECONCILER_DEPLOYMENT,
         ):
             self._scale_if_present(self._gpu(target), deployment, 0)
         self._update_registry(target, remove=True)
-        self._roll_cpu_for_registry()
+        purge_registry_cluster(self, cluster_id)
 
     def _target(self, cluster_id: str) -> ClusterTarget:
         for target in self.config.clusters:
@@ -1051,6 +1058,7 @@ def parser() -> argparse.ArgumentParser:
             "rollback",
             "commit",
             "join-cluster",
+            "drain-cluster",
             "remove-cluster",
             "sync-state",
             "verify",
@@ -1116,6 +1124,10 @@ def main() -> int:
             if not arguments.cluster_id:
                 raise ReleaseError("--cluster-id is required")
             release.join_cluster(arguments.cluster_id)
+        elif arguments.mode == "drain-cluster":
+            if not arguments.cluster_id:
+                raise ReleaseError("--cluster-id is required")
+            drain_registry_cluster(release, arguments.cluster_id)
         elif arguments.mode == "remove-cluster":
             if not arguments.cluster_id:
                 raise ReleaseError("--cluster-id is required")

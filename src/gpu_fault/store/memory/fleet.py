@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from datetime import datetime
 
 from gpu_fault.store.shared.errors import NotFoundError
+
+if TYPE_CHECKING:
+    from gpu_fault.regional import (
+        RegionalRegistryHead,
+        RegionalRegistryMember,
+        RegionalRegistryRevision,
+    )
 
 
 class MemoryFleetMixin:
@@ -13,6 +20,9 @@ class MemoryFleetMixin:
     _barriers: Any
     _fleet_deployments: Any
     _regional_clusters: Any
+    _regional_registry_head: RegionalRegistryHead | None
+    _regional_registry_members: dict[str, RegionalRegistryMember]
+    _regional_registry_revisions: dict[int, RegionalRegistryRevision]
 
     _lock: Any
 
@@ -47,6 +57,75 @@ class MemoryFleetMixin:
     def list_regional_cluster_ids(self) -> list[str]:
         with self._lock:
             return sorted(self._regional_clusters)
+
+    def get_regional_registry_head(self) -> RegionalRegistryHead:
+        with self._lock:
+            if self._regional_registry_head is None:
+                raise NotFoundError("regional-registry-head")
+            return self._regional_registry_head
+
+    def get_regional_registry_revision(
+        self, generation: int
+    ) -> RegionalRegistryRevision:
+        with self._lock:
+            revision = self._regional_registry_revisions.get(generation)
+            if revision is None:
+                raise NotFoundError(str(generation))
+            return revision
+
+    def publish_regional_registry_revision(
+        self,
+        revision: RegionalRegistryRevision,
+        *,
+        expected_generation: int,
+    ) -> RegionalRegistryHead:
+        from gpu_fault.regional import RegionalRegistryHead
+
+        with self._lock:
+            current_generation = (
+                self._regional_registry_head.generation
+                if self._regional_registry_head is not None
+                else 0
+            )
+            if (
+                self._regional_registry_head is not None
+                and self._regional_registry_head.generation == revision.generation
+                and self._regional_registry_head.content_sha256
+                == revision.content_sha256
+            ):
+                return self._regional_registry_head
+            if current_generation != expected_generation:
+                raise ValueError("regional registry generation conflict")
+            if revision.generation != expected_generation + 1:
+                raise ValueError("regional registry generation must be consecutive")
+            for registration in revision.registrations:
+                existing = self._regional_clusters.get(registration.cluster_id)
+                if existing is not None and existing.region != registration.region:
+                    raise ValueError("regional cluster cannot move between regions")
+            self._regional_registry_revisions[revision.generation] = revision
+            self._regional_clusters = {
+                item.cluster_id: item for item in revision.registrations
+            }
+            self._regional_registry_head = RegionalRegistryHead(
+                generation=revision.generation,
+                content_sha256=revision.content_sha256,
+                updated_at=revision.created_at,
+            )
+            return self._regional_registry_head
+
+    def save_regional_registry_member(
+        self, member: RegionalRegistryMember
+    ) -> RegionalRegistryMember:
+        with self._lock:
+            self._regional_registry_members[member.member_id] = member
+            return member
+
+    def list_regional_registry_members(self) -> list[RegionalRegistryMember]:
+        with self._lock:
+            members: list[RegionalRegistryMember] = list(
+                self._regional_registry_members.values()
+            )
+            return sorted(members, key=lambda item: item.member_id)
 
     def save_agent(self, agent) -> None:
         with self._lock:

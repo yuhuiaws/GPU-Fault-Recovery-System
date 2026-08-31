@@ -57,7 +57,7 @@ LOGGER = logging.getLogger(__name__)
 class RegionalRouterDependencies:
     context: Any
     store_io: AsyncStoreExecutor
-    auth_registry: dict[str, Any]
+    auth_registry: Any
     max_unclaimed_seconds: float
     max_claim_age_seconds: float
     executor_compatibility: RegionalExecutorCompatibilityPolicy

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from gpu_fault.regional import RegionalClusterRegistration
+from gpu_fault.regional import RegionalClusterRegistration, RegionalRegistryRevision
 from gpu_fault.regional_registry import sync_regional_cluster_registry
 from gpu_fault.store import NotFoundError, SqliteStore
 from tests._builders import build_store
@@ -77,6 +77,40 @@ def test_registry_sync_prunes_expired_synthetic_registration() -> None:
 
     assert configured == []
     assert store.list_regional_clusters() == []
+
+
+def test_durable_revision_supersedes_stale_bootstrap_secret() -> None:
+    store = build_store()
+    active = _registration("cluster-active")
+    revision = RegionalRegistryRevision.build(
+        generation=1,
+        registrations=[active],
+        previous_generation=None,
+        required_member_ids=[],
+        reason="runtime authority",
+        created_at=NOW,
+    )
+    store.publish_regional_registry_revision(revision, expected_generation=0)
+
+    configured = sync_regional_cluster_registry(
+        store,
+        [
+            {
+                "cluster_id": "cluster-stale",
+                "region": "us-west-2",
+                "hyperpod_cluster_name": "hyperpod-stale",
+                "eks_cluster_arn": (
+                    "arn:aws:eks:us-west-2:123456789012:cluster/cluster-stale"
+                ),
+                "token": "s" * 32,
+                "agent_endpoint_allowed_cidrs": ["10.0.0.0/16"],
+            }
+        ],
+        now=NOW,
+    )
+
+    assert configured == [active]
+    assert store.list_regional_clusters() == [active]
 
 
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])

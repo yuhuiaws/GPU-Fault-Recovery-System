@@ -26,7 +26,13 @@ categories:
         description: "发布标识，仅用于发布追踪；实际代码身份以 wheel SHA 和 module_digest 为准。"
       - name: GPU_FAULT_REGIONAL_CLUSTERS_JSON
         production: 由区域 registry ConfigMap/Secret 生成
-        description: "区域集群注册表。包含集群身份与 token 摘要来源；不得手工覆盖其他集群条目。"
+        description: "区域集群注册表 bootstrap/灾备副本；运行时权威版本位于 Aurora revision。"
+      - name: GPU_FAULT_REGISTRY_POLL_SECONDS
+        production: "1"
+        description: "CPU 进程轮询 durable registry head 的周期。"
+      - name: GPU_FAULT_REGISTRY_STALE_SECONDS
+        production: "10"
+        description: "超过该时间未成功刷新 registry 时 readiness 和 cluster-token 请求 fail closed。"
       - name: GPU_FAULT_UNKNOWN_ENV_POLICY
         description: "发现未知 GPU_FAULT_* 变量时的策略。生产保持 error，避免拼写错误静默生效。"
       - name: GPU_FAULT_ALLOW_SINGLE_CLUSTER

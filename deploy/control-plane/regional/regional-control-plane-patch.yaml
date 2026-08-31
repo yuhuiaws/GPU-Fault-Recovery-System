@@ -164,6 +164,10 @@ spec:
                 secretKeyRef:
                   name: gpu-fault-regional-clusters
                   key: clusters.json
+            - name: GPU_FAULT_REGISTRY_POLL_SECONDS
+              value: "1"
+            - name: GPU_FAULT_REGISTRY_STALE_SECONDS
+              value: "10"
             - name: GPU_FAULT_ENABLE_KUBERNETES_ADAPTER
               value: "false"
             - name: GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER

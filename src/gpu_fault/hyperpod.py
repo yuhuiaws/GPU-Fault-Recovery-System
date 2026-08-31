@@ -341,6 +341,16 @@ class HyperPodSubmissionRecord(StrictModel):
         )
 
 
+def hyperpod_submission_idempotency_key(
+    workflow_request_id: str,
+    step_index: int,
+    operation: WorkflowOperation,
+) -> str:
+    """Return the durable provider-submission key for a workflow step."""
+
+    return f"{workflow_request_id}/{operation.value}/{step_index}"
+
+
 class HyperPodAdapterError(ValueError):
     pass
 
@@ -1035,8 +1045,10 @@ class HyperPodWorkflowDispatcher:
             confirm_cluster_name=confirm_cluster_name,
             workflow_fencing_token=workflow.fencing_token,
             expected_fencing_token=expected_fencing_token,
-            idempotency_key=(
-                f"{workflow.request_id}/{step.operation.value}/{step_index}"
+            idempotency_key=hyperpod_submission_idempotency_key(
+                workflow.request_id,
+                step_index,
+                step.operation,
             ),
         )
 

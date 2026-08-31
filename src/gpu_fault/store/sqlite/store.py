@@ -118,6 +118,9 @@ class SqliteStore(
         )
         from gpu_fault.regional import (
             RegionalClusterRegistration,
+            RegionalRegistryHead,
+            RegionalRegistryMember,
+            RegionalRegistryRevision,
             RemoteActionCommand,
         )
         from gpu_fault.installation_resources import InstallationResource
@@ -152,6 +155,9 @@ class SqliteStore(
             "hyperpod_node_identity": HyperPodNodeIdentity,
             "hyperpod_submission": HyperPodSubmissionRecord,
             "regional_cluster": RegionalClusterRegistration,
+            "regional_registry_head": RegionalRegistryHead,
+            "regional_registry_member": RegionalRegistryMember,
+            "regional_registry_revision": RegionalRegistryRevision,
             "installation_resource": InstallationResource,
             "remote_command": RemoteActionCommand,
             "processor_leadership": ProcessorLeadership,

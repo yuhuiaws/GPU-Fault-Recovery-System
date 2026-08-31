@@ -426,6 +426,51 @@ def test_destr002_preflight_and_reboot_contract() -> None:
     ), state
 
 
+def test_destr002_wait_stops_on_terminal_workflow_without_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    regional = _regional(tmp_path)
+    state = {
+        "workflow": {"status": "SUCCEEDED", "completed_operations": ["RESTART_NODE"]},
+        "submission": None,
+    }
+    monkeypatch.setattr(regional, "store_snapshot", lambda **_kwargs: state)
+    ticks = iter([0.0, 0.0])
+    monkeypatch.setattr(destr002.time, "monotonic", lambda: next(ticks))
+    settings = destr002.Settings(
+        regional=regional.settings,
+        node="node-a",
+        host_probe_image="registry.example/probe@sha256:" + "a" * 64,
+        hyperpod_cluster="hp-cluster",
+        executor_role_arn="arn:aws:iam::123456789012:role/executor",
+        predecessor_path=tmp_path / "predecessor.json",
+    )
+
+    observed = destr002.wait_for_submission(
+        regional,
+        settings,
+        marker="marker-a",
+        observed_after=datetime.now(timezone.utc),
+        case_dir=tmp_path,
+        timeout_seconds=5,
+    )
+
+    assert observed is state
+
+
+def test_destr002_duplicate_replay_requires_exact_submitted_record() -> None:
+    source = destr002.DIRECT_DUPLICATE_REPLAY
+
+    read_index = source.index("get_hyperpod_submission")
+    submit_index = source.index("result = step_adapter.dispatcher.adapter.submit")
+
+    assert "hyperpod_submission_idempotency_key" in source
+    assert 'record.state != "SUBMITTED"' in source
+    assert "record.result is None" in source
+    assert read_index < submit_index
+    assert "hyperpod_submission_idempotency_key" in live_fixture_module.STORE_PROBE
+
+
 def _destr003_settings(tmp_path: Path) -> destr003.Settings:
     return destr003.Settings(
         regional=_regional(tmp_path).settings,

@@ -14,6 +14,7 @@ from gpu_fault.hyperpod import (
     HyperPodSubmissionRecord,
     HyperPodWorkflowDispatcher,
     HyperPodWorkloadRecoveryEvidence,
+    hyperpod_submission_idempotency_key,
 )
 from gpu_fault.models import (
     CapabilityMode,
@@ -544,6 +545,9 @@ def test_workflow_dispatcher_enforces_status_owner_and_step() -> None:
     )
 
     assert result.submitted, "expected result.submitted to be truthy"
+    assert result.idempotency_key == hyperpod_submission_idempotency_key(
+        workflow.request_id, 0, WorkflowOperation.RESTART_NODE
+    )
     assert len(client.reboot_requests) == 1
 
     wrong_owner = copy_model(

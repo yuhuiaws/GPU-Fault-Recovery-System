@@ -366,16 +366,15 @@ class HyperPodLifecycleStepAdapter(
             return WorkflowStepOutcome.failed(
                 f"failed to revoke node agent before HyperPod mutation: {exc}"
             )
-        try:
-            result = self.dispatcher.submit(
-                context.workflow,
-                context.step_index,
-                isolation_verified_nodes=isolation,
-                confirm_cluster_name=(context.request.confirm_cluster_name),
-                expected_fencing_token=(context.request.expected_fencing_token),
-            )
-        except Exception:
-            raise
+        # The dispatcher owns the provider submission key; it is distinct
+        # from the remote command idempotency key carried by this context.
+        result = self.dispatcher.submit(
+            context.workflow,
+            context.step_index,
+            isolation_verified_nodes=isolation,
+            confirm_cluster_name=(context.request.confirm_cluster_name),
+            expected_fencing_token=(context.request.expected_fencing_token),
+        )
         if result.failures:
             return WorkflowStepOutcome.failed(
                 "HyperPod rejected nodes: "
@@ -388,6 +387,7 @@ class HyperPodLifecycleStepAdapter(
             operation_id=result.operation_id,
             details={
                 "action": result.action.value,
+                "submission_idempotency_key": result.idempotency_key,
                 "submitted_nodes": (result.successful_node_logical_ids),
                 "revoked_agents": revoked_agents,
                 "agent_baselines": agent_baselines,

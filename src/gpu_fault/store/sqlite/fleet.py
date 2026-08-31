@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from datetime import datetime
+
+if TYPE_CHECKING:
+    from gpu_fault.regional import (
+        RegionalRegistryHead,
+        RegionalRegistryMember,
+        RegionalRegistryRevision,
+    )
 
 
 class SqliteFleetMixin:
@@ -65,6 +72,91 @@ class SqliteFleetMixin:
             """
         ).fetchall()
         return [str(row[0]) for row in rows]
+
+    def get_regional_registry_head(self) -> RegionalRegistryHead:
+        return cast(
+            "RegionalRegistryHead",
+            self._get("regional_registry_head", "current"),
+        )
+
+    def get_regional_registry_revision(
+        self, generation: int
+    ) -> RegionalRegistryRevision:
+        return cast(
+            "RegionalRegistryRevision",
+            self._get("regional_registry_revision", str(generation)),
+        )
+
+    def publish_regional_registry_revision(
+        self,
+        revision: RegionalRegistryRevision,
+        *,
+        expected_generation: int,
+    ) -> RegionalRegistryHead:
+        from gpu_fault.regional import RegionalRegistryHead
+
+        with self._state_transaction("regional_registry/head"):
+            current = self._get_optional("regional_registry_head", "current")
+            current_generation = current.generation if current is not None else 0
+            if (
+                current is not None
+                and current.generation == revision.generation
+                and current.content_sha256 == revision.content_sha256
+            ):
+                return cast("RegionalRegistryHead", current)
+            if current_generation != expected_generation:
+                raise ValueError("regional registry generation conflict")
+            if revision.generation != expected_generation + 1:
+                raise ValueError("regional registry generation must be consecutive")
+            for registration in revision.registrations:
+                existing = self._get_optional(
+                    "regional_cluster",
+                    registration.cluster_id,
+                )
+                if existing is not None and existing.region != registration.region:
+                    raise ValueError("regional cluster cannot move between regions")
+            configured_ids = {
+                registration.cluster_id for registration in revision.registrations
+            }
+            for cluster_id in self.list_regional_cluster_ids():
+                if cluster_id not in configured_ids:
+                    self._delete("regional_cluster", cluster_id)
+            for registration in revision.registrations:
+                self._put(
+                    "regional_cluster",
+                    registration.cluster_id,
+                    registration,
+                )
+            self._put(
+                "regional_registry_revision",
+                str(revision.generation),
+                revision,
+            )
+            head = RegionalRegistryHead(
+                generation=revision.generation,
+                content_sha256=revision.content_sha256,
+                updated_at=revision.created_at,
+            )
+            self._put("regional_registry_head", "current", head)
+            return head
+
+    def save_regional_registry_member(
+        self, member: RegionalRegistryMember
+    ) -> RegionalRegistryMember:
+        with self._state_transaction(f"regional_registry_member/{member.member_id}"):
+            self._put(
+                "regional_registry_member",
+                member.member_id,
+                member,
+            )
+            return member
+
+    def list_regional_registry_members(self) -> list[RegionalRegistryMember]:
+        members = cast(
+            "list[RegionalRegistryMember]",
+            self._list("regional_registry_member"),
+        )
+        return sorted(members, key=lambda item: item.member_id)
 
     @staticmethod
     def _agent_key(cluster_id: str, node_id: str) -> str:

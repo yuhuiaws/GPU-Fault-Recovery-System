@@ -5,11 +5,25 @@ import os
 import random
 from threading import Event, Thread
 import time
+from typing import Any
 
 from gpu_fault.app.periodic_services import PeriodicServiceRunner
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def start_regional_registry_worker(runtime: Any, stop: Event) -> Thread | None:
+    if runtime is None:
+        return None
+    worker = Thread(
+        target=runtime.run,
+        args=(stop,),
+        name="gpu-fault-regional-registry",
+        daemon=True,
+    )
+    worker.start()
+    return worker
 
 
 def start_processor_threads(

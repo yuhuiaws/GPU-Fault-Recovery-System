@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from gpu_fault.async_store import StoreIoCapacityExceeded
+from gpu_fault.regional_registry_runtime import regional_cluster_request_allowed
 
 
 @dataclass(frozen=True)
@@ -87,9 +88,25 @@ def install_regional_authorization(
             return await call_next(request)
         cluster_id = request.headers.get("X-GPU-Fault-Cluster-ID")
         try:
-            dependencies.authenticate_cluster(
+            registration = dependencies.authenticate_cluster(
                 cluster_id, request.headers.get("Authorization")
             )
+            request.state.regional_cluster_registration = registration
+            if not regional_cluster_request_allowed(
+                registration,
+                path=request.url.path,
+                method=request.method,
+            ):
+                return JSONResponse(
+                    status_code=423,
+                    content={
+                        "detail": (
+                            "regional cluster lifecycle "
+                            f"{registration.lifecycle_state.value} "
+                            "does not allow this request"
+                        )
+                    },
+                )
             if request.method in {"POST", "PUT", "PATCH"}:
                 body = await request.body()
                 payload = request.scope.get("gpu_fault_json_payload")
@@ -165,5 +182,6 @@ def install_regional_authorization(
             return JSONResponse(
                 status_code=status_code,
                 content={"detail": detail},
+                headers=getattr(exc, "headers", None),
             )
         return await call_next(request)

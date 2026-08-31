@@ -5,6 +5,7 @@ import ipaddress
 import json
 import secrets
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Any
 
 from pydantic import Field, field_validator, model_validator
@@ -36,6 +37,13 @@ from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import EvidenceKind
 
 
+class RegionalClusterLifecycle(StrEnum):
+    PENDING = "PENDING"
+    ACTIVE = "ACTIVE"
+    DRAINING = "DRAINING"
+    REVOKED = "REVOKED"
+
+
 class RegionalClusterRegistration(StrictModel):
     cluster_id: str
     region: str
@@ -43,6 +51,7 @@ class RegionalClusterRegistration(StrictModel):
     eks_cluster_arn: str
     token_sha256: str = Field(min_length=64, max_length=64)
     enabled: bool = True
+    lifecycle_state: RegionalClusterLifecycle = RegionalClusterLifecycle.ACTIVE
     synthetic: bool = False
     synthetic_run_id: str | None = Field(default=None, min_length=1, max_length=128)
     synthetic_expires_at: datetime | None = None
@@ -91,17 +100,170 @@ class RegionalClusterRegistration(StrictModel):
         observed = now or datetime.now(timezone.utc)
         if observed.tzinfo is None:
             raise ValueError("regional cluster activity check requires timezone")
-        return self.enabled and (
-            not self.synthetic
-            or (
-                self.synthetic_expires_at is not None
-                and self.synthetic_expires_at > observed
+        return (
+            self.enabled
+            and self.lifecycle_state is RegionalClusterLifecycle.ACTIVE
+            and (
+                not self.synthetic
+                or (
+                    self.synthetic_expires_at is not None
+                    and self.synthetic_expires_at > observed
+                )
             )
+        )
+
+    def accepts_token(self, now: datetime | None = None) -> bool:
+        observed = now or datetime.now(timezone.utc)
+        if observed.tzinfo is None:
+            raise ValueError("regional cluster activity check requires timezone")
+        return (
+            self.enabled
+            and self.lifecycle_state is not RegionalClusterLifecycle.REVOKED
+            and (
+                not self.synthetic
+                or (
+                    self.synthetic_expires_at is not None
+                    and self.synthetic_expires_at > observed
+                )
+            )
+        )
+
+    def token_matches(self, token: str) -> bool:
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        return self.accepts_token() and secrets.compare_digest(
+            digest,
+            self.token_sha256,
         )
 
     def authenticates(self, token: str) -> bool:
         digest = hashlib.sha256(token.encode()).hexdigest()
-        return self.is_active() and secrets.compare_digest(digest, self.token_sha256)
+        return self.is_active() and secrets.compare_digest(
+            digest,
+            self.token_sha256,
+        )
+
+
+def regional_registry_content_sha256(
+    registrations: list[RegionalClusterRegistration],
+) -> str:
+    payload = [
+        item.model_dump(mode="json")
+        for item in sorted(registrations, key=lambda value: value.cluster_id)
+    ]
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class RegionalRegistryRevision(StrictModel):
+    generation: int = Field(ge=1)
+    content_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    registrations: list[RegionalClusterRegistration] = Field(default_factory=list)
+    previous_generation: int | None = Field(default=None, ge=1)
+    required_member_ids: list[str] = Field(default_factory=list)
+    reason: str = Field(min_length=1, max_length=512)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_revision(self) -> RegionalRegistryRevision:
+        cluster_ids = [item.cluster_id for item in self.registrations]
+        if len(cluster_ids) != len(set(cluster_ids)):
+            raise ValueError("regional registry cluster IDs must be unique")
+        if len(self.required_member_ids) != len(set(self.required_member_ids)):
+            raise ValueError("regional registry required member IDs must be unique")
+        if (
+            self.previous_generation is not None
+            and self.previous_generation >= self.generation
+        ):
+            raise ValueError("regional registry generation must increase")
+        expected = regional_registry_content_sha256(self.registrations)
+        if not secrets.compare_digest(self.content_sha256, expected):
+            raise ValueError("regional registry content digest mismatch")
+        return self
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        generation: int,
+        registrations: list[RegionalClusterRegistration],
+        previous_generation: int | None,
+        required_member_ids: list[str],
+        reason: str,
+        created_at: datetime | None = None,
+    ) -> RegionalRegistryRevision:
+        normalized = sorted(registrations, key=lambda item: item.cluster_id)
+        return cls(
+            generation=generation,
+            content_sha256=regional_registry_content_sha256(normalized),
+            registrations=normalized,
+            previous_generation=previous_generation,
+            required_member_ids=sorted(set(required_member_ids)),
+            reason=reason,
+            created_at=created_at or datetime.now(timezone.utc),
+        )
+
+
+class RegionalRegistryHead(StrictModel):
+    generation: int = Field(ge=1)
+    content_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RegionalRegistryMember(StrictModel):
+    member_id: str = Field(min_length=1, max_length=256)
+    service_role: str = Field(min_length=1, max_length=64)
+    release_id: str = Field(min_length=1, max_length=256)
+    generation: int = Field(ge=0)
+    content_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    ready: bool
+    error: str | None = Field(default=None, max_length=1024)
+    started_at: datetime
+    last_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RegionalRegistryPublishRequest(StrictModel):
+    expected_generation: int = Field(ge=0)
+    registrations: list[RegionalClusterRegistration] = Field(default_factory=list)
+    required_member_ids: list[str] | None = None
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class RegionalRegistryRollbackRequest(StrictModel):
+    expected_generation: int = Field(ge=1)
+    target_generation: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class RegionalRegistryStatus(StrictModel):
+    generation: int = Field(ge=1)
+    content_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    cluster_states: dict[str, RegionalClusterLifecycle]
+    required_member_ids: list[str]
+    acked_member_ids: list[str]
+    missing_member_ids: list[str]
+    active_member_ids: list[str]
+    members: list[RegionalRegistryMember]
+    converged: bool
 
 
 def cluster_token_sha256(token: str) -> str:

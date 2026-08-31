@@ -195,6 +195,7 @@ import sys
 from datetime import datetime, timezone
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.hyperpod import hyperpod_submission_idempotency_key
 from gpu_fault.store import NotFoundError
 
 (
@@ -296,10 +297,18 @@ if hyperpod_cluster and commands:
         None,
     )
     if restart_command is not None:
+        submission_key = (
+            restart_command.result_details.get("submission_idempotency_key")
+            or hyperpod_submission_idempotency_key(
+                workflow.request_id,
+                restart_command.step_index,
+                restart_command.step.operation,
+            )
+        )
         try:
             submission = store.get_hyperpod_submission(
                 hyperpod_cluster,
-                restart_command.idempotency_key,
+                submission_key,
             )
         except NotFoundError:
             pass

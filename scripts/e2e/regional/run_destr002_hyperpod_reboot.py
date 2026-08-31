@@ -111,7 +111,10 @@ import json
 import sys
 
 from gpu_fault.cluster_executor import executor_from_environment
-from gpu_fault.hyperpod import HyperPodAction
+from gpu_fault.hyperpod import (
+    HyperPodAction,
+    hyperpod_submission_idempotency_key,
+)
 from gpu_fault.regional import RemoteActionCommand
 
 command = RemoteActionCommand.model_validate(json.loads(sys.argv[1]))
@@ -121,6 +124,34 @@ step_adapter = next(
     for item in executor.adapters
     if getattr(item, "owner", "") == "gpu-fault-hyperpod-adapter"
 )
+submission_key = (
+    command.result_details.get("submission_idempotency_key")
+    or hyperpod_submission_idempotency_key(
+        command.workflow.request_id,
+        command.step_index,
+        command.step.operation,
+    )
+)
+lifecycle = step_adapter.dispatcher.adapter
+if lifecycle.store is None:
+    raise RuntimeError("HyperPod durable submission store is unavailable")
+record = lifecycle.store.get_hyperpod_submission(
+    lifecycle.config.cluster_name,
+    submission_key,
+)
+expected_identity = (
+    HyperPodAction.REBOOT,
+    tuple(sorted(command.step.node_ids)),
+)
+if (
+    record.idempotency_key != submission_key
+    or record.request_identity != expected_identity
+    or record.state != "SUBMITTED"
+    or record.result is None
+):
+    raise RuntimeError(
+        "exact HyperPod submission is not safely replayable"
+    )
 result = step_adapter.dispatcher.adapter.submit(
     HyperPodAction.REBOOT,
     command.step.node_ids,
@@ -128,7 +159,7 @@ result = step_adapter.dispatcher.adapter.submit(
     confirm_cluster_name=executor.confirm_cluster_name,
     workflow_fencing_token=command.workflow.fencing_token,
     expected_fencing_token=command.fencing_token,
-    idempotency_key=command.idempotency_key,
+    idempotency_key=submission_key,
 )
 print(json.dumps(result.model_dump(mode="json"), sort_keys=True, default=str))
 """
@@ -359,7 +390,12 @@ def wait_for_submission(
         )
         if submission.get("state") == "SUBMITTED":
             return last
-        if workflow.get("status") in {"FAILED", "BLOCKED"}:
+        if workflow.get("status") in {
+            "BLOCKED",
+            "FAILED",
+            "SUCCEEDED",
+            "SUPERSEDED",
+        }:
             return last
         time.sleep(5)
     raise RegionalFixtureError(

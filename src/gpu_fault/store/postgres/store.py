@@ -133,10 +133,7 @@ class PostgresStore(
         from gpu_fault.hyperpod import (
             HyperPodSubmissionRecord,
         )
-        from gpu_fault.regional import (
-            RegionalClusterRegistration,
-            RemoteActionCommand,
-        )
+        from gpu_fault import regional as regional_models
         from gpu_fault.installation_resources import InstallationResource
         from gpu_fault.processor import (
             PeriodicTaskLease,
@@ -168,9 +165,12 @@ class PostgresStore(
             "raw_evidence": RawEvidenceRecord,
             "hyperpod_node_identity": HyperPodNodeIdentity,
             "hyperpod_submission": HyperPodSubmissionRecord,
-            "regional_cluster": RegionalClusterRegistration,
+            "regional_cluster": regional_models.RegionalClusterRegistration,
+            "regional_registry_head": regional_models.RegionalRegistryHead,
+            "regional_registry_member": regional_models.RegionalRegistryMember,
+            "regional_registry_revision": regional_models.RegionalRegistryRevision,
             "installation_resource": InstallationResource,
-            "remote_command": RemoteActionCommand,
+            "remote_command": regional_models.RemoteActionCommand,
             "processor_leadership": ProcessorLeadership,
             "periodic_task_lease": PeriodicTaskLease,
             "processor_lane": ProcessorLaneLease,

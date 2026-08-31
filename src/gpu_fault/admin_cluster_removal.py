@@ -377,6 +377,30 @@ def _run_control_plane_unregister(
         raise BootstrapError("control-plane cluster unregister failed")
 
 
+def _run_control_plane_drain(
+    request: RemoveClusterRequest,
+) -> None:
+    with materialized_release_config(request.site) as config:
+        completed = subprocess.run(
+            [
+                str(
+                    request.site.repository_root
+                    / "deploy/control-plane/regional/rollout-regional-release.sh"
+                ),
+                "drain-cluster",
+                "--cluster-id",
+                request.cluster_id,
+                "--config",
+                str(config),
+            ],
+            cwd=request.site.repository_root,
+            env={**os.environ, **effective_environment(request.site)},
+            check=False,
+        )
+    if completed.returncode:
+        raise BootstrapError("control-plane cluster drain failed")
+
+
 def _idempotent_aws(
     arguments: list[str],
     *,
@@ -778,6 +802,10 @@ def remove_cluster(
     remaining_networks = [dict(item) for item in discovery["remaining_networks"]]
     cpu_vpc_id = str(discovery["cpu_vpc_id"])
     snapshot = load_installation_resource_snapshot(Path(discovery["registry_snapshot"]))
+
+    if not _done(state, "CONTROL_REGISTRY_DRAINING"):
+        _run_control_plane_drain(request)
+        _complete(state_path, state, "CONTROL_REGISTRY_DRAINING")
 
     if not _done(state, "KUBERNETES_REMOVED"):
         cleanup_path = _run_kubernetes_cleanup(request, target, state_dir)

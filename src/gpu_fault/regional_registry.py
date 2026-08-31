@@ -9,6 +9,7 @@ from gpu_fault.regional import (
     RegionalClusterRegistration,
     cluster_token_sha256,
 )
+from gpu_fault.store import NotFoundError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -21,6 +22,16 @@ def sync_regional_cluster_registry(
     now: datetime | None = None,
 ) -> list[RegionalClusterRegistration]:
     """Make the durable registry exactly match the validated config."""
+
+    try:
+        head = store.get_regional_registry_head()
+    except (AttributeError, NotFoundError):
+        pass
+    else:
+        revision = store.get_regional_registry_revision(head.generation)
+        if revision.content_sha256 != head.content_sha256:
+            raise RuntimeError("durable regional registry head digest mismatch")
+        return list(revision.registrations)
 
     configured: list[RegionalClusterRegistration] = []
     configured_ids: set[str] = set()

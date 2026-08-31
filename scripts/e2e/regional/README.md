@@ -23,6 +23,15 @@ probes under `scripts/`, `tests/manifests/`, or the `scripts/e2e/` root.
 - `run_ha009_aurora_credential_rotation.py`
 - `run_boot019_admin_lifecycle.py`
 - `run_boot020_release_rolling.py`
+- `run_boot_acceptance.py`
+- `run_identity_acceptance.py`
+- `run_workload_acceptance.py`
+- `run_preemption_contracts.py`
+- `run_preempt012_acceptance.py`
+- `run_notification_acceptance.py`
+- `run_capacity_acceptance.py`
+- `run_net001_collector_replay.py`
+- `run_blast_acceptance.py`
 - `run_destr001_gpu_reset.py`
 - `run_destr002_hyperpod_reboot.py`
 - `run_destr003_warm_spare_failover.py`
@@ -41,6 +50,14 @@ The BOOT-019/020 runners are plan-only by default. Their live paths require
 both `--execute` and the case-specific confirmation string, keep resumable
 evidence under a caller-supplied `--run-dir`, and remain `manual` in the case
 catalog because they attach/remove clusters or roll real releases.
+
+The grouped BOOT-011..018, AUTH/ISO, WORKLOAD/E2E, PREEMPT-012, NOTIFY,
+CAP-001..004 and NET-001 drivers use the same plan/execute guard. They derive
+their formal predecessor from `testcases/regional-execution-order.yaml` and
+default to the preceding evidence file under the same run directory.
+`run_preemption_contracts.py` is the deterministic non-live command entry for
+PREEMPT-001..009. `run_blast_acceptance.py` executes one explicit read-only
+BLAST case.
 
 `run_ha008_processor_exit_probe.py` is the fatal child process used internally
 by the HA-008 acceptance wrapper. It is not the public case entry point.
@@ -89,6 +106,26 @@ manual live case into executed acceptance evidence.
 Current classification:
 
 - `NET-004` and `NET-005` have reusable read-only/isolated audit commands.
+- BOOT-011..018 share `run_boot_acceptance.py`. Greenfield actions remain
+  plan-only; runtime CA, SES, dispatcher and owner checks cover every selected
+  live replica. BOOT-018 performs reproducible builds and removes the isolated
+  site after live identity verification unless explicitly retained.
+- AUTH-007/010/012..015 and ISO-003..005 share
+  `run_identity_acceptance.py`. Registry, token and key documents remain only
+  in memory and are restored in `finally`; Secret values never enter evidence.
+- WORKLOAD-001/002, ISO-001 and E2E-001 share
+  `run_workload_acceptance.py`. It owns prewarm, managed submission,
+  observation checks and workload cleanup. E2E-001 emits the execution card
+  and CPU baseline consumed by BLAST-001.
+- PREEMPT-001..009 use `run_preemption_contracts.py`; PREEMPT-012 combines a
+  real fail-safe quiesce/restore cycle with the deployed executor state
+  machine and live PostgreSQL.
+- NOTIFY-001..005 share `run_notification_acceptance.py`. Reset/restart email
+  cases use labeled drills rather than repeating physical actions.
+- CAP-001..004 share `run_capacity_acceptance.py`, promoted from the isolated
+  disposable-control-plane harness. NET-001 uses
+  `run_net001_collector_replay.py` and arms a host rollback timer before any
+  TCP/443 rule is added.
 - `HA-007` and `HA-008` have reusable isolated subprocess drivers.
 - `NET-002/003` and `HA-001/002/005/006` have reusable manual live drivers.
   Their generalized source has not yet been rerun live, so existing private

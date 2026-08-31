@@ -47,6 +47,7 @@ from gpu_fault.app.routes.completion import (
 from gpu_fault.regional_compatibility import (
     RegionalExecutorCompatibilityPolicy,
 )
+from gpu_fault.regional_registry_runtime import RegionalRegistryRuntime
 from gpu_fault.app.routes.configuration import (
     ConfigurationRouterDependencies,
     get_configuration_dependencies,
@@ -81,6 +82,9 @@ from gpu_fault.app.routes.regional import (
     RegionalRouterDependencies,
     get_regional_dependencies,
     router as regional_router,
+)
+from gpu_fault.app.routes.regional_registry import (
+    router as regional_registry_router,
 )
 from gpu_fault.app.routes.workflows import (
     WorkflowRouterDependencies,
@@ -225,12 +229,6 @@ def _configure_service_runtime(
     evidence_admission_batcher,
     telemetry_spool_batcher,
 ):
-    regional_auth_registry = {
-        registration.cluster_id: registration
-        for registration in (
-            ctx.store.list_regional_clusters() if ctx.regional_mode else []
-        )
-    }
     service_role = os.getenv("GPU_FAULT_SERVICE_ROLE", "all").strip().lower()
     if service_role not in {
         "all",
@@ -241,6 +239,18 @@ def _configure_service_runtime(
         raise ValueError(
             "GPU_FAULT_SERVICE_ROLE must be all, ingress, worker, or spool-worker"
         )
+    regional_auth_registry = (
+        RegionalRegistryRuntime.bootstrap(
+            ctx.store,
+            member_id=(_pod_process_owner() or f"local:{service_role}:{os.getpid()}"),
+            service_role=service_role,
+            release_id=os.getenv("GPU_FAULT_RELEASE_ID", "local"),
+            poll_seconds=float(os.getenv("GPU_FAULT_REGISTRY_POLL_SECONDS", "1")),
+            stale_seconds=float(os.getenv("GPU_FAULT_REGISTRY_STALE_SECONDS", "10")),
+        )
+        if ctx.regional_mode
+        else None
+    )
     background_services_enabled = service_role in {
         "all",
         "worker",
@@ -369,6 +379,7 @@ def _configure_service_runtime(
             telemetry_spool_batcher=telemetry_spool_batcher,
             event_loop_lag=event_loop_lag,
             collector_metrics_snapshot=collector_metrics_snapshot,
+            regional_registry_runtime=regional_auth_registry,
         )
     )
     return (
@@ -401,6 +412,12 @@ def _install_regional_auth(
     registry.load(app.routes)
 
     def authenticate_regional_cluster(cluster_id, authorization):
+        if regional_auth_registry is None or not regional_auth_registry.is_ready():
+            raise HTTPException(
+                status_code=503,
+                detail="regional registry snapshot is not current",
+                headers={"Retry-After": "2"},
+            )
         if not cluster_id:
             raise HTTPException(
                 status_code=401, detail="X-GPU-Fault-Cluster-ID is required"
@@ -415,7 +432,7 @@ def _install_regional_auth(
                 status_code=403, detail="regional cluster is not registered"
             )
         token = authorization.removeprefix("Bearer ").strip()
-        if not registration.authenticates(token):
+        if not registration.token_matches(token):
             raise HTTPException(
                 status_code=403, detail="regional cluster authentication failed"
             )
@@ -519,6 +536,7 @@ def _install_core_routes(
         )
     )
     app.include_router(regional_router)
+    app.include_router(regional_registry_router)
 
     app.dependency_overrides[get_admin_dependencies] = lambda: (
         AdminRouterDependencies(
@@ -527,6 +545,7 @@ def _install_core_routes(
             processor_mode=processor_mode,
             service_role=service_role,
             environment=os.environ,
+            regional_registry_runtime=regional_auth_registry,
         )
     )
     app.include_router(admin_router)
@@ -811,7 +830,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
     app.state.fault_admission_batcher = fault_admission_batcher
     app.state.evidence_admission_batcher = evidence_admission_batcher
     app.state.telemetry_spool_batcher = telemetry_spool_batcher
-
+    app.state.regional_registry_runtime = regional_auth_registry
     processor_paths = (
         "/v1/runtime-profiles",
         "/v1/installation-resources",

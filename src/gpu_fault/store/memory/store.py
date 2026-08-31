@@ -100,6 +100,9 @@ class InMemoryStore(
         self._hyperpod_node_identities = {}
         self._hyperpod_submissions = {}
         self._regional_clusters = {}
+        self._regional_registry_revisions = {}
+        self._regional_registry_head = None
+        self._regional_registry_members = {}
         self._remote_commands = {}
         self._processor_leadership = None
         self._periodic_task_leases = {}

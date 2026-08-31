@@ -3977,8 +3977,13 @@ test_cases:
   - 前驱保持 RUNNING 并按原串行语义跑完
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-001配置关闭
+  command:
+  - python3
+  - scripts/e2e/regional/run_preemption_contracts.py
+  - --case
+  - GF-REGIONAL-PREEMPT-001
   related_pytest: tests/execution/test_executor.py::test_preemption_config_disabled_keeps_predecessor_running
 - id: GF-REGIONAL-PREEMPT-002
   title: 同 attempt clean boundary 抢占与步骤继承
@@ -3997,8 +4002,13 @@ test_cases:
   - evidence、checkpoint、quiesce、verify、硬件动作、restore 与 restart 均不得继承
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-002同attempt-clean-boundary
+  command:
+  - python3
+  - scripts/e2e/regional/run_preemption_contracts.py
+  - --case
+  - GF-REGIONAL-PREEMPT-002
   related_pytest: tests/orchestration/test_cross_fault_arbitration.py::test_preemption_marks_stronger_successor_and_reuses_containment
 - id: GF-REGIONAL-PREEMPT-003
   title: 无 job 的同节点抢占与跨节点隔离
@@ -4016,8 +4026,13 @@ test_cases:
   - 两个不同 job 仅因位于同一节点也不抢占
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-003无job同节点
+  command:
+  - python3
+  - scripts/e2e/regional/run_preemption_contracts.py
+  - --case
+  - GF-REGIONAL-PREEMPT-003
   related_pytest: tests/orchestration/test_merge.py::test_idle_node_stronger_action_requests_safe_preemption
 - id: GF-REGIONAL-PREEMPT-004
   title: recovery rank 门禁只允许严格更高级抢占
@@ -4034,8 +4049,13 @@ test_cases:
   - 只有严格更高 rank 设置 preempt_predecessor=true
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-004rank门禁
+  command:
+  - python3
+  - scripts/e2e/regional/run_preemption_contracts.py
+  - --case
+  - GF-REGIONAL-PREEMPT-004
   related_pytest: tests/orchestration/test_merge.py::test_preemption_requires_strictly_higher_recovery_rank
 - id: GF-REGIONAL-PREEMPT-005
   title: 未被领取的 remote command 在抢占前原子取消
@@ -4051,8 +4071,13 @@ test_cases:
   - 数据面不得领取该 command
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-005remote-pending取消
+  command:
+  - python3
+  - scripts/e2e/regional/run_preemption_contracts.py
+  - --case
+  - GF-REGIONAL-PREEMPT-005
   related_pytest: tests/execution/test_node_action.py::test_unclaimed_remote_command_is_cancelled_before_preemption
 - id: GF-REGIONAL-PREEMPT-006
   title: 已提交 reset 被 reboot 抢占时只执行一次
@@ -4071,8 +4096,13 @@ test_cases:
   - 高级 reboot 由 HyperPodSubmissionRecord 与 CloudTrail 证明只提交一次
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-006已提交resetreboot
+  command:
+  - python3
+  - scripts/e2e/regional/run_preemption_contracts.py
+  - --case
+  - GF-REGIONAL-PREEMPT-006
   related_pytest: tests/execution/test_misc.py::test_submitted_reset_restores_before_reboot_preemption
 - id: GF-REGIONAL-PREEMPT-007
   title: 已提交 reboot 被 replace 抢占时不并发调用 provider
@@ -4089,8 +4119,13 @@ test_cases:
   - BatchReplaceClusterNodes 始终不被调用，只验证 warm-spare 与 fail-closed 分支
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-007已提交rebootreplace
+  command:
+  - python3
+  - scripts/e2e/regional/run_preemption_contracts.py
+  - --case
+  - GF-REGIONAL-PREEMPT-007
   related_pytest: tests/execution/test_misc.py::test_submitted_reboot_finishes_before_replace_successor
 - id: GF-REGIONAL-PREEMPT-008
   title: QUIESCE 后抢占先补偿 RESTORE 再跳过低级 reset
@@ -4109,8 +4144,13 @@ test_cases:
   - 任一分支最终state file删除、timer取消且服务恢复active
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-008quiesce后跳过低级reset
+  command:
+  - python3
+  - scripts/e2e/regional/run_preemption_contracts.py
+  - --case
+  - GF-REGIONAL-PREEMPT-008
   related_pytest: tests/execution/test_misc.py::test_reset_to_reboot_hands_off_quiesce_and_skips_low_reset
 - id: GF-REGIONAL-PREEMPT-009
   title: 四类 WAITING 的可抢占性分类
@@ -4128,8 +4168,13 @@ test_cases:
   - RESTART_WORKLOAD WAITING 等 workload mutation 终态
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-009waiting分类
+  command:
+  - python3
+  - scripts/e2e/regional/run_preemption_contracts.py
+  - --case
+  - GF-REGIONAL-PREEMPT-009
   related_pytest: tests/execution/test_validation.py::test_local_validation_waiting_is_safe_to_preempt
 - id: GF-REGIONAL-PREEMPT-010
   title: 前驱终态回写不得覆盖 incident 的 successor 指针

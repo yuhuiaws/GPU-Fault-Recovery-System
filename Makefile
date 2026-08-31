@@ -33,6 +33,7 @@ DOCUMENTATION_TESTS = \
 	tests/test_fault_scenario_catalog.py \
 	tests/regional/test_regional_acceptance_spec.py \
 	tests/regional/test_regional_acceptance_fixtures.py \
+	tests/regional/test_complete_acceptance_entries.py \
 	tests/test_operations_manual_guide.py \
 	tests/test_env_reference.py \
 	tests/regional/test_regional_case_index.py \

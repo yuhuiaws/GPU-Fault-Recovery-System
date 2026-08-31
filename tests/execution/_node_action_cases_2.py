@@ -380,6 +380,10 @@ def test_hyperpod_reboot_waits_for_post_reboot_stabilization() -> None:
     assert still_stabilizing.status is WorkflowStatus.RUNNING
     assert completed.status is WorkflowStatus.SUCCEEDED
     execution = store.get_workflow(workflow.request_id).step_executions[0]
+    assert (
+        execution.details["submission_idempotency_key"]
+        == "workflow-active/RESTART_NODE/0"
+    )
     assert execution.details["post_reboot_stabilization_seconds"] == 60
 
 
