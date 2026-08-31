@@ -17,7 +17,6 @@ from scripts.perf import benchmark_correlated_action_scenario as benchmark
 from scripts.perf import regional_correlated_action_suite as suite
 from tests._builders import build_context, copy_model, workflow_step_execution
 
-NOW = datetime.now(timezone.utc)
 RESTART_SAFETY_PARAMETERS = {
     "cluster_id",
     "job_id",
@@ -125,15 +124,16 @@ def test_correlated_action_database_audit_script_compiles(monkeypatch) -> None:
 
 
 def test_correlated_action_payloads_share_attempt_identity() -> None:
+    observed_at = datetime.now(timezone.utc)
     identity = benchmark.attempt_identity("run-a", 3)
-    observation = benchmark.observation_payload("perf-cap-003", identity, NOW)
-    heartbeat = benchmark.heartbeat_payload("perf-cap-003", identity, NOW)
+    observation = benchmark.observation_payload("perf-cap-003", identity, observed_at)
+    heartbeat = benchmark.heartbeat_payload("perf-cap-003", identity, observed_at)
     weak = benchmark.xid_payload(
         xid=11,
         event_id="weak",
         cluster_id="perf-cap-003",
         identity=identity,
-        observed_at=NOW,
+        observed_at=observed_at,
         profile_version="hyperpod-v1",
     )
     strong = benchmark.xid_payload(
@@ -141,7 +141,7 @@ def test_correlated_action_payloads_share_attempt_identity() -> None:
         event_id="strong",
         cluster_id="perf-cap-003",
         identity=identity,
-        observed_at=NOW,
+        observed_at=observed_at,
         profile_version="hyperpod-v1",
     )
 
@@ -156,7 +156,7 @@ def test_correlated_action_payloads_share_attempt_identity() -> None:
         event_id="sxid",
         cluster_id="perf-cap-003",
         identity=identity,
-        observed_at=NOW,
+        observed_at=observed_at,
         profile_version="hyperpod-v1",
     )
     AttemptObservation(**observation)
@@ -352,6 +352,7 @@ def test_correlated_action_verdict_rejects_incomplete_job_and_claim_errors() -> 
 
 
 def test_correlated_action_chain_preempts_and_escalates_fabric_reset() -> None:
+    observed_at = datetime.now(timezone.utc)
     context = build_context()
     context.orchestrator = IncidentOrchestrator(
         context.store, workflow_preemption_enabled=True
@@ -359,7 +360,7 @@ def test_correlated_action_chain_preempts_and_escalates_fabric_reset() -> None:
     identity = benchmark.attempt_identity("run-a", 0, "preempt")
     observation = AttemptObservation(
         **benchmark.observation_payload(
-            "cluster-a", identity, NOW, profile_version="simulated-v1"
+            "cluster-a", identity, observed_at, profile_version="simulated-v1"
         )
     )
     context.store.save_attempt_observation(observation)
@@ -369,7 +370,7 @@ def test_correlated_action_chain_preempts_and_escalates_fabric_reset() -> None:
             event_id="corr-live-run-a-c000-weak",
             cluster_id="cluster-a",
             identity=identity,
-            observed_at=NOW,
+            observed_at=observed_at,
             profile_version="simulated-v1",
         )
     )
@@ -381,7 +382,7 @@ def test_correlated_action_chain_preempts_and_escalates_fabric_reset() -> None:
             event_id="corr-live-run-a-c000-aggregate",
             cluster_id="cluster-a",
             identity=identity,
-            observed_at=NOW,
+            observed_at=observed_at,
             profile_version="simulated-v1",
         )
     )
@@ -420,7 +421,7 @@ def test_correlated_action_chain_preempts_and_escalates_fabric_reset() -> None:
             event_id="corr-live-run-a-c000-strong",
             cluster_id="cluster-a",
             identity=identity,
-            observed_at=NOW,
+            observed_at=observed_at,
             profile_version="simulated-v1",
         )
     )
@@ -484,12 +485,13 @@ def test_correlated_action_chain_preempts_and_escalates_fabric_reset() -> None:
 
 
 def test_correlated_action_reset_gpu_failure_escalates_to_reboot() -> None:
+    observed_at = datetime.now(timezone.utc)
     context = build_context()
     identity = benchmark.attempt_identity("run-a", 0, "reset")
     context.store.save_attempt_observation(
         AttemptObservation(
             **benchmark.observation_payload(
-                "cluster-a", identity, NOW, profile_version="simulated-v1"
+                "cluster-a", identity, observed_at, profile_version="simulated-v1"
             )
         )
     )
@@ -499,7 +501,7 @@ def test_correlated_action_reset_gpu_failure_escalates_to_reboot() -> None:
             event_id="corr-live-run-a-c000-reset",
             cluster_id="cluster-a",
             identity=identity,
-            observed_at=NOW,
+            observed_at=observed_at,
             profile_version="simulated-v1",
         )
     )
@@ -553,12 +555,13 @@ def test_correlated_action_reset_gpu_failure_escalates_to_reboot() -> None:
 
 
 def test_correlated_action_escalation_blocks_without_restart_context() -> None:
+    observed_at = datetime.now(timezone.utc)
     context = build_context()
     identity = benchmark.attempt_identity("run-a", 0, "missing-restart-context")
     context.store.save_attempt_observation(
         AttemptObservation(
             **benchmark.observation_payload(
-                "cluster-a", identity, NOW, profile_version="simulated-v1"
+                "cluster-a", identity, observed_at, profile_version="simulated-v1"
             )
         )
     )
@@ -568,7 +571,7 @@ def test_correlated_action_escalation_blocks_without_restart_context() -> None:
             event_id="corr-live-run-a-c000-missing-restart-context",
             cluster_id="cluster-a",
             identity=identity,
-            observed_at=NOW,
+            observed_at=observed_at,
             profile_version="simulated-v1",
         )
     )
@@ -614,12 +617,13 @@ def test_correlated_action_escalation_blocks_without_restart_context() -> None:
 def test_correlated_action_escalation_blocks_if_any_restart_context_is_incomplete() -> (
     None
 ):
+    observed_at = datetime.now(timezone.utc)
     context = build_context()
     identity = benchmark.attempt_identity("run-a", 0, "mixed-restart-context")
     context.store.save_attempt_observation(
         AttemptObservation(
             **benchmark.observation_payload(
-                "cluster-a", identity, NOW, profile_version="simulated-v1"
+                "cluster-a", identity, observed_at, profile_version="simulated-v1"
             )
         )
     )
@@ -629,7 +633,7 @@ def test_correlated_action_escalation_blocks_if_any_restart_context_is_incomplet
             event_id="corr-live-run-a-c000-mixed-restart-context",
             cluster_id="cluster-a",
             identity=identity,
-            observed_at=NOW,
+            observed_at=observed_at,
             profile_version="simulated-v1",
         )
     )
