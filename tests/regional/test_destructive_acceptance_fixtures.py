@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import audit_destr013_replacement_invariant as destr013
+from scripts.e2e.regional import regional_live_fixture as live_fixture_module
 from scripts.e2e.regional import run_destr001_gpu_reset as destr001
 from scripts.e2e.regional import run_destr002_hyperpod_reboot as destr002
 from scripts.e2e.regional import run_destr003_warm_spare_failover as destr003
@@ -186,6 +187,79 @@ def test_store_snapshot_falls_back_to_release_state(
     assert result["release_id"] == "release-a", result
 
 
+def test_wait_for_workflow_preserves_observed_waiting_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    regional = _regional(tmp_path)
+    snapshots = iter(
+        (
+            {
+                "event": {"event_id": "event-a"},
+                "decision": {"disposition": "EXECUTABLE"},
+                "workflow": {
+                    "status": "RUNNING",
+                    "completed_operations": [],
+                    "step_executions": [
+                        {
+                            "step_index": 2,
+                            "operation": "RESET_GPU",
+                            "status": "WAITING",
+                            "adapter_operation_id": "remote/command-a",
+                            "details": {"mutation_submitted_by_control_plane": False},
+                        }
+                    ],
+                },
+                "commands": [{"status": "WAITING"}],
+            },
+            {
+                "event": {"event_id": "event-a"},
+                "decision": {"disposition": "EXECUTABLE"},
+                "workflow": {
+                    "status": "SUCCEEDED",
+                    "completed_operations": ["RESET_GPU"],
+                    "step_executions": [
+                        {
+                            "step_index": 2,
+                            "operation": "RESET_GPU",
+                            "status": "SUCCEEDED",
+                            "adapter_operation_id": "remote/command-a",
+                            "details": {"reset_attempts": 1},
+                        }
+                    ],
+                },
+                "commands": [{"status": "SUCCEEDED"}],
+            },
+        )
+    )
+    monkeypatch.setattr(regional, "store_snapshot", lambda **_kwargs: next(snapshots))
+    monkeypatch.setattr(live_fixture_module.time, "sleep", lambda _seconds: None)
+
+    result = regional.wait_for_workflow(
+        node="node-a",
+        marker="marker-a",
+        observed_after=datetime.now(timezone.utc),
+        case_dir=tmp_path,
+        timeout_seconds=5,
+    )
+
+    assert result["workflow"]["status"] == "SUCCEEDED", result
+    assert result["observed_waiting_step_executions"] == [
+        {
+            "step_index": 2,
+            "operation": "RESET_GPU",
+            "status": "WAITING",
+            "adapter_operation_id": "remote/command-a",
+            "details": {"mutation_submitted_by_control_plane": False},
+            "error": None,
+        }
+    ], result
+    timeline = json.loads((tmp_path / "timeline.json").read_text(encoding="utf-8"))
+    assert (
+        timeline["observed_waiting_step_executions"]
+        == result["observed_waiting_step_executions"]
+    ), timeline
+
+
 def test_managed_workload_fixture_uses_source_manifest_identity(tmp_path: Path) -> None:
     site = tmp_path / "site.yaml"
     site.write_text("schemaVersion: 1\n", encoding="utf-8")
@@ -236,14 +310,14 @@ def test_warm_spare_gpu_holder_is_node_pinned_and_bounded(tmp_path: Path) -> Non
 
 
 def _reset_state() -> dict[str, Any]:
-    step_executions = []
+    waiting = []
     for operation in (
         "QUIESCE_GPU_SERVICES",
         "VERIFY_NO_GPU_CLIENTS",
         "RESET_GPU",
         "RESTORE_GPU_SERVICES",
     ):
-        step_executions.append(
+        waiting.append(
             {
                 "operation": operation,
                 "status": "WAITING",
@@ -259,8 +333,21 @@ def _reset_state() -> dict[str, Any]:
                 {"operation": operation} for operation in destr001.EXPECTED_STEPS
             ],
             "completed_operations": list(destr001.EXPECTED_STEPS),
-            "step_executions": step_executions,
+            "step_executions": [
+                {
+                    "operation": operation,
+                    "status": "SUCCEEDED",
+                    "adapter_operation_id": f"remote/{operation.lower()}",
+                }
+                for operation in (
+                    "QUIESCE_GPU_SERVICES",
+                    "VERIFY_NO_GPU_CLIENTS",
+                    "RESET_GPU",
+                    "RESTORE_GPU_SERVICES",
+                )
+            ],
         },
+        "observed_waiting_step_executions": waiting,
         "commands": [
             {"status": "SUCCEEDED", "step": {"operation": operation}}
             for operation in (
@@ -279,7 +366,9 @@ def test_destr001_requires_the_exact_reset_contract() -> None:
     state = _reset_state()
 
     assert destr001.workflow_errors(state) == [], state
-    state["workflow"]["step_executions"] = state["workflow"]["step_executions"][:-1]
+    state["observed_waiting_step_executions"] = state[
+        "observed_waiting_step_executions"
+    ][:-1]
     errors = destr001.workflow_errors(state)
     assert any("WAITING evidence" in error for error in errors), errors
 
@@ -474,9 +563,10 @@ def test_destr008_notification_semantics_distinguish_no_pool_from_shortage(
 
 
 def _restart_state(gpu_count: int) -> dict[str, Any]:
+    waiting: list[dict[str, Any]] = []
     executions: list[dict[str, Any]] = []
     for operation in ("STOP_WORKLOADS", "RESTART_WORKLOAD"):
-        executions.append(
+        waiting.append(
             {
                 "operation": operation,
                 "status": "WAITING",
@@ -519,6 +609,7 @@ def _restart_state(gpu_count: int) -> dict[str, Any]:
             ],
             "step_executions": executions,
         },
+        "observed_waiting_step_executions": waiting,
     }
 
 

@@ -217,16 +217,21 @@ def read_only_preflight(
     return result
 
 
-def waiting_details_present(workflow: dict[str, Any]) -> bool:
+def waiting_details_present(state: dict[str, Any]) -> bool:
     required_operations = {
         "QUIESCE_GPU_SERVICES",
         "VERIFY_NO_GPU_CLIENTS",
         "RESET_GPU",
         "RESTORE_GPU_SERVICES",
     }
+    workflow = state.get("workflow") or {}
+    executions = [
+        *(workflow.get("step_executions") or []),
+        *(state.get("observed_waiting_step_executions") or []),
+    ]
     observed = {
         str(item.get("operation"))
-        for item in workflow.get("step_executions", [])
+        for item in executions
         if item.get("status") == "WAITING"
         and (item.get("details") or {}).get("mutation_submitted_by_control_plane")
         is False
@@ -253,7 +258,7 @@ def workflow_errors(state: dict[str, Any]) -> list[str]:
     completed = workflow.get("completed_operations") or []
     if completed != EXPECTED_STEPS:
         errors.append("completed operation sequence differs from the reset contract")
-    if not waiting_details_present(workflow):
+    if not waiting_details_present(state):
         errors.append("remote WAITING evidence lacks control-plane mutation=false")
     commands = state.get("commands") or []
     remote_operations = {

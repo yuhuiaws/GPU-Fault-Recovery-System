@@ -363,13 +363,18 @@ def control_plane_log_snapshot(
     return {"entries": entries, "suspicious": suspicious}
 
 
-def remote_waiting_evidence(workflow: dict[str, Any], operation: str) -> bool:
+def remote_waiting_evidence(state: dict[str, Any], operation: str) -> bool:
+    workflow = state.get("workflow") or {}
+    executions = [
+        *(workflow.get("step_executions") or []),
+        *(state.get("observed_waiting_step_executions") or []),
+    ]
     return any(
         item.get("operation") == operation
         and item.get("status") == "WAITING"
         and (item.get("details") or {}).get("mutation_submitted_by_control_plane")
         is False
-        for item in workflow.get("step_executions", [])
+        for item in executions
     )
 
 
@@ -408,7 +413,7 @@ def workflow_errors(
     if FORBIDDEN_OPERATIONS.intersection(operations):
         errors.append("workload restart workflow contains a node mutation")
     for operation in ("STOP_WORKLOADS", "RESTART_WORKLOAD"):
-        if not remote_waiting_evidence(workflow, operation):
+        if not remote_waiting_evidence(state, operation):
             errors.append(f"{operation} lacks remote WAITING evidence")
         terminal = terminal_step(workflow, operation)
         if terminal is None or terminal.get("status") != "SUCCEEDED":

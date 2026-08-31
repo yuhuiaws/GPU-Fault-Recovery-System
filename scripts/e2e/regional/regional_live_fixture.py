@@ -84,6 +84,27 @@ def predecessor_evidence(
     }
 
 
+def waiting_step_executions(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    result = []
+    for item in workflow.get("step_executions") or []:
+        if not isinstance(item, dict) or item.get("status") != "WAITING":
+            continue
+        result.append(
+            {
+                key: item.get(key)
+                for key in (
+                    "step_index",
+                    "operation",
+                    "status",
+                    "adapter_operation_id",
+                    "details",
+                    "error",
+                )
+            }
+        )
+    return result
+
+
 @dataclass(frozen=True)
 class RegionalLiveSettings:
     cpu_kubeconfig: Path
@@ -589,6 +610,7 @@ class RegionalLiveFixture:
     ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_seconds
         timeline: list[dict[str, Any]] = []
+        observed_waiting: dict[tuple[int, str], dict[str, Any]] = {}
         last: dict[str, Any] = {}
         while time.monotonic() < deadline:
             last = self.store_snapshot(
@@ -600,6 +622,18 @@ class RegionalLiveFixture:
                 hyperpod_cluster=hyperpod_cluster,
             )
             workflow = last.get("workflow") or {}
+            current_waiting = waiting_step_executions(workflow)
+            for execution in current_waiting:
+                step_index = execution.get("step_index")
+                observed_waiting[
+                    (
+                        step_index if isinstance(step_index, int) else -1,
+                        str(execution.get("operation") or ""),
+                    )
+                ] = execution
+            waiting_evidence = [
+                observed_waiting[key] for key in sorted(observed_waiting)
+            ]
             timeline.append(
                 {
                     "observed_at": datetime.now(timezone.utc).isoformat(),
@@ -610,13 +644,23 @@ class RegionalLiveFixture:
                     "command_statuses": [
                         item.get("status") for item in last.get("commands") or []
                     ],
+                    "waiting_step_executions": current_waiting,
                     "submission_state": ((last.get("submission") or {}).get("state")),
                 }
             )
-            write_json_atomic(case_dir / "timeline.json", {"entries": timeline})
+            write_json_atomic(
+                case_dir / "timeline.json",
+                {
+                    "entries": timeline,
+                    "observed_waiting_step_executions": waiting_evidence,
+                },
+            )
             status = workflow.get("status")
             if status and (not terminal or status in TERMINAL_WORKFLOW_STATUSES):
-                return last
+                return {
+                    **last,
+                    "observed_waiting_step_executions": waiting_evidence,
+                }
             time.sleep(5)
         raise RegionalFixtureError(
             f"workflow did not reach the requested state: {last}"
