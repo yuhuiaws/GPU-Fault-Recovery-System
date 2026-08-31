@@ -314,6 +314,8 @@ class RestartGuardEmailBuilder:
             ),
             body_text=body,
             support_case_draft="",
+            category="ACTION_COMPLETED",
+            priority=10,
         )
 
     def build_fabric_reset_completed(

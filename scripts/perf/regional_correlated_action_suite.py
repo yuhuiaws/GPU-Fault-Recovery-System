@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -65,6 +66,8 @@ def scenario_job(
     *,
     clusters: int,
     run_id: str,
+    scenario_max_seconds: int,
+    active_deadline_seconds: int,
     executor_protocol_version: int,
     executor_artifact_sha256: str,
     executor_compatibility_digest: str,
@@ -80,7 +83,7 @@ def scenario_job(
             "parallelism": clusters,
             "completionMode": "Indexed",
             "backoffLimit": 0,
-            "activeDeadlineSeconds": 1200,
+            "activeDeadlineSeconds": active_deadline_seconds,
             "template": {
                 "spec": {
                     "restartPolicy": "Never",
@@ -133,6 +136,10 @@ def scenario_job(
                                     },
                                 },
                                 {"name": "CORRELATED_ACTION_RUN_ID", "value": run_id},
+                                {
+                                    "name": "SCENARIO_MAX_SECONDS",
+                                    "value": str(scenario_max_seconds),
+                                },
                                 {
                                     "name": "EXECUTOR_PROTOCOL_VERSION",
                                     "value": str(executor_protocol_version),
@@ -289,27 +296,21 @@ def collect_logs(target: Path) -> list[dict]:
     return documents
 
 
-def database_audit(run_id: str) -> dict:
-    pod = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ).strip()
-    script = f"""
+def _database_audit_script_prefix(run_id: str) -> str:
+    return f"""
 import json, os, psycopg
+from datetime import datetime, timezone
 prefix='corr-live-{run_id}-%'
 with psycopg.connect(os.environ['GPU_FAULT_STORE_URL']) as conn:
     cur=conn.cursor()
     cur.execute(
-        "SELECT payload FROM gpu_fault_objects "
+        "SELECT key,payload FROM gpu_fault_objects "
         "WHERE kind='incident' AND payload->>'event_id' LIKE %s",
         (prefix,),
     )
-    incidents=[row[0] for row in cur.fetchall()]
-    incident_ids=[item['incident_id'] for item in incidents]
+    incident_rows=cur.fetchall()
+    incidents=[row[1] for row in incident_rows]
+    incident_ids=[row[0] for row in incident_rows]
     cur.execute(
         "SELECT payload FROM gpu_fault_objects WHERE kind='workflow'"
     )
@@ -344,6 +345,22 @@ with psycopg.connect(os.environ['GPU_FAULT_STORE_URL']) as conn:
         (workflow_ids,),
     )
     commands=[row[0] for row in cur.fetchall()]
+    related_incident_ids=sorted({{
+        item.get('incident_id')
+        for item in [*workflows,*commands]
+        if item.get('incident_id')
+    }})
+    cur.execute(
+        "SELECT key,payload FROM gpu_fault_objects "
+        "WHERE kind='incident' AND key=ANY(%s)",
+        (related_incident_ids,),
+    )
+    incident_by_id={{row[0]:row[1] for row in cur.fetchall()}}
+"""
+
+
+def _database_audit_script_suffix() -> str:
+    return f"""
 
 by_id={{item['request_id']:item for item in workflows}}
 def operations(item):
@@ -372,6 +389,23 @@ reboot=[
     item for item in workflows
     if 'RESTART_NODE' in operations(item)
 ]
+weak_by_id={{item['request_id']:item for item in weak}}
+required_containment={{'MARK_UNSCHEDULABLE','STOP_WORKLOADS'}}
+allowed_inherited=required_containment|{{'QUIESCE_GPU_SERVICES'}}
+preemption_pairs=[]
+for item in strong:
+    predecessor=weak_by_id.get(item.get('predecessor_workflow_id'))
+    inherited={{
+        item['official_steps'][index].get('operation')
+        for index in item.get('inherited_step_indexes',[])
+    }}
+    if (
+        predecessor is not None
+        and predecessor.get('preempted_by_workflow_id')==item['request_id']
+        and predecessor.get('incident_id')==item.get('incident_id')
+        and required_containment<=inherited<=allowed_inherited
+    ):
+        preemption_pairs.append((predecessor,item))
 weak_ok=sum(
     item.get('status')=='SUPERSEDED'
     and bool(item.get('preempted_by_workflow_id'))
@@ -379,17 +413,41 @@ weak_ok=sum(
 )
 strong_ok=sum(
     item.get('status')=='FAILED'
-    and item.get('predecessor_workflow_id') in by_id
-    and {{
-        item['official_steps'][index].get('operation')
-        for index in item.get('inherited_step_indexes',[])
-    }} == {{'MARK_UNSCHEDULABLE','STOP_WORKLOADS'}}
     and any(
         execution.get('operation')=='RESET_ALL_GPUS_NVSWITCHES'
         and execution.get('status')=='FAILED'
         for execution in item.get('step_executions',[])
     )
     for item in strong
+)
+failed_sources={{
+    item['request_id']:item
+    for item in [*strong,*reset_gpu]
+}}
+deterministic_reboot_sources={{
+    f"workflow-reboot-after-{{request_id}}":request_id
+    for request_id in failed_sources
+}}
+reboot_by_predecessor={{}}
+unexpected_reboot_predecessors=0
+for item in reboot:
+    predecessor=(
+        item.get('predecessor_workflow_id')
+        or deterministic_reboot_sources.get(item['request_id'])
+    )
+    if predecessor not in failed_sources:
+        unexpected_reboot_predecessors+=1
+        continue
+    reboot_by_predecessor.setdefault(predecessor,[]).append(item)
+reboot_successor_pairs=sum(
+    len(items)==1
+    and items[0].get('status')=='SUCCEEDED'
+    and 'RESTART_NODE' in operations(items[0])
+    for items in reboot_by_predecessor.values()
+)
+duplicate_reboot_successors=sum(
+    max(0,len(items)-1)
+    for items in reboot_by_predecessor.values()
 )
 reboot_ok=sum(
     item.get('status')=='SUCCEEDED'
@@ -410,10 +468,48 @@ terminal_commands=sum(
 duplicates=len(commands)-len({{
     item.get('idempotency_key') for item in commands
 }})
-fencing=sum(
-    int(item.get('fencing_token',0))
-    != int((by_id.get(item.get('workflow_request_id')) or {{}}).get('fencing_token',-1))
+duplicate_workflow_steps=len(commands)-len({{
+    (item.get('workflow_request_id'),item.get('step_index'))
     for item in commands
+}})
+fencing=sum(
+    (
+        int(item.get('fencing_token',0))
+        != int(
+            (by_id.get(item.get('workflow_request_id')) or {{}})
+            .get('fencing_token',-1)
+        )
+        or int(item.get('fencing_token',0))
+        != int(
+            (incident_by_id.get(item.get('incident_id')) or {{}})
+            .get('fencing_token',-1)
+        )
+    )
+    for item in commands
+)
+observed_at=datetime.now(timezone.utc)
+nonterminal=[
+    item for item in workflows
+    if item.get('status') in ('PENDING','RUNNING','WAITING')
+]
+lease_states={{'active':0,'expired':0,'missing':0}}
+for item in nonterminal:
+    raw=item.get('execution_lease_expires_at')
+    if not raw:
+        lease_states['missing']+=1
+        continue
+    expires=datetime.fromisoformat(str(raw).replace('Z','+00:00'))
+    lease_states['active' if expires>observed_at else 'expired']+=1
+commands_by_workflow={{}}
+for item in commands:
+    commands_by_workflow.setdefault(item.get('workflow_request_id'),[]).append(item)
+terminal_command_nonterminal_workflows=sum(
+    bool(commands_by_workflow.get(item['request_id']))
+    and all(
+        command.get('status') in {sorted(TERMINAL_COMMANDS)!r}
+        for command in commands_by_workflow[item['request_id']]
+    )
+    for item in nonterminal
 )
 out={{
     'incident_count':len(incidents),
@@ -423,14 +519,24 @@ out={{
     'strong_workflow_count':len(strong),
     'reset_gpu_workflow_count':len(reset_gpu),
     'reboot_workflow_count':len(reboot),
+    'preemption_pair_count':len(preemption_pairs),
     'weak_superseded_count':weak_ok,
     'strong_preempt_failed_fabric_reset_count':strong_ok,
     'reset_gpu_failed_count':len(reset_gpu),
     'reboot_succeeded_count':reboot_ok,
+    'reboot_successor_pair_count':reboot_successor_pairs,
+    'unique_reboot_predecessor_count':len(reboot_by_predecessor),
+    'duplicate_reboot_successors':duplicate_reboot_successors,
+    'unexpected_reboot_predecessors':unexpected_reboot_predecessors,
     'terminal_workflow_count':terminal_workflows,
     'terminal_command_count':terminal_commands,
     'duplicate_idempotency_keys':duplicates,
+    'duplicate_workflow_steps':duplicate_workflow_steps,
     'fencing_mismatches':fencing,
+    'nonterminal_lease_states':lease_states,
+    'terminal_command_nonterminal_workflows':(
+        terminal_command_nonterminal_workflows
+    ),
     'budget_wait_total':sum(
         int(item.get('remediation_budget_wait_count',0))
         for item in workflows
@@ -451,6 +557,18 @@ out={{
 }}
 print(json.dumps(out,sort_keys=True))
 """
+
+
+def database_audit(run_id: str) -> dict:
+    pod = control(
+        "get",
+        "pod",
+        "-l",
+        "app=gpu-fault-api-ha",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ).strip()
+    script = _database_audit_script_prefix(run_id) + _database_audit_script_suffix()
     output = control(
         "exec",
         "-i",
@@ -464,40 +582,104 @@ print(json.dumps(out,sort_keys=True))
     return json.loads(output.splitlines()[-1])
 
 
+def audit_is_terminal(audit: dict) -> bool:
+    return bool(audit.get("workflow_count")) and (
+        int(audit.get("terminal_workflow_count", 0))
+        == int(audit.get("workflow_count", 0))
+        and int(audit.get("terminal_command_count", 0))
+        == int(audit.get("command_count", 0))
+        and int(audit.get("permanent_budget_waiters", 0)) == 0
+    )
+
+
+def wait_for_terminal_drain(
+    run_id: str,
+    *,
+    timeout_seconds: int,
+) -> tuple[dict, list[dict]]:
+    deadline = time.monotonic() + timeout_seconds
+    history = []
+    while True:
+        audit = database_audit(run_id)
+        history.append(
+            {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "workflow_count": audit.get("workflow_count"),
+                "terminal_workflow_count": audit.get("terminal_workflow_count"),
+                "command_count": audit.get("command_count"),
+                "terminal_command_count": audit.get("terminal_command_count"),
+                "permanent_budget_waiters": audit.get("permanent_budget_waiters"),
+                "workflow_statuses": audit.get("workflow_statuses"),
+                "command_statuses": audit.get("command_statuses"),
+            }
+        )
+        if audit_is_terminal(audit) or time.monotonic() >= deadline:
+            return audit, history
+        time.sleep(5)
+
+
 def verdict(summary: dict, clusters: int) -> tuple[str, list[str]]:
     errors = []
     audit = summary["audit"]
+    if summary.get("job_status") != "Complete":
+        errors.append("scenario job did not complete")
+    if int(summary.get("job_succeeded", 0)) != clusters:
+        errors.append("scenario job succeeded count mismatch")
+    if int(summary.get("job_failed", 0)):
+        errors.append("scenario job failed count is nonzero")
     if len(summary["pod_results"]) != clusters:
         errors.append("scenario pod result count mismatch")
     for item in summary["pod_results"]:
         for key in (
+            "aggregate_shared_incident",
+            "aggregate_shared_workflow",
             "strong_sent",
             "primary_reset_failed",
+            "primary_reboot_succeeded",
             "reset_attempt_started",
             "reset_gpu_failed",
+            "reset_reboot_succeeded",
             "idle_terminal",
         ):
             if not item.get(key):
                 errors.append(f"scenario pod missing {key}")
         if int(item.get("duplicate_claims", 0)):
             errors.append("scenario duplicate claims are nonzero")
+        if int(item.get("claim_errors", 0)):
+            errors.append("scenario claim errors are nonzero")
         if int(item.get("result_errors", 0)):
             errors.append("scenario result errors are nonzero")
-    for key in (
-        "weak_superseded_count",
-        "strong_preempt_failed_fabric_reset_count",
-        "reset_gpu_failed_count",
-    ):
-        if int(audit.get(key, 0)) != clusters:
-            errors.append(f"{key} does not equal cluster count")
-    if int(audit.get("reboot_succeeded_count", 0)) != clusters * 2:
-        errors.append("reboot_succeeded_count does not equal twice cluster count")
+        if int(item.get("ownership_errors", 0)):
+            errors.append("scenario ownership errors are nonzero")
+    expected_counts = {
+        "incident_count": clusters * 2,
+        "workflow_count": clusters * 5,
+        "weak_workflow_count": clusters,
+        "strong_workflow_count": clusters,
+        "reset_gpu_workflow_count": clusters,
+        "preemption_pair_count": clusters,
+        "weak_superseded_count": clusters,
+        "strong_preempt_failed_fabric_reset_count": clusters,
+        "reset_gpu_failed_count": clusters,
+        "reboot_workflow_count": clusters * 2,
+        "reboot_succeeded_count": clusters * 2,
+        "reboot_successor_pair_count": clusters * 2,
+        "unique_reboot_predecessor_count": clusters * 2,
+    }
+    for key, expected in expected_counts.items():
+        if int(audit.get(key, 0)) != expected:
+            errors.append(f"{key} does not equal {expected}")
+    if int(audit.get("command_count", 0)) <= 0:
+        errors.append("scenario created no remote commands")
     if audit["terminal_workflow_count"] != audit["workflow_count"]:
         errors.append("nonterminal workflows remain")
     if audit["terminal_command_count"] != audit["command_count"]:
         errors.append("nonterminal commands remain")
     for key in (
         "duplicate_idempotency_keys",
+        "duplicate_workflow_steps",
+        "duplicate_reboot_successors",
+        "unexpected_reboot_predecessors",
         "fencing_mismatches",
         "permanent_budget_waiters",
     ):
@@ -520,6 +702,12 @@ import os, psycopg
 prefix='corr-live-{run_id}-%'
 with psycopg.connect(os.environ['GPU_FAULT_STORE_URL'],autocommit=True) as conn:
     cur=conn.cursor()
+    cur.execute(
+        "DELETE FROM gpu_fault_objects "
+        "WHERE kind='xid_policy_decision' "
+        "AND payload->>'event_id' LIKE %s",
+        (prefix,),
+    )
     cur.execute(
         "SELECT key FROM gpu_fault_objects "
         "WHERE kind='incident' AND payload->>'event_id' LIKE %s",
@@ -596,13 +784,25 @@ def main() -> int:
     parser.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACT_ROOT)
     parser.add_argument("--label")
     parser.add_argument("--suite-id")
-    parser.add_argument("--timeout-seconds", type=int, default=900)
+    parser.add_argument("--scenario-max-seconds", type=int, default=1800)
+    parser.add_argument("--terminal-drain-seconds", type=int, default=600)
+    parser.add_argument("--timeout-seconds", type=int)
     parser.add_argument("--allow-live-registry", action="store_true")
     parser.add_argument("--confirm-live-registry")
     parser.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
     args = parser.parse_args()
     if args.synthetic_ttl_seconds < 300:
         parser.error("--synthetic-ttl-seconds must be at least 300")
+    if args.scenario_max_seconds < 60:
+        parser.error("--scenario-max-seconds must be at least 60")
+    if args.terminal_drain_seconds < 0:
+        parser.error("--terminal-drain-seconds must not be negative")
+    timeout_seconds = args.timeout_seconds or args.scenario_max_seconds + 300
+    if timeout_seconds < args.scenario_max_seconds + 60:
+        parser.error(
+            "--timeout-seconds must leave at least 60 seconds beyond "
+            "--scenario-max-seconds"
+        )
     try:
         registry_scope = validate_registry_target(
             allow_live_registry=args.allow_live_registry,
@@ -655,6 +855,8 @@ def main() -> int:
         manifest = scenario_job(
             clusters=args.clusters,
             run_id=run_id,
+            scenario_max_seconds=args.scenario_max_seconds,
+            active_deadline_seconds=timeout_seconds,
             runtime_profile_version=str(seeded["runtime_profile_version"]),
             **identity,
         )
@@ -666,18 +868,45 @@ def main() -> int:
             "wait",
             "--for=condition=complete",
             f"job/{JOB_NAME}",
-            f"--timeout={args.timeout_seconds}s",
+            f"--timeout={timeout_seconds}s",
             check=False,
-            timeout=args.timeout_seconds + 60,
+            timeout=timeout_seconds + 60,
+        )
+        job = json.loads(dataplane("get", "job", JOB_NAME, "-o", "json"))
+        conditions = {
+            str(item.get("type")): str(item.get("status"))
+            for item in job.get("status", {}).get("conditions", [])
+        }
+        job_status = (
+            "Complete"
+            if conditions.get("Complete") == "True"
+            else "Failed"
+            if conditions.get("Failed") == "True"
+            else "Incomplete"
         )
         pod_results = collect_logs(artifacts / "pods")
-        audit = database_audit(run_id)
+        if job_status == "Complete":
+            audit, drain_history = wait_for_terminal_drain(
+                run_id,
+                timeout_seconds=args.terminal_drain_seconds,
+            )
+        else:
+            audit = database_audit(run_id)
+            drain_history = []
+        (artifacts / "terminal-drain.json").write_text(
+            json.dumps(drain_history, indent=2, sort_keys=True) + "\n"
+        )
         summary = {
             "run_id": run_id,
             "clusters": args.clusters,
             "registry_scope": registry_scope,
             "seeded": seeded,
             "job_wait_output": wait,
+            "job_status": job_status,
+            "job_succeeded": int(job.get("status", {}).get("succeeded", 0)),
+            "job_failed": int(job.get("status", {}).get("failed", 0)),
+            "scenario_max_seconds": args.scenario_max_seconds,
+            "terminal_drain_seconds": args.terminal_drain_seconds,
             "pod_results": pod_results,
             "audit": audit,
         }

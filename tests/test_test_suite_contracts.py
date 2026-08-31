@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,6 +152,40 @@ def test_tests_are_covered_by_architecture_and_quality_gates() -> None:
     assert "pytest-cov" in project
     assert "pytest-xdist" in project
     assert "private-test-coupling-check:" in makefile
+
+
+def test_make_python_prefers_local_venv_and_preserves_overrides(tmp_path: Path) -> None:
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assignment = next(
+        line for line in makefile.splitlines() if line.startswith("PYTHON ?=")
+    )
+    probe = assignment + "\nprint-python:\n\t@printf '%s\\n' '$(PYTHON)'\n"
+    default_environment = os.environ.copy()
+    for name in ("PYTHON", "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES"):
+        default_environment.pop(name, None)
+
+    def resolve(cwd: Path, *arguments: str) -> str:
+        completed = subprocess.run(
+            ["make", "--no-print-directory", "-s", "-f", "-", *arguments],
+            cwd=cwd,
+            env=default_environment,
+            input=probe,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    with_venv = tmp_path / "with-venv"
+    with_venv.joinpath(".venv/bin").mkdir(parents=True)
+    with_venv.joinpath(".venv/bin/python").touch()
+    without_venv = tmp_path / "without-venv"
+    without_venv.mkdir()
+
+    assert resolve(with_venv, "print-python") == ".venv/bin/python"
+    assert resolve(without_venv, "print-python") == "python3"
+    assert resolve(with_venv, "print-python", "PYTHON=python-custom") == "python-custom"
 
 
 def test_tests_do_not_need_architecture_size_exceptions() -> None:

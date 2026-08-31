@@ -13,6 +13,7 @@ import time
 from gpu_fault.lifecycle import ShutdownCoordinator
 
 
+ROOT = Path(__file__).resolve().parents[3]
 CASE_ID = "GF-REGIONAL-HA-007"
 LIFESPAN_BUDGET_SECONDS = 130
 KUBERNETES_GRACE_SECONDS = 240
@@ -75,6 +76,14 @@ def _wait_for_file(path: Path, process: subprocess.Popen) -> None:
     raise RuntimeError("HA-007 child did not become ready")
 
 
+def _child_environment() -> dict[str, str]:
+    env = dict(os.environ)
+    source = str(ROOT / "src")
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = source if not existing else source + os.pathsep + existing
+    return env
+
+
 def run_probe(run_dir: Path, durations: list[float]) -> dict:
     run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     results = []
@@ -97,7 +106,7 @@ def run_probe(run_dir: Path, durations: list[float]) -> dict:
                 ],
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                env=os.environ,
+                env=_child_environment(),
             )
             _wait_for_file(started_file, process)
             signal_started = time.monotonic()

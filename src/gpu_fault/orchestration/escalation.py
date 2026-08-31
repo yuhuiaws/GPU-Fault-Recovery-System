@@ -17,6 +17,15 @@ from gpu_fault.operation_registry import (
 from gpu_fault.store.shared.errors import NotFoundError
 
 
+RESTART_SAFETY_PARAMETERS = (
+    "cluster_id",
+    "job_id",
+    "source_attempt_id",
+    "source_gpu_count",
+    "restart_budget",
+)
+
+
 class HardwareEscalationService:
     def __init__(self, store, builder) -> None:
         self.store = store
@@ -377,6 +386,30 @@ class HardwareEscalationService:
             errors.append("runtime_profile_version is required for execution")
         replacement_steps = []
         inventory_parameters_by_operation: dict[WorkflowOperation, dict] = {}
+        restart_source_steps = [
+            source_step
+            for source_step in workflow.official_steps
+            if source_step.operation is WorkflowOperation.RESTART_WORKLOAD
+        ]
+        restart_contexts = [
+            {name: source_step.parameters[name] for name in RESTART_SAFETY_PARAMETERS}
+            for source_step in restart_source_steps
+            if all(name in source_step.parameters for name in RESTART_SAFETY_PARAMETERS)
+        ]
+        restart_context = restart_contexts[0] if restart_contexts else None
+        restart_context_error = None
+        if len(restart_contexts) != len(restart_source_steps):
+            restart_context_error = (
+                "failed workflow has no complete restart safety context"
+            )
+            restart_context = None
+        elif any(value != restart_context for value in restart_contexts[1:]):
+            restart_context_error = (
+                "failed workflow has inconsistent restart safety context"
+            )
+            restart_context = None
+        if restart_context_error is not None:
+            errors.append(restart_context_error)
         for source_step in workflow.official_steps:
             requirements = source_step.parameters.get("inventory_requirements_by_node")
             if (
@@ -415,10 +448,20 @@ class HardwareEscalationService:
             replacement_steps.extend(compiled)
             errors.extend(compile_errors)
         normalized_steps = []
+        missing_restart_context_reported = restart_context_error is not None
         for step in replacement_steps:
             parameters = dict(step.parameters)
             if step.operation is WorkflowOperation.REPLACE_NODE:
                 parameters["replacement_strategy"] = "HEALTHY_WARM_SPARE_ONLY"
+            if step.operation is WorkflowOperation.RESTART_WORKLOAD:
+                if restart_context is None:
+                    if not missing_restart_context_reported:
+                        errors.append(
+                            "failed workflow has no complete restart safety context"
+                        )
+                        missing_restart_context_reported = True
+                else:
+                    parameters.update(restart_context)
             inventory_parameters = inventory_parameters_by_operation.get(step.operation)
             if inventory_parameters:
                 parameters.update(inventory_parameters)

@@ -108,15 +108,18 @@ def test_synthetic_registry_uses_placeholder_aws_account() -> None:
 
 
 def test_synthetic_registry_metadata_passes_runtime_model() -> None:
+    observed_at = datetime.now(timezone.utc)
     entry = registry_module.perf_cluster_entries(
-        1, run_id="run-a", expires_at=NOW + timedelta(days=1)
+        1, run_id="run-a", expires_at=observed_at + timedelta(days=1)
     )[0]
     token = entry.pop("token")
     entry["token_sha256"] = hashlib.sha256(token.encode()).hexdigest()
 
     registration = RegionalClusterRegistration(**entry)
 
-    assert registration.is_active(NOW), "synthetic registration was inactive before TTL"
+    assert registration.is_active(observed_at), (
+        "synthetic registration was inactive before TTL"
+    )
     assert registration.authenticates(token), (
         "active synthetic registration rejected its token"
     )
@@ -298,6 +301,19 @@ def test_capacity_cleanup_removes_synthetic_notification_chain() -> None:
         sql, pattern = statements[name]
         assert "cluster_name" in sql
         assert pattern == "cluster"
+
+
+def test_capacity_cleanup_removes_synthetic_links() -> None:
+    statements = {
+        name: (sql, pattern) for name, sql, pattern in suite.AUDIT_PURGE_STATEMENTS
+    }
+
+    sql, pattern = statements["gpu_fault_links"]
+
+    assert "DELETE FROM gpu_fault_links" in sql
+    assert "strpos(link.key, pattern.prefix)" in sql
+    assert "strpos(link.value, pattern.prefix)" in sql
+    assert pattern == "cluster"
 
 
 def test_repository_registry_baselines_are_redacted() -> None:

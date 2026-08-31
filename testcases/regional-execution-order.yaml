@@ -78,7 +78,7 @@ phases:
       - case: GF-REGIONAL-HA-002
       - range: {prefix: HA, start: 5, end: 9}
   - sequence: 13
-    name: 破坏性动作（非 warm spare）
+    name: 破坏性能力验收（含非破坏性 fail-closed 负向用例）
     maintenance_window: 是
     entries:
       - case: GF-REGIONAL-DESTR-011

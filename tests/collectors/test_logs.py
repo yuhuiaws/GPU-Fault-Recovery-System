@@ -20,6 +20,24 @@ from ._support import (
 )
 
 
+def _write_fabric_file_state(state, log, *, offset: int) -> None:
+    stat = log.stat()
+    state.write_text(
+        json.dumps(
+            {
+                "journal_cursor": None,
+                "files": {
+                    str(log): {
+                        "device": stat.st_dev,
+                        "inode": stat.st_ino,
+                        "offset": offset,
+                    }
+                },
+            }
+        )
+    )
+
+
 def test_kernel_collector_filters_and_uses_stable_kmsg_id() -> None:
     sink = RecordingSink()
     collector = KernelLogCollector(
@@ -357,7 +375,9 @@ def test_fabric_manager_file_collector_persists_offsets(tmp_path) -> None:
         now=lambda: NOW,
     )
 
+    initial_size = log.stat().st_size
     stats = first.collect_once()
+    initial_offset = json.loads(state.read_text())["files"][str(log)]["offset"]
     with log.open("a") as stream:
         stream.write(
             "nvidia-nvswitch3: "
@@ -375,13 +395,14 @@ def test_fabric_manager_file_collector_persists_offsets(tmp_path) -> None:
     )
     resumed = second.collect_once()
 
-    assert stats.observed == 2
-    assert stats.delivered == 1
+    assert stats.observed == 0
+    assert stats.delivered == 0
+    assert initial_offset == initial_size
     assert resumed.observed == 1
     assert resumed.delivered == 1
-    assert len(sink.requests) == 2
-    assert sink.requests[1][1]["source"] == "file"
-    assert sink.requests[1][1]["fields"]["path"] == str(log)
+    assert len(sink.requests) == 1
+    assert sink.requests[0][1]["source"] == "file"
+    assert sink.requests[0][1]["fields"]["path"] == str(log)
 
 
 def test_fabric_manager_file_cursor_rolls_back_on_delivery_failure(tmp_path) -> None:
@@ -392,6 +413,7 @@ def test_fabric_manager_file_cursor_rolls_back_on_delivery_failure(tmp_path) -> 
         "SXid (PCI:0000:c1:00.0): 12020, Fatal, "
         "Link 46 egress sequence ID error\n"
     )
+    _write_fabric_file_state(state, log, offset=0)
 
     class FailingSink:
         def post(self, *_args, **_kwargs):
@@ -410,7 +432,7 @@ def test_fabric_manager_file_cursor_rolls_back_on_delivery_failure(tmp_path) -> 
     with pytest.raises(CollectorError, match="unavailable"):
         collector.collect_once()
 
-    assert not state.exists()
+    assert json.loads(state.read_text())["files"][str(log)]["offset"] == 0
     sink = RecordingSink()
     retry = FabricManagerLogCollector(
         sink,
@@ -464,11 +486,13 @@ def test_fabric_manager_journal_has_no_line_cap_and_accepts_instance_unit(
 
 def test_fabric_manager_file_preserves_source_timestamp(tmp_path) -> None:
     log = tmp_path / "fabricmanager.log"
+    state = tmp_path / "state.json"
     log.write_text(
         "[2026-08-13T12:34:56Z] nvidia-nvswitch0: "
         "SXid (PCI:0000:ab:00.0): 22013, Non-fatal, "
         "Link 12 SAW_MVB error\n"
     )
+    _write_fabric_file_state(state, log, offset=0)
     sink = RecordingSink()
     collector = FabricManagerLogCollector(
         sink,
@@ -476,7 +500,7 @@ def test_fabric_manager_file_preserves_source_timestamp(tmp_path) -> None:
         node_id="worker-1",
         journal_enabled=False,
         log_paths=[str(log)],
-        state_path=str(tmp_path / "state.json"),
+        state_path=str(state),
         now=lambda: NOW,
     )
 
@@ -485,12 +509,13 @@ def test_fabric_manager_file_preserves_source_timestamp(tmp_path) -> None:
     assert sink.requests[0][1]["observed_at"] == ("2026-08-13T12:34:56+00:00")
 
 
-def test_fabric_manager_initial_tail_discards_partial_first_line(tmp_path) -> None:
+def test_fabric_manager_initial_file_baselines_at_eof(tmp_path) -> None:
     log = tmp_path / "fabricmanager.log"
+    state = tmp_path / "state.json"
     log.write_text(
         ("x" * 1_000_100) + "\n" + "nvidia-nvswitch0: "
         "SXid (PCI:0000:ab:00.0): 22013, Non-fatal, "
-        "Link 12 SAW_MVB error\n"
+        "Link 12 SAW_MVB error marker=COLLECT011-stale\n"
     )
     sink = RecordingSink()
     collector = FabricManagerLogCollector(
@@ -499,16 +524,64 @@ def test_fabric_manager_initial_tail_discards_partial_first_line(tmp_path) -> No
         node_id="worker-1",
         journal_enabled=False,
         log_paths=[str(log)],
-        state_path=str(tmp_path / "state.json"),
+        state_path=str(state),
         now=lambda: NOW,
     )
 
-    stats = collector.collect_once()
+    initial_size = log.stat().st_size
+    baseline = collector.collect_once()
+    with log.open("a") as stream:
+        stream.write(
+            "nvidia-nvswitch0: "
+            "SXid (PCI:0000:ab:00.0): 22014, Non-fatal, "
+            "Link 13 fresh event\n"
+        )
+    delivered = FabricManagerLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        journal_enabled=False,
+        log_paths=[str(log)],
+        state_path=str(state),
+        now=lambda: NOW,
+    ).collect_once()
 
-    assert stats.observed == 1
-    assert stats.delivered == 1
+    assert baseline.observed == 0
+    assert baseline.delivered == 0
+    assert json.loads(state.read_text())["files"][str(log)]["offset"] > initial_size
+    assert delivered.observed == 1
+    assert delivered.delivered == 1
     assert len(sink.requests) == 1
-    assert sink.requests[0][1]["message"].startswith("nvidia-nvswitch0:")
+    assert sink.requests[0][1]["message"].endswith("fresh event")
+
+
+def test_fabric_manager_corrupt_state_does_not_replay_existing_file(tmp_path) -> None:
+    log = tmp_path / "fabricmanager.log"
+    state = tmp_path / "state.json"
+    log.write_text(
+        "[2026-08-25T03:48:08Z] nvidia-nvswitch0: "
+        "SXid (PCI:0000:ab:00.0): 11001, Fatal, "
+        "Link 12 marker=COLLECT011-stale\n"
+    )
+    state.write_text("{not-json")
+    sink = RecordingSink()
+
+    stats = FabricManagerLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        journal_enabled=False,
+        log_paths=[str(log)],
+        state_path=str(state),
+        now=lambda: NOW,
+    ).collect_once()
+
+    assert stats.observed == 0
+    assert stats.delivered == 0
+    assert sink.requests == []
+    assert json.loads(state.read_text())["files"][str(log)]["offset"] == (
+        log.stat().st_size
+    )
 
 
 def test_fabric_manager_commits_each_successful_record(tmp_path) -> None:
@@ -519,6 +592,7 @@ def test_fabric_manager_commits_each_successful_record(tmp_path) -> None:
         "nvidia-nvswitch0: SXid (PCI:0000:ab:00.0): 22014, Non-fatal, Link 13 second",
     ]
     log.write_text("\n".join(messages) + "\n")
+    _write_fabric_file_state(state, log, offset=0)
 
     class FailSecondSink:
         def __init__(self):
@@ -600,6 +674,8 @@ def test_fabric_manager_state_fsyncs_once_per_batch(
         )
         + "\n"
     )
+    state = tmp_path / "state.json"
+    _write_fabric_file_state(state, log, offset=0)
     fsync_calls = []
     monkeypatch.setattr(
         "gpu_fault.collectors.logs.fabric_manager.os.fsync", fsync_calls.append
@@ -611,7 +687,7 @@ def test_fabric_manager_state_fsyncs_once_per_batch(
         node_id="worker-1",
         journal_enabled=False,
         log_paths=[str(log)],
-        state_path=str(tmp_path / "state.json"),
+        state_path=str(state),
         now=lambda: NOW,
     )
 
@@ -626,6 +702,8 @@ def test_fabric_manager_skips_state_write_without_new_records(
 ) -> None:
     log = tmp_path / "fabricmanager.log"
     log.write_text("")
+    state = tmp_path / "state.json"
+    _write_fabric_file_state(state, log, offset=0)
     fsync_calls = []
     monkeypatch.setattr(
         "gpu_fault.collectors.logs.fabric_manager.os.fsync", fsync_calls.append
@@ -636,7 +714,7 @@ def test_fabric_manager_skips_state_write_without_new_records(
         node_id="worker-1",
         journal_enabled=False,
         log_paths=[str(log)],
-        state_path=str(tmp_path / "state.json"),
+        state_path=str(state),
         now=lambda: NOW,
     )
 

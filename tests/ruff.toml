@@ -1,0 +1,5 @@
+extend = "../pyproject.toml"
+src = ["..", "../src"]
+
+[format]
+skip-magic-trailing-comma = true

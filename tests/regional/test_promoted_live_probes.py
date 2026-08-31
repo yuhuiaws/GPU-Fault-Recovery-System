@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import json
+import socket
+import time
+from pathlib import Path
+from threading import Thread
+from types import SimpleNamespace
+
+from scripts.e2e.regional.probes import (
+    ha001_probe,
+    ha005_probe,
+    ha006_executor,
+    net002_executor,
+    net003_executor,
+    node_host_probe,
+)
+
+
+def _context(key: str, operation: str = "FREEZE_EVIDENCE"):
+    return SimpleNamespace(
+        idempotency_key=key,
+        step=SimpleNamespace(
+            operation=SimpleNamespace(value=operation), execution_owner="test-owner"
+        ),
+        incident=SimpleNamespace(cluster_id="cluster-a", incident_id="incident-a"),
+    )
+
+
+def test_net002_automatic_block_rollback(tmp_path: Path, monkeypatch) -> None:
+    block = tmp_path / "block"
+    rollback = tmp_path / "rollback.json"
+    monkeypatch.setattr(net002_executor, "BLOCK", block)
+    monkeypatch.setattr(net002_executor, "ROLLBACK_STATE", rollback)
+    monkeypatch.setattr(net002_executor, "BLOCK_ROLLBACK_SECONDS", 0.05)
+    block.touch()
+
+    Thread(target=net002_executor.rollback_stale_block, daemon=True).start()
+    deadline = time.monotonic() + 2
+    while block.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert not block.exists(), "automatic rollback left the network block marker"
+    assert json.loads(rollback.read_text())["automatic"] is True
+
+
+def test_net003_ledger_is_exactly_once(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(net003_executor, "ACTION_STARTED", tmp_path / "started")
+    monkeypatch.setattr(net003_executor, "LEDGER", tmp_path / "ledger.json")
+    adapter = net003_executor.LedgerAdapter("notification-a")
+    context = _context("workflow/0/FREEZE_EVIDENCE")
+    monkeypatch.setattr(net003_executor.time, "sleep", lambda _seconds: None)
+
+    first = adapter.execute(context)
+    second = adapter.execute(context)
+
+    assert first.details["cached"] is False
+    assert second.details["cached"] is True
+    assert second.details["physical_count"] == 1
+    assert second.details["notification_id"] == "notification-a"
+
+
+def test_ha001_probe_ledger_replays_three_operations_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(ha001_probe, "LEDGER", tmp_path / "ledger.json")
+    adapter = ha001_probe.SimulatedAdapter()
+    operations = ["FREEZE_EVIDENCE", "STOP_WORKLOADS", "RESTART_WORKLOAD"]
+
+    for index, operation in enumerate(operations):
+        context = _context(f"workflow/{index}/{operation}", operation)
+        assert adapter.execute(context).details["cached"] is False
+        assert adapter.execute(context).details["cached"] is True
+
+    ledger = json.loads((tmp_path / "ledger.json").read_text())
+    assert ledger["physical_count"] == 3
+    assert ledger["operations"] == operations
+
+
+def test_ha005_outbox_status_counts_replayable_records(
+    tmp_path: Path, monkeypatch
+) -> None:
+    outbox = tmp_path / "outbox.ndjson"
+    monkeypatch.setattr(ha005_probe, "OUTBOX", outbox)
+    outbox.write_text(
+        "\n".join(json.dumps({"replayable": value}) for value in (True, False, True))
+        + "\n"
+    )
+
+    assert ha005_probe.outbox_status() == {"records": 3, "replayable": 2}
+
+
+class _NotificationRegistry:
+    def __init__(self) -> None:
+        self.notification_id: str | None = None
+
+    def save_notification_if_absent(self, candidate):
+        if self.notification_id is None:
+            self.notification_id = candidate.notification_id
+            return candidate
+        return candidate.model_copy(update={"notification_id": self.notification_id})
+
+
+def test_ha006_shared_ledger_has_one_winner(tmp_path: Path, monkeypatch) -> None:
+    registry = _NotificationRegistry()
+    monkeypatch.setattr(ha006_executor, "WINNER", tmp_path / "winner.json")
+    pod = ["pod-a"]
+    monkeypatch.setattr(socket, "gethostname", lambda: pod[0])
+    first = ha006_executor.SharedLedgerAdapter(
+        registry, run_id="run-a", sleep_seconds=0
+    ).execute(_context("workflow/0/RUN_DCGM_DIAGNOSTIC"))
+    pod[0] = "pod-b"
+    second = ha006_executor.SharedLedgerAdapter(
+        registry, run_id="run-a", sleep_seconds=0
+    ).execute(_context("workflow/0/RUN_DCGM_DIAGNOSTIC"))
+
+    assert first.details["cached"] is False
+    assert second.details["cached"] is True
+    assert (
+        first.details["shared_notification_id"]
+        == (second.details["shared_notification_id"])
+    )
+    assert json.loads((tmp_path / "winner.json").read_text())["pod"] == "pod-a"
+
+
+def test_node_host_probe_reads_fabric_manager_ledger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import sqlite3
+
+    ledger = tmp_path / "node-actions.db"
+    connection = sqlite3.connect(ledger)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE results (
+                command_id TEXT,
+                completed_at TEXT,
+                attempt INTEGER,
+                state TEXT,
+                operation TEXT,
+                started_at TEXT
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO results VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "command-a",
+                    "2026-08-31T07:00:02Z",
+                    1,
+                    "SUCCEEDED",
+                    "RESTART_FABRIC_MANAGER",
+                    "2026-08-31T07:00:01Z",
+                ),
+                (
+                    "command-b",
+                    "2026-08-31T07:00:03Z",
+                    1,
+                    "SUCCEEDED",
+                    "RUN_DCGM_DIAGNOSTIC",
+                    "2026-08-31T07:00:01Z",
+                ),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setattr(node_host_probe, "LEDGER", ledger)
+
+    rows = node_host_probe.ledger_rows()
+
+    assert rows == [
+        {
+            "command_id": "command-a",
+            "completed_at": "2026-08-31T07:00:02Z",
+            "attempt": 1,
+            "state": "SUCCEEDED",
+            "operation": "RESTART_FABRIC_MANAGER",
+            "started_at": "2026-08-31T07:00:01Z",
+        }
+    ]
+
+
+def test_node_host_probe_timer_snapshot_ignores_countdown_text(monkeypatch) -> None:
+    monkeypatch.setattr(
+        node_host_probe,
+        "run",
+        lambda _command: SimpleNamespace(
+            stdout=(
+                "Mon 2026-08-31 08:00:00 UTC 10min left "
+                "gpu-fault-certificate-check.timer "
+                "gpu-fault-certificate-check.service\n"
+            )
+        ),
+    )
+
+    assert node_host_probe.gpu_fault_timers() == ["gpu-fault-certificate-check.timer"]
+
+
+def test_node_host_probe_counts_systemd_unit_transition_once(monkeypatch) -> None:
+    lines = [
+        {"MESSAGE": 'Started "Nvidia Fabric Manager"'},
+        {
+            "MESSAGE": (
+                "Started nvidia-fabricmanager.service - NVIDIA fabric manager service."
+            )
+        },
+        {"MESSAGE": 'Stopped "Nvidia Fabric Manager"'},
+        {
+            "MESSAGE": (
+                "Stopped nvidia-fabricmanager.service - NVIDIA fabric manager service."
+            )
+        },
+    ]
+    monkeypatch.setattr(
+        node_host_probe,
+        "run",
+        lambda _command: SimpleNamespace(
+            stdout="\n".join(json.dumps(item) for item in lines)
+        ),
+    )
+
+    summary = node_host_probe.journal_summary(1.0)
+
+    assert summary["started_count"] == 1
+    assert summary["stopped_count"] == 1

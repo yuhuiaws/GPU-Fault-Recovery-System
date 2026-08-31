@@ -22,9 +22,54 @@ from scripts.e2e.regional.run_boot020_release_rolling import (
     configure_gpu_kubeconfig,
     run_release_rolling,
 )
-from scripts.e2e.regional.run_ha007_control_worker_shutdown import run_probe
+from scripts.e2e.regional.run_ha007_control_worker_shutdown import (
+    _child_environment,
+    run_probe,
+)
+from scripts.e2e.regional.run_ha008_processor_exit_acceptance import (
+    run_acceptance as run_ha008_acceptance,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
+PROMOTED_MANUAL_DRIVERS = {
+    "GF-REGIONAL-NET-002": "run_net002_command_recovery.py",
+    "GF-REGIONAL-NET-003": "run_net003_result_retry.py",
+    "GF-REGIONAL-HA-001": "run_ha001_control_plane_failover.py",
+    "GF-REGIONAL-HA-002": "run_ha002_pdb_topology.py",
+    "GF-REGIONAL-HA-003": "run_ha003_aurora_failover_reset.py",
+    "GF-REGIONAL-HA-004": "run_ha004_waiting_reclaim_reset.py",
+    "GF-REGIONAL-HA-005": "run_ha005_rollout_continuity.py",
+    "GF-REGIONAL-HA-006": "run_ha006_executor_takeover.py",
+    "GF-REGIONAL-DESTR-001": "run_destr001_gpu_reset.py",
+    "GF-REGIONAL-DESTR-002": "run_destr002_hyperpod_reboot.py",
+    "GF-REGIONAL-DESTR-003": "run_destr003_warm_spare_failover.py",
+    "GF-REGIONAL-DESTR-008": "run_destr008_warm_spare_shortage.py",
+    "GF-REGIONAL-DESTR-009": "run_destr009_workload_restart.py",
+    "GF-REGIONAL-DESTR-012": "run_destr012_managed_recovery_guard.py",
+    "GF-REGIONAL-ISO-006": "run_iso006_cluster_offline.py",
+    "GF-REGIONAL-E2E-002": "run_e2e002_multicluster_fault.py",
+    "GF-REGIONAL-COLLECT-001": "run_collector_acceptance.py",
+    "GF-REGIONAL-COLLECT-002": "run_collector_acceptance.py",
+    "GF-REGIONAL-COLLECT-003": "run_collector_acceptance.py",
+    "GF-REGIONAL-COLLECT-004": "run_collector_destructive.py",
+    "GF-REGIONAL-COLLECT-005": "run_collector_acceptance.py",
+    "GF-REGIONAL-COLLECT-008": "run_collector_destructive.py",
+    "GF-REGIONAL-COLLECT-009": "run_collector_acceptance.py",
+    "GF-REGIONAL-COLLECT-010": "run_collector_acceptance.py",
+    "GF-REGIONAL-COLLECT-011": "run_collector_acceptance.py",
+    "GF-REGIONAL-COLLECT-012": "run_collector_acceptance.py",
+    "GF-REGIONAL-COLLECT-013": "run_collector_destructive.py",
+    "GF-REGIONAL-COLLECT-014": "run_collector_destructive.py",
+    "GF-REGIONAL-COLLECT-016": "run_collect016_training_recovery.py",
+    "GF-REGIONAL-COLLECT-017": "run_collect017_efa_plugin.py",
+    "GF-REGIONAL-COLLECT-015": "run_collector_destructive.py",
+}
+PLAN_ONLY_SMOKE_CASES = {
+    "GF-REGIONAL-NET-002": "NET002_LIVE_REGISTRY_INTERRUPTION",
+    "GF-REGIONAL-NET-003": "NET003_RESULT_CONNECTION_RESET",
+    "GF-REGIONAL-HA-005": "HA005_CONTROL_PLANE_ROLLOUT",
+    "GF-REGIONAL-HA-006": "HA006_FORCE_DELETE_TEST_EXECUTOR",
+}
 
 
 def test_regional_fixture_layout_has_no_legacy_scattered_directories() -> None:
@@ -64,6 +109,21 @@ def test_regional_fixture_layout_has_no_legacy_scattered_directories() -> None:
         "isolated_api.py",
         "render_manifest.py",
     }
+
+
+def test_public_regional_contracts_do_not_reference_task_local_runners() -> None:
+    public_contracts = (
+        ROOT / "testcases/fault-scenarios.yaml",
+        ROOT / "docs/区域模式端到端验收测试用例.md",
+    )
+
+    for path in public_contracts:
+        assert ".codex/" not in path.read_text(encoding="utf-8"), path
+    fixture_readme = (ROOT / "scripts/e2e/regional/README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "ignored `.codex/`" in fixture_readme
+    assert "never referenced by the catalog" in fixture_readme
 
 
 def test_local_executor_guard_fixture_covers_iso002_and_cmd011() -> None:
@@ -156,6 +216,101 @@ def test_collector_outbox_fixture_covers_current_delivery_contract() -> None:
     )
     assert "'bounded_sequences': [12, 13, 14]" in result.stdout
     assert "'unwritable_buffered': False" in result.stdout
+
+
+def test_net004_dependency_audit_is_environment_driven() -> None:
+    path = ROOT / "scripts/e2e/regional/audit_net004_dependency_boundary.py"
+    source = path.read_text(encoding="utf-8")
+
+    assert "/secure/gpu-fault-bootstrap" not in source
+    assert "gpu-fault-gpu-1-" not in source
+    assert "514385905925" not in source
+
+    help_result = subprocess.run(
+        [sys.executable, str(path), "--help"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "--cpu-kubeconfig" in help_result.stdout
+    assert "--gpu-kubeconfig" in help_result.stdout
+    assert "--gpu-context" in help_result.stdout
+    assert "--region" in help_result.stdout
+
+    env = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "")}
+    missing = subprocess.run(
+        [sys.executable, str(path)],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert missing.returncode == 1
+    assert "CPU_KUBECONFIG" in missing.stdout
+
+
+@pytest.mark.parametrize(("case_id", "script_name"), PROMOTED_MANUAL_DRIVERS.items())
+def test_promoted_manual_live_driver_has_safety_entrypoint(
+    case_id: str, script_name: str
+) -> None:
+    path = ROOT / "scripts/e2e/regional" / script_name
+    source = path.read_text(encoding="utf-8")
+
+    assert "/secure/gpu-fault-bootstrap" not in source
+    assert "gpu-fault-gpu-1-" not in source
+    assert "514385905925" not in source
+    assert "2026, 8, 31" not in source
+
+    help_result = subprocess.run(
+        [sys.executable, str(path), "--help"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    for option in ("--plan", "--execute", "--confirm", "--maintenance-window-end"):
+        assert option in help_result.stdout, (case_id, option)
+
+
+@pytest.mark.parametrize(("case_id", "confirmation"), PLAN_ONLY_SMOKE_CASES.items())
+def test_synthetic_registry_live_driver_plan_is_non_mutating(
+    tmp_path: Path, case_id: str, confirmation: str
+) -> None:
+    script_name = PROMOTED_MANUAL_DRIVERS[case_id]
+    env = {
+        **os.environ,
+        "GPU_FAULT_CONTROL_KUBECONFIG": "/tmp/cpu.kubeconfig",
+        "KUBECONFIG": "/tmp/gpu.kubeconfig",
+        "GPU_FAULT_DATAPLANE_CONTEXT": "test-gpu-context",
+        "GPU_FAULT_PERF_AWS_REGION": "us-west-2",
+        "GPU_FAULT_PERF_CONTROL_NAMESPACE": "gpu-fault-system",
+        "GPU_FAULT_PERF_DATAPLANE_NAMESPACE": "gpu-fault-system",
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/e2e/regional" / script_name),
+            "--run-dir",
+            str(tmp_path),
+            "--attempt",
+            "7",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    plan = json.loads(
+        (tmp_path / "cases" / case_id / "plan.json").read_text(encoding="utf-8")
+    )
+
+    assert json.loads(completed.stdout)["case_id"] == case_id
+    assert plan["attempt"] == 7
+    assert plan["confirmation"] == confirmation
+    assert plan["mutation_performed"] is False
 
 
 def _readiness_matrix() -> dict:
@@ -453,3 +608,31 @@ def test_ha007_runner_waits_for_in_flight_requests(tmp_path: Path) -> None:
     assert report["status"] == "PASS"
     assert [item["completed"] for item in report["runs"]] == [1, 1]
     assert all(not item["shutdown_failures"] for item in report["runs"]), report
+
+
+def test_ha007_child_uses_the_repository_source_tree(monkeypatch) -> None:
+    monkeypatch.setenv("PYTHONPATH", "/existing/path")
+
+    child_path = _child_environment()["PYTHONPATH"].split(os.pathsep)
+
+    assert child_path[0] == str(ROOT / "src")
+    assert child_path[1:] == ["/existing/path"]
+
+
+def test_ha008_acceptance_runs_both_fatal_exit_branches(tmp_path: Path) -> None:
+    report = run_ha008_acceptance(tmp_path)
+
+    assert report["verdict"] == "PASS"
+    assert [item["exit_code"] for item in report["branches"]] == [70, 70]
+    assert [item["status_after_exit"] for item in report["branches"]] == [
+        "PENDING",
+        "LEASED",
+    ]
+    assert all(item["stale_result_rejected"] for item in report["branches"]), (
+        "a fatal-exit branch accepted a stale result"
+    )
+    assert all(item["final_status"] == "COMPLETED" for item in report["branches"]), (
+        "a fatal-exit branch did not converge to COMPLETED"
+    )
+    assert not list(tmp_path.glob("*.db")), "HA-008 left a temporary database"
+    assert not list(tmp_path.glob("*claim*")), "HA-008 left a claim state file"

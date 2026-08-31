@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -151,6 +152,41 @@ def test_existing_bundle_is_reused_without_build(
         repository_root=tmp_path,
         signing=_signing_material(tmp_path / "state"),
     ), "existing complete deploy-host bundle was not reused"
+
+
+def test_deploy_host_venv_is_bound_to_managed_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    venv = state / "deployer-venv"
+    artifacts = staging_deploy.DeployHostArtifacts(
+        archive=state / "bundle.tar.gz",
+        checksum=state / "bundle.tar.gz.sha256",
+        signature_bundle=state / "bundle.sigstore.json",
+    )
+
+    def run(_arguments, **_kwargs):
+        venv.joinpath("bin").mkdir(parents=True)
+        venv.joinpath("bin/gpu-fault-admin").write_text("", encoding="utf-8")
+        return ""
+
+    monkeypatch.setattr(staging_deploy, "_run", run)
+
+    result = staging_deploy.ensure_deploy_host_venv(
+        state,
+        repository_root=tmp_path,
+        signing=_signing_material(state),
+        artifacts=artifacts,
+    )
+
+    binding = json.loads(
+        result.joinpath("gpu-fault-managed-state-dir.json").read_text(encoding="utf-8")
+    )
+    assert binding == {"schema_version": 1, "state_dir": str(state.resolve())}
+    assert (
+        result.joinpath("gpu-fault-managed-state-dir.json").stat().st_mode & 0o777
+        == 0o600
+    )
 
 
 def test_partial_bundle_is_removed_and_rebuilt(
@@ -427,6 +463,37 @@ def test_dirty_source_is_snapshotted_without_changing_original(tmp_path: Path) -
     assert _git(first.repository_root, "status", "--porcelain") == ""
     assert "tracked.txt" in _git(repository, "status", "--short")
     assert "new.txt" in _git(repository, "status", "--short")
+
+
+def test_dirty_snapshot_preserves_tracked_modes_across_umasks(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init")
+    _git(repository, "config", "user.name", "Test")
+    _git(repository, "config", "user.email", "test@example.com")
+    tracked = repository / "tracked.txt"
+    tracked.write_text("before\n", encoding="utf-8")
+    tracked.chmod(0o664)
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-m", "initial")
+    tracked.write_text("after\n", encoding="utf-8")
+    state = tmp_path / "state"
+
+    previous_umask = os.umask(0o077)
+    try:
+        first = staging_deploy.prepare_source_checkout(repository, state_dir=state)
+    finally:
+        os.umask(previous_umask)
+
+    assert first.repository_root.joinpath("tracked.txt").stat().st_mode & 0o777 == 0o664
+
+    tracked.chmod(0o644)
+    second = staging_deploy.prepare_source_checkout(repository, state_dir=state)
+
+    assert second.fingerprint != first.fingerprint
+    assert (
+        second.repository_root.joinpath("tracked.txt").stat().st_mode & 0o777 == 0o644
+    )
 
 
 def test_snapshot_metadata_must_match_current_fingerprint(tmp_path: Path) -> None:

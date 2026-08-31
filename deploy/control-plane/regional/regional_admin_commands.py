@@ -19,7 +19,8 @@ from regional_release_reporting import build_release_status
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 ROOT = Path(__file__).resolve().parents[3]
-RETRY_PHASES = frozenset({"failed", "rolled-back"})
+RESUMABLE_PHASES = frozenset({"failed"})
+RETRY_PHASES = frozenset({*RESUMABLE_PHASES, "rolled-back"})
 BOOTSTRAP_PHASES = frozenset(
     {
         "bootstrap-started",
@@ -180,7 +181,7 @@ def run_deploy(release: Any) -> None:
     assert state is not None
     if state.get("phase") in RETRY_PHASES:
         release.upgrade(
-            resume=True,
+            resume=state.get("phase") in RESUMABLE_PHASES,
             diff=retry_release_diff(release, state),
         )
         return
@@ -211,7 +212,7 @@ def build_release_summary(release: Any) -> dict[str, Any]:
         result["next_deploy"] = (
             {
                 **retry_diff.as_dict(),
-                "resume": True,
+                "resume": state.get("phase") in RESUMABLE_PHASES,
             }
             if retry_diff is not None
             else classify_release(release, state).as_dict()

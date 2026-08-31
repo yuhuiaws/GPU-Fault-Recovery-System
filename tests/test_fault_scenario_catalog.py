@@ -260,6 +260,93 @@ def test_explicit_case_selection_preserves_requested_order() -> None:
     assert [case["id"] for case in selected] == requested
 
 
+def test_net004_uses_the_read_only_dependency_audit() -> None:
+    case = next(
+        case for case in load_catalog(CATALOG) if case["id"] == "GF-REGIONAL-NET-004"
+    )
+
+    assert case["automation"] == "command"
+    assert case["command"] == [
+        "python3",
+        "scripts/e2e/regional/audit_net004_dependency_boundary.py",
+    ]
+    assert case["risk"] == "read-only-signal-replay"
+
+
+def test_ha008_uses_the_isolated_fatal_exit_acceptance() -> None:
+    case = next(
+        case for case in load_catalog(CATALOG) if case["id"] == "GF-REGIONAL-HA-008"
+    )
+
+    assert case["automation"] == "command"
+    assert case["command"] == [
+        "python3",
+        "scripts/e2e/regional/run_ha008_processor_exit_acceptance.py",
+    ]
+    assert case["risk"] == "non-destructive"
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    ["GF-REGIONAL-DESTR-005", "GF-REGIONAL-DESTR-006", "GF-REGIONAL-DESTR-007"],
+)
+def test_warm_spare_guards_use_the_read_only_deployed_audit(case_id: str) -> None:
+    case = next(item for item in load_catalog(CATALOG) if item["id"] == case_id)
+
+    assert case["automation"] == "command"
+    assert case["command"] == [
+        "python3",
+        "scripts/e2e/regional/audit_warm_spare_guardrails.py",
+        "--case",
+        case_id,
+    ]
+    assert case["risk"] == "live-non-destructive"
+
+
+def test_promoted_live_drivers_remain_manual_until_revalidated() -> None:
+    expected = {
+        "GF-REGIONAL-NET-002": "run_net002_command_recovery.py",
+        "GF-REGIONAL-NET-003": "run_net003_result_retry.py",
+        "GF-REGIONAL-HA-001": "run_ha001_control_plane_failover.py",
+        "GF-REGIONAL-HA-002": "run_ha002_pdb_topology.py",
+        "GF-REGIONAL-HA-003": "run_ha003_aurora_failover_reset.py",
+        "GF-REGIONAL-HA-004": "run_ha004_waiting_reclaim_reset.py",
+        "GF-REGIONAL-HA-005": "run_ha005_rollout_continuity.py",
+        "GF-REGIONAL-HA-006": "run_ha006_executor_takeover.py",
+        "GF-REGIONAL-DESTR-001": "run_destr001_gpu_reset.py",
+        "GF-REGIONAL-DESTR-002": "run_destr002_hyperpod_reboot.py",
+        "GF-REGIONAL-DESTR-003": "run_destr003_warm_spare_failover.py",
+        "GF-REGIONAL-DESTR-008": "run_destr008_warm_spare_shortage.py",
+        "GF-REGIONAL-DESTR-009": "run_destr009_workload_restart.py",
+        "GF-REGIONAL-DESTR-012": "run_destr012_managed_recovery_guard.py",
+        "GF-REGIONAL-DESTR-013": "audit_destr013_replacement_invariant.py",
+        "GF-REGIONAL-ISO-006": "run_iso006_cluster_offline.py",
+        "GF-REGIONAL-E2E-002": "run_e2e002_multicluster_fault.py",
+        "GF-REGIONAL-COLLECT-001": "run_collector_acceptance.py",
+        "GF-REGIONAL-COLLECT-002": "run_collector_acceptance.py",
+        "GF-REGIONAL-COLLECT-003": "run_collector_acceptance.py",
+        "GF-REGIONAL-COLLECT-004": "run_collector_destructive.py",
+        "GF-REGIONAL-COLLECT-005": "run_collector_acceptance.py",
+        "GF-REGIONAL-COLLECT-008": "run_collector_destructive.py",
+        "GF-REGIONAL-COLLECT-009": "run_collector_acceptance.py",
+        "GF-REGIONAL-COLLECT-010": "run_collector_acceptance.py",
+        "GF-REGIONAL-COLLECT-011": "run_collector_acceptance.py",
+        "GF-REGIONAL-COLLECT-012": "run_collector_acceptance.py",
+        "GF-REGIONAL-COLLECT-013": "run_collector_destructive.py",
+        "GF-REGIONAL-COLLECT-014": "run_collector_destructive.py",
+        "GF-REGIONAL-COLLECT-016": "run_collect016_training_recovery.py",
+        "GF-REGIONAL-COLLECT-017": "run_collect017_efa_plugin.py",
+        "GF-REGIONAL-COLLECT-015": "run_collector_destructive.py",
+    }
+    cases = {case["id"]: case for case in load_catalog(CATALOG)}
+    bodies = _regional_case_bodies()
+
+    for case_id, script_name in expected.items():
+        assert cases[case_id]["automation"] == "manual"
+        assert "command" not in cases[case_id]
+        assert f"scripts/e2e/regional/{script_name}" in bodies[case_id]
+
+
 def test_superseded_manual_case_reports_its_replacement() -> None:
     cases = load_catalog(CATALOG)
     case = next(

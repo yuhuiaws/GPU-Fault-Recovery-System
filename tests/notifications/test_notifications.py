@@ -18,6 +18,7 @@ from ._notifications_cases_1 import (
     test_not_applicable_email_is_a_field_only_template,
     test_not_applicable_xid_creates_and_sends_one_email,
     test_notification_evidence_does_not_scan_all_markers,
+    test_remote_fabric_manager_completion_creates_one_drill_notification,
     test_restart_guard_uses_a_predefined_template,
     test_ses_delivery_adds_declared_site_context,
     test_ses_delivery_is_disabled_by_default,

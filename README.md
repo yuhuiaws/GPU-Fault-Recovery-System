@@ -81,12 +81,16 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 要求 Python 3.12。
 
 ```bash
-scripts/setup-deploy-host.sh --venv .venv --allow-network
+make deploy-host-setup-online
 . .venv/bin/activate
 make PYTHON=.venv/bin/python check
 ```
 
+`deploy-host-setup-online`是开发checkout的公共初始化入口，内部封装
+`scripts/setup-deploy-host.sh --venv .venv --allow-network`。
 生产部署机必须使用CI生成并验签的离线bundle，见[CI 发布流程](docs/CI发布流程.md)。
+初始化后，Make默认自动使用`.venv/bin/python`；无本地venv的源码包回退到`python3`，
+CI和高级调用仍可用`PYTHON=...`显式覆盖。
 
 需要手工逐项执行时，建议按以下顺序：
 

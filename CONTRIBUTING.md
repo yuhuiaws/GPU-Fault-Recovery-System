@@ -97,6 +97,8 @@ GitHub Actions从触发、OIDC/ECR、质量门禁、制品签名到`gpu-fault-re
 PostgreSQL。`make coverage`要求设置`GPU_FAULT_TEST_POSTGRES_URL`：先由4个worker
 采集非PostgreSQL覆盖率，再串行追加隔离PostgreSQL 16测试库覆盖率，最后统一强制当前
 78%的floor。覆盖率可以提高，不能通过调低`COVERAGE_FLOOR`掩盖未测试的新分支。
+Make在checkout中检测到`.venv/bin/python`时会自动使用该解释器；源码包没有`.venv`
+时回退到`python3`，显式`PYTHON=...`始终优先。
 
 只修改文档时，仍必须运行：
 

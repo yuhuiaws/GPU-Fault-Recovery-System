@@ -84,6 +84,19 @@ AUDIT_PURGE_STATEMENTS = (
         "cluster",
     ),
     (
+        "gpu_fault_links",
+        """
+        WITH pattern AS (
+            SELECT rtrim(%s, '%') AS prefix
+        )
+        DELETE FROM gpu_fault_links AS link
+        USING pattern
+        WHERE strpos(link.key, pattern.prefix) > 0
+           OR strpos(link.value, pattern.prefix) > 0
+        """,
+        "cluster",
+    ),
+    (
         "gpu_fault_objects",
         "DELETE FROM gpu_fault_objects WHERE payload->>'cluster_id' LIKE %s",
         "cluster",

@@ -275,6 +275,11 @@ class NodeActionExecutor(
         with self._inflight_lock:
             inflight = self._inflight.get(command.command_id)
             if inflight is None:
+                completed = self.ledger.get(command.command_id)
+                if completed is not None and not completed.retryable:
+                    return completed
+                if completed is not None:
+                    attempt = completed.attempt + 1
                 inflight = Event()
                 self._inflight[command.command_id] = inflight
                 owns_execution = True

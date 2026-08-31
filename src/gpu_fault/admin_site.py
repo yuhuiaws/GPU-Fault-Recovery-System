@@ -873,5 +873,6 @@ def effective_environment(site: RenderedSite) -> dict[str, str]:
     return {
         **os.environ,
         **site.environment,
+        "PYTHONPATH": str(site.repository_root / "src"),
         "GPU_FAULT_REPO_ROOT": str(site.repository_root),
     }

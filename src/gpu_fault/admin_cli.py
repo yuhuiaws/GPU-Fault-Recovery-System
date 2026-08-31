@@ -4,6 +4,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -48,6 +49,44 @@ COMMANDS = {
     "verify": "verify",
     "status": "status",
 }
+DEPLOY_HOST_STATE_BINDING = "gpu-fault-managed-state-dir.json"
+
+
+def _bound_deploy_host_state_dir(prefix: Path | None = None) -> Path | None:
+    binding = (prefix or Path(sys.prefix)).resolve() / DEPLOY_HOST_STATE_BINDING
+    if not binding.is_file():
+        return None
+    try:
+        value = json.loads(binding.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SiteConfigError("deploy-host state-dir binding is invalid") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise SiteConfigError("deploy-host state-dir binding schema is invalid")
+    state_dir = value.get("state_dir")
+    if not isinstance(state_dir, str) or not state_dir.strip():
+        raise SiteConfigError("deploy-host state-dir binding has no state directory")
+    return Path(state_dir).expanduser().resolve()
+
+
+def enforce_deploy_host_state_dir(arguments: argparse.Namespace) -> None:
+    bound = _bound_deploy_host_state_dir()
+    if bound is None:
+        return
+    provided = cast(Path | None, getattr(arguments, "state_dir", None))
+    if provided is not None:
+        if provided.expanduser().resolve() == bound:
+            return
+        raise SiteConfigError(
+            f"installed deploy-host is bound to --state-dir {bound}; "
+            f"refusing {provided.expanduser().resolve()}"
+        )
+    explicit = cast(Path | None, getattr(arguments, "file", None))
+    if explicit is not None and explicit.expanduser().resolve() == bound / "site.yaml":
+        return
+    raise SiteConfigError(
+        f"installed deploy-host is bound to --state-dir {bound}; "
+        f"{arguments.command} requires that managed state"
+    )
 
 
 def _add_managed_site_arguments(
@@ -426,6 +465,10 @@ def _run_automatic_release(
     completed = subprocess.run(
         command,
         cwd=repository_root,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(repository_root / "src"),
+        },
         check=False,
     )
     if completed.returncode:
@@ -677,6 +720,7 @@ def run(arguments: argparse.Namespace) -> int:
 def main() -> int:
     arguments = parser().parse_args()
     try:
+        enforce_deploy_host_state_dir(arguments)
         return run(arguments)
     except (
         BootstrapError,

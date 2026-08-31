@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -123,6 +124,10 @@ def run_source_deploy(
     completed = subprocess.run(
         command,
         cwd=repository_root,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(repository_root / "src"),
+        },
         check=False,
     )
     return completed.returncode

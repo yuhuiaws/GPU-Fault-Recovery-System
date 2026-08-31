@@ -1,4 +1,7 @@
-PYTHON ?= python3
+# Local development dependencies, including pytest-xdist, live in the
+# repository venv. Source bundles and CI can still fall back to or explicitly
+# override the interpreter.
+PYTHON ?= $(firstword $(wildcard .venv/bin/python) python3)
 # Quality gates import Python modules from deploy/. Keep interpreter caches out
 # of the checkout so a prior gate cannot poison the later deploy layout check.
 PYTHONPYCACHEPREFIX ?= /tmp/gpu-fault-pycache
@@ -104,9 +107,7 @@ run:
 	PYTHONPATH=src $(PYTHON) -m gpu_fault.api
 
 format:
-	$(PYTHON) -m ruff format src deploy $(QUALITY_SCRIPTS)
-	$(PYTHON) -m ruff format \
-		--config 'format.skip-magic-trailing-comma=true' tests
+	$(PYTHON) -m ruff format src tests deploy $(QUALITY_SCRIPTS)
 	$(PYTHON) -m ruff check --select I --fix tests
 
 python-cache-clean:
@@ -123,9 +124,7 @@ python-cache-clean:
 
 check:
 	$(MAKE) python-cache-clean
-	$(PYTHON) -m ruff format --check src deploy $(QUALITY_SCRIPTS)
-	$(PYTHON) -m ruff format --check \
-		--config 'format.skip-magic-trailing-comma=true' tests
+	$(PYTHON) -m ruff format --check src tests deploy $(QUALITY_SCRIPTS)
 	$(PYTHON) -m ruff check src tests deploy $(QUALITY_SCRIPTS)
 	$(PYTHON) -m ruff check --select I tests
 	$(MAKE) mypy-check

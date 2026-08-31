@@ -138,6 +138,60 @@ def test_retry_diff_restores_physical_artifact_changes(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
+    ("phase", "expected_resume"), (("failed", True), ("rolled-back", False))
+)
+def test_deploy_only_resumes_an_unrolled_back_release(
+    monkeypatch, phase: str, expected_resume: bool
+) -> None:
+    module = _admin_module()
+    expected_diff = module.diff_from_changed({"control_plane_wheel"})
+    calls: list[dict[str, object]] = []
+    release = SimpleNamespace(
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
+        _cpu=lambda *args: ["kubectl", *args],
+        _load_state=lambda: {"phase": phase, "release_id": "previous-candidate"},
+        upgrade=lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
+    )
+    monkeypatch.setattr(
+        module, "retry_release_diff", lambda _release, _state: expected_diff
+    )
+
+    module.run_deploy(release)
+
+    assert calls == [{"resume": expected_resume, "diff": expected_diff}]
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_resume"), (("failed", True), ("rolled-back", False))
+)
+def test_release_summary_reports_retry_transaction_mode(
+    monkeypatch, phase: str, expected_resume: bool
+) -> None:
+    module = _admin_module()
+    release = SimpleNamespace(
+        config=SimpleNamespace(site_name="test-site"),
+        _load_state=lambda: {"phase": phase},
+    )
+    monkeypatch.setattr(
+        module, "build_release_status", lambda _release: {"site_name": "test-site"}
+    )
+    monkeypatch.setattr(
+        module,
+        "retry_release_diff",
+        lambda _release, _state: module.diff_from_changed({"control_plane_wheel"}),
+    )
+
+    report = module.build_release_summary(release)
+
+    assert report["next_deploy"]["resume"] is expected_resume
+
+
+@pytest.mark.parametrize(
     ("state_exists", "phase"),
     [
         (False, None),

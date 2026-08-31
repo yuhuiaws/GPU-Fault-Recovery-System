@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from threading import RLock
+from typing import Any
 
 from gpu_fault.models import (
     AdvisoryNotification,
@@ -91,6 +92,43 @@ def _is_throttled(exc: BaseException) -> bool:
         if isinstance(error, dict):
             codes.add(str(error.get("Code", "")))
     return bool(codes & THROTTLE_ERROR_CODES)
+
+
+def _dispatch_remote_node_action_completion(
+    service: AdvisoryNotificationService,
+    command: Any,
+    existing_id: str | None,
+) -> list[NotificationResult]:
+    common = {
+        "cluster_id": command.cluster_id,
+        "incident_id": command.incident.incident_id,
+        "workflow_id": command.workflow.request_id,
+        "event_id": command.incident.event_id,
+        "event_type": command.incident.event_type,
+        "policy_source": command.incident.policy_source,
+        "official_action": command.incident.official_action,
+        "reasons": command.incident.reasons,
+        "operation_id": command.idempotency_key,
+        "node_results": command.result_details.get("node_results", {}),
+        "workload_ids": command.step.workload_ids,
+    }
+    if command.step.operation is WorkflowOperation.RESTART_FABRIC_MANAGER:
+        kind = NotificationKind.FABRIC_MANAGER_RESTARTED
+        values = common
+    elif command.step.operation is WorkflowOperation.RESET_GPU:
+        kind = NotificationKind.GPU_RESET_COMPLETED
+        values = {
+            **common,
+            "node_ids": command.step.node_ids,
+            "gpu_uuids": command.step.gpu_uuids,
+        }
+    else:
+        return []
+    notification = service.builders.build(kind, **values)
+    notification = service.store.save_notification_if_absent(notification)
+    if notification.notification_id == existing_id:
+        return []
+    return [service.send(notification.notification_id)]
 
 
 class AdvisoryNotificationService:
@@ -465,26 +503,9 @@ class AdvisoryNotificationService:
                 notification = self.store.save_notification_if_absent(notification)
                 if notification.notification_id != existing_id:
                     results.append(self.send(notification.notification_id))
-        if command.step.operation is WorkflowOperation.RESET_GPU:
-            notification = self.builders.build(
-                NotificationKind.GPU_RESET_COMPLETED,
-                cluster_id=command.cluster_id,
-                incident_id=command.incident.incident_id,
-                workflow_id=command.workflow.request_id,
-                event_id=command.incident.event_id,
-                event_type=command.incident.event_type,
-                policy_source=command.incident.policy_source,
-                official_action=command.incident.official_action,
-                reasons=command.incident.reasons,
-                operation_id=command.idempotency_key,
-                node_ids=command.step.node_ids,
-                gpu_uuids=command.step.gpu_uuids,
-                node_results=command.result_details.get("node_results", {}),
-                workload_ids=command.step.workload_ids,
-            )
-            notification = self.store.save_notification_if_absent(notification)
-            if notification.notification_id != existing_id:
-                results.append(self.send(notification.notification_id))
+        results.extend(
+            _dispatch_remote_node_action_completion(self, command, existing_id)
+        )
         return results
 
     def preview_not_applicable(

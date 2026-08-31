@@ -4,6 +4,7 @@ import json
 import subprocess
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +25,7 @@ from gpu_fault.admin_bootstrap_common import (
 from gpu_fault.admin_bootstrap_site import (
     existing_gpu_context,
     preserve_existing_site_contract,
+    recover_verified_site_contract,
     validate_existing_cluster_identity,
 )
 from gpu_fault.admin_bootstrap_site import site_identifier as _site_identifier
@@ -975,6 +977,79 @@ def test_existing_site_preserves_release_profile_and_cluster_context() -> None:
     assert result["spec"]["clusters"][0]["allowedNamespaces"] == [
         "gpu-fault-system",
         "training",
+    ]
+
+
+def test_existing_site_recovers_latest_verified_release_contract(
+    tmp_path: Path,
+) -> None:
+    existing = {
+        "kind": "RegionalSite",
+        "metadata": {"name": "test-site"},
+        "spec": {
+            "repositoryRoot": "/repo/current",
+            "awsRegion": "us-west-2",
+            "cpu": {"eksArn": "arn:aws:eks:us-west-2:123456789012:cluster/cpu"},
+            "release": {"manifest": "/repo/current/dist/current-release.json"},
+            "runtimeProfile": {
+                "source": "/repo/current/config/profile.yaml",
+                "templateSource": "/repo/current/config/profile.yaml",
+                "version": "profile-v1",
+            },
+            "clusters": [
+                {
+                    "clusterId": "gpu-a",
+                    "eksClusterArn": (
+                        "arn:aws:eks:us-west-2:123456789012:cluster/gpu-a"
+                    ),
+                    "context": "current-context",
+                    "agentEndpointAllowedCidrs": ["192.0.2.0/24"],
+                }
+            ],
+        },
+    }
+    verified = {
+        "kind": "RegionalSite",
+        "metadata": {"name": "test-site"},
+        "spec": {
+            "repositoryRoot": "/repo/previous",
+            "awsRegion": "us-west-2",
+            "cpu": {"eksArn": "arn:aws:eks:us-west-2:123456789012:cluster/cpu"},
+            "release": {"manifest": "dist/current-release.json"},
+            "runtimeProfile": {
+                "source": "/secure/profiles/profile-v1.yaml",
+                "templateSource": "/repo/previous/config/profile.yaml",
+                "version": "profile-v1",
+            },
+            "clusters": [
+                {
+                    "clusterId": "gpu-a",
+                    "eksClusterArn": (
+                        "arn:aws:eks:us-west-2:123456789012:cluster/gpu-a"
+                    ),
+                    "context": "verified-context",
+                    "agentEndpointAllowedCidrs": ["198.51.100.0/24"],
+                }
+            ],
+        },
+    }
+    release = tmp_path / "release-deploy/release-a"
+    release.mkdir(parents=True)
+    (release / "state.json").write_text(
+        json.dumps({"phase": "COMPLETED", "verification": {"status": "PASSED"}}),
+        encoding="utf-8",
+    )
+    (release / "site.candidate.yaml").write_text(json.dumps(verified), encoding="utf-8")
+
+    recovered = recover_verified_site_contract(tmp_path, existing)
+
+    assert recovered is not None
+    assert recovered["spec"]["repositoryRoot"] == "/repo/current"
+    assert recovered["spec"]["release"] == verified["spec"]["release"]
+    assert recovered["spec"]["runtimeProfile"] == verified["spec"]["runtimeProfile"]
+    assert recovered["spec"]["clusters"][0]["context"] == "verified-context"
+    assert recovered["spec"]["clusters"][0]["agentEndpointAllowedCidrs"] == [
+        "198.51.100.0/24"
     ]
 
 

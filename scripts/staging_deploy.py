@@ -143,17 +143,37 @@ def _untracked_files(repository_root: Path) -> tuple[Path, ...]:
     return tuple(Path(os.fsdecode(value)) for value in raw.split(b"\0") if value)
 
 
+def _tracked_files(repository_root: Path) -> tuple[Path, ...]:
+    raw = _git_bytes(repository_root, "ls-files", "-z")
+    return tuple(Path(os.fsdecode(value)) for value in raw.split(b"\0") if value)
+
+
 def _source_fingerprint(
     repository_root: Path,
     *,
     head: str,
-) -> tuple[str, bytes, tuple[Path, ...]]:
+) -> tuple[str, bytes, tuple[Path, ...], tuple[Path, ...]]:
     diff = _git_bytes(repository_root, "diff", "--binary", "HEAD")
+    tracked = _tracked_files(repository_root)
     untracked = _untracked_files(repository_root)
     digest = hashlib.sha256()
     digest.update(head.encode())
     digest.update(b"\0diff\0")
     digest.update(diff)
+    for relative in sorted(tracked, key=lambda value: value.as_posix()):
+        if relative.is_absolute() or ".." in relative.parts:
+            raise StagingDeployError(f"tracked source leaves repository: {relative}")
+        source = repository_root.resolve() / relative
+        digest.update(b"\0tracked-mode\0")
+        digest.update(relative.as_posix().encode())
+        if source.is_symlink():
+            digest.update(b"\0symlink\0")
+        elif source.is_file():
+            digest.update(f"{source.stat().st_mode & 0o777:04o}".encode())
+        elif not source.exists():
+            digest.update(b"\0missing\0")
+        else:
+            raise StagingDeployError(f"unsupported tracked source type: {relative}")
     for relative in sorted(untracked, key=lambda value: value.as_posix()):
         if relative.is_absolute() or ".." in relative.parts:
             raise StagingDeployError(f"untracked source leaves repository: {relative}")
@@ -172,7 +192,7 @@ def _source_fingerprint(
                     digest.update(chunk)
         else:
             raise StagingDeployError(f"unsupported untracked source type: {relative}")
-    return digest.hexdigest(), diff, untracked
+    return digest.hexdigest(), diff, tracked, untracked
 
 
 def _copy_untracked_files(
@@ -192,6 +212,23 @@ def _copy_untracked_files(
             shutil.copy2(source, target)
         else:
             raise StagingDeployError(f"unsupported untracked source type: {relative}")
+
+
+def _copy_tracked_file_modes(
+    repository_root: Path,
+    snapshot_root: Path,
+    paths: Sequence[Path],
+) -> None:
+    for relative in paths:
+        source = repository_root / relative
+        target = snapshot_root / relative
+        if source.is_symlink() or not source.exists():
+            continue
+        if not source.is_file() or not target.is_file():
+            raise StagingDeployError(
+                f"tracked source mode cannot be preserved: {relative}"
+            )
+        target.chmod(source.stat().st_mode & 0o777)
 
 
 def _apply_snapshot_diff(snapshot_root: Path, diff: bytes) -> None:
@@ -266,7 +303,7 @@ def prepare_source_checkout(
             fingerprint=head,
             snapshot=False,
         )
-    fingerprint, diff, untracked = _source_fingerprint(
+    fingerprint, diff, tracked, untracked = _source_fingerprint(
         repository_root,
         head=head,
     )
@@ -296,6 +333,7 @@ def prepare_source_checkout(
     )
     _apply_snapshot_diff(candidate, diff)
     _copy_untracked_files(repository_root, candidate, untracked)
+    _copy_tracked_file_modes(repository_root, candidate, tracked)
     _run(["git", "add", "-A"], cwd=candidate)
     commit_environment = {
         **os.environ,
@@ -507,6 +545,22 @@ def ensure_deploy_host_venv(
     admin = venv / "bin/gpu-fault-admin"
     if not admin.is_file():
         raise StagingDeployError(f"deploy-host venv has no admin CLI: {admin}")
+    binding = venv.resolve() / "gpu-fault-managed-state-dir.json"
+    temporary = binding.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "state_dir": str(state_dir.expanduser().resolve()),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, binding)
     return venv
 
 

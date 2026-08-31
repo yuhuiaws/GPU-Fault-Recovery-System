@@ -294,7 +294,15 @@ class FabricManagerLogCollector:
                     "offset", 0
                 )
                 if previous is None:
-                    offset = max(0, stat.st_size - 1_000_000)
+                    # Historical file content has no trustworthy node-generation
+                    # boundary when the durable checkpoint is absent.
+                    self._files[key] = {
+                        "device": stat.st_dev,
+                        "inode": stat.st_ino,
+                        "offset": stat.st_size,
+                    }
+                    self._state_dirty = True
+                    continue
                 elif identity_changed or truncated:
                     offset = 0
                 else:

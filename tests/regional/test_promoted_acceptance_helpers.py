@@ -1,0 +1,407 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from scripts.e2e.regional import audit_destr011_provider_replace as destr011
+from scripts.e2e.regional import audit_destr013_replacement_invariant as destr013
+from scripts.e2e.regional import audit_warm_spare_guardrails as warm_spare
+from scripts.e2e.regional import run_destr001_gpu_reset as destr001
+from scripts.e2e.regional import run_destr002_hyperpod_reboot as destr002
+from scripts.e2e.regional import run_destr003_warm_spare_failover as destr003
+from scripts.e2e.regional import run_destr008_warm_spare_shortage as destr008
+from scripts.e2e.regional import run_destr009_workload_restart as destr009
+from scripts.e2e.regional import run_destr010_fabric_manager_restart as destr010
+from scripts.e2e.regional import run_destr012_managed_recovery_guard as destr012
+from scripts.e2e.regional import run_ha003_aurora_failover_reset as ha003
+from scripts.e2e.regional import run_ha004_waiting_reclaim_reset as ha004
+from scripts.e2e.regional import run_ha009_aurora_credential_rotation as ha009
+from scripts.e2e.regional.host_probe_fixture import HostProbeFixture, HostProbeSettings
+
+ROOT = Path(__file__).resolve().parents[2]
+REGIONAL = ROOT / "scripts/e2e/regional"
+
+
+def test_promoted_ha_and_destructive_helpers_exist() -> None:
+    expected = {
+        "run_ha007_control_worker_shutdown.py",
+        "run_ha008_processor_exit_acceptance.py",
+        "run_ha009_aurora_credential_rotation.py",
+        "run_ha003_aurora_failover_reset.py",
+        "run_ha004_waiting_reclaim_reset.py",
+        "audit_destr013_replacement_invariant.py",
+        "audit_destr011_provider_replace.py",
+        "audit_warm_spare_guardrails.py",
+        "run_destr001_gpu_reset.py",
+        "run_destr002_hyperpod_reboot.py",
+        "run_destr003_warm_spare_failover.py",
+        "run_destr008_warm_spare_shortage.py",
+        "run_destr009_workload_restart.py",
+        "run_destr010_fabric_manager_restart.py",
+        "run_destr012_managed_recovery_guard.py",
+        "host_probe_fixture.py",
+        "regional_live_fixture.py",
+        "managed_workload_fixture.py",
+        "warm_spare_fixture.py",
+        "collector_acceptance_fixture.py",
+        "run_collector_acceptance.py",
+        "run_collector_destructive.py",
+        "run_collect016_training_recovery.py",
+        "run_collect017_efa_plugin.py",
+        "multi_cluster_fixture.py",
+        "run_iso006_cluster_offline.py",
+        "run_e2e002_multicluster_fault.py",
+    }
+
+    assert expected <= {path.name for path in REGIONAL.glob("*.py")}
+
+
+def test_promoted_helpers_contain_no_site_specific_topology() -> None:
+    forbidden = (
+        "/secure/" + "gpu-fault-bootstrap",
+        "hypd" + "-1127",
+        "514385" + "905925",
+        "gpu-fault-" + "us-west-2-control-plane",
+    )
+    paths = (
+        REGIONAL / "run_ha009_aurora_credential_rotation.py",
+        REGIONAL / "run_ha003_aurora_failover_reset.py",
+        REGIONAL / "run_ha004_waiting_reclaim_reset.py",
+        REGIONAL / "audit_destr013_replacement_invariant.py",
+        REGIONAL / "audit_destr011_provider_replace.py",
+        REGIONAL / "audit_warm_spare_guardrails.py",
+        REGIONAL / "run_destr001_gpu_reset.py",
+        REGIONAL / "run_destr002_hyperpod_reboot.py",
+        REGIONAL / "run_destr003_warm_spare_failover.py",
+        REGIONAL / "run_destr008_warm_spare_shortage.py",
+        REGIONAL / "run_destr009_workload_restart.py",
+        REGIONAL / "run_destr010_fabric_manager_restart.py",
+        REGIONAL / "run_destr012_managed_recovery_guard.py",
+        REGIONAL / "host_probe_fixture.py",
+        REGIONAL / "regional_live_fixture.py",
+        REGIONAL / "managed_workload_fixture.py",
+        REGIONAL / "warm_spare_fixture.py",
+        REGIONAL / "collector_acceptance_fixture.py",
+        REGIONAL / "run_collector_acceptance.py",
+        REGIONAL / "run_collector_destructive.py",
+        REGIONAL / "run_collect016_training_recovery.py",
+        REGIONAL / "run_collect017_efa_plugin.py",
+        REGIONAL / "multi_cluster_fixture.py",
+        REGIONAL / "run_iso006_cluster_offline.py",
+        REGIONAL / "run_e2e002_multicluster_fault.py",
+    )
+
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        assert all(value not in source for value in forbidden), path
+
+
+def test_ha009_default_invocation_is_plan_only(tmp_path: Path) -> None:
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(ROOT / "src"),
+        "GPU_FAULT_CONTROL_KUBECONFIG": "/secure/cpu.kubeconfig",
+        "KUBECONFIG": "/secure/gpu.kubeconfig",
+        "GPU_FAULT_DATAPLANE_CONTEXT": "gpu-context",
+        "GPU_FAULT_PERF_AWS_REGION": "us-west-2",
+        "GPU_FAULT_PERF_CONTROL_NAMESPACE": "gpu-fault-system",
+        "GPU_FAULT_PERF_DATAPLANE_NAMESPACE": "gpu-fault-system",
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(REGIONAL / "run_ha009_aurora_credential_rotation.py"),
+            "--run-dir",
+            str(tmp_path),
+            "--rds-cluster-id",
+            "aurora-test",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+    plan_path = tmp_path / "cases/GF-REGIONAL-HA-009/plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert plan["mutation_performed"] is False
+    assert plan["confirmation"] == "HA009_ROTATE_AURORA_CREDENTIALS"
+    assert plan["details"]["rds_cluster_id"] == "aurora-test"
+    assert plan_path.stat().st_mode & 0o777 == 0o600
+    assert '"mutation_performed": false' in completed.stdout
+
+
+def test_ha009_accepts_rds_current_pending_alias() -> None:
+    complete = {
+        "stages": {
+            "AWSCURRENT": "version-new",
+            "AWSPENDING": "version-new",
+            "AWSPREVIOUS": "version-old",
+        }
+    }
+    still_pending = {
+        "stages": {"AWSCURRENT": "version-old", "AWSPENDING": "version-new"}
+    }
+
+    assert ha009.managed_rotation_complete(
+        complete, old_current="version-old", cluster_status="available"
+    ), "completed managed rotation was not recognized"
+    assert not ha009.managed_rotation_complete(
+        still_pending, old_current="version-old", cluster_status="available"
+    ), "stale AWSCURRENT was accepted as a completed rotation"
+
+
+def test_destructive_audits_are_parameterized(tmp_path: Path) -> None:
+    kubeconfig = tmp_path / "gpu.kubeconfig"
+    kubeconfig.write_text("apiVersion: v1\n", encoding="utf-8")
+    cpu_kubeconfig = tmp_path / "cpu.kubeconfig"
+    cpu_kubeconfig.write_text("apiVersion: v1\n", encoding="utf-8")
+    common = {
+        "gpu_kubeconfig": str(kubeconfig),
+        "gpu_context": "gpu-context",
+        "namespace": "gpu-fault-system",
+        "region": "us-east-2",
+    }
+    destr011.configure(
+        SimpleNamespace(
+            **common,
+            executor_role_arn="arn:aws:iam::123456789012:role/executor",
+            hyperpod_cluster_name="gpu-hyperpod",
+        )
+    )
+    warm_spare.configure(
+        SimpleNamespace(
+            **common,
+            cpu_kubeconfig=str(cpu_kubeconfig),
+            cpu_context="cpu-context",
+            managed_gpu_cluster_name="gpu-hyperpod",
+            automatic_negative_cluster_name="automatic-test",
+        ),
+        set(warm_spare.CASE_IDS),
+    )
+
+    assert destr011.GPU_KUBECONFIG == kubeconfig.resolve()
+    assert destr011.HYPERPOD_CLUSTER == "gpu-hyperpod"
+    assert destr011.AWS_REGION == "us-east-2"
+    assert warm_spare.CPU_KUBECONFIG == cpu_kubeconfig.resolve()
+    assert warm_spare.CPU_CONTEXT == "cpu-context"
+    assert warm_spare.GPU_KUBECONFIG == kubeconfig.resolve()
+    assert warm_spare.MANAGED_GPU_CLUSTER == "gpu-hyperpod"
+    assert warm_spare.AUTOMATIC_NEGATIVE_CLUSTER == "automatic-test"
+
+
+def test_host_probe_fixture_is_node_pinned_and_time_bounded(tmp_path: Path) -> None:
+    kubeconfig = tmp_path / "gpu.kubeconfig"
+    kubeconfig.write_text("apiVersion: v1\n", encoding="utf-8")
+    probe = tmp_path / "probe.py"
+    probe.write_text("print('{}')\n", encoding="utf-8")
+    fixture = HostProbeFixture(
+        HostProbeSettings(
+            kubeconfig=kubeconfig,
+            context="gpu-context",
+            namespace="gpu-fault-system",
+            node="node-a",
+            image="registry.example/probe@sha256:" + "a" * 64,
+            case_id="GF-REGIONAL-DESTR-010",
+            run_id="run-a",
+            probe_script=probe,
+        )
+    )
+
+    configmap, pod = fixture.manifests()
+
+    assert configmap["metadata"]["namespace"] == "gpu-fault-system"
+    assert pod["spec"]["nodeName"] == "node-a"
+    assert pod["spec"]["activeDeadlineSeconds"] == 1800
+    assert pod["spec"]["containers"][0]["securityContext"] == {"privileged": True}
+    assert pod["spec"]["volumes"][0]["hostPath"]["path"] == "/"
+
+
+def test_destr010_exact_workflow_contract() -> None:
+    state: dict[str, Any] = {
+        "event": {"xid": 45, "evidence_ref": "kmsg://node/boot/1"},
+        "decision": {"official_action": "RESTART_FM", "disposition": "EXECUTABLE"},
+        "workflow": {
+            "status": "SUCCEEDED",
+            "official_steps": [
+                {
+                    "operation": "FREEZE_EVIDENCE",
+                    "execution_owner": "gpu-fault-control-plane",
+                },
+                {
+                    "operation": "RESTART_FABRIC_MANAGER",
+                    "execution_owner": "gpu-fault-node-agent",
+                },
+            ],
+            "completed_operations": ["FREEZE_EVIDENCE", "RESTART_FABRIC_MANAGER"],
+        },
+        "commands": [{"status": "SUCCEEDED"}],
+        "evidence": [{"record_id": "evidence-a"}],
+        "notifications": [
+            {
+                "notification_id": "notification-a",
+                "category": "ACTION_COMPLETED",
+                "subject": "[DRILL:test] [GPU Fabric Manager 已自动重启]",
+                "status": "SKIPPED",
+            }
+        ],
+    }
+
+    assert destr010.workflow_errors(state) == []
+    state["workflow"]["completed_operations"].append("MARK_UNSCHEDULABLE")
+    assert "forbidden isolation/quiesce" in " ".join(destr010.workflow_errors(state))
+
+
+def test_destr010_parser_is_plan_only_by_default(tmp_path: Path) -> None:
+    arguments = destr010.parser().parse_args(["--run-dir", str(tmp_path)])
+
+    assert arguments.execute is False
+    assert arguments.plan is False
+    assert destr010.CONFIRMATION == "DESTR010_RESTART_FABRIC_MANAGER"
+
+
+def test_destructive_sequence_parsers_are_plan_only(tmp_path: Path) -> None:
+    modules = (destr001, destr002, destr003, destr008, destr009, destr012, ha003, ha004)
+
+    for module in modules:
+        arguments = module.parser().parse_args(["--run-dir", str(tmp_path)])
+        assert arguments.execute is False, module.CASE_ID
+        assert arguments.predecessor_evidence == "", module.CASE_ID
+
+
+def test_destr013_parser_requires_an_explicit_window(tmp_path: Path) -> None:
+    arguments = destr013.parser().parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--window-start",
+            "2026-08-30T00:00:00Z",
+            "--window-end",
+            "2026-08-31T00:00:00Z",
+        ]
+    )
+
+    assert arguments.window_start.endswith("Z"), arguments.window_start
+    assert arguments.window_end.endswith("Z"), arguments.window_end
+
+
+def _gpu_node(
+    name: str,
+    *,
+    unschedulable: bool = False,
+    taints: list[dict[str, Any]] | None = None,
+    incident_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "uid": f"uid-{name}",
+        "ready": "True",
+        "gpu_allocatable": 8,
+        "unschedulable": unschedulable,
+        "taints": taints or [],
+        "ownership_annotations": {
+            "gpu-fault.io/incident-id": incident_id,
+            "gpu-fault.io/fencing-token": "1" if incident_id else None,
+            "gpu-fault.io/previous-unschedulable": ("false" if incident_id else None),
+        },
+    }
+
+
+def test_warm_spare_audit_blocks_preexisting_quarantine() -> None:
+    nodes = [
+        _gpu_node("node-a"),
+        _gpu_node(
+            "node-b",
+            unschedulable=True,
+            taints=[
+                {
+                    "key": "gpu-fault.io/quarantined",
+                    "value": "incident-deadbeef",
+                    "effect": "NoSchedule",
+                }
+            ],
+            incident_id="incident-a",
+        ),
+    ]
+
+    errors = warm_spare.node_preflight_errors(nodes)
+
+    assert errors == ["node-b has pre-existing gpu-fault quarantine ownership"]
+
+
+def test_warm_spare_audit_requires_exact_node_postflight() -> None:
+    baseline = [_gpu_node("node-a"), _gpu_node("node-b")]
+    postflight = [
+        _gpu_node("node-a"),
+        _gpu_node(
+            "node-b",
+            unschedulable=True,
+            taints=[
+                {
+                    "key": "gpu-fault.io/quarantined",
+                    "value": "incident-deadbeef",
+                    "effect": "NoSchedule",
+                }
+            ],
+            incident_id="incident-a",
+        ),
+    ]
+
+    errors = warm_spare.node_state_drift(baseline, postflight)
+
+    assert any("node-b changed unschedulable" in error for error in errors), (
+        "postflight did not detect the cordon drift"
+    )
+    assert any("node-b changed taints" in error for error in errors), (
+        "postflight did not detect the taint drift"
+    )
+    assert any("node-b changed ownership_annotations" in error for error in errors), (
+        "postflight did not detect the ownership drift"
+    )
+
+
+def test_warm_spare_audit_allows_unchanged_preexisting_business_taint() -> None:
+    taints = [{"key": "workload.example/dedicated", "effect": "NoSchedule"}]
+    baseline = [_gpu_node("node-a", unschedulable=True, taints=taints)]
+
+    assert warm_spare.node_preflight_errors(baseline) == []
+    assert warm_spare.node_state_drift(baseline, baseline) == []
+
+
+def test_warm_spare_audit_records_postflight_after_probe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baseline = [_gpu_node("node-a")]
+    snapshots = iter([baseline, baseline])
+    monkeypatch.setattr(warm_spare, "node_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        warm_spare,
+        "cluster_recovery",
+        lambda _name: (_ for _ in ()).throw(RuntimeError("probe unavailable")),
+    )
+    monkeypatch.setattr(warm_spare, "replace_events", lambda _start, _end: [])
+
+    exit_code = warm_spare.run_audit(tmp_path, ["GF-REGIONAL-DESTR-005"])
+
+    result = json.loads(
+        (tmp_path / "cases/GF-REGIONAL-DESTR-005/GF-REGIONAL-DESTR-005.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    postflight = json.loads(
+        (tmp_path / "gpu-node-postflight.json").read_text(encoding="utf-8")
+    )
+    assert exit_code == 1
+    assert result["verdict"] == "FAIL"
+    assert result["node_state_identical"] is True
+    assert "RuntimeError: probe unavailable" in result["errors"]
+    assert postflight == baseline

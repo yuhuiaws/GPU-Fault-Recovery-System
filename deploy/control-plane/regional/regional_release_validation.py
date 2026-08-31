@@ -294,6 +294,7 @@ print(
             "queue": store.processor_queue_stats(),
             "remote_commands": store.remote_command_stats(),
         },
+        default=float,
         sort_keys=True,
     )
 )

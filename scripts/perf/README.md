@@ -46,8 +46,9 @@ Supported entry points:
   metrics, Aurora sampling, teardown and artifacts.
 - `regional_action_capacity_suite.py`: regional action execution capacity.
 - `regional_correlated_action_suite.py`: live synthetic event-to-action
-  preemption and failure-escalation chains, including complete workflow/command
-  terminal-state audit.
+  same-rank aggregation, preemption and failure-escalation chains, including
+  budget-wave-aware scenario timeouts, a separate terminal-drain phase, exact
+  workflow relationships and complete workflow/command terminal-state audit.
 - `seed_regional_action_workflows.py` and
   `benchmark_regional_action_executor.py`: action-side data and load drivers.
 - `capture_processor_inflight.py`: optional in-flight sampling attached to a

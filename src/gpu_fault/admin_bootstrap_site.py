@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
@@ -43,6 +44,112 @@ def load_existing_site(state_dir: Path) -> dict[str, Any] | None:
     if not isinstance(value, dict) or value.get("kind") != "RegionalSite":
         raise BootstrapError("existing site.yaml is not a RegionalSite")
     return value
+
+
+def load_latest_verified_site_contract(state_dir: Path) -> dict[str, Any] | None:
+    release_root = state_dir / "release-deploy"
+    if not release_root.is_dir():
+        return None
+    states = sorted(
+        release_root.glob("*/state.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for state_path in states:
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BootstrapError(
+                f"cannot load release state {state_path}: {exc}"
+            ) from exc
+        if not isinstance(state, dict) or state.get("phase") != "COMPLETED":
+            continue
+        verification = state.get("verification")
+        if not isinstance(verification, dict) or verification.get("status") != "PASSED":
+            continue
+        candidate_path = state_path.parent / "site.candidate.yaml"
+        if not candidate_path.is_file():
+            raise BootstrapError(
+                f"completed release has no candidate site: {candidate_path}"
+            )
+        try:
+            candidate = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            raise BootstrapError(
+                f"cannot load verified candidate site {candidate_path}: {exc}"
+            ) from exc
+        if not isinstance(candidate, dict) or candidate.get("kind") != "RegionalSite":
+            raise BootstrapError(
+                f"verified candidate site is not a RegionalSite: {candidate_path}"
+            )
+        return candidate
+    return None
+
+
+def recover_verified_site_contract(
+    state_dir: Path,
+    existing: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if existing is None:
+        return None
+    verified = load_latest_verified_site_contract(state_dir)
+    if verified is None:
+        return existing
+    existing_spec = existing.get("spec")
+    verified_spec = verified.get("spec")
+    if not isinstance(existing_spec, dict) or not isinstance(verified_spec, dict):
+        raise BootstrapError("site contract has no valid spec")
+    identity_fields = (
+        (
+            (existing.get("metadata") or {}).get("name"),
+            (verified.get("metadata") or {}).get("name"),
+            "site name",
+        ),
+        (
+            existing_spec.get("awsRegion"),
+            verified_spec.get("awsRegion"),
+            "AWS Region",
+        ),
+        (
+            (existing_spec.get("cpu") or {}).get("eksArn"),
+            (verified_spec.get("cpu") or {}).get("eksArn"),
+            "CPU EKS ARN",
+        ),
+    )
+    for current, stable, description in identity_fields:
+        if current != stable:
+            raise BootstrapError(
+                f"verified release candidate {description} differs from site.yaml"
+            )
+
+    recovered = deepcopy(existing)
+    recovered_spec = recovered["spec"]
+    for key in ("release", "runtimeProfile"):
+        value = verified_spec.get(key)
+        if isinstance(value, dict):
+            recovered_spec[key] = deepcopy(value)
+    verified_clusters = {
+        item.get("eksClusterArn"): item
+        for item in verified_spec.get("clusters", [])
+        if isinstance(item, dict) and item.get("eksClusterArn")
+    }
+    for cluster in recovered_spec.get("clusters", []):
+        if not isinstance(cluster, dict):
+            continue
+        stable = verified_clusters.get(cluster.get("eksClusterArn"))
+        if not isinstance(stable, dict):
+            continue
+        for key in (
+            "context",
+            "allowedNamespaces",
+            "agentEndpointAllowedCidrs",
+            "tokenFile",
+            "caFile",
+            "fleetMasterFile",
+        ):
+            if key in stable:
+                cluster[key] = deepcopy(stable[key])
+    return recovered
 
 
 def existing_gpu_context(
@@ -156,7 +263,10 @@ def discover_bootstrap_scope(
     discover: Callable[..., ClusterIdentity],
     alias: Callable[[str, str, int], str],
 ) -> tuple[dict[str, Any] | None, ClusterIdentity, list[ClusterIdentity]]:
-    existing = load_existing_site(request.state_dir)
+    existing = recover_verified_site_contract(
+        request.state_dir,
+        load_existing_site(request.state_dir),
+    )
     cpu = discover(
         runner,
         cluster_arn=request.cpu_cluster_arn,

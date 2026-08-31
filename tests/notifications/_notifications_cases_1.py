@@ -9,7 +9,15 @@ import httpx
 import pytest
 
 from gpu_fault.app import ApplicationContext, create_app
-from gpu_fault.models import AdvisoryNotification, NotificationStatus
+from gpu_fault.models import (
+    AdvisoryNotification,
+    IncidentState,
+    NotificationStatus,
+    WorkflowOperation,
+    WorkflowRequest,
+    WorkflowStatus,
+    WorkflowStepSpec,
+)
 from gpu_fault.notification_service import AdvisoryNotificationService
 from gpu_fault.notifications import (
     FABRIC_RESET_EMAIL_TEMPLATE,
@@ -41,6 +49,7 @@ from gpu_fault.notifications import (
     WarmSpareReplacementEmailBuilder,
     XidInvestigatoryEmailBuilder,
 )
+from gpu_fault.regional import RemoteActionCommand, RemoteCommandStatus
 from gpu_fault.store import InMemoryStore, SqliteStore
 from tests._builders import build_store, fault_incident
 from tests.notifications._support import (
@@ -102,6 +111,78 @@ def test_store_labels_performance_notification_without_incident() -> None:
         "performance notification subject was not labeled as a drill"
     )
     assert "演练通知 / DRILL - 非真实故障" in saved.body_text
+
+
+def test_remote_fabric_manager_completion_creates_one_drill_notification() -> None:
+    store = build_store()
+    notifier = RecordingNotifier()
+    service = AdvisoryNotificationService(store, notifier, async_delivery=False)
+    step = WorkflowStepSpec(
+        operation=WorkflowOperation.RESTART_FABRIC_MANAGER,
+        execution_owner="gpu-fault-node-agent",
+        node_ids=["node-a"],
+        gpu_uuids=["GPU-a"],
+    )
+    workflow = WorkflowRequest(
+        request_id="workflow-fm",
+        incident_id="incident-fm",
+        status=WorkflowStatus.SUCCEEDED,
+        official_action="RESTART_FM",
+        fencing_token=1,
+        official_steps=[step],
+    )
+    incident = fault_incident(
+        "incident-fm",
+        "event-fm",
+        state=IncidentState.RECOVERED,
+        workflow_request_id=workflow.request_id,
+        official_action="RESTART_FM",
+        reasons=["solo XID 45"],
+        fencing_token=1,
+        drill_id="destr010-test",
+    )
+    store.save_incident(incident)
+    store.save_workflow(workflow)
+    command = RemoteActionCommand(
+        command_id="remote-fm",
+        cluster_id=incident.cluster_id,
+        workflow_request_id=workflow.request_id,
+        incident_id=incident.incident_id,
+        step_index=0,
+        fencing_token=1,
+        idempotency_key="workflow-fm/0/RESTART_FABRIC_MANAGER",
+        step=step,
+        workflow=workflow,
+        incident=incident,
+        status=RemoteCommandStatus.SUCCEEDED,
+        result_details={
+            "node_results": {
+                "node-a": {
+                    "active": True,
+                    "previous_main_pid": "101",
+                    "current_main_pid": "202",
+                    "service": "nvidia-fabricmanager",
+                }
+            }
+        },
+    )
+
+    first = service.dispatch_remote_completion(command)
+    second = service.dispatch_remote_completion(command)
+
+    notifications = store.list_notifications()
+    assert len(notifications) == 1
+    assert notifications[0].drill_id == "destr010-test"
+    assert "Fabric Manager" in notifications[0].subject
+    assert notifications[0].category == "ACTION_COMPLETED"
+    result = store.get_notification_result(notifications[0].notification_id)
+    assert result is not None
+    assert result.status is NotificationStatus.SKIPPED
+    assert notifier.notifications == []
+    assert [item.status for item in first + second] == [
+        NotificationStatus.SKIPPED,
+        NotificationStatus.SKIPPED,
+    ]
 
 
 def test_warm_spare_replacement_email_lists_rebinding() -> None:
@@ -495,6 +576,7 @@ def test_fabric_manager_restart_email_is_a_field_only_template() -> None:
     assert "重启后 MainPID：202" in notification.body_text
     assert "服务状态：active" in notification.body_text
     assert RESTART_FABRIC_MANAGER_TEMPLATE_VERSION in notification.body_text
+    assert notification.category == "ACTION_COMPLETED"
     assert "建议" not in notification.body_text
     assert "prompt" not in RESTART_FABRIC_MANAGER_EMAIL_TEMPLATE.lower()
 

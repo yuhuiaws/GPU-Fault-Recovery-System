@@ -179,6 +179,41 @@ def test_stability_window_accepts_steady_samples(tmp_path: Path, monkeypatch) ->
     assert report["sample_count"] == 2
 
 
+def test_stability_snapshot_normalizes_decimal_store_stats(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
+    calls = []
+    responses = iter(
+        (
+            "api-pod",
+            json.dumps(
+                {
+                    "queue": {"depth": 0, "oldest_age_seconds": 0.5},
+                    "remote_commands": {"by_status": {}},
+                }
+            ),
+        )
+    )
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return next(responses)
+
+    monkeypatch.setattr(release.runner, "run", run)
+    monkeypatch.setattr(release, "_get_json", lambda _command: {"items": []})
+    monkeypatch.setattr(
+        release, "_critical_amp_alerts", lambda: {"count": 0, "alerts": []}
+    )
+
+    snapshot = VALIDATION_MODULE.stability_snapshot(release)
+    script = calls[1][calls[1].index("-c") + 1]
+
+    assert "default=float" in script
+    assert snapshot["queue"]["oldest_age_seconds"] == 0.5
+
+
 def test_stability_window_rejects_new_restarts(tmp_path: Path, monkeypatch) -> None:
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))

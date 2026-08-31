@@ -136,6 +136,11 @@ release-ref由内部根据Git commit或dirty快照计算，不是公共参数。
 
 任何签名、commit、平台、摘要、集群身份或资源状态不确定时均fail closed。
 
+统一源码部署安装的受信 deploy-host venv 会以`0600`文件绑定其所属
+`state-dir`。此后该安装中的`gpu-fault-admin`若收到其他`--state-dir`，会在源码扫描、
+AWS查询或Kubernetes访问之前直接拒绝。需要管理另一站点时必须使用由该站点自身部署
+流程安装的deploy-host，不能复用其他state目录的CLI。
+
 ## 9. 修改代码后的循环
 
 已知相关测试时，可先执行一个最小测试获得快速反馈：

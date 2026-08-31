@@ -231,14 +231,13 @@ def test_release_manifest_is_complete_and_no_sdist_exists() -> None:
         "node_runtime": manifest["components"]["node_runtime"]["wheel_sha256"],
         "node_bundle": manifest["bundle_sha256"],
     }
+    release_identity = {"artifacts": hashes, "delivery": delivery_sha256}
+    if manifest.get("staging_only", False):
+        release_identity["staging_only"] = True
     assert (
         manifest["release_id"]
         == hashlib.sha256(
-            json.dumps(
-                {"artifacts": hashes, "delivery": delivery_sha256},
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
+            json.dumps(release_identity, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()[:12]
     )
     assert all(

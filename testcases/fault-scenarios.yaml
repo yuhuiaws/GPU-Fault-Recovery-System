@@ -2734,6 +2734,7 @@ test_cases:
     verdict: BLOCKED
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-iso-006
+  related_pytest: tests/regional/test_collector_and_multicluster_fixtures.py::test_multi_cluster_runners_are_plan_only
 
 - id: GF-REGIONAL-CMD-001
   title: claim 的 max_commands 边界值
@@ -3057,6 +3058,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-003
+  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_ha003_waits_for_reset_claim_before_failover
 - id: GF-REGIONAL-HA-004
   title: 双 executor 副本对 WAITING command 重领时不产生重复物理动作
   category: regional-destructive-acceptance
@@ -3074,6 +3076,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-004
+  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_ha004_reclaim_timeline_keeps_one_command_id
 - id: GF-REGIONAL-HA-005
   title: 控制面滚动升级期间数据面只观察到可重试错误
   category: regional-high-availability
@@ -3171,8 +3174,11 @@ test_cases:
   - executor HTTP 超时小于 NLB idle timeout
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-004
+  command:
+  - python3
+  - scripts/e2e/regional/audit_net004_dependency_boundary.py
 - id: GF-REGIONAL-NET-005
   title: Collector有界outbox容量、dead-letter与实时事件优先
   category: regional-network-resilience
@@ -3344,6 +3350,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-001
+  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr001_requires_the_exact_reset_contract
 
 - id: GF-REGIONAL-DESTR-002
   title: 经 provider 的真实节点 reboot
@@ -3368,6 +3375,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-002
+  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr002_preflight_and_reboot_contract
 - id: GF-REGIONAL-DESTR-003
   title: warm spare 方式的节点替换只使用客户自备的热备 GPU 节点
   category: regional-destructive-acceptance
@@ -3391,6 +3399,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-003
+  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr003_requires_local_warm_spare_rebinding_and_notification
 
 - id: GF-REGIONAL-DESTR-004
   title: 【已作废】HyperPod 主动 replace 由 provider 销毁并重建实例
@@ -3414,51 +3423,70 @@ test_cases:
   title: warm spare step 被路由到 managed 或 provider adapter 时必须失败
   category: regional-destructive-acceptance
   level: staging
-  risk: non-destructive
+  risk: live-non-destructive
   problem: warm spare 语义若能被 provider 路径接管，客户的热备节点约束就被绕过。
-  injection: 构造带 replacement_strategy=HEALTHY_WARM_SPARE_ONLY 但 execution_owner 指向 managed recovery owner 的 REPLACE_NODE step 并 dispatch。
+  injection: >-
+    在已部署控制面 Pod 的隔离 Python 进程中构造带 replacement_strategy=HEALTHY_WARM_SPARE_ONLY、 execution_owner 指向 managed recovery owner 的 REPLACE_NODE step；不创建持久 workflow， 不修改 Profile、workload 或节点。
   expected:
-  - step FAILED 且 error 为 healthy warm-spare replacement cannot be delegated to managed/provider node recovery
+  - 执行前所有 GPU 节点均无 gpu-fault quarantine taint 与 ownership annotation，否则用例 FAIL/INCOMPLETE
+  - 已部署 ManagedRecoveryObserverAdapter 返回 FAILED，error 为 healthy warm-spare replacement cannot be delegated to managed/provider node recovery
   - CloudTrail 中无任何 provider 调用
-  - 集群状态未变
-  - 仅在隔离数据库中注册唯一临时profile版本；不得覆盖或改写任何已发布的内容寻址profile
-  - 临时profile把nodeReplace改成DELEGATE/hyperpod-managed-node-recovery时必须同步补observed条目，否则会降级成OBSERVE
-  - affected_workload_ids 必须是集群里真实存在的 workload，因为 STOP_WORKLOADS 排在 REPLACE_NODE 之前，填不存在的 Job 会让 workflow 在第 3 步以 K8s 404 终止，第 4 步的守卫永远不被 dispatch
-  - 每轮结束必须删除占位 Job，并在 health snapshot、DCGM PASS 后通过正式 VALIDATE_GPU/HOST/FABRIC/RESTORE_SCHEDULING 恢复节点，不得直接删 taint 或 ownership 注解
-  - 测试使用独立数据库，清理时删除整个测试数据库，不通过覆盖同一profile_version做回滚
+  - finally 中全体 GPU 节点的 UID、Ready、GPU allocatable、taints、unschedulable 与 ownership annotation 逐字段等于基线
+  - 用例不创建 workload、临时 Profile、持久 workflow 或 Kubernetes mutation
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-005
+  command:
+  - python3
+  - scripts/e2e/regional/audit_warm_spare_guardrails.py
+  - --case
+  - GF-REGIONAL-DESTR-005
 - id: GF-REGIONAL-DESTR-006
   title: warm spare 要求 HyperPod NodeRecovery=None
   category: regional-destructive-acceptance
   level: staging
-  risk: non-destructive
+  risk: live-non-destructive
   problem: NodeRecovery=Automatic 时 provider 会自己替换节点，与客户自备热备的语义冲突，必须 fail-closed。
-  injection: 对一个本来就是NodeRecovery=Automatic且不受管的测试/CPU HyperPod集群执行只读preflight；不得修改受管GPU集群的NodeRecovery。
+  injection: 对一个本来就是NodeRecovery=Automatic且不受管的测试/CPU HyperPod集群执行隔离进程只读preflight；不得修改任何集群的NodeRecovery。
   expected:
+  - 执行前所有 GPU 节点均无 gpu-fault quarantine taint 与 ownership annotation，否则用例 FAIL/INCOMPLETE
   - step FAILED 且 error 为 healthy warm-spare replacement requires HyperPod NodeRecovery=None; provider replacement is disabled
   - 没有热备节点被分配且 spare pool 状态未变
+  - finally 中全体 GPU 节点调度状态与 ownership 逐字段等于基线
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-006
+  command:
+  - python3
+  - scripts/e2e/regional/audit_warm_spare_guardrails.py
+  - --case
+  - GF-REGIONAL-DESTR-006
 - id: GF-REGIONAL-DESTR-007
   title: warm spare 要求 spare coordinator 与远端状态均已启用
   category: regional-destructive-acceptance
   level: staging
-  risk: non-destructive
+  risk: live-non-destructive
   problem: 依赖缺失时必须启动失败或 step 失败，绝不允许降级为 provider replace。
-  injection: 先让 executor 在 SPARE_FAILOVER=true 与 REMOTE_STATE=false 组合下启动，再在 SPARE_FAILOVER=false 时触发 warm spare 的 REPLACE_NODE。
+  injection: >-
+    在已部署 Executor Pod 的隔离 Python 进程中分别构造 SPARE_FAILOVER=true/REMOTE_STATE=false 启动输入和 coordinator 缺失的 warm-spare REPLACE_NODE step；不滚动生产 Deployment， 不创建 remote command，不修改节点或 workload。
   expected:
+  - 执行前所有 GPU 节点均无 gpu-fault quarantine taint 与 ownership annotation，否则用例 FAIL/INCOMPLETE
   - 组合冲突时 executor 启动失败且日志含 regional HyperPod spare failover requires GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true
   - coordinator 关闭时 step FAILED 且 error 含 healthy warm-spare replacement is required but the spare coordinator is disabled
   - 两种情况下 CloudTrail 均为空
+  - 生产 Executor 两副本的 SPARE_FAILOVER=true、REMOTE_STATE=true、ALLOW_HYPERPOD_REPLACE=false 全程未变化
+  - finally 中全体 GPU 节点调度状态与 ownership 逐字段等于基线
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-007
+  command:
+  - python3
+  - scripts/e2e/regional/audit_warm_spare_guardrails.py
+  - --case
+  - GF-REGIONAL-DESTR-007
   related_pytest: tests/hyperpod/test_cluster_executor.py::test_executor_spare_failover_requires_remote_state
 
 - id: GF-REGIONAL-DESTR-008
@@ -3478,6 +3506,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-008
+  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr008_notification_semantics_distinguish_no_pool_from_shortage
 
 - id: GF-REGIONAL-DESTR-009
   title: workload 停止与重启经 executor 本地执行
@@ -3500,6 +3529,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-009
+  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr009_workflow_contract_scales_to_expected_gpu_count
 - id: GF-REGIONAL-DESTR-010
   title: Fabric Manager 重启与 GPU 服务静默经 Node Agent
   category: regional-destructive-acceptance
@@ -3514,6 +3544,7 @@ test_cases:
   - journal 中 nvidia-fabricmanager.service 只被重启一次且终态 active
   - 不出现 MARK_UNSCHEDULABLE/QUIESCE_GPU_SERVICES/RESTORE_GPU_SERVICES，节点不被隔离且无新增 quiesce/fail-safe timer
   - 终态workflow重放返回缓存的 SUCCEEDED，Node Agent ledger、MainPID 与 Started 计数不再变化
+  - 同一incident恰有一条ACTION_COMPLETED Fabric Manager通知，重放不新增notification；drill可为SKIPPED，真实邮件启用时为SENT
   evidence:
     verdict: NOT_RUN
   automation: manual
@@ -3568,13 +3599,14 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-012
+  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr012_group_d_requires_prewrite_failure_details
 - id: GF-REGIONAL-DESTR-013
   title: 硬约束否证 NodeRecovery 恒为 None 且全程不存在 BatchReplaceClusterNodes
   category: regional-destructive-acceptance
   level: staging
   risk: non-destructive
   problem: >-
-    方案硬约束要求受管 GPU 集群 NodeRecovery 为 None 且任何情况下都不调用 BatchReplaceClusterNodes。本用例替代已作废的 GF-REGIONAL-DESTR-004，不验证 replace 能否正常工作，而验证该动作不存在且没有配置或权限能让它出现。必须最后执行，以覆盖“破坏性动作（非 warm spare）”与“Warm spare”的完整 CloudTrail 时间窗。
+    方案硬约束要求受管 GPU 集群 NodeRecovery 为 None 且任何情况下都不调用 BatchReplaceClusterNodes。本用例替代已作废的 GF-REGIONAL-DESTR-004，不验证 replace 能否正常工作，而验证该动作不存在且没有配置或权限能让它出现。必须最后执行，以覆盖“破坏性能力验收（含非破坏性 fail-closed 负向用例）”与“Warm spare”的完整 CloudTrail 时间窗。
   injection: 不注入故障。只读核对集群 NodeRecovery、executor 开关、IAM 权限、CloudTrail 与 manifest 五处。
   expected:
   - DescribeCluster 的 NodeRecovery 为 None
@@ -3587,6 +3619,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-013
+  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr013_manifest_audit_keeps_provider_replace_disabled
 
 - id: GF-REGIONAL-NOTIFY-001
   title: 关键动作各有一封 SENT 邮件且含非空 SES MessageId
@@ -3707,6 +3740,7 @@ test_cases:
     verdict: BLOCKED
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-e2e-002
+  related_pytest: tests/regional/test_collector_and_multicluster_fixtures.py::test_multi_cluster_runners_are_plan_only
 
 - id: GF-REGIONAL-BOOT-018
   title: 发布制品 Node bundle 与运行进程四面一致
@@ -3862,8 +3896,11 @@ test_cases:
   - release 失败时产生明确日志或 metric
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-008
+  command:
+  - python3
+  - scripts/e2e/regional/run_ha008_processor_exit_acceptance.py
   related_pytest: tests/processor/test_processor_leadership.py::test_processor_abandons_in_flight_request_lease
 - id: GF-REGIONAL-HA-009
   title: Aurora凭据轮换期间请求连续性与全角色重连
@@ -4642,6 +4679,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-001
+  related_pytest: tests/regional/test_collector_and_multicluster_fixtures.py::test_collector_case_registries_cover_the_requested_order
 - id: GF-REGIONAL-COLLECT-002
   title: edge filter异常沿必须在一个采集周期内投递
   category: regional-collector
@@ -4659,6 +4697,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-002
+  related_pytest: tests/regional/test_collector_and_multicluster_fixtures.py::test_collector_host_probe_has_narrow_action_allowlists
 - id: GF-REGIONAL-COLLECT-003
   title: EXPECTED_GPU_COUNT 与 EXPECTED_EFA_DEVICE_COUNT 真机核对
   category: regional-collector
@@ -4695,6 +4734,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-004
+  related_pytest: tests/collectors/test_gpu.py::test_host_collector_reports_persistent_gpu_and_efa_card_loss
 - id: GF-REGIONAL-COLLECT-005
   title: fabric-manager collector 的采集层与游标持久化
   category: regional-collector
@@ -4703,8 +4743,9 @@ test_cases:
   problem: >-
     kernel collector 的采集层已被真实 /dev/kmsg 驱动过， fabric-manager collector 至今只有 ingest 侧覆盖。
   injection: >-
-    向线上fabric manager日志追加一条唯一marker的未知、Non-fatal SXID 99999，确认只验证采集和游标而不生成恢复workflow，再重启采集器观察是否重放。
+    先验证缺失/损坏state时Collector只记录当前EOF且不重放历史行；再向线上fabric manager日志追加一条唯一marker的未知、Non-fatal SXID 99999，确认只验证采集和游标而不生成恢复workflow，并重启采集器观察是否重放。
   expected:
+  - 首次文件基线或state损坏恢复只写当前device、inode和EOF，历史SXID不投递
   - 控制面收到对应事件
   - 未生成节点变更workflow
   - 游标前进并持久化落盘
@@ -4773,6 +4814,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-008
+  related_pytest: tests/orchestration/test_xid.py::test_xid_48_solo_and_companion_compile_the_same_containment
 - id: GF-REGIONAL-COLLECT-009
   title: CHECK_MECHANICALS等待与人工确认闭环真机跑通
   category: regional-collector
@@ -4791,6 +4833,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-009
+  related_pytest: tests/execution/test_misc.py::test_mechanical_inspection_waits_for_incident_fenced_annotation
 - id: GF-REGIONAL-COLLECT-010
   title: UPDATE_SWFW 未配置固件目标版本时必须 fail-closed
   category: regional-collector
@@ -4809,6 +4852,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-010
+  related_pytest: tests/orchestration/test_misc.py::test_failed_firmware_remediation_escalates_directly_to_support
 - id: GF-REGIONAL-COLLECT-011
   title: SXID SCOPE_DEPENDENT_RESET 两个方向都 fail-closed
   category: regional-collector
@@ -4828,6 +4872,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-011
+  related_pytest: tests/orchestration/test_sxid_topology.py::test_conflicting_or_untrusted_topology_fails_closed
 - id: GF-REGIONAL-COLLECT-012
   title: XID RESTART_APP 从 API 重放换成真 kmsg 注入
   category: regional-collector
@@ -4846,6 +4891,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-012
+  related_pytest: tests/orchestration/test_misc.py::test_restart_app_requires_workload_identity
 - id: GF-REGIONAL-COLLECT-013
   title: XID RESET_GPU 真 kmsg 注入并真的执行单卡 reset
   category: regional-collector
@@ -4863,6 +4909,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-013
+  related_pytest: tests/node_agent/test_remediation.py::test_gpu_reset_is_idempotent_and_rechecks_clients
 - id: GF-REGIONAL-COLLECT-014
   title: SXID整机GPU与NVSwitch reset的双证据门与正向
   category: regional-collector
@@ -4881,6 +4928,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-014
+  related_pytest: tests/node_agent/test_remediation.py::test_full_fabric_reset_verifies_inventory_and_is_idempotent
 - id: GF-REGIONAL-COLLECT-016
   title: 真实分布式训练下的 RESTART_APP 与 RESET_GPU 执行段
   category: regional-collector
@@ -4899,6 +4947,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-016
+  related_pytest: tests/hyperpod/test_e2e_distributed_xid_reset.py::test_three_node_job_stops_before_two_fault_gpu_resets
 - id: GF-REGIONAL-COLLECT-017
   title: EFA 分层恢复与 Kubernetes accelerator allocatable
   category: regional-collector
@@ -4916,6 +4965,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-017
+  related_pytest: tests/collectors/test_host.py::test_efa_inventory_distinguishes_unbound_driver_from_missing_pci
 - id: GF-REGIONAL-COLLECT-015
   title: SXID ALWAYS_FATAL 经 provider 真机整机重启
   category: regional-collector
@@ -4936,3 +4986,4 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-015
+  related_pytest: tests/policy/test_policy.py::test_always_fatal_sxid_uses_host_restart_branch

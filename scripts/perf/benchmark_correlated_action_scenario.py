@@ -4,9 +4,11 @@ import json
 import os
 import ssl
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib import error, request
+from urllib.parse import urlencode
 
 
 OWNERS = [
@@ -36,6 +38,18 @@ class Client:
                 "Content-Type": "application/json",
             },
             method="POST",
+        )
+        with request.urlopen(value, context=self.context, timeout=30) as response:
+            return json.loads(response.read() or b"{}")
+
+    def get(self, path: str) -> dict:
+        value = request.Request(
+            self.base_url + path,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "X-GPU-Fault-Cluster-ID": self.cluster_id,
+            },
+            method="GET",
         )
         with request.urlopen(value, context=self.context, timeout=30) as response:
             return json.loads(response.read() or b"{}")
@@ -72,7 +86,7 @@ def observation_payload(
         "started_at": (observed_at - timedelta(minutes=1)).isoformat(),
         "expected_critical_ranks": 1,
         "workload_ids": [identity["workload_id"]],
-        "restart_budget": 0,
+        "restart_budget": 1,
         "runtime_profile_version": profile_version,
         "containers": [
             {
@@ -250,6 +264,281 @@ def post_attempt(
     )
 
 
+def post_aggregated_weak_event(
+    client: Client,
+    *,
+    cluster_id: str,
+    identity: dict[str, str],
+    run_id: str,
+    offset: int,
+    observed_at: datetime,
+    profile_version: str,
+) -> dict[str, object]:
+    weak_event_id = f"corr-live-{run_id}-c{offset:03d}-weak"
+    aggregate_event_id = f"corr-live-{run_id}-c{offset:03d}-aggregate"
+    weak = client.post(
+        "/v1/gpu-events/xid",
+        xid_payload(
+            xid=48,
+            event_id=weak_event_id,
+            cluster_id=cluster_id,
+            identity=identity,
+            observed_at=observed_at,
+            profile_version=profile_version,
+        ),
+    )
+    weak_workflow_id = str(weak.get("workflow_request_id") or "")
+    if not weak_workflow_id:
+        raise RuntimeError("weak event did not create a workflow")
+    aggregate = client.post(
+        "/v1/gpu-events/xid",
+        xid_payload(
+            xid=48,
+            event_id=aggregate_event_id,
+            cluster_id=cluster_id,
+            identity=identity,
+            observed_at=observed_at + timedelta(milliseconds=100),
+            profile_version=profile_version,
+        ),
+    )
+    shared_incident = bool(weak.get("incident_id")) and (
+        aggregate.get("incident_id") == weak.get("incident_id")
+    )
+    shared_workflow = aggregate.get("workflow_request_id") == weak_workflow_id
+    if not shared_incident or not shared_workflow:
+        raise RuntimeError(
+            "same-rank event did not aggregate into the weak incident/workflow"
+        )
+    return {
+        "weak_event_id": weak_event_id,
+        "aggregate_event_id": aggregate_event_id,
+        "weak_workflow_id": weak_workflow_id,
+        "aggregate_shared_incident": shared_incident,
+        "aggregate_shared_workflow": shared_workflow,
+    }
+
+
+def incident_ownership(client: Client, incident_id: str) -> dict:
+    return client.get(
+        "/v1/regional/executors/incident-ownership?"
+        + urlencode({"incident_id": incident_id})
+    )
+
+
+def ownership_succeeded(report: dict) -> bool:
+    return bool(report.get("terminal")) and report.get("workflow_status") == "SUCCEEDED"
+
+
+@dataclass
+class ScenarioState:
+    executor_id: str
+    strong_workflow_id: str = ""
+    primary_reboot_workflow_id: str = ""
+    primary_reboot_incident_id: str = ""
+    reset_workflow_id: str = ""
+    reset_reboot_workflow_id: str = ""
+    reset_reboot_incident_id: str = ""
+    strong_sent: bool = False
+    primary_reset_failed: bool = False
+    primary_reboot_succeeded: bool = False
+    reset_attempt_started: bool = False
+    reset_gpu_failed: bool = False
+    reset_reboot_succeeded: bool = False
+    primary_containment: set[str] = field(default_factory=set)
+    completed_ids: set[str] = field(default_factory=set)
+    duplicate_claims: int = 0
+    claim_errors: int = 0
+    result_errors: int = 0
+    ownership_errors: int = 0
+    idle_started: float | None = None
+    last_ownership_poll: float = 0.0
+    operations: dict[str, int] = field(default_factory=dict)
+
+
+def _poll_ownership(client: Client, state: ScenarioState) -> None:
+    if state.primary_reboot_incident_id and not state.primary_reboot_succeeded:
+        primary = incident_ownership(client, state.primary_reboot_incident_id)
+        if primary.get("terminal") and not ownership_succeeded(primary):
+            raise RuntimeError(
+                "primary reboot workflow reached a non-success terminal "
+                f"state: {primary.get('workflow_status')}"
+            )
+        state.primary_reboot_succeeded = ownership_succeeded(primary)
+    if state.reset_reboot_incident_id and not state.reset_reboot_succeeded:
+        reset_report = incident_ownership(client, state.reset_reboot_incident_id)
+        if reset_report.get("terminal") and not ownership_succeeded(reset_report):
+            raise RuntimeError(
+                "reset reboot workflow reached a non-success terminal "
+                f"state: {reset_report.get('workflow_status')}"
+            )
+        state.reset_reboot_succeeded = ownership_succeeded(reset_report)
+
+
+def _start_reset_attempt(
+    client: Client,
+    state: ScenarioState,
+    *,
+    cluster_id: str,
+    reset_identity: dict[str, str],
+    reset_event_id: str,
+    profile_version: str,
+) -> None:
+    reset_now = datetime.now(timezone.utc)
+    post_attempt(
+        client,
+        cluster_id=cluster_id,
+        identity=reset_identity,
+        observed_at=reset_now,
+        profile_version=profile_version,
+    )
+    reset = client.post(
+        "/v1/gpu-events/xid",
+        xid_payload(
+            xid=48,
+            event_id=reset_event_id,
+            cluster_id=cluster_id,
+            identity=reset_identity,
+            observed_at=reset_now,
+            profile_version=profile_version,
+        ),
+    )
+    state.reset_workflow_id = str(reset.get("workflow_request_id") or "")
+    if not state.reset_workflow_id:
+        raise RuntimeError("reset-only event did not create a workflow")
+    state.reset_attempt_started = True
+    state.idle_started = None
+
+
+def _handle_scenario_command(
+    client: Client,
+    command: dict,
+    state: ScenarioState,
+    *,
+    weak_workflow_id: str,
+    strong_event_id: str,
+    cluster_id: str,
+    primary_identity: dict[str, str],
+    observed_at: datetime,
+    profile_version: str,
+) -> None:
+    command_id = command["command_id"]
+    workflow = command["workflow"]
+    workflow_id = workflow["request_id"]
+    operation = command["step"]["operation"]
+    if command_id in state.completed_ids:
+        state.duplicate_claims += 1
+    fail_primary_reset = (
+        bool(state.strong_workflow_id)
+        and workflow_id == state.strong_workflow_id
+        and operation == "RESET_ALL_GPUS_NVSWITCHES"
+        and not state.primary_reset_failed
+    )
+    fail_reset_gpu = (
+        bool(state.reset_workflow_id)
+        and workflow_id == state.reset_workflow_id
+        and operation == "RESET_GPU"
+        and not state.reset_gpu_failed
+    )
+    try:
+        command_result(
+            client,
+            command,
+            failed=fail_primary_reset or fail_reset_gpu,
+            executor_id=state.executor_id,
+        )
+    except Exception:
+        state.result_errors += 1
+        time.sleep(0.1)
+        return
+    state.completed_ids.add(command_id)
+    state.operations[operation] = state.operations.get(operation, 0) + 1
+    state.primary_reset_failed = state.primary_reset_failed or fail_primary_reset
+    state.reset_gpu_failed = state.reset_gpu_failed or fail_reset_gpu
+    if workflow_id == weak_workflow_id and operation in {
+        "MARK_UNSCHEDULABLE",
+        "STOP_WORKLOADS",
+    }:
+        state.primary_containment.add(operation)
+    if (
+        workflow_id == weak_workflow_id
+        and not state.strong_sent
+        and state.primary_containment == {"MARK_UNSCHEDULABLE", "STOP_WORKLOADS"}
+    ):
+        strong = client.post(
+            "/v1/gpu-events/sxid",
+            sxid_payload(
+                event_id=strong_event_id,
+                cluster_id=cluster_id,
+                identity=primary_identity,
+                observed_at=observed_at + timedelta(seconds=1),
+                profile_version=profile_version,
+            ),
+        )
+        state.strong_workflow_id = str(strong.get("workflow_request_id") or "")
+        if not state.strong_workflow_id or state.strong_workflow_id == weak_workflow_id:
+            raise RuntimeError("strong event did not create a successor")
+        state.strong_sent = True
+    if operation != "RESTART_NODE":
+        return
+    predecessor = workflow.get("predecessor_workflow_id")
+    incident_id = str((command.get("incident") or {}).get("incident_id") or "")
+    if predecessor == state.strong_workflow_id or workflow_id == (
+        f"workflow-reboot-after-{state.strong_workflow_id}"
+    ):
+        state.primary_reboot_workflow_id = workflow_id
+        state.primary_reboot_incident_id = incident_id
+    if predecessor == state.reset_workflow_id or workflow_id == (
+        f"workflow-reboot-after-{state.reset_workflow_id}"
+    ):
+        state.reset_reboot_workflow_id = workflow_id
+        state.reset_reboot_incident_id = incident_id
+
+
+def _scenario_output(
+    state: ScenarioState,
+    *,
+    cluster_id: str,
+    weak_event_id: str,
+    aggregate_event_id: str,
+    strong_event_id: str,
+    reset_event_id: str,
+    weak_workflow_id: str,
+    aggregate_shared_incident: bool,
+    aggregate_shared_workflow: bool,
+) -> dict:
+    return {
+        "cluster_id": cluster_id,
+        "weak_event_id": weak_event_id,
+        "aggregate_event_id": aggregate_event_id,
+        "strong_event_id": strong_event_id,
+        "reset_event_id": reset_event_id,
+        "weak_workflow_id": weak_workflow_id,
+        "aggregate_shared_incident": aggregate_shared_incident,
+        "aggregate_shared_workflow": aggregate_shared_workflow,
+        "strong_workflow_id": state.strong_workflow_id,
+        "primary_reboot_workflow_id": state.primary_reboot_workflow_id,
+        "primary_reboot_incident_id": state.primary_reboot_incident_id,
+        "primary_reboot_succeeded": state.primary_reboot_succeeded,
+        "reset_workflow_id": state.reset_workflow_id,
+        "reset_reboot_workflow_id": state.reset_reboot_workflow_id,
+        "reset_reboot_incident_id": state.reset_reboot_incident_id,
+        "reset_reboot_succeeded": state.reset_reboot_succeeded,
+        "strong_sent": state.strong_sent,
+        "primary_reset_failed": state.primary_reset_failed,
+        "reset_attempt_started": state.reset_attempt_started,
+        "reset_gpu_failed": state.reset_gpu_failed,
+        "completed_commands": len(state.completed_ids),
+        "duplicate_claims": state.duplicate_claims,
+        "claim_errors": state.claim_errors,
+        "result_errors": state.result_errors,
+        "ownership_errors": state.ownership_errors,
+        "operations": state.operations,
+        "idle_terminal": (
+            state.primary_reboot_succeeded and state.reset_reboot_succeeded
+        ),
+    }
+
+
 def run_scenario(
     client: Client,
     *,
@@ -268,199 +557,102 @@ def run_scenario(
         observed_at=now,
         profile_version=profile_version,
     )
-    weak_event_id = f"corr-live-{run_id}-c{offset:03d}-weak"
+    aggregated = post_aggregated_weak_event(
+        client,
+        cluster_id=cluster_id,
+        identity=primary_identity,
+        run_id=run_id,
+        offset=offset,
+        observed_at=now,
+        profile_version=profile_version,
+    )
+    weak_event_id = str(aggregated["weak_event_id"])
+    aggregate_event_id = str(aggregated["aggregate_event_id"])
+    weak_workflow_id = str(aggregated["weak_workflow_id"])
+    aggregate_shared_incident = bool(aggregated["aggregate_shared_incident"])
+    aggregate_shared_workflow = bool(aggregated["aggregate_shared_workflow"])
     strong_event_id = f"corr-live-{run_id}-c{offset:03d}-strong"
     reset_event_id = f"corr-live-{run_id}-c{offset:03d}-reset"
-    weak = client.post(
-        "/v1/gpu-events/xid",
-        xid_payload(
-            xid=48,
-            event_id=weak_event_id,
-            cluster_id=cluster_id,
-            identity=primary_identity,
-            observed_at=now,
-            profile_version=profile_version,
-        ),
-    )
-    weak_workflow_id = str(weak.get("workflow_request_id") or "")
-    if not weak_workflow_id:
-        raise RuntimeError("weak event did not create a workflow")
 
-    executor_id = f"correlated-action-{offset:03d}"
-    strong_workflow_id = ""
-    primary_reboot_workflow_id = ""
-    reset_workflow_id = ""
-    reset_reboot_workflow_id = ""
-    strong_sent = False
-    primary_reset_failed = False
-    reset_attempt_started = False
-    reset_gpu_failed = False
-    primary_containment: set[str] = set()
-    completed_ids: set[str] = set()
-    duplicate_claims = 0
-    claim_errors = 0
-    result_errors = 0
-    idle_started: float | None = None
+    state = ScenarioState(executor_id=f"correlated-action-{offset:03d}")
     deadline = time.monotonic() + float(os.getenv("SCENARIO_MAX_SECONDS", "600"))
-    operations: dict[str, int] = {}
 
     while time.monotonic() < deadline:
         try:
             claim = client.post(
                 "/v1/regional/executors/claim",
-                claim_payload(executor_id),
+                claim_payload(state.executor_id),
             )
         except (error.HTTPError, error.URLError, OSError):
-            claim_errors += 1
+            state.claim_errors += 1
             time.sleep(0.1)
             continue
         commands = claim.get("commands") or []
         if not commands:
-            if idle_started is None:
-                idle_started = time.monotonic()
-            if (
-                reset_gpu_failed
-                and reset_reboot_workflow_id
-                and time.monotonic() - idle_started >= 20
-            ):
-                break
-            if (
-                primary_reboot_workflow_id
-                and not reset_attempt_started
-                and time.monotonic() - idle_started >= 2
-            ):
-                reset_now = datetime.now(timezone.utc)
-                post_attempt(
+            if state.idle_started is None:
+                state.idle_started = time.monotonic()
+            now_monotonic = time.monotonic()
+            if now_monotonic - state.last_ownership_poll >= 1:
+                try:
+                    _poll_ownership(client, state)
+                except (error.HTTPError, error.URLError, OSError):
+                    state.ownership_errors += 1
+                state.last_ownership_poll = now_monotonic
+            if state.primary_reboot_succeeded and not state.reset_attempt_started:
+                _start_reset_attempt(
                     client,
                     cluster_id=cluster_id,
-                    identity=reset_identity,
-                    observed_at=reset_now,
+                    state=state,
+                    reset_identity=reset_identity,
+                    reset_event_id=reset_event_id,
                     profile_version=profile_version,
                 )
-                reset = client.post(
-                    "/v1/gpu-events/xid",
-                    xid_payload(
-                        xid=48,
-                        event_id=reset_event_id,
-                        cluster_id=cluster_id,
-                        identity=reset_identity,
-                        observed_at=reset_now,
-                        profile_version=profile_version,
-                    ),
-                )
-                reset_workflow_id = str(reset.get("workflow_request_id") or "")
-                if not reset_workflow_id:
-                    raise RuntimeError("reset-only event did not create a workflow")
-                reset_attempt_started = True
-                idle_started = None
+            if state.reset_reboot_succeeded:
+                break
             time.sleep(0.1)
             continue
-        idle_started = None
-        command = commands[0]
-        command_id = command["command_id"]
-        workflow = command["workflow"]
-        workflow_id = workflow["request_id"]
-        operation = command["step"]["operation"]
-        if command_id in completed_ids:
-            duplicate_claims += 1
-        try:
-            fail_primary_reset = (
-                bool(strong_workflow_id)
-                and workflow_id == strong_workflow_id
-                and operation == "RESET_ALL_GPUS_NVSWITCHES"
-                and not primary_reset_failed
-            )
-            fail_reset_gpu = (
-                bool(reset_workflow_id)
-                and workflow_id == reset_workflow_id
-                and operation == "RESET_GPU"
-                and not reset_gpu_failed
-            )
-            command_result(
-                client,
-                command,
-                failed=fail_primary_reset or fail_reset_gpu,
-                executor_id=executor_id,
-            )
-        except Exception:
-            result_errors += 1
-            time.sleep(0.1)
-            continue
-        completed_ids.add(command_id)
-        operations[operation] = operations.get(operation, 0) + 1
-        if fail_primary_reset:
-            primary_reset_failed = True
-        if fail_reset_gpu:
-            reset_gpu_failed = True
-        if workflow_id == weak_workflow_id and operation in {
-            "MARK_UNSCHEDULABLE",
-            "STOP_WORKLOADS",
-        }:
-            primary_containment.add(operation)
-        if (
-            workflow_id == weak_workflow_id
-            and not strong_sent
-            and primary_containment == {"MARK_UNSCHEDULABLE", "STOP_WORKLOADS"}
-        ):
-            strong = client.post(
-                "/v1/gpu-events/sxid",
-                sxid_payload(
-                    event_id=strong_event_id,
-                    cluster_id=cluster_id,
-                    identity=primary_identity,
-                    observed_at=now + timedelta(seconds=1),
-                    profile_version=profile_version,
-                ),
-            )
-            strong_workflow_id = str(strong.get("workflow_request_id") or "")
-            if not strong_workflow_id or strong_workflow_id == weak_workflow_id:
-                raise RuntimeError("strong event did not create a successor")
-            strong_sent = True
-        if operation == "RESTART_NODE":
-            predecessor = workflow.get("predecessor_workflow_id")
-            if predecessor == strong_workflow_id or workflow_id == (
-                f"workflow-reboot-after-{strong_workflow_id}"
-            ):
-                primary_reboot_workflow_id = workflow_id
-            if predecessor == reset_workflow_id or workflow_id == (
-                f"workflow-reboot-after-{reset_workflow_id}"
-            ):
-                reset_reboot_workflow_id = workflow_id
+        state.idle_started = None
+        _handle_scenario_command(
+            client,
+            commands[0],
+            state,
+            weak_workflow_id=weak_workflow_id,
+            strong_event_id=strong_event_id,
+            cluster_id=cluster_id,
+            primary_identity=primary_identity,
+            observed_at=now,
+            profile_version=profile_version,
+        )
 
-    return {
-        "cluster_id": cluster_id,
-        "weak_event_id": weak_event_id,
-        "strong_event_id": strong_event_id,
-        "reset_event_id": reset_event_id,
-        "weak_workflow_id": weak_workflow_id,
-        "strong_workflow_id": strong_workflow_id,
-        "primary_reboot_workflow_id": primary_reboot_workflow_id,
-        "reset_workflow_id": reset_workflow_id,
-        "reset_reboot_workflow_id": reset_reboot_workflow_id,
-        "strong_sent": strong_sent,
-        "primary_reset_failed": primary_reset_failed,
-        "reset_attempt_started": reset_attempt_started,
-        "reset_gpu_failed": reset_gpu_failed,
-        "completed_commands": len(completed_ids),
-        "duplicate_claims": duplicate_claims,
-        "claim_errors": claim_errors,
-        "result_errors": result_errors,
-        "operations": operations,
-        "idle_terminal": idle_started is not None,
-    }
+    return _scenario_output(
+        state,
+        cluster_id=cluster_id,
+        weak_event_id=weak_event_id,
+        aggregate_event_id=aggregate_event_id,
+        strong_event_id=strong_event_id,
+        reset_event_id=reset_event_id,
+        weak_workflow_id=weak_workflow_id,
+        aggregate_shared_incident=aggregate_shared_incident,
+        aggregate_shared_workflow=aggregate_shared_workflow,
+    )
 
 
 def scenario_succeeded(output: dict) -> bool:
     return bool(
-        output["strong_sent"]
+        output["aggregate_shared_incident"]
+        and output["aggregate_shared_workflow"]
+        and output["strong_sent"]
         and output["primary_reset_failed"]
         and output["primary_reboot_workflow_id"]
+        and output["primary_reboot_succeeded"]
         and output["reset_attempt_started"]
         and output["reset_gpu_failed"]
         and output["reset_reboot_workflow_id"]
+        and output["reset_reboot_succeeded"]
         and not output["duplicate_claims"]
         and not output["claim_errors"]
         and not output["result_errors"]
+        and not output["ownership_errors"]
         and output["idle_terminal"]
     )
 

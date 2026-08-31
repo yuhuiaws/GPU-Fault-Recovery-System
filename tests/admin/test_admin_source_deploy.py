@@ -93,3 +93,4 @@ def test_source_deploy_hides_release_and_artifact_paths(
     assert "--prebuilt-attestation" not in command
     assert "--profile-approval" not in command
     assert options["cwd"] == source
+    assert options["env"]["PYTHONPATH"] == str(source / "src")

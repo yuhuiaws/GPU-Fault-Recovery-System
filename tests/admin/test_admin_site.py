@@ -15,6 +15,7 @@ from gpu_fault.admin_bootstrap_common import BootstrapResult
 from gpu_fault.admin_site import (
     RegionalSite,
     SiteConfigError,
+    effective_environment,
     load_site,
     materialized_release_config,
 )
@@ -130,6 +131,18 @@ def site_file(tmp_path: Path) -> Path:
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     path.chmod(0o600)
     return path
+
+
+def test_effective_environment_pins_repository_pythonpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYTHONPATH", "/stale/source")
+    site = load_site(site_file(tmp_path))
+
+    environment = effective_environment(site)
+
+    assert environment["PYTHONPATH"] == str(site.repository_root / "src")
+    assert environment["GPU_FAULT_REPO_ROOT"] == str(site.repository_root)
 
 
 def test_site_yaml_renders_the_existing_release_contract(tmp_path: Path) -> None:
@@ -367,6 +380,69 @@ def test_console_script_is_published() -> None:
     )
 
 
+def test_deploy_host_binding_rejects_another_state_before_dispatch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    canonical = tmp_path / "canonical"
+    wrong = tmp_path / "wrong"
+    monkeypatch.setattr(
+        admin_cli, "_bound_deploy_host_state_dir", lambda: canonical.resolve()
+    )
+    arguments = argparse.Namespace(
+        command="status",
+        state_dir=wrong,
+        file=None,
+        repo_root=None,
+        show_effective_config=False,
+    )
+
+    with pytest.raises(SiteConfigError, match="installed deploy-host is bound"):
+        admin_cli.enforce_deploy_host_state_dir(arguments)
+
+
+def test_deploy_host_binding_allows_canonical_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    canonical = tmp_path / "canonical"
+    monkeypatch.setattr(
+        admin_cli, "_bound_deploy_host_state_dir", lambda: canonical.resolve()
+    )
+    arguments = argparse.Namespace(
+        command="status",
+        state_dir=canonical,
+        file=None,
+        repo_root=None,
+        show_effective_config=False,
+    )
+
+    admin_cli.enforce_deploy_host_state_dir(arguments)
+
+
+def test_admin_main_enforces_binding_before_dispatch(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    class Parser:
+        @staticmethod
+        def parse_args():
+            return arguments
+
+    canonical = tmp_path / "canonical"
+    wrong = tmp_path / "wrong"
+    arguments = argparse.Namespace(command="status", state_dir=wrong, file=None)
+    monkeypatch.setattr(admin_cli, "parser", Parser)
+    monkeypatch.setattr(
+        admin_cli, "_bound_deploy_host_state_dir", lambda: canonical.resolve()
+    )
+    monkeypatch.setattr(
+        admin_cli,
+        "run",
+        lambda _arguments: pytest.fail("dispatch ran before state binding"),
+    )
+
+    assert admin_cli.main() == 2
+    assert "installed deploy-host is bound" in capsys.readouterr().err
+
+
 def test_legacy_uninstall_accepts_cluster_arns_without_site_file() -> None:
     arguments = admin_cli.parser().parse_args(
         [
@@ -418,7 +494,7 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
     tmp_path: Path, monkeypatch
 ) -> None:
     path = site_file(tmp_path)
-    calls: list[list[str]] = []
+    calls: list[tuple[list[str], dict]] = []
     requests = []
     monkeypatch.setattr(
         admin_cli,
@@ -432,8 +508,7 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
     )
 
     def fake_run(arguments, **kwargs):
-        del kwargs
-        calls.append([str(item) for item in arguments])
+        calls.append(([str(item) for item in arguments], kwargs))
         return subprocess.CompletedProcess(arguments, 0)
 
     monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
@@ -464,14 +539,16 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
 
     assert admin_cli.run(arguments) == 0
     assert len(calls) == 1
-    assert calls[0][1].endswith("scripts/release_deploy.py"), (
+    command, options = calls[0]
+    assert command[1].endswith("scripts/release_deploy.py"), (
         "ARN deploy did not delegate to the signed release state machine"
     )
-    assert "--prebuilt-attestation" in calls[0]
-    assert "--prebuilt-bundle" in calls[0]
-    assert "--cosign-key" in calls[0]
-    assert "--profile-approval" not in calls[0]
-    assert "--allow-staging-release" in calls[0]
+    assert "--prebuilt-attestation" in command
+    assert "--prebuilt-bundle" in command
+    assert "--cosign-key" in command
+    assert "--profile-approval" not in command
+    assert "--allow-staging-release" in command
+    assert options["env"]["PYTHONPATH"] == str((tmp_path / "repo") / "src")
     assert requests[0].gpu_cluster_arns == (
         "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a",
         "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-b",

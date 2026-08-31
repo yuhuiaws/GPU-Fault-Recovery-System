@@ -29,6 +29,7 @@ def _registration(cluster_id: str) -> RegionalClusterRegistration:
 
 def test_synthetic_registration_expires_and_stops_authenticating() -> None:
     token = "t" * 32
+    now = datetime.now(timezone.utc)
     registration = RegionalClusterRegistration(
         cluster_id="perf-cap-000",
         region="us-west-2",
@@ -37,12 +38,12 @@ def test_synthetic_registration_expires_and_stops_authenticating() -> None:
         token_sha256=hashlib.sha256(token.encode()).hexdigest(),
         synthetic=True,
         synthetic_run_id="run-a",
-        synthetic_expires_at=NOW + timedelta(days=1),
+        synthetic_expires_at=now + timedelta(days=1),
         agent_endpoint_allowed_cidrs=["127.0.0.1/32"],
     )
 
-    assert registration.is_active(NOW), "synthetic registration was inactive before TTL"
-    assert not registration.is_active(NOW + timedelta(days=2)), (
+    assert registration.is_active(now), "synthetic registration was inactive before TTL"
+    assert not registration.is_active(now + timedelta(days=2)), (
         "synthetic registration remained active after TTL"
     )
     assert registration.authenticates(token), (

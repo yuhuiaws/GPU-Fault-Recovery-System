@@ -1,0 +1,50 @@
+# SOURCE MANIFEST: run gpu-training-submit or gpu-fault-workload-annotate first.
+# Direct kubectl apply starts training but does not enroll it in fault management.
+# DESTR-012 D-group fixture: one managed Job with one GPU.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-fault-xid11-auto-resume-guard
+  namespace: gpu-fault-system
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-xid11-auto-resume-guard
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: pytorch
+          image: public.ecr.aws/deep-learning-containers/pytorch-training@sha256:ff2c928a2e7b3b290b7c3e353085a373b3cfc7f6b165e338b9be4df439feae38
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              exec python3 - <<'PY'
+              import time
+
+              import torch
+
+              device = torch.device("cuda", 0)
+              step = 0
+              while step < 3600:
+                  value = torch.tensor([1.0], device=device)
+                  assert value.item() == 1.0
+                  print(
+                      f"HEARTBEAT step={step} all_reduce={value.item()}",
+                      flush=True,
+                  )
+                  step += 1
+                  time.sleep(2)
+              PY
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: "1"

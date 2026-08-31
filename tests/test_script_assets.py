@@ -48,8 +48,8 @@ YAML_QUALITY_ROOTS = {
 # 的 tests 拿掉，旧断言不动声色地通过。
 GATES = {
     "ruff format --check": {
-        "Makefile": [PYTHON_QUALITY_ROOTS - {"tests"}, {"tests"}],
-        "ci.yml": [PYTHON_QUALITY_ROOTS - {"tests"}, {"tests"}],
+        "Makefile": [PYTHON_QUALITY_ROOTS],
+        "ci.yml": [PYTHON_QUALITY_ROOTS],
     },
     "ruff check": {
         "Makefile": [PYTHON_QUALITY_ROOTS, {"tests"}, {"tests"}],

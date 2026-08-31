@@ -38,10 +38,7 @@ jobs:
           python -m pip install
           '.[dev,collectors,postgres,performance]'
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: python -m ruff format --check src deploy scripts tools
-      - run: >-
-          python -m ruff format --check \
-            --config 'format.skip-magic-trailing-comma=true' tests
+      - run: python -m ruff format --check src tests deploy scripts tools
       - run: >-
           python -m ruff check src tests deploy scripts tools
       - run: python -m ruff check --select I tests
