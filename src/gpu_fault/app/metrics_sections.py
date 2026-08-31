@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 
 def metrics_label_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
@@ -145,7 +147,8 @@ def render_processor_metrics_2(
             f"gpu_fault_store_io_max_in_flight {store_io.max_in_flight}",
             "# HELP gpu_fault_store_io_rejections_total Store calls rejected because I/O capacity was exhausted.",
             "# TYPE gpu_fault_store_io_rejections_total counter",
-            f"gpu_fault_store_io_rejections_total {store_io.rejected_total}",
+            "gpu_fault_store_io_rejections_total"
+            f'{{process_id="{os.getpid()}"}} {store_io.rejected_total}',
             "# HELP gpu_fault_store_io_admission_wait_seconds Time waiting for a Store I/O admission slot.",
             "# TYPE gpu_fault_store_io_admission_wait_seconds summary",
             f"gpu_fault_store_io_admission_wait_seconds_sum {store_io.admission_wait_sum_seconds:.6f}",

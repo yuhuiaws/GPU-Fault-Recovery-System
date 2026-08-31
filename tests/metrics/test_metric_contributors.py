@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from gpu_fault.app import ApplicationContext
+from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.app.builtin_metric_contributors import (
     closed_loop_metric_lines,
     orchestration_metric_lines,
@@ -23,6 +24,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from tests._builders import (
+    asgi_client,
     build_store,
     fault_incident,
     workflow_request,
@@ -55,6 +57,25 @@ def test_collector_metrics_use_background_snapshot_only() -> None:
     snapshot = SimpleNamespace(lines=lambda: ["snapshot 1"])
     runtime = SimpleNamespace(collector_metrics_snapshot=snapshot)
     assert collector_silence_lines(runtime) == ["snapshot 1"]
+
+
+def test_process_local_store_rejection_counter_has_process_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("gpu_fault.app.metrics_sections.os.getpid", lambda: 4321)
+    app = create_app(ApplicationContext(store=build_store()))
+
+    async def fetch() -> str:
+        async with asgi_client(app) as client:
+            response = await client.get("/metrics")
+            assert response.status_code == 200, response.text
+            return response.text
+
+    metrics = asyncio.run(fetch())
+
+    assert 'gpu_fault_store_io_rejections_total{process_id="4321"} 0' in metrics, (
+        metrics
+    )
 
 
 def test_ambiguous_attempt_metric_is_exported(monkeypatch) -> None:
