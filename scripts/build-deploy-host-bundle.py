@@ -172,6 +172,12 @@ def build_bundle(
             ROOT / "src/gpu_fault/data/deploy-host-tools.json",
             tool_manifest,
         )
+        admin_config_template = staging / "config/admin-config.example.yaml"
+        admin_config_template.parent.mkdir(parents=True)
+        shutil.copy2(
+            ROOT / "config/admin-config.example.yaml",
+            admin_config_template,
+        )
         project_wheel = _build_wheelhouse(
             python,
             staging / "wheelhouse",
@@ -197,6 +203,9 @@ def build_bundle(
                     "dirty": bool(status),
                 },
                 "tool_manifest": tool_manifest.relative_to(staging).as_posix(),
+                "admin_config_template": (
+                    admin_config_template.relative_to(staging).as_posix()
+                ),
             },
         )
         write_deterministic_archive(staging, output)

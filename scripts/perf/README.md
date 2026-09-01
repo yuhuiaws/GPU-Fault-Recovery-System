@@ -29,6 +29,9 @@ Executor, Watcher, Collector, or Node Runtime. In isolated mode, the action
 suites derive short-lived synthetic Agent and Executor identities from the CPU
 release state and its active required pins. Any pin mismatch fails closed.
 Live-registry mode retains the real Agent and Executor Deployment cross-checks.
+The Executor pin cross-check reads the real Deployment from
+`GPU_FAULT_PERF_IDENTITY_NAMESPACE` (default `gpu-fault-system`); load and
+simulator Jobs remain in `GPU_FAULT_PERF_DATAPLANE_NAMESPACE`.
 
 Mutating the production `gpu-fault-system` registry requires both
 `--allow-live-registry` and
@@ -71,6 +74,13 @@ suite's synthetic registry, token, TLS, cleanup and evidence guards.
 The formal integrated run is:
 
 ```bash
+export GPU_FAULT_CONTROL_KUBECONFIG=<cpu-control-plane-kubeconfig>
+export GPU_FAULT_DATAPLANE_CONTEXT=<approved-gpu-perf-context>
+export GPU_FAULT_PERF_AWS_REGION=<aws-region>
+export GPU_FAULT_PERF_CONTROL_NAMESPACE=gpu-fault-system
+export GPU_FAULT_PERF_DATAPLANE_NAMESPACE=gpu-fault-perf-system
+export GPU_FAULT_PERF_IDENTITY_NAMESPACE=gpu-fault-system
+
 scripts/perf/regional_integrated_workflow_capacity_suite.py \
   --clusters 32 \
   --spool-mode disabled \
@@ -92,6 +102,15 @@ budgets for the selected 32/50-cluster matrix.
 The formal matrix contains four runs: 32/50 clusters crossed with
 `--spool-mode disabled/enabled`. The runner verifies every live ingress Pod and
 the dedicated spool-worker replica count before registering synthetic clusters.
+Apply the matching `32-disabled`, `32-enabled`, `50-disabled`, or `50-enabled`
+AdminConfig preset through `gpu-fault-admin config` before each run. The current
+command totals are 30 per cluster: 960 for 32 clusters and 1500 for 50.
+
+The runner records the previous Aurora Min/Max in
+`aurora-preflight.json.initial_scaling` but does not restore it. After the final
+round, restore Aurora through the approved AWS/IaC path and reapply the pre-run
+AdminConfig. Do not continue after a failed verdict, cleanup residual, registry
+residual, nonterminal workflow/command, or critical alert.
 
 The supported CLI remains in `regional_capacity_suite.py`; its implementation
 is split by responsibility:

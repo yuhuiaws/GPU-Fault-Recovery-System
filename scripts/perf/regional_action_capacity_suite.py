@@ -10,7 +10,10 @@ from pathlib import Path
 from gpu_fault.models import WorkflowOperation
 
 if __package__:
-    from .regional_capacity_registry import validate_registry_target
+    from .regional_capacity_registry import (
+        dataplane_identity,
+        validate_registry_target,
+    )
     from .regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
         CONNECTION_SECRET,
@@ -30,7 +33,10 @@ if __package__:
         write_status,
     )
 else:
-    from regional_capacity_registry import validate_registry_target
+    from regional_capacity_registry import (
+        dataplane_identity,
+        validate_registry_target,
+    )
     from regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
         CONNECTION_SECRET,
@@ -389,7 +395,7 @@ def executor_identity(
     )
     if require_dataplane_deployment:
         deployment = json.loads(
-            dataplane(
+            dataplane_identity(
                 "get",
                 "deployment",
                 "gpu-fault-cluster-executor",

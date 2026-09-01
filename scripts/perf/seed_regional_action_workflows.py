@@ -6,7 +6,13 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.collector_requirements import required_collectors_for_agent
 from gpu_fault.fleet import AgentLifecycleState, AgentRecord
+from gpu_fault.gpu_metrics import (
+    GpuMetricBatch,
+    GpuMetricSample,
+    GpuMetricSource,
+)
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
@@ -15,6 +21,8 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepSpec,
 )
+from gpu_fault.telemetry import CollectorKind, CollectorStatus
+from gpu_fault.telemetry_models import TelemetryMetricLatest
 
 
 KUBERNETES_OWNER = "gpu-fault-kubernetes-adapter"
@@ -169,6 +177,117 @@ def integrated_node_id(run_id: str, cluster_index: int, workflow_index: int) -> 
     return f"integrated-node-{run_id}-c{cluster_index:03d}-w{workflow_index:02d}"
 
 
+def refresh_integrated_agent_heartbeats(
+    context: ApplicationContext,
+    *,
+    run_id: str,
+    clusters: int,
+    workflows_per_cluster: int,
+    now: datetime,
+    lease_seconds: int,
+) -> int:
+    refreshed = 0
+    for cluster_index in range(clusters):
+        cluster_id = f"perf-cap-{cluster_index:03d}"
+        agents = {item.node_id: item for item in context.store.list_agents(cluster_id)}
+        for workflow_index in range(workflows_per_cluster):
+            node_id = integrated_node_id(run_id, cluster_index, workflow_index)
+            record = agents.get(node_id)
+            if record is None:
+                raise RuntimeError(
+                    f"synthetic Agent heartbeat target is missing: {cluster_id}/{node_id}"
+                )
+            if record.lifecycle_state is not AgentLifecycleState.ACTIVE:
+                raise RuntimeError(
+                    f"synthetic Agent heartbeat target is not ACTIVE: "
+                    f"{cluster_id}/{node_id}"
+                )
+            context.store.save_agent(
+                record.model_copy(
+                    update={
+                        "last_seen_at": now,
+                        "lease_expires_at": now + timedelta(seconds=lease_seconds),
+                    }
+                )
+            )
+            gpu_uuid = f"GPU-integrated-{cluster_index:03d}-{workflow_index:02d}"
+            gpu_samples = [
+                GpuMetricSample(
+                    metric_name=name,
+                    canonical_name=name,
+                    value=value,
+                    gpu_index=str(workflow_index),
+                    gpu_uuid=gpu_uuid,
+                )
+                for name, value in (
+                    ("gpu_temperature_c", 30.0),
+                    ("nvlink_crc_aggregate_error_total", 0.0),
+                    ("nvlink_recovery_aggregate_error_total", 0.0),
+                    ("nvlink_replay_aggregate_error_total", 0.0),
+                )
+            ]
+            batch_id = (
+                f"integrated-validation-{run_id}-{cluster_index:03d}-"
+                f"{workflow_index:02d}-{int(now.timestamp() * 1_000_000)}"
+            )
+            context.gpu_metrics.ingest(
+                GpuMetricBatch(
+                    batch_id=batch_id,
+                    cluster_id=cluster_id,
+                    node_id=node_id,
+                    observed_at=now,
+                    collected_at=now,
+                    source=GpuMetricSource.DCGM_EXPORTER,
+                    samples=gpu_samples,
+                    runtime_profile_version=record.runtime_profile_version,
+                )
+            )
+            host_samples = [
+                TelemetryMetricLatest(
+                    cluster_id=cluster_id,
+                    node_id=node_id,
+                    observed_at=now,
+                    name=name,
+                    value=value,
+                )
+                for name, value in (
+                    ("network_link_up", 1.0),
+                    ("rdma_link_down", 0.0),
+                    ("rdma_errors_delta", 0.0),
+                )
+            ]
+            context.store.observe_telemetry_metrics(host_samples)
+            required_collectors = required_collectors_for_agent(record)
+            context.store.save_collector_statuses_batch(
+                [
+                    CollectorStatus(
+                        cluster_id=cluster_id,
+                        node_id=node_id,
+                        collector=collector,
+                        observed_at=now,
+                        ingested_at=now,
+                        last_success_at=now,
+                        batch_id=batch_id,
+                        sample_count=(
+                            len(gpu_samples)
+                            if collector is CollectorKind.GPU_METRICS
+                            else (
+                                len(host_samples)
+                                if collector is CollectorKind.HOST_TELEMETRY
+                                else 1
+                            )
+                        ),
+                    )
+                    for collector in sorted(
+                        required_collectors,
+                        key=lambda item: item.value,
+                    )
+                ]
+            )
+            refreshed += 1
+    return refreshed
+
+
 def workflow_steps(
     *,
     nodes: list[str],
@@ -259,6 +378,28 @@ def main() -> None:
     agents_created = 0
     now = datetime.now(timezone.utc)
     try:
+        if seed_mode == "integrated-heartbeats":
+            workflows_per_cluster = int(os.getenv("ACTION_WORKFLOWS_PER_CLUSTER", "4"))
+            lease_seconds = int(os.getenv("ACTION_AGENT_LEASE_SECONDS", "1800"))
+            refreshed = refresh_integrated_agent_heartbeats(
+                context,
+                run_id=run_id,
+                clusters=clusters,
+                workflows_per_cluster=workflows_per_cluster,
+                now=now,
+                lease_seconds=lease_seconds,
+            )
+            print(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "clusters": clusters,
+                        "agents_refreshed": refreshed,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
         agent_template, identity, identity_source = agent_source(context, now)
         if identity is not None:
             runtime_profile_version = str(identity["runtime_profile_version"])

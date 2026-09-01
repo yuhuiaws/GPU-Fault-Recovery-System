@@ -62,7 +62,7 @@ gpu-fault-admin deploy \
 
 首次建站需要覆盖容量默认值时，可以额外传入严格、权限`0600`的
 `--config <AdminConfig.yaml>`；不传仍是原四参数默认路径。已有站点的容量变化使用
-`gpu-fault-admin capacity plan/apply`，详见
+`gpu-fault-admin config --state-dir ... --reference ...`，详见
 [管理员容量配置](docs/管理员容量配置.md)，不得通过shell环境变量或`kubectl set env`
 替代。
 

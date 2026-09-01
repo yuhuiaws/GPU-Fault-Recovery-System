@@ -206,6 +206,16 @@ def main() -> None:
     cluster_id = registration["cluster_id"]
     expected = int(os.environ["EXPECTED_COMMANDS"])
     workers = int(os.getenv("ACTION_EXECUTOR_WORKERS", "8"))
+    min_concurrent_commands = int(
+        os.getenv(
+            "ACTION_MIN_CONCURRENT_COMMANDS",
+            str(min(workers, expected or 1)),
+        )
+    )
+    if min_concurrent_commands < 1 or min_concurrent_commands > workers:
+        raise ValueError(
+            "ACTION_MIN_CONCURRENT_COMMANDS must be within 1..ACTION_EXECUTOR_WORKERS"
+        )
     delay_scale = float(os.getenv("ACTION_DELAY_SCALE", "1"))
     lease_seconds = int(os.getenv("ACTION_LEASE_SECONDS", "120"))
     renewal_interval = float(
@@ -299,6 +309,7 @@ def main() -> None:
         "injected_renewal_failures": state.injected_renewal_failures,
         "long_commands": state.long_commands,
         "max_concurrent_commands": state.max_active_commands,
+        "min_concurrent_commands": min_concurrent_commands,
         "wall_seconds": wall,
         "command_p50_ms": statistics.median(latencies) * 1000 if latencies else 0.0,
         "command_p95_ms": percentile(latencies, 0.95) * 1000,
@@ -317,7 +328,7 @@ def main() -> None:
         or (expected <= 0 and not completed_ids)
         or duplicate_claims
         or result_errors
-        or state.max_active_commands < min(workers, expected or 1)
+        or state.max_active_commands < min_concurrent_commands
         or (state.long_commands and state.renewals == 0)
         or (
             inject_renew_failure

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from gpu_fault.app import ApplicationContext
 from gpu_fault.fleet import AgentRecord
 from gpu_fault.models import WorkflowOperation
 from scripts.perf import benchmark_regional_action_executor as benchmark
 from scripts.perf import regional_action_capacity_suite as suite
+from tests._builders import build_store
 from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -117,6 +120,60 @@ def test_action_capacity_seed_builds_release_bound_agent_identity() -> None:
     assert agent.lease_expires_at == NOW + timedelta(minutes=30)
 
 
+def test_integrated_agent_heartbeat_refresh_preserves_identity() -> None:
+    context = ApplicationContext(store=build_store())
+    node_id = MODULE.integrated_node_id("run-a", 0, 0)
+    agent = MODULE.release_bound_synthetic_agent(
+        release_agent_identity(),
+        cluster_id="perf-cap-000",
+        node_id=node_id,
+        run_id="run-a",
+        now=NOW,
+    )
+    context.store.save_agent(agent)
+    refreshed_at = NOW + timedelta(minutes=5)
+
+    count = MODULE.refresh_integrated_agent_heartbeats(
+        context,
+        run_id="run-a",
+        clusters=1,
+        workflows_per_cluster=1,
+        now=refreshed_at,
+        lease_seconds=600,
+    )
+    refreshed = context.store.list_agents("perf-cap-000")[0]
+
+    assert count == 1
+    assert refreshed.identity == agent.identity
+    assert refreshed.first_seen_at == agent.first_seen_at
+    assert refreshed.last_seen_at == refreshed_at
+    assert refreshed.lease_expires_at == refreshed_at + timedelta(seconds=600)
+    latest = context.gpu_metrics.latest("perf-cap-000", node_id)
+    assert {item.sample.canonical_name for item in latest} == {
+        "gpu_temperature_c",
+        "nvlink_crc_aggregate_error_total",
+        "nvlink_recovery_aggregate_error_total",
+        "nvlink_replay_aggregate_error_total",
+    }
+    host = context.store.list_telemetry_metrics_latest("perf-cap-000", node_id)
+    assert {item.name for item in host} == {
+        "network_link_up",
+        "rdma_link_down",
+        "rdma_errors_delta",
+    }
+    statuses = context.store.list_collector_statuses("perf-cap-000", node_id)
+    assert {item.collector.value for item in statuses} == {
+        "FABRIC_MANAGER_LOG",
+        "GPU_INVENTORY",
+        "GPU_METRICS",
+        "HOST_TELEMETRY",
+        "NVIDIA_KERNEL",
+    }
+    assert all(item.last_success_at == refreshed_at for item in statuses), (
+        "synthetic collector refresh left a stale success timestamp"
+    )
+
+
 def test_action_capacity_seed_rejects_unknown_release_identity_fields() -> None:
     identity = release_agent_identity()
     identity["unexpected"] = "value"
@@ -146,7 +203,7 @@ def test_isolated_executor_identity_does_not_read_live_deployment(monkeypatch) -
     monkeypatch.setattr(suite, "_control_environment", lambda _keys: environment)
     monkeypatch.setattr(
         suite,
-        "dataplane",
+        "dataplane_identity",
         lambda *_args, **_kwargs: pytest.fail(
             "isolated identity read a live Executor Deployment"
         ),
@@ -157,6 +214,56 @@ def test_isolated_executor_identity_does_not_read_live_deployment(monkeypatch) -
         "executor_artifact_sha256": "a" * 64,
         "executor_compatibility_digest": "b" * 64,
     }
+
+
+def test_live_executor_identity_reads_production_deployment(monkeypatch) -> None:
+    state = {
+        "executor_protocol_version": 2,
+        "executor_wheel_sha256": "a" * 64,
+        "component_digests": {"executor": "b" * 64},
+    }
+    environment = {
+        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION": "2",
+        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": "a" * 64,
+        "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST": "b" * 64,
+    }
+    calls = []
+    deployment = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "env": [
+                                {
+                                    "name": "GPU_FAULT_EXECUTOR_ARTIFACT_SHA256",
+                                    "value": "a" * 64,
+                                },
+                                {
+                                    "name": ("GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST"),
+                                    "value": "b" * 64,
+                                },
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(suite, "_release_state", lambda: state)
+    monkeypatch.setattr(suite, "_control_environment", lambda _keys: environment)
+    monkeypatch.setattr(
+        suite,
+        "dataplane_identity",
+        lambda *args, **_kwargs: calls.append(args) or json.dumps(deployment),
+    )
+
+    assert suite.executor_identity(require_dataplane_deployment=True) == {
+        "executor_protocol_version": 2,
+        "executor_artifact_sha256": "a" * 64,
+        "executor_compatibility_digest": "b" * 64,
+    }
+    assert calls == [("get", "deployment", "gpu-fault-cluster-executor", "-o", "json")]
 
 
 def test_release_agent_identity_fails_closed_on_control_pin_drift(monkeypatch) -> None:

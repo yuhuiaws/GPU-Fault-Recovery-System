@@ -21,12 +21,20 @@ DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 DEFAULT_DCGM_EXPORTER_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
 
 
+def _number_text(value: float) -> str:
+    return str(int(value)) if value.is_integer() else str(value)
+
+
 def admin_config_renderer_environment(
     admin_config: AdminConfig,
 ) -> dict[str, str]:
     capacity = admin_config.capacity
     remediation = capacity.remediation
     spool = capacity.telemetry_spool
+    processor = admin_config.processor
+    workflow = admin_config.workflow
+    notification = admin_config.notification_delivery
+    evidence = admin_config.evidence
     return {
         "GPU_FAULT_CONTROL_WORKER_REPLICAS": str(capacity.control_worker_replicas),
         "GPU_FAULT_TELEMETRY_SPOOL": str(spool.enabled).lower(),
@@ -44,6 +52,40 @@ def admin_config_renderer_environment(
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": str(
             remediation.max_active_per_resource_class
         ),
+        "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH": str(processor.max_queue_depth),
+        "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": str(
+            processor.max_cluster_queue_depth
+        ),
+        "GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH": str(
+            max(1, processor.max_queue_depth // 8)
+        ),
+        "GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH": str(
+            max(1, processor.max_cluster_queue_depth // 8)
+        ),
+        "GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD": str(
+            min(256, processor.max_queue_depth)
+        ),
+        "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS": str(processor.retry_after_seconds),
+        "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS": str(
+            processor.retry_backoff_seconds
+        ),
+        "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS": str(
+            processor.retry_backoff_max_seconds
+        ),
+        "GPU_FAULT_PROCESSOR_RETRYABLE_RESPONSE_MAX_AGE_SECONDS": str(
+            max(300, processor.retry_backoff_max_seconds)
+        ),
+        "GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS": str(
+            processor.completed_retention_seconds
+        ),
+        "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS": _number_text(
+            workflow.poll_interval_seconds
+        ),
+        "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS": str(workflow.dispatcher_workers),
+        "GPU_FAULT_NOTIFICATION_BATCH_SIZE": str(notification.batch_size),
+        "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS": str(notification.max_attempts),
+        "GPU_FAULT_EVIDENCE_RETENTION_HOURS": str(evidence.retention_hours),
+        "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE": str(evidence.max_records_per_node),
     }
 
 

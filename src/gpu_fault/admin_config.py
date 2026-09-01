@@ -7,12 +7,10 @@ import os
 import re
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Mapping
-
-import yaml  # type: ignore[import-untyped]
 
 
 ADMIN_CONFIG_API_VERSION = "gpu-fault.aws/v1alpha1"
@@ -146,33 +144,186 @@ class CapacityConfig:
 
 
 @dataclass(frozen=True)
+class ProcessorConfig:
+    max_queue_depth: int = 65536
+    max_cluster_queue_depth: int = 1024
+    retry_after_seconds: int = 2
+    retry_backoff_seconds: int = 1
+    retry_backoff_max_seconds: int = 30
+    completed_retention_seconds: int = 600
+
+    def validate(self) -> None:
+        bounds = {
+            "maxQueueDepth": (self.max_queue_depth, 1024, 1_000_000),
+            "maxClusterQueueDepth": (
+                self.max_cluster_queue_depth,
+                1,
+                100_000,
+            ),
+            "retryAfterSeconds": (self.retry_after_seconds, 1, 60),
+            "retryBackoffSeconds": (
+                self.retry_backoff_seconds,
+                1,
+                60,
+            ),
+            "retryBackoffMaxSeconds": (
+                self.retry_backoff_max_seconds,
+                1,
+                600,
+            ),
+            "completedRetentionSeconds": (
+                self.completed_retention_seconds,
+                60,
+                604800,
+            ),
+        }
+        for name, (value, minimum, maximum) in bounds.items():
+            if not minimum <= value <= maximum:
+                raise AdminConfigError(
+                    f"spec.processor.{name} must be within {minimum}..{maximum}"
+                )
+        if self.max_cluster_queue_depth > self.max_queue_depth:
+            raise AdminConfigError("maxClusterQueueDepth must not exceed maxQueueDepth")
+        if self.retry_backoff_max_seconds < self.retry_backoff_seconds:
+            raise AdminConfigError(
+                "retryBackoffMaxSeconds must not be less than retryBackoffSeconds"
+            )
+        if self.completed_retention_seconds < max(
+            300,
+            self.retry_backoff_max_seconds,
+        ):
+            raise AdminConfigError(
+                "completedRetentionSeconds must cover retryable response age"
+            )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "max_queue_depth": self.max_queue_depth,
+            "max_cluster_queue_depth": self.max_cluster_queue_depth,
+            "retry_after_seconds": self.retry_after_seconds,
+            "retry_backoff_seconds": self.retry_backoff_seconds,
+            "retry_backoff_max_seconds": self.retry_backoff_max_seconds,
+            "completed_retention_seconds": self.completed_retention_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class WorkflowConfig:
+    poll_interval_seconds: float = 5.0
+    dispatcher_workers: int = 8
+
+    def validate(self) -> None:
+        if not 0.5 <= self.poll_interval_seconds <= 60:
+            raise AdminConfigError(
+                "spec.workflow.pollIntervalSeconds must be within 0.5..60"
+            )
+        if not 1 <= self.dispatcher_workers <= 64:
+            raise AdminConfigError(
+                "spec.workflow.dispatcherWorkers must be within 1..64"
+            )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "poll_interval_seconds": self.poll_interval_seconds,
+            "dispatcher_workers": self.dispatcher_workers,
+        }
+
+
+@dataclass(frozen=True)
+class NotificationDeliveryConfig:
+    batch_size: int = 25
+    max_attempts: int = 8
+
+    def validate(self) -> None:
+        if not 1 <= self.batch_size <= 1000:
+            raise AdminConfigError(
+                "spec.notificationDelivery.batchSize must be within 1..1000"
+            )
+        if not 1 <= self.max_attempts <= 32:
+            raise AdminConfigError(
+                "spec.notificationDelivery.maxAttempts must be within 1..32"
+            )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "batch_size": self.batch_size,
+            "max_attempts": self.max_attempts,
+        }
+
+
+@dataclass(frozen=True)
+class EvidenceConfig:
+    retention_hours: int = 24
+    max_records_per_node: int = 10000
+
+    def validate(self) -> None:
+        if not 1 <= self.retention_hours <= 8760:
+            raise AdminConfigError(
+                "spec.evidence.retentionHours must be within 1..8760"
+            )
+        if not 100 <= self.max_records_per_node <= 1_000_000:
+            raise AdminConfigError(
+                "spec.evidence.maxRecordsPerNode must be within 100..1000000"
+            )
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "retention_hours": self.retention_hours,
+            "max_records_per_node": self.max_records_per_node,
+        }
+
+
+@dataclass(frozen=True)
 class AdminConfig:
     capacity: CapacityConfig = CapacityConfig()
+    processor: ProcessorConfig = ProcessorConfig()
+    workflow: WorkflowConfig = WorkflowConfig()
+    notification_delivery: NotificationDeliveryConfig = NotificationDeliveryConfig()
+    evidence: EvidenceConfig = EvidenceConfig()
 
     def validate(self) -> None:
         self.capacity.validate()
+        self.processor.validate()
+        self.workflow.validate()
+        self.notification_delivery.validate()
+        self.evidence.validate()
 
     def as_dict(self) -> dict[str, object]:
         return {
             "schema_version": 1,
             "capacity": self.capacity.as_dict(),
+            "processor": self.processor.as_dict(),
+            "workflow": self.workflow.as_dict(),
+            "notification_delivery": self.notification_delivery.as_dict(),
+            "evidence": self.evidence.as_dict(),
         }
 
     def sha256(self) -> str:
         return canonical_sha256(self.as_dict())
 
     def role_payload(self, role: str) -> dict[str, object]:
+        common = {
+            "processor": self.processor.as_dict(),
+            "workflow": self.workflow.as_dict(),
+            "notification_delivery": self.notification_delivery.as_dict(),
+            "evidence": self.evidence.as_dict(),
+        }
         if role == "ingress":
             return {
+                **common,
                 "telemetry_spool_enabled": (self.capacity.telemetry_spool.enabled),
             }
         if role == "worker":
             return {
+                **common,
                 "control_worker_replicas": (self.capacity.control_worker_replicas),
                 "remediation": self.capacity.remediation.as_dict(),
             }
         if role == "spool":
-            return self.capacity.telemetry_spool.as_dict()
+            return {
+                **common,
+                "telemetry_spool": self.capacity.telemetry_spool.as_dict(),
+            }
         raise AdminConfigError(f"unknown control-plane role: {role}")
 
     def role_sha256(self) -> dict[str, str]:
@@ -186,7 +337,14 @@ class AdminConfig:
         data = _mapping(
             value,
             "admin config",
-            allowed={"schema_version", "capacity"},
+            allowed={
+                "schema_version",
+                "capacity",
+                "processor",
+                "workflow",
+                "notification_delivery",
+                "evidence",
+            },
         )
         if data.get("schema_version", 1) != 1:
             raise AdminConfigError("admin config schema_version must be 1")
@@ -214,6 +372,39 @@ class AdminConfig:
                 "max_active_per_failure_domain",
                 "max_active_per_resource_class",
             },
+        )
+        processor_data = _mapping(
+            data.get("processor") or {},
+            "admin config processor",
+            allowed={
+                "max_queue_depth",
+                "max_cluster_queue_depth",
+                "retry_after_seconds",
+                "retry_backoff_seconds",
+                "retry_backoff_max_seconds",
+                "completed_retention_seconds",
+            },
+        )
+        workflow_data = _mapping(
+            data.get("workflow") or {},
+            "admin config workflow",
+            allowed={
+                "poll_interval_seconds",
+                "dispatcher_workers",
+            },
+        )
+        notification_data = _mapping(
+            data.get("notification_delivery") or {},
+            "admin config notification_delivery",
+            allowed={
+                "batch_size",
+                "max_attempts",
+            },
+        )
+        evidence_data = _mapping(
+            data.get("evidence") or {},
+            "admin config evidence",
+            allowed={"retention_hours", "max_records_per_node"},
         )
         config = cls(
             capacity=CapacityConfig(
@@ -261,7 +452,75 @@ class AdminConfig:
                         default=2,
                     ),
                 ),
-            )
+            ),
+            processor=ProcessorConfig(
+                max_queue_depth=_integer(
+                    processor_data.get("max_queue_depth"),
+                    "admin config processor.max_queue_depth",
+                    default=65536,
+                ),
+                max_cluster_queue_depth=_integer(
+                    processor_data.get("max_cluster_queue_depth"),
+                    "admin config processor.max_cluster_queue_depth",
+                    default=1024,
+                ),
+                retry_after_seconds=_integer(
+                    processor_data.get("retry_after_seconds"),
+                    "admin config processor.retry_after_seconds",
+                    default=2,
+                ),
+                retry_backoff_seconds=_integer(
+                    processor_data.get("retry_backoff_seconds"),
+                    "admin config processor.retry_backoff_seconds",
+                    default=1,
+                ),
+                retry_backoff_max_seconds=_integer(
+                    processor_data.get("retry_backoff_max_seconds"),
+                    "admin config processor.retry_backoff_max_seconds",
+                    default=30,
+                ),
+                completed_retention_seconds=_integer(
+                    processor_data.get("completed_retention_seconds"),
+                    "admin config processor.completed_retention_seconds",
+                    default=600,
+                ),
+            ),
+            workflow=WorkflowConfig(
+                poll_interval_seconds=_number(
+                    workflow_data.get("poll_interval_seconds"),
+                    "admin config workflow.poll_interval_seconds",
+                    default=5.0,
+                ),
+                dispatcher_workers=_integer(
+                    workflow_data.get("dispatcher_workers"),
+                    "admin config workflow.dispatcher_workers",
+                    default=8,
+                ),
+            ),
+            notification_delivery=NotificationDeliveryConfig(
+                batch_size=_integer(
+                    notification_data.get("batch_size"),
+                    "admin config notification_delivery.batch_size",
+                    default=25,
+                ),
+                max_attempts=_integer(
+                    notification_data.get("max_attempts"),
+                    "admin config notification_delivery.max_attempts",
+                    default=8,
+                ),
+            ),
+            evidence=EvidenceConfig(
+                retention_hours=_integer(
+                    evidence_data.get("retention_hours"),
+                    "admin config evidence.retention_hours",
+                    default=24,
+                ),
+                max_records_per_node=_integer(
+                    evidence_data.get("max_records_per_node"),
+                    "admin config evidence.max_records_per_node",
+                    default=10000,
+                ),
+            ),
         )
         config.validate()
         return config
@@ -306,6 +565,14 @@ def _integer(value: object, path: str, *, default: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise AdminConfigError(f"{path} must be an integer")
     return value
+
+
+def _number(value: object, path: str, *, default: float) -> float:
+    if value is None:
+        return default
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise AdminConfigError(f"{path} must be a number")
+    return float(value)
 
 
 def _boolean(value: object, path: str, *, default: bool) -> bool:
@@ -380,7 +647,11 @@ def apply_capacity_patch(
         not isinstance(raw_preset, str) or not raw_preset.strip()
     ):
         raise AdminConfigError(f"{path}.preset must be a non-empty string")
-    current = preset_admin_config(raw_preset) if isinstance(raw_preset, str) else base
+    current_capacity = (
+        preset_admin_config(raw_preset).capacity
+        if isinstance(raw_preset, str)
+        else base.capacity
+    )
     spool_data = _mapping(
         data.get("telemetrySpool") or {},
         f"{path}.telemetrySpool",
@@ -392,15 +663,13 @@ def apply_capacity_patch(
         allowed={
             "maxActiveRegion",
             "maxActivePerCluster",
-            "maxActivePerNode",
-            "maxActivePerFailureDomain",
             "maxActivePerResourceClass",
         },
     )
-    current_capacity = current.capacity
     current_spool = current_capacity.telemetry_spool
     current_remediation = current_capacity.remediation
-    config = AdminConfig(
+    config = replace(
+        base,
         capacity=CapacityConfig(
             control_worker_replicas=_integer(
                 data.get("controlWorkerReplicas"),
@@ -430,15 +699,9 @@ def apply_capacity_patch(
                     f"{path}.remediation.maxActivePerCluster",
                     default=current_remediation.max_active_per_cluster,
                 ),
-                max_active_per_node=_integer(
-                    remediation_data.get("maxActivePerNode"),
-                    f"{path}.remediation.maxActivePerNode",
-                    default=current_remediation.max_active_per_node,
-                ),
-                max_active_per_failure_domain=_integer(
-                    remediation_data.get("maxActivePerFailureDomain"),
-                    f"{path}.remediation.maxActivePerFailureDomain",
-                    default=(current_remediation.max_active_per_failure_domain),
+                max_active_per_node=current_remediation.max_active_per_node,
+                max_active_per_failure_domain=(
+                    current_remediation.max_active_per_failure_domain
                 ),
                 max_active_per_resource_class=_integer(
                     remediation_data.get("maxActivePerResourceClass"),
@@ -446,48 +709,148 @@ def apply_capacity_patch(
                     default=(current_remediation.max_active_per_resource_class),
                 ),
             ),
-        )
+        ),
     )
     config.validate()
     return config
 
 
-def load_admin_config_file(
-    path: Path,
+def apply_admin_config_patch(
+    base: AdminConfig,
+    value: object,
     *,
-    base: AdminConfig | None = None,
+    path: str = "spec",
 ) -> AdminConfig:
-    source = path.expanduser().resolve()
-    try:
-        if source.stat().st_mode & 0o077:
-            raise AdminConfigError(
-                f"admin config must not grant group/other permissions: {source}"
-            )
-        document = yaml.safe_load(source.read_text(encoding="utf-8"))
-    except AdminConfigError:
-        raise
-    except (OSError, yaml.YAMLError) as exc:
-        raise AdminConfigError(f"cannot read admin config {source}: {exc}") from exc
     data = _mapping(
-        document,
-        "admin config file",
-        allowed={"apiVersion", "kind", "spec"},
+        value or {},
+        path,
+        allowed={
+            "capacity",
+            "processor",
+            "workflow",
+            "notificationDelivery",
+            "evidence",
+        },
     )
-    if data.get("apiVersion") != ADMIN_CONFIG_API_VERSION:
-        raise AdminConfigError(
-            f"admin config apiVersion must be {ADMIN_CONFIG_API_VERSION}"
+    current = (
+        apply_capacity_patch(
+            base,
+            data.get("capacity"),
+            path=f"{path}.capacity",
         )
-    if data.get("kind") != ADMIN_CONFIG_KIND:
-        raise AdminConfigError(f"admin config kind must be {ADMIN_CONFIG_KIND}")
-    spec = _mapping(
-        data.get("spec") or {},
-        "admin config spec",
-        allowed={"capacity"},
+        if "capacity" in data
+        else base
     )
-    return apply_capacity_patch(
-        base or default_admin_config(),
-        spec.get("capacity") or {},
+    processor_data = _mapping(
+        data.get("processor") or {},
+        f"{path}.processor",
+        allowed={
+            "maxQueueDepth",
+            "maxClusterQueueDepth",
+            "retryAfterSeconds",
+            "retryBackoffSeconds",
+            "retryBackoffMaxSeconds",
+            "completedRetentionSeconds",
+        },
     )
+    workflow_data = _mapping(
+        data.get("workflow") or {},
+        f"{path}.workflow",
+        allowed={"pollIntervalSeconds", "dispatcherWorkers"},
+    )
+    notification_data = _mapping(
+        data.get("notificationDelivery") or {},
+        f"{path}.notificationDelivery",
+        allowed={
+            "batchSize",
+            "maxAttempts",
+        },
+    )
+    evidence_data = _mapping(
+        data.get("evidence") or {},
+        f"{path}.evidence",
+        allowed={"retentionHours", "maxRecordsPerNode"},
+    )
+    processor = current.processor
+    workflow = current.workflow
+    notification = current.notification_delivery
+    evidence = current.evidence
+    max_queue_depth = _integer(
+        processor_data.get("maxQueueDepth"),
+        f"{path}.processor.maxQueueDepth",
+        default=processor.max_queue_depth,
+    )
+    max_cluster_queue_depth = _integer(
+        processor_data.get("maxClusterQueueDepth"),
+        f"{path}.processor.maxClusterQueueDepth",
+        default=processor.max_cluster_queue_depth,
+    )
+    retry_backoff_max_seconds = _integer(
+        processor_data.get("retryBackoffMaxSeconds"),
+        f"{path}.processor.retryBackoffMaxSeconds",
+        default=processor.retry_backoff_max_seconds,
+    )
+    config = AdminConfig(
+        capacity=current.capacity,
+        processor=ProcessorConfig(
+            max_queue_depth=max_queue_depth,
+            max_cluster_queue_depth=max_cluster_queue_depth,
+            retry_after_seconds=_integer(
+                processor_data.get("retryAfterSeconds"),
+                f"{path}.processor.retryAfterSeconds",
+                default=processor.retry_after_seconds,
+            ),
+            retry_backoff_seconds=_integer(
+                processor_data.get("retryBackoffSeconds"),
+                f"{path}.processor.retryBackoffSeconds",
+                default=processor.retry_backoff_seconds,
+            ),
+            retry_backoff_max_seconds=retry_backoff_max_seconds,
+            completed_retention_seconds=_integer(
+                processor_data.get("completedRetentionSeconds"),
+                f"{path}.processor.completedRetentionSeconds",
+                default=processor.completed_retention_seconds,
+            ),
+        ),
+        workflow=WorkflowConfig(
+            poll_interval_seconds=_number(
+                workflow_data.get("pollIntervalSeconds"),
+                f"{path}.workflow.pollIntervalSeconds",
+                default=workflow.poll_interval_seconds,
+            ),
+            dispatcher_workers=_integer(
+                workflow_data.get("dispatcherWorkers"),
+                f"{path}.workflow.dispatcherWorkers",
+                default=workflow.dispatcher_workers,
+            ),
+        ),
+        notification_delivery=NotificationDeliveryConfig(
+            batch_size=_integer(
+                notification_data.get("batchSize"),
+                f"{path}.notificationDelivery.batchSize",
+                default=notification.batch_size,
+            ),
+            max_attempts=_integer(
+                notification_data.get("maxAttempts"),
+                f"{path}.notificationDelivery.maxAttempts",
+                default=notification.max_attempts,
+            ),
+        ),
+        evidence=EvidenceConfig(
+            retention_hours=_integer(
+                evidence_data.get("retentionHours"),
+                f"{path}.evidence.retentionHours",
+                default=evidence.retention_hours,
+            ),
+            max_records_per_node=_integer(
+                evidence_data.get("maxRecordsPerNode"),
+                f"{path}.evidence.maxRecordsPerNode",
+                default=evidence.max_records_per_node,
+            ),
+        ),
+    )
+    config.validate()
+    return config
 
 
 def admin_config_desired_path(state_dir: Path) -> Path:
@@ -610,38 +973,15 @@ def load_desired_admin_config(state_dir: Path) -> AdminConfig:
     return config
 
 
-def initialize_desired_admin_config(
+def persist_desired_admin_config(
     state_dir: Path,
     *,
-    config_file: Path | None = None,
-    permit_change: bool = False,
-) -> AdminConfig:
-    with admin_config_lock(state_dir):
-        path = admin_config_desired_path(state_dir)
-        current = load_desired_admin_config(state_dir)
-        desired = (
-            load_admin_config_file(config_file, base=current)
-            if config_file is not None
-            else current
-        )
-        if desired != current and not permit_change:
-            raise AdminConfigError(
-                "existing site admin config differs from --config; use "
-                "gpu-fault-admin config plan/apply"
-            )
-        if not path.is_file() or desired != current:
-            _write_json_atomic(
-                path,
-                _desired_record(
-                    desired,
-                    source=(
-                        f"file:{config_file.expanduser().resolve()}"
-                        if config_file is not None
-                        else "release-defaults"
-                    ),
-                ),
-            )
-        return desired
+    config: AdminConfig,
+    source: str,
+) -> Path:
+    path = admin_config_desired_path(state_dir)
+    _write_json_atomic(path, _desired_record(config, source=source))
+    return path
 
 
 def _site_identity_sha256(value: object) -> str:
@@ -676,8 +1016,20 @@ def _changes(
     current: AdminConfig,
     desired: AdminConfig,
 ) -> list[dict[str, object]]:
-    before = _flatten(current.as_dict()["capacity"], prefix="capacity")
-    after = _flatten(desired.as_dict()["capacity"], prefix="capacity")
+    before = _flatten(
+        {
+            key: value
+            for key, value in current.as_dict().items()
+            if key != "schema_version"
+        }
+    )
+    after = _flatten(
+        {
+            key: value
+            for key, value in desired.as_dict().items()
+            if key != "schema_version"
+        }
+    )
     return [
         {
             "field": field,
@@ -796,6 +1148,60 @@ def _validated_plan(document: dict[str, Any]) -> tuple[dict[str, Any], str]:
     return document, digest
 
 
+def _admin_config_plan_document(
+    current: AdminConfig,
+    *,
+    site_identity: Mapping[str, str],
+    release_identity: Mapping[str, object],
+    desired: AdminConfig,
+    source: str,
+) -> dict[str, Any]:
+    desired.validate()
+    current_roles = current.role_sha256()
+    desired_roles = desired.role_sha256()
+    changes = _changes(current, desired)
+    document: dict[str, Any] = {
+        "schema_version": 1,
+        "site_identity": dict(site_identity),
+        "site_identity_sha256": _site_identity_sha256(dict(site_identity)),
+        "release_identity": _validated_release_identity(dict(release_identity)),
+        "current_config_sha256": current.sha256(),
+        "desired_config_sha256": desired.sha256(),
+        "current_role_sha256": current_roles,
+        "desired_role_sha256": desired_roles,
+        "current_config": current.as_dict(),
+        "desired_config": desired.as_dict(),
+        "affected_roles": sorted(
+            role
+            for role in ADMIN_CONFIG_ROLES
+            if current_roles[role] != desired_roles[role]
+        ),
+        "changes": changes,
+        "source": source,
+        "approval_required": bool(changes),
+    }
+    document["plan_sha256"] = admin_config_plan_sha256(document)
+    return document
+
+
+def preview_admin_config_plan(
+    state_dir: Path,
+    *,
+    site_identity: Mapping[str, str],
+    release_identity: Mapping[str, object],
+    desired: AdminConfig,
+    source: str,
+) -> dict[str, Any]:
+    with admin_config_lock(state_dir):
+        return _admin_config_plan_document(
+            load_desired_admin_config(state_dir),
+            site_identity=site_identity,
+            release_identity=release_identity,
+            desired=desired,
+            source=source,
+        )
+
+
 def create_admin_config_plan(
     state_dir: Path,
     *,
@@ -804,33 +1210,14 @@ def create_admin_config_plan(
     desired: AdminConfig,
     source: str,
 ) -> dict[str, Any]:
-    desired.validate()
     with admin_config_lock(state_dir):
-        current = load_desired_admin_config(state_dir)
-        current_roles = current.role_sha256()
-        desired_roles = desired.role_sha256()
-        changes = _changes(current, desired)
-        document: dict[str, Any] = {
-            "schema_version": 1,
-            "site_identity": dict(site_identity),
-            "site_identity_sha256": _site_identity_sha256(dict(site_identity)),
-            "release_identity": _validated_release_identity(dict(release_identity)),
-            "current_config_sha256": current.sha256(),
-            "desired_config_sha256": desired.sha256(),
-            "current_role_sha256": current_roles,
-            "desired_role_sha256": desired_roles,
-            "current_config": current.as_dict(),
-            "desired_config": desired.as_dict(),
-            "affected_roles": sorted(
-                role
-                for role in ADMIN_CONFIG_ROLES
-                if current_roles[role] != desired_roles[role]
-            ),
-            "changes": changes,
-            "source": source,
-            "approval_required": bool(changes),
-        }
-        document["plan_sha256"] = admin_config_plan_sha256(document)
+        document = _admin_config_plan_document(
+            load_desired_admin_config(state_dir),
+            site_identity=site_identity,
+            release_identity=release_identity,
+            desired=desired,
+            source=source,
+        )
         approval_path = admin_config_approval_path(state_dir)
         if approval_path.is_file():
             previous_plan = load_admin_config_plan(state_dir)

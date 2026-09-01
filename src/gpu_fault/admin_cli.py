@@ -34,13 +34,20 @@ from gpu_fault.admin_notifications import (
 from gpu_fault.admin_config import (
     AdminConfig,
     AdminConfigError,
+    admin_config_plan_path,
     apply_capacity_patch,
     complete_admin_config_apply,
     create_admin_config_plan,
-    initialize_desired_admin_config,
-    load_admin_config_file,
+    load_admin_config_plan,
     load_desired_admin_config,
     prepare_admin_config_apply,
+    preview_admin_config_plan,
+)
+from gpu_fault.admin_config_file import (
+    admin_config_file_path,
+    initialize_desired_admin_config,
+    load_admin_config_file,
+    write_admin_config_file,
 )
 from gpu_fault.admin_profile_approval import approve_profile
 from gpu_fault.admin_resource_registry import sync_installation_resource_registry
@@ -130,35 +137,7 @@ def _add_managed_site_arguments(
         )
 
 
-def _add_admin_config_apply_arguments(command: argparse.ArgumentParser) -> None:
-    command.add_argument(
-        "--state-dir",
-        required=True,
-        type=Path,
-        metavar="STATE_DIR",
-        help="private state directory containing the pending config plan",
-    )
-    command.add_argument(
-        "--plan-sha256",
-        required=True,
-        metavar="SHA256",
-        help="exact SHA-256 from the reviewed admin config plan",
-    )
-    command.add_argument(
-        "--reference",
-        required=True,
-        metavar="REFERENCE",
-        help="approved change or maintenance-window reference",
-    )
-
-
-def _add_capacity_plan_arguments(command: argparse.ArgumentParser) -> None:
-    command.add_argument(
-        "--state-dir",
-        required=True,
-        type=Path,
-        metavar="STATE_DIR",
-    )
+def _add_capacity_options(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--preset",
         choices=(
@@ -178,8 +157,6 @@ def _add_capacity_plan_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--spool-replicas", type=int)
     command.add_argument("--max-active-region", type=int)
     command.add_argument("--max-active-per-cluster", type=int)
-    command.add_argument("--max-active-per-node", type=int)
-    command.add_argument("--max-active-per-failure-domain", type=int)
     command.add_argument("--max-active-per-resource-class", type=int)
 
 
@@ -213,55 +190,40 @@ def _add_profile_approval_command(commands: Any) -> None:
     )
 
 
-def _add_admin_config_commands(commands: Any) -> None:
-    capacity = commands.add_parser(
-        "capacity",
-        help="plan or apply an audited control-plane capacity configuration",
-    )
-    capacity_commands = capacity.add_subparsers(
-        dest="capacity_command",
-        required=True,
-    )
-    capacity_plan = capacity_commands.add_parser(
-        "plan",
-        help="create a capacity configuration plan",
-    )
-    _add_capacity_plan_arguments(capacity_plan)
-    capacity_apply = capacity_commands.add_parser(
-        "apply",
-        help="apply the reviewed capacity configuration plan",
-    )
-    _add_admin_config_apply_arguments(capacity_apply)
+def _add_admin_config_command(commands: Any) -> None:
     config = commands.add_parser(
         "config",
-        help="plan or apply a schema-validated administrator config file",
+        usage=(
+            "gpu-fault-admin config --state-dir STATE_DIR "
+            "[--file ADMIN_CONFIG | --preset PRESET] --reference REFERENCE"
+        ),
+        help="validate and apply an audited administrator configuration",
     )
-    config_commands = config.add_subparsers(
-        dest="config_command",
-        required=True,
-    )
-    config_plan = config_commands.add_parser(
-        "plan",
-        help="create a plan from an AdminConfig YAML file",
-    )
-    config_plan.add_argument(
+    config.add_argument(
         "--state-dir",
         required=True,
         type=Path,
         metavar="STATE_DIR",
     )
-    config_plan.add_argument(
+    config.add_argument(
         "--file",
-        required=True,
         dest="admin_config_file",
         type=Path,
         metavar="ADMIN_CONFIG",
+        help=("private AdminConfig YAML; defaults to <state-dir>/admin-config.yaml"),
     )
-    config_apply = config_commands.add_parser(
-        "apply",
-        help="apply the reviewed administrator configuration plan",
+    _add_capacity_options(config)
+    config.add_argument(
+        "--reference",
+        required=True,
+        metavar="REFERENCE",
+        help="approved change or maintenance-window reference",
     )
-    _add_admin_config_apply_arguments(config_apply)
+    config.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and print the internal change plan without applying it",
+    )
 
 
 def _managed_site_file(
@@ -345,7 +307,7 @@ def parser() -> argparse.ArgumentParser:
         metavar="ADMIN_CONFIG",
         help=(
             "private AdminConfig YAML for first deployment; existing sites "
-            "must use config plan/apply"
+            "must use gpu-fault-admin config"
         ),
     )
     deploy.add_argument(
@@ -399,7 +361,7 @@ def parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     _add_profile_approval_command(commands)
-    _add_admin_config_commands(commands)
+    _add_admin_config_command(commands)
     join = commands.add_parser(
         "join-cluster",
         usage=(
@@ -743,11 +705,6 @@ def _capacity_candidate(
     for attribute, field in (
         ("max_active_region", "maxActiveRegion"),
         ("max_active_per_cluster", "maxActivePerCluster"),
-        ("max_active_per_node", "maxActivePerNode"),
-        (
-            "max_active_per_failure_domain",
-            "maxActivePerFailureDomain",
-        ),
         ("max_active_per_resource_class", "maxActivePerResourceClass"),
     ):
         value = cast(int | None, getattr(arguments, attribute))
@@ -762,40 +719,55 @@ def _capacity_candidate(
     return apply_capacity_patch(current, capacity)
 
 
-def _run_admin_config_plan(
+def _capacity_options_requested(arguments: argparse.Namespace) -> bool:
+    return any(
+        getattr(arguments, name, None) is not None
+        for name in (
+            "preset",
+            "control_worker_replicas",
+            "spool",
+            "spool_replicas",
+            "max_active_region",
+            "max_active_per_cluster",
+            "max_active_per_resource_class",
+        )
+    )
+
+
+def _admin_config_candidate(
     arguments: argparse.Namespace,
-    *,
-    capacity: bool,
-) -> int:
-    site_file = _managed_site_file(
-        arguments,
-        command="capacity plan" if capacity else "config plan",
+    current: AdminConfig,
+) -> tuple[AdminConfig, str]:
+    configured_file = cast(
+        Path | None,
+        getattr(arguments, "admin_config_file", None),
     )
-    assert site_file is not None
-    site = load_site(site_file)
-    current = load_desired_admin_config(arguments.state_dir)
-    if capacity:
-        desired = _capacity_candidate(arguments, current)
-        source = (
-            f"preset:{arguments.preset}"
-            if arguments.preset is not None
-            else "explicit-capacity-options"
+    capacity_options = _capacity_options_requested(arguments)
+    if configured_file is not None and capacity_options:
+        raise AdminConfigError(
+            "--file cannot be combined with --preset or explicit capacity options"
         )
-    else:
-        desired = load_admin_config_file(
-            arguments.admin_config_file,
-            base=current,
-        )
-        source = f"file:{arguments.admin_config_file.expanduser().resolve()}"
-    plan = create_admin_config_plan(
-        arguments.state_dir,
-        site_identity=_admin_config_site_identity(site),
-        release_identity=_current_release_metadata(site.repository_root),
-        desired=desired,
-        source=source,
+    if configured_file is None and not capacity_options:
+        configured_file = admin_config_file_path(arguments.state_dir)
+        if not configured_file.is_file():
+            write_admin_config_file(
+                configured_file,
+                current,
+                overwrite=False,
+            )
+            raise AdminConfigError(
+                f"created {configured_file}; edit it and rerun gpu-fault-admin config"
+            )
+    if configured_file is not None:
+        desired = load_admin_config_file(configured_file, base=current)
+        return desired, f"file:{configured_file.expanduser().resolve()}"
+    desired = _capacity_candidate(arguments, current)
+    source = (
+        f"preset:{arguments.preset}"
+        if arguments.preset is not None
+        else "explicit-capacity-options"
     )
-    print(json.dumps(plan, indent=2, sort_keys=True))
-    return 0
+    return desired, source
 
 
 def _current_release_metadata(
@@ -819,23 +791,81 @@ def _current_release_metadata(
     }
 
 
-def _run_admin_config_apply(arguments: argparse.Namespace) -> int:
-    site_file = _managed_site_file(arguments, command="config apply")
+def _pending_admin_config_plan(
+    state_dir: Path,
+    *,
+    site_identity: dict[str, str],
+    release_identity: dict[str, object],
+    desired: AdminConfig,
+) -> dict[str, Any] | None:
+    if not admin_config_plan_path(state_dir).is_file():
+        return None
+    plan = load_admin_config_plan(state_dir)
+    if (
+        plan.get("site_identity") == site_identity
+        and plan.get("release_identity") == release_identity
+        and plan.get("desired_config_sha256") == desired.sha256()
+    ):
+        return plan
+    return None
+
+
+def _run_admin_config(arguments: argparse.Namespace) -> int:
+    site_file = _managed_site_file(arguments, command="config")
     assert site_file is not None
     site = load_site(site_file)
     release_identity = _current_release_metadata(site.repository_root)
+    site_identity = _admin_config_site_identity(site)
+    current = load_desired_admin_config(arguments.state_dir)
+    desired, source = _admin_config_candidate(arguments, current)
+    if arguments.dry_run:
+        plan = preview_admin_config_plan(
+            arguments.state_dir,
+            site_identity=site_identity,
+            release_identity=release_identity,
+            desired=desired,
+            source=source,
+        )
+        print(
+            json.dumps(
+                {"status": "DRY_RUN", **plan},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    active_plan = _pending_admin_config_plan(
+        arguments.state_dir,
+        site_identity=site_identity,
+        release_identity=release_identity,
+        desired=desired,
+    )
+    if active_plan is None:
+        active_plan = create_admin_config_plan(
+            arguments.state_dir,
+            site_identity=site_identity,
+            release_identity=release_identity,
+            desired=desired,
+            source=source,
+        )
+    plan_sha256 = str(active_plan["plan_sha256"])
     prepared = prepare_admin_config_apply(
         arguments.state_dir,
-        expected_plan_sha256=arguments.plan_sha256,
+        expected_plan_sha256=plan_sha256,
         reference=arguments.reference,
         current_release_identity=release_identity,
+    )
+    write_admin_config_file(
+        admin_config_file_path(arguments.state_dir),
+        desired,
+        overwrite=True,
     )
     release_id = str(release_identity["release_id"])
     staging_only = bool(release_identity["staging_only"])
     if prepared.no_op:
         result = complete_admin_config_apply(
             arguments.state_dir,
-            expected_plan_sha256=arguments.plan_sha256,
+            expected_plan_sha256=plan_sha256,
             release_id=release_id,
             success=True,
         )
@@ -843,7 +873,7 @@ def _run_admin_config_apply(arguments: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "status": "NOOP",
-                    "plan_sha256": arguments.plan_sha256,
+                    "plan_sha256": plan_sha256,
                     "reference": arguments.reference,
                     "audit": str(result),
                 },
@@ -862,7 +892,7 @@ def _run_admin_config_apply(arguments: argparse.Namespace) -> int:
     except Exception as exc:
         complete_admin_config_apply(
             arguments.state_dir,
-            expected_plan_sha256=arguments.plan_sha256,
+            expected_plan_sha256=plan_sha256,
             release_id=release_id,
             success=False,
             error=f"{type(exc).__name__}: {exc}",
@@ -871,7 +901,7 @@ def _run_admin_config_apply(arguments: argparse.Namespace) -> int:
     if returncode:
         complete_admin_config_apply(
             arguments.state_dir,
-            expected_plan_sha256=arguments.plan_sha256,
+            expected_plan_sha256=plan_sha256,
             release_id=release_id,
             success=False,
             error=f"release-deploy exited with status {returncode}",
@@ -879,7 +909,7 @@ def _run_admin_config_apply(arguments: argparse.Namespace) -> int:
         return returncode
     result = complete_admin_config_apply(
         arguments.state_dir,
-        expected_plan_sha256=arguments.plan_sha256,
+        expected_plan_sha256=plan_sha256,
         release_id=release_id,
         success=True,
     )
@@ -890,7 +920,7 @@ def _run_admin_config_apply(arguments: argparse.Namespace) -> int:
                 "release_id": release_id,
                 "config_sha256": prepared.config.sha256(),
                 "affected_roles": prepared.plan["affected_roles"],
-                "plan_sha256": arguments.plan_sha256,
+                "plan_sha256": plan_sha256,
                 "reference": arguments.reference,
                 "audit": str(result),
             },
@@ -902,14 +932,8 @@ def _run_admin_config_apply(arguments: argparse.Namespace) -> int:
 
 
 def run(arguments: argparse.Namespace) -> int:
-    if arguments.command == "capacity":
-        if arguments.capacity_command == "plan":
-            return _run_admin_config_plan(arguments, capacity=True)
-        return _run_admin_config_apply(arguments)
     if arguments.command == "config":
-        if arguments.config_command == "plan":
-            return _run_admin_config_plan(arguments, capacity=False)
-        return _run_admin_config_apply(arguments)
+        return _run_admin_config(arguments)
     if arguments.command == "approve-profile":
         return _run_profile_approval(arguments)
     if arguments.command == "join-cluster":

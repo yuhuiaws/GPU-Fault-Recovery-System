@@ -14,6 +14,7 @@ manifest_inputs:
   - scripts/setup-deploy-host.sh
   - scripts/setup_deploy_host.py
   - scripts/staging_deploy.py
+  - config/admin-config.example.yaml
   - src/gpu_fault/admin_source_deploy.py
   - src/gpu_fault/data/deploy-host-tools.json
   - deploy/control-plane/base/control-plane-deployment.yaml

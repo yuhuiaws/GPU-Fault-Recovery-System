@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -102,7 +103,7 @@ TERMINAL_WORKFLOWS = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
 TERMINAL_COMMANDS = {"SUCCEEDED", "FAILED", "CANCELLED"}
 FORMAL_NODES_PER_CLUSTER = 256
 FORMAL_WORKFLOWS_PER_CLUSTER = 4
-FORMAL_COMMANDS_PER_CLUSTER = 36
+FORMAL_COMMANDS_PER_CLUSTER = 30
 FORMAL_AURORA_MIN_ACU = 124.0
 FORMAL_AURORA_MAX_ACU = 128.0
 FORMAL_MODELS = {
@@ -363,6 +364,66 @@ def seed_integrated_agents(
     return json.loads(output.splitlines()[-1])
 
 
+def refresh_integrated_agents(
+    *,
+    run_id: str,
+    clusters: int,
+    workflows_per_cluster: int,
+    lease_seconds: int,
+) -> dict:
+    pod = control(
+        "get",
+        "pod",
+        "-l",
+        "app=gpu-fault-api-ha",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ).strip()
+    output = control(
+        "exec",
+        "-i",
+        pod,
+        "--",
+        "env",
+        f"ACTION_RUN_ID={run_id}",
+        f"ACTION_CLUSTERS={clusters}",
+        f"ACTION_WORKFLOWS_PER_CLUSTER={workflows_per_cluster}",
+        f"ACTION_AGENT_LEASE_SECONDS={lease_seconds}",
+        "ACTION_SEED_MODE=integrated-heartbeats",
+        "python3",
+        "-",
+        stdin=(PERF_DIR / "seed_regional_action_workflows.py").read_bytes(),
+        timeout=180,
+    )
+    return json.loads(output.splitlines()[-1])
+
+
+def integrated_agent_heartbeat_refresher(
+    *,
+    run_id: str,
+    clusters: int,
+    workflows_per_cluster: int,
+    lease_seconds: int,
+    interval_seconds: int = 30,
+) -> Callable[[], None]:
+    next_refresh = 0.0
+
+    def refresh() -> None:
+        nonlocal next_refresh
+        now = time.monotonic()
+        if now < next_refresh:
+            return
+        refresh_integrated_agents(
+            run_id=run_id,
+            clusters=clusters,
+            workflows_per_cluster=workflows_per_cluster,
+            lease_seconds=lease_seconds,
+        )
+        next_refresh = now + interval_seconds
+
+    return refresh
+
+
 def build_load_manifest(
     *,
     run_id: str,
@@ -390,7 +451,7 @@ def build_load_manifest(
         cpu_request="2",
         cpu_limit="4",
         include_telemetry=True,
-        prewarm_connections=True,
+        prewarm_connections=False,
     )
     environment = manifest["spec"]["template"]["spec"]["containers"][0]["env"]
     environment.extend(
@@ -436,6 +497,7 @@ def build_executor_manifest(
                 "name": "ACTION_IDLE_EXIT_SECONDS",
                 "value": str(idle_exit_seconds),
             },
+            {"name": "ACTION_MIN_CONCURRENT_COMMANDS", "value": "1"},
         ]
     )
     manifest["spec"]["activeDeadlineSeconds"] = max_seconds + 120
@@ -682,10 +744,13 @@ def wait_for_workflows(
     *,
     expected_workflows: int,
     timeout_seconds: int,
+    heartbeat_refresh: Callable[[], None] | None = None,
 ) -> tuple[dict, list[dict]]:
     history = []
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
+        if heartbeat_refresh is not None:
+            heartbeat_refresh()
         audit = workflow_audit(run_id)
         audit["elapsed_seconds"] = timeout_seconds - max(
             0.0,
@@ -716,15 +781,21 @@ def verdict(
         errors.append("fixed ingress request total changed")
     if ingress.get("job_status") != "Complete":
         errors.append("mixed ingress Job did not complete")
+    paths = ingress.get("paths") or {}
     for kind, expected in (
         ("NVIDIA_KERNEL", model["xid"]),
         ("FABRIC_MANAGER_LOG", model["sxid"]),
     ):
-        path = (ingress.get("paths") or {}).get(kind) or {}
+        path = paths.get(kind) or {}
         if int(path.get("count", 0)) != expected:
             errors.append(f"{kind} count changed from {expected}")
-        if int((path.get("status_counts") or {}).get("429", 0)):
-            errors.append(f"{kind} returned HTTP 429")
+    for kind, path in sorted(paths.items()):
+        status_counts = path.get("status_counts") or {}
+        for status, count in sorted(status_counts.items()):
+            if int(count) and not 200 <= int(status) < 300:
+                errors.append(f"{kind} returned HTTP {status}")
+        if path.get("errors"):
+            errors.append(f"{kind} produced client errors")
     if audit["incident_count"] != expected_workflows:
         errors.append("action-bearing incident count mismatch")
     if audit["context_incident_count"] != expected_workflows:
@@ -836,6 +907,7 @@ def execute_integrated_jobs(
     seeded: dict,
     expected_workflows: int,
     aurora_preflight: dict,
+    heartbeat_refresh: Callable[[], None],
 ) -> int:
     publish_fixtures("burst")
     upsert_configmap(
@@ -890,6 +962,7 @@ def execute_integrated_jobs(
     dataplane("apply", "-f", "-", stdin=json.dumps(load_manifest).encode())
     wait_for_executor_pods(args.clusters)
     wait_for_load_pods(LOAD_JOB, args.clusters, timeout_seconds=600)
+    heartbeat_refresh()
     start_epoch = time.time() + args.lead_seconds
     release_start_gate(start_epoch)
     ingress_status = wait_for_job(
@@ -900,6 +973,7 @@ def execute_integrated_jobs(
         run_id,
         expected_workflows=expected_workflows,
         timeout_seconds=args.timeout_seconds,
+        heartbeat_refresh=heartbeat_refresh,
     )
     executor_status = wait_for_job(
         EXECUTOR_JOB,
@@ -1083,6 +1157,12 @@ def run(args: argparse.Namespace) -> int:
             lease_seconds=args.timeout_seconds + 900,
             agent_identity=None,
         )
+        heartbeat_refresh = integrated_agent_heartbeat_refresher(
+            run_id=run_id,
+            clusters=args.clusters,
+            workflows_per_cluster=args.workflows_per_cluster,
+            lease_seconds=args.timeout_seconds + 900,
+        )
         result = execute_integrated_jobs(
             args,
             run_id=run_id,
@@ -1092,6 +1172,7 @@ def run(args: argparse.Namespace) -> int:
             seeded=seeded,
             expected_workflows=expected_workflows,
             aurora_preflight=aurora_preflight,
+            heartbeat_refresh=heartbeat_refresh,
         )
     except BaseException as exc:
         failure = exc

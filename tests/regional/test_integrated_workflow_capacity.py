@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from gpu_fault.operation_registry import OPERATION_REGISTRY, OperationScope
+from gpu_fault.operation_registry import (
+    OPERATION_REGISTRY,
+    OperationAdapter,
+    OperationScope,
+)
 from gpu_fault.policy import SxidEvent, XidEvent
 from scripts.perf import benchmark_regional_action_executor as executor
 from scripts.perf import benchmark_synchronized_burst as burst
@@ -291,12 +295,14 @@ def test_action_mix_compiles_current_online_dags() -> None:
             sum(
                 OPERATION_REGISTRY[step.operation].scope
                 is not OperationScope.CONTROL_PLANE
+                and OperationAdapter.GPU_VALIDATION
+                not in OPERATION_REGISTRY[step.operation].adapters
                 for step in workflow.official_steps
             )
         )
 
     assert lengths == [10, 10, 8, 12]
-    assert remote_counts == [9, 9, 7, 11]
+    assert remote_counts == [8, 8, 5, 9]
     assert sum(remote_counts) == suite.FORMAL_COMMANDS_PER_CLUSTER
     assert {
         "MARK_UNSCHEDULABLE",
@@ -436,6 +442,7 @@ def test_integrated_load_manifest_carries_action_contract() -> None:
     assert environment["ACTION_WORKFLOWS_PER_CLUSTER"] == "4"
     assert environment["ACTION_RUN_ID"] == "run-a"
     assert environment["RUNTIME_PROFILE_VERSION"] == "profile-a"
+    assert environment["PREWARM_CONNECTIONS"] == "false"
 
 
 def test_integrated_executor_uses_idle_drain_and_realistic_simulated_delays() -> None:
@@ -455,9 +462,10 @@ def test_integrated_executor_uses_idle_drain_and_realistic_simulated_delays() ->
         for item in manifest["spec"]["template"]["spec"]["containers"][0]["env"]
     }
 
-    assert environment["EXPECTED_COMMANDS"] == "36"
+    assert environment["EXPECTED_COMMANDS"] == "30"
     assert environment["ACTION_IDLE_EXIT_SECONDS"] == "300"
     assert environment["ACTION_MAX_SECONDS"] == "1800"
+    assert environment["ACTION_MIN_CONCURRENT_COMMANDS"] == "1"
     assert executor.DELAYS["RESET_GPU"] == 8.0
     assert executor.DELAYS["RESTART_NODE"] == 120.0
 
@@ -521,8 +529,8 @@ def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> No
             "permanent_budget_waiters": 0,
         },
         "executor": {
-            "expected_commands": 1152,
-            "completed_commands": 1152,
+            "expected_commands": 960,
+            "completed_commands": 960,
             "duplicate_claims": 0,
             "claim_errors": 0,
             "result_errors": 0,
@@ -535,6 +543,65 @@ def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> No
 
     assert status == "PASS", errors
     assert errors == []
+
+
+@pytest.mark.parametrize("status_code", ("429", "503"))
+def test_integrated_verdict_rejects_ingress_http_errors(status_code: str) -> None:
+    expected = 128
+    summary = {
+        "clusters": 32,
+        "fixed_matrix": {**suite.FORMAL_MODELS[32], "p0": 1000, "p50": 1000},
+        "ingress": {
+            "requests": 26576,
+            "job_status": "Complete",
+            "paths": {
+                "NVIDIA_KERNEL": {"count": 500, "status_counts": {"202": 500}},
+                "FABRIC_MANAGER_LOG": {"count": 500, "status_counts": {"202": 500}},
+                "GPU_METRICS": {
+                    "count": 8192,
+                    "status_counts": {"202": 8191, status_code: 1},
+                },
+            },
+        },
+        "workflow": {
+            "incident_count": expected,
+            "context_incident_count": expected,
+            "workflow_count": expected,
+            "succeeded_workflow_count": expected,
+            "terminal_command_count": 960,
+            "command_count": 960,
+            "simulated_command_count": 960,
+            "step_count_min": 8,
+            "step_count_max": 12,
+            "operation_counts": {
+                "MARK_UNSCHEDULABLE": 128,
+                "STOP_WORKLOADS": 128,
+                "COLLECT_DIAGNOSTIC_BUNDLE": 32,
+                "RESET_GPU": 64,
+                "RESET_ALL_GPUS_NVSWITCHES": 32,
+                "RESTART_NODE": 32,
+                "RESTORE_SCHEDULING": 128,
+            },
+            "duplicate_idempotency_keys": 0,
+            "duplicate_workflow_steps": 0,
+            "fencing_mismatches": 0,
+            "permanent_budget_waiters": 0,
+        },
+        "executor": {
+            "expected_commands": 960,
+            "completed_commands": 960,
+            "duplicate_claims": 0,
+            "claim_errors": 0,
+            "result_errors": 0,
+            "long_commands": 32,
+            "renewals": 32,
+        },
+    }
+
+    status, errors = suite.verdict(summary, expected_workflows=expected)
+
+    assert status == "FAIL"
+    assert f"GPU_METRICS returned HTTP {status_code}" in errors
 
 
 def test_50_cluster_manifest_uses_formal_41524_matrix() -> None:
@@ -610,6 +677,32 @@ def test_integrated_embedded_database_scripts_compile(
     assert len(scripts) == 2
     for index, script in enumerate(scripts):
         compile(script, f"integrated-script-{index}", "exec")
+
+
+def test_integrated_heartbeat_refresher_is_throttled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    times = iter((0.0, 10.0, 30.0))
+    monkeypatch.setattr(suite.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(
+        suite, "refresh_integrated_agents", lambda **kwargs: calls.append(kwargs) or {}
+    )
+    refresh = suite.integrated_agent_heartbeat_refresher(
+        run_id="run-a",
+        clusters=32,
+        workflows_per_cluster=4,
+        lease_seconds=2700,
+        interval_seconds=30,
+    )
+
+    refresh()
+    refresh()
+    refresh()
+
+    assert len(calls) == 2
+    assert calls[0]["run_id"] == "run-a"
+    assert calls[1]["lease_seconds"] == 2700
 
 
 def test_integrated_runner_refuses_non_live_registry(

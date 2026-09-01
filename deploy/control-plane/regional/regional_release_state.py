@@ -223,7 +223,8 @@ def captured_admin_config(
     snapshots: dict[str, dict[str, str]],
 ) -> AdminConfig:
     try:
-        defaults = default_admin_config().capacity
+        defaults = default_admin_config()
+        capacity_defaults = defaults.capacity
         worker = release._get_json(
             release._cpu(
                 "-n",
@@ -247,28 +248,44 @@ def captured_admin_config(
             {},
         )
         worker_core = snapshots.get("gpu-fault-control-worker-config-core", {})
+        ingress_processor = snapshots.get(
+            "gpu-fault-api-ha-config-processor",
+            {},
+        )
+        ingress_recovery = snapshots.get(
+            "gpu-fault-api-ha-config-recovery",
+            {},
+        )
+        ingress_notification = snapshots.get(
+            "gpu-fault-api-ha-config-notification",
+            {},
+        )
         spool_enabled = ingress_telemetry.get(
             "GPU_FAULT_TELEMETRY_SPOOL",
-            str(defaults.telemetry_spool.enabled).lower(),
+            str(capacity_defaults.telemetry_spool.enabled).lower(),
         )
         if spool_enabled not in {"true", "false"}:
             raise AdminConfigError("live ingress telemetry spool value is invalid")
         worker_replicas = (worker.get("spec") or {}).get("replicas")
         spool_replicas = (spool.get("spec") or {}).get("replicas")
-        remediation = defaults.remediation
+        remediation = capacity_defaults.remediation
+        processor = defaults.processor
+        workflow = defaults.workflow
+        notification = defaults.notification_delivery
+        evidence = defaults.evidence
         return AdminConfig.from_mapping(
             {
                 "schema_version": 1,
                 "capacity": {
                     "control_worker_replicas": int(
-                        defaults.control_worker_replicas
+                        capacity_defaults.control_worker_replicas
                         if worker_replicas is None
                         else worker_replicas
                     ),
                     "telemetry_spool": {
                         "enabled": spool_enabled == "true",
                         "replicas": int(
-                            defaults.telemetry_spool.replicas
+                            capacity_defaults.telemetry_spool.replicas
                             if spool_replicas is None
                             else spool_replicas
                         ),
@@ -306,12 +323,90 @@ def captured_admin_config(
                         ),
                     },
                 },
+                "processor": {
+                    "max_queue_depth": int(
+                        ingress_processor.get(
+                            "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH",
+                            processor.max_queue_depth,
+                        )
+                    ),
+                    "max_cluster_queue_depth": int(
+                        ingress_processor.get(
+                            "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH",
+                            processor.max_cluster_queue_depth,
+                        )
+                    ),
+                    "retry_after_seconds": int(
+                        ingress_processor.get(
+                            "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS",
+                            processor.retry_after_seconds,
+                        )
+                    ),
+                    "retry_backoff_seconds": int(
+                        ingress_processor.get(
+                            "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS",
+                            processor.retry_backoff_seconds,
+                        )
+                    ),
+                    "retry_backoff_max_seconds": int(
+                        ingress_processor.get(
+                            "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS",
+                            processor.retry_backoff_max_seconds,
+                        )
+                    ),
+                    "completed_retention_seconds": int(
+                        ingress_processor.get(
+                            ("GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS"),
+                            processor.completed_retention_seconds,
+                        )
+                    ),
+                },
+                "workflow": {
+                    "poll_interval_seconds": float(
+                        ingress_recovery.get(
+                            "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS",
+                            workflow.poll_interval_seconds,
+                        )
+                    ),
+                    "dispatcher_workers": int(
+                        ingress_recovery.get(
+                            "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS",
+                            workflow.dispatcher_workers,
+                        )
+                    ),
+                },
+                "notification_delivery": {
+                    "batch_size": int(
+                        ingress_notification.get(
+                            "GPU_FAULT_NOTIFICATION_BATCH_SIZE",
+                            notification.batch_size,
+                        )
+                    ),
+                    "max_attempts": int(
+                        ingress_notification.get(
+                            "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS",
+                            notification.max_attempts,
+                        )
+                    ),
+                },
+                "evidence": {
+                    "retention_hours": int(
+                        ingress_processor.get(
+                            "GPU_FAULT_EVIDENCE_RETENTION_HOURS",
+                            evidence.retention_hours,
+                        )
+                    ),
+                    "max_records_per_node": int(
+                        ingress_processor.get(
+                            "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE",
+                            evidence.max_records_per_node,
+                        )
+                    ),
+                },
             }
         )
     except (AdminConfigError, KeyError, TypeError, ValueError) as exc:
-        raise ReleaseError(
-            "cannot capture a valid live administrator capacity config"
-        ) from exc
+        raise ReleaseError("cannot capture a valid live administrator config") from exc
 
 
 def capture_agent_identities(release: Any) -> dict[str, dict[str, Any]]:

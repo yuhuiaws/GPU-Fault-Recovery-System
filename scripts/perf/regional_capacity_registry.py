@@ -22,6 +22,10 @@ NAMESPACE = os.getenv(
     "GPU_FAULT_PERF_DATAPLANE_NAMESPACE",
     "gpu-fault-perf-system",
 )
+IDENTITY_NAMESPACE = os.getenv(
+    "GPU_FAULT_PERF_IDENTITY_NAMESPACE",
+    "gpu-fault-system",
+)
 CONTROL_KUBECONFIG = os.getenv(
     "GPU_FAULT_CONTROL_KUBECONFIG",
     "/tmp/gpu-fault-control-plane.kubeconfig",
@@ -126,6 +130,26 @@ def dataplane(
             *args,
         ],
         stdin=stdin,
+        check=check,
+        timeout=timeout,
+    )
+    return result.stdout.decode()
+
+
+def dataplane_identity(
+    *args: str,
+    check: bool = True,
+    timeout: int = 300,
+) -> str:
+    result = run(
+        [
+            "kubectl",
+            "--context",
+            DATAPLANE_CONTEXT,
+            "-n",
+            IDENTITY_NAMESPACE,
+            *args,
+        ],
         check=check,
         timeout=timeout,
     )

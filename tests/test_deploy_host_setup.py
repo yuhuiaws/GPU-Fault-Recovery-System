@@ -37,12 +37,18 @@ def _bundle_tree(tmp_path: Path) -> Path:
     root = tmp_path / deploy_host_bundle.BUNDLE_ROOT
     (root / "requirements").mkdir(parents=True)
     (root / "wheelhouse").mkdir()
+    (root / "config").mkdir()
     (root / "requirements/deploy-host.lock").write_text(
         "example==1\n", encoding="utf-8"
     )
     wheel = root / "wheelhouse/example-1-py3-none-any.whl"
     wheel.write_bytes(b"wheel")
     wheel.chmod(0o644)
+    template = root / "config/admin-config.example.yaml"
+    template.write_text(
+        "apiVersion: gpu-fault.aws/v1alpha1\nkind: AdminConfig\nspec: {}\n",
+        encoding="utf-8",
+    )
     compatibility = deploy_host_bundle.host_compatibility()
     deploy_host_bundle.write_bundle_manifest(
         root,
@@ -55,6 +61,7 @@ def _bundle_tree(tmp_path: Path) -> Path:
             "requirements": {"deploy_host": "requirements/deploy-host.lock"},
             "source": {"git_commit": "a" * 40, "dirty": False},
             "tool_manifest": "deploy-host-tools.json",
+            "admin_config_template": "config/admin-config.example.yaml",
         },
     )
     return root
@@ -75,6 +82,9 @@ def test_deploy_host_bundle_is_deterministic_and_verified(tmp_path: Path) -> Non
         first, tmp_path / "extracted"
     )
     assert deploy_host_bundle.verify_bundle_tree(extracted)["project_version"] == "1.0"
+    assert (extracted / "config/admin-config.example.yaml").is_file(), (
+        "deploy-host archive omitted the administrator config template"
+    )
 
 
 def test_deploy_host_bundle_rejects_tampered_payload(tmp_path: Path) -> None:
@@ -130,6 +140,19 @@ def test_bundle_setup_reinstalls_project_wheel_without_source_path_leakage() -> 
     assert 'environment.pop("PYTHONPATH", None)' in source
     assert 'environment.pop("PYTHONHOME", None)' in source
     assert '"deployment-host venv is incomplete" not in str(exc)' in source
+    assert "admin-config.example.yaml" in source
+
+
+def test_setup_installs_admin_config_template_read_only(tmp_path: Path) -> None:
+    source = tmp_path / "admin-config.example.yaml"
+    source.write_text("kind: AdminConfig\n", encoding="utf-8")
+    venv = tmp_path / "venv"
+
+    installed = setup_deploy_host.install_admin_config_template(source, venv)
+
+    assert installed == venv / "share/gpu-fault/admin-config.example.yaml"
+    assert installed.read_text(encoding="utf-8") == "kind: AdminConfig\n"
+    assert installed.stat().st_mode & 0o777 == 0o644
 
 
 def test_bundle_signature_verification_uses_cosign(

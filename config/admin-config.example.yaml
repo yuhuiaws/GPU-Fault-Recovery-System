@@ -1,0 +1,30 @@
+apiVersion: gpu-fault.aws/v1alpha1
+kind: AdminConfig
+spec:
+  # Only fields declared in this template are supported administrator inputs.
+  # Omitted fields keep their current persisted value.
+  capacity:
+    controlWorkerReplicas: 6
+    telemetrySpool:
+      enabled: false
+      replicas: 0
+    remediation:
+      maxActiveRegion: 20
+      maxActivePerCluster: 5
+      maxActivePerResourceClass: 2
+  processor:
+    maxQueueDepth: 65536
+    maxClusterQueueDepth: 1024
+    retryAfterSeconds: 2
+    retryBackoffSeconds: 1
+    retryBackoffMaxSeconds: 30
+    completedRetentionSeconds: 600
+  workflow:
+    pollIntervalSeconds: 5
+    dispatcherWorkers: 8
+  notificationDelivery:
+    batchSize: 25
+    maxAttempts: 8
+  evidence:
+    retentionHours: 24
+    maxRecordsPerNode: 10000

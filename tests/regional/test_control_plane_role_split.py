@@ -323,6 +323,50 @@ def test_worker_replica_override_updates_notification_shards() -> None:
     assert worker_env["GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS"] == "28"
 
 
+def test_role_split_applies_common_administrator_tuning_to_all_roles() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy/control-plane/tools/render_control_plane_role_split.py"),
+            "--json",
+        ],
+        input=json.dumps(_deployment()),
+        text=True,
+        capture_output=True,
+        check=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH": "131072",
+            "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": "2048",
+            "GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH": "16384",
+            "GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH": "256",
+            "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS": "45",
+            "GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS": "900",
+            "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS": "10",
+            "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS": "12",
+            "GPU_FAULT_NOTIFICATION_BATCH_SIZE": "50",
+            "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS": "10",
+            "GPU_FAULT_EVIDENCE_RETENTION_HOURS": "48",
+            "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE": "20000",
+        },
+    )
+    items = {
+        item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
+    }
+
+    for deployment_name in (
+        "gpu-fault-api-ha",
+        "gpu-fault-control-worker",
+        "gpu-fault-telemetry-spool-worker",
+    ):
+        values = _effective_env(items, items[deployment_name])
+        assert values["GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH"] == "131072"
+        assert values["GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS"] == "10"
+        assert values["GPU_FAULT_NOTIFICATION_BATCH_SIZE"] == "50"
+        assert values["GPU_FAULT_EVIDENCE_RETENTION_HOURS"] == "48"
+
+
 POOL_ENV = (
     "GPU_FAULT_PROCESSOR_WORKERS",
     "GPU_FAULT_PROCESSOR_FAULT_WORKERS",

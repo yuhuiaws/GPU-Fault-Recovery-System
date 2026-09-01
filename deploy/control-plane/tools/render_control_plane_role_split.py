@@ -328,10 +328,21 @@ def boolean_environment(name: str, default: str) -> str:
     return value
 
 
+def environment_text(value: object) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def renderer_admin_config() -> AdminConfig:
-    defaults = DEFAULT_ADMIN_CONFIG.capacity
-    remediation = defaults.remediation
-    spool = defaults.telemetry_spool
+    defaults = DEFAULT_ADMIN_CONFIG
+    capacity = defaults.capacity
+    remediation = capacity.remediation
+    spool = capacity.telemetry_spool
+    processor = defaults.processor
+    workflow = defaults.workflow
+    notification = defaults.notification_delivery
+    evidence = defaults.evidence
     return AdminConfig.from_mapping(
         {
             "schema_version": 1,
@@ -339,7 +350,7 @@ def renderer_admin_config() -> AdminConfig:
                 "control_worker_replicas": int(
                     os.getenv(
                         "GPU_FAULT_CONTROL_WORKER_REPLICAS",
-                        str(defaults.control_worker_replicas),
+                        str(capacity.control_worker_replicas),
                     )
                 ),
                 "telemetry_spool": {
@@ -390,6 +401,86 @@ def renderer_admin_config() -> AdminConfig:
                     ),
                 },
             },
+            "processor": {
+                "max_queue_depth": int(
+                    os.getenv(
+                        "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH",
+                        str(processor.max_queue_depth),
+                    )
+                ),
+                "max_cluster_queue_depth": int(
+                    os.getenv(
+                        "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH",
+                        str(processor.max_cluster_queue_depth),
+                    )
+                ),
+                "retry_after_seconds": int(
+                    os.getenv(
+                        "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS",
+                        str(processor.retry_after_seconds),
+                    )
+                ),
+                "retry_backoff_seconds": int(
+                    os.getenv(
+                        "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS",
+                        str(processor.retry_backoff_seconds),
+                    )
+                ),
+                "retry_backoff_max_seconds": int(
+                    os.getenv(
+                        "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS",
+                        str(processor.retry_backoff_max_seconds),
+                    )
+                ),
+                "completed_retention_seconds": int(
+                    os.getenv(
+                        "GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS",
+                        str(processor.completed_retention_seconds),
+                    )
+                ),
+            },
+            "workflow": {
+                "poll_interval_seconds": float(
+                    os.getenv(
+                        "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS",
+                        str(workflow.poll_interval_seconds),
+                    )
+                ),
+                "dispatcher_workers": int(
+                    os.getenv(
+                        "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS",
+                        str(workflow.dispatcher_workers),
+                    )
+                ),
+            },
+            "notification_delivery": {
+                "batch_size": int(
+                    os.getenv(
+                        "GPU_FAULT_NOTIFICATION_BATCH_SIZE",
+                        str(notification.batch_size),
+                    )
+                ),
+                "max_attempts": int(
+                    os.getenv(
+                        "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS",
+                        str(notification.max_attempts),
+                    )
+                ),
+            },
+            "evidence": {
+                "retention_hours": int(
+                    os.getenv(
+                        "GPU_FAULT_EVIDENCE_RETENTION_HOURS",
+                        str(evidence.retention_hours),
+                    )
+                ),
+                "max_records_per_node": int(
+                    os.getenv(
+                        "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE",
+                        str(evidence.max_records_per_node),
+                    )
+                ),
+            },
         }
     )
 
@@ -432,7 +523,54 @@ def configure_worker_capacity(container: dict, config: AdminConfig) -> None:
         ),
     }
     for name, value in values.items():
-        set_env(container, name, str(value))
+        set_env(container, name, environment_text(value))
+
+
+def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
+    processor = config.processor
+    workflow = config.workflow
+    notification = config.notification_delivery
+    evidence = config.evidence
+    values = {
+        "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH": processor.max_queue_depth,
+        "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": (
+            processor.max_cluster_queue_depth
+        ),
+        "GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH": (
+            max(1, processor.max_queue_depth // 8)
+        ),
+        "GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH": (
+            max(1, processor.max_cluster_queue_depth // 8)
+        ),
+        "GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD": min(
+            256,
+            processor.max_queue_depth,
+        ),
+        "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS": (processor.retry_after_seconds),
+        "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS": (processor.retry_backoff_seconds),
+        "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS": (
+            processor.retry_backoff_max_seconds
+        ),
+        "GPU_FAULT_PROCESSOR_RETRYABLE_RESPONSE_MAX_AGE_SECONDS": (
+            max(300, processor.retry_backoff_max_seconds)
+        ),
+        "GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS": (
+            processor.completed_retention_seconds
+        ),
+        "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS": (workflow.poll_interval_seconds),
+        "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS": (workflow.dispatcher_workers),
+        "GPU_FAULT_NOTIFICATION_BATCH_SIZE": notification.batch_size,
+        "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS": notification.max_attempts,
+        "GPU_FAULT_EVIDENCE_RETENTION_HOURS": evidence.retention_hours,
+        "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE": (evidence.max_records_per_node),
+    }
+    for name, value in values.items():
+        set_env(container, name, environment_text(value))
+
+
+def configure_base(container: dict, config: AdminConfig) -> None:
+    configure_processor_retry(container)
+    configure_admin_tuning(container, config)
 
 
 def parse_options() -> tuple[argparse.Namespace, AdminConfig]:
@@ -451,7 +589,7 @@ def main() -> None:
     containers = pod_spec["containers"]
     api = next(item for item in containers if item["name"] == "api")
     base = copy.deepcopy(api)
-    configure_processor_retry(base)
+    configure_base(base, admin_config)
 
     ingress = copy.deepcopy(base)
     ingress["name"] = "api"

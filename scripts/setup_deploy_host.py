@@ -181,6 +181,18 @@ def _install_bundled_tools(bundle_root: Path, venv: Path) -> None:
             target.symlink_to(os.path.relpath(path, target.parent))
 
 
+def install_admin_config_template(source: Path, venv: Path) -> Path:
+    if not source.is_file():
+        raise DeployHostSetupError(
+            f"administrator config template is missing: {source}"
+        )
+    destination = venv / "share/gpu-fault/admin-config.example.yaml"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    destination.chmod(0o644)
+    return destination
+
+
 def _dependency_report(venv: Path) -> dict[str, Any]:
     env = _isolated_python_environment()
     env["PATH"] = f"{venv / 'bin'}:{env.get('PATH', '')}"
@@ -212,6 +224,11 @@ def _check_venv(venv: Path) -> dict[str, Any]:
     state_path = venv / STATE_NAME
     if not python.is_file() or not admin.is_file() or not state_path.is_file():
         raise DeployHostSetupError(f"deployment-host venv is incomplete: {venv}")
+    admin_config_template = venv / "share/gpu-fault/admin-config.example.yaml"
+    if not admin_config_template.is_file():
+        raise DeployHostSetupError(
+            f"deployment-host administrator config template is missing: {venv}"
+        )
     _run([str(admin), "--help"], capture=True)
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -222,6 +239,7 @@ def _check_venv(venv: Path) -> dict[str, Any]:
         "healthy": True,
         "venv": str(venv),
         "state": state,
+        "admin_config_template": str(admin_config_template),
         "dependencies": _dependency_report(venv),
     }
 
@@ -262,6 +280,10 @@ def _install_from_bundle(
         env=_isolated_python_environment(),
     )
     _install_bundled_tools(bundle_root, venv)
+    install_admin_config_template(
+        bundle_root / str(manifest["admin_config_template"]),
+        venv,
+    )
     return manifest
 
 
@@ -288,6 +310,10 @@ def _install_online(
             str(repo_root),
         ],
         env=_isolated_python_environment(),
+    )
+    install_admin_config_template(
+        repo_root / "config/admin-config.example.yaml",
+        venv,
     )
     commit = _run(
         ["git", "rev-parse", "HEAD"],

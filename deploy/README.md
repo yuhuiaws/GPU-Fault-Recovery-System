@@ -38,8 +38,8 @@ builds/pushes/signs the release, maintains the private internal site, and runs
 preflight/deploy/verify/stability.
 
 An optional private `--config <AdminConfig.yaml>` is accepted only for initial
-site configuration. Existing sites use `gpu-fault-admin capacity plan/apply`
-or `config plan/apply`. The normalized state is stored outside `deploy/`;
+site configuration. Existing sites edit `<state-dir>/admin-config.yaml` and run
+`gpu-fault-admin config --state-dir ... --reference ...`. The normalized state is stored outside `deploy/`;
 config-only releases dynamically render into a temporary directory from the
 same reviewed role-split sources, preserve the signed image/wheel identities,
 and select only affected CPU roles.

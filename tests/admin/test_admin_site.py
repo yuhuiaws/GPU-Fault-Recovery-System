@@ -14,8 +14,12 @@ from gpu_fault import admin_cli
 from gpu_fault.admin_bootstrap_common import BootstrapResult
 from gpu_fault.admin_config import (
     AdminConfigError,
-    initialize_desired_admin_config,
+    admin_config_plan_path,
     load_desired_admin_config,
+)
+from gpu_fault.admin_config_file import (
+    admin_config_file_path,
+    initialize_desired_admin_config,
 )
 from gpu_fault.admin_site import (
     RegionalSite,
@@ -620,23 +624,18 @@ def test_public_deploy_help_exposes_optional_admin_config(capsys) -> None:
         assert value not in help_text
 
 
-def test_capacity_plan_creates_reviewable_role_scoped_plan(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    site_file(tmp_path)
-    arguments = admin_cli.parser().parse_args(
-        ["capacity", "plan", "--state-dir", str(tmp_path), "--preset", "32-disabled"]
-    )
+def test_config_help_is_single_level(capsys) -> None:
+    with pytest.raises(SystemExit, match="0"):
+        admin_cli.parser().parse_args(["config", "--help"])
 
-    assert admin_cli.run(arguments) == 0
-    output = json.loads(capsys.readouterr().out)
-    assert output["source"] == "preset:32-disabled"
-    assert output["affected_roles"] == ["worker"]
-    assert output["approval_required"] is True
-    assert len(output["plan_sha256"]) == 64
+    help_text = capsys.readouterr().out
+    for value in ("--state-dir", "--file", "--preset", "--reference", "--dry-run"):
+        assert value in help_text
+    for value in ("config plan", "config apply", "--plan-sha256"):
+        assert value not in help_text
 
 
-def test_config_plan_accepts_partial_private_yaml(
+def test_config_dry_run_from_private_yaml_is_role_scoped(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     site_file(tmp_path)
@@ -662,44 +661,47 @@ def test_config_plan_accepts_partial_private_yaml(
     )
     config.chmod(0o600)
     arguments = admin_cli.parser().parse_args(
-        ["config", "plan", "--state-dir", str(tmp_path), "--file", str(config)]
+        [
+            "config",
+            "--state-dir",
+            str(tmp_path),
+            "--file",
+            str(config),
+            "--reference",
+            "CHG-12345",
+            "--dry-run",
+        ]
     )
 
     assert admin_cli.run(arguments) == 0
     output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "DRY_RUN"
     assert output["source"] == f"file:{config.resolve()}"
+    assert output["affected_roles"] == ["worker"]
     assert output["desired_config"]["capacity"]["telemetry_spool"] == {
         "enabled": False,
         "replicas": 0,
     }
+    assert not admin_config_plan_path(tmp_path).exists(), (
+        "config --dry-run persisted an active internal plan"
+    )
 
 
-def test_capacity_apply_uses_existing_signed_release_without_building(
+def test_config_preset_uses_existing_signed_release_without_building(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     site_file(tmp_path)
-    plan_arguments = admin_cli.parser().parse_args(
-        ["capacity", "plan", "--state-dir", str(tmp_path), "--preset", "32-disabled"]
-    )
-    assert admin_cli.run(plan_arguments) == 0
-    plan = json.loads(capsys.readouterr().out)
     calls: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        admin_cli,
-        "_current_release_metadata",
-        lambda _root: dict(plan["release_identity"]),
-    )
     monkeypatch.setattr(
         admin_cli, "_run_automatic_release", lambda **kwargs: calls.append(kwargs) or 0
     )
     arguments = admin_cli.parser().parse_args(
         [
-            "capacity",
-            "apply",
+            "config",
             "--state-dir",
             str(tmp_path),
-            "--plan-sha256",
-            plan["plan_sha256"],
+            "--preset",
+            "32-disabled",
             "--reference",
             "CHG-12345",
         ]
@@ -711,6 +713,23 @@ def test_capacity_apply_uses_existing_signed_release_without_building(
     assert output["release_id"] == "release-a"
     assert output["affected_roles"] == ["worker"]
     assert calls[0]["site_file"] == tmp_path / "site.yaml"
+    assert admin_config_file_path(tmp_path).is_file(), (
+        "config preset did not materialize the canonical editable file"
+    )
+
+
+def test_config_without_input_creates_canonical_file_and_stops(tmp_path: Path) -> None:
+    site_file(tmp_path)
+    arguments = admin_cli.parser().parse_args(
+        ["config", "--state-dir", str(tmp_path), "--reference", "CHG-12345"]
+    )
+
+    with pytest.raises(AdminConfigError, match="edit it and rerun"):
+        admin_cli.run(arguments)
+
+    path = admin_config_file_path(tmp_path)
+    assert path.is_file(), "config without input did not create admin-config.yaml"
+    assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_first_deploy_can_import_private_admin_config(
@@ -751,6 +770,10 @@ def test_first_deploy_can_import_private_admin_config(
     assert admin_cli.run(arguments) == 0
     desired = load_desired_admin_config(tmp_path / "state")
     assert desired.capacity.remediation.max_active_region == 128
+    canonical = admin_config_file_path(tmp_path / "state")
+    assert load_desired_admin_config(tmp_path / "state") == (
+        admin_cli.load_admin_config_file(canonical)
+    )
     assert calls, "first deploy did not continue into source preparation"
 
 
@@ -784,7 +807,7 @@ def test_existing_site_rejects_direct_config_change_on_deploy(tmp_path: Path) ->
         ]
     )
 
-    with pytest.raises(AdminConfigError, match="config plan/apply"):
+    with pytest.raises(AdminConfigError, match="gpu-fault-admin config"):
         admin_cli.run(arguments)
 
 

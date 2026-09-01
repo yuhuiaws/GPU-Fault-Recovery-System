@@ -364,6 +364,9 @@ libc实现；任一不匹配都fail closed。生产bundle还要求clean源码且
 checkout一致。依赖安装始终使用`--no-index`，在同目录临时venv中完成全部依赖和系统
 工具检查后才原子替换目标venv；相同bundle重复执行只验证并复用。初始化器不调用系统
 包管理器，报告和venv不得包含AWS凭据、token、私钥、数据库密码或kubeconfig。
+bundle还携带经过Manifest摘要校验的`config/admin-config.example.yaml`，setup将其安装
+到`<deploy-host-venv>/share/gpu-fault/admin-config.example.yaml`。该文件是管理员首次
+部署前准备`0600`配置输入的只读模板，不包含凭据，也不会自动写入任何state-dir。
 
 ### 6.3 消费签名 release
 
