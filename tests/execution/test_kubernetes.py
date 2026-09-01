@@ -28,6 +28,7 @@ from ._kubernetes_cases_2 import (
     test_kubernetes_auto_resume_guard_runs_before_pod_termination,
     test_kubernetes_refuses_workload_with_hyperpod_auto_resume,
     test_kubernetes_restart_clones_terminal_job_idempotently,
+    test_kubernetes_restart_fails_closed_when_source_workload_is_missing,
     test_kubernetes_stop_captures_training_log_before_delete,
     test_kubernetes_stop_rejects_active_incident_takeover,
     test_kubernetes_stop_retries_workload_patch_conflict,
