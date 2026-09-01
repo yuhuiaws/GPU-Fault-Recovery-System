@@ -11,6 +11,7 @@ import pytest
 
 from scripts.e2e.regional import audit_destr013_replacement_invariant as destr013
 from scripts.e2e.regional import regional_live_fixture as live_fixture_module
+from scripts.e2e.regional import run_collector_destructive as collector_destructive
 from scripts.e2e.regional import run_destr001_gpu_reset as destr001
 from scripts.e2e.regional import run_destr002_hyperpod_reboot as destr002
 from scripts.e2e.regional import run_destr003_warm_spare_failover as destr003
@@ -19,6 +20,7 @@ from scripts.e2e.regional import run_destr009_workload_restart as destr009
 from scripts.e2e.regional import run_destr012_managed_recovery_guard as destr012
 from scripts.e2e.regional import run_ha003_aurora_failover_reset as ha003
 from scripts.e2e.regional import run_ha004_waiting_reclaim_reset as ha004
+from scripts.e2e.regional import run_workload_acceptance as workload_acceptance
 from scripts.e2e.regional.acceptance_scope import (
     EXECUTION_SCOPE_ENV,
     SELECTION_REFERENCE_ENV,
@@ -35,6 +37,7 @@ from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveSettings,
     predecessor_evidence,
     provider_event_actor_matches_role,
+    runtime_identity_errors,
 )
 from scripts.e2e.regional.warm_spare_fixture import (
     GpuHolderFixture,
@@ -640,6 +643,50 @@ def test_destr002_redacts_lease_tokens_from_evidence() -> None:
     assert source["commands"][0]["lease_token"] == "sensitive-lease-token-value", source
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("NVIDIA H200", "H200"),
+        ("ml.p5.48xlarge", "H100"),
+        ("p5.48xlarge", "H100"),
+        ("ml.p5e.48xlarge", "H200"),
+        ("ml.p5en.48xlarge", "H200"),
+        ("ml.p6-b200.48xlarge", "B200"),
+        ("ml.p6-b300.48xlarge", "B300"),
+    ],
+)
+def test_destr009_normalizes_gpu_product_or_instance_type(
+    value: str, expected: str
+) -> None:
+    assert destr009.normalize_product(value) == expected, value
+
+
+def test_destr009_rejects_unknown_gpu_product() -> None:
+    with pytest.raises(
+        destr009.RegionalFixtureError, match="cannot normalize GPU product"
+    ):
+        destr009.normalize_product("ml.unknown.48xlarge")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        live_fixture_module.EXECUTOR_XID_POST,
+        workload_acceptance.OBSERVATION_POST_PROBE,
+        collector_destructive.FABRIC_POST,
+    ],
+)
+def test_executor_event_probes_scope_private_ca_to_the_probe_process(
+    source: str,
+) -> None:
+    ca_index = source.index(
+        'os.environ["SSL_CERT_FILE"] = os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]'
+    )
+    sink_index = source.index("sink = HttpEventSink(")
+
+    assert ca_index < sink_index, source
+
+
 def _destr003_settings(tmp_path: Path) -> destr003.Settings:
     return destr003.Settings(
         regional=_regional(tmp_path).settings,
@@ -790,9 +837,11 @@ def _restart_state(gpu_count: int) -> dict[str, Any]:
         details: dict[str, Any] = {}
         if operation == "RESTART_WORKLOAD":
             details = {
-                "source_gpu_count": gpu_count,
-                "target_gpu_count": gpu_count,
-                "restart_count": 1,
+                "notification_context": {
+                    "source_gpu_count": gpu_count,
+                    "target_gpu_count": gpu_count,
+                    "restart_count": 1,
+                }
             }
         executions.append(
             {
@@ -824,6 +873,11 @@ def _restart_state(gpu_count: int) -> dict[str, Any]:
             "step_executions": executions,
         },
         "observed_waiting_step_executions": waiting,
+        "commands": [
+            {"status": "SUCCEEDED", "step": {"operation": operation}}
+            for operation in ("STOP_WORKLOADS", "RESTART_WORKLOAD")
+        ],
+        "restart_budget": {"budget": 1, "restart_count": 1},
     }
 
 
@@ -833,6 +887,189 @@ def test_destr009_workflow_contract_scales_to_expected_gpu_count() -> None:
     assert destr009.workflow_errors(state, expected_gpu_count=24) == [], state
     errors = destr009.workflow_errors(state, expected_gpu_count=1)
     assert any("source GPU count is not 1" in error for error in errors), errors
+
+
+def test_destr009_accepts_fast_remote_step_terminal_evidence() -> None:
+    state = _restart_state(24)
+    state["observed_waiting_step_executions"] = [
+        item
+        for item in state["observed_waiting_step_executions"]
+        if item["operation"] != "RESTART_WORKLOAD"
+    ]
+
+    assert destr009.workflow_errors(state) == [], state
+
+
+def test_destr009_rejects_fast_step_without_remote_command_evidence() -> None:
+    state = _restart_state(24)
+    state["observed_waiting_step_executions"] = []
+    state["commands"] = [
+        item
+        for item in state["commands"]
+        if item["step"]["operation"] != "RESTART_WORKLOAD"
+    ]
+
+    errors = destr009.workflow_errors(state)
+
+    assert any(
+        "RESTART_WORKLOAD lacks remote execution evidence" in item for item in errors
+    ), errors
+
+
+def test_destr009_cleanup_waits_for_late_remote_command_quiescence(
+    tmp_path: Path,
+) -> None:
+    snapshots = [
+        {"event": {"event_id": "event-a"}, "workflow": None, "commands": []},
+        {
+            "event": {"event_id": "event-a"},
+            "workflow": {"request_id": "workflow-a", "status": "RUNNING"},
+            "commands": [
+                {
+                    "step": {"operation": "RESTART_WORKLOAD"},
+                    "status": "PENDING",
+                    "lease_token": "sensitive-lease-token",
+                }
+            ],
+        },
+        {
+            "event": {"event_id": "event-a"},
+            "workflow": {"request_id": "workflow-a", "status": "SUCCEEDED"},
+            "commands": [
+                {
+                    "step": {"operation": "RESTART_WORKLOAD"},
+                    "status": "SUCCEEDED",
+                    "updated_at": "2026-09-01T15:01:15Z",
+                }
+            ],
+        },
+    ]
+
+    class Regional:
+        calls = 0
+
+        def store_snapshot(self, **_kwargs):
+            index = min(self.calls, len(snapshots) - 1)
+            self.calls += 1
+            return snapshots[index]
+
+    regional = Regional()
+    report = destr009.wait_for_cleanup_quiescence(
+        regional=regional,
+        node="node-a",
+        marker="marker-a",
+        observed_after=datetime.now(timezone.utc),
+        job_id="job-a",
+        attempt_id="attempt-a",
+        case_dir=tmp_path,
+        timeout_seconds=1,
+        quiet_seconds=0,
+        poll_seconds=0,
+    )
+
+    assert regional.calls == 3
+    assert report["safe_to_delete"] is True
+    persisted = json.loads(
+        (tmp_path / "cleanup-quiescence.json").read_text(encoding="utf-8")
+    )
+    assert "sensitive-lease-token" not in json.dumps(persisted, sort_keys=True)
+    assert persisted["entries"][1]["commands"][0]["status"] == "PENDING"
+    assert persisted["entries"][-1]["commands"][0]["status"] == "SUCCEEDED"
+
+
+def test_destr009_cleanup_waits_before_deleting_workload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    class Regional:
+        def kubectl(self, *_args, **_kwargs):
+            return ""
+
+        def verify_runtime_identity(self, *_args, **_kwargs):
+            calls.append("identity")
+
+    class Workload:
+        resource = "pytorchjob"
+        name = "training-a"
+
+        def delete(self):
+            calls.append("delete")
+
+    class Prewarm:
+        def cleanup(self):
+            return {}
+
+    monkeypatch.setattr(
+        destr009,
+        "wait_for_cleanup_quiescence",
+        lambda **_kwargs: calls.append("quiescence") or {"safe_to_delete": True},
+    )
+    result: dict[str, Any] = {"verdict": "PASS"}
+
+    destr009.cleanup_case(
+        regional=Regional(),
+        workload=Workload(),
+        prewarm=Prewarm(),
+        case_dir=tmp_path,
+        runtime_identity={},
+        result=result,
+        node="node-a",
+        marker="marker-a",
+        observed_after=datetime.now(timezone.utc),
+        job_id="job-a",
+        attempt_id="attempt-a",
+    )
+
+    assert calls[:2] == ["quiescence", "delete"]
+    assert result["workload_residual"] is False
+
+
+def test_destr009_cleanup_defers_delete_without_quiescence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deleted = False
+
+    class Regional:
+        def verify_runtime_identity(self, *_args, **_kwargs):
+            return None
+
+    class Workload:
+        resource = "pytorchjob"
+        name = "training-a"
+
+        def delete(self):
+            nonlocal deleted
+            deleted = True
+
+    class Prewarm:
+        def cleanup(self):
+            return {}
+
+    def fail_quiescence(**_kwargs):
+        raise destr009.RegionalFixtureError("remote command is still PENDING")
+
+    monkeypatch.setattr(destr009, "wait_for_cleanup_quiescence", fail_quiescence)
+    result: dict[str, Any] = {"verdict": "PASS"}
+
+    destr009.cleanup_case(
+        regional=Regional(),
+        workload=Workload(),
+        prewarm=Prewarm(),
+        case_dir=tmp_path,
+        runtime_identity={},
+        result=result,
+        node="node-a",
+        marker="marker-a",
+        observed_after=datetime.now(timezone.utc),
+        job_id="job-a",
+        attempt_id="attempt-a",
+    )
+
+    assert deleted is False
+    assert result["workload_cleanup_deferred"] is True
+    assert result["workload_residual"] is True
+    assert result["verdict"] == "FAIL"
 
 
 def test_destr012_group_d_requires_prewrite_failure_details() -> None:
@@ -890,6 +1127,7 @@ def test_destr012_keeps_group_c_optional_and_isolated(tmp_path: Path) -> None:
         "release_id": "release-a",
         "store": {"profile": {"profile_version": "profile-a"}},
         "group_b": {"profile": {"profile_sha256s": ["a" * 64]}},
+        "runtime_identity": {"release_state": {}, "deployments": {}},
     }
 
     details = destr012.plan_details(settings, preflight)
@@ -898,6 +1136,73 @@ def test_destr012_keeps_group_c_optional_and_isolated(tmp_path: Path) -> None:
     assert details["group_c"]["optional"] is True, details
     assert details["group_c"]["planned_status"] == "NOT_RUN", details
     assert details["rollback"]["production_Runtime_Profile_is_never_modified"] is True
+    assert (
+        details["preflight_identity"]["runtime_identity"]
+        == preflight["runtime_identity"]
+    )
+
+
+def _runtime_identity(*, phase: str = "complete") -> dict[str, Any]:
+    deployments = {}
+    for plane, names in live_fixture_module.RUNTIME_IDENTITY_DEPLOYMENTS.items():
+        deployments[plane] = {
+            name: {
+                "generation": 1,
+                "desired_replicas": 2,
+                "observed_generation": 1,
+                "updated_replicas": 2,
+                "ready_replicas": 2,
+                "available_replicas": 2,
+                "template_sha256": "a" * 64,
+                "images": ["registry.example/runtime@sha256:" + "b" * 64],
+            }
+            for name in names
+        }
+    return {
+        "release_state": {"release_id": "release-a", "phase": phase},
+        "deployments": deployments,
+    }
+
+
+def test_runtime_identity_rejects_active_release_rollback() -> None:
+    errors = runtime_identity_errors(
+        _runtime_identity(phase="rollback-controller-staged")
+    )
+
+    assert any("rollback is active" in error for error in errors), errors
+
+
+def test_runtime_identity_rejects_incomplete_runtime_rollout() -> None:
+    identity = _runtime_identity()
+    identity["deployments"]["gpu"]["gpu-fault-cluster-executor"]["ready_replicas"] = 1
+
+    errors = runtime_identity_errors(identity)
+
+    assert any(
+        "gpu/gpu-fault-cluster-executor is not fully rolled out" in error
+        for error in errors
+    ), errors
+
+
+def test_runtime_identity_verification_records_and_rejects_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _regional(tmp_path)
+    expected = _runtime_identity()
+    current = _runtime_identity()
+    current["release_state"]["updated_at_epoch"] = 2
+    monkeypatch.setattr(fixture, "runtime_identity", lambda: current)
+    evidence = tmp_path / "runtime-identity.json"
+
+    with pytest.raises(
+        live_fixture_module.RegionalFixtureError,
+        match="release/runtime deployment identity drifted",
+    ):
+        fixture.verify_runtime_identity(
+            expected, evidence_path=evidence, stage="after group A"
+        )
+
+    assert json.loads(evidence.read_text(encoding="utf-8")) == current
 
 
 def _ha003_settings(tmp_path: Path) -> ha003.Settings:

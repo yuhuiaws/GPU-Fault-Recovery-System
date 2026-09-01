@@ -41,6 +41,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveSettings,
     predecessor_evidence,
     required,
+    runtime_identity_errors,
     settings_from_arguments,
 )
 
@@ -349,6 +350,7 @@ def read_only_preflight(
     state = (
         regional.store_snapshot(node=str(candidates[0]["name"])) if candidates else {}
     )
+    runtime_identity = regional.runtime_identity()
     profile_version = str((state.get("profile") or {}).get("profile_version") or "")
     group_b = (
         group_b_audit(regional, profile_version=profile_version)
@@ -361,6 +363,7 @@ def read_only_preflight(
         PREDECESSOR_CASE_ID,
     )
     errors = list(group_b["errors"])
+    errors.extend(runtime_identity_errors(runtime_identity))
     if not predecessor["valid"]:
         errors.append("DESTR-009 predecessor evidence is not PASS")
     if len(candidates) < 3:
@@ -385,6 +388,7 @@ def read_only_preflight(
         "candidate_nodes": candidates,
         "gpu_workloads": gpu_workloads,
         "store": state,
+        "runtime_identity": runtime_identity,
         "group_b": group_b,
         "focused_tests": tests,
         "cpu_blast": regional.cpu_blast_snapshot(),
@@ -799,11 +803,13 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "candidate_node_uids": sorted(
                 str(item["uid"]) for item in preflight["candidate_nodes"]
             ),
+            "runtime_identity": preflight["runtime_identity"],
         },
         "stop_conditions": [
             "DESTR-009 has not passed in formal sequence",
             "B finds auto-resume=true or replica/Profile disagreement",
             "preflight or focused regression failure",
+            "release rollback is active or a required deployment is not fully rolled out",
             "fewer than three idle Ready GPU nodes",
             "A differs from the DESTR-009 restart contract",
             "D mutates spec.suspend or Pod UIDs before failing",
@@ -848,6 +854,7 @@ def execute_case(
         "candidate_node_uids": sorted(
             str(item["uid"]) for item in preflight["candidate_nodes"]
         ),
+        "runtime_identity": preflight["runtime_identity"],
     }
     if current != planned:
         raise RegionalFixtureError(f"DESTR-012 plan drifted: {planned} != {current}")
@@ -885,6 +892,11 @@ def execute_case(
             raise RegionalFixtureError(
                 "training image is not cached on every candidate"
             )
+        regional.verify_runtime_identity(
+            planned["runtime_identity"],
+            evidence_path=case_dir / "runtime-identity-before-group-a.json",
+            stage="before DESTR-012 group A",
+        )
 
         group_a = run_group_a(
             settings,
@@ -895,6 +907,11 @@ def execute_case(
         write_json_atomic(case_dir / "group-a.json", group_a)
         if group_a["verdict"] != "PASS":
             raise RegionalFixtureError("group A failed")
+        regional.verify_runtime_identity(
+            planned["runtime_identity"],
+            evidence_path=case_dir / "runtime-identity-after-group-a.json",
+            stage="after DESTR-012 group A",
+        )
 
         group_d = run_group_d(
             settings,
@@ -905,6 +922,11 @@ def execute_case(
         write_json_atomic(case_dir / "group-d.json", group_d)
         if group_d["verdict"] != "PASS":
             raise RegionalFixtureError("group D failed")
+        regional.verify_runtime_identity(
+            planned["runtime_identity"],
+            evidence_path=case_dir / "runtime-identity-after-group-d.json",
+            stage="after DESTR-012 group D",
+        )
 
         group_c = {
             "group": "C",
@@ -985,6 +1007,17 @@ def execute_case(
             result["verdict"] = "FAIL"
         result["prewarm_residuals"] = prewarm_residuals
         if any(prewarm_residuals.values()):
+            result["verdict"] = "FAIL"
+        try:
+            regional.verify_runtime_identity(
+                planned["runtime_identity"],
+                evidence_path=case_dir / "runtime-identity-after-cleanup.json",
+                stage="after DESTR-012 cleanup",
+            )
+        except Exception as exc:
+            errors = result.setdefault("errors", [])
+            if isinstance(errors, list):
+                errors.append(f"{type(exc).__name__}: {exc}")
             result["verdict"] = "FAIL"
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))

@@ -3,7 +3,6 @@ from __future__ import annotations
 import gzip
 import hashlib
 import re
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib import parse as urllib_parse
@@ -39,21 +38,12 @@ from gpu_fault.adapters.common import (
     ANNOTATION_WORKFLOW,
     LABEL_ATTEMPT_ID,
 )
-
-
-@dataclass
-class _WorkloadMutation:
-    workloads: list[tuple[str, str, str, str, Any]]
-    parsed: list[tuple[str, str, str, str]]
-    absent_workload_ids: list[str] = field(default_factory=list)
-    terminating_pods: list[tuple[str, str]] = field(default_factory=list)
-    log_evidence: list[dict[str, Any]] = field(default_factory=list)
-    log_errors: list[dict[str, str]] = field(default_factory=list)
-    target_gpu_count: int | None = None
-    restart_count: int | None = None
-    restart_attempt_id: str | None = None
-    retry_workload_ids: list[str] = field(default_factory=list)
-    created_retry_ids: list[str] = field(default_factory=list)
+from gpu_fault.adapters.kubernetes.restart_source_guard import (
+    _WorkloadMutation,
+    refresh_restart_workloads,
+    restart_source_failure,
+    workload_lifecycle_identity,
+)
 
 
 class KubernetesWorkloadOperationsMixin:
@@ -164,7 +154,17 @@ class KubernetesWorkloadOperationsMixin:
                     "already_absent_workloads": (prepared.absent_workload_ids),
                 },
             )
-        self._apply_workload_mutation(context, prepared, suspend)
+        try:
+            self._apply_workload_mutation(context, prepared, suspend)
+        except Exception as exc:
+            if not suspend and getattr(exc, "status", None) in {404, 410}:
+                return restart_source_failure(
+                    "RESTART_SOURCE_WORKLOAD_NOT_FOUND_DURING_MUTATION",
+                    "restart source workload disappeared during mutation",
+                    list(context.step.workload_ids),
+                    kubernetes_status=getattr(exc, "status", None),
+                )
+            raise
         if suspend:
             self._delete_terminating_pods(prepared.terminating_pods)
             outcome = self._suspend_outcome(context, prepared)
@@ -227,23 +227,40 @@ class KubernetesWorkloadOperationsMixin:
         ]
         workloads = []
         absent_workload_ids = []
+        source_workload_uids = {}
+        source_resource_versions = {}
+        deleting_workload_ids = []
         for namespace, kind, name, workload_id in parsed_workloads:
             try:
                 workload = self._read_workload(namespace, kind, name)
             except Exception as exc:
-                if getattr(exc, "status", None) == 404:
+                if getattr(exc, "status", None) in {404, 410}:
                     absent_workload_ids.append(workload_id)
                     continue
                 raise
+            uid, resource_version, deleting = workload_lifecycle_identity(
+                workload,
+                metadata_reader=self._metadata,
+                resource_version_reader=self._resource_version,
+            )
+            source_workload_uids[workload_id] = uid
+            source_resource_versions[workload_id] = resource_version
+            if not suspend and deleting:
+                deleting_workload_ids.append(workload_id)
             workloads.append((namespace, kind, name, workload_id, workload))
         if not suspend and absent_workload_ids:
-            return WorkflowStepOutcome.failed(
+            return restart_source_failure(
+                "RESTART_SOURCE_WORKLOAD_NOT_FOUND",
                 "restart source workload is missing: "
                 + ", ".join(sorted(absent_workload_ids)),
-                details={
-                    "reason": "RESTART_SOURCE_WORKLOAD_NOT_FOUND",
-                    "missing_workload_ids": sorted(absent_workload_ids),
-                },
+                absent_workload_ids,
+            )
+        if deleting_workload_ids:
+            return restart_source_failure(
+                "RESTART_SOURCE_WORKLOAD_DELETING",
+                "restart source workload is being deleted: "
+                + ", ".join(sorted(deleting_workload_ids)),
+                deleting_workload_ids,
             )
         conflict = self._managed_job_recovery_conflict(workloads)
         if conflict is not None:
@@ -252,6 +269,8 @@ class KubernetesWorkloadOperationsMixin:
             workloads=workloads,
             parsed=parsed_workloads,
             absent_workload_ids=absent_workload_ids,
+            source_workload_uids=source_workload_uids,
+            source_resource_versions=source_resource_versions,
         )
         if suspend:
             initiator = context.step.parameters.get("termination_initiator_incident_id")
@@ -262,7 +281,18 @@ class KubernetesWorkloadOperationsMixin:
                     state.log_errors,
                 ) = self._mark_terminating_pods(workloads, context)
         if not suspend:
-            guard, state.restart_count = self._restart_guard(context, workloads)
+            refresh_failure = refresh_restart_workloads(
+                state,
+                read_workload=self._read_workload,
+                metadata_reader=self._metadata,
+                resource_version_reader=self._resource_version,
+            )
+            if refresh_failure is not None:
+                return refresh_failure
+            refreshed_conflict = self._managed_job_recovery_conflict(state.workloads)
+            if refreshed_conflict is not None:
+                return refreshed_conflict
+            guard, state.restart_count = self._restart_guard(context, state.workloads)
             if guard is not None:
                 return guard
             state.restart_attempt_id = self._restart_attempt_id(
@@ -271,7 +301,7 @@ class KubernetesWorkloadOperationsMixin:
             )
             declared_gpu_counts = [
                 self._declared_gpu_count(kind, workload)
-                for _, kind, _, _, workload in workloads
+                for _, kind, _, _, workload in state.workloads
             ]
             if all(count is not None for count in declared_gpu_counts):
                 state.target_gpu_count = sum(declared_gpu_counts)

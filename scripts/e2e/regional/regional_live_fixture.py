@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -31,6 +32,31 @@ PROVIDER_MUTATIONS = {
     "RebootClusterNodes",
     "ReplaceClusterNodes",
 }
+RUNTIME_IDENTITY_DEPLOYMENTS = {
+    "cpu": (
+        "gpu-fault-api-ha",
+        "gpu-fault-control-worker",
+    ),
+    "gpu": (
+        "gpu-fault-cluster-executor",
+        "gpu-fault-completion-watcher",
+        "gpu-fault-kubernetes-node-resource-collector",
+    ),
+}
+RELEASE_STATE_IDENTITY_FIELDS = (
+    "release_id",
+    "phase",
+    "transaction_committed",
+    "updated_at_epoch",
+    "wheel_sha256",
+    "executor_wheel_sha256",
+    "runtime_image",
+    "runtime_profile_version",
+    "runtime_profile_sha256",
+    "cpu_manifest_sha256",
+    "executor_manifest_sha256",
+    "cluster_registry_digest",
+)
 
 
 def provider_event_actor_matches_role(
@@ -42,6 +68,46 @@ def provider_event_actor_matches_role(
     if session_issuer_role_name:
         return session_issuer_role_name == expected_role_name
     return expected_role_name in event.get("username", "")
+
+
+def runtime_identity_errors(value: dict[str, Any]) -> list[str]:
+    errors = []
+    release_state = value.get("release_state")
+    if not isinstance(release_state, dict):
+        errors.append("regional release identity is unavailable")
+    else:
+        phase = str(release_state.get("phase") or "").strip().lower()
+        if phase.startswith("rollback-") or phase == "rolling-back":
+            errors.append(f"regional release rollback is active at phase {phase}")
+    deployments = value.get("deployments")
+    if not isinstance(deployments, dict):
+        errors.append("runtime deployment identity is unavailable")
+        return errors
+    for plane, names in RUNTIME_IDENTITY_DEPLOYMENTS.items():
+        plane_deployments = deployments.get(plane)
+        if not isinstance(plane_deployments, dict):
+            errors.append(f"{plane} runtime deployment identity is unavailable")
+            continue
+        for name in names:
+            item = plane_deployments.get(name)
+            if not isinstance(item, dict):
+                errors.append(f"{plane}/{name} runtime deployment is unavailable")
+                continue
+            generation = int(item.get("generation") or 0)
+            desired = int(item.get("desired_replicas") or 0)
+            observed = int(item.get("observed_generation") or 0)
+            updated = int(item.get("updated_replicas") or 0)
+            ready = int(item.get("ready_replicas") or 0)
+            available = int(item.get("available_replicas") or 0)
+            if (
+                desired <= 0
+                or observed != generation
+                or updated != desired
+                or ready != desired
+                or available != desired
+            ):
+                errors.append(f"{plane}/{name} is not fully rolled out")
+    return errors
 
 
 class RegionalFixtureError(RuntimeError):
@@ -413,6 +479,7 @@ from urllib.request import Request, urlopen
 from gpu_fault.collectors.sinks import HttpEventSink
 
 payload = json.loads(sys.argv[1])
+os.environ["SSL_CERT_FILE"] = os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
 sink = HttpEventSink(
     os.environ["GPU_FAULT_CONTROL_PLANE_URL"],
     bearer_token=os.environ["GPU_FAULT_CONTROL_PLANE_TOKEN"],
@@ -655,6 +722,108 @@ class RegionalLiveFixture:
         )
         state = json.loads(value["data"]["state.json"])
         return str(state.get("release_id") or "")
+
+    def runtime_identity(self) -> dict[str, Any]:
+        release_document = json.loads(
+            self.kubectl(
+                "cpu",
+                "get",
+                "configmap",
+                "gpu-fault-regional-release-state",
+                "-o",
+                "json",
+            )
+        )
+        try:
+            release_state = json.loads(release_document["data"]["state.json"])
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise RegionalFixtureError(
+                "regional release state is not valid JSON"
+            ) from exc
+        if not isinstance(release_state, dict):
+            raise RegionalFixtureError("regional release state is not an object")
+
+        deployments: dict[str, dict[str, Any]] = {}
+        for plane, names in RUNTIME_IDENTITY_DEPLOYMENTS.items():
+            value = json.loads(
+                self.kubectl(
+                    plane,
+                    "get",
+                    "deployment",
+                    *names,
+                    "-o",
+                    "json",
+                )
+            )
+            items = {
+                str(item.get("metadata", {}).get("name") or ""): item
+                for item in value.get("items", [])
+                if isinstance(item, dict)
+            }
+            if set(items) != set(names):
+                missing = sorted(set(names) - set(items))
+                raise RegionalFixtureError(
+                    f"{plane} runtime deployments are missing: {missing}"
+                )
+            plane_identity: dict[str, Any] = {}
+            for name in names:
+                item = items[name]
+                metadata = item.get("metadata") or {}
+                spec = item.get("spec") or {}
+                status = item.get("status") or {}
+                template = spec.get("template") or {}
+                template_spec = template.get("spec") or {}
+                containers = [
+                    *(template_spec.get("initContainers") or []),
+                    *(template_spec.get("containers") or []),
+                ]
+                canonical = json.dumps(
+                    template,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                plane_identity[name] = {
+                    "generation": int(metadata.get("generation") or 0),
+                    "desired_replicas": int(spec.get("replicas") or 0),
+                    "observed_generation": int(status.get("observedGeneration") or 0),
+                    "updated_replicas": int(status.get("updatedReplicas") or 0),
+                    "ready_replicas": int(status.get("readyReplicas") or 0),
+                    "available_replicas": int(status.get("availableReplicas") or 0),
+                    "template_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+                    "images": sorted(
+                        str(container.get("image") or "")
+                        for container in containers
+                        if isinstance(container, dict)
+                    ),
+                }
+            deployments[plane] = plane_identity
+        return {
+            "release_state": {
+                field: release_state.get(field)
+                for field in RELEASE_STATE_IDENTITY_FIELDS
+            },
+            "deployments": deployments,
+        }
+
+    def verify_runtime_identity(
+        self,
+        expected: dict[str, Any],
+        *,
+        evidence_path: Path,
+        stage: str,
+    ) -> dict[str, Any]:
+        current = self.runtime_identity()
+        write_json_atomic(evidence_path, current)
+        if current != expected:
+            raise RegionalFixtureError(
+                f"{stage} release/runtime deployment identity drifted"
+            )
+        errors = runtime_identity_errors(current)
+        if errors:
+            raise RegionalFixtureError(
+                f"{stage} runtime identity is unsafe: {'; '.join(errors)}"
+            )
+        return current
 
     def post_xid_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("cluster_id") != self.settings.cluster_id:

@@ -2,18 +2,17 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import signal
 import sys
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, cast
-
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -28,10 +27,10 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     build_plan,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
+    TRAINING_IMAGE,
     ImagePrewarmFixture,
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
-    TRAINING_IMAGE,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
@@ -39,6 +38,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveSettings,
     predecessor_evidence,
     required,
+    runtime_identity_errors,
     settings_from_arguments,
 )
 
@@ -50,6 +50,14 @@ DEFAULT_MANIFEST = (
 CASE_ID = "GF-REGIONAL-DESTR-009"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-002"
 CONFIRMATION = "DESTR009_RESTART_24GPU_WORKLOAD"
+INSTANCE_TYPE_GPU_PRODUCTS = {
+    "p5.4xlarge": "H100",
+    "p5.48xlarge": "H100",
+    "p5e.48xlarge": "H200",
+    "p5en.48xlarge": "H200",
+    "p6-b200.48xlarge": "B200",
+    "p6-b300.48xlarge": "B300",
+}
 CORE_OPERATIONS = {
     "FREEZE_EVIDENCE",
     "STOP_WORKLOADS",
@@ -61,6 +69,11 @@ FORBIDDEN_OPERATIONS = {
     "RESTART_NODE",
     "REPLACE_NODE",
 }
+CLEANUP_TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED"}
+CLEANUP_TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED"}
+CLEANUP_QUIET_SECONDS = 15
+CLEANUP_TIMEOUT_SECONDS = 300
+CLEANUP_POLL_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -195,12 +208,14 @@ def read_only_preflight(
     state = (
         fixture.store_snapshot(node=str(candidates[0]["name"])) if candidates else {}
     )
+    runtime_identity = fixture.runtime_identity()
     tests = focused_tests(case_dir)
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
     )
     errors = []
+    errors.extend(runtime_identity_errors(runtime_identity))
     if not predecessor["valid"]:
         errors.append("DESTR-002 predecessor evidence is not PASS")
     if len(candidates) < 3:
@@ -226,6 +241,7 @@ def read_only_preflight(
         "candidate_nodes": candidates,
         "gpu_workloads": gpu_workloads,
         "store": state,
+        "runtime_identity": runtime_identity,
         "focused_tests": tests,
         "cpu_blast": fixture.cpu_blast_snapshot(),
         "predecessor": predecessor,
@@ -284,13 +300,17 @@ def wait_observation(
 
 def normalize_product(value: str | None) -> str:
     match = re.search(
-        r"(?:NVIDIA[-_ ]*)?(H200|H100|B200|B100|A100|A800|H800)",
+        r"(?:NVIDIA[-_ ]*)?(H200|H100|B300|B200|B100|A100|A800|H800)",
         str(value or ""),
         re.IGNORECASE,
     )
-    if match is None:
-        raise RegionalFixtureError(f"cannot normalize GPU product: {value!r}")
-    return match.group(1).upper()
+    if match is not None:
+        return match.group(1).upper()
+    instance_type = str(value or "").strip().lower().removeprefix("ml.")
+    product = INSTANCE_TYPE_GPU_PRODUCTS.get(instance_type)
+    if product is not None:
+        return product
+    raise RegionalFixtureError(f"cannot normalize GPU product: {value!r}")
 
 
 def xid11_payload(
@@ -378,6 +398,24 @@ def remote_waiting_evidence(state: dict[str, Any], operation: str) -> bool:
     )
 
 
+def remote_execution_evidence(state: dict[str, Any], operation: str) -> bool:
+    if remote_waiting_evidence(state, operation):
+        return True
+    workflow = state.get("workflow") or {}
+    terminal = terminal_step(workflow, operation)
+    command_succeeded = any(
+        (item.get("step") or {}).get("operation") == operation
+        and item.get("status") == "SUCCEEDED"
+        for item in state.get("commands") or []
+    )
+    return bool(
+        terminal
+        and terminal.get("status") == "SUCCEEDED"
+        and str(terminal.get("adapter_operation_id") or "").startswith("remote/")
+        and command_succeeded
+    )
+
+
 def terminal_step(
     workflow: dict[str, Any],
     operation: str,
@@ -413,8 +451,8 @@ def workflow_errors(
     if FORBIDDEN_OPERATIONS.intersection(operations):
         errors.append("workload restart workflow contains a node mutation")
     for operation in ("STOP_WORKLOADS", "RESTART_WORKLOAD"):
-        if not remote_waiting_evidence(state, operation):
-            errors.append(f"{operation} lacks remote WAITING evidence")
+        if not remote_execution_evidence(state, operation):
+            errors.append(f"{operation} lacks remote execution evidence")
         terminal = terminal_step(workflow, operation)
         if terminal is None or terminal.get("status") != "SUCCEEDED":
             errors.append(f"{operation} did not reach SUCCEEDED")
@@ -422,11 +460,24 @@ def workflow_errors(
             errors.append(f"{operation} adapter_operation_id is not remote/")
     restart = terminal_step(workflow, "RESTART_WORKLOAD") or {}
     details = restart.get("details") or {}
-    if details.get("source_gpu_count") != expected_gpu_count:
+    notification_context = details.get("notification_context") or {}
+    source_gpu_count = details.get(
+        "source_gpu_count",
+        notification_context.get("source_gpu_count"),
+    )
+    target_gpu_count = details.get(
+        "target_gpu_count",
+        notification_context.get("target_gpu_count"),
+    )
+    restart_count = (state.get("restart_budget") or {}).get(
+        "restart_count",
+        details.get("restart_count", notification_context.get("restart_count")),
+    )
+    if source_gpu_count != expected_gpu_count:
         errors.append(f"RESTART_WORKLOAD source GPU count is not {expected_gpu_count}")
-    if details.get("target_gpu_count") != expected_gpu_count:
+    if target_gpu_count != expected_gpu_count:
         errors.append(f"RESTART_WORKLOAD target GPU count is not {expected_gpu_count}")
-    if details.get("restart_count") != 1:
+    if restart_count != 1:
         errors.append("RESTART_WORKLOAD restart count is not one")
     return errors
 
@@ -457,6 +508,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "candidate_node_uids": sorted(
                 str(item["uid"]) for item in preflight["candidate_nodes"]
             ),
+            "runtime_identity": preflight["runtime_identity"],
         },
         "stop_conditions": [
             "DESTR-002 has not passed in formal sequence",
@@ -468,16 +520,188 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "processor receipt is not HTTP 200",
             "workflow differs from the three-step workload contract",
             "restart budget, Pod replacement or target GPU count is incorrect",
+            "cleanup cannot prove workflow and remote-command quiescence",
             "any node/provider/control-plane Kubernetes mutation appears",
         ],
         "rollback": {
-            "runner_finally_deletes_the_test_PyTorchJob": True,
+            "runner_waits_for_async_quiescence_before_workload_delete": True,
+            "runner_deletes_test_PyTorchJob_only_after_quiescence": True,
             "runner_finally_deletes_image_prewarm_Pods": True,
             "no_node_reboot_reset_or_replacement_is_authorized": True,
             "failed_workload_cleanup_is_reported_as_a_blocker": True,
         },
         "preflight": preflight,
     }
+
+
+def cleanup_quiescence_summary(state: dict[str, Any]) -> dict[str, Any]:
+    workflow = state.get("workflow") or {}
+    commands = state.get("commands") or []
+    return {
+        "event_observed": bool(state.get("event")),
+        "workflow_request_id": workflow.get("request_id"),
+        "workflow_status": workflow.get("status"),
+        "commands": [
+            {
+                "operation": (item.get("step") or {}).get("operation"),
+                "status": item.get("status"),
+                "status_source": item.get("status_source"),
+                "updated_at": item.get("updated_at"),
+            }
+            for item in commands
+        ],
+    }
+
+
+def wait_for_cleanup_quiescence(
+    *,
+    regional: RegionalLiveFixture,
+    node: str,
+    marker: str,
+    observed_after: datetime,
+    job_id: str,
+    attempt_id: str,
+    case_dir: Path,
+    timeout_seconds: int = CLEANUP_TIMEOUT_SECONDS,
+    quiet_seconds: int = CLEANUP_QUIET_SECONDS,
+    poll_seconds: int = CLEANUP_POLL_SECONDS,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    stable_since: float | None = None
+    stable_signature = ""
+    entries: list[dict[str, Any]] = []
+    last_summary: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        state = regional.store_snapshot(
+            node=node,
+            marker=marker,
+            observed_after=observed_after,
+            job_id=job_id,
+            attempt_id=attempt_id,
+        )
+        summary = cleanup_quiescence_summary(state)
+        last_summary = summary
+        workflow_terminal = (
+            summary["workflow_status"] in CLEANUP_TERMINAL_WORKFLOW_STATUSES
+        )
+        commands = summary["commands"]
+        commands_terminal = all(
+            item.get("status") in CLEANUP_TERMINAL_COMMAND_STATUSES for item in commands
+        )
+        quiescent = bool(
+            summary["event_observed"] and workflow_terminal and commands_terminal
+        )
+        signature = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+        now = time.monotonic()
+        if quiescent and signature == stable_signature:
+            stable_since = stable_since if stable_since is not None else now
+        elif quiescent:
+            stable_signature = signature
+            stable_since = now
+        else:
+            stable_signature = ""
+            stable_since = None
+        quiet_elapsed = (
+            max(0.0, now - stable_since) if stable_since is not None else 0.0
+        )
+        entries.append(
+            {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "quiescent": quiescent,
+                "quiet_elapsed_seconds": round(quiet_elapsed, 3),
+                **summary,
+            }
+        )
+        report = {
+            "safe_to_delete": bool(quiescent and quiet_elapsed >= quiet_seconds),
+            "quiet_seconds": quiet_seconds,
+            "entries": entries,
+        }
+        write_json_atomic(case_dir / "cleanup-quiescence.json", report)
+        if report["safe_to_delete"]:
+            return report
+        time.sleep(poll_seconds)
+    raise RegionalFixtureError(
+        "cleanup could not prove workflow and remote-command quiescence: "
+        + json.dumps(last_summary, sort_keys=True)
+    )
+
+
+def cleanup_case(
+    *,
+    regional: RegionalLiveFixture,
+    workload: ManagedWorkloadFixture,
+    prewarm: ImagePrewarmFixture,
+    case_dir: Path,
+    runtime_identity: dict[str, Any],
+    result: dict[str, Any],
+    node: str | None,
+    marker: str | None,
+    observed_after: datetime | None,
+    job_id: str,
+    attempt_id: str,
+) -> None:
+    cleanup_deferred = False
+    if node and marker and observed_after is not None:
+        try:
+            result["cleanup_quiescence"] = wait_for_cleanup_quiescence(
+                regional=regional,
+                node=node,
+                marker=marker,
+                observed_after=observed_after,
+                job_id=job_id,
+                attempt_id=attempt_id,
+                case_dir=case_dir,
+            )
+        except Exception as exc:
+            cleanup_deferred = True
+            result["cleanup_quiescence_error"] = f"{type(exc).__name__}: {exc}"
+            result["workload_cleanup_deferred"] = True
+            result["verdict"] = "FAIL"
+    try:
+        if cleanup_deferred:
+            workload_residual = True
+        else:
+            workload.delete()
+            workload_residual = bool(
+                regional.kubectl(
+                    "gpu",
+                    "get",
+                    workload.resource,
+                    workload.name,
+                    "--ignore-not-found",
+                    "-o",
+                    "name",
+                    check=False,
+                ).strip()
+            )
+    except Exception as exc:
+        workload_residual = True
+        result["workload_cleanup_error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
+    result["workload_residual"] = workload_residual
+    if workload_residual:
+        result["verdict"] = "FAIL"
+    try:
+        prewarm_residuals = prewarm.cleanup()
+    except Exception as exc:
+        prewarm_residuals = {"cleanup_error": True}
+        result["prewarm_cleanup_error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
+    result["prewarm_residuals"] = prewarm_residuals
+    if any(prewarm_residuals.values()):
+        result["verdict"] = "FAIL"
+    try:
+        regional.verify_runtime_identity(
+            runtime_identity,
+            evidence_path=case_dir / "runtime-identity-after-cleanup.json",
+            stage="after DESTR-009 cleanup",
+        )
+    except Exception as exc:
+        errors = result.setdefault("errors", [])
+        if isinstance(errors, list):
+            errors.append(f"{type(exc).__name__}: {exc}")
+        result["verdict"] = "FAIL"
 
 
 def execute_case(
@@ -503,6 +727,7 @@ def execute_case(
         "candidate_node_uids": sorted(
             str(item["uid"]) for item in preflight["candidate_nodes"]
         ),
+        "runtime_identity": preflight["runtime_identity"],
     }
     if current != planned:
         raise RegionalFixtureError(f"DESTR-009 plan drifted: {planned} != {current}")
@@ -535,6 +760,8 @@ def execute_case(
         "maintenance_window_end": maintenance_window_end.isoformat(),
     }
     injection_started: datetime | None = None
+    marker: str | None = None
+    target_node: str | None = None
     try:
         candidate_names = [str(item["name"]) for item in preflight["candidate_nodes"]]
         prewarm.create(candidate_names)
@@ -554,6 +781,11 @@ def execute_case(
         write_json_atomic(case_dir / "source-observation.json", observation)
         node_metadata = regional.node_metadata(target_node)
         product = normalize_product(node_metadata.get("product"))
+        regional.verify_runtime_identity(
+            planned["runtime_identity"],
+            evidence_path=case_dir / "runtime-identity-before-xid.json",
+            stage="before DESTR-009 XID replay",
+        )
         if datetime.now(timezone.utc) >= maintenance_window_end:
             raise RegionalFixtureError(
                 "approved maintenance window ended before XID replay"
@@ -586,6 +818,11 @@ def execute_case(
         errors = workflow_errors(state)
         target = workload.wait_restarted(source_uids, timeout_seconds=900)
         write_json_atomic(case_dir / "workload-target.json", target)
+        regional.verify_runtime_identity(
+            planned["runtime_identity"],
+            evidence_path=case_dir / "runtime-identity-after-restart.json",
+            stage="after DESTR-009 workload restart",
+        )
         target_uids = {str(item["uid"]) for item in target["pods"]}
         if not target_uids.isdisjoint(source_uids):
             errors.append("old and new PyTorchJob Pod UIDs overlap")
@@ -645,36 +882,19 @@ def execute_case(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        try:
-            workload.delete()
-            workload_residual = bool(
-                regional.kubectl(
-                    "gpu",
-                    "get",
-                    workload.resource,
-                    workload.name,
-                    "--ignore-not-found",
-                    "-o",
-                    "name",
-                    check=False,
-                ).strip()
-            )
-        except Exception as exc:
-            workload_residual = True
-            result["workload_cleanup_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
-        result["workload_residual"] = workload_residual
-        if workload_residual:
-            result["verdict"] = "FAIL"
-        try:
-            prewarm_residuals = prewarm.cleanup()
-        except Exception as exc:
-            prewarm_residuals = {"cleanup_error": True}
-            result["prewarm_cleanup_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
-        result["prewarm_residuals"] = prewarm_residuals
-        if any(prewarm_residuals.values()):
-            result["verdict"] = "FAIL"
+        cleanup_case(
+            regional=regional,
+            workload=workload,
+            prewarm=prewarm,
+            case_dir=case_dir,
+            runtime_identity=planned["runtime_identity"],
+            result=result,
+            node=target_node,
+            marker=marker,
+            observed_after=injection_started,
+            job_id=settings.job_id,
+            attempt_id=settings.attempt_id,
+        )
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1

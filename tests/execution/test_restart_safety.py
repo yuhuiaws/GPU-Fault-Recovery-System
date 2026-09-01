@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+import pytest
+
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
 from gpu_fault.models import (
     IncidentState,
@@ -11,7 +13,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from gpu_fault.runtime_adapters import KubernetesWorkflowAdapter
-from gpu_fault.store import SqliteStore
+from gpu_fault.store import NotFoundError, SqliteStore
 from tests._builders import (
     build_store,
     copy_model,
@@ -294,6 +296,149 @@ class PyTorchCustomApi:
         self, _group, _version, _namespace, _plural, body
     ):
         self.created[body["metadata"]["name"]] = body
+
+
+def _execute_pytorch_restart(custom: PyTorchCustomApi, operation_id: str):
+    store = build_store()
+    adapter = KubernetesWorkflowAdapter(
+        core_api=UnusedApi(), batch_api=UnusedApi(), custom_api=custom, store=store
+    )
+    context = restart_context(
+        operation_id,
+        source_gpu_count=24,
+        restart_budget=1,
+        workload_id="training/pytorchjob/training-job",
+    )
+    return adapter.execute(context), store
+
+
+def test_restart_missing_source_fails_closed() -> None:
+    class MissingCustom(PyTorchCustomApi):
+        def get_namespaced_custom_object(
+            self, _group, _version, _namespace, _plural, name
+        ):
+            error = KeyError(name)
+            error.status = 404
+            raise error
+
+    custom = MissingCustom()
+
+    outcome, store = _execute_pytorch_restart(custom, "missing-source")
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.details["reason"] == "RESTART_SOURCE_WORKLOAD_NOT_FOUND"
+    assert outcome.details["source_workload_ids"] == [
+        "training/pytorchjob/training-job"
+    ]
+    assert custom.created == {}
+    with pytest.raises(NotFoundError):
+        store.get_restart_budget("cluster-a", "train-1")
+
+
+def test_restart_rejects_source_uid_drift_before_budget_or_mutation() -> None:
+    class ReplacedCustom(PyTorchCustomApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+            self.workload["metadata"]["uid"] = "source-uid-a"
+
+        def get_namespaced_custom_object(self, group, version, namespace, plural, name):
+            value = super().get_namespaced_custom_object(
+                group, version, namespace, plural, name
+            )
+            if name == "training-job":
+                self.reads += 1
+                value["metadata"]["uid"] = (
+                    "source-uid-a" if self.reads == 1 else "source-uid-b"
+                )
+            return value
+
+    custom = ReplacedCustom()
+
+    outcome, store = _execute_pytorch_restart(custom, "uid-drift")
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.details["reason"] == "RESTART_SOURCE_WORKLOAD_IDENTITY_DRIFT"
+    assert outcome.details["identity_drift"] == [
+        {
+            "workload_id": "training/pytorchjob/training-job",
+            "expected_uid": "source-uid-a",
+            "current_uid": "source-uid-b",
+        }
+    ]
+    assert custom.patches == []
+    assert custom.created == {}
+    with pytest.raises(NotFoundError):
+        store.get_restart_budget("cluster-a", "train-1")
+
+
+def test_restart_rechecks_managed_recovery_owner_after_final_read() -> None:
+    class OwnershipChangedCustom(PyTorchCustomApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+            self.workload["metadata"]["uid"] = "source-uid-a"
+
+        def get_namespaced_custom_object(self, group, version, namespace, plural, name):
+            value = super().get_namespaced_custom_object(
+                group, version, namespace, plural, name
+            )
+            if name == "training-job":
+                self.reads += 1
+                if self.reads == 2:
+                    value["metadata"]["annotations"][
+                        "sagemaker.amazonaws.com/enable-job-auto-resume"
+                    ] = "true"
+            return value
+
+    custom = OwnershipChangedCustom()
+
+    outcome, store = _execute_pytorch_restart(custom, "owner-changed")
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "enable-job-auto-resume is enabled" in (outcome.error or "")
+    assert custom.patches == []
+    assert custom.created == {}
+    with pytest.raises(NotFoundError):
+        store.get_restart_budget("cluster-a", "train-1")
+
+
+def test_restart_rejects_source_already_being_deleted() -> None:
+    custom = PyTorchCustomApi()
+    custom.workload["metadata"].update(
+        {"uid": "source-uid-a", "deletionTimestamp": "2026-09-01T16:00:00Z"}
+    )
+
+    outcome, store = _execute_pytorch_restart(custom, "source-deleting")
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.details["reason"] == "RESTART_SOURCE_WORKLOAD_DELETING"
+    assert custom.patches == []
+    assert custom.created == {}
+    with pytest.raises(NotFoundError):
+        store.get_restart_budget("cluster-a", "train-1")
+
+
+def test_restart_source_disappearing_during_patch_is_controlled_failure() -> None:
+    class VanishingCustom(PyTorchCustomApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.workload["metadata"]["uid"] = "source-uid-a"
+
+        def patch_namespaced_custom_object(self, *_args, **_kwargs):
+            error = KeyError("training-job")
+            error.status = 404
+            raise error
+
+    custom = VanishingCustom()
+
+    outcome, _store = _execute_pytorch_restart(custom, "source-vanished")
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert (
+        outcome.details["reason"] == "RESTART_SOURCE_WORKLOAD_NOT_FOUND_DURING_MUTATION"
+    )
+    assert custom.created == {}
 
 
 class PodCoreApi:

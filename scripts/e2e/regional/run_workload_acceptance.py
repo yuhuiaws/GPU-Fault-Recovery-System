@@ -625,6 +625,7 @@ import sys
 from gpu_fault.collectors.sinks import HttpEventSink
 
 payload = json.loads(sys.argv[1])
+os.environ["SSL_CERT_FILE"] = os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
 sink = HttpEventSink(
     os.environ["GPU_FAULT_CONTROL_PLANE_URL"],
     bearer_token=os.environ["GPU_FAULT_CONTROL_PLANE_TOKEN"],
