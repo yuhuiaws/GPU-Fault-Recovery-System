@@ -173,6 +173,160 @@ def _blocked_result(
     }
 
 
+def _execute_scheduled_cases(
+    scheduled: tuple[_ScheduledCase, ...],
+    batch_key: str | None,
+    *,
+    execute: Callable[[dict[str, Any], ExecutionPolicy], dict[str, Any]],
+    execute_batch: (
+        Callable[
+            [Sequence[dict[str, Any]], Sequence[ExecutionPolicy]],
+            Mapping[str, dict[str, Any]],
+        ]
+        | None
+    ),
+    queued_at: Mapping[str, str],
+    queued_monotonic: Mapping[str, float],
+    collect_all: bool,
+    monotonic: Callable[[], float],
+    utc_now: Callable[[], str],
+) -> list[dict[str, Any]]:
+    started_at = utc_now()
+    started = monotonic()
+    try:
+        if batch_key is None:
+            item = scheduled[0]
+            raw_results = {
+                str(item.case["id"]): execute(item.case, item.policy),
+            }
+        else:
+            assert execute_batch is not None
+            raw_results = dict(
+                execute_batch(
+                    [item.case for item in scheduled],
+                    [item.policy for item in scheduled],
+                )
+            )
+    except Exception as exc:
+        raw_results = {
+            str(item.case["id"]): _failure_result(item.case, exc) for item in scheduled
+        }
+    completed_at = utc_now()
+    expected = {str(item.case["id"]) for item in scheduled}
+    if set(raw_results) != expected:
+        error = ValueError(
+            "batch executor result IDs do not match scheduled cases: "
+            f"expected={sorted(expected)} actual={sorted(raw_results)}"
+        )
+        raw_results = {
+            str(item.case["id"]): _failure_result(item.case, error)
+            for item in scheduled
+        }
+    batch_id = (
+        f"{batch_key}:{started_at}:{threading.current_thread().name}"
+        if batch_key is not None
+        else None
+    )
+    output = []
+    for item in scheduled:
+        case = item.case
+        policy = item.policy
+        case_id = str(case["id"])
+        result = _validated_result(case, raw_results[case_id])
+        result_id = result.get("id", case_id)
+        if result_id != case_id:
+            result = _failure_result(
+                case,
+                ValueError(f"executor returned result id {result_id!r} for {case_id}"),
+            )
+        result.setdefault("id", case_id)
+        result.setdefault("title", case.get("title", case_id))
+        scheduling = {
+            "queued_at": queued_at[case_id],
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "lock_wait_seconds": round(
+                started - queued_monotonic[case_id],
+                3,
+            ),
+            "execution_seconds": round(monotonic() - started, 3),
+            "worker": threading.current_thread().name,
+            "locks": [lock.as_dict() for lock in policy.effective_locks()],
+            "depends_on": list(policy.depends_on),
+            "failure_scope": policy.failure_scope,
+            "environment": policy.environment,
+            "collect_all": collect_all,
+        }
+        if batch_key is not None:
+            scheduling["batch"] = {
+                "id": batch_id,
+                "key": batch_key,
+                "size": len(scheduled),
+            }
+        result["scheduling"] = scheduling
+        output.append(result)
+    return output
+
+
+def _dependencies_ready(
+    policy: ExecutionPolicy,
+    *,
+    results: Mapping[str, Mapping[str, Any]],
+    selected_ids: set[str],
+) -> bool:
+    return all(
+        dependency in results
+        for dependency in policy.depends_on
+        if dependency in selected_ids
+    )
+
+
+def _block_failed_dependencies(
+    pending: list[dict[str, Any]],
+    *,
+    policies: Mapping[str, ExecutionPolicy],
+    results: dict[str, dict[str, Any]],
+    selected_ids: set[str],
+    success_predicate: Callable[[Mapping[str, Any]], bool],
+    queued_at: Mapping[str, str],
+    queued_monotonic: Mapping[str, float],
+    on_finish: Callable[[dict[str, Any], dict[str, Any]], None] | None,
+    monotonic: Callable[[], float],
+    utc_now: Callable[[], str],
+) -> bool:
+    progressed = False
+    for case in list(pending):
+        case_id = str(case["id"])
+        policy = policies[case_id]
+        selected_dependencies = [
+            dependency for dependency in policy.depends_on if dependency in selected_ids
+        ]
+        failed_dependencies = [
+            dependency
+            for dependency in selected_dependencies
+            if dependency in results and not success_predicate(results[dependency])
+        ]
+        if not failed_dependencies:
+            continue
+        result = _blocked_result(
+            case,
+            reason=(
+                "blocked by failed prerequisite(s): " + ", ".join(failed_dependencies)
+            ),
+            queued_at=queued_at[case_id],
+            queued_monotonic=queued_monotonic[case_id],
+            policy=policy,
+            monotonic=monotonic,
+            utc_now=utc_now,
+        )
+        results[case_id] = result
+        pending.remove(case)
+        if on_finish is not None:
+            on_finish(case, result)
+        progressed = True
+    return progressed
+
+
 def run_scheduled_cases(
     cases: Sequence[dict[str, Any]],
     *,
@@ -226,96 +380,6 @@ def run_scheduled_cases(
     locks = ResourceLockManager()
     global_failure: str | None = None
 
-    def execute_cases(
-        scheduled: tuple[_ScheduledCase, ...],
-        batch_key: str | None,
-    ) -> list[dict[str, Any]]:
-        started_at = utc_now()
-        started = monotonic()
-        try:
-            if batch_key is None:
-                item = scheduled[0]
-                raw_results = {
-                    str(item.case["id"]): execute(item.case, item.policy),
-                }
-            else:
-                assert execute_batch is not None
-                raw_results = dict(
-                    execute_batch(
-                        [item.case for item in scheduled],
-                        [item.policy for item in scheduled],
-                    )
-                )
-        except Exception as exc:
-            raw_results = {
-                str(item.case["id"]): _failure_result(item.case, exc)
-                for item in scheduled
-            }
-        completed_at = utc_now()
-        expected = {str(item.case["id"]) for item in scheduled}
-        if set(raw_results) != expected:
-            error = ValueError(
-                "batch executor result IDs do not match scheduled cases: "
-                f"expected={sorted(expected)} actual={sorted(raw_results)}"
-            )
-            raw_results = {
-                str(item.case["id"]): _failure_result(item.case, error)
-                for item in scheduled
-            }
-        batch_id = (
-            f"{batch_key}:{started_at}:{threading.current_thread().name}"
-            if batch_key is not None
-            else None
-        )
-        output = []
-        for item in scheduled:
-            case = item.case
-            policy = item.policy
-            case_id = str(case["id"])
-            result = _validated_result(case, raw_results[case_id])
-            result_id = result.get("id", case_id)
-            if result_id != case_id:
-                result = _failure_result(
-                    case,
-                    ValueError(
-                        f"executor returned result id {result_id!r} for {case_id}"
-                    ),
-                )
-            result.setdefault("id", case_id)
-            result.setdefault("title", case.get("title", case_id))
-            scheduling = {
-                "queued_at": queued_at[case_id],
-                "started_at": started_at,
-                "completed_at": completed_at,
-                "lock_wait_seconds": round(
-                    started - queued_monotonic[case_id],
-                    3,
-                ),
-                "execution_seconds": round(monotonic() - started, 3),
-                "worker": threading.current_thread().name,
-                "locks": [lock.as_dict() for lock in policy.effective_locks()],
-                "depends_on": list(policy.depends_on),
-                "failure_scope": policy.failure_scope,
-                "environment": policy.environment,
-                "collect_all": collect_all,
-            }
-            if batch_key is not None:
-                scheduling["batch"] = {
-                    "id": batch_id,
-                    "key": batch_key,
-                    "size": len(scheduled),
-                }
-            result["scheduling"] = scheduling
-            output.append(result)
-        return output
-
-    def dependencies_ready(case: dict[str, Any], policy: ExecutionPolicy) -> bool:
-        return all(
-            dependency in results
-            for dependency in policy.depends_on
-            if dependency in selected_ids
-        )
-
     with ThreadPoolExecutor(
         max_workers=max_workers,
         thread_name_prefix="fault-case",
@@ -342,38 +406,21 @@ def run_scheduled_cases(
                         on_finish(case, result)
                 progressed = True
 
-            for case in list(pending):
-                case_id = str(case["id"])
-                policy = policies[case_id]
-                selected_dependencies = [
-                    dependency
-                    for dependency in policy.depends_on
-                    if dependency in selected_ids
-                ]
-                failed_dependencies = [
-                    dependency
-                    for dependency in selected_dependencies
-                    if dependency in results
-                    and not success_predicate(results[dependency])
-                ]
-                if failed_dependencies:
-                    result = _blocked_result(
-                        case,
-                        reason=(
-                            "blocked by failed prerequisite(s): "
-                            + ", ".join(failed_dependencies)
-                        ),
-                        queued_at=queued_at[case_id],
-                        queued_monotonic=queued_monotonic[case_id],
-                        policy=policy,
-                        monotonic=monotonic,
-                        utc_now=utc_now,
-                    )
-                    results[case_id] = result
-                    pending.remove(case)
-                    if on_finish is not None:
-                        on_finish(case, result)
-                    progressed = True
+            progressed = (
+                _block_failed_dependencies(
+                    pending,
+                    policies=policies,
+                    results=results,
+                    selected_ids=selected_ids,
+                    success_predicate=success_predicate,
+                    queued_at=queued_at,
+                    queued_monotonic=queued_monotonic,
+                    on_finish=on_finish,
+                    monotonic=monotonic,
+                    utc_now=utc_now,
+                )
+                or progressed
+            )
 
             while active_case_count < max_workers:
                 candidate = None
@@ -382,7 +429,11 @@ def run_scheduled_cases(
                 for case in pending:
                     case_id = str(case["id"])
                     policy = policies[case_id]
-                    if not dependencies_ready(case, policy):
+                    if not _dependencies_ready(
+                        policy,
+                        results=results,
+                        selected_ids=selected_ids,
+                    ):
                         continue
                     effective_locks = policy.effective_locks()
                     if not locks.can_acquire(effective_locks):
@@ -421,7 +472,11 @@ def run_scheduled_cases(
                         policy = policies[case_id]
                         if batch_key_for(case, policy) != batch_key:
                             continue
-                        if not dependencies_ready(case, policy):
+                        if not _dependencies_ready(
+                            policy,
+                            results=results,
+                            selected_ids=selected_ids,
+                        ):
                             continue
                         effective_locks = policy.effective_locks()
                         if not locks.can_acquire(effective_locks):
@@ -439,9 +494,16 @@ def run_scheduled_cases(
                     for item in scheduled:
                         on_start(item.case, item.policy)
                 future = pool.submit(
-                    execute_cases,
+                    _execute_scheduled_cases,
                     tuple(scheduled),
                     batch_key,
+                    execute=execute,
+                    execute_batch=execute_batch,
+                    queued_at=queued_at,
+                    queued_monotonic=queued_monotonic,
+                    collect_all=collect_all,
+                    monotonic=monotonic,
+                    utc_now=utc_now,
                 )
                 active[future] = tuple(scheduled)
                 active_case_count += len(scheduled)

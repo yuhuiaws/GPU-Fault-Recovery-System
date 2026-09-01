@@ -19,7 +19,8 @@
     "src/gpu_fault/orchestration/coordinator.py": 1683,
     "src/gpu_fault/policy/engine.py": 1655,
     "src/gpu_fault/processor/coordinator.py": 1639,
-    "src/gpu_fault/store/postgres/ddl.py": 1523
+    "src/gpu_fault/store/postgres/ddl.py": 1523,
+    "tools/codex_acceptance.py": 1553
   },
   "functions": {
     "deploy/control-plane/tools/render_control_plane_role_split.py:main": 652,
@@ -39,6 +40,8 @@
     "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator.__init__": 252,
     "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator._claim_active_by_pool": 215,
     "src/gpu_fault/service.py:CompletionService.handle_terminal": 203,
-    "src/gpu_fault/store/postgres/store.py:PostgresStore.__init__": 234
+    "src/gpu_fault/store/postgres/store.py:PostgresStore.__init__": 234,
+    "tools/case_scheduler.py:run_scheduled_cases": 228,
+    "tools/regional_acceptance_plan.py:compile_regional_acceptance_plan": 209
   }
 }
