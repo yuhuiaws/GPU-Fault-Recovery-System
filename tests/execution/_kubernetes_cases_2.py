@@ -272,7 +272,7 @@ def test_kubernetes_restart_fails_closed_when_source_workload_is_missing() -> No
     assert outcome.status is WorkflowStepStatus.FAILED
     assert outcome.details == {
         "reason": "RESTART_SOURCE_WORKLOAD_NOT_FOUND",
-        "missing_workload_ids": ["gpu-fault-system/pytorchjob/training-job"],
+        "source_workload_ids": ["gpu-fault-system/pytorchjob/training-job"],
     }
     assert outcome.error == (
         "restart source workload is missing: gpu-fault-system/pytorchjob/training-job"
