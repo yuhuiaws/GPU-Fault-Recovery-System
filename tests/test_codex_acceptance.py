@@ -89,6 +89,32 @@ def _analysis_result(
         evidence = []
         blockers = []
         human_actions = ["Run the approved manual observation."]
+    if status == "NEEDS_HUMAN":
+        test_process = [
+            {
+                "step_id": "request-human-action",
+                "kind": "requires-human",
+                "description": "Record the required controlled human action.",
+                "depends_on": [],
+                "expected": "An authorized operator performs the observation.",
+                "executor_ref": "human",
+                "status": "PLANNED",
+                "evidence": [],
+            }
+        ]
+    else:
+        test_process = [
+            {
+                "step_id": "inspect-evidence",
+                "kind": "evidence-check",
+                "description": "Inspect the existing read-only evidence.",
+                "depends_on": [],
+                "expected": "The evidence resolves the case expectation.",
+                "executor_ref": "provided-observations",
+                "status": status,
+                "evidence": evidence,
+            }
+        ]
     return {
         "case_id": case_id,
         "status": status,
@@ -96,6 +122,7 @@ def _analysis_result(
         "failure_details": failure_details,
         "reproduction": reproduction,
         "evidence": evidence,
+        "test_process": test_process,
         "affected_dependents": list(affected_dependents),
         "blockers": blockers,
         "human_actions": human_actions,

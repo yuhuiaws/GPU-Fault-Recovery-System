@@ -84,6 +84,15 @@ class EnvironmentMode(str, Enum):
     ISOLATED = "isolated"
 
 
+LOCAL_PROXY_RISKS = frozenset(
+    {
+        "non-destructive",
+        "read-only-signal-replay",
+        "live-non-destructive",
+    }
+)
+
+
 @dataclass(frozen=True, order=True)
 class ResourceLock:
     resource: str
@@ -1137,7 +1146,10 @@ def _local_executor(
         and catalog_case.automation is AutomationKind.COMMAND
     ):
         return ExecutorKind.COMMAND, (), catalog_case.command, False, None
-    if catalog_case.automation is AutomationKind.MANUAL:
+    if (
+        catalog_case.automation is AutomationKind.MANUAL
+        and catalog_case.risk in LOCAL_PROXY_RISKS
+    ):
         if catalog_case.related_pytest is not None:
             return (
                 ExecutorKind.PYTEST,

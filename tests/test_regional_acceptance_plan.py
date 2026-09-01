@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any, cast
 
@@ -40,6 +41,10 @@ def _write_override(tmp_path: Path, cases: dict[str, object]) -> Path:
         {
             "schema_version": 1,
             "reviewed": True,
+            "reviewed_by": "test-acceptance-reviewer",
+            "reviewed_at": "2026-09-01T00:00:00Z",
+            "order_sha256": hashlib.sha256(ORDER.read_bytes()).hexdigest(),
+            "catalog_sha256": hashlib.sha256(CATALOG.read_bytes()).hexdigest(),
             "cases": cases,
         },
     )

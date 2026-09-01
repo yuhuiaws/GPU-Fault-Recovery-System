@@ -564,6 +564,40 @@ def _analysis_schema(case_ids: Sequence[str]) -> dict[str, object]:
             "observation": {"type": "string", "minLength": 1},
         },
     }
+    test_step_schema: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": sorted(_TEST_STEP_FIELDS),
+        "properties": {
+            "step_id": {
+                "type": "string",
+                "pattern": _STEP_ID.pattern,
+            },
+            "kind": {
+                "type": "string",
+                "enum": list(TEST_STEP_KINDS),
+            },
+            "description": {"type": "string", "minLength": 1},
+            "depends_on": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {
+                    "type": "string",
+                    "pattern": _STEP_ID.pattern,
+                },
+            },
+            "expected": {"type": "string", "minLength": 1},
+            "executor_ref": {"type": "string", "minLength": 1},
+            "status": {
+                "type": "string",
+                "enum": list(TEST_STEP_STATUSES),
+            },
+            "evidence": {
+                "type": "array",
+                "items": evidence_schema,
+            },
+        },
+    }
     result_schema: dict[str, object] = {
         "type": "object",
         "additionalProperties": False,
@@ -583,6 +617,11 @@ def _analysis_schema(case_ids: Sequence[str]) -> dict[str, object]:
             "evidence": {
                 "type": "array",
                 "items": evidence_schema,
+            },
+            "test_process": {
+                "type": "array",
+                "minItems": 1,
+                "items": test_step_schema,
             },
             "affected_dependents": {
                 "type": "array",
@@ -736,7 +775,10 @@ def _analysis_prompt(cases: Sequence[Mapping[str, object]]) -> str:
         "manual/live action is required. Never infer PASS from source code "
         "alone for a live or destructive case.\n"
         "For every case, always return failure_details, reproduction, evidence, "
-        "and affected_dependents arrays. Reproduction must contain only "
+        "test_process, and affected_dependents arrays. test_process must be a "
+        "non-empty dependency-safe sequence of concrete steps. Mark any "
+        "required live action or human action as PLANNED or BLOCKED, never as "
+        "executed by this read-only analysis. Reproduction must contain only "
         "read-only diagnostic or observation steps and must never contain a "
         "mutation or repair instruction. affected_dependents may contain only "
         "IDs from this batch.\n"
@@ -853,6 +895,108 @@ def _parse_evidence_items(
     return tuple(parsed)
 
 
+def _parse_test_process(
+    value: object,
+    context: str,
+) -> tuple[TestProcessStep, ...]:
+    if not isinstance(value, list) or not value:
+        raise InvalidCodexOutput(f"{context} must be a non-empty JSON array")
+    parsed: list[TestProcessStep] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(value):
+        step_context = f"{context}[{index}]"
+        mapping = _require_mapping(item, step_context)
+        _require_exact_keys(mapping, _TEST_STEP_FIELDS, step_context)
+        step_id = _require_output_text(
+            mapping.get("step_id"),
+            f"{step_context}.step_id",
+        )
+        if _STEP_ID.fullmatch(step_id) is None:
+            raise InvalidCodexOutput(f"{step_context}.step_id is invalid")
+        if step_id in seen_ids:
+            raise InvalidCodexOutput(f"{context} duplicates step_id {step_id}")
+        seen_ids.add(step_id)
+        kind_value = mapping.get("kind")
+        if kind_value not in TEST_STEP_KINDS:
+            raise InvalidCodexOutput(f"{step_context}.kind is unsupported")
+        kind = cast(TestStepKind, kind_value)
+        depends_on = _output_string_list(
+            mapping.get("depends_on"),
+            f"{step_context}.depends_on",
+        )
+        if len(depends_on) != len(set(depends_on)):
+            raise InvalidCodexOutput(
+                f"{step_context}.depends_on contains duplicates"
+            )
+        if step_id in depends_on:
+            raise InvalidCodexOutput(f"{step_context} depends on itself")
+        executor_ref = _require_output_text(
+            mapping.get("executor_ref"),
+            f"{step_context}.executor_ref",
+        )
+        fixed_executor = _FIXED_STEP_EXECUTORS.get(kind)
+        if fixed_executor is not None and executor_ref != fixed_executor:
+            raise InvalidCodexOutput(
+                f"{step_context}.executor_ref must be {fixed_executor}"
+            )
+        status_value = mapping.get("status")
+        if status_value not in TEST_STEP_STATUSES:
+            raise InvalidCodexOutput(f"{step_context}.status is unsupported")
+        status = cast(TestStepStatus, status_value)
+        if kind in {"requires-live-action", "requires-human"} and status in {
+            "PASS",
+            "FAIL",
+        }:
+            raise InvalidCodexOutput(
+                f"{step_context} cannot claim a read-only execution result"
+            )
+        evidence = _parse_evidence_items(
+            mapping.get("evidence"),
+            f"{step_context}.evidence",
+        )
+        if status in {"PASS", "FAIL"} and not evidence:
+            raise InvalidCodexOutput(f"{step_context} {status} requires evidence")
+        parsed.append(
+            TestProcessStep(
+                step_id=step_id,
+                kind=kind,
+                description=_require_output_text(
+                    mapping.get("description"),
+                    f"{step_context}.description",
+                ),
+                depends_on=depends_on,
+                expected=_require_output_text(
+                    mapping.get("expected"),
+                    f"{step_context}.expected",
+                ),
+                executor_ref=executor_ref,
+                status=status,
+                evidence=evidence,
+            )
+        )
+
+    known_ids = frozenset(seen_ids)
+    remaining = {step.step_id: set(step.depends_on) for step in parsed}
+    for step_id, dependencies in remaining.items():
+        unknown = sorted(dependencies - known_ids)
+        if unknown:
+            raise InvalidCodexOutput(
+                f"{context} step {step_id} references unknown dependencies"
+            )
+    while remaining:
+        ready = sorted(
+            step_id for step_id, dependencies in remaining.items() if not dependencies
+        )
+        if not ready:
+            raise InvalidCodexOutput(f"{context} contains a dependency cycle")
+        for step_id in ready:
+            del remaining[step_id]
+        ready_set = set(ready)
+        for dependencies in remaining.values():
+            dependencies.difference_update(ready_set)
+    return tuple(parsed)
+
+
 def _validate_status_evidence(
     *,
     status: AcceptanceStatus,
@@ -926,6 +1070,10 @@ def _parse_analysis_results(
             mapping.get("evidence"),
             f"{context}.evidence",
         )
+        test_process = _parse_test_process(
+            mapping.get("test_process"),
+            f"{context}.test_process",
+        )
         affected_dependents = _output_string_list(
             mapping.get("affected_dependents"),
             f"{context}.affected_dependents",
@@ -969,6 +1117,7 @@ def _parse_analysis_results(
             failure_details=failure_details,
             reproduction=reproduction,
             evidence=evidence,
+            test_process=test_process,
             affected_dependents=affected_dependents,
             blockers=blockers,
             human_actions=human_actions,
