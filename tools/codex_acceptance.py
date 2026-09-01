@@ -925,9 +925,7 @@ def _parse_test_process(
             f"{step_context}.depends_on",
         )
         if len(depends_on) != len(set(depends_on)):
-            raise InvalidCodexOutput(
-                f"{step_context}.depends_on contains duplicates"
-            )
+            raise InvalidCodexOutput(f"{step_context}.depends_on contains duplicates")
         if step_id in depends_on:
             raise InvalidCodexOutput(f"{step_context} depends on itself")
         executor_ref = _require_output_text(

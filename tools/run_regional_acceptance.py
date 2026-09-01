@@ -132,7 +132,9 @@ def build_local_environment(
     for name in extra_names:
         value = source_environment.get(name)
         if value is None or not value:
-            raise ValueError(f"required inherited environment variable is unset: {name}")
+            raise ValueError(
+                f"required inherited environment variable is unset: {name}"
+            )
         environment[name] = value
     return environment
 
@@ -222,8 +224,7 @@ def _scheduler_policy(
     mode: PlanMode,
 ) -> ExecutionPolicy:
     if mode is not PlanMode.FORMAL and (
-        case.executor in {ExecutorKind.HUMAN, ExecutorKind.DO_NOT_RUN}
-        or case.blocked
+        case.executor in {ExecutorKind.HUMAN, ExecutorKind.DO_NOT_RUN} or case.blocked
     ):
         return ExecutionPolicy(
             parallel_safe=True,
@@ -570,17 +571,13 @@ def execute_plan(
             error = RuntimeError(
                 "codex-manual executor requires --manual-backend codex-read-only"
             )
-            return {
-                case.id: _agent_blocked_result(case, error) for case in batch_cases
-            }
+            return {case.id: _agent_blocked_result(case, error) for case in batch_cases}
         try:
             analyses = backend.analyze_manual_cases(
                 [_case_payload(case) for case in batch_cases]
             )
         except CodexAcceptanceError as exc:
-            return {
-                case.id: _agent_blocked_result(case, exc) for case in batch_cases
-            }
+            return {case.id: _agent_blocked_result(case, exc) for case in batch_cases}
         return {
             case.id: _agent_result(case, analyses[case.id], plan)
             for case in batch_cases
@@ -710,9 +707,7 @@ def propose_dependencies(
         catalog_path=catalog_path,
     )
     runnable = [
-        case
-        for case in plan.cases
-        if case.executor is not ExecutorKind.DO_NOT_RUN
+        case for case in plan.cases if case.executor is not ExecutorKind.DO_NOT_RUN
     ]
     cases = [
         {

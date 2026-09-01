@@ -139,9 +139,7 @@ def test_runner_emits_the_standard_v2_envelope(tmp_path: Path, monkeypatch) -> N
     report = tmp_path / "fault-report.json"
 
     monkeypatch.setattr(
-        runner,
-        "run_case",
-        lambda case, **_kwargs: {"id": case["id"], "status": "PASS"},
+        runner, "run_case", lambda case, **_kwargs: {"id": case["id"], "status": "PASS"}
     )
 
     result = runner.main(["--case", "GF-POL-001", "--report", str(report)])
@@ -159,15 +157,9 @@ def test_runner_emits_the_standard_v2_envelope(tmp_path: Path, monkeypatch) -> N
 
 
 def test_runner_isolates_local_cases_but_preserves_cap005_environment(
-    tmp_path: Path,
-    monkeypatch,
+    tmp_path: Path, monkeypatch
 ) -> None:
-    reports = iter(
-        [
-            tmp_path / "local.json",
-            tmp_path / "cap005.json",
-        ]
-    )
+    reports = iter([tmp_path / "local.json", tmp_path / "cap005.json"])
     observed = []
 
     def fake_run_case(case, **kwargs):
@@ -178,14 +170,7 @@ def test_runner_isolates_local_cases_but_preserves_cap005_environment(
 
     assert (
         runner.main(
-            [
-                "--case",
-                "GF-POL-001",
-                "--report",
-                str(next(reports)),
-                "--workers",
-                "2",
-            ]
+            ["--case", "GF-POL-001", "--report", str(next(reports)), "--workers", "2"]
         )
         == 0
     )
@@ -205,9 +190,6 @@ def test_runner_isolates_local_cases_but_preserves_cap005_environment(
     )
 
     assert observed == [
-        (
-            "GF-POL-001",
-            runner.build_isolated_environment(),
-        ),
+        ("GF-POL-001", runner.build_isolated_environment()),
         ("GF-REGIONAL-CAP-005", None),
     ]

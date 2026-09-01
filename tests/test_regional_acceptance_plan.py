@@ -15,7 +15,6 @@ from tools.regional_acceptance_plan import (
     compile_regional_acceptance_plan,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ORDER = ROOT / "testcases" / "regional-execution-order.yaml"
 CATALOG = ROOT / "testcases" / "fault-scenarios.yaml"
@@ -29,8 +28,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 def _write_yaml(path: Path, value: object) -> Path:
     path.write_text(
-        yaml.safe_dump(value, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
+        yaml.safe_dump(value, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
     return path
 
@@ -59,23 +57,14 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
     assert plan.repair_allowed is False
     assert len(plan.execution_order) == 152
     assert len(plan.cases) == 153
-    assert plan.execution_order[:2] == (
-        "GF-REGIONAL-BOOT-011",
-        "GF-REGIONAL-BOOT-012",
-    )
+    assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-011", "GF-REGIONAL-BOOT-012")
     assert plan.execution_order[-1] == "GF-REGIONAL-COLLECT-015"
     assert plan.do_not_run_case_ids == ("GF-REGIONAL-DESTR-004",)
-    assert plan.case_ids == (
-        *plan.execution_order,
-        "GF-REGIONAL-DESTR-004",
-    )
+    assert plan.case_ids == (*plan.execution_order, "GF-REGIONAL-DESTR-004")
 
     first = plan.case(plan.execution_order[0])
     assert first.execution.depends_on == ()
-    for previous, case_id in zip(
-        plan.execution_order,
-        plan.execution_order[1:],
-    ):
+    for previous, case_id in zip(plan.execution_order, plan.execution_order[1:]):
         case = plan.case(case_id)
         assert case.mandatory_depends_on == (previous,)
         assert case.execution.depends_on == (previous,)
@@ -141,10 +130,7 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
     gate = plan.case("GF-REGIONAL-BOOT-017")
     assert gate.executor is ExecutorKind.COMMAND
     assert gate.local_proxy is True
-    assert gate.command == (
-        "python3",
-        "scripts/check-manual-command-order.py",
-    )
+    assert gate.command == ("python3", "scripts/check-manual-command-order.py")
 
     human = plan.case("GF-REGIONAL-BOOT-001")
     assert human.executor is ExecutorKind.HUMAN
@@ -190,8 +176,7 @@ def test_collect_all_blocks_only_real_dependents_and_keeps_subagents_read_only(
     )
 
     plan = compile_regional_acceptance_plan(
-        mode=PlanMode.COLLECT_ALL,
-        override_path=override,
+        mode=PlanMode.COLLECT_ALL, override_path=override
     )
 
     assert plan.collect_all is True
@@ -247,12 +232,7 @@ def test_reviewed_override_only_adds_constraints_and_codex_manual(
             "GF-REGIONAL-BOOT-013": {
                 "executor": "codex-manual",
                 "depends_on": ["GF-REGIONAL-BOOT-011"],
-                "locks": [
-                    {
-                        "resource": "acceptance-evidence",
-                        "mode": "shared",
-                    }
-                ],
+                "locks": [{"resource": "acceptance-evidence", "mode": "shared"}],
             },
             "GF-REGIONAL-BOOT-014": {"depends_on": []},
         },
@@ -277,8 +257,7 @@ def test_reviewed_override_only_adds_constraints_and_codex_manual(
     assert no_op_addition.execution.depends_on == ("GF-REGIONAL-BOOT-013",)
 
     local = compile_regional_acceptance_plan(
-        mode=PlanMode.LOCAL_PREACCEPTANCE,
-        override_path=override,
+        mode=PlanMode.LOCAL_PREACCEPTANCE, override_path=override
     )
     local_selected = local.case("GF-REGIONAL-BOOT-013")
     assert local_selected.executor is ExecutorKind.CODEX_MANUAL
@@ -286,20 +265,14 @@ def test_reviewed_override_only_adds_constraints_and_codex_manual(
 
 
 @pytest.mark.parametrize(  # type: ignore[untyped-decorator]
-    "reviewed",
-    [False, "true", None],
+    "reviewed", [False, "true", None]
 )
 def test_override_requires_explicit_boolean_review(
-    tmp_path: Path,
-    reviewed: object,
+    tmp_path: Path, reviewed: object
 ) -> None:
     override = _write_yaml(
         tmp_path / "override.yaml",
-        {
-            "schema_version": 1,
-            "reviewed": reviewed,
-            "cases": {},
-        },
+        {"schema_version": 1, "reviewed": reviewed, "cases": {}},
     )
 
     with pytest.raises(ValueError, match="reviewed: true"):
@@ -310,31 +283,25 @@ def test_override_cannot_promote_cases_to_command_or_reclassify_pytest(
     tmp_path: Path,
 ) -> None:
     command_override = _write_override(
-        tmp_path,
-        {"GF-REGIONAL-DESTR-001": {"executor": "command"}},
+        tmp_path, {"GF-REGIONAL-DESTR-001": {"executor": "command"}}
     )
     with pytest.raises(ValueError, match="may only be codex-manual"):
         compile_regional_acceptance_plan(override_path=command_override)
 
     codex_override = _write_override(
-        tmp_path,
-        {"GF-REGIONAL-PREEMPT-010": {"executor": "codex-manual"}},
+        tmp_path, {"GF-REGIONAL-PREEMPT-010": {"executor": "codex-manual"}}
     )
     with pytest.raises(ValueError, match="only for manual cases"):
         compile_regional_acceptance_plan(override_path=codex_override)
 
 
 def test_override_rejects_unknown_and_do_not_run_cases(tmp_path: Path) -> None:
-    unknown = _write_override(
-        tmp_path,
-        {"GF-REGIONAL-FAKE-001": {"depends_on": []}},
-    )
+    unknown = _write_override(tmp_path, {"GF-REGIONAL-FAKE-001": {"depends_on": []}})
     with pytest.raises(ValueError, match="unknown case ID"):
         compile_regional_acceptance_plan(override_path=unknown)
 
     retired = _write_override(
-        tmp_path,
-        {"GF-REGIONAL-DESTR-004": {"executor": "codex-manual"}},
+        tmp_path, {"GF-REGIONAL-DESTR-004": {"executor": "codex-manual"}}
     )
     with pytest.raises(ValueError, match="DO_NOT_RUN"):
         compile_regional_acceptance_plan(override_path=retired)
@@ -344,13 +311,11 @@ def test_override_rejects_unknown_dependencies_and_lock_replacement(
     tmp_path: Path,
 ) -> None:
     unknown_dependency = _write_override(
-        tmp_path,
-        {"GF-REGIONAL-BOOT-013": {"depends_on": ["GF-REGIONAL-FAKE-001"]}},
+        tmp_path, {"GF-REGIONAL-BOOT-013": {"depends_on": ["GF-REGIONAL-FAKE-001"]}}
     )
     with pytest.raises(ValueError, match="unknown dependencies"):
         compile_regional_acceptance_plan(
-            mode=PlanMode.LOCAL_PREACCEPTANCE,
-            override_path=unknown_dependency,
+            mode=PlanMode.LOCAL_PREACCEPTANCE, override_path=unknown_dependency
         )
 
     replacement = _write_override(
@@ -376,20 +341,14 @@ def test_dependency_cycle_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="dependency cycle"):
         compile_regional_acceptance_plan(
-            mode=PlanMode.LOCAL_PREACCEPTANCE,
-            override_path=override,
+            mode=PlanMode.LOCAL_PREACCEPTANCE, override_path=override
         )
 
 
-def test_order_rejects_duplicate_unknown_and_missing_cases(
-    tmp_path: Path,
-) -> None:
+def test_order_rejects_duplicate_unknown_and_missing_cases(tmp_path: Path) -> None:
     duplicate_value = _read_yaml(ORDER)
     duplicate_phases = cast(list[dict[str, Any]], duplicate_value["phases"])
-    duplicate_entries = cast(
-        list[dict[str, Any]],
-        duplicate_phases[0]["entries"],
-    )
+    duplicate_entries = cast(list[dict[str, Any]], duplicate_phases[0]["entries"])
     duplicate_entries.append({"case": "GF-REGIONAL-BOOT-011"})
     duplicate_order = _write_yaml(tmp_path / "duplicate.yaml", duplicate_value)
     with pytest.raises(ValueError, match="duplicate regional"):
@@ -412,9 +371,7 @@ def test_order_rejects_duplicate_unknown_and_missing_cases(
         compile_regional_acceptance_plan(order_path=missing_order)
 
 
-def test_order_requires_do_not_run_and_plan_output_is_stable(
-    tmp_path: Path,
-) -> None:
+def test_order_requires_do_not_run_and_plan_output_is_stable(tmp_path: Path) -> None:
     value = _read_yaml(ORDER)
     value["do_not_run"] = []
     no_retired = _write_yaml(tmp_path / "no-retired.yaml", value)

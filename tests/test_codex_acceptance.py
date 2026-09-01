@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
 import json
-from pathlib import Path
 import subprocess
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import cast
 from unittest import mock
 
@@ -34,10 +34,7 @@ def _manual_case(case_id: str) -> dict[str, object]:
     }
 
 
-def _regional_case(
-    case_id: str,
-    phase: str,
-) -> dict[str, object]:
+def _regional_case(case_id: str, phase: str) -> dict[str, object]:
     return {
         "id": case_id,
         "title": f"Regional case {case_id}",
@@ -50,10 +47,7 @@ def _regional_case(
 
 
 def _analysis_result(
-    case_id: str,
-    *,
-    status: str = "PASS",
-    affected_dependents: Sequence[str] = (),
+    case_id: str, *, status: str = "PASS", affected_dependents: Sequence[str] = ()
 ) -> dict[str, object]:
     if status == "PASS":
         failure_details: list[str] = []
@@ -130,17 +124,10 @@ def _analysis_result(
 
 
 def _analysis_payload(*results: Mapping[str, object]) -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "results": [dict(result) for result in results],
-    }
+    return {"schema_version": 1, "results": [dict(result) for result in results]}
 
 
-def _review_payload(
-    case_id: str,
-    *,
-    status: str = "PASS",
-) -> dict[str, object]:
+def _review_payload(case_id: str, *, status: str = "PASS") -> dict[str, object]:
     return {
         "schema_version": 1,
         "review": {
@@ -177,12 +164,7 @@ def _dependency_payload(
             {
                 "case_id": "case-b",
                 "depends_on": list(second_depends_on),
-                "locks": [
-                    {
-                        "resource": "regional-evidence",
-                        "mode": "shared",
-                    }
-                ],
+                "locks": [{"resource": "regional-evidence", "mode": "shared"}],
                 "executor": "human",
                 "confidence": 0.75,
                 "rationale": "The second phase follows the first phase.",
@@ -190,12 +172,7 @@ def _dependency_payload(
             {
                 "case_id": "case-a",
                 "depends_on": list(first_depends_on),
-                "locks": [
-                    {
-                        "resource": "regional-evidence",
-                        "mode": "shared",
-                    }
-                ],
+                "locks": [{"resource": "regional-evidence", "mode": "shared"}],
                 "executor": first_executor,
                 "confidence": 0.9,
                 "rationale": "Static evidence can be inspected read-only.",
@@ -210,12 +187,10 @@ def _argument_after(command: Sequence[str], flag: str) -> str:
 
 
 def _success_runner(
-    payload: Mapping[str, object],
-    capture: dict[str, object] | None = None,
+    payload: Mapping[str, object], capture: dict[str, object] | None = None
 ) -> Callable[..., subprocess.CompletedProcess[str]]:
     def run(
-        command: Sequence[str],
-        **kwargs: object,
+        command: Sequence[str], **kwargs: object
     ) -> subprocess.CompletedProcess[str]:
         arguments = list(command)
         schema_path = Path(_argument_after(arguments, "--output-schema"))
@@ -224,22 +199,16 @@ def _success_runner(
             capture["command"] = arguments
             capture["kwargs"] = dict(kwargs)
             capture["schema"] = cast(
-                object,
-                json.loads(schema_path.read_text(encoding="utf-8")),
+                object, json.loads(schema_path.read_text(encoding="utf-8"))
             )
-        output_path.write_text(
-            json.dumps(payload),
-            encoding="utf-8",
-        )
+        output_path.write_text(json.dumps(payload), encoding="utf-8")
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
     return run
 
 
 def _backend(
-    repository: Path,
-    *,
-    environment: Mapping[str, str] | None = None,
+    repository: Path, *, environment: Mapping[str, str] | None = None
 ) -> CodexAcceptanceBackend:
     default_environment = {
         "HOME": "/home/tester",
@@ -283,8 +252,7 @@ def test_manual_batch_uses_hardened_codex_exec_and_clean_environment(
     with mock.patch(
         "tools.codex_acceptance.subprocess.run",
         side_effect=_success_runner(
-            _analysis_payload(_analysis_result("case-a")),
-            capture,
+            _analysis_payload(_analysis_result("case-a")), capture
         ),
     ) as run:
         results = backend.analyze_manual_cases([_manual_case("case-a")])
@@ -388,22 +356,15 @@ def test_environment_builder_uses_an_allowlist() -> None:
     }
 
 
-def test_batch_maps_every_case_and_does_not_stop_after_failure(
-    tmp_path: Path,
-) -> None:
+def test_batch_maps_every_case_and_does_not_stop_after_failure(tmp_path: Path) -> None:
     payload = _analysis_payload(
         _analysis_result("case-b", status="BLOCKED"),
-        _analysis_result(
-            "case-a",
-            status="FAIL",
-            affected_dependents=("case-b",),
-        ),
+        _analysis_result("case-a", status="FAIL", affected_dependents=("case-b",)),
     )
     backend = _backend(tmp_path)
 
     with mock.patch(
-        "tools.codex_acceptance.subprocess.run",
-        side_effect=_success_runner(payload),
+        "tools.codex_acceptance.subprocess.run", side_effect=_success_runner(payload)
     ):
         results = backend.analyze_manual_cases(
             [_manual_case("case-a"), _manual_case("case-b")]
@@ -420,9 +381,7 @@ def test_batch_maps_every_case_and_does_not_stop_after_failure(
     assert results["case-b"].blockers == ("Required evidence is unavailable.",)
 
 
-def test_evidence_review_is_an_independent_read_only_invocation(
-    tmp_path: Path,
-) -> None:
+def test_evidence_review_is_an_independent_read_only_invocation(tmp_path: Path) -> None:
     capture: dict[str, object] = {}
     backend = _backend(tmp_path)
 
@@ -463,10 +422,7 @@ def test_dependency_proposal_is_structured_ordered_and_untrusted(
         side_effect=_success_runner(_dependency_payload(), capture),
     ):
         proposal = backend.propose_dependencies(
-            [
-                _regional_case("case-a", "phase-1"),
-                _regional_case("case-b", "phase-2"),
-            ],
+            [_regional_case("case-a", "phase-1"), _regional_case("case-b", "phase-2")],
             [MandatoryOrderEdge(before="case-a", after="case-b")],
         )
 
@@ -504,25 +460,19 @@ def test_dependency_proposal_is_structured_ordered_and_untrusted(
     ],
 )  # type: ignore[untyped-decorator]
 def test_subprocess_and_output_failures_are_fail_closed(
-    tmp_path: Path,
-    mode: str,
-    expected_error: type[Exception],
+    tmp_path: Path, mode: str, expected_error: type[Exception]
 ) -> None:
     backend = _backend(tmp_path)
 
     def run(
-        command: Sequence[str],
-        **_kwargs: object,
+        command: Sequence[str], **_kwargs: object
     ) -> subprocess.CompletedProcess[str]:
         arguments = list(command)
         if mode == "timeout":
             raise subprocess.TimeoutExpired(arguments, 37)
         if mode == "nonzero":
             return subprocess.CompletedProcess(
-                arguments,
-                9,
-                stdout="sensitive-token",
-                stderr="sensitive-secret",
+                arguments, 9, stdout="sensitive-token", stderr="sensitive-secret"
             )
         output_path = Path(_argument_after(arguments, "--output-last-message"))
         if mode == "empty":
@@ -550,10 +500,7 @@ def test_subprocess_and_output_failures_are_fail_closed(
         "fail-without-reproduction",
     ],
 )  # type: ignore[untyped-decorator]
-def test_batch_rejects_illegal_structured_results(
-    tmp_path: Path,
-    mode: str,
-) -> None:
+def test_batch_rejects_illegal_structured_results(tmp_path: Path, mode: str) -> None:
     result = _analysis_result("case-a")
     if mode == "unsupported-status":
         result["status"] = "NOT_RUN"
@@ -577,18 +524,9 @@ def test_batch_rejects_illegal_structured_results(
 
 
 @pytest.mark.parametrize(
-    "mode",
-    [
-        "trusted",
-        "missing-mandatory-edge",
-        "cycle",
-        "unsupported-executor",
-    ],
+    "mode", ["trusted", "missing-mandatory-edge", "cycle", "unsupported-executor"]
 )  # type: ignore[untyped-decorator]
-def test_dependency_proposal_rejects_unusable_output(
-    tmp_path: Path,
-    mode: str,
-) -> None:
+def test_dependency_proposal_rejects_unusable_output(tmp_path: Path, mode: str) -> None:
     if mode == "trusted":
         payload = _dependency_payload(trusted=True)
     elif mode == "missing-mandatory-edge":
@@ -607,10 +545,7 @@ def test_dependency_proposal_rejects_unusable_output(
         pytest.raises(InvalidCodexOutput),
     ):
         backend.propose_dependencies(
-            [
-                _regional_case("case-a", "phase-1"),
-                _regional_case("case-b", "phase-2"),
-            ],
+            [_regional_case("case-a", "phase-1"), _regional_case("case-b", "phase-2")],
             [("case-a", "case-b")],
         )
 
@@ -637,8 +572,7 @@ def test_review_rejects_a_mismatched_case_id(tmp_path: Path) -> None:
     ],
 )  # type: ignore[untyped-decorator]
 def test_invalid_batch_input_never_invokes_codex(
-    tmp_path: Path,
-    cases: list[dict[str, object]],
+    tmp_path: Path, cases: list[dict[str, object]]
 ) -> None:
     backend = _backend(tmp_path)
 
@@ -659,8 +593,7 @@ def test_invalid_mandatory_edge_never_invokes_codex(tmp_path: Path) -> None:
         pytest.raises(InvalidAcceptanceInput),
     ):
         backend.propose_dependencies(
-            [_regional_case("case-a", "phase-1")],
-            [("case-a", "unknown-case")],
+            [_regional_case("case-a", "phase-1")], [("case-a", "unknown-case")]
         )
 
     run.assert_not_called()

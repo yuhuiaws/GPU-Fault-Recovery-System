@@ -710,9 +710,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def execute(case: dict[str, Any], policy: ExecutionPolicy) -> dict[str, Any]:
         environment = (
-            build_isolated_environment()
-            if policy.environment == "isolated"
-            else None
+            build_isolated_environment() if policy.environment == "isolated" else None
         )
         return run_case(case, environment=environment)
 

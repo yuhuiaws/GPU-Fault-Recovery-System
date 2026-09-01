@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-from threading import Barrier, Lock
 import time
+from threading import Barrier, Lock
 
 import pytest
 
-from tools.case_scheduler import (
-    ExecutionPolicy,
-    ResourceLock,
-    run_scheduled_cases,
-)
+from tools.case_scheduler import ExecutionPolicy, ResourceLock, run_scheduled_cases
 
 
 def _case(case_id: str) -> dict:
@@ -33,8 +29,7 @@ def test_shared_locks_allow_parallel_execution() -> None:
     results = run_scheduled_cases(
         cases,
         policy_for=lambda _case: ExecutionPolicy(
-            parallel_safe=True,
-            locks=(ResourceLock("local-test", "shared"),),
+            parallel_safe=True, locks=(ResourceLock("local-test", "shared"),)
         ),
         execute=execute,
         max_workers=2,
@@ -63,8 +58,7 @@ def test_exclusive_lock_serializes_cases() -> None:
     results = run_scheduled_cases(
         cases,
         policy_for=lambda _case: ExecutionPolicy(
-            parallel_safe=True,
-            locks=(ResourceLock("postgres-server", "exclusive"),),
+            parallel_safe=True, locks=(ResourceLock("postgres-server", "exclusive"),)
         ),
         execute=execute,
         max_workers=2,
@@ -83,8 +77,7 @@ def test_postgres_exclusive_lock_can_overlap_local_shared_lock() -> None:
         resource = "postgres-server" if case["id"] == "cap005" else "local-test"
         mode = "exclusive" if case["id"] == "cap005" else "shared"
         return ExecutionPolicy(
-            parallel_safe=True,
-            locks=(ResourceLock(resource, mode),),
+            parallel_safe=True, locks=(ResourceLock(resource, mode),)
         )
 
     def execute(case, _policy):
@@ -92,10 +85,7 @@ def test_postgres_exclusive_lock_can_overlap_local_shared_lock() -> None:
         return {"id": case["id"], "status": "PASS"}
 
     results = run_scheduled_cases(
-        cases,
-        policy_for=policy,
-        execute=execute,
-        max_workers=2,
+        cases, policy_for=policy, execute=execute, max_workers=2
     )
 
     assert [result["status"] for result in results] == ["PASS", "PASS"]
@@ -111,8 +101,7 @@ def test_global_exclusive_case_waits_for_parallel_case() -> None:
         if case["id"] == "exclusive":
             return ExecutionPolicy(parallel_safe=False, failure_scope="global")
         return ExecutionPolicy(
-            parallel_safe=True,
-            locks=(ResourceLock("local-test", "shared"),),
+            parallel_safe=True, locks=(ResourceLock("local-test", "shared"),)
         )
 
     def execute(case, _policy):
@@ -123,12 +112,7 @@ def test_global_exclusive_case_waits_for_parallel_case() -> None:
             events.append(f"end:{case['id']}")
         return {"id": case["id"], "status": "PASS"}
 
-    run_scheduled_cases(
-        cases,
-        policy_for=policy,
-        execute=execute,
-        max_workers=2,
-    )
+    run_scheduled_cases(cases, policy_for=policy, execute=execute, max_workers=2)
 
     assert events == [
         "start:parallel",
@@ -152,8 +136,7 @@ def test_collect_all_continues_after_global_failure() -> None:
     results = run_scheduled_cases(
         cases,
         policy_for=lambda _case: ExecutionPolicy(
-            parallel_safe=False,
-            failure_scope="global",
+            parallel_safe=False, failure_scope="global"
         ),
         execute=execute,
         max_workers=2,
@@ -184,10 +167,7 @@ def test_failed_prerequisite_blocks_dependent_case() -> None:
         }
 
     results = run_scheduled_cases(
-        cases,
-        policy_for=policy,
-        execute=execute,
-        max_workers=2,
+        cases, policy_for=policy, execute=execute, max_workers=2
     )
 
     assert executed == ["parent"]
@@ -210,11 +190,7 @@ def test_custom_success_predicate_allows_advisory_pass() -> None:
     def execute(case, _policy):
         executed.append(case["id"])
         if case["id"] == "parent":
-            return {
-                "id": case["id"],
-                "status": "NOT_RUN",
-                "analysis_status": "PASS",
-            }
+            return {"id": case["id"], "status": "NOT_RUN", "analysis_status": "PASS"}
         return {"id": case["id"], "status": "PASS"}
 
     results = run_scheduled_cases(
@@ -223,8 +199,7 @@ def test_custom_success_predicate_allows_advisory_pass() -> None:
         execute=execute,
         max_workers=2,
         is_successful=lambda result: (
-            result.get("status") == "PASS"
-            or result.get("analysis_status") == "PASS"
+            result.get("status") == "PASS" or result.get("analysis_status") == "PASS"
         ),
     )
 
@@ -243,8 +218,7 @@ def test_results_remain_in_declared_order() -> None:
     results = run_scheduled_cases(
         cases,
         policy_for=lambda _case: ExecutionPolicy(
-            parallel_safe=True,
-            locks=(ResourceLock("local-test", "shared"),),
+            parallel_safe=True, locks=(ResourceLock("local-test", "shared"),)
         ),
         execute=execute,
         max_workers=2,
@@ -262,15 +236,12 @@ def test_batch_executor_groups_compatible_cases() -> None:
 
     def execute_batch(batch, _policies):
         batches.append([case["id"] for case in batch])
-        return {
-            case["id"]: {"id": case["id"], "status": "PASS"} for case in batch
-        }
+        return {case["id"]: {"id": case["id"], "status": "PASS"} for case in batch}
 
     results = run_scheduled_cases(
         cases,
         policy_for=lambda _case: ExecutionPolicy(
-            parallel_safe=True,
-            locks=(ResourceLock("local-test", "shared"),),
+            parallel_safe=True, locks=(ResourceLock("local-test", "shared"),)
         ),
         execute=execute,
         batch_key_for=(
@@ -300,15 +271,12 @@ def test_batch_executor_respects_intra_batch_resource_conflicts() -> None:
 
     def execute_batch(batch, _policies):
         batches.append([case["id"] for case in batch])
-        return {
-            case["id"]: {"id": case["id"], "status": "PASS"} for case in batch
-        }
+        return {case["id"]: {"id": case["id"], "status": "PASS"} for case in batch}
 
     results = run_scheduled_cases(
         cases,
         policy_for=lambda _case: ExecutionPolicy(
-            parallel_safe=True,
-            locks=(ResourceLock("shared-target", "exclusive"),),
+            parallel_safe=True, locks=(ResourceLock("shared-target", "exclusive"),)
         ),
         execute=lambda case, _policy: {"id": case["id"], "status": "PASS"},
         batch_key_for=lambda _case, _policy: "codex-manual",
@@ -327,8 +295,7 @@ def test_batch_executor_missing_result_fails_closed() -> None:
     results = run_scheduled_cases(
         cases,
         policy_for=lambda _case: ExecutionPolicy(
-            parallel_safe=True,
-            locks=(ResourceLock("local-test", "shared"),),
+            parallel_safe=True, locks=(ResourceLock("local-test", "shared"),)
         ),
         execute=lambda case, _policy: {"id": case["id"], "status": "PASS"},
         batch_key_for=lambda _case, _policy: "codex-manual",
@@ -352,8 +319,7 @@ def test_invalid_status_and_malformed_batch_fail_per_case() -> None:
     results = run_scheduled_cases(
         cases,
         policy_for=lambda _case: ExecutionPolicy(
-            parallel_safe=True,
-            locks=(ResourceLock("local-test", "shared"),),
+            parallel_safe=True, locks=(ResourceLock("local-test", "shared"),)
         ),
         execute=lambda case, _policy: {"id": case["id"], "status": "PASS"},
         batch_key_for=lambda _case, _policy: "codex-manual",
@@ -373,8 +339,7 @@ def test_invalid_status_and_malformed_batch_fail_per_case() -> None:
 
 def test_batch_configuration_requires_both_callbacks() -> None:
     with pytest.raises(
-        ValueError,
-        match="batch_key_for and execute_batch must be configured together",
+        ValueError, match="batch_key_for and execute_batch must be configured together"
     ):
         run_scheduled_cases(
             [_case("case-a")],

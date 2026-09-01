@@ -911,8 +911,7 @@ def load_reviewed_override(
         )
     if metadata.catalog_sha256 != catalog_sha256:
         raise ValueError(
-            "reviewed override catalog_sha256 does not match the current "
-            "fault catalog"
+            "reviewed override catalog_sha256 does not match the current fault catalog"
         )
     raw_cases = _mapping(root.get("cases"), "override cases")
     result: dict[str, _CaseOverride] = {}
@@ -1002,9 +1001,7 @@ def untrusted_dependency_proposal_to_override_template(
             raise ValueError(f"dependency proposal has duplicate case ID: {case_id}")
         executor = _string(value.get("executor"), f"{context}.executor")
         if executor not in allowed_executors:
-            raise ValueError(
-                f"{context}.executor has unsupported value: {executor!r}"
-            )
+            raise ValueError(f"{context}.executor has unsupported value: {executor!r}")
         candidate: dict[str, object] = {
             "depends_on": list(
                 _unique_strings(
