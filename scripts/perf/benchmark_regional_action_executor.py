@@ -34,6 +34,7 @@ DELAYS = {
     "RESTART_WORKLOAD": 2.0,
     "RESTORE_SCHEDULING": 0.5,
 }
+CLAIM_ERROR_SAMPLE_LIMIT = 20
 
 
 def claim_payload(executor_id: str, max_commands: int) -> dict:
@@ -53,6 +54,14 @@ def percentile(values: list[float], ratio: float) -> float:
     if not ordered:
         return 0.0
     return ordered[int((len(ordered) - 1) * ratio)]
+
+
+def request_error_category(exc: BaseException) -> str:
+    if isinstance(exc, error.HTTPError):
+        return f"{type(exc).__name__}:{exc.code}"
+    if isinstance(exc, error.URLError):
+        return f"{type(exc).__name__}:{type(exc.reason).__name__}"
+    return type(exc).__name__
 
 
 class Client:
@@ -239,6 +248,8 @@ def main() -> None:
     completed_ids: set[str] = set()
     duplicate_claims = 0
     claim_errors = 0
+    claim_error_counts: dict[str, int] = {}
+    claim_error_samples: list[dict[str, str | float]] = []
     result_errors = 0
     state = SimulationState(
         client=client,
@@ -263,8 +274,17 @@ def main() -> None:
                 claim_payload(executor_id, min(25, workers)),
             )
             commands = claim.get("commands") or []
-        except (error.HTTPError, error.URLError, OSError):
+        except (error.HTTPError, error.URLError, OSError) as exc:
             claim_errors += 1
+            category = request_error_category(exc)
+            claim_error_counts[category] = claim_error_counts.get(category, 0) + 1
+            if len(claim_error_samples) < CLAIM_ERROR_SAMPLE_LIMIT:
+                claim_error_samples.append(
+                    {
+                        "category": category,
+                        "elapsed_seconds": round(time.monotonic() - started, 6),
+                    }
+                )
             time.sleep(0.1)
             continue
         if not commands:
@@ -301,6 +321,8 @@ def main() -> None:
         "completed_commands": len(completed_ids),
         "duplicate_claims": duplicate_claims,
         "claim_errors": claim_errors,
+        "claim_error_counts": dict(sorted(claim_error_counts.items())),
+        "claim_error_samples": claim_error_samples,
         "result_errors": result_errors,
         "lease_seconds": lease_seconds,
         "renewal_interval_seconds": renewal_interval,

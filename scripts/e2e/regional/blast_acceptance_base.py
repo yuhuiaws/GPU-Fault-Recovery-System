@@ -22,7 +22,9 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from gpu_fault.admin_site import load_site  # noqa: E402
-
+from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
+    scoped_case_evidence,
+)
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
 )
@@ -98,7 +100,13 @@ def json_command(args: Sequence[str]) -> Any:
 
 def write_json(path: Path, value: Any) -> None:
     path.write_text(
-        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        json.dumps(
+            scoped_case_evidence(value),
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
     path.chmod(0o600)

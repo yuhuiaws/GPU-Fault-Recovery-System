@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 if __package__:
     from .acceptance_runner_common import write_json_atomic
+    from .acceptance_scope import current_acceptance_scope
 else:
     from acceptance_runner_common import write_json_atomic
+    from acceptance_scope import current_acceptance_scope
 
 
 COMMON_ENVIRONMENT_KEYS = (
@@ -76,12 +78,14 @@ def build_plan(
     details: dict[str, Any],
     environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    scope = current_acceptance_scope()
     plan = {
-        "schema_version": 1,
+        "schema_version": 2,
         "case_id": case_id,
         "attempt": attempt,
         "confirmation": confirmation,
         "environment": environment or environment_snapshot(),
+        **scope.plan_fields(),
         "details": details,
         "mutation_performed": False,
     }
@@ -107,11 +111,14 @@ def authorize_execution(
     if not path.is_file():
         raise RuntimeError("run --plan before --execute")
     plan = json.loads(path.read_text(encoding="utf-8"))
+    scope = current_acceptance_scope()
     expected = {
+        "schema_version": 2,
         "case_id": case_id,
         "attempt": arguments.attempt,
         "confirmation": confirmation,
         "environment": environment or environment_snapshot(),
+        **scope.plan_fields(),
     }
     for key, value in expected.items():
         if plan.get(key) != value:

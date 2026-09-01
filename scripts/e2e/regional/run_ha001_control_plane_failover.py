@@ -2,22 +2,28 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 if __package__:
+    from .acceptance_scope import current_acceptance_scope, scoped_case_evidence
     from .live_driver_guard import (
         add_live_arguments,
+    )
+    from .live_driver_guard import (
         authorize_execution as guard_authorize_execution,
     )
 else:
+    from acceptance_scope import current_acceptance_scope, scoped_case_evidence
     from live_driver_guard import (
         add_live_arguments,
+    )
+    from live_driver_guard import (
         authorize_execution as guard_authorize_execution,
     )
 
@@ -91,7 +97,9 @@ def log(message: str) -> None:
 
 
 def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
+    )
     path.chmod(0o600)
 
 
@@ -347,12 +355,14 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
             f"unexpected control-plane baseline: ingress={len(ingress)} "
             f"workers={len(workers)}"
         )
+    scope = current_acceptance_scope()
     plan = {
-        "schema_version": 1,
+        "schema_version": 2,
         "case_id": CASE_ID,
         "attempt": attempt,
         "confirmation": CONFIRMATION,
         "environment": environment_values(),
+        **scope.plan_fields(),
         "mutation_performed": False,
         "region": AWS_REGION,
         "cpu_kubeconfig": str(CPU_KUBECONFIG),

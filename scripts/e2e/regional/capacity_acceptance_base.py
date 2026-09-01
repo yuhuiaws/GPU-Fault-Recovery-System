@@ -29,6 +29,9 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from gpu_fault.admin_site import load_site  # noqa: E402
+from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
+    scoped_case_evidence,
+)
 
 TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 CASE_IDS = tuple(f"GF-REGIONAL-CAP-{number:03d}" for number in range(1, 5))
@@ -64,7 +67,13 @@ def percentile(values: Sequence[float], ratio: float) -> float | None:
 
 def write_json(path: Path, value: Any) -> None:
     path.write_text(
-        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        json.dumps(
+            scoped_case_evidence(value),
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
     path.chmod(0o600)

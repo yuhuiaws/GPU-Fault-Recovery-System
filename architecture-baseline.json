@@ -23,7 +23,7 @@
   },
   "functions": {
     "deploy/control-plane/tools/render_control_plane_role_split.py:main": 652,
-    "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 255,
+    "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 252,
     "src/gpu_fault/adapters/hyperpod/lifecycle.py:HyperPodLifecycleStepAdapter.execute": 212,
     "src/gpu_fault/admin_bootstrap.py:_ensure_aurora": 335,
     "src/gpu_fault/admin_bootstrap.py:bootstrap_from_arns": 214,

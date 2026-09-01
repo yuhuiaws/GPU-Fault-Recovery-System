@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 if __package__:
     from . import run_ha005_rollout_continuity as BASE
+    from .acceptance_scope import scoped_case_evidence
     from .live_driver_guard import (
         add_live_arguments,
         authorize_execution,
@@ -20,6 +21,7 @@ if __package__:
     )
 else:
     import run_ha005_rollout_continuity as BASE
+    from acceptance_scope import scoped_case_evidence
     from live_driver_guard import (
         add_live_arguments,
         authorize_execution,
@@ -85,7 +87,9 @@ def log(message: str) -> None:
 
 
 def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
+    )
     path.chmod(0o600)
 
 

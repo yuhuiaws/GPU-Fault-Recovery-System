@@ -9,9 +9,9 @@ whether the split works at all, neither of which shows up in pod status:
     worker still returns 202 for every request and simply never
     processes any of them;
   * each tier's uvicorn command matches the tier - ingress on 8080 with
-    several workers, worker on 8081 with one, and no
-    --limit-max-requests on the worker, because recycling a worker
-    process mid-claim drops its leases until they expire;
+    several workers, worker on 8081 with one, and no request-count worker
+    recycling on any tier. Ingress recycling removes serving capacity
+    during bursts; worker recycling can strand leases;
   * the ingress tier carries no processor pool sizing. Those pools are
     created by run_processor, which never starts on an ingress replica,
     so a value there is inert - and inert config is worse than absent
@@ -127,6 +127,23 @@ def env_names(item: dict) -> set[str]:
     return set(env_values(item))
 
 
+def reject_request_count_recycling(
+    problems: list[str],
+    deployment_name: str,
+    command: str,
+) -> None:
+    if "--limit-max-requests" in command:
+        consequence = (
+            "recycle removes ingress capacity"
+            if deployment_name == "gpu-fault-api-ha"
+            else "mid-claim recycle strands leases"
+        )
+        problems.append(
+            f"{deployment_name} recycles uvicorn workers by request count; "
+            + consequence
+        )
+
+
 def main() -> int:
     problems: list[str] = []
     expected_runtime_image = os.getenv("GPU_FAULT_RUNTIME_IMAGE")
@@ -208,6 +225,7 @@ def main() -> int:
         problems.append("gpu-fault-api-ha does not serve on 8080")
     if "--workers 4" not in command:
         problems.append("gpu-fault-api-ha lost its uvicorn worker count")
+    reject_request_count_recycling(problems, "gpu-fault-api-ha", command)
     inert = sorted(env_names(api) & set(PROCESSOR_POOL_ENV))
     if inert:
         problems.append(
@@ -239,11 +257,7 @@ def main() -> int:
     worker_command = control_worker["args"][0]
     if "--port 8081" not in worker_command:
         problems.append("gpu-fault-control-worker does not serve on 8081")
-    if "--limit-max-requests" in worker_command:
-        problems.append(
-            "gpu-fault-control-worker recycles uvicorn processes; "
-            "a recycle mid-claim strands leases"
-        )
+    reject_request_count_recycling(problems, "gpu-fault-control-worker", worker_command)
     replicas = worker["spec"].get("replicas", 0)
     if not replicas:
         problems.append(

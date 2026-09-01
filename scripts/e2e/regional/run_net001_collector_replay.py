@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
 import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
+    scoped_case_evidence,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     authorize_execution,
@@ -26,7 +29,6 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     predecessor_evidence,
 )
-
 
 CASE_ID = "GF-REGIONAL-NET-001"
 CONFIRMATION = "NET001_COLLECTOR_OUTBOX_REPLAY"
@@ -120,7 +122,7 @@ def command(
 def write_json(path: Path, payload: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        json.dumps(scoped_case_evidence(payload), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     temporary.replace(path)

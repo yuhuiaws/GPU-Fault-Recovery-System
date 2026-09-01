@@ -314,6 +314,18 @@ def test_action_capacity_claim_carries_live_executor_pins(monkeypatch) -> None:
     assert payload["lease_seconds"] == 10
 
 
+def test_action_capacity_classifies_claim_errors_without_messages() -> None:
+    http_error = benchmark.error.HTTPError(
+        "https://control.example", 503, "unavailable", {}, None
+    )
+    reset_error = benchmark.error.URLError(ConnectionResetError("private detail"))
+
+    assert benchmark.request_error_category(http_error) == "HTTPError:503"
+    assert (
+        benchmark.request_error_category(reset_error) == "URLError:ConnectionResetError"
+    )
+
+
 def test_action_capacity_job_injects_live_executor_pins() -> None:
     manifest = suite.executor_job(
         clusters=1,
@@ -355,6 +367,14 @@ def test_action_capacity_summary_keeps_renewal_and_concurrency_evidence() -> Non
         [
             {
                 "wall_seconds": 10.0,
+                "claim_errors": 1,
+                "claim_error_counts": {"URLError:ConnectionResetError": 1},
+                "claim_error_samples": [
+                    {
+                        "category": "URLError:ConnectionResetError",
+                        "elapsed_seconds": 2.5,
+                    }
+                ],
                 "renewals": 8,
                 "renewal_errors": 1,
                 "injected_renewal_failures": 1,
@@ -363,6 +383,11 @@ def test_action_capacity_summary_keeps_renewal_and_concurrency_evidence() -> Non
             },
             {
                 "wall_seconds": 12.0,
+                "claim_errors": 2,
+                "claim_error_counts": {"HTTPError:503": 2},
+                "claim_error_samples": [
+                    {"category": "HTTPError:503", "elapsed_seconds": 1.5}
+                ],
                 "renewals": 9,
                 "renewal_errors": 0,
                 "injected_renewal_failures": 0,
@@ -372,6 +397,15 @@ def test_action_capacity_summary_keeps_renewal_and_concurrency_evidence() -> Non
         ]
     )
 
+    assert summary["claim_errors"] == 3
+    assert summary["claim_error_counts"] == {
+        "HTTPError:503": 2,
+        "URLError:ConnectionResetError": 1,
+    }
+    assert summary["claim_error_samples"] == [
+        {"category": "HTTPError:503", "elapsed_seconds": 1.5},
+        {"category": "URLError:ConnectionResetError", "elapsed_seconds": 2.5},
+    ]
     assert summary["renewals"] == 17
     assert summary["renewal_errors"] == 1
     assert summary["injected_renewal_failures"] == 1

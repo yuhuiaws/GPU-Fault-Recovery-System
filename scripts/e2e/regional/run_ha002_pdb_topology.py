@@ -5,19 +5,25 @@ import argparse
 import importlib.util
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import time
+from pathlib import Path
 
 if __package__:
+    from .acceptance_scope import current_acceptance_scope, scoped_case_evidence
     from .live_driver_guard import (
         add_live_arguments,
+    )
+    from .live_driver_guard import (
         authorize_execution as guard_authorize_execution,
     )
 else:
+    from acceptance_scope import current_acceptance_scope, scoped_case_evidence
     from live_driver_guard import (
         add_live_arguments,
+    )
+    from live_driver_guard import (
         authorize_execution as guard_authorize_execution,
     )
 
@@ -42,7 +48,9 @@ class CaseError(RuntimeError):
 
 
 def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
+    )
     path.chmod(0o600)
 
 
@@ -342,12 +350,14 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
             "no clean CPU node carries one ingress and at least two workers"
         )
     selected = sorted(candidates, key=lambda item: item["node"]["name"])[0]
+    scope = current_acceptance_scope()
     plan = {
-        "schema_version": 1,
+        "schema_version": 2,
         "case_id": CASE_ID,
         "attempt": attempt,
         "confirmation": CONFIRMATION,
         "environment": COMMON.environment_values(),
+        **scope.plan_fields(),
         "mutation_performed": False,
         "region": COMMON.AWS_REGION,
         "maintenance_window_required_at_execute": True,

@@ -161,6 +161,10 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
         in (ingress["spec"]["template"]["spec"]["containers"][0]["args"][0])
     )
     assert (
+        "--limit-max-requests"
+        not in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    )
+    assert (
         "pip install"
         not in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
     )

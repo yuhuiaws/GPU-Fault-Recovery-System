@@ -19,6 +19,10 @@ from scripts.e2e.regional import run_destr009_workload_restart as destr009
 from scripts.e2e.regional import run_destr012_managed_recovery_guard as destr012
 from scripts.e2e.regional import run_ha003_aurora_failover_reset as ha003
 from scripts.e2e.regional import run_ha004_waiting_reclaim_reset as ha004
+from scripts.e2e.regional.acceptance_scope import (
+    EXECUTION_SCOPE_ENV,
+    SELECTION_REFERENCE_ENV,
+)
 from scripts.e2e.regional.managed_workload_fixture import (
     TRAINING_IMAGE,
     ImagePrewarmFixture,
@@ -108,6 +112,46 @@ def test_predecessor_evidence_requires_exact_pass(tmp_path: Path) -> None:
     )
     passed = predecessor_evidence(path, "GF-REGIONAL-DESTR-010")
     assert passed["valid"] is True, passed
+
+
+def test_selective_predecessor_is_explicitly_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(EXECUTION_SCOPE_ENV, "selective")
+    monkeypatch.setenv(SELECTION_REFERENCE_ENV, "CHG-DESTR001-SELECTIVE")
+
+    result = predecessor_evidence(tmp_path / "missing.json", "GF-REGIONAL-DESTR-010")
+
+    assert result["valid"] is True, result
+    assert result["execution_allowed"] is True, result
+    assert result["evidence_valid"] is False, result
+    assert result["verdict"] == "SKIPPED_BY_OPERATOR", result
+    assert result["execution_scope"] == "selective", result
+    assert result["formal_sequence_satisfied"] is False, result
+    assert result["selection_reference"] == "CHG-DESTR001-SELECTIVE", result
+
+
+def test_formal_predecessor_rejects_selective_pass(tmp_path: Path) -> None:
+    path = tmp_path / "predecessor.json"
+    path.write_text(
+        json.dumps(
+            {
+                "case_id": "GF-REGIONAL-DESTR-010",
+                "verdict": "PASS",
+                "execution_scope": "selective",
+                "selection_reference": "CHG-OLD-SELECTIVE",
+                "formal_sequence_satisfied": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = predecessor_evidence(path, "GF-REGIONAL-DESTR-010")
+
+    assert result["valid"] is False, result
+    assert result["evidence_valid"] is True, result
+    assert result["formal_sequence_satisfied"] is False, result
+    assert "selective evidence" in result["error"], result
 
 
 def test_image_prewarm_is_node_pinned_without_gpu_request(tmp_path: Path) -> None:

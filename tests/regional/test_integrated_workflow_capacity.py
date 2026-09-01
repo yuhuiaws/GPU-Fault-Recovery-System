@@ -15,6 +15,7 @@ from gpu_fault.policy import SxidEvent, XidEvent
 from scripts.perf import benchmark_regional_action_executor as executor
 from scripts.perf import benchmark_synchronized_burst as burst
 from scripts.perf import regional_action_capacity_suite as action_suite
+from scripts.perf import regional_capacity_suite as capacity_suite
 from scripts.perf import regional_integrated_workflow_capacity_suite as suite
 from scripts.perf import seed_regional_action_workflows as seed
 from tests._builders import build_context
@@ -217,6 +218,43 @@ def test_remediation_budget_preflight_reads_every_live_worker(
 
     assert result["expected"] == expected
     assert result["pods"] == {"worker-a": expected, "worker-b": expected}
+
+
+@pytest.mark.parametrize(
+    ("extra_flags", "valid"),
+    [
+        ("", True),
+        (" --limit-max-requests 20000 --limit-max-requests-jitter 2000", False),
+    ],
+)
+def test_ingress_process_model_preflight_rejects_request_count_recycling(
+    extra_flags: str, valid: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deployment = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "api",
+                            "args": [
+                                "uvicorn gpu_fault.app:create_app "
+                                "--workers 4 --limit-concurrency 4096" + extra_flags
+                            ],
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(
+        capacity_suite, "control", lambda *_args, **_kwargs: json.dumps(deployment)
+    )
+
+    report = suite.ingress_process_model_preflight()
+
+    assert report["valid"] is valid
+    assert bool(report["request_count_recycling_flags"]) is not valid
 
 
 def test_action_mix_covers_reboot_and_diagnostic_fabric_reset() -> None:
@@ -505,6 +543,14 @@ def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> No
                 "FABRIC_MANAGER_LOG": {"count": 500, "status_counts": {"200": 500}},
             },
         },
+        "control_plane_pod_lifecycle": {
+            "restart_count_delta": 0,
+            "restarted_pods": {},
+            "missing_pods": [],
+            "added_pods": [],
+            "counter_regressions": {},
+            "not_ready_after": [],
+        },
         "workflow": {
             "incident_count": expected,
             "context_incident_count": expected,
@@ -545,6 +591,22 @@ def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> No
     assert status == "PASS", errors
     assert errors == []
 
+    summary["ingress"]["paths"]["NVIDIA_KERNEL"]["transport_retries"] = {
+        "URLError:ConnectionResetError": 1
+    }
+    status, errors = suite.verdict(summary, expected_workflows=expected)
+
+    assert status == "FAIL"
+    assert "NVIDIA_KERNEL required transport retries" in errors
+
+    summary["ingress"]["paths"]["NVIDIA_KERNEL"]["transport_retries"] = {}
+    summary["control_plane_pod_lifecycle"]["restart_count_delta"] = 1
+    summary["control_plane_pod_lifecycle"]["restarted_pods"] = {"ingress-a": 1}
+    status, errors = suite.verdict(summary, expected_workflows=expected)
+
+    assert status == "FAIL"
+    assert "control-plane container restarts are nonzero" in errors
+
 
 @pytest.mark.parametrize("status_code", ("429", "503"))
 def test_integrated_verdict_rejects_ingress_http_errors(status_code: str) -> None:
@@ -563,6 +625,14 @@ def test_integrated_verdict_rejects_ingress_http_errors(status_code: str) -> Non
                     "status_counts": {"202": 8191, status_code: 1},
                 },
             },
+        },
+        "control_plane_pod_lifecycle": {
+            "restart_count_delta": 0,
+            "restarted_pods": {},
+            "missing_pods": [],
+            "added_pods": [],
+            "counter_regressions": {},
+            "not_ready_after": [],
         },
         "workflow": {
             "incident_count": expected,
@@ -603,6 +673,80 @@ def test_integrated_verdict_rejects_ingress_http_errors(status_code: str) -> Non
 
     assert status == "FAIL"
     assert f"GPU_METRICS returned HTTP {status_code}" in errors
+
+
+def test_control_pod_runtime_snapshot_is_redacted_and_detects_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = {
+        "items": [
+            {
+                "metadata": {
+                    "name": "gpu-fault-api-ha-a",
+                    "uid": "private-uid",
+                    "labels": {"app": "gpu-fault-api-ha"},
+                },
+                "spec": {"nodeName": "private-node"},
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.0.0.1",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [
+                        {
+                            "name": "api",
+                            "ready": True,
+                            "restartCount": 0,
+                            "containerID": "private-container-id",
+                            "state": {"running": {"startedAt": "2026-09-01T09:00:00Z"}},
+                            "lastState": {},
+                        }
+                    ],
+                },
+            },
+            {"metadata": {"name": "unrelated-pod"}, "status": {"phase": "Running"}},
+        ]
+    }
+    monkeypatch.setattr(
+        capacity_suite, "control", lambda *args, **_kwargs: json.dumps(document)
+    )
+
+    before = suite.control_pod_runtime_snapshot()
+
+    assert before == {
+        "gpu-fault-api-ha-a": {
+            "role": "gpu-fault-api-ha",
+            "phase": "Running",
+            "ready": True,
+            "restart_count": 0,
+            "containers": {
+                "api": {
+                    "ready": True,
+                    "restart_count": 0,
+                    "running_started_at": "2026-09-01T09:00:00Z",
+                    "last_termination": None,
+                }
+            },
+        }
+    }
+    assert "private" not in json.dumps(before)
+
+    after = json.loads(json.dumps(before))
+    after["gpu-fault-api-ha-a"]["restart_count"] = 1
+    after["gpu-fault-api-ha-a"]["ready"] = False
+    after["gpu-fault-control-worker-b"] = {
+        "role": "gpu-fault-control-worker",
+        "phase": "Running",
+        "ready": True,
+        "restart_count": 0,
+        "containers": {},
+    }
+
+    lifecycle = suite.control_pod_lifecycle(before, after)
+
+    assert lifecycle["restart_count_delta"] == 1
+    assert lifecycle["restarted_pods"] == {"gpu-fault-api-ha-a": 1}
+    assert lifecycle["added_pods"] == ["gpu-fault-control-worker-b"]
+    assert lifecycle["not_ready_after"] == ["gpu-fault-api-ha-a"]
 
 
 def test_50_cluster_manifest_uses_formal_41524_matrix() -> None:

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -17,7 +17,10 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
-
+from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
+    FORMAL_SCOPE,
+    current_acceptance_scope,
+)
 
 TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED"}
 PROVIDER_MUTATIONS = {
@@ -56,12 +59,30 @@ def predecessor_evidence(
     path: Path,
     expected_case_id: str,
 ) -> dict[str, Any]:
+    scope = current_acceptance_scope()
+    if scope.selective:
+        return {
+            "path": str(path),
+            "case_id": expected_case_id,
+            "expected_case_id": expected_case_id,
+            "verdict": "SKIPPED_BY_OPERATOR",
+            "status": "SKIPPED_BY_OPERATOR",
+            "valid": True,
+            "execution_allowed": True,
+            "evidence_valid": False,
+            **scope.result_fields(),
+            "error": None,
+        }
     if not path.is_file():
         return {
             "path": str(path),
             "case_id": expected_case_id,
             "verdict": "MISSING",
             "valid": False,
+            "execution_allowed": False,
+            "evidence_valid": False,
+            **scope.plan_fields(),
+            "formal_sequence_satisfied": False,
             "error": "predecessor evidence does not exist",
         }
     try:
@@ -72,6 +93,10 @@ def predecessor_evidence(
             "case_id": expected_case_id,
             "verdict": "INVALID",
             "valid": False,
+            "execution_allowed": False,
+            "evidence_valid": False,
+            **scope.plan_fields(),
+            "formal_sequence_satisfied": False,
             "error": f"cannot read predecessor evidence: {exc}",
         }
     if not isinstance(value, dict):
@@ -80,18 +105,43 @@ def predecessor_evidence(
             "case_id": expected_case_id,
             "verdict": "INVALID",
             "valid": False,
+            "execution_allowed": False,
+            "evidence_valid": False,
+            **scope.plan_fields(),
+            "formal_sequence_satisfied": False,
             "error": "predecessor evidence is not a JSON object",
         }
     actual_case_id = str(value.get("case_id") or "")
     verdict = str(value.get("verdict") or "")
-    valid = actual_case_id == expected_case_id and verdict == "PASS"
+    evidence_scope = str(value.get("execution_scope") or FORMAL_SCOPE)
+    formal_sequence_satisfied = bool(
+        value.get(
+            "formal_sequence_satisfied",
+            evidence_scope == FORMAL_SCOPE,
+        )
+    )
+    evidence_valid = actual_case_id == expected_case_id and verdict == "PASS"
+    valid = (
+        evidence_valid and evidence_scope == FORMAL_SCOPE and formal_sequence_satisfied
+    )
+    if not evidence_valid:
+        error = "predecessor case must have verdict PASS"
+    elif evidence_scope != FORMAL_SCOPE or not formal_sequence_satisfied:
+        error = "selective evidence cannot satisfy a formal predecessor"
+    else:
+        error = None
     return {
         "path": str(path),
         "case_id": actual_case_id,
         "expected_case_id": expected_case_id,
         "verdict": verdict,
         "valid": valid,
-        "error": (None if valid else "predecessor case must have verdict PASS"),
+        "execution_allowed": valid,
+        "evidence_valid": evidence_valid,
+        "evidence_execution_scope": evidence_scope,
+        **scope.plan_fields(),
+        "formal_sequence_satisfied": valid,
+        "error": error,
     }
 
 

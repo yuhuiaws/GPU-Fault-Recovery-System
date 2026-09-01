@@ -3,14 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
-from threading import Event, Lock, Thread
 import time
+from pathlib import Path
+from threading import Event, Lock, Thread
 
 from gpu_fault.lifecycle import ShutdownCoordinator
+
+if __package__:
+    from .acceptance_scope import scoped_case_evidence
+else:
+    from acceptance_scope import scoped_case_evidence
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -20,7 +25,9 @@ KUBERNETES_GRACE_SECONDS = 240
 
 
 def _write_json(path: Path, value: dict) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
+    )
     path.chmod(0o600)
 
 

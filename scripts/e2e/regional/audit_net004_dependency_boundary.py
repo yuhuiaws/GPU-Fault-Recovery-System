@@ -4,9 +4,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import subprocess
 import time
+from pathlib import Path
+
+if __package__:
+    from .acceptance_scope import scoped_case_evidence
+else:
+    from acceptance_scope import scoped_case_evidence
 
 
 CPU_KUBECONFIG = Path()
@@ -29,7 +34,9 @@ class CaseError(RuntimeError):
 
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
+    )
     path.chmod(0o600)
 
 

@@ -233,7 +233,7 @@ def replace_uvicorn_args(
         "--timeout-worker-healthcheck 20 --no-access-log"
     )
     if ingress:
-        flags += " --limit-concurrency 4096 --limit-max-requests 20000 --limit-max-requests-jitter 2000"
+        flags += " --limit-concurrency 4096"
     container["args"] = [prefix + flags]
 
 

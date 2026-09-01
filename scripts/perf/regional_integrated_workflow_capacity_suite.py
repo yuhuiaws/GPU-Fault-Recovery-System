@@ -39,8 +39,11 @@ if __package__:
         aurora_window,
         build_job,
         collect_logs,
+        control_pod_lifecycle,
+        control_pod_runtime_snapshot,
         control_pods,
         drain_targets,
+        ingress_process_model_preflight,
         postgres_counters,
         prepare_start_gate,
         processor_priority_latency,
@@ -79,8 +82,11 @@ else:
         aurora_window,
         build_job,
         collect_logs,
+        control_pod_lifecycle,
+        control_pod_runtime_snapshot,
         control_pods,
         drain_targets,
+        ingress_process_model_preflight,
         postgres_counters,
         prepare_start_gate,
         processor_priority_latency,
@@ -865,6 +871,22 @@ def verdict(
                 errors.append(f"{kind} returned HTTP {status}")
         if path.get("errors"):
             errors.append(f"{kind} produced client errors")
+        if path.get("transport_retries"):
+            errors.append(f"{kind} required transport retries")
+    lifecycle = summary.get("control_plane_pod_lifecycle")
+    if not isinstance(lifecycle, dict):
+        errors.append("control-plane Pod lifecycle evidence is missing")
+    else:
+        if int(lifecycle.get("restart_count_delta", 0)):
+            errors.append("control-plane container restarts are nonzero")
+        if (
+            lifecycle.get("missing_pods")
+            or lifecycle.get("added_pods")
+            or lifecycle.get("counter_regressions")
+        ):
+            errors.append("control-plane Pod set changed during the run")
+        if lifecycle.get("not_ready_after"):
+            errors.append("a control-plane Pod is not Ready after the run")
     if audit["incident_count"] != expected_workflows:
         errors.append("action-bearing incident count mismatch")
     if audit["context_incident_count"] != expected_workflows:
@@ -1023,6 +1045,7 @@ def execute_integrated_jobs(
             check=False,
         )
     pods = control_pods()
+    pod_runtime_before = control_pod_runtime_snapshot()
     metrics_before = scrape_metrics(pods)
     cgroup_before = scrape_cgroup(pods)
     postgres_before = postgres_counters()
@@ -1070,6 +1093,7 @@ def execute_integrated_jobs(
     )
     metrics_after = scrape_metrics(pods)
     cgroup_after = scrape_cgroup(pods)
+    pod_runtime_after = control_pod_runtime_snapshot()
     postgres_after = postgres_counters()
     summary = {
         "run_id": run_id,
@@ -1107,6 +1131,10 @@ def execute_integrated_jobs(
             }
             for pod, after in cgroup_after.items()
         },
+        "control_plane_pod_lifecycle": control_pod_lifecycle(
+            pod_runtime_before,
+            pod_runtime_after,
+        ),
         "processor_priority_latency": processor_priority_latency(),
         "postgres_deltas": {
             key: (postgres_after.get(key) or 0) - (postgres_before.get(key) or 0)
@@ -1125,6 +1153,8 @@ def execute_integrated_jobs(
         ("metrics-after.json", metrics_after),
         ("cgroup-before.json", cgroup_before),
         ("cgroup-after.json", cgroup_after),
+        ("control-pods-before.json", pod_runtime_before),
+        ("control-pods-after.json", pod_runtime_after),
         ("postgres-before.json", postgres_before),
         ("postgres-after.json", postgres_after),
     ):
@@ -1198,6 +1228,20 @@ def run(args: argparse.Namespace) -> int:
     failure: BaseException | None = None
     result = 1
     try:
+        ingress_process_preflight = ingress_process_model_preflight()
+        (artifacts / "ingress-process-model-preflight.json").write_text(
+            json.dumps(ingress_process_preflight, indent=2, sort_keys=True) + "\n"
+        )
+        if not ingress_process_preflight["valid"]:
+            raise RuntimeError(
+                "live ingress uses request-count worker recycling: "
+                + ", ".join(
+                    str(item)
+                    for item in ingress_process_preflight[
+                        "request_count_recycling_flags"
+                    ]
+                )
+            )
         aurora_preflight = ensure_aurora_capacity(
             args.aurora_cluster_id,
             timeout_seconds=args.aurora_preflight_timeout_seconds,

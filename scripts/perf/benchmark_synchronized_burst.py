@@ -56,6 +56,12 @@ def server_timing(headers) -> dict[str, float]:
     return values
 
 
+def transport_error_category(exc: BaseException) -> str:
+    if isinstance(exc, urllib_error.URLError):
+        return f"{type(exc).__name__}:{type(exc.reason).__name__}"
+    return type(exc).__name__
+
+
 def synchronized_start_epoch() -> float:
     gate = os.getenv("START_GATE_NAME", "").strip()
     if not gate:
@@ -508,6 +514,7 @@ def build_output(
     latencies: dict[str, list[float]],
     statuses: dict[str, dict[int, int]],
     errors: dict[str, dict[str, int]],
+    transport_retries: dict[str, dict[str, int]],
     server_durations: dict[str, list[float]],
     network_overheads: dict[str, list[float]],
     stage_durations: dict[str, dict[str, list[float]]],
@@ -533,6 +540,7 @@ def build_output(
             "count": len(values),
             "status_counts": statuses[kind],
             "errors": errors.get(kind, {}),
+            "transport_retries": transport_retries.get(kind, {}),
             "p50_ms": statistics.median(values),
             "p95_ms": percentile(values, 0.95),
             "p99_ms": percentile(values, 0.99),
@@ -643,7 +651,7 @@ def send_event(
     base_url: str,
     base_path: str,
     ssl_context: ssl.SSLContext,
-) -> tuple[str, int, float, str | None, dict[str, float]]:
+) -> tuple[str, int, float, str | None, dict[str, float], str | None]:
     index, (kind, template_kind, node_index) = indexed_event
     sequence = cluster_offset * 1_000_000 + index
     workflow_index = action_event_indexes.get(index)
@@ -669,7 +677,7 @@ def send_event(
             runtime_profile_version=runtime_profile_version,
         )
     except Exception as exc:
-        return kind, 0, 0.0, type(exc).__name__, {}
+        return kind, 0, 0.0, type(exc).__name__, {}, None
     if kind.endswith("_EVIDENCE"):
         payload["edge_filter_reasons"] = ["threshold:synthetic-priority-50"]
         payload["collection_errors"] = []
@@ -686,6 +694,7 @@ def send_event(
     if compressed:
         body = gzip.compress(body, compresslevel=6)
     begin = time.perf_counter()
+    transport_retry: str | None = None
     for attempt in range(2):
         try:
             headers = {
@@ -727,6 +736,7 @@ def send_event(
                 (time.perf_counter() - begin) * 1000,
                 None,
                 timing,
+                transport_retry,
             )
         except urllib_error.HTTPError as exc:
             return (
@@ -735,13 +745,16 @@ def send_event(
                 (time.perf_counter() - begin) * 1000,
                 None,
                 server_timing(exc.headers),
+                transport_retry,
             )
         except (urllib_error.URLError, TimeoutError, OSError) as exc:
+            category = transport_error_category(exc)
             connection = connections[index]
             if connection is not None:
                 connection.close()
                 connections[index] = None
             if attempt == 0:
+                transport_retry = category
                 continue
             return (
                 kind,
@@ -749,6 +762,7 @@ def send_event(
                 (time.perf_counter() - begin) * 1000,
                 type(exc).__name__,
                 {},
+                transport_retry,
             )
     raise AssertionError("unreachable send retry state")
 
@@ -822,6 +836,7 @@ def main() -> None:
     stage_durations: dict[str, dict[str, list[float]]] = {}
     statuses: dict[str, dict[int, int]] = {}
     errors: dict[str, dict[str, int]] = {}
+    transport_retries: dict[str, dict[str, int]] = {}
 
     sender = partial(
         send_event,
@@ -843,7 +858,7 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(sender, item) for item in enumerate(events)]
         for future in as_completed(futures):
-            kind, status, latency, error, timing = future.result()
+            kind, status, latency, error, timing, transport_retry = future.result()
             latencies.setdefault(kind, []).append(latency)
             statuses.setdefault(kind, {})[status] = (
                 statuses.setdefault(kind, {}).get(status, 0) + 1
@@ -852,6 +867,9 @@ def main() -> None:
                 errors.setdefault(kind, {})[error] = (
                     errors.setdefault(kind, {}).get(error, 0) + 1
                 )
+            if transport_retry:
+                retries = transport_retries.setdefault(kind, {})
+                retries[transport_retry] = retries.get(transport_retry, 0) + 1
             if "total" in timing:
                 total = timing["total"]
                 server_durations.setdefault(kind, []).append(total)
@@ -878,6 +896,7 @@ def main() -> None:
         latencies=latencies,
         statuses=statuses,
         errors=errors,
+        transport_retries=transport_retries,
         server_durations=server_durations,
         network_overheads=network_overheads,
         stage_durations=stage_durations,

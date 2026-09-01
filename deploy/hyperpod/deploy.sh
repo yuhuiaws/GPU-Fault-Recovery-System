@@ -101,9 +101,8 @@ POSTGRES_FLEET_CONNECTION_BUDGET="${GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET:-
 # false is the only safe production value: the in-process bootstrap
 # takes LOCK TABLE gpu_fault_processor_queue IN SHARE ROW EXCLUSIVE
 # MODE, which blocks every admission, claim, completion and cleanup for
-# as long as it holds, and uvicorn's --limit-max-requests recycles each
-# of the twelve ingress processes, so "once at startup" is really "every
-# few minutes". deploy_control_plane runs the DDL from
+# as long as it holds. Normal Pod replacement makes process startup a
+# recurring event, so deploy_control_plane runs the DDL from
 # postgres-schema-ensure-job.yaml instead; set this to true only for a
 # throwaway database where that Job cannot run.
 POSTGRES_AUTO_SCHEMA_INIT="${GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT:-false}"

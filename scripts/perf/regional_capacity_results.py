@@ -65,6 +65,7 @@ def aggregate(documents: list[dict]) -> dict:
                     "stages": {},
                     "status": {},
                     "errors": {},
+                    "transport_retries": {},
                 },
             )
             entry["latencies"].extend(value.get("raw_latencies_ms", []))
@@ -82,6 +83,10 @@ def aggregate(documents: list[dict]) -> dict:
                 )
             for error, count in (value.get("errors") or {}).items():
                 entry["errors"][error] = entry["errors"].get(error, 0) + count
+            for error, count in (value.get("transport_retries") or {}).items():
+                entry["transport_retries"][error] = (
+                    entry["transport_retries"].get(error, 0) + count
+                )
     summary = {
         "pods": len(documents),
         "requests": sum(document.get("events", 0) for document in documents),
@@ -118,6 +123,7 @@ def aggregate(documents: list[dict]) -> dict:
             "count": len(latencies),
             "status_counts": entry["status"],
             "errors": entry["errors"],
+            "transport_retries": entry["transport_retries"],
             "p50_ms": percentile(latencies, 0.50),
             "p95_ms": percentile(latencies, 0.95),
             "p99_ms": percentile(latencies, 0.99),

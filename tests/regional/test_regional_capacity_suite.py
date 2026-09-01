@@ -524,6 +524,7 @@ def test_result_aggregation_preserves_fault_latency_summary() -> None:
                     "NVIDIA_KERNEL": {
                         "raw_latencies_ms": [10.0, 20.0],
                         "status_counts": {"202": 2},
+                        "transport_retries": {"URLError:ConnectionResetError": 1},
                     }
                 },
             }
@@ -534,3 +535,53 @@ def test_result_aggregation_preserves_fault_latency_summary() -> None:
     assert summary["throughput_req_s"] == 2.0
     assert summary["fault_p50_ms"] == 10.0
     assert summary["fault_p99_ms"] == 10.0
+    assert summary["paths"]["NVIDIA_KERNEL"]["transport_retries"] == {
+        "URLError:ConnectionResetError": 1
+    }
+
+
+def test_synchronized_burst_records_recovered_transport_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class Response:
+        status = 202
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise burst.urllib_error.URLError(ConnectionResetError())
+        return Response()
+
+    monkeypatch.setattr(burst, "build_event_payload", lambda **_kwargs: {})
+    monkeypatch.setattr(burst.urllib_request, "urlopen", fake_urlopen)
+
+    result = burst.send_event(
+        (0, ("NVIDIA_KERNEL", "NVIDIA_KERNEL", 0)),
+        templates={},
+        registration={"cluster_id": "cluster-a", "token": "token-a"},
+        cluster_offset=0,
+        correlate_attempt_faults=False,
+        action_event_indexes={},
+        action_run_id="",
+        runtime_profile_version="profile-a",
+        connections=[None],
+        prewarm_connections=False,
+        base_url="https://control.example",
+        base_path="",
+        ssl_context=SimpleNamespace(),
+    )
+
+    assert result[1] == 202
+    assert result[3] is None
+    assert result[5] == "URLError:ConnectionResetError"
+    assert attempts == 2

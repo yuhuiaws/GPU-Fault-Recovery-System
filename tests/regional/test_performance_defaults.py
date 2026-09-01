@@ -50,11 +50,11 @@ def test_hyperpod_deploy_runs_schema_ddl_in_a_job() -> None:
 
     The in-process bootstrap takes SHARE ROW EXCLUSIVE on
     gpu_fault_processor_queue, which blocks every admission, claim and
-    completion while it holds, and uvicorn recycles ingress processes on
-    --limit-max-requests, so a `true` default turns a one-off into a
-    recurring stall. The manifests say false; this asserts deploy.sh's
-    imperative `set env` does not put it back to true, and that the
-    migration Job it replaces the bootstrap with actually runs.
+    completion while it holds. Pod replacement makes process startup a
+    recurring event, so a `true` default turns a one-off into a recurring
+    stall. The manifests say false; this asserts deploy.sh's imperative
+    `set env` does not put it back to true, and that the migration Job it
+    replaces the bootstrap with actually runs.
     """
 
     script = (ROOT / "deploy/hyperpod/deploy.sh").read_text(encoding="utf-8")

@@ -143,10 +143,9 @@ spec:
             # Bootstrap DDL is a separate step, not a pod start
             # side effect: _create_schema takes an exclusive lock on
             # the queue table to reseed the counts, so with several
-            # replicas restarting (uvicorn --limit-max-requests
-            # recycles workers on its own) it periodically froze the
-            # live queue. Run postgres-schema-ensure-job.yaml before
-            # rolling, and keep this false.
+            # replicas restarting it periodically froze the live queue.
+            # Run postgres-schema-ensure-job.yaml before rolling, and
+            # keep this false.
             - name: GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT
               value: "false"
             - name: GPU_FAULT_POSTGRES_HOT_STATE_MODE

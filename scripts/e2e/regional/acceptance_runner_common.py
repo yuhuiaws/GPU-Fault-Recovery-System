@@ -5,16 +5,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+if __package__:
+    from .acceptance_scope import scoped_case_evidence
+else:
+    from acceptance_scope import scoped_case_evidence
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    document = scoped_case_evidence(value)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        json.dumps(document, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     temporary.chmod(0o600)

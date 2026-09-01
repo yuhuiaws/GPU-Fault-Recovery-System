@@ -116,6 +116,15 @@ else:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PERF_DIR = REPO_ROOT / "scripts" / "perf"
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "artifacts" / "perf"
+CONTROL_POD_PREFIXES = (
+    "gpu-fault-api-ha-",
+    "gpu-fault-control-worker-",
+    "gpu-fault-telemetry-spool-worker-",
+)
+INGRESS_REQUEST_RECYCLE_FLAGS = (
+    "--limit-max-requests",
+    "--limit-max-requests-jitter",
+)
 
 AURORA_INSTANCE = os.getenv("GPU_FAULT_AURORA_INSTANCE", "gpu-fault-aurora-writer")
 SCRIPT_CONFIGMAP = "gpu-fault-perf-suite-scripts"
@@ -372,6 +381,118 @@ METRIC_PATTERN = re.compile(
     r"rejections_total|in_flight|processor_claim|store_io_|"
     r"telemetry_spool|queue_bypass|processor_notification"
 )
+
+
+def control_pod_runtime_snapshot() -> dict[str, dict]:
+    document = json.loads(control("get", "pod", "-o", "json"))
+    snapshot: dict[str, dict] = {}
+    for pod in document.get("items") or []:
+        metadata = pod.get("metadata") or {}
+        name = str(metadata.get("name") or "")
+        if not name.startswith(CONTROL_POD_PREFIXES):
+            continue
+        status = pod.get("status") or {}
+        ready = any(
+            item.get("type") == "Ready" and item.get("status") == "True"
+            for item in status.get("conditions") or []
+        )
+        containers = {}
+        restart_count = 0
+        for item in status.get("containerStatuses") or []:
+            container_name = str(item.get("name") or "")
+            restarts = int(item.get("restartCount") or 0)
+            restart_count += restarts
+            running = (item.get("state") or {}).get("running") or {}
+            terminated = (item.get("lastState") or {}).get("terminated") or {}
+            containers[container_name] = {
+                "ready": bool(item.get("ready")),
+                "restart_count": restarts,
+                "running_started_at": running.get("startedAt"),
+                "last_termination": (
+                    {
+                        "reason": terminated.get("reason"),
+                        "exit_code": terminated.get("exitCode"),
+                        "started_at": terminated.get("startedAt"),
+                        "finished_at": terminated.get("finishedAt"),
+                    }
+                    if terminated
+                    else None
+                ),
+            }
+        snapshot[name] = {
+            "role": (metadata.get("labels") or {}).get("app"),
+            "phase": status.get("phase"),
+            "ready": ready,
+            "restart_count": restart_count,
+            "containers": dict(sorted(containers.items())),
+        }
+    return dict(sorted(snapshot.items()))
+
+
+def control_pod_lifecycle(
+    before: dict[str, dict],
+    after: dict[str, dict],
+) -> dict[str, object]:
+    before_names = set(before)
+    after_names = set(after)
+    restarted_pods: dict[str, int] = {}
+    counter_regressions: dict[str, dict[str, int]] = {}
+    for name in sorted(before_names & after_names):
+        before_count = int(before[name].get("restart_count", 0))
+        after_count = int(after[name].get("restart_count", 0))
+        if after_count > before_count:
+            restarted_pods[name] = after_count - before_count
+        elif after_count < before_count:
+            counter_regressions[name] = {
+                "before": before_count,
+                "after": after_count,
+            }
+    return {
+        "restart_count_delta": sum(restarted_pods.values()),
+        "restarted_pods": restarted_pods,
+        "missing_pods": sorted(before_names - after_names),
+        "added_pods": sorted(after_names - before_names),
+        "counter_regressions": counter_regressions,
+        "not_ready_after": sorted(
+            name for name, item in after.items() if not item.get("ready")
+        ),
+    }
+
+
+def ingress_process_model_preflight() -> dict[str, object]:
+    deployment = json.loads(
+        control(
+            "get",
+            "deployment",
+            "gpu-fault-api-ha",
+            "-o",
+            "json",
+        )
+    )
+    containers = (
+        deployment.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    api = next(
+        (item for item in containers if item.get("name") == "api"),
+        None,
+    )
+    if api is None:
+        raise RuntimeError("live ingress Deployment has no api container")
+    args = api.get("args") or []
+    if len(args) != 1 or not isinstance(args[0], str):
+        raise RuntimeError("live ingress command is not a single shell argument")
+    command = args[0]
+    forbidden = [flag for flag in INGRESS_REQUEST_RECYCLE_FLAGS if flag in command]
+    return {
+        "deployment": "gpu-fault-api-ha",
+        "uvicorn_workers_4": "--workers 4" in command,
+        "limit_concurrency_4096": "--limit-concurrency 4096" in command,
+        "request_count_recycling_flags": forbidden,
+        "valid": not forbidden,
+    }
 
 
 def scrape_metrics(pods: list[str]) -> dict[str, str]:

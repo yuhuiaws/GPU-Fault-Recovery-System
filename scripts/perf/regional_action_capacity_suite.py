@@ -60,6 +60,7 @@ else:
 SCRIPT_CONFIGMAP = "gpu-fault-action-capacity-script"
 JOB_NAME = "gpu-fault-action-capacity-executors"
 TERMINAL = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
+CLAIM_ERROR_SAMPLE_LIMIT = 20
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PERF_DIR = REPO_ROOT / "scripts" / "perf"
 AGENT_IDENTITY_ENV_KEYS = (
@@ -634,6 +635,24 @@ def collect_executor_logs(
 
 def aggregate_executor_documents(documents: list[dict]) -> dict:
     walls = [item.get("wall_seconds", 0.0) for item in documents]
+    claim_error_counts: dict[str, int] = {}
+    claim_error_samples: list[dict] = []
+    for item in documents:
+        for category, count in (item.get("claim_error_counts") or {}).items():
+            claim_error_counts[str(category)] = claim_error_counts.get(
+                str(category), 0
+            ) + int(count)
+        for sample in item.get("claim_error_samples") or []:
+            if isinstance(sample, dict):
+                claim_error_samples.append(
+                    {
+                        "category": str(sample.get("category", "unknown")),
+                        "elapsed_seconds": float(sample.get("elapsed_seconds", 0.0)),
+                    }
+                )
+    claim_error_samples.sort(
+        key=lambda item: (item["elapsed_seconds"], item["category"])
+    )
     return {
         "executor_pods": len(documents),
         "expected_commands": sum(
@@ -646,6 +665,8 @@ def aggregate_executor_documents(documents: list[dict]) -> dict:
         "executor_wall_max": max(walls) if walls else None,
         "duplicate_claims": sum(item.get("duplicate_claims", 0) for item in documents),
         "claim_errors": sum(item.get("claim_errors", 0) for item in documents),
+        "claim_error_counts": dict(sorted(claim_error_counts.items())),
+        "claim_error_samples": claim_error_samples[:CLAIM_ERROR_SAMPLE_LIMIT],
         "result_errors": sum(item.get("result_errors", 0) for item in documents),
         "renewals": sum(item.get("renewals", 0) for item in documents),
         "renewal_errors": sum(item.get("renewal_errors", 0) for item in documents),

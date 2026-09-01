@@ -3,15 +3,20 @@ from __future__ import annotations
 
 import argparse
 import base64
-from datetime import datetime, timedelta, timezone
 import importlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+if __package__:
+    from .acceptance_scope import scoped_case_evidence
+else:
+    from acceptance_scope import scoped_case_evidence
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -20,7 +25,9 @@ CASE_ID = "GF-REGIONAL-HA-008"
 
 
 def _write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
+    )
     path.chmod(0o600)
 
 

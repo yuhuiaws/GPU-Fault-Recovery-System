@@ -102,6 +102,11 @@ budgets for the selected 32/50-cluster matrix.
 The formal matrix contains four runs: 32/50 clusters crossed with
 `--spool-mode disabled/enabled`. The runner verifies every live ingress Pod and
 the dedicated spool-worker replica count before registering synthetic clusters.
+It also rejects a live ingress command containing Uvicorn
+`--limit-max-requests`; request-count recycling can overlap during a burst and
+remove serving capacity even though Kubernetes reports no container restart.
+The result is written to `ingress-process-model-preflight.json` before Aurora
+scaling or synthetic registry registration.
 Apply the matching `32-disabled`, `32-enabled`, `50-disabled`, or `50-enabled`
 AdminConfig preset through `gpu-fault-admin config` before each run. The current
 command totals are 30 per cluster: 960 for 32 clusters and 1500 for 50.
@@ -118,6 +123,15 @@ its bounded `finally` block deletes both Jobs and their Pods, purges database
 rows, and removes the synthetic registry revision. A completed teardown writes
 `cleanup-workloads.json`, `cleanup-residuals.json`, and
 `registry-postflight.json`; any residual keeps the run aborted.
+
+The integrated evidence distinguishes final client failures from recovered
+first-attempt transport failures. Each ingress path reports
+`transport_retries`; executor claim failures report bounded, redacted
+`claim_error_counts` and `claim_error_samples`. The runner also writes
+`control-pods-before.json` and `control-pods-after.json` and rejects any
+control-plane Pod replacement, container restart, counter regression, or Pod
+that is not Ready after the run. These checks do not change request, timeout,
+concurrency, or capacity thresholds.
 
 The runner records the previous Aurora Min/Max in
 `aurora-preflight.json.initial_scaling` but does not restore it. After the final

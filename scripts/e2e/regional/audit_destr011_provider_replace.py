@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+if __package__:
+    from .acceptance_scope import scoped_case_evidence
+else:
+    from acceptance_scope import scoped_case_evidence
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -80,7 +85,9 @@ def command(argv: list[str], *, timeout: int = 180) -> str:
 
 
 def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
+    )
     path.chmod(0o600)
 
 
