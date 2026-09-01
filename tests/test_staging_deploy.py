@@ -236,6 +236,7 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
         git_commit="a" * 40,
         fingerprint="a" * 64,
         snapshot=False,
+        isolated=True,
     )
     monkeypatch.setattr(
         staging_deploy, "prepare_source_checkout", lambda *_args, **_kwargs: source
@@ -275,6 +276,7 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
 
     assert result["deploy_host_bundle_reused"] is True
     assert result["source_snapshot"] is False
+    assert result["source_isolated"] is True
     assert calls[0] == ("scan", repository)
     deploy_call = next(item for item in calls if item[0] == "deploy")
     assert deploy_call[1]["state_dir"] == state
@@ -286,6 +288,7 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
     )
     assert state_value["source_repository_root"] == str(repository)
     assert state_value["release_ref"] == source.git_commit
+    assert state_value["source_isolated"] is True
 
 
 def test_staging_state_must_be_outside_repository(tmp_path: Path) -> None:
@@ -344,6 +347,7 @@ def test_source_scan_runs_before_snapshot_and_bundle(
         git_commit="a" * 40,
         fingerprint="b" * 64,
         snapshot=True,
+        isolated=True,
     )
     monkeypatch.setattr(
         staging_deploy,
@@ -436,6 +440,45 @@ def _git(repository: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
+def test_clean_source_is_isolated_without_staging_tier(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init")
+    _git(repository, "config", "user.name", "Test")
+    _git(repository, "config", "user.email", "test@example.com")
+    (repository / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    tracked = repository / "tracked.txt"
+    tracked.write_text("release\n", encoding="utf-8")
+    tracked.chmod(0o664)
+    _git(repository, "add", ".gitignore", "tracked.txt")
+    _git(repository, "commit", "-m", "initial")
+    state = tmp_path / "state"
+
+    first = staging_deploy.prepare_source_checkout(repository, state_dir=state)
+    first.repository_root.joinpath("dist").mkdir()
+    first.repository_root.joinpath("dist/current-release.json").write_text(
+        "signed-release\n", encoding="utf-8"
+    )
+    repository.joinpath("dist").mkdir()
+    repository.joinpath("dist/current-release.json").write_text(
+        "later-local-build\n", encoding="utf-8"
+    )
+    second = staging_deploy.prepare_source_checkout(repository, state_dir=state)
+
+    assert first == second
+    assert first.repository_root != repository
+    assert first.snapshot is False
+    assert first.isolated is True
+    assert first.git_commit == _git(repository, "rev-parse", "HEAD")
+    assert first.repository_root.joinpath("tracked.txt").stat().st_mode & 0o777 == 0o664
+    assert (
+        first.repository_root.joinpath("dist/current-release.json").read_text(
+            encoding="utf-8"
+        )
+        == "signed-release\n"
+    )
+
+
 def test_dirty_source_is_snapshotted_without_changing_original(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -457,6 +500,7 @@ def test_dirty_source_is_snapshotted_without_changing_original(tmp_path: Path) -
     )
 
     assert first.snapshot is True
+    assert first.isolated is True
     assert first == second
     assert (first.repository_root / "tracked.txt").read_text() == "after\n"
     assert (first.repository_root / "new.txt").read_text() == "new\n"
@@ -517,5 +561,25 @@ def test_snapshot_metadata_must_match_current_fingerprint(tmp_path: Path) -> Non
 
     with pytest.raises(
         staging_deploy.StagingDeployError, match="snapshot identity does not match"
+    ):
+        staging_deploy.prepare_source_checkout(repository, state_dir=state)
+
+
+def test_snapshot_prepared_tree_must_remain_unchanged(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init")
+    _git(repository, "config", "user.name", "Test")
+    _git(repository, "config", "user.email", "test@example.com")
+    tracked = repository / "tracked.txt"
+    tracked.write_text("release\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-m", "initial")
+    state = tmp_path / "state"
+    checkout = staging_deploy.prepare_source_checkout(repository, state_dir=state)
+    checkout.repository_root.joinpath("tracked.txt").chmod(0o600)
+
+    with pytest.raises(
+        staging_deploy.StagingDeployError, match="prepared tree does not match"
     ):
         staging_deploy.prepare_source_checkout(repository, state_dir=state)

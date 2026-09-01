@@ -47,6 +47,7 @@ class SourceCheckout:
     git_commit: str
     fingerprint: str
     snapshot: bool
+    isolated: bool = False
 
 
 def _run(
@@ -146,6 +147,31 @@ def _untracked_files(repository_root: Path) -> tuple[Path, ...]:
 def _tracked_files(repository_root: Path) -> tuple[Path, ...]:
     raw = _git_bytes(repository_root, "ls-files", "-z")
     return tuple(Path(os.fsdecode(value)) for value in raw.split(b"\0") if value)
+
+
+def _prepared_tree_sha256(repository_root: Path) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(
+        _tracked_files(repository_root),
+        key=lambda value: value.as_posix(),
+    ):
+        if relative.is_absolute() or ".." in relative.parts:
+            raise StagingDeployError(f"prepared source leaves repository: {relative}")
+        source = repository_root.resolve() / relative
+        digest.update(b"\0path\0")
+        digest.update(relative.as_posix().encode())
+        if source.is_symlink():
+            digest.update(b"\0symlink\0")
+            digest.update(os.readlink(source).encode())
+            continue
+        if not source.is_file():
+            raise StagingDeployError(f"prepared source file is missing: {relative}")
+        digest.update(b"\0file\0")
+        digest.update(f"{source.stat().st_mode & 0o777:04o}".encode())
+        with source.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _source_fingerprint(
@@ -254,20 +280,31 @@ def _load_source_snapshot(
     *,
     expected_fingerprint: str,
     expected_base_commit: str,
+    expected_staging_only: bool,
     snapshot_dir: Path,
 ) -> SourceCheckout | None:
     if not path.is_file():
         return None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
+        schema_version = int(value["schema_version"])
         repository_root = Path(str(value["repository_root"])).resolve()
         git_commit = str(value["git_commit"])
         fingerprint = str(value["fingerprint"])
         base_commit = str(value["base_commit"])
+        raw_staging_only = value.get("staging_only", git_commit != base_commit)
+        if not isinstance(raw_staging_only, bool):
+            raise ValueError("staging_only must be a boolean")
+        staging_only = raw_staging_only
+        prepared_tree_sha256 = value.get("prepared_tree_sha256")
     except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
         raise StagingDeployError("staging source snapshot metadata is invalid") from exc
+    if schema_version not in {1, 2}:
+        raise StagingDeployError("staging source snapshot schema is invalid")
     if fingerprint != expected_fingerprint or base_commit != expected_base_commit:
         raise StagingDeployError("staging source snapshot identity does not match")
+    if staging_only is not expected_staging_only:
+        raise StagingDeployError("staging source snapshot tier does not match")
     try:
         repository_root.relative_to(snapshot_dir.resolve())
     except ValueError as exc:
@@ -280,13 +317,32 @@ def _load_source_snapshot(
         raise StagingDeployError("staging source snapshot is not clean")
     if _git_output(repository_root, "rev-parse", "HEAD") != git_commit:
         raise StagingDeployError("staging source snapshot commit does not match")
-    if _git_output(repository_root, "rev-parse", "HEAD^") != base_commit:
-        raise StagingDeployError("staging source snapshot base commit does not match")
+    if staging_only:
+        if _git_output(repository_root, "rev-parse", "HEAD^") != base_commit:
+            raise StagingDeployError(
+                "staging source snapshot base commit does not match"
+            )
+    elif git_commit != base_commit:
+        raise StagingDeployError("clean source snapshot base commit does not match")
+    if prepared_tree_sha256 is not None:
+        if (
+            not isinstance(prepared_tree_sha256, str)
+            or len(prepared_tree_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in prepared_tree_sha256
+            )
+            or _prepared_tree_sha256(repository_root) != prepared_tree_sha256
+        ):
+            raise StagingDeployError(
+                "staging source snapshot prepared tree does not match"
+            )
     return SourceCheckout(
         repository_root=repository_root,
         git_commit=git_commit,
         fingerprint=fingerprint,
-        snapshot=True,
+        snapshot=staging_only,
+        isolated=True,
     )
 
 
@@ -296,13 +352,7 @@ def prepare_source_checkout(
     state_dir: Path,
 ) -> SourceCheckout:
     head = _repository_head(repository_root)
-    if not _worktree_status(repository_root):
-        return SourceCheckout(
-            repository_root=repository_root,
-            git_commit=head,
-            fingerprint=head,
-            snapshot=False,
-        )
+    staging_only = bool(_worktree_status(repository_root))
     fingerprint, diff, tracked, untracked = _source_fingerprint(
         repository_root,
         head=head,
@@ -313,6 +363,7 @@ def prepare_source_checkout(
         metadata_path,
         expected_fingerprint=fingerprint,
         expected_base_commit=head,
+        expected_staging_only=staging_only,
         snapshot_dir=snapshot_dir,
     )
     if existing is not None:
@@ -334,33 +385,37 @@ def prepare_source_checkout(
     _apply_snapshot_diff(candidate, diff)
     _copy_untracked_files(repository_root, candidate, untracked)
     _copy_tracked_file_modes(repository_root, candidate, tracked)
-    _run(["git", "add", "-A"], cwd=candidate)
-    commit_environment = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "GPU Fault Staging Snapshot",
-        "GIT_AUTHOR_EMAIL": "staging@localhost",
-        "GIT_COMMITTER_NAME": "GPU Fault Staging Snapshot",
-        "GIT_COMMITTER_EMAIL": "staging@localhost",
-    }
-    _run(
-        [
-            "git",
-            "commit",
-            "--no-gpg-sign",
-            "--no-verify",
-            "-m",
-            f"staging snapshot {fingerprint[:12]}",
-        ],
-        cwd=candidate,
-        env=commit_environment,
-    )
+    if staging_only:
+        _run(["git", "add", "-A"], cwd=candidate)
+        commit_environment = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "GPU Fault Staging Snapshot",
+            "GIT_AUTHOR_EMAIL": "staging@localhost",
+            "GIT_COMMITTER_NAME": "GPU Fault Staging Snapshot",
+            "GIT_COMMITTER_EMAIL": "staging@localhost",
+        }
+        _run(
+            [
+                "git",
+                "commit",
+                "--no-gpg-sign",
+                "--no-verify",
+                "-m",
+                f"staging snapshot {fingerprint[:12]}",
+            ],
+            cwd=candidate,
+            env=commit_environment,
+        )
     git_commit = _git_output(candidate, "rev-parse", "HEAD")
+    prepared_tree_sha256 = _prepared_tree_sha256(candidate)
     metadata = {
-        "schema_version": 1,
+        "schema_version": 2,
         "fingerprint": fingerprint,
         "base_commit": head,
         "git_commit": git_commit,
         "repository_root": str(candidate),
+        "staging_only": staging_only,
+        "prepared_tree_sha256": prepared_tree_sha256,
     }
     temporary = metadata_path.with_suffix(".tmp")
     temporary.write_text(
@@ -373,7 +428,8 @@ def prepare_source_checkout(
         repository_root=candidate,
         git_commit=git_commit,
         fingerprint=fingerprint,
-        snapshot=True,
+        snapshot=staging_only,
+        isolated=True,
     )
 
 
@@ -578,6 +634,7 @@ def record_source_deploy_state(
         "release_ref": source.git_commit,
         "source_fingerprint": source.fingerprint,
         "source_snapshot": source.snapshot,
+        "source_isolated": source.isolated,
     }
     temporary = target.with_suffix(".tmp")
     temporary.write_text(
@@ -688,6 +745,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
         "source_fingerprint": source.fingerprint,
         "source_checkout": str(source.repository_root),
         "source_snapshot": source.snapshot,
+        "source_isolated": source.isolated,
         "state_dir": str(state_dir),
         "deploy_host_bundle": str(artifacts.archive),
         "deploy_host_bundle_reused": bundle_reused,

@@ -49,18 +49,19 @@ def site_file(tmp_path: Path) -> Path:
     bundle = root / "dist/bundle.tar.gz"
     wheel.write_bytes(b"wheel")
     bundle.write_bytes(b"bundle")
-    (root / "dist/current-release.json").write_text(
-        json.dumps(
-            {
-                "release_id": "release-a",
-                "wheel": str(wheel),
-                "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
-                "bundle": str(bundle),
-                "bundle_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
-            }
-        ),
-        encoding="utf-8",
+    manifest = json.dumps(
+        {
+            "release_id": "release-a",
+            "wheel": str(wheel),
+            "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+            "bundle": str(bundle),
+            "bundle_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+        }
     )
+    (root / "dist/current-release.json").write_text(manifest, encoding="utf-8")
+    immutable = root / "dist/release-a/release.json"
+    immutable.parent.mkdir()
+    immutable.write_text(manifest, encoding="utf-8")
     (root / "config").mkdir()
     (root / "config/profile.yaml").write_text(
         "cluster_id: placeholder\n"
@@ -141,6 +142,27 @@ def site_file(tmp_path: Path) -> Path:
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     path.chmod(0o600)
     return path
+
+
+def mock_live_release(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    release_id: str = "release-a",
+    committed: bool = True,
+    phase: str = "complete",
+) -> None:
+    monkeypatch.setattr(
+        admin_cli, "verify_prebuilt_release", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        admin_cli,
+        "_live_release_state",
+        lambda _site: {
+            "release_id": release_id,
+            "transaction_committed": committed,
+            "phase": phase,
+        },
+    )
 
 
 def test_effective_environment_pins_repository_pythonpath(
@@ -636,9 +658,10 @@ def test_config_help_is_single_level(capsys) -> None:
 
 
 def test_config_dry_run_from_private_yaml_is_role_scoped(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     site_file(tmp_path)
+    mock_live_release(monkeypatch)
     initialize_desired_admin_config(tmp_path)
     config = tmp_path / "capacity.yaml"
     config.write_text(
@@ -691,6 +714,7 @@ def test_config_preset_uses_existing_signed_release_without_building(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     site_file(tmp_path)
+    mock_live_release(monkeypatch)
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
         admin_cli, "_run_automatic_release", lambda **kwargs: calls.append(kwargs) or 0
@@ -716,6 +740,108 @@ def test_config_preset_uses_existing_signed_release_without_building(
     assert admin_config_file_path(tmp_path).is_file(), (
         "config preset did not materialize the canonical editable file"
     )
+
+
+def test_config_rejects_local_release_drift_from_live_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_file(tmp_path)
+    initialize_desired_admin_config(tmp_path)
+    mock_live_release(monkeypatch, release_id="release-b")
+    arguments = admin_cli.parser().parse_args(
+        [
+            "config",
+            "--state-dir",
+            str(tmp_path),
+            "--preset",
+            "32-disabled",
+            "--reference",
+            "CHG-12345",
+            "--dry-run",
+        ]
+    )
+
+    with pytest.raises(SiteConfigError, match="differs from the live regional release"):
+        admin_cli.run(arguments)
+
+    assert not admin_config_plan_path(tmp_path).exists(), (
+        "release drift persisted an admin config plan"
+    )
+
+
+def test_config_reads_live_release_state_from_the_cpu_configmap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_file(tmp_path)
+    initialize_desired_admin_config(tmp_path)
+    expected = {
+        "release_id": "release-a",
+        "transaction_committed": True,
+        "phase": "complete",
+    }
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        admin_cli, "verify_prebuilt_release", lambda *_args, **_kwargs: None
+    )
+
+    def run(arguments, **_kwargs):
+        calls.append(list(arguments))
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=json.dumps({"data": {"state.json": json.dumps(expected)}}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(admin_cli.subprocess, "run", run)
+    arguments = admin_cli.parser().parse_args(
+        [
+            "config",
+            "--state-dir",
+            str(tmp_path),
+            "--preset",
+            "32-disabled",
+            "--reference",
+            "CHG-12345",
+            "--dry-run",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert calls[0][-5:] == [
+        "get",
+        "configmap",
+        "gpu-fault-regional-release-state",
+        "-o",
+        "json",
+    ]
+
+
+def test_config_requires_content_addressed_release_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = site_file(tmp_path)
+    root = Path(yaml.safe_load(site.read_text())["spec"]["repositoryRoot"])
+    (root / "dist/release-a/release.json").unlink()
+    initialize_desired_admin_config(tmp_path)
+    mock_live_release(monkeypatch)
+    arguments = admin_cli.parser().parse_args(
+        [
+            "config",
+            "--state-dir",
+            str(tmp_path),
+            "--preset",
+            "32-disabled",
+            "--reference",
+            "CHG-12345",
+            "--dry-run",
+        ]
+    )
+
+    with pytest.raises(
+        SiteConfigError, match="content-addressed release manifest is missing"
+    ):
+        admin_cli.run(arguments)
 
 
 def test_config_without_input_creates_canonical_file_and_stops(tmp_path: Path) -> None:

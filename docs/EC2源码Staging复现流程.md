@@ -116,7 +116,10 @@ GPU集合变化不会由`deploy`隐式接受。新增或移除集群必须使用
 | dirty工作区 | public scan、影响测试、区域影响计划；不确定时升级全量 | `staging_only=true` |
 | clean commit | 完整`make check`、PostgreSQL stress和制品一致性 | production |
 
-dirty工作区会被复制到隔离的本地临时commit，当前分支、index和工作区不被修改。
+clean与dirty源码都会先复制到`state-dir/source-snapshots/<fingerprint>/`下的隔离
+checkout，后续build、签名、site和config-only发布只引用该checkout，不再引用可变的
+开发工作区。clean源码保持原commit并生成production release；dirty工作区额外转换为
+隔离的本地临时commit，当前分支、index和工作区不被修改，并生成staging-only release。
 staging attestation绑定影响测试基线。普通生产验签默认拒绝staging-only release。
 
 release-ref由内部根据Git commit或dirty快照计算，不是公共参数。
@@ -127,7 +130,7 @@ release-ref由内部根据Git commit或dirty快照计算，不是公共参数。
 
 | 对象 | 允许复用的条件 |
 |---|---|
-| 源码快照 | HEAD、tracked diff和未跟踪源码摘要完全一致 |
+| 源码快照 | HEAD、tracked diff、未跟踪源码、文件权限和准备后tree摘要完全一致 |
 | deploy-host bundle和venv | commit、平台、摘要和签名一致 |
 | Runtime Image | 完整image input digest一致，且ECR digest仍存在 |
 | 签名release | commit、发布等级、影响基线、签名和runtime repository一致 |
@@ -135,6 +138,9 @@ release-ref由内部根据Git commit或dirty快照计算，不是公共参数。
 | Kubernetes发布 | release diff明确分类为NOOP或有限升级 |
 
 任何签名、commit、平台、摘要、集群身份或资源状态不确定时均fail closed。
+snapshot中的content-addressed release Manifest与签名材料会随site持续保留；
+开发checkout后续运行测试或生成新的`dist/`不会改变已部署站点的
+`status/verify/config`输入。
 
 统一源码部署安装的受信 deploy-host venv 会以`0600`文件绑定其所属
 `state-dir`。此后该安装中的`gpu-fault-admin`若收到其他`--state-dir`，会在源码扫描、

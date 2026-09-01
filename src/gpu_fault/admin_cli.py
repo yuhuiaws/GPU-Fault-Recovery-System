@@ -50,6 +50,7 @@ from gpu_fault.admin_config_file import (
     write_admin_config_file,
 )
 from gpu_fault.admin_profile_approval import approve_profile
+from gpu_fault.admin_release_artifacts import verify_prebuilt_release
 from gpu_fault.admin_resource_registry import sync_installation_resource_registry
 from gpu_fault.admin_site import (
     RenderedSite,
@@ -68,6 +69,7 @@ COMMANDS = {
     "status": "status",
 }
 DEPLOY_HOST_STATE_BINDING = "gpu-fault-managed-state-dir.json"
+REGIONAL_RELEASE_STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 
 
 def _bound_deploy_host_state_dir(prefix: Path | None = None) -> Path | None:
@@ -782,13 +784,76 @@ def _current_release_metadata(
     if not isinstance(value, dict):
         raise SiteConfigError("current release manifest must be a JSON object")
     release_id = str(value.get("release_id") or "").strip()
-    if not release_id:
+    if not release_id or Path(release_id).name != release_id:
         raise SiteConfigError("current release manifest has no release_id")
+    immutable = repository_root / "dist" / release_id / "release.json"
+    try:
+        immutable_raw = immutable.read_bytes()
+    except OSError as exc:
+        raise SiteConfigError("content-addressed release manifest is missing") from exc
+    if immutable_raw != raw:
+        raise SiteConfigError(
+            "current release manifest differs from its content-addressed copy"
+        )
+    staging_only = value.get("staging_only", False)
+    if not isinstance(staging_only, bool):
+        raise SiteConfigError("current release staging_only must be a boolean")
     return {
         "release_id": release_id,
         "manifest_sha256": hashlib.sha256(raw).hexdigest(),
-        "staging_only": bool(value.get("staging_only", False)),
+        "staging_only": staging_only,
     }
+
+
+def _live_release_state(site: RenderedSite) -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(site.release_config["cpu_kubeconfig"]),
+            "-n",
+            str(site.release_config["namespace"]),
+            "get",
+            "configmap",
+            REGIONAL_RELEASE_STATE_CONFIG_MAP,
+            "-o",
+            "json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode:
+        raise SiteConfigError("cannot read the live regional release state")
+    try:
+        document = json.loads(completed.stdout)
+        raw = (document.get("data") or {})["state.json"]
+        state = json.loads(raw)
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise SiteConfigError("live regional release state is invalid") from exc
+    if not isinstance(state, dict):
+        raise SiteConfigError("live regional release state must be an object")
+    return cast(dict[str, Any], state)
+
+
+def _validate_live_release_identity(
+    site: RenderedSite,
+    release_identity: dict[str, object],
+) -> None:
+    state = _live_release_state(site)
+    if state.get("transaction_committed") is not True:
+        raise SiteConfigError("live regional release is not committed")
+    if str(state.get("phase") or "").strip().lower() not in {
+        "complete",
+        "completed",
+    }:
+        raise SiteConfigError("live regional release is not complete")
+    live_release_id = str(state.get("release_id") or "").strip()
+    if live_release_id != release_identity["release_id"]:
+        raise SiteConfigError(
+            "current signed release differs from the live regional release"
+        )
 
 
 def _pending_admin_config_plan(
@@ -818,6 +883,13 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
     site_identity = _admin_config_site_identity(site)
     current = load_desired_admin_config(arguments.state_dir)
     desired, source = _admin_config_candidate(arguments, current)
+    verify_prebuilt_release(
+        CommandRunner(),
+        repository_root=site.repository_root,
+        state_dir=arguments.state_dir,
+        staging_only=bool(release_identity["staging_only"]),
+    )
+    _validate_live_release_identity(site, release_identity)
     if arguments.dry_run:
         plan = preview_admin_config_plan(
             arguments.state_dir,
