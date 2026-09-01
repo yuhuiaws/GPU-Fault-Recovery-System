@@ -102,18 +102,6 @@ for cluster_id in clusters:
     }
 print(json.dumps(result, separators=(",", ":")))
 """
-REMOTE_COMMAND_STATS_SCRIPT = r"""
-import json
-
-from gpu_fault.app import ApplicationContext
-
-print(
-    json.dumps(
-        ApplicationContext.from_environment().store.remote_command_stats(),
-        separators=(",", ":"),
-    )
-)
-"""
 EXECUTOR_TLS_SCRIPT = r"""
 import json
 import os
@@ -1121,25 +1109,6 @@ def _control_api_report(release: Any) -> dict[str, Any]:
                 CONTROL_PLANE_PYTHON,
                 "-c",
                 CONTROL_API_SCRIPT,
-            ),
-            capture=True,
-            sensitive=True,
-        )
-    )
-
-
-def remote_command_stats(release: Any) -> dict[str, Any]:
-    return json.loads(
-        release.runner.run(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "exec",
-                _cpu_ingress_pod(release),
-                "--",
-                CONTROL_PLANE_PYTHON,
-                "-c",
-                REMOTE_COMMAND_STATS_SCRIPT,
             ),
             capture=True,
             sensitive=True,

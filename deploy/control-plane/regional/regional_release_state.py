@@ -23,6 +23,53 @@ from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 SENSITIVE_CONFIG_KEY = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
 DIGEST_IMAGE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
+REMOTE_COMMAND_STATS_SCRIPT = """
+import json
+
+from gpu_fault.app import ApplicationContext
+
+print(
+    json.dumps(
+        ApplicationContext.from_environment().store.remote_command_stats(),
+        separators=(",", ":"),
+    )
+)
+"""
+
+
+def remote_command_stats(release: Any) -> dict[str, Any]:
+    pod = release.runner.run(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "pod",
+            "-l",
+            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ),
+        capture=True,
+    )
+    if not pod:
+        raise ReleaseError("no Running CPU ingress Pod")
+    return json.loads(
+        release.runner.run(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "exec",
+                pod,
+                "--",
+                CONTROL_PLANE_PYTHON,
+                "-c",
+                REMOTE_COMMAND_STATS_SCRIPT,
+            ),
+            capture=True,
+            sensitive=True,
+        )
+    )
 
 
 def get_json(release: Any, args: list[str]) -> dict[str, Any]:
@@ -502,7 +549,8 @@ print(json.dumps([
 
 def capture_previous(release: Any) -> dict[str, Any]:
     live_state = dict(release.state) if release.state else release._load_state()
-    remote = release._remote_command_stats()
+    probe = getattr(release, "_remote_command_stats", None)
+    remote = probe() if probe is not None else remote_command_stats(release)
     metadata = release._config_map_data("gpu-fault-release-metadata")
     clusters = {}
     runtime_images = {
