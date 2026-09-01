@@ -2,16 +2,15 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
 import signal
 import sys
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, cast
-
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -239,6 +238,8 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
         "test_hyperpod_reboot_auto_confirms_new_ready_agent_incarnation",
         "tests/execution/_node_action_cases_2.py::"
         "test_hyperpod_reboot_waits_for_post_reboot_stabilization",
+        "tests/regional/test_destructive_acceptance_fixtures.py::"
+        "test_destr002_allows_transient_zero_gpu_capacity_before_validation",
     ]
     completed = RegionalLiveFixture.run(
         command,
@@ -490,6 +491,23 @@ def workflow_errors(
     return errors
 
 
+def node_recovery_errors(
+    baseline: dict[str, Any],
+    first_ready: dict[str, Any],
+    final: dict[str, Any],
+) -> list[str]:
+    errors = []
+    if first_ready.get("boot_id") == baseline.get("boot_id"):
+        errors.append("Kubernetes Node boot ID did not change")
+    if first_ready.get("uid") != baseline.get("uid") or final.get(
+        "uid"
+    ) != baseline.get("uid"):
+        errors.append("Kubernetes Node UID changed across reboot")
+    if final.get("gpu_allocatable") != baseline.get("gpu_allocatable"):
+        errors.append("target GPU capacity did not return to baseline after validation")
+    return errors
+
+
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     state = preflight["store"]
     targets = (preflight["provider_preflight"].get("positive") or {}).get(
@@ -678,14 +696,6 @@ def execute_case(
             ),
             expected_boot_id=(preflight["store"].get("agent") or {}).get("boot_id"),
         )
-        if node_after_boot["boot_id"] == preflight["node"]["boot_id"]:
-            errors.append("Kubernetes Node boot ID did not change")
-        if (
-            node_after_boot["uid"] != preflight["node"]["uid"]
-            or node_after_boot["gpu_allocatable"]
-            != preflight["node"]["gpu_allocatable"]
-        ):
-            errors.append("Kubernetes Node identity or GPU capacity changed")
         provider = regional.provider_events(
             injection_started,
             datetime.now(timezone.utc),
@@ -724,6 +734,13 @@ def execute_case(
             errors.append("submission record does not identify the target node")
         final_node = regional.node_snapshot(settings.node)
         write_json_atomic(case_dir / "node-final.json", final_node)
+        errors.extend(
+            node_recovery_errors(
+                preflight["node"],
+                node_after_boot,
+                final_node,
+            )
+        )
         if final_node["ready"] != "True":
             errors.append("target node is not Ready after reboot")
         if final_node["unschedulable"] or final_node["ownership_annotations"]:

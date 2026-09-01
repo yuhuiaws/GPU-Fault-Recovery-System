@@ -547,6 +547,39 @@ def test_destr002_preflight_and_reboot_contract() -> None:
     ), state
 
 
+def test_destr002_allows_transient_zero_gpu_capacity_before_validation() -> None:
+    baseline = {"uid": "uid-a", "boot_id": "boot-old", "gpu_allocatable": "8"}
+    first_ready = {"uid": "uid-a", "boot_id": "boot-new", "gpu_allocatable": "0"}
+    final = {"uid": "uid-a", "boot_id": "boot-new", "gpu_allocatable": "8"}
+
+    assert destr002.node_recovery_errors(baseline, first_ready, final) == [], final
+
+
+@pytest.mark.parametrize(
+    ("first_ready", "final", "expected_error"),
+    [
+        (
+            {"uid": "uid-new", "boot_id": "boot-new", "gpu_allocatable": "0"},
+            {"uid": "uid-new", "boot_id": "boot-new", "gpu_allocatable": "8"},
+            "Kubernetes Node UID changed across reboot",
+        ),
+        (
+            {"uid": "uid-a", "boot_id": "boot-new", "gpu_allocatable": "0"},
+            {"uid": "uid-a", "boot_id": "boot-new", "gpu_allocatable": "0"},
+            "target GPU capacity did not return to baseline after validation",
+        ),
+    ],
+)
+def test_destr002_rejects_identity_or_final_gpu_capacity_drift(
+    first_ready: dict[str, Any], final: dict[str, Any], expected_error: str
+) -> None:
+    baseline = {"uid": "uid-a", "boot_id": "boot-old", "gpu_allocatable": "8"}
+
+    errors = destr002.node_recovery_errors(baseline, first_ready, final)
+
+    assert expected_error in errors, errors
+
+
 def test_destr002_wait_stops_on_terminal_workflow_without_submission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
