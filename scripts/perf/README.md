@@ -106,6 +106,19 @@ Apply the matching `32-disabled`, `32-enabled`, `50-disabled`, or `50-enabled`
 AdminConfig preset through `gpu-fault-admin config` before each run. The current
 command totals are 30 per cluster: 960 for 32 clusters and 1500 for 50.
 
+Before the start gate and every 30 seconds during workflow drain, the integrated
+runner refreshes synthetic Agent leases, required collector success, healthy
+GPU/NVLink/RDMA samples, and fresh `load1_per_cpu`,
+`memory_used_percent`, and `filesystem_used_percent` host samples. Host sample
+timestamps must cross the completed reboot barrier so `VALIDATE_HOST` cannot
+pass on stale telemetry.
+
+Integrated cleanup ignores subsequent `SIGINT`, `SIGTERM`, and `SIGHUP` while
+its bounded `finally` block deletes both Jobs and their Pods, purges database
+rows, and removes the synthetic registry revision. A completed teardown writes
+`cleanup-workloads.json`, `cleanup-residuals.json`, and
+`registry-postflight.json`; any residual keeps the run aborted.
+
 The runner records the previous Aurora Min/Max in
 `aurora-preflight.json.initial_scaling` but does not restore it. After the final
 round, restore Aurora through the approved AWS/IaC path and reapply the pre-run

@@ -706,6 +706,50 @@ def test_integrated_heartbeat_refresher_is_throttled(
     assert calls[1]["lease_seconds"] == 2700
 
 
+def test_integrated_cleanup_signal_guard_ignores_and_restores_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guarded = tuple(
+        getattr(suite.signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP")
+    )
+    original = {value: object() for value in guarded}
+    active = dict(original)
+
+    monkeypatch.setattr(suite.signal, "getsignal", lambda value: active[value])
+    monkeypatch.setattr(
+        suite.signal,
+        "signal",
+        lambda value, handler: active.__setitem__(value, handler),
+    )
+
+    with suite.cleanup_signal_guard():
+        assert all(active[value] is suite.signal.SIG_IGN for value in guarded), (
+            "cleanup did not ignore termination signals"
+        )
+
+    assert active == original
+
+
+def test_integrated_workload_cleanup_waits_for_jobs_and_pods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    samples = iter(
+        ({"jobs": ["job/load"], "pods": ["pod/load"]}, {"jobs": [], "pods": []})
+    )
+    clock = iter((0.0, 0.1))
+    sleeps = []
+    monkeypatch.setattr(suite, "integrated_workload_residuals", lambda: next(samples))
+    monkeypatch.setattr(suite.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(suite.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    result = suite.wait_for_integrated_workload_cleanup(
+        timeout_seconds=1, sample_seconds=2
+    )
+
+    assert result == {"jobs": [], "pods": []}
+    assert sleeps == [2]
+
+
 def test_integrated_runner_refuses_non_live_registry(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

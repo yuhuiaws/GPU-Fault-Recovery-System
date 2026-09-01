@@ -156,11 +156,17 @@ def test_integrated_agent_heartbeat_refresh_preserves_identity() -> None:
         "nvlink_replay_aggregate_error_total",
     }
     host = context.store.list_telemetry_metrics_latest("perf-cap-000", node_id)
-    assert {item.name for item in host} == {
-        "network_link_up",
-        "rdma_link_down",
-        "rdma_errors_delta",
+    assert {item.name: item.value for item in host} == {
+        "load1_per_cpu": 0.1,
+        "memory_used_percent": 10.0,
+        "filesystem_used_percent": 20.0,
+        "network_link_up": 1.0,
+        "rdma_link_down": 0.0,
+        "rdma_errors_delta": 0.0,
     }
+    assert all(item.observed_at == refreshed_at for item in host), (
+        "synthetic host metrics did not cross the post-action freshness barrier"
+    )
     statuses = context.store.list_collector_statuses("perf-cap-000", node_id)
     assert {item.collector.value for item in statuses} == {
         "FABRIC_MANAGER_LOG",

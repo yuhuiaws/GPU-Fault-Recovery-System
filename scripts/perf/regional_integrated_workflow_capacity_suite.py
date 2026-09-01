@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
+import signal
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -124,6 +126,73 @@ FORMAL_MODELS = {
         "total": 41524,
     },
 }
+
+
+@contextmanager
+def cleanup_signal_guard() -> Iterator[None]:
+    guarded = tuple(
+        value
+        for name in ("SIGINT", "SIGTERM", "SIGHUP")
+        if (value := getattr(signal, name, None)) is not None
+    )
+    previous: dict[signal.Signals, object] = {}
+    try:
+        for value in guarded:
+            previous[value] = signal.getsignal(value)
+            signal.signal(value, signal.SIG_IGN)
+    except (OSError, ValueError):
+        for value, handler in previous.items():
+            signal.signal(value, handler)
+        previous.clear()
+    try:
+        yield
+    finally:
+        for value, handler in previous.items():
+            signal.signal(value, handler)
+
+
+def integrated_workload_residuals() -> dict[str, list[str]]:
+    jobs = []
+    for job in (LOAD_JOB, EXECUTOR_JOB):
+        jobs.extend(
+            dataplane(
+                "get",
+                "job",
+                job,
+                "--ignore-not-found",
+                "-o",
+                "name",
+                timeout=60,
+            ).split()
+        )
+    pods = dataplane(
+        "get",
+        "pod",
+        "-l",
+        f"job-name in ({LOAD_JOB},{EXECUTOR_JOB})",
+        "-o",
+        "name",
+        timeout=60,
+    ).split()
+    return {"jobs": sorted(jobs), "pods": sorted(pods)}
+
+
+def wait_for_integrated_workload_cleanup(
+    *,
+    timeout_seconds: int = 180,
+    sample_seconds: int = 2,
+) -> dict[str, list[str]]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        residuals = integrated_workload_residuals()
+        if not residuals["jobs"] and not residuals["pods"]:
+            return residuals
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "integrated workload cleanup left residual resources: "
+                + json.dumps(residuals, sort_keys=True)
+            )
+        time.sleep(sample_seconds)
 
 
 def aws_json(*arguments: str, timeout: int = 120) -> dict:
@@ -1177,40 +1246,55 @@ def run(args: argparse.Namespace) -> int:
     except BaseException as exc:
         failure = exc
     finally:
-        for job in (LOAD_JOB, EXECUTOR_JOB):
-            dataplane("delete", "job", job, "--ignore-not-found", check=False)
-        for configmap in (EXECUTOR_CONFIGMAP, START_GATE_CONFIGMAP):
-            dataplane(
-                "delete",
-                "configmap",
-                configmap,
-                "--ignore-not-found",
-                check=False,
-            )
-        purge_integrated_rows(run_id)
-        try:
-            teardown(
-                purge=True,
-                deregister_clusters=True,
-                allow_live_registry=args.allow_live_registry,
-                live_registry_confirmation=args.confirm_live_registry,
-                artifacts=artifacts,
-                run_id=run_id,
-            )
-            residuals = workflow_audit(run_id)
-            (artifacts / "cleanup-residuals.json").write_text(
-                json.dumps(residuals, indent=2, sort_keys=True) + "\n"
-            )
-            if any(
-                int(residuals.get(key, 0))
-                for key in ("incident_count", "workflow_count", "command_count")
-            ):
-                raise RuntimeError("integrated workflow cleanup left residual rows")
-        except Exception as cleanup_error:
-            if failure is None:
-                failure = cleanup_error
-            else:
-                failure.add_note(f"integrated teardown also failed: {cleanup_error}")
+        with cleanup_signal_guard():
+            for job in (LOAD_JOB, EXECUTOR_JOB):
+                dataplane(
+                    "delete",
+                    "job",
+                    job,
+                    "--ignore-not-found",
+                    "--wait=true",
+                    check=False,
+                    timeout=300,
+                )
+            for configmap in (EXECUTOR_CONFIGMAP, START_GATE_CONFIGMAP):
+                dataplane(
+                    "delete",
+                    "configmap",
+                    configmap,
+                    "--ignore-not-found",
+                    check=False,
+                )
+            purge_integrated_rows(run_id)
+            try:
+                teardown(
+                    purge=True,
+                    deregister_clusters=True,
+                    allow_live_registry=args.allow_live_registry,
+                    live_registry_confirmation=args.confirm_live_registry,
+                    artifacts=artifacts,
+                    run_id=run_id,
+                )
+                workload_residuals = wait_for_integrated_workload_cleanup()
+                (artifacts / "cleanup-workloads.json").write_text(
+                    json.dumps(workload_residuals, indent=2, sort_keys=True) + "\n"
+                )
+                residuals = workflow_audit(run_id)
+                (artifacts / "cleanup-residuals.json").write_text(
+                    json.dumps(residuals, indent=2, sort_keys=True) + "\n"
+                )
+                if any(
+                    int(residuals.get(key, 0))
+                    for key in ("incident_count", "workflow_count", "command_count")
+                ):
+                    raise RuntimeError("integrated workflow cleanup left residual rows")
+            except Exception as cleanup_error:
+                if failure is None:
+                    failure = cleanup_error
+                else:
+                    failure.add_note(
+                        f"integrated teardown also failed: {cleanup_error}"
+                    )
     if failure is not None:
         write_status(
             artifacts,

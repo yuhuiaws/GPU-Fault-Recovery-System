@@ -40,6 +40,14 @@ IDENTITY_KEYS = {
     "config_digest",
     "allowed_operations",
 }
+INTEGRATED_HEALTHY_HOST_METRICS = (
+    ("load1_per_cpu", 0.1),
+    ("memory_used_percent", 10.0),
+    ("filesystem_used_percent", 20.0),
+    ("network_link_up", 1.0),
+    ("rdma_link_down", 0.0),
+    ("rdma_errors_delta", 0.0),
+)
 
 
 def synthetic_agent(
@@ -250,11 +258,7 @@ def refresh_integrated_agent_heartbeats(
                     name=name,
                     value=value,
                 )
-                for name, value in (
-                    ("network_link_up", 1.0),
-                    ("rdma_link_down", 0.0),
-                    ("rdma_errors_delta", 0.0),
-                )
+                for name, value in INTEGRATED_HEALTHY_HOST_METRICS
             ]
             context.store.observe_telemetry_metrics(host_samples)
             required_collectors = required_collectors_for_agent(record)
