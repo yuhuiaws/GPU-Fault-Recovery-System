@@ -573,6 +573,7 @@ def test_snapshot_prepared_tree_must_remain_unchanged(tmp_path: Path) -> None:
     _git(repository, "config", "user.email", "test@example.com")
     tracked = repository / "tracked.txt"
     tracked.write_text("release\n", encoding="utf-8")
+    tracked.chmod(0o644)
     _git(repository, "add", "tracked.txt")
     _git(repository, "commit", "-m", "initial")
     state = tmp_path / "state"
