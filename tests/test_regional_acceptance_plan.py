@@ -22,7 +22,7 @@ CATALOG = ROOT / "testcases" / "fault-scenarios.yaml"
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert isinstance(value, dict)
+    assert isinstance(value, dict), path
     return cast(dict[str, Any], value)
 
 
@@ -146,14 +146,16 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
         and not case.blocked
     ]
     assert len(automated) == 62
-    assert all(case.risk == "non-destructive" or case.local_proxy for case in automated)
+    assert all(
+        case.risk == "non-destructive" or case.local_proxy for case in automated
+    ), [case.id for case in automated]
     assert all(
         case.execution.failure_scope is FailureScope.CASE
         and case.execution.collect_all
         and case.execution.read_only
         and not case.execution.repair_allowed
         for case in plan.cases
-    )
+    ), plan.as_dict()
 
 
 def test_collect_all_blocks_only_real_dependents_and_keeps_subagents_read_only(
@@ -200,9 +202,9 @@ def test_collect_all_blocks_only_real_dependents_and_keeps_subagents_read_only(
         assert case.blocked is False
         assert case.pytest_nodeids == ()
         assert case.command == ()
-        assert case.problem
-        assert case.injection
-        assert case.expected
+        assert case.problem, case.id
+        assert case.injection, case.id
+        assert case.expected, case.id
         assert case.procedure is not None
         assert case.execution.parallel_safe is True
         assert case.execution.failure_scope is FailureScope.CASE

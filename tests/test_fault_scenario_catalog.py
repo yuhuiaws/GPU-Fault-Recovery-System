@@ -201,7 +201,9 @@ def test_fault_case_runner_direct_script_entrypoint_resolves_scheduler() -> None
     )
 
     assert result.returncode == 0, result.stdout
-    assert result.stdout.startswith("GF-POL-001\tcomponent\tnon-destructive\t")
+    assert result.stdout.startswith("GF-POL-001\tcomponent\tnon-destructive\t"), (
+        result.stdout
+    )
 
 
 def test_isolated_environment_does_not_inherit_credentials() -> None:
@@ -304,8 +306,8 @@ def test_also_case_adds_explicit_command_to_filtered_pytest_selection() -> None:
     )
 
     assert selected[-1]["id"] == "GF-REGIONAL-CAP-005"
-    assert any(case["automation"] == "pytest" for case in selected[:-1])
-    assert all(case["automation"] == "pytest" for case in selected[:-1])
+    assert any(case["automation"] == "pytest" for case in selected[:-1]), selected
+    assert all(case["automation"] == "pytest" for case in selected[:-1]), selected
 
 
 def test_also_case_requires_live_opt_in() -> None:

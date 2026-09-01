@@ -145,7 +145,9 @@ def test_collect_all_continues_after_global_failure() -> None:
 
     assert executed == ["failure", "independent"]
     assert [result["status"] for result in results] == ["FAIL", "PASS"]
-    assert all(result["scheduling"]["collect_all"] is True for result in results)
+    assert all(result["scheduling"]["collect_all"] is True for result in results), (
+        results
+    )
 
 
 def test_failed_prerequisite_blocks_dependent_case() -> None:
@@ -310,7 +312,7 @@ def test_batch_executor_missing_result_fails_closed() -> None:
     assert all(
         "batch executor result IDs do not match" in result["output"]
         for result in results
-    )
+    ), results
 
 
 def test_invalid_status_and_malformed_batch_fail_per_case() -> None:
