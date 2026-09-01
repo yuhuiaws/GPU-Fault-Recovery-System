@@ -34,6 +34,7 @@ from gpu_fault.admin_notifications import (
 from gpu_fault.admin_config import (
     AdminConfig,
     AdminConfigError,
+    admin_config_approval_path,
     admin_config_plan_path,
     apply_capacity_patch,
     complete_admin_config_apply,
@@ -840,20 +841,52 @@ def _live_release_state(site: RenderedSite) -> dict[str, Any]:
 def _validate_live_release_identity(
     site: RenderedSite,
     release_identity: dict[str, object],
+    *,
+    uncommitted_target_sha256: str | None = None,
 ) -> None:
     state = _live_release_state(site)
-    if state.get("transaction_committed") is not True:
-        raise SiteConfigError("live regional release is not committed")
-    if str(state.get("phase") or "").strip().lower() not in {
-        "complete",
-        "completed",
-    }:
-        raise SiteConfigError("live regional release is not complete")
+    phase = str(state.get("phase") or "").strip().lower()
     live_release_id = str(state.get("release_id") or "").strip()
     if live_release_id != release_identity["release_id"]:
         raise SiteConfigError(
             "current signed release differs from the live regional release"
         )
+    if state.get("transaction_committed") is True:
+        if phase not in {
+            "complete",
+            "completed",
+        }:
+            raise SiteConfigError("live regional release is not complete")
+        return
+    if uncommitted_target_sha256 is None:
+        raise SiteConfigError("live regional release is not committed")
+    if "rollback" in phase or state.get("rollback_result") is not None:
+        raise SiteConfigError("live regional release is rolling back")
+    release_diff = state.get("release_diff")
+    if (
+        not isinstance(release_diff, dict)
+        or release_diff.get("kind") != "CONTROL_PLANE_ONLY"
+        or state.get("admin_config_sha256") != uncommitted_target_sha256
+    ):
+        raise SiteConfigError(
+            "uncommitted live release does not match the active admin config plan"
+        )
+    if phase not in {
+        "complete",
+        "completed",
+        "cpu-staged",
+        "cpu-finalized",
+        "data-plane-progress",
+        "data-converged",
+        "endpoint-ready",
+        "observability-ready",
+        "profile-ready",
+        "registry-staged",
+        "schema-ready",
+        "uploaded",
+        "verified",
+    }:
+        raise SiteConfigError("uncommitted live release phase cannot be resumed")
 
 
 def _pending_admin_config_plan(
@@ -889,7 +922,22 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
         state_dir=arguments.state_dir,
         staging_only=bool(release_identity["staging_only"]),
     )
-    _validate_live_release_identity(site, release_identity)
+    active_plan = _pending_admin_config_plan(
+        arguments.state_dir,
+        site_identity=site_identity,
+        release_identity=release_identity,
+        desired=desired,
+    )
+    resumable = (
+        not arguments.dry_run
+        and active_plan is not None
+        and admin_config_approval_path(arguments.state_dir).is_file()
+    )
+    _validate_live_release_identity(
+        site,
+        release_identity,
+        uncommitted_target_sha256=(desired.sha256() if resumable else None),
+    )
     if arguments.dry_run:
         plan = preview_admin_config_plan(
             arguments.state_dir,
@@ -906,12 +954,6 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
             )
         )
         return 0
-    active_plan = _pending_admin_config_plan(
-        arguments.state_dir,
-        site_identity=site_identity,
-        release_identity=release_identity,
-        desired=desired,
-    )
     if active_plan is None:
         active_plan = create_admin_config_plan(
             arguments.state_dir,

@@ -15,7 +15,10 @@ from gpu_fault.admin_bootstrap_common import BootstrapResult
 from gpu_fault.admin_config import (
     AdminConfigError,
     admin_config_plan_path,
+    create_admin_config_plan,
     load_desired_admin_config,
+    prepare_admin_config_apply,
+    preset_admin_config,
 )
 from gpu_fault.admin_config_file import (
     admin_config_file_path,
@@ -150,19 +153,29 @@ def mock_live_release(
     release_id: str = "release-a",
     committed: bool = True,
     phase: str = "complete",
+    admin_config_sha256: str | None = None,
+    release_diff_kind: str | None = None,
+    rollback_result: object = None,
 ) -> None:
     monkeypatch.setattr(
         admin_cli, "verify_prebuilt_release", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(
-        admin_cli,
-        "_live_release_state",
-        lambda _site: {
+
+    def live_state(_site):
+        state = {
             "release_id": release_id,
             "transaction_committed": committed,
             "phase": phase,
-        },
-    )
+        }
+        if admin_config_sha256 is not None:
+            state["admin_config_sha256"] = admin_config_sha256
+        if release_diff_kind is not None:
+            state["release_diff"] = {"kind": release_diff_kind, "changed": []}
+        if rollback_result is not None:
+            state["rollback_result"] = rollback_result
+        return state
+
+    monkeypatch.setattr(admin_cli, "_live_release_state", live_state)
 
 
 def test_effective_environment_pins_repository_pythonpath(
@@ -766,6 +779,98 @@ def test_config_rejects_local_release_drift_from_live_state(
 
     assert not admin_config_plan_path(tmp_path).exists(), (
         "release drift persisted an admin config plan"
+    )
+
+
+def test_config_rejects_uncommitted_live_state_without_active_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_file(tmp_path)
+    initialize_desired_admin_config(tmp_path)
+    desired = preset_admin_config("32-enabled")
+    mock_live_release(
+        monkeypatch,
+        committed=False,
+        phase="cpu-staged",
+        admin_config_sha256=desired.sha256(),
+        release_diff_kind="CONTROL_PLANE_ONLY",
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "config",
+            "--state-dir",
+            str(tmp_path),
+            "--preset",
+            "32-enabled",
+            "--reference",
+            "CHG-12345",
+        ]
+    )
+
+    with pytest.raises(SiteConfigError, match="live regional release is not committed"):
+        admin_cli.run(arguments)
+
+
+def test_config_resumes_matching_approved_uncommitted_live_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = site_file(tmp_path)
+    initialize_desired_admin_config(tmp_path)
+    root = Path(yaml.safe_load(path.read_text())["spec"]["repositoryRoot"])
+    raw = (root / "dist/current-release.json").read_bytes()
+    release_identity = {
+        "release_id": "release-a",
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "staging_only": False,
+    }
+    desired = preset_admin_config("32-enabled")
+    plan = create_admin_config_plan(
+        tmp_path,
+        site_identity={
+            "site_name": "test-site",
+            "aws_region": REGION,
+            "cpu_eks_arn": ("arn:aws:eks:us-east-1:123456789012:cluster/control"),
+        },
+        release_identity=release_identity,
+        desired=desired,
+        source="preset:32-enabled",
+    )
+    prepare_admin_config_apply(
+        tmp_path,
+        expected_plan_sha256=str(plan["plan_sha256"]),
+        reference="CHG-12345",
+        current_release_identity=release_identity,
+    )
+    mock_live_release(
+        monkeypatch,
+        committed=False,
+        phase="cpu-staged",
+        admin_config_sha256=desired.sha256(),
+        release_diff_kind="CONTROL_PLANE_ONLY",
+    )
+    calls = []
+    monkeypatch.setattr(
+        admin_cli, "_run_automatic_release", lambda **kwargs: calls.append(kwargs) or 0
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "config",
+            "--state-dir",
+            str(tmp_path),
+            "--preset",
+            "32-enabled",
+            "--reference",
+            "CHG-12345",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "APPLIED"
+    assert output["release_id"] == "release-a"
+    assert calls, "matching approved plan did not resume release deployment"
+    assert not admin_config_plan_path(tmp_path).exists(), (
+        "successful resume left the active admin config plan"
     )
 
 
