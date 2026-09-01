@@ -361,6 +361,7 @@ def test_executor_rebinds_future_validation_and_restore_steps() -> None:
     operations = [
         WorkflowOperation.REPLACE_NODE,
         WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.VALIDATE_HOST,
         WorkflowOperation.VALIDATE_FABRIC,
         WorkflowOperation.RESTORE_SCHEDULING,
     ]

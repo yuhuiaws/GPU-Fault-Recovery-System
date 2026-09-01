@@ -56,6 +56,7 @@ def test_reboot_workflow_restarts_workload_only_after_node_recovers() -> None:
         WorkflowOperation.STOP_WORKLOADS,
         WorkflowOperation.RESTART_NODE,
         WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.VALIDATE_HOST,
         WorkflowOperation.VALIDATE_FABRIC,
         WorkflowOperation.RESTORE_SCHEDULING,
         WorkflowOperation.RESTART_WORKLOAD,
@@ -94,9 +95,10 @@ def test_reboot_workflow_restarts_workload_only_after_node_recovers() -> None:
         "workflow-active/1/RESTART_NODE",
         "workflow-active/1/RESTART_NODE",
         "workflow-active/2/VALIDATE_GPU",
-        "workflow-active/3/VALIDATE_FABRIC",
-        "workflow-active/4/RESTORE_SCHEDULING",
-        "workflow-active/5/RESTART_WORKLOAD",
+        "workflow-active/3/VALIDATE_HOST",
+        "workflow-active/4/VALIDATE_FABRIC",
+        "workflow-active/5/RESTORE_SCHEDULING",
+        "workflow-active/6/RESTART_WORKLOAD",
     ]
 
 

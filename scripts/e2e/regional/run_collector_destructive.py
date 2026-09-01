@@ -39,6 +39,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
+    provider_event_actor_matches_role,
     required,
     settings_from_arguments,
 )
@@ -623,7 +624,10 @@ def run_collect004(
         ]
         if len(reboot) != 1:
             result["errors"].append("CloudTrail does not contain exactly one reboot")
-        elif settings.executor_role_arn.rsplit("/", 1)[-1] not in reboot[0]["username"]:
+        elif not provider_event_actor_matches_role(
+            reboot[0],
+            settings.executor_role_arn,
+        ):
             result["errors"].append("reboot actor is not the executor role")
     finally:
         try:
@@ -821,7 +825,10 @@ def run_collect015(
     ]
     if len(reboot) != 1:
         errors.append("CloudTrail reboot count is not one")
-    elif settings.executor_role_arn.rsplit("/", 1)[-1] not in reboot[0]["username"]:
+    elif not provider_event_actor_matches_role(
+        reboot[0],
+        settings.executor_role_arn,
+    ):
         errors.append("reboot actor is not the executor role")
     if replace:
         errors.append("CloudTrail contains provider replacement")

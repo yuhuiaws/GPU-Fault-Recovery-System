@@ -114,6 +114,7 @@ class GpuValidationAdapter:
         readiness_after = None
         if operation in {
             WorkflowOperation.VALIDATE_GPU,
+            WorkflowOperation.VALIDATE_HOST,
             WorkflowOperation.VALIDATE_FABRIC,
         }:
             readiness_barriers = [

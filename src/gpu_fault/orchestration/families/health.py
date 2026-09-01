@@ -347,6 +347,7 @@ class NodeHealthPlanBuilder:
         operations += [
             WorkflowOperation.REPLACE_NODE,
             WorkflowOperation.VALIDATE_GPU,
+            WorkflowOperation.VALIDATE_HOST,
             WorkflowOperation.VALIDATE_FABRIC,
             WorkflowOperation.RESTORE_SCHEDULING,
         ]
@@ -388,6 +389,7 @@ class NodeHealthPlanBuilder:
         operations += [
             WorkflowOperation.RESTART_NODE,
             WorkflowOperation.VALIDATE_GPU,
+            WorkflowOperation.VALIDATE_HOST,
             WorkflowOperation.VALIDATE_FABRIC,
             WorkflowOperation.RESTORE_SCHEDULING,
         ]

@@ -30,6 +30,7 @@ from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
+    provider_event_actor_matches_role,
 )
 from scripts.e2e.regional.warm_spare_fixture import (
     GpuHolderFixture,
@@ -185,6 +186,82 @@ def test_store_snapshot_falls_back_to_release_state(
     result = regional.store_snapshot(node="node-a")
 
     assert result["release_id"] == "release-a", result
+
+
+def test_provider_events_use_cloudtrail_session_issuer_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    regional = _regional(tmp_path)
+    expected_role = "arn:aws:iam::123456789012:role/path/executor-role"
+    cloudtrail_event = json.dumps(
+        {
+            "userIdentity": {
+                "type": "AssumedRole",
+                "sessionContext": {"sessionIssuer": {"arn": expected_role}},
+            }
+        }
+    )
+    payload = {
+        "Events": [
+            {
+                "EventName": "BatchRebootClusterNodes",
+                "EventTime": "2026-09-01T00:00:00Z",
+                "Username": "pod-session",
+                "CloudTrailEvent": cloudtrail_event,
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        regional,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    events = regional.provider_events(
+        datetime.now(timezone.utc), datetime.now(timezone.utc)
+    )
+
+    assert events[0]["session_issuer_role_name"] == "executor-role", events
+    assert provider_event_actor_matches_role(events[0], expected_role), events
+    assert not provider_event_actor_matches_role(
+        events[0], "arn:aws:iam::123456789012:role/other-role"
+    ), events
+
+
+def test_destr002_executor_restart_does_not_wait_for_deleted_pod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    regional = _regional(tmp_path)
+    snapshots = iter(
+        (
+            [
+                {"name": "executor-a", "uid": "uid-a", "node": "node-a"},
+                {"name": "executor-b", "uid": "uid-b", "node": "node-b"},
+            ],
+            [
+                {"name": "executor-b", "uid": "uid-b", "node": "node-b"},
+                {"name": "executor-c", "uid": "uid-c", "node": "node-c"},
+            ],
+        )
+    )
+    delete_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    monkeypatch.setattr(regional, "ready_pods", lambda *_args: next(snapshots))
+    monkeypatch.setattr(
+        regional,
+        "kubectl",
+        lambda *args, **kwargs: delete_calls.append((args, kwargs)) or "",
+    )
+
+    result = destr002.restart_executor(
+        regional, {"result_details": {"executor_id": "lease/executor-a"}}
+    )
+
+    assert result["deleted"]["uid"] == "uid-a", result
+    assert delete_calls == [
+        (("gpu", "delete", "pod", "executor-a", "--wait=false"), {"timeout": 30})
+    ], delete_calls
 
 
 def test_wait_for_workflow_preserves_observed_waiting_evidence(

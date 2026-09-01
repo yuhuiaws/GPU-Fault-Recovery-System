@@ -30,6 +30,17 @@ PROVIDER_MUTATIONS = {
 }
 
 
+def provider_event_actor_matches_role(
+    event: dict[str, str],
+    expected_role_arn: str,
+) -> bool:
+    expected_role_name = expected_role_arn.rsplit("/", 1)[-1]
+    session_issuer_role_name = event.get("session_issuer_role_name", "")
+    if session_issuer_role_name:
+        return session_issuer_role_name == expected_role_name
+    return expected_role_name in event.get("username", "")
+
+
 class RegionalFixtureError(RuntimeError):
     pass
 
@@ -954,15 +965,30 @@ class RegionalLiveFixture:
                 timeout=180,
             ).stdout
         )
-        return [
-            {
-                "event_name": str(item.get("EventName") or ""),
-                "event_time": str(item.get("EventTime") or ""),
-                "username": str(item.get("Username") or ""),
-            }
-            for item in value.get("Events", [])
-            if item.get("EventName") in PROVIDER_MUTATIONS
-        ]
+        result = []
+        for item in value.get("Events", []):
+            if item.get("EventName") not in PROVIDER_MUTATIONS:
+                continue
+            session_issuer_role_name = ""
+            try:
+                detail = json.loads(str(item.get("CloudTrailEvent") or "{}"))
+            except json.JSONDecodeError:
+                detail = {}
+            identity = detail.get("userIdentity") or {}
+            session_context = identity.get("sessionContext") or {}
+            session_issuer = session_context.get("sessionIssuer") or {}
+            session_issuer_arn = str(session_issuer.get("arn") or "")
+            if ":role/" in session_issuer_arn:
+                session_issuer_role_name = session_issuer_arn.rsplit("/", 1)[-1]
+            result.append(
+                {
+                    "event_name": str(item.get("EventName") or ""),
+                    "event_time": str(item.get("EventTime") or ""),
+                    "username": str(item.get("Username") or ""),
+                    "session_issuer_role_name": session_issuer_role_name,
+                }
+            )
+        return result
 
     def wait_node_ready(
         self,

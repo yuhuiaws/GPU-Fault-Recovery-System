@@ -301,7 +301,7 @@ def test_action_mix_compiles_current_online_dags() -> None:
             )
         )
 
-    assert lengths == [10, 10, 8, 12]
+    assert lengths == [10, 10, 9, 12]
     assert remote_counts == [8, 8, 5, 9]
     assert sum(remote_counts) == suite.FORMAL_COMMANDS_PER_CLUSTER
     assert {
@@ -313,6 +313,7 @@ def test_action_mix_compiles_current_online_dags() -> None:
         "RESTART_NODE",
         "RESTART_WORKLOAD",
         "RESTORE_SCHEDULING",
+        "VALIDATE_HOST",
     }.issubset(operations), operations
 
 

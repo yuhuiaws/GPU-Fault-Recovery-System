@@ -34,6 +34,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
+    provider_event_actor_matches_role,
     required,
     settings_from_arguments,
 )
@@ -426,8 +427,8 @@ def restart_executor(
         "delete",
         "pod",
         str(target["name"]),
-        "--wait=true",
-        timeout=180,
+        "--wait=false",
+        timeout=30,
     )
     deadline = time.monotonic() + 300
     pods_after: list[dict[str, Any]] = []
@@ -698,7 +699,10 @@ def execute_case(
         ]
         if len(reboot_events) != 1:
             errors.append("CloudTrail does not contain exactly one reboot event")
-        elif settings.executor_role_name not in reboot_events[0]["username"]:
+        elif not provider_event_actor_matches_role(
+            reboot_events[0],
+            settings.executor_role_arn,
+        ):
             errors.append("CloudTrail reboot actor is not the executor role")
         if forbidden:
             errors.append("CloudTrail contains replace/delete mutation")

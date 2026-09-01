@@ -344,6 +344,7 @@ def test_site_replacement_finding_creates_full_active_workflow(
         WorkflowOperation.STOP_WORKLOADS,
         WorkflowOperation.REPLACE_NODE,
         WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.VALIDATE_HOST,
         WorkflowOperation.VALIDATE_FABRIC,
         WorkflowOperation.RESTORE_SCHEDULING,
         WorkflowOperation.RESTART_WORKLOAD,

@@ -539,6 +539,7 @@ class HardwareEscalationService:
                 [
                     next_operation,
                     WorkflowOperation.VALIDATE_GPU,
+                    WorkflowOperation.VALIDATE_HOST,
                     WorkflowOperation.VALIDATE_FABRIC,
                     WorkflowOperation.RESTORE_SCHEDULING,
                 ]

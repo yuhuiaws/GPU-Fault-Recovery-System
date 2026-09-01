@@ -586,6 +586,7 @@ class WorkflowBuilder:
                     [
                         WorkflowOperation.RESTART_NODE,
                         WorkflowOperation.VALIDATE_GPU,
+                        WorkflowOperation.VALIDATE_HOST,
                         WorkflowOperation.VALIDATE_FABRIC,
                     ]
                 )
@@ -594,6 +595,7 @@ class WorkflowBuilder:
                     [
                         WorkflowOperation.REPLACE_NODE,
                         WorkflowOperation.VALIDATE_GPU,
+                        WorkflowOperation.VALIDATE_HOST,
                         WorkflowOperation.VALIDATE_FABRIC,
                     ]
                 )

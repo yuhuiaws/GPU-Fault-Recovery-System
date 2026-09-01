@@ -78,6 +78,7 @@ def test_direct_official_action_creates_owned_proactive_workflow(
         WorkflowOperation.MARK_UNSCHEDULABLE,
         WorkflowOperation.RESTART_NODE,
         WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.VALIDATE_HOST,
         WorkflowOperation.VALIDATE_FABRIC,
         WorkflowOperation.RESTORE_SCHEDULING,
     ]
@@ -486,6 +487,7 @@ def test_hyperpod_restart_vm_uses_node_reboot_not_stop_start(
         WorkflowOperation.STOP_WORKLOADS,
         WorkflowOperation.RESTART_NODE,
         WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.VALIDATE_HOST,
         WorkflowOperation.VALIDATE_FABRIC,
         WorkflowOperation.RESTORE_SCHEDULING,
         WorkflowOperation.RESTART_WORKLOAD,
@@ -646,6 +648,7 @@ def test_failed_gpu_validation_escalates_to_idempotent_reboot(
         WorkflowOperation.STOP_WORKLOADS,
         WorkflowOperation.RESTART_NODE,
         WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.VALIDATE_HOST,
         WorkflowOperation.VALIDATE_FABRIC,
         WorkflowOperation.RESTORE_SCHEDULING,
         WorkflowOperation.RESTART_WORKLOAD,

@@ -228,6 +228,80 @@ def test_gpu_validation_waits_for_post_action_telemetry() -> None:
     assert ready.status is WorkflowStepStatus.SUCCEEDED
 
 
+def test_host_validation_waits_for_post_reboot_telemetry() -> None:
+    rebooted_at = datetime.now(timezone.utc)
+
+    class ValidationStore:
+        sample_at = rebooted_at - timedelta(seconds=1)
+
+        def list_collector_statuses(self, cluster_id, node_id):
+            return [
+                CollectorStatus(
+                    cluster_id=cluster_id,
+                    node_id=node_id,
+                    collector=CollectorKind.HOST_TELEMETRY,
+                    observed_at=self.sample_at,
+                    ingested_at=self.sample_at,
+                    last_success_at=self.sample_at,
+                )
+            ]
+
+        def list_telemetry_metrics_latest(self, cluster_id, node_id):
+            return [
+                SimpleNamespace(name=name, value=value, observed_at=self.sample_at)
+                for name, value in {
+                    "gpu_inventory_expected_count": 8,
+                    "gpu_inventory_active_count": 8,
+                    "load1_per_cpu": 0.1,
+                    "memory_used_percent": 10,
+                    "filesystem_used_percent": 20,
+                }.items()
+            ]
+
+    class ValidationMetrics:
+        store = ValidationStore()
+
+        def latest(self, cluster_id, node_id):
+            return []
+
+        def findings(self, cluster_id, node_id):
+            return []
+
+    store = build_store()
+    incident, workflow = workflow_state(
+        store, [WorkflowOperation.RESTART_NODE, WorkflowOperation.VALIDATE_HOST]
+    )
+    step = copy_model(
+        workflow.official_steps[1], execution_owner="gpu-fault-validation-adapter"
+    )
+    workflow = copy_model(
+        workflow,
+        official_steps=[workflow.official_steps[0], step],
+        step_executions=[
+            workflow_step_execution(
+                0, WorkflowOperation.RESTART_NODE, updated_at=rebooted_at
+            )
+        ],
+    )
+    adapter = GpuValidationAdapter(ValidationMetrics(), store=ValidationMetrics.store)
+    context = WorkflowStepContext(
+        workflow=workflow,
+        incident=incident,
+        step=step,
+        step_index=1,
+        request=WorkflowExecutionRequest(expected_fencing_token=3),
+        idempotency_key="validation/post-reboot-host",
+    )
+
+    waiting = adapter.execute(context)
+    ValidationMetrics.store.sample_at = rebooted_at + timedelta(seconds=1)
+    ready = adapter.execute(context)
+
+    assert waiting.status is WorkflowStepStatus.WAITING
+    assert waiting.details["pending_nodes"] == ["node-a"]
+    assert ready.status is WorkflowStepStatus.SUCCEEDED
+
+
 def test_post_action_validation_accepts_edge_filter_window() -> None:
     now = datetime.now(timezone.utc)
     action_completed_at = now - timedelta(minutes=4)
