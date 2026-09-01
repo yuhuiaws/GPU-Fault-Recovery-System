@@ -3196,6 +3196,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-005
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - scripts/e2e/regional/audit_collector_outbox.py
@@ -3834,6 +3841,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-022
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - -m
@@ -3959,6 +3973,15 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cap-005
+  execution:
+    parallel_safe: true
+    environment: inherit
+    failure_scope: branch
+    locks:
+    - resource: postgres-server
+      mode: exclusive
+    - resource: cap005-workdir
+      mode: exclusive
   command:
   - python3
   - scripts/e2e/regional/run_cap005_postgres_suite.py
@@ -4328,6 +4351,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-017同job双节点并行branch
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - -m
@@ -4408,6 +4438,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-021同节点同级不同gpu
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - -m
@@ -4472,6 +4509,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-024持续采集与按需诊断边界
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - -m
@@ -4499,6 +4543,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-025completionwatcher因果ack
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - -m
@@ -4525,6 +4576,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-026quarantine终止共享restart
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - -m
@@ -4571,6 +4629,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-028不同attempt独立与节点独占不变量
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - -m
@@ -4606,6 +4671,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-029warm-spare替换成功通知
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - -m
@@ -4656,6 +4728,13 @@ test_cases:
     verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-031critical-host-quarantine合并
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
   command:
   - python3
   - -m

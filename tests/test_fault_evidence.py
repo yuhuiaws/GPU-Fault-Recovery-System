@@ -139,7 +139,9 @@ def test_runner_emits_the_standard_v2_envelope(tmp_path: Path, monkeypatch) -> N
     report = tmp_path / "fault-report.json"
 
     monkeypatch.setattr(
-        runner, "run_case", lambda case: {"id": case["id"], "status": "PASS"}
+        runner,
+        "run_case",
+        lambda case, **_kwargs: {"id": case["id"], "status": "PASS"},
     )
 
     result = runner.main(["--case", "GF-POL-001", "--report", str(report)])
@@ -152,3 +154,60 @@ def test_runner_emits_the_standard_v2_envelope(tmp_path: Path, monkeypatch) -> N
     assert payload["limitations"] == []
     assert "executed_at" in payload
     assert "generated_at" not in payload
+    assert payload["summary"]["workers"] == 1
+    assert payload["results"][0]["scheduling"]["locks"]
+
+
+def test_runner_isolates_local_cases_but_preserves_cap005_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    reports = iter(
+        [
+            tmp_path / "local.json",
+            tmp_path / "cap005.json",
+        ]
+    )
+    observed = []
+
+    def fake_run_case(case, **kwargs):
+        observed.append((case["id"], kwargs.get("environment")))
+        return {"id": case["id"], "status": "PASS"}
+
+    monkeypatch.setattr(runner, "run_case", fake_run_case)
+
+    assert (
+        runner.main(
+            [
+                "--case",
+                "GF-POL-001",
+                "--report",
+                str(next(reports)),
+                "--workers",
+                "2",
+            ]
+        )
+        == 0
+    )
+    assert (
+        runner.main(
+            [
+                "--case",
+                "GF-REGIONAL-CAP-005",
+                "--include-live",
+                "--report",
+                str(next(reports)),
+                "--workers",
+                "2",
+            ]
+        )
+        == 0
+    )
+
+    assert observed == [
+        (
+            "GF-POL-001",
+            runner.build_isolated_environment(),
+        ),
+        ("GF-REGIONAL-CAP-005", None),
+    ]

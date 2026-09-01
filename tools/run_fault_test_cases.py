@@ -10,11 +10,30 @@ import platform
 import subprocess
 import sys
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import yaml
 
 from gpu_fault.policy import load_xid_policy
+
+if __package__:
+    from .case_scheduler import (
+        ENVIRONMENT_MODES,
+        FAILURE_SCOPES,
+        LOCK_MODES,
+        ExecutionPolicy,
+        ResourceLock,
+        run_scheduled_cases,
+    )
+else:
+    from case_scheduler import (
+        ENVIRONMENT_MODES,
+        FAILURE_SCOPES,
+        LOCK_MODES,
+        ExecutionPolicy,
+        ResourceLock,
+        run_scheduled_cases,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +54,7 @@ OPTIONAL_CASE_FIELDS = {
     "capture_processing_trace",
     "command",
     "evidence",
+    "execution",
     "gate",
     "manifest",
     "operator_case",
@@ -108,6 +128,29 @@ NONEMPTY_STRING_FIELDS = {
 }
 TRACE_ENV = "GPU_FAULT_EMIT_PROCESSING_TRACE"
 TRACE_PREFIX = "GPU_FAULT_PROCESSING_TRACE="
+EXECUTION_FIELDS = {
+    "depends_on",
+    "environment",
+    "failure_scope",
+    "locks",
+    "parallel_safe",
+}
+LOCK_FIELDS = {"mode", "resource"}
+ISOLATED_ENVIRONMENT_NAMES = (
+    "HOME",
+    "PATH",
+    "PYTHONPATH",
+    "PYTHONPYCACHEPREFIX",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -148,6 +191,55 @@ def _validate_evidence(case: dict[str, Any]) -> str | None:
     if verdict not in CURRENT_STATUS_VALUES:
         raise ValueError(f"unsupported test case evidence verdict: {verdict}")
     return verdict
+
+
+def _validate_execution(case: dict[str, Any]) -> None:
+    execution = case.get("execution")
+    if execution is None:
+        return
+    if not isinstance(execution, dict):
+        raise ValueError("test case execution must be a mapping")
+    unknown = set(execution) - EXECUTION_FIELDS
+    if unknown:
+        raise ValueError(f"test case execution has unknown fields: {sorted(unknown)}")
+    parallel_safe = execution.get("parallel_safe")
+    if not isinstance(parallel_safe, bool):
+        raise ValueError("test case execution.parallel_safe must be a boolean")
+    failure_scope = execution.get("failure_scope", "branch")
+    if failure_scope not in FAILURE_SCOPES:
+        raise ValueError(f"unsupported test case failure scope: {failure_scope}")
+    environment = execution.get("environment", "inherit")
+    if environment not in ENVIRONMENT_MODES:
+        raise ValueError(f"unsupported test case execution environment: {environment}")
+    depends_on = execution.get("depends_on", [])
+    if not isinstance(depends_on, list) or any(
+        not isinstance(item, str) or not item for item in depends_on
+    ):
+        raise ValueError("test case execution.depends_on must be a list of case IDs")
+    if case["id"] in depends_on:
+        raise ValueError("test case cannot depend on itself")
+    locks = execution.get("locks", [])
+    if not isinstance(locks, list):
+        raise ValueError("test case execution.locks must be a list")
+    if parallel_safe and not locks:
+        raise ValueError("parallel-safe test case execution requires resource locks")
+    resources = set()
+    for lock in locks:
+        if not isinstance(lock, dict):
+            raise ValueError("test case resource lock must be a mapping")
+        lock_unknown = set(lock) - LOCK_FIELDS
+        if lock_unknown:
+            raise ValueError(
+                f"test case resource lock has unknown fields: {sorted(lock_unknown)}"
+            )
+        resource = lock.get("resource")
+        mode = lock.get("mode")
+        _validate_nonempty_string(resource, "execution.locks.resource")
+        if mode not in LOCK_MODES:
+            raise ValueError(f"unsupported test case resource lock mode: {mode}")
+        if resource in resources:
+            raise ValueError(f"duplicate test case resource lock: {resource}")
+        resources.add(resource)
 
 
 def _validate_case(case: dict[str, Any]) -> None:
@@ -218,6 +310,7 @@ def _validate_case(case: dict[str, Any]) -> None:
             raise ValueError(f"test case {field} does not exist: {case[field]}")
     if "operator_case" in case:
         _validate_nonempty_string(case["operator_case"], "operator_case")
+    _validate_execution(case)
     current_status = _validate_evidence(case)
     superseded_by = case.get("superseded_by")
     if current_status == "SUPERSEDED":
@@ -316,11 +409,17 @@ def load_catalog(path: Path) -> list[dict[str, Any]]:
         seen.add(case_id)
     for case in cases:
         evidence = case.get("evidence") or {}
-        if evidence.get("verdict") != "SUPERSEDED":
-            continue
-        if case["superseded_by"] not in seen:
+        if evidence.get("verdict") == "SUPERSEDED":
+            if case["superseded_by"] not in seen:
+                raise ValueError(
+                    f"superseded_by references unknown case: {case['superseded_by']}"
+                )
+        execution = case.get("execution") or {}
+        unknown_dependencies = set(execution.get("depends_on", ())) - seen
+        if unknown_dependencies:
             raise ValueError(
-                f"superseded_by references unknown case: {case['superseded_by']}"
+                "test case execution depends_on references unknown cases: "
+                + ", ".join(sorted(unknown_dependencies))
             )
     return cases
 
@@ -333,9 +432,12 @@ def select_cases(
     levels: set[str],
     include_manual: bool,
     include_live: bool,
+    also_case_ids: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     requested_ids = list(case_ids)
     requested = set(requested_ids)
+    additional_ids = list(also_case_ids)
+    additional = set(additional_ids)
     selected = []
     for case in cases:
         if requested and case["id"] not in requested:
@@ -352,12 +454,21 @@ def select_cases(
             if case["id"] not in requested:
                 continue
         selected.append(case)
-    unknown = requested.difference(case["id"] for case in cases)
+    by_id = {case["id"]: case for case in cases}
+    unknown = (requested | additional).difference(by_id)
     if unknown:
         raise ValueError(f"unknown test case IDs: {sorted(unknown)}")
     if requested_ids and not isinstance(case_ids, (set, frozenset)):
         position = {case_id: index for index, case_id in enumerate(requested_ids)}
         selected.sort(key=lambda case: position[case["id"]])
+    for case_id in additional_ids:
+        case = by_id[case_id]
+        if case["automation"] != "command":
+            raise ValueError("--also-case only accepts command automation cases")
+        if not include_live:
+            raise ValueError("--also-case requires --include-live")
+        if case_id not in {item["id"] for item in selected}:
+            selected.append(case)
     return selected
 
 
@@ -379,7 +490,27 @@ def _extract_processing_trace(
     return trace, "\n".join(retained).strip()
 
 
-def run_case(case: dict[str, Any]) -> dict[str, Any]:
+def build_isolated_environment(
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    source_environment = os.environ if source is None else source
+    environment = {
+        name: value
+        for name in ISOLATED_ENVIRONMENT_NAMES
+        if (value := source_environment.get(name)) is not None
+    }
+    environment.setdefault("PATH", os.defpath)
+    environment["GPU_FAULT_STORE_URL"] = ""
+    environment["GPU_FAULT_TEST_POSTGRES_URL"] = ""
+    return environment
+
+
+def run_case(
+    case: dict[str, Any],
+    *,
+    environment: Mapping[str, str] | None = None,
+    environment_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     start = time.monotonic()
     if case["automation"] == "manual":
@@ -423,13 +554,15 @@ def run_case(case: dict[str, Any]) -> dict[str, Any]:
         command.append(str(case["pytest_nodeid"]))
     else:
         command = [str(item) for item in case["command"]]
-    environment = os.environ.copy()
+    child_environment = dict(os.environ if environment is None else environment)
+    if environment_overrides:
+        child_environment.update(environment_overrides)
     if case.get("capture_processing_trace"):
-        environment[TRACE_ENV] = "1"
+        child_environment[TRACE_ENV] = "1"
     completed = subprocess.run(
         command,
         cwd=ROOT,
-        env=environment,
+        env=child_environment,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -474,6 +607,38 @@ def run_case(case: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def execution_policy(case: dict[str, Any]) -> ExecutionPolicy:
+    configured = case.get("execution")
+    if configured is not None:
+        return ExecutionPolicy(
+            parallel_safe=bool(configured["parallel_safe"]),
+            locks=tuple(
+                ResourceLock(
+                    resource=str(lock["resource"]),
+                    mode=str(lock["mode"]),
+                )
+                for lock in configured.get("locks", ())
+            ),
+            depends_on=tuple(str(item) for item in configured.get("depends_on", ())),
+            failure_scope=str(configured.get("failure_scope", "branch")),
+            environment=str(configured.get("environment", "inherit")),
+        )
+    if case["automation"] == "pytest" and case["risk"] == "non-destructive":
+        return ExecutionPolicy(
+            parallel_safe=True,
+            locks=(ResourceLock("local-test", "shared"),),
+            environment="isolated",
+        )
+    return ExecutionPolicy(parallel_safe=False, failure_scope="global")
+
+
+def _positive_integer(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=("Run recorded GPU fault simulation test cases and emit JSON.")
@@ -484,6 +649,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         dest="case_ids",
+    )
+    parser.add_argument(
+        "--also-case",
+        action="append",
+        default=[],
+        dest="also_case_ids",
+        help=(
+            "Add an explicitly selected command case to the default or "
+            "filtered pytest selection. Requires --include-live."
+        ),
     )
     parser.add_argument("--category", action="append", default=[])
     parser.add_argument("--level", action="append", default=[])
@@ -499,6 +674,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--workers",
+        type=_positive_integer,
+        default=1,
+        help=(
+            "Run explicitly parallel-safe cases concurrently. "
+            "Defaults to 1 and preserves serial execution."
+        ),
+    )
     return parser
 
 
@@ -512,6 +696,7 @@ def main(argv: list[str] | None = None) -> int:
         levels=set(args.level),
         include_manual=args.include_manual,
         include_live=args.include_live,
+        also_case_ids=args.also_case_ids,
     )
     if args.list:
         for case in selected:
@@ -521,21 +706,39 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: no test cases selected", file=sys.stderr)
         return 2
 
-    results = []
-    for case in selected:
+    run_started = time.monotonic()
+
+    def execute(case: dict[str, Any], policy: ExecutionPolicy) -> dict[str, Any]:
+        environment = (
+            build_isolated_environment()
+            if policy.environment == "isolated"
+            else None
+        )
+        return run_case(case, environment=environment)
+
+    def on_start(case: dict[str, Any], _policy: ExecutionPolicy) -> None:
         print(f"RUN  {case['id']} {case['title']}", flush=True)
-        result = run_case(case)
-        results.append(result)
+
+    def on_finish(case: dict[str, Any], result: dict[str, Any]) -> None:
         print(f"{result['status']:7} {case['id']}", flush=True)
+
+    results = run_scheduled_cases(
+        selected,
+        policy_for=execution_policy,
+        execute=execute,
+        max_workers=args.workers,
+        on_start=on_start,
+        on_finish=on_finish,
+    )
 
     counts = {
         status: sum(item["status"] == status for item in results)
-        for status in ("PASS", "FAIL", "NOT_RUN")
+        for status in ("PASS", "FAIL", "BLOCKED", "NOT_RUN")
     }
     executed_at = datetime.now(timezone.utc).isoformat()
     verdict = (
         "FAIL"
-        if counts["FAIL"]
+        if counts["FAIL"] or counts["BLOCKED"]
         else "NOT_RUN"
         if counts["PASS"] == 0
         else "PASS_WITH_LIMITATIONS"
@@ -548,8 +751,11 @@ def main(argv: list[str] | None = None) -> int:
         "executed_at": executed_at,
         "verdict": verdict,
         "limitations": (
-            ["Report contains NOT_RUN cases and is not complete acceptance evidence."]
-            if counts["NOT_RUN"]
+            [
+                "Report contains BLOCKED or NOT_RUN cases and is not "
+                "complete acceptance evidence."
+            ]
+            if counts["BLOCKED"] or counts["NOT_RUN"]
             else []
         ),
         "catalog": str(args.catalog),
@@ -560,6 +766,8 @@ def main(argv: list[str] | None = None) -> int:
         "summary": {
             "total": len(results),
             **{key.lower(): value for key, value in counts.items()},
+            "workers": args.workers,
+            "wall_duration_seconds": round(time.monotonic() - run_started, 3),
         },
         "results": results,
     }
@@ -576,9 +784,9 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "SUMMARY "
         f"pass={counts['PASS']} fail={counts['FAIL']} "
-        f"not_run={counts['NOT_RUN']}"
+        f"blocked={counts['BLOCKED']} not_run={counts['NOT_RUN']}"
     )
-    return 1 if counts["FAIL"] else 0
+    return 1 if counts["FAIL"] or counts["BLOCKED"] else 0
 
 
 if __name__ == "__main__":

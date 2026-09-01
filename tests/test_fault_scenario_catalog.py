@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
@@ -16,6 +17,8 @@ from tools import run_fault_test_cases as runner
 from tools.run_fault_test_cases import (
     TRACE_PREFIX,
     _extract_processing_trace,
+    build_isolated_environment,
+    execution_policy,
     load_catalog,
     run_case,
     select_cases,
@@ -180,6 +183,50 @@ def test_every_pytest_reference_is_collectable() -> None:
     assert result.returncode == 0, result.stdout
 
 
+def test_fault_case_runner_direct_script_entrypoint_resolves_scheduler() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools/run_fault_test_cases.py"),
+            "--case",
+            "GF-POL-001",
+            "--list",
+        ],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert result.stdout.startswith("GF-POL-001\tcomponent\tnon-destructive\t")
+
+
+def test_isolated_environment_does_not_inherit_credentials() -> None:
+    environment = build_isolated_environment(
+        {
+            "HOME": "/home/tester",
+            "PATH": "/bin",
+            "PYTHONPATH": "src",
+            "GPU_FAULT_EXECUTION_TOKEN": "sensitive",
+            "GPU_FAULT_CLUSTER_TOKEN": "sensitive",
+            "GPU_FAULT_STORE_URL": "postgresql://sensitive",
+            "AWS_SECRET_ACCESS_KEY": "sensitive",
+            "KUBECONFIG": "/sensitive/kubeconfig",
+        }
+    )
+
+    assert environment == {
+        "HOME": "/home/tester",
+        "PATH": "/bin",
+        "PYTHONPATH": "src",
+        "GPU_FAULT_STORE_URL": "",
+        "GPU_FAULT_TEST_POSTGRES_URL": "",
+    }
+
+
 def test_manual_cases_reference_real_document_sections() -> None:
     cases = load_catalog(CATALOG)
     parsed: dict[Path, set[str]] = {}
@@ -242,6 +289,38 @@ def test_include_live_does_not_execute_an_unselected_command() -> None:
     )
 
     assert all(case["automation"] != "command" for case in selected)
+
+
+def test_also_case_adds_explicit_command_to_filtered_pytest_selection() -> None:
+    cases = load_catalog(CATALOG)
+    selected = select_cases(
+        cases,
+        case_ids=[],
+        categories=set(),
+        levels={"unit", "component"},
+        include_manual=False,
+        include_live=True,
+        also_case_ids=["GF-REGIONAL-CAP-005"],
+    )
+
+    assert selected[-1]["id"] == "GF-REGIONAL-CAP-005"
+    assert any(case["automation"] == "pytest" for case in selected[:-1])
+    assert all(case["automation"] == "pytest" for case in selected[:-1])
+
+
+def test_also_case_requires_live_opt_in() -> None:
+    cases = load_catalog(CATALOG)
+
+    with pytest.raises(ValueError, match="requires --include-live"):
+        select_cases(
+            cases,
+            case_ids=[],
+            categories=set(),
+            levels={"unit"},
+            include_manual=False,
+            include_live=False,
+            also_case_ids=["GF-REGIONAL-CAP-005"],
+        )
 
 
 def test_explicit_case_selection_preserves_requested_order() -> None:
@@ -345,6 +424,36 @@ def test_promoted_live_drivers_remain_manual_until_revalidated() -> None:
         assert cases[case_id]["automation"] == "manual"
         assert "command" not in cases[case_id]
         assert f"scripts/e2e/regional/{script_name}" in bodies[case_id]
+
+
+def test_parallel_command_cases_declare_resource_locks() -> None:
+    cases = {case["id"]: case for case in load_catalog(CATALOG)}
+    local_cases = {
+        "GF-REGIONAL-BOOT-022",
+        "GF-REGIONAL-NET-005",
+        "GF-REGIONAL-PREEMPT-017",
+        "GF-REGIONAL-PREEMPT-021",
+        "GF-REGIONAL-PREEMPT-024",
+        "GF-REGIONAL-PREEMPT-025",
+        "GF-REGIONAL-PREEMPT-026",
+        "GF-REGIONAL-PREEMPT-028",
+        "GF-REGIONAL-PREEMPT-029",
+        "GF-REGIONAL-PREEMPT-031",
+    }
+
+    for case_id in local_cases:
+        policy = execution_policy(cases[case_id])
+        assert policy.parallel_safe is True
+        assert policy.environment == "isolated"
+        assert policy.locks == (runner.ResourceLock("local-test", "shared"),)
+
+    cap005 = execution_policy(cases["GF-REGIONAL-CAP-005"])
+    assert cap005.parallel_safe is True
+    assert cap005.environment == "inherit"
+    assert set(cap005.locks) == {
+        runner.ResourceLock("postgres-server", "exclusive"),
+        runner.ResourceLock("cap005-workdir", "exclusive"),
+    }
 
 
 def test_superseded_manual_case_reports_its_replacement() -> None:

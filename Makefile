@@ -7,6 +7,8 @@ PYTHON ?= $(firstword $(wildcard .venv/bin/python) python3)
 PYTHONPYCACHEPREFIX ?= /tmp/gpu-fault-pycache
 export PYTHONPYCACHEPREFIX
 PYTEST_XDIST_WORKERS ?= 4
+FAULT_TEST_WORKERS ?= 1
+PARALLEL_FAULT_TEST_WORKERS ?= 4
 COVERAGE_FLOOR ?= 78
 BASE ?= origin/main
 COSIGN ?= cosign
@@ -46,7 +48,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_reconnect.py \
 	tests/store/test_store_contracts.py
 
-.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
@@ -97,12 +99,22 @@ test-postgres-stress:
 		$(MAKE) test-postgres PYTHON="$(PYTHON)"
 
 fault-test-cases:
-	$(PYTHON) tools/run_fault_test_cases.py
+	$(PYTHON) tools/run_fault_test_cases.py \
+		--workers $(FAULT_TEST_WORKERS)
 
 fault-test-cases-ci:
 	$(PYTHON) tools/run_fault_test_cases.py \
 		--level unit \
-		--level component
+		--level component \
+		--workers $(FAULT_TEST_WORKERS)
+
+fault-test-cases-with-cap005:
+	@test -n "$${GPU_FAULT_STORE_URL}" || \
+		(printf 'GPU_FAULT_STORE_URL is required\n' >&2; exit 2)
+	$(PYTHON) tools/run_fault_test_cases.py \
+		--also-case GF-REGIONAL-CAP-005 \
+		--include-live \
+		--workers $(PARALLEL_FAULT_TEST_WORKERS)
 
 run:
 	PYTHONPATH=src $(PYTHON) -m gpu_fault.api
