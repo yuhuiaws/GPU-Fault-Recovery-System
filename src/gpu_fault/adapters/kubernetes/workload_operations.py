@@ -231,11 +231,20 @@ class KubernetesWorkloadOperationsMixin:
             try:
                 workload = self._read_workload(namespace, kind, name)
             except Exception as exc:
-                if suspend and getattr(exc, "status", None) == 404:
+                if getattr(exc, "status", None) == 404:
                     absent_workload_ids.append(workload_id)
                     continue
                 raise
             workloads.append((namespace, kind, name, workload_id, workload))
+        if not suspend and absent_workload_ids:
+            return WorkflowStepOutcome.failed(
+                "restart source workload is missing: "
+                + ", ".join(sorted(absent_workload_ids)),
+                details={
+                    "reason": "RESTART_SOURCE_WORKLOAD_NOT_FOUND",
+                    "missing_workload_ids": sorted(absent_workload_ids),
+                },
+            )
         conflict = self._managed_job_recovery_conflict(workloads)
         if conflict is not None:
             return conflict

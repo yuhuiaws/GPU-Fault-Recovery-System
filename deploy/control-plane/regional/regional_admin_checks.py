@@ -102,6 +102,18 @@ for cluster_id in clusters:
     }
 print(json.dumps(result, separators=(",", ":")))
 """
+REMOTE_COMMAND_STATS_SCRIPT = r"""
+import json
+
+from gpu_fault.app import ApplicationContext
+
+print(
+    json.dumps(
+        ApplicationContext.from_environment().store.remote_command_stats(),
+        separators=(",", ":"),
+    )
+)
+"""
 EXECUTOR_TLS_SCRIPT = r"""
 import json
 import os
@@ -1116,6 +1128,25 @@ def _control_api_report(release: Any) -> dict[str, Any]:
     )
 
 
+def remote_command_stats(release: Any) -> dict[str, Any]:
+    return json.loads(
+        release.runner.run(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "exec",
+                _cpu_ingress_pod(release),
+                "--",
+                CONTROL_PLANE_PYTHON,
+                "-c",
+                REMOTE_COMMAND_STATS_SCRIPT,
+            ),
+            capture=True,
+            sensitive=True,
+        )
+    )
+
+
 def _check_control_api(release: Any) -> CheckValue:
     report = _control_api_report(release)
     if report.get("healthz", {}).get("status") != "ok":
@@ -1217,8 +1248,25 @@ def _check_control_api(release: Any) -> CheckValue:
             f"oldest unclaimed remote command is {oldest:.1f}s; "
             f"limit is {release.config.health.remote_command_max_unclaimed_seconds}s"
         )
-    if int(remote.get("executor_internal_error_total", 0) or 0) > 0:
-        raise ReleaseError("executor internal remote-command errors are non-zero")
+    current_internal_errors = int(remote.get("executor_internal_error_total", 0) or 0)
+    state = release._load_state()
+    previous = state.get("previous")
+    raw_baseline = (
+        previous.get("executor_internal_error_total", 0)
+        if isinstance(previous, dict)
+        else 0
+    )
+    try:
+        baseline_internal_errors = int(raw_baseline or 0)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseError(
+            "executor internal remote-command error baseline is invalid"
+        ) from exc
+    if current_internal_errors > baseline_internal_errors:
+        raise ReleaseError(
+            "executor internal remote-command errors increased during release: "
+            f"{baseline_internal_errors}->{current_internal_errors}"
+        )
     return CheckValue("control-plane API, fleet and collectors are healthy", report)
 
 

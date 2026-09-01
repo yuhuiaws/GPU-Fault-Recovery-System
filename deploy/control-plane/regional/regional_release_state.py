@@ -502,6 +502,7 @@ print(json.dumps([
 
 def capture_previous(release: Any) -> dict[str, Any]:
     live_state = dict(release.state) if release.state else release._load_state()
+    remote = release._remote_command_stats()
     metadata = release._config_map_data("gpu-fault-release-metadata")
     clusters = {}
     runtime_images = {
@@ -666,6 +667,9 @@ def capture_previous(release: Any) -> dict[str, Any]:
         ),
         "cpu_role_config_maps": role_config_maps,
         "admin_config": admin_config.as_dict(),
+        "executor_internal_error_total": int(
+            remote.get("executor_internal_error_total", 0) or 0
+        ),
         "release_delivery_sha256": live_state.get("release_delivery_sha256"),
         "rendered_manifest_sha256": live_state.get("rendered_manifest_sha256"),
         "node_template_sha256": live_state.get("node_template_sha256"),

@@ -17,6 +17,7 @@ import regional_deployment_inventory as inventory
 from regional_admin_checks import (
     build_health_report,
     build_preflight_report,
+    remote_command_stats,
     report_exit_code,
 )
 from regional_admin_commands import (
@@ -294,6 +295,7 @@ class RegionalRelease:
     _registry = registry
     _registry_entry = staticmethod(registry_entry)
     _registry_payloads = registry_payloads
+    _remote_command_stats = remote_command_stats
     _retry_failed_installer_jobs = retry_failed_installer_jobs
     _restore_registry_backup = restore_registry_backup
     _save_state = save_state

@@ -225,6 +225,7 @@ def test_previous_release_snapshot_reads_live_images() -> None:
         _config_map_binary_key=lambda _args, name: f"{name}-key",
         _config_map_sha=lambda *_args: "4" * 64,
         _capture_agent_identities=lambda: {target.cluster_id: _legacy_agent_identity()},
+        _remote_command_stats=lambda: {"executor_internal_error_total": 2},
         _target_node_names=lambda _target: ("node-a",),
     )
 
@@ -235,6 +236,7 @@ def test_previous_release_snapshot_reads_live_images() -> None:
     assert previous["adot_image"] == previous_adot
     assert previous["runtime_image"] != release.runtime_image
     assert previous["release_delivery_sha256"] == "1" * 64
+    assert previous["executor_internal_error_total"] == 2
     assert previous["clusters"][target.cluster_id]["dcgm_image"] == previous_dcgm
     assert previous["agent_identities"][target.cluster_id]["agent_version"] == "0.10.0"
 
@@ -567,5 +569,6 @@ def _snapshot_release(
         _config_map_binary_key=lambda _args, name: f"{name}-key",
         _config_map_sha=lambda *_args: "4" * 64,
         _capture_agent_identities=lambda: {target.cluster_id: _legacy_agent_identity()},
+        _remote_command_stats=lambda: {"executor_internal_error_total": 0},
         _target_node_names=lambda _target: ("node-a",),
     )

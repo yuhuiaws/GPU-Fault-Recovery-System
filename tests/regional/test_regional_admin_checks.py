@@ -358,7 +358,9 @@ def test_health_report_uses_bounded_parallel_checks(monkeypatch) -> None:
     assert [item["name"] for item in report["checks"]] == submitted
 
 
-def control_api_release() -> SimpleNamespace:
+def control_api_release(
+    *, executor_internal_error_baseline: int = 0
+) -> SimpleNamespace:
     return SimpleNamespace(
         wheel_sha="a" * 64,
         node_wheel_sha="a" * 64,
@@ -370,6 +372,11 @@ def control_api_release() -> SimpleNamespace:
             health=SimpleNamespace(remote_command_max_unclaimed_seconds=300),
             clusters=[SimpleNamespace(cluster_id="gpu-a")],
         ),
+        _load_state=lambda: {
+            "previous": {
+                "executor_internal_error_total": (executor_internal_error_baseline)
+            }
+        },
     )
 
 
@@ -422,6 +429,19 @@ def test_control_api_health_accepts_a_converged_fleet(monkeypatch) -> None:
     monkeypatch.setattr(module, "_control_api_report", lambda _release: report)
 
     value = module._check_control_api(control_api_release())
+
+    assert value.summary == "control-plane API, fleet and collectors are healthy"
+
+
+def test_control_api_health_accepts_historical_internal_errors(monkeypatch) -> None:
+    module = CHECKS._load()
+    report = healthy_control_api_report()
+    report["remote_commands"]["executor_internal_error_total"] = 2
+    monkeypatch.setattr(module, "_control_api_report", lambda _release: report)
+
+    value = module._check_control_api(
+        control_api_release(executor_internal_error_baseline=2)
+    )
 
     assert value.summary == "control-plane API, fleet and collectors are healthy"
 

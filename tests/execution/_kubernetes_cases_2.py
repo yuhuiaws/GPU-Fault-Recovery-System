@@ -238,6 +238,47 @@ def test_kubernetes_stop_treats_missing_workload_as_already_stopped() -> None:
     assert batch.suspend_patches == []
 
 
+def test_kubernetes_restart_fails_closed_when_source_workload_is_missing() -> None:
+    class MissingCustom:
+        def get_namespaced_custom_object(self, *_args):
+            error = KeyError("missing PyTorchJob")
+            error.status = 404
+            raise error
+
+    store = build_store()
+    incident, workflow = workflow_state(store, [WorkflowOperation.RESTART_WORKLOAD])
+    adapter = KubernetesWorkflowAdapter(
+        core_api=UnusedApi(),
+        batch_api=UnusedApi(),
+        custom_api=MissingCustom(),
+        store=store,
+    )
+    step = copy_model(
+        workflow.official_steps[0],
+        execution_owner=adapter.owner,
+        workload_ids=["gpu-fault-system/pytorchjob/training-job"],
+    )
+    context = WorkflowStepContext(
+        workflow=copy_model(workflow, official_steps=[step]),
+        incident=incident,
+        step=step,
+        step_index=0,
+        request=WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token),
+        idempotency_key="workflow-missing-source/RESTART_WORKLOAD",
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.details == {
+        "reason": "RESTART_SOURCE_WORKLOAD_NOT_FOUND",
+        "missing_workload_ids": ["gpu-fault-system/pytorchjob/training-job"],
+    }
+    assert outcome.error == (
+        "restart source workload is missing: gpu-fault-system/pytorchjob/training-job"
+    )
+
+
 @pytest.mark.parametrize(
     "previous_status",
     [WorkflowStatus.BLOCKED, WorkflowStatus.SUCCEEDED, WorkflowStatus.FAILED],
