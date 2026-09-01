@@ -177,6 +177,147 @@ def test_stability_window_accepts_steady_samples(tmp_path: Path, monkeypatch) ->
 
     assert report["healthy"] is True
     assert report["sample_count"] == 2
+    assert report["critical_clear"]["wait_seconds"] == 0
+
+
+def test_stability_waits_for_labeled_store_io_alert_to_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
+    steady = {
+        "restarts": {"cpu/pod/container": 0},
+        "not_ready": [],
+        "queue": {"depth": 0, "oldest_age_seconds": 0.0},
+        "remote_commands": {"by_status": {}},
+        "critical_alerts": {"count": 0, "alerts": []},
+    }
+    firing = {
+        **steady,
+        "critical_alerts": {
+            "count": 1,
+            "alerts": [
+                {"alertname": "GpuFaultStoreIoRejected", "severity": "critical"}
+            ],
+        },
+    }
+    snapshots = iter((firing, steady, steady))
+    times = iter((0.0, 0.0, 0.0, 120.0))
+    monkeypatch.setattr(release, "_stability_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        release,
+        "_store_io_rejection_series_ready",
+        lambda: {"ready": True, "pods": {"api/pod": {}}, "errors": []},
+    )
+    monkeypatch.setattr(MODULE.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(MODULE.time, "sleep", lambda _seconds: None)
+
+    report = release.validate_stability_window(
+        window_seconds=120,
+        sample_seconds=120,
+        critical_clear_timeout_seconds=30,
+        critical_clear_sample_seconds=30,
+    )
+
+    assert report["healthy"] is True
+    assert report["critical_clear"]["initial_alerts"] == ["GpuFaultStoreIoRejected"]
+    assert report["critical_clear"]["wait_seconds"] == 30
+
+
+def test_stability_rejects_unlabeled_store_io_series(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
+    baseline = {
+        "restarts": {"cpu/pod/container": 0},
+        "not_ready": [],
+        "queue": {"depth": 0, "oldest_age_seconds": 0.0},
+        "remote_commands": {"by_status": {}},
+        "critical_alerts": {
+            "count": 1,
+            "alerts": [
+                {"alertname": "GpuFaultStoreIoRejected", "severity": "critical"}
+            ],
+        },
+    }
+    monkeypatch.setattr(release, "_stability_snapshot", lambda: baseline)
+    monkeypatch.setattr(
+        release,
+        "_store_io_rejection_series_ready",
+        lambda: {
+            "ready": False,
+            "pods": {},
+            "errors": ["gpu-fault-api-ha/pod has unlabeled Store I/O series"],
+        },
+    )
+
+    with pytest.raises(MODULE.ReleaseError, match="not labeled zero"):
+        release.validate_stability_window(window_seconds=120)
+
+
+def test_stability_rejects_unexpected_baseline_critical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
+    baseline = {
+        "restarts": {"cpu/pod/container": 0},
+        "not_ready": [],
+        "queue": {"depth": 0, "oldest_age_seconds": 0.0},
+        "remote_commands": {"by_status": {}},
+        "critical_alerts": {
+            "count": 1,
+            "alerts": [
+                {"alertname": "GpuFaultRemoteCommandStalled", "severity": "critical"}
+            ],
+        },
+    }
+    monkeypatch.setattr(release, "_stability_snapshot", lambda: baseline)
+    monkeypatch.setattr(
+        release,
+        "_store_io_rejection_series_ready",
+        lambda: pytest.fail("unexpected critical alert entered settle path"),
+    )
+
+    with pytest.raises(MODULE.ReleaseError, match="non-settleable"):
+        release.validate_stability_window(window_seconds=120)
+
+
+def test_store_io_rejection_series_gate_reads_each_running_cpu_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
+
+    def get_json(command: list[str]) -> dict:
+        if "deployment" in command:
+            name = command[command.index("deployment") + 1]
+            return {
+                "spec": {
+                    "replicas": (0 if name == "gpu-fault-telemetry-spool-worker" else 1)
+                }
+            }
+        selector = command[command.index("-l") + 1]
+        role = selector.split("=", 1)[1]
+        return {"items": [{"metadata": {"name": f"{role}-pod"}}]}
+
+    monkeypatch.setattr(release, "_get_json", get_json)
+    monkeypatch.setattr(
+        release.runner,
+        "run",
+        lambda *_args, **_kwargs: json.dumps(
+            {"series_count": 1, "all_labeled": True, "all_zero": True}
+        ),
+    )
+
+    report = VALIDATION_MODULE.store_io_rejection_series_ready(release)
+
+    assert report["ready"] is True
+    assert sorted(report["pods"]) == [
+        "gpu-fault-api-ha/gpu-fault-api-ha-pod",
+        "gpu-fault-control-worker/gpu-fault-control-worker-pod",
+    ]
 
 
 def test_stability_snapshot_normalizes_decimal_store_stats(

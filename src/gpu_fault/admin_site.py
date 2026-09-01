@@ -12,6 +12,11 @@ from typing import Any, Iterator, Mapping, Sequence, cast
 
 import yaml  # type: ignore[import-untyped]
 
+from gpu_fault.admin_config import (
+    admin_config_desired_path,
+    load_desired_admin_config,
+)
+
 
 SITE_API_VERSION = "gpu-fault.aws/v1alpha1"
 SITE_KIND = "RegionalSite"
@@ -705,6 +710,10 @@ class RenderedSite:
             "runtime_profile_version": self.release_config["runtime_profile"][
                 "version"
             ],
+            "admin_config_sha256": self.release_config["admin_config"]["config_sha256"],
+            "admin_config_role_sha256": self.release_config["admin_config"][
+                "role_sha256"
+            ],
             "environment_keys": sorted(self.environment),
         }
 
@@ -774,6 +783,12 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             }
         )
     health = site.spec.health
+    admin_state_dir = source.parent
+    for candidate in source.parents:
+        if admin_config_desired_path(candidate).is_file():
+            admin_state_dir = candidate
+            break
+    admin_config = load_desired_admin_config(admin_state_dir)
     release_config: dict[str, Any] = {
         "site_name": site.name,
         "aws_region": site.spec.aws_region,
@@ -830,6 +845,11 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             "email_sender": site.spec.notifications.email_sender,
             "email_recipients": list(site.spec.notifications.email_recipients),
             "email_subject_prefix": (site.spec.notifications.email_subject_prefix),
+        },
+        "admin_config": {
+            "config": admin_config.as_dict(),
+            "config_sha256": admin_config.sha256(),
+            "role_sha256": admin_config.role_sha256(),
         },
         "clusters": clusters,
     }

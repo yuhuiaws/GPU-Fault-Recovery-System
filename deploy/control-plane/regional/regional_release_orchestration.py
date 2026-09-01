@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,7 +22,9 @@ from regional_release_legacy import (
     rollback_controller_config,
     validate_rollback_agent_identity,
 )
+from regional_release_rendering import admin_config_renderer_environment
 from regional_runtime_profile import ensure_runtime_profile
+from gpu_fault.admin_config import AdminConfig
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -58,6 +61,7 @@ def build_rollback_environment(
     )
     return {
         **os.environ,
+        **admin_config_renderer_environment(rollback_config.admin_config),
         "KUBECONFIG": rollback_config.cpu_kubeconfig,
         "GPU_FAULT_AWS_REGION": rollback_config.aws_region,
         "GPU_FAULT_NAMESPACE": rollback_config.namespace,
@@ -93,12 +97,61 @@ def build_rollback_environment(
         "GPU_FAULT_NOTIFICATION_CONFIG_SHA256": notification_digest(
             rollback_config.notifications
         ),
+        "GPU_FAULT_ADMIN_CONFIG_SHA256": rollback_config.admin_config.sha256(),
+        "GPU_FAULT_ADMIN_CONFIG_INGRESS_SHA256": (
+            rollback_config.admin_config.role_sha256()["ingress"]
+        ),
+        "GPU_FAULT_ADMIN_CONFIG_WORKER_SHA256": (
+            rollback_config.admin_config.role_sha256()["worker"]
+        ),
+        "GPU_FAULT_ADMIN_CONFIG_SPOOL_SHA256": (
+            rollback_config.admin_config.role_sha256()["spool"]
+        ),
+        "GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS": "spool,worker,ingress",
         "GPU_FAULT_LEGACY_COMPONENT_PINS": str(legacy_component_pins).lower(),
         "GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS": str(preserve_role_config_maps).lower(),
         "GPU_FAULT_FORCE_ROLE_RESTART": "true",
         "GPU_FAULT_FINALIZE_AGENT_PIN": "true",
         "GPU_FAULT_FINALIZE_DATA_PLANE_PIN": "true",
     }
+
+
+def _apply_rollback_cpu_environment(
+    self: Any,
+    environment: dict[str, str],
+) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="gpu-fault-rollback-role-split-"
+    ) as directory:
+        generated = Path(directory)
+        render_environment = {
+            **environment,
+            "GPU_FAULT_ROLE_SPLIT_OUT_DIR": str(generated),
+        }
+        self.runner.run(
+            [
+                "bash",
+                str(
+                    ROOT / "deploy/control-plane/tools/"
+                    "render-control-plane-role-split.sh"
+                ),
+            ],
+            env=render_environment,
+        )
+        apply_environment = {
+            **environment,
+            "GPU_FAULT_ROLE_SPLIT_GENERATED_DIR": str(generated),
+        }
+        self.runner.run(
+            [
+                "bash",
+                str(
+                    ROOT / "deploy/control-plane/tools/"
+                    "apply-control-plane-role-split.sh"
+                ),
+            ],
+            env=apply_environment,
+        )
 
 
 def _default_release_diff() -> ReleaseDiff:
@@ -266,7 +319,11 @@ def run_upgrade_phases(
         registry_staged = self._stage_registry()
         checkpoint("registry-staged")
     if plan.has(ReleaseComponent.CPU_STAGE) and ("cpu-staged" not in completed_phases):
-        self._apply_cpu(finalize=False, force_restart=registry_staged)
+        self._apply_cpu(
+            finalize=False,
+            force_restart=registry_staged,
+            diff=diff,
+        )
         checkpoint("cpu-staged")
     if plan.has(ReleaseComponent.RUNTIME_PROFILE) and (
         "profile-ready" not in completed_phases
@@ -301,7 +358,7 @@ def run_upgrade_phases(
             self._ensure_profile_transition_safe(
                 previous.get("runtime_profile_version")
             )
-        self._apply_cpu(finalize=True)
+        self._apply_cpu(finalize=True, diff=diff)
         checkpoint("cpu-finalized")
     if "verified" not in completed_phases:
         self._validate_release_quick(plan)
@@ -360,6 +417,9 @@ def upgrade_release(
         plan=plan,
     )
     if not resume:
+        # A new transaction must not inherit rollback checkpoints or failure
+        # fields from the currently deployed release.
+        self.state = {}
         self._save_state(
             "preflight",
             previous=previous,
@@ -456,6 +516,7 @@ def _restore_rollback_cpu(
     runtime_profile_version: str,
     runtime_image: str,
 ) -> None:
+    previous_admin_config = AdminConfig.from_mapping(previous.get("admin_config") or {})
     cpu_secret = (previous.get("secret_backups") or {}).get("cpu") or {}
     if cpu_secret.get("backup"):
         self._restore_secret(
@@ -473,7 +534,10 @@ def _restore_rollback_cpu(
         self.config.wheel.name,
     )
     environment = build_rollback_environment(
-        rollback_config=self.config.for_rollback(config_digest),
+        rollback_config=self.config.for_rollback(
+            config_digest,
+            admin_config=previous_admin_config,
+        ),
         metadata=metadata,
         cpu_wheel=cpu_wheel,
         cpu_sha=cpu_sha,
@@ -483,13 +547,7 @@ def _restore_rollback_cpu(
         runtime_image=runtime_image,
         preserve_role_config_maps=preserve_role_config_maps,
     )
-    self.runner.run(
-        [
-            "bash",
-            str(ROOT / "deploy/control-plane/tools/apply-control-plane-role-split.sh"),
-        ],
-        env=environment,
-    )
+    _apply_rollback_cpu_environment(self, environment)
     refresh_exists = (
         subprocess.run(
             self._cpu(
@@ -527,6 +585,7 @@ def _stage_rollback_controller(
     config_digest: str,
     runtime_profile_version: str,
 ) -> None:
+    previous_admin_config = AdminConfig.from_mapping(previous.get("admin_config") or {})
     cpu_secret = (previous.get("secret_backups") or {}).get("cpu") or {}
     if cpu_secret.get("backup"):
         self._restore_secret(
@@ -558,7 +617,10 @@ def _stage_rollback_controller(
         self.config.wheel.name,
     )
     environment = build_rollback_environment(
-        rollback_config=self.config.for_rollback(config_digest),
+        rollback_config=self.config.for_rollback(
+            config_digest,
+            admin_config=previous_admin_config,
+        ),
         metadata=metadata,
         cpu_wheel=cpu_wheel,
         cpu_sha=cpu_sha,
@@ -568,13 +630,7 @@ def _stage_rollback_controller(
         runtime_image=self.runtime_image,
         preserve_role_config_maps=True,
     )
-    self.runner.run(
-        [
-            "bash",
-            str(ROOT / "deploy/control-plane/tools/apply-control-plane-role-split.sh"),
-        ],
-        env=environment,
-    )
+    _apply_rollback_cpu_environment(self, environment)
 
 
 def rollback_target(

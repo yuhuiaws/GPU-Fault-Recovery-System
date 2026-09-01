@@ -12,6 +12,11 @@ import yaml
 
 from gpu_fault import admin_cli
 from gpu_fault.admin_bootstrap_common import BootstrapResult
+from gpu_fault.admin_config import (
+    AdminConfigError,
+    initialize_desired_admin_config,
+    load_desired_admin_config,
+)
 from gpu_fault.admin_site import (
     RegionalSite,
     SiteConfigError,
@@ -43,6 +48,7 @@ def site_file(tmp_path: Path) -> Path:
     (root / "dist/current-release.json").write_text(
         json.dumps(
             {
+                "release_id": "release-a",
                 "wheel": str(wheel),
                 "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
                 "bundle": str(bundle),
@@ -265,6 +271,7 @@ def test_generated_release_json_loads_through_the_existing_state_machine(
     assert config.aws_region == REGION
     assert config.health.aurora_cluster_id == "gpu-fault-aurora"
     assert config.clusters[0].cluster_id == "gpu-a"
+    assert config.admin_config.capacity.control_worker_replicas == 6
 
 
 def test_site_yaml_must_be_private(tmp_path: Path) -> None:
@@ -587,7 +594,7 @@ def test_public_arn_deploy_delegates_to_internal_source_preparation(
     )
 
 
-def test_public_deploy_help_only_exposes_four_inputs(capsys) -> None:
+def test_public_deploy_help_exposes_optional_admin_config(capsys) -> None:
     with pytest.raises(SystemExit, match="0"):
         admin_cli.parser().parse_args(["deploy", "--help"])
 
@@ -597,6 +604,7 @@ def test_public_deploy_help_only_exposes_four_inputs(capsys) -> None:
         "--gpu-cluster-arn",
         "--state-dir",
         "--admin-email",
+        "--config",
     ):
         assert value in help_text
     for value in (
@@ -610,6 +618,174 @@ def test_public_deploy_help_only_exposes_four_inputs(capsys) -> None:
         "--email-sender",
     ):
         assert value not in help_text
+
+
+def test_capacity_plan_creates_reviewable_role_scoped_plan(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    site_file(tmp_path)
+    arguments = admin_cli.parser().parse_args(
+        ["capacity", "plan", "--state-dir", str(tmp_path), "--preset", "32-disabled"]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["source"] == "preset:32-disabled"
+    assert output["affected_roles"] == ["worker"]
+    assert output["approval_required"] is True
+    assert len(output["plan_sha256"]) == 64
+
+
+def test_config_plan_accepts_partial_private_yaml(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    site_file(tmp_path)
+    initialize_desired_admin_config(tmp_path)
+    config = tmp_path / "capacity.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gpu-fault.aws/v1alpha1",
+                "kind": "AdminConfig",
+                "spec": {
+                    "capacity": {
+                        "remediation": {
+                            "maxActiveRegion": 128,
+                            "maxActivePerCluster": 4,
+                            "maxActivePerResourceClass": 4,
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+    arguments = admin_cli.parser().parse_args(
+        ["config", "plan", "--state-dir", str(tmp_path), "--file", str(config)]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["source"] == f"file:{config.resolve()}"
+    assert output["desired_config"]["capacity"]["telemetry_spool"] == {
+        "enabled": False,
+        "replicas": 0,
+    }
+
+
+def test_capacity_apply_uses_existing_signed_release_without_building(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    site_file(tmp_path)
+    plan_arguments = admin_cli.parser().parse_args(
+        ["capacity", "plan", "--state-dir", str(tmp_path), "--preset", "32-disabled"]
+    )
+    assert admin_cli.run(plan_arguments) == 0
+    plan = json.loads(capsys.readouterr().out)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        admin_cli,
+        "_current_release_metadata",
+        lambda _root: dict(plan["release_identity"]),
+    )
+    monkeypatch.setattr(
+        admin_cli, "_run_automatic_release", lambda **kwargs: calls.append(kwargs) or 0
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "capacity",
+            "apply",
+            "--state-dir",
+            str(tmp_path),
+            "--plan-sha256",
+            plan["plan_sha256"],
+            "--reference",
+            "CHG-12345",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "APPLIED"
+    assert output["release_id"] == "release-a"
+    assert output["affected_roles"] == ["worker"]
+    assert calls[0]["site_file"] == tmp_path / "site.yaml"
+
+
+def test_first_deploy_can_import_private_admin_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "admin-config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gpu-fault.aws/v1alpha1",
+                "kind": "AdminConfig",
+                "spec": {"capacity": {"preset": "32-disabled"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+    calls = []
+    monkeypatch.setattr(
+        admin_cli, "run_source_deploy", lambda **kwargs: calls.append(kwargs) or 0
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--cpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--admin-email",
+            "operations@example.com",
+            "--config",
+            str(config),
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    desired = load_desired_admin_config(tmp_path / "state")
+    assert desired.capacity.remediation.max_active_region == 128
+    assert calls, "first deploy did not continue into source preparation"
+
+
+def test_existing_site_rejects_direct_config_change_on_deploy(tmp_path: Path) -> None:
+    site_file(tmp_path)
+    config = tmp_path / "admin-config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gpu-fault.aws/v1alpha1",
+                "kind": "AdminConfig",
+                "spec": {"capacity": {"preset": "50-disabled"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--cpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
+            "--state-dir",
+            str(tmp_path),
+            "--admin-email",
+            "operations@example.com",
+            "--config",
+            str(config),
+        ]
+    )
+
+    with pytest.raises(AdminConfigError, match="config plan/apply"):
+        admin_cli.run(arguments)
 
 
 def test_approve_profile_command_records_pending_plan(

@@ -123,3 +123,39 @@ def test_cpu_role_config_snapshot_rejects_sensitive_keys() -> None:
 
     with pytest.raises(STATE_MODULE.ReleaseError, match="sensitive-looking keys"):
         STATE_MODULE.cpu_role_config_maps(SnapshotRelease())
+
+
+def test_previous_state_captures_the_live_administrator_config() -> None:
+    class SnapshotRelease:
+        config = SimpleNamespace(namespace="gpu-fault-system")
+
+        @staticmethod
+        def _cpu(*args):
+            return ["kubectl", *args]
+
+        @staticmethod
+        def _get_json(arguments):
+            name = arguments[arguments.index("deployment") + 1]
+            return {
+                "spec": {
+                    "replicas": (3 if name == "gpu-fault-telemetry-spool-worker" else 6)
+                }
+            }
+
+    snapshots = {
+        "gpu-fault-api-ha-config-telemetry": {"GPU_FAULT_TELEMETRY_SPOOL": "true"},
+        "gpu-fault-control-worker-config-core": {
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "128",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": "4",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": "1",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": "4",
+        },
+    }
+
+    config = STATE_MODULE.captured_admin_config(SnapshotRelease(), snapshots)
+
+    assert config.capacity.control_worker_replicas == 6
+    assert config.capacity.telemetry_spool.enabled is True
+    assert config.capacity.telemetry_spool.replicas == 3
+    assert config.capacity.remediation.max_active_region == 128

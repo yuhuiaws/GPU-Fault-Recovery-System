@@ -44,6 +44,23 @@ NOTIFICATION_CONFIG_SHA256="$(
 LEGACY_COMPONENT_PINS="${GPU_FAULT_LEGACY_COMPONENT_PINS:-false}"
 PRESERVE_ROLE_CONFIG_MAPS="${GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS:-false}"
 FORCE_ROLE_RESTART="${GPU_FAULT_FORCE_ROLE_RESTART:-false}"
+ROLE_TARGETS="$(
+    printf '%s' \
+        "${GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS:-spool,worker,ingress}"
+)"
+ADMIN_CONFIG_SHA256="${GPU_FAULT_ADMIN_CONFIG_SHA256:-${WHEEL_SHA256:-}}"
+ADMIN_CONFIG_INGRESS_SHA256="$(
+    printf '%s' \
+        "${GPU_FAULT_ADMIN_CONFIG_INGRESS_SHA256:-${ADMIN_CONFIG_SHA256}}"
+)"
+ADMIN_CONFIG_WORKER_SHA256="$(
+    printf '%s' \
+        "${GPU_FAULT_ADMIN_CONFIG_WORKER_SHA256:-${ADMIN_CONFIG_SHA256}}"
+)"
+ADMIN_CONFIG_SPOOL_SHA256="$(
+    printf '%s' \
+        "${GPU_FAULT_ADMIN_CONFIG_SPOOL_SHA256:-${ADMIN_CONFIG_SHA256}}"
+)"
 CONTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 
@@ -86,6 +103,10 @@ trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 [[ "${FORCE_ROLE_RESTART}" == "true" ||
     "${FORCE_ROLE_RESTART}" == "false" ]] || {
     echo "GPU_FAULT_FORCE_ROLE_RESTART must be true or false" >&2
+    exit 2
+}
+[[ "${ROLE_TARGETS}" =~ ^(ingress|worker|spool)(,(ingress|worker|spool))*$ ]] || {
+    echo "GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS is invalid" >&2
     exit 2
 }
 if [[ "${ALLOW_EMAIL}" != "true" &&
@@ -136,7 +157,44 @@ fi
     echo "cannot derive wheel SHA-256 from ${WHEEL_CONFIGMAP}" >&2
     exit 1
 }
+if [[ -z "${ADMIN_CONFIG_SHA256}" ]]; then
+    ADMIN_CONFIG_SHA256="${WHEEL_SHA256}"
+fi
+if [[ -z "${ADMIN_CONFIG_INGRESS_SHA256}" ]]; then
+    ADMIN_CONFIG_INGRESS_SHA256="${ADMIN_CONFIG_SHA256}"
+fi
+if [[ -z "${ADMIN_CONFIG_WORKER_SHA256}" ]]; then
+    ADMIN_CONFIG_WORKER_SHA256="${ADMIN_CONFIG_SHA256}"
+fi
+if [[ -z "${ADMIN_CONFIG_SPOOL_SHA256}" ]]; then
+    ADMIN_CONFIG_SPOOL_SHA256="${ADMIN_CONFIG_SHA256}"
+fi
+for digest in \
+    "${ADMIN_CONFIG_SHA256}" \
+    "${ADMIN_CONFIG_INGRESS_SHA256}" \
+    "${ADMIN_CONFIG_WORKER_SHA256}" \
+    "${ADMIN_CONFIG_SPOOL_SHA256}"; do
+    [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "admin config digests must be lowercase SHA-256 values" >&2
+        exit 2
+    }
+done
 RELEASE_ID="${WHEEL_SHA256:0:12}"
+
+role_selected() {
+    local role="$1"
+    [[ ",${ROLE_TARGETS}," == *",${role},"* ]]
+}
+
+manifest_role() {
+    local name="$1"
+    case "${name}" in
+        gpu-fault-api-ha-*) printf 'ingress' ;;
+        gpu-fault-control-worker-*) printf 'worker' ;;
+        gpu-fault-telemetry-spool-worker-*) printf 'spool' ;;
+        *) return 1 ;;
+    esac
+}
 
 REQUIRED_AGENT_ARTIFACT_SHA256="${GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256:-${WHEEL_SHA256}}"
 REQUIRED_AGENT_COMPATIBILITY_DIGEST="${GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST:-${REQUIRED_AGENT_ARTIFACT_SHA256}}"
@@ -542,6 +600,7 @@ render_manifest() {
 
 stamp_release() {
     local deployment="$1"
+    local admin_config_sha256="$2"
     kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" patch deployment \
         "${deployment}" --type=merge -p "$(
             jq -nc \
@@ -549,6 +608,7 @@ stamp_release() {
                 --arg release "${RELEASE_ID}" \
                 --arg runtime_image "${RUNTIME_IMAGE}" \
                 --arg notification "${NOTIFICATION_CONFIG_SHA256}" \
+                --arg role_admin_config "${admin_config_sha256}" \
                 '{
                     spec: {
                         template: {
@@ -559,13 +619,38 @@ stamp_release() {
                                     "gpu-fault.io/release-wheel-sha256": $sha,
                                     "gpu-fault.io/release-rollout": $release,
                                     "gpu-fault.io/runtime-image": $runtime_image,
-                                    "gpu-fault.io/notification-config-sha256": $notification
+                                    "gpu-fault.io/notification-config-sha256": $notification,
+                                    "gpu-fault.io/role-config-sha256": $role_admin_config
                                 }
                             }
                         }
                     }
                 }'
         )"
+}
+
+stamp_admin_config_metadata() {
+    local deployment
+    for deployment in \
+        gpu-fault-telemetry-spool-worker \
+        gpu-fault-control-worker \
+        gpu-fault-api-ha; do
+        if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
+            "${deployment}" >/dev/null 2>&1; then
+            kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" patch deployment \
+                "${deployment}" --type=merge -p "$(
+                    jq -nc \
+                        --arg admin_config "${ADMIN_CONFIG_SHA256}" \
+                        '{
+                            metadata: {
+                                annotations: {
+                                    "gpu-fault.io/admin-config-sha256": $admin_config
+                                }
+                            }
+                        }'
+                )"
+        fi
+    done
 }
 
 startup_failure_reason() {
@@ -671,65 +756,181 @@ wait_for_rollout() {
         "deployment/${deployment}" --timeout=1s
 }
 
+wait_for_spool_drain() {
+    local timeout="${GPU_FAULT_TELEMETRY_SPOOL_DRAIN_TIMEOUT_SECONDS:-300}"
+    local deadline
+    local pod
+    local metrics
+    local depth
+    local leased
+    [[ "${timeout}" =~ ^[0-9]+$ ]] && ((timeout >= 30)) || {
+        echo "GPU_FAULT_TELEMETRY_SPOOL_DRAIN_TIMEOUT_SECONDS must be at least 30" >&2
+        return 2
+    }
+    deadline=$((SECONDS + timeout))
+    while ((SECONDS < deadline)); do
+        pod="$(
+            kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get pod \
+                -l app=gpu-fault-api-ha \
+                --field-selector=status.phase=Running \
+                -o jsonpath='{.items[0].metadata.name}'
+        )"
+        [[ -n "${pod}" ]] || {
+            echo "cannot inspect telemetry spool drain without a Running ingress Pod" >&2
+            return 1
+        }
+        metrics="$(
+            kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" exec "${pod}" -- \
+                /opt/gpu-fault/control-plane/bin/python -c \
+                'from urllib.request import urlopen; print(urlopen("http://127.0.0.1:8080/metrics", timeout=5).read().decode())'
+        )"
+        depth="$(
+            awk '$1=="gpu_fault_telemetry_spool_depth"{print int($2)}' \
+                <<<"${metrics}" |
+                tail -n 1
+        )"
+        leased="$(
+            awk '$1=="gpu_fault_telemetry_spool_leased"{print int($2)}' \
+                <<<"${metrics}" |
+                tail -n 1
+        )"
+        if [[ "${depth:-}" == "0" && "${leased:-}" == "0" ]]; then
+            return 0
+        fi
+        sleep 5
+    done
+    echo "telemetry spool did not drain before its disable timeout" >&2
+    return 1
+}
+
+CURRENT_INGRESS_POD="$(
+    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get pod \
+        -l app=gpu-fault-api-ha \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' \
+        2>/dev/null || true
+)"
+CURRENT_INGRESS_EXISTS="false"
+if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
+    gpu-fault-api-ha >/dev/null 2>&1; then
+    CURRENT_INGRESS_EXISTS="true"
+fi
+if [[ -n "${CURRENT_INGRESS_POD}" ]]; then
+    CURRENT_SPOOL_ADMISSION="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" exec \
+            "${CURRENT_INGRESS_POD}" -- \
+            /opt/gpu-fault/control-plane/bin/python -c \
+            'import os; print(os.environ.get("GPU_FAULT_TELEMETRY_SPOOL", ""))' \
+            2>/dev/null || true
+    )"
+fi
+if [[ -z "${CURRENT_SPOOL_ADMISSION:-}" ]]; then
+    CURRENT_SPOOL_ADMISSION="$(
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
+            gpu-fault-api-ha-config-telemetry \
+            -o jsonpath='{.data.GPU_FAULT_TELEMETRY_SPOOL}' \
+            2>/dev/null || true
+    )"
+fi
+if [[ "${CURRENT_INGRESS_EXISTS}" == "true" &&
+    -z "${CURRENT_SPOOL_ADMISSION}" ]] &&
+    { role_selected ingress || role_selected spool; }; then
+    echo "cannot determine the live ingress telemetry spool mode" >&2
+    exit 2
+fi
+[[ -z "${CURRENT_SPOOL_ADMISSION}" ||
+    "${CURRENT_SPOOL_ADMISSION}" == "true" ||
+    "${CURRENT_SPOOL_ADMISSION}" == "false" ]] || {
+    echo "live ingress has an invalid GPU_FAULT_TELEMETRY_SPOOL value" >&2
+    exit 2
+}
+
 if [[ "${PRESERVE_ROLE_CONFIG_MAPS}" != "true" ]]; then
     for config in "${GENERATED}"/gpu-fault-*-config-*.yaml; do
         name="$(basename "${config}" .yaml)"
-        apply_manifest "${name}"
+        role="$(manifest_role "${name}" || true)"
+        if [[ -n "${role}" ]] && role_selected "${role}"; then
+            apply_manifest "${name}"
+        fi
     done
 fi
 
-apply_manifest gpu-fault-api-ha-pdb
-apply_manifest gpu-fault-control-worker-pdb
-apply_manifest gpu-fault-telemetry-spool-worker-pdb
-remove_legacy_notification_env gpu-fault-telemetry-spool-worker
-apply_manifest gpu-fault-telemetry-spool-worker
-stamp_release gpu-fault-telemetry-spool-worker
-if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
-    "${FORCE_ROLE_RESTART}" == "true" ]]; then
-    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
-        deployment/gpu-fault-telemetry-spool-worker
+apply_spool_role() {
+    role_selected spool || return 0
+    apply_manifest gpu-fault-telemetry-spool-worker-pdb
+    remove_legacy_notification_env gpu-fault-telemetry-spool-worker
+    apply_manifest gpu-fault-telemetry-spool-worker
+    stamp_release \
+        gpu-fault-telemetry-spool-worker \
+        "${ADMIN_CONFIG_SPOOL_SHA256}"
+    if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
+        "${FORCE_ROLE_RESTART}" == "true" ]]; then
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
+            deployment/gpu-fault-telemetry-spool-worker
+    fi
+    wait_for_rollout gpu-fault-telemetry-spool-worker
+}
+
+apply_worker_role() {
+    role_selected worker || return 0
+    apply_manifest gpu-fault-control-worker-pdb
+    remove_legacy_notification_env gpu-fault-control-worker
+    apply_manifest gpu-fault-control-worker
+    stamp_release \
+        gpu-fault-control-worker \
+        "${ADMIN_CONFIG_WORKER_SHA256}"
+    if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
+        "${FORCE_ROLE_RESTART}" == "true" ]]; then
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
+            deployment/gpu-fault-control-worker
+    fi
+    wait_for_rollout gpu-fault-control-worker
+}
+
+apply_ingress_role() {
+    role_selected ingress || return 0
+    apply_manifest gpu-fault-api-ha-pdb
+    # Remove inert processor pool values left by historical broad
+    # `kubectl set env` operations before applying the typed role config.
+    if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
+        gpu-fault-api-ha >/dev/null 2>&1; then
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" set env \
+            deployment/gpu-fault-api-ha \
+            GPU_FAULT_PROCESSOR_WORKERS- \
+            GPU_FAULT_PROCESSOR_FAULT_WORKERS- \
+            GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS- \
+            GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS- \
+            GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS- \
+            GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS-
+    fi
+    remove_legacy_notification_env gpu-fault-api-ha
+    apply_manifest gpu-fault-api-ha-ingress
+    stamp_release gpu-fault-api-ha "${ADMIN_CONFIG_INGRESS_SHA256}"
+    if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
+        "${FORCE_ROLE_RESTART}" == "true" ]]; then
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
+            deployment/gpu-fault-api-ha
+    fi
+    wait_for_rollout gpu-fault-api-ha
+}
+
+if [[ "${CURRENT_SPOOL_ADMISSION}" == "true" &&
+    "${GPU_FAULT_TELEMETRY_SPOOL:-false}" == "false" ]] &&
+    role_selected ingress && role_selected spool; then
+    # Stop new admission first, leave the old consumer running until every
+    # queued and leased row has drained, and only then scale it to zero.
+    apply_ingress_role
+    apply_worker_role
+    wait_for_spool_drain
+    apply_spool_role
+else
+    # Greenfield, steady-state and enable transitions all prove the consumer
+    # tier before ingress can begin writing to the spool.
+    apply_spool_role
+    apply_worker_role
+    apply_ingress_role
 fi
-
-# Admission remains off on the running ingress revision until a live
-# consumer tier is proven ready.
-wait_for_rollout gpu-fault-telemetry-spool-worker
-
-remove_legacy_notification_env gpu-fault-control-worker
-apply_manifest gpu-fault-control-worker
-stamp_release gpu-fault-control-worker
-if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
-    "${FORCE_ROLE_RESTART}" == "true" ]]; then
-    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
-        deployment/gpu-fault-control-worker
-fi
-
-# An upgrade may carry processor pool values added by `kubectl set env`;
-# a greenfield namespace has no ingress Deployment yet. Only run the
-# cleanup when the old Deployment exists, otherwise the NotFound would
-# abort the first deployment before ingress is created.
-if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployment \
-    gpu-fault-api-ha >/dev/null 2>&1; then
-    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" set env \
-        deployment/gpu-fault-api-ha \
-        GPU_FAULT_PROCESSOR_WORKERS- \
-        GPU_FAULT_PROCESSOR_FAULT_WORKERS- \
-        GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS- \
-        GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS- \
-        GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS- \
-        GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS-
-fi
-
-wait_for_rollout gpu-fault-control-worker
-
-remove_legacy_notification_env gpu-fault-api-ha
-apply_manifest gpu-fault-api-ha-ingress
-stamp_release gpu-fault-api-ha
-if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
-    "${FORCE_ROLE_RESTART}" == "true" ]]; then
-    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
-        deployment/gpu-fault-api-ha
-fi
-wait_for_rollout gpu-fault-api-ha
+stamp_admin_config_metadata
 
 GPU_FAULT_NAMESPACE="${NAMESPACE}" \
 GPU_FAULT_RUNTIME_IMAGE="${RUNTIME_IMAGE}" \

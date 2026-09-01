@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+from gpu_fault.admin_config import default_admin_config
 from scripts.component_wheels import COMPONENTS, dependency_closure, entrypoint_modules
 from tests._script_loader import lazy_script_module
 
@@ -12,6 +13,7 @@ DIFF = lazy_script_module(
 
 
 def _release() -> SimpleNamespace:
+    admin_config = default_admin_config()
     return SimpleNamespace(
         wheel_sha="a" * 64,
         executor_wheel_sha="b" * 64,
@@ -24,6 +26,7 @@ def _release() -> SimpleNamespace:
         dcgm_digest="1" * 64,
         notification_digest="3" * 64,
         cluster_registry_digest="6" * 64,
+        admin_config_role_digests=admin_config.role_sha256(),
         rendered_manifest_digest="7" * 64,
         node_template_sha="8" * 64,
         runtime_image="runtime@sha256:" + "1" * 64,
@@ -77,6 +80,7 @@ def _state() -> dict:
         "dcgm_digest": release.dcgm_digest,
         "notification_digest": release.notification_digest,
         "cluster_registry_digest": release.cluster_registry_digest,
+        "admin_config_role_sha256": release.admin_config_role_digests,
         "cluster_ids": ["gpu-a"],
         "release_delivery_sha256": release.config.release_delivery_sha256,
         "cpu_manifest_sha256": release.config.delivery_component_digests["cpu"],
@@ -261,6 +265,26 @@ def test_execution_plan_selects_only_changed_component_dependencies() -> None:
         DIFF.ReleaseComponent.WATCHER,
         DIFF.ReleaseComponent.VERIFY,
     )
+
+
+def test_admin_config_change_is_control_plane_only_and_skips_registry() -> None:
+    release = _release()
+    state = _state()
+    state["admin_config_role_sha256"] = {
+        **release.admin_config_role_digests,
+        "worker": "9" * 64,
+    }
+
+    diff = DIFF.classify_release(release, state)
+    plan = DIFF.build_execution_plan(diff)
+
+    assert diff.kind is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
+    assert diff.changed == {"admin_config_worker"}
+    assert plan.nodes == (
+        DIFF.ReleaseComponent.CPU_FINALIZE,
+        DIFF.ReleaseComponent.VERIFY,
+    )
+    assert DIFF.control_plane_role_targets(diff) == ("worker",)
 
 
 def test_component_dependency_closures_are_runtime_specific() -> None:

@@ -87,7 +87,9 @@ def test_control_plane_only_upgrade_skips_schema_and_gpu(
         lambda: pytest.fail("control-only upgrade ran schema"),
     )
     monkeypatch.setattr(
-        release, "_apply_cpu", lambda *, finalize: calls.append(("cpu", finalize))
+        release,
+        "_apply_cpu",
+        lambda *, finalize, **_kwargs: calls.append(("cpu", finalize)),
     )
     monkeypatch.setattr(release, "_stage_registry", lambda: False)
     monkeypatch.setattr(
@@ -109,6 +111,48 @@ def test_control_plane_only_upgrade_skips_schema_and_gpu(
     assert ("cpu", False) not in calls
     assert "schema-ready" in calls
     assert "verify" in calls
+
+
+def test_new_upgrade_discards_stale_rollback_checkpoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
+    release.state = {
+        "release_id": "previous-release",
+        "rollback_completed_phases": [
+            "rollback-controller-staged",
+            "rollback-data-restored",
+            "rollback-cpu-restored",
+            "rollback-verified",
+        ],
+        "rollback_completed_cluster_ids": ["gpu-a"],
+        "rollback_result": {"status": "PASSED"},
+    }
+    saves: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
+    monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
+    monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
+    monkeypatch.setattr(release, "_capture_previous", lambda: {"metadata": {}})
+    monkeypatch.setattr(release, "_backup_release_secrets", lambda: {})
+    monkeypatch.setattr(
+        release,
+        "_save_state",
+        lambda phase, **_updates: saves.append((phase, dict(release.state))),
+    )
+    monkeypatch.setattr(release, "_upload_release", lambda _diff: None)
+    monkeypatch.setattr(release, "_ensure_schema", lambda: None)
+    monkeypatch.setattr(release, "_apply_cpu", lambda **_kwargs: None)
+    monkeypatch.setattr(release, "_stage_registry", lambda: False)
+    monkeypatch.setattr(release, "_validate_release_quick", lambda _plan: None)
+    diff = DIFF_MODULE.ReleaseDiff(
+        kind=DIFF_MODULE.ReleaseChangeKind.CONTROL_PLANE_ONLY,
+        changed=frozenset({"control_plane_wheel"}),
+    )
+
+    release.upgrade(diff=diff)
+
+    assert saves[0] == ("preflight", {})
 
 
 def test_endpoint_only_upgrade_skips_executor_and_node_rollout(
@@ -938,12 +982,17 @@ def test_join_cluster_requires_current_release_artifact(tmp_path) -> None:
 def test_sync_release_state_records_a_noop_topology() -> None:
     calls = []
     release = SimpleNamespace(
+        state={
+            "rollback_completed_phases": ["rollback-verified"],
+            "rollback_result": {"status": "PASSED"},
+        },
         _capture_previous=lambda: {"live_runtime_image": "legacy-runtime:stable"},
         _save_state=lambda phase, **updates: calls.append((phase, updates)),
     )
 
     MODULE.sync_release_state(release)
 
+    assert release.state == {}
     assert calls == [
         (
             "complete",
@@ -1148,7 +1197,11 @@ def test_regional_release_config_imports_with_runtime_pythonpath() -> None:
     completed = subprocess.run(
         [sys.executable, "-c", "import regional_release_config"],
         cwd=ROOT / "deploy/control-plane/regional",
-        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        env={
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(ROOT / "src"),
+        },
         text=True,
         capture_output=True,
         check=False,
@@ -1324,6 +1377,9 @@ def test_non_default_runtime_profile_reaches_every_plane(tmp_path: Path) -> None
     )
     assert (
         cpu_environment["GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"] == "hyperpod-v2"
+    )
+    assert cpu_environment["GPU_FAULT_ADMIN_CONFIG_SHA256"] == (
+        release.admin_config_digest
     )
 
     rendered_manifests = [

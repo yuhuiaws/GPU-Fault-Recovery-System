@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONTROL_PLANE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+REPO_DIR="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 BASE_DIR="${CONTROL_PLANE_DIR}/base"
 REGIONAL_DIR="${CONTROL_PLANE_DIR}/regional"
 OUT_DIR="${GPU_FAULT_ROLE_SPLIT_OUT_DIR:-${REGIONAL_DIR}/generated}"
@@ -32,6 +33,7 @@ install -m 0644 \
     "${WORK_DIR}/kustomization.yaml"
 
 kubectl kustomize "${WORK_DIR}" |
+    PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}" \
     python3 "${SCRIPT_DIR}/render_control_plane_role_split.py" \
         --out-dir "${OUT_DIR}"
 

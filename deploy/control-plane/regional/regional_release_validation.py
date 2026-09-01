@@ -17,6 +17,15 @@ from regional_release_runtime_identity import (
 
 
 ROOT = Path(__file__).resolve().parents[3]
+TRANSIENT_CRITICAL_ALERTS = frozenset({"GpuFaultStoreIoRejected"})
+CRITICAL_CLEAR_TIMEOUT_SECONDS = 420
+CRITICAL_CLEAR_SAMPLE_SECONDS = 15
+STORE_IO_REJECTION_METRIC = "gpu_fault_store_io_rejections_total"
+CPU_METRIC_PORTS = {
+    "gpu-fault-api-ha": 8080,
+    "gpu-fault-control-worker": 8081,
+    "gpu-fault-telemetry-spool-worker": 8082,
+}
 
 
 def ensure_profile_transition_safe(
@@ -228,6 +237,190 @@ print(json.dumps({"count": len(critical), "alerts": critical}, sort_keys=True))
     return result
 
 
+def store_io_rejection_series_ready(release: Any) -> dict[str, Any]:
+    reports: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for deployment, port in CPU_METRIC_PORTS.items():
+        deployed = release._get_json(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+                deployment,
+            )
+        )
+        replicas = int((deployed.get("spec") or {}).get("replicas") or 0)
+        if replicas == 0:
+            continue
+        pods = release._get_json(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "get",
+                "pods",
+                "-l",
+                f"app={deployment}",
+                "--field-selector=status.phase=Running",
+            )
+        )
+        names = sorted(
+            str((item.get("metadata") or {}).get("name") or "")
+            for item in pods.get("items", [])
+            if (item.get("metadata") or {}).get("name")
+        )
+        if len(names) != replicas:
+            errors.append(
+                f"{deployment} has {len(names)}/{replicas} Running metric Pods"
+            )
+        script = f"""
+import json
+from urllib.request import urlopen
+
+metric = {STORE_IO_REJECTION_METRIC!r}
+text = urlopen(
+    "http://127.0.0.1:{port}/metrics",
+    timeout=10,
+).read().decode()
+series = []
+for line in text.splitlines():
+    if not (
+        line.startswith(metric + "{{")
+        or line.startswith(metric + " ")
+    ):
+        continue
+    name, raw = line.rsplit(None, 1)
+    series.append(
+        {{
+            "labeled": 'process_id="' in name,
+            "value": float(raw),
+        }}
+    )
+print(
+    json.dumps(
+        {{
+            "series_count": len(series),
+            "all_labeled": bool(series)
+            and all(item["labeled"] for item in series),
+            "all_zero": bool(series)
+            and all(item["value"] == 0 for item in series),
+        }},
+        sort_keys=True,
+    )
+)
+"""
+        for pod in names:
+            raw = release.runner.run(
+                release._cpu(
+                    "-n",
+                    release.config.namespace,
+                    "exec",
+                    pod,
+                    "--",
+                    CONTROL_PLANE_PYTHON,
+                    "-c",
+                    script,
+                ),
+                capture=True,
+            )
+            report = json.loads(raw)
+            reports[f"{deployment}/{pod}"] = report
+            if not report.get("all_labeled"):
+                errors.append(f"{deployment}/{pod} has unlabeled Store I/O series")
+            if not report.get("all_zero"):
+                errors.append(f"{deployment}/{pod} has nonzero Store I/O rejections")
+    return {
+        "ready": not errors,
+        "pods": reports,
+        "errors": errors,
+    }
+
+
+def _critical_alert_names(snapshot: dict[str, Any]) -> set[str]:
+    critical = snapshot.get("critical_alerts") or {}
+    names = {
+        str(item.get("alertname") or "").strip() or "<unknown>"
+        for item in critical.get("alerts") or []
+    }
+    if int(critical.get("count", 0)) and not names:
+        names.add("<unknown>")
+    return names
+
+
+def _nonterminal_remote_commands(snapshot: dict[str, Any]) -> bool:
+    remote = (snapshot.get("remote_commands") or {}).get("by_status") or {}
+    return any(
+        int(remote.get(status, 0)) for status in ("PENDING", "LEASED", "WAITING")
+    )
+
+
+def wait_for_stability_baseline(
+    release: Any,
+    baseline: dict[str, Any],
+    *,
+    timeout_seconds: int = CRITICAL_CLEAR_TIMEOUT_SECONDS,
+    sample_seconds: int = CRITICAL_CLEAR_SAMPLE_SECONDS,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    alerts = _critical_alert_names(baseline)
+    report = {
+        "initial_alerts": sorted(alerts),
+        "wait_seconds": 0,
+        "sample_count": 1,
+        "metric_series": None,
+    }
+    if not alerts:
+        return baseline, report
+    unexpected = alerts - TRANSIENT_CRITICAL_ALERTS
+    if unexpected:
+        raise ReleaseError(
+            "release stability baseline has non-settleable critical alerts: "
+            + ", ".join(sorted(unexpected))
+        )
+    metric_series = release._store_io_rejection_series_ready()
+    report["metric_series"] = metric_series
+    if not metric_series.get("ready"):
+        details = ", ".join(metric_series.get("errors") or [])
+        raise ReleaseError(
+            "release Store I/O rejection metric series are not labeled zero"
+            + (f": {details}" if details else "")
+        )
+    if timeout_seconds < 1 or sample_seconds < 1:
+        raise ReleaseError("release critical-clear wait configuration is invalid")
+    initial_restarts = baseline["restarts"]
+    waited = 0
+    while waited < timeout_seconds:
+        delay = min(sample_seconds, timeout_seconds - waited)
+        time.sleep(delay)
+        waited += delay
+        sample = release._stability_snapshot()
+        report["wait_seconds"] = waited
+        report["sample_count"] = int(report["sample_count"]) + 1
+        if sample["not_ready"]:
+            raise ReleaseError("release critical-clear wait has non-Ready Pods")
+        for key, count in sample["restarts"].items():
+            if count > int(initial_restarts.get(key, 0)):
+                raise ReleaseError(
+                    f"release critical-clear wait observed a restart: {key}"
+                )
+        if _nonterminal_remote_commands(sample):
+            raise ReleaseError(
+                "release critical-clear wait has non-terminal remote commands"
+            )
+        current = _critical_alert_names(sample)
+        unexpected = current - TRANSIENT_CRITICAL_ALERTS
+        if unexpected:
+            raise ReleaseError(
+                "release critical-clear wait observed unexpected critical alerts: "
+                + ", ".join(sorted(unexpected))
+            )
+        if not current:
+            return sample, report
+    raise ReleaseError(
+        "release transient critical alerts did not clear within "
+        f"{timeout_seconds} seconds: " + ", ".join(sorted(alerts))
+    )
+
+
 def stability_snapshot(release: Any) -> dict[str, Any]:
     restarts: dict[str, int] = {}
     not_ready: list[str] = []
@@ -328,6 +521,8 @@ def validate_stability_window(
     *,
     window_seconds: int | None = None,
     sample_seconds: int = 30,
+    critical_clear_timeout_seconds: int = CRITICAL_CLEAR_TIMEOUT_SECONDS,
+    critical_clear_sample_seconds: int = CRITICAL_CLEAR_SAMPLE_SECONDS,
 ) -> dict[str, Any]:
     configured = (
         window_seconds
@@ -341,8 +536,12 @@ def validate_stability_window(
     baseline = release._stability_snapshot()
     if baseline["not_ready"]:
         raise ReleaseError("release stability baseline has non-Ready Pods")
-    if int(baseline["critical_alerts"].get("count", 0)):
-        raise ReleaseError("release stability baseline has critical alerts")
+    baseline, critical_clear = wait_for_stability_baseline(
+        release,
+        baseline,
+        timeout_seconds=critical_clear_timeout_seconds,
+        sample_seconds=critical_clear_sample_seconds,
+    )
     samples = [baseline]
     deadline = time.monotonic() + configured
     while time.monotonic() < deadline:
@@ -384,6 +583,7 @@ def validate_stability_window(
         "final_queue": samples[-1]["queue"],
         "restart_total": sum(samples[-1]["restarts"].values()),
         "critical_alert_count": int(samples[-1]["critical_alerts"].get("count", 0)),
+        "critical_clear": critical_clear,
     }
 
 

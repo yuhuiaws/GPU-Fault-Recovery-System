@@ -14,10 +14,37 @@ from regional_release_config import (
     ReleaseError,
     render_nlb_manifest,
 )
+from gpu_fault.admin_config import AdminConfig
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 DEFAULT_DCGM_EXPORTER_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
+
+
+def admin_config_renderer_environment(
+    admin_config: AdminConfig,
+) -> dict[str, str]:
+    capacity = admin_config.capacity
+    remediation = capacity.remediation
+    spool = capacity.telemetry_spool
+    return {
+        "GPU_FAULT_CONTROL_WORKER_REPLICAS": str(capacity.control_worker_replicas),
+        "GPU_FAULT_TELEMETRY_SPOOL": str(spool.enabled).lower(),
+        "GPU_FAULT_TELEMETRY_SPOOL_REPLICAS": str(spool.replicas),
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": str(remediation.max_active_region),
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": str(
+            remediation.max_active_per_cluster
+        ),
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": str(
+            remediation.max_active_per_node
+        ),
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": str(
+            remediation.max_active_per_failure_domain
+        ),
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": str(
+            remediation.max_active_per_resource_class
+        ),
+    }
 
 
 def _documents(text: str) -> list[dict[str, Any]]:
@@ -129,6 +156,7 @@ def rendered_release_manifest_sha256(release: Any) -> str:
     )
     payload = {
         "cpu": cpu_documents,
+        "admin_config": config.admin_config.as_dict(),
         "gpu": gpu_documents,
         "schema": _documents(schema_text),
         "aurora_refresh": _documents(refresh_text),
@@ -210,6 +238,7 @@ def build_cpu_apply_environment(
     config = release.config
     return {
         **os.environ,
+        **admin_config_renderer_environment(config.admin_config),
         "KUBECONFIG": config.cpu_kubeconfig,
         "GPU_FAULT_AWS_REGION": config.aws_region,
         "GPU_FAULT_NAMESPACE": config.namespace,
@@ -236,6 +265,16 @@ def build_cpu_apply_environment(
         ).lower(),
         "GPU_FAULT_NOTIFICATION_CONFIG_SHA256": notification_digest(
             config.notifications
+        ),
+        "GPU_FAULT_ADMIN_CONFIG_SHA256": release.admin_config_digest,
+        "GPU_FAULT_ADMIN_CONFIG_INGRESS_SHA256": (
+            release.admin_config_role_digests["ingress"]
+        ),
+        "GPU_FAULT_ADMIN_CONFIG_WORKER_SHA256": (
+            release.admin_config_role_digests["worker"]
+        ),
+        "GPU_FAULT_ADMIN_CONFIG_SPOOL_SHA256": (
+            release.admin_config_role_digests["spool"]
         ),
         "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION": str(config.agent_protocol_version),
         "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION": str(

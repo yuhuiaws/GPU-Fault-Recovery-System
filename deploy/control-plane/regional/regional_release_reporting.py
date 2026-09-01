@@ -82,6 +82,9 @@ def build_release_status(release: Any) -> dict[str, Any]:
             "release_delivery_sha256": config.release_delivery_sha256,
             "delivery_component_digests": config.delivery_component_digests,
             "rendered_manifest_sha256": release.rendered_manifest_digest,
+            "admin_config_sha256": release.admin_config_digest,
+            "admin_config_role_sha256": release.admin_config_role_digests,
+            "admin_config": config.admin_config.as_dict(),
             "node_template_sha256": release.node_template_sha,
             "images": {
                 "runtime": release.runtime_image,

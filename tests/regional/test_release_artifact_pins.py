@@ -5,6 +5,7 @@ from pathlib import Path
 
 import yaml
 
+from gpu_fault.admin_config import preset_admin_config
 from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -189,11 +190,13 @@ def test_rollback_uses_previous_executor_and_node_pins(
     )
     monkeypatch.setattr(release, "_save_state", lambda *_args, **_kwargs: None)
     target = config.clusters[0]
+    previous_admin_config = preset_admin_config("32-enabled")
     previous = {
         "cpu_wheel": "old-control-wheel",
         "runtime_image": previous_runtime_image,
         "node_installer_image": previous_installer_image,
         "runtime_profile_version": "hyperpod-v1",
+        "admin_config": previous_admin_config.as_dict(),
         "cpu_role_config_maps": {
             "gpu-fault-control-worker-config-core": {"GPU_FAULT_SERVICE_ROLE": "worker"}
         },
@@ -256,6 +259,18 @@ def test_rollback_uses_previous_executor_and_node_pins(
     ), "rollback CPU stages did not force a restart"
     assert cpu_applies[0]["env"]["GPU_FAULT_RUNTIME_IMAGE"] == release.runtime_image
     assert cpu_applies[1]["env"]["GPU_FAULT_RUNTIME_IMAGE"] == previous_runtime_image
+    cpu_renders = [
+        kwargs
+        for args, kwargs in release.runner.calls
+        if args[0] == "bash" and "render-control-plane-role-split.sh" in args[1]
+    ]
+    assert len(cpu_renders) == 2
+    assert all(
+        item["env"]["GPU_FAULT_TELEMETRY_SPOOL"] == "true"
+        and item["env"]["GPU_FAULT_TELEMETRY_SPOOL_REPLICAS"] == "3"
+        and item["env"]["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] == "128"
+        for item in cpu_renders
+    ), "rollback CPU stages did not render the previous administrator config"
     core_patches = [
         args
         for args, _kwargs in release.runner.calls

@@ -31,6 +31,17 @@ from gpu_fault.admin_notifications import (
     resolve_admin_email,
     validate_admin_email,
 )
+from gpu_fault.admin_config import (
+    AdminConfig,
+    AdminConfigError,
+    apply_capacity_patch,
+    complete_admin_config_apply,
+    create_admin_config_plan,
+    initialize_desired_admin_config,
+    load_admin_config_file,
+    load_desired_admin_config,
+    prepare_admin_config_apply,
+)
 from gpu_fault.admin_profile_approval import approve_profile
 from gpu_fault.admin_resource_registry import sync_installation_resource_registry
 from gpu_fault.admin_site import (
@@ -119,6 +130,140 @@ def _add_managed_site_arguments(
         )
 
 
+def _add_admin_config_apply_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--state-dir",
+        required=True,
+        type=Path,
+        metavar="STATE_DIR",
+        help="private state directory containing the pending config plan",
+    )
+    command.add_argument(
+        "--plan-sha256",
+        required=True,
+        metavar="SHA256",
+        help="exact SHA-256 from the reviewed admin config plan",
+    )
+    command.add_argument(
+        "--reference",
+        required=True,
+        metavar="REFERENCE",
+        help="approved change or maintenance-window reference",
+    )
+
+
+def _add_capacity_plan_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--state-dir",
+        required=True,
+        type=Path,
+        metavar="STATE_DIR",
+    )
+    command.add_argument(
+        "--preset",
+        choices=(
+            "default",
+            "32-disabled",
+            "32-enabled",
+            "50-disabled",
+            "50-enabled",
+        ),
+    )
+    command.add_argument("--control-worker-replicas", type=int)
+    command.add_argument(
+        "--spool",
+        choices=("enabled", "disabled"),
+        help="enable or disable telemetry spool admission",
+    )
+    command.add_argument("--spool-replicas", type=int)
+    command.add_argument("--max-active-region", type=int)
+    command.add_argument("--max-active-per-cluster", type=int)
+    command.add_argument("--max-active-per-node", type=int)
+    command.add_argument("--max-active-per-failure-domain", type=int)
+    command.add_argument("--max-active-per-resource-class", type=int)
+
+
+def _add_profile_approval_command(commands: Any) -> None:
+    approve = commands.add_parser(
+        "approve-profile",
+        usage=(
+            "gpu-fault-admin approve-profile --state-dir STATE_DIR "
+            "--plan-sha256 SHA256 --reference REFERENCE"
+        ),
+        help="approve the pending Runtime Profile plan recorded in private state",
+    )
+    approve.add_argument(
+        "--state-dir",
+        required=True,
+        type=Path,
+        metavar="STATE_DIR",
+        help="private state directory containing profile-plan.json",
+    )
+    approve.add_argument(
+        "--plan-sha256",
+        required=True,
+        metavar="SHA256",
+        help="exact plan_sha256 recorded from the reviewed profile-plan.json",
+    )
+    approve.add_argument(
+        "--reference",
+        required=True,
+        metavar="REFERENCE",
+        help="approved change or maintenance-window reference",
+    )
+
+
+def _add_admin_config_commands(commands: Any) -> None:
+    capacity = commands.add_parser(
+        "capacity",
+        help="plan or apply an audited control-plane capacity configuration",
+    )
+    capacity_commands = capacity.add_subparsers(
+        dest="capacity_command",
+        required=True,
+    )
+    capacity_plan = capacity_commands.add_parser(
+        "plan",
+        help="create a capacity configuration plan",
+    )
+    _add_capacity_plan_arguments(capacity_plan)
+    capacity_apply = capacity_commands.add_parser(
+        "apply",
+        help="apply the reviewed capacity configuration plan",
+    )
+    _add_admin_config_apply_arguments(capacity_apply)
+    config = commands.add_parser(
+        "config",
+        help="plan or apply a schema-validated administrator config file",
+    )
+    config_commands = config.add_subparsers(
+        dest="config_command",
+        required=True,
+    )
+    config_plan = config_commands.add_parser(
+        "plan",
+        help="create a plan from an AdminConfig YAML file",
+    )
+    config_plan.add_argument(
+        "--state-dir",
+        required=True,
+        type=Path,
+        metavar="STATE_DIR",
+    )
+    config_plan.add_argument(
+        "--file",
+        required=True,
+        dest="admin_config_file",
+        type=Path,
+        metavar="ADMIN_CONFIG",
+    )
+    config_apply = config_commands.add_parser(
+        "apply",
+        help="apply the reviewed administrator configuration plan",
+    )
+    _add_admin_config_apply_arguments(config_apply)
+
+
 def _managed_site_file(
     arguments: argparse.Namespace,
     *,
@@ -194,6 +339,16 @@ def parser() -> argparse.ArgumentParser:
         help=("private state directory used for both first deployment and upgrades"),
     )
     deploy.add_argument(
+        "--config",
+        dest="admin_config_file",
+        type=Path,
+        metavar="ADMIN_CONFIG",
+        help=(
+            "private AdminConfig YAML for first deployment; existing sites "
+            "must use config plan/apply"
+        ),
+    )
+    deploy.add_argument(
         "--allow-legacy-python-foundation",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -243,33 +398,8 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    approve = commands.add_parser(
-        "approve-profile",
-        usage=(
-            "gpu-fault-admin approve-profile --state-dir STATE_DIR "
-            "--plan-sha256 SHA256 --reference REFERENCE"
-        ),
-        help="approve the pending Runtime Profile plan recorded in private state",
-    )
-    approve.add_argument(
-        "--state-dir",
-        required=True,
-        type=Path,
-        metavar="STATE_DIR",
-        help="private state directory containing profile-plan.json",
-    )
-    approve.add_argument(
-        "--plan-sha256",
-        required=True,
-        metavar="SHA256",
-        help="exact plan_sha256 recorded from the reviewed profile-plan.json",
-    )
-    approve.add_argument(
-        "--reference",
-        required=True,
-        metavar="REFERENCE",
-        help="approved change or maintenance-window reference",
-    )
+    _add_profile_approval_command(commands)
+    _add_admin_config_commands(commands)
     join = commands.add_parser(
         "join-cluster",
         usage=(
@@ -582,7 +712,204 @@ def _run_profile_approval(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _admin_config_site_identity(site: RenderedSite) -> dict[str, str]:
+    return {
+        "site_name": str(site.release_config["site_name"]),
+        "aws_region": str(site.release_config["aws_region"]),
+        "cpu_eks_arn": str(site.release_config["cpu_eks_arn"]),
+    }
+
+
+def _capacity_candidate(
+    arguments: argparse.Namespace,
+    current: AdminConfig,
+) -> AdminConfig:
+    capacity: dict[str, Any] = {}
+    if arguments.preset is not None:
+        capacity["preset"] = arguments.preset
+    if arguments.control_worker_replicas is not None:
+        capacity["controlWorkerReplicas"] = arguments.control_worker_replicas
+    spool: dict[str, Any] = {}
+    if arguments.spool is not None:
+        enabled = arguments.spool == "enabled"
+        spool["enabled"] = enabled
+        if arguments.spool_replicas is None:
+            spool["replicas"] = 3 if enabled else 0
+    if arguments.spool_replicas is not None:
+        spool["replicas"] = arguments.spool_replicas
+    if spool:
+        capacity["telemetrySpool"] = spool
+    remediation: dict[str, int] = {}
+    for attribute, field in (
+        ("max_active_region", "maxActiveRegion"),
+        ("max_active_per_cluster", "maxActivePerCluster"),
+        ("max_active_per_node", "maxActivePerNode"),
+        (
+            "max_active_per_failure_domain",
+            "maxActivePerFailureDomain",
+        ),
+        ("max_active_per_resource_class", "maxActivePerResourceClass"),
+    ):
+        value = cast(int | None, getattr(arguments, attribute))
+        if value is not None:
+            remediation[field] = value
+    if remediation:
+        capacity["remediation"] = remediation
+    if not capacity:
+        raise AdminConfigError(
+            "capacity plan requires --preset or at least one explicit setting"
+        )
+    return apply_capacity_patch(current, capacity)
+
+
+def _run_admin_config_plan(
+    arguments: argparse.Namespace,
+    *,
+    capacity: bool,
+) -> int:
+    site_file = _managed_site_file(
+        arguments,
+        command="capacity plan" if capacity else "config plan",
+    )
+    assert site_file is not None
+    site = load_site(site_file)
+    current = load_desired_admin_config(arguments.state_dir)
+    if capacity:
+        desired = _capacity_candidate(arguments, current)
+        source = (
+            f"preset:{arguments.preset}"
+            if arguments.preset is not None
+            else "explicit-capacity-options"
+        )
+    else:
+        desired = load_admin_config_file(
+            arguments.admin_config_file,
+            base=current,
+        )
+        source = f"file:{arguments.admin_config_file.expanduser().resolve()}"
+    plan = create_admin_config_plan(
+        arguments.state_dir,
+        site_identity=_admin_config_site_identity(site),
+        release_identity=_current_release_metadata(site.repository_root),
+        desired=desired,
+        source=source,
+    )
+    print(json.dumps(plan, indent=2, sort_keys=True))
+    return 0
+
+
+def _current_release_metadata(
+    repository_root: Path,
+) -> dict[str, object]:
+    path = repository_root / "dist/current-release.json"
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SiteConfigError("current release manifest is invalid") from exc
+    if not isinstance(value, dict):
+        raise SiteConfigError("current release manifest must be a JSON object")
+    release_id = str(value.get("release_id") or "").strip()
+    if not release_id:
+        raise SiteConfigError("current release manifest has no release_id")
+    return {
+        "release_id": release_id,
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "staging_only": bool(value.get("staging_only", False)),
+    }
+
+
+def _run_admin_config_apply(arguments: argparse.Namespace) -> int:
+    site_file = _managed_site_file(arguments, command="config apply")
+    assert site_file is not None
+    site = load_site(site_file)
+    release_identity = _current_release_metadata(site.repository_root)
+    prepared = prepare_admin_config_apply(
+        arguments.state_dir,
+        expected_plan_sha256=arguments.plan_sha256,
+        reference=arguments.reference,
+        current_release_identity=release_identity,
+    )
+    release_id = str(release_identity["release_id"])
+    staging_only = bool(release_identity["staging_only"])
+    if prepared.no_op:
+        result = complete_admin_config_apply(
+            arguments.state_dir,
+            expected_plan_sha256=arguments.plan_sha256,
+            release_id=release_id,
+            success=True,
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "NOOP",
+                    "plan_sha256": arguments.plan_sha256,
+                    "reference": arguments.reference,
+                    "audit": str(result),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    try:
+        returncode = _run_automatic_release(
+            repository_root=site.repository_root,
+            site_file=site_file,
+            state_dir=arguments.state_dir,
+            staging_only_release=staging_only,
+        )
+    except Exception as exc:
+        complete_admin_config_apply(
+            arguments.state_dir,
+            expected_plan_sha256=arguments.plan_sha256,
+            release_id=release_id,
+            success=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    if returncode:
+        complete_admin_config_apply(
+            arguments.state_dir,
+            expected_plan_sha256=arguments.plan_sha256,
+            release_id=release_id,
+            success=False,
+            error=f"release-deploy exited with status {returncode}",
+        )
+        return returncode
+    result = complete_admin_config_apply(
+        arguments.state_dir,
+        expected_plan_sha256=arguments.plan_sha256,
+        release_id=release_id,
+        success=True,
+    )
+    print(
+        json.dumps(
+            {
+                "status": "APPLIED",
+                "release_id": release_id,
+                "config_sha256": prepared.config.sha256(),
+                "affected_roles": prepared.plan["affected_roles"],
+                "plan_sha256": arguments.plan_sha256,
+                "reference": arguments.reference,
+                "audit": str(result),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def run(arguments: argparse.Namespace) -> int:
+    if arguments.command == "capacity":
+        if arguments.capacity_command == "plan":
+            return _run_admin_config_plan(arguments, capacity=True)
+        return _run_admin_config_apply(arguments)
+    if arguments.command == "config":
+        if arguments.config_command == "plan":
+            return _run_admin_config_plan(arguments, capacity=False)
+        return _run_admin_config_apply(arguments)
     if arguments.command == "approve-profile":
         return _run_profile_approval(arguments)
     if arguments.command == "join-cluster":
@@ -602,6 +929,14 @@ def run(arguments: argparse.Namespace) -> int:
             raise SiteConfigError("deploy requires --state-dir")
         if not arguments.alert_email:
             raise SiteConfigError("deploy requires --admin-email")
+        existing_site = (
+            arguments.state_dir.expanduser().resolve() / "site.yaml"
+        ).is_file()
+        initialize_desired_admin_config(
+            arguments.state_dir,
+            config_file=getattr(arguments, "admin_config_file", None),
+            permit_change=not existing_site,
+        )
         if not getattr(arguments, "prepared_source_release", False):
             return run_source_deploy(
                 cpu_cluster_arn=arguments.cpu_cluster_arn,
@@ -723,6 +1058,7 @@ def main() -> int:
         enforce_deploy_host_state_dir(arguments)
         return run(arguments)
     except (
+        AdminConfigError,
         BootstrapError,
         OSError,
         SiteConfigError,

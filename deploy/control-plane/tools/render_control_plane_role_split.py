@@ -29,6 +29,12 @@ from pathlib import Path
 
 import yaml
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from gpu_fault.admin_config import AdminConfig, default_admin_config  # noqa: E402
+
 
 CONTROL_PLANE_RUNTIME_PATH = (
     "/opt/gpu-fault/control-plane/bin:/opt/app-root/bin:"
@@ -53,6 +59,7 @@ PROCESSOR_POOL_ENV = (
 )
 
 SENSITIVE_ENV = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
+DEFAULT_ADMIN_CONFIG = default_admin_config()
 
 
 def config_domain(name: str) -> str:
@@ -182,9 +189,17 @@ def configure_processor_retry(container: dict) -> None:
     set_env(container, "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS", "30")
 
 
-def configure_worker_queue_coordination(worker: dict) -> None:
+def configure_worker_queue_coordination(
+    worker: dict,
+    *,
+    notification_shards: int,
+) -> None:
     set_env(worker, "GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS", "5")
-    set_env(worker, "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS", "24")
+    set_env(
+        worker,
+        "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS",
+        str(notification_shards),
+    )
     set_env(worker, "GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY", "1")
     set_env(worker, "GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS", "30")
     set_env(worker, "GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS", "1")
@@ -313,35 +328,122 @@ def boolean_environment(name: str, default: str) -> str:
     return value
 
 
-def configure_ingress_spool(container: dict) -> None:
-    set_env(
-        container,
-        "GPU_FAULT_TELEMETRY_SPOOL",
-        boolean_environment("GPU_FAULT_TELEMETRY_SPOOL", "false"),
+def renderer_admin_config() -> AdminConfig:
+    defaults = DEFAULT_ADMIN_CONFIG.capacity
+    remediation = defaults.remediation
+    spool = defaults.telemetry_spool
+    return AdminConfig.from_mapping(
+        {
+            "schema_version": 1,
+            "capacity": {
+                "control_worker_replicas": int(
+                    os.getenv(
+                        "GPU_FAULT_CONTROL_WORKER_REPLICAS",
+                        str(defaults.control_worker_replicas),
+                    )
+                ),
+                "telemetry_spool": {
+                    "enabled": (
+                        boolean_environment(
+                            "GPU_FAULT_TELEMETRY_SPOOL",
+                            str(spool.enabled).lower(),
+                        )
+                        == "true"
+                    ),
+                    "replicas": int(
+                        os.getenv(
+                            "GPU_FAULT_TELEMETRY_SPOOL_REPLICAS",
+                            str(spool.replicas),
+                        )
+                    ),
+                },
+                "remediation": {
+                    "max_active_region": int(
+                        os.getenv(
+                            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
+                            str(remediation.max_active_region),
+                        )
+                    ),
+                    "max_active_per_cluster": int(
+                        os.getenv(
+                            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
+                            str(remediation.max_active_per_cluster),
+                        )
+                    ),
+                    "max_active_per_node": int(
+                        os.getenv(
+                            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
+                            str(remediation.max_active_per_node),
+                        )
+                    ),
+                    "max_active_per_failure_domain": int(
+                        os.getenv(
+                            ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"),
+                            str(remediation.max_active_per_failure_domain),
+                        )
+                    ),
+                    "max_active_per_resource_class": int(
+                        os.getenv(
+                            ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"),
+                            str(remediation.max_active_per_resource_class),
+                        )
+                    ),
+                },
+            },
+        }
     )
 
 
-def configure_worker_capacity(container: dict) -> None:
+def configure_ingress_spool(container: dict, config: AdminConfig) -> None:
+    set_env(
+        container,
+        "GPU_FAULT_TELEMETRY_SPOOL",
+        str(config.capacity.telemetry_spool.enabled).lower(),
+    )
+
+
+def configure_ingress_capacity(container: dict, config: AdminConfig) -> None:
+    configure_ingress_spool(container, config)
+    if config.capacity.telemetry_spool.enabled:
+        set_env(container, "GPU_FAULT_POSTGRES_POOL_MIN_SIZE", "16")
+        set_env(container, "GPU_FAULT_POSTGRES_POOL_MAX_SIZE", "48")
+        set_env(container, "GPU_FAULT_STORE_IO_WORKERS", "24")
+    set_env(
+        container,
+        "GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET",
+        str(config.capacity.postgres_fleet_connection_budget()),
+    )
+
+
+def configure_worker_capacity(container: dict, config: AdminConfig) -> None:
     set_env(container, "GPU_FAULT_PROCESSOR_WORKERS", "24")
-    defaults = {
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "20",
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": "5",
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1",
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": "1",
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": "2",
+    remediation = config.capacity.remediation
+    values = {
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": (remediation.max_active_region),
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": (
+            remediation.max_active_per_cluster
+        ),
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": (remediation.max_active_per_node),
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": (
+            remediation.max_active_per_failure_domain
+        ),
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": (
+            remediation.max_active_per_resource_class
+        ),
     }
-    for name, default in defaults.items():
-        value = os.getenv(name, default).strip()
-        if int(value) < 1:
-            raise ValueError(f"{name} must be positive")
-        set_env(container, name, value)
+    for name, value in values.items():
+        set_env(container, name, str(value))
 
 
-def main() -> None:
+def parse_options() -> tuple[argparse.Namespace, AdminConfig]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir")
     parser.add_argument("--json", action="store_true")
-    options = parser.parse_args()
+    return parser.parse_args(), renderer_admin_config()
+
+
+def main() -> None:
+    options, admin_config = parse_options()
 
     source = read_source(options.json)
     deployment = copy.deepcopy(source)
@@ -473,7 +575,7 @@ def main() -> None:
         "GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS",
         "30",
     )
-    configure_ingress_spool(ingress)
+    configure_ingress_capacity(ingress, admin_config)
     set_env(
         ingress,
         "GPU_FAULT_TELEMETRY_SPOOL_MAX_DEPTH",
@@ -552,8 +654,8 @@ def main() -> None:
     )
 
     worker_deployment = consumer_copy(source, "control")
-    worker_deployment["spec"]["replicas"] = int(
-        os.getenv("GPU_FAULT_CONTROL_WORKER_REPLICAS", "6")
+    worker_deployment["spec"]["replicas"] = (
+        admin_config.capacity.control_worker_replicas
     )
     worker_deployment["spec"]["selector"]["matchLabels"] = {
         "app": "gpu-fault-control-worker"
@@ -630,7 +732,7 @@ def main() -> None:
     # than inherited from the base manifest: this is the only tier the
     # pools exist on, so the value has to be visible next to the four
     # pools it sizes the defaults for.
-    configure_worker_capacity(worker)
+    configure_worker_capacity(worker, admin_config)
     set_env(worker, "GPU_FAULT_PROCESSOR_FAULT_WORKERS", "4")
     set_env(
         worker,
@@ -642,7 +744,10 @@ def main() -> None:
         "GPU_FAULT_PROCESSOR_FAULT_BUSY_BACKOFF_MAX_SECONDS",
         "0.1",
     )
-    configure_worker_queue_coordination(worker)
+    configure_worker_queue_coordination(
+        worker,
+        notification_shards=(admin_config.capacity.control_worker_replicas * 4),
+    )
     set_env(
         worker,
         "GPU_FAULT_PROCESSOR_THREAD_DUMP_SIGNAL",
@@ -726,8 +831,8 @@ def main() -> None:
         max_unavailable=1,
     )
     spool_deployment = consumer_copy(source, "spool")
-    spool_deployment["spec"]["replicas"] = int(
-        os.getenv("GPU_FAULT_TELEMETRY_SPOOL_REPLICAS", "0")
+    spool_deployment["spec"]["replicas"] = (
+        admin_config.capacity.telemetry_spool.replicas
     )
     spool_deployment["spec"]["selector"]["matchLabels"] = {
         "app": "gpu-fault-telemetry-spool-worker"

@@ -56,6 +56,27 @@ class ReleaseExecutionPlan:
 
 
 PLAN_ORDER = tuple(ReleaseComponent)
+ADMIN_CONFIG_CHANGE_FIELDS = frozenset(
+    {
+        "admin_config_ingress",
+        "admin_config_worker",
+        "admin_config_spool",
+    }
+)
+ADMIN_CONFIG_ROLE_FIELDS = {
+    "admin_config_ingress": "ingress",
+    "admin_config_worker": "worker",
+    "admin_config_spool": "spool",
+}
+
+
+def control_plane_role_targets(diff: ReleaseDiff) -> tuple[str, ...]:
+    scoped = diff.changed - {"release_delivery", "rendered_manifests"}
+    if scoped and scoped.issubset(ADMIN_CONFIG_CHANGE_FIELDS):
+        return tuple(
+            role for field, role in ADMIN_CONFIG_ROLE_FIELDS.items() if field in scoped
+        )
+    return ("spool", "worker", "ingress")
 
 
 def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
@@ -156,11 +177,18 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "runtime_image",
             "notifications",
             "clusters",
+            *ADMIN_CONFIG_CHANGE_FIELDS,
         }
     )
     cpu_stage = pin_changed or profile or bool(changed & {"clusters"})
     cpu_finalize = cpu_changed or cpu_stage
-    registry = cpu_finalize or bool(changed & {"clusters"})
+    scoped = changed - {"release_delivery", "rendered_manifests"}
+    admin_config_only = bool(scoped) and scoped.issubset(ADMIN_CONFIG_CHANGE_FIELDS)
+    registry = (
+        cpu_stage
+        or bool(changed & {"clusters"})
+        or (cpu_finalize and not admin_config_only)
+    )
 
     for enabled, component in (
         (schema, ReleaseComponent.SCHEMA),
@@ -220,6 +248,7 @@ def diff_from_changed(changed: Iterable[str]) -> ReleaseDiff:
             "cpu_manifests",
             "observability_manifests",
             "adot_image",
+            *ADMIN_CONFIG_CHANGE_FIELDS,
         }
     ):
         kind = ReleaseChangeKind.CONTROL_PLANE_ONLY
@@ -257,6 +286,9 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "dcgm": release.dcgm_digest,
         "notifications": release.notification_digest,
         "clusters": release.cluster_registry_digest,
+        "admin_config_ingress": release.admin_config_role_digests["ingress"],
+        "admin_config_worker": release.admin_config_role_digests["worker"],
+        "admin_config_spool": release.admin_config_role_digests["spool"],
         "release_delivery": release.config.release_delivery_sha256,
         "cpu_manifests": release.config.delivery_component_digests.get("cpu"),
         "executor_manifests": release.config.delivery_component_digests.get("executor"),
@@ -293,6 +325,15 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "dcgm": state.get("dcgm_digest"),
         "notifications": state.get("notification_digest"),
         "clusters": state.get("cluster_registry_digest"),
+        "admin_config_ingress": (
+            (state.get("admin_config_role_sha256") or {}).get("ingress")
+        ),
+        "admin_config_worker": (
+            (state.get("admin_config_role_sha256") or {}).get("worker")
+        ),
+        "admin_config_spool": (
+            (state.get("admin_config_role_sha256") or {}).get("spool")
+        ),
         "release_delivery": state.get("release_delivery_sha256"),
         "cpu_manifests": state.get("cpu_manifest_sha256"),
         "executor_manifests": state.get("executor_manifest_sha256"),

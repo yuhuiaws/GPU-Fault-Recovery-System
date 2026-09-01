@@ -130,6 +130,7 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert ingress_env["GPU_FAULT_POSTGRES_POOL_MAX_SIZE"] == "40"
     assert ingress_env["GPU_FAULT_POSTGRES_POOL_MIN_SIZE"] == "2"
     assert ingress_env["GPU_FAULT_STORE_IO_WORKERS"] == "28"
+    assert ingress_env["GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET"] == "1200"
     assert ingress_env["GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_WORKERS"] == "8"
     assert ingress_env["GPU_FAULT_TELEMETRY_SPOOL_ADMISSION_PARTITIONS"] == "8"
     assert ingress_env["GPU_FAULT_TELEMETRY_SPOOL_BATCH_GROUPS"] == "8"
@@ -283,12 +284,43 @@ def test_role_split_accepts_formal_capacity_overrides() -> None:
     worker_env = _effective_env(items, items["gpu-fault-control-worker"])
 
     assert ingress_env["GPU_FAULT_TELEMETRY_SPOOL"] == "true"
+    assert ingress_env["GPU_FAULT_POSTGRES_POOL_MIN_SIZE"] == "16"
+    assert ingress_env["GPU_FAULT_POSTGRES_POOL_MAX_SIZE"] == "48"
+    assert ingress_env["GPU_FAULT_STORE_IO_WORKERS"] == "24"
+    assert ingress_env["GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET"] == "1240"
     assert items["gpu-fault-telemetry-spool-worker"]["spec"]["replicas"] == 3
     assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] == "128"
     assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER"] == "4"
     assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"] == "4"
     assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE"] == "1"
     assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"] == "1"
+
+
+def test_worker_replica_override_updates_notification_shards() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy/control-plane/tools/render_control_plane_role_split.py"),
+            "--json",
+        ],
+        input=json.dumps(_deployment()),
+        text=True,
+        capture_output=True,
+        check=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            "GPU_FAULT_CONTROL_WORKER_REPLICAS": "7",
+        },
+    )
+    items = {
+        item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
+    }
+    worker = items["gpu-fault-control-worker"]
+    worker_env = _effective_env(items, worker)
+
+    assert worker["spec"]["replicas"] == 7
+    assert worker_env["GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS"] == "28"
 
 
 POOL_ENV = (

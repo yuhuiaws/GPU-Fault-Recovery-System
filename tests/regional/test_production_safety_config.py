@@ -291,6 +291,23 @@ def test_role_split_deploy_waits_for_spool_before_ingress() -> None:
     assert spool_ready < ingress_apply
 
 
+def test_config_only_rollout_is_role_scoped_and_spool_disable_drains() -> None:
+    script = (
+        ROOT / "deploy/control-plane/tools/apply-control-plane-role-split.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS" in script
+    assert "stamp_admin_config_metadata" in script
+    assert "gpu-fault.io/admin-config-sha256" in script
+    assert "gpu-fault.io/role-config-sha256" in script
+    assert "role_selected worker" in script
+    disable = script.index('if [[ "${CURRENT_SPOOL_ADMISSION}" == "true"')
+    ingress = script.index("apply_ingress_role", disable)
+    drain = script.index("wait_for_spool_drain", ingress)
+    spool = script.index("apply_spool_role", drain)
+    assert ingress < drain < spool
+
+
 def test_deployment_scripts_support_site_image_mirrors() -> None:
     role_split = (
         ROOT / "deploy/control-plane/tools/apply-control-plane-role-split.sh"
@@ -407,8 +424,9 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert 'PRESERVE_ROLE_CONFIG_MAPS}" != "true"' in script
     assert 'name="$(basename "${config}" .yaml)"' in script
     assert 'apply_manifest "${name}"' in script
+    ingress_role = script.index("apply_ingress_role()")
     ingress_exists = script.index(
-        "get deployment \\\n    gpu-fault-api-ha >/dev/null 2>&1"
+        "get deployment \\\n        gpu-fault-api-ha >/dev/null 2>&1", ingress_role
     )
     stale_env_cleanup = script.index("GPU_FAULT_PROCESSOR_WORKERS-")
     ingress_apply = script.index("apply_manifest gpu-fault-api-ha-ingress")

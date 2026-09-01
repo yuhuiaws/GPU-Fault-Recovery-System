@@ -60,6 +60,12 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 ```
 
+首次建站需要覆盖容量默认值时，可以额外传入严格、权限`0600`的
+`--config <AdminConfig.yaml>`；不传仍是原四参数默认路径。已有站点的容量变化使用
+`gpu-fault-admin capacity plan/apply`，详见
+[管理员容量配置](docs/管理员容量配置.md)，不得通过shell环境变量或`kubectl set env`
+替代。
+
 开发者修改代码后也使用同一四参数命令；dirty/clean等级、影响测试、构建、验签和部署
 由内部流程选择：
 

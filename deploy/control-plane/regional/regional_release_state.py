@@ -10,6 +10,12 @@ from typing import Any
 
 import regional_deployment_inventory as inventory
 import yaml
+
+from gpu_fault.admin_config import (
+    AdminConfig,
+    AdminConfigError,
+    default_admin_config,
+)
 from regional_release_config import ClusterTarget, ReleaseError
 from regional_release_legacy import AGENT_IDENTITY_FIELDS
 from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
@@ -210,6 +216,102 @@ def cpu_role_config_maps(release: Any) -> dict[str, dict[str, str]]:
             )
         snapshots[name] = data
     return snapshots
+
+
+def captured_admin_config(
+    release: Any,
+    snapshots: dict[str, dict[str, str]],
+) -> AdminConfig:
+    try:
+        defaults = default_admin_config().capacity
+        worker = release._get_json(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+                "gpu-fault-control-worker",
+            )
+        )
+        spool = release._get_json(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+                "gpu-fault-telemetry-spool-worker",
+            )
+        )
+        ingress_telemetry = snapshots.get(
+            "gpu-fault-api-ha-config-telemetry",
+            {},
+        )
+        worker_core = snapshots.get("gpu-fault-control-worker-config-core", {})
+        spool_enabled = ingress_telemetry.get(
+            "GPU_FAULT_TELEMETRY_SPOOL",
+            str(defaults.telemetry_spool.enabled).lower(),
+        )
+        if spool_enabled not in {"true", "false"}:
+            raise AdminConfigError("live ingress telemetry spool value is invalid")
+        worker_replicas = (worker.get("spec") or {}).get("replicas")
+        spool_replicas = (spool.get("spec") or {}).get("replicas")
+        remediation = defaults.remediation
+        return AdminConfig.from_mapping(
+            {
+                "schema_version": 1,
+                "capacity": {
+                    "control_worker_replicas": int(
+                        defaults.control_worker_replicas
+                        if worker_replicas is None
+                        else worker_replicas
+                    ),
+                    "telemetry_spool": {
+                        "enabled": spool_enabled == "true",
+                        "replicas": int(
+                            defaults.telemetry_spool.replicas
+                            if spool_replicas is None
+                            else spool_replicas
+                        ),
+                    },
+                    "remediation": {
+                        "max_active_region": int(
+                            worker_core.get(
+                                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
+                                remediation.max_active_region,
+                            )
+                        ),
+                        "max_active_per_cluster": int(
+                            worker_core.get(
+                                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
+                                remediation.max_active_per_cluster,
+                            )
+                        ),
+                        "max_active_per_node": int(
+                            worker_core.get(
+                                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
+                                remediation.max_active_per_node,
+                            )
+                        ),
+                        "max_active_per_failure_domain": int(
+                            worker_core.get(
+                                ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"),
+                                remediation.max_active_per_failure_domain,
+                            )
+                        ),
+                        "max_active_per_resource_class": int(
+                            worker_core.get(
+                                ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"),
+                                remediation.max_active_per_resource_class,
+                            )
+                        ),
+                    },
+                },
+            }
+        )
+    except (AdminConfigError, KeyError, TypeError, ValueError) as exc:
+        raise ReleaseError(
+            "cannot capture a valid live administrator capacity config"
+        ) from exc
 
 
 def capture_agent_identities(release: Any) -> dict[str, dict[str, Any]]:
@@ -455,6 +557,8 @@ def capture_previous(release: Any) -> dict[str, Any]:
             raise ReleaseError(
                 f"{target.cluster_id} active Agent set does not match HyperPod nodes"
             )
+    role_config_maps = cpu_role_config_maps(release)
+    admin_config = captured_admin_config(release, role_config_maps)
     return {
         "metadata": metadata,
         "agent_identities": agent_identities,
@@ -465,7 +569,8 @@ def capture_previous(release: Any) -> dict[str, Any]:
             release._cpu(),
             inventory.CPU_INGRESS_DEPLOYMENT,
         ),
-        "cpu_role_config_maps": cpu_role_config_maps(release),
+        "cpu_role_config_maps": role_config_maps,
+        "admin_config": admin_config.as_dict(),
         "release_delivery_sha256": live_state.get("release_delivery_sha256"),
         "rendered_manifest_sha256": live_state.get("rendered_manifest_sha256"),
         "node_template_sha256": live_state.get("node_template_sha256"),
@@ -562,6 +667,9 @@ def save_state(release: Any, phase: str, **updates: Any) -> None:
             "notification_digest": release.notification_digest,
             "cluster_ids": sorted(item.cluster_id for item in release.config.clusters),
             "cluster_registry_digest": release.cluster_registry_digest,
+            "admin_config_sha256": release.admin_config_digest,
+            "admin_config_role_sha256": release.admin_config_role_digests,
+            "admin_config": release.config.admin_config.as_dict(),
             "release_manifest_schema_version": (
                 release.config.release_manifest_schema_version
             ),

@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from gpu_fault.admin_config import AdminConfig
+
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_NAMESPACE = "gpu-fault-system"
 DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
@@ -656,12 +658,19 @@ class ReleaseConfig:
     dns: RegionalDnsConfig
     health: RegionalHealthConfig
     notifications: RegionalNotificationConfig
+    admin_config: AdminConfig
     auto_rollback: bool = True
 
-    def for_rollback(self, agent_config_digest: str) -> ReleaseConfig:
+    def for_rollback(
+        self,
+        agent_config_digest: str,
+        *,
+        admin_config: AdminConfig | None = None,
+    ) -> ReleaseConfig:
         return replace(
             self,
             agent_config_digest=agent_config_digest,
+            admin_config=admin_config or self.admin_config,
             auto_rollback=False,
         )
 
@@ -728,6 +737,17 @@ class ReleaseConfig:
         notifications = RegionalNotificationConfig.from_mapping(
             dict(value.get("notifications") or {})
         )
+        raw_admin_config = dict(value.get("admin_config") or {})
+        admin_config = AdminConfig.from_mapping(raw_admin_config.get("config") or {})
+        if raw_admin_config:
+            if raw_admin_config.get("config_sha256") != admin_config.sha256():
+                raise ReleaseError(
+                    "admin_config.config_sha256 does not match its content"
+                )
+            if raw_admin_config.get("role_sha256") != admin_config.role_sha256():
+                raise ReleaseError(
+                    "admin_config.role_sha256 does not match its content"
+                )
         dns = RegionalDnsConfig.from_mapping(dict(value.get("dns") or {}))
         if len(digest) != 64 or any(
             character not in "0123456789abcdef" for character in digest
@@ -796,6 +816,7 @@ class ReleaseConfig:
             dns=dns,
             health=health,
             notifications=notifications,
+            admin_config=admin_config,
             auto_rollback=bool(value.get("auto_rollback", True)),
         )
 

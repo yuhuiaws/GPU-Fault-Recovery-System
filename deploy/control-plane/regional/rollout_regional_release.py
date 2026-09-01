@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ from regional_release_diff import (
     ReleaseChangeKind,
     ReleaseDiff,
     classify_release,
+    control_plane_role_targets,
 )
 from regional_release_fleet_rollout import (
     agent_heartbeats_converged,
@@ -132,6 +134,7 @@ from regional_release_validation import (
     critical_amp_alerts,
     ensure_profile_transition_safe,
     stability_snapshot,
+    store_io_rejection_series_ready,
     validate_release_quick,
     validate_rollback,
     validate_stability_window,
@@ -194,6 +197,7 @@ class Runner:
 
 def sync_release_state(release: Any) -> None:
     previous = release._capture_previous()
+    release.state = {}
     release._save_state(
         "complete",
         previous=None,
@@ -203,6 +207,38 @@ def sync_release_state(release: Any) -> None:
         ).as_dict(),
         adopted_live_runtime_image=previous["live_runtime_image"],
     )
+
+
+def render_and_apply_cpu_roles(
+    release: Any,
+    environment: dict[str, str],
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="gpu-fault-role-split-") as directory:
+        generated = Path(directory)
+        release.runner.run(
+            [
+                "bash",
+                str(
+                    ROOT
+                    / "deploy/control-plane/tools/render-control-plane-role-split.sh"
+                ),
+            ],
+            env={
+                **environment,
+                "GPU_FAULT_ROLE_SPLIT_OUT_DIR": str(generated),
+            },
+        )
+        environment["GPU_FAULT_ROLE_SPLIT_GENERATED_DIR"] = str(generated)
+        release.runner.run(
+            [
+                "bash",
+                str(
+                    ROOT
+                    / "deploy/control-plane/tools/apply-control-plane-role-split.sh"
+                ),
+            ],
+            env=environment,
+        )
 
 
 def bootstrap_resume_context(
@@ -288,6 +324,8 @@ class RegionalRelease:
         )
         self.notification_digest = notification_digest(config.notifications)
         self.cluster_registry_digest = registry_config_digest(config.clusters)
+        self.admin_config_digest = config.admin_config.sha256()
+        self.admin_config_role_digests = config.admin_config.role_sha256()
         self.wheel_cm = "gpu-fault-control-plane-wheel-0100-" + self.wheel_sha[:12]
         self.executor_wheel_cm = (
             "gpu-fault-executor-wheel-0100-" + self.executor_wheel_sha[:12]
@@ -619,21 +657,18 @@ class RegionalRelease:
         *,
         finalize: bool,
         force_restart: bool = False,
+        diff: ReleaseDiff | None = None,
     ) -> None:
         ensure_notification_secret(self)
         environment = build_cpu_apply_environment(self, finalize=finalize)
+        environment["GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS"] = ",".join(
+            control_plane_role_targets(diff)
+            if diff is not None
+            else ("spool", "worker", "ingress")
+        )
         if force_restart:
             environment["GPU_FAULT_FORCE_ROLE_RESTART"] = "true"
-        self.runner.run(
-            [
-                "bash",
-                str(
-                    ROOT
-                    / "deploy/control-plane/tools/apply-control-plane-role-split.sh"
-                ),
-            ],
-            env=environment,
-        )
+        render_and_apply_cpu_roles(self, environment)
         cronjob = subprocess.run(
             self._cpu(
                 "-n",
@@ -771,6 +806,7 @@ class RegionalRelease:
 
     _validate_release_quick = validate_release_quick
     _critical_amp_alerts = critical_amp_alerts
+    _store_io_rejection_series_ready = store_io_rejection_series_ready
     _stability_snapshot = stability_snapshot
     validate_stability_window = validate_stability_window
     _validate_rollback = validate_rollback
