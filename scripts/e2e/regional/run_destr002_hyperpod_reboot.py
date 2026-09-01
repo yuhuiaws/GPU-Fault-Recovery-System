@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -405,6 +406,22 @@ def wait_for_submission(
     )
 
 
+def redact_lease_tokens(value: Any) -> Any:
+    if isinstance(value, dict):
+        result = {}
+        for key, child in value.items():
+            if key == "lease_token" and child not in (None, ""):
+                raw = str(child).encode()
+                result["lease_token_sha256"] = hashlib.sha256(raw).hexdigest()
+                result["lease_token_length"] = len(raw)
+            else:
+                result[key] = redact_lease_tokens(child)
+        return result
+    if isinstance(value, list):
+        return [redact_lease_tokens(child) for child in value]
+    return value
+
+
 def restart_executor(
     regional: RegionalLiveFixture,
     command: dict[str, Any],
@@ -653,7 +670,10 @@ def execute_case(
             case_dir=case_dir,
             timeout_seconds=600,
         )
-        write_json_atomic(case_dir / "submitted-state.json", submitted)
+        write_json_atomic(
+            case_dir / "submitted-state.json",
+            redact_lease_tokens(submitted),
+        )
         if (submitted.get("submission") or {}).get("state") != "SUBMITTED":
             raise RegionalFixtureError("reboot submission did not reach SUBMITTED")
         reboot_commands = [

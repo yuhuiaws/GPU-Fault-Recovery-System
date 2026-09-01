@@ -625,6 +625,21 @@ def test_destr002_duplicate_replay_requires_exact_submitted_record() -> None:
     assert "hyperpod_submission_idempotency_key" in live_fixture_module.STORE_PROBE
 
 
+def test_destr002_redacts_lease_tokens_from_evidence() -> None:
+    source = {
+        "commands": [
+            {"command_id": "command-a", "lease_token": "sensitive-lease-token-value"}
+        ]
+    }
+
+    redacted = destr002.redact_lease_tokens(source)
+
+    assert "lease_token" not in redacted["commands"][0], redacted
+    assert redacted["commands"][0]["lease_token_length"] == 27, redacted
+    assert len(redacted["commands"][0]["lease_token_sha256"]) == 64, redacted
+    assert source["commands"][0]["lease_token"] == "sensitive-lease-token-value", source
+
+
 def _destr003_settings(tmp_path: Path) -> destr003.Settings:
     return destr003.Settings(
         regional=_regional(tmp_path).settings,
