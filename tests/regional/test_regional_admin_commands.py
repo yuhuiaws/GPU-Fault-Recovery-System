@@ -138,7 +138,13 @@ def test_retry_diff_restores_physical_artifact_changes(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("phase", "expected_resume"), (("failed", True), ("rolled-back", False))
+    ("phase", "expected_resume"),
+    (
+        ("failed", True),
+        ("registry-staged", True),
+        ("data-plane-progress", True),
+        ("rolled-back", False),
+    ),
 )
 def test_deploy_only_resumes_an_unrolled_back_release(
     monkeypatch, phase: str, expected_resume: bool
@@ -166,8 +172,39 @@ def test_deploy_only_resumes_an_unrolled_back_release(
     assert calls == [{"resume": expected_resume, "diff": expected_diff}]
 
 
+def test_explicit_resume_reuses_the_checkpoint_retry_diff(monkeypatch) -> None:
+    module = _admin_module()
+    expected_diff = module.diff_from_changed({"control_plane_wheel"})
+    calls: list[dict[str, object]] = []
+    state = {"phase": "registry-staged", "release_id": "candidate-release"}
+    release = SimpleNamespace(
+        _load_state=lambda: state, upgrade=lambda **kwargs: calls.append(kwargs)
+    )
+    monkeypatch.setattr(
+        module, "retry_release_diff", lambda _release, value: expected_diff
+    )
+
+    module.run_resume(release)
+
+    assert calls == [{"resume": True, "diff": expected_diff}]
+
+
+def test_explicit_resume_rejects_a_terminal_release() -> None:
+    module = _admin_module()
+    release = SimpleNamespace(_load_state=lambda: {"phase": "complete"})
+
+    with pytest.raises(module.ReleaseError, match="incomplete upgrade transaction"):
+        module.run_resume(release)
+
+
 @pytest.mark.parametrize(
-    ("phase", "expected_resume"), (("failed", True), ("rolled-back", False))
+    ("phase", "expected_resume"),
+    (
+        ("failed", True),
+        ("registry-staged", True),
+        ("data-plane-progress", True),
+        ("rolled-back", False),
+    ),
 )
 def test_release_summary_reports_retry_transaction_mode(
     monkeypatch, phase: str, expected_resume: bool

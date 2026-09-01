@@ -25,6 +25,7 @@ from regional_admin_commands import (
     build_release_summary,
     ensure_schema,
     run_deploy,
+    run_resume,
 )
 from regional_dns import apply_control_plane_nlb
 from regional_gpu_bootstrap import (
@@ -1151,7 +1152,7 @@ def main() -> int:
         elif arguments.mode == "upgrade":
             release.upgrade()
         elif arguments.mode == "resume":
-            release.upgrade(resume=True)
+            run_resume(release)
         elif arguments.mode == "rollback":
             release.rollback()
         elif arguments.mode == "commit":

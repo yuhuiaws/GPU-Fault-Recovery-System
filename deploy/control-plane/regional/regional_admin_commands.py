@@ -19,7 +19,23 @@ from regional_release_reporting import build_release_status
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 ROOT = Path(__file__).resolve().parents[3]
-RESUMABLE_PHASES = frozenset({"failed"})
+RESUMABLE_PHASES = frozenset(
+    {
+        "preflight",
+        "uploaded",
+        "schema-ready",
+        "registry-staged",
+        "cpu-staged",
+        "profile-ready",
+        "endpoint-ready",
+        "observability-ready",
+        "data-plane-progress",
+        "data-converged",
+        "cpu-finalized",
+        "verified",
+        "failed",
+    }
+)
 RETRY_PHASES = frozenset({*RESUMABLE_PHASES, "rolled-back"})
 BOOTSTRAP_PHASES = frozenset(
     {
@@ -190,6 +206,20 @@ def run_deploy(release: Any) -> None:
         release.noop(diff)
         return
     release.upgrade(diff=diff)
+
+
+def run_resume(release: Any) -> None:
+    state = release._load_state()
+    phase = str(state.get("phase") or "")
+    if phase not in RESUMABLE_PHASES:
+        raise ReleaseError(
+            "resume requires an incomplete upgrade transaction; "
+            f"current phase is {phase or 'unknown'}"
+        )
+    release.upgrade(
+        resume=True,
+        diff=retry_release_diff(release, state),
+    )
 
 
 def build_release_summary(release: Any) -> dict[str, Any]:
