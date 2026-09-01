@@ -423,24 +423,17 @@ def healthy_control_api_report() -> dict:
     }
 
 
-def test_control_api_health_accepts_a_converged_fleet(monkeypatch) -> None:
+@pytest.mark.parametrize(("baseline", "current"), ((0, 0), (2, 2)))
+def test_control_api_health_accepts_a_converged_fleet(
+    monkeypatch, baseline: int, current: int
+) -> None:
     module = CHECKS._load()
     report = healthy_control_api_report()
-    monkeypatch.setattr(module, "_control_api_report", lambda _release: report)
-
-    value = module._check_control_api(control_api_release())
-
-    assert value.summary == "control-plane API, fleet and collectors are healthy"
-
-
-def test_control_api_health_accepts_historical_internal_errors(monkeypatch) -> None:
-    module = CHECKS._load()
-    report = healthy_control_api_report()
-    report["remote_commands"]["executor_internal_error_total"] = 2
+    report["remote_commands"]["executor_internal_error_total"] = current
     monkeypatch.setattr(module, "_control_api_report", lambda _release: report)
 
     value = module._check_control_api(
-        control_api_release(executor_internal_error_baseline=2)
+        control_api_release(executor_internal_error_baseline=baseline)
     )
 
     assert value.summary == "control-plane API, fleet and collectors are healthy"
