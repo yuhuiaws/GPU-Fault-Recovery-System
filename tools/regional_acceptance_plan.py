@@ -1218,6 +1218,36 @@ def _validate_dependencies(
         visit(case.id)
 
 
+def _load_plan_overrides(
+    override_path: Path | None,
+    *,
+    catalog: Mapping[str, _CatalogCase],
+    retired_ids: set[str],
+    order_digest: str,
+    catalog_digest: str,
+) -> tuple[Mapping[str, _CaseOverride], ReviewMetadata | None]:
+    if override_path is None:
+        return {}, None
+    reviewed = load_reviewed_override(
+        override_path,
+        known_cases={
+            case_id: catalog_case.automation
+            for case_id, catalog_case in catalog.items()
+        },
+        do_not_run_case_ids=retired_ids,
+        order_sha256=order_digest,
+        catalog_sha256=catalog_digest,
+    )
+    return reviewed.cases, reviewed.metadata
+
+
+def _plan_mode(value: PlanMode | str) -> PlanMode:
+    try:
+        return PlanMode(value)
+    except ValueError as exc:
+        raise ValueError(f"unsupported regional acceptance mode: {value}") from exc
+
+
 def compile_regional_acceptance_plan(
     *,
     mode: PlanMode | str = PlanMode.FORMAL,
@@ -1227,10 +1257,7 @@ def compile_regional_acceptance_plan(
 ) -> RegionalAcceptancePlan:
     """Compile and validate the complete regional acceptance plan."""
 
-    try:
-        selected_mode = PlanMode(mode)
-    except ValueError as exc:
-        raise ValueError(f"unsupported regional acceptance mode: {mode}") from exc
+    selected_mode = _plan_mode(mode)
 
     order_digest = _file_sha256(order_path)
     catalog_digest = _file_sha256(catalog_path)
@@ -1242,21 +1269,13 @@ def compile_regional_acceptance_plan(
         raise ValueError("fault catalog changed while compiling")
     _validate_coverage(ordered, retired, catalog)
     retired_ids = {item.id for item in retired}
-    overrides: Mapping[str, _CaseOverride] = {}
-    review_metadata: ReviewMetadata | None = None
-    if override_path is not None:
-        reviewed_override = load_reviewed_override(
-            override_path,
-            known_cases={
-                case_id: catalog_case.automation
-                for case_id, catalog_case in catalog.items()
-            },
-            do_not_run_case_ids=retired_ids,
-            order_sha256=order_digest,
-            catalog_sha256=catalog_digest,
-        )
-        overrides = reviewed_override.cases
-        review_metadata = reviewed_override.metadata
+    overrides, review_metadata = _load_plan_overrides(
+        override_path,
+        catalog=catalog,
+        retired_ids=retired_ids,
+        order_digest=order_digest,
+        catalog_digest=catalog_digest,
+    )
 
     index = {item.id: position for position, item in enumerate((*ordered, *retired))}
     cases: list[RegionalAcceptanceCase] = []

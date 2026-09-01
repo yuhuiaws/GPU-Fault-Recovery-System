@@ -18,6 +18,11 @@ import subprocess
 import tempfile
 from typing import Literal, cast
 
+if __package__:
+    from .codex_acceptance_schema import build_analysis_schema
+else:
+    from codex_acceptance_schema import build_analysis_schema
+
 
 AcceptanceStatus = Literal["PASS", "FAIL", "BLOCKED", "NEEDS_HUMAN"]
 TestStepKind = Literal[
@@ -555,101 +560,16 @@ def _string_array_schema() -> dict[str, object]:
 
 
 def _analysis_schema(case_ids: Sequence[str]) -> dict[str, object]:
-    evidence_schema: dict[str, object] = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["source", "observation"],
-        "properties": {
-            "source": {"type": "string", "minLength": 1},
-            "observation": {"type": "string", "minLength": 1},
-        },
-    }
-    test_step_schema: dict[str, object] = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": sorted(_TEST_STEP_FIELDS),
-        "properties": {
-            "step_id": {
-                "type": "string",
-                "pattern": _STEP_ID.pattern,
-            },
-            "kind": {
-                "type": "string",
-                "enum": list(TEST_STEP_KINDS),
-            },
-            "description": {"type": "string", "minLength": 1},
-            "depends_on": {
-                "type": "array",
-                "uniqueItems": True,
-                "items": {
-                    "type": "string",
-                    "pattern": _STEP_ID.pattern,
-                },
-            },
-            "expected": {"type": "string", "minLength": 1},
-            "executor_ref": {"type": "string", "minLength": 1},
-            "status": {
-                "type": "string",
-                "enum": list(TEST_STEP_STATUSES),
-            },
-            "evidence": {
-                "type": "array",
-                "items": evidence_schema,
-            },
-        },
-    }
-    result_schema: dict[str, object] = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": sorted(_ANALYSIS_RESULT_FIELDS),
-        "properties": {
-            "case_id": {
-                "type": "string",
-                "enum": list(case_ids),
-            },
-            "status": {
-                "type": "string",
-                "enum": list(ACCEPTANCE_STATUSES),
-            },
-            "summary": {"type": "string", "minLength": 1},
-            "failure_details": _string_array_schema(),
-            "reproduction": _string_array_schema(),
-            "evidence": {
-                "type": "array",
-                "items": evidence_schema,
-            },
-            "test_process": {
-                "type": "array",
-                "minItems": 1,
-                "items": test_step_schema,
-            },
-            "affected_dependents": {
-                "type": "array",
-                "uniqueItems": True,
-                "items": {
-                    "type": "string",
-                    "enum": list(case_ids),
-                },
-            },
-            "blockers": _string_array_schema(),
-            "human_actions": _string_array_schema(),
-        },
-    }
-    return {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["schema_version", "results"],
-        "properties": {
-            "schema_version": {"type": "integer", "const": SCHEMA_VERSION},
-            "results": {
-                "type": "array",
-                "minItems": len(case_ids),
-                "maxItems": len(case_ids),
-                "items": result_schema,
-            },
-        },
-    }
+    return build_analysis_schema(
+        case_ids,
+        schema_version=SCHEMA_VERSION,
+        acceptance_statuses=ACCEPTANCE_STATUSES,
+        result_fields=_ANALYSIS_RESULT_FIELDS,
+        test_step_fields=_TEST_STEP_FIELDS,
+        step_id_pattern=_STEP_ID.pattern,
+        test_step_kinds=TEST_STEP_KINDS,
+        test_step_statuses=TEST_STEP_STATUSES,
+    )
 
 
 def _review_schema(case_id: str) -> dict[str, object]:

@@ -327,6 +327,124 @@ def _block_failed_dependencies(
     return progressed
 
 
+def _block_pending_for_global_failure(
+    pending: list[dict[str, Any]],
+    *,
+    global_failure: str,
+    policies: Mapping[str, ExecutionPolicy],
+    results: dict[str, dict[str, Any]],
+    queued_at: Mapping[str, str],
+    queued_monotonic: Mapping[str, float],
+    on_finish: Callable[[dict[str, Any], dict[str, Any]], None] | None,
+    monotonic: Callable[[], float],
+    utc_now: Callable[[], str],
+) -> None:
+    for case in list(pending):
+        case_id = str(case["id"])
+        result = _blocked_result(
+            case,
+            reason=f"blocked by global failure in {global_failure}",
+            queued_at=queued_at[case_id],
+            queued_monotonic=queued_monotonic[case_id],
+            policy=policies[case_id],
+            monotonic=monotonic,
+            utc_now=utc_now,
+        )
+        results[case_id] = result
+        pending.remove(case)
+        if on_finish is not None:
+            on_finish(case, result)
+
+
+def _block_unresolved_pending(
+    pending: list[dict[str, Any]],
+    *,
+    policies: Mapping[str, ExecutionPolicy],
+    results: dict[str, dict[str, Any]],
+    queued_at: Mapping[str, str],
+    queued_monotonic: Mapping[str, float],
+    on_finish: Callable[[dict[str, Any], dict[str, Any]], None] | None,
+    monotonic: Callable[[], float],
+    utc_now: Callable[[], str],
+) -> None:
+    unresolved = ", ".join(str(case["id"]) for case in pending)
+    for case in list(pending):
+        case_id = str(case["id"])
+        result = _blocked_result(
+            case,
+            reason=(
+                "dependency cycle or unsatisfied selected prerequisite: " + unresolved
+            ),
+            queued_at=queued_at[case_id],
+            queued_monotonic=queued_monotonic[case_id],
+            policy=policies[case_id],
+            monotonic=monotonic,
+            utc_now=utc_now,
+        )
+        results[case_id] = result
+        pending.remove(case)
+        if on_finish is not None:
+            on_finish(case, result)
+
+
+def _validated_success_predicate(
+    *,
+    max_workers: int,
+    max_batch_size: int,
+    batch_key_for: Callable[[dict[str, Any], ExecutionPolicy], str | None] | None,
+    execute_batch: (
+        Callable[
+            [Sequence[dict[str, Any]], Sequence[ExecutionPolicy]],
+            Mapping[str, dict[str, Any]],
+        ]
+        | None
+    ),
+    is_successful: Callable[[Mapping[str, Any]], bool] | None,
+) -> Callable[[Mapping[str, Any]], bool]:
+    if max_workers < 1:
+        raise ValueError("max_workers must be at least 1")
+    if max_batch_size < 1:
+        raise ValueError("max_batch_size must be at least 1")
+    if (batch_key_for is None) != (execute_batch is None):
+        raise ValueError("batch_key_for and execute_batch must be configured together")
+    if is_successful is not None:
+        return is_successful
+    return lambda result: result.get("status") == "PASS"
+
+
+def _collect_completed(
+    active: dict[Future[list[dict[str, Any]]], tuple[_ScheduledCase, ...]],
+    *,
+    active_case_count: int,
+    locks: ResourceLockManager,
+    results: dict[str, dict[str, Any]],
+    collect_all: bool,
+    on_finish: Callable[[dict[str, Any], dict[str, Any]], None] | None,
+) -> tuple[int, str | None]:
+    global_failure = None
+    completed, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
+    for future in completed:
+        scheduled = active.pop(future)
+        active_case_count -= len(scheduled)
+        for item in scheduled:
+            locks.release(item.locks)
+        batch_results = future.result()
+        for item, result in zip(scheduled, batch_results):
+            case = item.case
+            policy = item.policy
+            case_id = str(case["id"])
+            results[case_id] = result
+            if on_finish is not None:
+                on_finish(case, result)
+            if (
+                result.get("status") == "FAIL"
+                and policy.failure_scope == "global"
+                and not collect_all
+            ):
+                global_failure = case_id
+    return active_case_count, global_failure
+
+
 def run_scheduled_cases(
     cases: Sequence[dict[str, Any]],
     *,
@@ -351,16 +469,12 @@ def run_scheduled_cases(
     monotonic: Callable[[], float] = time.monotonic,
     utc_now: Callable[[], str] = _utc_now,
 ) -> list[dict[str, Any]]:
-    if max_workers < 1:
-        raise ValueError("max_workers must be at least 1")
-    if max_batch_size < 1:
-        raise ValueError("max_batch_size must be at least 1")
-    if (batch_key_for is None) != (execute_batch is None):
-        raise ValueError("batch_key_for and execute_batch must be configured together")
-    success_predicate = (
-        is_successful
-        if is_successful is not None
-        else lambda result: result.get("status") == "PASS"
+    success_predicate = _validated_success_predicate(
+        max_workers=max_workers,
+        max_batch_size=max_batch_size,
+        batch_key_for=batch_key_for,
+        execute_batch=execute_batch,
+        is_successful=is_successful,
     )
     case_ids = [str(case["id"]) for case in cases]
     if len(case_ids) != len(set(case_ids)):
@@ -388,22 +502,17 @@ def run_scheduled_cases(
             progressed = False
 
             if global_failure is not None:
-                for case in list(pending):
-                    case_id = str(case["id"])
-                    policy = policies[case_id]
-                    result = _blocked_result(
-                        case,
-                        reason=f"blocked by global failure in {global_failure}",
-                        queued_at=queued_at[case_id],
-                        queued_monotonic=queued_monotonic[case_id],
-                        policy=policy,
-                        monotonic=monotonic,
-                        utc_now=utc_now,
-                    )
-                    results[case_id] = result
-                    pending.remove(case)
-                    if on_finish is not None:
-                        on_finish(case, result)
+                _block_pending_for_global_failure(
+                    pending,
+                    global_failure=global_failure,
+                    policies=policies,
+                    results=results,
+                    queued_at=queued_at,
+                    queued_monotonic=queued_monotonic,
+                    on_finish=on_finish,
+                    monotonic=monotonic,
+                    utc_now=utc_now,
+                )
                 progressed = True
 
             progressed = (
@@ -510,48 +619,28 @@ def run_scheduled_cases(
                 progressed = True
 
             if active:
-                completed, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
-                for future in completed:
-                    scheduled = active.pop(future)
-                    active_case_count -= len(scheduled)
-                    for item in scheduled:
-                        locks.release(item.locks)
-                    batch_results = future.result()
-                    for item, result in zip(scheduled, batch_results):
-                        case = item.case
-                        policy = item.policy
-                        case_id = str(case["id"])
-                        results[case_id] = result
-                        if on_finish is not None:
-                            on_finish(case, result)
-                        if (
-                            result.get("status") == "FAIL"
-                            and policy.failure_scope == "global"
-                            and not collect_all
-                        ):
-                            global_failure = case_id
+                active_case_count, completed_global_failure = _collect_completed(
+                    active,
+                    active_case_count=active_case_count,
+                    locks=locks,
+                    results=results,
+                    collect_all=collect_all,
+                    on_finish=on_finish,
+                )
+                if completed_global_failure is not None:
+                    global_failure = completed_global_failure
                 continue
 
             if pending and not progressed:
-                unresolved = ", ".join(str(case["id"]) for case in pending)
-                for case in list(pending):
-                    case_id = str(case["id"])
-                    policy = policies[case_id]
-                    result = _blocked_result(
-                        case,
-                        reason=(
-                            "dependency cycle or unsatisfied selected prerequisite: "
-                            + unresolved
-                        ),
-                        queued_at=queued_at[case_id],
-                        queued_monotonic=queued_monotonic[case_id],
-                        policy=policy,
-                        monotonic=monotonic,
-                        utc_now=utc_now,
-                    )
-                    results[case_id] = result
-                    pending.remove(case)
-                    if on_finish is not None:
-                        on_finish(case, result)
+                _block_unresolved_pending(
+                    pending,
+                    policies=policies,
+                    results=results,
+                    queued_at=queued_at,
+                    queued_monotonic=queued_monotonic,
+                    on_finish=on_finish,
+                    monotonic=monotonic,
+                    utc_now=utc_now,
+                )
 
     return [results[case_id] for case_id in case_ids]
