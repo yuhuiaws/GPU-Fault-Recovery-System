@@ -181,7 +181,10 @@ def initialize_desired_admin_config(
     with admin_config_lock(state_dir):
         desired_path = admin_config_desired_path(state_dir)
         editable = admin_config_file_path(state_dir)
-        current = load_desired_admin_config(state_dir)
+        current = load_desired_admin_config(
+            state_dir,
+            migrate_legacy=True,
+        )
         source_file = config_file
         if source_file is None and permit_change and editable.is_file():
             source_file = editable

@@ -956,20 +956,49 @@ def _desired_record(
     return record
 
 
-def load_desired_admin_config(state_dir: Path) -> AdminConfig:
+def load_desired_admin_config(
+    state_dir: Path, *, migrate_legacy: bool = False
+) -> AdminConfig:
     path = admin_config_desired_path(state_dir)
     if not path.is_file():
         return default_admin_config()
     record = _read_json(path, "desired admin config")
     if record.get("schema_version") != 1:
         raise AdminConfigError("desired admin config schema is invalid")
-    config = AdminConfig.from_mapping(record.get("config"))
-    if record.get("config_sha256") != config.sha256():
+    raw_config = record.get("config")
+    if not isinstance(raw_config, Mapping):
+        raise AdminConfigError("desired admin config content must be a mapping")
+    config = AdminConfig.from_mapping(raw_config)
+    legacy = set(raw_config) == {"schema_version", "capacity"}
+    expected_config = canonical_sha256(dict(raw_config)) if legacy else config.sha256()
+    if record.get("config_sha256") != expected_config:
         raise AdminConfigError("desired admin config digest does not match its content")
-    if record.get("role_sha256") != config.role_sha256():
-        raise AdminConfigError(
-            "desired admin config role digests do not match its content"
-        )
+    expected_roles = config.role_sha256()
+    if legacy:
+        capacity = config.capacity
+        legacy_payloads = {
+            "ingress": {"telemetry_spool_enabled": capacity.telemetry_spool.enabled},
+            "worker": {
+                "control_worker_replicas": capacity.control_worker_replicas,
+                "remediation": capacity.remediation.as_dict(),
+            },
+            "spool": capacity.telemetry_spool.as_dict(),
+        }
+        expected_roles = {
+            role: canonical_sha256(payload) for role, payload in legacy_payloads.items()
+        }
+    if record.get("role_sha256") != expected_roles:
+        raise AdminConfigError("desired admin config role digests do not match")
+    if migrate_legacy and legacy:
+        source = record.get("source")
+        migration_source = "legacy-capacity-migration"
+        if isinstance(source, str) and source:
+            migration_source += f":{source}"
+        migrated = _desired_record(config, source=migration_source)
+        for key in ("plan_sha256", "reference"):
+            if isinstance(record.get(key), str):
+                migrated[key] = record[key]
+        _write_json_atomic(path, migrated)
     return config
 
 

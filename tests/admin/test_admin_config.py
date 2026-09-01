@@ -13,6 +13,7 @@ from gpu_fault.admin_config import (
     admin_config_desired_path,
     admin_config_history_path,
     admin_config_plan_path,
+    canonical_sha256,
     complete_admin_config_apply,
     create_admin_config_plan,
     default_admin_config,
@@ -275,6 +276,65 @@ def test_tampered_desired_config_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(AdminConfigError, match="digest does not match"):
         load_desired_admin_config(tmp_path)
+
+
+def _legacy_capacity_record(config) -> dict[str, object]:
+    capacity = config.capacity
+    content = {"schema_version": 1, "capacity": capacity.as_dict()}
+    return {
+        "schema_version": 1,
+        "config": content,
+        "config_sha256": canonical_sha256(content),
+        "role_sha256": {
+            "ingress": canonical_sha256(
+                {"telemetry_spool_enabled": capacity.telemetry_spool.enabled}
+            ),
+            "worker": canonical_sha256(
+                {
+                    "control_worker_replicas": capacity.control_worker_replicas,
+                    "remediation": capacity.remediation.as_dict(),
+                }
+            ),
+            "spool": canonical_sha256(capacity.telemetry_spool.as_dict()),
+        },
+        "source": "approved-plan:legacy",
+        "plan_sha256": "a" * 64,
+        "reference": "CHG-LEGACY",
+        "updated_at": "2026-08-31T00:00:00+00:00",
+    }
+
+
+def test_legacy_capacity_only_desired_config_is_verified_and_migrated(
+    tmp_path: Path,
+) -> None:
+    desired = preset_admin_config("32-disabled")
+    path = admin_config_desired_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(_legacy_capacity_record(desired)), encoding="utf-8")
+
+    assert load_desired_admin_config(tmp_path) == desired
+    initialize_desired_admin_config(tmp_path)
+    migrated = json.loads(path.read_text(encoding="utf-8"))
+
+    assert migrated["config"] == desired.as_dict()
+    assert migrated["config_sha256"] == desired.sha256()
+    assert migrated["role_sha256"] == desired.role_sha256()
+    assert migrated["source"] == ("legacy-capacity-migration:approved-plan:legacy")
+    assert migrated["plan_sha256"] == "a" * 64
+    assert migrated["reference"] == "CHG-LEGACY"
+
+
+def test_tampered_legacy_capacity_only_desired_config_fails_closed(
+    tmp_path: Path,
+) -> None:
+    record = _legacy_capacity_record(preset_admin_config("32-disabled"))
+    record["config"]["capacity"]["control_worker_replicas"] = 7
+    path = admin_config_desired_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(AdminConfigError, match="digest does not match"):
+        load_desired_admin_config(tmp_path, migrate_legacy=True)
 
 
 def test_default_admin_config_is_stable() -> None:
