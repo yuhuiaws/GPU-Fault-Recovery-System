@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gpu_fault.node_agent.executor as executor_module
-
 from tests._builders import copy_model, node_action_result
 
 from ._support import (
