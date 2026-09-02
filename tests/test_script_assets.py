@@ -224,16 +224,32 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
     upload = steps[upload_index]
 
     assert coverage_index < runner_index < upload_index
-    assert steps[coverage_index]["run"] == "make coverage PYTHON=python"
-    assert steps[runner_index]["run"] == "make fault-test-cases-ci PYTHON=python"
+    assert "make coverage PYTHON=python" in steps[coverage_index]["run"]
+    assert (
+        "FAULT_TEST_PYTEST_RESULTS=artifacts/ci-unit-gate/pytest-case-results.json"
+        in steps[coverage_index]["run"]
+    )
+    assert "make fault-test-cases-ci PYTHON=python" in steps[runner_index]["run"]
+    assert (
+        "FAULT_TEST_REPORT=artifacts/ci-unit-gate/fault-report.json"
+        in steps[runner_index]["run"]
+    )
     assert upload["if"] == "always()"
     assert upload["uses"] == "actions/upload-artifact@v4"
     assert upload["with"] == {
         "name": "fault-test-report",
-        "path": "artifacts/fault/fault-tests-*.json",
+        "path": "artifacts/ci-unit-gate/fault-report.json",
         "if-no-files-found": "error",
         "retention-days": 30,
     }
+    names = {step.get("name") for step in steps}
+    assert {
+        "Restore signed unit gate by content identity",
+        "Sign unit domain gate",
+        "Verify unit domain gate signature",
+        "Verify unit domain content identity",
+        "Upload signed unit domain gate",
+    } <= names
     assert workflow["jobs"]["test"]["needs"] == ["static", "unit", "artifact"]
     assert "gpu-fault-ci-candidate" in (ROOT / ".github/workflows/ci.yml").read_text(
         encoding="utf-8"
@@ -244,6 +260,12 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
         if step.get("name") == "Upload component candidate"
     )
     assert component_upload["if"] == "github.event_name == 'push'"
+    final_names = {step.get("name") for step in workflow["jobs"]["test"]["steps"]}
+    assert {
+        "Download signed unit domain gate",
+        "Verify unit domain gate signature",
+        "Verify unit domain gate identity",
+    } <= final_names
 
 
 def test_coverage_floor_is_wired_into_make_and_ci() -> None:

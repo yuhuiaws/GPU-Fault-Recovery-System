@@ -31,6 +31,7 @@ from release_identity import bind_runtime_image, build_release_identity
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
 DIST = ROOT / "dist"
+PRESERVED_DIST_DIRECTORIES = {"ci-domains"}
 
 
 @dataclass(frozen=True)
@@ -168,10 +169,19 @@ def _publish_release(
     staged_current = staging / "current-release.json"
     _write_synced(staged_current, content)
     os.replace(staged_current, DIST / "current-release.json")
-    for path in sorted(DIST.iterdir()):
-        if path.is_dir() and not path.name.startswith(".") and path != release_dir:
-            shutil.rmtree(path)
+    prune_dist(release_dir)
     return manifest, content
+
+
+def prune_dist(release_dir: Path) -> None:
+    for path in sorted(DIST.iterdir()):
+        if (
+            path.is_dir()
+            and not path.name.startswith(".")
+            and path.name not in PRESERVED_DIST_DIRECTORIES
+            and path != release_dir
+        ):
+            shutil.rmtree(path)
 
 
 def prepare_component_artifacts(

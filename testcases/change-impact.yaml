@@ -513,10 +513,12 @@ rules:
       - scripts/check-*.py
       - scripts/audit-*.py
       - scripts/ci_gate.py
+      - scripts/ci_unit_gate.py
       - scripts/prune_artifacts.py
       - scripts/resolve_ci_run.py
       - scripts/__init__.py
       - tools/__init__.py
+      - config/ci-unit-gate.json
       - architecture-baseline.json
       - mypy-baseline.json
       - assert-message-baseline.json

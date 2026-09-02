@@ -60,6 +60,25 @@ def test_release_builder_never_deletes_published_dist() -> None:
     assert 'os.replace(staged_current, DIST / "current-release.json")' in source
 
 
+def test_release_pruning_preserves_signed_ci_domains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dist = tmp_path / "dist"
+    release = dist / "release-current"
+    domains = dist / "ci-domains/unit"
+    stale = dist / "release-stale"
+    for path in (release, domains, stale):
+        path.mkdir(parents=True, exist_ok=True)
+    globals_ = BUILD.prune_dist.__globals__
+    monkeypatch.setitem(globals_, "DIST", dist)
+
+    BUILD.prune_dist(release)
+
+    assert release.is_dir(), "current content-addressed release was pruned"
+    assert domains.is_dir(), "signed CI domain evidence was pruned"
+    assert not stale.exists(), "stale content-addressed release was retained"
+
+
 def test_runtime_component_identity_must_match_release_artifacts() -> None:
     descriptor = {
         "components": {

@@ -19,7 +19,8 @@
 - `.github/workflows/release.yml`：候选解析、验签、ECR晋级和最终artifact上传；
 - `Makefile` 中的 `release-build-promoted`、`deploy-host-sign`，以及受信本地环境使用的
   `release-build`、`deploy-host-bundle`；
-- `scripts/ci_gate.py`、`scripts/resolve_ci_run.py`：main CI候选身份和Release run选择；
+- `scripts/ci_unit_gate.py`、`scripts/ci_gate.py`、`scripts/resolve_ci_run.py`：
+  内容寻址unit门禁、main CI候选身份和Release run选择；
 - `scripts/build-release-runtime-image.py`、`scripts/build-release-artifacts.py`、
   `scripts/build-release-attestation.py`：运行镜像、Manifest v3 和 attestation；
 - `scripts/build-deploy-host-bundle.py`、`scripts/deploy_host_bundle.py`：部署机离线包。
@@ -33,9 +34,11 @@
 ```text
 main push
   -> static、unit、artifact 三个 job 并行
-  -> unit: coverage + PostgreSQL contract + fault report复用 + PostgreSQL stress
+  -> unit: 计算五个内容域摘要
+       -> 命中历史成功main CI的同身份签名gate：验签并复用
+       -> 未命中：coverage + PostgreSQL contract + fault report + stress并签名
   -> artifact: source-only canonical组件制品 + 未签名deploy-host bundle
-  -> test: 汇总全部成功结果，生成并签名CI gate
+  -> test: 验证unit域gate，汇总本次static/artifact，生成并签名commit CI gate
   -> 上传 gpu-fault-ci-candidate
 
 workflow_dispatch 或 v* tag
@@ -140,12 +143,37 @@ Release workflow 消费以下 GitHub repository 或 environment variables：
 
 | job | 主要职责 |
 |---|---|
-| `static` | Ruff、mypy strict、compileall、架构、部署契约、文档静态门禁、配置、YAML、Shell和artifact安全检查 |
-| `unit` | 4路xdist覆盖率、串行PostgreSQL contract、覆盖率floor、fault report和main PostgreSQL stress |
+| `static` | Ruff、mypy strict、compileall、架构、部署契约、文档与CI工具测试、配置、YAML、Shell和artifact安全检查 |
+| `unit` | 内容身份恢复；未命中时执行4路xdist覆盖率、PostgreSQL contract、fault report和main PostgreSQL stress |
 | `artifact` | 构建并验证source-only三个组件wheel与Node bundle；main额外构建未签名deploy-host bundle |
 
-`make coverage`在非PostgreSQL pytest过程中加载`tools.pytest_case_reporter`，把每个
-nodeid结果写入`artifacts/fault/pytest-case-results.json`。随后
+`config/ci-unit-gate.json`定义不进入unit身份的文档与CI工具边界。
+`scripts/ci_unit_gate.py`把其余输入分别摘要为：
+
+- `runtime`：项目运行时代码和非部署脚本；
+- `deployment`：`deploy/`、管理员/发布部署代码及相应测试；
+- `tests`：普通测试和测试数据；
+- `fault_runner`：fault catalog、runner、scheduler和pytest结果转换；
+- `dependencies`：`pyproject.toml`、`uv.lock`和requirements lock。
+
+身份还包含Python版本/ABI、Runner image、实际PostgreSQL image ID和已安装distribution
+版本。coverage复用键由`runtime + dependencies + tests + 环境`计算。命中历史成功main
+CI的同键artifact后，先验证`unit-gate.json`的Cosign签名、证据SHA和producer run，再以
+producer commit为BASE生成当前change-impact计划：
+
+- 只涉及docs/CI工具时由当前static gate覆盖；
+- deployment或其他选择性域变化时只执行计划列出的pytest/check；
+- fault runner、未知路径、full域或需要PostgreSQL的delta会拒绝复用并回退完整unit门禁。
+
+当前run随后把历史coverage证据、delta计划和当前五域完整身份重新组成并签名新的unit
+gate。环境、签名、run结论或文件清单不一致同样会重新执行完整门禁。
+
+文档、`.github/`和对应CI/文档契约测试由当前commit的`static` job执行，因此这些变化
+可以复用unit gate，但不能跳过当前静态检查。
+
+未命中复用时，`make coverage`在非PostgreSQL pytest过程中加载
+`tools.pytest_case_reporter`，把每个nodeid结果写入固定域证据目录。文档/契约测试不
+重复进入coverage，由`static`的`make docs-check`执行。随后
 `make fault-test-cases-ci`校验源码身份并直接把这些结果映射到fault catalog，不再为
 64条unit/component case重新启动pytest；缺少结果文件时仍可回退到单进程批量pytest。
 
@@ -166,12 +194,13 @@ workflow在候选验签成功后签名。
 聚合job `test`依赖三个job并逐一要求`success`。main push时它：
 
 1. 下载artifact job生成的完整`dist/`；
-2. 要求工作树干净，读取source-only schema v3 Manifest；
-3. 记录Git commit、Git tree、repository、main CI workflow ref、run ID；
-4. 对`dist/`中除CI gate自身外的每个文件记录相对路径、权限、大小和SHA-256；
-5. 固定`static/coverage/artifact/postgres_stress`均为`PASSED`；
-6. keyless签名`dist/ci-gate.json`；
-7. 上传`gpu-fault-ci-candidate`，保留30天。
+2. 下载unit job本次重新上传的签名域gate，并再次验签、核对内容身份和证据；
+3. 要求工作树干净，读取source-only schema v3 Manifest；
+4. 记录Git commit、Git tree、repository、main CI workflow ref、run ID；
+5. 对`dist/`中除CI gate自身外的每个文件记录相对路径、权限、大小和SHA-256；
+6. 把unit gate的identity、producer run/commit、SHA和是否复用写入`domains.unit`；
+7. keyless签名`dist/ci-gate.json`；
+8. 上传`gpu-fault-ci-candidate`，保留30天。
 
 CI gate只能由`ci.yml@refs/heads/main`生成。PR聚合job只给出分支保护结果，不签名或上传
 该候选。
@@ -329,7 +358,9 @@ artifact，不是自动创建的 GitHub Release asset，也不会自动复制到
 
 | 位置 | 生产者 | 用途 |
 |---|---|---|
-| `dist/ci-gate.json` | main CI `test` job | 绑定已测试源码、source-only候选清单和四类质量门禁 |
+| `dist/ci-domains/unit/unit-gate.json` | main CI `unit` job或历史成功main CI | 绑定五个执行域、环境、coverage/fault/PostgreSQL证据 |
+| `dist/ci-domains/unit/unit-gate.bundle.json` | main CI `cosign sign-blob` | unit域gate的Sigstore签名 |
+| `dist/ci-gate.json` | main CI `test` job | 绑定当前源码、source-only候选、unit域gate及组合质量门禁 |
 | `dist/ci-gate.bundle.json` | main CI `cosign sign-blob` | CI gate的Sigstore签名材料 |
 | ECR 中的不可变 Runtime Image digest | `build-release-runtime-image.py` | CPU Control Plane 和 GPU Executor 运行镜像 |
 | `dist/release-runtime-image.json` | 同上 | 绑定 OCI digest、平台、输入和镜像内组件 |
@@ -356,12 +387,13 @@ artifact，不是自动创建的 GitHub Release asset，也不会自动复制到
 
 发布链路按以下关系逐层绑定：
 
-1. main CI gate绑定commit、tree、source-only候选清单和质量门禁，并由固定CI identity签名；
-2. Runtime Image descriptor绑定OCI digest、构建输入和候选中的镜像组件；
-3. Manifest v3绑定三个wheel、Node bundle、Runtime Image和delivery identity；
-4. attestation绑定Manifest SHA、release ID、delivery identity、源码状态和CI gate SHA；
-5. Release Sigstore bundle证明attestation来自批准的GitHub OIDC identity；
-6. deploy-host archive使用独立Manifest和签名，绑定平台、源码commit、依赖身份和全部payload。
+1. unit域gate绑定五个内容域、测试环境和证据，并由固定main CI identity签名；
+2. 当前commit CI gate验签并绑定unit域gate，同时绑定当前tree、static和artifact；
+3. Runtime Image descriptor绑定OCI digest、构建输入和候选中的镜像组件；
+4. Manifest v3绑定三个wheel、Node bundle、Runtime Image和delivery identity；
+5. attestation绑定Manifest SHA、release ID、delivery identity、源码状态和CI gate SHA；
+6. Release Sigstore bundle证明attestation来自批准的GitHub OIDC identity；
+7. deploy-host archive使用独立Manifest和签名，绑定平台、源码commit、依赖身份和全部payload。
 
 仅有版本号、tag、文件名、ConfigMap 名或 Kubernetes annotation 均不足以替代上述绑定。
 任何一层缺失、摘要不一致、身份不匹配或制品来自不同 workflow run 时都必须停止。
@@ -431,6 +463,8 @@ site和低层`release-deploy`参数不进入普通管理员命令。实际Kubern
 | 失败阶段 | 处理原则 |
 |---|---|
 | main CI任一并行job失败 | 修复对应静态、测试、PostgreSQL或artifact问题后提交新commit |
+| unit域gate未命中或delta要求full/PostgreSQL | 正常执行完整coverage/fault/PostgreSQL门禁并生成新签名gate |
+| unit域gate签名、身份或历史run不合法 | fail closed；不得复用，调查artifact后重新执行门禁 |
 | 找不到匹配main CI run | 先让目标commit通过main push CI；不得用其他commit候选代替 |
 | CI gate签名、源码或文件清单失败 | 停止晋级；不得获取AWS身份或拼接其他run文件 |
 | OIDC、AWS 凭据或 ECR 登录失败 | 修复 GitHub environment、角色信任或最小权限后重跑 |

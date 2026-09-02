@@ -65,7 +65,8 @@ jobs:
       - run: >-
           PYTHONPATH=src
           python tools/generate_nvidia_xid_policy.py --check
-      - run: make docs-static-check
+      - run: make ci-tooling-check PYTHON=python
+      - run: make docs-check
       - name: Check pull-request documentation impact
         if: github.event_name == 'pull_request'
         run: >-
@@ -79,6 +80,10 @@ jobs:
 
   unit:
     runs-on: ubuntu-latest
+    outputs:
+      unit_gate_artifact: ${{ steps.restore_unit_gate.outputs.artifact_name }}
+      unit_gate_identity: ${{ steps.restore_unit_gate.outputs.identity }}
+      unit_gate_reused: ${{ steps.restore_unit_gate.outputs.reused }}
     services:
       postgres:
         image: postgres:16
@@ -112,19 +117,105 @@ jobs:
       - run: >-
           python -m pip install
           '.[dev,collectors,postgres,performance]'
-      - name: Run full suite with coverage floor
-        run: make coverage PYTHON=python
-      - name: Build fault report from pytest results
-        run: make fault-test-cases-ci PYTHON=python
-      - name: Run PostgreSQL stress gate
+      - uses: sigstore/cosign-installer@v3
         if: github.event_name == 'push'
+      - name: Restore signed unit gate by content identity
+        id: restore_unit_gate
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/ci_unit_gate.py restore
+          --postgres-container "${{ job.services.postgres.id }}"
+          --destination artifacts/ci-unit-gate
+          --current-run-id "${GITHUB_RUN_ID}"
+          --github-output "${GITHUB_OUTPUT}"
+      - name: Run full suite with coverage floor
+        if: >-
+          github.event_name != 'push' ||
+          steps.restore_unit_gate.outputs.reused != 'true'
+        run: >-
+          make coverage PYTHON=python
+          FAULT_TEST_PYTEST_RESULTS=artifacts/ci-unit-gate/pytest-case-results.json
+      - name: Verify reused base unit gate signature
+        if: >-
+          github.event_name == 'push' &&
+          steps.restore_unit_gate.outputs.reused == 'true'
+        run: >-
+          cosign verify-blob
+          --bundle artifacts/ci-unit-gate/base-unit-gate.bundle.json
+          --certificate-identity
+          "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main"
+          --certificate-oidc-issuer
+          "https://token.actions.githubusercontent.com"
+          artifacts/ci-unit-gate/base-unit-gate.json
+      - name: Run changed-domain delta gate
+        if: >-
+          github.event_name == 'push' &&
+          steps.restore_unit_gate.outputs.reused == 'true' &&
+          steps.restore_unit_gate.outputs.delta_required == 'true'
+        run: >-
+          python scripts/select-affected-tests.py
+          --base "${{ steps.restore_unit_gate.outputs.base_commit }}"
+          --execute
+      - name: Build fault report from pytest results
+        if: >-
+          github.event_name != 'push' ||
+          steps.restore_unit_gate.outputs.reused != 'true'
+        run: >-
+          make fault-test-cases-ci PYTHON=python
+          FAULT_TEST_PYTEST_RESULTS=artifacts/ci-unit-gate/pytest-case-results.json
+          FAULT_TEST_REPORT=artifacts/ci-unit-gate/fault-report.json
+      - name: Run PostgreSQL stress gate
+        if: >-
+          github.event_name == 'push' &&
+          steps.restore_unit_gate.outputs.reused != 'true'
         run: make test-postgres-stress PYTHON=python
+      - name: Build unit domain gate
+        if: github.event_name == 'push'
+        run: >-
+          python scripts/ci_unit_gate.py build
+          --postgres-container "${{ job.services.postgres.id }}"
+          --artifact-root artifacts/ci-unit-gate
+          --pytest-results artifacts/ci-unit-gate/pytest-case-results.json
+          --fault-report artifacts/ci-unit-gate/fault-report.json
+      - name: Sign unit domain gate
+        if: github.event_name == 'push'
+        run: >-
+          cosign sign-blob --yes
+          --bundle artifacts/ci-unit-gate/unit-gate.bundle.json
+          artifacts/ci-unit-gate/unit-gate.json
+      - name: Verify unit domain gate signature
+        if: github.event_name == 'push'
+        run: >-
+          cosign verify-blob
+          --bundle artifacts/ci-unit-gate/unit-gate.bundle.json
+          --certificate-identity
+          "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main"
+          --certificate-oidc-issuer
+          "https://token.actions.githubusercontent.com"
+          artifacts/ci-unit-gate/unit-gate.json
+      - name: Verify unit domain content identity
+        if: github.event_name == 'push'
+        run: >-
+          python scripts/ci_unit_gate.py verify
+          --postgres-container "${{ job.services.postgres.id }}"
+          --artifact-root artifacts/ci-unit-gate
+          --gate artifacts/ci-unit-gate/unit-gate.json
+      - name: Upload signed unit domain gate
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.restore_unit_gate.outputs.artifact_name }}
+          path: artifacts/ci-unit-gate/
+          if-no-files-found: error
+          retention-days: 30
       - name: Upload fault test report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fault-test-report
-          path: artifacts/fault/fault-tests-*.json
+          path: artifacts/ci-unit-gate/fault-report.json
           if-no-files-found: error
           retention-days: 30
 
@@ -194,9 +285,36 @@ jobs:
         with:
           name: gpu-fault-component-artifacts
           path: dist
+      - name: Download signed unit domain gate
+        if: github.event_name == 'push'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.unit.outputs.unit_gate_artifact }}
+          path: dist/ci-domains/unit
+      - name: Verify unit domain gate signature
+        if: github.event_name == 'push'
+        run: >-
+          cosign verify-blob
+          --bundle dist/ci-domains/unit/unit-gate.bundle.json
+          --certificate-identity
+          "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main"
+          --certificate-oidc-issuer
+          "https://token.actions.githubusercontent.com"
+          dist/ci-domains/unit/unit-gate.json
+      - name: Verify unit domain gate identity
+        if: github.event_name == 'push'
+        run: >-
+          python scripts/ci_unit_gate.py verify
+          --expected-identity "${{ needs.unit.outputs.unit_gate_identity }}"
+          --artifact-root dist/ci-domains/unit
+          --gate dist/ci-domains/unit/unit-gate.json
       - name: Build CI gate
         if: github.event_name == 'push'
-        run: python scripts/ci_gate.py build --dist dist --output dist/ci-gate.json
+        run: >-
+          python scripts/ci_gate.py build
+          --dist dist
+          --unit-gate dist/ci-domains/unit/unit-gate.json
+          --output dist/ci-gate.json
       - name: Sign CI gate
         if: github.event_name == 'push'
         run: >-

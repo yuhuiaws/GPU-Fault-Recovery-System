@@ -9,12 +9,19 @@ import subprocess
 import sys
 from typing import Any, Sequence
 
+if __package__:
+    from scripts.ci_unit_gate import verify_unit_gate
+else:
+    from ci_unit_gate import verify_unit_gate
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
 QUALITY_GATES = {
     "artifact": "PASSED",
     "coverage": "PASSED",
+    "fault_catalog": "PASSED",
+    "postgres_contract": "PASSED",
     "postgres_stress": "PASSED",
     "static": "PASSED",
 }
@@ -89,7 +96,26 @@ def _candidate_release(dist: Path) -> tuple[dict[str, Any], Path]:
     return release, current
 
 
-def build_gate(dist: Path) -> dict[str, Any]:
+def _unit_domain(dist: Path, path: Path) -> dict[str, Any]:
+    path = path.resolve()
+    try:
+        relative = path.relative_to(dist.resolve()).as_posix()
+    except ValueError as exc:
+        raise CiGateError("unit domain gate leaves candidate dist") from exc
+    unit = verify_unit_gate(path, path.parent)
+    producer = unit["producer"]
+    return {
+        "path": relative,
+        "sha256": _sha256(path),
+        "identity_sha256": unit["identity"]["sha256"],
+        "coverage_identity_sha256": unit["identity"]["coverage_sha256"],
+        "producer_run_id": producer["run_id"],
+        "producer_git_commit": producer["git_commit"],
+        "reused": unit.get("reused_from") is not None,
+    }
+
+
+def build_gate(dist: Path, unit_gate_path: Path) -> dict[str, Any]:
     if _git("status", "--porcelain", "--untracked-files=normal"):
         raise CiGateError("CI gate requires a clean source tree")
     repository = os.getenv("GITHUB_REPOSITORY", "")
@@ -103,6 +129,7 @@ def build_gate(dist: Path) -> dict[str, Any]:
     ):
         raise CiGateError("CI gate must be built by the main CI workflow")
     release, current = _candidate_release(dist)
+    unit = _unit_domain(dist, unit_gate_path)
     return {
         "schema_version": SCHEMA_VERSION,
         "repository": repository,
@@ -117,6 +144,7 @@ def build_gate(dist: Path) -> dict[str, Any]:
             "manifest_sha256": _sha256(current),
             "files": artifact_inventory(dist),
         },
+        "domains": {"unit": unit},
         "quality_gates": dict(QUALITY_GATES),
     }
 
@@ -158,6 +186,27 @@ def verify_gate(path: Path, dist: Path) -> dict[str, Any]:
         or candidate.get("release_id") != release.get("release_id")
     ):
         raise CiGateError("CI gate candidate artifacts do not match")
+    domains = gate.get("domains")
+    unit = domains.get("unit") if isinstance(domains, dict) else None
+    if not isinstance(unit, dict):
+        raise CiGateError("CI gate unit domain is missing")
+    unit_path = (dist / str(unit.get("path") or "")).resolve()
+    try:
+        unit_path.relative_to(dist.resolve())
+    except ValueError as exc:
+        raise CiGateError("CI gate unit domain leaves candidate dist") from exc
+    if not unit_path.is_file() or _sha256(unit_path) != unit.get("sha256"):
+        raise CiGateError("CI gate unit domain artifact does not match")
+    unit_gate = verify_unit_gate(unit_path, unit_path.parent)
+    if (
+        unit.get("identity_sha256") != unit_gate["identity"]["sha256"]
+        or unit.get("coverage_identity_sha256")
+        != unit_gate["identity"]["coverage_sha256"]
+        or str(unit.get("producer_run_id") or "")
+        != str(unit_gate["producer"]["run_id"])
+        or unit.get("producer_git_commit") != unit_gate["producer"]["git_commit"]
+    ):
+        raise CiGateError("CI gate unit domain identity does not match")
     return gate
 
 
@@ -167,13 +216,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
     build = commands.add_parser("build")
     build.add_argument("--dist", type=Path, default=ROOT / "dist")
     build.add_argument("--output", type=Path, required=True)
+    build.add_argument("--unit-gate", type=Path, required=True)
     verify = commands.add_parser("verify")
     verify.add_argument("--dist", type=Path, default=ROOT / "dist")
     verify.add_argument("--gate", type=Path, required=True)
     options = parser.parse_args(arguments)
     try:
         if options.command == "build":
-            value = build_gate(options.dist.resolve())
+            value = build_gate(
+                options.dist.resolve(),
+                options.unit_gate.resolve(),
+            )
             options.output.write_text(
                 json.dumps(value, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",

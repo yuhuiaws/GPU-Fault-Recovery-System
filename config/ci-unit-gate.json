@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "domain": "unit",
+  "exclude_prefixes": [
+    ".github/",
+    "docs/"
+  ],
+  "exclude_globs": [
+    "**/README.md",
+    "scripts/**/README.md",
+    "scripts/audit-*.py",
+    "scripts/check-*.py"
+  ],
+  "exclude_files": [
+    ".yamllint",
+    "architecture-baseline.json",
+    "assert-message-baseline.json",
+    "CONTRIBUTING.md",
+    "README.md",
+    "mypy-baseline.json",
+    "scripts/README.md",
+    "scripts/ci_gate.py",
+    "scripts/prune_artifacts.py",
+    "scripts/resolve_ci_run.py",
+    "tests/regional/test_complete_acceptance_entries.py",
+    "tests/regional/test_regional_acceptance_fixtures.py",
+    "tests/regional/test_regional_acceptance_spec.py",
+    "tests/regional/test_regional_case_index.py",
+    "tests/test_change_impact.py",
+    "tests/test_deployment_manual_contracts.py",
+    "tests/test_doc_impact.py",
+    "tests/test_documentation_contracts.py",
+    "tests/test_env_reference.py",
+    "tests/test_fault_evidence.py",
+    "tests/test_fault_scenario_catalog.py",
+    "tests/test_operations_manual_guide.py",
+    "tests/test_ci_gate.py",
+    "tests/test_ci_unit_gate.py",
+    "tests/test_script_assets.py"
+  ],
+  "protocol": {
+    "coverage_floor": 78,
+    "postgres_image": "postgres:16",
+    "postgres_stress_rounds": 40,
+    "postgres_stress_workers": 8,
+    "pytest_workers": 4
+  },
+  "reuse": {
+    "coverage_groups": [
+      "dependencies",
+      "runtime",
+      "tests"
+    ],
+    "static_only_domains": [
+      "ci-tooling",
+      "docs-only"
+    ]
+  }
+}

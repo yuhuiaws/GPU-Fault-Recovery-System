@@ -106,7 +106,12 @@ GitHub Actions从触发、OIDC/ECR、质量门禁、制品签名到`gpu-fault-re
 `make check`的最终全量测试和`make test-parallel`使用4个worker且不连接外部
 PostgreSQL。`make coverage`要求设置`GPU_FAULT_TEST_POSTGRES_URL`：先由4个worker
 采集非PostgreSQL覆盖率，再串行追加隔离PostgreSQL 16测试库覆盖率，最后统一强制当前
-78%的floor。覆盖率可以提高，不能通过调低`COVERAGE_FLOOR`掩盖未测试的新分支。
+78%的floor。文档和CI契约测试由`make docs-check`、`make ci-tooling-check`独立执行，
+不重复计入coverage。main CI按runtime、deployment、tests、fault runner和dependencies
+内容摘要复用已签名unit gate。runtime、dependencies、普通tests或测试环境变化会重新
+执行完整coverage；deployment/fault runner变化先按change-impact矩阵执行delta，
+矩阵要求full、PostgreSQL或无法分类时回退完整门禁。覆盖率可以提高，不能通过调低
+`COVERAGE_FLOOR`掩盖未测试的新分支。
 Make在checkout中检测到`.venv/bin/python`时会自动使用该解释器；源码包没有`.venv`
 时回退到`python3`，显式`PYTHON=...`始终优先。
 

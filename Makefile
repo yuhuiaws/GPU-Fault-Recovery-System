@@ -10,6 +10,7 @@ PYTEST_XDIST_WORKERS ?= 4
 FAULT_TEST_WORKERS ?= 1
 PARALLEL_FAULT_TEST_WORKERS ?= 4
 FAULT_TEST_PYTEST_RESULTS ?= artifacts/fault/pytest-case-results.json
+FAULT_TEST_REPORT ?=
 COVERAGE_FLOOR ?= 78
 BASE ?= origin/main
 COSIGN ?= cosign
@@ -46,13 +47,18 @@ DOCUMENTATION_TESTS = \
 	tests/test_fault_evidence.py \
 	tests/test_doc_impact.py \
 	tests/test_change_impact.py
+CI_TOOLING_TESTS = \
+	tests/test_script_assets.py \
+	tests/test_ci_gate.py \
+	tests/test_ci_unit_gate.py
 POSTGRES_TESTS = \
 	tests/store/test_postgres_store.py \
 	tests/store/test_postgres_processor_claim.py \
 	tests/store/test_postgres_reconnect.py \
 	tests/store/test_store_contracts.py
+COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS),--ignore=$(test))
 
-.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
@@ -83,6 +89,7 @@ coverage:
 	PYTEST_GPU_FAULT_CASE_REPORT="$(FAULT_TEST_PYTEST_RESULTS)" \
 	$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \
 		-p tools.pytest_case_reporter \
+		$(COVERAGE_IGNORE_ARGS) \
 		--cov=src/gpu_fault \
 		--cov-branch \
 		--cov-report=
@@ -114,12 +121,14 @@ fault-test-cases-ci:
 			--level unit \
 			--level component \
 			--pytest-results "$(FAULT_TEST_PYTEST_RESULTS)" \
+			$(if $(FAULT_TEST_REPORT),--report "$(FAULT_TEST_REPORT)",) \
 			--workers $(FAULT_TEST_WORKERS); \
 	else \
 		$(PYTHON) tools/run_fault_test_cases.py \
 			--level unit \
 			--level component \
 			--batch-pytest \
+			$(if $(FAULT_TEST_REPORT),--report "$(FAULT_TEST_REPORT)",) \
 			--workers $(FAULT_TEST_WORKERS); \
 	fi
 
@@ -204,6 +213,9 @@ assert-message-check:
 
 public-release-check:
 	$(PYTHON) scripts/check-public-release.py
+
+ci-tooling-check:
+	$(PYTHON) -m pytest $(CI_TOOLING_TESTS)
 
 docs-check:
 	$(MAKE) docs-static-check
