@@ -205,16 +205,61 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
     assert workflow["jobs"]["static"]["env"]["PYTHONPYCACHEPREFIX"].startswith(
         "/tmp/"
     ), "static CI must keep compileall output outside the checkout"
+    coverage_job = workflow["jobs"]["coverage"]
+    assert coverage_job["strategy"]["matrix"]["shard"] == [
+        "runtime_0",
+        "runtime_1",
+        "runtime_2",
+        "deployment",
+        "fault_runner",
+    ]
+    assert "CI_TEST_RUNNER" in coverage_job["runs-on"]
+    assert coverage_job["env"]["PYTEST_XDIST_DIST"] == "worksteal"
+    coverage_steps = coverage_job["steps"]
+    run_index = next(
+        index
+        for index, step in enumerate(coverage_steps)
+        if step.get("name") == "Run coverage shard with duration evidence"
+    )
+    shard_build_index = next(
+        index
+        for index, step in enumerate(coverage_steps)
+        if step.get("name") == "Build coverage shard gate"
+    )
+    shard_upload_index = next(
+        index
+        for index, step in enumerate(coverage_steps)
+        if step.get("name") == "Upload coverage shard"
+    )
+    assert run_index < shard_build_index < shard_upload_index
+    assert "make coverage-shard PYTHON=python" in coverage_steps[run_index]["run"]
+    assert "COVERAGE_SHARD=" in coverage_steps[run_index]["run"]
+    names = {step.get("name") for step in coverage_steps}
+    assert {
+        "Restore signed coverage shard",
+        "Sign coverage shard gate",
+        "Verify coverage shard signature",
+        "Verify coverage shard content identity",
+    } <= names
+
+    postgres_steps = workflow["jobs"]["postgres"]["steps"]
+    postgres_run = next(
+        step
+        for step in postgres_steps
+        if step.get("name") == "Run PostgreSQL coverage and stress shard"
+    )
+    assert "COVERAGE_INCLUDE_STRESS=1" in postgres_run["run"]
+
     steps = workflow["jobs"]["unit"]["steps"]
-    coverage_index = next(
+    combine_index = next(
         index
         for index, step in enumerate(steps)
-        if step.get("name") == "Run full suite with coverage floor"
+        if step.get("name") == "Combine branch coverage and enforce floor"
     )
     runner_index = next(
         index
         for index, step in enumerate(steps)
-        if step.get("name") == "Build fault report from pytest results"
+        if step.get("name") == "Build fault report from combined pytest results"
     )
     upload_index = next(
         index
@@ -222,29 +267,26 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
         if step.get("name") == "Upload fault test report"
     )
     upload = steps[upload_index]
-
-    assert coverage_index < runner_index < upload_index
-    assert "make coverage PYTHON=python" in steps[coverage_index]["run"]
-    assert (
-        "FAULT_TEST_PYTEST_RESULTS=artifacts/ci-unit-gate/pytest-case-results.json"
-        in steps[coverage_index]["run"]
-    )
+    assert combine_index < runner_index < upload_index
+    assert "make coverage-combine PYTHON=python" in steps[combine_index]["run"]
     assert "make fault-test-cases-ci PYTHON=python" in steps[runner_index]["run"]
     assert (
-        "FAULT_TEST_REPORT=artifacts/ci-unit-gate/fault-report.json"
+        "FAULT_TEST_REPORT=artifacts/coverage-combined/fault-report.json"
         in steps[runner_index]["run"]
     )
     assert upload["if"] == "always()"
     assert upload["uses"] == "actions/upload-artifact@v4"
     assert upload["with"] == {
         "name": "fault-test-report",
-        "path": "artifacts/ci-unit-gate/fault-report.json",
+        "path": "artifacts/coverage-combined/fault-report.json",
         "if-no-files-found": "error",
         "retention-days": 30,
     }
     names = {step.get("name") for step in steps}
     assert {
-        "Restore signed unit gate by content identity",
+        "Download coverage shards",
+        "Verify coverage shard signatures",
+        "Combine branch coverage and enforce floor",
         "Sign unit domain gate",
         "Verify unit domain gate signature",
         "Verify unit domain content identity",
@@ -264,6 +306,7 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
     assert {
         "Download signed unit domain gate",
         "Verify unit domain gate signature",
+        "Verify embedded coverage shard signatures",
         "Verify unit domain gate identity",
     } <= final_names
 
@@ -276,9 +319,34 @@ def test_coverage_floor_is_wired_into_make_and_ci() -> None:
     assert "GPU_FAULT_TEST_POSTGRES_URL=" in makefile
     assert "--cov-append" in makefile
     assert "--cov-fail-under=$(COVERAGE_FLOOR)" in makefile
-    assert "Run full suite with coverage floor" in workflow
-    assert "make coverage PYTHON=python" in workflow
+    assert "$(POSTGRES_TESTS),--ignore=$(test)" in makefile
+    assert "PYTEST_XDIST_DIST ?= worksteal" in makefile
+    assert "--durations=$(PYTEST_DURATIONS)" in makefile
+    assert "Combine branch coverage and enforce floor" in workflow
+    assert "make coverage-combine PYTHON=python" in workflow
+    assert "scripts/ci_coverage_gate.py combine" in makefile
     assert "make coverage" in (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+
+
+def test_release_verifies_all_ci_signatures_before_aws() -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["build"]["steps"]
+    names = [step.get("name") for step in steps]
+    ci_gate = names.index("Verify CI gate signature")
+    candidate = names.index("Verify candidate source and artifacts")
+    unit = names.index("Verify promoted unit domain signature")
+    shards = names.index("Verify promoted coverage shard signatures")
+    aws = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("uses") == "aws-actions/configure-aws-credentials@v4"
+    )
+
+    assert ci_gate < candidate < unit < shards < aws
+    assert "dist/ci-domains/unit/unit-gate.bundle.json" in steps[unit]["run"]
+    assert "dist/ci-domains/unit/shards" in steps[shards]["run"]
 
 
 def test_scripts_and_tools_need_no_architecture_size_exceptions() -> None:

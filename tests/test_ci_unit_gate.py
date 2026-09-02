@@ -4,12 +4,16 @@ import hashlib
 import io
 import json
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
 import pytest
+from coverage import CoverageData
 
-from scripts import ci_unit_gate
+from scripts import ci_coverage_gate, ci_gate_artifacts, ci_unit_gate
+from scripts.component_wheels import APPLICATION_COMPONENT_NAMES, component_modules
+from tools.pytest_case_reporter import partition_for_nodeid
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,22 +26,23 @@ def _identity_root(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     files = {
         ".github/workflows/ci.yml": "name: CI\n",
-        "CONTRIBUTING.md": "contributing\n",
-        "README.md": "readme\n",
+        "Makefile": "coverage-shard:\n\t@true\n",
         "config/ci-unit-gate.json": (ROOT / "config/ci-unit-gate.json").read_text(
             encoding="utf-8"
         ),
         "deploy/manifest.yaml": "kind: Deployment\n",
         "docs/guide.md": "guide\n",
-        "pyproject.toml": "[project]\nname='example'\n",
         "requirements/build.lock": "build==1\n",
-        "scripts/release_deploy.py": "VALUE = 'deploy'\n",
-        "scripts/ci_gate.py": "VALUE = 'ci'\n",
+        "src/gpu_fault/admin_config.py": "VALUE = 'shared'\n",
+        "src/gpu_fault/admin_only.py": "VALUE = 'deployment'\n",
         "src/gpu_fault/runtime.py": "VALUE = 'runtime'\n",
         "testcases/fault-scenarios.yaml": "schema_version: 1\n",
+        "tests/admin/test_admin.py": "def test_admin(): pass\n",
+        "tests/conftest.py": "VALUE = 'shared tests'\n",
+        "tests/store/test_postgres_store.py": "def test_postgres(): pass\n",
+        "tests/test_case_scheduler.py": "def test_scheduler(): pass\n",
         "tests/test_runtime.py": "def test_runtime(): pass\n",
-        "tests/test_script_assets.py": "def test_ci(): pass\n",
-        "tools/run_fault_test_cases.py": "VALUE = 'fault'\n",
+        "tools/case_scheduler.py": "VALUE = 'fault'\n",
         "uv.lock": "version = 1\n",
     }
     for relative, content in files.items():
@@ -49,93 +54,6 @@ def _identity_root(tmp_path: Path) -> Path:
     return root
 
 
-def _identity(root: Path) -> dict:
-    return ci_unit_gate.unit_identity(
-        root,
-        postgres_image="sha256:postgres",
-        distributions={"pytest": "9.1.1"},
-        environment={"ImageOS": "ubuntu24", "ImageVersion": "20260901.1"},
-    )
-
-
-def test_unit_identity_excludes_docs_and_ci_but_splits_execution_domains(
-    tmp_path: Path,
-) -> None:
-    root = _identity_root(tmp_path)
-    before = _identity(root)
-
-    (root / "docs/guide.md").write_text("changed docs\n", encoding="utf-8")
-    (root / ".github/workflows/ci.yml").write_text("name: changed\n", encoding="utf-8")
-    (root / "scripts/ci_gate.py").write_text("VALUE = 'changed'\n", encoding="utf-8")
-    (root / "tests/test_script_assets.py").write_text(
-        "def test_changed(): pass\n", encoding="utf-8"
-    )
-    excluded = _identity(root)
-
-    assert excluded["sha256"] == before["sha256"]
-    assert set(before["groups"]) == {
-        "dependencies",
-        "deployment",
-        "fault_runner",
-        "runtime",
-        "tests",
-    }
-
-
-def test_unit_identity_excludes_exact_documentation_test_set() -> None:
-    config = ci_unit_gate.load_config(ROOT)
-    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-    block = makefile.split("DOCUMENTATION_TESTS = \\\n", 1)[1].split(
-        "\nCI_TOOLING_TESTS =", 1
-    )[0]
-    documented = {
-        line.strip().rstrip("\\").strip() for line in block.splitlines() if line.strip()
-    }
-    excluded = set(config["exclude_files"])
-
-    assert documented <= excluded
-
-    tooling_block = makefile.split("CI_TOOLING_TESTS = \\\n", 1)[1].split(
-        "\nPOSTGRES_TESTS =", 1
-    )[0]
-    tooling = {
-        line.strip().rstrip("\\").strip()
-        for line in tooling_block.splitlines()
-        if line.strip()
-    }
-    assert tooling <= excluded
-
-
-@pytest.mark.parametrize(
-    ("relative", "group", "coverage_changes"),
-    [
-        ("requirements/build.lock", "dependencies", True),
-        ("deploy/manifest.yaml", "deployment", False),
-        ("tools/run_fault_test_cases.py", "fault_runner", False),
-        ("src/gpu_fault/runtime.py", "runtime", True),
-        ("tests/test_runtime.py", "tests", True),
-    ],
-)
-def test_unit_identity_changes_only_the_owned_group(
-    tmp_path: Path, relative: str, group: str, coverage_changes: bool
-) -> None:
-    root = _identity_root(tmp_path)
-    before = _identity(root)
-    path = root / relative
-    path.write_text(path.read_text(encoding="utf-8") + "changed\n", encoding="utf-8")
-
-    after = _identity(root)
-
-    assert after["sha256"] != before["sha256"]
-    changed = {
-        name
-        for name in before["groups"]
-        if before["groups"][name]["sha256"] != after["groups"][name]["sha256"]
-    }
-    assert changed == {group}
-    assert (after["coverage_sha256"] != before["coverage_sha256"]) is coverage_changes
-
-
 def _committed_root(tmp_path: Path) -> Path:
     root = _identity_root(tmp_path)
     _git(root, "config", "user.name", "CI")
@@ -144,83 +62,274 @@ def _committed_root(tmp_path: Path) -> Path:
     return root
 
 
-def _evidence(root: Path) -> tuple[Path, Path]:
-    pytest_results = root / "pytest-results.json"
-    pytest_results.write_text(
+def _identity(root: Path, shard: str) -> dict:
+    return ci_coverage_gate.shard_identity(
+        root,
+        shard,
+        postgres_image="sha256:postgres" if shard == "postgres" else "",
+        distributions={"coverage": "7.16.0", "pytest": "9.1.1"},
+        environment_identity={
+            "machine": "x86_64",
+            "postgres_image": ("sha256:postgres" if shard == "postgres" else ""),
+            "python_cache_tag": "cpython-312",
+            "python_implementation": "CPython",
+            "python_version": "3.12.14",
+            "runner_environment": "github-hosted",
+            "runner_image_os": "ubuntu24",
+            "runner_image_version": "20260901.1",
+            "runner_label": "ubuntu-latest",
+            "sysconfig_platform": "linux-x86_64",
+        },
+        pytest_workers="4",
+    )
+
+
+def test_coverage_test_partition_is_complete_and_disjoint() -> None:
+    counts = ci_coverage_gate.validate_test_partition(ROOT)
+    config = ci_coverage_gate.load_config(ROOT)
+    assigned = {
+        relative
+        for shard in ci_coverage_gate.SHARDS
+        for relative in ci_coverage_gate.pytest_targets(ROOT, shard)
+    }
+    collectable = {
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "tests").rglob("test_*.py")
+    }
+
+    assert all(counts[domain] > 0 for domain in ci_coverage_gate.TEST_DOMAINS), (
+        "every logical coverage domain must retain at least one test file"
+    )
+    assert assigned == collectable - set(config["tests"]["coverage_excluded_files"])
+    assert sum(counts.values()) == len(assigned)
+
+
+def test_runtime_nodeid_partitions_are_stable_disjoint_and_complete() -> None:
+    nodeids = [f"tests/test_runtime.py::test_case[{index}]" for index in range(1000)]
+    count = len(ci_coverage_gate.RUNTIME_SHARDS)
+    partitions = [
+        {nodeid for nodeid in nodeids if partition_for_nodeid(nodeid, count) == index}
+        for index in range(count)
+    ]
+
+    assert set.union(*partitions) == set(nodeids)
+    assert sum(len(partition) for partition in partitions) == len(nodeids)
+    assert max(map(len, partitions)) - min(map(len, partitions)) < 80
+
+
+def test_coverage_excludes_the_static_documentation_and_ci_tests() -> None:
+    config = ci_coverage_gate.load_config(ROOT)
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    docs_block = makefile.split("DOCUMENTATION_TESTS = \\\n", 1)[1].split(
+        "\nCI_TOOLING_TESTS =", 1
+    )[0]
+    docs = {
+        line.strip().rstrip("\\").strip()
+        for line in docs_block.splitlines()
+        if line.strip()
+    }
+    tooling_block = makefile.split("CI_TOOLING_TESTS = \\\n", 1)[1].split(
+        "\nPOSTGRES_TESTS =", 1
+    )[0]
+    tooling = {
+        line.strip().rstrip("\\").strip()
+        for line in tooling_block.splitlines()
+        if line.strip()
+    }
+
+    assert docs | tooling <= set(config["tests"]["coverage_excluded_files"])
+
+
+def test_deployment_only_coverage_scope_matches_distribution_split() -> None:
+    application_modules = {
+        module
+        for component in APPLICATION_COMPONENT_NAMES
+        for module in component_modules(component)
+    }
+    deploy_host_only = set(component_modules("deploy_host")) - application_modules
+    expected = {
+        (
+            "src/"
+            + module.replace(".", "/")
+            + (
+                "/__init__.py"
+                if (ROOT / ("src/" + module.replace(".", "/"))).is_dir()
+                else ".py"
+            )
+        )
+        for module in deploy_host_only
+    }
+
+    assert set(ci_coverage_gate.deployment_only_source_files(ROOT)) == expected
+
+
+@pytest.mark.parametrize(
+    ("relative", "affected"),
+    [
+        ("requirements/build.lock", set(ci_coverage_gate.SHARDS)),
+        ("Makefile", set(ci_coverage_gate.SHARDS)),
+        ("src/gpu_fault/runtime.py", set(ci_coverage_gate.SHARDS)),
+        ("src/gpu_fault/admin_only.py", {"deployment"}),
+        ("tests/test_runtime.py", set(ci_coverage_gate.RUNTIME_SHARDS)),
+        ("tests/admin/test_admin.py", {"deployment"}),
+        ("tests/test_case_scheduler.py", {"fault_runner"}),
+        ("tests/store/test_postgres_store.py", {"postgres"}),
+        ("testcases/fault-scenarios.yaml", {"fault_runner"}),
+        ("tests/conftest.py", set(ci_coverage_gate.SHARDS)),
+        ("docs/guide.md", set()),
+        (".github/workflows/ci.yml", set()),
+    ],
+)
+def test_shard_identity_changes_only_affected_domains(
+    tmp_path: Path, relative: str, affected: set[str]
+) -> None:
+    root = _identity_root(tmp_path)
+    before = {
+        shard: _identity(root, shard)["sha256"] for shard in ci_coverage_gate.SHARDS
+    }
+    path = root / relative
+    path.write_text(path.read_text(encoding="utf-8") + "changed\n", encoding="utf-8")
+    after = {
+        shard: _identity(root, shard)["sha256"] for shard in ci_coverage_gate.SHARDS
+    }
+
+    assert {
+        shard for shard in ci_coverage_gate.SHARDS if before[shard] != after[shard]
+    } == affected
+
+
+def _write_coverage_data(root: Path, path: Path, shard: str) -> None:
+    data = CoverageData(basename=str(path))
+    measured = [
+        root / "src/gpu_fault/runtime.py",
+        (
+            root / "src/gpu_fault/admin_only.py"
+            if shard == "deployment"
+            else root / "src/gpu_fault/admin_config.py"
+        ),
+    ]
+    data.add_lines({item.relative_to(root).as_posix(): {1} for item in measured})
+    data.write()
+
+
+def _write_pytest_results(path: Path, nodeid: str) -> None:
+    path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "source_identity": "a" * 64,
-                "records": {"tests/test_runtime.py::test_runtime": {"status": "PASS"}},
+                "records": {
+                    nodeid: {
+                        "duration_seconds": 0.01,
+                        "output": "",
+                        "phases": {"call": "passed"},
+                        "status": "PASS",
+                    }
+                },
             }
         ),
         encoding="utf-8",
     )
-    fault_report = root / "fault-report.json"
-    fault_report.write_text(
-        json.dumps({"schema_version": 2, "verdict": "PASS", "results": []}),
+
+
+def _write_durations(path: Path, shard: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "shard": shard,
+                "pytest": {"record_count": 1, "slowest": [], "wall_seconds": 1.0},
+                "postgres_stress": (
+                    {"record_count": 1, "slowest": [], "wall_seconds": 1.0}
+                    if shard == "postgres"
+                    else None
+                ),
+            }
+        ),
         encoding="utf-8",
     )
-    return pytest_results, fault_report
 
 
-def test_unit_gate_binds_evidence_and_rejects_tampering(
+def _set_main_environment(monkeypatch: pytest.MonkeyPatch, *, run_id: str) -> None:
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repository")
+    monkeypatch.setenv(
+        "GITHUB_WORKFLOW_REF",
+        "owner/repository/.github/workflows/ci.yml@refs/heads/main",
+    )
+    monkeypatch.setenv("GITHUB_RUN_ID", run_id)
+
+
+def _build_shard(
+    root: Path,
+    destination: Path,
+    shard: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_id: str = "123",
+) -> dict:
+    _set_main_environment(monkeypatch, run_id=run_id)
+    destination.mkdir(parents=True, exist_ok=True)
+    coverage_data = destination / ci_coverage_gate.COVERAGE_DATA_NAME
+    pytest_results = destination / ci_coverage_gate.PYTEST_RESULTS_NAME
+    durations = destination / ci_coverage_gate.DURATIONS_NAME
+    stress = (
+        destination / ci_coverage_gate.STRESS_RESULTS_NAME
+        if shard == "postgres"
+        else None
+    )
+    _write_coverage_data(root, coverage_data, shard)
+    _write_pytest_results(pytest_results, f"tests/{shard}.py::test_pass")
+    _write_durations(durations, shard)
+    if stress is not None:
+        _write_pytest_results(stress, "tests/postgres.py::test_stress")
+    gate = ci_coverage_gate.build_shard_gate(
+        root,
+        destination,
+        identity=_identity(root, shard),
+        coverage_data=coverage_data,
+        pytest_results=pytest_results,
+        durations=durations,
+        stress_results=stress,
+    )
+    (destination / ci_coverage_gate.BUNDLE_NAME).write_text("{}", encoding="utf-8")
+    return gate
+
+
+def test_coverage_shard_gate_binds_evidence_and_rejects_tampering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _committed_root(tmp_path)
     artifact_root = tmp_path / "artifact"
-    pytest_results, fault_report = _evidence(tmp_path)
-    identity = _identity(root)
-    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repository")
-    monkeypatch.setenv(
-        "GITHUB_WORKFLOW_REF",
-        "owner/repository/.github/workflows/ci.yml@refs/heads/main",
-    )
-    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    gate = _build_shard(root, artifact_root, "runtime_0", monkeypatch)
 
-    gate = ci_unit_gate.build_unit_gate(
-        root,
-        artifact_root,
-        identity=identity,
-        pytest_results=pytest_results,
-        fault_report=fault_report,
-    )
-
-    path = artifact_root / ci_unit_gate.GATE_NAME
     assert (
-        ci_unit_gate.verify_unit_gate(
-            path, artifact_root, expected_identity=identity["sha256"]
+        ci_coverage_gate.verify_shard_gate(
+            artifact_root / ci_coverage_gate.GATE_NAME,
+            artifact_root,
+            expected_identity=gate["identity"]["sha256"],
+            expected_shard="runtime_0",
+            require_trusted=True,
+            source_root=root,
         )
         == gate
     )
-    (artifact_root / ci_unit_gate.FAULT_REPORT_NAME).write_text(
+    (artifact_root / ci_coverage_gate.DURATIONS_NAME).write_text(
         "tampered\n", encoding="utf-8"
     )
-    with pytest.raises(ci_unit_gate.UnitGateError, match="evidence does not match"):
-        ci_unit_gate.verify_unit_gate(path, artifact_root)
+    with pytest.raises(
+        ci_gate_artifacts.GateArtifactError, match="evidence does not match"
+    ):
+        ci_coverage_gate.verify_shard_gate(
+            artifact_root / ci_coverage_gate.GATE_NAME, artifact_root, source_root=root
+        )
 
 
-def test_restore_reusable_gate_requires_matching_successful_artifact(
+def test_restore_reusable_shard_resigns_current_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _committed_root(tmp_path)
     source = tmp_path / "source"
-    pytest_results, fault_report = _evidence(tmp_path)
-    identity = _identity(root)
-    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repository")
-    monkeypatch.setenv(
-        "GITHUB_WORKFLOW_REF",
-        "owner/repository/.github/workflows/ci.yml@refs/heads/main",
-    )
-    monkeypatch.setenv("GITHUB_RUN_ID", "99")
-    ci_unit_gate.build_unit_gate(
-        root,
-        source,
-        identity=identity,
-        pytest_results=pytest_results,
-        fault_report=fault_report,
-    )
-    (source / ci_unit_gate.BUNDLE_NAME).write_text("{}", encoding="utf-8")
+    gate = _build_shard(root, source, "runtime_0", monkeypatch, run_id="99")
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as value:
         for path in sorted(source.iterdir()):
@@ -230,48 +339,152 @@ def test_restore_reusable_gate_requires_matching_successful_artifact(
         "archive_download_url": "https://example.invalid/artifact",
         "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
     }
-    run = {"id": 99}
     monkeypatch.setattr(
-        ci_unit_gate, "find_reusable_artifact", lambda **_kwargs: (artifact, run)
+        ci_coverage_gate,
+        "find_reusable_artifact",
+        lambda **_kwargs: (artifact, {"id": 99}),
     )
-    monkeypatch.setattr(ci_unit_gate, "_download", lambda *_args: data)
-    monkeypatch.setattr(ci_unit_gate, "_is_ancestor", lambda *_args: True)
-    monkeypatch.setattr(
-        ci_unit_gate,
-        "change_impact_plan",
-        lambda *_args: {"domains": ["docs-only"], "full": False, "postgres": False},
-    )
+    monkeypatch.setattr(ci_coverage_gate, "download", lambda *_args: data)
+    monkeypatch.setattr(ci_coverage_gate, "_is_ancestor", lambda *_args: True)
 
     destination = tmp_path / "restored"
-    result = ci_unit_gate.restore_reusable_gate(
+    result = ci_coverage_gate.restore_reusable_shard(
         root=root,
         repository="owner/repository",
         token="token",
-        identity=identity,
+        identity=gate["identity"],
         destination=destination,
         current_run_id=100,
     )
 
     assert result["reused"] == "true"
-    assert result["delta_required"] == "false"
-    assert result["source_run_id"] == 99
-    assert (destination / ci_unit_gate.BASE_GATE_NAME).is_file(), (
-        "reusable unit gate was not restored"
+    assert (destination / ci_coverage_gate.BASE_GATE_NAME).is_file(), (
+        "restored evidence must retain the signed base gate"
     )
-    monkeypatch.setenv("GITHUB_RUN_ID", "100")
-    current = ci_unit_gate.build_unit_gate(
+    _set_main_environment(monkeypatch, run_id="100")
+    current = ci_coverage_gate.build_shard_gate(
         root,
         destination,
-        identity=identity,
-        pytest_results=destination / ci_unit_gate.PYTEST_RESULTS_NAME,
-        fault_report=destination / ci_unit_gate.FAULT_REPORT_NAME,
+        identity=gate["identity"],
+        coverage_data=destination / ci_coverage_gate.COVERAGE_DATA_NAME,
+        pytest_results=destination / ci_coverage_gate.PYTEST_RESULTS_NAME,
+        durations=destination / ci_coverage_gate.DURATIONS_NAME,
+    )
+    assert current["producer"]["run_id"] == "100"
+    assert current["reused_from"]["producer_run_id"] == "99"
+
+
+def _unit_evidence(root: Path) -> tuple[Path, Path, Path, Path]:
+    coverage = root / "coverage.json"
+    coverage.write_text(
+        json.dumps(
+            {
+                "meta": {"branch_coverage": True},
+                "files": {"src/gpu_fault/runtime.py": {}},
+                "totals": {"percent_covered": 80.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    pytest_results = root / "pytest-case-results.json"
+    _write_pytest_results(pytest_results, "tests/runtime.py::test_pass")
+    fault_report = root / "fault-report.json"
+    fault_report.write_text(
+        json.dumps({"schema_version": 2, "verdict": "PASS", "results": []}),
+        encoding="utf-8",
+    )
+    durations = root / "test-durations.json"
+    durations.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "shards": {
+                    shard: {
+                        "pytest": {"wall_seconds": 1.0},
+                        "postgres_stress": None,
+                        "producer_run_id": "123",
+                        "reused": False,
+                    }
+                    for shard in ci_coverage_gate.SHARDS
+                },
+                "slowest": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return coverage, pytest_results, fault_report, durations
+
+
+def test_unit_gate_aggregates_all_signed_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _committed_root(tmp_path)
+    shards_root = tmp_path / "shards"
+    for shard in ci_coverage_gate.SHARDS:
+        _build_shard(root, shards_root / shard, shard, monkeypatch)
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    coverage, pytest_results, fault_report, durations = _unit_evidence(evidence_root)
+    artifact_root = tmp_path / "unit"
+    _set_main_environment(monkeypatch, run_id="123")
+
+    gate = ci_unit_gate.build_unit_gate(
+        root,
+        artifact_root,
+        shards_root=shards_root,
+        coverage_summary=coverage,
+        pytest_results=pytest_results,
+        fault_report=fault_report,
+        durations=durations,
+        require_run_id="123",
     )
 
-    assert current["reused_from"]["producer_run_id"] == "99"
-    assert current["delta"]["domains"] == ["docs-only"]
+    assert set(gate["shards"]) == set(ci_coverage_gate.SHARDS)
+    assert (
+        ci_unit_gate.verify_unit_gate(
+            artifact_root / ci_unit_gate.GATE_NAME,
+            artifact_root,
+            expected_identity=gate["identity"]["sha256"],
+            source_root=root,
+        )
+        == gate
+    )
+    bundle = artifact_root / "shards" / "runtime_0" / ci_coverage_gate.BUNDLE_NAME
+    bundle.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(ci_unit_gate.UnitGateError, match="artifact does not match"):
+        ci_unit_gate.verify_unit_gate(
+            artifact_root / ci_unit_gate.GATE_NAME, artifact_root, source_root=root
+        )
 
 
-def test_reusable_gate_skips_failed_main_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_coverage_combine_uses_the_configured_data_file_basename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _committed_root(tmp_path)
+    shards_root = tmp_path / "shards"
+    for shard in ci_coverage_gate.SHARDS:
+        _build_shard(root, shards_root / shard, shard, monkeypatch)
+    output_root = tmp_path / "combined"
+
+    ci_coverage_gate.combine_shards(
+        root=root,
+        shards_root=shards_root,
+        output_root=output_root,
+        python=sys.executable,
+        require_run_id="123",
+    )
+
+    summary = json.loads((output_root / "coverage.json").read_text(encoding="utf-8"))
+    merged = json.loads(
+        (output_root / "pytest-case-results.json").read_text(encoding="utf-8")
+    )
+    assert summary["totals"]["percent_covered"] >= 78
+    assert len(merged["records"]) == len(ci_coverage_gate.SHARDS)
+
+
+def test_reusable_artifact_skips_failed_main_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     artifacts = {
         "artifacts": [
             {
@@ -302,12 +515,12 @@ def test_reusable_gate_skips_failed_main_runs(monkeypatch: pytest.MonkeyPatch) -
             "status": "completed",
         }
 
-    monkeypatch.setattr(ci_unit_gate, "_api_json", api)
+    monkeypatch.setattr(ci_gate_artifacts, "api_json", api)
 
-    found = ci_unit_gate.find_reusable_artifact(
+    found = ci_gate_artifacts.find_reusable_artifact(
         repository="owner/repository",
         token="token",
-        name="gpu-fault-unit-gate-" + "a" * 64,
+        name="gpu-fault-coverage-runtime-" + "a" * 64,
         current_run_id=None,
     )
 
@@ -315,31 +528,10 @@ def test_reusable_gate_skips_failed_main_runs(monkeypatch: pytest.MonkeyPatch) -
     assert found[0]["id"] == 2
 
 
-@pytest.mark.parametrize(
-    ("plan", "expected"),
-    [
-        (
-            {"domains": ["docs-only", "ci-tooling"], "full": False, "postgres": False},
-            False,
-        ),
-        ({"domains": ["release-rollout"], "full": False, "postgres": False}, True),
-        ({"domains": ["runtime-foundation"], "full": True, "postgres": False}, None),
-        ({"domains": ["schema-transaction"], "full": False, "postgres": True}, None),
-    ],
-)
-def test_delta_requirement_fails_closed(plan: dict, expected: bool | None) -> None:
-    assert (
-        ci_unit_gate.delta_required_for_plan(
-            plan, static_only_domains={"ci-tooling", "docs-only"}
-        )
-        is expected
-    )
-
-
-def test_unit_gate_zip_rejects_path_traversal(tmp_path: Path) -> None:
+def test_gate_zip_rejects_path_traversal(tmp_path: Path) -> None:
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as value:
         value.writestr("../outside", "unsafe")
 
-    with pytest.raises(ci_unit_gate.UnitGateError, match="unsafe"):
-        ci_unit_gate.extract_unit_gate_archive(archive.getvalue(), tmp_path)
+    with pytest.raises(ci_gate_artifacts.GateArtifactError, match="unsafe"):
+        ci_gate_artifacts.extract_archive(archive.getvalue(), tmp_path)

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts import ci_gate, ci_unit_gate, resolve_ci_run
+from scripts import ci_coverage_gate, ci_gate, resolve_ci_run
 
 
 def _candidate(tmp_path: Path) -> Path:
@@ -23,32 +23,16 @@ def _candidate(tmp_path: Path) -> Path:
 
 def _unit_gate(dist: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = dist / "ci-domains/unit"
-    pytest_results = root / ci_unit_gate.PYTEST_RESULTS_NAME
-    fault_report = root / ci_unit_gate.FAULT_REPORT_NAME
     root.mkdir(parents=True)
-    pytest_results.write_text(
-        json.dumps({"schema_version": 1, "records": {}}), encoding="utf-8"
-    )
-    fault_report.write_text(
-        json.dumps({"schema_version": 2, "verdict": "PASS"}), encoding="utf-8"
-    )
-    identity = ci_unit_gate.unit_identity(
-        Path(__file__).resolve().parents[1], postgres_image="sha256:postgres"
-    )
-    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repository")
-    monkeypatch.setenv(
-        "GITHUB_WORKFLOW_REF",
-        "owner/repository/.github/workflows/ci.yml@refs/heads/main",
-    )
-    monkeypatch.setenv("GITHUB_RUN_ID", "123")
-    ci_unit_gate.build_unit_gate(
-        Path(__file__).resolve().parents[1],
-        root,
-        identity=identity,
-        pytest_results=pytest_results,
-        fault_report=fault_report,
-    )
-    return root / ci_unit_gate.GATE_NAME
+    path = root / "unit-gate.json"
+    path.write_text("{}", encoding="utf-8")
+    unit = {
+        "identity": {"coverage_sha256": "b" * 64, "sha256": "a" * 64},
+        "producer": {"git_commit": "c" * 40, "run_id": "123"},
+        "reuse": {"fresh_shards": sorted(ci_coverage_gate.SHARDS), "reused_shards": []},
+    }
+    monkeypatch.setattr(ci_gate, "verify_unit_gate", lambda *_args, **_kwargs: unit)
+    return path
 
 
 def test_ci_gate_binds_source_and_candidate(

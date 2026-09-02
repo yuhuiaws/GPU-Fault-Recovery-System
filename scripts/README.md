@@ -25,10 +25,12 @@ generic fault-case runner.
 - `component_artifacts.py` and `component_artifact_cache.py`: validate canonical
   component wheels/Node bundle and persist source-only artifact sets across
   staging snapshots without reusing delivery identity.
-- `ci_unit_gate.py`, `ci_gate.py` and `resolve_ci_run.py`: content-address and
-  sign the runtime/deployment/tests/fault/dependency unit domains, bind reused
-  or fresh evidence into the exact current checkout, then resolve that
-  candidate for Release promotion.
+- `ci_coverage_gate.py`, `ci_gate_artifacts.py`, `ci_unit_gate.py`,
+  `ci_gate.py` and `resolve_ci_run.py`: partition runtime, deployment,
+  fault-runner and PostgreSQL coverage; content-address, restore and sign each
+  shard; combine branch coverage under one floor; bind duration/fault evidence
+  into the current unit and commit gates; then resolve that candidate for
+  Release promotion.
 - `staging_deploy.py`: private source preparation invoked by
   `gpu-fault-admin deploy`; it creates or reuses signing material, isolated
   dirty-worktree commits, commit-bound deploy-host bundles and the internal

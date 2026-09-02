@@ -7,11 +7,18 @@ PYTHON ?= $(firstword $(wildcard .venv/bin/python) python3)
 PYTHONPYCACHEPREFIX ?= /tmp/gpu-fault-pycache
 export PYTHONPYCACHEPREFIX
 PYTEST_XDIST_WORKERS ?= 4
+PYTEST_XDIST_DIST ?= worksteal
+PYTEST_DURATIONS ?= 50
 FAULT_TEST_WORKERS ?= 1
 PARALLEL_FAULT_TEST_WORKERS ?= 4
 FAULT_TEST_PYTEST_RESULTS ?= artifacts/fault/pytest-case-results.json
 FAULT_TEST_REPORT ?=
 COVERAGE_FLOOR ?= 78
+COVERAGE_SHARD ?=
+COVERAGE_SHARD_ROOT ?= artifacts/coverage-shards/$(COVERAGE_SHARD)
+COVERAGE_SHARDS_ROOT ?= artifacts/coverage-shards
+COVERAGE_COMBINED_ROOT ?= artifacts/coverage-combined
+COVERAGE_INCLUDE_STRESS ?= 0
 BASE ?= origin/main
 COSIGN ?= cosign
 RUNTIME_IMAGE_PLATFORM ?= linux/amd64
@@ -56,16 +63,18 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_processor_claim.py \
 	tests/store/test_postgres_reconnect.py \
 	tests/store/test_store_contracts.py
-COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS),--ignore=$(test))
+COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS) $(POSTGRES_TESTS),--ignore=$(test))
 
-.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
 
 test-parallel:
 	GPU_FAULT_TEST_POSTGRES_URL= \
-		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS)
+		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \
+		--dist=$(PYTEST_XDIST_DIST) \
+		--durations=$(PYTEST_DURATIONS)
 
 test-impact:
 	$(PYTHON) scripts/select-affected-tests.py \
@@ -88,23 +97,46 @@ coverage:
 	GPU_FAULT_TEST_POSTGRES_URL= \
 	PYTEST_GPU_FAULT_CASE_REPORT="$(FAULT_TEST_PYTEST_RESULTS)" \
 	$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \
+		--dist=$(PYTEST_XDIST_DIST) \
 		-p tools.pytest_case_reporter \
 		$(COVERAGE_IGNORE_ARGS) \
 		--cov=src/gpu_fault \
 		--cov-branch \
-		--cov-report=
+		--cov-report= \
+		--durations=$(PYTEST_DURATIONS)
 	$(PYTHON) -m pytest $(POSTGRES_TESTS) \
 		--cov=src/gpu_fault \
 		--cov-branch \
 		--cov-append \
 		--cov-fail-under=$(COVERAGE_FLOOR) \
 		--cov-report=term-missing \
-		--cov-report=html
+		--cov-report=html \
+		--durations=$(PYTEST_DURATIONS)
+
+coverage-shard:
+	@test -n "$(COVERAGE_SHARD)" || \
+		(printf 'COVERAGE_SHARD is required\n' >&2; exit 2)
+	$(PYTHON) scripts/ci_coverage_gate.py run \
+		--shard "$(COVERAGE_SHARD)" \
+		--python "$(PYTHON)" \
+		--artifact-root "$(COVERAGE_SHARD_ROOT)" \
+		--workers "$(PYTEST_XDIST_WORKERS)" \
+		--dist "$(PYTEST_XDIST_DIST)" \
+		--durations "$(PYTEST_DURATIONS)" \
+		$(if $(filter true yes 1,$(COVERAGE_INCLUDE_STRESS)),--include-stress,)
+
+coverage-combine:
+	$(PYTHON) scripts/ci_coverage_gate.py combine \
+		--python "$(PYTHON)" \
+		--shards-root "$(COVERAGE_SHARDS_ROOT)" \
+		--output-root "$(COVERAGE_COMBINED_ROOT)" \
+		$(if $(GITHUB_RUN_ID),--require-run-id "$(GITHUB_RUN_ID)",)
 
 test-postgres:
 	@test -n "$${GPU_FAULT_TEST_POSTGRES_URL}" || \
 		(printf 'GPU_FAULT_TEST_POSTGRES_URL is required\n' >&2; exit 2)
-	$(PYTHON) -m pytest $(POSTGRES_TESTS)
+	$(PYTHON) -m pytest $(POSTGRES_TESTS) \
+		--durations=$(PYTEST_DURATIONS)
 
 test-postgres-stress:
 	GPU_FAULT_POSTGRES_LOCK_STRESS_WORKERS=8 \

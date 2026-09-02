@@ -92,9 +92,10 @@ Documentation-Impact-Reason: 仅重构内部实现，公共行为、命令和验
 ## 开发规范
 
 - [CI 发布流程](CI发布流程.md)：GitHub main CI并行门禁、签名候选、Release晋级、
-  artifact交付和部署消费边界。离线deploy-host安装隔离工作区Python路径、强制安装
-  bundle项目wheel，按lock/平台复用共享依赖层，并自动重建同摘要但不完整的venv；
-  签名密码只进入最终cosign进程，不进入测试或构建。
+  artifact交付和部署消费边界。Runtime逻辑域拆成三个nodeid子shard，与deployment、
+  fault-runner和PostgreSQL shard独立签名复用并最终统一执行floor；离线deploy-host安装隔离工作区
+  Python路径、强制安装bundle项目wheel，按lock/平台复用共享依赖层，并自动重建同摘要
+  但不完整的venv；签名密码只进入最终cosign进程，不进入测试或构建。
 - [EC2源码统一部署流程](EC2源码Staging复现流程.md)：代码修改后的最短验证、
   staging部署、非破坏性测试和生产晋级闭环。
 - [开发者部署实现](开发者部署实现.md)：内部site、生产 Manifest、renderer、

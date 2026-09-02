@@ -107,15 +107,23 @@ GitHub Actions从触发、OIDC/ECR、质量门禁、制品签名到`gpu-fault-re
 wheel。只修改管理员部署代码时必须验证deploy-host bundle和deployment影响域；不得因此
 重建或滚动未变化的应用Runtime组件。
 
-`make check`的最终全量测试和`make test-parallel`使用4个worker且不连接外部
-PostgreSQL。`make coverage`要求设置`GPU_FAULT_TEST_POSTGRES_URL`：先由4个worker
-采集非PostgreSQL覆盖率，再串行追加隔离PostgreSQL 16测试库覆盖率，最后统一强制当前
-78%的floor。文档和CI契约测试由`make docs-check`、`make ci-tooling-check`独立执行，
-不重复计入coverage。main CI按runtime、deployment、tests、fault runner和dependencies
-内容摘要复用已签名unit gate。runtime、dependencies、普通tests或测试环境变化会重新
-执行完整coverage；deployment/fault runner变化先按change-impact矩阵执行delta，
-矩阵要求full、PostgreSQL或无法分类时回退完整门禁。覆盖率可以提高，不能通过调低
-`COVERAGE_FLOOR`掩盖未测试的新分支。
+`make check`的最终全量测试和`make test-parallel`默认使用4个worker、
+`--dist=worksteal`且不连接外部PostgreSQL。`make coverage`仍是本地单进程入口：
+先采集非PostgreSQL覆盖率，再串行追加隔离PostgreSQL 16测试库覆盖率，最后统一强制
+当前78%的floor。文档和CI契约测试由`make docs-check`、`make ci-tooling-check`
+独立执行，不重复计入coverage。
+
+main CI把fresh门禁分成`runtime`、`deployment`、`fault_runner`和`postgres`四个逻辑
+域；其中runtime按稳定pytest nodeid哈希拆成`runtime_0..2`，因此共有六个并行物理
+shard。每个shard按自己的源码、测试、依赖和Runner环境计算内容身份，独立恢复、验签、
+重签和上传；聚合`unit` job最后执行`coverage combine`并统一强制78% floor，再生成
+fault report和签名unit gate。deploy-host-only管理员源码只进入deployment shard；
+文档或`.github/`变化由当前static验证，可复用六个历史shard。所有pytest shard保留
+`--durations`结构化证据。仓库已配置较高规格Runner时可设置`CI_TEST_RUNNER`及匹配的
+`CI_PYTEST_WORKERS`，未设置时保持`ubuntu-latest`和4个worker。
+
+覆盖率可以提高，不能通过调低`COVERAGE_FLOOR`、跳过shard或丢弃PostgreSQL stress
+掩盖未测试的新分支。
 Make在checkout中检测到`.venv/bin/python`时会自动使用该解释器；源码包没有`.venv`
 时回退到`python3`，显式`PYTHON=...`始终优先。
 

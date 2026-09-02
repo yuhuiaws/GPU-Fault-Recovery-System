@@ -69,6 +69,28 @@ jobs:
           dist/ci-gate.json
       - name: Verify candidate source and artifacts
         run: python scripts/ci_gate.py verify --gate dist/ci-gate.json --dist dist
+      - name: Verify promoted unit domain signature
+        run: >-
+          cosign verify-blob
+          --bundle dist/ci-domains/unit/unit-gate.bundle.json
+          --certificate-identity
+          "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main"
+          --certificate-oidc-issuer
+          "https://token.actions.githubusercontent.com"
+          dist/ci-domains/unit/unit-gate.json
+      - name: Verify promoted coverage shard signatures
+        run: |
+          while IFS= read -r -d '' gate; do
+            root="$(dirname "${gate}")"
+            cosign verify-blob \
+              --bundle "${root}/coverage-shard-gate.bundle.json" \
+              --certificate-identity \
+              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main" \
+              --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+              "${gate}"
+          done < <(find dist/ci-domains/unit/shards \
+            -name coverage-shard-gate.json -print0)
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.RELEASE_ROLE_ARN }}

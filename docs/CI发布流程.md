@@ -19,8 +19,9 @@
 - `.github/workflows/release.yml`：候选解析、验签、ECR晋级和最终artifact上传；
 - `Makefile` 中的 `release-build-promoted`、`deploy-host-sign`，以及受信本地环境使用的
   `release-build`、`deploy-host-bundle`；
-- `scripts/ci_unit_gate.py`、`scripts/ci_gate.py`、`scripts/resolve_ci_run.py`：
-  内容寻址unit门禁、main CI候选身份和Release run选择；
+- `scripts/ci_coverage_gate.py`、`scripts/ci_gate_artifacts.py`、
+  `scripts/ci_unit_gate.py`、`scripts/ci_gate.py`、`scripts/resolve_ci_run.py`：
+  内容寻址coverage shard、聚合unit门禁、main CI候选身份和Release run选择；
 - `scripts/build-release-runtime-image.py`、`scripts/build-release-artifacts.py`、
   `scripts/build-release-attestation.py`：运行镜像、Manifest v3 和 attestation；
 - `scripts/build-deploy-host-bundle.py`、`scripts/deploy_host_bundle.py`：部署机离线包。
@@ -33,10 +34,16 @@
 
 ```text
 main push
-  -> static、unit、artifact 三个 job 并行
-  -> unit: 计算五个内容域摘要
-       -> 命中历史成功main CI的同身份签名gate：验签并复用
-       -> 未命中：coverage + PostgreSQL contract + fault report + stress并签名
+  -> static、artifact、5个非PG coverage shard、1个PG shard并行
+  -> 每个coverage shard:
+       -> 计算域内容身份
+       -> 命中历史成功main CI的同身份签名gate：验签并复用证据
+       -> 未命中：执行本域pytest、branch coverage和duration采集
+       -> 生成当前run gate并独立签名
+  -> unit: 验签六个物理shard
+       -> coverage combine + 统一78% floor
+       -> 合并pytest结果、生成fault report和duration汇总
+       -> 生成并签名聚合unit gate
   -> artifact: source-only canonical组件制品 + 未签名deploy-host bundle
   -> test: 验证unit域gate，汇总本次static/artifact，生成并签名commit CI gate
   -> 上传 gpu-fault-ci-candidate
@@ -56,9 +63,9 @@ workflow_dispatch 或 v* tag
   -> 上传 dist/ 为 gpu-fault-release artifact
 ```
 
-PR也并行运行`static`、`unit`和`artifact`，但不执行PostgreSQL stress、不构建
-deploy-host bundle，也不生成可供Release跨run下载的签名候选。最终job仍名为`test`，
-用于保持分支保护的单一聚合状态。
+PR也运行相同的六个fresh shard、统一coverage floor、PostgreSQL stress、`static`和
+`artifact`，但shard不作main信任签名、不构建deploy-host bundle，也不生成可供Release
+跨run下载的签名候选。最终job仍名为`test`，用于保持分支保护的单一聚合状态。
 
 Release workflow只接受checkout得到的clean commit，并要求其候选来自
 `refs/heads/main`上的成功push CI。它生成：
@@ -130,7 +137,17 @@ Release workflow 消费以下 GitHub repository 或 environment variables：
 两个 repository 值都必须匹配 ECR URI。cache repository 只用于加速 layer 构建，
 不能作为可信发布制品，也不能替代 Runtime Image digest 校验。
 
-只有CI的`unit` job创建临时PostgreSQL 16 service，并设置只指向该service的
+CI测试还支持以下可选repository variables：
+
+| 名称 | 默认 | 作用 |
+|---|---|---|
+| `CI_TEST_RUNNER` | `ubuntu-latest` | coverage和PostgreSQL shard使用的已配置larger/self-hosted Runner label |
+| `CI_PYTEST_WORKERS` | `4` | 非PostgreSQL shard的xdist worker数；应与Runner CPU/IO容量匹配 |
+
+未配置larger runner时不得填写不存在的label。worker数变化会进入shard协议身份；CI固定
+使用`--dist=worksteal`减少长尾，但不会以增加worker代替慢测试分析。
+
+只有CI的`postgres` shard创建临时PostgreSQL 16 service，并设置只指向该service的
 `GPU_FAULT_TEST_POSTGRES_URL`。Release job不再创建PostgreSQL，也不重复执行已经由
 签名CI gate证明的测试。该测试连接不是生产数据库连接，不得替换为生产Aurora。
 
@@ -138,47 +155,80 @@ Release workflow 消费以下 GitHub repository 或 environment variables：
 
 ### 3.1 并行CI门禁
 
-三个job各自使用Python 3.12和pip cache，并安装hash固定的`requirements/build.lock`
-后再安装项目测试extras：
+所有job使用Python 3.12和pip cache，并安装hash固定的`requirements/build.lock`后再
+安装项目测试extras。CI的执行单元如下：
 
 | job | 主要职责 |
 |---|---|
 | `static` | Ruff、mypy strict、compileall、架构、部署契约、文档与CI工具测试、配置、YAML、Shell和artifact安全检查 |
-| `unit` | 内容身份恢复；未命中时执行4路xdist覆盖率、PostgreSQL contract、fault report和main PostgreSQL stress |
+| `coverage-runtime_0..2` | 普通Runtime pytest按稳定nodeid哈希分为三份，分别采集branch coverage和duration证据 |
+| `coverage-deployment` | 发布、区域编排、deploy-host管理员pytest及对应coverage |
+| `coverage-fault_runner` | fault scheduler/runner测试和duration证据 |
+| `coverage-postgres` | 串行PostgreSQL contract coverage，再执行8 workers × 40 rounds stress |
+| `unit` | 验签六个物理shard、合并coverage、统一floor、fault report、duration汇总和聚合签名 |
 | `artifact` | 构建并验证source-only三个组件wheel与Node bundle；main额外构建未签名deploy-host bundle |
+| `test` | 聚合static/unit/artifact并为main生成commit级CI gate |
 
-`config/ci-unit-gate.json`定义不进入unit身份的文档与CI工具边界。
-`scripts/ci_unit_gate.py`把其余输入分别摘要为：
+`config/ci-unit-gate.json`定义测试分区、内容身份组、coverage协议和不重复进入coverage的
+文档/CI测试。四个逻辑域按以下边界执行，其中runtime生成三个物理shard：
 
-- `runtime`：项目运行时代码和非部署脚本；
-- `deployment`：`deploy/`、管理员/发布部署代码及相应测试；
-- `tests`：普通测试和测试数据；
-- `fault_runner`：fault catalog、runner、scheduler和pytest结果转换；
-- `dependencies`：`pyproject.toml`、`uv.lock`和requirements lock。
+| shard | 测试边界 | 内容身份要点 |
+|---|---|---|
+| `runtime_0..2` | 除静态、部署、fault runner和PostgreSQL入口外的普通测试；每个具体nodeid按SHA-256取模只进入一份 | dependencies、Runtime源码、Runtime测试、共享fixture、分区总数和index |
+| `deployment` | `tests/admin/`、可执行regional测试和release/deploy/artifact根测试 | dependencies、Runtime共享源码、部署/deploy-host-only源码和部署测试 |
+| `fault_runner` | `tests/test_case_scheduler.py`；catalog完整契约仍由static执行 | dependencies、Runtime共享源码、testcases、runner/scheduler和runner测试 |
+| `postgres` | 4个`tests/store/test_postgres*.py`/contract入口 | dependencies、Runtime共享源码、PostgreSQL测试、实际PostgreSQL image |
 
-身份还包含Python版本/ABI、Runner image、实际PostgreSQL image ID和已安装distribution
-版本。coverage复用键由`runtime + dependencies + tests + 环境`计算。命中历史成功main
-CI的同键artifact后，先验证`unit-gate.json`的Cosign签名、证据SHA和producer run，再以
-producer commit为BASE生成当前change-impact计划：
+PostgreSQL shard的四个直接入口是：
 
-- 只涉及docs/CI工具时由当前static gate覆盖；
-- deployment或其他选择性域变化时只执行计划列出的pytest/check；
-- fault runner、未知路径、full域或需要PostgreSQL的delta会拒绝复用并回退完整unit门禁。
+```text
+tests/store/test_postgres_store.py
+tests/store/test_postgres_processor_claim.py
+tests/store/test_postgres_reconnect.py
+tests/store/test_store_contracts.py
+```
 
-当前run随后把历史coverage证据、delta计划和当前五域完整身份重新组成并签名新的unit
-gate。环境、签名、run结论或文件清单不一致同样会重新执行完整门禁。
+它主要覆盖`src/gpu_fault/store/postgres/**`、`store/contracts.py`、
+`store/shared/**`、schema/DDL、连接池与重连，以及processor claim、lease、counter和
+fencing。由于这些测试会消费共享model、Store contract和Runtime辅助代码，其身份保守
+绑定Runtime源码，而不是只摘要`store/postgres/`；deploy-host-only管理员源码不在该
+身份中。
 
-文档、`.github/`和对应CI/文档契约测试由当前commit的`static` job执行，因此这些变化
-可以复用unit gate，但不能跳过当前静态检查。
+每个shard身份还包含Python版本/ABI、Runner image、实际worker协议和已安装distribution；
+PostgreSQL shard额外包含容器image ID。main push先按
+`gpu-fault-coverage-<shard>-<identity>`查找历史artifact，只接受已完成且成功的main
+push run。命中后：
 
-未命中复用时，`make coverage`在非PostgreSQL pytest过程中加载
-`tools.pytest_case_reporter`，把每个nodeid结果写入固定域证据目录。文档/契约测试不
-重复进入coverage，由`static`的`make docs-check`执行。随后
-`make fault-test-cases-ci`校验源码身份并直接把这些结果映射到fault catalog，不再为
-64条unit/component case重新启动pytest；缺少结果文件时仍可回退到单进程批量pytest。
+1. 验证历史shard gate的Cosign workflow identity、producer run和全部证据SHA；
+2. 要求producer commit仍是当前commit的祖先；
+3. 复用coverage、pytest和duration证据；
+4. 生成带`reused_from`的当前run shard gate并重新签名。
 
-main push额外运行`make test-postgres-stress`，覆盖schema、并发、lease、counter和
-fencing；任何skip或失败都会阻止候选生成。
+未命中的shard只执行自己的pytest。五个非PostgreSQL shard在独立Runner上使用
+`--dist=worksteal`；每个pytest命令同时打印`--durations=50`并写入结构化
+`durations.json`。因此fresh run的墙钟由最慢shard决定，不再把约3800条普通测试、
+PostgreSQL contract和stress串在同一job中。
+
+pytest nodeid是“测试文件路径 + 测试类/函数 + 参数化case ID”，例如：
+
+```text
+tests/collectors/test_xid_kmsg_catalog_replay.py::test_xid_kmsg_catalog_replay_b200[GF-XID-KMSG-B200-143]
+```
+
+它不是GPU或Kubernetes节点身份。按nodeid而不是按文件拆分，可以把同一文件中的数百个
+参数化case分散到三个runtime Runner；分区算法确定、互斥且并集完整。测试函数或参数ID
+变化会改变runtime身份，使三个runtime shard同时失效重跑。
+
+runtime、fault runner和PostgreSQL coverage显式排除deploy-host-only模块；
+deployment shard采集完整应用源码覆盖。这样只修改独立管理员CLI代码时，旧Runtime
+coverage不会携带变化模块的陈旧行号，只有deployment shard失效。最终`unit` job再次
+核对六个shard属于当前run、验签并执行`coverage combine`，只在合并数据达到78% floor
+后继续。
+
+六份pytest结果在shard身份校验后合并并改写为当前源码身份。
+`make fault-test-cases-ci`直接把这些结果映射到64条unit/component fault case，不再次
+启动pytest。文档/CI契约测试由当前commit的`static` job执行，因此docs或`.github/`
+变化可以复用六个shard，但不能跳过当前static和artifact门禁。
 
 `artifact-check`只生成一套canonical Control Plane、Executor、Node Runtime wheel和
 Node bundle。source-only Manifest为`deployable=false`，但包含物理SHA、
@@ -194,11 +244,13 @@ workflow在候选验签成功后签名。
 聚合job `test`依赖三个job并逐一要求`success`。main push时它：
 
 1. 下载artifact job生成的完整`dist/`；
-2. 下载unit job本次重新上传的签名域gate，并再次验签、核对内容身份和证据；
+2. 下载unit job本次生成的聚合签名gate，再次验签，并核对其内六个shard gate、
+   签名bundle、内容身份和证据；
 3. 要求工作树干净，读取source-only schema v3 Manifest；
 4. 记录Git commit、Git tree、repository、main CI workflow ref、run ID；
 5. 对`dist/`中除CI gate自身外的每个文件记录相对路径、权限、大小和SHA-256；
-6. 把unit gate的identity、producer run/commit、SHA和是否复用写入`domains.unit`；
+6. 把unit gate的identity、producer run/commit、SHA和复用shard清单写入
+   `domains.unit`；
 7. keyless签名`dist/ci-gate.json`；
 8. 上传`gpu-fault-ci-candidate`，保留30天。
 
@@ -213,7 +265,8 @@ Release checkout目标commit后，先解析匹配的成功main CI run并下载
 1. 用精确CI workflow certificate identity和GitHub Actions issuer验证CI gate签名；
 2. 验证gate的commit、tree和repository与当前checkout一致；
 3. 重新计算候选Manifest SHA和完整文件清单；
-4. 只有全部一致后才获取AWS OIDC身份、登录ECR和安装发布依赖。
+4. 再次验证聚合unit gate和六个coverage shard的独立Cosign签名；
+5. 只有全部一致后才获取AWS OIDC身份、登录ECR和安装发布依赖。
 
 因此手工提供其他run ID、tag指向未通过main CI的commit、候选缺文件或跨run混合制品都
 会在AWS/ECR动作之前失败。
@@ -364,8 +417,10 @@ artifact，不是自动创建的 GitHub Release asset，也不会自动复制到
 
 | 位置 | 生产者 | 用途 |
 |---|---|---|
-| `dist/ci-domains/unit/unit-gate.json` | main CI `unit` job或历史成功main CI | 绑定五个执行域、环境、coverage/fault/PostgreSQL证据 |
+| `dist/ci-domains/unit/unit-gate.json` | main CI `unit` job | 聚合六个当前run shard、统一coverage/fault/duration证据 |
 | `dist/ci-domains/unit/unit-gate.bundle.json` | main CI `cosign sign-blob` | unit域gate的Sigstore签名 |
+| `dist/ci-domains/unit/shards/<shard>/coverage-shard-gate.json` | 对应coverage job | 绑定单个shard内容身份、producer和coverage/pytest/duration证据 |
+| 同目录`coverage-shard-gate.bundle.json` | 对应coverage job的`cosign sign-blob` | 单个shard的独立Sigstore签名 |
 | `dist/ci-gate.json` | main CI `test` job | 绑定当前源码、source-only候选、unit域gate及组合质量门禁 |
 | `dist/ci-gate.bundle.json` | main CI `cosign sign-blob` | CI gate的Sigstore签名材料 |
 | ECR 中的不可变 Runtime Image digest | `build-release-runtime-image.py` | CPU Control Plane 和 GPU Executor 运行镜像 |
@@ -393,13 +448,14 @@ artifact，不是自动创建的 GitHub Release asset，也不会自动复制到
 
 发布链路按以下关系逐层绑定：
 
-1. unit域gate绑定五个内容域、测试环境和证据，并由固定main CI identity签名；
-2. 当前commit CI gate验签并绑定unit域gate，同时绑定当前tree、static和artifact；
-3. Runtime Image descriptor绑定OCI digest、构建输入和候选中的镜像组件；
-4. Manifest v3绑定三个wheel、Node bundle、Runtime Image和delivery identity；
-5. attestation绑定Manifest SHA、release ID、delivery identity、源码状态和CI gate SHA；
-6. Release Sigstore bundle证明attestation来自批准的GitHub OIDC identity；
-7. deploy-host archive使用独立`gpu-fault-deploy-host` distribution、Manifest和签名，
+1. 六个coverage shard分别绑定本域内容、测试环境和证据，并由固定main CI identity签名；
+2. unit域gate验签并聚合六个当前run shard、统一coverage floor、fault和duration证据；
+3. 当前commit CI gate验签并绑定unit域gate，同时绑定当前tree、static和artifact；
+4. Runtime Image descriptor绑定OCI digest、构建输入和候选中的镜像组件；
+5. Manifest v3绑定三个wheel、Node bundle、Runtime Image和delivery identity；
+6. attestation绑定Manifest SHA、release ID、delivery identity、源码状态和CI gate SHA；
+7. Release Sigstore bundle证明attestation来自批准的GitHub OIDC identity；
+8. deploy-host archive使用独立`gpu-fault-deploy-host` distribution、Manifest和签名，
    绑定平台、源码commit、依赖身份和全部payload。
 
 仅有版本号、tag、文件名、ConfigMap 名或 Kubernetes annotation 均不足以替代上述绑定。
@@ -470,8 +526,9 @@ site和低层`release-deploy`参数不进入普通管理员命令。实际Kubern
 | 失败阶段 | 处理原则 |
 |---|---|
 | main CI任一并行job失败 | 修复对应静态、测试、PostgreSQL或artifact问题后提交新commit |
-| unit域gate未命中或delta要求full/PostgreSQL | 正常执行完整coverage/fault/PostgreSQL门禁并生成新签名gate |
-| unit域gate签名、身份或历史run不合法 | fail closed；不得复用，调查artifact后重新执行门禁 |
+| 单个coverage shard未命中 | 只执行该shard；其他同身份shard继续复用 |
+| shard签名、身份、证据或历史run不合法 | fail closed；不得复用该shard，调查artifact后重新执行 |
+| coverage combine或78% floor失败 | 检查分片遗漏、陈旧数据或覆盖率回退；不得单独接受某个shard |
 | 找不到匹配main CI run | 先让目标commit通过main push CI；不得用其他commit候选代替 |
 | CI gate签名、源码或文件清单失败 | 停止晋级；不得获取AWS身份或拼接其他run文件 |
 | OIDC、AWS 凭据或 ECR 登录失败 | 修复 GitHub environment、角色信任或最小权限后重跑 |

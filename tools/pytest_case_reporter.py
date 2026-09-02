@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,8 @@ from tools.pytest_result_identity import source_identity
 
 
 REPORT_ENV = "PYTEST_GPU_FAULT_CASE_REPORT"
+PARTITION_COUNT_ENV = "PYTEST_GPU_FAULT_PARTITION_COUNT"
+PARTITION_INDEX_ENV = "PYTEST_GPU_FAULT_PARTITION_INDEX"
 REPORT_SCHEMA_VERSION = 1
 REPORTS: dict[str, dict[str, Any]] = {}
 
@@ -20,6 +23,27 @@ def _report_path() -> Path | None:
 
 def _worker_report_path(path: Path, worker_id: str) -> Path:
     return path.with_name(f"{path.name}.worker-{worker_id}.json")
+
+
+def partition_for_nodeid(nodeid: str, count: int) -> int:
+    if count < 1:
+        raise ValueError("pytest partition count must be positive")
+    digest = hashlib.sha256(nodeid.encode()).digest()
+    return int.from_bytes(digest[:8], "big") % count
+
+
+def _partition() -> tuple[int, int] | None:
+    raw_count = os.getenv(PARTITION_COUNT_ENV, "").strip()
+    raw_index = os.getenv(PARTITION_INDEX_ENV, "").strip()
+    if not raw_count and not raw_index:
+        return None
+    if not raw_count.isdecimal() or not raw_index.isdecimal():
+        raise RuntimeError("pytest partition count and index must be integers")
+    count = int(raw_count)
+    index = int(raw_index)
+    if count < 1 or not 0 <= index < count:
+        raise RuntimeError("pytest partition index is outside the configured count")
+    return count, index
 
 
 def _write_records(path: Path, records: dict[str, dict[str, Any]]) -> None:
@@ -62,11 +86,27 @@ def _write_final_report(path: Path, records: dict[str, dict[str, Any]]) -> None:
 
 def pytest_configure(config: Any) -> None:
     REPORTS.clear()
+    _partition()
     path = _report_path()
     if path is None or hasattr(config, "workerinput"):
         return
     for worker_path in path.parent.glob(f"{path.name}.worker-*.json"):
         worker_path.unlink()
+
+
+def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
+    partition = _partition()
+    if partition is None:
+        return
+    count, index = partition
+    selected = [
+        item for item in items if partition_for_nodeid(str(item.nodeid), count) == index
+    ]
+    selected_ids = {id(item) for item in selected}
+    deselected = [item for item in items if id(item) not in selected_ids]
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
 
 
 def pytest_runtest_logreport(report: Any) -> None:

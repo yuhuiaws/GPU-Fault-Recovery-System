@@ -78,29 +78,23 @@ jobs:
           python -m gpu_fault.config_cli validate
           deploy/control-plane/regional/generated
 
-  unit:
-    runs-on: ubuntu-latest
-    outputs:
-      unit_gate_artifact: ${{ steps.restore_unit_gate.outputs.artifact_name }}
-      unit_gate_identity: ${{ steps.restore_unit_gate.outputs.identity }}
-      unit_gate_reused: ${{ steps.restore_unit_gate.outputs.reused }}
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: gpu_fault
-          POSTGRES_PASSWORD: gpu_fault
-          POSTGRES_DB: gpu_fault_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U gpu_fault -d gpu_fault_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+  coverage:
+    name: coverage-${{ matrix.shard }}
+    runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - runtime_0
+          - runtime_1
+          - runtime_2
+          - deployment
+          - fault_runner
     env:
-      GPU_FAULT_TEST_POSTGRES_URL: >-
-        postgresql://gpu_fault:gpu_fault@127.0.0.1:5432/gpu_fault_test
+      CI_TEST_RUNNER_LABEL: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
+      PYTEST_DURATIONS: "50"
+      PYTEST_XDIST_DIST: worksteal
+      PYTEST_XDIST_WORKERS: ${{ vars.CI_PYTEST_WORKERS || '4' }}
       PYTHONPYCACHEPREFIX: /tmp/gpu-fault-pycache
     steps:
       - uses: actions/checkout@v4
@@ -119,66 +113,269 @@ jobs:
           '.[dev,collectors,postgres,performance]'
       - uses: sigstore/cosign-installer@v3
         if: github.event_name == 'push'
-      - name: Restore signed unit gate by content identity
-        id: restore_unit_gate
+      - name: Restore signed coverage shard
+        id: restore_shard
         if: github.event_name == 'push'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
-          python scripts/ci_unit_gate.py restore
-          --postgres-container "${{ job.services.postgres.id }}"
-          --destination artifacts/ci-unit-gate
+          python scripts/ci_coverage_gate.py restore
+          --shard "${{ matrix.shard }}"
+          --destination artifacts/coverage-shard
           --current-run-id "${GITHUB_RUN_ID}"
           --github-output "${GITHUB_OUTPUT}"
-      - name: Run full suite with coverage floor
+      - name: Run coverage shard with duration evidence
         if: >-
           github.event_name != 'push' ||
-          steps.restore_unit_gate.outputs.reused != 'true'
+          steps.restore_shard.outputs.reused != 'true'
         run: >-
-          make coverage PYTHON=python
-          FAULT_TEST_PYTEST_RESULTS=artifacts/ci-unit-gate/pytest-case-results.json
-      - name: Verify reused base unit gate signature
+          make coverage-shard PYTHON=python
+          COVERAGE_SHARD="${{ matrix.shard }}"
+          COVERAGE_SHARD_ROOT=artifacts/coverage-shard
+      - name: Verify reused coverage shard signature
         if: >-
           github.event_name == 'push' &&
-          steps.restore_unit_gate.outputs.reused == 'true'
+          steps.restore_shard.outputs.reused == 'true'
         run: >-
           cosign verify-blob
-          --bundle artifacts/ci-unit-gate/base-unit-gate.bundle.json
+          --bundle
+          artifacts/coverage-shard/base-coverage-shard-gate.bundle.json
           --certificate-identity
           "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main"
           --certificate-oidc-issuer
           "https://token.actions.githubusercontent.com"
-          artifacts/ci-unit-gate/base-unit-gate.json
-      - name: Run changed-domain delta gate
-        if: >-
-          github.event_name == 'push' &&
-          steps.restore_unit_gate.outputs.reused == 'true' &&
-          steps.restore_unit_gate.outputs.delta_required == 'true'
+          artifacts/coverage-shard/base-coverage-shard-gate.json
+      - name: Build coverage shard gate
+        id: build_shard
         run: >-
-          python scripts/select-affected-tests.py
-          --base "${{ steps.restore_unit_gate.outputs.base_commit }}"
-          --execute
-      - name: Build fault report from pytest results
+          python scripts/ci_coverage_gate.py build
+          --shard "${{ matrix.shard }}"
+          --artifact-root artifacts/coverage-shard
+          --coverage-data artifacts/coverage-shard/coverage-data
+          --pytest-results artifacts/coverage-shard/pytest-results.json
+          --durations artifacts/coverage-shard/durations.json
+          --github-output "${GITHUB_OUTPUT}"
+      - name: Sign coverage shard gate
+        if: github.event_name == 'push'
+        run: >-
+          cosign sign-blob --yes
+          --bundle artifacts/coverage-shard/coverage-shard-gate.bundle.json
+          artifacts/coverage-shard/coverage-shard-gate.json
+      - name: Verify coverage shard signature
+        if: github.event_name == 'push'
+        run: >-
+          cosign verify-blob
+          --bundle artifacts/coverage-shard/coverage-shard-gate.bundle.json
+          --certificate-identity
+          "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main"
+          --certificate-oidc-issuer
+          "https://token.actions.githubusercontent.com"
+          artifacts/coverage-shard/coverage-shard-gate.json
+      - name: Verify coverage shard content identity
+        run: >-
+          python scripts/ci_coverage_gate.py verify
+          --shard "${{ matrix.shard }}"
+          --artifact-root artifacts/coverage-shard
+          --gate artifacts/coverage-shard/coverage-shard-gate.json
+      - name: Upload coverage shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build_shard.outputs.artifact_name }}
+          path: artifacts/coverage-shard/
+          if-no-files-found: error
+          retention-days: 30
+
+  postgres:
+    name: coverage-postgres
+    runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gpu_fault
+          POSTGRES_PASSWORD: gpu_fault
+          POSTGRES_DB: gpu_fault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gpu_fault -d gpu_fault_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CI_TEST_RUNNER_LABEL: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
+      GPU_FAULT_TEST_POSTGRES_URL: >-
+        postgresql://gpu_fault:gpu_fault@127.0.0.1:5432/gpu_fault_test
+      PYTEST_DURATIONS: "50"
+      PYTEST_XDIST_DIST: worksteal
+      PYTEST_XDIST_WORKERS: ${{ vars.CI_PYTEST_WORKERS || '4' }}
+      PYTHONPYCACHEPREFIX: /tmp/gpu-fault-pycache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: >-
+          python -m pip install --require-hashes
+          --requirement requirements/build.lock
+      - run: >-
+          python -m pip install
+          '.[dev,collectors,postgres,performance]'
+      - uses: sigstore/cosign-installer@v3
+        if: github.event_name == 'push'
+      - name: Restore signed PostgreSQL coverage shard
+        id: restore_shard
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/ci_coverage_gate.py restore
+          --shard postgres
+          --postgres-container "${{ job.services.postgres.id }}"
+          --destination artifacts/coverage-shard
+          --current-run-id "${GITHUB_RUN_ID}"
+          --github-output "${GITHUB_OUTPUT}"
+      - name: Run PostgreSQL coverage and stress shard
         if: >-
           github.event_name != 'push' ||
-          steps.restore_unit_gate.outputs.reused != 'true'
+          steps.restore_shard.outputs.reused != 'true'
         run: >-
-          make fault-test-cases-ci PYTHON=python
-          FAULT_TEST_PYTEST_RESULTS=artifacts/ci-unit-gate/pytest-case-results.json
-          FAULT_TEST_REPORT=artifacts/ci-unit-gate/fault-report.json
-      - name: Run PostgreSQL stress gate
+          make coverage-shard PYTHON=python
+          COVERAGE_SHARD=postgres
+          COVERAGE_SHARD_ROOT=artifacts/coverage-shard
+          COVERAGE_INCLUDE_STRESS=1
+      - name: Verify reused PostgreSQL shard signature
         if: >-
           github.event_name == 'push' &&
-          steps.restore_unit_gate.outputs.reused != 'true'
-        run: make test-postgres-stress PYTHON=python
+          steps.restore_shard.outputs.reused == 'true'
+        run: >-
+          cosign verify-blob
+          --bundle
+          artifacts/coverage-shard/base-coverage-shard-gate.bundle.json
+          --certificate-identity
+          "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main"
+          --certificate-oidc-issuer
+          "https://token.actions.githubusercontent.com"
+          artifacts/coverage-shard/base-coverage-shard-gate.json
+      - name: Build PostgreSQL coverage shard gate
+        id: build_shard
+        run: >-
+          python scripts/ci_coverage_gate.py build
+          --shard postgres
+          --postgres-container "${{ job.services.postgres.id }}"
+          --artifact-root artifacts/coverage-shard
+          --coverage-data artifacts/coverage-shard/coverage-data
+          --pytest-results artifacts/coverage-shard/pytest-results.json
+          --durations artifacts/coverage-shard/durations.json
+          --stress-results
+          artifacts/coverage-shard/postgres-stress-results.json
+          --github-output "${GITHUB_OUTPUT}"
+      - name: Sign PostgreSQL coverage shard gate
+        if: github.event_name == 'push'
+        run: >-
+          cosign sign-blob --yes
+          --bundle artifacts/coverage-shard/coverage-shard-gate.bundle.json
+          artifacts/coverage-shard/coverage-shard-gate.json
+      - name: Verify PostgreSQL coverage shard signature
+        if: github.event_name == 'push'
+        run: >-
+          cosign verify-blob
+          --bundle artifacts/coverage-shard/coverage-shard-gate.bundle.json
+          --certificate-identity
+          "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main"
+          --certificate-oidc-issuer
+          "https://token.actions.githubusercontent.com"
+          artifacts/coverage-shard/coverage-shard-gate.json
+      - name: Verify PostgreSQL coverage shard content identity
+        run: >-
+          python scripts/ci_coverage_gate.py verify
+          --shard postgres
+          --postgres-container "${{ job.services.postgres.id }}"
+          --artifact-root artifacts/coverage-shard
+          --gate artifacts/coverage-shard/coverage-shard-gate.json
+      - name: Upload PostgreSQL coverage shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build_shard.outputs.artifact_name }}
+          path: artifacts/coverage-shard/
+          if-no-files-found: error
+          retention-days: 30
+
+  unit:
+    needs:
+      - coverage
+      - postgres
+    runs-on: ubuntu-latest
+    outputs:
+      unit_gate_artifact: ${{ steps.build_unit_gate.outputs.artifact_name }}
+      unit_gate_identity: ${{ steps.build_unit_gate.outputs.identity }}
+      unit_gate_reused: ${{ steps.build_unit_gate.outputs.reused }}
+    env:
+      PYTHONPYCACHEPREFIX: /tmp/gpu-fault-pycache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: >-
+          python -m pip install --require-hashes
+          --requirement requirements/build.lock
+      - run: >-
+          python -m pip install
+          '.[dev,collectors,postgres,performance]'
+      - uses: sigstore/cosign-installer@v3
+        if: github.event_name == 'push'
+      - name: Download coverage shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gpu-fault-coverage-*
+          path: artifacts/coverage-shards
+      - name: Verify coverage shard signatures
+        if: github.event_name == 'push'
+        run: |
+          while IFS= read -r -d '' gate; do
+            root="$(dirname "${gate}")"
+            cosign verify-blob \
+              --bundle "${root}/coverage-shard-gate.bundle.json" \
+              --certificate-identity \
+              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main" \
+              --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+              "${gate}"
+          done < <(find artifacts/coverage-shards \
+            -name coverage-shard-gate.json -print0)
+      - name: Combine branch coverage and enforce floor
+        run: >-
+          make coverage-combine PYTHON=python
+          COVERAGE_SHARDS_ROOT=artifacts/coverage-shards
+          COVERAGE_COMBINED_ROOT=artifacts/coverage-combined
+      - name: Build fault report from combined pytest results
+        run: >-
+          make fault-test-cases-ci PYTHON=python
+          FAULT_TEST_PYTEST_RESULTS=artifacts/coverage-combined/pytest-case-results.json
+          FAULT_TEST_REPORT=artifacts/coverage-combined/fault-report.json
       - name: Build unit domain gate
+        id: build_unit_gate
         if: github.event_name == 'push'
         run: >-
           python scripts/ci_unit_gate.py build
-          --postgres-container "${{ job.services.postgres.id }}"
           --artifact-root artifacts/ci-unit-gate
-          --pytest-results artifacts/ci-unit-gate/pytest-case-results.json
-          --fault-report artifacts/ci-unit-gate/fault-report.json
+          --shards-root artifacts/coverage-shards
+          --coverage-summary artifacts/coverage-combined/coverage.json
+          --pytest-results
+          artifacts/coverage-combined/pytest-case-results.json
+          --fault-report artifacts/coverage-combined/fault-report.json
+          --durations artifacts/coverage-combined/test-durations.json
+          --require-run-id "${GITHUB_RUN_ID}"
+          --github-output "${GITHUB_OUTPUT}"
       - name: Sign unit domain gate
         if: github.event_name == 'push'
         run: >-
@@ -195,19 +392,44 @@ jobs:
           --certificate-oidc-issuer
           "https://token.actions.githubusercontent.com"
           artifacts/ci-unit-gate/unit-gate.json
+      - name: Verify embedded coverage shard signatures
+        if: github.event_name == 'push'
+        run: |
+          while IFS= read -r -d '' gate; do
+            root="$(dirname "${gate}")"
+            cosign verify-blob \
+              --bundle "${root}/coverage-shard-gate.bundle.json" \
+              --certificate-identity \
+              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main" \
+              --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+              "${gate}"
+          done < <(find artifacts/ci-unit-gate/shards \
+            -name coverage-shard-gate.json -print0)
       - name: Verify unit domain content identity
         if: github.event_name == 'push'
         run: >-
           python scripts/ci_unit_gate.py verify
-          --postgres-container "${{ job.services.postgres.id }}"
+          --expected-identity
+          "${{ steps.build_unit_gate.outputs.identity }}"
           --artifact-root artifacts/ci-unit-gate
           --gate artifacts/ci-unit-gate/unit-gate.json
       - name: Upload signed unit domain gate
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.restore_unit_gate.outputs.artifact_name }}
+          name: ${{ steps.build_unit_gate.outputs.artifact_name }}
           path: artifacts/ci-unit-gate/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload coverage timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-evidence
+          path: |
+            artifacts/coverage-combined/coverage.json
+            artifacts/coverage-combined/test-durations.json
           if-no-files-found: error
           retention-days: 30
       - name: Upload fault test report
@@ -215,7 +437,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fault-test-report
-          path: artifacts/ci-unit-gate/fault-report.json
+          path: artifacts/coverage-combined/fault-report.json
           if-no-files-found: error
           retention-days: 30
 
@@ -301,6 +523,20 @@ jobs:
           --certificate-oidc-issuer
           "https://token.actions.githubusercontent.com"
           dist/ci-domains/unit/unit-gate.json
+      - name: Verify embedded coverage shard signatures
+        if: github.event_name == 'push'
+        run: |
+          while IFS= read -r -d '' gate; do
+            root="$(dirname "${gate}")"
+            cosign verify-blob \
+              --bundle "${root}/coverage-shard-gate.bundle.json" \
+              --certificate-identity \
+              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main" \
+              --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+              "${gate}"
+          done < <(find dist/ci-domains/unit/shards \
+            -name coverage-shard-gate.json -print0)
       - name: Verify unit domain gate identity
         if: github.event_name == 'push'
         run: >-

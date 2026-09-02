@@ -111,7 +111,8 @@ def _unit_domain(dist: Path, path: Path) -> dict[str, Any]:
         "coverage_identity_sha256": unit["identity"]["coverage_sha256"],
         "producer_run_id": producer["run_id"],
         "producer_git_commit": producer["git_commit"],
-        "reused": unit.get("reused_from") is not None,
+        "reused": bool(unit["reuse"]["reused_shards"]),
+        "reused_shards": unit["reuse"]["reused_shards"],
     }
 
 
@@ -205,6 +206,8 @@ def verify_gate(path: Path, dist: Path) -> dict[str, Any]:
         or str(unit.get("producer_run_id") or "")
         != str(unit_gate["producer"]["run_id"])
         or unit.get("producer_git_commit") != unit_gate["producer"]["git_commit"]
+        or unit.get("reused") != bool(unit_gate["reuse"]["reused_shards"])
+        or unit.get("reused_shards") != unit_gate["reuse"]["reused_shards"]
     ):
         raise CiGateError("CI gate unit domain identity does not match")
     return gate
