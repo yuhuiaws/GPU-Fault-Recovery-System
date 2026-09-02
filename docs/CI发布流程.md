@@ -542,6 +542,7 @@ site和低层`release-deploy`参数不进入普通管理员命令。实际Kubern
 |---|---|
 | main CI任一并行job失败 | 修复对应静态、测试、PostgreSQL或artifact问题后提交新commit |
 | 单个coverage shard未命中 | 只执行该shard；其他同身份shard继续复用 |
+| GitHub artifact查询或下载临时不可用 | 安全回退fresh执行该shard；不把不可验证的历史证据当作通过 |
 | shard签名、身份、证据或历史run不合法 | fail closed；不得复用该shard，调查artifact后重新执行 |
 | coverage combine或78% floor失败 | 检查分片遗漏、陈旧数据或覆盖率回退；不得单独接受某个shard |
 | 找不到匹配main CI run | 先让目标commit通过main push CI；不得用其他commit候选代替 |

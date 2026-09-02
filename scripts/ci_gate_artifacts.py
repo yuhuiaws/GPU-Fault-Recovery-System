@@ -8,13 +8,44 @@ from pathlib import Path
 import stat
 import subprocess
 from typing import Any
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlsplit
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+    urlopen,
+)
 import zipfile
 
 
 class GateArtifactError(RuntimeError):
     pass
+
+
+class ArtifactRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> Request | None:
+        redirected = super().redirect_request(
+            request,
+            file_pointer,
+            code,
+            message,
+            headers,
+            new_url,
+        )
+        if (
+            redirected is not None
+            and urlsplit(request.full_url).netloc != urlsplit(new_url).netloc
+        ):
+            redirected.remove_header("Authorization")
+        return redirected
 
 
 def canonical_sha256(value: object) -> str:
@@ -96,7 +127,8 @@ def download(url: str, token: str) -> bytes:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urlopen(request, timeout=60) as response:
+    opener = build_opener(ArtifactRedirectHandler())
+    with opener.open(request, timeout=60) as response:
         return response.read()
 
 

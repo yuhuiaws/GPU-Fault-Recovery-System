@@ -17,6 +17,7 @@ import sysconfig
 import tempfile
 import time
 from typing import Any, Mapping, Sequence
+from urllib.error import HTTPError, URLError
 
 if __package__:
     from scripts.ci_gate_artifacts import (
@@ -648,12 +649,6 @@ def restore_reusable_shard(
 ) -> dict[str, object]:
     shard = str(identity["shard"])
     name = artifact_name(shard, str(identity["sha256"]))
-    found = find_reusable_artifact(
-        repository=repository,
-        token=token,
-        name=name,
-        current_run_id=current_run_id,
-    )
     destination = _clean_directory(root, destination, "coverage restore destination")
     base = {
         "artifact_name": name,
@@ -661,10 +656,30 @@ def restore_reusable_shard(
         "reused": "false",
         "source_run_id": "",
     }
+    try:
+        found = find_reusable_artifact(
+            repository=repository,
+            token=token,
+            name=name,
+            current_run_id=current_run_id,
+        )
+    except (HTTPError, URLError) as exc:
+        print(
+            f"ci-coverage-gate: signed shard lookup unavailable; running fresh: {exc}",
+            file=sys.stderr,
+        )
+        return base
     if found is None:
         return base
     artifact, run = found
-    data = download(str(artifact["archive_download_url"]), token)
+    try:
+        data = download(str(artifact["archive_download_url"]), token)
+    except (HTTPError, URLError) as exc:
+        print(
+            f"ci-coverage-gate: signed shard download unavailable; running fresh: {exc}",
+            file=sys.stderr,
+        )
+        return base
     expected_digest = str(artifact.get("digest") or "")
     if (
         expected_digest

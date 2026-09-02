@@ -6,7 +6,10 @@ import json
 import subprocess
 import sys
 import zipfile
+from email.message import Message
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request
 
 import pytest
 from coverage import CoverageData
@@ -374,6 +377,31 @@ def test_restore_reusable_shard_resigns_current_run(
     assert current["reused_from"]["producer_run_id"] == "99"
 
 
+def test_restore_network_failure_falls_back_to_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _identity_root(tmp_path)
+    identity = _identity(root, "runtime_0")
+    monkeypatch.setattr(
+        ci_coverage_gate,
+        "find_reusable_artifact",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            HTTPError("https://api.github.com/example", 503, "unavailable", {}, None)
+        ),
+    )
+
+    result = ci_coverage_gate.restore_reusable_shard(
+        root=root,
+        repository="owner/repository",
+        token="token",
+        identity=identity,
+        destination=tmp_path / "restored",
+        current_run_id=100,
+    )
+
+    assert result["reused"] == "false"
+
+
 def _unit_evidence(root: Path) -> tuple[Path, Path, Path, Path]:
     coverage = root / "coverage.json"
     coverage.write_text(
@@ -526,6 +554,24 @@ def test_reusable_artifact_skips_failed_main_runs(
 
     assert found is not None
     assert found[0]["id"] == 2
+
+
+def test_artifact_redirect_drops_authentication_on_cross_origin() -> None:
+    request = Request(
+        "https://api.github.com/repos/owner/repository/actions/artifacts/1/zip",
+        headers={"Authorization": "Bearer example"},
+    )
+    redirected = ci_gate_artifacts.ArtifactRedirectHandler().redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        Message(),
+        "https://objects.example.invalid/artifact.zip?signature=example",
+    )
+
+    assert redirected is not None
+    assert redirected.get_header("Authorization") is None
 
 
 def test_gate_zip_rejects_path_traversal(tmp_path: Path) -> None:
