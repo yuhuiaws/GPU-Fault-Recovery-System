@@ -202,9 +202,7 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     )
-    assert workflow["jobs"]["static"]["env"]["PYTHONPYCACHEPREFIX"].startswith(
-        "/tmp/"
-    )
+    assert workflow["jobs"]["static"]["env"]["PYTHONPYCACHEPREFIX"].startswith("/tmp/")
     steps = workflow["jobs"]["unit"]["steps"]
     coverage_index = next(
         index
