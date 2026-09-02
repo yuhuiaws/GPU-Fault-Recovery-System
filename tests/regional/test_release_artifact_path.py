@@ -13,6 +13,26 @@ MODULE_PATH = ROOT / "scripts/release-artifact-path.py"
 MODULE = lazy_script_module("release_artifact_path", MODULE_PATH)
 
 
+def release_manifest(tmp_path: Path, *, module_digest: str) -> Path:
+    wheel = tmp_path / "release.whl"
+    wheel.write_bytes(b"wheel")
+    document = {
+        "wheel": str(wheel),
+        "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        "module_digest": module_digest,
+        "components": {
+            "control_plane": {
+                "wheel": str(wheel),
+                "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                "module_digest": module_digest,
+            }
+        },
+    }
+    manifest = tmp_path / "release.json"
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+    return manifest
+
+
 def test_release_artifact_path_verifies_hash(tmp_path: Path) -> None:
     wheel = tmp_path / "release.whl"
     wheel.write_bytes(b"wheel")
@@ -41,12 +61,11 @@ def test_release_artifact_path_verifies_the_release_matches_this_checkout(
     # 手册里每一处 WHEEL="$(release-artifact-path.py wheel)" 都可能装上旧树的
     # wheel，而 /v1/version 的 module_digest 才是唯一能识别进程身份的字段。
     live = MODULE.checkout_module_digest()
-    current = json.loads(
-        (ROOT / "dist/current-release.json").read_text(encoding="utf-8")
-    )
+    manifest = release_manifest(tmp_path, module_digest=live)
+    current = json.loads(manifest.read_text(encoding="utf-8"))
 
     assert current["module_digest"] == live
-    assert MODULE.verify_module_digest(ROOT / "dist/current-release.json") == live
+    assert MODULE.verify_module_digest(manifest) == live
 
     stale = tmp_path / "release.json"
     stale_document = json.loads(json.dumps(current))
@@ -67,9 +86,10 @@ def test_release_artifact_path_verifies_the_release_matches_this_checkout(
 
 
 def test_release_artifact_path_checks_the_digest_before_printing(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     calls: list[Path] = []
+    manifest = release_manifest(tmp_path, module_digest=MODULE.checkout_module_digest())
     # MODULE 是 LazyScriptModule 包装器，setattr 只会落在包装器上，main()
     # 查的是脚本自己的 globals。
     monkeypatch.setitem(
@@ -77,14 +97,23 @@ def test_release_artifact_path_checks_the_digest_before_printing(
         "verify_module_digest",
         lambda path, _key="wheel": calls.append(path),
     )
-    monkeypatch.setattr("sys.argv", ["release-artifact-path.py", "wheel"])
+    monkeypatch.setattr(
+        "sys.argv", ["release-artifact-path.py", "wheel", "--manifest", str(manifest)]
+    )
 
     assert MODULE.main() == 0
-    assert calls == [ROOT / "dist/current-release.json"]
+    assert calls == [manifest]
 
     calls.clear()
     monkeypatch.setattr(
-        "sys.argv", ["release-artifact-path.py", "wheel", "--skip-module-digest"]
+        "sys.argv",
+        [
+            "release-artifact-path.py",
+            "wheel",
+            "--manifest",
+            str(manifest),
+            "--skip-module-digest",
+        ],
     )
 
     assert MODULE.main() == 0

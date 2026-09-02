@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gpu_fault.node_agent.executor as executor_module
+
 from tests._builders import copy_model, node_action_result
 
 from ._support import (
@@ -26,7 +28,6 @@ from ._support import (
     print_config_digest,
     pytest,
     result_params,
-    time,
     timedelta,
     timezone,
 )
@@ -264,6 +265,19 @@ def test_node_action_ledger_prunes_old_results_and_fencing(tmp_path) -> None:
 def test_ledger_save_failure_releases_all_inflight_waiters(
     tmp_path, monkeypatch
 ) -> None:
+    waiter_started = Event()
+
+    class TrackingEvent:
+        def __init__(self) -> None:
+            self.event = Event()
+
+        def set(self) -> None:
+            self.event.set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            waiter_started.set()
+            return self.event.wait(timeout=timeout)
+
     class BlockingRunner(FakeRunner):
         def __init__(self) -> None:
             super().__init__()
@@ -277,6 +291,7 @@ def test_ledger_save_failure_releases_all_inflight_waiters(
             return super().__call__(command, **kwargs)
 
     runner = BlockingRunner()
+    monkeypatch.setattr(executor_module, "Event", TrackingEvent)
     agent = executor(tmp_path, runner)
     signed = envelope(command(WorkflowOperation.RESET_GPU))
     monkeypatch.setattr(
@@ -289,7 +304,9 @@ def test_ledger_save_failure_releases_all_inflight_waiters(
         first = pool.submit(agent.execute, signed)
         assert runner.started.wait(timeout=7)
         second = pool.submit(agent.execute, signed)
-        time.sleep(0.1)
+        assert waiter_started.wait(timeout=7), (
+            "second node action did not enter the in-flight wait path"
+        )
         runner.release.set()
         with pytest.raises(OSError, match="ledger is full"):
             first.result(timeout=2)
