@@ -233,3 +233,48 @@ def test_build_staging_attestation_requires_and_records_impact_base(
     )
 
     assert value["impact_base"] == "origin/release"
+
+
+def test_staging_attestation_binds_impact_plan(tmp_path: Path, monkeypatch) -> None:
+    path = manifest(tmp_path, staging_only=True)
+    impact_plan = tmp_path / "dist/staging-impact-plan.json"
+    impact_plan.write_text('{"schema_version":1}\n', encoding="utf-8")
+    monkeypatch.setattr(
+        release_attestation,
+        "source_state",
+        lambda _root: {"git_commit": "a" * 40, "dirty": False, "diff_sha256": "b" * 64},
+    )
+
+    value = release_attestation.build_attestation(
+        tmp_path,
+        path,
+        staging_only=True,
+        impact_base="origin/release",
+        impact_plan_path=impact_plan,
+    )
+
+    assert value["impact_plan"] == {
+        "path": "dist/staging-impact-plan.json",
+        "sha256": release_attestation.sha256(impact_plan),
+    }
+
+
+def test_production_attestation_binds_ci_gate(tmp_path: Path, monkeypatch) -> None:
+    path = manifest(tmp_path)
+    gate = tmp_path / "dist/ci-gate.json"
+    gate.write_text('{"schema_version":1}\n', encoding="utf-8")
+    monkeypatch.setattr(
+        release_attestation,
+        "source_state",
+        lambda _root: {"git_commit": "a" * 40, "dirty": False, "diff_sha256": "b" * 64},
+    )
+
+    value = release_attestation.build_attestation(tmp_path, path, ci_gate_path=gate)
+
+    assert value["ci_gate"] == {
+        "path": "dist/ci-gate.json",
+        "sha256": release_attestation.sha256(gate),
+    }
+    assert {item["command"] for item in value["quality_gates"]} == set(
+        release_attestation.PROMOTED_QUALITY_GATES
+    )

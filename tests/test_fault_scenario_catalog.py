@@ -8,12 +8,15 @@ import subprocess
 import sys
 import unicodedata
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from gpu_fault.policy import load_xid_policy
+from tools import pytest_case_reporter
 from tools import run_fault_test_cases as runner
+from tools.pytest_result_identity import source_identity
 from tools.run_fault_test_cases import (
     TRACE_PREFIX,
     _extract_processing_trace,
@@ -21,6 +24,7 @@ from tools.run_fault_test_cases import (
     execution_policy,
     load_catalog,
     run_case,
+    run_pytest_batch,
     select_cases,
 )
 
@@ -484,6 +488,188 @@ def test_processing_trace_is_extracted_from_pytest_output() -> None:
 
     assert trace == {"schema_version": 1, "xid": 94}
     assert output == "pytest prelude\n. [100%]"
+
+
+def test_pytest_batch_preserves_per_case_results() -> None:
+    common = {
+        "title": "batch",
+        "category": "test",
+        "level": "unit",
+        "risk": "non-destructive",
+        "problem": "batch",
+        "injection": "pytest",
+        "expected": ["per-case result"],
+        "automation": "pytest",
+    }
+    cases = [
+        {
+            **common,
+            "id": "GF-BATCH-A",
+            "pytest_nodeid": (
+                "tests/test_builders.py::"
+                "test_shared_builders_preserve_control_plane_defaults"
+            ),
+        },
+        {
+            **common,
+            "id": "GF-BATCH-B",
+            "pytest_nodeid": (
+                "tests/test_builders.py::"
+                "test_execute_workflow_builds_the_fencing_request"
+            ),
+        },
+        {
+            **common,
+            "id": "GF-BATCH-PARAM",
+            "pytest_nodeid": (
+                "tests/host_health/test_dcgm_diagnostic_analysis.py::"
+                "test_dcgm_failure_maps_to_fixed_guidance"
+            ),
+        },
+    ]
+
+    results = run_pytest_batch(cases, environment=build_isolated_environment())
+
+    assert results["GF-BATCH-A"]["status"] == "PASS", results
+    assert results["GF-BATCH-B"]["status"] == "PASS", results
+    assert results["GF-BATCH-PARAM"]["status"] == "PASS", results
+
+
+def test_pytest_case_reporter_records_failure() -> None:
+    pytest_case_reporter.pytest_configure(object())
+    pytest_case_reporter.pytest_runtest_logreport(
+        SimpleNamespace(
+            nodeid="tests/example.py::test_failure",
+            duration=0.25,
+            when="call",
+            outcome="failed",
+            capstdout="captured output",
+            capstderr="",
+            failed=True,
+            longrepr="assert False",
+        )
+    )
+
+    record = pytest_case_reporter.REPORTS["tests/example.py::test_failure"]
+
+    assert record["status"] == "FAIL"
+    assert record["duration_seconds"] == 0.25
+    assert record["output"] == ["captured output", "assert False"]
+
+
+def test_pytest_report_control_does_not_use_runtime_environment_namespace() -> None:
+    assert not pytest_case_reporter.REPORT_ENV.startswith("GPU_FAULT_"), (
+        "pytest reporting control leaked into the strict runtime environment namespace"
+    )
+    assert runner.PYTEST_BATCH_REPORT_ENV == pytest_case_reporter.REPORT_ENV
+
+
+def test_pytest_case_reporter_fails_closed_on_skip() -> None:
+    pytest_case_reporter.pytest_configure(object())
+    pytest_case_reporter.pytest_runtest_logreport(
+        SimpleNamespace(
+            nodeid="tests/example.py::test_skipped",
+            duration=0.01,
+            when="setup",
+            outcome="skipped",
+            capstdout="",
+            capstderr="",
+            failed=False,
+            skipped=True,
+            longrepr="requires unavailable dependency",
+        )
+    )
+
+    record = pytest_case_reporter.REPORTS["tests/example.py::test_skipped"]
+
+    assert record["status"] == "FAIL"
+    assert record["output"] == ["requires unavailable dependency"]
+
+
+def test_pytest_case_reporter_merges_xdist_workers(tmp_path: Path) -> None:
+    report = tmp_path / "pytest-results.json"
+    environment = build_isolated_environment()
+    environment[runner.PYTEST_BATCH_REPORT_ENV] = str(report)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-n",
+            "2",
+            "-p",
+            "tools.pytest_case_reporter",
+            "tests/test_builders.py::test_shared_builders_preserve_control_plane_defaults",
+            "tests/test_builders.py::test_execute_workflow_builds_the_fencing_request",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    value = json.loads(report.read_text(encoding="utf-8"))
+    assert value["schema_version"] == 1
+    assert value["source_identity"] == source_identity(ROOT)
+    assert len(value["records"]) == 2
+
+
+def test_fault_runner_reuses_pytest_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = next(item for item in load_catalog(CATALOG) if item["id"] == "GF-POL-001")
+    pytest_results = tmp_path / "pytest-results.json"
+    pytest_results.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_identity": source_identity(ROOT),
+                "records": {
+                    case["pytest_nodeid"]: {
+                        "duration_seconds": 0.1,
+                        "output": "",
+                        "phases": {
+                            "setup": "passed",
+                            "call": "passed",
+                            "teardown": "passed",
+                        },
+                        "status": "PASS",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = tmp_path / "fault-report.json"
+    monkeypatch.setattr(
+        runner,
+        "run_case",
+        lambda *_args, **_kwargs: pytest.fail("stored pytest result was re-executed"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_pytest_batch",
+        lambda *_args, **_kwargs: pytest.fail("stored pytest result was re-executed"),
+    )
+
+    result = runner.main(
+        [
+            "--case",
+            case["id"],
+            "--pytest-results",
+            str(pytest_results),
+            "--report",
+            str(report),
+        ]
+    )
+
+    assert result == 0
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["results"][0]["status"] == "PASS"
 
 
 @pytest.mark.parametrize(

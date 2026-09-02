@@ -144,6 +144,69 @@ def test_hyperpod_discovery_uses_the_complete_input_arn(monkeypatch) -> None:
     )
 
 
+def test_eks_hyperpod_inventory_is_loaded_once_per_runner(monkeypatch) -> None:
+    calls: list[tuple[str, str, tuple[str, ...]]] = []
+    eks_arns = {
+        "gpu-a": "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+        "gpu-b": "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
+    }
+
+    class Runner:
+        def aws_json(self, region, service, operation, *arguments, **_kwargs):
+            calls.append((service, operation, arguments))
+            if service == "sagemaker" and operation == "list-clusters":
+                return {
+                    "ClusterSummaries": [
+                        {"ClusterName": name} for name in sorted(eks_arns)
+                    ]
+                }
+            if service == "sagemaker":
+                name = arguments[arguments.index("--cluster-name") + 1]
+                return {
+                    "ClusterArn": (
+                        f"arn:aws:sagemaker:{region}:123456789012:cluster/{name}"
+                    ),
+                    "ClusterName": name,
+                    "NodeRecovery": "None",
+                    "Orchestrator": {"Eks": {"ClusterArn": eks_arns[name]}},
+                }
+            name = arguments[arguments.index("--name") + 1]
+            return {
+                "cluster": {
+                    "status": "ACTIVE",
+                    "resourcesVpcConfig": {
+                        "vpcId": "vpc-a",
+                        "subnetIds": [f"subnet-{name}"],
+                    },
+                }
+            }
+
+    monkeypatch.setattr(
+        admin_bootstrap,
+        "discover_subnet_cidrs",
+        lambda *_args, **_kwargs: ("10.0.0.0/24",),
+    )
+    admin_bootstrap.hyperpod_inventory.cache_clear()
+    runner = Runner()
+
+    for name, eks_arn in eks_arns.items():
+        discovered = admin_bootstrap.discover_cluster(
+            runner, cluster_arn=eks_arn, role="gpu", context=name
+        )
+        assert discovered.hyperpod_name == name
+
+    assert (
+        sum(operation == "list-clusters" for _service, operation, _args in calls) == 1
+    )
+    assert (
+        sum(
+            service == "sagemaker" and operation == "describe-cluster"
+            for service, operation, _args in calls
+        )
+        == 2
+    )
+
+
 def test_public_subnet_allocator_avoids_existing_ranges() -> None:
     selected = _unused_subnet_cidrs(
         ["10.0.0.0/24"], ["10.0.0.0/28", "10.0.0.16/28"], count=2
@@ -367,13 +430,22 @@ def test_release_repositories_are_created_with_separate_mutability(monkeypatch) 
     assert repositories["cache"]["repository_name"].startswith(
         "gpu-fault/runtime-cache-"
     ), "cache ECR repository name is not site-content-addressed"
-    create_calls = [call for call in calls if call[2] == "create-repository"]
-    assert create_calls[0][3][
-        create_calls[0][3].index("--image-tag-mutability") + 1
-    ] == ("IMMUTABLE")
-    assert (
-        create_calls[1][3][create_calls[1][3].index("--image-tag-mutability") + 1]
-        == "MUTABLE"
+    create_calls = {
+        call[3][call[3].index("--repository-name") + 1]: call
+        for call in calls
+        if call[2] == "create-repository"
+    }
+    runtime_call = next(
+        call for name, call in create_calls.items() if "runtime-cache-" not in name
+    )
+    cache_call = next(
+        call for name, call in create_calls.items() if "runtime-cache-" in name
+    )
+    assert runtime_call[3][runtime_call[3].index("--image-tag-mutability") + 1] == (
+        "IMMUTABLE"
+    )
+    assert cache_call[3][cache_call[3].index("--image-tag-mutability") + 1] == (
+        "MUTABLE"
     )
     policy_call = next(call for call in calls if call[2] == "put-lifecycle-policy")
     policy = json.loads(
@@ -537,6 +609,8 @@ def test_admin_release_build_uses_ecr_and_state_signing_material(
             commands.append((list(arguments), kwargs))
             if arguments[:3] == ["aws", "ecr", "get-login-password"]:
                 return "login-password"
+            if any("select-affected-tests.py" in item for item in arguments):
+                return json.dumps({"postgres": False})
             return ""
 
     monkeypatch.setattr(
@@ -580,12 +654,19 @@ def test_admin_release_build_uses_ecr_and_state_signing_material(
     )
     if staging_only:
         assert "BASE=origin/release" in make_command
+        assert "IMPACT_PLAN_PREPARED=1" in make_command
+        assert any(item.startswith("STAGING_IMPACT_PLAN=") for item in make_command), (
+            "staging release build did not receive the prepared impact plan"
+        )
     else:
         assert all(not item.startswith("BASE=") for item in make_command), (
             "production release build unexpectedly received a staging impact base"
         )
     assert any(item.startswith("RUNTIME_IMAGE_CACHE_FROM=") for item in make_command), (
         "admin release build did not receive the created cache ECR repository"
+    )
+    assert make_options["env"]["GPU_FAULT_TEST_POSTGRES_URL"] == (
+        "" if staging_only else "postgresql://postgres@127.0.0.1:5432/postgres"
     )
     assert make_options["env"]["COSIGN_PASSWORD"] == "password"
     assert result["release_id"] == "release-a"

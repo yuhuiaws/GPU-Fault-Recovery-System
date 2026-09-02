@@ -154,6 +154,32 @@ def test_existing_bundle_is_reused_without_build(
     ), "existing complete deploy-host bundle was not reused"
 
 
+def test_deploy_host_wheelhouse_cache_is_lock_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    requirements = repository / "requirements"
+    requirements.mkdir(parents=True)
+    (requirements / "build.lock").write_text("build-a\n", encoding="utf-8")
+    (requirements / "deploy-host.lock").write_text("host-a\n", encoding="utf-8")
+    monkeypatch.setattr(staging_deploy, "bundle_platform_id", lambda: "test-platform")
+
+    first = staging_deploy.deploy_host_wheelhouse_cache(
+        tmp_path / "state", repository_root=repository
+    )
+    (requirements / "deploy-host.lock").write_text("host-b\n", encoding="utf-8")
+    second = staging_deploy.deploy_host_wheelhouse_cache(
+        tmp_path / "state", repository_root=repository
+    )
+
+    assert first != second
+    assert first.parent == second.parent
+    assert first.name.startswith("test-platform-"), (
+        "deploy-host wheelhouse cache key omitted the platform"
+    )
+    assert first.stat().st_mode & 0o777 == 0o700
+
+
 def test_deploy_host_venv_is_bound_to_managed_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -199,7 +225,10 @@ def test_partial_bundle_is_removed_and_rebuilt(
     )
     artifacts.archive.write_text("partial", encoding="utf-8")
 
-    def run(_arguments, **_kwargs):
+    commands: list[list[str]] = []
+
+    def run(arguments, **_kwargs):
+        commands.append([str(item) for item in arguments])
         for path in (artifacts.archive, artifacts.checksum, artifacts.signature_bundle):
             path.write_text("rebuilt", encoding="utf-8")
         return ""
@@ -211,10 +240,12 @@ def test_partial_bundle_is_removed_and_rebuilt(
             artifacts,
             repository_root=tmp_path,
             signing=_signing_material(tmp_path / "state"),
+            wheelhouse_cache=tmp_path / "wheel-cache",
         )
         is False
     )
     assert artifacts.archive.read_text(encoding="utf-8") == "rebuilt"
+    assert f"DEPLOY_HOST_WHEELHOUSE={tmp_path / 'wheel-cache'}" in commands[0]
 
 
 def test_deploy_uses_same_orchestration_for_first_and_later_runs(
@@ -251,6 +282,11 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
     )
     monkeypatch.setattr(
         staging_deploy, "deploy_host_artifacts", lambda *_args, **_kwargs: artifacts
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "deploy_host_wheelhouse_cache",
+        lambda *_args, **_kwargs: state / "wheelhouse",
     )
     monkeypatch.setattr(
         staging_deploy, "ensure_deploy_host_bundle", lambda *_args, **_kwargs: True
@@ -363,6 +399,11 @@ def test_source_scan_runs_before_snapshot_and_bundle(
     monkeypatch.setattr(
         staging_deploy, "deploy_host_artifacts", lambda *_args, **_kwargs: artifacts
     )
+    monkeypatch.setattr(
+        staging_deploy,
+        "deploy_host_wheelhouse_cache",
+        lambda *_args, **_kwargs: state / "wheelhouse",
+    )
 
     def bundle(*_args, **_kwargs):
         events.append(("bundle", snapshot))
@@ -425,8 +466,9 @@ def test_makefile_keeps_staging_release_build_internal() -> None:
     staging_build = makefile.split("release-build-staging:\n", 1)[1].split(
         "\nrelease-deploy:", 1
     )[0]
-    assert "$(MAKE) test-impact" in staging_build
-    assert "$(MAKE) regional-impact-plan" in staging_build
+    assert "--write-plan" in staging_build
+    assert "--read-plan" in staging_build
+    assert staging_build.count("scripts/select-affected-tests.py") == 2
     assert "--staging-only" in staging_build
     assert "build-release-attestation.py" in staging_build
     assert "--staging-only" in staging_build

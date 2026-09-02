@@ -132,6 +132,9 @@ release-ref由内部根据Git commit或dirty快照计算，不是公共参数。
 |---|---|
 | 源码快照 | HEAD、tracked diff、未跟踪源码、文件权限和准备后tree摘要完全一致 |
 | deploy-host bundle和venv | commit、平台、摘要和签名一致 |
+| deploy-host wheelhouse | `build.lock`、`deploy-host.lock`、平台和Python ABI一致 |
+| deploy-host依赖层 | 两个lock和平台计算的dependency identity一致且健康 |
+| source-only组件制品 | component build identity一致；delivery Manifest重新生成 |
 | Runtime Image | 完整image input digest一致，且ECR digest仍存在 |
 | 签名release | commit、发布等级、影响基线、签名和runtime repository一致 |
 | AWS资源 | site ownership、ARN、标签、配置和生命周期策略一致 |
@@ -142,10 +145,25 @@ snapshot中的content-addressed release Manifest与签名材料会随site持续�
 开发checkout后续运行测试或生成新的`dist/`不会改变已部署站点的
 `status/verify/config`输入。
 
+dirty staging会先生成一份绑定`BASE`、changed files和计划SHA的
+`dist/staging-impact-plan.json`。静态检查、pytest、regional影响清单和attestation
+共同消费该文件；读取时仍重新核对当前changed files，计划漂移会fail closed。只有计划
+标记`postgres=true`时才启动临时PostgreSQL 16，普通非数据库修改不再为满足空参数检查而
+启动容器。
+
+组件缓存位于`STATE_DIR/component-artifacts/`，不属于开发checkout的`dist/`。它只复用
+三个wheel和Node installer bundle的物理文件；新的隔离snapshot仍重算delivery identity
+并生成自己的Manifest。缓存identity覆盖组件源码和Node bundle脚本/unit等输入，任何
+不匹配或文件损坏都会自动回退重建。
+
 统一源码部署安装的受信 deploy-host venv 会以`0600`文件绑定其所属
 `state-dir`。此后该安装中的`gpu-fault-admin`若收到其他`--state-dir`，会在源码扫描、
 AWS查询或Kubernetes访问之前直接拒绝。需要管理另一站点时必须使用由该站点自身部署
 流程安装的deploy-host，不能复用其他state目录的CLI。
+
+deploy-host bundle中的第三方依赖按lock和平台安装到
+`STATE_DIR`相邻的共享dependency venv。项目wheel更新但依赖identity不变时只重建轻量
+overlay venv，不再重复安装全部第三方wheel；依赖层校验失败时不会激活新venv。
 
 ## 9. 修改代码后的循环
 

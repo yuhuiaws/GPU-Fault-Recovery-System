@@ -29,7 +29,7 @@
 | [详细设计](详细设计.md) | 当前代码模块、协议和状态机如何实现 |
 | [详细设计 v2（可编码视角）](详细设计-v2.md) | 每个模块怎么跑、数据怎么流、异常怎么处理，够据此编码联调 |
 | [NVIDIA 策略供应链与实现](components/nvidia-policy.md) | Catalog 固定来源、生成摘要、动作语义和运行时门禁 |
-| [CI 发布流程](CI发布流程.md) | Release workflow如何构建、签名、上传并交付部署制品 |
+| [CI 发布流程](CI发布流程.md) | main CI如何生成签名候选，Release如何验签晋级和交付制品 |
 | [EC2源码Staging统一部署流程](EC2源码Staging复现流程.md) | 首次、dirty迭代和后续升级均用四参数`gpu-fault-admin deploy` |
 | [管理员快速部署](管理员快速部署.md) | 如何用四参数`gpu-fault-admin deploy`完成首次和后续部署 |
 | [Runtime Profile变更审批](管理员Profile变更审批.md) | 管理员如何审核计划SHA、批准、续跑和保存证据 |
@@ -91,9 +91,10 @@ Documentation-Impact-Reason: 仅重构内部实现，公共行为、命令和验
 
 ## 开发规范
 
-- [CI 发布流程](CI发布流程.md)：GitHub Release workflow、签名制品、artifact交付和
-  部署消费边界。离线deploy-host安装隔离工作区Python路径、强制安装bundle项目wheel，
-  并自动重建同摘要但不完整的venv；签名密码只进入最终cosign进程，不进入测试或构建。
+- [CI 发布流程](CI发布流程.md)：GitHub main CI并行门禁、签名候选、Release晋级、
+  artifact交付和部署消费边界。离线deploy-host安装隔离工作区Python路径、强制安装
+  bundle项目wheel，按lock/平台复用共享依赖层，并自动重建同摘要但不完整的venv；
+  签名密码只进入最终cosign进程，不进入测试或构建。
 - [EC2源码统一部署流程](EC2源码Staging复现流程.md)：代码修改后的最短验证、
   staging部署、非破坏性测试和生产晋级闭环。
 - [开发者部署实现](开发者部署实现.md)：内部site、生产 Manifest、renderer、

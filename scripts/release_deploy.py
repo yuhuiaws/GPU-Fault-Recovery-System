@@ -49,6 +49,7 @@ SITE_ENV = "GPU_FAULT_SITE_FILE"
 VERIFICATION_REPORT = "verification-report.json"
 STABILITY_REPORT = "stability-report.json"
 RELEASE_SUMMARY_REPORT = "release-summary.json"
+EXPECTED_STATE_SHA256_ENV = "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -765,6 +766,33 @@ def _collect_release_summary(
         )
 
 
+def _collect_release_diff(
+    site_file: Path,
+    *,
+    root: Path,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    site = load_site(site_file, repository_root=root)
+    diff_environment = {
+        **effective_environment(site),
+        **environment,
+        **site.environment,
+        "GPU_FAULT_REPO_ROOT": str(root),
+    }
+    rollout = root / "deploy/control-plane/regional/rollout-regional-release.sh"
+    with materialized_release_config(site) as config:
+        return _run_json(
+            [
+                str(rollout),
+                "release-diff",
+                "--config",
+                str(config),
+            ],
+            cwd=root,
+            environment=diff_environment,
+        )
+
+
 def _collect_stability_report(
     site_file: Path,
     *,
@@ -836,14 +864,17 @@ def _release_summary_warnings(report: dict[str, Any]) -> list[str]:
     return warnings
 
 
-def _is_clean_noop_summary(report: dict[str, Any]) -> bool:
+def _is_clean_noop_diff(report: dict[str, Any]) -> bool:
     next_deploy = report.get("next_deploy")
+    changed = next_deploy.get("changed") if isinstance(next_deploy, dict) else None
     return (
-        report.get("mode") == "release-summary"
+        report.get("mode") == "release-diff"
         and isinstance(next_deploy, dict)
         and next_deploy.get("kind") == "NOOP"
-        and next_deploy.get("changed") == []
-        and not _release_summary_warnings(report)
+        and isinstance(changed, list)
+        and set(changed).issubset({"release_delivery", "rendered_manifests"})
+        and isinstance(report.get("state_sha256"), str)
+        and len(str(report["state_sha256"])) == 64
     )
 
 
@@ -996,6 +1027,70 @@ def _consume_profile_approval_state(
     )
 
 
+def _deployment_decision(
+    site_file: Path,
+    *,
+    root: Path,
+    environment: Mapping[str, str],
+) -> tuple[dict[str, Any], str | None]:
+    try:
+        candidate_diff = _collect_release_diff(
+            site_file,
+            root=root,
+            environment=environment,
+        )
+    except Exception as exc:
+        return (
+            {
+                "status": "APPLIED",
+                "fast_path": False,
+                "reason": (
+                    "release diff unavailable; used full deploy path: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            },
+            None,
+        )
+    state_sha256 = candidate_diff.get("state_sha256")
+    if not isinstance(state_sha256, str) or len(state_sha256) != 64:
+        return (
+            {
+                "status": "APPLIED",
+                "fast_path": False,
+                "reason": "release diff did not return a valid state identity",
+            },
+            None,
+        )
+    if not _is_clean_noop_diff(candidate_diff):
+        return (
+            {
+                "status": "APPLIED",
+                "fast_path": False,
+                "reason": "component release diff requires deployment",
+                "next_deploy": candidate_diff.get("next_deploy"),
+            },
+            state_sha256,
+        )
+    _run_release_mode(
+        site_file,
+        mode="stage-noop",
+        root=root,
+        environment={
+            **environment,
+            EXPECTED_STATE_SHA256_ENV: state_sha256,
+        },
+    )
+    return (
+        {
+            "status": "SKIPPED_NOOP",
+            "fast_path": True,
+            "reason": "component release diff classified desired state as NOOP",
+            "next_deploy": candidate_diff["next_deploy"],
+        },
+        state_sha256,
+    )
+
+
 def _execute_release_locked(
     site_file: Path,
     *,
@@ -1045,53 +1140,24 @@ def _execute_release_locked(
 
         summary_report: dict[str, Any] | None = None
         summary_generated_at: str | None = None
-        deployment: dict[str, Any]
-        same_release = current_state.get("release_id") == prepared.release_id
-        if same_release:
-            try:
-                candidate_summary = _collect_release_summary(
-                    site_file,
-                    root=root,
-                    environment=environment,
-                )
-            except Exception as exc:
-                deployment = {
-                    "status": "APPLIED",
-                    "fast_path": False,
-                    "reason": (
-                        "NOOP classification unavailable; used full deploy path: "
-                        f"{type(exc).__name__}: {exc}"
-                    ),
-                }
-            else:
-                if _is_clean_noop_summary(candidate_summary):
-                    summary_report = candidate_summary
-                    summary_generated_at = _utc_now()
-                    deployment = {
-                        "status": "SKIPPED_NOOP",
-                        "fast_path": True,
-                        "reason": "live release summary classified desired state as NOOP",
-                        "next_deploy": candidate_summary["next_deploy"],
-                    }
-                else:
-                    deployment = {
-                        "status": "APPLIED",
-                        "fast_path": False,
-                        "reason": "live release summary requires deployment",
-                        "next_deploy": candidate_summary.get("next_deploy"),
-                    }
-        else:
-            deployment = {
-                "status": "APPLIED",
-                "fast_path": False,
-                "reason": "live release ID differs from the desired release",
-            }
+        deployment, expected_state_sha256 = _deployment_decision(
+            site_file,
+            root=root,
+            environment=environment,
+        )
 
         if not deployment["fast_path"]:
             _run(
                 deploy_command,
                 cwd=root,
-                environment=environment,
+                environment={
+                    **environment,
+                    **(
+                        {EXPECTED_STATE_SHA256_ENV: expected_state_sha256}
+                        if expected_state_sha256 is not None
+                        else {}
+                    ),
+                },
             )
             deployment_succeeded = True
         _update_phase(prepared, "DEPLOYED", deployment=deployment)

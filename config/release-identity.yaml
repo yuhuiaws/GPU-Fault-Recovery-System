@@ -7,16 +7,9 @@ manifest_inputs:
   - deploy/image/Dockerfile
   - requirements/build.in
   - requirements/build.lock
-  - requirements/deploy-host.lock
   - requirements/runtime.lock
-  - scripts/build-deploy-host-bundle.py
-  - scripts/deploy_host_bundle.py
-  - scripts/setup-deploy-host.sh
-  - scripts/setup_deploy_host.py
-  - scripts/staging_deploy.py
-  - config/admin-config.example.yaml
-  - src/gpu_fault/admin_source_deploy.py
-  - src/gpu_fault/data/deploy-host-tools.json
+  - scripts/component_artifacts.py
+  - scripts/component_artifact_cache.py
   - deploy/control-plane/base/control-plane-deployment.yaml
   - deploy/control-plane/base/role-split-input.kustomization.yaml
   - deploy/control-plane/regional/aurora-credential-refresh.yaml
@@ -53,17 +46,15 @@ rendered_manifest_inputs:
   - deploy/control-plane/regional/generated/manifest-list.txt
 runtime_image_inputs:
   - pyproject.toml
-  - README.md
   - LICENSE
   - deploy/image/Dockerfile
   - requirements/build.lock
   - requirements/runtime.lock
   - scripts/build-release-runtime-image.py
+  - scripts/component_artifacts.py
+  - scripts/component_artifact_cache.py
   - scripts/component_wheels.py
   - scripts/release_image.py
-  - src/**/*.py
-  - src/**/*.json
-  - src/**/*.yaml
 node_template_inputs:
   - deploy/control-plane/regional/cleanup-inventory.json
   - deploy/control-plane/tools/sync_installed_resource_registry.py

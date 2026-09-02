@@ -528,11 +528,30 @@ def deploy_host_artifacts(
     )
 
 
+def deploy_host_wheelhouse_cache(
+    state_dir: Path,
+    *,
+    repository_root: Path,
+) -> Path:
+    digest = hashlib.sha256()
+    for name in ("build.lock", "deploy-host.lock"):
+        digest.update((repository_root / "requirements" / name).read_bytes())
+    cache = (
+        state_dir
+        / "deploy-host-wheelhouse"
+        / f"{bundle_platform_id()}-{digest.hexdigest()[:16]}"
+    )
+    cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cache.chmod(0o700)
+    return cache
+
+
 def ensure_deploy_host_bundle(
     artifacts: DeployHostArtifacts,
     *,
     repository_root: Path,
     signing: SigningMaterial,
+    wheelhouse_cache: Path | None = None,
 ) -> bool:
     present = (
         artifacts.archive.is_file(),
@@ -550,15 +569,18 @@ def ensure_deploy_host_bundle(
         return True
     artifacts.archive.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     environment = {**os.environ, "COSIGN_PASSWORD": signing.password}
+    command = [
+        "make",
+        "deploy-host-bundle",
+        f"PYTHON={sys.executable}",
+        f"COSIGN_SIGNING_KEY={signing.private_key}",
+        f"DEPLOY_HOST_ARCHIVE={artifacts.archive}",
+        f"DEPLOY_HOST_SIGNATURE_BUNDLE={artifacts.signature_bundle}",
+    ]
+    if wheelhouse_cache is not None:
+        command.append(f"DEPLOY_HOST_WHEELHOUSE={wheelhouse_cache}")
     _run(
-        [
-            "make",
-            "deploy-host-bundle",
-            f"PYTHON={sys.executable}",
-            f"COSIGN_SIGNING_KEY={signing.private_key}",
-            f"DEPLOY_HOST_ARCHIVE={artifacts.archive}",
-            f"DEPLOY_HOST_SIGNATURE_BUNDLE={artifacts.signature_bundle}",
-        ],
+        command,
         cwd=repository_root,
         env=environment,
     )
@@ -718,10 +740,15 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
         state_dir,
         git_commit=source.git_commit,
     )
+    wheelhouse_cache = deploy_host_wheelhouse_cache(
+        state_dir,
+        repository_root=source.repository_root,
+    )
     bundle_reused = ensure_deploy_host_bundle(
         artifacts,
         repository_root=source.repository_root,
         signing=signing,
+        wheelhouse_cache=wheelhouse_cache,
     )
     venv = ensure_deploy_host_venv(
         state_dir,

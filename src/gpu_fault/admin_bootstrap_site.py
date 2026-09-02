@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -18,6 +19,35 @@ from gpu_fault.admin_bootstrap_common import (
     CommandRunner,
     safe_name,
 )
+
+
+@lru_cache(maxsize=32)
+def hyperpod_inventory(
+    runner: CommandRunner,
+    *,
+    region: str,
+) -> tuple[dict[str, Any], ...]:
+    summaries = runner.aws_json(region, "sagemaker", "list-clusters").get(
+        "ClusterSummaries",
+        [],
+    )
+    names = [item.get("ClusterName") for item in summaries if item.get("ClusterName")]
+
+    def describe(name: str) -> dict[str, Any]:
+        return runner.aws_json(
+            region,
+            "sagemaker",
+            "describe-cluster",
+            "--cluster-name",
+            name,
+        )
+
+    values = []
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(names)))) as executor:
+        futures = {executor.submit(describe, name): name for name in names}
+        for future in as_completed(futures):
+            values.append(future.result())
+    return tuple(values)
 
 
 def cluster_alias(value: str, role: str, index: int) -> str:

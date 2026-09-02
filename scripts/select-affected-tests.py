@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import fnmatch
 from functools import lru_cache
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,7 @@ ALLOWED_CHECKS = {
     "runtime-image-check",
     "xid-catalog-check",
 }
+PLAN_FILE_SCHEMA_VERSION = 1
 
 
 class ImpactError(RuntimeError):
@@ -109,6 +111,84 @@ class Plan:
             "postgres": self.postgres,
             "reasons": list(self.reasons),
         }
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _plan_from_mapping(value: object) -> Plan:
+    raw = _mapping(value, "impact plan")
+    expected = {
+        "changed_files",
+        "domains",
+        "pytest_targets",
+        "checks",
+        "regional_safe_cases",
+        "regional_approval_cases",
+        "not_selected_regional_families",
+        "full",
+        "postgres",
+        "reasons",
+    }
+    if set(raw) != expected:
+        raise ImpactError(
+            "impact plan fields do not match: "
+            f"expected={sorted(expected)} actual={sorted(raw)}"
+        )
+
+    def strings(name: str) -> tuple[str, ...]:
+        return _strings(raw[name], f"impact plan.{name}")
+
+    if not isinstance(raw["full"], bool) or not isinstance(raw["postgres"], bool):
+        raise ImpactError("impact plan full/postgres fields must be booleans")
+    return Plan(
+        changed_files=strings("changed_files"),
+        domains=strings("domains"),
+        pytest_targets=strings("pytest_targets"),
+        checks=strings("checks"),
+        safe_cases=strings("regional_safe_cases"),
+        approval_cases=strings("regional_approval_cases"),
+        not_selected_families=strings("not_selected_regional_families"),
+        full=raw["full"],
+        postgres=raw["postgres"],
+        reasons=strings("reasons"),
+    )
+
+
+def write_plan_file(path: Path, *, base: str, plan: Plan) -> None:
+    payload = {
+        "schema_version": PLAN_FILE_SCHEMA_VERSION,
+        "base": base,
+        "plan": plan.as_dict(),
+    }
+    payload["sha256"] = _canonical_sha256(payload)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def load_plan_file(path: Path, *, expected_base: str) -> Plan:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ImpactError(f"impact plan file is invalid: {path}") from exc
+    raw = _mapping(value, "impact plan file")
+    digest = raw.pop("sha256", None)
+    if (
+        raw.get("schema_version") != PLAN_FILE_SCHEMA_VERSION
+        or raw.get("base") != expected_base
+        or not isinstance(digest, str)
+        or _canonical_sha256(raw) != digest
+    ):
+        raise ImpactError("impact plan file identity does not match")
+    return _plan_from_mapping(raw.get("plan"))
 
 
 def _mapping(value: object, field: str) -> dict[str, Any]:
@@ -616,6 +696,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regional-only", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--write-plan", type=Path)
+    parser.add_argument("--read-plan", type=Path)
     return parser
 
 
@@ -629,12 +711,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 0
-        changed = (
-            tuple(arguments.changed_file)
-            if arguments.changed_file
-            else changed_files_from_git(arguments.base)
-        )
-        plan = build_plan(changed, settings)
+        if arguments.read_plan is not None and (
+            arguments.changed_file or arguments.write_plan is not None
+        ):
+            raise ImpactError(
+                "--read-plan cannot be combined with --changed-file or --write-plan"
+            )
+        if arguments.read_plan is not None:
+            plan = load_plan_file(
+                arguments.read_plan.resolve(),
+                expected_base=arguments.base,
+            )
+            current = changed_files_from_git(arguments.base)
+            if current != plan.changed_files:
+                raise ImpactError(
+                    "impact plan changed files differ from the current checkout"
+                )
+        else:
+            changed = (
+                tuple(arguments.changed_file)
+                if arguments.changed_file
+                else changed_files_from_git(arguments.base)
+            )
+            plan = build_plan(changed, settings)
+            if arguments.write_plan is not None:
+                write_plan_file(
+                    arguments.write_plan.resolve(),
+                    base=arguments.base,
+                    plan=plan,
+                )
         if arguments.format == "json":
             print(json.dumps(plan.as_dict(), indent=2, sort_keys=True))
         else:

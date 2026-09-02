@@ -33,6 +33,16 @@ def _release_summary(
     }
 
 
+def _release_diff(
+    kind: str = "NOOP", changed: list[str] | None = None
+) -> dict[str, object]:
+    return {
+        "mode": "release-diff",
+        "state_sha256": "a" * 64,
+        "next_deploy": {"kind": kind, "changed": changed or [], "resume": False},
+    }
+
+
 def _stability_report() -> dict[str, object]:
     return {
         "mode": "stability",
@@ -280,7 +290,11 @@ def test_execute_release_uses_verified_noop_fast_path(
     def run_json(arguments, **_kwargs):
         command = list(arguments)
         calls.append(("json", command))
-        return _verification_report() if "verify" in command else _release_summary()
+        if "verify" in command:
+            return _verification_report()
+        if "release-diff" in command:
+            return _release_diff("NOOP", ["release_delivery"])
+        return _release_summary()
 
     monkeypatch.setattr(release_deploy, "_run_json", run_json)
 
@@ -288,16 +302,18 @@ def test_execute_release_uses_verified_noop_fast_path(
     prepared = release_deploy.execute_release(
         site,
         live_state={
-            "release_id": "release-a",
+            "release_id": "release-previous",
             "runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
         },
     )
 
     assert calls[0][1][-1] == "check"
-    assert calls[1][1][1] == "release-summary"
-    assert calls[2][1][3] == "verify"
-    assert calls[3][1][1] == "commit"
-    assert len(calls) == 4
+    assert calls[1][1][1] == "release-diff"
+    assert calls[2][1][1] == "stage-noop"
+    assert calls[3][1][3] == "verify"
+    assert calls[4][1][1] == "commit"
+    assert calls[5][1][1] == "release-summary"
+    assert len(calls) == 6
     assert all("deploy" not in command for _kind, command in calls), (
         "verified NOOP release still invoked the deploy command"
     )
@@ -324,12 +340,6 @@ def test_execute_release_falls_back_to_deploy_for_non_noop_change(
 ) -> None:
     site = _site(tmp_path, monkeypatch)
     calls: list[tuple[str, list[str]]] = []
-    summaries = iter(
-        (
-            _release_summary("CONTROL_PLANE_ONLY", ["control_plane_wheel"]),
-            _release_summary(),
-        )
-    )
     monkeypatch.setattr(
         release_deploy,
         "_run",
@@ -343,7 +353,9 @@ def test_execute_release_falls_back_to_deploy_for_non_noop_change(
             return _verification_report()
         if "stability" in command:
             return _stability_report()
-        return next(summaries)
+        if "release-diff" in command:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+        return _release_summary()
 
     monkeypatch.setattr(release_deploy, "_run_json", run_json)
     profile = tmp_path / "repo/config/profile.yaml"
@@ -357,7 +369,7 @@ def test_execute_release_falls_back_to_deploy_for_non_noop_change(
         },
     )
 
-    assert calls[0][1][1] == "release-summary"
+    assert calls[0][1][1] == "release-diff"
     assert calls[1][1][3] == "deploy"
     assert calls[2][1][3] == "verify"
     assert calls[3][1][1] == "stability"
@@ -392,6 +404,8 @@ def test_execute_release_records_failure(
     def fail_verify(arguments, **_kwargs):
         if "verify" in arguments:
             raise release_deploy.ReleaseDeployError("verify failed")
+        if "release-diff" in arguments:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
         return _release_summary()
 
     monkeypatch.setattr(release_deploy, "_run_json", fail_verify)
@@ -420,7 +434,6 @@ def test_execute_release_rolls_back_after_stability_failure(
 ) -> None:
     site = _site(tmp_path, monkeypatch)
     commands = []
-    summaries = iter((_release_summary("CONTROL_PLANE_ONLY", ["control_plane_wheel"]),))
     monkeypatch.setattr(
         release_deploy,
         "_run",
@@ -432,7 +445,9 @@ def test_execute_release_rolls_back_after_stability_failure(
             return _verification_report()
         if "stability" in arguments:
             return {"mode": "stability", "healthy": False, "window_seconds": 120}
-        return next(summaries)
+        if "release-diff" in arguments:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+        return _release_summary()
 
     monkeypatch.setattr(release_deploy, "_run_json", run_json)
     profile = tmp_path / "repo/config/profile.yaml"
@@ -469,6 +484,8 @@ def test_release_summary_failure_does_not_fail_verified_deployment(
             return _verification_report()
         if "stability" in arguments:
             return _stability_report()
+        if "release-diff" in arguments:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
         raise release_deploy.ReleaseDeployError("summary endpoint unavailable")
 
     monkeypatch.setattr(release_deploy, "_run_json", run_json)
@@ -548,6 +565,8 @@ def test_profile_change_requires_approval_and_generates_version(
             return _verification_report()
         if "stability" in arguments:
             return _stability_report()
+        if "release-diff" in arguments:
+            return _release_diff("FULL", ["runtime_profile"])
         return _release_summary()
 
     monkeypatch.setattr(release_deploy, "_run_json", run_json)
@@ -610,6 +629,8 @@ def test_profile_approval_survives_failed_release_and_resumes(
     def fail_verify(arguments, **_kwargs):
         if "verify" in arguments:
             raise release_deploy.ReleaseDeployError("verify failed")
+        if "release-diff" in arguments:
+            return _release_diff("FULL", ["runtime_profile"])
         return _release_summary()
 
     monkeypatch.setattr(release_deploy, "_run_json", fail_verify)
@@ -638,6 +659,8 @@ def test_profile_approval_survives_failed_release_and_resumes(
             return _verification_report()
         if "stability" in arguments:
             return _stability_report()
+        if "release-diff" in arguments:
+            return _release_diff("FULL", ["runtime_profile"])
         return _release_summary()
 
     monkeypatch.setattr(release_deploy, "_run_json", succeed)

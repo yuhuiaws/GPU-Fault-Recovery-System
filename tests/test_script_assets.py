@@ -202,7 +202,7 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     )
-    steps = workflow["jobs"]["test"]["steps"]
+    steps = workflow["jobs"]["unit"]["steps"]
     coverage_index = next(
         index
         for index, step in enumerate(steps)
@@ -211,7 +211,7 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
     runner_index = next(
         index
         for index, step in enumerate(steps)
-        if step.get("name") == "Run unit and component fault scenario catalog runner"
+        if step.get("name") == "Build fault report from pytest results"
     )
     upload_index = next(
         index
@@ -222,7 +222,7 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
 
     assert coverage_index < runner_index < upload_index
     assert steps[coverage_index]["run"] == "make coverage PYTHON=python"
-    assert steps[runner_index]["run"] == "make fault-test-cases-ci"
+    assert steps[runner_index]["run"] == "make fault-test-cases-ci PYTHON=python"
     assert upload["if"] == "always()"
     assert upload["uses"] == "actions/upload-artifact@v4"
     assert upload["with"] == {
@@ -231,6 +231,16 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
         "if-no-files-found": "error",
         "retention-days": 30,
     }
+    assert workflow["jobs"]["test"]["needs"] == ["static", "unit", "artifact"]
+    assert "gpu-fault-ci-candidate" in (ROOT / ".github/workflows/ci.yml").read_text(
+        encoding="utf-8"
+    )
+    component_upload = next(
+        step
+        for step in workflow["jobs"]["artifact"]["steps"]
+        if step.get("name") == "Upload component candidate"
+    )
+    assert component_upload["if"] == "github.event_name == 'push'"
 
 
 def test_coverage_floor_is_wired_into_make_and_ci() -> None:

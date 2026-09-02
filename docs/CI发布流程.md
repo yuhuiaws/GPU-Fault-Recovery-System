@@ -1,7 +1,8 @@
 # CI 发布流程
 
-本文描述当前 GitHub Actions `Release` workflow 从源码提交到签名发布制品的完整过程，
-面向 Release 工程师、维护发布自动化的开发者，以及负责下载和验签制品的管理员。
+本文描述当前 GitHub Actions `CI` 与 `Release` workflow 从源码提交、质量门禁、
+受信候选到签名发布制品的完整过程，面向 Release 工程师、维护发布自动化的开发者，
+以及负责下载和验签制品的管理员。
 
 本文只描述 CI 构建与发布制品。实际 AWS/Kubernetes 部署继续使用
 [管理员快速部署](管理员快速部署.md)、[管理员日常运维](管理员日常运维.md)和
@@ -14,8 +15,11 @@
 
 当前流程的实现事实源是：
 
-- `.github/workflows/release.yml`：触发条件、GitHub 权限、Runner 步骤和 artifact 上传；
-- `Makefile` 中的 `release-build`、`deploy-host-bundle`：发布门禁和构建顺序；
+- `.github/workflows/ci.yml`：并行质量门禁、main候选、CI gate和候选签名；
+- `.github/workflows/release.yml`：候选解析、验签、ECR晋级和最终artifact上传；
+- `Makefile` 中的 `release-build-promoted`、`deploy-host-sign`，以及受信本地环境使用的
+  `release-build`、`deploy-host-bundle`；
+- `scripts/ci_gate.py`、`scripts/resolve_ci_run.py`：main CI候选身份和Release run选择；
 - `scripts/build-release-runtime-image.py`、`scripts/build-release-artifacts.py`、
   `scripts/build-release-attestation.py`：运行镜像、Manifest v3 和 attestation；
 - `scripts/build-deploy-host-bundle.py`、`scripts/deploy_host_bundle.py`：部署机离线包。
@@ -24,30 +28,41 @@
 
 ## 1. 流程边界
 
-当前 Release CI 的主链路是：
+当前主链路分成main CI和Release晋级两段：
 
 ```text
+main push
+  -> static、unit、artifact 三个 job 并行
+  -> unit: coverage + PostgreSQL contract + fault report复用 + PostgreSQL stress
+  -> artifact: source-only canonical组件制品 + 未签名deploy-host bundle
+  -> test: 汇总全部成功结果，生成并签名CI gate
+  -> 上传 gpu-fault-ci-candidate
+
 workflow_dispatch 或 v* tag
-  -> checkout 完整 Git 历史
-  -> 准备 Python 3.12、PostgreSQL 16、Buildx、Cosign
-  -> 通过 GitHub OIDC 获取 AWS 临时身份并登录 ECR
-  -> make release-build
-       -> make check
-       -> make test-postgres-stress
-       -> 构建或复用并推送不可变 Runtime Image
-       -> 重建三个组件 wheel 和 Node bundle
-       -> 生成 Manifest v3、attestation 并签名
-  -> make deploy-host-bundle
-       -> 构建部署机离线 wheelhouse 和项目 wheel
-       -> 生成 SHA-256 并签名
+  -> checkout目标commit
+  -> 解析该commit对应的成功main CI run
+  -> 下载候选并验证CI gate签名、源码身份和完整文件清单
+  -> 通过GitHub OIDC获取AWS临时身份并登录ECR
+  -> make release-build-promoted
+       -> 再次验证CI gate
+       -> 用候选组件制品构建或复用不可变Runtime Image
+       -> 生成deployable Manifest v3和绑定CI gate的attestation
+       -> 运行最终制品一致性检查并签名attestation
+  -> make deploy-host-sign
+       -> 只签名CI已经构建的deploy-host archive，不重复构建
   -> 上传 dist/ 为 gpu-fault-release artifact
 ```
 
-Release CI只接受checkout得到的clean commit，并且只调用`release-build`。因此它生成：
+PR也并行运行`static`、`unit`和`artifact`，但不执行PostgreSQL stress、不构建
+deploy-host bundle，也不生成可供Release跨run下载的签名候选。最终job仍名为`test`，
+用于保持分支保护的单一聚合状态。
+
+Release workflow只接受checkout得到的clean commit，并要求其候选来自
+`refs/heads/main`上的成功push CI。它生成：
 
 - Manifest中的`staging_only=false`；
 - attestation中的`release_tier=production`；
-- 完整`make check`和PostgreSQL stress门禁记录。
+- 绑定签名CI gate的晋级门禁记录。
 
 `release-build-staging`只供统一CLI的内部源码准备器处理dirty隔离快照。该等级执行影响
 选择并在不确定时升级全量门禁，但其Manifest固定为`staging_only=true`，普通生产验签
@@ -62,35 +77,41 @@ Release CI只接受checkout得到的clean commit，并且只调用`release-build
 - 不把 GitHub Actions artifact 自动复制到 `/secure/release/`。
 
 首次 ARN 部署可以由 `gpu-fault-admin deploy` 在受控部署机内部复用
-`release-build`。这是管理员首次部署路径，不等同于本文描述的 GitHub Release
-workflow。
+`release-build`。直接`release-build`仍在同一进程内执行`make check`和PostgreSQL
+stress；这是管理员首次部署或受信本地复现路径，不等同于本文描述的签名CI候选晋级。
 
 ## 2. 触发、权限和输入
 
 ### 2.1 触发条件
 
+`.github/workflows/ci.yml`只响应Pull Request和`main` push。普通feature branch push
+不重复运行CI；同一PR或分支的新提交会通过concurrency取消旧run。
+
 `.github/workflows/release.yml` 支持两种触发方式：
 
 | 方式 | 用途 |
 |---|---|
-| `workflow_dispatch` | 经审批后手工构建指定分支或提交的发布候选 |
-| 推送 `v*` tag | 为版本标签构建发布候选 |
+| `workflow_dispatch` | 经审批后晋级所选commit；可选指定成功CI run ID |
+| 推送 `v*` tag | 晋级标签指向commit对应的成功main CI候选 |
 
-workflow 使用 `fetch-depth: 0` checkout 完整历史。构建器需要 Git commit、提交时间和
-干净工作树状态来计算源码身份、确定性时间戳和 attestation。
+两个workflow都使用`fetch-depth: 0`。Release默认按`git rev-parse HEAD`查询最近的
+成功main push CI；显式`ci_run_id`只省略查询，后续源码commit、Git tree、repository和
+artifact清单仍必须与当前checkout完全一致。
 
 ### 2.2 GitHub 权限
 
-workflow 只声明：
+两个workflow只声明：
 
 | 权限 | 用途 |
 |---|---|
+| `actions: read` | Release跨run下载受信CI候选 |
 | `contents: read` | checkout 源码 |
-| `id-token: write` | AWS OIDC 临时凭据和 Cosign keyless 签名 |
+| `id-token: write` | CI gate、release attestation、deploy-host archive的keyless签名，以及Release的AWS OIDC |
 
-CI 未配置 `COSIGN_SIGNING_KEY`，因此当前 GitHub workflow 使用 keyless
-`cosign sign-blob`。部署侧必须使用审批过的 certificate identity 和 OIDC issuer
-验证，不能只检查文件存在或 SHA-256。
+GitHub workflow不配置`COSIGN_SIGNING_KEY`，因此使用keyless `cosign sign-blob`。
+Release在请求AWS身份之前先把CI gate的certificate identity固定为
+`ci.yml@refs/heads/main`并验证OIDC issuer。部署侧同样必须验证批准的Release identity
+和issuer，不能只检查文件存在或SHA-256。
 
 ### 2.3 Repository variables
 
@@ -106,72 +127,79 @@ Release workflow 消费以下 GitHub repository 或 environment variables：
 两个 repository 值都必须匹配 ECR URI。cache repository 只用于加速 layer 构建，
 不能作为可信发布制品，也不能替代 Runtime Image digest 校验。
 
-workflow 内部另外创建临时 PostgreSQL 16 service，并设置只指向该 service 的
-`GPU_FAULT_TEST_POSTGRES_URL`。该值不是生产数据库连接，也不得替换为生产 Aurora。
+只有CI的`unit` job创建临时PostgreSQL 16 service，并设置只指向该service的
+`GPU_FAULT_TEST_POSTGRES_URL`。Release job不再创建PostgreSQL，也不重复执行已经由
+签名CI gate证明的测试。该测试连接不是生产数据库连接，不得替换为生产Aurora。
 
 ## 3. CI 执行步骤
 
-### 3.1 初始化 Runner
+### 3.1 并行CI门禁
 
-CI 按以下顺序准备构建环境：
+三个job各自使用Python 3.12和pip cache，并安装hash固定的`requirements/build.lock`
+后再安装项目测试extras：
 
-1. checkout 完整 Git 历史；
-2. 安装 Python 3.12 并启用 pip cache；
-3. 初始化 Docker Buildx；
-4. 安装 Cosign；
-5. 使用 `RELEASE_ROLE_ARN` 和 `AWS_REGION` 获取 AWS 临时凭据；
-6. 登录 Amazon ECR；
-7. 升级 pip，并安装项目的
-   `dev,collectors,postgres,performance` extras。
+| job | 主要职责 |
+|---|---|
+| `static` | Ruff、mypy strict、compileall、架构、部署契约、文档静态门禁、配置、YAML、Shell和artifact安全检查 |
+| `unit` | 4路xdist覆盖率、串行PostgreSQL contract、覆盖率floor、fault report和main PostgreSQL stress |
+| `artifact` | 构建并验证source-only三个组件wheel与Node bundle；main额外构建未签名deploy-host bundle |
 
-PostgreSQL service 必须先通过 `pg_isready` 健康检查，后续 job 才会继续。
+`make coverage`在非PostgreSQL pytest过程中加载`tools.pytest_case_reporter`，把每个
+nodeid结果写入`artifacts/fault/pytest-case-results.json`。随后
+`make fault-test-cases-ci`校验源码身份并直接把这些结果映射到fault catalog，不再为
+64条unit/component case重新启动pytest；缺少结果文件时仍可回退到单进程批量pytest。
 
-### 3.2 选择 Runtime Image repository
+main push额外运行`make test-postgres-stress`，覆盖schema、并发、lease、counter和
+fencing；任何skip或失败都会阻止候选生成。
 
-workflow 验证 `RUNTIME_IMAGE_REPOSITORY` 非空且是 ECR URI，然后写入后续步骤的环境。
+`artifact-check`只生成一套canonical Control Plane、Executor、Node Runtime wheel和
+Node bundle。source-only Manifest为`deployable=false`，但包含物理SHA、
+`module_digest`、bundle内嵌wheel和component build identity。component identity还覆盖
+Python/平台、build lock、组件源码以及全部Node bundle输入，不能用旧bundle搭配新源码。
 
-提供 `RUNTIME_IMAGE_CACHE_REPOSITORY` 时，workflow 生成：
+deploy-host bundle在main CI artifact job中构建一次。`actions/cache`按两个lock、
+Runner OS/architecture和Python 3.12保存wheelhouse；archive此时未签名，留给Release
+workflow在候选验签成功后签名。
 
-- `RUNTIME_IMAGE_CACHE_FROM`：读取 `buildcache-linux-amd64`；
-- `RUNTIME_IMAGE_CACHE_TO`：以 registry cache 模式更新同一 cache tag。
+### 3.2 生成受信CI候选
 
-未提供 cache repository 时不启用远端 cache，不影响发布制品身份。
+聚合job `test`依赖三个job并逐一要求`success`。main push时它：
 
-### 3.3 执行 `make release-build`
+1. 下载artifact job生成的完整`dist/`；
+2. 要求工作树干净，读取source-only schema v3 Manifest；
+3. 记录Git commit、Git tree、repository、main CI workflow ref、run ID；
+4. 对`dist/`中除CI gate自身外的每个文件记录相对路径、权限、大小和SHA-256；
+5. 固定`static/coverage/artifact/postgres_stress`均为`PASSED`；
+6. keyless签名`dist/ci-gate.json`；
+7. 上传`gpu-fault-ci-candidate`，保留30天。
 
-`release-build` 首先 fail closed 检查：
+CI gate只能由`ci.yml@refs/heads/main`生成。PR聚合job只给出分支保护结果，不签名或上传
+该候选。
 
-- `RUNTIME_IMAGE_REPOSITORY` 已设置；
-- `GPU_FAULT_TEST_POSTGRES_URL` 已设置；
-- Git 工作树干净；
-- Cosign 命令可用。
+### 3.3 Release先验签后访问云端
 
-随后严格按以下顺序执行。
+Release checkout目标commit后，先解析匹配的成功main CI run并下载
+`gpu-fault-ci-candidate`。随后依次：
 
-#### 3.3.1 完整质量门禁
+1. 用精确CI workflow certificate identity和GitHub Actions issuer验证CI gate签名；
+2. 验证gate的commit、tree和repository与当前checkout一致；
+3. 重新计算候选Manifest SHA和完整文件清单；
+4. 只有全部一致后才获取AWS OIDC身份、登录ECR和安装发布依赖。
 
-```bash
-make check
-```
+因此手工提供其他run ID、tag指向未通过main CI的commit、候选缺文件或跨run混合制品都
+会在AWS/ECR动作之前失败。
 
-该门禁覆盖 Ruff、mypy strict、compileall、架构和部署契约、文档检查、配置与生成物检查、
-artifact 安全检查、ShellCheck、三个组件 wheel/Node bundle 一致性以及普通全量 pytest。
+### 3.4 执行 `make release-build-promoted`
 
-`make check` 内部的 `artifact-check` 只证明源码可以确定性构建出一致制品。此时尚未绑定
-已推送 Runtime Image，因此该中间候选不能替代后续 deployable Manifest。
+`release-build-promoted`要求`RUNTIME_IMAGE_REPOSITORY`、`CI_GATE`、clean工作树和
+Cosign。它不重复`make check`或PostgreSQL stress，而是再次执行`ci_gate.py verify`，
+然后继续以下步骤。
 
-#### 3.3.2 PostgreSQL stress
+#### 3.4.1 构建或复用 Runtime Image
 
-```bash
-make test-postgres-stress
-```
-
-该步骤单独使用 CI PostgreSQL 16 service，覆盖 schema、并发、lease、counter 和
-fencing 等不能由普通 xdist 测试代替的路径。任何 skip 或失败都会终止发布。
-
-#### 3.3.3 构建或复用 Runtime Image
-
-`scripts/build-release-runtime-image.py` 根据以下输入计算规范化 image input digest：
+`scripts/build-release-runtime-image.py`先验证`artifact-check`留下的source-only
+Manifest、delivery identity、wheel SHA、`module_digest`以及Node bundle内嵌wheel，
+再根据以下输入计算规范化 image input digest：
 
 - Dockerfile 和固定 base image digest；
 - runtime dependency lock；
@@ -179,7 +207,7 @@ fencing 等不能由普通 xdist 测试代替的路径。任何 skip 或失败�
 - control-plane/executor wheel SHA-256 与 `module_digest`；
 - 构建器定义的其他 Runtime Image 输入。
 
-目标不可变 tag 不存在时，CI 构建并推送镜像；tag 已存在时，只有目标 platform 和全部
+目标不可变tag不存在时，Release构建并推送镜像；tag已存在时，只有目标platform和全部
 `gpu-fault.*` labels 与本次输入完全一致才允许复用。任一 label 不一致都会失败，不能把
 已有 tag 当作普通 mutable tag 覆盖。
 
@@ -191,17 +219,20 @@ dist/release-runtime-image.json
 
 该 descriptor 记录最终 OCI digest、平台、构建输入和镜像内组件身份。
 
-#### 3.3.4 构建最终发布制品
+#### 3.4.2 构建最终发布制品
 
-`scripts/build-release-artifacts.py` 使用 Runtime Image descriptor 重新构建：
+`scripts/build-release-artifacts.py` 使用 Runtime Image descriptor 和已验证的
+canonical制品生成最终release：
 
-1. Control Plane wheel；
-2. Cluster Executor wheel；
-3. Node Runtime wheel；
-4. 只包含精确 Node Runtime wheel 的 Node installer bundle。
+1. 复用 Control Plane wheel；
+2. 复用 Cluster Executor wheel；
+3. 复用 Node Runtime wheel；
+4. 复用只包含该精确 Node Runtime wheel 的 Node installer bundle。
 
-构建器逐项比较 Runtime Image descriptor 中的组件 wheel SHA 和 `module_digest`。
-镜像与本次重建结果不一致时不会生成最终 release。
+构建器重新计算source identity、四个物理SHA、三个`module_digest`和bundle内嵌wheel，
+并逐项比较 Runtime Image descriptor。任何不一致都不会生成最终release。组件构建使用
+`requirements/build.lock`中固定的build frontend/backend和`--no-isolation`，不会为
+每个组件重复创建隔离构建环境。
 
 最终 `release_id` 由四个制品 SHA 和 delivery identity 计算，发布目录采用
 `dist/<release-id>/`，并生成 `deployable=true` 的 Manifest v3：
@@ -213,13 +244,13 @@ dist/current-release.json
 
 `current-release.json` 是同一 Manifest 的稳定入口，不是另一份可独立修改的事实源。
 
-#### 3.3.5 独立制品一致性测试
+#### 3.4.3 独立制品一致性测试
 
-CI 设置 `GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1`，再次运行
+Release设置`GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1`，运行
 `tests/test_artifact_consistency.py`，验证源码、三个 wheel、Node bundle 和 Runtime
 Image 中组件的实际内容一致。该检查失败时不得只保留或发布已推送的 OCI。
 
-#### 3.3.6 生成并签名 release attestation
+#### 3.4.4 生成并签名 release attestation
 
 `scripts/build-release-attestation.py` 生成：
 
@@ -235,7 +266,11 @@ attestation 绑定：
 - delivery identity SHA；
 - Git commit 和干净工作树状态；
 - `release_tier=production`；
-- `make check` 与 `make test-postgres-stress` 的 PASS 结论。
+- `dist/ci-gate.json`的SHA-256；
+- `ci_gate.py verify`和最终artifact consistency的PASS结论。
+
+main CI中的static、coverage、artifact和PostgreSQL stress结论保存在被绑定的CI gate中，
+不伪装成Release job再次执行了`make check`。
 
 随后 `cosign sign-blob` 对 `dist/current-attestation.json` 执行 keyless 签名并生成：
 
@@ -245,22 +280,23 @@ dist/current-attestation.bundle.json
 
 部署阶段必须同时校验签名身份、Manifest SHA、release ID 和 delivery identity。
 
-### 3.4 执行 `make deploy-host-bundle`
+### 3.5 签名deploy-host archive并上传
 
 部署机离线包与 Node installer bundle 是两个独立制品。该步骤不会复用 Node bundle。
 
-`scripts/build-deploy-host-bundle.py`：
+CI artifact job中的`scripts/build-deploy-host-bundle.py`：
 
 1. 再次要求干净源码树；
 2. 复制 `requirements/build.lock` 和 `requirements/deploy-host.lock`；
-3. 为两个 lock 准备完整离线 wheelhouse；
-4. 在临时 venv 中使用该 wheelhouse 构建项目 wheel；
+3. 从按两个lock、OS、架构和Python ABI缓存的目录补齐完整离线wheelhouse；
+4. 在只安装`build.lock`的临时venv中构建项目wheel；
 5. 加入部署机工具清单和可选审核后二进制；
 6. 记录 Git commit、平台、Python ABI、libc 和每个文件的 SHA-256、大小、权限；
 7. 生成确定性 tar.gz 和 `.sha256` sidecar。
 
-当前 CI 没有设置 `DEPLOY_HOST_WHEELHOUSE`，因此只有这一构建阶段可以联网下载 lock
-指定的 wheel。部署机安装始终使用 `--no-index`，不能再次在线解析依赖。
+CI workflow使用`actions/cache`持久化`DEPLOY_HOST_WHEELHOUSE`。缓存miss时仍按
+hash lock下载，cache hit时只校验和补齐缺失wheel。部署机安装始终使用 `--no-index`，
+不能再次在线解析依赖。
 
 默认 Ubuntu x86-64、CPython 3.12 Runner 生成：
 
@@ -269,7 +305,8 @@ dist/gpu-fault-deploy-host-linux-x86-64-cpython-312.tar.gz
 dist/gpu-fault-deploy-host-linux-x86-64-cpython-312.tar.gz.sha256
 ```
 
-随后 Cosign keyless 签名生成：
+Release验证完整候选后只运行`make deploy-host-sign`，对上述原始archive执行Cosign
+keyless签名，不重新构建项目wheel或wheelhouse：
 
 ```text
 dist/gpu-fault-deploy-host-linux-x86-64-cpython-312.sigstore.json
@@ -278,9 +315,7 @@ dist/gpu-fault-deploy-host-linux-x86-64-cpython-312.sigstore.json
 文件名由构建 Runner 的 OS、CPU architecture 和 Python cache tag 计算。其他平台必须在
 对应受信环境重新构建和签名，不能手工改名。
 
-### 3.5 上传 GitHub Actions artifact
-
-所有步骤成功后，`actions/upload-artifact` 将整个 `dist/` 上传为：
+所有步骤成功后，`actions/upload-artifact`将整个`dist/`上传为：
 
 ```text
 artifact name: gpu-fault-release
@@ -294,6 +329,8 @@ artifact，不是自动创建的 GitHub Release asset，也不会自动复制到
 
 | 位置 | 生产者 | 用途 |
 |---|---|---|
+| `dist/ci-gate.json` | main CI `test` job | 绑定已测试源码、source-only候选清单和四类质量门禁 |
+| `dist/ci-gate.bundle.json` | main CI `cosign sign-blob` | CI gate的Sigstore签名材料 |
 | ECR 中的不可变 Runtime Image digest | `build-release-runtime-image.py` | CPU Control Plane 和 GPU Executor 运行镜像 |
 | `dist/release-runtime-image.json` | 同上 | 绑定 OCI digest、平台、输入和镜像内组件 |
 | `dist/current-release.json` | `build-release-artifacts.py` | 当前 deployable Manifest v3 稳定入口 |
@@ -319,11 +356,12 @@ artifact，不是自动创建的 GitHub Release asset，也不会自动复制到
 
 发布链路按以下关系逐层绑定：
 
-1. Runtime Image descriptor 绑定 OCI digest、构建输入和镜像内组件；
-2. Manifest v3 绑定三个 wheel、Node bundle、Runtime Image 和 delivery identity；
-3. attestation 绑定 Manifest SHA、release ID、delivery identity、源码状态和质量门禁；
-4. Sigstore bundle 证明 attestation 来自批准的 GitHub OIDC identity；
-5. deploy-host archive 使用独立 Manifest 和签名，绑定平台、源码 commit 和全部 payload。
+1. main CI gate绑定commit、tree、source-only候选清单和质量门禁，并由固定CI identity签名；
+2. Runtime Image descriptor绑定OCI digest、构建输入和候选中的镜像组件；
+3. Manifest v3绑定三个wheel、Node bundle、Runtime Image和delivery identity；
+4. attestation绑定Manifest SHA、release ID、delivery identity、源码状态和CI gate SHA；
+5. Release Sigstore bundle证明attestation来自批准的GitHub OIDC identity；
+6. deploy-host archive使用独立Manifest和签名，绑定平台、源码commit、依赖身份和全部payload。
 
 仅有版本号、tag、文件名、ConfigMap 名或 Kubernetes annotation 均不足以替代上述绑定。
 任何一层缺失、摘要不一致、身份不匹配或制品来自不同 workflow run 时都必须停止。
@@ -361,9 +399,13 @@ make deploy-host-setup \
 setup 会在安装前验证签名、archive 内容、平台兼容性、源码 commit 和当前 checkout。
 bundle Manifest绑定OS、CPU架构、Python实现/3.12 ABI cache tag、sysconfig platform和
 libc实现；任一不匹配都fail closed。生产bundle还要求clean源码且Git commit与当前
-checkout一致。依赖安装始终使用`--no-index`，在同目录临时venv中完成全部依赖和系统
-工具检查后才原子替换目标venv；相同bundle重复执行只验证并复用。初始化器不调用系统
-包管理器，报告和venv不得包含AWS凭据、token、私钥、数据库密码或kubeconfig。
+checkout一致。依赖安装始终使用`--no-index`。bundle中的
+`dependency_identity_sha256`覆盖两个lock和平台兼容信息；相同依赖身份只创建一次共享
+依赖venv，后续不同项目wheel只创建轻量overlay venv并通过`.pth`引用共享
+site-packages，不重复安装两个lock。依赖层缺失、损坏或身份不一致时fail closed；旧
+bundle没有依赖身份时保留原完整安装路径。完整依赖、项目CLI和系统工具检查通过后才
+原子替换目标venv；相同bundle重复执行只验证并复用。初始化器不调用系统包管理器，
+报告和venv不得包含AWS凭据、token、私钥、数据库密码或kubeconfig。
 bundle还携带经过Manifest摘要校验的`config/admin-config.example.yaml`，setup将其安装
 到`<deploy-host-venv>/share/gpu-fault/admin-config.example.yaml`。该文件是管理员首次
 部署前准备`0600`配置输入的只读模板，不包含凭据，也不会自动写入任何state-dir。
@@ -388,9 +430,11 @@ site和低层`release-deploy`参数不进入普通管理员命令。实际Kubern
 
 | 失败阶段 | 处理原则 |
 |---|---|
+| main CI任一并行job失败 | 修复对应静态、测试、PostgreSQL或artifact问题后提交新commit |
+| 找不到匹配main CI run | 先让目标commit通过main push CI；不得用其他commit候选代替 |
+| CI gate签名、源码或文件清单失败 | 停止晋级；不得获取AWS身份或拼接其他run文件 |
 | OIDC、AWS 凭据或 ECR 登录失败 | 修复 GitHub environment、角色信任或最小权限后重跑 |
 | repository URI 校验失败 | 修正 GitHub variable；不得绕过 ECR URI 检查 |
-| `make check` 失败 | 修复源码、测试、文档或生成物后提交新 commit |
 | PostgreSQL stress 失败 | 修复并发/schema问题或 CI service；不得以普通 pytest 代替 |
 | Runtime Image tag/label不一致 | 调查输入或 registry 漂移；不得覆盖不匹配的不可变 tag |
 | wheel、Node bundle 或镜像一致性失败 | 停止发布并调查工具链、lock 或源码闭包漂移 |
@@ -431,11 +475,11 @@ make PYTHON=.venv/bin/python deploy-host-bundle
 | 变化 | 必须审阅 |
 |---|---|
 | workflow trigger、权限、Runner 或 GitHub variables | 本文第 2、3 节 |
-| `release-build` 顺序或质量门禁 | 本文第 3.3 节、开发者部署实现和运维手册 |
+| CI并行job、CI gate或`release-build-promoted` | 本文第3.1至3.4节、开发者部署实现和运维手册 |
 | `release-build-staging`或两级attestation边界 | EC2源码Staging流程、安全参考和本文第 1 节 |
 | Manifest、wheel、Node bundle、attestation | 本文第 4、5 节及对应制品测试 |
-| deploy-host bundle、平台或 lock | 本文第 3.4、6.2 节和开发者部署实现 |
-| artifact 名称、路径或保留期 | 本文第 3.5、4、6.1 节 |
+| deploy-host bundle、共享依赖层、平台或 lock | 本文第3.5、6.2节和开发者部署实现 |
+| artifact 名称、路径或保留期 | 本文第3.2、3.5、4、6.1节 |
 | CI 与实际部署职责边界 | 本文第 1、6.3 节和管理员文档 |
 
 只修改文档仍必须运行：

@@ -94,6 +94,22 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def dependency_identity(
+    root: Path,
+    compatibility: Mapping[str, Any],
+) -> str:
+    payload = {
+        "compatibility": dict(compatibility),
+        "requirements": {
+            name: sha256_file(root / "requirements" / name)
+            for name in ("build.lock", "deploy-host.lock")
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def _payload_files(root: Path) -> list[Path]:
     return [
         path

@@ -9,6 +9,7 @@ export PYTHONPYCACHEPREFIX
 PYTEST_XDIST_WORKERS ?= 4
 FAULT_TEST_WORKERS ?= 1
 PARALLEL_FAULT_TEST_WORKERS ?= 4
+FAULT_TEST_PYTEST_RESULTS ?= artifacts/fault/pytest-case-results.json
 COVERAGE_FLOOR ?= 78
 BASE ?= origin/main
 COSIGN ?= cosign
@@ -17,6 +18,9 @@ RELEASE_ATTESTATION := dist/current-attestation.json
 RELEASE_ATTESTATION_BUNDLE := dist/current-attestation.bundle.json
 PREBUILT_ATTESTATION ?= $(RELEASE_ATTESTATION)
 PREBUILT_BUNDLE ?= $(RELEASE_ATTESTATION_BUNDLE)
+STAGING_IMPACT_PLAN ?= dist/staging-impact-plan.json
+SOURCE_COMPONENT_ARTIFACTS ?= dist/current-release.json
+COMPONENT_ARTIFACT_CACHE_ROOT ?=
 DEPLOY_HOST_PLATFORM ?= $(shell $(PYTHON) -c "from scripts.deploy_host_bundle import bundle_platform_id; print(bundle_platform_id())")
 DEPLOY_HOST_ARCHIVE ?= dist/gpu-fault-deploy-host-$(DEPLOY_HOST_PLATFORM).tar.gz
 DEPLOY_HOST_SIGNATURE_BUNDLE ?= dist/gpu-fault-deploy-host-$(DEPLOY_HOST_PLATFORM).sigstore.json
@@ -48,7 +52,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_reconnect.py \
 	tests/store/test_store_contracts.py
 
-.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
@@ -76,7 +80,9 @@ coverage:
 	$(MAKE) python-cache-clean
 	$(PYTHON) -m coverage erase
 	GPU_FAULT_TEST_POSTGRES_URL= \
+	PYTEST_GPU_FAULT_CASE_REPORT="$(FAULT_TEST_PYTEST_RESULTS)" \
 	$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \
+		-p tools.pytest_case_reporter \
 		--cov=src/gpu_fault \
 		--cov-branch \
 		--cov-report=
@@ -103,10 +109,19 @@ fault-test-cases:
 		--workers $(FAULT_TEST_WORKERS)
 
 fault-test-cases-ci:
-	$(PYTHON) tools/run_fault_test_cases.py \
-		--level unit \
-		--level component \
-		--workers $(FAULT_TEST_WORKERS)
+	@if [ -f "$(FAULT_TEST_PYTEST_RESULTS)" ]; then \
+		$(PYTHON) tools/run_fault_test_cases.py \
+			--level unit \
+			--level component \
+			--pytest-results "$(FAULT_TEST_PYTEST_RESULTS)" \
+			--workers $(FAULT_TEST_WORKERS); \
+	else \
+		$(PYTHON) tools/run_fault_test_cases.py \
+			--level unit \
+			--level component \
+			--batch-pytest \
+			--workers $(FAULT_TEST_WORKERS); \
+	fi
 
 fault-test-cases-with-cap005:
 	@test -n "$${GPU_FAULT_STORE_URL}" || \
@@ -150,7 +165,7 @@ check:
 	$(MAKE) public-release-check
 	$(MAKE) xid-catalog-check
 	$(MAKE) deployment-contracts-check
-	$(MAKE) docs-check
+	$(MAKE) docs-check DOCS_PYTEST=0
 	$(MAKE) config-check
 	$(MAKE) deploy-check
 	$(MAKE) artifacts-safety-check
@@ -191,6 +206,12 @@ public-release-check:
 	$(PYTHON) scripts/check-public-release.py
 
 docs-check:
+	$(MAKE) docs-static-check
+	@if [ "$(DOCS_PYTEST)" != "0" ]; then \
+		$(PYTHON) -m pytest $(DOCUMENTATION_TESTS); \
+	fi
+
+docs-static-check:
 	$(MAKE) doc-impact-check
 	$(MAKE) impact-check
 	$(MAKE) env-doc-check
@@ -198,7 +219,6 @@ docs-check:
 	$(MAKE) manual-command-order-check
 	$(MAKE) doc-reference-check
 	$(MAKE) fault-evidence-check
-	$(PYTHON) -m pytest $(DOCUMENTATION_TESTS)
 
 doc-impact-check:
 	$(PYTHON) scripts/check-doc-impact.py
@@ -287,37 +307,7 @@ release-build:
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-runtime-image.py \
 		--repository "$(RUNTIME_IMAGE_REPOSITORY)" \
 		--platform "$(RUNTIME_IMAGE_PLATFORM)" \
-		$(foreach arg,$(RUNTIME_IMAGE_BUILD_ARGS),--build-arg "$(arg)") \
-		$(if $(RUNTIME_IMAGE_CACHE_FROM),--cache-from "$(RUNTIME_IMAGE_CACHE_FROM)",) \
-		$(if $(RUNTIME_IMAGE_CACHE_TO),--cache-to "$(RUNTIME_IMAGE_CACHE_TO)",) \
-		$(if $(filter true yes 1,$(RUNTIME_IMAGE_FORCE_REBUILD)),--force-rebuild,) \
-		--push
-	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-artifacts.py \
-		--python "$(PYTHON)" \
-		--runtime-image-descriptor dist/release-runtime-image.json
-	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
-		env -u COSIGN_PASSWORD $(PYTHON) -m pytest tests/test_artifact_consistency.py
-	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py
-	$(COSIGN) sign-blob --yes \
-		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
-		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
-		"$(RELEASE_ATTESTATION)" >/dev/null
-
-release-build-staging:
-	@test -n "$(RUNTIME_IMAGE_REPOSITORY)" || \
-		(printf 'RUNTIME_IMAGE_REPOSITORY is required\n' >&2; exit 2)
-	@test -n "$${GPU_FAULT_TEST_POSTGRES_URL}" || \
-		(printf 'GPU_FAULT_TEST_POSTGRES_URL is required\n' >&2; exit 2)
-	@test -z "$$(git status --porcelain --untracked-files=normal)" || \
-		(printf 'release-build-staging requires a clean source tree\n' >&2; exit 2)
-	@command -v "$(COSIGN)" >/dev/null || \
-		(printf 'cosign is required\n' >&2; exit 2)
-	env -u COSIGN_PASSWORD $(MAKE) public-release-check PYTHON="$(PYTHON)"
-	env -u COSIGN_PASSWORD $(MAKE) test-impact BASE="$(BASE)" PYTHON="$(PYTHON)"
-	env -u COSIGN_PASSWORD $(MAKE) regional-impact-plan BASE="$(BASE)" PYTHON="$(PYTHON)"
-	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-runtime-image.py \
-		--repository "$(RUNTIME_IMAGE_REPOSITORY)" \
-		--platform "$(RUNTIME_IMAGE_PLATFORM)" \
+		--component-artifacts "$(SOURCE_COMPONENT_ARTIFACTS)" \
 		$(foreach arg,$(RUNTIME_IMAGE_BUILD_ARGS),--build-arg "$(arg)") \
 		$(if $(RUNTIME_IMAGE_CACHE_FROM),--cache-from "$(RUNTIME_IMAGE_CACHE_FROM)",) \
 		$(if $(RUNTIME_IMAGE_CACHE_TO),--cache-to "$(RUNTIME_IMAGE_CACHE_TO)",) \
@@ -326,12 +316,91 @@ release-build-staging:
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-artifacts.py \
 		--python "$(PYTHON)" \
 		--runtime-image-descriptor dist/release-runtime-image.json \
+		--reuse-artifacts-from "$(SOURCE_COMPONENT_ARTIFACTS)"
+	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
+		env -u COSIGN_PASSWORD $(PYTHON) -m pytest tests/test_artifact_consistency.py
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py
+	$(COSIGN) sign-blob --yes \
+		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
+		"$(RELEASE_ATTESTATION)" >/dev/null
+
+release-build-promoted:
+	@test -n "$(RUNTIME_IMAGE_REPOSITORY)" || \
+		(printf 'RUNTIME_IMAGE_REPOSITORY is required\n' >&2; exit 2)
+	@test -n "$(CI_GATE)" || \
+		(printf 'CI_GATE is required\n' >&2; exit 2)
+	@test -z "$$(git status --porcelain --untracked-files=normal)" || \
+		(printf 'release-build-promoted requires a clean source tree\n' >&2; exit 2)
+	@command -v "$(COSIGN)" >/dev/null || \
+		(printf 'cosign is required\n' >&2; exit 2)
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/ci_gate.py verify \
+		--gate "$(CI_GATE)" \
+		--dist dist
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-runtime-image.py \
+		--repository "$(RUNTIME_IMAGE_REPOSITORY)" \
+		--platform "$(RUNTIME_IMAGE_PLATFORM)" \
+		--component-artifacts "$(SOURCE_COMPONENT_ARTIFACTS)" \
+		$(foreach arg,$(RUNTIME_IMAGE_BUILD_ARGS),--build-arg "$(arg)") \
+		$(if $(RUNTIME_IMAGE_CACHE_FROM),--cache-from "$(RUNTIME_IMAGE_CACHE_FROM)",) \
+		$(if $(RUNTIME_IMAGE_CACHE_TO),--cache-to "$(RUNTIME_IMAGE_CACHE_TO)",) \
+		$(if $(filter true yes 1,$(RUNTIME_IMAGE_FORCE_REBUILD)),--force-rebuild,) \
+		--push
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-artifacts.py \
+		--python "$(PYTHON)" \
+		--runtime-image-descriptor dist/release-runtime-image.json \
+		--reuse-artifacts-from "$(SOURCE_COMPONENT_ARTIFACTS)"
+	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
+		env -u COSIGN_PASSWORD $(PYTHON) -m pytest tests/test_artifact_consistency.py
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py \
+		--ci-gate "$(CI_GATE)"
+	$(COSIGN) sign-blob --yes \
+		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
+		"$(RELEASE_ATTESTATION)" >/dev/null
+
+release-build-staging:
+	@test -n "$(RUNTIME_IMAGE_REPOSITORY)" || \
+		(printf 'RUNTIME_IMAGE_REPOSITORY is required\n' >&2; exit 2)
+	@test -z "$$(git status --porcelain --untracked-files=normal)" || \
+		(printf 'release-build-staging requires a clean source tree\n' >&2; exit 2)
+	@command -v "$(COSIGN)" >/dev/null || \
+		(printf 'cosign is required\n' >&2; exit 2)
+	env -u COSIGN_PASSWORD $(MAKE) public-release-check PYTHON="$(PYTHON)"
+	@if [ "$(IMPACT_PLAN_PREPARED)" != "1" ]; then \
+		env -u COSIGN_PASSWORD $(PYTHON) scripts/select-affected-tests.py \
+			--base "$(BASE)" \
+			--format json \
+			--write-plan "$(STAGING_IMPACT_PLAN)" >/dev/null; \
+	fi
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/select-affected-tests.py \
+		--base "$(BASE)" \
+		--read-plan "$(STAGING_IMPACT_PLAN)" \
+		--execute
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-artifacts.py \
+		--python "$(PYTHON)" \
+		--reuse-if-current \
+		$(if $(COMPONENT_ARTIFACT_CACHE_ROOT),--component-cache-root "$(COMPONENT_ARTIFACT_CACHE_ROOT)",)
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-runtime-image.py \
+		--repository "$(RUNTIME_IMAGE_REPOSITORY)" \
+		--platform "$(RUNTIME_IMAGE_PLATFORM)" \
+		--component-artifacts "$(SOURCE_COMPONENT_ARTIFACTS)" \
+		$(foreach arg,$(RUNTIME_IMAGE_BUILD_ARGS),--build-arg "$(arg)") \
+		$(if $(RUNTIME_IMAGE_CACHE_FROM),--cache-from "$(RUNTIME_IMAGE_CACHE_FROM)",) \
+		$(if $(RUNTIME_IMAGE_CACHE_TO),--cache-to "$(RUNTIME_IMAGE_CACHE_TO)",) \
+		$(if $(filter true yes 1,$(RUNTIME_IMAGE_FORCE_REBUILD)),--force-rebuild,) \
+		--push
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-artifacts.py \
+		--python "$(PYTHON)" \
+		--runtime-image-descriptor dist/release-runtime-image.json \
+		--reuse-artifacts-from "$(SOURCE_COMPONENT_ARTIFACTS)" \
 		--staging-only
 	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
 		env -u COSIGN_PASSWORD $(PYTHON) -m pytest tests/test_artifact_consistency.py
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py \
 		--staging-only \
-		--impact-base "$(BASE)"
+		--impact-base "$(BASE)" \
+		--impact-plan "$(STAGING_IMPACT_PLAN)"
 	$(COSIGN) sign-blob --yes \
 		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
@@ -388,6 +457,15 @@ deploy-host-bundle:
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-deploy-host-bundle.py \
 		--python "$(PYTHON)" \
 		--output "$(DEPLOY_HOST_ARCHIVE)" $(if $(DEPLOY_HOST_WHEELHOUSE),--wheelhouse "$(DEPLOY_HOST_WHEELHOUSE)",) $(if $(DEPLOY_HOST_TOOLS_DIR),--tools-dir "$(DEPLOY_HOST_TOOLS_DIR)",) $(if $(filter true yes 1,$(DEPLOY_HOST_ALLOW_DIRTY)),--allow-dirty,)
+	$(COSIGN) sign-blob --yes \
+		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+		--bundle "$(DEPLOY_HOST_SIGNATURE_BUNDLE)" \
+		"$(DEPLOY_HOST_ARCHIVE)" >/dev/null
+
+deploy-host-sign:
+	@test -f "$(DEPLOY_HOST_ARCHIVE)" || \
+		(printf 'DEPLOY_HOST_ARCHIVE does not exist: %s\n' \
+			"$(DEPLOY_HOST_ARCHIVE)" >&2; exit 2)
 	$(COSIGN) sign-blob --yes \
 		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
 		--bundle "$(DEPLOY_HOST_SIGNATURE_BUNDLE)" \

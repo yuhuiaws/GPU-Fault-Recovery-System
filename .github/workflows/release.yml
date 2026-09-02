@@ -2,34 +2,27 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Successful main CI run ID; empty resolves by selected commit
+        required: false
+        type: string
   push:
     tags:
       - "v*"
 
 permissions:
+  actions: read
   contents: read
   id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: gpu_fault
-          POSTGRES_PASSWORD: gpu_fault
-          POSTGRES_DB: gpu_fault_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U gpu_fault -d gpu_fault_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    env:
-      GPU_FAULT_TEST_POSTGRES_URL: >-
-        postgresql://gpu_fault:gpu_fault@127.0.0.1:5432/gpu_fault_test
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,12 +33,51 @@ jobs:
           cache: pip
       - uses: docker/setup-buildx-action@v3
       - uses: sigstore/cosign-installer@v3
+      - name: Resolve trusted CI run
+        id: ci-run
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ inputs.ci_run_id }}
+        run: |
+          if [ -n "${INPUT_RUN_ID}" ]; then
+            run_id="${INPUT_RUN_ID}"
+          else
+            run_id="$(
+              python scripts/resolve_ci_run.py \
+                --commit "$(git rev-parse HEAD)"
+            )"
+          fi
+          case "${run_id}" in
+            *[!0-9]*|'') echo "CI run ID must be numeric" >&2; exit 2 ;;
+          esac
+          printf 'run_id=%s\n' "${run_id}" >> "${GITHUB_OUTPUT}"
+      - name: Download trusted CI candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: gpu-fault-ci-candidate
+          path: dist
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.ci-run.outputs.run_id }}
+      - name: Verify CI gate signature
+        run: >-
+          cosign verify-blob
+          --bundle dist/ci-gate.bundle.json
+          --certificate-identity
+          "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main"
+          --certificate-oidc-issuer
+          "https://token.actions.githubusercontent.com"
+          dist/ci-gate.json
+      - name: Verify candidate source and artifacts
+        run: python scripts/ci_gate.py verify --gate dist/ci-gate.json --dist dist
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.RELEASE_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
       - uses: aws-actions/amazon-ecr-login@v2
       - run: python -m pip install --upgrade pip
+      - run: >-
+          python -m pip install --require-hashes
+          --requirement requirements/build.lock
       - run: >-
           python -m pip install
           '.[dev,collectors,postgres,performance]'
@@ -70,9 +102,13 @@ jobs:
             printf 'RUNTIME_IMAGE_CACHE_TO=type=registry,ref=%s:buildcache-linux-amd64,mode=max,image-manifest=true,oci-mediatypes=true\n' \
               "${CACHE_REPOSITORY}" >> "${GITHUB_ENV}"
           fi
-      - run: make release-build PYTHON=python
-      - name: Build signed deployment-host bundle
-        run: make deploy-host-bundle PYTHON=python
+      - name: Promote tested candidate to signed release
+        run: >-
+          make release-build-promoted
+          PYTHON=python
+          CI_GATE=dist/ci-gate.json
+      - name: Sign prebuilt deployment-host bundle
+        run: make deploy-host-sign PYTHON=python
       - name: Upload signed release bundle
         uses: actions/upload-artifact@v4
         with:

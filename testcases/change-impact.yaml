@@ -35,6 +35,8 @@ rules:
       - testcases/fault-scenarios.yaml
       - testcases/regional-execution-order.yaml
       - tools/run_fault_test_cases.py
+      - tools/pytest_case_reporter.py
+      - tools/pytest_result_identity.py
       - scripts/build-regional-case-index.py
       - scripts/build-fault-evidence-index.py
       - docs/区域模式端到端验收测试用例.md
@@ -86,6 +88,8 @@ rules:
       - scripts/release_identity.py
       - scripts/release_image.py
       - scripts/release_attestation.py
+      - scripts/component_artifacts.py
+      - scripts/component_artifact_cache.py
       - scripts/component_wheels.py
       - scripts/release-artifact-path.py
       - scripts/build-release-runtime-image.py
@@ -508,7 +512,9 @@ rules:
       - Makefile
       - scripts/check-*.py
       - scripts/audit-*.py
+      - scripts/ci_gate.py
       - scripts/prune_artifacts.py
+      - scripts/resolve_ci_run.py
       - scripts/__init__.py
       - tools/__init__.py
       - architecture-baseline.json

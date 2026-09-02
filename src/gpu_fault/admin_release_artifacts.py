@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from collections.abc import Iterator
 import json
 import os
@@ -24,6 +24,7 @@ DEFAULT_ADOT_IMAGE_AMD64 = (
     "public.ecr.aws/aws-observability/aws-otel-collector@"
     "sha256:bb72328152c72fb9662056759b275f7cc85e115db12bbb114fbea9f68dc4816c"
 )
+STAGING_IMPACT_PLAN = Path("dist/staging-impact-plan.json")
 
 
 def _private_file(path: Path, description: str) -> Path:
@@ -247,6 +248,36 @@ def verify_prebuilt_release(
     )
 
 
+def prepare_staging_impact_plan(
+    runner: CommandRunner,
+    *,
+    repository_root: Path,
+    impact_base: str,
+) -> tuple[Path, dict[str, Any]]:
+    path = repository_root / STAGING_IMPACT_PLAN
+    path.parent.mkdir(parents=True, exist_ok=True)
+    output = runner.run(
+        [
+            sys.executable,
+            str(repository_root / "scripts/select-affected-tests.py"),
+            "--base",
+            impact_base,
+            "--format",
+            "json",
+            "--write-plan",
+            str(path),
+        ],
+        cwd=repository_root,
+    )
+    try:
+        plan = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise BootstrapError("staging impact plan output is invalid") from exc
+    if not isinstance(plan, dict) or not isinstance(plan.get("postgres"), bool):
+        raise BootstrapError("staging impact plan is incomplete")
+    return path, plan
+
+
 def build_signed_release(
     runner: CommandRunner,
     *,
@@ -291,6 +322,15 @@ def build_signed_release(
     )
     if reusable is not None:
         return reusable
+    impact_plan_path: Path | None = None
+    postgres_required = True
+    if staging_only:
+        impact_plan_path, impact_plan = prepare_staging_impact_plan(
+            runner,
+            repository_root=repository_root,
+            impact_base=impact_base,
+        )
+        postgres_required = bool(impact_plan["postgres"])
     signing_dir = state_dir / "release-signing"
     signing_key = _private_file(
         cosign_signing_key or signing_dir / "cosign.key",
@@ -340,6 +380,14 @@ def build_signed_release(
     ]
     if staging_only:
         command.append(f"BASE={impact_base}")
+        assert impact_plan_path is not None
+        command.extend(
+            [
+                f"STAGING_IMPACT_PLAN={impact_plan_path}",
+                "IMPACT_PLAN_PREPARED=1",
+                f"COMPONENT_ARTIFACT_CACHE_ROOT={state_dir / 'component-artifacts'}",
+            ]
+        )
     if cache_repository:
         cache_ref = f"{cache_repository}:buildcache-linux-amd64"
         command.extend(
@@ -352,10 +400,13 @@ def build_signed_release(
                 ),
             ]
         )
-    with isolated_postgres_url(runner) as postgres_url:
+    postgres_context = (
+        isolated_postgres_url(runner) if postgres_required else nullcontext("")
+    )
+    with postgres_context as postgres_url:
         environment = {
             **os.environ,
-            "GPU_FAULT_TEST_POSTGRES_URL": postgres_url,
+            "GPU_FAULT_TEST_POSTGRES_URL": str(postgres_url),
         }
         if password is not None:
             environment["COSIGN_PASSWORD"] = password

@@ -11,9 +11,19 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from component_artifact_cache import (
+    find_cached_manifest,
+    store_component_artifacts,
+)
+from component_artifacts import (
+    ComponentArtifactError,
+    component_build_identity,
+    load_component_artifacts,
+)
 from component_wheels import build_component
 from release_identity import bind_runtime_image, build_release_identity
 
@@ -21,6 +31,14 @@ from release_identity import bind_runtime_image, build_release_identity
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
 DIST = ROOT / "dist"
+
+
+@dataclass(frozen=True)
+class PreparedArtifacts:
+    wheels: dict[str, Path]
+    bundle: Path
+    module_digests: dict[str, str]
+    module_counts: dict[str, int]
 
 
 def sha256(path: Path) -> str:
@@ -72,7 +90,7 @@ def resolve_python_executable(value: str) -> str:
     executable = shutil.which(value)
     if executable is None:
         raise RuntimeError(f"Python executable was not found: {value}")
-    return str(Path(executable).resolve())
+    return str(Path(executable).absolute())
 
 
 def _write_synced(path: Path, content: str) -> None:
@@ -156,14 +174,109 @@ def _publish_release(
     return manifest, content
 
 
+def prepare_component_artifacts(
+    python: str,
+    *,
+    staging: Path,
+    reuse_artifacts_from: Path | None,
+) -> PreparedArtifacts:
+    if reuse_artifacts_from is not None:
+        resolved_manifest = reuse_artifacts_from.resolve()
+        external = not resolved_manifest.is_relative_to((ROOT / "dist").resolve())
+        cached = load_component_artifacts(
+            ROOT,
+            reuse_artifacts_from,
+            artifact_root=(resolved_manifest.parent.parent if external else ROOT),
+            require_delivery_identity=not external,
+        )
+        wheels = {
+            name: Path(shutil.copy2(path, staging / path.name))
+            for name, path in cached.wheels.items()
+        }
+        return PreparedArtifacts(
+            wheels=wheels,
+            bundle=Path(shutil.copy2(cached.bundle, staging / cached.bundle.name)),
+            module_digests=cached.module_digests,
+            module_counts=cached.module_counts,
+        )
+
+    built = {
+        name: build_component(
+            python=python,
+            name=name,
+            build_root=BUILD / "components",
+            output=staging,
+        )
+        for name in ("control_plane", "executor", "node_runtime")
+    }
+    node_wheel = built["node_runtime"][0]
+    run(
+        [
+            str(ROOT / "deploy/node/build-node-installer-bundle.sh"),
+            str(staging),
+        ],
+        env={**os.environ, "GPU_FAULT_NODE_WHEEL": str(node_wheel)},
+    )
+    bundles = sorted(staging.glob("gpu-fault-node-installer-*.tar.gz"))
+    if len(bundles) != 1:
+        raise RuntimeError(
+            f"bundle build produced {len(bundles)} bundles; expected one"
+        )
+    return PreparedArtifacts(
+        wheels={name: value[0] for name, value in built.items()},
+        bundle=bundles[0],
+        module_digests={name: value[1] for name, value in built.items()},
+        module_counts={name: len(value[2]) for name, value in built.items()},
+    )
+
+
+def resolve_current_component_artifacts(
+    *,
+    staging_only: bool,
+    component_cache_root: Path | None,
+) -> tuple[dict[str, object] | None, Path | None]:
+    try:
+        cached = load_component_artifacts(
+            ROOT,
+            DIST / "current-release.json",
+        )
+    except ComponentArtifactError:
+        cached_manifest = (
+            find_cached_manifest(ROOT, component_cache_root)
+            if component_cache_root is not None
+            else None
+        )
+        return None, cached_manifest
+    if cached.manifest.get("staging_only", False) is not staging_only:
+        return None, None
+    if component_cache_root is not None:
+        store_component_artifacts(
+            ROOT,
+            component_cache_root,
+            DIST / "current-release.json",
+        )
+    return cached.manifest, None
+
+
 def build(
     python: str,
     *,
     runtime_image_descriptor: Path | None = None,
     staging_only: bool = False,
+    reuse_artifacts_from: Path | None = None,
+    reuse_if_current: bool = False,
+    component_cache_root: Path | None = None,
 ) -> dict[str, object]:
     python = resolve_python_executable(python)
     delivery = build_release_identity(ROOT)
+    if runtime_image_descriptor is None and reuse_if_current:
+        current, cached_manifest = resolve_current_component_artifacts(
+            staging_only=staging_only,
+            component_cache_root=component_cache_root,
+        )
+        if current is not None:
+            return current
+        reuse_artifacts_from = reuse_artifacts_from or cached_manifest
     runtime_descriptor: dict[str, object] | None = None
     if runtime_image_descriptor is not None:
         runtime_descriptor = json.loads(
@@ -174,41 +287,19 @@ def build(
     DIST.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".build-", dir=DIST) as directory:
         staging = Path(directory)
-        control_wheel, control_digest, control_modules = build_component(
-            python=python,
-            name="control_plane",
-            build_root=BUILD / "components",
-            output=staging,
+        artifacts = prepare_component_artifacts(
+            python,
+            staging=staging,
+            reuse_artifacts_from=reuse_artifacts_from,
         )
-        executor_wheel, executor_digest, executor_modules = build_component(
-            python=python,
-            name="executor",
-            build_root=BUILD / "components",
-            output=staging,
-        )
-        node_wheel, node_digest, node_modules = build_component(
-            python=python,
-            name="node_runtime",
-            build_root=BUILD / "components",
-            output=staging,
-        )
-        env = {
-            **os.environ,
-            "GPU_FAULT_NODE_WHEEL": str(node_wheel),
-        }
-        run(
-            [
-                str(ROOT / "deploy/node/build-node-installer-bundle.sh"),
-                str(staging),
-            ],
-            env=env,
-        )
-        bundles = sorted(staging.glob("gpu-fault-node-installer-*.tar.gz"))
-        if len(bundles) != 1:
-            raise RuntimeError(
-                f"bundle build produced {len(bundles)} bundles; expected one"
-            )
-        bundle = bundles[0]
+        control_wheel = artifacts.wheels["control_plane"]
+        executor_wheel = artifacts.wheels["executor"]
+        node_wheel = artifacts.wheels["node_runtime"]
+        bundle = artifacts.bundle
+        control_digest = artifacts.module_digests["control_plane"]
+        executor_digest = artifacts.module_digests["executor"]
+        node_digest = artifacts.module_digests["node_runtime"]
+        module_counts = artifacts.module_counts
 
         hashes = {
             "control_plane": sha256(control_wheel),
@@ -292,6 +383,7 @@ def build(
         published = Path("dist") / release_id
         manifest: dict[str, object] = {
             "schema_version": 3,
+            "component_build_identity_sha256": component_build_identity(ROOT),
             "deployable": bool(delivery["runtime_prebuilt"]),
             "staging_only": staging_only,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -315,19 +407,19 @@ def build(
                     "wheel": (published / control_wheel.name).as_posix(),
                     "wheel_sha256": hashes["control_plane"],
                     "module_digest": control_digest,
-                    "module_count": len(control_modules),
+                    "module_count": module_counts["control_plane"],
                 },
                 "executor": {
                     "wheel": (published / executor_wheel.name).as_posix(),
                     "wheel_sha256": hashes["executor"],
                     "module_digest": executor_digest,
-                    "module_count": len(executor_modules),
+                    "module_count": module_counts["executor"],
                 },
                 "node_runtime": {
                     "wheel": (published / node_wheel.name).as_posix(),
                     "wheel_sha256": hashes["node_runtime"],
                     "module_digest": node_digest,
-                    "module_count": len(node_modules),
+                    "module_count": module_counts["node_runtime"],
                 },
                 "node_bundle": {
                     "bundle": (published / bundle.name).as_posix(),
@@ -347,6 +439,12 @@ def build(
             manifest=manifest,
             content=content,
         )
+        if runtime_image_descriptor is None and component_cache_root is not None:
+            store_component_artifacts(
+                ROOT,
+                component_cache_root,
+                DIST / "current-release.json",
+            )
     shutil.rmtree(BUILD, ignore_errors=True)
     return manifest
 
@@ -361,6 +459,9 @@ def main() -> int:
         "--runtime-image-descriptor",
         type=Path,
     )
+    parser.add_argument("--reuse-artifacts-from", type=Path)
+    parser.add_argument("--reuse-if-current", action="store_true")
+    parser.add_argument("--component-cache-root", type=Path)
     parser.add_argument("--staging-only", action="store_true")
     args = parser.parse_args()
     manifest = build(
@@ -371,6 +472,17 @@ def main() -> int:
             else None
         ),
         staging_only=args.staging_only,
+        reuse_artifacts_from=(
+            args.reuse_artifacts_from.resolve()
+            if args.reuse_artifacts_from is not None
+            else None
+        ),
+        reuse_if_current=args.reuse_if_current,
+        component_cache_root=(
+            args.component_cache_root.resolve()
+            if args.component_cache_root is not None
+            else None
+        ),
     )
     print(
         "release_id={release_id}\n"

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
 import tempfile
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -73,8 +77,102 @@ def remote_command_stats(release: Any) -> dict[str, Any]:
 
 
 def get_json(release: Any, args: list[str]) -> dict[str, Any]:
-    raw = release.runner.run(args + ["-o", "json"], capture=True)
-    return json.loads(raw) if raw else {}
+    cache = getattr(release, "_json_read_cache", None)
+    key = tuple(args)
+    if cache is None or "get" not in args:
+        raw = release.runner.run(args + ["-o", "json"], capture=True)
+        return json.loads(raw) if raw else {}
+
+    lock: threading.Lock = release._json_read_cache_lock
+    with lock:
+        future = cache.get(key)
+        owner = future is None
+        if owner:
+            future = Future()
+            cache[key] = future
+    assert future is not None
+    if not owner:
+        return copy.deepcopy(future.result())
+    try:
+        raw = release.runner.run(args + ["-o", "json"], capture=True)
+        value = json.loads(raw) if raw else {}
+        _cache_list_items(cache, args, value, lock)
+    except Exception as exc:
+        future.set_exception(exc)
+        raise
+    future.set_result(value)
+    return copy.deepcopy(value)
+
+
+def _cache_list_items(
+    cache: dict[tuple[str, ...], Future[dict[str, Any]]],
+    args: list[str],
+    value: dict[str, Any],
+    lock: threading.Lock,
+) -> None:
+    try:
+        get_index = args.index("get")
+    except ValueError:
+        return
+    if len(args) != get_index + 2 or not isinstance(value.get("items"), list):
+        return
+    prefix = args[: get_index + 2]
+    with lock:
+        for item in value["items"]:
+            if not isinstance(item, dict):
+                continue
+            name = str((item.get("metadata") or {}).get("name") or "")
+            if not name:
+                continue
+            item_key = tuple([*prefix, name])
+            if item_key in cache:
+                continue
+            future: Future[dict[str, Any]] = Future()
+            future.set_result(item)
+            cache[item_key] = future
+
+
+@contextmanager
+def read_snapshot(release: Any):
+    previous_cache = getattr(release, "_json_read_cache", None)
+    previous_lock = getattr(release, "_json_read_cache_lock", None)
+    release._json_read_cache = {}
+    release._json_read_cache_lock = threading.Lock()
+    try:
+        yield
+    finally:
+        release._json_read_cache = previous_cache
+        release._json_read_cache_lock = previous_lock
+
+
+def prime_deployment_snapshot(release: Any) -> None:
+    if not getattr(release, "_deployment_snapshot_enabled", False):
+        return
+    commands = [
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "deployment",
+        )
+    ]
+    commands.extend(
+        (
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+            )
+            for target in release.config.clusters
+        )
+    )
+    with ThreadPoolExecutor(max_workers=min(8, len(commands))) as executor:
+        for future in (
+            executor.submit(release._get_json, command) for command in commands
+        ):
+            future.result()
 
 
 def config_map_data(release: Any, name: str) -> dict[str, str]:
@@ -547,7 +645,7 @@ print(json.dumps([
     return result
 
 
-def capture_previous(release: Any) -> dict[str, Any]:
+def _capture_previous(release: Any) -> dict[str, Any]:
     live_state = dict(release.state) if release.state else release._load_state()
     probe = getattr(release, "_remote_command_stats", None)
     remote = probe() if probe is not None else remote_command_stats(release)
@@ -727,6 +825,12 @@ def capture_previous(release: Any) -> dict[str, Any]:
         "adot_image": adot_image,
         "clusters": clusters,
     }
+
+
+def capture_previous(release: Any) -> dict[str, Any]:
+    with read_snapshot(release):
+        prime_deployment_snapshot(release)
+        return _capture_previous(release)
 
 
 def deployment_template_name(

@@ -13,6 +13,7 @@ from pathlib import Path
 from deploy_host_bundle import (
     BUNDLE_ROOT,
     bundle_platform_id,
+    dependency_identity,
     host_compatibility,
     sha256_file,
     write_bundle_manifest,
@@ -66,6 +67,12 @@ def _copy_files(source: Path, destination: Path) -> None:
             shutil.copy2(path, target)
 
 
+def _copy_wheels(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in sorted(source.glob("*.whl")):
+        shutil.copy2(path, destination / path.name)
+
+
 def _build_wheelhouse(
     python: str,
     destination: Path,
@@ -73,26 +80,27 @@ def _build_wheelhouse(
     source: Path | None,
 ) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
+    wheel_cache = source or destination
+    wheel_cache.mkdir(parents=True, exist_ok=True)
+    for lock in (
+        ROOT / "requirements/build.lock",
+        ROOT / "requirements/deploy-host.lock",
+    ):
+        _run(
+            [
+                python,
+                "-m",
+                "pip",
+                "wheel",
+                "--require-hashes",
+                "--wheel-dir",
+                str(wheel_cache),
+                "--requirement",
+                str(lock),
+            ]
+        )
     if source is not None:
-        _copy_files(source, destination)
-    else:
-        for lock in (
-            ROOT / "requirements/build.lock",
-            ROOT / "requirements/deploy-host.lock",
-        ):
-            _run(
-                [
-                    python,
-                    "-m",
-                    "pip",
-                    "wheel",
-                    "--require-hashes",
-                    "--wheel-dir",
-                    str(destination),
-                    "--requirement",
-                    str(lock),
-                ]
-            )
+        _copy_wheels(source, destination)
     for existing in destination.glob("gpu_fault_control_plane-*.whl"):
         existing.unlink()
     source_date_epoch = _git_output("show", "-s", "--format=%ct", "HEAD")
@@ -110,24 +118,20 @@ def _build_wheelhouse(
             build_venv = Path(directory)
             _run([python, "-m", "venv", str(build_venv)])
             build_python = build_venv / "bin/python"
-            for lock in (
-                ROOT / "requirements/build.lock",
-                ROOT / "requirements/deploy-host.lock",
-            ):
-                _run(
-                    [
-                        str(build_python),
-                        "-m",
-                        "pip",
-                        "install",
-                        "--no-index",
-                        "--find-links",
-                        str(destination),
-                        "--require-hashes",
-                        "--requirement",
-                        str(lock),
-                    ]
-                )
+            _run(
+                [
+                    str(build_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-index",
+                    "--find-links",
+                    str(destination),
+                    "--require-hashes",
+                    "--requirement",
+                    str(ROOT / "requirements/build.lock"),
+                ]
+            )
             _run(
                 [
                     str(build_python),
@@ -190,6 +194,10 @@ def build_bundle(
             staging,
             metadata={
                 "compatibility": compatibility,
+                "dependency_identity_sha256": dependency_identity(
+                    staging,
+                    compatibility,
+                ),
                 "platform_id": bundle_platform_id(compatibility),
                 "project_version": _project_version(),
                 "project_wheel": project_wheel.relative_to(staging).as_posix(),

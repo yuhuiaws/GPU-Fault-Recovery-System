@@ -87,6 +87,27 @@ def test_deploy_host_bundle_is_deterministic_and_verified(tmp_path: Path) -> Non
     )
 
 
+def test_deploy_host_dependency_identity_covers_locks_and_platform(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "bundle"
+    requirements = root / "requirements"
+    requirements.mkdir(parents=True)
+    (requirements / "build.lock").write_text("build-a\n", encoding="utf-8")
+    (requirements / "deploy-host.lock").write_text("host-a\n", encoding="utf-8")
+    compatibility = deploy_host_bundle.host_compatibility()
+
+    first = deploy_host_bundle.dependency_identity(root, compatibility)
+    (requirements / "deploy-host.lock").write_text("host-b\n", encoding="utf-8")
+    second = deploy_host_bundle.dependency_identity(root, compatibility)
+    changed_platform = deploy_host_bundle.dependency_identity(
+        root, {**compatibility, "architecture": "different"}
+    )
+
+    assert first != second
+    assert second != changed_platform
+
+
 def test_deploy_host_bundle_rejects_tampered_payload(tmp_path: Path) -> None:
     root = _bundle_tree(tmp_path)
     archive = tmp_path / "bundle.tar.gz"
@@ -153,6 +174,104 @@ def test_setup_installs_admin_config_template_read_only(tmp_path: Path) -> None:
     assert installed == venv / "share/gpu-fault/admin-config.example.yaml"
     assert installed.read_text(encoding="utf-8") == "kind: AdminConfig\n"
     assert installed.stat().st_mode & 0o777 == 0o644
+
+
+def test_layered_bundle_install_reuses_dependency_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    (bundle / "requirements").mkdir(parents=True)
+    (bundle / "wheelhouse").mkdir()
+    (bundle / "config").mkdir()
+    for name in ("build.lock", "deploy-host.lock"):
+        (bundle / "requirements" / name).write_text("", encoding="utf-8")
+    project_wheel = bundle / "wheelhouse/project.whl"
+    project_wheel.write_bytes(b"wheel")
+    template = bundle / "config/admin-config.example.yaml"
+    template.write_text("kind: AdminConfig\n", encoding="utf-8")
+    manifest = {
+        "requirements": {
+            "build": "requirements/build.lock",
+            "deploy_host": "requirements/deploy-host.lock",
+        },
+        "project_wheel": "wheelhouse/project.whl",
+        "admin_config_template": "config/admin-config.example.yaml",
+        "dependency_identity_sha256": "a" * 64,
+    }
+    (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    venv = tmp_path / "overlay"
+    dependency_venv = tmp_path / "dependencies"
+    commands = []
+    monkeypatch.setattr(
+        setup_deploy_host,
+        "_venv_site_paths",
+        lambda path: (
+            (tmp_path / "overlay-site")
+            if path == venv
+            else (tmp_path / "dependency-site"),
+        ),
+    )
+    monkeypatch.setattr(
+        setup_deploy_host,
+        "_pip_install",
+        lambda *_args, **_kwargs: pytest.fail(
+            "layered overlay reinstalled dependency locks"
+        ),
+    )
+    monkeypatch.setattr(
+        setup_deploy_host,
+        "_run",
+        lambda arguments, **_kwargs: commands.append(list(arguments)) or "",
+    )
+
+    setup_deploy_host.install_from_bundle(
+        bundle, venv=venv, dependency_venv=dependency_venv
+    )
+
+    pth = tmp_path / "overlay-site/gpu-fault-deploy-host-dependencies.pth"
+    assert pth.read_text(encoding="utf-8") == f"{tmp_path / 'dependency-site'}\n"
+    assert len(commands) == 1
+    assert str(project_wheel) in commands[0]
+
+
+def test_existing_overlay_revalidates_dependency_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv = tmp_path / "venv"
+    dependency_venv = tmp_path / "dependencies"
+    (venv / "bin").mkdir(parents=True)
+    dependency_venv.mkdir()
+    (venv / "bin/python").write_text("", encoding="utf-8")
+    (venv / "bin/gpu-fault-admin").write_text("", encoding="utf-8")
+    (venv / "share/gpu-fault").mkdir(parents=True)
+    (venv / "share/gpu-fault/admin-config.example.yaml").write_text(
+        "kind: AdminConfig\n", encoding="utf-8"
+    )
+    (venv / setup_deploy_host.STATE_NAME).write_text(
+        json.dumps(
+            {
+                "dependency_identity_sha256": "a" * 64,
+                "dependency_venv": str(dependency_venv),
+            }
+        ),
+        encoding="utf-8",
+    )
+    checked: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        setup_deploy_host,
+        "_check_dependency_venv",
+        lambda path, identity: checked.append((path, identity)),
+    )
+    monkeypatch.setattr(setup_deploy_host, "_run", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(
+        setup_deploy_host,
+        "_dependency_report",
+        lambda *_args, **_kwargs: {"healthy": True},
+    )
+
+    setup_deploy_host.check_deploy_host_venv(venv)
+
+    assert checked == [(dependency_venv, "a" * 64)]
 
 
 def test_bundle_signature_verification_uses_cosign(

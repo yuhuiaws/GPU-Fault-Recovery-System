@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Iterable, Mapping
 
@@ -25,6 +26,7 @@ if __package__:
         ResourceLock,
         run_scheduled_cases,
     )
+    from .pytest_result_identity import source_identity
 else:
     from case_scheduler import (
         ENVIRONMENT_MODES,
@@ -34,6 +36,7 @@ else:
         ResourceLock,
         run_scheduled_cases,
     )
+    from pytest_result_identity import source_identity
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -128,6 +131,8 @@ NONEMPTY_STRING_FIELDS = {
 }
 TRACE_ENV = "GPU_FAULT_EMIT_PROCESSING_TRACE"
 TRACE_PREFIX = "GPU_FAULT_PROCESSING_TRACE="
+PYTEST_BATCH_REPORT_ENV = "PYTEST_GPU_FAULT_CASE_REPORT"
+PYTEST_RESULT_SCHEMA_VERSION = 1
 EXECUTION_FIELDS = {
     "depends_on",
     "environment",
@@ -607,6 +612,188 @@ def run_case(
     return result
 
 
+def pytest_batch_eligible(
+    case: dict[str, Any],
+    policy: ExecutionPolicy,
+) -> bool:
+    return (
+        case["automation"] == "pytest"
+        and not case.get("capture_processing_trace")
+        and policy.parallel_safe
+        and policy.environment == "isolated"
+        and not policy.depends_on
+        and policy.failure_scope == "branch"
+        and all(lock.mode == "shared" for lock in policy.effective_locks())
+    )
+
+
+def _normalized_pytest_nodeid(value: str) -> str:
+    path_text, separator, selector = value.partition("::")
+    path = Path(path_text)
+    resolved = (path if path.is_absolute() else ROOT / path).resolve()
+    return str(resolved) + (f"::{selector}" if separator else "")
+
+
+def _results_from_pytest_records(
+    requested: Mapping[str, dict[str, Any]],
+    *,
+    normalized_records: Mapping[str, object],
+    started: datetime,
+    batch_output: str,
+) -> dict[str, dict[str, Any]]:
+    normalized = {
+        _normalized_pytest_nodeid(nodeid): case for nodeid, case in requested.items()
+    }
+    if len(normalized) != len(requested):
+        raise ValueError("pytest cases must use unique nodeids")
+    results: dict[str, dict[str, Any]] = {}
+    for nodeid, case in requested.items():
+        normalized_nodeid = _normalized_pytest_nodeid(nodeid)
+        exact = normalized_records.get(normalized_nodeid)
+        records_for_case = (
+            [exact]
+            if isinstance(exact, dict)
+            else [
+                record
+                for reported_nodeid, record in normalized_records.items()
+                if reported_nodeid.startswith(normalized_nodeid + "[")
+                and isinstance(record, dict)
+            ]
+        )
+        if records_for_case:
+            status = (
+                "PASS"
+                if all(record.get("status") == "PASS" for record in records_for_case)
+                else "FAIL"
+            )
+            output = "\n".join(
+                str(record.get("output") or "").strip()
+                for record in records_for_case
+                if str(record.get("output") or "").strip()
+            )
+            duration = round(
+                sum(
+                    float(record.get("duration_seconds") or 0.0)
+                    for record in records_for_case
+                ),
+                3,
+            )
+        else:
+            status = "FAIL"
+            output = (
+                f"pytest produced no result for {nodeid}; "
+                f"available={sorted(normalized_records)}"
+                + (f"\n{batch_output}" if batch_output else "")
+            )
+            duration = 0.0
+        results[str(case["id"])] = {
+            "id": case["id"],
+            "title": case["title"],
+            "category": case["category"],
+            "level": case["level"],
+            "risk": case["risk"],
+            "problem": case["problem"],
+            "injection": case["injection"],
+            "expected": case["expected"],
+            "status": status,
+            "executor": nodeid,
+            "started_at": started.isoformat(),
+            "duration_seconds": duration,
+            "output": output,
+        }
+    return results
+
+
+def run_pytest_batch(
+    cases: Iterable[dict[str, Any]],
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    selected = tuple(cases)
+    if not selected:
+        return {}
+    started = datetime.now(timezone.utc)
+    requested = {str(case["pytest_nodeid"]): case for case in selected}
+    if len(requested) != len(selected):
+        raise ValueError("batched pytest cases must use unique nodeids")
+    with tempfile.TemporaryDirectory(prefix="gpu-fault-pytest-batch-") as directory:
+        report_path = Path(directory) / "report.json"
+        child_environment = dict(os.environ if environment is None else environment)
+        child_environment[PYTEST_BATCH_REPORT_ENV] = str(report_path)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "tools.pytest_case_reporter",
+                *requested,
+            ],
+            cwd=ROOT,
+            env=child_environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        try:
+            records = _load_pytest_result_records(report_path)
+        except ValueError:
+            records = {}
+    batch_output = (completed.stdout or "").strip()
+    normalized_records = (
+        {
+            _normalized_pytest_nodeid(str(nodeid)): record
+            for nodeid, record in records.items()
+        }
+        if isinstance(records, dict)
+        else {}
+    )
+    return _results_from_pytest_records(
+        requested,
+        normalized_records=normalized_records,
+        started=started,
+        batch_output=batch_output,
+    )
+
+
+def load_pytest_results(
+    cases: Iterable[dict[str, Any]],
+    *,
+    path: Path,
+) -> dict[str, dict[str, Any]]:
+    records = _load_pytest_result_records(path)
+    selected = tuple(cases)
+    started = datetime.now(timezone.utc)
+    requested = {str(case["pytest_nodeid"]): case for case in selected}
+    normalized_records = {
+        _normalized_pytest_nodeid(str(nodeid)): record
+        for nodeid, record in records.items()
+    }
+    return _results_from_pytest_records(
+        requested,
+        normalized_records=normalized_records,
+        started=started,
+        batch_output="",
+    )
+
+
+def _load_pytest_result_records(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"pytest case results are invalid: {path}") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != PYTEST_RESULT_SCHEMA_VERSION
+        or value.get("source_identity") != source_identity(ROOT)
+        or not isinstance(value.get("records"), dict)
+    ):
+        raise ValueError("pytest case result identity does not match current source")
+    return dict(value["records"])
+
+
 def execution_policy(case: dict[str, Any]) -> ExecutionPolicy:
     configured = case.get("execution")
     if configured is not None:
@@ -683,6 +870,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Defaults to 1 and preserves serial execution."
         ),
     )
+    parser.add_argument(
+        "--batch-pytest",
+        action="store_true",
+        help=(
+            "Run a compatible all-pytest selection in one pytest process while "
+            "retaining per-case results."
+        ),
+    )
+    parser.add_argument(
+        "--pytest-results",
+        type=Path,
+        help="Reuse per-node pytest results emitted by tools.pytest_case_reporter.",
+    )
     return parser
 
 
@@ -707,12 +907,51 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     run_started = time.monotonic()
+    policies = {str(case["id"]): execution_policy(case) for case in selected}
+    if args.batch_pytest and args.pytest_results is not None:
+        print(
+            "ERROR: --batch-pytest and --pytest-results are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
+    batch_enabled = bool(args.batch_pytest or args.pytest_results is not None)
+    if batch_enabled:
+        incompatible = [
+            str(case["id"])
+            for case in selected
+            if not pytest_batch_eligible(case, policies[str(case["id"])])
+        ]
+        if incompatible:
+            print(
+                "ERROR: --batch-pytest selection contains incompatible cases: "
+                + ", ".join(incompatible),
+                file=sys.stderr,
+            )
+            return 2
 
     def execute(case: dict[str, Any], policy: ExecutionPolicy) -> dict[str, Any]:
         environment = (
             build_isolated_environment() if policy.environment == "isolated" else None
         )
         return run_case(case, environment=environment)
+
+    def execute_batch(
+        cases: Iterable[dict[str, Any]],
+        policies: Iterable[ExecutionPolicy],
+    ) -> dict[str, dict[str, Any]]:
+        case_values = tuple(cases)
+        policy_values = tuple(policies)
+        if args.pytest_results is not None:
+            return load_pytest_results(
+                case_values,
+                path=args.pytest_results.resolve(),
+            )
+        environment = (
+            build_isolated_environment()
+            if policy_values and policy_values[0].environment == "isolated"
+            else None
+        )
+        return run_pytest_batch(case_values, environment=environment)
 
     def on_start(case: dict[str, Any], _policy: ExecutionPolicy) -> None:
         print(f"RUN  {case['id']} {case['title']}", flush=True)
@@ -724,7 +963,12 @@ def main(argv: list[str] | None = None) -> int:
         selected,
         policy_for=execution_policy,
         execute=execute,
-        max_workers=args.workers,
+        batch_key_for=(
+            (lambda _case, _policy: "isolated-pytest") if batch_enabled else None
+        ),
+        execute_batch=execute_batch if batch_enabled else None,
+        max_batch_size=len(selected) if batch_enabled else 1,
+        max_workers=max(args.workers, len(selected)) if batch_enabled else args.workers,
         on_start=on_start,
         on_finish=on_finish,
     )

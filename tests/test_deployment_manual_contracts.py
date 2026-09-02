@@ -357,12 +357,16 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "STATE_DIR" in target
     assert "RUNTIME_IMAGE_CACHE_REPOSITORY" in workflow
     assert "cosign sign-blob" not in workflow
+    assert "release-build-promoted" in makefile
+    assert "scripts/ci_gate.py verify" in makefile
     assert "scripts/build-deploy-host-bundle.py" in host_bundle
     assert "env -u COSIGN_PASSWORD" in host_bundle
     assert "$(COSIGN) sign-blob --yes" in host_bundle
     assert "scripts/setup-deploy-host.sh" in host_setup
     assert "--signature-bundle" in host_setup
-    assert "make deploy-host-bundle PYTHON=python" in workflow
+    assert "make release-build-promoted" in workflow
+    assert "make deploy-host-sign PYTHON=python" in workflow
+    assert "cosign verify-blob" in workflow
     assert "make PYTHON=.venv/bin/python release-build" in developer
     assert "make PYTHON=.venv/bin/python release-deploy" in developer
     assert "gpu-fault-admin approve-profile" in developer

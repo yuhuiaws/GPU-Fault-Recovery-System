@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tomllib
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -437,6 +438,18 @@ def component_source_digest(name: str) -> str:
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=8)
+def validated_build_python(python: str) -> str:
+    script = (
+        "import importlib.metadata as m;"
+        "expected={'build':'1.6.0','setuptools':'84.0.0'};"
+        "actual={name:m.version(name) for name in expected};"
+        "assert actual == expected, (actual, expected)"
+    )
+    subprocess.run([python, "-c", script], check=True)
+    return python
+
+
 def build_component(
     *,
     python: str,
@@ -444,6 +457,7 @@ def build_component(
     build_root: Path,
     output: Path,
 ) -> tuple[Path, str, set[str]]:
+    python = validated_build_python(python)
     component = COMPONENTS[name]
     selected = dependency_closure(
         {
@@ -460,14 +474,30 @@ def build_component(
     before = set(output.glob("*.whl"))
     previous_umask = os.umask(0o022)
     try:
-        subprocess.run(
-            [python, "-m", "build", "--wheel", "--outdir", str(output)],
+        completed = subprocess.run(
+            [
+                python,
+                "-m",
+                "build",
+                "--wheel",
+                "--no-isolation",
+                "--outdir",
+                str(output),
+            ],
             cwd=project,
             env={**os.environ, "SOURCE_DATE_EPOCH": "315532800"},
-            check=True,
+            text=True,
+            capture_output=True,
+            check=False,
         )
     finally:
         os.umask(previous_umask)
+    if completed.returncode:
+        raise RuntimeError(
+            f"{name} wheel build failed with status {completed.returncode}:\n"
+            + (completed.stdout or "")
+            + (completed.stderr or "")
+        )
     wheels = sorted(set(output.glob("*.whl")) - before)
     if len(wheels) != 1:
         raise RuntimeError(f"{name} build produced {len(wheels)} wheels")

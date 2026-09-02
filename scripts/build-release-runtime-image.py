@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--build-arg", action="append", default=[])
     parser.add_argument("--cache-from", action="append", default=[])
     parser.add_argument("--cache-to", action="append", default=[])
+    parser.add_argument("--component-artifacts", type=Path)
     parser.add_argument("--force-rebuild", action="store_true")
     parser.add_argument(
         "--output",
@@ -45,6 +46,11 @@ def main() -> None:
         build_args=build_arguments(arguments.build_arg),
         cache_from=tuple(arguments.cache_from),
         cache_to=tuple(arguments.cache_to),
+        component_artifacts=(
+            arguments.component_artifacts.resolve()
+            if arguments.component_artifacts is not None
+            else None
+        ),
         reuse_registry_image=not arguments.force_rebuild,
     )
     output = arguments.output.resolve()

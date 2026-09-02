@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -165,6 +166,25 @@ def test_regional_only_output_never_contains_execution_command() -> None:
 
     assert "Run pytest:" not in text
     assert "Regional safe cases:" in text
+
+
+def test_impact_plan_file_is_digest_and_base_bound(tmp_path: Path) -> None:
+    plan = MODULE.build_plan(["src/gpu_fault/cluster_executor.py"], settings())
+    path = tmp_path / "impact-plan.json"
+
+    MODULE.write_plan_file(path, base="origin/main", plan=plan)
+
+    assert MODULE.load_plan_file(path, expected_base="origin/main") == plan
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["plan"]["postgres"] = not value["plan"]["postgres"]
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    try:
+        MODULE.load_plan_file(path, expected_base="origin/main")
+    except MODULE.ImpactError as exc:
+        assert "identity" in str(exc)
+    else:
+        raise AssertionError("tampered impact plan was accepted")
 
 
 def test_make_targets_execute_pytest_but_never_execute_regional_cases() -> None:

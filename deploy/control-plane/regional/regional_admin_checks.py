@@ -9,6 +9,7 @@ import re
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -176,6 +177,17 @@ def _report(mode: str, release: Any, checks: list[dict[str, Any]]) -> dict[str, 
 
 def report_exit_code(report: dict[str, Any]) -> int:
     return 0 if report.get("healthy") else 1
+
+
+def _read_snapshot(release: Any):
+    factory = getattr(release, "_read_snapshot", None)
+    return factory() if callable(factory) else nullcontext()
+
+
+def _prime_deployment_snapshot(release: Any) -> None:
+    prime = getattr(release, "_prime_deployment_snapshot", None)
+    if callable(prime):
+        prime()
 
 
 def _decode_secret(value: str) -> bytes:
@@ -938,11 +950,13 @@ def build_preflight_report(release: Any) -> dict[str, Any]:
         ("email_notifications", lambda: check_email_notifications(release)),
         ("monitoring", lambda: _check_monitoring(release)),
     ]
-    with ThreadPoolExecutor(max_workers=min(8, len(specifications))) as executor:
-        futures = [
-            executor.submit(_check, name, function) for name, function in specifications
-        ]
-        checks = [future.result() for future in futures]
+    with _read_snapshot(release):
+        with ThreadPoolExecutor(max_workers=min(8, len(specifications))) as executor:
+            futures = [
+                executor.submit(_check, name, function)
+                for name, function in specifications
+            ]
+            checks = [future.result() for future in futures]
     return _report("preflight", release, checks)
 
 
@@ -1431,11 +1445,14 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
             ("monitoring", lambda: _check_monitoring(release)),
         ]
     )
-    with ThreadPoolExecutor(max_workers=min(8, len(specifications))) as executor:
-        futures = [
-            executor.submit(_check, name, function) for name, function in specifications
-        ]
-        checks = [future.result() for future in futures]
+    with _read_snapshot(release):
+        _prime_deployment_snapshot(release)
+        with ThreadPoolExecutor(max_workers=min(8, len(specifications))) as executor:
+            futures = [
+                executor.submit(_check, name, function)
+                for name, function in specifications
+            ]
+            checks = [future.result() for future in futures]
     return _report(mode, release, checks)
 
 

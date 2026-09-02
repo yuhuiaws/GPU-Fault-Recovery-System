@@ -10,7 +10,6 @@ import secrets
 import subprocess
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
 from urllib.parse import quote
@@ -50,6 +49,7 @@ from gpu_fault.admin_bootstrap_site import (
     cluster_alias as _cluster_alias,
     discover_bootstrap_scope,
     discover_subnet_cidrs,
+    hyperpod_inventory,
     preserve_existing_site_contract,
     site_identifier as _site_identifier,
 )
@@ -76,30 +76,11 @@ def _find_hyperpod_for_eks(
     eks_arn: str,
     region: str,
 ) -> dict[str, Any]:
-    summaries = runner.aws_json(region, "sagemaker", "list-clusters").get(
-        "ClusterSummaries",
-        [],
-    )
-    names = [item.get("ClusterName") for item in summaries if item.get("ClusterName")]
-
-    def describe(name: str) -> dict[str, Any]:
-        return runner.aws_json(
-            region,
-            "sagemaker",
-            "describe-cluster",
-            "--cluster-name",
-            name,
-        )
-
-    matches = []
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(names)))) as executor:
-        futures = {executor.submit(describe, name): name for name in names}
-        for future in as_completed(futures):
-            value = future.result()
-            if (value.get("Orchestrator") or {}).get("Eks", {}).get(
-                "ClusterArn"
-            ) == eks_arn:
-                matches.append(value)
+    matches = [
+        value
+        for value in hyperpod_inventory(runner, region=region)
+        if (value.get("Orchestrator") or {}).get("Eks", {}).get("ClusterArn") == eks_arn
+    ]
     if len(matches) != 1:
         raise BootstrapError(
             f"EKS cluster {eks_arn} must belong to exactly one HyperPod cluster; "
@@ -2021,10 +2002,7 @@ def bootstrap_from_arns(
         },
         state=state,
     )
-    adot_image = _discover_adot_image(
-        active_runner,
-        cpu_kubeconfig=cpu_kubeconfig,
-    )
+    adot_image = str(release["images"]["adot"])
 
     executor_tasks = {
         f"executor_role:{_safe_name(cluster.hyperpod_name)}": (

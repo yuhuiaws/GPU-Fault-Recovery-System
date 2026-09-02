@@ -12,9 +12,11 @@ import tempfile
 from typing import Any
 
 if __package__:
+    from scripts.component_artifacts import load_component_artifacts
     from scripts.component_wheels import COMPONENTS, build_component
     from scripts.release_identity import build_release_identity
 else:
+    from component_artifacts import load_component_artifacts
     from component_wheels import COMPONENTS, build_component
     from release_identity import build_release_identity
 
@@ -311,6 +313,7 @@ def build_runtime_image(
     build_args: Mapping[str, str] | None = None,
     cache_from: Sequence[str] = (),
     cache_to: Sequence[str] = (),
+    component_artifacts: Path | None = None,
     reuse_registry_image: bool = True,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
@@ -340,13 +343,23 @@ def build_runtime_image(
             requirements / "runtime.lock",
         )
         components: dict[str, dict[str, str]] = {}
+        cached = (
+            load_component_artifacts(root, component_artifacts)
+            if component_artifacts is not None
+            else None
+        )
         for name in RUNTIME_COMPONENTS:
-            wheel, module_digest, _modules = build_component(
-                python=sys.executable,
-                name=name,
-                build_root=temporary / "components",
-                output=wheels,
-            )
+            if cached is None:
+                wheel, module_digest, _modules = build_component(
+                    python=sys.executable,
+                    name=name,
+                    build_root=temporary / "components",
+                    output=wheels,
+                )
+            else:
+                source = cached.wheels[name]
+                wheel = Path(shutil.copy2(source, wheels / source.name))
+                module_digest = cached.module_digests[name]
             components[name] = {
                 "distribution": COMPONENTS[name].distribution,
                 "wheel_sha256": _sha256(wheel),

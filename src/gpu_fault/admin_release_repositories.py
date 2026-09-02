@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Mapping
 
 from gpu_fault.admin_bootstrap_common import (
@@ -283,20 +284,25 @@ def ensure_release_repositories(
     cpu: ClusterIdentity,
     site_id: str,
 ) -> dict[str, dict[str, str]]:
-    return {
-        "runtime": _ensure_ecr_repository(
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        runtime = executor.submit(
+            _ensure_ecr_repository,
             runner,
             cpu=cpu,
             site_id=site_id,
             cache=False,
-        ),
-        "cache": _ensure_ecr_repository(
+        )
+        cache = executor.submit(
+            _ensure_ecr_repository,
             runner,
             cpu=cpu,
             site_id=site_id,
             cache=True,
-        ),
-    }
+        )
+        return {
+            "runtime": runtime.result(),
+            "cache": cache.result(),
+        }
 
 
 def prepare_signed_release(

@@ -46,8 +46,12 @@ make regional-impact-plan BASE=origin/main
 `test-impact`执行相关静态检查和pytest；`regional-impact-plan`只输出受影响的区域用例，
 不会自动执行live或destructive case。无法匹配的文件、共享契约、Python/依赖/runtime
 image、schema/事务变化或跨越三个以上影响域时会fail closed并升级为完整门禁。
-版本候选和正式发布仍必须运行`make check`；完整区域验收只跟随首次上线、重大架构变化
-或影响计划明确要求执行。规则与说明见
+统一staging release内部只计算一次带摘要的影响计划，测试执行和regional计划共同消费；
+只有计划要求PostgreSQL时才启动隔离PostgreSQL 16。
+受信本地production候选仍运行`make check`；GitHub Release只晋级已经由签名main CI
+gate证明等价static、coverage、artifact和PostgreSQL stress门禁的同commit候选，不在
+Release job重复测试。完整区域验收只跟随首次上线、重大架构变化或影响计划明确要求
+执行。规则与说明见
 [变更影响与测试选择](docs/变更影响与测试选择.md)。
 
 管理员首次部署由一个ARN命令完成基础资源、release build和应用部署：

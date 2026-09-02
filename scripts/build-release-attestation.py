@@ -14,6 +14,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--staging-only", action="store_true")
     parser.add_argument("--impact-base")
+    parser.add_argument("--impact-plan", type=Path)
+    parser.add_argument("--ci-gate", type=Path)
     arguments = parser.parse_args()
     manifest = ROOT / "dist/current-release.json"
     attestation = build_attestation(
@@ -21,6 +23,8 @@ def main() -> None:
         manifest,
         staging_only=arguments.staging_only,
         impact_base=arguments.impact_base,
+        impact_plan_path=arguments.impact_plan,
+        ci_gate_path=arguments.ci_gate,
     )
     release_id = attestation["subject"]["release_id"]
     path = ROOT / "dist" / release_id / "attestation.json"

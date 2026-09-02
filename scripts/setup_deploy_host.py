@@ -13,6 +13,7 @@ from typing import Any, Mapping, Sequence
 if __package__:
     from scripts.deploy_host_bundle import (
         DeployHostBundleError,
+        dependency_identity,
         extract_verified_bundle,
         sha256_file,
         validate_host_compatibility,
@@ -20,6 +21,7 @@ if __package__:
 else:
     from deploy_host_bundle import (
         DeployHostBundleError,
+        dependency_identity,
         extract_verified_bundle,
         sha256_file,
         validate_host_compatibility,
@@ -28,6 +30,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_NAME = "deploy-host-state.json"
+DEPENDENCY_STATE_NAME = "deploy-host-dependency-state.json"
 
 
 class DeployHostSetupError(RuntimeError):
@@ -193,9 +196,17 @@ def install_admin_config_template(source: Path, venv: Path) -> Path:
     return destination
 
 
-def _dependency_report(venv: Path) -> dict[str, Any]:
+def _dependency_report(
+    venv: Path,
+    *,
+    dependency_venv: Path | None = None,
+) -> dict[str, Any]:
     env = _isolated_python_environment()
-    env["PATH"] = f"{venv / 'bin'}:{env.get('PATH', '')}"
+    paths = [str(venv / "bin")]
+    if dependency_venv is not None:
+        paths.append(str(dependency_venv / "bin"))
+    paths.append(env.get("PATH", ""))
+    env["PATH"] = ":".join(paths)
     output = _run(
         [
             str(_python_path(venv)),
@@ -218,7 +229,7 @@ def _dependency_report(venv: Path) -> dict[str, Any]:
     return report
 
 
-def _check_venv(venv: Path) -> dict[str, Any]:
+def check_deploy_host_venv(venv: Path) -> dict[str, Any]:
     python = _python_path(venv)
     admin = venv / "bin/gpu-fault-admin"
     state_path = venv / STATE_NAME
@@ -229,40 +240,172 @@ def _check_venv(venv: Path) -> dict[str, Any]:
         raise DeployHostSetupError(
             f"deployment-host administrator config template is missing: {venv}"
         )
-    _run([str(admin), "--help"], capture=True)
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DeployHostSetupError("deployment-host state is invalid") from exc
+    dependency_path = state.get("dependency_venv")
+    dependency_venv = Path(str(dependency_path)).resolve() if dependency_path else None
+    if dependency_venv is not None and not dependency_venv.is_dir():
+        raise DeployHostSetupError(f"deployment-host venv is incomplete: {venv}")
+    dependency_identity_value = state.get("dependency_identity_sha256")
+    if dependency_venv is not None:
+        dependency_identity = str(dependency_identity_value or "")
+        if len(dependency_identity) != 64:
+            raise DeployHostSetupError(f"deployment-host venv is incomplete: {venv}")
+        _check_dependency_venv(dependency_venv, dependency_identity)
+    elif dependency_identity_value is not None:
+        raise DeployHostSetupError(f"deployment-host venv is incomplete: {venv}")
+    _run([str(admin), "--help"], capture=True)
     return {
         "schema_version": 1,
         "healthy": True,
         "venv": str(venv),
         "state": state,
         "admin_config_template": str(admin_config_template),
-        "dependencies": _dependency_report(venv),
+        "dependencies": _dependency_report(
+            venv,
+            dependency_venv=dependency_venv,
+        ),
     }
 
 
-def _install_from_bundle(
+def _venv_site_paths(venv: Path) -> tuple[Path, ...]:
+    output = _run(
+        [
+            str(_python_path(venv)),
+            "-c",
+            (
+                "import json,sysconfig;"
+                "paths=sysconfig.get_paths();"
+                "print(json.dumps([paths['purelib'],paths['platlib']]))"
+            ),
+        ],
+        capture=True,
+    )
+    values = json.loads(output)
+    if not isinstance(values, list) or not values:
+        raise DeployHostSetupError("deployment-host venv site paths are invalid")
+    return tuple(dict.fromkeys(Path(str(value)) for value in values))
+
+
+def _check_dependency_venv(venv: Path, expected_identity: str) -> None:
+    state_path = venv / DEPENDENCY_STATE_NAME
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeployHostSetupError(
+            f"deployment-host dependency venv is incomplete: {venv}"
+        ) from exc
+    if state.get("dependency_identity_sha256") != expected_identity:
+        raise DeployHostSetupError(
+            "deployment-host dependency venv identity does not match"
+        )
+    _run(
+        [
+            str(_python_path(venv)),
+            "-c",
+            (
+                "import importlib.metadata as m;"
+                "names=('build','boto3','kubernetes','psycopg','pytest','ruff','PyYAML');"
+                "print(','.join(m.version(name) for name in names))"
+            ),
+        ],
+        capture=True,
+    )
+
+
+def _ensure_dependency_venv(
+    bundle_root: Path,
+    *,
+    target_venv: Path,
+    base_python: str,
+    manifest: Mapping[str, Any],
+) -> tuple[Path, bool]:
+    expected = str(manifest.get("dependency_identity_sha256") or "")
+    actual = dependency_identity(
+        bundle_root,
+        dict(manifest["compatibility"]),
+    )
+    if len(expected) != 64 or expected != actual:
+        raise DeployHostSetupError(
+            "deploy-host bundle dependency identity does not match"
+        )
+    versions = target_venv.parent / f".{target_venv.name}.dependencies"
+    versions.mkdir(mode=0o700, parents=True, exist_ok=True)
+    dependency_venv = versions / expected[:24]
+    if dependency_venv.is_dir():
+        _check_dependency_venv(dependency_venv, expected)
+        return dependency_venv, True
+
+    staged = Path(tempfile.mkdtemp(prefix=".dependency-", dir=versions))
+    try:
+        _run([base_python, "-m", "venv", str(staged)])
+        requirements = dict(manifest["requirements"])
+        wheelhouse = bundle_root / "wheelhouse"
+        for name in ("build", "deploy_host"):
+            _pip_install(
+                _python_path(staged),
+                requirements=bundle_root / str(requirements[name]),
+                wheelhouse=wheelhouse,
+            )
+        state_path = staged / DEPENDENCY_STATE_NAME
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "dependency_identity_sha256": expected,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+        _check_dependency_venv(staged, expected)
+        try:
+            os.replace(staged, dependency_venv)
+        except OSError:
+            if not dependency_venv.is_dir():
+                raise
+            shutil.rmtree(staged, ignore_errors=True)
+            _check_dependency_venv(dependency_venv, expected)
+    except Exception:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise
+    return dependency_venv, False
+
+
+def install_from_bundle(
     bundle_root: Path,
     *,
     venv: Path,
+    dependency_venv: Path | None = None,
 ) -> dict[str, Any]:
     manifest = json.loads((bundle_root / "manifest.json").read_text(encoding="utf-8"))
     requirements = dict(manifest["requirements"])
     wheelhouse = bundle_root / "wheelhouse"
     python = _python_path(venv)
-    _pip_install(
-        python,
-        requirements=bundle_root / str(requirements["build"]),
-        wheelhouse=wheelhouse,
-    )
-    _pip_install(
-        python,
-        requirements=bundle_root / str(requirements["deploy_host"]),
-        wheelhouse=wheelhouse,
-    )
+    if dependency_venv is None:
+        _pip_install(
+            python,
+            requirements=bundle_root / str(requirements["build"]),
+            wheelhouse=wheelhouse,
+        )
+        _pip_install(
+            python,
+            requirements=bundle_root / str(requirements["deploy_host"]),
+            wheelhouse=wheelhouse,
+        )
+    else:
+        dependency_paths = _venv_site_paths(dependency_venv)
+        for site_path in _venv_site_paths(venv):
+            site_path.mkdir(parents=True, exist_ok=True)
+            (site_path / "gpu-fault-deploy-host-dependencies.pth").write_text(
+                "\n".join(str(path) for path in dependency_paths) + "\n",
+                encoding="utf-8",
+            )
     project_wheel = bundle_root / str(manifest["project_wheel"])
     _run(
         [
@@ -420,7 +563,7 @@ def setup_deploy_host(
                         allow_source_mismatch=allow_source_mismatch,
                     )
                     try:
-                        result = _check_venv(venv)
+                        result = check_deploy_host_venv(venv)
                     except DeployHostSetupError as exc:
                         if "deployment-host venv is incomplete" not in str(exc):
                             raise
@@ -455,14 +598,32 @@ def setup_deploy_host(
                     repo_root=repo_root,
                     allow_source_mismatch=allow_source_mismatch,
                 )
-                metadata = _install_from_bundle(bundle_root, venv=staged)
+                dependency_venv = None
+                dependency_reused = None
+                if bundle_manifest.get("dependency_identity_sha256"):
+                    dependency_venv, dependency_reused = _ensure_dependency_venv(
+                        bundle_root,
+                        target_venv=venv,
+                        base_python=python,
+                        manifest=bundle_manifest,
+                    )
+                metadata = install_from_bundle(
+                    bundle_root,
+                    venv=staged,
+                    dependency_venv=dependency_venv,
+                )
                 mode = "bundle"
             else:
                 compatibility = None
                 source_binding = None
+                dependency_venv = None
+                dependency_reused = None
                 metadata = _install_online(repo_root=repo_root, venv=staged)
                 mode = "online"
-        dependencies = _dependency_report(staged)
+        dependencies = _dependency_report(
+            staged,
+            dependency_venv=dependency_venv,
+        )
         state = {
             "schema_version": 1,
             "mode": mode,
@@ -472,6 +633,11 @@ def setup_deploy_host(
             "project_version": metadata.get("project_version"),
             "source": metadata.get("source"),
             "source_binding": source_binding,
+            "dependency_identity_sha256": metadata.get("dependency_identity_sha256"),
+            "dependency_venv": (
+                str(dependency_venv) if dependency_venv is not None else None
+            ),
+            "dependency_reused": dependency_reused,
             "dependencies": dependencies,
         }
         state_path = staged / STATE_NAME
@@ -484,7 +650,7 @@ def setup_deploy_host(
     except Exception:
         shutil.rmtree(staged, ignore_errors=True)
         raise
-    result = _check_venv(venv)
+    result = check_deploy_host_venv(venv)
     result["reused"] = False
     return result
 
@@ -513,7 +679,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     venv = venv.absolute()
     try:
         result = (
-            _check_venv(venv)
+            check_deploy_host_venv(venv)
             if options.check
             else setup_deploy_host(
                 repo_root=repo_root,

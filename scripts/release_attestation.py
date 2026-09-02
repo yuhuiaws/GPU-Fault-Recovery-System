@@ -16,10 +16,13 @@ PRODUCTION_QUALITY_GATES = (
     "make check",
     "make test-postgres-stress",
 )
+PROMOTED_QUALITY_GATES = (
+    "python scripts/ci_gate.py verify",
+    "pytest tests/test_artifact_consistency.py",
+)
 STAGING_QUALITY_GATES = (
     "make public-release-check",
     "make test-impact",
-    "make regional-impact-plan",
     "pytest tests/test_artifact_consistency.py",
 )
 
@@ -91,6 +94,8 @@ def build_attestation(
     *,
     staging_only: bool = False,
     impact_base: str | None = None,
+    impact_plan_path: Path | None = None,
+    ci_gate_path: Path | None = None,
 ) -> dict[str, Any]:
     manifest = load_manifest(manifest_path, allow_staging=staging_only)
     if manifest.get("staging_only", False) is not staging_only:
@@ -104,6 +109,14 @@ def build_attestation(
     if not staging_only and impact_base is not None:
         raise ReleaseAttestationError(
             "production attestation must not declare an impact test base"
+        )
+    if not staging_only and impact_plan_path is not None:
+        raise ReleaseAttestationError(
+            "production attestation must not declare an impact plan"
+        )
+    if staging_only and ci_gate_path is not None:
+        raise ReleaseAttestationError(
+            "staging attestation must not declare a production CI gate"
         )
     state = source_state(root)
     result = {
@@ -119,12 +132,44 @@ def build_attestation(
         "quality_gates": [
             {"command": command, "status": "PASSED"}
             for command in (
-                STAGING_QUALITY_GATES if staging_only else PRODUCTION_QUALITY_GATES
+                STAGING_QUALITY_GATES
+                if staging_only
+                else PROMOTED_QUALITY_GATES
+                if ci_gate_path is not None
+                else PRODUCTION_QUALITY_GATES
             )
         ],
     }
     if impact_base is not None:
         result["impact_base"] = impact_base
+    if impact_plan_path is not None:
+        resolved_plan = impact_plan_path.resolve()
+        try:
+            relative_plan = resolved_plan.relative_to(root.resolve())
+        except ValueError as exc:
+            raise ReleaseAttestationError(
+                "staging impact plan leaves repository"
+            ) from exc
+        if not resolved_plan.is_file():
+            raise ReleaseAttestationError("staging impact plan is missing")
+        result["impact_plan"] = {
+            "path": str(relative_plan),
+            "sha256": sha256(resolved_plan),
+        }
+    if ci_gate_path is not None:
+        resolved_gate = ci_gate_path.resolve()
+        try:
+            relative_gate = resolved_gate.relative_to(root.resolve())
+        except ValueError as exc:
+            raise ReleaseAttestationError(
+                "production CI gate leaves repository"
+            ) from exc
+        if not resolved_gate.is_file():
+            raise ReleaseAttestationError("production CI gate is missing")
+        result["ci_gate"] = {
+            "path": str(relative_gate),
+            "sha256": sha256(resolved_gate),
+        }
     return result
 
 
@@ -167,8 +212,36 @@ def verify_attestation(
         raise ReleaseAttestationError(
             "production attestation declares a staging impact test base"
         )
+    impact_plan = value.get("impact_plan")
+    if impact_plan is not None:
+        if not staging_only or not isinstance(impact_plan, dict):
+            raise ReleaseAttestationError("attestation impact plan is invalid")
+        plan_path = (root / str(impact_plan.get("path") or "")).resolve()
+        try:
+            plan_path.relative_to(root.resolve())
+        except ValueError as exc:
+            raise ReleaseAttestationError(
+                "attested impact plan leaves repository"
+            ) from exc
+        if not plan_path.is_file() or sha256(plan_path) != impact_plan.get("sha256"):
+            raise ReleaseAttestationError("attested impact plan SHA-256 does not match")
+    ci_gate = value.get("ci_gate")
+    if ci_gate is not None:
+        if staging_only or not isinstance(ci_gate, dict):
+            raise ReleaseAttestationError("attestation CI gate is invalid")
+        gate_path = (root / str(ci_gate.get("path") or "")).resolve()
+        try:
+            gate_path.relative_to(root.resolve())
+        except ValueError as exc:
+            raise ReleaseAttestationError("attested CI gate leaves repository") from exc
+        if not gate_path.is_file() or sha256(gate_path) != ci_gate.get("sha256"):
+            raise ReleaseAttestationError("attested CI gate SHA-256 does not match")
     expected_commands = set(
-        STAGING_QUALITY_GATES if staging_only else PRODUCTION_QUALITY_GATES
+        STAGING_QUALITY_GATES
+        if staging_only
+        else PROMOTED_QUALITY_GATES
+        if ci_gate is not None
+        else PRODUCTION_QUALITY_GATES
     )
     gates = value.get("quality_gates")
     if (

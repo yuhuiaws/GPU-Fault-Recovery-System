@@ -1,5 +1,6 @@
 import inspect
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -239,6 +240,82 @@ def test_previous_release_snapshot_reads_live_images() -> None:
     assert previous["executor_internal_error_total"] == 2
     assert previous["clusters"][target.cluster_id]["dcgm_image"] == previous_dcgm
     assert previous["agent_identities"][target.cluster_id]["agent_version"] == "0.10.0"
+
+
+def test_deployment_snapshot_primes_list_reads_and_returns_independent_values() -> None:
+    calls: list[tuple[str, ...]] = []
+    target = SimpleNamespace(cluster_id="gpu-a")
+
+    class Runner:
+        @staticmethod
+        def run(arguments, **_kwargs):
+            calls.append(tuple(arguments))
+            context = arguments[0]
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": f"{context}-deployment"},
+                            "spec": {"replicas": 1},
+                        }
+                    ]
+                }
+            )
+
+    def cpu_command(*args):
+        return ["cpu", *args]
+
+    def gpu_command(_target, *args):
+        return ["gpu", *args]
+
+    class SnapshotRelease:
+        _deployment_snapshot_enabled = True
+        runner = Runner()
+        config = SimpleNamespace(namespace="gpu-fault-system", clusters=(target,))
+        _cpu = staticmethod(cpu_command)
+        _gpu = staticmethod(gpu_command)
+
+        def _get_json(self, args):
+            return STATE.get_json(self, args)
+
+    release = SnapshotRelease()
+
+    def get_json(args):
+        return STATE.get_json(release, args)
+
+    with STATE.read_snapshot(release):
+        STATE.prime_deployment_snapshot(release)
+        commands = (
+            cpu_command(
+                "-n", release.config.namespace, "get", "deployment", "cpu-deployment"
+            ),
+            gpu_command(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+                "gpu-deployment",
+            ),
+        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first, second = [
+                future.result()
+                for future in (
+                    executor.submit(get_json, commands[0]),
+                    executor.submit(get_json, commands[1]),
+                )
+            ]
+        first["spec"]["replicas"] = 9
+        again = get_json(commands[0])
+
+    assert first["metadata"]["name"] == "cpu-deployment"
+    assert second["metadata"]["name"] == "gpu-deployment"
+    assert again["spec"]["replicas"] == 1
+    assert len(calls) == 2
+    assert all(
+        command[-4:] == ("get", "deployment", "-o", "json") for command in calls
+    ), "deployment snapshot issued an unexpected Kubernetes read"
 
 
 def test_legacy_state_adoption_uses_verified_rollback_runtime_image() -> None:

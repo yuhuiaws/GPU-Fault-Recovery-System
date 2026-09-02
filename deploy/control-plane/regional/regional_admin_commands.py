@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -12,6 +13,7 @@ from regional_release_config import ReleaseError
 from regional_release_diff import (
     ReleaseChangeKind,
     ReleaseDiff,
+    build_execution_plan,
     classify_release,
     diff_from_changed,
 )
@@ -19,6 +21,7 @@ from regional_release_reporting import build_release_status
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 ROOT = Path(__file__).resolve().parents[3]
+EXPECTED_STATE_SHA256_ENV = "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256"
 RESUMABLE_PHASES = frozenset(
     {
         "preflight",
@@ -59,6 +62,20 @@ def stored_release_diff(state: dict[str, Any]) -> ReleaseDiff | None:
     except (KeyError, TypeError, ValueError):
         return None
     return ReleaseDiff(kind=kind, changed=changed)
+
+
+def release_state_sha256(state: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _require_expected_state(state: dict[str, Any]) -> None:
+    expected = os.getenv(EXPECTED_STATE_SHA256_ENV, "").strip()
+    if expected and release_state_sha256(state) != expected:
+        raise ReleaseError(
+            "regional release state changed after the deployment diff was calculated"
+        )
 
 
 def retry_release_diff(release: Any, state: dict[str, Any]) -> ReleaseDiff:
@@ -182,6 +199,11 @@ def run_deploy(release: Any) -> None:
         ).returncode
         == 0
     )
+    expected_state = os.getenv(EXPECTED_STATE_SHA256_ENV, "").strip()
+    if expected_state and not state_exists:
+        raise ReleaseError(
+            "regional release state disappeared after the deployment diff was calculated"
+        )
     state = release._load_state() if state_exists else None
     bootstrap_required = not state_exists or (
         state is not None and state.get("phase") in BOOTSTRAP_PHASES
@@ -195,6 +217,7 @@ def run_deploy(release: Any) -> None:
         release.bootstrap()
         return
     assert state is not None
+    _require_expected_state(state)
     if state.get("phase") in RETRY_PHASES:
         release.upgrade(
             resume=state.get("phase") in RESUMABLE_PHASES,
@@ -206,6 +229,46 @@ def run_deploy(release: Any) -> None:
         release.noop(diff)
         return
     release.upgrade(diff=diff)
+
+
+def build_release_diff(release: Any) -> dict[str, Any]:
+    state = release._load_state()
+    retry_diff = (
+        retry_release_diff(release, state)
+        if state.get("phase") in RETRY_PHASES
+        else None
+    )
+    diff = retry_diff or classify_release(release, state)
+    return {
+        "mode": "release-diff",
+        "state_sha256": release_state_sha256(state),
+        "next_deploy": {
+            **diff.as_dict(),
+            "resume": bool(retry_diff) and state.get("phase") in RESUMABLE_PHASES,
+        },
+    }
+
+
+def stage_noop_release(release: Any) -> None:
+    state = release._load_state()
+    _require_expected_state(state)
+    diff = classify_release(release, state)
+    if diff.kind is not ReleaseChangeKind.NOOP:
+        raise ReleaseError(
+            f"stage-noop requires a current NOOP release diff; got {diff.kind.value}"
+        )
+    release._ensure_contexts()
+    release._require_cpu_secrets()
+    release.state = dict(state)
+    release._save_state(
+        "complete",
+        transaction_committed=False,
+        previous=None,
+        release_diff=diff.as_dict(),
+        execution_plan=build_execution_plan(diff).as_dict(),
+        completed_phases=[],
+        completed_cluster_ids=[],
+    )
 
 
 def run_resume(release: Any) -> None:

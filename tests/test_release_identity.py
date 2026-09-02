@@ -14,6 +14,8 @@ from scripts.release_identity import (
     sha256_bytes,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def identity_root(tmp_path: Path) -> Path:
     (tmp_path / "config").mkdir()
@@ -144,6 +146,19 @@ def test_release_identity_changes_with_component_inputs(tmp_path: Path) -> None:
         before["runtime_image_inputs"]["sha256"]
         != after["runtime_image_inputs"]["sha256"]
     )
+
+
+def test_application_release_identity_excludes_deploy_host_inputs() -> None:
+    config = yaml.safe_load(
+        (ROOT / "config/release-identity.yaml").read_text(encoding="utf-8")
+    )
+    patterns = {*config["manifest_inputs"], *config["runtime_image_inputs"]}
+
+    assert "requirements/deploy-host.lock" not in patterns
+    assert "scripts/build-deploy-host-bundle.py" not in patterns
+    assert "scripts/setup_deploy_host.py" not in patterns
+    assert "scripts/staging_deploy.py" not in patterns
+    assert "src/**/*.py" not in config["runtime_image_inputs"]
 
 
 def test_release_identity_includes_file_modes(tmp_path: Path) -> None:

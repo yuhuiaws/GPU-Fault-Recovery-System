@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -136,6 +137,51 @@ def test_matching_registry_image_skips_docker_build(monkeypatch) -> None:
     assert (
         inspected[0][1]["expected_labels"]["gpu-fault.image-input.sha256"]
         == descriptor["image_input_sha256"]
+    )
+
+
+def test_runtime_image_reuses_validated_component_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    wheels = {}
+    module_digests = {}
+    for name in ("control_plane", "executor"):
+        path = tmp_path / f"{name}.whl"
+        path.write_bytes(name.encode())
+        wheels[name] = path
+        module_digests[name] = hashlib.sha256(f"{name}-module".encode()).hexdigest()
+    monkeypatch.setattr(
+        release_image,
+        "load_component_artifacts",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            wheels=wheels, module_digests=module_digests
+        ),
+    )
+    monkeypatch.setattr(
+        release_image,
+        "build_component",
+        lambda **_kwargs: pytest.fail("validated component wheel was rebuilt"),
+    )
+    monkeypatch.setattr(
+        release_image,
+        "inspect_registry_image",
+        lambda *_args, **_kwargs: REGISTRY_DIGEST,
+    )
+
+    descriptor = release_image.build_runtime_image(
+        ROOT,
+        repository="registry.example/gpu-fault-runtime",
+        push=True,
+        component_artifacts=tmp_path / "current-release.json",
+        runner=lambda command, **_kwargs: pytest.fail(
+            f"registry reuse must skip docker build: {command}"
+        ),
+    )
+
+    assert descriptor["registry_reused"] is True
+    assert (
+        descriptor["components"]["control_plane"]["module_digest"]
+        == (module_digests["control_plane"])
     )
 
 

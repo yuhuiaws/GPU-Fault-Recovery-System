@@ -22,10 +22,12 @@ from regional_admin_checks import (
 from regional_admin_commands import (
     bootstrap_cpu_is_current,
     build_full_status,
+    build_release_diff,
     build_release_summary,
     ensure_schema,
     run_deploy,
     run_resume,
+    stage_noop_release,
 )
 from regional_dns import apply_control_plane_nlb
 from regional_gpu_bootstrap import (
@@ -45,6 +47,11 @@ from regional_release_config import (
     ClusterTarget,
     ReleaseConfig,
     ReleaseError,
+)
+from regional_release_artifacts import (
+    require_cpu_secrets,
+    upload_config_map,
+    upload_release,
 )
 from regional_release_diff import (
     ReleaseChangeKind,
@@ -128,6 +135,8 @@ from regional_release_state import (
     deployment_wheel,
     get_json,
     load_state,
+    prime_deployment_snapshot,
+    read_snapshot,
     save_state,
     template_bundle,
 )
@@ -274,6 +283,7 @@ def bootstrap_resume_context(
 
 
 class RegionalRelease:
+    _deployment_snapshot_enabled = True
     _ensure_contexts = ensure_region_contexts
     _apply_gpu_dcgm_exporter = apply_gpu_dcgm_exporter
     _cancel_active_installer_jobs = cancel_active_installer_jobs
@@ -290,17 +300,22 @@ class RegionalRelease:
     _ensure_schema = ensure_schema
     _get_json = get_json
     _load_state = load_state
+    _prime_deployment_snapshot = prime_deployment_snapshot
     _quiesce_gpu_executor = quiesce_gpu_executor
     _registry = registry
     _registry_entry = staticmethod(registry_entry)
     _registry_payloads = registry_payloads
     _retry_failed_installer_jobs = retry_failed_installer_jobs
+    _read_snapshot = read_snapshot
+    _require_cpu_secrets = require_cpu_secrets
     _restore_registry_backup = restore_registry_backup
     _save_state = save_state
     _stage_registry = stage_registry
     _stamp_gpu_deployments = stamp_gpu_deployments
     _template_bundle = template_bundle
     _update_registry = update_registry
+    _upload_config_map = upload_config_map
+    _upload_release = upload_release
     _upgrade_gpu_target = upgrade_gpu_target
     _validate_executor_iam_role = validate_executor_iam_role
     _verify_gpu_control_plane_endpoint = verify_gpu_control_plane_endpoint
@@ -461,26 +476,6 @@ class RegionalRelease:
             *args,
         ]
 
-    def _require_cpu_secrets(self, *, include_registry: bool = True) -> None:
-        names = [
-            "gpu-fault-aurora",
-            "gpu-fault-control-plane-active",
-            "gpu-fault-node-action-keys",
-        ]
-        if include_registry:
-            names.append("gpu-fault-regional-clusters")
-        for name in names:
-            self.runner.run(
-                self._cpu(
-                    "-n",
-                    self.config.namespace,
-                    "get",
-                    "secret",
-                    name,
-                ),
-                capture=True,
-            )
-
     def _remote_commands_are_idle(self) -> bool:
         script = (
             "from gpu_fault.app import ApplicationContext;"
@@ -568,90 +563,6 @@ class RegionalRelease:
 
     def status(self) -> dict[str, Any]:
         return build_full_status(self)
-
-    def _upload_config_map(
-        self,
-        kubectl: list[str],
-        name: str,
-        key: str,
-        path: Path,
-        expected_sha: str,
-    ) -> None:
-        exists = (
-            subprocess.run(
-                kubectl
-                + [
-                    "-n",
-                    self.config.namespace,
-                    "get",
-                    "configmap",
-                    name,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode
-            == 0
-        )
-        if not exists:
-            self.runner.run(
-                kubectl
-                + [
-                    "-n",
-                    self.config.namespace,
-                    "create",
-                    "configmap",
-                    name,
-                    f"--from-file={key}={path}",
-                ]
-            )
-        if self.runner.dry_run:
-            return
-        value = self._get_json(
-            kubectl
-            + [
-                "-n",
-                self.config.namespace,
-                "get",
-                "configmap",
-                name,
-            ]
-        )
-        encoded = (value.get("binaryData") or {}).get(key)
-        if not encoded:
-            raise ReleaseError(f"{name}/{key} is missing")
-        if hashlib.sha256(base64.b64decode(encoded)).hexdigest() != expected_sha:
-            raise ReleaseError(f"{name}/{key} digest mismatch")
-
-    def _upload_release(self, diff: ReleaseDiff | None = None) -> None:
-        wheel_key = self.config.wheel.name
-        executor_key = self.config.executor_wheel.name
-        bundle_key = self.config.bundle.name
-        if diff is None or diff.has("control_plane_wheel"):
-            self._upload_config_map(
-                self._cpu(),
-                self.wheel_cm,
-                wheel_key,
-                self.config.wheel,
-                self.wheel_sha,
-            )
-        for target in self.config.clusters:
-            kubectl = self._gpu(target)
-            if diff is None or diff.has("executor_wheel"):
-                self._upload_config_map(
-                    kubectl,
-                    self.executor_wheel_cm,
-                    executor_key,
-                    self.config.executor_wheel,
-                    self.executor_wheel_sha,
-                )
-            if diff is None or diff.has("node_runtime_wheel", "node_bundle"):
-                self._upload_config_map(
-                    kubectl,
-                    self.bundle_cm,
-                    bundle_key,
-                    self.config.bundle,
-                    self.bundle_sha,
-                )
 
     def _apply_cpu(
         self,
@@ -1087,6 +998,7 @@ def parser() -> argparse.ArgumentParser:
             "plan",
             "preflight",
             "release-summary",
+            "release-diff",
             "status",
             "bootstrap",
             "deploy",
@@ -1094,6 +1006,7 @@ def parser() -> argparse.ArgumentParser:
             "resume",
             "rollback",
             "commit",
+            "stage-noop",
             "join-cluster",
             "drain-cluster",
             "remove-cluster",
@@ -1145,6 +1058,9 @@ def main() -> int:
         elif arguments.mode == "release-summary":
             report = build_release_summary(release)
             print(json.dumps(report, indent=2, sort_keys=True))
+        elif arguments.mode == "release-diff":
+            report = build_release_diff(release)
+            print(json.dumps(report, indent=2, sort_keys=True))
         elif arguments.mode == "bootstrap":
             release.bootstrap()
         elif arguments.mode == "deploy":
@@ -1157,6 +1073,8 @@ def main() -> int:
             release.rollback()
         elif arguments.mode == "commit":
             release.commit_release()
+        elif arguments.mode == "stage-noop":
+            stage_noop_release(release)
         elif arguments.mode == "join-cluster":
             if not arguments.cluster_id:
                 raise ReleaseError("--cluster-id is required")
