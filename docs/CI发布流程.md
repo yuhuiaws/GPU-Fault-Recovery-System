@@ -240,6 +240,7 @@ coverage不会携带变化模块的陈旧行号，只有deployment shard失效�
 |---|---|---:|---:|---:|
 | `863a557` / `33615185401` | 旧单体unit | 18分44秒 | unit 18分19秒；其中普通coverage 14分44秒 | 包含在同一unit |
 | `a6dd742` / `33620340339` | 六个签名shard | 6分18秒 | `runtime_2` 4分53秒 | unit 57秒 |
+| `f90fdad` / `33622247519` | 稳定修复后fresh | 6分10秒 | `runtime_1` 4分41秒 | unit 59秒 |
 
 新流程fresh总墙钟减少约66%。同一run中其他参考值为：deployment 3分08秒、
 PostgreSQL contract+stress 2分20秒、static 2分40秒、artifact 1分23秒。后续比较应同时
