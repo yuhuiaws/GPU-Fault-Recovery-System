@@ -719,6 +719,15 @@ def _install_domain_routes(
     app.include_router(completion_router)
 
 
+def _request_budgets() -> tuple[float, float, float]:
+    request = float(os.getenv("GPU_FAULT_REQUEST_BUDGET_SECONDS", "15"))
+    fault = float(os.getenv("GPU_FAULT_FAULT_REQUEST_BUDGET_SECONDS", "30"))
+    telemetry = float(os.getenv("GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS", "30"))
+    if telemetry <= 0:
+        raise ValueError("GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS must be positive")
+    return request, fault, telemetry
+
+
 def create_app(context: ApplicationContext | None = None) -> FastAPI:
     # Before ApplicationContext, whose construction already logs.
     _configure_logging()
@@ -876,18 +885,11 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         channel = channel_for_path(path)
         return bool(channel and channel.receipt) or path.startswith("/v1/attempts/")
 
-    def is_fault_ingress_path(path: str) -> bool:
-        return is_fault_path(path)
-
-    request_budget_seconds = float(os.getenv("GPU_FAULT_REQUEST_BUDGET_SECONDS", "15"))
-    telemetry_request_budget_seconds = float(
-        os.getenv(
-            "GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS",
-            "30",
-        )
-    )
-    if telemetry_request_budget_seconds <= 0:
-        raise ValueError("GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS must be positive")
+    (
+        request_budget_seconds,
+        fault_request_budget_seconds,
+        telemetry_request_budget_seconds,
+    ) = _request_budgets()
     install_processor_dispatch(
         app,
         ProcessorDispatchDependencies(
@@ -906,7 +908,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
             requires_processor=requires_processor,
             replay_authorized=processor_replay_authorized,
             returns_processor_receipt=returns_processor_receipt,
-            is_fault_ingress_path=is_fault_ingress_path,
+            is_fault_ingress_path=is_fault_path,
             decode_json_body=decode_json_body,
             processor_max_queue_depth=processor_max_queue_depth,
             processor_max_cluster_queue_depth=(processor_max_cluster_queue_depth),
@@ -984,7 +986,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
             service_role=service_role,
             requires_processor=requires_processor,
             replay_authorized=processor_replay_authorized,
-            is_fault_path=is_fault_ingress_path,
+            is_fault_path=is_fault_path,
             fault_semaphore=ingress_fault_semaphore,
             normal_semaphore=ingress_normal_semaphore,
             fault_wait_seconds=ingress_fault_wait_seconds,
@@ -992,7 +994,12 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
             rejections=ingress_backpressure_rejections,
         ),
     )
-    install_request_deadline(app, request_budget_seconds=request_budget_seconds)
+    install_request_deadline(
+        app,
+        request_budget_seconds=request_budget_seconds,
+        fault_request_budget_seconds=fault_request_budget_seconds,
+        is_fault_path=is_fault_path,
+    )
 
     authorization_inventory = dict(authorization_registry.inventory)
     collector_route_paths = {

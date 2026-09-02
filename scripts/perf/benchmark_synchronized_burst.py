@@ -3,14 +3,19 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import socket
 import ssl
 import statistics
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from http.client import HTTPConnection, HTTPSConnection
 from pathlib import Path
+from threading import Lock
+from typing import Any, Callable, Iterator, cast
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import quote
@@ -31,6 +36,131 @@ INTEGRATED_ACTION_KINDS = (
     "RESTART_NODE",
     "FABRIC_RESET",
 )
+AddressInfo = tuple[int, int, int, str, tuple[Any, ...]]
+Resolver = Callable[..., list[AddressInfo]]
+
+
+@dataclass(frozen=True)
+class DnsResolution:
+    addresses: tuple[AddressInfo, ...]
+    attempts: int
+    seconds: float
+
+
+class ProcessDnsCache:
+    def __init__(
+        self,
+        *,
+        hostname: str,
+        port: int,
+        addresses: tuple[AddressInfo, ...],
+        fallback: Resolver,
+    ) -> None:
+        if not addresses:
+            raise ValueError("control-plane DNS cache requires at least one address")
+        self._hostname = self._normalize_hostname(hostname)
+        self._port = str(port)
+        self._addresses = addresses
+        self._fallback = fallback
+        self._lock = Lock()
+        self._next_address = 0
+        self._hits = 0
+
+    @property
+    def hits(self) -> int:
+        with self._lock:
+            return self._hits
+
+    @staticmethod
+    def _normalize_hostname(hostname: str | bytes | None) -> str:
+        if isinstance(hostname, bytes):
+            return hostname.decode("ascii").rstrip(".").lower()
+        return str(hostname or "").rstrip(".").lower()
+
+    def getaddrinfo(
+        self,
+        host: str | bytes | None,
+        port: str | int | None,
+        family: int = 0,
+        type: int = 0,
+        proto: int = 0,
+        flags: int = 0,
+    ) -> list[AddressInfo]:
+        if (
+            self._normalize_hostname(host) != self._hostname
+            or str(port) != self._port
+            or type not in {0, socket.SOCK_STREAM}
+            or proto not in {0, socket.IPPROTO_TCP}
+            or flags != 0
+        ):
+            return self._fallback(host, port, family, type, proto, flags)
+        addresses = [
+            item for item in self._addresses if family in {0, socket.AF_UNSPEC, item[0]}
+        ]
+        if not addresses:
+            return self._fallback(host, port, family, type, proto, flags)
+        with self._lock:
+            offset = self._next_address % len(addresses)
+            self._next_address += 1
+            self._hits += 1
+        return addresses[offset:] + addresses[:offset]
+
+
+def resolve_control_plane_dns(
+    hostname: str,
+    port: int,
+    *,
+    attempts: int = 5,
+    base_delay_seconds: float = 0.1,
+    resolver: Resolver | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> DnsResolution:
+    if attempts < 1:
+        raise ValueError("DNS resolution attempts must be positive")
+    if base_delay_seconds < 0:
+        raise ValueError("DNS resolution retry delay must not be negative")
+    active_resolver = resolver or cast(Resolver, socket.getaddrinfo)
+    started = time.perf_counter()
+    last_error: OSError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            values = active_resolver(
+                hostname,
+                port,
+                socket.AF_UNSPEC,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                0,
+            )
+        except OSError as exc:
+            last_error = exc
+        else:
+            addresses = tuple(dict.fromkeys(values))
+            if addresses:
+                return DnsResolution(
+                    addresses=addresses,
+                    attempts=attempt,
+                    seconds=time.perf_counter() - started,
+                )
+            last_error = socket.gaierror("control-plane DNS returned no addresses")
+        if attempt < attempts:
+            sleeper(base_delay_seconds * (2 ** (attempt - 1)))
+    raise RuntimeError(
+        f"control-plane DNS resolution failed after {attempts} attempts"
+    ) from last_error
+
+
+@contextmanager
+def process_dns_cache(cache: ProcessDnsCache | None) -> Iterator[None]:
+    if cache is None:
+        yield
+        return
+    previous = socket.getaddrinfo
+    socket.getaddrinfo = cache.getaddrinfo  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = previous
 
 
 def percentile(values: list[float], ratio: float) -> float:
@@ -511,6 +641,11 @@ def build_output(
     prewarm_connections: bool,
     prewarm_seconds: float,
     prewarm_errors: int,
+    dns_mode: str,
+    dns_resolution_seconds: float,
+    dns_resolution_attempts: int,
+    dns_address_count: int,
+    dns_cache_hits: int,
     latencies: dict[str, list[float]],
     statuses: dict[str, dict[int, int]],
     errors: dict[str, dict[str, int]],
@@ -533,6 +668,11 @@ def build_output(
         ),
         "prewarm_seconds": prewarm_seconds,
         "prewarm_errors": prewarm_errors,
+        "dns_mode": dns_mode,
+        "dns_resolution_seconds": dns_resolution_seconds,
+        "dns_resolution_attempts": dns_resolution_attempts,
+        "dns_address_count": dns_address_count,
+        "dns_cache_hits": dns_cache_hits,
         "paths": {},
     }
     for kind, values in sorted(latencies.items()):
@@ -786,12 +926,30 @@ def main() -> None:
     workers = int(os.getenv("WORKERS", "128"))
     include_telemetry = os.getenv("INCLUDE_TELEMETRY", "true").lower() == "true"
     prewarm_connections = os.getenv("PREWARM_CONNECTIONS", "false").lower() == "true"
+    cache_control_plane_dns = (
+        os.getenv("CACHE_CONTROL_PLANE_DNS", "true").lower() == "true"
+    )
     templates_path = Path(os.environ["TEMPLATES_FILE"])
     templates = json.loads(gzip.open(templates_path, "rt").read())
     ssl_context = ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
     parsed_base = urlsplit(base_url)
+    if parsed_base.hostname is None:
+        raise ValueError("GPU_FAULT_CONTROL_PLANE_URL must include a hostname")
     base_path = parsed_base.path.rstrip("/")
     connection_port = parsed_base.port or (443 if parsed_base.scheme == "https" else 80)
+    dns_resolution: DnsResolution | None = None
+    dns_cache: ProcessDnsCache | None = None
+    if cache_control_plane_dns:
+        dns_resolution = resolve_control_plane_dns(
+            parsed_base.hostname,
+            connection_port,
+        )
+        dns_cache = ProcessDnsCache(
+            hostname=parsed_base.hostname,
+            port=connection_port,
+            addresses=dns_resolution.addresses,
+            fallback=cast(Resolver, socket.getaddrinfo),
+        )
 
     events = build_events(
         cluster_count=cluster_count,
@@ -806,81 +964,83 @@ def main() -> None:
         workload_observation_total=workload_observation_total,
         correlate_attempt_faults=correlate_attempt_faults,
     )
-    (
-        action_run_id,
-        runtime_profile_version,
-        action_event_indexes,
-        setup_request_count,
-    ) = prepare_integrated_actions(
-        base_url=base_url,
-        registration=registration,
-        ssl_context=ssl_context,
-        events=events,
-        cluster_offset=cluster_offset,
-    )
+    with process_dns_cache(dns_cache):
+        (
+            action_run_id,
+            runtime_profile_version,
+            action_event_indexes,
+            setup_request_count,
+        ) = prepare_integrated_actions(
+            base_url=base_url,
+            registration=registration,
+            ssl_context=ssl_context,
+            events=events,
+            cluster_offset=cluster_offset,
+        )
+        connections, prewarm_errors, prewarm_seconds = prewarm_connection_pool(
+            events,
+            workers=workers,
+            enabled=prewarm_connections,
+            connection_factory=lambda: open_connection(
+                parsed_base,
+                connection_port,
+                ssl_context,
+            ),
+        )
+        start_epoch, actual_start = wait_for_synchronized_start()
+        latencies: dict[str, list[float]] = {}
+        server_durations: dict[str, list[float]] = {}
+        network_overheads: dict[str, list[float]] = {}
+        stage_durations: dict[str, dict[str, list[float]]] = {}
+        statuses: dict[str, dict[int, int]] = {}
+        errors: dict[str, dict[str, int]] = {}
+        transport_retries: dict[str, dict[str, int]] = {}
 
-    connections, prewarm_errors, prewarm_seconds = prewarm_connection_pool(
-        events,
-        workers=workers,
-        enabled=prewarm_connections,
-        connection_factory=lambda: open_connection(
-            parsed_base,
-            connection_port,
-            ssl_context,
-        ),
-    )
-    start_epoch, actual_start = wait_for_synchronized_start()
-    latencies: dict[str, list[float]] = {}
-    server_durations: dict[str, list[float]] = {}
-    network_overheads: dict[str, list[float]] = {}
-    stage_durations: dict[str, dict[str, list[float]]] = {}
-    statuses: dict[str, dict[int, int]] = {}
-    errors: dict[str, dict[str, int]] = {}
-    transport_retries: dict[str, dict[str, int]] = {}
-
-    sender = partial(
-        send_event,
-        templates=templates,
-        registration=registration,
-        cluster_offset=cluster_offset,
-        correlate_attempt_faults=correlate_attempt_faults,
-        action_event_indexes=action_event_indexes,
-        action_run_id=action_run_id,
-        runtime_profile_version=runtime_profile_version,
-        connections=connections,
-        prewarm_connections=prewarm_connections,
-        base_url=base_url,
-        base_path=base_path,
-        ssl_context=ssl_context,
-    )
-    cpu_started = time.process_time()
-    wall_started = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(sender, item) for item in enumerate(events)]
-        for future in as_completed(futures):
-            kind, status, latency, error, timing, transport_retry = future.result()
-            latencies.setdefault(kind, []).append(latency)
-            statuses.setdefault(kind, {})[status] = (
-                statuses.setdefault(kind, {}).get(status, 0) + 1
-            )
-            if error:
-                errors.setdefault(kind, {})[error] = (
-                    errors.setdefault(kind, {}).get(error, 0) + 1
+        sender = partial(
+            send_event,
+            templates=templates,
+            registration=registration,
+            cluster_offset=cluster_offset,
+            correlate_attempt_faults=correlate_attempt_faults,
+            action_event_indexes=action_event_indexes,
+            action_run_id=action_run_id,
+            runtime_profile_version=runtime_profile_version,
+            connections=connections,
+            prewarm_connections=prewarm_connections,
+            base_url=base_url,
+            base_path=base_path,
+            ssl_context=ssl_context,
+        )
+        cpu_started = time.process_time()
+        wall_started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(sender, item) for item in enumerate(events)]
+            for future in as_completed(futures):
+                kind, status, latency, error, timing, transport_retry = future.result()
+                latencies.setdefault(kind, []).append(latency)
+                statuses.setdefault(kind, {})[status] = (
+                    statuses.setdefault(kind, {}).get(status, 0) + 1
                 )
-            if transport_retry:
-                retries = transport_retries.setdefault(kind, {})
-                retries[transport_retry] = retries.get(transport_retry, 0) + 1
-            if "total" in timing:
-                total = timing["total"]
-                server_durations.setdefault(kind, []).append(total)
-                network_overheads.setdefault(kind, []).append(max(0.0, latency - total))
-            for stage, duration in timing.items():
-                stage_durations.setdefault(kind, {}).setdefault(stage, []).append(
-                    duration
-                )
-    for connection in connections:
-        if connection is not None:
-            connection.close()
+                if error:
+                    errors.setdefault(kind, {})[error] = (
+                        errors.setdefault(kind, {}).get(error, 0) + 1
+                    )
+                if transport_retry:
+                    retries = transport_retries.setdefault(kind, {})
+                    retries[transport_retry] = retries.get(transport_retry, 0) + 1
+                if "total" in timing:
+                    total = timing["total"]
+                    server_durations.setdefault(kind, []).append(total)
+                    network_overheads.setdefault(kind, []).append(
+                        max(0.0, latency - total)
+                    )
+                for stage, duration in timing.items():
+                    stage_durations.setdefault(kind, {}).setdefault(stage, []).append(
+                        duration
+                    )
+        for connection in connections:
+            if connection is not None:
+                connection.close()
     wall = time.perf_counter() - wall_started
     output = build_output(
         registration=registration,
@@ -893,6 +1053,17 @@ def main() -> None:
         prewarm_connections=prewarm_connections,
         prewarm_seconds=prewarm_seconds,
         prewarm_errors=prewarm_errors,
+        dns_mode=("process-cache" if dns_cache is not None else "system"),
+        dns_resolution_seconds=(
+            dns_resolution.seconds if dns_resolution is not None else 0.0
+        ),
+        dns_resolution_attempts=(
+            dns_resolution.attempts if dns_resolution is not None else 0
+        ),
+        dns_address_count=(
+            len(dns_resolution.addresses) if dns_resolution is not None else 0
+        ),
+        dns_cache_hits=(dns_cache.hits if dns_cache is not None else 0),
         latencies=latencies,
         statuses=statuses,
         errors=errors,

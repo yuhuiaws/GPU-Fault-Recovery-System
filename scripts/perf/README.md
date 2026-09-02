@@ -133,6 +133,15 @@ control-plane Pod replacement, container restart, counter regression, or Pod
 that is not Ready after the run. These checks do not change request, timeout,
 concurrency, or capacity thresholds.
 
+The synchronized ingress generator resolves the control-plane hostname with a
+bounded retry before the start gate and installs a process-local rotating
+address cache. Requests still use the declared `cold-connect` TCP/TLS model and
+the original hostname for HTTP Host, TLS SNI, and certificate verification, but
+the burst no longer turns every request into a separate CoreDNS query. Evidence
+records DNS resolution attempts, address count, and cache hits; the integrated
+verdict rejects a pre-resolution retry, missing cache, incomplete cache
+coverage, or any request transport retry.
+
 The runner records the previous Aurora Min/Max in
 `aurora-preflight.json.initial_scaling` but does not restore it. After the final
 round, restore Aurora through the approved AWS/IaC path and reapply the pre-run

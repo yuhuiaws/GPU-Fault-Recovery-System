@@ -115,6 +115,28 @@ def aggregate(documents: list[dict]) -> dict:
         "prewarm_errors": sum(
             document.get("prewarm_errors", 0) for document in documents
         ),
+        "dns_modes": sorted(
+            {
+                document.get("dns_mode")
+                for document in documents
+                if document.get("dns_mode")
+            }
+        ),
+        "dns_resolution_seconds_max": max(
+            document.get("dns_resolution_seconds", 0.0) for document in documents
+        ),
+        "dns_resolution_attempts_max": max(
+            document.get("dns_resolution_attempts", 0) for document in documents
+        ),
+        "dns_address_count_min": min(
+            document.get("dns_address_count", 0) for document in documents
+        ),
+        "dns_address_count_max": max(
+            document.get("dns_address_count", 0) for document in documents
+        ),
+        "dns_cache_hits": sum(
+            document.get("dns_cache_hits", 0) for document in documents
+        ),
         "paths": {},
     }
     for kind, entry in sorted(paths.items()):

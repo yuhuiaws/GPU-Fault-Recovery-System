@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -426,6 +427,7 @@ def test_burst_job_keeps_indexed_start_gate_contract() -> None:
     assert environment["CLUSTER_OFFSET"]["valueFrom"]["fieldRef"]["fieldPath"] == (
         "metadata.annotations['batch.kubernetes.io/job-completion-index']"
     )
+    assert environment["CACHE_CONTROL_PLANE_DNS"]["value"] == "true"
 
 
 def test_complete_single_cluster_burst_covers_attempt_context() -> None:
@@ -520,6 +522,11 @@ def test_result_aggregation_preserves_fault_latency_summary() -> None:
                 "wall_seconds": 1.0,
                 "start_lag_seconds": 0.1,
                 "client_cpu_cores": 0.5,
+                "dns_mode": "process-cache",
+                "dns_resolution_seconds": 0.02,
+                "dns_resolution_attempts": 1,
+                "dns_address_count": 2,
+                "dns_cache_hits": 2,
                 "paths": {
                     "NVIDIA_KERNEL": {
                         "raw_latencies_ms": [10.0, 20.0],
@@ -535,9 +542,129 @@ def test_result_aggregation_preserves_fault_latency_summary() -> None:
     assert summary["throughput_req_s"] == 2.0
     assert summary["fault_p50_ms"] == 10.0
     assert summary["fault_p99_ms"] == 10.0
+    assert summary["dns_modes"] == ["process-cache"]
+    assert summary["dns_resolution_attempts_max"] == 1
+    assert summary["dns_address_count_min"] == 2
+    assert summary["dns_address_count_max"] == 2
+    assert summary["dns_cache_hits"] == 2
     assert summary["paths"]["NVIDIA_KERNEL"]["transport_retries"] == {
         "URLError:ConnectionResetError": 1
     }
+
+
+def test_control_plane_dns_resolution_retries_and_deduplicates() -> None:
+    calls = 0
+    sleeps: list[float] = []
+    address = (
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+        socket.IPPROTO_TCP,
+        "",
+        ("10.0.0.1", 443),
+    )
+
+    def resolver(*_args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise socket.gaierror(socket.EAI_AGAIN, "temporary failure")
+        return [address, address]
+
+    resolution = burst.resolve_control_plane_dns(
+        "control.example",
+        443,
+        attempts=3,
+        base_delay_seconds=0.25,
+        resolver=resolver,
+        sleeper=sleeps.append,
+    )
+
+    assert resolution.addresses == (address,)
+    assert resolution.attempts == 2
+    assert sleeps == [0.25]
+
+
+def test_process_dns_cache_rotates_addresses_and_delegates() -> None:
+    first = (
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+        socket.IPPROTO_TCP,
+        "",
+        ("10.0.0.1", 443),
+    )
+    second = (
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+        socket.IPPROTO_TCP,
+        "",
+        ("10.0.0.2", 443),
+    )
+    delegated = (
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+        socket.IPPROTO_TCP,
+        "",
+        ("10.0.0.3", 443),
+    )
+    fallback_calls = []
+
+    def fallback(*args):
+        fallback_calls.append(args)
+        return [delegated]
+
+    cache = burst.ProcessDnsCache(
+        hostname="control.example",
+        port=443,
+        addresses=(first, second),
+        fallback=fallback,
+    )
+
+    assert cache.getaddrinfo(
+        "CONTROL.EXAMPLE.",
+        443,
+        socket.AF_UNSPEC,
+        socket.SOCK_STREAM,
+        socket.IPPROTO_TCP,
+    ) == [first, second]
+    assert cache.getaddrinfo(
+        "control.example", 443, socket.AF_UNSPEC, socket.SOCK_STREAM, socket.IPPROTO_TCP
+    ) == [second, first]
+    assert cache.getaddrinfo(
+        "other.example", 443, socket.AF_UNSPEC, socket.SOCK_STREAM, socket.IPPROTO_TCP
+    ) == [delegated]
+    assert cache.hits == 2
+    assert len(fallback_calls) == 1
+
+
+def test_process_dns_cache_restores_global_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    address = (
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+        socket.IPPROTO_TCP,
+        "",
+        ("10.0.0.1", 443),
+    )
+
+    def original(*_args):
+        return [address]
+
+    monkeypatch.setattr(burst.socket, "getaddrinfo", original)
+    cache = burst.ProcessDnsCache(
+        hostname="control.example", port=443, addresses=(address,), fallback=original
+    )
+
+    with burst.process_dns_cache(cache):
+        assert burst.socket.getaddrinfo(
+            "control.example",
+            443,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+        ) == [address]
+
+    assert burst.socket.getaddrinfo is original
 
 
 def test_synchronized_burst_records_recovered_transport_retry(

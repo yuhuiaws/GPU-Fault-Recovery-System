@@ -86,17 +86,30 @@ def install_request_deadline(
     app: FastAPI,
     *,
     request_budget_seconds: float,
+    fault_request_budget_seconds: float | None = None,
+    is_fault_path: Callable[[str], bool] | None = None,
 ) -> None:
     if request_budget_seconds < 0:
         raise ValueError("GPU_FAULT_REQUEST_BUDGET_SECONDS must not be negative")
+    fault_budget = (
+        request_budget_seconds
+        if fault_request_budget_seconds is None
+        else fault_request_budget_seconds
+    )
+    if fault_budget < 0:
+        raise ValueError("GPU_FAULT_FAULT_REQUEST_BUDGET_SECONDS must not be negative")
+    fault_path = is_fault_path or (lambda _path: False)
 
     @app.middleware("http")
     async def request_deadline(request: Request, call_next):
         started = time.monotonic()
-        if request_budget_seconds <= 0:
+        budget_seconds = (
+            fault_budget if fault_path(request.url.path) else request_budget_seconds
+        )
+        if budget_seconds <= 0:
             response = await call_next(request)
         else:
-            token = REQUEST_DEADLINE.set(time.monotonic() + request_budget_seconds)
+            token = REQUEST_DEADLINE.set(time.monotonic() + budget_seconds)
             try:
                 response = await call_next(request)
             finally:

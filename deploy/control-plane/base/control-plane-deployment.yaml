@@ -168,13 +168,14 @@ spec:
               value: "1024"
             - name: GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS
               value: "30"
-            # One budget for the whole request, clamping the ingress
-            # wait, the store I/O admission wait and the pool checkout.
-            # Before this each queue had its own timeout and a request
-            # could hold capacity for over a minute while the collector
-            # that sent it gave up after fifteen seconds.
+            # Routine requests keep the collector-facing 15 second
+            # deadline. Fault ingestion has a separate 30 second budget
+            # so its reserved ingress and Store I/O lanes are not cut
+            # short by the routine deadline.
             - name: GPU_FAULT_REQUEST_BUDGET_SECONDS
               value: "15"
+            - name: GPU_FAULT_FAULT_REQUEST_BUDGET_SECONDS
+              value: "30"
             - name: GPU_FAULT_POSTGRES_POOL_MIN_SIZE
               value: "2"
             # Sized to the store I/O thread pool above: a smaller pool

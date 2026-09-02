@@ -856,6 +856,14 @@ def verdict(
         errors.append("fixed ingress request total changed")
     if ingress.get("job_status") != "Complete":
         errors.append("mixed ingress Job did not complete")
+    if ingress.get("dns_modes") != ["process-cache"]:
+        errors.append("mixed ingress DNS process cache is not active")
+    if int(ingress.get("dns_resolution_attempts_max", 0)) != 1:
+        errors.append("mixed ingress DNS pre-resolution required retries")
+    if int(ingress.get("dns_address_count_min", 0)) < 1:
+        errors.append("mixed ingress DNS pre-resolution returned no addresses")
+    if int(ingress.get("dns_cache_hits", 0)) < int(ingress.get("requests", 0)):
+        errors.append("mixed ingress bypassed the DNS process cache")
     paths = ingress.get("paths") or {}
     for kind, expected in (
         ("NVIDIA_KERNEL", model["xid"]),

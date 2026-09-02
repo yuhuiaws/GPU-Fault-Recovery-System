@@ -148,6 +148,7 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert ingress_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS"] == "1"
     assert ingress_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS"] == "30"
     assert ingress_env["GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS"] == "30"
+    assert ingress_env["GPU_FAULT_FAULT_REQUEST_BUDGET_SECONDS"] == "30"
     assert (
         "--workers 4"
         in (ingress["spec"]["template"]["spec"]["containers"][0]["args"][0])

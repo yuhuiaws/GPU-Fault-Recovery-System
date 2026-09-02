@@ -82,6 +82,7 @@ def _job_environment(
             "name": "PREWARM_CONNECTIONS",
             "value": str(prewarm_connections).lower(),
         },
+        {"name": "CACHE_CONTROL_PLANE_DNS", "value": "true"},
         {"name": "DURATION_SECONDS", "value": str(duration_seconds)},
         {"name": "PYTHONPATH", "value": "/scripts"},
     ]

@@ -482,6 +482,7 @@ def test_integrated_load_manifest_carries_action_contract() -> None:
     assert environment["ACTION_RUN_ID"] == "run-a"
     assert environment["RUNTIME_PROFILE_VERSION"] == "profile-a"
     assert environment["PREWARM_CONNECTIONS"] == "false"
+    assert environment["CACHE_CONTROL_PLANE_DNS"] == "true"
 
 
 def test_integrated_executor_uses_idle_drain_and_realistic_simulated_delays() -> None:
@@ -538,6 +539,10 @@ def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> No
         "ingress": {
             "requests": 26576,
             "job_status": "Complete",
+            "dns_modes": ["process-cache"],
+            "dns_resolution_attempts_max": 1,
+            "dns_address_count_min": 2,
+            "dns_cache_hits": 26576,
             "paths": {
                 "NVIDIA_KERNEL": {"count": 500, "status_counts": {"200": 500}},
                 "FABRIC_MANAGER_LOG": {"count": 500, "status_counts": {"200": 500}},
@@ -600,6 +605,13 @@ def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> No
     assert "NVIDIA_KERNEL required transport retries" in errors
 
     summary["ingress"]["paths"]["NVIDIA_KERNEL"]["transport_retries"] = {}
+    summary["ingress"]["dns_resolution_attempts_max"] = 2
+    status, errors = suite.verdict(summary, expected_workflows=expected)
+
+    assert status == "FAIL"
+    assert "mixed ingress DNS pre-resolution required retries" in errors
+
+    summary["ingress"]["dns_resolution_attempts_max"] = 1
     summary["control_plane_pod_lifecycle"]["restart_count_delta"] = 1
     summary["control_plane_pod_lifecycle"]["restarted_pods"] = {"ingress-a": 1}
     status, errors = suite.verdict(summary, expected_workflows=expected)
@@ -617,6 +629,10 @@ def test_integrated_verdict_rejects_ingress_http_errors(status_code: str) -> Non
         "ingress": {
             "requests": 26576,
             "job_status": "Complete",
+            "dns_modes": ["process-cache"],
+            "dns_resolution_attempts_max": 1,
+            "dns_address_count_min": 2,
+            "dns_cache_hits": 26576,
             "paths": {
                 "NVIDIA_KERNEL": {"count": 500, "status_counts": {"202": 500}},
                 "FABRIC_MANAGER_LOG": {"count": 500, "status_counts": {"202": 500}},

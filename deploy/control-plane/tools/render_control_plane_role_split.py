@@ -506,6 +506,11 @@ def configure_ingress_capacity(container: dict, config: AdminConfig) -> None:
     )
 
 
+def configure_request_budgets(container: dict) -> None:
+    set_env(container, "GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS", "30")
+    set_env(container, "GPU_FAULT_FAULT_REQUEST_BUDGET_SECONDS", "30")
+
+
 def configure_worker_capacity(container: dict, config: AdminConfig) -> None:
     set_env(container, "GPU_FAULT_PROCESSOR_WORKERS", "24")
     remediation = config.capacity.remediation
@@ -708,11 +713,7 @@ def main() -> None:
         "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_PROJECTION_MARGIN",
         "0",
     )
-    set_env(
-        ingress,
-        "GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS",
-        "30",
-    )
+    configure_request_budgets(ingress)
     configure_ingress_capacity(ingress, admin_config)
     set_env(
         ingress,
