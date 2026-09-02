@@ -132,7 +132,7 @@ def download(url: str, token: str) -> bytes:
         return response.read()
 
 
-def successful_main_run(
+def completed_main_run(
     *,
     repository: str,
     token: str,
@@ -148,11 +148,34 @@ def successful_main_run(
     return (
         run
         if run.get("status") == "completed"
-        and run.get("conclusion") == "success"
         and run.get("event") == "push"
         and run.get("head_branch") == "main"
         and run.get("path") == ".github/workflows/ci.yml"
         else None
+    )
+
+
+def successful_run_job(
+    *,
+    repository: str,
+    token: str,
+    run_id: int,
+    name: str,
+) -> bool:
+    value = api_json(
+        f"https://api.github.com/repos/{quote(repository, safe='/')}/"
+        f"actions/runs/{run_id}/jobs?per_page=100",
+        token,
+    )
+    jobs = value.get("jobs") if isinstance(value, dict) else None
+    if not isinstance(jobs, list):
+        raise GateArtifactError("GitHub workflow jobs response is invalid")
+    return any(
+        isinstance(job, dict)
+        and job.get("name") == name
+        and job.get("status") == "completed"
+        and job.get("conclusion") == "success"
+        for job in jobs
     )
 
 
@@ -162,6 +185,7 @@ def find_reusable_artifact(
     token: str,
     name: str,
     current_run_id: int | None,
+    required_job_name: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     value = api_json(
         f"https://api.github.com/repos/{quote(repository, safe='/')}/"
@@ -186,12 +210,23 @@ def find_reusable_artifact(
             or (workflow_run or {}).get("head_branch") != "main"
         ):
             continue
-        run = successful_main_run(
+        run = completed_main_run(
             repository=repository,
             token=token,
             run_id=run_id,
         )
-        if run is not None:
+        if run is None:
+            continue
+        if required_job_name is None:
+            eligible = run.get("conclusion") == "success"
+        else:
+            eligible = successful_run_job(
+                repository=repository,
+                token=token,
+                run_id=run_id,
+                name=required_job_name,
+            )
+        if eligible:
             return artifact, run
     return None
 

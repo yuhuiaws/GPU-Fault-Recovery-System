@@ -662,6 +662,7 @@ def restore_reusable_shard(
             token=token,
             name=name,
             current_run_id=current_run_id,
+            required_job_name=f"coverage-{shard}",
         )
     except (HTTPError, URLError) as exc:
         print(

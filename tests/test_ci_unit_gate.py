@@ -510,7 +510,7 @@ def test_coverage_combine_uses_the_configured_data_file_basename(
     assert len(merged["records"]) == len(ci_coverage_gate.SHARDS)
 
 
-def test_reusable_artifact_skips_failed_main_runs(
+def test_reusable_artifact_requires_a_successful_producer_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     artifacts = {
@@ -533,9 +533,20 @@ def test_reusable_artifact_skips_failed_main_runs(
     def api(url: str, _token: str):
         if "actions/artifacts" in url:
             return artifacts
+        if url.endswith("/jobs?per_page=100"):
+            run_id = int(url.rsplit("/", 2)[1])
+            return {
+                "jobs": [
+                    {
+                        "conclusion": "failure" if run_id == 10 else "success",
+                        "name": "coverage-runtime_0",
+                        "status": "completed",
+                    }
+                ]
+            }
         run_id = int(url.rsplit("/", 1)[1])
         return {
-            "conclusion": "failure" if run_id == 10 else "success",
+            "conclusion": "failure",
             "event": "push",
             "head_branch": "main",
             "id": run_id,
@@ -550,6 +561,7 @@ def test_reusable_artifact_skips_failed_main_runs(
         token="token",
         name="gpu-fault-coverage-runtime-" + "a" * 64,
         current_run_id=None,
+        required_job_name="coverage-runtime_0",
     )
 
     assert found is not None

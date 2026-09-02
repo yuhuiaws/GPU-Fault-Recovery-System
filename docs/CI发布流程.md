@@ -196,8 +196,9 @@ fencing。由于这些测试会消费共享model、Store contract和Runtime辅�
 
 每个shard身份还包含Python版本/ABI、Runner image、实际worker协议和已安装distribution；
 PostgreSQL shard额外包含容器image ID。main push先按
-`gpu-fault-coverage-<shard>-<identity>`查找历史artifact，只接受已完成且成功的main
-push run。命中后：
+`gpu-fault-coverage-<shard>-<identity>`查找历史artifact，只接受已完成的main push中
+对应shard job成功的artifact；其他job失败不会废弃已经独立签名成功的shard。
+命中后：
 
 1. 验证历史shard gate的Cosign workflow identity、producer run和全部证据SHA；
 2. 要求producer commit仍是当前commit的祖先；

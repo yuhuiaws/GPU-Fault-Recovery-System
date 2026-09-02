@@ -472,7 +472,8 @@ def test_admission_batch_sheds_on_arrival_when_the_queue_cannot_be_reached() -> 
     async def scenario() -> None:
         item = SimpleNamespace(cluster_id="a", path="/v1/x")
         # No round has run yet, so nothing is projected and nothing sheds.
-        token = REQUEST_DEADLINE.set(time.monotonic() + 0.001)
+        # This verifies projection state, not sub-millisecond scheduler latency.
+        token = REQUEST_DEADLINE.set(time.monotonic() + 1)
         try:
             assert await batcher.submit(item) == (item, None)
             assert batcher.shed_total == 0
