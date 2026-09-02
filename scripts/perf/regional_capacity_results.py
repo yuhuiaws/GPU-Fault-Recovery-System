@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
 import statistics
 from datetime import datetime, timezone
+from typing import Callable
+
+
+MAX_POD_LOG_WORKERS = 16
 
 
 def metric_value(snapshot: str, name: str) -> float | None:
@@ -48,6 +53,41 @@ def percentile(values: list[float], ratio: float) -> float:
             int((len(ordered) - 1) * ratio),
         )
     ]
+
+
+def collect_pod_json_logs(
+    entries: list[tuple[str, str]],
+    target: Path,
+    *,
+    fetch: Callable[[str], str],
+    on_decode_error: Callable[[str], None] | None = None,
+) -> list[dict]:
+    target.mkdir(parents=True, exist_ok=True)
+
+    def order_key(entry: tuple[str, str]) -> tuple[int, int | str, str]:
+        index, pod = entry
+        return (0, int(index), pod) if index.isdigit() else (1, index, pod)
+
+    ordered = sorted(entries, key=order_key)
+    if not ordered:
+        return []
+    workers = min(MAX_POD_LOG_WORKERS, len(ordered))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        bodies = list(executor.map(lambda entry: fetch(entry[1]), ordered))
+    documents = []
+    for (index, pod), body in zip(ordered, bodies, strict=True):
+        (target / f"{index}-{pod}.log").write_text(body, encoding="utf-8")
+        try:
+            value = json.loads(body)
+        except json.JSONDecodeError:
+            if on_decode_error is not None:
+                on_decode_error(pod)
+            continue
+        if isinstance(value, dict):
+            documents.append(value)
+        elif on_decode_error is not None:
+            on_decode_error(pod)
+    return documents
 
 
 def aggregate(documents: list[dict]) -> dict:

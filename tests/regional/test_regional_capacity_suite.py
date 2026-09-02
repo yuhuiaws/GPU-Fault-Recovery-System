@@ -4,6 +4,8 @@ import hashlib
 import json
 import socket
 import sys
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +66,37 @@ def test_status_and_aborted_directory_are_explicit(tmp_path: Path) -> None:
     moved = suite.move_to_aborted(tmp_path, path)
     assert moved.is_dir()
     assert moved.relative_to(tmp_path).parts[0] == "_aborted"
+
+
+def test_pod_log_collection_is_parallel_and_index_ordered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_dataplane(*arguments, **_kwargs):
+        nonlocal active, max_active
+        if arguments[0] == "get":
+            return "pod-b 1\npod-a 0\n"
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return json.dumps({"pod": arguments[1]})
+
+    monkeypatch.setattr(suite, "dataplane", fake_dataplane)
+
+    documents = suite.collect_logs("job-a", tmp_path)
+
+    assert max_active == 2
+    assert [item["pod"] for item in documents] == ["pod-a", "pod-b"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "0-pod-a.log",
+        "1-pod-b.log",
+    ]
 
 
 def test_dataplane_context_must_be_explicit(monkeypatch) -> None:

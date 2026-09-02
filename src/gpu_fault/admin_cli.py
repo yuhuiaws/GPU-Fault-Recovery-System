@@ -20,6 +20,10 @@ from gpu_fault.admin_bootstrap_common import (
     CommandRunner,
 )
 from gpu_fault.admin_bootstrap_services import ensure_control_plane_role
+from gpu_fault.admin_aurora_capacity import (
+    aurora_capacity_changed,
+    reconcile_aurora_capacity,
+)
 from gpu_fault.admin_cluster_join import JoinClusterRequest, join_cluster
 from gpu_fault.admin_cluster_removal import (
     RemoveClusterRequest,
@@ -34,6 +38,7 @@ from gpu_fault.admin_notifications import (
 from gpu_fault.admin_config import (
     AdminConfig,
     AdminConfigError,
+    AuroraCapacityConfig,
     admin_config_approval_path,
     admin_config_plan_path,
     apply_capacity_patch,
@@ -899,13 +904,43 @@ def _pending_admin_config_plan(
     if not admin_config_plan_path(state_dir).is_file():
         return None
     plan = load_admin_config_plan(state_dir)
+    planned_desired = AdminConfig.from_mapping(plan.get("desired_config"))
     if (
         plan.get("site_identity") == site_identity
         and plan.get("release_identity") == release_identity
-        and plan.get("desired_config_sha256") == desired.sha256()
+        and planned_desired == desired
     ):
         return plan
     return None
+
+
+def _reconcile_site_aurora(
+    site: RenderedSite,
+    *,
+    expected: AuroraCapacityConfig,
+    desired: AuroraCapacityConfig,
+) -> dict[str, Any]:
+    return reconcile_aurora_capacity(
+        aws_region=str(site.release_config["aws_region"]),
+        cluster_id=str(site.release_config["health"]["aurora_cluster_id"]),
+        expected=expected,
+        desired=desired,
+    )
+
+
+def _rollback_site_aurora(
+    site: RenderedSite,
+    changed: bool,
+    current: AdminConfig,
+    desired: AdminConfig,
+) -> dict[str, Any] | None:
+    if not changed:
+        return None
+    return _reconcile_site_aurora(
+        site,
+        expected=desired.aurora,
+        desired=current.aurora,
+    )
 
 
 def _run_admin_config(arguments: argparse.Namespace) -> int:
@@ -914,7 +949,10 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
     site = load_site(site_file)
     release_identity = _current_release_metadata(site.repository_root)
     site_identity = _admin_config_site_identity(site)
-    current = load_desired_admin_config(arguments.state_dir)
+    current = load_desired_admin_config(
+        arguments.state_dir,
+        migrate_legacy=True,
+    )
     desired, source = _admin_config_candidate(arguments, current)
     verify_prebuilt_release(
         CommandRunner(),
@@ -936,7 +974,11 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
     _validate_live_release_identity(
         site,
         release_identity,
-        uncommitted_target_sha256=(desired.sha256() if resumable else None),
+        uncommitted_target_sha256=(
+            str(active_plan["desired_config_sha256"])
+            if resumable and active_plan is not None
+            else None
+        ),
     )
     if arguments.dry_run:
         plan = preview_admin_config_plan(
@@ -996,7 +1038,21 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
             )
         )
         return 0
+    reviewed_current = AdminConfig.from_mapping(prepared.plan["current_config"])
+    aurora_changed = aurora_capacity_changed(
+        reviewed_current.aurora,
+        prepared.config.aurora,
+    )
+    aurora_result: dict[str, Any] | None = None
+    rollback_result: dict[str, Any] | None = None
+
     try:
+        if aurora_changed:
+            aurora_result = _reconcile_site_aurora(
+                site,
+                expected=reviewed_current.aurora,
+                desired=prepared.config.aurora,
+            )
         returncode = _run_automatic_release(
             repository_root=site.repository_root,
             site_file=site_file,
@@ -1004,28 +1060,69 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
             staging_only_release=staging_only,
         )
     except Exception as exc:
+        rollback_error: Exception | None = None
+        try:
+            rollback_result = _rollback_site_aurora(
+                site, aurora_changed, reviewed_current, prepared.config
+            )
+        except Exception as rollback_exc:  # noqa: BLE001
+            rollback_error = rollback_exc
+        error = f"{type(exc).__name__}: {exc}"
+        if rollback_error is not None:
+            error += (
+                "; Aurora rollback failed: "
+                f"{type(rollback_error).__name__}: {rollback_error}"
+            )
         complete_admin_config_apply(
             arguments.state_dir,
             expected_plan_sha256=plan_sha256,
             release_id=release_id,
             success=False,
-            error=f"{type(exc).__name__}: {exc}",
+            error=error,
+            details=(
+                {"aurora_rollback": rollback_result}
+                if rollback_result is not None
+                else None
+            ),
         )
+        if rollback_error is not None:
+            raise AdminConfigError(error) from exc
         raise
     if returncode:
+        rollback_error = None
+        try:
+            rollback_result = _rollback_site_aurora(
+                site, aurora_changed, reviewed_current, prepared.config
+            )
+        except Exception as exc:  # noqa: BLE001
+            rollback_error = exc
+        error = f"release-deploy exited with status {returncode}"
+        if rollback_error is not None:
+            error += (
+                "; Aurora rollback failed: "
+                f"{type(rollback_error).__name__}: {rollback_error}"
+            )
         complete_admin_config_apply(
             arguments.state_dir,
             expected_plan_sha256=plan_sha256,
             release_id=release_id,
             success=False,
-            error=f"release-deploy exited with status {returncode}",
+            error=error,
+            details=(
+                {"aurora_rollback": rollback_result}
+                if rollback_result is not None
+                else None
+            ),
         )
+        if rollback_error is not None:
+            raise AdminConfigError(error)
         return returncode
     result = complete_admin_config_apply(
         arguments.state_dir,
         expected_plan_sha256=plan_sha256,
         release_id=release_id,
         success=True,
+        details={"aurora": aurora_result} if aurora_result is not None else None,
     )
     print(
         json.dumps(
@@ -1034,6 +1131,7 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
                 "release_id": release_id,
                 "config_sha256": prepared.config.sha256(),
                 "affected_roles": prepared.plan["affected_roles"],
+                "affected_resources": ["aurora"] if aurora_changed else [],
                 "plan_sha256": plan_sha256,
                 "reference": arguments.reference,
                 "audit": str(result),

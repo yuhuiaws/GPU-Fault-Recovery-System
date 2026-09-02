@@ -755,6 +755,112 @@ def test_config_preset_uses_existing_signed_release_without_building(
     )
 
 
+def test_config_applies_post_deploy_aurora_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    site_file(tmp_path)
+    mock_live_release(monkeypatch)
+    initialize_desired_admin_config(tmp_path)
+    config = tmp_path / "aurora.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gpu-fault.aws/v1alpha1",
+                "kind": "AdminConfig",
+                "spec": {"aurora": {"minAcu": 16, "maxAcu": 64}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+    aurora_calls = []
+    release_calls = []
+    monkeypatch.setattr(
+        admin_cli,
+        "reconcile_aurora_capacity",
+        lambda **kwargs: aurora_calls.append(kwargs)
+        or {"modified": True, "before": {}, "after": {}},
+    )
+    monkeypatch.setattr(
+        admin_cli,
+        "_run_automatic_release",
+        lambda **kwargs: release_calls.append(kwargs) or 0,
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "config",
+            "--state-dir",
+            str(tmp_path),
+            "--file",
+            str(config),
+            "--reference",
+            "CHG-AURORA-1",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["affected_roles"] == []
+    assert output["affected_resources"] == ["aurora"]
+    assert aurora_calls[0]["expected"].min_acu == 8.0
+    assert aurora_calls[0]["desired"].min_acu == 16.0
+    assert release_calls, "Aurora-only config did not refresh live release metadata"
+    assert load_desired_admin_config(tmp_path).aurora.min_acu == 16.0
+
+
+def test_config_rolls_back_aurora_when_release_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_file(tmp_path)
+    mock_live_release(monkeypatch)
+    initialize_desired_admin_config(tmp_path)
+    config = tmp_path / "aurora.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gpu-fault.aws/v1alpha1",
+                "kind": "AdminConfig",
+                "spec": {"aurora": {"minAcu": 16, "maxAcu": 64}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+    aurora_calls = []
+
+    def reconcile(**kwargs):
+        aurora_calls.append(kwargs)
+        return {"modified": True, "before": {}, "after": {}}
+
+    monkeypatch.setattr(admin_cli, "reconcile_aurora_capacity", reconcile)
+    monkeypatch.setattr(admin_cli, "_run_automatic_release", lambda **_kwargs: 7)
+    arguments = admin_cli.parser().parse_args(
+        [
+            "config",
+            "--state-dir",
+            str(tmp_path),
+            "--file",
+            str(config),
+            "--reference",
+            "CHG-AURORA-2",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 7
+    assert len(aurora_calls) == 2
+    assert aurora_calls[0]["desired"].min_acu == 16.0
+    assert aurora_calls[1]["desired"].min_acu == 8.0
+    plan = json.loads(admin_config_plan_path(tmp_path).read_text())
+    failed = (
+        tmp_path / "admin-config/history" / str(plan["plan_sha256"]) / "failed.json"
+    )
+    result = json.loads(failed.read_text())
+    assert result["status"] == "FAILED"
+    assert result["details"]["aurora_rollback"]["modified"] is True
+
+
 def test_config_rejects_local_release_drift_from_live_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

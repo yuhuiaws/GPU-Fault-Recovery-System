@@ -71,6 +71,7 @@ if __package__:
     from .regional_capacity_results import (
         aggregate,
         artifact_dir,
+        collect_pod_json_logs,
         drain_targets,
         move_to_aborted,
         write_status,
@@ -108,6 +109,7 @@ else:
     from regional_capacity_results import (
         aggregate,
         artifact_dir,
+        collect_pod_json_logs,
         drain_targets,
         move_to_aborted,
         write_status,
@@ -628,7 +630,6 @@ def aurora_window(
 
 
 def collect_logs(job: str, target: Path) -> list[dict]:
-    target.mkdir(parents=True, exist_ok=True)
     raw = dataplane(
         "get",
         "pod",
@@ -641,20 +642,20 @@ def collect_logs(job: str, target: Path) -> list[dict]:
         "batch\\.kubernetes\\.io/job-completion-index}"
         "{'\\n'}{end}",
     )
-    documents = []
+    entries = []
     for line in raw.splitlines():
         parts = line.split()
         if not parts:
             continue
         pod = parts[0]
         index = parts[1] if len(parts) > 1 else "?"
-        body = dataplane("logs", pod, check=False, timeout=180)
-        (target / f"{index}-{pod}.log").write_text(body)
-        try:
-            documents.append(json.loads(body))
-        except json.JSONDecodeError:
-            log(f"pod {pod} produced non-JSON output")
-    return documents
+        entries.append((index, pod))
+    return collect_pod_json_logs(
+        entries,
+        target,
+        fetch=lambda pod: dataplane("logs", pod, check=False, timeout=180),
+        on_decode_error=lambda pod: log(f"pod {pod} produced non-JSON output"),
+    )
 
 
 def wait_for_job(job: str, deadline_seconds: int) -> str:

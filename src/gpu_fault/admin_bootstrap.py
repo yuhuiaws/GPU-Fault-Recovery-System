@@ -34,6 +34,12 @@ from gpu_fault.admin_bootstrap_common import (
     write_yaml as _write_yaml,
 )
 from gpu_fault.admin_bootstrap_dependencies import validate_bootstrap_dependencies
+from gpu_fault.admin_bootstrap_aurora import (
+    bootstrap_aurora_capacity,
+    ensure_serverless_instances,
+    reconcile_existing_capacity,
+    scaling_configuration,
+)
 from gpu_fault.admin_notifications import (
     NotificationRouting,
 )
@@ -47,6 +53,7 @@ from gpu_fault.admin_bootstrap_site import (
     preserve_existing_site_contract,
     site_identifier as _site_identifier,
 )
+from gpu_fault.admin_config import AuroraCapacityConfig
 
 
 DEFAULT_ADOT_IMAGE_AMD64 = (
@@ -1534,6 +1541,7 @@ def _ensure_aurora(
     cpu_kubeconfig: Path,
     namespace: str,
     site_id: str,
+    capacity: AuroraCapacityConfig,
 ) -> dict[str, Any]:
     cluster_id = _safe_name(f"gpu-fault-{site_id}-aurora", maximum=63)
     subnets = _private_subnets(runner, cpu)
@@ -1685,6 +1693,13 @@ def _ensure_aurora(
             site_id=site_id,
             description=f"Aurora cluster {cluster_id}",
         )
+        reconcile_existing_capacity(
+            runner,
+            aws_region=cpu.region,
+            cluster_id=cluster_id,
+            cluster=existing_cluster,
+            capacity=capacity,
+        )
     if not cluster_exists:
         runner.run(
             [
@@ -1707,7 +1722,7 @@ def _ensure_aurora(
                 "gpu_fault_admin",
                 "--manage-master-user-password",
                 "--serverless-v2-scaling-configuration",
-                "MinCapacity=0.5,MaxCapacity=8",
+                scaling_configuration(capacity),
                 "--db-subnet-group-name",
                 subnet_group,
                 "--vpc-security-group-ids",
@@ -1724,66 +1739,13 @@ def _ensure_aurora(
             mutate=True,
             capture=False,
         )
-    instance_ids = [
-        _safe_name(f"{cluster_id}-{suffix}", maximum=63)
-        for suffix in ("writer", "reader")
-    ]
-    for instance_id, az in zip(instance_ids, availability_zones, strict=True):
-        instance_exists = (
-            subprocess.run(
-                [
-                    "aws",
-                    "rds",
-                    "describe-db-instances",
-                    "--region",
-                    cpu.region,
-                    "--db-instance-identifier",
-                    instance_id,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode
-            == 0
-        )
-        if not instance_exists:
-            runner.run(
-                [
-                    "aws",
-                    "rds",
-                    "create-db-instance",
-                    "--region",
-                    cpu.region,
-                    "--db-instance-identifier",
-                    instance_id,
-                    "--db-cluster-identifier",
-                    cluster_id,
-                    "--engine",
-                    "aurora-postgresql",
-                    "--db-instance-class",
-                    "db.serverless",
-                    "--availability-zone",
-                    az,
-                    "--promotion-tier",
-                    "0",
-                ],
-                mutate=True,
-                capture=False,
-            )
-    for instance_id in instance_ids:
-        runner.run(
-            [
-                "aws",
-                "rds",
-                "wait",
-                "db-instance-available",
-                "--region",
-                cpu.region,
-                "--db-instance-identifier",
-                instance_id,
-            ],
-            mutate=True,
-            capture=False,
-        )
+    instance_ids = ensure_serverless_instances(
+        runner,
+        aws_region=cpu.region,
+        cluster_id=cluster_id,
+        availability_zones=availability_zones,
+        safe_name=_safe_name,
+    )
     if runner.dry_run:
         return {
             "cluster_id": cluster_id,
@@ -2014,8 +1976,7 @@ def bootstrap_from_arns(
     site_id = _site_identifier(cpu, gpu_clusters)
     request.state_dir.mkdir(parents=True, exist_ok=True)
     request.state_dir.chmod(0o700)
-    state_file = request.state_dir / "bootstrap-state.json"
-    state = BootstrapState(state_file, site_id=site_id)
+    state = BootstrapState(request.state_dir / "bootstrap-state.json", site_id=site_id)
     state.phase("discovered")
     release = prepare_signed_release(
         active_runner, request=request, cpu=cpu, site_id=site_id, state=state
@@ -2097,6 +2058,7 @@ def bootstrap_from_arns(
                 cpu_kubeconfig=cpu_kubeconfig,
                 namespace=namespace,
                 site_id=site_id,
+                capacity=bootstrap_aurora_capacity(request.state_dir),
             ),
             "load_balancer_controller": lambda: ensure_load_balancer_controller(
                 active_runner,
@@ -2197,4 +2159,4 @@ def bootstrap_from_arns(
     )
     state.record("site_file", str(site_file))
     state.phase("site-ready")
-    return BootstrapResult(site_file=site_file, state_file=state_file)
+    return BootstrapResult(site_file=site_file, state_file=state.path)

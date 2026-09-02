@@ -10,6 +10,7 @@ from pathlib import Path
 from gpu_fault.models import WorkflowOperation
 
 if __package__:
+    from .regional_capacity_results import collect_pod_json_logs
     from .regional_capacity_registry import (
         dataplane_identity,
         validate_registry_target,
@@ -33,6 +34,7 @@ if __package__:
         write_status,
     )
 else:
+    from regional_capacity_results import collect_pod_json_logs
     from regional_capacity_registry import (
         dataplane_identity,
         validate_registry_target,
@@ -610,7 +612,6 @@ def collect_executor_logs(
     *,
     job_name: str = JOB_NAME,
 ) -> list[dict]:
-    target.mkdir(parents=True, exist_ok=True)
     raw = dataplane(
         "get",
         "pod",
@@ -621,16 +622,15 @@ def collect_executor_logs(
         "{.metadata.annotations.batch\\.kubernetes\\.io/"
         "job-completion-index}{'\\n'}{end}",
     )
-    documents = []
+    entries = []
     for line in raw.splitlines():
         pod, _, index = line.partition(" ")
-        body = dataplane("logs", pod, check=False, timeout=120)
-        (target / f"{index.strip()}-{pod}.log").write_text(body)
-        try:
-            documents.append(json.loads(body))
-        except json.JSONDecodeError:
-            pass
-    return documents
+        entries.append((index.strip(), pod))
+    return collect_pod_json_logs(
+        entries,
+        target,
+        fetch=lambda pod: dataplane("logs", pod, check=False, timeout=120),
+    )
 
 
 def aggregate_executor_documents(documents: list[dict]) -> dict:

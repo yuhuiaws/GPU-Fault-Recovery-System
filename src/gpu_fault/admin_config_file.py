@@ -71,6 +71,7 @@ def load_admin_config_file(
         "admin config spec",
         allowed={
             "capacity",
+            "aurora",
             "processor",
             "workflow",
             "notificationDelivery",
@@ -91,6 +92,7 @@ def admin_config_file_document(config: AdminConfig) -> dict[str, object]:
     capacity = config.capacity
     remediation = capacity.remediation
     spool = capacity.telemetry_spool
+    aurora = config.aurora
     processor = config.processor
     workflow = config.workflow
     notification = config.notification_delivery
@@ -112,6 +114,10 @@ def admin_config_file_document(config: AdminConfig) -> dict[str, object]:
                         remediation.max_active_per_resource_class
                     ),
                 },
+            },
+            "aurora": {
+                "minAcu": aurora.min_acu,
+                "maxAcu": aurora.max_acu,
             },
             "processor": {
                 "maxQueueDepth": processor.max_queue_depth,

@@ -10,6 +10,7 @@ import pytest
 
 from gpu_fault import (
     admin_bootstrap,
+    admin_bootstrap_aurora,
     admin_bootstrap_dependencies,
     admin_release_artifacts,
     admin_release_repositories,
@@ -29,6 +30,7 @@ from gpu_fault.admin_bootstrap_site import (
     validate_existing_cluster_identity,
 )
 from gpu_fault.admin_bootstrap_site import site_identifier as _site_identifier
+from gpu_fault.admin_config import AuroraCapacityConfig
 from gpu_fault.admin_release_repositories import ensure_release_repositories
 
 
@@ -166,6 +168,15 @@ def test_independent_bootstrap_tasks_run_in_parallel(tmp_path) -> None:
 
     assert result == {"a": "a", "b": "b", "c": "c"}
     assert elapsed < 0.25
+
+
+def test_bootstrap_aurora_formats_admin_config_capacity() -> None:
+    assert (
+        admin_bootstrap_aurora.scaling_configuration(
+            AuroraCapacityConfig(min_acu=8.0, max_acu=32.0)
+        )
+        == "MinCapacity=8,MaxCapacity=32"
+    )
 
 
 def test_parallel_bootstrap_persists_successes_when_another_task_fails(

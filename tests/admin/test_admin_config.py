@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import yaml
 
 from gpu_fault.admin_config import (
     AdminConfigError,
+    AuroraCapacityConfig,
     admin_config_approval_path,
     admin_config_desired_path,
     admin_config_history_path,
@@ -83,6 +85,7 @@ def test_admin_config_file_merges_omitted_fields_with_current_state(
     assert desired.capacity.control_worker_replicas == 6
     assert desired.capacity.telemetry_spool.enabled is True
     assert desired.capacity.telemetry_spool.replicas == 3
+    assert desired.aurora == current.aurora
 
 
 def test_admin_config_rejects_unsafe_or_incoherent_values(tmp_path: Path) -> None:
@@ -97,6 +100,13 @@ def test_admin_config_rejects_unsafe_or_incoherent_values(tmp_path: Path) -> Non
     path = _config_file(tmp_path, {"controlWorkerReplicas": 8})
     with pytest.raises(AdminConfigError, match="connection ceiling"):
         load_admin_config_file(path)
+
+    config = default_admin_config()
+    with pytest.raises(AdminConfigError, match="0.5 ACU increments"):
+        AuroraCapacityConfig(min_acu=8.25, max_acu=32).validate()
+    with pytest.raises(AdminConfigError, match="must not exceed"):
+        AuroraCapacityConfig(min_acu=32, max_acu=8).validate()
+    config.validate()
 
 
 def test_admin_config_file_must_be_private_and_rejects_unknown_fields(
@@ -307,7 +317,10 @@ def _legacy_capacity_record(config) -> dict[str, object]:
 def test_legacy_capacity_only_desired_config_is_verified_and_migrated(
     tmp_path: Path,
 ) -> None:
-    desired = preset_admin_config("32-disabled")
+    desired = replace(
+        preset_admin_config("32-disabled"),
+        aurora=AuroraCapacityConfig(min_acu=0.5, max_acu=8.0),
+    )
     path = admin_config_desired_path(tmp_path)
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(_legacy_capacity_record(desired)), encoding="utf-8")
@@ -322,6 +335,35 @@ def test_legacy_capacity_only_desired_config_is_verified_and_migrated(
     assert migrated["source"] == ("legacy-capacity-migration:approved-plan:legacy")
     assert migrated["plan_sha256"] == "a" * 64
     assert migrated["reference"] == "CHG-LEGACY"
+
+
+def test_legacy_full_admin_config_preserves_hidden_aurora_baseline(
+    tmp_path: Path,
+) -> None:
+    desired = replace(
+        preset_admin_config("32-disabled"),
+        aurora=AuroraCapacityConfig(min_acu=0.5, max_acu=8.0),
+    )
+    raw = desired.as_dict()
+    raw.pop("aurora")
+    record = {
+        "schema_version": 1,
+        "config": raw,
+        "config_sha256": canonical_sha256(raw),
+        "role_sha256": desired.role_sha256(),
+        "source": "release-defaults",
+        "updated_at": "2026-09-01T00:00:00+00:00",
+    }
+    path = admin_config_desired_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert load_desired_admin_config(tmp_path) == desired
+    initialize_desired_admin_config(tmp_path)
+    migrated = json.loads(path.read_text(encoding="utf-8"))
+
+    assert migrated["config"]["aurora"] == {"min_acu": 0.5, "max_acu": 8.0}
+    assert migrated["source"] == ("legacy-admin-config-migration:release-defaults")
 
 
 def test_tampered_legacy_capacity_only_desired_config_fails_closed(
@@ -343,6 +385,7 @@ def test_default_admin_config_is_stable() -> None:
     assert config.capacity.control_worker_replicas == 6
     assert config.capacity.remediation.max_active_region == 20
     assert config.capacity.telemetry_spool.enabled is False
+    assert config.aurora == AuroraCapacityConfig(min_acu=8.0, max_acu=32.0)
 
 
 def test_release_admin_config_template_matches_defaults() -> None:
@@ -353,7 +396,7 @@ def test_release_admin_config_template_matches_defaults() -> None:
     assert config == default_admin_config()
 
 
-def test_release_template_contains_only_eighteen_admin_fields() -> None:
+def test_release_template_contains_exactly_twenty_admin_fields() -> None:
     document = yaml.safe_load(
         (ROOT / "config/admin-config.example.yaml").read_text(encoding="utf-8")
     )
@@ -363,10 +406,36 @@ def test_release_template_contains_only_eighteen_admin_fields() -> None:
             return 1
         return sum(leaves(item) for item in value.values())
 
-    assert leaves(document["spec"]) == 18
+    assert leaves(document["spec"]) == 20
+    assert document["spec"]["aurora"] == {"minAcu": 8, "maxAcu": 32}
     remediation = document["spec"]["capacity"]["remediation"]
     assert "maxActivePerNode" not in remediation
     assert "maxActivePerFailureDomain" not in remediation
+
+
+def test_admin_config_file_updates_aurora_without_changing_capacity(
+    tmp_path: Path,
+) -> None:
+    current = preset_admin_config("32-enabled")
+    path = tmp_path / "admin-config.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gpu-fault.aws/v1alpha1",
+                "kind": "AdminConfig",
+                "spec": {"aurora": {"minAcu": 16, "maxAcu": 64}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+    desired = load_admin_config_file(path, base=current)
+
+    assert desired.aurora == AuroraCapacityConfig(min_acu=16.0, max_acu=64.0)
+    assert desired.capacity == current.capacity
+    assert desired.role_sha256() == current.role_sha256()
 
 
 def test_common_admin_tuning_changes_every_cpu_role_digest(tmp_path: Path) -> None:

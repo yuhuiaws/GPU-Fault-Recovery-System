@@ -148,6 +148,11 @@ round, restore Aurora through the approved AWS/IaC path and reapply the pre-run
 AdminConfig. Do not continue after a failed verdict, cleanup residual, registry
 residual, nonterminal workflow/command, or critical alert.
 
+After the measured window closes, load and executor Pod logs are fetched with a
+bounded pool of at most 16 concurrent `kubectl logs` calls. Results are sorted
+by Indexed Job completion index before artifact writes and aggregation, so this
+reduces operator wait time without changing the measured window or verdict.
+
 The supported CLI remains in `regional_capacity_suite.py`; its implementation
 is split by responsibility:
 

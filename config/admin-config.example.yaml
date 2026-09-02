@@ -12,6 +12,9 @@ spec:
       maxActiveRegion: 20
       maxActivePerCluster: 5
       maxActivePerResourceClass: 2
+  aurora:
+    minAcu: 8
+    maxAcu: 32
   processor:
     maxQueueDepth: 65536
     maxClusterQueueDepth: 1024
