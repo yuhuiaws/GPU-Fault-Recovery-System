@@ -191,11 +191,20 @@ rules:
       - deploy/control-plane/regional/cleanup-inventory.json
       - deploy/control-plane/tools/*installed_resource_registry.py
       - scripts/generate-cleanup-inventory.py
+      - scripts/build-deploy-host-bundle.py
+      - scripts/deploy_host_bundle.py
+      - scripts/deploy_host_component.py
+      - scripts/setup-deploy-host.sh
+      - scripts/setup_deploy_host.py
       - scripts/staging_deploy.py
+      - config/admin-config.example.yaml
+      - src/gpu_fault/admin_bootstrap_dependencies.py
+      - src/gpu_fault/data/deploy-host-tools.json
       - tests/admin/test_admin_bootstrap.py
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_admin_cluster_*.py
       - tests/test_staging_deploy.py
+      - tests/test_deploy_host_setup.py
       - tests/regional/test_installed_resource_registry.py
       - tests/regional/test_cleanup_*.py
     pytest:
@@ -204,6 +213,7 @@ rules:
       - tests/admin/test_admin_cluster_join.py
       - tests/admin/test_admin_cluster_removal.py
       - tests/test_staging_deploy.py
+      - tests/test_deploy_host_setup.py
       - tests/regional/test_installed_resource_registry.py
       - tests/regional/test_cleanup_inventory.py
       - tests/regional/test_cleanup_state.py

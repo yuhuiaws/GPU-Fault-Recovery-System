@@ -292,6 +292,7 @@ runtime-image-check:
 			'! python -c "import gpu_fault" >/dev/null 2>&1 && \
 			/opt/gpu-fault/control-plane/bin/python -c "import pydantic" && \
 			/opt/gpu-fault/executor/bin/python -c "import pydantic" && \
+			! test -e /opt/gpu-fault/control-plane/bin/gpu-fault-admin && \
 			test -x /opt/gpu-fault/control-plane/bin/gpu-fault-api && \
 			test -x /opt/gpu-fault/control-plane/bin/gpu-fault-store-migrate && \
 			test -x /opt/gpu-fault/executor/bin/gpu-fault-cluster-executor && \

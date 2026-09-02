@@ -158,7 +158,7 @@ def test_node_bundle_contains_the_exact_release_wheel(tmp_path: Path) -> None:
 def test_component_wheels_expose_only_their_runtime_surfaces(tmp_path: Path) -> None:
     manifest = release_manifest()
     expected_imports = {
-        "control_plane": ("gpu_fault.app", "gpu_fault.admin_cli"),
+        "control_plane": ("gpu_fault.app", "gpu_fault.config_cli"),
         "executor": (
             "gpu_fault.cluster_executor",
             "gpu_fault.completion_controller",
@@ -167,7 +167,11 @@ def test_component_wheels_expose_only_their_runtime_surfaces(tmp_path: Path) -> 
         "node_runtime": ("gpu_fault.node_agent.app", "gpu_fault.collectors_cli"),
     }
     forbidden = {
-        "control_plane": ("gpu_fault.cluster_executor", "gpu_fault.node_agent.app"),
+        "control_plane": (
+            "gpu_fault.admin_cli",
+            "gpu_fault.cluster_executor",
+            "gpu_fault.node_agent.app",
+        ),
         "executor": ("gpu_fault.app.factory", "gpu_fault.node_agent.app"),
         "node_runtime": ("gpu_fault.app.factory", "gpu_fault.cluster_executor"),
     }

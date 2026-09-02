@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -10,6 +9,7 @@ import tempfile
 import tomllib
 from pathlib import Path
 
+from component_wheels import build_component
 from deploy_host_bundle import (
     BUNDLE_ROOT,
     bundle_platform_id,
@@ -78,7 +78,7 @@ def _build_wheelhouse(
     destination: Path,
     *,
     source: Path | None,
-) -> Path:
+) -> tuple[Path, str]:
     destination.mkdir(parents=True, exist_ok=True)
     wheel_cache = source or destination
     wheel_cache.mkdir(parents=True, exist_ok=True)
@@ -101,57 +101,47 @@ def _build_wheelhouse(
         )
     if source is not None:
         _copy_wheels(source, destination)
-    for existing in destination.glob("gpu_fault_control_plane-*.whl"):
-        existing.unlink()
-    source_date_epoch = _git_output("show", "-s", "--format=%ct", "HEAD")
-    build_environment = {
-        **os.environ,
-        "PYTHONHASHSEED": "0",
-        "SOURCE_DATE_EPOCH": source_date_epoch,
-    }
-    shutil.rmtree(ROOT / "build", ignore_errors=True)
-    try:
-        with tempfile.TemporaryDirectory(
-            prefix="gpu-fault-deploy-host-build-",
-            dir=destination.parent,
-        ) as directory:
-            build_venv = Path(directory)
-            _run([python, "-m", "venv", str(build_venv)])
-            build_python = build_venv / "bin/python"
-            _run(
-                [
-                    str(build_python),
-                    "-m",
-                    "pip",
-                    "install",
-                    "--no-index",
-                    "--find-links",
-                    str(destination),
-                    "--require-hashes",
-                    "--requirement",
-                    str(ROOT / "requirements/build.lock"),
-                ]
-            )
-            _run(
-                [
-                    str(build_python),
-                    "-m",
-                    "build",
-                    "--wheel",
-                    "--no-isolation",
-                    "--outdir",
-                    str(destination),
-                ],
-                env=build_environment,
-            )
-    finally:
-        shutil.rmtree(ROOT / "build", ignore_errors=True)
-    wheels = sorted(destination.glob("gpu_fault_control_plane-*.whl"))
+    for pattern in (
+        "gpu_fault_control_plane-*.whl",
+        "gpu_fault_deploy_host-*.whl",
+    ):
+        for existing in destination.glob(pattern):
+            existing.unlink()
+    with tempfile.TemporaryDirectory(
+        prefix="gpu-fault-deploy-host-build-",
+        dir=destination.parent,
+    ) as directory:
+        build_venv = Path(directory) / "venv"
+        _run([python, "-m", "venv", str(build_venv)])
+        build_python = build_venv / "bin/python"
+        _run(
+            [
+                str(build_python),
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--find-links",
+                str(destination),
+                "--require-hashes",
+                "--requirement",
+                str(ROOT / "requirements/build.lock"),
+            ]
+        )
+        project_wheel, module_digest, _modules = build_component(
+            python=str(build_python),
+            name="deploy_host",
+            build_root=Path(directory) / "components",
+            output=destination,
+        )
+    wheels = sorted(destination.glob("gpu_fault_deploy_host-*.whl"))
     if len(wheels) != 1:
         raise RuntimeError(
             f"deploy-host bundle requires one project wheel, found {len(wheels)}"
         )
-    return wheels[0]
+    if wheels[0] != project_wheel:
+        raise RuntimeError("deploy-host component build returned an unexpected wheel")
+    return project_wheel, module_digest
 
 
 def build_bundle(
@@ -182,7 +172,7 @@ def build_bundle(
             ROOT / "config/admin-config.example.yaml",
             admin_config_template,
         )
-        project_wheel = _build_wheelhouse(
+        project_wheel, project_module_digest = _build_wheelhouse(
             python,
             staging / "wheelhouse",
             source=wheelhouse,
@@ -199,8 +189,11 @@ def build_bundle(
                     compatibility,
                 ),
                 "platform_id": bundle_platform_id(compatibility),
+                "project_distribution": "gpu-fault-deploy-host",
+                "project_module_digest": project_module_digest,
                 "project_version": _project_version(),
                 "project_wheel": project_wheel.relative_to(staging).as_posix(),
+                "project_wheel_sha256": sha256_file(project_wheel),
                 "python": "3.12",
                 "requirements": {
                     "build": "requirements/build.lock",

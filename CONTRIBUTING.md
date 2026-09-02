@@ -103,6 +103,10 @@ GitHub Actions从触发、OIDC/ECR、质量门禁、制品签名到`gpu-fault-re
 `release-build`、`release-deploy`、artifact路径、site生成路径和release-ref属于内部
 发布实现，不是普通开发者或管理员参数。
 
+`gpu-fault-admin`由独立deploy-host distribution交付，不属于Control Plane Runtime
+wheel。只修改管理员部署代码时必须验证deploy-host bundle和deployment影响域；不得因此
+重建或滚动未变化的应用Runtime组件。
+
 `make check`的最终全量测试和`make test-parallel`使用4个worker且不连接外部
 PostgreSQL。`make coverage`要求设置`GPU_FAULT_TEST_POSTGRES_URL`：先由4个worker
 采集非PostgreSQL覆盖率，再串行追加隔离PostgreSQL 16测试库覆盖率，最后统一强制当前

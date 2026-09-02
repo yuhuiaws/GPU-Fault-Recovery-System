@@ -2,7 +2,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gpu_fault.admin_config import default_admin_config
-from scripts.component_wheels import COMPONENTS, dependency_closure, entrypoint_modules
+from scripts import component_wheels
+from scripts.component_wheels import (
+    COMPONENTS,
+    component_data_files,
+    component_definition,
+    component_modules,
+    dependency_closure,
+    entrypoint_modules,
+)
 from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -302,3 +310,38 @@ def test_component_dependency_closures_are_runtime_specific() -> None:
     assert "gpu_fault.node_agent.app" in closures["node_runtime"]
     assert "gpu_fault.node_agent.app" not in closures["control_plane"]
     assert "gpu_fault.node_agent.app" not in closures["executor"]
+
+    deploy_host = component_modules("deploy_host")
+    assert component_definition("deploy_host").distribution == "gpu-fault-deploy-host"
+    assert "gpu_fault.admin_cli" in deploy_host
+    assert "gpu_fault.admin_cli" not in closures["control_plane"]
+    assert "deploy-host-tools.json" not in {
+        path.name for path in component_data_files("control_plane")
+    }
+    assert "deploy-host-tools.json" in {
+        path.name for path in component_data_files("deploy_host")
+    }
+
+
+def test_admin_source_change_only_changes_deploy_host_digest() -> None:
+    control_before = component_wheels.component_source_digest("control_plane")
+    deploy_before = component_wheels.component_source_digest("deploy_host")
+    source = component_wheels.MODULES["gpu_fault.admin_cli"]
+    override = {
+        source.relative_to(component_wheels.SOURCE).as_posix(): (
+            source.read_bytes() + b"\n# deployment-only change\n"
+        )
+    }
+
+    assert (
+        component_wheels.component_source_digest(
+            "control_plane", source_overrides=override
+        )
+        == control_before
+    )
+    assert (
+        component_wheels.component_source_digest(
+            "deploy_host", source_overrides=override
+        )
+        != deploy_before
+    )

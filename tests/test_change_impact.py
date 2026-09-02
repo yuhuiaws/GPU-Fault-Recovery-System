@@ -37,6 +37,15 @@ def test_release_change_selects_only_release_domain_and_cases() -> None:
     assert "PREEMPT" in plan.not_selected_families
 
 
+def test_deploy_host_component_change_stays_in_lifecycle_domain() -> None:
+    plan = MODULE.build_plan(["scripts/deploy_host_component.py"], settings())
+
+    assert plan.full is False
+    assert plan.domains == ("lifecycle-registry",)
+    assert "tests/test_deploy_host_setup.py" in plan.pytest_targets
+    assert plan.postgres is False
+
+
 def test_remote_command_change_does_not_select_boot_or_collect() -> None:
     plan = MODULE.build_plan(["src/gpu_fault/cluster_executor.py"], settings())
 

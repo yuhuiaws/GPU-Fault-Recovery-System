@@ -16,10 +16,12 @@ generic fault-case runner.
 ## Directory roles
 
 - `build-deploy-host-bundle.py`, `deploy_host_bundle.py`,
-  `setup_deploy_host.py` and `setup-deploy-host.sh`: build, verify and install
-  the signed offline deployment-host Python environment. Dependency locks are
-  installed once per platform-bound dependency identity; release-specific
-  project wheels use lightweight overlay venvs.
+  `deploy_host_component.py`, `setup_deploy_host.py` and
+  `setup-deploy-host.sh`: build, verify and install the signed offline
+  deployment-host Python environment. The dedicated `gpu-fault-deploy-host`
+  wheel owns `gpu-fault-admin` and is excluded from Runtime components.
+  Dependency locks are installed once per platform-bound dependency identity;
+  release-specific project wheels use lightweight overlay venvs.
 - `component_artifacts.py` and `component_artifact_cache.py`: validate canonical
   component wheels/Node bundle and persist source-only artifact sets across
   staging snapshots without reusing delivery identity.

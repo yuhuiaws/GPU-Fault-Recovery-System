@@ -318,7 +318,8 @@ CI artifact job中的`scripts/build-deploy-host-bundle.py`：
 1. 再次要求干净源码树；
 2. 复制 `requirements/build.lock` 和 `requirements/deploy-host.lock`；
 3. 从按两个lock、OS、架构和Python ABI缓存的目录补齐完整离线wheelhouse；
-4. 在只安装`build.lock`的临时venv中构建项目wheel；
+4. 在只安装`build.lock`的临时venv中构建独立
+   `gpu_fault_deploy_host-*.whl`；
 5. 加入部署机工具清单和可选审核后二进制；
 6. 记录 Git commit、平台、Python ABI、libc 和每个文件的 SHA-256、大小、权限；
 7. 生成确定性 tar.gz 和 `.sha256` sidecar。
@@ -326,6 +327,11 @@ CI artifact job中的`scripts/build-deploy-host-bundle.py`：
 CI workflow使用`actions/cache`持久化`DEPLOY_HOST_WHEELHOUSE`。缓存miss时仍按
 hash lock下载，cache hit时只校验和补齐缺失wheel。部署机安装始终使用 `--no-index`，
 不能再次在线解析依赖。
+
+deploy-host wheel以`gpu_fault.admin_cli`为根，只安装管理员部署CLI及其Python闭包和
+`deploy-host-tools.json`。Control Plane Runtime wheel不再包含`gpu_fault.admin_cli`、
+`gpu-fault-admin`入口或deploy-host工具清单。管理员代码变化因此只重建deploy-host
+bundle，不改变三个应用组件wheel、Runtime Image或应用release diff。
 
 默认 Ubuntu x86-64、CPython 3.12 Runner 生成：
 
@@ -393,7 +399,8 @@ artifact，不是自动创建的 GitHub Release asset，也不会自动复制到
 4. Manifest v3绑定三个wheel、Node bundle、Runtime Image和delivery identity；
 5. attestation绑定Manifest SHA、release ID、delivery identity、源码状态和CI gate SHA；
 6. Release Sigstore bundle证明attestation来自批准的GitHub OIDC identity；
-7. deploy-host archive使用独立Manifest和签名，绑定平台、源码commit、依赖身份和全部payload。
+7. deploy-host archive使用独立`gpu-fault-deploy-host` distribution、Manifest和签名，
+   绑定平台、源码commit、依赖身份和全部payload。
 
 仅有版本号、tag、文件名、ConfigMap 名或 Kubernetes annotation 均不足以替代上述绑定。
 任何一层缺失、摘要不一致、身份不匹配或制品来自不同 workflow run 时都必须停止。

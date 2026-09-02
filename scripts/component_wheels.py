@@ -10,7 +10,7 @@ import tomllib
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,13 +24,16 @@ class Component:
     scripts: dict[str, str]
     entry_points: dict[str, dict[str, str]]
     include_globs: tuple[str, ...] = ()
+    data_globs: tuple[str, ...] = (
+        "env-inventory.json",
+        "nvidia-*.yaml",
+    )
 
 
 COMPONENTS = {
     "control_plane": Component(
         distribution="gpu-fault-control-plane",
         roots=(
-            "gpu_fault.admin_cli",
             "gpu_fault.api",
             "gpu_fault.app",
             "gpu_fault.aurora_credential_refresh",
@@ -42,7 +45,6 @@ COMPONENTS = {
             "gpu_fault.workload_annotate_cli",
         ),
         scripts={
-            "gpu-fault-admin": "gpu_fault.admin_cli:main",
             "gpu-fault-api": "gpu_fault.api:run",
             "gpu-fault-aurora-credential-refresh": (
                 "gpu_fault.aurora_credential_refresh:main"
@@ -188,6 +190,20 @@ COMPONENTS = {
         },
     ),
 }
+APPLICATION_COMPONENT_NAMES = tuple(COMPONENTS)
+
+
+def component_definition(name: str) -> Component:
+    component = COMPONENTS.get(name)
+    if component is not None:
+        return component
+    if name != "deploy_host":
+        raise KeyError(name)
+    if __package__:
+        from scripts.deploy_host_component import DEPLOY_HOST_COMPONENT_SPEC
+    else:
+        from deploy_host_component import DEPLOY_HOST_COMPONENT_SPEC
+    return Component(**DEPLOY_HOST_COMPONENT_SPEC)
 
 
 def _module_map() -> dict[str, Path]:
@@ -320,7 +336,38 @@ def dependency_closure(roots: Iterable[str]) -> set[str]:
     return selected
 
 
-def _copy_modules(modules: set[str], destination: Path) -> None:
+def component_modules(name: str) -> set[str]:
+    component = component_definition(name)
+    return dependency_closure(
+        {
+            *component.roots,
+            *entrypoint_modules(component),
+            *extra_modules(component),
+        }
+    )
+
+
+def component_data_files(name: str) -> tuple[Path, ...]:
+    component = component_definition(name)
+    data = SOURCE / "data"
+    return tuple(
+        sorted(
+            {
+                path
+                for pattern in component.data_globs
+                for path in data.glob(pattern)
+                if path.is_file()
+            }
+        )
+    )
+
+
+def _copy_modules(
+    modules: set[str],
+    destination: Path,
+    *,
+    data_files: tuple[Path, ...],
+) -> None:
     package = destination / "src/gpu_fault"
     for module in sorted(modules):
         source = MODULES[module]
@@ -329,12 +376,11 @@ def _copy_modules(modules: set[str], destination: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         target.chmod(0o644)
-    data = SOURCE / "data"
-    if data.is_dir():
-        shutil.copytree(data, package / "data")
-        for path in (package / "data").rglob("*"):
-            if path.is_file():
-                path.chmod(0o644)
+    for source in data_files:
+        target = package / "data" / source.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        target.chmod(0o644)
 
 
 def _toml_array(values: Iterable[str]) -> str:
@@ -412,28 +458,25 @@ def package_digest(package: Path) -> str:
     return digest.hexdigest()
 
 
-def component_source_digest(name: str) -> str:
-    component = COMPONENTS[name]
-    selected = dependency_closure(
-        {
-            *component.roots,
-            *entrypoint_modules(component),
-            *extra_modules(component),
-        }
-    )
+def component_source_digest(
+    name: str,
+    *,
+    source_overrides: Mapping[str, bytes] | None = None,
+) -> str:
+    selected = component_modules(name)
     digest = hashlib.sha256()
     paths = [MODULES[module] for module in selected]
-    data = SOURCE / "data"
-    paths.extend(
-        path
-        for path in data.rglob("*")
-        if path.is_file() and path.suffix in {".yaml", ".yml", ".json"}
-    )
+    paths.extend(component_data_files(name))
     for path in sorted(paths, key=lambda item: item.relative_to(SOURCE).as_posix()):
         relative = path.relative_to(SOURCE).as_posix()
         digest.update(relative.encode())
         digest.update(b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
+        content = (
+            source_overrides.get(relative, path.read_bytes())
+            if source_overrides is not None
+            else path.read_bytes()
+        )
+        digest.update(hashlib.sha256(content).digest())
         digest.update(b"\n")
     return digest.hexdigest()
 
@@ -458,18 +501,16 @@ def build_component(
     output: Path,
 ) -> tuple[Path, str, set[str]]:
     python = validated_build_python(python)
-    component = COMPONENTS[name]
-    selected = dependency_closure(
-        {
-            *component.roots,
-            *entrypoint_modules(component),
-            *extra_modules(component),
-        }
-    )
+    component = component_definition(name)
+    selected = component_modules(name)
     project = build_root / name
     shutil.rmtree(project, ignore_errors=True)
     project.mkdir(parents=True)
-    _copy_modules(selected, project)
+    _copy_modules(
+        selected,
+        project,
+        data_files=component_data_files(name),
+    )
     _write_project(project, component)
     before = set(output.glob("*.whl"))
     previous_umask = os.umask(0o022)

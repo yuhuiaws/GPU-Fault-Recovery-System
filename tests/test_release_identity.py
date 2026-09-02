@@ -158,6 +158,7 @@ def test_application_release_identity_excludes_deploy_host_inputs() -> None:
     assert "scripts/build-deploy-host-bundle.py" not in patterns
     assert "scripts/setup_deploy_host.py" not in patterns
     assert "scripts/staging_deploy.py" not in patterns
+    assert "scripts/deploy_host_component.py" not in patterns
     assert "src/**/*.py" not in config["runtime_image_inputs"]
 
 

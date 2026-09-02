@@ -229,6 +229,47 @@ def _dependency_report(
     return report
 
 
+def deploy_host_project_report(
+    venv: Path,
+    state: Mapping[str, Any],
+) -> dict[str, str] | None:
+    distribution = str(state.get("project_distribution") or "")
+    expected_digest = str(state.get("project_module_digest") or "")
+    if not distribution and not expected_digest:
+        return None
+    if not distribution or len(expected_digest) != 64:
+        raise DeployHostSetupError(f"deployment-host venv is incomplete: {venv}")
+    output = _run(
+        [
+            str(_python_path(venv)),
+            "-c",
+            (
+                "import importlib.metadata as m,json;"
+                "from gpu_fault import module_digest;"
+                f"print(json.dumps({{'distribution':{distribution!r},"
+                f"'version':m.version({distribution!r}),"
+                "'module_digest':module_digest()}))"
+            ),
+        ],
+        capture=True,
+    )
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise DeployHostSetupError(
+            "deployment-host project identity is invalid"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("distribution") != distribution
+        or value.get("module_digest") != expected_digest
+    ):
+        raise DeployHostSetupError(
+            "deployment-host project identity does not match bundle"
+        )
+    return {key: str(item) for key, item in value.items()}
+
+
 def check_deploy_host_venv(venv: Path) -> dict[str, Any]:
     python = _python_path(venv)
     admin = venv / "bin/gpu-fault-admin"
@@ -263,6 +304,7 @@ def check_deploy_host_venv(venv: Path) -> dict[str, Any]:
         "venv": str(venv),
         "state": state,
         "admin_config_template": str(admin_config_template),
+        "project": deploy_host_project_report(venv, state),
         "dependencies": _dependency_report(
             venv,
             dependency_venv=dependency_venv,
@@ -631,6 +673,8 @@ def setup_deploy_host(
             "compatibility": compatibility,
             "platform_id": metadata.get("platform_id"),
             "project_version": metadata.get("project_version"),
+            "project_distribution": metadata.get("project_distribution"),
+            "project_module_digest": metadata.get("project_module_digest"),
             "source": metadata.get("source"),
             "source_binding": source_binding,
             "dependency_identity_sha256": metadata.get("dependency_identity_sha256"),

@@ -157,10 +157,11 @@ def test_component_build_identity_covers_node_bundle_inputs(
         "build_release_identity",
         lambda _root: {"node_template_inputs": dict(node_identity)},
     )
+    selected: list[str] = []
     monkeypatch.setattr(
         component_artifacts,
         "component_source_digest",
-        lambda name: _sha256(name.encode()),
+        lambda name: selected.append(name) or _sha256(name.encode()),
     )
 
     first = component_artifacts.component_build_identity(tmp_path)
@@ -168,3 +169,4 @@ def test_component_build_identity_covers_node_bundle_inputs(
     second = component_artifacts.component_build_identity(tmp_path)
 
     assert first != second
+    assert set(selected) == {"control_plane", "executor", "node_runtime"}

@@ -11,10 +11,13 @@ import tarfile
 from typing import Any
 
 if __package__:
-    from scripts.component_wheels import COMPONENTS, component_source_digest
+    from scripts.component_wheels import (
+        APPLICATION_COMPONENT_NAMES,
+        component_source_digest,
+    )
     from scripts.release_identity import build_release_identity
 else:
-    from component_wheels import COMPONENTS, component_source_digest
+    from component_wheels import APPLICATION_COMPONENT_NAMES, component_source_digest
     from release_identity import build_release_identity
 
 
@@ -61,7 +64,7 @@ def component_build_identity(root: Path) -> str:
             )
         },
         "components": {
-            name: component_source_digest(name) for name in sorted(COMPONENTS)
+            name: component_source_digest(name) for name in APPLICATION_COMPONENT_NAMES
         },
         "node_bundle_inputs_sha256": release_identity["node_template_inputs"]["sha256"],
     }
@@ -168,7 +171,7 @@ def load_component_artifacts(
     wheels: dict[str, Path] = {}
     module_digests: dict[str, str] = {}
     module_counts: dict[str, int] = {}
-    for name in COMPONENTS:
+    for name in APPLICATION_COMPONENT_NAMES:
         raw_component = raw_components.get(name)
         if not isinstance(raw_component, dict):
             raise ComponentArtifactError(

@@ -274,6 +274,65 @@ def test_existing_overlay_revalidates_dependency_identity(
     assert checked == [(dependency_venv, "a" * 64)]
 
 
+def test_deploy_host_project_identity_matches_separate_distribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv = tmp_path / "venv"
+    expected = "a" * 64
+    monkeypatch.setattr(
+        setup_deploy_host,
+        "_run",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "distribution": "gpu-fault-deploy-host",
+                "module_digest": expected,
+                "version": "0.10.0",
+            }
+        ),
+    )
+
+    report = setup_deploy_host.deploy_host_project_report(
+        venv,
+        {
+            "project_distribution": "gpu-fault-deploy-host",
+            "project_module_digest": expected,
+        },
+    )
+
+    assert report == {
+        "distribution": "gpu-fault-deploy-host",
+        "module_digest": expected,
+        "version": "0.10.0",
+    }
+
+
+def test_deploy_host_project_identity_rejects_runtime_wheel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        setup_deploy_host,
+        "_run",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "distribution": "gpu-fault-deploy-host",
+                "module_digest": "b" * 64,
+                "version": "0.10.0",
+            }
+        ),
+    )
+
+    with pytest.raises(
+        setup_deploy_host.DeployHostSetupError, match="project identity does not match"
+    ):
+        setup_deploy_host.deploy_host_project_report(
+            tmp_path / "venv",
+            {
+                "project_distribution": "gpu-fault-deploy-host",
+                "project_module_digest": "a" * 64,
+            },
+        )
+
+
 def test_bundle_signature_verification_uses_cosign(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
