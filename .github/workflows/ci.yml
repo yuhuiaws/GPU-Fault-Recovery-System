@@ -18,6 +18,8 @@ concurrency:
 jobs:
   static:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPYCACHEPREFIX: /tmp/gpu-fault-pycache
     steps:
       - uses: actions/checkout@v4
         with:
