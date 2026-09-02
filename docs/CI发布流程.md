@@ -230,6 +230,21 @@ coverage不会携带变化模块的陈旧行号，只有deployment shard失效�
 启动pytest。文档/CI契约测试由当前commit的`static` job执行，因此docs或`.github/`
 变化可以复用六个shard，但不能跳过当前static和artifact门禁。
 
+#### 3.1.1 Fresh实测基线
+
+以下数据来自默认`ubuntu-latest`、4个xdist worker，未配置larger runner；用于回归比较，
+不是固定SLA：
+
+| main commit / run | 流程 | 端到端 | 最长测试路径 | 聚合 |
+|---|---|---:|---:|---:|
+| `863a557` / `33615185401` | 旧单体unit | 18分44秒 | unit 18分19秒；其中普通coverage 14分44秒 | 包含在同一unit |
+| `a6dd742` / `33620340339` | 六个签名shard | 6分18秒 | `runtime_2` 4分53秒 | unit 57秒 |
+
+新流程fresh总墙钟减少约66%。同一run中其他参考值为：deployment 3分08秒、
+PostgreSQL contract+stress 2分20秒、static 2分40秒、artifact 1分23秒。后续比较应同时
+检查artifact的`test-durations.json`，避免只看总时长而遗漏Runner排队、依赖安装或单项
+测试长尾。
+
 `artifact-check`只生成一套canonical Control Plane、Executor、Node Runtime wheel和
 Node bundle。source-only Manifest为`deployable=false`，但包含物理SHA、
 `module_digest`、bundle内嵌wheel和component build identity。component identity还覆盖
