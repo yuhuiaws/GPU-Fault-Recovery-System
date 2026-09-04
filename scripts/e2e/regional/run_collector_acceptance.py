@@ -86,6 +86,39 @@ records = [
 print(json.dumps({"records": records}, sort_keys=True, default=str))
 """
 
+COLLECTOR_STATUS_PROBE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+
+# Every accepted batch stamps a collector status, whether or not it also became
+# raw evidence. That makes it the only complete record of the delivery cadence.
+cluster_id, node_id = sys.argv[1:]
+store = ApplicationContext.from_environment().store
+print(json.dumps({"records": [
+    {
+        "collector": str(item.collector),
+        "observed_at": item.observed_at.isoformat(),
+        "batch_id": item.batch_id or "",
+        "sample_count": item.sample_count,
+        "errors": list(item.errors),
+    }
+    for item in store.list_collector_statuses(cluster_id, node_id)
+]}, sort_keys=True, default=str))
+"""
+
+# The two on-node delivery chains COLLECT-001 judges, keyed by the ``batch_id``
+# prefix the producing collector stamps. The prefix is load-bearing: a collector
+# status row is keyed by (cluster, node, collector), and the control plane's own
+# Kubernetes allocatable collector reports on the same HOST_TELEMETRY channel as
+# the on-node host collector, on its own summary phase. Counting the merged
+# channel would measure two collectors and attribute the result to one.
+COLLECT001_PRODUCERS = {
+    "GPU_METRICS": "dcgm-",
+    "HOST_TELEMETRY": "host-",
+}
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -245,6 +278,19 @@ def recent_evidence(
     return cast(list[dict[str, Any]], value.get("records") or [])
 
 
+def collector_statuses(
+    regional: RegionalLiveFixture,
+    *,
+    node: str,
+) -> list[dict[str, Any]]:
+    value = regional.cpu_python(
+        COLLECTOR_STATUS_PROBE,
+        regional.settings.cluster_id,
+        node,
+    )
+    return cast(list[dict[str, Any]], value.get("records") or [])
+
+
 def evidence_kinds(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = {}
     for item in records:
@@ -267,8 +313,48 @@ def run_collect001(
         collector_setting(env, "GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS"),
     )
     started_at = datetime.now(timezone.utc)
-    duration = summary * 2 + interval * 2
-    time.sleep(duration)
+    # Two full summary cycles have to fit inside the window with room for the
+    # phase offset at either end, or "at least two deliveries" is not a
+    # property of the window.
+    duration = summary * 2 + interval * 4
+    # Poll the collector statuses rather than reading the evidence history once
+    # at the end. Steady-state deliveries are deliberately *not* persisted as
+    # evidence -- the control plane skips capture when a batch has no findings,
+    # no collection errors and no reason but `health-summary` -- so the evidence
+    # table cannot see the suppressed cadence this case exists to measure. It
+    # counted zero GPU_METRICS records on a healthy node and called the chain
+    # dead. The status row is upserted on every accepted batch, and polling once
+    # per collection interval cannot miss a delivery that is a summary apart.
+    deliveries: dict[str, list[str]] = {key: [] for key in COLLECT001_PRODUCERS}
+    timeline: list[dict[str, Any]] = []
+    deadline = time.monotonic() + duration
+    while True:
+        for record in collector_statuses(fixture.regional, node=fixture.node):
+            prefix = COLLECT001_PRODUCERS.get(str(record.get("collector")))
+            if prefix is None or not str(record.get("batch_id")).startswith(prefix):
+                continue
+            stamp = str(record.get("observed_at"))
+            observed_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if observed_at < started_at:
+                # A delivery from before the window. It is a real one, but its
+                # distance to the first in-window delivery is not a gap this
+                # window measured.
+                continue
+            series = deliveries[str(record["collector"])]
+            if stamp not in series:
+                series.append(stamp)
+        timeline.append(
+            {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "delivery_counts": {
+                    key: len(value) for key, value in sorted(deliveries.items())
+                },
+            }
+        )
+        write_json_atomic(case_dir / "timeline.json", {"entries": timeline})
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(interval)
     records = recent_evidence(
         fixture.regional,
         node=fixture.node,
@@ -276,29 +362,87 @@ def run_collect001(
     )
     by_kind = evidence_kinds(records)
     errors = []
-    for kind in ("GPU_METRICS", "HOST_TELEMETRY"):
-        items = sorted(
-            by_kind.get(kind, []),
-            key=lambda item: str(item.get("observed_at")),
+    observed: dict[str, Any] = {}
+    # What the sampling loop would have delivered with the filter switched off,
+    # and what a suppressed steady state should deliver instead.
+    sampled = duration // interval
+    suppressed = duration // summary
+    for kind in sorted(COLLECT001_PRODUCERS):
+        stamps = sorted(
+            datetime.fromisoformat(item.replace("Z", "+00:00"))
+            for item in deliveries[kind]
         )
-        if len(items) < 2:
-            errors.append(f"{kind} has fewer than two delivered records")
-            continue
-        stamps = [
-            datetime.fromisoformat(str(item["observed_at"]).replace("Z", "+00:00"))
-            for item in items
-        ]
         gaps = [
             (right - left).total_seconds()
             for left, right in zip(stamps, stamps[1:], strict=False)
         ]
-        if any(abs(gap - summary) > interval * 2 for gap in gaps):
-            errors.append(f"{kind} delivery gaps do not match summary cadence")
+        observed[kind] = {
+            "delivered": len(stamps),
+            "observed_at": [item.isoformat() for item in stamps],
+            "gaps_seconds": gaps,
+        }
+        if len(stamps) < 2:
+            errors.append(f"{kind} delivered fewer than two batches in the window")
+            continue
+        # One extra delivery beyond the summary count is an edge the node was
+        # entitled to report; the sampling cadence is an order of magnitude away
+        # from that, which is what makes the criterion decidable.
+        if len(stamps) > suppressed + 1:
+            errors.append(
+                f"{kind} delivered {len(stamps)} batches, closer to the "
+                f"{sampled}-sample collection cadence than to the {suppressed} "
+                "the summary cadence allows"
+            )
+        if max(gaps) < summary - interval * 2:
+            errors.append(
+                f"{kind} never went a full summary window without delivering, "
+                f"so no suppression was observed: gaps {gaps}"
+            )
+    # And the other half of the same mechanism: a batch whose only reason is the
+    # periodic summary must not be persisted as evidence at all. This is what
+    # the control plane's capture condition promises, and a collector that
+    # mislabels its own periodic delivery breaks it silently -- the Kubernetes
+    # allocatable collector called every healthy summary a `recovered:` edge and
+    # so wrote one raw evidence record per node per summary, forever.
+    persisted_summaries = [
+        item
+        for item in records
+        if set(item.get("payload", {}).get("edge_filter_reasons") or [])
+        == {"health-summary"}
+    ]
+    if persisted_summaries:
+        errors.append(
+            f"{len(persisted_summaries)} steady-state health summaries were "
+            "persisted as raw evidence"
+        )
+    # A recovery is a transition, and preflight established that nothing was
+    # broken when the window opened, so nothing inside it can have recovered.
+    # `recovered:<resource>` is the mislabel that made every healthy Kubernetes
+    # summary look like an edge; the host collector's own recovery reason is the
+    # bare `recovered`, which stays legitimate here.
+    false_recoveries = [
+        item
+        for item in records
+        if any(
+            str(reason).startswith("recovered:")
+            for reason in item.get("payload", {}).get("edge_filter_reasons") or []
+        )
+    ]
+    if false_recoveries:
+        errors.append(
+            f"{len(false_recoveries)} evidence records claim a resource recovery "
+            "in a window that began with every resource healthy"
+        )
     return {
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "collector_env": env,
         "observation_seconds": duration,
+        "collection_samples_in_window": sampled,
+        "summary_deliveries_in_window": suppressed,
+        "deliveries": observed,
+        "persisted_health_summaries": persisted_summaries,
+        "false_recovery_records": false_recoveries,
         "evidence_counts": {key: len(value) for key, value in sorted(by_kind.items())},
     }
 

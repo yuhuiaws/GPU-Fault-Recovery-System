@@ -126,6 +126,80 @@ def test_kubernetes_node_resource_collector_detects_allocatable_loss() -> None:
     assert by_name["gpu_kubernetes_allocatable_mismatch"]["value"] == 0
 
 
+def test_kubernetes_node_resource_summary_is_not_reported_as_a_recovery() -> None:
+    """A healthy node's periodic delivery is a summary, not a recovery.
+
+    The reason was chosen from the mismatch state alone, so an unchanged healthy
+    allocatable count that delivered only because its summary interval had
+    elapsed still said `recovered:efa`. That claimed a transition that never
+    happened, and since the control plane only declines to persist evidence for
+    batches whose sole reason is `health-summary`, one idle node kept writing a
+    raw evidence record every time a resource's summary came due.
+    """
+
+    allocatable = {"vpc.amazonaws.com/efa": "16", "nvidia.com/gpu": "8"}
+
+    class Core:
+        def list_node(self):
+            return SimpleNamespace(
+                items=[
+                    {
+                        "metadata": {
+                            "name": "gpu-worker",
+                            "labels": {
+                                "node.kubernetes.io/instance-type": ("ml.p5en.48xlarge")
+                            },
+                        },
+                        "status": {"allocatable": dict(allocatable)},
+                    }
+                ]
+            )
+
+        def list_pod_for_all_namespaces(self, **_kwargs):
+            return SimpleNamespace(items=[])
+
+    sink = RecordingSink()
+    collector = KubernetesNodeResourceCollector(
+        sink,
+        context(),
+        core_api=Core(),
+        required_consecutive_samples=2,
+        health_summary_seconds=300,
+        now=lambda: NOW,
+    )
+
+    assert collector.collect_once().delivered == 1
+    assert sink.requests[-1][1]["edge_filter_reasons"] == [
+        "baseline:efa",
+        "baseline:gpu",
+    ]
+
+    # Nothing changed, and no summary interval has elapsed: stay silent.
+    collector.now = lambda: NOW + timedelta(seconds=15)
+    assert collector.collect_once().delivered == 0
+
+    # A summary interval later the counts are still healthy and unchanged.
+    collector.now = lambda: NOW + timedelta(seconds=1200)
+    assert collector.collect_once().delivered == 1
+    assert sink.requests[-1][1]["edge_filter_reasons"] == ["health-summary"], (
+        "an unchanged healthy allocatable count was reported as a state change"
+    )
+
+    # A real transition out of a persistent mismatch still says `recovered`.
+    allocatable["vpc.amazonaws.com/efa"] = "15"
+    for offset in (1215, 1230):
+        collector.now = lambda offset=offset: NOW + timedelta(seconds=offset)
+        collector.collect_once()
+    assert (
+        "threshold:efa_kubernetes_allocatable_mismatch"
+        in (sink.requests[-1][1]["edge_filter_reasons"])
+    )
+    allocatable["vpc.amazonaws.com/efa"] = "16"
+    collector.now = lambda: NOW + timedelta(seconds=1245)
+    assert collector.collect_once().delivered == 1
+    assert sink.requests[-1][1]["edge_filter_reasons"] == ["recovered:efa"]
+
+
 def test_cloudwatch_collector_decodes_filters_and_delivers() -> None:
     sink = RecordingSink()
     collector = CloudWatchHmaCollector(sink, context(), now=lambda: NOW)

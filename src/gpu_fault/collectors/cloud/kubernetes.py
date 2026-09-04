@@ -292,7 +292,19 @@ class KubernetesNodeResourceCollector:
                             if persistent
                             else f"baseline:{resource}"
                             if previous is None
+                            # A recovery is a transition, so only say `recovered`
+                            # when the resource really was persistently missing
+                            # before. An unchanged healthy count that delivers
+                            # because its summary interval elapsed is a
+                            # `health-summary`: labelling it `recovered` claimed
+                            # a state change that never happened, and because
+                            # the control plane only skips capturing evidence
+                            # for batches whose sole reason is `health-summary`,
+                            # every periodic delivery for a healthy node was
+                            # persisted as raw evidence forever.
                             else f"recovered:{resource}"
+                            if previous
+                            else "health-summary"
                         )
                     )
                 labels = {
@@ -356,7 +368,10 @@ class KubernetesNodeResourceCollector:
                 ),
                 affected_workload_ids=workload_ids,
                 evidence_ref=(f"k8s://nodes/{node_id}/status/allocatable"),
-                edge_filter_reasons=edge_reasons,
+                # Both resources can now land on the same reason, and a batch
+                # reading `["health-summary", "health-summary"]` would no longer
+                # match the control plane's steady-state test on the reason set.
+                edge_filter_reasons=list(dict.fromkeys(edge_reasons)),
             )
             self.sink.post(
                 HOST_TELEMETRY_PATH,
