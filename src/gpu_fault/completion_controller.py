@@ -8,13 +8,19 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from threading import RLock, Timer
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 from gpu_fault.collectors import EventSink
+from gpu_fault.completion_attempt_state import (
+    AttemptSpec,
+    cache_terminal_attempt_observation,
+    publish_attempt_observation,
+    restore_persisted_attempt_observations,
+)
 from gpu_fault.completion_observation import (
     MissingAttemptTracker,
     ObservationOnlyTracker,
@@ -28,6 +34,7 @@ from gpu_fault.completion_outbox import (
     replay_completion_outbox,
 )
 from gpu_fault.env_validation import validate_gpu_fault_environment
+from gpu_fault.logging_setup import configure_logging
 from gpu_fault.models import Environment
 from gpu_fault.watcher import (
     AttemptObservation,
@@ -71,21 +78,6 @@ class CompletionControllerError(ValueError):
     pass
 
 
-@dataclass(frozen=True)
-class AttemptSpec:
-    cluster_id: str
-    environment: Environment
-    job_id: str
-    attempt_id: str
-    expected_critical_ranks: int
-    runtime_profile_version: str
-    cleanup_timeout_seconds: int
-    workload_ids: tuple[str, ...] = ()
-    checkpoint_manifest_ref: str | None = None
-    termination_initiator_incident_id: str | None = None
-    restart_budget: int = 1
-
-
 class KubernetesWorkloadStopper:
     """Emergency fallback when control-plane containment is unavailable."""
 
@@ -107,9 +99,8 @@ class KubernetesWorkloadStopper:
         self.core = core_api
         self.workload_log_tail_lines = workload_log_tail_lines
         self.workload_log_max_bytes = workload_log_max_bytes
-        self.workload_log_s3_uri = (
-            workload_log_s3_uri.rstrip("/") if workload_log_s3_uri else None
-        )
+        uri = workload_log_s3_uri
+        self.workload_log_s3_uri = uri.rstrip("/") if uri else None
         self.workload_log_s3_max_bytes = workload_log_s3_max_bytes
         self.workload_log_annotation_tail_bytes = workload_log_annotation_tail_bytes
         self.workload_log_uploader = workload_log_uploader
@@ -538,6 +529,12 @@ class KubernetesCompletionController:
         self.metadata_takeovers_total = 0
         self.reconcile_runs_total = 0
         self.reconciled_attempts_total = 0
+        try:
+            restore_persisted_attempt_observations(self)
+        except ValueError as exc:
+            raise CompletionControllerError(
+                "cannot restore persisted Completion Watcher attempt state"
+            ) from exc
 
     def run_once(self) -> list[dict[str, Any]]:
         pods, _ = list_completion_pods(
@@ -591,25 +588,16 @@ class KubernetesCompletionController:
                     continue
                 result = self.watcher.observe(observation)
                 if result.terminal_event is not None:
-                    self._missing_attempts.clear(attempt_id)
-                    observation = self._terminal_observations.setdefault(
-                        attempt_id, observation
+                    # Unknown live ranks cannot survive a terminal observation.
+                    observation = cache_terminal_attempt_observation(
+                        self, attempt_id, result.terminal_event, observation
                     )
                 self._last_observations[attempt_id] = observation
             except (CompletionControllerError, ValueError):
                 LOGGER.exception("cannot reconcile attempt %s", attempt_id)
                 continue
             if self.publish_observations:
-                try:
-                    self.sink.post(
-                        "/v1/workload-observations",
-                        observation.model_dump(mode="json"),
-                    )
-                except Exception:
-                    LOGGER.exception(
-                        "cannot publish workload observation for %s",
-                        attempt_id,
-                    )
+                publish_attempt_observation(self, observation, attempt_id)
             if self.observation_only.contains(attempt_id):
                 results.append(
                     {
@@ -1518,7 +1506,7 @@ def controller_from_environment() -> KubernetesCompletionController:
 
 
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+    configure_logging()
     validate_gpu_fault_environment(process_name="gpu-fault-completion-watcher")
     controller_from_environment().run()
 

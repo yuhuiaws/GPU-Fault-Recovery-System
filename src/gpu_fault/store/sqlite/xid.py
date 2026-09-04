@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 import json
 from datetime import datetime, timedelta
+from typing import Any, Callable, ContextManager, Sequence, cast
 
-from gpu_fault.models import XidMetricBaseline
+from gpu_fault.models import HealthSignalState, XidMetricBaseline
 from gpu_fault.policy import (
+    FaultPolicyDecision,
     Nvlink74BitOccurrenceState,
+    XidCorrelationRecord,
     XidCorrelationStatus,
+    XidEvent,
 )
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
@@ -16,23 +18,25 @@ from gpu_fault.store.shared.time import (
 
 
 class SqliteXidMixin:
-    # Attributes supplied by the composed concrete implementation.
+    # Attributes supplied by the composed concrete implementation. The row
+    # readers stay `Any` because the model class is resolved at run time from a
+    # string kind; every caller below states the row type with a `cast`.
     _db: Any
-    _get: Callable[..., Any]
-    _get_link: Callable[..., Any]
-    _get_optional: Callable[..., Any]
-    _link: Callable[..., Any]
-    _list: Callable[..., Any]
+    _get: Callable[[str, str], Any]
+    _get_link: Callable[[str, str], str | None]
+    _get_optional: Callable[[str, str], Any]
+    _link: Callable[[str, str, str], None]
+    _list: Callable[[str], list[Any]]
     _lock: Any
-    _next_health_signal_state: Callable[..., Any]
-    _put: Callable[..., Any]
-    _state_key: Callable[..., Any]
-    _state_transaction: Callable[..., Any]
-    _xid74_populated_bits: Callable[..., Any]
-    _xid74_scope: Callable[..., Any]
+    _next_health_signal_state: Callable[..., tuple[HealthSignalState, bool]]
+    _put: Callable[..., None]
+    _state_key: Callable[..., str]
+    _state_transaction: Callable[[str], ContextManager[None]]
+    _xid74_populated_bits: Callable[[XidEvent], list[tuple[int, int]]]
+    _xid74_scope: Callable[[XidEvent], tuple[str, str, int] | None]
 
     def save_xid_event_if_absent(
-        self, event, *, retain_from: datetime | None = None
+        self, event: XidEvent, *, retain_from: datetime | None = None
     ) -> bool:
         with self._lock:
             cursor = self._db.execute(
@@ -42,7 +46,7 @@ class SqliteXidMixin:
                 """,
                 (event.event_id, event.model_dump_json()),
             )
-            inserted = cursor.rowcount == 1
+            inserted: bool = cursor.rowcount == 1
             if inserted and retain_from is not None:
                 self._db.execute(
                     """
@@ -60,12 +64,12 @@ class SqliteXidMixin:
                 )
             return inserted
 
-    def record_xid74_occurrences(self, event) -> dict[str, int]:
+    def record_xid74_occurrences(self, event: XidEvent) -> dict[str, int]:
         scope = self._xid74_scope(event)
         if event.xid != 74 or scope is None:
             return {}
         scope_key = self._state_key(scope)
-        counts = {}
+        counts: dict[str, int] = {}
         with self._state_transaction(f"xid74-occurrence/{scope_key}"):
             for (
                 register_index,
@@ -74,7 +78,10 @@ class SqliteXidMixin:
                 state_parts = (*scope, register_index, bit)
                 state_key = self._state_key(state_parts)
                 event_key = self._state_key((event.event_id, *state_parts))
-                state = self._get_optional("xid74_occurrence_state", state_key)
+                state = cast(
+                    "Nvlink74BitOccurrenceState | None",
+                    self._get_optional("xid74_occurrence_state", state_key),
+                )
                 if self._get_link("xid74_occurrence_event", event_key) is None:
                     state = (
                         state.incremented(
@@ -108,9 +115,9 @@ class SqliteXidMixin:
                     counts[f"register{register_index + 1}.bit{bit}"] = state.count
         return counts
 
-    def get_xid_event(self, event_id: str):
+    def get_xid_event(self, event_id: str) -> XidEvent:
         with self._lock:
-            return self._get("xid_correlation_event", event_id)
+            return cast("XidEvent", self._get("xid_correlation_event", event_id))
 
     def list_xid_events(
         self,
@@ -119,7 +126,7 @@ class SqliteXidMixin:
         *,
         observed_after: datetime | None = None,
         observed_before: datetime | None = None,
-    ):
+    ) -> list[XidEvent]:
         with self._lock:
             return [
                 item
@@ -130,7 +137,7 @@ class SqliteXidMixin:
                 and (observed_before is None or item.observed_at <= observed_before)
             ]
 
-    def save_xid_policy_decision(self, decision) -> None:
+    def save_xid_policy_decision(self, decision: FaultPolicyDecision) -> None:
         with self._lock:
             self._put(
                 "xid_policy_decision",
@@ -138,11 +145,14 @@ class SqliteXidMixin:
                 decision,
             )
 
-    def get_xid_policy_decision(self, event_id: str):
+    def get_xid_policy_decision(self, event_id: str) -> FaultPolicyDecision | None:
         with self._lock:
-            return self._get_optional("xid_policy_decision", event_id)
+            return cast(
+                "FaultPolicyDecision | None",
+                self._get_optional("xid_policy_decision", event_id),
+            )
 
-    def save_xid_correlation_if_absent(self, correlation) -> bool:
+    def save_xid_correlation_if_absent(self, correlation: XidCorrelationRecord) -> bool:
         with self._lock:
             cursor = self._db.execute(
                 """
@@ -154,11 +164,12 @@ class SqliteXidMixin:
                     correlation.model_dump_json(),
                 ),
             )
-            return cursor.rowcount == 1
+            saved: bool = cursor.rowcount == 1
+            return saved
 
-    def get_xid_correlation(self, event_id: str):
+    def get_xid_correlation(self, event_id: str) -> XidCorrelationRecord:
         with self._lock:
-            return self._get("xid_correlation", event_id)
+            return cast("XidCorrelationRecord", self._get("xid_correlation", event_id))
 
     def claim_due_xid_correlations(
         self,
@@ -167,7 +178,7 @@ class SqliteXidMixin:
         now: datetime,
         lease_duration: timedelta,
         limit: int,
-    ):
+    ) -> list[XidCorrelationRecord]:
         with self._state_transaction("xid-correlation-claims"):
             due = sorted(
                 (
@@ -182,7 +193,7 @@ class SqliteXidMixin:
                     item.event_id,
                 ),
             )[:limit]
-            claimed = []
+            claimed: list[XidCorrelationRecord] = []
             for item in due:
                 value = item.model_copy(
                     update={
@@ -194,7 +205,9 @@ class SqliteXidMixin:
                 claimed.append(value)
             return claimed
 
-    def complete_xid_correlation(self, event_id: str, *, owner: str, now: datetime):
+    def complete_xid_correlation(
+        self, event_id: str, *, owner: str, now: datetime
+    ) -> XidCorrelationRecord:
         with self._state_transaction(f"xid-correlation/{event_id}"):
             current = self.get_xid_correlation(event_id)
             if current.lease_owner != owner:
@@ -237,7 +250,10 @@ class SqliteXidMixin:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                previous = self._get_optional("xid_metric_baseline", key)
+                previous = cast(
+                    "XidMetricBaseline | None",
+                    self._get_optional("xid_metric_baseline", key),
+                )
                 if previous is not None and observed_at <= previous.observed_at:
                     self._db.execute("COMMIT")
                     return False
@@ -248,18 +264,23 @@ class SqliteXidMixin:
                 self._db.execute("ROLLBACK")
                 raise
 
-    def claim_health_signal_transitions(self, items) -> list[bool]:
+    def claim_health_signal_transitions(
+        self, items: Sequence[tuple[str, bool, datetime, float]]
+    ) -> list[bool]:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                results = []
+                results: list[bool] = []
                 for (
                     signal_key,
                     active,
                     observed_at,
                     minimum_active_seconds,
                 ) in items:
-                    previous = self._get_optional("health_signal_state", signal_key)
+                    previous = cast(
+                        "HealthSignalState | None",
+                        self._get_optional("health_signal_state", signal_key),
+                    )
                     if previous is not None and observed_at <= previous.observed_at:
                         results.append(False)
                         continue

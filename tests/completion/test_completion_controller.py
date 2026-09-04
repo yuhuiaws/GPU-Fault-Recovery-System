@@ -21,6 +21,8 @@ class FakeCoreApi:
         self.pods = pods or []
         self.list_calls = 0
         self.pod_patches = []
+        self.config_map_version = 1
+        self.config_map_data = {"active-attempts.json": "{}", "events.json": "[]"}
 
     def list_pod_for_all_namespaces(self, **_kwargs):
         self.list_calls += 1
@@ -31,6 +33,17 @@ class FakeCoreApi:
 
     def read_namespaced_pod_log(self, *_args, **_kwargs):
         return "training log line\n"
+
+    def read_namespaced_config_map(self, _name, _namespace):
+        return {
+            "metadata": {"resourceVersion": str(self.config_map_version)},
+            "data": dict(self.config_map_data),
+        }
+
+    def replace_namespaced_config_map(self, _name, _namespace, body):
+        assert body["metadata"]["resourceVersion"] == str(self.config_map_version)
+        self.config_map_version += 1
+        self.config_map_data = dict(body["data"])
 
 
 class FakeWatch:
@@ -229,6 +242,47 @@ def test_disappeared_running_attempt_emits_stopped_tombstone_after_grace() -> No
     )
     assert terminal["terminal_status"] == "STOPPED"
     assert [item["rank"] for item in terminal["allocation"]] == [0]
+
+
+def test_restart_restores_attempt_and_terminalizes_missing_pods() -> None:
+    from gpu_fault.completion_outbox import KubernetesCompletionOutbox
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0)])
+    delivered = FakeSink()
+    first_sink = KubernetesCompletionOutbox(core, delivered)
+    first = KubernetesCompletionController(
+        core,
+        first_sink,
+        cluster_id="hp-cluster",
+        cleanup_timeout_seconds=30,
+        now=clock,
+        publish_observations=True,
+    )
+    first.run_once()
+    assert json.loads(core.config_map_data["active-attempts.json"]), (
+        "running attempt was not persisted for Watcher restart"
+    )
+
+    core.pods = []
+    restarted_sink = KubernetesCompletionOutbox(core, delivered)
+    restarted = KubernetesCompletionController(
+        core,
+        restarted_sink,
+        cluster_id="hp-cluster",
+        cleanup_timeout_seconds=30,
+        now=clock,
+        publish_observations=True,
+    )
+    restarted.run_once()
+    clock.value += timedelta(seconds=31)
+    restarted.run_once()
+
+    observations = [
+        value for path, value in delivered.posts if path == "/v1/workload-observations"
+    ]
+    assert observations[-1]["workload_phase"] == "STOPPED"
+    assert json.loads(core.config_map_data["active-attempts.json"]) == {}
 
 
 def test_observation_uses_earliest_pod_start_with_creation_fallback() -> None:
@@ -770,7 +824,15 @@ def test_cleanup_timeout_submits_when_remaining_pod_disappears() -> None:
         [pod(0, exit_code=1, expected_ranks=2), pod(1, expected_ranks=2)]
     )
     sink = FakeSink()
-    subject = controller(core, sink, clock, cleanup_timeout=30)
+    subject = KubernetesCompletionController(
+        core,
+        sink,
+        cluster_id="hp-cluster",
+        environment=Environment.HYPERPOD_EKS,
+        cleanup_timeout_seconds=30,
+        now=clock,
+        publish_observations=True,
+    )
 
     subject.run_once()
     core.pods = []
@@ -780,7 +842,13 @@ def test_cleanup_timeout_submits_when_remaining_pod_disappears() -> None:
     terminal = next(
         payload for path, payload in sink.posts if path == "/v1/attempts/terminal"
     )
+    observation = [
+        payload for path, payload in sink.posts if path == "/v1/workload-observations"
+    ][-1]
     assert terminal["terminal_status"] == "TIMED_OUT"
+    assert observation["workload_phase"] == "FAILED"
+    assert [item["rank"] for item in observation["containers"]] == [0]
+    assert observation["containers"][0]["terminated"] is True
 
 
 def test_missing_required_metadata_fails_closed() -> None:

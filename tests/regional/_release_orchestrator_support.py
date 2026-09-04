@@ -6,8 +6,15 @@ from pathlib import Path
 
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.models import RuntimeProfile
+from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_MODULE_PATH = ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
+RELEASE_MODULE = lazy_script_module(RELEASE_MODULE_PATH)
+RUNTIME_PROFILE_MODULE = lazy_script_module(
+    ROOT / "deploy/control-plane/regional/regional_runtime_profile.py"
+)
+DNS_MODULE = lazy_script_module(ROOT / "deploy/control-plane/regional/regional_dns.py")
 REGION = "us-east-1"
 CPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-fault-control-plane"
 GPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"

@@ -23,10 +23,10 @@ spec:
             /script/audit_collector_runtime_probe.py \
             /host/tmp/audit_collector_runtime_probe.py
           set +e
-          chroot /host /opt/gpu-fault/venv/bin/python \
+          chroot /host /opt/gpu-fault/current/venv/bin/python \
             /tmp/audit_collector_runtime_probe.py host-rdma
           status=$?
-          chroot /host /opt/gpu-fault/venv/bin/python -c \
+          chroot /host /opt/gpu-fault/current/venv/bin/python -c \
             'import os; os.unlink("/tmp/audit_collector_runtime_probe.py")'
           exit "${status}"
       volumeMounts:

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
+from threading import Event as ThreadEvent
 from typing import Any, Callable
 
-from contextlib import contextmanager
-from threading import Event as ThreadEvent
-
+from gpu_fault.attempt_observation_state import (
+    terminal_attempt_observation_state,
+)
+from gpu_fault.models import TerminalEvent
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -12,6 +16,60 @@ from gpu_fault.telemetry_models import (
     WorkloadObservationState,
 )
 from gpu_fault.training_models import TrainingProgressState
+
+
+@dataclass(frozen=True)
+class _ObservationScanSource:
+    """One of the two tables an attempt-observation read can come from.
+
+    ``hot_state_mode`` decides which: ``dedicated`` reads the purpose-built table,
+    ``legacy`` the generic object table, and ``dual`` both, merged. The two differ
+    only in the table name, the ``ORDER BY`` expression and a mandatory kind
+    predicate, so they share one query builder rather than two near-copies.
+    """
+
+    table: str
+    order_expression: str
+    cluster_expression: str
+    kind_clause: str | None = None
+
+    def query(
+        self,
+        cluster_id: str | None,
+        *,
+        limit: int | None,
+        newest_first: bool,
+    ) -> tuple[str, list[Any]]:
+        clauses = [] if self.kind_clause is None else [self.kind_clause]
+        parameters: list[Any] = []
+        if cluster_id is not None:
+            clauses.append(f"{self.cluster_expression}=%s")
+            parameters.append(cluster_id)
+        query = f"SELECT key, payload FROM {self.table}"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        direction = "DESC" if newest_first else "ASC"
+        query += f" ORDER BY {self.order_expression} {direction}, key"
+        if limit is not None:
+            # Pushed into SQL rather than sliced after the fetch: the whole point
+            # of the bound is that a week of rows is never decoded, and slicing in
+            # Python would decode them all first.
+            query += " LIMIT %s"
+            parameters.append(limit)
+        return query, parameters
+
+
+_DEDICATED_OBSERVATION_SCAN = _ObservationScanSource(
+    table="gpu_fault_attempt_observations",
+    order_expression="observed_at",
+    cluster_expression="cluster_id",
+)
+_LEGACY_OBSERVATION_SCAN = _ObservationScanSource(
+    table="gpu_fault_objects",
+    order_expression="payload->'observation'->>'observed_at'",
+    cluster_expression="payload->'observation'->>'cluster_id'",
+    kind_clause="kind='attempt_observation'",
+)
 
 
 class PostgresCollectorTelemetryMixin:
@@ -340,6 +398,16 @@ class PostgresCollectorTelemetryMixin:
     def _save_attempt_observation_now(self, observation) -> bool:
         storage_key = self._state_key((observation.cluster_id, observation.attempt_id))
         with self._state_transaction(f"attempt_observation/{storage_key}"):
+            event = self._get_optional(
+                "event",
+                (
+                    f"{observation.cluster_id}/{observation.attempt_id}/"
+                    "TrainingAttemptTerminal"
+                ),
+            )
+            if event is not None:
+                self._terminalize_attempt_observation(event)
+                return False
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """
@@ -398,6 +466,118 @@ class PostgresCollectorTelemetryMixin:
                 )
             return True
 
+    def _terminalize_attempt_observation(self, event: TerminalEvent) -> bool:
+        storage_key = self._state_key((event.cluster_id, event.attempt_id))
+        previous = None
+        if self.hot_state_mode != "legacy":
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT payload
+                    FROM gpu_fault_attempt_observations
+                    WHERE key=%s
+                    """,
+                    (storage_key,),
+                )
+                row = cursor.fetchone()
+            if row is not None:
+                previous = self._decode("attempt_observation", row[0])
+        if previous is None and self.hot_state_mode in {"legacy", "dual"}:
+            previous = self._get_optional("attempt_observation", storage_key)
+        terminal = terminal_attempt_observation_state(event, previous)
+        if terminal == previous:
+            return False
+        if self.hot_state_mode != "legacy":
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO gpu_fault_attempt_observations(
+                        key, cluster_id, attempt_id,
+                        observed_at, payload
+                    )
+                    VALUES (%s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT(key) DO UPDATE SET
+                        cluster_id=excluded.cluster_id,
+                        attempt_id=excluded.attempt_id,
+                        observed_at=excluded.observed_at,
+                        payload=excluded.payload
+                    """,
+                    (
+                        storage_key,
+                        event.cluster_id,
+                        event.attempt_id,
+                        terminal.observation.observed_at,
+                        terminal.model_dump_json(),
+                    ),
+                )
+        if self.hot_state_mode in {"legacy", "dual"}:
+            self._put("attempt_observation", storage_key, terminal)
+        return True
+
+    def _reconcile_terminal_attempt_observations(self, limit: int) -> int:
+        if self.hot_state_mode == "legacy":
+            joins = """
+                LEFT JOIN gpu_fault_objects AS legacy
+                  ON legacy.kind='attempt_observation'
+                 AND legacy.payload->'observation'->>'cluster_id'=
+                     event.payload->>'cluster_id'
+                 AND legacy.payload->'observation'->>'attempt_id'=
+                     event.payload->>'attempt_id'
+            """
+            inconsistent = """
+                legacy.key IS NULL
+                OR legacy.payload->'observation'->>'workload_phase'
+                   IN ('PENDING', 'RUNNING')
+            """
+        elif self.hot_state_mode == "dedicated":
+            joins = """
+                LEFT JOIN gpu_fault_attempt_observations AS dedicated
+                  ON dedicated.cluster_id=event.payload->>'cluster_id'
+                 AND dedicated.attempt_id=event.payload->>'attempt_id'
+            """
+            inconsistent = """
+                dedicated.key IS NULL
+                OR dedicated.payload->'observation'->>'workload_phase'
+                   IN ('PENDING', 'RUNNING')
+            """
+        else:
+            joins = """
+                LEFT JOIN gpu_fault_objects AS legacy
+                  ON legacy.kind='attempt_observation'
+                 AND legacy.payload->'observation'->>'cluster_id'=
+                     event.payload->>'cluster_id'
+                 AND legacy.payload->'observation'->>'attempt_id'=
+                     event.payload->>'attempt_id'
+                LEFT JOIN gpu_fault_attempt_observations AS dedicated
+                  ON dedicated.cluster_id=event.payload->>'cluster_id'
+                 AND dedicated.attempt_id=event.payload->>'attempt_id'
+            """
+            inconsistent = """
+                legacy.key IS NULL
+                OR legacy.payload->'observation'->>'workload_phase'
+                   IN ('PENDING', 'RUNNING')
+                OR dedicated.key IS NULL
+                OR dedicated.payload->'observation'->>'workload_phase'
+                   IN ('PENDING', 'RUNNING')
+            """
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT event.payload
+                FROM gpu_fault_objects AS event
+                {joins}
+                WHERE event.kind='event'
+                  AND ({inconsistent})
+                ORDER BY event.payload->>'ended_at', event.key
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            events = [self._decode("event", row[0]) for row in cursor.fetchall()]
+        return sum(
+            int(self._terminalize_attempt_observation(event)) for event in events
+        )
+
     def _save_attempt_observations_batch(self, observations) -> list[bool]:
         if not observations:
             return []
@@ -417,6 +597,46 @@ class PostgresCollectorTelemetryMixin:
         keys = list(selected_by_key)
         values = [selected_by_key[key] for key in keys]
         with self._db.transaction():
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT pg_advisory_xact_lock(
+                        hashtextextended(
+                            'attempt_observation/' || value,
+                            0
+                        )
+                    )
+                    FROM (
+                        SELECT value
+                        FROM unnest(%s::text[]) AS value
+                        ORDER BY value
+                    ) AS ordered
+                    """,
+                    (sorted(keys),),
+                )
+                cursor.execute(
+                    """
+                    SELECT payload
+                    FROM gpu_fault_objects
+                    WHERE kind='event'
+                      AND key=ANY(%s::text[])
+                    ORDER BY key
+                    """,
+                    (
+                        [
+                            (
+                                f"{item.cluster_id}/{item.attempt_id}/"
+                                "TrainingAttemptTerminal"
+                            )
+                            for item in values
+                        ],
+                    ),
+                )
+                terminal_events = [
+                    self._decode("event", row[0]) for row in cursor.fetchall()
+                ]
+            for event in terminal_events:
+                self._terminalize_attempt_observation(event)
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """
@@ -447,6 +667,16 @@ class PostgresCollectorTelemetryMixin:
                                 observation::jsonb
                             )
                         FROM input
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM gpu_fault_objects AS terminal
+                            WHERE terminal.kind='event'
+                              AND terminal.key=(
+                                  input.cluster_id || '/' ||
+                                  input.attempt_id ||
+                                  '/TrainingAttemptTerminal'
+                              )
+                        )
                         ON CONFLICT(key) DO UPDATE SET
                             cluster_id=excluded.cluster_id,
                             attempt_id=excluded.attempt_id,
@@ -482,76 +712,83 @@ class PostgresCollectorTelemetryMixin:
             return self._save_attempt_observations_batch(observations)
         return super().save_attempt_observations_batch(observations)
 
-    def list_attempt_observation_states(self, cluster_id: str | None = None):
+    def list_attempt_observation_states(
+        self,
+        cluster_id: str | None = None,
+        *,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ):
         if self.hot_state_mode == "legacy":
-            return super().list_attempt_observation_states(cluster_id)
-        clauses = []
-        parameters = []
-        if cluster_id is not None:
-            clauses.append("cluster_id=%s")
-            parameters.append(cluster_id)
-        query = "SELECT key, payload FROM gpu_fault_attempt_observations"
-        if clauses:
-            query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY observed_at, key"
-        with self._db.cursor() as cursor:
-            cursor.execute(query, parameters)
-            rows = cursor.fetchall()
-        by_key = {
-            key: self._decode("attempt_observation", payload) for key, payload in rows
-        }
+            return super().list_attempt_observation_states(
+                cluster_id,
+                limit=limit,
+                newest_first=newest_first,
+            )
+        by_key = self._scan_attempt_observations(
+            _DEDICATED_OBSERVATION_SCAN,
+            cluster_id,
+            limit=limit,
+            newest_first=newest_first,
+        )
         if self.hot_state_mode == "dual":
-            legacy_clauses = ["kind='attempt_observation'"]
-            legacy_parameters = []
-            if cluster_id is not None:
-                legacy_clauses.append("payload->'observation'->>'cluster_id'=%s")
-                legacy_parameters.append(cluster_id)
-            with self._db.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT key, payload
-                    FROM gpu_fault_objects
-                    WHERE """
-                    + " AND ".join(legacy_clauses),
-                    legacy_parameters,
-                )
-                legacy_rows = cursor.fetchall()
-            legacy = {
-                key: self._decode("attempt_observation", payload)
-                for key, payload in legacy_rows
-            }
+            # Taking the newest ``limit`` from each source and then the newest
+            # ``limit`` of the merge is exactly the newest ``limit`` of the union,
+            # because any row in the union's top slice is also in its own source's
+            # top slice. The dedicated table wins on key collisions.
+            legacy = self._scan_attempt_observations(
+                _LEGACY_OBSERVATION_SCAN,
+                cluster_id,
+                limit=limit,
+                newest_first=newest_first,
+            )
             legacy.update(by_key)
             by_key = legacy
-        return sorted(
+        ordered = sorted(
             by_key.values(),
             key=lambda item: (
                 item.observation.observed_at,
                 item.observation.attempt_id,
             ),
+            reverse=newest_first,
         )
+        return ordered if limit is None else ordered[:limit]
 
-    def _legacy_list_attempt_observation_states(self, cluster_id: str | None = None):
-        clauses = ["kind='attempt_observation'"]
-        parameters = []
-        if cluster_id is not None:
-            clauses.append("payload->'observation'->>'cluster_id'=%s")
-            parameters.append(cluster_id)
+    def _scan_attempt_observations(
+        self,
+        source: _ObservationScanSource,
+        cluster_id: str | None,
+        *,
+        limit: int | None,
+        newest_first: bool,
+    ) -> dict[str, Any]:
+        query, parameters = source.query(
+            cluster_id,
+            limit=limit,
+            newest_first=newest_first,
+        )
         with self._db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT payload
-                FROM gpu_fault_objects
-                WHERE """
-                + " AND ".join(clauses)
-                + """
-                ORDER BY
-                    payload->'observation'->>'observed_at',
-                    key
-                """,
-                parameters,
-            )
+            cursor.execute(query, parameters)
             rows = cursor.fetchall()
-        return [self._decode("attempt_observation", row[0]) for row in rows]
+        return {
+            key: self._decode("attempt_observation", payload) for key, payload in rows
+        }
+
+    def _legacy_list_attempt_observation_states(
+        self,
+        cluster_id: str | None = None,
+        *,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ):
+        return list(
+            self._scan_attempt_observations(
+                _LEGACY_OBSERVATION_SCAN,
+                cluster_id,
+                limit=limit,
+                newest_first=newest_first,
+            ).values()
+        )
 
     def observe_telemetry_metrics(self, items) -> list[bool]:
         if not items:

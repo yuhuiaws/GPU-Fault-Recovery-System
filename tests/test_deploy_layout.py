@@ -115,7 +115,7 @@ def test_layout_gate_rejects_python_cache_artifacts(tmp_path: Path) -> None:
 def test_lazy_path_module_does_not_write_python_cache(tmp_path: Path) -> None:
     script = tmp_path / "tool.py"
     script.write_text("VALUE = 7\n", encoding="utf-8")
-    module = lazy_script_module("cache_free_test_tool", script)
+    module = lazy_script_module(script)
 
     assert module.VALUE == 7
     assert not (tmp_path / "__pycache__").exists(), (

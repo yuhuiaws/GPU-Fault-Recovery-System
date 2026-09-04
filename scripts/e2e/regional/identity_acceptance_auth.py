@@ -4,16 +4,17 @@ import base64
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import ssl
 import sys
 import threading
 import time
-from typing import Any, cast
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, cast
 
 from scripts.e2e.regional.host_probe_fixture import (
     HostProbeFixture,
@@ -338,7 +339,7 @@ def direct_claim(
     identity: dict[str, Any],
 ) -> int | str:
     payload = {
-        "executor_id": "auth012-rotation-probe",
+        "executor_id": "token-rotation-probe",
         "executor_protocol_version": 2,
         "executor_artifact_sha256": identity["artifact"],
         "executor_compatibility_digest": identity["compatibility"],
@@ -370,28 +371,54 @@ def update_registry_token(
     entries: list[dict[str, Any]],
     cluster_id: str,
     token: str,
+    *,
+    retiring_token: str | None = None,
+    rotation_expires_at: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Return the registry with one cluster's token, and rotation slot, replaced.
+
+    Both plaintext fields are handed to the control plane, which stores only the
+    digests; the driver never writes a token into evidence.
+    """
+
     result = [dict(item) for item in entries]
     for item in result:
-        if item.get("cluster_id") == cluster_id:
-            item["token"] = token
-            item.pop("token_sha256", None)
-            return result
+        if item.get("cluster_id") != cluster_id:
+            continue
+        item["token"] = token
+        item.pop("token_sha256", None)
+        item.pop("retiring_token", None)
+        item.pop("retiring_token_sha256", None)
+        item.pop("token_rotation_expires_at", None)
+        if retiring_token is not None:
+            item["retiring_token"] = retiring_token
+            item["token_rotation_expires_at"] = rotation_expires_at
+        return result
     raise IdentityAcceptanceError("target cluster is absent from registry")
 
 
-def run_auth012(
+def run_auth016(
     site: IdentitySite,
     target: ClusterTarget,
 ) -> dict[str, Any]:
+    """Prove the overlap window rotates a cluster token without any 403.
+
+    The old token stays valid until an explicit deadline, so the control plane
+    can accept the new credential before the data plane presents it. What has to
+    be proven is both halves of that: no rejection while both slots are live,
+    and an immediate rejection once the retiring slot is dropped.
+    """
+
     original_registry = site.registry()
     old_token = read_cluster_token(site, target)
     new_token = secrets.token_urlsafe(48)
     identity = executor_claim_identity(site, target)
     primary = site.regional(target)
     before_commands = primary.cpu_python(REMOTE_STATUS_PROBE)
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=30)
     token_lock = threading.Lock()
     token_box = [old_token]
+    phase_box = ["baseline"]
     stop = threading.Event()
     samples: list[dict[str, Any]] = []
 
@@ -399,22 +426,55 @@ def run_auth012(
         while not stop.is_set():
             with token_lock:
                 token = token_box[0]
+                phase = phase_box[0]
             samples.append(
                 {
                     "observed_at": utc_now(),
-                    "monotonic": time.monotonic(),
+                    "phase": phase,
                     "status": direct_claim(target, token=token, identity=identity),
                 }
             )
             stop.wait(2)
 
+    def enter(phase: str, *, token: str | None = None) -> None:
+        with token_lock:
+            phase_box[0] = phase
+            if token is not None:
+                token_box[0] = token
+
     thread = threading.Thread(target=sampler, daemon=True)
     restored = False
     control_rollout = None
     executor_rollout = None
+    new_token_during_overlap: int | str | None = None
+    old_token_after_completion: int | str | None = None
     try:
         thread.start()
         time.sleep(60)
+        # Control plane first: both slots live, data plane untouched.
+        site.write_registry(
+            update_registry_token(
+                original_registry,
+                target.cluster_id,
+                new_token,
+                retiring_token=old_token,
+                rotation_expires_at=deadline.isoformat().replace("+00:00", "Z"),
+            )
+        )
+        control_rollout = site.rollout_control()
+        enter("overlap")
+        time.sleep(30)
+        new_token_during_overlap = direct_claim(
+            target,
+            token=new_token,
+            identity=identity,
+        )
+        write_cluster_token(site, target, new_token)
+        executor_rollout = rollout_executor(site, target)
+        enter("cutover", token=new_token)
+        time.sleep(30)
+        # Finishing the rotation must withdraw the old credential at once
+        # instead of leaving it live until the deadline lapses.
         site.write_registry(
             update_registry_token(
                 original_registry,
@@ -422,13 +482,14 @@ def run_auth012(
                 new_token,
             )
         )
-        control_rollout = site.rollout_control()
+        site.rollout_control()
+        enter("completed")
+        old_token_after_completion = direct_claim(
+            target,
+            token=old_token,
+            identity=identity,
+        )
         time.sleep(10)
-        write_cluster_token(site, target, new_token)
-        with token_lock:
-            token_box[0] = new_token
-        executor_rollout = rollout_executor(site, target)
-        time.sleep(60)
     finally:
         stop.set()
         thread.join(timeout=15)
@@ -439,28 +500,14 @@ def run_auth012(
         restored = site.registry() == original_registry and secret_digest(
             read_cluster_token(site, target)
         ) == secret_digest(old_token)
-    statuses = [item["status"] for item in samples]
-    first_403 = next(
-        (index for index, item in enumerate(samples) if item["status"] == 403),
-        None,
-    )
-    recovered_index = (
-        next(
-            (
-                index
-                for index, item in enumerate(samples[first_403 + 1 :], first_403 + 1)
-                if item["status"] == 200
-            ),
-            None,
-        )
-        if first_403 is not None
-        else None
-    )
-    failure_seconds = (
-        samples[recovered_index]["monotonic"] - samples[first_403]["monotonic"]
-        if first_403 is not None and recovered_index is not None
-        else None
-    )
+    by_phase: dict[str, list[int | str]] = {}
+    for item in samples:
+        by_phase.setdefault(str(item["phase"]), []).append(item["status"])
+    uninterrupted = [
+        phase
+        for phase in ("baseline", "overlap", "cutover")
+        if by_phase.get(phase) and set(by_phase[phase]) == {200}
+    ]
     after_commands = primary.cpu_python(REMOTE_STATUS_PROBE)
     before_status = {
         item["command_id"]: item["status"] for item in before_commands["commands"]
@@ -473,31 +520,38 @@ def run_auth012(
         for command_id in before_status
     )
     checks = {
-        "baseline_contains_200": 200 in statuses[:30],
-        "failure_window_observed": first_403 is not None,
-        "recovered_with_new_token": recovered_index is not None,
+        "baseline_only_200": "baseline" in uninterrupted,
+        "overlap_only_200": "overlap" in uninterrupted,
+        "cutover_only_200": "cutover" in uninterrupted,
+        "new_token_accepted_during_overlap": new_token_during_overlap == 200,
+        "old_token_rejected_after_completion": old_token_after_completion == 403,
         "remote_commands_not_misterminated": commands_stable,
         "original_credentials_restored": restored,
     }
-    public_samples = [
-        {
-            "observed_at": item["observed_at"],
-            "status": item["status"],
-        }
-        for item in samples
-    ]
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
-        "failure_window_seconds": failure_seconds,
+        "statuses_by_phase": {
+            phase: sorted({str(value) for value in statuses})
+            for phase, statuses in sorted(by_phase.items())
+        },
+        "rotation_window_seconds": 1800,
         "control_rollout_seconds": control_rollout,
         "executor_rollout_seconds": executor_rollout,
-        "samples": public_samples,
+        "samples": [
+            {
+                "observed_at": item["observed_at"],
+                "phase": item["phase"],
+                "status": item["status"],
+            }
+            for item in samples
+        ],
         "old_token_sha256": secret_digest(old_token),
         "new_token_sha256": secret_digest(new_token),
         "limitations": [
-            "The current single-token registry necessarily produces a non-zero "
-            "authentication failure window; both original Secrets are restored."
+            "The retiring token stays valid for the whole overlap window, so this "
+            "case proves there is no interruption, not that the old credential is "
+            "revoked instantly; both original Secrets are restored."
         ],
     }
 

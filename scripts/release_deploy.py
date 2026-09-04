@@ -14,11 +14,13 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from gpu_fault.admin_bootstrap_common import (
+from gpu_fault.admin.atomic_json import write_json_atomic
+from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
     compute_agent_config_digest,
 )
-from gpu_fault.admin_profile_approval import (
+from gpu_fault.admin.operation_lock import inherited_lock_pass_fds
+from gpu_fault.admin.profile_approval import (
     ProfileApprovalError,
     StaleProfileApprovalError,
     clear_profile_plan,
@@ -30,18 +32,37 @@ from gpu_fault.admin_profile_approval import (
     supersede_profile_approval,
     write_profile_plan,
 )
-from gpu_fault.admin_site import (
+from gpu_fault.admin.site import (
     effective_environment,
     load_site,
     materialized_release_config,
 )
 from gpu_fault.capabilities import compile_runtime_profile
+from gpu_fault.digests import SHA256_PATTERN
 from gpu_fault.models import CapabilityMode, RuntimeProfile
 
 if __package__:
     from scripts.release_attestation import verify_attestation
+    from scripts.release_failure_recovery import (
+        recover_release_failure,
+    )
+    from scripts.release_live_state import (
+        ReleaseStateNotFound as LiveReleaseStateNotFound,
+    )
+    from scripts.release_live_state import (
+        ReleaseStateReadError as LiveReleaseStateReadError,
+    )
+    from scripts.release_live_state import (
+        read_live_release_state as _read_live_release_state,
+    )
 else:
     from release_attestation import verify_attestation
+    from release_failure_recovery import (
+        recover_release_failure,
+    )
+    from release_live_state import ReleaseStateNotFound as LiveReleaseStateNotFound
+    from release_live_state import ReleaseStateReadError as LiveReleaseStateReadError
+    from release_live_state import read_live_release_state as _read_live_release_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,11 +71,15 @@ VERIFICATION_REPORT = "verification-report.json"
 STABILITY_REPORT = "stability-report.json"
 RELEASE_SUMMARY_REPORT = "release-summary.json"
 EXPECTED_STATE_SHA256_ENV = "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256"
-SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
 RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class ReleaseDeployError(RuntimeError):
+    pass
+
+
+class ReleaseStateNotFound(ReleaseDeployError):
     pass
 
 
@@ -296,36 +321,12 @@ def read_live_release_state(
     *,
     runner=subprocess.run,
 ) -> dict[str, Any]:
-    site = load_site(site_file)
-    command = [
-        "kubectl",
-        "--kubeconfig",
-        str(site.release_config["cpu_kubeconfig"]),
-        "-n",
-        str(site.release_config["namespace"]),
-        "get",
-        "configmap",
-        "gpu-fault-regional-release-state",
-        "-o",
-        "json",
-    ]
-    completed = runner(
-        command,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode:
-        raise ReleaseDeployError(
-            completed.stderr.strip() or "cannot read gpu-fault-regional-release-state"
-        )
     try:
-        config_map = json.loads(completed.stdout)
-        raw = config_map["data"]["state.json"]
-        value = json.loads(raw)
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise ReleaseDeployError("regional release state is invalid") from exc
-    return _mapping(value, "regional release state")
+        return _read_live_release_state(site_file, runner=runner)
+    except LiveReleaseStateNotFound as exc:
+        raise ReleaseStateNotFound(str(exc)) from exc
+    except LiveReleaseStateReadError as exc:
+        raise ReleaseDeployError(str(exc)) from exc
 
 
 def plan_runtime_profile(
@@ -464,18 +465,6 @@ def _profile_plan_payload(plan: ProfilePlan) -> dict[str, Any]:
     }
     payload["plan_sha256"] = profile_plan_sha256(payload)
     return payload
-
-
-def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    temporary.chmod(0o600)
-    temporary.replace(path)
 
 
 def _write_yaml_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -637,8 +626,8 @@ def prepare_site_release(
             "approval_relation": profile_plan.approval_relation,
         },
     }
-    _write_json_atomic(state_dir / "plan.json", plan)
-    _write_json_atomic(
+    write_json_atomic(state_dir / "plan.json", plan)
+    write_json_atomic(
         state_dir / "state.json",
         {
             **plan,
@@ -666,6 +655,7 @@ def _run(
         cwd=cwd,
         env=dict(environment),
         check=False,
+        pass_fds=inherited_lock_pass_fds(),
     )
     if completed.returncode:
         raise ReleaseDeployError(
@@ -685,6 +675,7 @@ def _run_json(
         stdout=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        pass_fds=inherited_lock_pass_fds(),
     )
     output = completed.stdout or ""
     if output:
@@ -871,6 +862,8 @@ def _is_clean_noop_diff(report: dict[str, Any]) -> bool:
         report.get("mode") == "release-diff"
         and isinstance(next_deploy, dict)
         and next_deploy.get("kind") == "NOOP"
+        and next_deploy.get("action", "upgrade") == "upgrade"
+        and next_deploy.get("resume", False) is False
         and isinstance(changed, list)
         and set(changed).issubset({"release_delivery", "rendered_manifests"})
         and isinstance(report.get("state_sha256"), str)
@@ -882,7 +875,7 @@ def _update_phase(prepared: PreparedRelease, phase: str, **values: Any) -> None:
     state_path = prepared.state_dir / "state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state.update({"phase": phase, **values})
-    _write_json_atomic(state_path, state)
+    write_json_atomic(state_path, state)
 
 
 def _complete_release(
@@ -906,7 +899,7 @@ def _complete_release(
             )
             summary_generated_at = _utc_now()
         summary_path = prepared.state_dir / RELEASE_SUMMARY_REPORT
-        _write_json_atomic(summary_path, summary_report)
+        write_json_atomic(summary_path, summary_report)
         completion_warnings.extend(_release_summary_warnings(summary_report))
         release_summary = {
             "status": (
@@ -1091,6 +1084,45 @@ def _deployment_decision(
     )
 
 
+def _finalize_quick_validation_evidence(
+    path: Path,
+    *,
+    prepared: PreparedRelease,
+    site_file: Path,
+    root: Path,
+    environment: Mapping[str, str],
+) -> Path | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != 1
+            or value.get("release_id") != prepared.release_id
+        ):
+            raise ValueError("quick validation evidence identity is invalid")
+        diff = _collect_release_diff(
+            site_file,
+            root=root,
+            environment=environment,
+        )
+        if not _is_clean_noop_diff(diff):
+            raise ValueError("post-deploy release state is not NOOP")
+        value["release_state_sha256"] = diff["state_sha256"]
+        value["finalized_at"] = _utc_now()
+        write_json_atomic(path, value)
+        path.chmod(0o600)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(
+            "release-deploy: quick validation evidence was not reusable; "
+            f"full verification will run: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    return path
+
+
 def _execute_release_locked(
     site_file: Path,
     *,
@@ -1107,9 +1139,16 @@ def _execute_release_locked(
         **os.environ,
         "PYTHONPATH": str(root / "src"),
     }
-    current_state = (
-        live_state if live_state is not None else read_live_release_state(site_file)
+    automatic_rollback = bool(
+        load_site(site_file, repository_root=root).release_config["auto_rollback"]
     )
+    if live_state is not None:
+        current_state = live_state
+    else:
+        try:
+            current_state = read_live_release_state(site_file)
+        except ReleaseStateNotFound:
+            current_state = {}
     profile_plan = plan_runtime_profile(
         site_file,
         live_profile_sha256=str(current_state.get("runtime_profile_sha256") or "")
@@ -1128,11 +1167,12 @@ def _execute_release_locked(
         profile_plan=profile_plan,
     )
     deployment_succeeded = False
+    commit_started = False
     try:
         deploy_command = [
             sys.executable,
             "-m",
-            "gpu_fault.admin_cli",
+            "gpu_fault.admin.cli",
             "deploy",
             "-f",
             str(site_file),
@@ -1147,11 +1187,14 @@ def _execute_release_locked(
         )
 
         if not deployment["fast_path"]:
+            quick_evidence_path = prepared.state_dir / "quick-validation.json"
+            quick_evidence_path.unlink(missing_ok=True)
             _run(
                 deploy_command,
                 cwd=root,
                 environment={
                     **environment,
+                    QUICK_VALIDATION_EVIDENCE_ENV: str(quick_evidence_path),
                     **(
                         {EXPECTED_STATE_SHA256_ENV: expected_state_sha256}
                         if expected_state_sha256 is not None
@@ -1160,22 +1203,38 @@ def _execute_release_locked(
                 },
             )
             deployment_succeeded = True
+            reusable_quick_evidence = _finalize_quick_validation_evidence(
+                quick_evidence_path,
+                prepared=prepared,
+                site_file=site_file,
+                root=root,
+                environment=environment,
+            )
+        else:
+            reusable_quick_evidence = None
         _update_phase(prepared, "DEPLOYED", deployment=deployment)
         verification_report = _run_json(
             [
                 sys.executable,
                 "-m",
-                "gpu_fault.admin_cli",
+                "gpu_fault.admin.cli",
                 "verify",
                 "-f",
                 str(site_file),
             ],
             cwd=root,
-            environment=environment,
+            environment={
+                **environment,
+                **(
+                    {QUICK_VALIDATION_EVIDENCE_ENV: str(reusable_quick_evidence)}
+                    if reusable_quick_evidence is not None
+                    else {}
+                ),
+            },
         )
         _validate_verification_report(verification_report)
         verification_path = prepared.state_dir / VERIFICATION_REPORT
-        _write_json_atomic(verification_path, verification_report)
+        write_json_atomic(verification_path, verification_report)
         verification = _verification_metadata(
             verification_path,
             verification_report,
@@ -1194,7 +1253,7 @@ def _execute_release_locked(
             )
             _validate_stability_report(stability_report)
             stability_path = prepared.state_dir / STABILITY_REPORT
-            _write_json_atomic(stability_path, stability_report)
+            write_json_atomic(stability_path, stability_report)
             stability = _verification_metadata(
                 stability_path,
                 stability_report,
@@ -1205,6 +1264,7 @@ def _execute_release_locked(
                 verification=verification,
                 stability=stability,
             )
+        commit_started = True
         _run_release_mode(
             site_file,
             mode="commit",
@@ -1223,26 +1283,27 @@ def _execute_release_locked(
             summary_generated_at=summary_generated_at,
         )
     except Exception as exc:
-        rollback: dict[str, Any] | None = None
-        if deployment_succeeded:
-            try:
-                _run_release_mode(
-                    site_file,
-                    mode="rollback",
-                    root=root,
-                    environment=environment,
-                )
-            except Exception as rollback_exc:
-                rollback = {
-                    "status": "FAILED",
-                    "error": (f"{type(rollback_exc).__name__}: {rollback_exc}"),
-                }
-            else:
-                rollback = {"status": "PASSED"}
+        failure_error = f"{type(exc).__name__}: {exc}"
+        failed_at = _utc_now()
+        rollback = recover_release_failure(
+            prepared,
+            site_file=site_file,
+            root=root,
+            environment=environment,
+            failure_error=failure_error,
+            failed_at=failed_at,
+            deployment_succeeded=deployment_succeeded,
+            commit_started=commit_started,
+            automatic_rollback=automatic_rollback,
+            run_release_mode=_run_release_mode,
+            read_live_state=read_live_release_state,
+            update_phase=_update_phase,
+        )
         _update_phase(
             prepared,
             "FAILED",
-            error=f"{type(exc).__name__}: {exc}",
+            error=failure_error,
+            failed_at=failed_at,
             rollback=rollback,
         )
         if rollback is not None and rollback["status"] == "FAILED":

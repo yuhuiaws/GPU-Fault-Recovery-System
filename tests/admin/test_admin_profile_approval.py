@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from gpu_fault import admin_profile_approval
+from gpu_fault.admin import profile_approval as admin_profile_approval
 
 
 def _plan(**updates: object) -> dict[str, object]:

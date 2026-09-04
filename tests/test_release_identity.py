@@ -62,6 +62,9 @@ def identity_root(tmp_path: Path) -> Path:
         "component_inputs": {
             "collector": ["manifests/gpu.yaml"],
             "cpu": ["manifests/cpu.yaml"],
+            "cpu_ingress": ["manifests/cpu.yaml"],
+            "cpu_spool": ["manifests/cpu.yaml"],
+            "cpu_worker": ["manifests/cpu.yaml"],
             "dcgm": ["manifests/gpu.yaml"],
             "endpoint": ["manifests/cpu.yaml"],
             "executor": ["manifests/gpu.yaml"],
@@ -160,6 +163,18 @@ def test_application_release_identity_excludes_deploy_host_inputs() -> None:
     assert "scripts/staging_deploy.py" not in patterns
     assert "scripts/deploy_host_component.py" not in patterns
     assert "src/**/*.py" not in config["runtime_image_inputs"]
+    assert (
+        "deploy/control-plane/regional/regional_release_*.py"
+        not in config["renderer_inputs"]
+    )
+    assert (
+        "deploy/control-plane/regional/regional_release_validation.py"
+        not in config["renderer_inputs"]
+    )
+    assert (
+        "deploy/control-plane/regional/rollout_regional_release.py"
+        not in config["renderer_inputs"]
+    )
 
 
 def test_release_identity_includes_file_modes(tmp_path: Path) -> None:

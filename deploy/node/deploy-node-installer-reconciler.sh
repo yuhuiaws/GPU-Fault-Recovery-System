@@ -20,6 +20,8 @@ ACTIVE_DEADLINE_SECONDS="$(
     printf '%s' "${GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS:-840}"
 )"
 ALLOWED_NODES="${GPU_FAULT_INSTALLER_ALLOWED_NODES-*}"
+SYNC_REGISTRY="${GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY:-true}"
+WAIT_FOR_ROLLOUT="${GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT:-true}"
 INSTALLER_CONFIG_MAP="$(
     printf '%s' \
         "${GPU_FAULT_INSTALLER_CONFIG_MAP:-gpu-fault-node-installer-0100}"
@@ -35,8 +37,10 @@ NODE_ACTION_KEYS_SECRET="$(
 DEFAULT_RUNTIME_IMAGE="public.ecr.aws/docker/library/python:3.12-slim"
 RUNTIME_IMAGE="${GPU_FAULT_RUNTIME_IMAGE:-${DEFAULT_RUNTIME_IMAGE}}"
 NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-}"
+PREFLIGHT_ONLY="${GPU_FAULT_RECONCILER_PREFLIGHT_ONLY:-false}"
+REQUIRE_ROLLBACK_SLOT="${GPU_FAULT_REQUIRE_ROLLBACK_SLOT:-false}"
 
-for command in kubectl sed; do
+for command in awk kubectl python3 sed sha256sum; do
     command -v "${command}" >/dev/null || {
         printf 'ERROR: %s is required\n' "${command}" >&2
         exit 1
@@ -87,6 +91,23 @@ done
     printf 'ERROR: invalid GPU_FAULT_INSTALLER_ALLOWED_NODES\n' >&2
     exit 2
 }
+[[ "${SYNC_REGISTRY}" == "true" || "${SYNC_REGISTRY}" == "false" ]] || {
+    printf 'ERROR: invalid GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY\n' >&2
+    exit 2
+}
+[[ "${WAIT_FOR_ROLLOUT}" == "true" || "${WAIT_FOR_ROLLOUT}" == "false" ]] || {
+    printf 'ERROR: GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT must be true or false\n' >&2
+    exit 2
+}
+[[ "${PREFLIGHT_ONLY}" == "true" || "${PREFLIGHT_ONLY}" == "false" ]] || {
+    printf 'ERROR: GPU_FAULT_RECONCILER_PREFLIGHT_ONLY must be true or false\n' >&2
+    exit 2
+}
+[[ "${REQUIRE_ROLLBACK_SLOT}" == "true" ||
+    "${REQUIRE_ROLLBACK_SLOT}" == "false" ]] || {
+    printf 'ERROR: GPU_FAULT_REQUIRE_ROLLBACK_SLOT must be true or false\n' >&2
+    exit 2
+}
 [[ "${NODE_COMPATIBILITY_DIGEST}" =~ ^[0-9a-f]{64}$ ]] || {
     printf 'ERROR: invalid GPU_FAULT_NODE_COMPATIBILITY_DIGEST\n' >&2
     exit 2
@@ -111,7 +132,18 @@ kubectl_context -n "${NAMESPACE}" get configmap \
     "${WHEEL_CONFIG_MAP}" >/dev/null
 kubectl_context -n "${NAMESPACE}" get secret \
     gpu-fault-regional-connection >/dev/null
-if [[ -n "${FLEET_MASTER_FILE}" ]]; then
+mapfile -t NODES < <(
+    kubectl_context get nodes \
+        -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER}" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+)
+(( ${#NODES[@]} > 0 )) || {
+    printf 'ERROR: no HyperPod node found for %s\n' \
+        "${HYPERPOD_CLUSTER}" >&2
+    exit 1
+}
+
+if [[ -n "${FLEET_MASTER_FILE}" && "${PREFLIGHT_ONLY}" != "true" ]]; then
     GPU_FAULT_KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
     GPU_FAULT_NAMESPACE="${NAMESPACE}" \
     GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
@@ -128,24 +160,115 @@ else
     }
 fi
 
-NODE="$(
-    kubectl_context get nodes \
-        -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER}" \
-        -o jsonpath='{.items[0].metadata.name}'
-)"
-[[ -n "${NODE}" ]] || {
-    printf 'ERROR: no Ready HyperPod node found for %s\n' \
-        "${HYPERPOD_CLUSTER}" >&2
-    exit 1
-}
-MANIFEST="$(mktemp)"
-trap 'rm -f "${MANIFEST}"' EXIT
+kubectl_context -n "${NAMESPACE}" get secret \
+    "${NODE_ACTION_KEYS_SECRET}" -o json |
+    python3 -c '
+import base64
+import json
+import sys
 
-if [[ -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
-    TEMPLATE_CONFIG_MAP="${TEMPLATE_CONFIG_MAP_OVERRIDE}"
-    kubectl_context -n "${NAMESPACE}" get configmap \
-        "${TEMPLATE_CONFIG_MAP}" >/dev/null
-else
+document = json.load(sys.stdin)
+data = document.get("data") or {}
+keys = set(data.keys())
+missing = sorted(set(sys.argv[1:]) - keys)
+if missing:
+    raise SystemExit(
+        "node action key Secret is missing node-scoped keys: " + ", ".join(missing)
+    )
+invalid = []
+for node in sys.argv[1:]:
+    try:
+        value = base64.b64decode(data[node], validate=True)
+    except (ValueError, TypeError):
+        invalid.append(node)
+        continue
+    if len(value) < 32:
+        invalid.append(node)
+if invalid:
+    raise SystemExit(
+        "node action key Secret has invalid node-scoped keys: "
+        + ", ".join(sorted(invalid))
+    )
+' "${NODES[@]}"
+
+kubectl_context -n "${NAMESPACE}" get configmap \
+    "${INSTALLER_CONFIG_MAP}" -o json |
+    python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+keys = set((document.get("data") or {})) | set(document.get("binaryData") or {})
+if sys.argv[1] not in keys:
+    raise SystemExit("installer ConfigMap is missing the candidate bundle")
+' "gpu-fault-node-installer-${VERSION}.tar.gz"
+kubectl_context -n "${NAMESPACE}" get configmap \
+    "${WHEEL_CONFIG_MAP}" -o json |
+    python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+keys = set((document.get("data") or {})) | set(document.get("binaryData") or {})
+if sys.argv[1] not in keys:
+    raise SystemExit("wheel ConfigMap is missing the candidate Executor wheel")
+' "${EXECUTOR_WHEEL_FILENAME}"
+kubectl_context -n "${NAMESPACE}" get secret \
+    gpu-fault-regional-connection -o json |
+    python3 -c '
+import base64
+import json
+import sys
+
+required = {"ca.crt", "cluster-id", "cluster-token", "control-plane-url"}
+data = json.load(sys.stdin).get("data") or {}
+keys = set(data.keys())
+missing = sorted(required - keys)
+if missing:
+    raise SystemExit(
+        "regional connection Secret is missing keys: " + ", ".join(missing)
+    )
+decoded = {
+    key: base64.b64decode(data[key], validate=True).decode()
+    for key in required
+}
+if decoded["cluster-id"] != sys.argv[1]:
+    raise SystemExit("regional connection Secret cluster binding is invalid")
+if not decoded["control-plane-url"].startswith("https://"):
+    raise SystemExit("regional connection Secret endpoint must use HTTPS")
+if not decoded["cluster-token"] or not decoded["ca.crt"]:
+    raise SystemExit("regional connection Secret contains an empty credential")
+' "${CLUSTER_ID}"
+
+if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
+    kubectl_context -n "${NAMESPACE}" get jobs -o json |
+        python3 -c '
+import json
+import sys
+
+active = []
+for item in json.load(sys.stdin).get("items", []):
+    name = str((item.get("metadata") or {}).get("name") or "")
+    if not name.startswith("gpu-fault-install-"):
+        continue
+    status = item.get("status") or {}
+    if int(status.get("active") or 0):
+        active.append(name)
+if active:
+    raise SystemExit("active node installer Jobs exist: " + ", ".join(sorted(active)))
+'
+fi
+
+NODE="${NODES[0]}"
+MANIFEST="$(mktemp)"
+CONFIG_MAP_MANIFEST="$(mktemp)"
+RECONCILER_MANIFEST="$(mktemp)"
+JOB_MANIFEST="$(mktemp)"
+trap 'rm -f "${MANIFEST}" "${CONFIG_MAP_MANIFEST}" "${RECONCILER_MANIFEST}" "${JOB_MANIFEST}"' EXIT
+
+render_installer_job() {
+    local node="$1"
+    shift
     GPU_FAULT_KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
     GPU_FAULT_NAMESPACE="${NAMESPACE}" \
     GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
@@ -163,16 +286,30 @@ else
     GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS="${ACTIVE_DEADLINE_SECONDS}" \
     GPU_FAULT_NODE_COMPATIBILITY_DIGEST="${NODE_COMPATIBILITY_DIGEST}" \
     GPU_FAULT_DCGM_METRICS_URL="${DCGM_METRICS_URL}" \
+    GPU_FAULT_REQUIRE_ROLLBACK_SLOT="${REQUIRE_ROLLBACK_SLOT}" \
         "${SCRIPT_DIR}/run-hyperpod-installer-job.sh" \
-        --node "${NODE}" --render-only >"${MANIFEST}"
+        --node "${node}" "$@"
+}
+
+if [[ -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
+    TEMPLATE_CONFIG_MAP="${TEMPLATE_CONFIG_MAP_OVERRIDE}"
+    kubectl_context -n "${NAMESPACE}" get configmap \
+        "${TEMPLATE_CONFIG_MAP}" >/dev/null
+else
+    render_installer_job "${NODE}" --render-only >"${MANIFEST}"
     TEMPLATE_SHA256="$(sha256sum "${MANIFEST}" | awk '{print $1}')"
     TEMPLATE_CONFIG_MAP="gpu-fault-node-installer-template-${TEMPLATE_SHA256:0:12}"
 
     kubectl_context -n "${NAMESPACE}" create configmap \
         "${TEMPLATE_CONFIG_MAP}" \
         --from-file="job.yaml=${MANIFEST}" \
-        --dry-run=client -o yaml |
-        kubectl_context apply -f -
+        --dry-run=client -o yaml >"${CONFIG_MAP_MANIFEST}"
+    if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
+        kubectl_context apply --dry-run=server \
+            -f "${CONFIG_MAP_MANIFEST}" >/dev/null
+    else
+        kubectl_context apply -f "${CONFIG_MAP_MANIFEST}"
+    fi
 fi
 
 sed \
@@ -186,20 +323,47 @@ sed \
     -e "s#REPLACE_WITH_INSTALLER_MAX_UNAVAILABLE#${MAX_UNAVAILABLE}#g" \
     -e "s#REPLACE_WITH_INSTALLER_ACTIVE_DEADLINE_SECONDS#${ACTIVE_DEADLINE_SECONDS}#g" \
     -e "s#REPLACE_WITH_INSTALLER_ALLOWED_NODES#${ALLOWED_NODES}#g" \
+    -e "s#REPLACE_WITH_INSTALLER_WAVE_GENERATION#${ARTIFACT_SHA256:0:12}-${MAX_UNAVAILABLE}#g" \
     -e "s#REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP#${TEMPLATE_CONFIG_MAP}#g" \
     -e "s#REPLACE_WITH_DCGM_METRICS_URL#${DCGM_METRICS_URL}#g" \
     -e "s#gpu-fault-executor-wheel-0100#${WHEEL_CONFIG_MAP}#g" \
     -e "s#gpu_fault_cluster_executor-0.10.0-py3-none-any.whl#${EXECUTOR_WHEEL_FILENAME}#g" \
     -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
-    "${REPO_DIR}/deploy/dataplane/node-installer-reconciler.yaml" |
-    kubectl_context apply -f -
+    "${REPO_DIR}/deploy/dataplane/node-installer-reconciler.yaml" \
+    >"${RECONCILER_MANIFEST}"
 
-kubectl_context -n "${NAMESPACE}" rollout status \
-    deployment/gpu-fault-node-installer-reconciler --timeout=10m
+if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
+    kubectl_context apply --dry-run=server \
+        -f "${RECONCILER_MANIFEST}" >/dev/null
+    for node in "${NODES[@]}"; do
+        render_installer_job "${node}" --render-only >"${JOB_MANIFEST}"
+        kubectl_context apply --dry-run=server \
+            -f "${JOB_MANIFEST}" >/dev/null
+        render_installer_job "${node}" --preflight-only --render-only \
+            >"${JOB_MANIFEST}"
+        kubectl_context apply --dry-run=server \
+            -f "${JOB_MANIFEST}" >/dev/null
+    done
+    for node in "${NODES[@]}"; do
+        render_installer_job "${node}" --preflight-only
+    done
+    printf '{"node_count":%d,"status":"PASSED","template_config_map":"%s"}\n' \
+        "${#NODES[@]}" "${TEMPLATE_CONFIG_MAP}"
+    exit 0
+fi
 
-python3 \
-    "${REPO_DIR}/deploy/control-plane/tools/sync_installed_resource_registry.py" \
-    --plane gpu \
-    --context "${KUBECTL_CONTEXT}" \
-    --namespace "${NAMESPACE}" \
-    --release-id "${ARTIFACT_SHA256:0:12}"
+kubectl_context apply -f "${RECONCILER_MANIFEST}"
+
+if [[ "${WAIT_FOR_ROLLOUT}" == "true" ]]; then
+    kubectl_context -n "${NAMESPACE}" rollout status \
+        deployment/gpu-fault-node-installer-reconciler --timeout=10m
+fi
+
+if [[ "${SYNC_REGISTRY}" == "true" ]]; then
+    python3 \
+        "${REPO_DIR}/deploy/control-plane/tools/sync_installed_resource_registry.py" \
+        --plane gpu \
+        --context "${KUBECTL_CONTEXT}" \
+        --namespace "${NAMESPACE}" \
+        --release-id "${ARTIFACT_SHA256:0:12}"
+fi

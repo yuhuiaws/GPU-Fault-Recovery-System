@@ -6,8 +6,8 @@ from datetime import datetime
 from threading import RLock
 from typing import Any, Protocol
 
+from gpu_fault.processor.completion_signals import ProcessorCompletionSignals
 from gpu_fault.processor.models import ProcessorRequest
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -104,6 +104,9 @@ class ProcessorLaneRuntimeMixin:
         self.retry_backoff_max_seconds = retry_backoff_max_seconds
 
     def _initialize_lane_runtime_state(self) -> None:
+        # Not declared in the contract block above: the host supplies the state
+        # listed there, while this registry is created and owned here.
+        self.completion_signals = ProcessorCompletionSignals()
         self._claimed_not_started: dict[str, ProcessorRequest] = {}
         self._claimed_not_started_released_total = 0
         self._lane_holder_by_path: dict[str, dict[str, float | int]] = {}
@@ -184,17 +187,22 @@ class ProcessorLaneRuntimeMixin:
         with self._state_lock:
             self._claimed_not_started.pop(request_id, None)
             state = self._in_flight.pop(request_id, None)
-            if state is None:
-                return
-            path = self._metric_path(state.item.path)
-            values = self._lane_holder_by_path.setdefault(
-                path,
-                {"count": 0, "sum": 0.0, "max": 0.0},
-            )
-            duration = max(0.0, observed - state.started)
-            values["count"] += 1
-            values["sum"] += duration
-            values["max"] = max(float(values["max"]), duration)
+            if state is not None:
+                path = self._metric_path(state.item.path)
+                values = self._lane_holder_by_path.setdefault(
+                    path,
+                    {"count": 0, "sum": 0.0, "max": 0.0},
+                )
+                duration = max(0.0, observed - state.started)
+                values["count"] += 1
+                values["sum"] += duration
+                values["max"] = max(float(values["max"]), duration)
+        # Every caller of this is the ``finally`` of a path that has already
+        # committed the request's outcome to the store, so a caller woken here
+        # reads the response rather than another "not yet". Signalled outside the
+        # state lock, and unconditionally: the request is equally finished in this
+        # process whether or not it was ever counted as in flight.
+        self.completion_signals.signal(request_id)
 
     def _observe_retry_schedule(self, path: str, delay_seconds: float) -> None:
         path = self._metric_path(path)

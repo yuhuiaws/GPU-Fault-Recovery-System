@@ -30,14 +30,12 @@ manifest_inputs:
   - deploy/observability/amp-rules.yaml
 renderer_inputs:
   - deploy/image/Dockerfile
-  - deploy/control-plane/regional/regional_release_*.py
   - deploy/control-plane/tools/apply-control-plane-role-split.sh
   - deploy/control-plane/tools/render-control-plane-role-split.sh
   - deploy/control-plane/tools/render_control_plane_role_split.py
   - deploy/control-plane/regional/regional_dns.py
   - deploy/control-plane/regional/regional_gpu_bootstrap.py
   - deploy/control-plane/regional/regional_release_rendering.py
-  - deploy/control-plane/regional/rollout_regional_release.py
   - deploy/node/deploy-node-installer-reconciler.sh
   - scripts/build-release-artifacts.py
   - scripts/component_wheels.py
@@ -71,6 +69,12 @@ component_inputs:
     - deploy/control-plane/tools/apply-control-plane-role-split.sh
     - deploy/control-plane/tools/render-control-plane-role-split.sh
     - deploy/control-plane/tools/render_control_plane_role_split.py
+  cpu_ingress:
+    - deploy/control-plane/regional/generated/gpu-fault-api-ha-*.yaml
+  cpu_worker:
+    - deploy/control-plane/regional/generated/gpu-fault-control-worker*.yaml
+  cpu_spool:
+    - deploy/control-plane/regional/generated/gpu-fault-telemetry-spool-worker*.yaml
   dcgm:
     - deploy/dataplane/dcgm-counters.csv
     - deploy/dataplane/hyperpod-dcgm-exporter.yaml

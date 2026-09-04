@@ -920,10 +920,16 @@ def test_destr009_cleanup_waits_for_late_remote_command_quiescence(
     tmp_path: Path,
 ) -> None:
     snapshots = [
-        {"event": {"event_id": "event-a"}, "workflow": None, "commands": []},
+        {
+            "event": {"event_id": "event-a"},
+            "workflow": None,
+            "commands": [],
+            "observations": [{"workload_phase": "RUNNING"}],
+        },
         {
             "event": {"event_id": "event-a"},
             "workflow": {"request_id": "workflow-a", "status": "RUNNING"},
+            "observations": [{"workload_phase": "RUNNING"}],
             "commands": [
                 {
                     "step": {"operation": "RESTART_WORKLOAD"},
@@ -935,6 +941,7 @@ def test_destr009_cleanup_waits_for_late_remote_command_quiescence(
         {
             "event": {"event_id": "event-a"},
             "workflow": {"request_id": "workflow-a", "status": "SUCCEEDED"},
+            "observations": [{"workload_phase": "FAILED"}],
             "commands": [
                 {
                     "step": {"operation": "RESTART_WORKLOAD"},
@@ -975,6 +982,36 @@ def test_destr009_cleanup_waits_for_late_remote_command_quiescence(
     assert "sensitive-lease-token" not in json.dumps(persisted, sort_keys=True)
     assert persisted["entries"][1]["commands"][0]["status"] == "PENDING"
     assert persisted["entries"][-1]["commands"][0]["status"] == "SUCCEEDED"
+    assert persisted["entries"][-1]["observation_terminal"] is True
+
+
+def test_destr009_cleanup_rejects_active_observation_after_terminal_workflow(
+    tmp_path: Path,
+) -> None:
+    class Regional:
+        def store_snapshot(self, **_kwargs):
+            return {
+                "event": {"event_id": "event-a"},
+                "workflow": {"request_id": "workflow-a", "status": "SUCCEEDED"},
+                "observations": [{"workload_phase": "RUNNING"}],
+                "commands": [
+                    {"step": {"operation": "RESTART_WORKLOAD"}, "status": "SUCCEEDED"}
+                ],
+            }
+
+    with pytest.raises(destr009.RegionalFixtureError, match="cleanup could not prove"):
+        destr009.wait_for_cleanup_quiescence(
+            regional=Regional(),
+            node="node-a",
+            marker="marker-a",
+            observed_after=datetime.now(timezone.utc),
+            job_id="job-a",
+            attempt_id="attempt-a",
+            case_dir=tmp_path,
+            timeout_seconds=0,
+            quiet_seconds=0,
+            poll_seconds=0,
+        )
 
 
 def test_destr009_cleanup_waits_before_deleting_workload(
@@ -1316,3 +1353,71 @@ def test_destr013_manifest_audit_keeps_provider_replace_disabled() -> None:
 
     assert result["violations"] == [], result
     assert result["observed_replace_settings"], result
+
+
+def test_a_signal_abort_is_not_swallowed_by_the_probe_retry_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ^C during a destructive case has to land on the first retry.
+
+    ``pod_python`` retries three times on a bare ``except Exception``, and the
+    wait loops retry for their whole timeout. When the signal handler raised a
+    ``RegionalFixtureError`` -- a ``RuntimeError`` -- those loops caught the
+    abort and kept going, so the operator's interrupt did nothing until the
+    timeout expired. That is why this abort derives from ``BaseException``.
+    """
+
+    regional = _regional(tmp_path)
+    attempts: list[int] = []
+
+    def interrupted(*_args: Any, **_kwargs: Any) -> str:
+        attempts.append(1)
+        live_fixture_module.abort_on_signal(2, None)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(regional, "ready_pod", lambda *_a, **_k: "pod-a")
+    monkeypatch.setattr(regional, "kubectl", interrupted)
+
+    with pytest.raises(live_fixture_module.RegionalFixtureAbort) as raised:
+        regional.pod_python("cpu", "gpu-fault-api-ha", "print()")
+
+    assert attempts == [1], (
+        f"the abort was retried {len(attempts)} times instead of propagating"
+    )
+    assert raised.value.signum == 2
+    assert not isinstance(raised.value, Exception), (
+        "an abort that is an Exception is catchable by the loops it must escape"
+    )
+
+
+def test_run_case_main_reports_an_abort_distinctly_from_a_fail_verdict() -> None:
+    """Exit 1 already means ``verdict: FAIL``, so an abort needs its own code."""
+
+    def aborted() -> int:
+        live_fixture_module.abort_on_signal(15, None)
+        raise AssertionError("unreachable")
+
+    assert live_fixture_module.run_case_main(aborted) == 143
+    assert live_fixture_module.run_case_main(lambda: 1) == 1
+    assert live_fixture_module.run_case_main(lambda: 0) == 0
+
+
+def test_every_regional_runner_installs_the_shared_abort_handler() -> None:
+    """The handler was copy-pasted into 19 runners; one copy is enough.
+
+    A runner that keeps a local ``abort_on_signal`` re-introduces the
+    swallowed-abort defect silently, so the absence is asserted rather than
+    left to review.
+    """
+
+    offenders = []
+    for path in sorted(REGIONAL.glob("run_*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "install_abort_signals" not in source:
+            continue
+        if "def abort_on_signal" in source:
+            offenders.append(f"{path.name}: keeps a local abort_on_signal")
+        if "raise SystemExit(main())" in source:
+            offenders.append(f"{path.name}: entry point bypasses run_case_main")
+
+    assert offenders == [], offenders

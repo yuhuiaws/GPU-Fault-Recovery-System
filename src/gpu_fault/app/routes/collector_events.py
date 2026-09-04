@@ -492,6 +492,9 @@ async def ingest_node_logs(
                 else []
             ),
         )
+        # The errors are handed over so this batch does not count as a success:
+        # a node whose journal read failed produced no entries, and recording it
+        # as a success is what would make a broken collector look healthy.
         dependencies.record_collector_status(
             CollectorKind.NODE_LOGS,
             enriched.cluster_id,
@@ -499,8 +502,11 @@ async def ingest_node_logs(
             enriched.collected_at,
             enriched.batch_id,
             len(enriched.entries),
+            enriched.collection_errors,
         )
-        if enriched.entries:
+        # An error-only batch has no entries and is still the only record that
+        # the node's log collection is broken, so it is kept as evidence too.
+        if enriched.entries or enriched.collection_errors:
             dependencies.capture_evidence(
                 record_id=f"node-logs/{enriched.batch_id}",
                 cluster_id=enriched.cluster_id,

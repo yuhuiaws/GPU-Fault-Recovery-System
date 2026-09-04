@@ -9,7 +9,7 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = lazy_script_module(
-    "cleanup_state", ROOT / "deploy" / "control-plane" / "tools" / "cleanup_state.py"
+    ROOT / "deploy" / "control-plane" / "tools" / "cleanup_state.py"
 )
 
 

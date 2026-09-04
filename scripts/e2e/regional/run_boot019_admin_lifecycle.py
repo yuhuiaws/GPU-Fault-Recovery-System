@@ -7,10 +7,10 @@ import json
 import ssl
 import subprocess
 import sys
-from pathlib import Path
-from typing import Any, Protocol
 import urllib.error
 import urllib.request
+from pathlib import Path
+from typing import Any, Protocol
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -18,18 +18,17 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from gpu_fault import admin_cluster_join  # noqa: E402
-from gpu_fault.admin_cluster_join import JoinClusterRequest, join_cluster  # noqa: E402
-from gpu_fault.admin_cluster_removal import (  # noqa: E402
+from gpu_fault.admin import cluster_join as admin_cluster_join  # noqa: E402
+from gpu_fault.admin.cluster_join import JoinClusterRequest, join_cluster  # noqa: E402
+from gpu_fault.admin.cluster_removal import (  # noqa: E402
     RemoveClusterRequest,
     remove_cluster,
 )
-from gpu_fault.admin_resource_registry import (  # noqa: E402
+from gpu_fault.admin.resource_registry import (  # noqa: E402
     fetch_installation_resource_registry,
 )
-from gpu_fault.admin_site import RenderedSite, load_site  # noqa: E402
-from gpu_fault.admin_uninstall import UninstallRequest, uninstall  # noqa: E402
-
+from gpu_fault.admin.site import RenderedSite, load_site  # noqa: E402
+from gpu_fault.admin.uninstall import UninstallRequest, uninstall  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder  # noqa: E402
 
 CASE_ID = "GF-REGIONAL-BOOT-019"

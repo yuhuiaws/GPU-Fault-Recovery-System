@@ -4,13 +4,11 @@ import base64
 import hashlib
 import ipaddress
 import json
-import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from regional_release_config import ClusterTarget, ReleaseError
-
 
 REGISTRY_SECRET = "gpu-fault-regional-clusters"
 REGISTRY_CURRENT_KEY = "clusters.json"
@@ -42,19 +40,14 @@ def registry_config_digest(clusters: tuple[ClusterTarget, ...]) -> str:
 def registry_payloads(
     release: Any,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
-    exists = (
-        subprocess.run(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "secret",
-                REGISTRY_SECRET,
-            ),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+    exists = release.runner.probe(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "secret",
+            REGISTRY_SECRET,
+        ),
     )
     if not exists:
         return [], None
@@ -67,6 +60,12 @@ def registry_payloads(
             REGISTRY_SECRET,
         )
     )
+    return _registry_payloads_from_secret(value)
+
+
+def _registry_payloads_from_secret(
+    value: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
     data = value.get("data") or {}
 
     def decode(key: str) -> list[dict[str, Any]] | None:
@@ -182,6 +181,24 @@ def write_registry(
         raise ReleaseError("regional cluster registry write did not persist")
 
 
+def initialize_registry(
+    release: Any,
+    *,
+    load: Callable[
+        [Any],
+        tuple[list[dict[str, Any]], list[dict[str, Any]] | None],
+    ] = registry_payloads,
+    desired: Callable[[Any], list[dict[str, Any]]] = desired_registry,
+    write: Callable[..., None] = write_registry,
+) -> None:
+    current, backup = load(release)
+    if backup is not None:
+        raise ReleaseError("regional cluster registry has an unfinished release backup")
+    target = desired(release)
+    if current != target:
+        write(release, target)
+
+
 def stage_registry(release: Any) -> bool:
     current, backup = registry_payloads(release)
     desired = desired_registry(release)
@@ -215,11 +232,80 @@ def update_registry(
     *,
     remove: bool,
 ) -> None:
-    registrations, backup = registry_payloads(release)
-    if backup is not None:
-        raise ReleaseError("regional cluster registry has an unfinished release backup")
-    remaining = [
-        item for item in registrations if item.get("cluster_id") != target.cluster_id
-    ]
-    desired = remaining if remove else [*remaining, registry_entry(target)]
-    write_registry(release, desired)
+    for attempt in range(8):
+        secret = release._get_json(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "get",
+                "secret",
+                REGISTRY_SECRET,
+            )
+        )
+        registrations, backup = _registry_payloads_from_secret(secret)
+        if backup is not None:
+            raise ReleaseError(
+                "regional cluster registry has an unfinished release backup"
+            )
+        remaining = [
+            item
+            for item in registrations
+            if item.get("cluster_id") != target.cluster_id
+        ]
+        desired = (
+            remaining
+            if remove
+            else sorted(
+                [*remaining, registry_entry(target)],
+                key=lambda item: str(item["cluster_id"]),
+            )
+        )
+        if registrations == desired:
+            return
+        metadata = secret.get("metadata") or {}
+        resource_version = str(metadata.get("resourceVersion") or "")
+        if not resource_version:
+            raise ReleaseError(
+                "regional cluster registry Secret has no resourceVersion"
+            )
+        data = secret.get("data") or {}
+        operation = "replace" if REGISTRY_CURRENT_KEY in data else "add"
+        patch = [
+            {
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": resource_version,
+            },
+            {
+                "op": operation,
+                "path": f"/data/{REGISTRY_CURRENT_KEY}",
+                "value": base64.b64encode(
+                    json.dumps(
+                        desired,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).decode(),
+            },
+        ]
+        try:
+            release.runner.run(
+                release._cpu(
+                    "-n",
+                    release.config.namespace,
+                    "patch",
+                    "secret",
+                    REGISTRY_SECRET,
+                    "--type=json",
+                    "-p",
+                    json.dumps(patch, separators=(",", ":")),
+                ),
+                sensitive=True,
+            )
+        except ReleaseError as exc:
+            if attempt == 7:
+                raise ReleaseError(
+                    "regional cluster registry changed repeatedly during update"
+                ) from exc
+            continue
+        return

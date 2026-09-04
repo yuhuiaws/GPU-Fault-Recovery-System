@@ -30,7 +30,8 @@ REQUESTED_CASES = {
     *(f"GF-REGIONAL-BOOT-{number:03d}" for number in range(11, 19)),
     "GF-REGIONAL-AUTH-007",
     "GF-REGIONAL-AUTH-010",
-    *(f"GF-REGIONAL-AUTH-{number:03d}" for number in range(12, 16)),
+    # AUTH-012 is SUPERSEDED by AUTH-016 and has no driver.
+    *(f"GF-REGIONAL-AUTH-{number:03d}" for number in range(13, 17)),
     "GF-REGIONAL-WORKLOAD-001",
     "GF-REGIONAL-WORKLOAD-002",
     "GF-REGIONAL-ISO-001",
@@ -66,7 +67,9 @@ def test_requested_cases_have_complete_reusable_entries() -> None:
 def test_reusable_entries_follow_the_formal_predecessor_chain() -> None:
     assert formal_predecessor("GF-REGIONAL-BOOT-011") is None
     assert formal_predecessor("GF-REGIONAL-AUTH-007") == "GF-REGIONAL-AUTH-006"
-    assert formal_predecessor("GF-REGIONAL-WORKLOAD-001") == "GF-REGIONAL-AUTH-015"
+    # AUTH-012 is skipped in the execution order, so AUTH-013 follows AUTH-011.
+    assert formal_predecessor("GF-REGIONAL-AUTH-013") == "GF-REGIONAL-AUTH-011"
+    assert formal_predecessor("GF-REGIONAL-WORKLOAD-001") == "GF-REGIONAL-AUTH-016"
     assert formal_predecessor("GF-REGIONAL-ISO-001") == ("GF-REGIONAL-WORKLOAD-002")
     assert formal_predecessor("GF-REGIONAL-PREEMPT-012") == ("GF-REGIONAL-PREEMPT-011")
     assert formal_predecessor("GF-REGIONAL-E2E-001") == ("GF-REGIONAL-PREEMPT-031")

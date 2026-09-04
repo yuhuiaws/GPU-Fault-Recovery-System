@@ -5,14 +5,15 @@ import hashlib
 import json
 import subprocess
 import tomllib
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import yaml
 
-from gpu_fault import admin_cli
-from gpu_fault.admin_bootstrap_common import BootstrapResult
-from gpu_fault.admin_config import (
+from gpu_fault.admin import cli as admin_cli
+from gpu_fault.admin.bootstrap_common import BootstrapResult
+from gpu_fault.admin.config import (
     AdminConfigError,
     admin_config_plan_path,
     create_admin_config_plan,
@@ -20,11 +21,11 @@ from gpu_fault.admin_config import (
     prepare_admin_config_apply,
     preset_admin_config,
 )
-from gpu_fault.admin_config_file import (
+from gpu_fault.admin.config_file import (
     admin_config_file_path,
     initialize_desired_admin_config,
 )
-from gpu_fault.admin_site import (
+from gpu_fault.admin.site import (
     RegionalSite,
     SiteConfigError,
     effective_environment,
@@ -36,8 +37,7 @@ from tests._script_loader import lazy_script_module
 REGION = "us-east-1"
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_CONFIG = lazy_script_module(
-    "admin_site_release_config",
-    ROOT / "deploy/control-plane/regional/regional_release_config.py",
+    ROOT / "deploy/control-plane/regional/regional_release_config.py"
 )
 
 
@@ -199,6 +199,9 @@ def test_site_yaml_renders_the_existing_release_contract(tmp_path: Path) -> None
     assert rendered.release_config["nlb"]["public_subnets"] == "subnet-a,subnet-b"
     assert rendered.release_config["health"]["amp_workspace_id"] == "ws-test"
     assert rendered.release_config["clusters"][0]["region"] == REGION
+    assert rendered.release_config["release"]["upgrade_max_unavailable"] == 1
+    assert rendered.release_config["release"]["rollback_max_unavailable"] == 2
+    assert rendered.release_config["release"]["upgrade_max_parallel_clusters"] == 1
     assert rendered.environment["GPU_FAULT_RUNTIME_IMAGE"].startswith(
         "registry.example/runtime"
     )
@@ -219,6 +222,14 @@ def test_runtime_profile_template_defaults_to_active_source(tmp_path: Path) -> N
     )
     profile = RegionalSite.from_value(document).spec.runtime_profile
     assert profile.template_source == "config/profile-template.yaml"
+
+
+def test_site_release_rollout_limits_are_bounded(tmp_path: Path) -> None:
+    document = yaml.safe_load(site_file(tmp_path).read_text(encoding="utf-8"))
+    document["spec"]["release"]["rollbackMaxUnavailable"] = 5
+
+    with pytest.raises(SiteConfigError, match="rollbackMaxUnavailable"):
+        RegionalSite.from_value(document)
 
 
 def test_site_email_notification_contract(tmp_path: Path) -> None:
@@ -295,7 +306,39 @@ def test_admin_cli_exposes_arn_only_cluster_join(tmp_path, monkeypatch) -> None:
         "join-cluster did not preserve the requested GPU ARN"
     )
     assert calls[0].cluster_id is None
-    assert calls[0].allowed_namespaces == ()
+    assert calls[0].allowed_namespaces == ("gpu-fault-system", "training")
+    assert calls[0].state_dir is None
+
+
+def test_admin_cli_exposes_bounded_batch_cluster_join(tmp_path, monkeypatch) -> None:
+    site_file(tmp_path)
+    batches = []
+    monkeypatch.setattr(
+        admin_cli,
+        "join_clusters",
+        lambda requests: batches.append(requests)
+        or {"phase": "COMPLETED", "joined": []},
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "join-cluster",
+            "--state-dir",
+            str(tmp_path),
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu-c",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert [request.gpu_cluster_arn for request in batches[0]] == [
+        "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
+        "arn:aws:eks:us-east-1:123456789012:cluster/gpu-c",
+    ]
+    assert all(request.state_dir is None for request in batches[0]), (
+        "public batch join leaked the site root as a transaction state directory"
+    )
 
 
 def test_generated_release_json_loads_through_the_existing_state_machine(
@@ -401,6 +444,8 @@ def test_admin_read_only_commands_map_to_regional_modes(
         return subprocess.CompletedProcess(arguments, 0)
 
     monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
+    if command == "status":
+        monkeypatch.setattr(admin_cli, "_live_release_state", lambda _site: {})
     monkeypatch.setattr(
         admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
     )
@@ -416,13 +461,52 @@ def test_admin_read_only_commands_map_to_regional_modes(
     assert [call[1] for call in calls] == [command]
 
 
+def test_status_uses_previous_management_baseline_after_verified_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = site_file(tmp_path)
+    used = []
+
+    monkeypatch.setattr(
+        admin_cli,
+        "_live_release_state",
+        lambda _site: {
+            "phase": "rolled-back",
+            "rollback_result": {"status": "PASSED"},
+            "previous": {"release_delivery_sha256": "a" * 64},
+        },
+    )
+
+    @contextmanager
+    def materialized(site, state, **_kwargs):
+        used.append((site, state["phase"]))
+        yield path
+
+    monkeypatch.setattr(admin_cli, "materialized_rollback_status_site", materialized)
+    monkeypatch.setattr(
+        admin_cli.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(arguments, 0),
+    )
+    arguments = argparse.Namespace(
+        command="status",
+        file=None,
+        state_dir=tmp_path,
+        repo_root=None,
+        show_effective_config=False,
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert used == [(path, "rolled-back")]
+
+
 def test_console_script_is_published() -> None:
     project = tomllib.loads(
         (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text()
     )
 
     assert project["project"]["scripts"]["gpu-fault-admin"] == (
-        "gpu_fault.admin_cli:main"
+        "gpu_fault.admin.cli:main"
     )
 
 
@@ -542,13 +626,18 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
     path = site_file(tmp_path)
     calls: list[tuple[list[str], dict]] = []
     requests = []
+    joined = []
     monkeypatch.setattr(
         admin_cli,
         "bootstrap_from_arns",
         lambda request: (
             requests.append(request)
             or BootstrapResult(
-                site_file=path, state_file=request.state_dir / "bootstrap-state.json"
+                site_file=path,
+                state_file=request.state_dir / "bootstrap-state.json",
+                pending_gpu_cluster_arns=(
+                    "arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-b",
+                ),
             )
         ),
     )
@@ -565,6 +654,12 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
         admin_cli,
         "sync_installation_resource_registry",
         lambda _site: tmp_path / "installation-resources.json",
+    )
+    monkeypatch.setattr(
+        admin_cli,
+        "join_clusters",
+        lambda requests: joined.extend(request.gpu_cluster_arn for request in requests)
+        or {},
     )
     arguments = argparse.Namespace(
         command="deploy",
@@ -601,6 +696,7 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
     )
     assert requests[0].staging_only_release is True
     assert requests[0].impact_base == "origin/release"
+    assert joined == ["arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-b"]
 
 
 def test_public_arn_deploy_delegates_to_internal_source_preparation(

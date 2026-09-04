@@ -37,4 +37,6 @@ from ._regional_control_plane_cases_2 import (
     test_regional_registry_persists_notification_over_api,
     test_regional_registry_satisfies_the_notification_sink_protocol,
     test_remote_hyperpod_submission_endpoints_enforce_cluster_binding,
+    test_the_data_plane_can_read_its_own_fleet_rollout_fence,
+    test_the_fleet_rollout_fence_route_is_cluster_scoped,
 )

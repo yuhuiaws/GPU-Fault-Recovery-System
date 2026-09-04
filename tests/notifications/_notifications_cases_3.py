@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from gpu_fault.notification_service import AdvisoryNotificationService
 from gpu_fault.notifications import DisabledNotificationNotifier
 from tests._builders import build_store
-from tests.notifications._support import RecordingNotifier, _delivery_mode
+from tests.notifications._support import (
+    RecordingNotifier,
+    _aged_notification,
+    _delivery_mode,
+    _watermark_already_drawn,
+)
 
 
 def test_the_load_suites_label_every_synthetic_fault_as_a_drill() -> None:
@@ -22,6 +29,87 @@ def test_the_load_suites_label_every_synthetic_fault_as_a_drill() -> None:
     for kind in ("NVIDIA_KERNEL", "FABRIC_MANAGER_LOG"):
         payload = suite.stamp({}, kind, "cluster-a", "node-a", 1)
         assert HyperPodHmaNormalizer._drill_id(payload["message"]) == suite.DRILL_ID
+
+
+def test_the_bulk_resend_scan_is_bounded_and_says_when_it_truncated() -> None:
+    """The synchronous path used to read the whole notification history.
+
+    Nothing leaves that table, and nothing leaves the pending set either --
+    drills and expired advisories are both recorded SKIPPED, which is picked up
+    again -- so the read grew forever and carried one extra result lookup per
+    row.
+    """
+
+    store = build_store()
+    _watermark_already_drawn(store)
+    for index in range(4):
+        _aged_notification(
+            store, age=timedelta(seconds=40 - index), incident_id=f"incident-{index}"
+        )
+    service = AdvisoryNotificationService(
+        store, RecordingNotifier(), async_delivery=False, dispatch_scan_limit=2
+    )
+
+    report = service.dispatch_pending()
+
+    assert report.scan_truncated is True
+    # The newest two are the ones still deliverable, and they are attempted
+    # oldest-first within that window.
+    assert report.sent == 2
+    assert [item.incident_id for item in service.notifier.notifications] == [
+        "incident-2",
+        "incident-3",
+    ]
+
+
+def test_a_bulk_resend_within_budget_reports_no_truncation() -> None:
+    store = build_store()
+    _watermark_already_drawn(store)
+    _aged_notification(store, age=timedelta(seconds=30), incident_id="incident-live")
+    service = AdvisoryNotificationService(
+        store, RecordingNotifier(), async_delivery=False, dispatch_scan_limit=50
+    )
+
+    report = service.dispatch_pending()
+
+    assert report.scan_truncated is False
+    assert report.sent == 1
+
+
+def test_a_non_positive_dispatch_scan_budget_is_refused() -> None:
+    """Zero would read nothing and report an empty backlog as a healthy one."""
+
+    with pytest.raises(ValueError, match="dispatch scan limit"):
+        AdvisoryNotificationService(
+            build_store(),
+            RecordingNotifier(),
+            async_delivery=False,
+            dispatch_scan_limit=0,
+        )
+
+
+def test_an_unbounded_notification_read_is_unchanged() -> None:
+    """Only the dispatch path is bounded.
+
+    Every other caller reads the whole table oldest-first and must keep doing
+    so; the acceptance scripts count on it.
+    """
+
+    store = build_store()
+    for index in range(3):
+        _aged_notification(
+            store, age=timedelta(seconds=30 - index), incident_id=f"incident-{index}"
+        )
+
+    assert [item.incident_id for item in store.list_notifications()] == [
+        "incident-0",
+        "incident-1",
+        "incident-2",
+    ]
+    assert [
+        item.incident_id
+        for item in store.list_notifications(limit=2, newest_first=True)
+    ] == ["incident-2", "incident-1"]
 
 
 def test_a_negative_shelf_life_is_refused() -> None:

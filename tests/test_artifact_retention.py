@@ -7,7 +7,7 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts/prune_artifacts.py"
-MODULE = lazy_script_module("prune_artifacts", MODULE_PATH)
+MODULE = lazy_script_module(MODULE_PATH)
 
 
 def test_retention_policy_has_an_entry_point() -> None:

@@ -120,6 +120,19 @@ NODE_INFLIGHT_WAIT_TIMEOUT_SECONDS="2100"
 NODE_ACTION_RETENTION_SECONDS="604800"
 NODE_ACTION_MAX_RESULTS="10000"
 NODE_INSTANCE_ID=""
+RUNTIME_ROOT="/opt/gpu-fault"
+RUNTIME_RELEASES_DIR="${RUNTIME_ROOT}/releases"
+RUNTIME_CURRENT_LINK="${RUNTIME_ROOT}/current"
+LEGACY_VENV_PATH="${RUNTIME_ROOT}/venv"
+RUNTIME_ARTIFACT_MARKER="${RUNTIME_ROOT}/runtime-artifact-sha256"
+INSTALL_BACKUP=""
+RUNTIME_ACTIVATED="false"
+RUNTIME_SERVICES_STOPPED="false"
+COMPAT_VENV_CREATED="false"
+PREVIOUS_CURRENT_TARGET=""
+STATE_ROOT_CREATED="false"
+ACTIVE_GPU_FAULT_UNITS=()
+ENABLED_GPU_FAULT_UNITS=()
 
 usage() {
     printf '%s\n' \
@@ -215,6 +228,7 @@ usage() {
         "  --node-action-max-results N     Ledger row cap; default: 10000" \
         "  --node-instance-id ID           Stable VM or Kubernetes Node UID" \
         "  --no-start                      Install and enable without starting" \
+        "  --print-config-digest-environment  Print deterministic Agent digest inputs" \
         "  -h, --help"
 }
 
@@ -223,8 +237,184 @@ die() {
     exit 1
 }
 
+atomic_symlink() {
+    local target="$1"
+    local link="$2"
+    local temporary="${link}.next.$$"
+
+    rm -f "${temporary}"
+    ln -s "${target}" "${temporary}"
+    mv -Tf "${temporary}" "${link}"
+}
+
+begin_install_transaction() {
+    if [[ ! -d /var/lib/gpu-fault ]]; then
+        STATE_ROOT_CREATED="true"
+    fi
+    install -d -m 0755 /var/lib/gpu-fault
+    INSTALL_BACKUP="$(mktemp -d /var/lib/gpu-fault/.install-backup.XXXXXX)"
+    chmod 0700 "${INSTALL_BACKUP}"
+    install -d -m 0700 \
+        "${INSTALL_BACKUP}/systemd" \
+        "${INSTALL_BACKUP}/opt"
+    if [[ -d /etc/gpu-fault ]]; then
+        cp -a /etc/gpu-fault "${INSTALL_BACKUP}/etc-gpu-fault"
+        touch "${INSTALL_BACKUP}/had-etc-gpu-fault"
+    fi
+    shopt -s nullglob
+    local unit
+    for unit in /etc/systemd/system/gpu-fault-*.service \
+        /etc/systemd/system/gpu-fault-*.timer; do
+        cp -a "${unit}" "${INSTALL_BACKUP}/systemd/"
+    done
+    local path
+    for path in \
+        "${RUNTIME_ROOT}/verify" \
+        "${RUNTIME_ROOT}/verify-certificate-bundle" \
+        "${RUNTIME_ROOT}/check-control-plane-certificate" \
+        "${RUNTIME_ROOT}/uninstall" \
+        "${RUNTIME_ROOT}/installed-units.txt" \
+        "${RUNTIME_ARTIFACT_MARKER}"; do
+        if [[ -e "${path}" || -L "${path}" ]]; then
+            cp -a "${path}" "${INSTALL_BACKUP}/opt/"
+        fi
+    done
+    if [[ -e "${RUNTIME_CURRENT_LINK}" &&
+        ! -L "${RUNTIME_CURRENT_LINK}" ]]; then
+        die "${RUNTIME_CURRENT_LINK} must be an atomic symlink"
+    fi
+    if [[ -L "${RUNTIME_CURRENT_LINK}" ]]; then
+        PREVIOUS_CURRENT_TARGET="$(readlink -f "${RUNTIME_CURRENT_LINK}")"
+        [[ -d "${PREVIOUS_CURRENT_TARGET}/venv" ]] ||
+            die "current runtime slot is unavailable"
+    fi
+    trap finish_install_transaction EXIT
+}
+
+record_unit_state() {
+    shopt -s nullglob
+    local unit_path
+    local unit
+    for unit_path in /etc/systemd/system/gpu-fault-*.service \
+        /etc/systemd/system/gpu-fault-*.timer; do
+        unit="${unit_path##*/}"
+        if systemctl is-active --quiet "${unit}"; then
+            ACTIVE_GPU_FAULT_UNITS+=("${unit}")
+        fi
+        if systemctl is-enabled --quiet "${unit}"; then
+            ENABLED_GPU_FAULT_UNITS+=("${unit}")
+        fi
+    done
+}
+
+restore_install_files() {
+    if [[ -f "${INSTALL_BACKUP}/had-etc-gpu-fault" ]]; then
+        rm -rf /etc/gpu-fault
+        cp -a "${INSTALL_BACKUP}/etc-gpu-fault" /etc/gpu-fault
+    else
+        rm -rf /etc/gpu-fault
+    fi
+    rm -f /etc/systemd/system/gpu-fault-*.service \
+        /etc/systemd/system/gpu-fault-*.timer
+    shopt -s nullglob
+    local unit
+    for unit in "${INSTALL_BACKUP}/systemd/"*; do
+        cp -a "${unit}" /etc/systemd/system/
+    done
+    local name
+    for name in verify verify-certificate-bundle \
+        check-control-plane-certificate uninstall installed-units.txt \
+        runtime-artifact-sha256; do
+        rm -f "${RUNTIME_ROOT}/${name}"
+        if [[ -e "${INSTALL_BACKUP}/opt/${name}" ||
+            -L "${INSTALL_BACKUP}/opt/${name}" ]]; then
+            cp -a "${INSTALL_BACKUP}/opt/${name}" "${RUNTIME_ROOT}/${name}"
+        fi
+    done
+}
+
+restore_unit_state() {
+    shopt -s nullglob
+    local unit_path
+    local unit
+    for unit_path in /etc/systemd/system/gpu-fault-*.service \
+        /etc/systemd/system/gpu-fault-*.timer; do
+        unit="${unit_path##*/}"
+        systemctl disable "${unit}" >/dev/null 2>&1 || true
+    done
+    for unit in "${ENABLED_GPU_FAULT_UNITS[@]}"; do
+        systemctl enable "${unit}" >/dev/null 2>&1 || true
+    done
+    if [[ "${RUNTIME_SERVICES_STOPPED}" == "true" ]]; then
+        for unit in "${ACTIVE_GPU_FAULT_UNITS[@]}"; do
+            systemctl restart "${unit}" >/dev/null 2>&1 || true
+        done
+    fi
+}
+
+finish_install_transaction() {
+    local status=$?
+    trap - EXIT
+    set +e
+    if [[ "${status}" -ne 0 && -n "${INSTALL_BACKUP}" ]]; then
+        if [[ "${RUNTIME_ACTIVATED}" == "true" ]]; then
+            if [[ -n "${PREVIOUS_CURRENT_TARGET}" ]]; then
+                atomic_symlink \
+                    "${PREVIOUS_CURRENT_TARGET}" \
+                    "${RUNTIME_CURRENT_LINK}"
+            else
+                rm -f "${RUNTIME_CURRENT_LINK}"
+            fi
+            if [[ "${COMPAT_VENV_CREATED}" == "true" ]]; then
+                rm -f "${LEGACY_VENV_PATH}"
+            fi
+        fi
+        restore_install_files
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            restore_unit_state
+        fi
+    fi
+    if [[ -n "${INSTALL_BACKUP}" ]]; then
+        rm -rf "${INSTALL_BACKUP}"
+    fi
+    if [[ "${status}" -ne 0 && "${STATE_ROOT_CREATED}" == "true" ]]; then
+        rmdir /var/lib/gpu-fault >/dev/null 2>&1 || true
+    fi
+    exit "${status}"
+}
+
 require_value() {
     [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
+}
+
+print_config_digest_environment() {
+    python3 - \
+        "${RUNTIME_ROOT}" \
+        "${RUNTIME_CURRENT_LINK}" \
+        "${PY_SPY_VERSION}" \
+        "${PY_SPY_BINARY_SHA256}" <<'PY'
+import json
+import sys
+
+runtime_root, current_link, py_spy_version, py_spy_sha256 = sys.argv[1:]
+if len(py_spy_sha256) != 64:
+    raise SystemExit("PY_SPY_BINARY_SHA256 must be SHA-256")
+print(
+    json.dumps(
+        {
+            "GPU_FAULT_PYTHON_STACK_TOOL": (
+                f"{runtime_root}/tools/py-spy-{py_spy_version}-"
+                f"{py_spy_sha256[:12]}/venv/bin/py-spy"
+            ),
+            "GPU_FAULT_QUIESCE_RESTORE_COMMAND": (
+                f"{current_link}/venv/bin/gpu-fault-restore-gpu-services"
+            ),
+        },
+        sort_keys=True,
+    )
+)
+PY
 }
 
 trim_whitespace() {
@@ -388,6 +578,10 @@ while [[ $# -gt 0 ]]; do
         --node-action-max-results) require_value "$@"; NODE_ACTION_MAX_RESULTS="$2"; shift 2 ;;
         --node-instance-id) require_value "$@"; NODE_INSTANCE_ID="$2"; shift 2 ;;
         --no-start) NO_START="true"; shift ;;
+        --print-config-digest-environment)
+            print_config_digest_environment
+            exit 0
+            ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
@@ -546,6 +740,7 @@ fi
     die "--device-sweep-timeout must be an integer"
 (( DEVICE_SWEEP_TIMEOUT_SECONDS <= 120 )) ||
     die "--device-sweep-timeout must be between 0 and 120"
+begin_install_transaction
 if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
     if [[ -n "${NODE_ACTION_SECRET}" &&
         -n "${NODE_ACTION_SECRET_FILE}" ]]; then
@@ -786,13 +981,16 @@ command -v "${PYTHON_COMMAND}" >/dev/null ||
     'import sys; raise SystemExit(sys.version_info < (3, 12))' ||
     die "Python 3.12 or newer is required"
 command -v systemctl >/dev/null || die "systemd is required"
-systemctl stop gpu-fault-node-agent.service >/dev/null 2>&1 || true
+record_unit_state
 shopt -s nullglob
 existing_quiesce_states=(
     /var/lib/gpu-fault/quiesce/quiesce-*.json
 )
 if (( ${#existing_quiesce_states[@]} > 0 )); then
-    existing_restore_command="/opt/gpu-fault/venv/bin/gpu-fault-restore-gpu-services"
+    existing_restore_command="${RUNTIME_CURRENT_LINK}/venv/bin/gpu-fault-restore-gpu-services"
+    if [[ ! -x "${existing_restore_command}" ]]; then
+        existing_restore_command="${LEGACY_VENV_PATH}/bin/gpu-fault-restore-gpu-services"
+    fi
     [[ -x "${existing_restore_command}" ]] ||
         die "quiesce state exists but restore command is unavailable"
     for state_file in "${existing_quiesce_states[@]}"; do
@@ -894,27 +1092,123 @@ if [[ "${DCGM_EXPORTER_MODE}" == "docker" ]]; then
     docker info >/dev/null || die "Docker daemon is unavailable"
 fi
 
-install -d -m 0755 /opt/gpu-fault /etc/gpu-fault \
-    /var/lib/gpu-fault
-"${PYTHON_COMMAND}" -m venv /opt/gpu-fault/venv
-PIP_ARGS=(install --upgrade "${WHEEL}[collectors]")
-if [[ -n "${WHEELHOUSE}" ]]; then
-    [[ -d "${WHEELHOUSE}" ]] || die "wheelhouse does not exist: ${WHEELHOUSE}"
-    PIP_ARGS+=(--no-index --find-links "${WHEELHOUSE}")
-fi
-/opt/gpu-fault/venv/bin/python -m pip "${PIP_ARGS[@]}"
-/opt/gpu-fault/venv/bin/python -m pip install \
-    --force-reinstall --no-deps "${WHEEL}"
-if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
-    /opt/gpu-fault/venv/bin/python -m pip install \
+runtime_record_digest() {
+    local release_dir="$1"
+    "${release_dir}/venv/bin/python" -c '
+import hashlib
+from importlib.metadata import distribution
+
+record = distribution("gpu-fault-node-runtime").read_text("RECORD")
+if not record:
+    raise SystemExit("node runtime RECORD is unavailable")
+print(hashlib.sha256(record.encode()).hexdigest())
+'
+}
+
+validate_runtime_slot() {
+    local release_dir="$1"
+    local expected_artifact="$2"
+    local observed_record
+
+    [[ -f "${release_dir}/.complete" ]] || return 1
+    [[ -f "${release_dir}/artifact.sha256" ]] || return 1
+    [[ -f "${release_dir}/record.sha256" ]] || return 1
+    [[ "$(<"${release_dir}/artifact.sha256")" == "${expected_artifact}" ]] ||
+        return 1
+    [[ -x "${release_dir}/venv/bin/gpu-fault-collector" ]] || return 1
+    [[ -x "${release_dir}/venv/bin/gpu-fault-node-agent" ]] || return 1
+    [[ -x "${release_dir}/venv/bin/gpu-fault-restore-gpu-services" ]] ||
+        return 1
+    "${release_dir}/venv/bin/python" -m pip check >/dev/null || return 1
+    "${release_dir}/venv/bin/python" -c 'import gpu_fault' || return 1
+    observed_record="$(runtime_record_digest "${release_dir}")" || return 1
+    [[ "$(<"${release_dir}/record.sha256")" == "${observed_record}" ]]
+}
+
+prepare_runtime_slot() {
+    local release_dir="$1"
+    local expected_artifact="$2"
+    local record_digest
+    local release_resolved
+    local current_resolved
+
+    if [[ -d "${release_dir}" ]]; then
+        if validate_runtime_slot "${release_dir}" "${expected_artifact}"; then
+            printf 'Reusing node runtime slot %s\n' "${expected_artifact}"
+            return
+        fi
+        if [[ -n "${PREVIOUS_CURRENT_TARGET}" ]]; then
+            release_resolved="$(readlink -f "${release_dir}")"
+            current_resolved="$(readlink -f "${PREVIOUS_CURRENT_TARGET}")"
+            if [[ "${release_resolved}" == "${current_resolved}" ]]; then
+                die "active node runtime slot failed integrity validation"
+            fi
+        fi
+        rm -rf "${release_dir}"
+    fi
+    install -d -m 0755 "${release_dir}"
+    "${PYTHON_COMMAND}" -m venv "${release_dir}/venv"
+    PIP_ARGS=(install --upgrade "${WHEEL}[collectors]")
+    if [[ -n "${WHEELHOUSE}" ]]; then
+        [[ -d "${WHEELHOUSE}" ]] ||
+            die "wheelhouse does not exist: ${WHEELHOUSE}"
+        PIP_ARGS+=(--no-index --find-links "${WHEELHOUSE}")
+    fi
+    "${release_dir}/venv/bin/python" -m pip "${PIP_ARGS[@]}"
+    "${release_dir}/venv/bin/python" -m pip install \
+        --force-reinstall --no-deps "${WHEEL}"
+    record_digest="$(runtime_record_digest "${release_dir}")" ||
+        die "node runtime RECORD validation failed"
+    printf '%s\n' "${expected_artifact}" > "${release_dir}/artifact.sha256"
+    printf '%s\n' "${record_digest}" > "${release_dir}/record.sha256"
+    chmod 0644 "${release_dir}/artifact.sha256" \
+        "${release_dir}/record.sha256"
+    touch "${release_dir}/.complete"
+    chmod 0644 "${release_dir}/.complete"
+    validate_runtime_slot "${release_dir}" "${expected_artifact}" ||
+        die "candidate node runtime slot validation failed"
+}
+
+prepare_py_spy() {
+    local tool_dir="$1"
+    local binary="${tool_dir}/venv/bin/py-spy"
+    local observed_sha
+
+    if [[ -f "${tool_dir}/.complete" && -x "${binary}" ]]; then
+        observed_sha="$(sha256sum "${binary}" | cut -d' ' -f1)"
+        if [[ "${observed_sha}" == "${PY_SPY_BINARY_SHA256}" ]]; then
+            "${binary}" --version >/dev/null ||
+                die "py-spy installation verification failed"
+            return
+        fi
+        die "existing py-spy tool slot failed integrity validation"
+    fi
+    if [[ -e "${tool_dir}" ]]; then
+        rm -rf "${tool_dir}"
+    fi
+    install -d -m 0755 "${tool_dir}"
+    "${PYTHON_COMMAND}" -m venv "${tool_dir}/venv"
+    "${tool_dir}/venv/bin/python" -m pip install \
         --force-reinstall --no-deps --only-binary=:all: \
         "py-spy==${PY_SPY_VERSION}"
-    [[ "$(
-        sha256sum /opt/gpu-fault/venv/bin/py-spy | cut -d' ' -f1
-    )" == "${PY_SPY_BINARY_SHA256}" ]] ||
+    observed_sha="$(sha256sum "${binary}" | cut -d' ' -f1)"
+    [[ "${observed_sha}" == "${PY_SPY_BINARY_SHA256}" ]] ||
         die "py-spy binary SHA-256 mismatch"
-    /opt/gpu-fault/venv/bin/py-spy --version >/dev/null ||
+    "${binary}" --version >/dev/null ||
         die "py-spy installation verification failed"
+    touch "${tool_dir}/.complete"
+    chmod 0644 "${tool_dir}/.complete"
+}
+
+install -d -m 0755 "${RUNTIME_ROOT}" "${RUNTIME_RELEASES_DIR}" \
+    "${RUNTIME_ROOT}/tools" /etc/gpu-fault /var/lib/gpu-fault
+RUNTIME_RELEASE_DIR="${RUNTIME_RELEASES_DIR}/${WHEEL_SHA256}"
+prepare_runtime_slot "${RUNTIME_RELEASE_DIR}" "${WHEEL_SHA256}"
+PY_SPY_COMMAND=""
+if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
+    PY_SPY_DIR="${RUNTIME_ROOT}/tools/py-spy-${PY_SPY_VERSION}-${PY_SPY_BINARY_SHA256:0:12}"
+    prepare_py_spy "${PY_SPY_DIR}"
+    PY_SPY_COMMAND="${PY_SPY_DIR}/venv/bin/py-spy"
 fi
 
 install -m 0644 "${REPO_DIR}/deploy/dataplane/dcgm-counters.csv" \
@@ -1100,7 +1394,7 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
         write_env GPU_FAULT_DIAGNOSTIC_MAX_ARCHIVES \
             "${DIAGNOSTIC_MAX_ARCHIVES}"
         write_env GPU_FAULT_PYTHON_STACK_TOOL \
-            "/opt/gpu-fault/venv/bin/py-spy"
+            "${PY_SPY_COMMAND}"
         write_env GPU_FAULT_NODE_ALLOW_FIELD_DIAGNOSTIC \
             "${ALLOW_FIELD_DIAGNOSTIC}"
         write_env GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND \
@@ -1154,6 +1448,8 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
             "${RESTORE_SETTLE_SECONDS}"
         write_env GPU_FAULT_QUIESCE_STATE_DIR \
             "/var/lib/gpu-fault/quiesce"
+        write_env GPU_FAULT_QUIESCE_RESTORE_COMMAND \
+            "${RUNTIME_CURRENT_LINK}/venv/bin/gpu-fault-restore-gpu-services"
         write_env GPU_FAULT_NODE_AGENT_PORT "${NODE_AGENT_PORT}"
         if [[ -n "${NODE_AGENT_TLS_CERT}" ]]; then
             write_env GPU_FAULT_NODE_AGENT_TLS_CERT \
@@ -1227,6 +1523,34 @@ find /etc/systemd/system -maxdepth 1 -type f \
 chmod 0644 /opt/gpu-fault/installed-units.txt
 [[ -s /opt/gpu-fault/installed-units.txt ]] ||
     die "no installed gpu-fault systemd units were recorded"
+
+if [[ "${NO_START}" == "false" ]]; then
+    for runtime_unit in \
+        gpu-fault-node-agent.service \
+        gpu-fault-metrics-collector.service \
+        gpu-fault-host-collector.service \
+        gpu-fault-fabric-manager-collector.service \
+        gpu-fault-log-collector.service \
+        gpu-fault-kernel-collector.service; do
+        if systemctl is-active --quiet "${runtime_unit}"; then
+            systemctl stop "${runtime_unit}"
+            RUNTIME_SERVICES_STOPPED="true"
+        fi
+    done
+fi
+atomic_symlink "${RUNTIME_RELEASE_DIR}" "${RUNTIME_CURRENT_LINK}"
+RUNTIME_ACTIVATED="true"
+if [[ ! -e "${LEGACY_VENV_PATH}" && ! -L "${LEGACY_VENV_PATH}" ]]; then
+    atomic_symlink "${RUNTIME_CURRENT_LINK}/venv" "${LEGACY_VENV_PATH}"
+    COMPAT_VENV_CREATED="true"
+elif [[ -L "${LEGACY_VENV_PATH}" ]]; then
+    legacy_venv_target="$(readlink "${LEGACY_VENV_PATH}")"
+    [[ "${legacy_venv_target}" == "${RUNTIME_CURRENT_LINK}/venv" ]] ||
+        die "${LEGACY_VENV_PATH} points outside the managed runtime"
+fi
+printf '%s\n' "${WHEEL_SHA256}" > "${RUNTIME_ARTIFACT_MARKER}.tmp"
+chmod 0644 "${RUNTIME_ARTIFACT_MARKER}.tmp"
+mv -f "${RUNTIME_ARTIFACT_MARKER}.tmp" "${RUNTIME_ARTIFACT_MARKER}"
 
 systemctl daemon-reload
 systemctl enable gpu-fault-gpu-persistence.service

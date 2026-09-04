@@ -310,18 +310,18 @@ def test_spoolable_telemetry_gets_its_own_request_budget(monkeypatch) -> None:
     original = store.try_spool_telemetry_requests
 
     def slow_spool(*args, **kwargs):
-        time.sleep(0.1)
+        time.sleep(0.5)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(store, "try_spool_telemetry_requests", slow_spool)
-    monkeypatch.setenv("GPU_FAULT_REQUEST_BUDGET_SECONDS", "0.05")
+    monkeypatch.setenv("GPU_FAULT_REQUEST_BUDGET_SECONDS", "0.2")
     monkeypatch.setenv("GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS", "10")
     client = build_client(monkeypatch, store)
 
     response = client.post(GPU_METRICS_PATH, gpu_metrics_payload())
 
-    assert response.status_code == 202
-    assert float(response.headers["X-GPU-Fault-Server-Duration-Ms"]) >= 100
+    assert response.status_code == 202, response.text
+    assert float(response.headers["X-GPU-Fault-Server-Duration-Ms"]) >= 450
 
 
 def test_spool_admission_batches_across_clusters(monkeypatch) -> None:

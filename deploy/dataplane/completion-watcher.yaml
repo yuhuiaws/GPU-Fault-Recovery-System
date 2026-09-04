@@ -10,6 +10,7 @@ metadata:
   name: gpu-fault-completion-watcher-outbox
   namespace: gpu-fault-system
 data:
+  active-attempts.json: "{}"
   events.json: "[]"
 ---
 apiVersion: rbac.authorization.k8s.io/v1

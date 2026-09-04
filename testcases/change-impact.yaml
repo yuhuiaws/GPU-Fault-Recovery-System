@@ -88,6 +88,9 @@ rules:
       - scripts/release_identity.py
       - scripts/release_image.py
       - scripts/release_attestation.py
+      - scripts/run_release_gates.py
+      - scripts/run_static_gates.py
+      - tests/test_release_gates.py
       - scripts/component_artifacts.py
       - scripts/component_artifact_cache.py
       - scripts/component_wheels.py
@@ -101,6 +104,7 @@ rules:
       - tests/test_release_identity.py
       - tests/test_release_image.py
       - tests/test_release_attestation.py
+      - tests/test_release_gates.py
       - tests/test_artifact_consistency.py
     regional_cases:
       - GF-REGIONAL-BOOT-018..022
@@ -143,23 +147,28 @@ rules:
       - deploy/control-plane/base/**
       - deploy/control-plane/regional/**
       - deploy/control-plane/tools/**
-      - src/gpu_fault/admin_release_artifacts.py
-      - src/gpu_fault/admin_source_deploy.py
-      - src/gpu_fault/admin_site.py
+      - src/gpu_fault/admin/release_artifacts.py
+      - src/gpu_fault/admin/source_deploy.py
+      - src/gpu_fault/admin/site.py
       - src/gpu_fault/fleet_deployment.py
       - scripts/capture_release_evidence.py
       - scripts/release_deploy.py
+      - scripts/deploy_source_identity.py
+      - scripts/restore_ci_candidate.py
       - scripts/staging_deploy.py
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
       - tests/test_staging_deploy.py
+      - tests/test_restore_ci_candidate.py
       - tests/regional/test_*release*.py
       - tests/test_artifact_consistency.py
     pytest:
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
       - tests/test_staging_deploy.py
+      - tests/test_restore_ci_candidate.py
       - tests/regional/test_regional_release_orchestrator.py
+      - tests/regional/test_regional_release_config_and_profile.py
       - tests/regional/test_regional_release_resume.py
       - tests/regional/test_release_diff.py
       - tests/regional/test_release_rollback_state.py
@@ -180,11 +189,11 @@ rules:
   - id: lifecycle-registry
     description: Bootstrap, join/remove, cleanup registry, and installation resources.
     paths:
-      - src/gpu_fault/admin_bootstrap*.py
-      - src/gpu_fault/admin_source_deploy.py
-      - src/gpu_fault/admin_cluster_*.py
-      - src/gpu_fault/admin_uninstall.py
-      - src/gpu_fault/admin_resource_registry.py
+      - src/gpu_fault/admin/bootstrap*.py
+      - src/gpu_fault/admin/source_deploy.py
+      - src/gpu_fault/admin/cluster_*.py
+      - src/gpu_fault/admin/uninstall.py
+      - src/gpu_fault/admin/resource_registry.py
       - src/gpu_fault/installation_*.py
       - deploy/aws/**
       - config/site.example.yaml
@@ -194,17 +203,20 @@ rules:
       - scripts/build-deploy-host-bundle.py
       - scripts/deploy_host_bundle.py
       - scripts/deploy_host_component.py
+      - scripts/deploy_host_identity.py
+      - scripts/deploy_source_identity.py
       - scripts/setup-deploy-host.sh
       - scripts/setup_deploy_host.py
       - scripts/staging_deploy.py
       - config/admin-config.example.yaml
-      - src/gpu_fault/admin_bootstrap_dependencies.py
+      - src/gpu_fault/admin/bootstrap_dependencies.py
       - src/gpu_fault/data/deploy-host-tools.json
       - tests/admin/test_admin_bootstrap.py
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_admin_cluster_*.py
       - tests/test_staging_deploy.py
       - tests/test_deploy_host_setup.py
+      - tests/test_restore_ci_candidate.py
       - tests/regional/test_installed_resource_registry.py
       - tests/regional/test_cleanup_*.py
     pytest:
@@ -214,6 +226,7 @@ rules:
       - tests/admin/test_admin_cluster_removal.py
       - tests/test_staging_deploy.py
       - tests/test_deploy_host_setup.py
+      - tests/test_restore_ci_candidate.py
       - tests/regional/test_installed_resource_registry.py
       - tests/regional/test_cleanup_inventory.py
       - tests/regional/test_cleanup_state.py
@@ -234,7 +247,7 @@ rules:
     paths:
       - src/gpu_fault/capabilities.py
       - src/gpu_fault/runtime_adapters.py
-      - src/gpu_fault/admin_release_artifacts.py
+      - src/gpu_fault/admin/release_artifacts.py
       - config/runtime-profile*.yaml
       - tests/regional/test_capabilities.py
     pytest:
@@ -261,9 +274,11 @@ rules:
     pytest:
       - tests/regional/test_authorization_registry.py
       - tests/regional/test_regional_control_plane.py
+      - tests/regional/test_regional_token_rotation.py
       - tests/regional/test_production_safety_config.py
     regional_cases:
-      - GF-REGIONAL-AUTH-001..015
+      - GF-REGIONAL-AUTH-001..011
+      - GF-REGIONAL-AUTH-013..016
       - GF-REGIONAL-BLAST-002..004
     checks:
       - config-check
@@ -420,12 +435,14 @@ rules:
     description: HyperPod reboot, warm spare, provider guards, and replacement.
     paths:
       - src/gpu_fault/hyperpod*.py
+      - src/gpu_fault/markers.py
       - src/gpu_fault/spare_health.py
       - src/gpu_fault/adapters/hyperpod/**
       - deploy/hyperpod/**
       - tests/hyperpod/test_hyperpod*.py
     pytest:
       - tests/hyperpod
+      - tests/store/test_marker_scope_lookups.py
     regional_cases:
       - GF-REGIONAL-DESTR-002..003
       - GF-REGIONAL-DESTR-005..008
@@ -438,12 +455,15 @@ rules:
     paths:
       - src/gpu_fault/notifications/**
       - src/gpu_fault/notification_*.py
-      - src/gpu_fault/admin_notifications.py
+      - src/gpu_fault/admin/notifications.py
+      - src/gpu_fault/admin/notification_bootstrap.py
       - tests/notifications/**
       - tests/admin/test_admin_notifications.py
+      - tests/admin/test_admin_notification_bootstrap.py
     pytest:
       - tests/notifications
       - tests/admin/test_admin_notifications.py
+      - tests/admin/test_admin_notification_bootstrap.py
     regional_cases:
       - GF-REGIONAL-NOTIFY-001..006
       - GF-REGIONAL-BOOT-013..014
@@ -515,29 +535,63 @@ rules:
       - docs-check
     counts_as_domain: false
 
+  - id: ci-trust
+    description: Signed CI gate identity, artifact restore, and promotion trust boundary.
+    paths:
+      - scripts/ci_coverage_gate.py
+      - scripts/ci_candidate_receipt.py
+      - scripts/ci_gate.py
+      - scripts/ci_gate_artifacts.py
+      - scripts/ci_unit_gate.py
+      - scripts/resolve_ci_run.py
+      - scripts/restore_ci_candidate.py
+      - config/ci-unit-gate.json
+      - tests/test_ci_gate.py
+      - tests/test_ci_unit_gate.py
+      - tests/test_restore_ci_candidate.py
+    pytest:
+      - tests/test_ci_gate.py
+      - tests/test_ci_unit_gate.py
+      - tests/test_restore_ci_candidate.py
+    regional_cases: []
+    checks:
+      - ci-tooling-check
+      - docs-check
+    full: true
+    counts_as_domain: false
+
   - id: ci-tooling
-    description: CI and developer-only quality tooling.
+    description: CI and developer-only quality tooling outside the trust boundary.
     paths:
       - .github/**
       - Makefile
       - scripts/check-*.py
       - scripts/audit-*.py
-      - scripts/ci_gate.py
-      - scripts/ci_unit_gate.py
       - scripts/prune_artifacts.py
-      - scripts/resolve_ci_run.py
       - scripts/__init__.py
       - tools/__init__.py
-      - config/ci-unit-gate.json
       - architecture-baseline.json
       - mypy-baseline.json
       - assert-message-baseline.json
+      - test-private-coupling-baseline.json
+      - test-source-assertion-baseline.json
     pytest:
       - tests/test_doc_impact.py
     regional_cases: []
     checks:
       - docs-check
     counts_as_domain: false
+
+  - id: admin-cli-surface
+    description: Administrator command parsing, dispatch, and managed-state binding.
+    paths:
+      - src/gpu_fault/admin/cli.py
+      - tests/admin/test_admin_site.py
+    pytest:
+      - tests/admin/test_admin_site.py
+    regional_cases: []
+    checks:
+      - deployment-contracts-check
 
   - id: control-plane-api
     description: General API factory, lifecycle, middleware, and routes.
@@ -560,7 +614,8 @@ rules:
       - tests/regional/test_plugins.py
     regional_cases:
       - GF-REGIONAL-BOOT-001..015
-      - GF-REGIONAL-AUTH-001..015
+      - GF-REGIONAL-AUTH-001..011
+      - GF-REGIONAL-AUTH-013..016
       - GF-REGIONAL-BLAST-001..004
     checks:
       - config-check
@@ -569,7 +624,7 @@ rules:
   - id: admin-operations
     description: Administrator CLI and AWS integration not owned by a narrower domain.
     paths:
-      - src/gpu_fault/admin_*.py
+      - src/gpu_fault/admin/*.py
       - src/gpu_fault/aws_errors.py
       - src/gpu_fault/aurora_credential_refresh.py
       - tests/admin/**

@@ -16,7 +16,7 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 PATH = ROOT / "scripts/perf/seed_regional_action_workflows.py"
-MODULE = lazy_script_module("seed_regional_action_workflows", PATH)
+MODULE = lazy_script_module(PATH)
 NOW = datetime(2026, 8, 28, tzinfo=timezone.utc)
 
 

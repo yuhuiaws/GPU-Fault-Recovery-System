@@ -932,7 +932,10 @@ if [ "${mode}" = uninstall ] && [ -x /opt/gpu-fault/uninstall ]; then
 else
     for state_file in /var/lib/gpu-fault/quiesce/quiesce-*.json; do
         [ -e "${state_file}" ] || continue
-        restore=/opt/gpu-fault/venv/bin/gpu-fault-restore-gpu-services
+        restore=/opt/gpu-fault/current/venv/bin/gpu-fault-restore-gpu-services
+        if [ ! -x "${restore}" ]; then
+            restore=/opt/gpu-fault/venv/bin/gpu-fault-restore-gpu-services
+        fi
         if [ ! -x "${restore}" ]; then
             echo "quiesce state exists but restore command is unavailable" >&2
             exit 1

@@ -1,0 +1,24 @@
+{
+  "allowed": {
+    "tests/regional/test_release_probes.py": {
+      "reason": "a probe is shipped to a Pod as source text, so the text is the artifact: this audits that each one parses, imports only what exists inside the Pod, and that no program went back to being an inline literal in the engine",
+      "sites": 4
+    },
+    "tests/test_deploy_layout.py": {
+      "reason": "audits that the architecture gate still declares every source root; the declaration is data, not behaviour",
+      "sites": 1
+    },
+    "tests/test_deployment_manual_contracts.py": {
+      "reason": "audits the release gate runner's declared gate list and worker limit, which is configuration expressed in Python",
+      "sites": 2
+    },
+    "tests/test_script_assets.py": {
+      "reason": "audits the architecture and code-size gate scripts' declared roots and thresholds",
+      "sites": 2
+    },
+    "tests/test_test_suite_contracts.py": {
+      "reason": "audits the architecture gate roots and the release gate runner's pytest wiring",
+      "sites": 2
+    }
+  }
+}

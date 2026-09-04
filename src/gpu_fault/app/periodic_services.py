@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import logging
 import os
-from threading import Event
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from threading import Event
 from typing import Callable
 
-from gpu_fault.telemetry import CollectorKind
 from gpu_fault.collector_requirements import (
     collector_silent_thresholds,
 )
-
+from gpu_fault.env_validation import training_health_monitor_enabled
+from gpu_fault.telemetry import CollectorKind
 
 LOGGER = logging.getLogger(__name__)
 
@@ -199,9 +199,7 @@ class PeriodicServiceRunner:
         return lease.owner_id == self.processor.owner_id
 
     def _run_training(self, now: float) -> None:
-        if os.getenv(
-            "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR", "false"
-        ).lower() != "true" or not self._due(
+        if not training_health_monitor_enabled() or not self._due(
             "training-health",
             now,
             self.config.training_interval,

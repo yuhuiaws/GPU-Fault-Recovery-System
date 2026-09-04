@@ -207,33 +207,41 @@ class HostTelemetryCollector(
         self._rank_progress_at: datetime | None = None
         self._rank_liveness_warned = False
 
+    #: Contributor methods, in collection order. This is a class constant rather
+    #: than a literal inside :meth:`collect_once` so a caller that has to account
+    #: for every contributor — a test silencing them, for instance — reads the
+    #: same list the collector runs. Two host tests silenced a hand-copied subset
+    #: and left ``_rank_liveness`` live, so it shelled out to ``nvidia-smi``.
+    CONTRIBUTORS: tuple[str, ...] = (
+        "_cpu",
+        "_memory",
+        "_filesystems",
+        "_shared_filesystems",
+        "_lustre",
+        "_diskstats",
+        "_network",
+        "_tcp",
+        "_gpu_utilization",
+        "_rank_liveness",
+        "_gpu_inventory",
+        "_efa_inventory",
+        "_rdma",
+        "_efa_network",
+        "_nvswitch_topology",
+        "_smart",
+        "_bmc",
+    )
+
     def collect_once(self) -> HostTelemetryBatch:
         observed_at = self.now()
         samples: list[HostMetricSample] = []
         errors: list[str] = []
-        for collector in (
-            self._cpu,
-            self._memory,
-            self._filesystems,
-            self._shared_filesystems,
-            self._lustre,
-            self._diskstats,
-            self._network,
-            self._tcp,
-            self._gpu_utilization,
-            self._rank_liveness,
-            self._gpu_inventory,
-            self._efa_inventory,
-            self._rdma,
-            self._efa_network,
-            self._nvswitch_topology,
-            self._smart,
-            self._bmc,
-        ):
+        for name in self.CONTRIBUTORS:
+            collector = getattr(self, name)
             try:
                 samples.extend(collector(observed_at))
             except Exception as exc:
-                errors.append(f"{collector.__name__}: {type(exc).__name__}: {exc}")
+                errors.append(f"{name}: {type(exc).__name__}: {exc}")
         batch = HostTelemetryBatch(
             batch_id=(
                 f"host-{self.node_id}-{int(observed_at.timestamp() * 1_000_000)}"

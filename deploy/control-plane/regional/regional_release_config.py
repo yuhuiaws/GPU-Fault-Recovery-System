@@ -9,10 +9,11 @@ from typing import Any
 
 import yaml
 
-from gpu_fault.admin_config import AdminConfig
+from gpu_fault.admin.config import AdminConfig
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_NAMESPACE = "gpu-fault-system"
+MAX_UPGRADE_PARALLEL_CLUSTERS = 8
 DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 RUNTIME_PROFILE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
@@ -24,6 +25,14 @@ EKS_ARN_PATTERN = re.compile(
 
 
 class ReleaseError(RuntimeError):
+    pass
+
+
+class ClusterLocalReleaseError(ReleaseError):
+    pass
+
+
+class PartialClusterRolloutError(ReleaseError):
     pass
 
 
@@ -423,7 +432,7 @@ def _parse_delivery_identity(
             "schema v3 release requires a prebuilt deployable runtime image"
         )
     raw_components = dict(delivery.get("components") or {})
-    expected_components = {
+    legacy_components = {
         "collector",
         "cpu",
         "dcgm",
@@ -434,12 +443,20 @@ def _parse_delivery_identity(
         "schema",
         "watcher",
     }
-    if set(raw_components) != expected_components:
+    role_components = {"cpu_ingress", "cpu_spool", "cpu_worker"}
+    if set(raw_components) not in {
+        frozenset(legacy_components),
+        frozenset({*legacy_components, *role_components}),
+    }:
         raise ReleaseError("release delivery components are incomplete")
     component_digests = {
         name: str((raw_components[name] or {}).get("sha256") or "")
         for name in sorted(raw_components)
     }
+    if not role_components.issubset(component_digests):
+        component_digests.update(
+            {name: component_digests["cpu"] for name in role_components}
+        )
     if any(
         not re.fullmatch(r"[0-9a-f]{64}", value) for value in component_digests.values()
     ):
@@ -477,6 +494,20 @@ def _parse_delivery_identity(
         node_template_sha256,
         bool(database.get("rollback_compatible", False)),
     )
+
+
+def parse_delivery_identity(
+    manifest: dict[str, Any],
+    components: dict[str, Any],
+) -> tuple[
+    dict[str, Any],
+    str,
+    dict[str, str],
+    dict[str, str],
+    str,
+    bool,
+]:
+    return _parse_delivery_identity(manifest, components)
 
 
 def load_release_artifacts(
@@ -574,7 +605,7 @@ def load_release_artifacts(
                 locked_images,
                 node_template_sha256,
                 schema_rollback_compatible,
-            ) = _parse_delivery_identity(
+            ) = parse_delivery_identity(
                 manifest,
                 components,
             )
@@ -648,6 +679,9 @@ class ReleaseConfig:
     locked_images: dict[str, str]
     node_template_sha256: str
     schema_rollback_compatible: bool
+    upgrade_max_unavailable: int
+    rollback_max_unavailable: int
+    upgrade_max_parallel_clusters: int
     agent_config_digest: str
     runtime_profile_source: Path
     runtime_profile_template_source: Path
@@ -688,6 +722,28 @@ class ReleaseConfig:
             "cpu_hyperpod_cluster_name",
         )
         release = value.get("release") or {}
+        try:
+            upgrade_max_unavailable = int(release.get("upgrade_max_unavailable", 1))
+            rollback_max_unavailable = int(release.get("rollback_max_unavailable", 2))
+            upgrade_max_parallel_clusters = int(
+                release.get("upgrade_max_parallel_clusters", 1)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ReleaseError(
+                "release rollout max unavailable values must be integers"
+            ) from exc
+        if not 1 <= upgrade_max_unavailable <= 32:
+            raise ReleaseError("release.upgrade_max_unavailable must be within 1..32")
+        if not 1 <= rollback_max_unavailable <= 4:
+            raise ReleaseError("release.rollback_max_unavailable must be within 1..4")
+        # Cross-cluster parallelism multiplies the blast radius of one release, so
+        # it stays opt-in: the default rolls one GPU cluster at a time. Rollback
+        # is deliberately not covered by this knob and stays serial.
+        if not 1 <= upgrade_max_parallel_clusters <= MAX_UPGRADE_PARALLEL_CLUSTERS:
+            raise ReleaseError(
+                "release.upgrade_max_parallel_clusters must be within "
+                f"1..{MAX_UPGRADE_PARALLEL_CLUSTERS}"
+            )
         clusters = tuple(
             ClusterTarget.from_mapping(item, expected_region=aws_region)
             for item in value.get("clusters", [])
@@ -804,6 +860,9 @@ class ReleaseConfig:
             locked_images=artifacts.locked_images,
             node_template_sha256=artifacts.node_template_sha256,
             schema_rollback_compatible=(artifacts.schema_rollback_compatible),
+            upgrade_max_unavailable=upgrade_max_unavailable,
+            rollback_max_unavailable=rollback_max_unavailable,
+            upgrade_max_parallel_clusters=upgrade_max_parallel_clusters,
             agent_config_digest=digest,
             runtime_profile_source=runtime_profile_source.resolve(),
             runtime_profile_template_source=(runtime_profile_template_source.resolve()),

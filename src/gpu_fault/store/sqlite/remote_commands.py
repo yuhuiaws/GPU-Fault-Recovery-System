@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Callable, TYPE_CHECKING
-
 import secrets
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from gpu_fault.remote_command_models import (
     RemoteCommandStatus,
@@ -15,7 +14,11 @@ from gpu_fault.store.shared.errors import (
 )
 from gpu_fault.store.shared.remote_helpers import (
     remote_command_identity as _remote_command_identity,
+)
+from gpu_fault.store.shared.remote_helpers import (
     remote_command_stats as _remote_command_stats,
+)
+from gpu_fault.store.shared.remote_helpers import (
     unclaimed_expiry_update as _unclaimed_expiry_update,
 )
 
@@ -50,9 +53,18 @@ class SqliteRemoteCommandMixin:
             raise NotFoundError(command_id)
         return command  # type: ignore[no-any-return]
 
-    def list_remote_commands(self) -> list[RemoteActionCommand]:
+    def list_remote_commands(
+        self,
+        *,
+        workflow_request_ids: Iterable[str] | None = None,
+    ) -> list[RemoteActionCommand]:
+        wanted = None if workflow_request_ids is None else set(workflow_request_ids)
         return sorted(
-            self._list("remote_command"),
+            (
+                item
+                for item in self._list("remote_command")
+                if wanted is None or item.workflow_request_id in wanted
+            ),
             key=lambda item: (item.created_at, item.command_id),
         )
 
@@ -154,7 +166,7 @@ class SqliteRemoteCommandMixin:
                 claimed.append(command)
         return claimed
 
-    def remote_command_stats(self, *, now: datetime | None = None) -> dict:
+    def remote_command_stats(self, *, now: datetime | None = None) -> dict[str, Any]:
         return _remote_command_stats(self._list("remote_command"), now=now)
 
     def expire_unclaimed_remote_commands(

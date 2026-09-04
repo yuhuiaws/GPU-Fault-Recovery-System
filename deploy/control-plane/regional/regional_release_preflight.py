@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from regional_release_config import (
@@ -131,7 +132,8 @@ def ensure_region_contexts(release: Any) -> None:
         require_node_recovery_none=False,
     )
     runner.run(cpu_command("get", "--raw=/readyz"), capture=True)
-    for target in config.clusters:
+
+    def validate_cluster(target: Any) -> None:
         gpu_eks_arn = _context_eks_arn(
             runner,
             gpu_command(target),
@@ -158,3 +160,18 @@ def ensure_region_contexts(release: Any) -> None:
             configured_cidrs=target.agent_endpoint_allowed_cidrs,
         )
         release._validate_executor_iam_role(target)
+
+    if not config.clusters:
+        return
+    # The CPU checks above gate everything, so they stay ahead of this; the
+    # clusters themselves are independent, and each one is a handful of reads
+    # against a different API server plus a whole IAM role expansion. Every
+    # future is resolved in configuration order, so a fleet where two clusters
+    # are both wrong reports the same one every time instead of whichever
+    # thread lost the race.
+    with ThreadPoolExecutor(max_workers=min(8, len(config.clusters))) as executor:
+        futures = [
+            executor.submit(validate_cluster, target) for target in config.clusters
+        ]
+    for future in futures:
+        future.result()

@@ -3,12 +3,12 @@ from __future__ import annotations
 import logging
 import os
 import random
-from threading import Event, Thread
 import time
+from threading import Event, Thread
 from typing import Any
 
 from gpu_fault.app.periodic_services import PeriodicServiceRunner
-
+from gpu_fault.env_validation import training_health_monitor_enabled
 
 LOGGER = logging.getLogger(__name__)
 
@@ -198,7 +198,7 @@ def start_nonprocessor_workers(
 
 
 def _start_training_worker(context, stop, ingest):
-    if os.getenv("GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR", "false").lower() != "true":
+    if not training_health_monitor_enabled():
         return None
     interval = float(os.getenv("GPU_FAULT_TRAINING_HEALTH_SCAN_SECONDS", "15"))
 

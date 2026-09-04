@@ -50,6 +50,9 @@ The BOOT-019/020 runners are plan-only by default. Their live paths require
 both `--execute` and the case-specific confirmation string, keep resumable
 evidence under a caller-supplied `--run-dir`, and remain `manual` in the case
 catalog because they attach/remove clusters or roll real releases.
+BOOT-020 consumes distinct CPU-only, Executor-only, Agent-only and FULL
+configs, and records component rollback scope plus `T_safe`, `T_full` and
+interrupted-resume RTO evidence.
 
 The grouped BOOT-011..018, AUTH/ISO, WORKLOAD/E2E, PREEMPT-012, NOTIFY,
 CAP-001..004 and NET-001 drivers use the same plan/execute guard. They derive

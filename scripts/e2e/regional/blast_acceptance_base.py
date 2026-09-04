@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from gpu_fault.admin_site import load_site  # noqa: E402
+from gpu_fault.admin.site import load_site  # noqa: E402
 from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
     scoped_case_evidence,
 )

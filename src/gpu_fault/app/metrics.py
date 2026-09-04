@@ -8,6 +8,7 @@ from fastapi.responses import Response
 from gpu_fault.app.authorization import authorization_bucket
 from gpu_fault.app.builtin_metric_contributors import (
     closed_loop_metric_lines,
+    fleet_rollout_metric_lines,
     orchestration_metric_lines,
     policy_metric_lines,
     remote_command_metric_lines,
@@ -271,6 +272,10 @@ METRIC_CONTRIBUTORS.register("core", render_prometheus_metrics)
 METRIC_CONTRIBUTORS.register(
     "remote-command",
     remote_command_metric_lines,
+)
+METRIC_CONTRIBUTORS.register(
+    "fleet-rollout",
+    fleet_rollout_metric_lines,
 )
 METRIC_CONTRIBUTORS.register("policy", policy_metric_lines)
 METRIC_CONTRIBUTORS.register(

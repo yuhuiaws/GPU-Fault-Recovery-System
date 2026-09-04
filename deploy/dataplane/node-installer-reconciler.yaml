@@ -1,4 +1,14 @@
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-fault-node-installer-wave
+  namespace: gpu-fault-system
+data:
+  allowed-nodes: "REPLACE_WITH_INSTALLER_ALLOWED_NODES"
+  max-unavailable: "REPLACE_WITH_INSTALLER_MAX_UNAVAILABLE"
+  generation: "REPLACE_WITH_INSTALLER_WAVE_GENERATION"
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: gpu-fault-node-installer-reconciler
@@ -17,7 +27,9 @@ rules:
     verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["gpu-fault-node-installer-template"]
+    resourceNames:
+      - "gpu-fault-node-installer-template"
+      - "gpu-fault-node-installer-wave"
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -110,11 +122,13 @@ spec:
             - name: GPU_FAULT_INSTALL_RETRY_SECONDS
               value: "300"
             - name: GPU_FAULT_INSTALLER_MAX_UNAVAILABLE
-              value: "REPLACE_WITH_INSTALLER_MAX_UNAVAILABLE"
+              value: "1"
             - name: GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS
               value: "REPLACE_WITH_INSTALLER_ACTIVE_DEADLINE_SECONDS"
             - name: GPU_FAULT_INSTALLER_ALLOWED_NODES
-              value: "REPLACE_WITH_INSTALLER_ALLOWED_NODES"
+              value: "*"
+            - name: GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP
+              value: gpu-fault-node-installer-wave
           resources:
             requests:
               cpu: 50m

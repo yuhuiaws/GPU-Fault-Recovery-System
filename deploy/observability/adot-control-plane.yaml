@@ -123,9 +123,87 @@ data:
                 # the never-claimed remote command gauges; without it a
                 # recovery that silently never happens produces no signal
                 # at all (GF-REGIONAL-BOOT-015).
+                #
+                # The last four families are recovery *outcomes* rather than
+                # component health: workflow status counts, closed-loop
+                # milestone latency, notification delivery results and
+                # remediation budget waiting. Every family before them
+                # describes a component that broke. Without these, a control
+                # plane whose every component is green while no GPU node
+                # actually returns to the training pool reaches AMP as
+                # silence, so the gpu-fault-recovery-outcome group in
+                # amp-rules.yaml would be dead configuration.
+                #
+                # gpu_fault_fleet_rollout_.+ is the fleet rollout fence, which
+                # blocks every destructive remediation for a cluster while a
+                # deployment there is non-terminal. A rollout abandoned before
+                # its first wave held a live cluster for 36 hours on 2026-09-03
+                # and the only trace was a WARNING on one worker.
                 - action: keep
                   source_labels: [__name__]
-                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations
+                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+
+                # Dropped because they describe the collector, not the fleet.
+                # The receiver stamps every metric with the instrumentation
+                # scope it arrived under, and those labels then take part in
+                # alert series identity: upgrading the ADOT image changes
+                # otel_scope_version, which resolves every firing alert and
+                # re-fires it as new, invalidating the silences an operator put
+                # in place mid-incident. Nothing in amp-rules.yaml selects on
+                # them.
+                - action: labeldrop
+                  regex: otel_scope_name|otel_scope_version
+
+            # The collector's own pipeline counters. Nothing else can report
+            # them: `retry_on_failure` below gives up after `max_elapsed_time`
+            # and drops the batch, and the only record of that drop is a counter
+            # on the self-telemetry endpoint. Until this job existed an AMP
+            # workspace that was rejecting writes was indistinguishable from a
+            # fleet with nothing to report.
+            #
+            # Total failure is still reported by absence rather than by these
+            # counters -- if remote_write is entirely down they cannot reach AMP
+            # either, which is what GpuFaultAdotSelfMetricsMissing and
+            # GpuFaultControlPlaneMetricsMissing are for. What this job adds is
+            # the partial case, which absence cannot see: some batches land and
+            # some are dropped, so every other rule in amp-rules.yaml keeps
+            # evaluating and quietly does it on holes.
+            #
+            # The reader is bound to loopback (service.telemetry below) and this
+            # is its only reader, so unlike the control-plane job there is no
+            # credential and nothing is reachable from the pod network.
+            - job_name: gpu-fault-adot-self
+              scrape_interval: 30s
+              scrape_timeout: 5s
+              static_configs:
+                - targets: ["127.0.0.1:8889"]
+              relabel_configs:
+                # `up` carries the target's label set, so these have to be added
+                # here rather than in metric_relabel_configs for
+                # GpuFaultAdotSelfMetricsMissing to group like every other rule.
+                - action: replace
+                  target_label: control_plane_cluster
+                  replacement: gpu-fault-regional-control-plane
+                - action: replace
+                  target_label: region
+                  replacement: REPLACE_WITH_AWS_REGION
+              metric_relabel_configs:
+                # Unsuffixed on purpose: the pinned aws-otel-collector v0.49.0
+                # (core v0.156.0) publishes its own counters without `_total` on
+                # :8889, and `add_metric_suffixes: false` below means nothing adds
+                # one before AMP either. Verified by running the pinned image and
+                # reading the endpoint -- the names cannot be guessed from the
+                # upstream documentation, which describes a suffixed form.
+                - action: keep
+                  source_labels: [__name__]
+                  regex: up|otelcol_exporter_send_failed_metric_points|otelcol_exporter_sent_metric_points|otelcol_exporter_queue_size|otelcol_exporter_queue_capacity
+                # Same argument as the job above, with two labels that are worse:
+                # service_instance_id is a UUID the collector regenerates on
+                # every start and service_version moves with the image, so a
+                # restart or an image bump would resolve and re-fire these alerts
+                # as new series and drop the silences an operator put in place
+                # mid-incident.
+                - action: labeldrop
+                  regex: otel_scope_name|otel_scope_version|service_instance_id|service_version
 
     processors:
       batch:
@@ -143,6 +221,13 @@ data:
           enabled: true
           initial_interval: 1s
           max_interval: 10s
+          # After 120s of retries the batch is dropped. That bound stays: the
+          # container is capped at 256Mi with GOMEMLIMIT 220MiB, and this
+          # exporter applies backpressure rather than spooling to disk, so a
+          # longer window buys nothing except a larger in-memory backlog and an
+          # OOMKill instead of a gap. The drop is deliberate; what was wrong was
+          # that it was silent, which the gpu-fault-adot-self scrape job above and
+          # GpuFaultTelemetryRemoteWriteFailing now fix.
           max_elapsed_time: 120s
 
     extensions:
@@ -169,7 +254,12 @@ data:
             - pull:
                 exporter:
                   prometheus:
-                    host: 0.0.0.0
+                    # Loopback, not 0.0.0.0: the only reader is the
+                    # gpu-fault-adot-self scrape job in this same container, and
+                    # the endpoint carries no authentication of its own, so
+                    # binding the pod IP would publish the collector's internals
+                    # to anything in the namespace for no gain.
+                    host: 127.0.0.1
                     port: 8889
 ---
 apiVersion: apps/v1
@@ -255,7 +345,21 @@ metadata:
   name: gpu-fault-adot
   namespace: gpu-fault-system
 spec:
-  minAvailable: 1
+  # `minAvailable: 1` against `replicas: 1` is unsatisfiable by construction:
+  # evicting the only Pod leaves zero available, so the API server refuses every
+  # eviction and `kubectl drain` on whichever node happens to host the collector
+  # blocks forever -- including the drain a node replacement or an EKS version
+  # upgrade needs. The budget was reaching for "do not take the collector down",
+  # but a budget cannot keep a single-replica workload up; it can only forbid the
+  # disruption, and forbidding all of them is an operator dead end.
+  #
+  # What is actually worth expressing is a cap on *concurrent* voluntary
+  # disruptions, which `maxUnavailable: 1` says without ever reaching zero
+  # allowed disruptions, and which keeps meaning something if the Deployment is
+  # ever scaled out. The cost is a scrape gap while the Pod reschedules: path B
+  # is pull-based and stateless, so that is a gap in graphs, not lost fault data
+  # (see the header -- the control plane never talks to this collector).
+  maxUnavailable: 1
   selector:
     matchLabels:
       app: gpu-fault-adot

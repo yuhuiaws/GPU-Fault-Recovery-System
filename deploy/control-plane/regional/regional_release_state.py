@@ -4,41 +4,44 @@ import copy
 import hashlib
 import json
 import re
+import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import regional_deployment_inventory as inventory
 import yaml
+from regional_release_config import ClusterTarget, ReleaseError
+from regional_release_diff import ReleaseComponent, ReleaseExecutionPlan
+from regional_release_legacy import AGENT_IDENTITY_FIELDS
+from regional_release_probes import probe_source
+from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
 
-from gpu_fault.admin_config import (
+from gpu_fault.admin.config import (
     AdminConfig,
     AdminConfigError,
     default_admin_config,
 )
-from regional_release_config import ClusterTarget, ReleaseError
-from regional_release_legacy import AGENT_IDENTITY_FIELDS
-from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
+from gpu_fault.release_state_snapshot import (
+    ReleaseStateSnapshotError,
+    canonical_previous_bytes,
+    encode_previous_snapshot,
+    hydrate_previous_snapshot,
+    validate_snapshot_config_map,
+)
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
+PREVIOUS_SNAPSHOT_LABEL = "gpu-fault.io/release-previous-snapshot"
+PREVIOUS_SNAPSHOT_DIGEST_ANNOTATION = "gpu-fault.io/snapshot-sha256"
+MAX_RELEASE_STATE_BYTES = 700 * 1024
+MAX_CAPTURE_WORKERS = 8
 SENSITIVE_CONFIG_KEY = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
 DIGEST_IMAGE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
-REMOTE_COMMAND_STATS_SCRIPT = """
-import json
-
-from gpu_fault.app import ApplicationContext
-
-print(
-    json.dumps(
-        ApplicationContext.from_environment().store.remote_command_stats(),
-        separators=(",", ":"),
-    )
-)
-"""
 
 
 def remote_command_stats(release: Any) -> dict[str, Any]:
@@ -68,7 +71,7 @@ def remote_command_stats(release: Any) -> dict[str, Any]:
                 "--",
                 CONTROL_PLANE_PYTHON,
                 "-c",
-                REMOTE_COMMAND_STATS_SCRIPT,
+                probe_source("remote_command_stats"),
             ),
             capture=True,
             sensitive=True,
@@ -76,14 +79,52 @@ def remote_command_stats(release: Any) -> dict[str, Any]:
     )
 
 
-def get_json(release: Any, args: list[str]) -> dict[str, Any]:
-    cache = getattr(release, "_json_read_cache", None)
-    key = tuple(args)
-    if cache is None or "get" not in args:
-        raw = release.runner.run(args + ["-o", "json"], capture=True)
-        return json.loads(raw) if raw else {}
+_STATE_LOCK_GUARD = threading.Lock()
 
-    lock: threading.Lock = release._json_read_cache_lock
+
+@contextmanager
+def state_transaction(release: Any):
+    """Serialize one read-modify-write of the release state.
+
+    `save_state` derives its payload from `release.state` and writes it to a
+    single ConfigMap, so anything that reads the state, derives an update from
+    it and checkpoints the result has to hold this lock for the whole sequence:
+    two GPU clusters rolling in parallel would otherwise each derive from the
+    same base and drop the other's cluster entry. The lock is reentrant so a
+    caller can checkpoint from inside its own transaction.
+    """
+
+    lock = getattr(release, "_state_lock", None)
+    if lock is None:
+        with _STATE_LOCK_GUARD:
+            lock = getattr(release, "_state_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                release._state_lock = lock
+    with lock:
+        yield
+
+
+def cached_read(
+    cache: dict[tuple[str, ...], Future[dict[str, Any]]],
+    lock: threading.Lock,
+    key: tuple[str, ...],
+    fetch: Callable[[], dict[str, Any]],
+    after: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Read `key` once per snapshot, even when several threads ask at once.
+
+    A `Future` is published under the key *before* the read starts, so the
+    second caller waits on the first read instead of issuing its own: the checks
+    fan out over a thread pool and several of them ask for the same Deployment
+    and the same ACM certificate, which without this arrive as duplicate
+    concurrent calls rather than as cache hits.
+
+    Every caller gets its own deepcopy. Callers mutate what they are handed --
+    `capture_previous` rewrites fields on the documents it reads -- and a shared
+    object would carry that mutation to whoever reads the key next.
+    """
+
     with lock:
         future = cache.get(key)
         owner = future is None
@@ -94,14 +135,33 @@ def get_json(release: Any, args: list[str]) -> dict[str, Any]:
     if not owner:
         return copy.deepcopy(future.result())
     try:
-        raw = release.runner.run(args + ["-o", "json"], capture=True)
-        value = json.loads(raw) if raw else {}
-        _cache_list_items(cache, args, value, lock)
+        value = fetch()
+        if after is not None:
+            after(value)
     except Exception as exc:
         future.set_exception(exc)
         raise
     future.set_result(value)
     return copy.deepcopy(value)
+
+
+def get_json(release: Any, args: list[str]) -> dict[str, Any]:
+    def fetch() -> dict[str, Any]:
+        raw = release.runner.run(args + ["-o", "json"], capture=True)
+        return json.loads(raw) if raw else {}
+
+    cache = getattr(release, "_json_read_cache", None)
+    if cache is None or "get" not in args:
+        return fetch()
+
+    lock: threading.Lock = release._json_read_cache_lock
+    return cached_read(
+        cache,
+        lock,
+        tuple(args),
+        fetch,
+        after=lambda value: _cache_list_items(cache, args, value, lock),
+    )
 
 
 def _cache_list_items(
@@ -134,18 +194,55 @@ def _cache_list_items(
 
 @contextmanager
 def read_snapshot(release: Any):
-    previous_cache = getattr(release, "_json_read_cache", None)
-    previous_lock = getattr(release, "_json_read_cache_lock", None)
+    """Serve every read-only `kubectl get` in the block from one observation.
+
+    A nested block *joins* the snapshot already open instead of starting a
+    second one. `status` runs the health report and the release summary inside
+    one snapshot; if the health report reset the cache, the two halves of a
+    single status output would describe two different observations of the
+    cluster, and every read the outer block had already paid for would be paid
+    for again.
+
+    Nothing that polls for convergence may run inside a snapshot at all -- see
+    `regional_release_gpu_rollout.gpu_node_items` -- so joining does not widen
+    that hazard; it only stops a nested block from discarding a warm cache.
+    """
+
+    if getattr(release, "_json_read_cache", None) is not None:
+        yield
+        return
     release._json_read_cache = {}
+    # AWS reads share the snapshot's lifetime but not its key space: `_get_json`
+    # keys on a kubectl argv and `_aws_json` on an aws argv, and one dictionary
+    # holding both would make a collision between the two a silent wrong answer
+    # rather than a name clash. They share the lock -- it guards the two
+    # dictionaries for a few instructions each, never a read.
+    release._aws_read_cache = {}
     release._json_read_cache_lock = threading.Lock()
     try:
         yield
     finally:
-        release._json_read_cache = previous_cache
-        release._json_read_cache_lock = previous_lock
+        release._json_read_cache = None
+        release._aws_read_cache = None
+        release._json_read_cache_lock = None
 
 
-def prime_deployment_snapshot(release: Any) -> None:
+def _plan_captures_gpu(plan: ReleaseExecutionPlan | None) -> bool:
+    return plan is None or plan.has(
+        ReleaseComponent.ENDPOINT,
+        ReleaseComponent.DCGM,
+        ReleaseComponent.EXECUTOR,
+        ReleaseComponent.WATCHER,
+        ReleaseComponent.COLLECTOR,
+        ReleaseComponent.RECONCILER,
+        ReleaseComponent.AGENT,
+    )
+
+
+def prime_deployment_snapshot(
+    release: Any,
+    plan: ReleaseExecutionPlan | None = None,
+) -> None:
     if not getattr(release, "_deployment_snapshot_enabled", False):
         return
     commands = [
@@ -156,18 +253,19 @@ def prime_deployment_snapshot(release: Any) -> None:
             "deployment",
         )
     ]
-    commands.extend(
-        (
-            release._gpu(
-                target,
-                "-n",
-                release.config.namespace,
-                "get",
-                "deployment",
+    if _plan_captures_gpu(plan):
+        commands.extend(
+            (
+                release._gpu(
+                    target,
+                    "-n",
+                    release.config.namespace,
+                    "get",
+                    "deployment",
+                )
+                for target in release.config.clusters
             )
-            for target in release.config.clusters
         )
-    )
     with ThreadPoolExecutor(max_workers=min(8, len(commands))) as executor:
         for future in (
             executor.submit(release._get_json, command) for command in commands
@@ -571,44 +669,6 @@ def capture_agent_identities(release: Any) -> dict[str, dict[str, Any]]:
     )
     if not pod:
         raise ReleaseError("cannot capture previous Agent identity without CPU ingress")
-    script = """
-import json
-from datetime import datetime, timezone
-
-from gpu_fault.app import ApplicationContext
-
-now = datetime.now(timezone.utc)
-records = [
-    item
-    for item in ApplicationContext.from_environment().store.list_agents()
-    if getattr(item.lifecycle_state, "value", item.lifecycle_state) == "ACTIVE"
-    and item.lease_expires_at is not None
-    and item.lease_expires_at > now
-]
-print(json.dumps([
-    {
-        "cluster_id": item.cluster_id,
-        "node_id": item.node_id,
-        "agent_protocol_version": item.agent_protocol_version,
-        "agent_version": item.agent_version,
-        "artifact_sha256": item.artifact_sha256,
-        "compatibility_digest": (
-            item.compatibility_digest or item.artifact_sha256
-        ),
-        "installer_bundle_sha256": getattr(
-            item, "installer_bundle_sha256", None
-        ),
-        "installer_template_sha256": getattr(
-            item, "installer_template_sha256", None
-        ),
-        "policy_version": item.policy_version,
-        "runtime_profile_version": item.runtime_profile_version,
-        "config_digest": item.config_digest,
-        "node_action_key_version": item.node_action_key_version,
-    }
-    for item in records
-], sort_keys=True))
-"""
     raw = release.runner.run(
         release._cpu(
             "-n",
@@ -619,7 +679,7 @@ print(json.dumps([
             "--",
             CONTROL_PLANE_PYTHON,
             "-c",
-            script,
+            probe_source("active_agent_identities"),
         ),
         capture=True,
     )
@@ -645,7 +705,156 @@ print(json.dumps([
     return result
 
 
-def _capture_previous(release: Any) -> dict[str, Any]:
+def capture_gpu_cluster_snapshot(
+    release: Any,
+    target: ClusterTarget,
+) -> tuple[dict[str, Any], dict[str, str | None], str | None]:
+    template = release._deployment_template_name(target)
+    executor_wheel = release._deployment_wheel(
+        release._gpu(target),
+        inventory.GPU_EXECUTOR_DEPLOYMENT,
+    )
+    reconciler_wheel = release._deployment_wheel(
+        release._gpu(target),
+        inventory.GPU_RECONCILER_DEPLOYMENT,
+    )
+    bundle_name = release._template_bundle(target, template) if template else None
+    template_sha256 = deployment_env_value(
+        release,
+        release._gpu(target),
+        inventory.GPU_RECONCILER_DEPLOYMENT,
+        "GPU_FAULT_INSTALLER_TEMPLATE_SHA256",
+    )
+    template_text = None
+    if template:
+        template_value = release._get_json(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                "configmap",
+                template,
+            )
+        )
+        template_text = (template_value.get("data") or {}).get("job.yaml")
+        if template_text and not template_sha256:
+            template_sha256 = hashlib.sha256(template_text.encode()).hexdigest()
+    installer_image = (
+        template_container_image(
+            template_text,
+            container_name="installer",
+        )
+        if template_text
+        else None
+    )
+    runtime_images = {
+        f"{target.cluster_id}/{deployment}": deployment_image(
+            release,
+            release._gpu(target),
+            deployment,
+        )
+        for deployment in (
+            *inventory.DEPLOYMENTS,
+            inventory.GPU_RECONCILER_DEPLOYMENT,
+        )
+    }
+    bundle_key = release._config_map_binary_key(
+        release._gpu(target),
+        bundle_name,
+    )
+    bundle_sha256 = (
+        release._config_map_sha(
+            release._gpu(target),
+            bundle_name,
+            bundle_key or release.config.bundle.name,
+        )
+        if bundle_name
+        else None
+    )
+    snapshot = {
+        "wheel": executor_wheel,
+        "wheel_key": release._config_map_binary_key(
+            release._gpu(target),
+            executor_wheel,
+        ),
+        "reconciler_wheel": reconciler_wheel,
+        "reconciler_wheel_key": release._config_map_binary_key(
+            release._gpu(target),
+            reconciler_wheel,
+        ),
+        "template": template,
+        "template_sha256": template_sha256,
+        "bundle": bundle_name,
+        "bundle_key": bundle_key,
+        "bundle_sha256": bundle_sha256,
+        "dcgm_image": (
+            release._get_json(
+                release._gpu(
+                    target,
+                    "-n",
+                    release.config.namespace,
+                    "get",
+                    "daemonset",
+                    "gpu-fault-dcgm-exporter",
+                )
+            )
+            .get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("containers", [{}])[0]
+            .get("image")
+        ),
+    }
+    return snapshot, runtime_images, installer_image
+
+
+def _map_clusters(
+    release: Any,
+    read: Any,
+    *,
+    targets: Any,
+    failure: str,
+) -> list[tuple[ClusterTarget, Any]]:
+    """Run a read-only per-cluster capture with bounded parallelism.
+
+    Results come back in the configured cluster order so the captured snapshot
+    stays byte-stable, and the first failure is reported with its cluster id.
+    """
+
+    selected = list(targets)
+    if len(selected) < 2:
+        return [(target, read(target)) for target in selected]
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_CAPTURE_WORKERS, len(selected))
+    ) as pool:
+        futures = [(target, pool.submit(read, target)) for target in selected]
+        results: list[tuple[ClusterTarget, Any]] = []
+        errors: list[tuple[str, Exception]] = []
+        for target, future in futures:
+            try:
+                results.append((target, future.result()))
+            except Exception as exc:  # noqa: PERF203 - drain every cluster first
+                errors.append((target.cluster_id, exc))
+    if errors:
+        cluster_id, exc = errors[0]
+        raise ReleaseError(f"{cluster_id} {failure} failed: {exc}") from exc
+    return results
+
+
+def _capture_previous(
+    release: Any,
+    plan: ReleaseExecutionPlan | None = None,
+) -> dict[str, Any]:
+    capture_gpu = _plan_captures_gpu(plan)
+    capture_cpu = plan is None or plan.has(
+        ReleaseComponent.CPU_STAGE,
+        ReleaseComponent.CPU_FINALIZE,
+    )
+    capture_observability_state = plan is None or plan.has(
+        ReleaseComponent.OBSERVABILITY
+    )
+    capture_endpoint_state = plan is None or plan.has(ReleaseComponent.ENDPOINT)
     live_state = dict(release.state) if release.state else release._load_state()
     probe = getattr(release, "_remote_command_stats", None)
     remote = probe() if probe is not None else remote_command_stats(release)
@@ -660,102 +869,18 @@ def _capture_previous(release: Any) -> dict[str, Any]:
         for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
     }
     node_installer_images: dict[str, str | None] = {}
-    for target in release.config.clusters:
-        template = release._deployment_template_name(target)
-        executor_wheel = release._deployment_wheel(
-            release._gpu(target),
-            inventory.GPU_EXECUTOR_DEPLOYMENT,
-        )
-        reconciler_wheel = release._deployment_wheel(
-            release._gpu(target),
-            inventory.GPU_RECONCILER_DEPLOYMENT,
-        )
-        bundle_name = release._template_bundle(target, template) if template else None
-        template_sha256 = deployment_env_value(
-            release,
-            release._gpu(target),
-            inventory.GPU_RECONCILER_DEPLOYMENT,
-            "GPU_FAULT_INSTALLER_TEMPLATE_SHA256",
-        )
-        template_text = None
-        if template:
-            template_value = release._get_json(
-                release._gpu(
-                    target,
-                    "-n",
-                    release.config.namespace,
-                    "get",
-                    "configmap",
-                    template,
-                )
-            )
-            template_text = (template_value.get("data") or {}).get("job.yaml")
-            if template_text and not template_sha256:
-                template_sha256 = hashlib.sha256(template_text.encode()).hexdigest()
-        node_installer_images[target.cluster_id] = (
-            template_container_image(
-                template_text,
-                container_name="installer",
-            )
-            if template_text
-            else None
-        )
-        for deployment in (
-            *inventory.DEPLOYMENTS,
-            inventory.GPU_RECONCILER_DEPLOYMENT,
-        ):
-            runtime_images[f"{target.cluster_id}/{deployment}"] = deployment_image(
-                release,
-                release._gpu(target),
-                deployment,
-            )
-        bundle_key = release._config_map_binary_key(
-            release._gpu(target),
-            bundle_name,
-        )
-        bundle_sha256 = (
-            release._config_map_sha(
-                release._gpu(target),
-                bundle_name,
-                bundle_key or release.config.bundle.name,
-            )
-            if bundle_name
-            else None
-        )
-        clusters[target.cluster_id] = {
-            "wheel": executor_wheel,
-            "wheel_key": release._config_map_binary_key(
-                release._gpu(target),
-                executor_wheel,
-            ),
-            "reconciler_wheel": reconciler_wheel,
-            "reconciler_wheel_key": release._config_map_binary_key(
-                release._gpu(target),
-                reconciler_wheel,
-            ),
-            "template": template,
-            "template_sha256": template_sha256,
-            "bundle": bundle_name,
-            "bundle_key": bundle_key,
-            "bundle_sha256": bundle_sha256,
-            "dcgm_image": (
-                release._get_json(
-                    release._gpu(
-                        target,
-                        "-n",
-                        release.config.namespace,
-                        "get",
-                        "daemonset",
-                        "gpu-fault-dcgm-exporter",
-                    )
-                )
-                .get("spec", {})
-                .get("template", {})
-                .get("spec", {})
-                .get("containers", [{}])[0]
-                .get("image")
-            ),
-        }
+    # Every cluster snapshot is read-only and scoped to its own GPU cluster, so
+    # the captures run concurrently and the results are merged in cluster order
+    # to keep the snapshot byte-stable.
+    for target, (snapshot, target_images, installer_image) in _map_clusters(
+        release,
+        lambda target: capture_gpu_cluster_snapshot(release, target),
+        targets=release.config.clusters if capture_gpu else (),
+        failure="previous-state capture",
+    ):
+        clusters[target.cluster_id] = snapshot
+        runtime_images.update(target_images)
+        node_installer_images[target.cluster_id] = installer_image
     live_runtime_image = require_consistent_images("runtime", runtime_images)
     runtime_image = live_runtime_image
     adopted_live_runtime_image = str(
@@ -772,45 +897,103 @@ def _capture_previous(release: Any) -> dict[str, Any]:
                 "legacy release-state adoption has no immutable rollback runtime image"
             )
         runtime_image = rollback_runtime_image
-    node_installer_image = require_consistent_images(
-        "Node Installer",
-        node_installer_images,
+    node_installer_image = (
+        require_consistent_images("Node Installer", node_installer_images)
+        if capture_gpu
+        else str(live_state.get("node_installer_image") or release.node_installer_image)
     )
-    adot_image = deployment_image(
-        release,
-        release._cpu(),
-        "gpu-fault-adot",
-        container_name="collector",
+    adot_image = (
+        deployment_image(
+            release,
+            release._cpu(),
+            "gpu-fault-adot",
+            container_name="collector",
+        )
+        if capture_observability_state
+        else str(live_state.get("adot_image") or release.adot_image)
     )
     if not adot_image:
         raise ReleaseError(
             "cannot capture previous ADOT image from deployment/gpu-fault-adot"
         )
-    capture_identities = getattr(release, "_capture_agent_identities", None)
-    agent_identities = (
-        capture_identities()
-        if capture_identities is not None
-        else capture_agent_identities(release)
+    agent_identities: dict[str, dict[str, Any]] = {}
+    if capture_gpu:
+        capture_identities = getattr(release, "_capture_agent_identities", None)
+        agent_identities = (
+            capture_identities()
+            if capture_identities is not None
+            else capture_agent_identities(release)
+        )
+        for target, expected_nodes in _map_clusters(
+            release,
+            lambda target: set(release._target_node_names(target)),
+            targets=release.config.clusters,
+            failure="active Agent set capture",
+        ):
+            captured_nodes = set(agent_identities[target.cluster_id]["node_ids"])
+            if expected_nodes != captured_nodes:
+                raise ReleaseError(
+                    f"{target.cluster_id} active Agent set does not match HyperPod nodes"
+                )
+    role_config_maps = cpu_role_config_maps(release) if capture_cpu else {}
+    admin_config = (
+        captured_admin_config(release, role_config_maps)
+        if capture_cpu
+        else AdminConfig.from_mapping(live_state.get("admin_config") or {})
     )
-    for target in release.config.clusters:
-        expected_nodes = set(release._target_node_names(target))
-        captured_nodes = set(agent_identities[target.cluster_id]["node_ids"])
-        if expected_nodes != captured_nodes:
-            raise ReleaseError(
-                f"{target.cluster_id} active Agent set does not match HyperPod nodes"
-            )
-    role_config_maps = cpu_role_config_maps(release)
-    admin_config = captured_admin_config(release, role_config_maps)
-    return {
+    capture_observability_fn = getattr(
+        release,
+        "_capture_observability_snapshot",
+        None,
+    )
+    observability = (
+        capture_observability_fn()
+        if capture_observability_fn is not None and capture_observability_state
+        else None
+    )
+    # The endpoint has to be read before the endpoint component overwrites it:
+    # the previous NLB Service only exists as a file in the previous checkout,
+    # and the Route53 record is gone the moment `ensure_control_plane_dns`
+    # UPSERTs the candidate's. Captured here, beside the observability snapshot,
+    # for the same reason and at the same point.
+    capture_endpoint_fn = getattr(release, "_capture_endpoint_snapshot", None)
+    endpoint = (
+        capture_endpoint_fn()
+        if capture_endpoint_fn is not None and capture_endpoint_state
+        else None
+    )
+    cpu_wheel = (
+        release._deployment_wheel(
+            release._cpu(),
+            inventory.CPU_INGRESS_DEPLOYMENT,
+        )
+        if capture_cpu
+        else live_state.get("wheel_config_map")
+    )
+    cpu_wheel_key = (
+        release._config_map_binary_key(release._cpu(), cpu_wheel)
+        if capture_cpu
+        else None
+    )
+    cpu_wheel_sha256 = (
+        release._config_map_sha(
+            release._cpu(),
+            cpu_wheel,
+            cpu_wheel_key or release.config.wheel.name,
+        )
+        if capture_cpu and cpu_wheel
+        else None
+    )
+    result = {
+        "release_id": live_state.get("release_id"),
         "metadata": metadata,
+        "component_digests": dict(live_state.get("component_digests") or {}),
         "agent_identities": agent_identities,
         "runtime_profile_version": release._config_map_data(
             "gpu-fault-api-ha-config-core"
         ).get("GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"),
-        "cpu_wheel": release._deployment_wheel(
-            release._cpu(),
-            inventory.CPU_INGRESS_DEPLOYMENT,
-        ),
+        "cpu_wheel": cpu_wheel,
+        "cpu_wheel_sha256": cpu_wheel_sha256,
         "cpu_role_config_maps": role_config_maps,
         "admin_config": admin_config.as_dict(),
         "executor_internal_error_total": int(
@@ -823,14 +1006,202 @@ def _capture_previous(release: Any) -> dict[str, Any]:
         "runtime_image": runtime_image,
         "node_installer_image": node_installer_image,
         "adot_image": adot_image,
+        "observability": observability,
+        "endpoint": endpoint,
         "clusters": clusters,
     }
+    timestamp_field = "executor_internal_error_last_seen_timestamp_seconds"
+    if remote.get(timestamp_field) is not None:
+        result[timestamp_field] = float(remote[timestamp_field])
+    return result
 
 
-def capture_previous(release: Any) -> dict[str, Any]:
+def capture_previous(
+    release: Any,
+    plan: ReleaseExecutionPlan | None = None,
+) -> dict[str, Any]:
     with read_snapshot(release):
-        prime_deployment_snapshot(release)
-        return _capture_previous(release)
+        prime_deployment_snapshot(release, plan)
+        return _capture_previous(release, plan)
+
+
+def _snapshot_config_map(
+    release: Any,
+    name: str,
+) -> dict[str, Any]:
+    return release._get_json(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "configmap",
+            name,
+        )
+    )
+
+
+def ensure_previous_snapshot(
+    release: Any,
+    previous: dict[str, Any],
+) -> dict[str, Any]:
+    cached = getattr(release, "_previous_snapshot_reference", None)
+    if (
+        isinstance(cached, dict)
+        and cached.get("sha256")
+        == hashlib.sha256(canonical_previous_bytes(previous)).hexdigest()
+    ):
+        # Every save_state re-derives this reference, so the unchanged case must
+        # not pay for gzip and per-chunk hashing: the canonical digest alone
+        # decides whether the externalized snapshot is still the same one.
+        return cached
+    reference, chunks = encode_previous_snapshot(previous)
+    if release.runner.dry_run:
+        release._previous_snapshot_reference = reference
+        return reference
+    with tempfile.TemporaryDirectory(prefix="gpu-fault-release-previous-") as directory:
+        root = Path(directory)
+        for chunk_ref, (name, chunk) in zip(
+            reference["chunks"],
+            chunks,
+            strict=True,
+        ):
+            exists = release.runner.probe(
+                release._cpu(
+                    "-n",
+                    release.config.namespace,
+                    "get",
+                    "configmap",
+                    name,
+                ),
+            )
+            if exists:
+                current = _snapshot_config_map(release, name)
+                annotations = (current.get("metadata") or {}).get("annotations") or {}
+                if (
+                    current.get("immutable") is not True
+                    or annotations.get(PREVIOUS_SNAPSHOT_DIGEST_ANNOTATION)
+                    != reference["sha256"]
+                ):
+                    raise ReleaseError(
+                        f"previous snapshot ConfigMap identity changed: {name}"
+                    )
+                try:
+                    validate_snapshot_config_map(
+                        current,
+                        key=str(chunk_ref["key"]),
+                        expected_sha256=str(chunk_ref["sha256"]),
+                        expected_size=int(chunk_ref["size_bytes"]),
+                    )
+                except ReleaseStateSnapshotError as exc:
+                    raise ReleaseError(str(exc)) from exc
+                continue
+            chunk_path = root / f"{name}.part"
+            chunk_path.write_bytes(chunk)
+            rendered = release.runner.run(
+                release._cpu(
+                    "-n",
+                    release.config.namespace,
+                    "create",
+                    "configmap",
+                    name,
+                    f"--from-file={chunk_ref['key']}={chunk_path}",
+                    "--dry-run=client",
+                    "-o",
+                    "yaml",
+                ),
+                capture=True,
+            )
+            document = yaml.safe_load(rendered)
+            if not isinstance(document, dict):
+                raise ReleaseError("cannot render previous snapshot ConfigMap")
+            metadata = document.setdefault("metadata", {})
+            metadata["labels"] = {
+                **dict(metadata.get("labels") or {}),
+                PREVIOUS_SNAPSHOT_LABEL: "true",
+            }
+            metadata["annotations"] = {
+                **dict(metadata.get("annotations") or {}),
+                PREVIOUS_SNAPSHOT_DIGEST_ANNOTATION: reference["sha256"],
+            }
+            document["immutable"] = True
+            release.runner.run(
+                release._cpu("create", "-f", "-"),
+                input_text=yaml.safe_dump(document, sort_keys=True),
+            )
+    release._previous_snapshot_reference = reference
+    return reference
+
+
+def cleanup_previous_snapshots(release: Any) -> None:
+    if release.runner.dry_run:
+        return
+    reference = release.state.get("previous_snapshot")
+    keep = {
+        str(item.get("config_map"))
+        for item in ((reference or {}).get("chunks") or [])
+        if isinstance(item, dict) and item.get("config_map")
+    }
+    value = release._get_json(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "configmap",
+            "-l",
+            f"{PREVIOUS_SNAPSHOT_LABEL}=true",
+        )
+    )
+    stale = sorted(
+        str((item.get("metadata") or {}).get("name") or "")
+        for item in value.get("items", [])
+        if str((item.get("metadata") or {}).get("name") or "")
+        and str((item.get("metadata") or {}).get("name") or "") not in keep
+    )
+    if stale:
+        release.runner.run(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "delete",
+                "configmap",
+                *stale,
+            )
+        )
+
+
+def render_persisted_state(release: Any) -> tuple[dict[str, Any], str]:
+    """Externalize the previous snapshot and serialize the state exactly once.
+
+    The document is only ever written or size-checked, and this function only
+    adds or removes top-level keys, so a shallow copy is enough: deep-copying a
+    state that is allowed to approach `MAX_RELEASE_STATE_BYTES` on every
+    checkpoint was pure overhead.
+    """
+
+    persisted = dict(release.state)
+    previous = persisted.get("previous")
+    if isinstance(previous, dict):
+        reference = ensure_previous_snapshot(release, previous)
+        persisted["previous_snapshot"] = reference
+        persisted["previous_snapshot_sha256"] = reference["sha256"]
+        persisted.pop("previous", None)
+        release.state["previous_snapshot"] = reference
+        release.state["previous_snapshot_sha256"] = reference["sha256"]
+    elif previous is None:
+        persisted.pop("previous_snapshot", None)
+        persisted.pop("previous_snapshot_sha256", None)
+        release.state.pop("previous_snapshot", None)
+        release.state.pop("previous_snapshot_sha256", None)
+    text = json.dumps(persisted, indent=2, sort_keys=True)
+    if len(text.encode()) > MAX_RELEASE_STATE_BYTES:
+        raise ReleaseError(
+            "regional release state exceeds the bounded ConfigMap payload"
+        )
+    return persisted, text
+
+
+def persisted_state(release: Any) -> dict[str, Any]:
+    return render_persisted_state(release)[0]
 
 
 def deployment_template_name(
@@ -886,7 +1257,44 @@ def template_bundle(
     return None
 
 
+def narrate_phase(release: Any, phase: str) -> None:
+    """Announce a durable checkpoint on the stream the operator is watching.
+
+    `save_state` is the only funnel for release state, but it writes a ConfigMap
+    and prints nothing, so an upgrade narrates thousands of `+ kubectl` lines
+    without ever saying which of its dozen transaction phases it is in. Reading
+    the state back does not recover that either: `completed_phases` is stored
+    sorted alphabetically, so `registry-staged` appears before `schema-ready`
+    even though the orchestrator reaches them the other way round. A real
+    upgrade checkpoints sixteen times, so one line each is cheap next to the
+    command trace, and it is the only timestamp in the log -- without it there
+    is no way to tell which phase is the slow one.
+
+    Printed after the write rather than before, so a line is a promise that the
+    checkpoint survived: resume and rollback both key off persisted phases.
+    """
+
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fields = [f"release-phase {stamp} {phase}"]
+    lifecycle = release.state.get("release_lifecycle")
+    if lifecycle:
+        fields.append(f"lifecycle={lifecycle}")
+    expected = release.state.get("cluster_ids") or []
+    if expected:
+        done = release.state.get("completed_cluster_ids") or []
+        # Several checkpoints share one phase name and differ only in which
+        # cluster just converged, so the phase alone cannot show progress.
+        fields.append(f"clusters={len(done)}/{len(expected)}")
+    print(" ".join(fields), file=sys.stderr, flush=True)
+
+
 def save_state(release: Any, phase: str, **updates: Any) -> None:
+    with state_transaction(release):
+        _write_state(release, phase, **updates)
+        narrate_phase(release, phase)
+
+
+def _write_state(release: Any, phase: str, **updates: Any) -> None:
     if release.state.get("release_id") not in {None, release.release_id}:
         release.state.pop("adopted_live_runtime_image", None)
     release.state.update(
@@ -924,9 +1332,28 @@ def save_state(release: Any, phase: str, **updates: Any) -> None:
             "release_manifest_schema_version": (
                 release.config.release_manifest_schema_version
             ),
+            "fleet_rollout_policy": {
+                "upgrade_max_unavailable": (release.config.upgrade_max_unavailable),
+                "rollback_max_unavailable": (release.config.rollback_max_unavailable),
+                "upgrade_max_parallel_clusters": (
+                    release.config.upgrade_max_parallel_clusters
+                ),
+                "first_rollback_wave_max_unavailable": 1,
+                "max_unavailable_per_failure_domain": 1,
+                "rollback_parallel_min_nodes": 6,
+            },
             "release_delivery_sha256": (release.config.release_delivery_sha256),
             "cpu_manifest_sha256": (
                 release.config.delivery_component_digests.get("cpu")
+            ),
+            "cpu_ingress_manifest_sha256": (
+                release.config.delivery_component_digests.get("cpu_ingress")
+            ),
+            "cpu_worker_manifest_sha256": (
+                release.config.delivery_component_digests.get("cpu_worker")
+            ),
+            "cpu_spool_manifest_sha256": (
+                release.config.delivery_component_digests.get("cpu_spool")
             ),
             "executor_manifest_sha256": (
                 release.config.delivery_component_digests.get("executor")
@@ -946,6 +1373,8 @@ def save_state(release: Any, phase: str, **updates: Any) -> None:
             "observability_manifest_sha256": (
                 release.config.delivery_component_digests.get("observability")
             ),
+            "observability_rules_sha256": release.observability_rules_digest,
+            "observability_adot_sha256": release.observability_adot_digest,
             "schema_manifest_sha256": (
                 release.config.delivery_component_digests.get("schema")
             ),
@@ -962,32 +1391,27 @@ def save_state(release: Any, phase: str, **updates: Any) -> None:
             **updates,
         }
     )
+    _persisted, text = render_persisted_state(release)
     if release.runner.dry_run:
         return
-    with tempfile.TemporaryDirectory() as directory:
-        state_file = Path(directory) / "state.json"
-        state_file.write_text(
-            json.dumps(release.state, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        rendered = release.runner.run(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "create",
-                "configmap",
-                STATE_CONFIG_MAP,
-                f"--from-file=state.json={state_file}",
-                "--dry-run=client",
-                "-o",
-                "yaml",
-            ),
-            capture=True,
-        )
-        release.runner.run(
-            release._cpu("apply", "-f", "-"),
-            input_text=rendered,
-        )
+    # Every component STARTED/FAILED transition checkpoints this ConfigMap, so
+    # the write is one `apply` of a manifest built in-process instead of a
+    # temp file plus a `create --dry-run=client` render round-trip. The manifest
+    # carries its own namespace, exactly like the rendered form it replaces.
+    release.runner.run(
+        release._cpu("apply", "-f", "-"),
+        input_text=json.dumps(
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": STATE_CONFIG_MAP,
+                    "namespace": release.config.namespace,
+                },
+                "data": {"state.json": text},
+            }
+        ),
+    )
 
 
 def load_state(release: Any) -> dict[str, Any]:
@@ -1003,5 +1427,14 @@ def load_state(release: Any) -> dict[str, Any]:
     raw = (value.get("data") or {}).get("state.json")
     if not raw:
         raise ReleaseError("regional release state is missing")
-    release.state = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ReleaseStateSnapshotError("regional release state is not an object")
+        release.state = hydrate_previous_snapshot(
+            parsed,
+            lambda name: _snapshot_config_map(release, name),
+        )
+    except (json.JSONDecodeError, ReleaseStateSnapshotError) as exc:
+        raise ReleaseError("regional release state is invalid") from exc
     return release.state

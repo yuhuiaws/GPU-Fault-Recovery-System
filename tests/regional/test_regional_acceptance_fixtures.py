@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from scripts.e2e.regional import (
+    audit_regional_command_protocol_live as live_protocol_audit,
+)
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
 from scripts.e2e.regional.audit_auth_boundary import validate_matrix
 from scripts.e2e.regional.audit_executor_readiness import validate_readiness_matrix
@@ -157,10 +160,56 @@ def test_command_protocol_fixtures_cover_every_cmd_case() -> None:
     )
 
 
-def test_cmd006_fixture_waits_for_the_documented_lease_expiry() -> None:
-    source = inspect.getsource(LiveProtocolAudit.run_006)
+def test_cmd006_fixture_waits_for_the_documented_lease_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CMD-006 has to outlast the lease it took, not just retry quickly.
 
-    assert "time.sleep(15)" in source
+    The second Executor claims a 10 second lease; completing with its token
+    before that lease expires proves nothing about expiry handling, so the
+    fixture sleeps past it and expects 409 from the now-expired token.
+    """
+
+    slept: list[float] = []
+    leases: list[int] = []
+    tokens = iter(("token-1", "token-2", "token-3"))
+    completions = iter(
+        (
+            (200, {}),
+            (409, {}),
+            (409, {}),
+            (200, {"status": "SUCCEEDED", "last_lease_owner": "cmd006-a3"}),
+        )
+    )
+    recorded: dict[str, dict] = {}
+    monkeypatch.setattr(
+        live_protocol_audit.time, "sleep", lambda seconds: slept.append(seconds)
+    )
+
+    def claim(*, executor_id: str, lease_seconds: int):
+        leases.append(lease_seconds)
+        return 200, {"commands": [{"executor_id": executor_id, "token": next(tokens)}]}
+
+    audit = SimpleNamespace(
+        seed=lambda _name: SimpleNamespace(command_id="command-1"),
+        claim=claim,
+        complete=lambda _command_id, payload: next(completions),
+        record=lambda case_id, **fields: recorded.update({case_id: fields}),
+        _lease_token=lambda command: command["token"],
+    )
+
+    LiveProtocolAudit.run_006(audit)
+
+    assert slept and slept[0] > leases[1], (
+        "the fixture completed with the second token before its lease expired"
+    )
+    assert recorded == {
+        "GF-REGIONAL-CMD-006": {
+            "stale_token_one": 409,
+            "expired_token_two": 409,
+            "final_owner": "cmd006-a3",
+        }
+    }
 
 
 def test_auth_boundary_fixture_validates_precise_results() -> None:
@@ -510,7 +559,8 @@ class FakeReleaseRollingBackend:
             else {
                 "noop": "NOOP",
                 "control_plane": "CONTROL_PLANE_ONLY",
-                "data_plane": "DATA_PLANE_COMPATIBLE",
+                "executor": "DATA_PLANE_COMPATIBLE",
+                "agent": "DATA_PLANE_COMPATIBLE",
                 "full": "FULL",
             }[scenario]
         )
@@ -536,16 +586,52 @@ class FakeReleaseRollingBackend:
         auto_rollback=None,
     ) -> dict:
         self.calls.append((scenario, fault_phase, resume, auto_rollback, diff["kind"]))
-        if scenario == "data_plane" and fault_phase:
-            return {"phase": "failed", "injected_failure": fault_phase}
-        if scenario == "full" and fault_phase:
-            return {"phase": "rolled-back", "injected_failure": fault_phase}
+        plans = {
+            "control_plane": {
+                "clusters": {},
+                "restores_data_plane": False,
+                "needs_controller": False,
+            },
+            "executor": {
+                "clusters": {"cluster-a": ["EXECUTOR"]},
+                "restores_data_plane": True,
+                "needs_controller": False,
+            },
+            "agent": {
+                "clusters": {"cluster-a": ["RECONCILER", "AGENT"]},
+                "restores_data_plane": True,
+                "needs_controller": True,
+            },
+            "full": {
+                "clusters": {"cluster-a": ["EXECUTOR", "RECONCILER", "AGENT"]},
+                "restores_data_plane": True,
+                "needs_controller": True,
+            },
+        }
+        if fault_phase:
+            if auto_rollback:
+                return {
+                    "phase": "rolled-back",
+                    "injected_failure": fault_phase,
+                    "rollback_plan": plans[scenario],
+                    "rollback_timing": {"t_safe_seconds": 30.0, "t_full_seconds": 45.0},
+                    "operation_duration_seconds": 45.0,
+                }
+            return {
+                "phase": "failed",
+                "injected_failure": fault_phase,
+                "operation_duration_seconds": 1.0,
+            }
         if scenario == "control_plane":
             self.live["cpu_wheel"] = "cpu-v2"
             self.cpu_generations = {"ingress": 2, "worker": 2}
-        elif scenario == "data_plane":
+        elif scenario == "executor":
             self.live["clusters"]["cluster-a"]["wheel"] = "executor-v2"
             self.gpu_generations["cluster-a"]["executor"] = 2
+        elif scenario == "agent":
+            self.live["clusters"]["cluster-a"]["reconciler_wheel"] = "node-v2"
+            self.live["clusters"]["cluster-a"]["bundle"] = "bundle-v2"
+            self.gpu_generations["cluster-a"]["reconciler"] = 2
         elif scenario == "full":
             self.live = {
                 "cpu_wheel": "cpu-v3",
@@ -561,7 +647,11 @@ class FakeReleaseRollingBackend:
             self.cpu_generations = {"ingress": 3, "worker": 3}
             self.gpu_generations = {"cluster-a": {"executor": 3, "reconciler": 2}}
         self.completed.add(scenario)
-        return {"phase": "complete", "injected_failure": None}
+        return {
+            "phase": "complete",
+            "injected_failure": None,
+            "operation_duration_seconds": 10.0 if resume else 20.0,
+        }
 
 
 def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
@@ -576,9 +666,13 @@ def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
     assert result["status"] == "COMPLETED"
     assert backend.calls == [
         ("noop", None, False, None, "NOOP"),
+        ("control_plane", "cpu-finalized", False, True, "CONTROL_PLANE_ONLY"),
         ("control_plane", None, False, None, "CONTROL_PLANE_ONLY"),
-        ("data_plane", "cpu-staged", False, False, "DATA_PLANE_COMPATIBLE"),
-        ("data_plane", None, True, False, "DATA_PLANE_COMPATIBLE"),
+        ("executor", "data-converged", False, True, "DATA_PLANE_COMPATIBLE"),
+        ("executor", "cpu-staged", False, False, "DATA_PLANE_COMPATIBLE"),
+        ("executor", None, True, False, "DATA_PLANE_COMPATIBLE"),
+        ("agent", "data-converged", False, True, "DATA_PLANE_COMPATIBLE"),
+        ("agent", None, False, None, "DATA_PLANE_COMPATIBLE"),
         ("full", "data-converged", False, True, "FULL"),
         ("full", None, False, None, "FULL"),
     ]

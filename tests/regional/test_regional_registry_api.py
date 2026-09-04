@@ -104,6 +104,76 @@ def test_registry_rollback_publishes_a_higher_generation() -> None:
     assert revision.registrations[0].lifecycle_state is RegionalClusterLifecycle.ACTIVE
 
 
+def test_cluster_transitions_merge_concurrent_join_membership() -> None:
+    _, app = context_and_app()
+    cluster_b = registration("cluster-b", "b" * 32)
+    cluster_c = registration("cluster-c", "c" * 32)
+
+    async def transition(client, item) -> None:
+        response = await client.post(
+            f"/v1/regional/registry/clusters/{item.cluster_id}/transition",
+            headers=operator_headers(),
+            json={
+                "registration": item.model_dump(mode="json"),
+                "lifecycle_state": "PENDING",
+                "reason": f"prepare {item.cluster_id}",
+            },
+        )
+        assert response.status_code == 200, response.text
+
+    async def scenario() -> None:
+        async with asgi_client(app) as client:
+            await asyncio.gather(
+                transition(client, cluster_b), transition(client, cluster_c)
+            )
+            status = await client.get(
+                "/v1/regional/registry/status", headers=operator_headers()
+            )
+
+        assert status.status_code == 200
+        assert status.json()["cluster_states"] == {
+            "cluster-a": "ACTIVE",
+            "cluster-b": "PENDING",
+            "cluster-c": "PENDING",
+        }
+
+    asyncio.run(scenario())
+
+
+def test_cluster_transition_rejects_identity_drift() -> None:
+    _, app = context_and_app()
+    pending = registration("cluster-b", "b" * 32).model_copy(
+        update={"lifecycle_state": RegionalClusterLifecycle.PENDING}
+    )
+    drifted = pending.model_copy(update={"region": "us-east-1"})
+
+    async def scenario() -> None:
+        async with asgi_client(app) as client:
+            first = await client.post(
+                "/v1/regional/registry/clusters/cluster-b/transition",
+                headers=operator_headers(),
+                json={
+                    "registration": pending.model_dump(mode="json"),
+                    "lifecycle_state": "PENDING",
+                    "reason": "prepare cluster-b",
+                },
+            )
+            second = await client.post(
+                "/v1/regional/registry/clusters/cluster-b/transition",
+                headers=operator_headers(),
+                json={
+                    "registration": drifted.model_dump(mode="json"),
+                    "lifecycle_state": "ACTIVE",
+                    "reason": "activate drifted cluster-b",
+                },
+            )
+
+        assert first.status_code == 200
+        assert second.status_code == 409
+
+    asyncio.run(scenario())
+
+
 def test_registry_api_requires_execution_token() -> None:
     _, app = context_and_app()
 

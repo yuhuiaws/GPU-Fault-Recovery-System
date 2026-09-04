@@ -2,10 +2,1210 @@
   "dynamic_prefixes": [
     "GPU_FAULT_NOTIFICATION_TTL_SECONDS_"
   ],
-  "schema_version": 1,
+  "schema_version": 3,
+  "value_bounds": {
+    "GPU_FAULT_COLLECTOR_GZIP_MIN_BYTES": {
+      "minimum": 0
+    },
+    "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS": {
+      "minimum": 1
+    },
+    "GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD": {
+      "maximum": 1
+    },
+    "GPU_FAULT_EFA_TRAFFIC_BASELINE_ALPHA": {
+      "maximum": 1
+    },
+    "GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS": {
+      "minimum": 1
+    },
+    "GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS": {
+      "minimum": 1
+    },
+    "GPU_FAULT_HUNG_PYSPY_SAMPLE_COUNT": {
+      "maximum": 5,
+      "minimum": 3
+    },
+    "GPU_FAULT_HUNG_PYSPY_SAMPLE_INTERVAL_SECONDS": {
+      "maximum": 30,
+      "minimum": 0
+    },
+    "GPU_FAULT_HUNG_PYSPY_TIMEOUT_SECONDS": {
+      "maximum": 60,
+      "minimum": 1
+    },
+    "GPU_FAULT_HUNG_STRACE_SAMPLE_COUNT": {
+      "maximum": 5,
+      "minimum": 2
+    },
+    "GPU_FAULT_HUNG_STRACE_SAMPLE_DURATION_SECONDS": {
+      "maximum": 30,
+      "minimum": 1
+    },
+    "GPU_FAULT_HUNG_STRACE_SAMPLE_INTERVAL_SECONDS": {
+      "maximum": 30,
+      "minimum": 0
+    },
+    "GPU_FAULT_HUNG_TRIAGE_MAX_NODES": {
+      "minimum": 0
+    },
+    "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS": {
+      "minimum": 0
+    },
+    "GPU_FAULT_NODE_LOG_CONTEXT_LINES": {
+      "minimum": 0
+    },
+    "GPU_FAULT_NODE_LOG_INITIAL_TAIL_BYTES": {
+      "minimum": 0
+    },
+    "GPU_FAULT_NODE_LOG_MAX_COLLECTION_ERRORS": {
+      "minimum": 1
+    },
+    "GPU_FAULT_NODE_LOG_MAX_JOURNAL_WINDOW_SECONDS": {
+      "minimum": 60
+    },
+    "GPU_FAULT_NODE_LOG_MAX_TRACKED_FILES": {
+      "minimum": 1
+    },
+    "GPU_FAULT_NOTIFICATION_BACKLOG_GRACE_SECONDS": {
+      "minimum": 0
+    },
+    "GPU_FAULT_NOTIFICATION_DISPATCH_SCAN_LIMIT": {
+      "minimum": 1
+    },
+    "GPU_FAULT_NOTIFICATION_TTL_SECONDS": {
+      "minimum": 0
+    },
+    "GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY": {
+      "minimum": 1
+    },
+    "GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS": {
+      "minimum": 0
+    },
+    "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION": {
+      "minimum": 1
+    },
+    "GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS": {
+      "minimum": 30
+    }
+  },
+  "value_kinds": {
+    "GPU_FAULT_AGENT_ENDPOINT_REQUIRE_TLS": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_ALLOW_EMAIL": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_ALLOW_HYPERPOD_MUTATION": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_ALLOW_HYPERPOD_REBOOT": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_ALLOW_HYPERPOD_REPLACE": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_ALLOW_SINGLE_CLUSTER": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_API_PORT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_AURORA_REFRESH_MAX_ATTEMPTS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_CLUSTER_EXECUTOR_READINESS_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_COLLECTOR_GZIP_MIN_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_COLLECTOR_HTTP_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_COLLECTOR_OUTBOX_MAX_RECORDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_COLLECTOR_OUTBOX_REPLAY_BUDGET_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_COMPLETION_OBSERVATION_RETENTION_CYCLES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_COMPLETION_OBSERVE_UNMANAGED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_COMPLETION_OUTBOX_MAX_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_COMPLETION_OUTBOX_MAX_RECORDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_COMPLETION_OUTBOX_REPLAY_BATCH_SIZE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_CONTAINER_RESTORE_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_CONTAINER_STOP_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DCGM_EDGE_FILTER_ENABLED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_DCGM_EXPORTER_PORT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DCGM_HISTORY_MAX_POINTS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT": {
+      "kind": "number"
+    },
+    "GPU_FAULT_DCGM_POWER_LIMIT_RATIO": {
+      "kind": "number"
+    },
+    "GPU_FAULT_DCGM_STATE_MAX_KEYS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD": {
+      "kind": "number"
+    },
+    "GPU_FAULT_DEFAULT_RESTART_BUDGET": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DEVICE_CLIENT_SAMPLES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DEVICE_CLIENT_SAMPLE_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_DEVICE_SWEEP_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DIAGNOSTIC_MAX_ARCHIVES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DIAGNOSTIC_RETENTION_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_DISCOVER_POD_GPU_UUIDS": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_DRIVER_BRANCH": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_EFA_TRAFFIC_BASELINE_ALPHA": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EFA_TRAFFIC_DROP_RATIO": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_EFA_TRAFFIC_SPIKE_RATIO": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EFA_TRAFFIC_STARTUP_GRACE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EFA_TRAFFIC_ZERO_BPS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EFA_TRAFFIC_ZERO_HUNG_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EFA_TRAFFIC_ZERO_WARNING_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_ENABLE_AGENT_REGISTRY": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_ENABLE_HYPERPOD_ADAPTER": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_EVIDENCE_RETENTION_HOURS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EVIDENCE_STORE_IO_MAX_IN_FLIGHT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_EVIDENCE_STORE_IO_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_EXECUTOR_READINESS_MAX_CLAIM_AGE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EXECUTOR_READINESS_MAX_UNCLAIMED_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_EXPECTED_GPU_COUNT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_FABRIC_MANAGER_HEALTH_SUMMARY_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_FABRIC_MANAGER_JOURNAL": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_FABRIC_MANAGER_LOG_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_FABRIC_MANAGER_SILENT_AFTER_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_FAULT_DECODE_MAX_IN_FLIGHT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_FAULT_DECODE_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_FAULT_REQUEST_BUDGET_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_FAULT_STORE_IO_MAX_IN_FLIGHT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_FAULT_STORE_IO_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_FIELD_DIAGNOSTIC_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_GPU_INVENTORY_MAX_AGE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_GPU_INVENTORY_SILENT_AFTER_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_GPU_METRICS_SILENT_AFTER_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_HOST_EDGE_FILTER_ENABLED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HOST_HISTORY_MAX_POINTS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HOST_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_HOST_NOTIFICATION_COOLDOWN_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HOST_TELEMETRY_SILENT_AFTER_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_HUNG_PYSPY_SAMPLE_COUNT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HUNG_PYSPY_SAMPLE_INTERVAL_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HUNG_PYSPY_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HUNG_STRACE_SAMPLE_COUNT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HUNG_STRACE_SAMPLE_DURATION_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HUNG_STRACE_SAMPLE_INTERVAL_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HUNG_TRIAGE_MAX_NODES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HYPERPOD_MAX_BATCH_SIZE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_INGRESS_DECODE_MAX_IN_FLIGHT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_INGRESS_DECODE_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_INGRESS_DECODE_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_INGRESS_FAULT_CONCURRENCY": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_INGRESS_FAULT_WAIT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_INGRESS_NORMAL_CONCURRENCY": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_INGRESS_NORMAL_WAIT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_INSTALLER_MAX_UNAVAILABLE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_INSTALL_RETRY_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_KERNEL_HEALTH_SUMMARY_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_KERNEL_SILENT_AFTER_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_KUBERNETES_EFA_HEALTH_SUMMARY_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_KUBERNETES_EFA_MISMATCH_SAMPLES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_KUBERNETES_RESOURCE_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_LEGACY_GPU_METRICS_INVENTORY_MAX_AGE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_LIFESPAN_SHUTDOWN_MAX_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_LOCAL_FILESYSTEM_DURATION_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_LOCAL_FILESYSTEM_WARNING_PERCENT": {
+      "kind": "number"
+    },
+    "GPU_FAULT_LOG_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_LONG_MUTATION_MIN_FAILSAFE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT": {
+      "kind": "number"
+    },
+    "GPU_FAULT_MEMORY_AVAILABLE_WARNING_PERCENT": {
+      "kind": "number"
+    },
+    "GPU_FAULT_MEMORY_PRESSURE_DURATION_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_METRICS_COLLECTOR_SNAPSHOT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_METRICS_COLLECTOR_TOP_N": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_METRICS_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_METRICS_OBSERVATION_SCAN_LIMIT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_METRICS_SCAN_TTL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_METRICS_WORKFLOW_SCAN_LIMIT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_MAX_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_ACTION_KEY_VERSION": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_ACTION_MAX_PARALLEL": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_ACTION_MAX_RESULTS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_ACTION_POLL_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_SKEW_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_ACTION_RETENTION_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_ACTION_SUBMIT_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_ACTION_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NODE_AGENT_PORT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_ALLOW_DRIVER_REMEDIATION": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NODE_ALLOW_FABRIC_RESET": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NODE_ALLOW_FIELD_DIAGNOSTIC": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NODE_ALLOW_FIRMWARE_UPDATE": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NODE_ALLOW_GPU_RESET": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NODE_HEARTBEAT_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_NODE_INFLIGHT_WAIT_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_CONTEXT_LINES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_INITIAL_TAIL_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_MAX_BATCH_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_MAX_COLLECTION_ERRORS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_MAX_ENTRIES_PER_BATCH": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_MAX_ENTRY_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_MAX_JOURNAL_WINDOW_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_MAX_TRACKED_FILES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NODE_LOG_SILENT_AFTER_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_NODE_SINGLE_GPU_RESET_SUPPORTED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NOTIFICATION_BACKLOG_GRACE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NOTIFICATION_DELIVER_DRILLS": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_NOTIFICATION_DISPATCH_SCAN_LIMIT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NOTIFICATION_LEASE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NOTIFICATION_POLL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_NOTIFICATION_THROTTLE_MAX_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_NOTIFICATION_TTL_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_NVSWITCH_TOPOLOGY_MAX_AGE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PAGE_CACHE_DURATION_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PAGE_CACHE_WARNING_PERCENT": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_POSTGRES_BOOTSTRAP_LOCK_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_POSTGRES_BOOTSTRAP_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_POSTGRES_POOL_MAX_IDLE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_POSTGRES_POOL_MAX_LIFETIME_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_POSTGRES_POOL_MAX_SIZE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_POSTGRES_POOL_MIN_SIZE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_POSTGRES_STATEMENT_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_POST_ACTION_VALIDATION_MAX_SAMPLE_AGE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_BUSY_BACKOFF_MAX_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_CLAIM_WINDOW_MULTIPLIER": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_DIAGNOSTICS_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_DIAGNOSTICS_STALE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_FAULT_BUSY_BACKOFF_MAX_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_FAULT_IDLE_BACKOFF_MAX_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_FAULT_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_IDLE_BACKOFF_MAX_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_LEADER_LEASE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_LEADER_RENEW_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_MAX_REQUEST_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_RECEIPT_POLL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_RECEIPT_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_REQUEST_MAX_EXECUTION_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_REQUEST_RENEW_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_RESPONSE_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_RETRYABLE_RESPONSE_MAX_AGE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_PROCESSOR_SNAPSHOT_BYPASS": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_PROCESSOR_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_PROXY_HEADERS_ENABLED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_QUICK_DIAGNOSTIC_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_QUIESCE_FAILSAFE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_QUIESCE_RETRY_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_QUIESCE_SETTLE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_RANK_LIVENESS_ENABLED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_RANK_PROGRESS_GPU_IDLE_PERCENT": {
+      "kind": "number"
+    },
+    "GPU_FAULT_RANK_PROGRESS_MIN_CPU_CORES": {
+      "kind": "number"
+    },
+    "GPU_FAULT_RANK_PROGRESS_MIN_WRITE_BPS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_RECONCILE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_REGISTRY_POLL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_REGISTRY_STALE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_REQUEST_BUDGET_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_REQUIRE_NODE_LOG_COLLECTOR": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_RESTORE_SETTLE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_SHUTDOWN_MARGIN_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_SPARE_HEALTH_FAILURE_THRESHOLD": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_SPARE_HEALTH_SCAN_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_SPARE_UNAVAILABLE_ALERT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_SPARE_UNAVAILABLE_RECHECK_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_STORE_IO_MAX_IN_FLIGHT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_STORE_IO_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TARGET_DRIVER_BRANCH": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_ADMISSION_PARTITIONS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_BATCH_DELAY_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_BATCH_GROUPS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_BATCH_SIZE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_FAULT_PRESSURE_POLL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_FAULT_PRESSURE_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_LEASE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_MAX_DEPTH": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_MAX_IN_FLIGHT_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_MAX_ITEM_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_NOTIFICATION_FALLBACK_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_PROJECTION_MARGIN": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_ITEMS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_RETRY_BACKOFF_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_MAX_IN_FLIGHT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TELEMETRY_SPOOL_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TRAINING_HEALTH_SCAN_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TRAINING_HEARTBEAT_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TRAINING_MAX_STEP_LAG": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TRAINING_MIN_THROUGHPUT_RATIO": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TRAINING_PROGRESS_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_TRAINING_STARTUP_GRACE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_TRANSIENT_GPU_WARNING_GRACE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_VALIDATION_REQUIRE_RDMA": {
+      "kind": "boolean",
+      "true_tokens": [
+        "true"
+      ]
+    },
+    "GPU_FAULT_WATCHER_CLEANUP_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_WATCHER_POLL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_WATCHER_RECONCILE_DEBOUNCE_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_WORKFLOW_BATCH_SIZE": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS": {
+      "kind": "number"
+    },
+    "GPU_FAULT_WORKLOAD_LOG_ANNOTATION_TAIL_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_WORKLOAD_LOG_MAX_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_WORKLOAD_LOG_S3_MAX_BYTES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_WORKLOAD_LOG_TAIL_LINES": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_XID_CORRELATION_LEASE_SECONDS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_XID_CORRELATION_POLL_SECONDS": {
+      "kind": "number"
+    }
+  },
   "variables": [
     "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL",
     "GPU_FAULT_ADAPTER",
+    "GPU_FAULT_ADMIN_LOG",
     "GPU_FAULT_ADOT_IMAGE",
     "GPU_FAULT_AFFECTED_WORKLOAD_IDS",
     "GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS",
@@ -247,6 +1447,7 @@
     "GPU_FAULT_INSTALLER_TEMPLATE_PATH",
     "GPU_FAULT_INSTALLER_TEMPLATE_SHA256",
     "GPU_FAULT_INSTALLER_VERSION",
+    "GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP",
     "GPU_FAULT_INSTALL_RETRY_SECONDS",
     "GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES",
     "GPU_FAULT_KERNEL_HEALTH_SUMMARY_SECONDS",
@@ -278,11 +1479,13 @@
     "GPU_FAULT_MEMORY_TEMP_CRITICAL_C",
     "GPU_FAULT_MEMORY_TEMP_WARNING_C",
     "GPU_FAULT_MEMORY_TEMP_WARNING_MARGIN_C",
-    "GPU_FAULT_METRICS_COLLECTOR_SILENCE_TTL_SECONDS",
     "GPU_FAULT_METRICS_COLLECTOR_SNAPSHOT_SECONDS",
     "GPU_FAULT_METRICS_COLLECTOR_TOP_N",
     "GPU_FAULT_METRICS_INTERVAL_SECONDS",
     "GPU_FAULT_METRICS_MODE",
+    "GPU_FAULT_METRICS_OBSERVATION_SCAN_LIMIT",
+    "GPU_FAULT_METRICS_SCAN_TTL_SECONDS",
+    "GPU_FAULT_METRICS_WORKFLOW_SCAN_LIMIT",
     "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_MAX_SECONDS",
     "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS",
     "GPU_FAULT_NAMESPACE",
@@ -336,11 +1539,16 @@
     "GPU_FAULT_NODE_INSTALLER_TEMPLATE_SHA256",
     "GPU_FAULT_NODE_INSTANCE_ID",
     "GPU_FAULT_NODE_INSTANCE_TYPE",
+    "GPU_FAULT_NODE_LOG_CONTEXT_LINES",
+    "GPU_FAULT_NODE_LOG_EXCLUDED_UNITS",
     "GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS",
     "GPU_FAULT_NODE_LOG_INITIAL_TAIL_BYTES",
     "GPU_FAULT_NODE_LOG_MAX_BATCH_BYTES",
+    "GPU_FAULT_NODE_LOG_MAX_COLLECTION_ERRORS",
     "GPU_FAULT_NODE_LOG_MAX_ENTRIES_PER_BATCH",
     "GPU_FAULT_NODE_LOG_MAX_ENTRY_BYTES",
+    "GPU_FAULT_NODE_LOG_MAX_JOURNAL_WINDOW_SECONDS",
+    "GPU_FAULT_NODE_LOG_MAX_TRACKED_FILES",
     "GPU_FAULT_NODE_LOG_SILENT_AFTER_SECONDS",
     "GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION",
     "GPU_FAULT_NODE_SINGLE_GPU_RESET_SUPPORTED",
@@ -350,6 +1558,7 @@
     "GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG",
     "GPU_FAULT_NOTIFICATION_DELIVER_DRILLS",
     "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED",
+    "GPU_FAULT_NOTIFICATION_DISPATCH_SCAN_LIMIT",
     "GPU_FAULT_NOTIFICATION_LEASE_SECONDS",
     "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS",
     "GPU_FAULT_NOTIFICATION_POLL_SECONDS",
@@ -447,6 +1656,7 @@
     "GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS",
     "GPU_FAULT_PYTHON_STACK_TOOL",
     "GPU_FAULT_QUICK_DIAGNOSTIC_TIMEOUT_SECONDS",
+    "GPU_FAULT_QUICK_VALIDATION_EVIDENCE",
     "GPU_FAULT_QUIESCE_CONTAINERS",
     "GPU_FAULT_QUIESCE_FAILSAFE_SECONDS",
     "GPU_FAULT_QUIESCE_PROCESSES",
@@ -489,6 +1699,7 @@
     "GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION",
     "GPU_FAULT_REQUIRE_NODE_LOG_COLLECTOR",
     "GPU_FAULT_RESTORE_SETTLE_SECONDS",
+    "GPU_FAULT_ROTATE_NODE_ACTION_KEY",
     "GPU_FAULT_RUNTIME_IMAGE",
     "GPU_FAULT_RUNTIME_PROFILE",
     "GPU_FAULT_RUNTIME_PROFILE_VERSION",
@@ -497,6 +1708,7 @@
     "GPU_FAULT_SHUTDOWN_MARGIN_SECONDS",
     "GPU_FAULT_SITE_FILE",
     "GPU_FAULT_SITE_ID",
+    "GPU_FAULT_SITE_OPERATION_LOCK_FD",
     "GPU_FAULT_SPARE_HEALTH_FAILURE_THRESHOLD",
     "GPU_FAULT_SPARE_HEALTH_SCAN_SECONDS",
     "GPU_FAULT_SPARE_UNAVAILABLE_ALERT_SECONDS",

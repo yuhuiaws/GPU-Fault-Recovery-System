@@ -7,6 +7,12 @@ from pathlib import Path
 
 import yaml
 
+from gpu_fault.env_validation import (
+    TRAINING_HEALTH_MONITOR_ENV,
+    training_health_monitor_enabled,
+)
+from gpu_fault.node_agent import common
+
 ROOT = Path(__file__).parents[2]
 NODE_SCRIPTS = (
     ROOT / "deploy/node/install-gpu-fault-collector.sh",
@@ -14,6 +20,7 @@ NODE_SCRIPTS = (
     ROOT / "deploy/node/uninstall-gpu-fault-collector.sh",
     ROOT / "deploy/node/build-node-installer-bundle.sh",
     ROOT / "deploy/node/run-hyperpod-installer-job.sh",
+    ROOT / "deploy/node/preflight-gpu-fault-node.sh",
     ROOT / "deploy/node/provision-node-action-keys.sh",
     ROOT / "deploy/node/verify-certificate-bundle.sh",
     ROOT / "deploy/node/check-control-plane-certificate.sh",
@@ -69,6 +76,52 @@ def test_node_installer_help_does_not_require_root() -> None:
     assert "--enable-node-log-collector" in result.stdout
     assert "--enable-nvidia-smi-metrics-collector" in result.stdout
     assert "--certificate-min-validity-seconds N" in result.stdout
+
+
+def test_node_installer_exposes_config_digest_environment() -> None:
+    result = subprocess.run(
+        ["bash", str(NODE_SCRIPTS[0]), "--print-config-digest-environment"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "GPU_FAULT_PYTHON_STACK_TOOL": (
+            "/opt/gpu-fault/tools/py-spy-0.4.1-e7c2de2dc544/venv/bin/py-spy"
+        ),
+        "GPU_FAULT_QUIESCE_RESTORE_COMMAND": (
+            "/opt/gpu-fault/current/venv/bin/gpu-fault-restore-gpu-services"
+        ),
+    }
+
+
+def test_node_rollout_preflight_is_read_only_and_server_validated() -> None:
+    deploy = (ROOT / "deploy/node/deploy-node-installer-reconciler.sh").read_text()
+    job = (ROOT / "deploy/node/run-hyperpod-installer-job.sh").read_text()
+    preflight = (ROOT / "deploy/node/preflight-gpu-fault-node.sh").read_text()
+
+    assert 'PREFLIGHT_ONLY="${GPU_FAULT_RECONCILER_PREFLIGHT_ONLY:-false}"' in deploy
+    assert 'if [[ "${PREFLIGHT_ONLY}" == "true" ]]' in deploy
+    assert deploy.count("apply --dry-run=server") >= 3
+    assert "--preflight-only --render-only" in deploy
+    assert 'render_installer_job "${node}" --preflight-only' in deploy
+    preflight_section = deploy.split('if [[ "${PREFLIGHT_ONLY}" == "true" ]]', 1)[1]
+    assert "provision-node-action-keys.sh" not in preflight_section.split("fi", 1)[0]
+    assert "GPU_FAULT_RECONCILER_PREFLIGHT_ONLY" not in job
+    assert "readOnly: ${HOST_ROOT_READ_ONLY}" in job
+    assert 'HOST_ROOT_READ_ONLY="true"' in job
+    assert "mountPath: /host/run/gpu-fault-preflight-artifact" in job
+    assert "chroot /host /usr/bin/env" in job
+    assert "preflight-gpu-fault-node.sh" in job
+    assert "GPU_FAULT_PREFLIGHT_CANDIDATE_BUNDLE" in job
+    assert '"${condition}" == *Failed*' in job
+    assert "GPU_FAULT_REQUIRE_ROLLBACK_SLOT" in preflight
+    assert "host has no rollback runtime slot" in preflight
+    assert "host has an unresolved GPU service quiesce state" in preflight
+    assert "host Python 3.12 venv support is unavailable" in preflight
+    assert "host has less than" in preflight
 
 
 def test_hyperpod_installer_supports_regional_connection_secret() -> None:
@@ -128,12 +181,10 @@ def test_regional_node_keys_are_derived_before_the_job() -> None:
     assert "GPU_FAULT_INSTALLER_TEMPLATE_PATH" in manifest
     assert "REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP" in manifest
     assert "REPLACE_WITH_HYPERPOD_CLUSTER" in manifest
-    for placeholder in (
-        "REPLACE_WITH_INSTALLER_MAX_UNAVAILABLE",
-        "REPLACE_WITH_INSTALLER_ACTIVE_DEADLINE_SECONDS",
-        "REPLACE_WITH_INSTALLER_ALLOWED_NODES",
-    ):
-        assert f'value: "{placeholder}"' in manifest
+    assert 'allowed-nodes: "REPLACE_WITH_INSTALLER_ALLOWED_NODES"' in manifest
+    assert 'max-unavailable: "REPLACE_WITH_INSTALLER_MAX_UNAVAILABLE"' in manifest
+    assert 'value: "REPLACE_WITH_INSTALLER_ACTIVE_DEADLINE_SECONDS"' in manifest
+    assert "GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP" in manifest
     assert 'NODE_ACTION_SECRET_NAME="${NODE_ACTION_KEYS_SECRET}"' in installer
     assert 'NODE_ACTION_SECRET_KEY="${NODE_NAME}"' in installer
     assert 'DERIVE_NODE_ACTION_SECRET="false"' in installer
@@ -206,6 +257,50 @@ def test_systemd_collectors_use_environment_node_id() -> None:
     assert "${GPU_FAULT_METRICS_MODE}" in metrics
     assert "gpu-fault-collector fabric-manager" in fabric
     assert "SupplementaryGroups=systemd-journal" in fabric
+
+
+def test_node_runtime_uses_content_addressed_atomic_slots() -> None:
+    installer = NODE_SCRIPTS[0].read_text()
+    runtime_units = (
+        "gpu-fault-kernel-collector.service",
+        "gpu-fault-metrics-collector.service",
+        "gpu-fault-host-collector.service",
+        "gpu-fault-log-collector.service",
+        "gpu-fault-fabric-manager-collector.service",
+        "gpu-fault-node-agent.service",
+    )
+
+    assert 'RUNTIME_RELEASE_DIR="${RUNTIME_RELEASES_DIR}/${WHEEL_SHA256}"' in installer
+    assert (
+        'prepare_runtime_slot "${RUNTIME_RELEASE_DIR}" "${WHEEL_SHA256}"' in installer
+    )
+    assert (
+        'atomic_symlink "${RUNTIME_RELEASE_DIR}" "${RUNTIME_CURRENT_LINK}"' in installer
+    )
+    assert 'touch "${release_dir}/.complete"' in installer
+    assert "runtime_record_digest" in installer
+    assert '"${PYTHON_COMMAND}" -m venv /opt/gpu-fault/venv' not in installer
+    assert 'PREVIOUS_CURRENT_TARGET="$(readlink -f "${RUNTIME_CURRENT_LINK}")"' in (
+        installer
+    )
+    assert "restore_install_files" in installer
+    assert "restore_unit_state" in installer
+    for name in runtime_units:
+        unit = (ROOT / "deploy/systemd" / name).read_text()
+        assert "/opt/gpu-fault/current/venv/bin/" in unit, name
+
+
+def test_legacy_node_venv_is_preserved_for_first_ab_rollback() -> None:
+    installer = NODE_SCRIPTS[0].read_text()
+
+    assert 'LEGACY_VENV_PATH="${RUNTIME_ROOT}/venv"' in installer
+    assert (
+        'if [[ ! -e "${LEGACY_VENV_PATH}" && ! -L "${LEGACY_VENV_PATH}" ]]' in installer
+    )
+    assert 'atomic_symlink "${RUNTIME_CURRENT_LINK}/venv" "${LEGACY_VENV_PATH}"' in (
+        installer
+    )
+    assert 'rm -rf "${LEGACY_VENV_PATH}"' not in installer
 
 
 def test_systemd_units_bound_memory_and_cpu() -> None:
@@ -376,7 +471,6 @@ def test_gpu_persistence_mode_is_installed_and_verified() -> None:
     installer = NODE_SCRIPTS[0].read_text()
     verifier = NODE_SCRIPTS[1].read_text()
     service = (ROOT / "deploy/systemd/gpu-fault-gpu-persistence.service").read_text()
-    node_agent = (ROOT / "src/gpu_fault/node_agent/common.py").read_text()
 
     assert "After=nvidia-persistenced.service" in service
     assert "ExecStart=@NVIDIA_SMI@ -pm 1" in service
@@ -385,7 +479,9 @@ def test_gpu_persistence_mode_is_installed_and_verified() -> None:
     assert "--query-gpu=persistence_mode" in installer
     assert "not every GPU entered persistence mode" in installer
     assert "GPU persistence mode" in verifier
-    assert '"gpu-fault-gpu-persistence"' in node_agent
+    assert "gpu-fault-gpu-persistence" in common.DEFAULT_QUIESCE_SERVICES, (
+        "the unit the installer enables must also be quiesced before a GPU reset"
+    )
 
 
 def test_agent_pin_migration_pauses_processor_workers() -> None:
@@ -427,16 +523,14 @@ def test_node_log_collector_is_disabled_by_production_deploy() -> None:
 
 
 def test_training_progress_monitor_is_disabled_by_default() -> None:
-    lifespan = "\n".join(
-        (
-            (ROOT / "src/gpu_fault/app/lifespan.py").read_text(),
-            (ROOT / "src/gpu_fault/app/periodic_services.py").read_text(),
-            (ROOT / "src/gpu_fault/app/lifespan_workers.py").read_text(),
-        )
-    )
     deploy = (ROOT / "deploy/hyperpod/deploy.sh").read_text()
 
-    assert '"GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR", "false"' in lifespan
+    assert training_health_monitor_enabled({}) is False, (
+        "the training-health monitor reads live workloads, so it must be opt-in"
+    )
+    assert (
+        training_health_monitor_enabled({TRAINING_HEALTH_MONITOR_ENV: "true"}) is True
+    )
     assert "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR:-false" in deploy
     assert "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR must be true or false" in deploy
     for manifest in (

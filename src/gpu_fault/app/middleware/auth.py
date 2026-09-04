@@ -141,6 +141,11 @@ def install_regional_authorization(
                             status_code=400,
                             content={"detail": "invalid JSON request body"},
                         )
+                    # The decoded bytes, not the wire bytes, are what the route
+                    # must read. Assigning them here is the whole mechanism:
+                    # once the body has been read, Starlette replays this cache
+                    # downstream and never consults the request's receive
+                    # channel again -- see tests/test_body_replay_contract.py.
                     request._body = body
                     request.scope["gpu_fault_body_decompressed"] = True
                     request.scope["gpu_fault_json_payload"] = payload
@@ -157,25 +162,6 @@ def install_regional_authorization(
                                 "all payload cluster_id values"
                             ),
                         )
-
-                    delivered = False
-
-                    async def replay_body():
-                        nonlocal delivered
-                        if delivered:
-                            return {
-                                "type": "http.request",
-                                "body": b"",
-                                "more_body": False,
-                            }
-                        delivered = True
-                        return {
-                            "type": "http.request",
-                            "body": body,
-                            "more_body": False,
-                        }
-
-                    request._receive = replay_body
         except (HTTPException, json.JSONDecodeError) as exc:
             status_code = getattr(exc, "status_code", 400)
             detail = getattr(exc, "detail", "invalid JSON request")

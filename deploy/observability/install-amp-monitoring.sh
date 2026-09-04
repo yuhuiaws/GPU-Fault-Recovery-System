@@ -62,6 +62,44 @@ if [[ "${KUBECONFIG_EKS_ARN}" != "${CPU_EKS_ARN}" ]]; then
     exit 2
 fi
 
+AMP_APPLY_TIMEOUT_SECONDS="${GPU_FAULT_AMP_APPLY_TIMEOUT_SECONDS:-300}"
+
+# AMP validates a rule namespace and an Alertmanager definition
+# asynchronously: the write returns immediately, the definition goes to
+# CREATING/UPDATING, and until it settles a describe still answers with the
+# previous one. Returning here before that happens makes the caller's own
+# verification read the definition this installer just replaced -- which reads
+# as "the live namespace is missing a group" on any release that adds one, and
+# passes on the retry, i.e. exactly the shape of failure nobody trusts. It also
+# hides the case that matters: a definition AMP rejected leaves the old rules
+# serving, so the new alerts never fire and nothing else would say so.
+wait_for_amp_definition() {
+    local label="$1" query="$2"
+    shift 2
+    local deadline=$((SECONDS + AMP_APPLY_TIMEOUT_SECONDS))
+    local status
+    while :; do
+        status="$("$@" --query "${query}" --output text)"
+        case "${status}" in
+        ACTIVE)
+            return 0
+            ;;
+        CREATING | UPDATING) ;;
+        *)
+            printf 'ERROR: %s was not applied: AMP reports status %s\n' \
+                "${label}" "${status}" >&2
+            exit 1
+            ;;
+        esac
+        if ((SECONDS >= deadline)); then
+            printf 'ERROR: %s is still %s after %ss\n' \
+                "${label}" "${status}" "${AMP_APPLY_TIMEOUT_SECONDS}" >&2
+            exit 1
+        fi
+        sleep 5
+    done
+}
+
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 WORKSPACE_ARN="arn:aws:aps:${AWS_REGION}:${ACCOUNT_ID}:workspace/${AMP_WORKSPACE_ID}"
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${IAM_ROLE_NAME}"
@@ -141,14 +179,6 @@ aws sns set-topic-attributes \
     --attribute-name Policy \
     --attribute-value "${SNS_POLICY}"
 
-if [[ -n "${GPU_FAULT_ALERT_EMAIL:-}" ]]; then
-    aws sns subscribe \
-        --region "${AWS_REGION}" \
-        --topic-arn "${SNS_TOPIC_ARN}" \
-        --protocol email \
-        --notification-endpoint "${GPU_FAULT_ALERT_EMAIL}" >/dev/null
-fi
-
 sed \
     -e "s/REPLACE_WITH_AMP_WORKSPACE_ID/${AMP_WORKSPACE_ID}/g" \
     -e "s/REPLACE_WITH_AWS_REGION/${AWS_REGION}/g" \
@@ -218,6 +248,13 @@ else
         --data "fileb://${REPO_DIR}/deploy/observability/amp-rules.yaml" \
         >/dev/null
 fi
+wait_for_amp_definition \
+    "AMP rule namespace ${RULE_NAMESPACE}" \
+    'ruleGroupsNamespace.status.statusCode' \
+    aws amp describe-rule-groups-namespace \
+    --region "${AWS_REGION}" \
+    --workspace-id "${AMP_WORKSPACE_ID}" \
+    --name "${RULE_NAMESPACE}"
 
 sed \
     -e "s#REPLACE_WITH_SNS_TOPIC_ARN#${SNS_TOPIC_ARN}#g" \
@@ -239,19 +276,66 @@ else
         --data "fileb://${TMP_DIR}/amp-alertmanager.yaml" \
         >/dev/null
 fi
+wait_for_amp_definition \
+    "AMP Alertmanager definition" \
+    'alertManagerDefinition.status.statusCode' \
+    aws amp describe-alert-manager-definition \
+    --region "${AWS_REGION}" \
+    --workspace-id "${AMP_WORKSPACE_ID}"
 
-CONFIRMED_SUBSCRIPTIONS="$(
-    aws sns list-subscriptions-by-topic \
-        --region "${AWS_REGION}" \
-        --topic-arn "${SNS_TOPIC_ARN}" \
-        --query 'length(Subscriptions[?SubscriptionArn != `PendingConfirmation` && SubscriptionArn != `Deleted`])' \
-        --output text
-)"
-if [[ "${GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION}" == "true" &&
-    "${CONFIRMED_SUBSCRIPTIONS}" == "0" ]]; then
-    printf 'ERROR: SNS topic %s has no confirmed subscription; confirm the email subscription or attach an operations endpoint before enabling production alerts\n' \
-        "${SNS_TOPIC_ARN}" >&2
-    exit 1
+if [[ "${GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION}" == "true" ]]; then
+    if [[ -n "${GPU_FAULT_ALERT_EMAIL:-}" ]]; then
+        read -r CONFIRMED_SUBSCRIPTIONS PENDING_SUBSCRIPTIONS < <(
+            aws sns list-subscriptions-by-topic \
+                --region "${AWS_REGION}" \
+                --topic-arn "${SNS_TOPIC_ARN}" \
+                --output json |
+                jq -r --arg endpoint "${GPU_FAULT_ALERT_EMAIL}" '
+                  [
+                    .Subscriptions[]?
+                    | select(
+                        ((.Protocol // "") | ascii_downcase) == "email"
+                        and ((.Endpoint // "") | ascii_downcase)
+                          == ($endpoint | ascii_downcase)
+                    )
+                  ] as $matches
+                  | [
+                      ($matches
+                        | map(select(
+                            ((.SubscriptionArn // "") | startswith("arn:"))
+                          ))
+                        | length),
+                      ($matches
+                        | map(select(
+                            .SubscriptionArn == "PendingConfirmation"
+                          ))
+                        | length)
+                    ]
+                  | @tsv
+                '
+        )
+        if [[ "${CONFIRMED_SUBSCRIPTIONS}" != "1" ||
+            "${PENDING_SUBSCRIPTIONS}" != "0" ]]; then
+            printf 'ERROR: SNS topic %s must have exactly one confirmed email subscription for the configured administrator endpoint and no pending duplicates (confirmed=%s pending=%s); confirm the existing request or remove duplicate subscriptions before retrying\n' \
+                "${SNS_TOPIC_ARN}" \
+                "${CONFIRMED_SUBSCRIPTIONS}" \
+                "${PENDING_SUBSCRIPTIONS}" >&2
+            exit 1
+        fi
+    else
+        CONFIRMED_SUBSCRIPTIONS="$(
+            aws sns list-subscriptions-by-topic \
+                --region "${AWS_REGION}" \
+                --topic-arn "${SNS_TOPIC_ARN}" \
+                --query 'length(Subscriptions[?SubscriptionArn != `PendingConfirmation` && SubscriptionArn != `Deleted`])' \
+                --output text
+        )"
+        if [[ "${CONFIRMED_SUBSCRIPTIONS}" == "0" ]]; then
+            printf 'ERROR: SNS topic %s has no confirmed subscription; attach an operations endpoint before enabling production alerts\n' \
+                "${SNS_TOPIC_ARN}" >&2
+            exit 1
+        fi
+    fi
 fi
 
 if [[ "${GPU_FAULT_ENABLE_ADOT}" == "true" ]]; then

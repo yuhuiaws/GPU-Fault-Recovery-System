@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
-
 from contextlib import contextmanager
+from typing import Any, Iterator, cast
+
+from pydantic import BaseModel
 
 from gpu_fault.store.shared.errors import NotFoundError
 
@@ -10,7 +11,12 @@ from gpu_fault.store.shared.errors import NotFoundError
 class PostgresCoreMixin:
     # Attributes supplied by the composed concrete implementation.
     _db: Any
-    _models: Any
+    _models: dict[str, type[BaseModel]]
+
+    # `_decode`, `_get`, `_get_for_update` and `_list` return `Any` on purpose:
+    # the model class is looked up in `_models` at run time from a string kind,
+    # so the row type is only knowable at the call site. Callers state it with a
+    # `cast`, which is what makes the mixins above them checkable.
 
     def close(self) -> None:
         executor = getattr(self, "_processor_completion_executor", None)
@@ -18,10 +24,10 @@ class PostgresCoreMixin:
             executor.shutdown(wait=True, cancel_futures=True)
         self._db.close()
 
-    def pool_metrics(self) -> dict:
-        return self._db.metrics_snapshot()
+    def pool_metrics(self) -> dict[str, Any]:
+        return cast("dict[str, Any]", self._db.metrics_snapshot())
 
-    def _put(self, kind: str, key: str, value) -> None:
+    def _put(self, kind: str, key: str, value: BaseModel) -> None:
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -43,12 +49,12 @@ class PostgresCoreMixin:
                 (kind, key),
             )
 
-    def _decode(self, kind: str, payload):
+    def _decode(self, kind: str, payload: Any) -> Any:
         if isinstance(payload, str):
             return self._models[kind].model_validate_json(payload)
         return self._models[kind].model_validate(payload)
 
-    def _get(self, kind: str, key: str):
+    def _get(self, kind: str, key: str) -> Any:
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -62,7 +68,7 @@ class PostgresCoreMixin:
             raise NotFoundError(key)
         return self._decode(kind, row[0])
 
-    def _get_for_update(self, kind: str, key: str):
+    def _get_for_update(self, kind: str, key: str) -> Any:
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -77,7 +83,7 @@ class PostgresCoreMixin:
             raise NotFoundError(key)
         return self._decode(kind, row[0])
 
-    def _list(self, kind: str):
+    def _list(self, kind: str) -> list[Any]:
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -114,7 +120,7 @@ class PostgresCoreMixin:
         return row[0] if row else None
 
     @contextmanager
-    def _state_transaction(self, lock_key: str):
+    def _state_transaction(self, lock_key: str) -> Iterator[None]:
         with self._db.transaction():
             with self._db.cursor() as cursor:
                 cursor.execute(

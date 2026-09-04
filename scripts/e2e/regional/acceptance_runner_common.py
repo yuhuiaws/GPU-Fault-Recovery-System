@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from gpu_fault.admin.atomic_json import write_json_atomic as _write_document
+
 if __package__:
     from .acceptance_scope import scoped_case_evidence
 else:
@@ -16,15 +18,16 @@ def utc_now() -> str:
 
 
 def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
-    document = scoped_case_evidence(value)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(document, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    temporary.chmod(0o600)
-    temporary.replace(path)
+    """Write one case evidence document, scoped to what the run may record.
+
+    The scoping is the part specific to acceptance evidence -- a selective run must
+    not claim the formal sequence -- and it has to happen before the bytes are
+    written, not on read, because the document on disk is the artifact an auditor
+    reads. The writing itself is the same all-or-nothing rename the admin tooling
+    uses for its state.
+    """
+
+    _write_document(path, scoped_case_evidence(value))
 
 
 class EvidenceRecorder:

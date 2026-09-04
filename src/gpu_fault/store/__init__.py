@@ -1,4 +1,5 @@
 from importlib import import_module
+from typing import Any
 
 _EXPORTS = {
     "EfaTrafficAdminConflict": (
@@ -31,7 +32,7 @@ _EXPORTS = {
 __all__ = [name for name in _EXPORTS if not name.startswith("_")]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     target = _EXPORTS.get(name)
     if target is None:
         raise AttributeError(name)

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, cast
 
-from datetime import datetime, timedelta, timezone
-
+from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     CompletionDecision,
     DiagnosticRequest,
@@ -17,14 +17,18 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
-from gpu_fault.installation_resources import InstallationResource
+from gpu_fault.store.shared.attempt_observation_support import (
+    AttemptObservationTerminalSupport,
+    reconcile_terminal_attempt_observations,
+    terminalize_attempt_observation,
+)
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
 
 
-class SqliteControlRecordMixin:
+class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
     # Attributes supplied by the composed concrete implementation.
     _hyperpod_submission_key: Callable[..., Any]
 
@@ -51,6 +55,7 @@ class SqliteControlRecordMixin:
         observed = now or datetime.now(timezone.utc)
         cutoff = _utc_text(observed - finding_history_retention)
         with self._state_transaction("hot_state/cleanup"):
+            terminalized = reconcile_terminal_attempt_observations(self, limit)
             cursor = self._db.execute(
                 """
                 DELETE FROM objects
@@ -71,7 +76,10 @@ class SqliteControlRecordMixin:
                 (cutoff, limit),
             )
             deleted = cursor.rowcount
-        return {"gpu_finding_history": deleted}
+        return {
+            "gpu_finding_history": deleted,
+            "attempt_observation_terminalized": terminalized,
+        }
 
     def save_raw_evidence(self, record, *, max_records_per_node: int) -> None:
         storage_key = self._state_key(
@@ -174,7 +182,8 @@ class SqliteControlRecordMixin:
         return len(expired)
 
     def save_event_if_absent(self, event: TerminalEvent) -> bool:
-        with self._lock:
+        storage_key = self._state_key((event.cluster_id, event.attempt_id))
+        with self._state_transaction(f"terminal_event/{storage_key}"):
             cursor = self._db.execute(
                 """
                 INSERT OR IGNORE INTO objects(kind, key, payload)
@@ -185,11 +194,12 @@ class SqliteControlRecordMixin:
             if cursor.rowcount:
                 self._link(
                     "attempt_event",
-                    self._state_key((event.cluster_id, event.attempt_id)),
+                    storage_key,
                     event.event_key,
                 )
-                return True
-            return False
+            terminal = event if cursor.rowcount else self._get("event", event.event_key)
+            terminalize_attempt_observation(self, terminal)
+            return bool(cursor.rowcount)
 
     @classmethod
     def _restart_budget_key(cls, cluster_id: str, job_id: str) -> str:
@@ -329,6 +339,45 @@ class SqliteControlRecordMixin:
                 marker.observed_at,
                 marker.marker_id,
             ),
+            reverse=True,
+        )[:limit]
+
+    def list_markers_in_scope_window(
+        self,
+        *,
+        node_ids: set[str],
+        gpu_uuids: set[str],
+        fabric_partitions: set[str],
+        observed_from: datetime,
+        observed_to: datetime,
+        limit: int = 1000,
+    ) -> list[NodeMarker]:
+        """Actionable markers whose scope touches an allocation, newest first.
+
+        The terminal-event correlator asks this once per completed training
+        attempt. It matches on GPU UUID and fabric partition as well as node ID,
+        because a marker raised by a fabric-level fault names the partition, not
+        the nodes attached to it.
+        """
+        if limit < 1 or not (node_ids or gpu_uuids or fabric_partitions):
+            return []
+        return sorted(
+            (
+                marker
+                for marker in self._list("marker")
+                if marker.active
+                and marker.trusted
+                and marker.recommended_action is not None
+                and observed_from <= marker.observed_at <= observed_to
+                and (
+                    set(marker.scope.node_ids).intersection(node_ids)
+                    or set(marker.scope.gpu_uuids).intersection(gpu_uuids)
+                    or set(marker.scope.fabric_partitions).intersection(
+                        fabric_partitions
+                    )
+                )
+            ),
+            key=lambda marker: (marker.observed_at, marker.marker_id),
             reverse=True,
         )[:limit]
 

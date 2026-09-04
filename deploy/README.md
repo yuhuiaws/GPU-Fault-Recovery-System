@@ -51,6 +51,7 @@ and select only affected CPU roles.
 | GPU data plane | `dataplane/` | Regional rollout orchestrator or the individual reviewed manifests |
 | GPU node installation | `node/` and `systemd/` | `node/build-node-installer-bundle.sh` and `node/install-gpu-fault-collector.sh` |
 | Observability | `observability/` | `observability/install-amp-monitoring.sh` |
+| Centralized container logs | `observability/` | `observability/install-cloudwatch-observability.sh` (read-only `status` unless `GPU_FAULT_CLOUDWATCH_ACTION=install`) |
 | Database and endpoint migrations | `migrations/` | Apply only the named runbook manifest |
 | AWS supporting resources | `aws/{s3,iam,lambda}/` | Use from the matching operations runbook |
 | Runtime image | `image/Dockerfile` | CI builds from `uv.lock`-derived hashed requirements and pushes by digest |

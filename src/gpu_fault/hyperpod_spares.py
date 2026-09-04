@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -12,13 +12,11 @@ from gpu_fault.hyperpod import (
     HyperPodLifecycleAdapter,
     HyperPodNode,
 )
-from gpu_fault.models import (
-    AdvisoryNotification,
-    NodeMarker,
-    RecoveryAction,
-    WorkflowStatus,
+from gpu_fault.markers import (
+    blocking_spare_markers,
+    describe_blocking_marker,
 )
-
+from gpu_fault.models import AdvisoryNotification
 
 LOGGER = logging.getLogger(__name__)
 
@@ -28,66 +26,11 @@ HYPERPOD_NODE_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
 HYPERPOD_SCHEDULABLE = "Schedulable"
 GPU_RESOURCE_NAME = "nvidia.com/gpu"
 
-#: Recommended actions that mean "this node must not take on work".
-#: A marker whose action is outside this set is observational (for
-#: example ``RUN_DIAGNOSTICS`` on a TCP retransmission blip) and must
-#: not disqualify an otherwise healthy warm spare -- warm-spare
-#: failover is the only supported node replacement path, so treating
-#: advisory noise as disqualifying makes real replacements fail.
-SPARE_BLOCKING_ACTIONS = frozenset(
-    {
-        RecoveryAction.QUARANTINE,
-        RecoveryAction.REPLACE_NODE,
-        RecoveryAction.REBOOT_NODE,
-        RecoveryAction.RESET_GPU,
-        RecoveryAction.DRAIN,
-        RecoveryAction.MARK_UNSCHEDULABLE,
-        RecoveryAction.ESCALATE_OPERATOR,
-    }
-)
-
 GpuClientChecker = Callable[[HyperPodNode, str, str], list[str]]
 
 
 class SpareHealthPending(RuntimeError):
     """A remote spare-health check has not completed yet."""
-
-
-def marker_disqualifies_spare(marker: NodeMarker, now: datetime) -> bool:
-    """Whether ``marker`` means a node is unfit to be a warm spare.
-
-    Only markers that actually ask for the node to stop taking work
-    disqualify it. Advisory markers (``MONITOR_ONLY`` dispositions such
-    as ``RUN_DIAGNOSTICS``) are recorded continuously on healthy nodes
-    and never produce a workflow, so the ``SUCCEEDED``-workflow escape
-    below can never clear them -- counting them would leave every node
-    permanently ineligible.
-    """
-    if not marker.active or not marker.trusted:
-        return False
-    if marker.expires_at is not None and marker.expires_at <= now:
-        return False
-    if marker.recommended_action not in SPARE_BLOCKING_ACTIONS:
-        return False
-    return True
-
-
-def describe_blocking_marker(marker: NodeMarker) -> str:
-    """Operator-readable identity of a disqualifying marker.
-
-    The bare "a marker exists" reason left no way to decide whether a
-    spare could be released by hand; the caller has the only copy of
-    this record, so it has to be named in the failure reason.
-    """
-    action = (
-        marker.recommended_action.value
-        if marker.recommended_action is not None
-        else "unknown"
-    )
-    detail = f"{marker.marker_id} ({marker.severity.value}/{action}"
-    if marker.raw_reason:
-        detail += f": {marker.raw_reason}"
-    return detail + ")"
 
 
 @runtime_checkable
@@ -505,15 +448,11 @@ class HyperPodSpareCoordinator:
         agent = matching_agents[0]
         if not self.registry.readiness(cluster_id, [agent.node_id]).ready:
             reasons.append("node agent is not fleet-ready")
-        active_markers = [
-            marker
-            for marker in self.store.list_markers()
-            if (
-                self._marker_blocks_spare(marker)
-                and set(marker.scope.node_ids).intersection(node.aliases)
-                and (observed_after is None or marker.observed_at > observed_after)
-            )
-        ]
+        active_markers = blocking_spare_markers(
+            self.store,
+            set(node.aliases),
+            observed_after=observed_after,
+        )
         if active_markers:
             reasons.append(
                 "active trusted node fault marker exists: "
@@ -532,19 +471,6 @@ class HyperPodSpareCoordinator:
         if findings:
             reasons.append("active GPU health finding exists")
         return reasons
-
-    def _marker_blocks_spare(self, marker) -> bool:
-        if not marker_disqualifies_spare(marker, datetime.now(timezone.utc)):
-            return False
-        if marker.incident_id:
-            try:
-                incident = self.store.get_incident(marker.incident_id)
-                workflow = self.store.get_workflow(incident.workflow_request_id)
-                if workflow.status is WorkflowStatus.SUCCEEDED:
-                    return False
-            except (KeyError, TypeError):
-                pass
-        return True
 
     def _reserve_and_activate(
         self,

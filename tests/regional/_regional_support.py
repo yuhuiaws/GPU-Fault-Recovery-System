@@ -19,7 +19,11 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStatus,
 )
-from gpu_fault.regional import RegionalClusterRegistration, cluster_token_sha256
+from gpu_fault.regional import (
+    RegionalClusterRegistration,
+    RemoteActionCommand,
+    cluster_token_sha256,
+)
 from tests._builders import copy_model, fault_incident, workflow_request, workflow_step
 
 NOW = datetime(2026, 7, 28, tzinfo=timezone.utc)
@@ -97,6 +101,42 @@ def workflow_state():
         idempotency_key="workflow-a/0/MARK_UNSCHEDULABLE",
     )
     return context
+
+
+def enqueue_remote_command(
+    store,
+    command_id: str,
+    *,
+    cluster_id: str = "cluster-a",
+    owner: str = "gpu-fault-kubernetes-adapter",
+    created_at: datetime = NOW,
+    **overrides,
+) -> RemoteActionCommand:
+    """Write one command straight into the regional backlog.
+
+    The dispatcher normally produces these, but a boundary sweep needs dozens of
+    them with chosen ids and creation times, and driving the dispatcher that many
+    times would only prove the dispatcher again. ``ensure_remote_command`` is the
+    store's own public entry point, so this is still the real write path.
+    """
+
+    context = workflow_state()
+    command = RemoteActionCommand(
+        command_id=command_id,
+        cluster_id=cluster_id,
+        workflow_request_id=f"workflow-{command_id}",
+        incident_id=f"incident-{command_id}",
+        step_index=0,
+        fencing_token=context.workflow.fencing_token,
+        idempotency_key=f"{command_id}/0/MARK_UNSCHEDULABLE",
+        step=copy_model(context.step, execution_owner=owner),
+        workflow=copy_model(context.workflow, request_id=f"workflow-{command_id}"),
+        incident=copy_model(context.incident, incident_id=f"incident-{command_id}"),
+        created_at=created_at,
+        updated_at=created_at,
+        **overrides,
+    )
+    return store.ensure_remote_command(command)
 
 
 def remote_context(suffix: str, execution_owner: str) -> WorkflowStepContext:

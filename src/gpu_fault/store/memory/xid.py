@@ -1,34 +1,40 @@
 from __future__ import annotations
 
-from typing import Any
-
 from datetime import datetime, timedelta
+from typing import Any, Iterable, Sequence
 
 from gpu_fault.models import (
     HealthSignalState,
     XidMetricBaseline,
 )
 from gpu_fault.policy import (
+    FaultPolicyDecision,
     Nvlink74BitOccurrenceState,
+    XidCorrelationRecord,
     XidCorrelationStatus,
+    XidEvent,
 )
 from gpu_fault.store.shared.errors import NotFoundError
+
+# One NVLink bit's identity: the scope from `_xid74_scope` plus the register
+# index and bit position inside it.
+_Xid74StateKey = tuple[str, str, int, int, int]
 
 
 class MemoryXidMixin:
     # Attributes supplied by the composed concrete implementation.
-    _health_signal_states: Any
-    _xid_correlation_events: Any
-    _xid_correlations: Any
-    _xid_policy_decisions: Any
+    _health_signal_states: dict[str, HealthSignalState]
+    _xid_correlation_events: dict[str, XidEvent]
+    _xid_correlations: dict[str, XidCorrelationRecord]
+    _xid_policy_decisions: dict[str, FaultPolicyDecision]
 
     _lock: Any
-    _xid74_counted_events: Any
-    _xid74_occurrence_states: Any
-    _xid_metric_baselines: Any
+    _xid74_counted_events: set[tuple[str, _Xid74StateKey]]
+    _xid74_occurrence_states: dict[_Xid74StateKey, Nvlink74BitOccurrenceState]
+    _xid_metric_baselines: dict[tuple[str, str, str], XidMetricBaseline]
 
     def save_xid_event_if_absent(
-        self, event, *, retain_from: datetime | None = None
+        self, event: XidEvent, *, retain_from: datetime | None = None
     ) -> bool:
         with self._lock:
             if event.event_id in self._xid_correlation_events:
@@ -45,7 +51,7 @@ class MemoryXidMixin:
             return True
 
     @staticmethod
-    def _xid74_scope(event):
+    def _xid74_scope(event: XidEvent) -> tuple[str, str, int] | None:
         gpu_key = (
             f"uuid:{event.gpu_uuid}"
             if event.gpu_uuid
@@ -64,7 +70,7 @@ class MemoryXidMixin:
         )
 
     @staticmethod
-    def _xid74_populated_bits(event):
+    def _xid74_populated_bits(event: XidEvent) -> list[tuple[int, int]]:
         return [
             (register_index, bit)
             for register_index, value in enumerate(event.registers)
@@ -72,12 +78,12 @@ class MemoryXidMixin:
             if value & (1 << bit)
         ]
 
-    def record_xid74_occurrences(self, event) -> dict[str, int]:
+    def record_xid74_occurrences(self, event: XidEvent) -> dict[str, int]:
         scope = self._xid74_scope(event)
         if event.xid != 74 or scope is None:
             return {}
         with self._lock:
-            counts = {}
+            counts: dict[str, int] = {}
             for (
                 register_index,
                 bit,
@@ -110,14 +116,14 @@ class MemoryXidMixin:
                     counts[f"register{register_index + 1}.bit{bit}"] = state.count
             return counts
 
-    def get_xid_event(self, event_id: str):
+    def get_xid_event(self, event_id: str) -> XidEvent:
         with self._lock:
             try:
                 return self._xid_correlation_events[event_id]
             except KeyError as exc:
                 raise NotFoundError(event_id) from exc
 
-    def get_xid_events(self, event_ids) -> dict:
+    def get_xid_events(self, event_ids: Iterable[str]) -> dict[str, XidEvent]:
         """Load the events behind a whole claimed batch at once.
 
         Correlation claims up to ``batch_size`` correlations and then
@@ -127,7 +133,7 @@ class MemoryXidMixin:
         Missing ids are absent from the result rather than raising, so
         the caller can log and skip them the same way it did before.
         """
-        found = {}
+        found: dict[str, XidEvent] = {}
         for event_id in event_ids:
             try:
                 found[event_id] = self.get_xid_event(event_id)
@@ -142,7 +148,7 @@ class MemoryXidMixin:
         *,
         observed_after: datetime | None = None,
         observed_before: datetime | None = None,
-    ):
+    ) -> list[XidEvent]:
         with self._lock:
             return [
                 item
@@ -153,7 +159,10 @@ class MemoryXidMixin:
                 and (observed_before is None or item.observed_at <= observed_before)
             ]
 
-    def list_xid_events_for_scopes(self, scopes) -> dict:
+    def list_xid_events_for_scopes(
+        self,
+        scopes: Iterable[tuple[str, str, datetime | None, datetime | None]],
+    ) -> dict[tuple[str, str], list[XidEvent]]:
         """Companion candidates for several node windows in one call.
 
         ``scopes`` is an iterable of ``(cluster_id, node_id,
@@ -164,7 +173,7 @@ class MemoryXidMixin:
         ones. Stores with a query planner override this with a single
         statement; here the loop is the whole point of the default.
         """
-        grouped: dict[tuple[str, str], dict[str, object]] = {}
+        grouped: dict[tuple[str, str], dict[str, XidEvent]] = {}
         for cluster_id, node_id, after, before in scopes:
             bucket = grouped.setdefault((cluster_id, node_id), {})
             for item in self.list_xid_events(
@@ -176,22 +185,22 @@ class MemoryXidMixin:
                 bucket[item.event_id] = item
         return {scope: list(bucket.values()) for scope, bucket in grouped.items()}
 
-    def save_xid_policy_decision(self, decision) -> None:
+    def save_xid_policy_decision(self, decision: FaultPolicyDecision) -> None:
         with self._lock:
             self._xid_policy_decisions[decision.event_id] = decision
 
-    def get_xid_policy_decision(self, event_id: str):
+    def get_xid_policy_decision(self, event_id: str) -> FaultPolicyDecision | None:
         with self._lock:
             return self._xid_policy_decisions.get(event_id)
 
-    def save_xid_correlation_if_absent(self, correlation) -> bool:
+    def save_xid_correlation_if_absent(self, correlation: XidCorrelationRecord) -> bool:
         with self._lock:
             if correlation.event_id in self._xid_correlations:
                 return False
             self._xid_correlations[correlation.event_id] = correlation
             return True
 
-    def get_xid_correlation(self, event_id: str):
+    def get_xid_correlation(self, event_id: str) -> XidCorrelationRecord:
         with self._lock:
             try:
                 return self._xid_correlations[event_id]
@@ -205,7 +214,7 @@ class MemoryXidMixin:
         now: datetime,
         lease_duration: timedelta,
         limit: int,
-    ):
+    ) -> list[XidCorrelationRecord]:
         with self._lock:
             due = sorted(
                 (
@@ -220,7 +229,7 @@ class MemoryXidMixin:
                     item.event_id,
                 ),
             )[:limit]
-            claimed = []
+            claimed: list[XidCorrelationRecord] = []
             for item in due:
                 value = item.model_copy(
                     update={
@@ -232,7 +241,9 @@ class MemoryXidMixin:
                 claimed.append(value)
             return claimed
 
-    def complete_xid_correlation(self, event_id: str, *, owner: str, now: datetime):
+    def complete_xid_correlation(
+        self, event_id: str, *, owner: str, now: datetime
+    ) -> XidCorrelationRecord:
         with self._lock:
             current = self.get_xid_correlation(event_id)
             if current.lease_owner != owner:
@@ -248,9 +259,11 @@ class MemoryXidMixin:
             self._xid_correlations[event_id] = completed
             return completed
 
-    def claim_health_signal_transitions(self, items) -> list[bool]:
+    def claim_health_signal_transitions(
+        self, items: Sequence[tuple[str, bool, datetime, float]]
+    ) -> list[bool]:
         with self._lock:
-            results = []
+            results: list[bool] = []
             for (
                 signal_key,
                 active,

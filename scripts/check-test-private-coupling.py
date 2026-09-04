@@ -9,10 +9,41 @@ import json
 from pathlib import Path
 import sys
 
-
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
 BASELINE = ROOT / "test-private-coupling-baseline.json"
+
+# Dunders are otherwise skipped, because ``self.__class__``, ``obj.__dict__``
+# and ``func.__name__`` are everywhere and say nothing about coupling. These
+# three do say something, and what they say is worse than ``module._helper``:
+# they reach into a callee's own namespace instead of merely reading a private
+# name, so the scan below would rate them as no coupling at all.
+#
+#   * ``__globals__`` swaps a module-level name out from under a function. The
+#     test keeps passing after the function stops looking that name up, because
+#     nothing about the patch is tied to the call the function actually makes.
+#     ``tests/_script_loader.py`` exists partly to get tests off this.
+#   * ``__wrapped__`` runs the undecorated function, i.e. not the one that ships.
+#   * ``__code__`` replaces what runs outright.
+#
+# Each is a legitimate tool in a couple of places, so they are ratcheted like
+# every other private access rather than banned.
+NAMESPACE_BYPASS_DUNDERS = frozenset({"__globals__", "__wrapped__", "__code__"})
+
+
+def receiver_name(node: ast.expr) -> str:
+    """Last dotted segment of the expression an attribute is read from.
+
+    Keys stay in the same ``owner.attribute`` shape as the private-name scan.
+    ``rollout.run_fleet_waves.__globals__`` and
+    ``module.run_fleet_waves.__globals__`` are the same coupling seen through two
+    handles, so both count against one entry.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return "<expression>"
 
 
 class PrivateAccessCollector(ast.NodeVisitor):
@@ -21,7 +52,10 @@ class PrivateAccessCollector(ast.NodeVisitor):
         self.accesses: Counter[str] = Counter()
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if (
+        if node.attr in NAMESPACE_BYPASS_DUNDERS:
+            owner = receiver_name(node.value)
+            self.accesses[f"{self.relative}:{owner}.{node.attr}"] += 1
+        elif (
             node.attr.startswith("_")
             and not node.attr.startswith("__")
             and isinstance(node.value, ast.Name)

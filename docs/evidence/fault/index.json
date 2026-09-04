@@ -5,5 +5,20 @@
   "provenance": "public-redacted",
   "provenance_note": "Raw execution reports are retained in a private evidence store. The public source tree intentionally contains no environment-specific fault reports.",
   "verdict_counts": {},
+  "pass_case_bindings": {
+    "bound": [],
+    "unbound": [
+      "GF-LIVE-KERNEL-COLLECTOR-001",
+      "GF-LIVE-KMSG-XID11-001",
+      "GF-LIVE-KMSG-XID45-FM-EMAIL-20260724",
+      "GF-LIVE-KMSG-XID45-SOLO-FM-20260724",
+      "GF-LIVE-KMSG-XID45-XID14-20260724",
+      "GF-LIVE-XID11-001",
+      "GF-LIVE-XID45-AURORA-HA-20260724",
+      "GF-LIVE-XID74-CORRECTED-20260726",
+      "GF-LIVE-XID74-SAFE-20260726",
+      "GF-LIVE-XID95-DUAL-RESET-RESUME-20260724"
+    ]
+  },
   "reports": []
 }

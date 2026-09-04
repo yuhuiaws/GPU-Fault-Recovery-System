@@ -6,6 +6,7 @@ import re
 import runpy
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,138 @@ def test_test_and_performance_variables_are_not_runtime_configuration() -> None:
     assert generator["concrete_name"]("GPU_FAULT_STORE_URL") is True, (
         "production runtime variables were excluded from the inventory"
     )
+
+
+def test_value_kinds_follow_the_coercion_at_the_read_site() -> None:
+    """The schema is derived from the code, so it cannot drift from it."""
+
+    generator = runpy.run_path(str(ROOT / "scripts/generate-env-reference.py"))
+    tree = ast.parse(
+        textwrap.dedent(
+            """
+            import os
+
+            def straight():
+                return int(os.getenv("GPU_FAULT_STRAIGHT", "1"))
+
+            def normalised():
+                raw = os.environ["GPU_FAULT_NORMALISED"]
+                return float(raw.strip())
+
+            def tolerant():
+                try:
+                    return int(os.getenv("GPU_FAULT_TOLERANT", "1"))
+                except ValueError:
+                    return 1
+            """
+        )
+    )
+
+    by_name, _ = generator["_module_observations"](tree)
+
+    assert by_name["GPU_FAULT_STRAIGHT"] == {("integer", frozenset())}
+    assert by_name["GPU_FAULT_NORMALISED"] == {("number", frozenset())}
+    assert "GPU_FAULT_TOLERANT" not in by_name, (
+        "a coercion the code deliberately guards must stay unvalidated"
+    )
+
+
+def test_value_bounds_follow_the_guard_at_the_read_site() -> None:
+    """A range is only recorded when the guarded value is the configured one.
+
+    The refusal these bounds move to start-up is the reading code's own, so the
+    inference has to stay narrower than the guards it reads. The cases below are
+    the four ways it can be handed something that looks like a bound but is not:
+    a value the code rescaled first, a comparison against another setting, a
+    guard that only applies inside another branch, and a variable that is read
+    twice with different limits.
+    """
+
+    generator = runpy.run_path(str(ROOT / "scripts/generate-env-reference.py"))
+    tree = ast.parse(
+        textwrap.dedent(
+            """
+            import os
+
+            def bounded():
+                limit = int(os.getenv("GPU_FAULT_BOUNDED", "10"))
+                if not 1 <= limit <= 100:
+                    raise ValueError("out of range")
+
+            def rescaled():
+                window = int(os.getenv("GPU_FAULT_RESCALED", "5")) * 1000
+                if window < 5000:
+                    raise ValueError("too small")
+
+            def relative():
+                ceiling = int(os.getenv("GPU_FAULT_RELATIVE", "5"))
+                if ceiling < other_setting:
+                    raise ValueError("inverted")
+
+            def conditional(enabled):
+                spread = int(os.getenv("GPU_FAULT_CONDITIONAL", "5"))
+                if enabled:
+                    if spread <= 0:
+                        raise ValueError("must be positive")
+            """
+        )
+    )
+
+    bounds = generator["_module_bounds"](tree)
+    merge = generator["_merge_bounds"]
+
+    assert merge(bounds["GPU_FAULT_BOUNDED"], "integer") == {
+        "minimum": 1,
+        "maximum": 100,
+    }
+    for name in ("GPU_FAULT_RESCALED", "GPU_FAULT_RELATIVE", "GPU_FAULT_CONDITIONAL"):
+        assert name not in bounds, f"{name} took a bound the read site does not state"
+
+    # Two roles, two limits: refusing the stricter one at start-up would break
+    # the role that can use it, so only what neither accepts is refused.
+    assert merge([("minimum", 30, False), ("minimum", 1, False)], "integer") == {
+        "minimum": 1
+    }
+    # "greater than 0" is exactly "at least 1" for an integer and has no
+    # inclusive form for a real number.
+    assert merge([("minimum", 0, True)], "integer") == {"minimum": 1}
+    assert merge([("minimum", 0, True)], "number") == {}
+
+
+def test_flag_helper_parameters_type_their_call_sites() -> None:
+    """Most switches are read through a helper, not at the call site."""
+
+    generator = runpy.run_path(str(ROOT / "scripts/generate-env-reference.py"))
+    tree = ast.parse(
+        textwrap.dedent(
+            """
+            import os
+
+            def _enabled(name):
+                return os.getenv(name, "0").strip().lower() in {"1", "true"}
+
+            SPOOL = _enabled("GPU_FAULT_SPOOL")
+            """
+        )
+    )
+
+    _, by_parameter = generator["_module_observations"](tree)
+
+    assert by_parameter[("_enabled", 0)] == {("boolean", frozenset({"1", "true"}))}
+    assert generator["_named_arguments"](tree)["_enabled"] == [{0: "GPU_FAULT_SPOOL"}]
+
+
+def test_conflicting_read_sites_leave_a_variable_unvalidated() -> None:
+    """A guessed kind would refuse a legal production value."""
+
+    generator = runpy.run_path(str(ROOT / "scripts/generate-env-reference.py"))
+    merge = generator["_merge_observations"]
+
+    assert merge({("integer", frozenset()), ("number", frozenset())}) == (
+        "number",
+        frozenset(),
+    )
+    assert merge({("boolean", frozenset({"true"})), ("integer", frozenset())}) is None
 
 
 def test_environment_reference_matches_source() -> None:

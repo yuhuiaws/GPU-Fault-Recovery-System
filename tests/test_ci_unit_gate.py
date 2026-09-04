@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import io
 import json
@@ -36,8 +37,9 @@ def _identity_root(tmp_path: Path) -> Path:
         "deploy/manifest.yaml": "kind: Deployment\n",
         "docs/guide.md": "guide\n",
         "requirements/build.lock": "build==1\n",
-        "src/gpu_fault/admin_config.py": "VALUE = 'shared'\n",
-        "src/gpu_fault/admin_only.py": "VALUE = 'deployment'\n",
+        "src/gpu_fault/admin/config.py": "VALUE = 'shared'\n",
+        "src/gpu_fault/admin/only.py": "VALUE = 'deployment'\n",
+        "src/gpu_fault/release_state_snapshot.py": "VALUE = 'snapshot'\n",
         "src/gpu_fault/runtime.py": "VALUE = 'runtime'\n",
         "testcases/fault-scenarios.yaml": "schema_version: 1\n",
         "tests/admin/test_admin.py": "def test_admin(): pass\n",
@@ -172,7 +174,7 @@ def test_deployment_only_coverage_scope_matches_distribution_split() -> None:
         ("requirements/build.lock", set(ci_coverage_gate.SHARDS)),
         ("Makefile", set(ci_coverage_gate.SHARDS)),
         ("src/gpu_fault/runtime.py", set(ci_coverage_gate.SHARDS)),
-        ("src/gpu_fault/admin_only.py", {"deployment"}),
+        ("src/gpu_fault/admin/only.py", {"deployment"}),
         ("tests/test_runtime.py", set(ci_coverage_gate.RUNTIME_SHARDS)),
         ("tests/admin/test_admin.py", {"deployment"}),
         ("tests/test_case_scheduler.py", {"fault_runner"}),
@@ -203,14 +205,17 @@ def test_shard_identity_changes_only_affected_domains(
 
 def _write_coverage_data(root: Path, path: Path, shard: str) -> None:
     data = CoverageData(basename=str(path))
-    measured = [
-        root / "src/gpu_fault/runtime.py",
-        (
-            root / "src/gpu_fault/admin_only.py"
-            if shard == "deployment"
-            else root / "src/gpu_fault/admin_config.py"
-        ),
-    ]
+    measured = [root / "src/gpu_fault/runtime.py"]
+    if shard == "deployment":
+        # Every deployment-only module has a module floor, and a floor that
+        # matches no measured file is itself a failure, so the shard that owns
+        # them has to measure all of them.
+        measured += [
+            root / "src/gpu_fault/admin/only.py",
+            root / "src/gpu_fault/release_state_snapshot.py",
+        ]
+    else:
+        measured.append(root / "src/gpu_fault/admin/config.py")
     data.add_lines({item.relative_to(root).as_posix(): {1} for item in measured})
     data.write()
 
@@ -584,6 +589,221 @@ def test_artifact_redirect_drops_authentication_on_cross_origin() -> None:
 
     assert redirected is not None
     assert redirected.get_header("Authorization") is None
+
+
+def _coverage_report(files: dict[str, tuple[int, int]]) -> dict:
+    """A coverage JSON report where each file covers ``reached`` of ``total``."""
+
+    return {
+        "files": {
+            relative: {
+                "summary": {
+                    "num_statements": total,
+                    "num_branches": 0,
+                    "missing_lines": total - reached,
+                    "num_partial_branches": 0,
+                }
+            }
+            for relative, (reached, total) in files.items()
+        }
+    }
+
+
+def _write_report(path: Path, files: dict[str, tuple[int, int]]) -> Path:
+    path.write_text(json.dumps(_coverage_report(files)), encoding="utf-8")
+    return path
+
+
+def _module_floors_config(entries: list[dict]) -> dict:
+    config = ci_coverage_gate.load_config(ROOT)
+    config["coverage"]["module_floors"] = entries
+    return config
+
+
+def test_module_floors_cover_every_deployment_only_source_file() -> None:
+    """No deployment-only module may sit outside a floor group.
+
+    These files are omitted from every runtime shard, so the repository floor
+    never sees them. A new one landing outside a group would be unmeasured in
+    practice while every gate still reported green.
+    """
+
+    config = ci_coverage_gate.load_config(ROOT)
+    patterns = [
+        pattern
+        for entry in config["coverage"]["module_floors"]
+        for pattern in entry["globs"]
+    ]
+
+    uncovered = [
+        relative
+        for relative in ci_coverage_gate.deployment_only_source_files(ROOT)
+        if not any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns)
+    ]
+
+    assert uncovered == [], "deployment-only modules without a module floor"
+
+
+def test_module_floors_report_group_and_file_shortfalls(tmp_path: Path) -> None:
+    config = _module_floors_config(
+        [
+            {
+                "id": "family",
+                "description": "test group",
+                "globs": ["src/gpu_fault/admin/*.py"],
+                "group_floor": 60,
+                "file_floor": 30,
+            }
+        ]
+    )
+    report = _write_report(
+        tmp_path / "coverage.json",
+        {
+            "src/gpu_fault/admin/good.py": (90, 100),
+            "src/gpu_fault/admin/bad.py": (10, 100),
+            "src/gpu_fault/runtime.py": (0, 100),
+        },
+    )
+
+    violations = ci_coverage_gate.module_floor_violations(report, config=config)
+
+    assert violations == [
+        "src/gpu_fault/admin/bad.py covers 10.0% of 100 measurable points, "
+        "below the family file floor of 30%",
+        "module group family covers 50.0%, below its group floor of 60%",
+    ]
+
+
+def test_module_floors_pass_when_the_family_clears_both_floors(tmp_path: Path) -> None:
+    config = _module_floors_config(
+        [
+            {
+                "id": "family",
+                "description": "test group",
+                "globs": ["src/gpu_fault/admin/*.py"],
+                "group_floor": 60,
+                "file_floor": 30,
+            }
+        ]
+    )
+    report = _write_report(
+        tmp_path / "coverage.json",
+        {
+            "src/gpu_fault/admin/good.py": (90, 100),
+            "src/gpu_fault/admin/thin.py": (31, 100),
+            # Nothing to measure: only imports and constants, so no floor applies.
+            "src/gpu_fault/admin/constants.py": (0, 0),
+        },
+    )
+
+    assert ci_coverage_gate.module_floor_violations(report, config=config) == []
+
+
+def test_module_floor_group_that_matches_nothing_fails(tmp_path: Path) -> None:
+    """A renamed module must not silently retire its floor."""
+
+    config = _module_floors_config(
+        [
+            {
+                "id": "renamed",
+                "description": "test group",
+                "globs": ["src/gpu_fault/gone_*.py"],
+                "group_floor": 60,
+                "file_floor": 30,
+            }
+        ]
+    )
+    report = _write_report(
+        tmp_path / "coverage.json", {"src/gpu_fault/runtime.py": (90, 100)}
+    )
+
+    assert ci_coverage_gate.module_floor_violations(report, config=config) == [
+        "coverage module floor renamed matched no measured file"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entries", "reason"),
+    [
+        ([], "no group at all leaves every module unfloored"),
+        (
+            [
+                {
+                    "id": "family",
+                    "description": "d",
+                    "globs": [],
+                    "group_floor": 60,
+                    "file_floor": 30,
+                }
+            ],
+            "a group with no globs matches nothing and cannot fail",
+        ),
+        (
+            [
+                {
+                    "id": "family",
+                    "description": "d",
+                    "globs": ["src/gpu_fault/admin/*.py"],
+                    "group_floor": 60,
+                    "file_floor": 0,
+                }
+            ],
+            "a file floor of zero passes an untested module",
+        ),
+        (
+            [
+                {
+                    "id": "family",
+                    "description": "d",
+                    "globs": ["src/gpu_fault/admin/*.py"],
+                    "group_floor": 20,
+                    "file_floor": 30,
+                }
+            ],
+            "a file floor above the group floor is contradictory",
+        ),
+        (
+            [
+                {
+                    "id": "family",
+                    "description": "d",
+                    "globs": ["a"],
+                    "group_floor": 60,
+                    "file_floor": 30,
+                },
+                {
+                    "id": "family",
+                    "description": "d",
+                    "globs": ["b"],
+                    "group_floor": 60,
+                    "file_floor": 30,
+                },
+            ],
+            "a duplicate id makes it ambiguous which floor a failure names",
+        ),
+    ],
+)
+def test_module_floor_config_rejects_a_floor_that_cannot_fail(
+    tmp_path: Path, entries: list[dict], reason: str
+) -> None:
+    root = tmp_path / "repo"
+    (root / "config").mkdir(parents=True)
+    (root / "config/ci-unit-gate.json").write_text(
+        json.dumps(_module_floors_config(entries)), encoding="utf-8"
+    )
+
+    with pytest.raises(ci_coverage_gate.CoverageGateError):
+        ci_coverage_gate.load_config(root)
+
+
+def test_module_floors_reject_an_unreadable_report(tmp_path: Path) -> None:
+    report = tmp_path / "coverage.json"
+    report.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ci_coverage_gate.CoverageGateError, match="unreadable"):
+        ci_coverage_gate.module_floor_violations(
+            report, config=ci_coverage_gate.load_config(ROOT)
+        )
 
 
 def test_gate_zip_rejects_path_traversal(tmp_path: Path) -> None:

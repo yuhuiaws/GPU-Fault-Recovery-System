@@ -204,8 +204,8 @@ def test_collector_cli_configures_root_logging(monkeypatch) -> None:
     printed with no timestamp/level/logger name -- the signature of
     ``logging.lastResort``. Root was at WARNING with no handlers
     because nothing in the collector process ever called basicConfig
-    (the same defect ``api._configure_logging`` fixed control-plane
-    side). Every ``LOGGER.info`` on the node was silently discarded.
+    (the same defect the control plane had fixed for itself). Every
+    ``LOGGER.info`` on the node was silently discarded.
     """
 
     root = logging.getLogger()
@@ -215,7 +215,7 @@ def test_collector_cli_configures_root_logging(monkeypatch) -> None:
         root.handlers = []
         monkeypatch.setenv("GPU_FAULT_LOG_LEVEL", "INFO")
 
-        collectors_cli._configure_logging()
+        collectors_cli.configure_logging()
 
         assert root.handlers, "collector left root logger unconfigured"
         assert root.level == logging.INFO
@@ -234,10 +234,10 @@ def test_collector_cli_logging_respects_existing_handlers(monkeypatch) -> None:
         root.setLevel(logging.CRITICAL)
         monkeypatch.setenv("GPU_FAULT_LOG_LEVEL", "DEBUG")
 
-        collectors_cli._configure_logging()
+        collectors_cli.configure_logging()
 
-        assert root.handlers == [sentinel]
-        assert root.level == logging.CRITICAL
+        assert root.handlers == [sentinel], "an embedder's handler must not be replaced"
+        assert root.level == logging.CRITICAL, "an embedder's level must not be raised"
     finally:
         root.handlers = saved_handlers
         root.setLevel(saved_level)

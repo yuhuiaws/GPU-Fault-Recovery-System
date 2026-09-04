@@ -20,7 +20,7 @@ from deploy_host_bundle import (
     write_deterministic_archive,
     write_sha256_sidecar,
 )
-
+from deploy_host_identity import build_identity as build_deploy_host_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -180,6 +180,11 @@ def build_bundle(
         if tools_dir is not None:
             _copy_files(tools_dir, staging / "tools")
         compatibility = host_compatibility()
+        payload_identity = build_deploy_host_identity(
+            ROOT,
+            compatibility=compatibility,
+            tools_dir=tools_dir,
+        )
         write_bundle_manifest(
             staging,
             metadata={
@@ -195,13 +200,13 @@ def build_bundle(
                 "project_wheel": project_wheel.relative_to(staging).as_posix(),
                 "project_wheel_sha256": sha256_file(project_wheel),
                 "python": "3.12",
+                "payload_identity_sha256": payload_identity["sha256"],
                 "requirements": {
                     "build": "requirements/build.lock",
                     "deploy_host": "requirements/deploy-host.lock",
                 },
                 "source": {
-                    "git_commit": _git_output("rev-parse", "HEAD"),
-                    "dirty": bool(status),
+                    "payload_identity_sha256": payload_identity["sha256"],
                 },
                 "tool_manifest": tool_manifest.relative_to(staging).as_posix(),
                 "admin_config_template": (
@@ -214,6 +219,7 @@ def build_bundle(
     return {
         "archive": str(output),
         "archive_sha256": sha256_file(output),
+        "payload_identity_sha256": payload_identity["sha256"],
         "sha256_file": str(sidecar),
     }
 

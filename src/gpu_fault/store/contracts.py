@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
+    Iterable,
     Protocol,
     TypedDict,
     runtime_checkable,
@@ -18,15 +20,12 @@ if TYPE_CHECKING:
         MultiNodeBarrier,
     )
     from gpu_fault.models import (
-        FaultIncident,
-        WorkflowRequest,
-    )
-    from gpu_fault.models import (
         AdvisoryNotification,
         CompletionDecision,
         DiagnosticRequest,
         EfaTrafficState,
         EffectiveRuntimeProfile,
+        FaultIncident,
         NodeMarker,
         NotificationDelivery,
         NotificationResult,
@@ -34,6 +33,7 @@ if TYPE_CHECKING:
         RecoveryPlan,
         TerminalEvent,
         TriageReport,
+        WorkflowRequest,
         WorkflowStatus,
     )
     from gpu_fault.processor.models import (
@@ -47,10 +47,10 @@ if TYPE_CHECKING:
         RegionalRegistryRevision,
         RemoteActionCommand,
     )
+    from gpu_fault.telemetry import CollectorStatus
     from gpu_fault.telemetry_models import (
         WorkloadObservationState,
     )
-    from gpu_fault.telemetry import CollectorStatus
 
 
 class ProcessorQueueStats(TypedDict):
@@ -189,6 +189,12 @@ class FleetStore(Protocol):
 
     def save_fleet_deployment(self, deployment: FleetDeployment) -> None: ...
 
+    def replace_fleet_deployment_if_matches(
+        self,
+        replacement: FleetDeployment,
+        expected: FleetDeployment | None,
+    ) -> bool: ...
+
     def get_fleet_deployment(self, deployment_id: str) -> FleetDeployment: ...
 
     def list_fleet_deployments(
@@ -237,6 +243,27 @@ class WorkflowStore(Protocol):
         workflow: WorkflowRequest,
     ) -> None: ...
 
+    def reconcile_restored_workflow(
+        self,
+        workflow_request_id: str,
+        successor_workflow_id: str,
+        *,
+        expected_fencing_token: int,
+        expected_workflow_updated_at: datetime,
+        reference: str,
+        reconciled_at: datetime,
+    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]: ...
+
+    def reconcile_retired_generation_workflow(
+        self,
+        workflow_request_id: str,
+        successor_workflow_id: str,
+        *,
+        expected_fencing_token: int,
+        reference: str | None,
+        reconciled_at: datetime,
+    ) -> tuple[WorkflowRequest, FaultIncident]: ...
+
     def get_incident(self, incident_id: str) -> FaultIncident: ...
 
     def save_incident(self, incident: FaultIncident) -> None: ...
@@ -252,6 +279,10 @@ class WorkflowStore(Protocol):
         limit: int = 100,
         newest_first: bool = False,
     ) -> list[WorkflowRequest]: ...
+
+    def workflow_status_counts(self) -> dict[WorkflowStatus, int]: ...
+
+    def blocked_workflows_without_verified_restore(self) -> int: ...
 
     def list_active_workflow_incidents(
         self,
@@ -342,7 +373,19 @@ class WorkflowStore(Protocol):
 
     def get_remote_command(self, command_id: str) -> RemoteActionCommand: ...
 
-    def list_remote_commands(self) -> list[RemoteActionCommand]: ...
+    def list_remote_commands(
+        self,
+        *,
+        workflow_request_ids: Iterable[str] | None = None,
+    ) -> list[RemoteActionCommand]: ...
+
+    # Every backend has implemented this since remote commands existed; it was
+    # missing here only because its callers reached the store through `Any`.
+    # `deploy/control-plane/regional/probes/` made them typed, which is the
+    # point of those probes being real modules rather than string literals.
+    def remote_command_stats(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any]: ...
 
     def has_incomplete_processor_requests_for_scopes(
         self,
@@ -364,7 +407,19 @@ class WorkflowStore(Protocol):
 class CompletionStore(Protocol):
     def add_marker(self, marker: NodeMarker) -> None: ...
 
-    def list_markers(self) -> list[NodeMarker]: ...
+    def list_markers(self) -> list[NodeMarker]:
+        """Every marker ever recorded. Not for a request path.
+
+        The marker table grows with every observation on every node, so no
+        production caller uses this: the scoped reads below answer the two
+        questions that are actually asked of it, and one of them is pinned by a
+        test that replaces this method with a raising stub. It stays on the
+        contract because the acceptance fixtures and tests that assert over the
+        whole table (``scripts/e2e/regional/q118_fallback_marker.py``,
+        ``scripts/e2e/regional/warm_spare_fixture.py``) legitimately want all of
+        it against a fixture-sized store.
+        """
+        ...
 
     def list_markers_for_incident(self, incident_id: str) -> list[NodeMarker]: ...
 
@@ -374,6 +429,17 @@ class CompletionStore(Protocol):
         observed_after: datetime,
         *,
         source_boot_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[NodeMarker]: ...
+
+    def list_markers_in_scope_window(
+        self,
+        *,
+        node_ids: set[str],
+        gpu_uuids: set[str],
+        fabric_partitions: set[str],
+        observed_from: datetime,
+        observed_to: datetime,
         limit: int = 1000,
     ) -> list[NodeMarker]: ...
 
@@ -404,7 +470,11 @@ class CompletionStore(Protocol):
     def save_profile(self, profile: EffectiveRuntimeProfile) -> None: ...
 
     def list_attempt_observation_states(
-        self, cluster_id: str | None = None
+        self,
+        cluster_id: str | None = None,
+        *,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[WorkloadObservationState]: ...
 
     def get_efa_traffic_state(self, state_key: str) -> EfaTrafficState: ...
@@ -437,6 +507,9 @@ class NotificationStore(Protocol):
 
     def list_notifications(
         self,
+        *,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[AdvisoryNotification]: ...
 
     def notification_status_counts(self) -> dict[NotificationStatus, int]: ...

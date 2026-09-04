@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Callable, TYPE_CHECKING
-
 import secrets
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from gpu_fault.remote_command_models import (
     RemoteCommandStatus,
@@ -13,6 +12,8 @@ from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.remote_helpers import (
     LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS,
     UNCLAIMED_DEADLINE_STATUS_SOURCE,
+)
+from gpu_fault.store.shared.remote_helpers import (
     unclaimed_expiry_update as _unclaimed_expiry_update,
 )
 from gpu_fault.store.shared.time import (
@@ -37,20 +38,32 @@ class PostgresRemoteCommandMixin:
             raise NotFoundError(command_id)
         return command  # type: ignore[no-any-return]
 
-    def list_remote_commands(self) -> list[RemoteActionCommand]:
+    def list_remote_commands(
+        self,
+        *,
+        workflow_request_ids: Iterable[str] | None = None,
+    ) -> list[RemoteActionCommand]:
+        query = """
+            SELECT payload
+            FROM gpu_fault_objects
+            WHERE kind='remote_command'
+        """
+        parameters: list[Any] = []
+        if workflow_request_ids is not None:
+            # ``build_workflow_reconcile_plan`` reads this table for at most 1000
+            # workflows and then filters every row in Python on exactly this
+            # field, so the whole command history was decoded to answer a
+            # question about a bounded set. Narrowing here is equivalent and
+            # keeps the read proportional to the reconcile scope.
+            query += " AND payload->>'workflow_request_id' = ANY(%s)"
+            parameters.append(sorted(set(workflow_request_ids)))
+        query += " ORDER BY payload->>'created_at', key"
         with self._db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT payload
-                FROM gpu_fault_objects
-                WHERE kind='remote_command'
-                ORDER BY payload->>'created_at', key
-                """
-            )
+            cursor.execute(query, parameters)
             rows = cursor.fetchall()
         return [self._decode("remote_command", row[0]) for row in rows]
 
-    def remote_command_stats(self, *, now: datetime | None = None) -> dict:
+    def remote_command_stats(self, *, now: datetime | None = None) -> dict[str, Any]:
         observed_at = now or datetime.now(timezone.utc)
         by_status = {status.value: 0 for status in RemoteCommandStatus}
         with self._db.cursor() as cursor:
@@ -61,6 +74,15 @@ class PostgresRemoteCommandMixin:
                     payload->>'status',
                     count(*),
                     count(*) FILTER (
+                        WHERE payload->>'status_source'=
+                              'executor-internal-error'
+                          AND NOT (
+                              COALESCE(payload->>'error', '')=ANY(%s)
+                          )
+                    ),
+                    max(
+                        (payload->>'updated_at')::timestamptz
+                    ) FILTER (
                         WHERE payload->>'status_source'=
                               'executor-internal-error'
                           AND NOT (
@@ -88,11 +110,13 @@ class PostgresRemoteCommandMixin:
                 """,
                 (
                     sorted(LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS),
+                    sorted(LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS),
                     UNCLAIMED_DEADLINE_STATUS_SOURCE,
                 ),
             )
             rows = cursor.fetchall()
         internal_errors = 0
+        internal_error_last_seen = 0.0
         unclaimed_expired = 0
         total = 0
         open_by_cluster: dict[str, int] = {}
@@ -107,12 +131,18 @@ class PostgresRemoteCommandMixin:
             status_value,
             count,
             error_count,
+            latest_internal_error,
             oldest_pending,
             expired_count,
         ) in rows:
             by_status[status_value] = count
             total += count
             internal_errors += error_count
+            if latest_internal_error is not None:
+                internal_error_last_seen = max(
+                    internal_error_last_seen,
+                    latest_internal_error.timestamp(),
+                )
             unclaimed_expired += expired_count
             if status_value in open_statuses:
                 open_by_cluster[cluster_id] = open_by_cluster.get(cluster_id, 0) + count
@@ -137,6 +167,9 @@ class PostgresRemoteCommandMixin:
                 default=0.0,
             ),
             "executor_internal_error_total": internal_errors,
+            "executor_internal_error_last_seen_timestamp_seconds": (
+                internal_error_last_seen
+            ),
             "unclaimed_expired_total": unclaimed_expired,
         }
 

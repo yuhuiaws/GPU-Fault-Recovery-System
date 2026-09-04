@@ -201,6 +201,19 @@ def test_revision_barrier_requires_every_named_member_at_same_digest() -> None:
             "POST",
             False,
         ),
+        (
+            RegionalClusterLifecycle.FAILED,
+            "/v1/regional/executors/claim",
+            "POST",
+            False,
+        ),
+        (RegionalClusterLifecycle.FAILED, "/v1/fleet/agents/heartbeat", "POST", True),
+        (
+            RegionalClusterLifecycle.ROLLED_BACK,
+            "/v1/fleet/agents/heartbeat",
+            "POST",
+            False,
+        ),
     ],
 )
 def test_cluster_lifecycle_route_policy(

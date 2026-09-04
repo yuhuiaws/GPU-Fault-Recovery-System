@@ -30,16 +30,28 @@ class PostgresNotificationMixin:
 
     def list_notifications(
         self,
+        *,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[AdvisoryNotification]:
+        if limit is not None and limit < 0:
+            raise ValueError("notification scan limit must not be negative")
+        direction = "DESC" if newest_first else "ASC"
+        query = f"""
+            SELECT payload
+            FROM gpu_fault_objects
+            WHERE kind='notification'
+            ORDER BY payload->>'created_at' {direction}, key {direction}
+        """
+        parameters: list[Any] = []
+        if limit is not None:
+            # Pushed into SQL rather than sliced after the fetch: the point of
+            # the bound is that the whole notification history is never decoded,
+            # and slicing in Python would decode all of it first.
+            query += " LIMIT %s"
+            parameters.append(limit)
         with self._db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT payload
-                FROM gpu_fault_objects
-                WHERE kind='notification'
-                ORDER BY payload->>'created_at', key
-                """
-            )
+            cursor.execute(query, parameters)
             rows = cursor.fetchall()
         return [self._decode("notification", row[0]) for row in rows]
 

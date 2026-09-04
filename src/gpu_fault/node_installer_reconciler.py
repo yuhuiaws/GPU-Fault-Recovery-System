@@ -13,6 +13,8 @@ from typing import Any, Callable
 
 import yaml
 
+from gpu_fault.logging_setup import configure_logging
+
 LOGGER = logging.getLogger(__name__)
 
 INSTALLER_VERSION_ANNOTATION = "gpu-fault.io/installer-version"
@@ -113,6 +115,7 @@ class NodeInstallerReconciler:
         max_unavailable: int = 1,
         job_active_deadline_seconds: int = 840,
         allowed_node_names: frozenset[str] | None = None,
+        wave_config_map: str | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.core = core_api
@@ -149,6 +152,7 @@ class NodeInstallerReconciler:
         self.max_unavailable = max_unavailable
         self.job_active_deadline_seconds = job_active_deadline_seconds
         self.allowed_node_names = allowed_node_names
+        self.wave_config_map = wave_config_map
         self.now = now or (lambda: datetime.now(UTC))
 
     @property
@@ -166,26 +170,50 @@ class NodeInstallerReconciler:
             "not_ready": 0,
             "unsupported": 0,
         }
+        allowed_node_names, max_unavailable = self._wave_settings()
         response = self.core.list_node(label_selector=self.node_selector)
         in_flight = 0
         nodes = sorted(
             (
                 item
                 for item in (_value(response, "items", []) or [])
-                if self.allowed_node_names is None
-                or str(_value(_metadata(item), "name")) in self.allowed_node_names
+                if allowed_node_names is None
+                or str(_value(_metadata(item), "name")) in allowed_node_names
             ),
             key=lambda item: str(_value(_metadata(item), "name")),
         )
         for node in nodes:
             outcome = self._reconcile_node(
                 node,
-                allow_create=in_flight < self.max_unavailable,
+                allow_create=in_flight < max_unavailable,
             )
             result[outcome] += 1
             if outcome in {"created", "running"}:
                 in_flight += 1
         return result
+
+    def _wave_settings(self) -> tuple[frozenset[str] | None, int]:
+        if self.wave_config_map is None:
+            return self.allowed_node_names, self.max_unavailable
+        value = self.core.read_namespaced_config_map(
+            self.wave_config_map,
+            self.namespace,
+        )
+        data = dict(_value(value, "data", {}) or {})
+        raw_nodes = str(data.get("allowed-nodes") or "").strip()
+        if raw_nodes == "*":
+            allowed_nodes = None
+        else:
+            allowed_nodes = frozenset(
+                item.strip() for item in raw_nodes.split(",") if item.strip()
+            )
+        try:
+            max_unavailable = int(data.get("max-unavailable") or "")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("installer wave max-unavailable is invalid") from exc
+        if max_unavailable < 1:
+            raise RuntimeError("installer wave max-unavailable must be positive")
+        return allowed_nodes, max_unavailable
 
     def _reconcile_node(self, node: Any, *, allow_create: bool = True) -> str:
         metadata = _metadata(node)
@@ -372,10 +400,7 @@ def _required_env(name: str) -> str:
 def main() -> None:
     from kubernetes import client, config
 
-    logging.basicConfig(
-        level=os.environ.get("GPU_FAULT_LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    configure_logging()
     namespace = os.environ.get("GPU_FAULT_NAMESPACE", "gpu-fault-system")
     template_name = os.environ.get(
         "GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP",
@@ -432,6 +457,7 @@ def main() -> None:
         max_unavailable=max_unavailable,
         job_active_deadline_seconds=active_deadline_seconds,
         allowed_node_names=allowed_nodes,
+        wave_config_map=(os.environ.get("GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP") or None),
     )
     while True:
         try:

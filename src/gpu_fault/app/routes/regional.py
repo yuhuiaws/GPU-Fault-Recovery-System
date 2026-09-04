@@ -1,29 +1,29 @@
 from __future__ import annotations
 
-from gpu_fault.app.authorization import authorization_bucket
-
 import logging
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
+from gpu_fault.app.authorization import authorization_bucket
 from gpu_fault.async_store import (
     AsyncStoreExecutor,
     StoreIoCapacityExceeded,
 )
+from gpu_fault.execution.fleet_preflight import (
+    fleet_rollout_fence_deployment_ids,
+)
 from gpu_fault.fleet import AgentRecord, AgentTransitionRequest
 from gpu_fault.hyperpod import HyperPodSubmissionRecord
-from gpu_fault.hyperpod_spares import (
+from gpu_fault.markers import (
+    blocking_spare_markers,
     describe_blocking_marker,
-    marker_disqualifies_spare,
 )
 from gpu_fault.models import (
     AdvisoryNotification,
     IncidentState,
-    NodeMarker,
     WorkflowOperation,
     WorkflowStatus,
 )
@@ -37,6 +37,7 @@ from gpu_fault.regional import (
     RemoteCommandLeaseRenewal,
     RemoteCommandResult,
     RemoteEvidenceCaptureRequest,
+    RemoteFleetRolloutFence,
     RemoteHyperPodSubmissionRequest,
     RemoteHyperPodSubmissionReservation,
     RemoteIncidentOwnershipReport,
@@ -48,7 +49,6 @@ from gpu_fault.regional_compatibility import (
 )
 from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import RawEvidenceRecord
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -123,6 +123,12 @@ async def list_regional_clusters(
         digest = item.pop("token_sha256", "") or ""
         item["token_sha256_present"] = bool(digest)
         item["token_sha256_length"] = len(digest)
+        # The retiring digest is redacted the same way, but whether a rotation is
+        # armed and when its window closes stay visible: that is what an operator
+        # needs to decide whether the rotation can be completed.
+        retiring = item.pop("retiring_token_sha256", None) or ""
+        item["retiring_token_sha256_present"] = bool(retiring)
+        item["retiring_token_sha256_length"] = len(retiring)
         redacted.append(item)
     return redacted
 
@@ -443,6 +449,43 @@ async def get_remote_incident_ownership(
     return await _store_call(dependencies, lookup)
 
 
+@router.get(
+    "/executors/fleet-rollout-fence",
+    response_model=RemoteFleetRolloutFence,
+)
+@authorization_bucket("cluster-token")
+async def get_remote_fleet_rollout_fence(
+    cluster_id: str | None = Header(
+        default=None,
+        alias="X-GPU-Fault-Cluster-ID",
+    ),
+    dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
+) -> RemoteFleetRolloutFence:
+    """Answer the rollout fence for the authenticated cluster only.
+
+    The data-plane executor is the last gate before a destructive step, and it
+    is the *only* gate once a remote command exists: the control-plane fence
+    runs before dispatch, and holding a workflow there does not revoke a
+    command already in the store. So the executor has to be able to ask, and
+    in the default regional deployment it owns no store to ask.
+
+    The cluster comes from the authenticated header, never from a query
+    parameter, so this cannot be turned into a cross-cluster read.
+    """
+
+    cluster_id = _require_cluster(cluster_id)
+    fencing = await _store_call(
+        dependencies,
+        fleet_rollout_fence_deployment_ids,
+        dependencies.context.store,
+        cluster_id,
+    )
+    return RemoteFleetRolloutFence(
+        cluster_id=cluster_id,
+        fencing_deployment_ids=list(fencing),
+    )
+
+
 @router.post(
     "/executors/hyperpod-submissions/outcome",
     response_model=RemoteHyperPodSubmissionReservation,
@@ -528,16 +571,11 @@ async def regional_spare_health(
             reasons.append(f"expected one matching agent, found {len(agents)}")
         elif not ctx.fleet_registry.readiness(cluster_id, [agents[0].node_id]).ready:
             reasons.append("node agent is not fleet-ready")
-        markers = [
-            marker
-            for marker in ctx.store.list_markers()
-            if _marker_blocks(ctx, marker)
-            and aliases.intersection(marker.scope.node_ids)
-            and (
-                health.observed_after is None
-                or marker.observed_at > health.observed_after
-            )
-        ]
+        markers = blocking_spare_markers(
+            ctx.store,
+            aliases,
+            observed_after=health.observed_after,
+        )
         if markers:
             reasons.append(
                 "active trusted node fault marker exists: "
@@ -559,20 +597,6 @@ async def regional_spare_health(
         return RemoteSpareHealthReport(ready=not reasons, reasons=reasons)
 
     return await _store_call(dependencies, evaluate)
-
-
-def _marker_blocks(ctx, marker: NodeMarker) -> bool:
-    if not marker_disqualifies_spare(marker, datetime.now(timezone.utc)):
-        return False
-    if marker.incident_id:
-        try:
-            incident = ctx.store.get_incident(marker.incident_id)
-            workflow = ctx.store.get_workflow(incident.workflow_request_id)
-            if workflow.status is WorkflowStatus.SUCCEEDED:
-                return False
-        except (KeyError, TypeError):
-            pass
-    return True
 
 
 @router.post(

@@ -21,6 +21,25 @@ PROFILE_EXAMPLES = tuple(
 )
 
 
+def test_environment_members_are_exactly_the_ones_decisions_branch_on() -> None:
+    """An environment nobody branches on takes the default path silently.
+
+    The recovery-ownership and RESTART_VM mappings ask which environment a profile
+    declares; a member outside that set would still load a profile and still
+    configure a watcher, and then behave like plain Kubernetes. So the member list
+    is pinned here, and an unsupported value fails at parse time instead.
+    """
+
+    assert {member.value for member in Environment} == {
+        "eks",
+        "hyperpod-eks",
+        "hyperpod-slurm",
+        "kubernetes",
+    }
+    with pytest.raises(ValueError, match="slurm"):
+        Environment("slurm")
+
+
 def test_rejects_multiple_destructive_writers() -> None:
     profile = RuntimeProfile(
         cluster_id="cluster-a",

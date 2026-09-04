@@ -42,6 +42,7 @@ jobs:
       - run: python scripts/check-mypy-baseline.py
       - run: python scripts/check-mixin-contracts.py
       - run: python scripts/check-test-private-coupling.py
+      - run: python scripts/check-test-source-assertions.py
       - run: python scripts/check-assert-messages.py
       - run: python scripts/check-public-release.py
       - run: python -m compileall -q src tests deploy scripts tools
@@ -441,6 +442,41 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Every other test job runs the suite in the same order: fixed shards, and a
+  # worksteal distribution that always starts from the same collection. A test
+  # that quietly depends on another one having run first (module-level cache,
+  # lru_cache, in-process singleton, a global someone else monkeypatched) stays
+  # green in that order forever and only fails the day an unrelated test is
+  # added. This job is the only thing that looks.
+  shuffle:
+    name: shuffled-order
+    runs-on: ${{ vars.CI_TEST_RUNNER || 'ubuntu-latest' }}
+    env:
+      # Seeded from the run id rather than from chance, so re-running this
+      # workflow reproduces the same order and a failure can be triaged instead
+      # of merely observed. A different push gets a different order.
+      GPU_FAULT_TEST_SHUFFLE_SEED: ${{ github.run_id }}
+      PYTEST_DURATIONS: "50"
+      PYTEST_XDIST_DIST: worksteal
+      PYTEST_XDIST_WORKERS: ${{ vars.CI_PYTEST_WORKERS || '4' }}
+      PYTHONPYCACHEPREFIX: /tmp/gpu-fault-pycache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: >-
+          python -m pip install --require-hashes
+          --requirement requirements/build.lock
+      - run: >-
+          python -m pip install
+          '.[dev,collectors,postgres,performance]'
+      - run: make test-shuffled PYTHON=python
+
   artifact:
     runs-on: ubuntu-latest
     steps:
@@ -487,6 +523,7 @@ jobs:
     needs:
       - static
       - unit
+      - shuffle
       - artifact
     runs-on: ubuntu-latest
     steps:
@@ -494,6 +531,7 @@ jobs:
         run: |
           test "${{ needs.static.result }}" = "success"
           test "${{ needs.unit.result }}" = "success"
+          test "${{ needs.shuffle.result }}" = "success"
           test "${{ needs.artifact.result }}" = "success"
       - uses: actions/checkout@v4
         if: github.event_name == 'push'

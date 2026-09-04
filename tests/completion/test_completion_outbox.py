@@ -11,7 +11,7 @@ from gpu_fault.completion_outbox import CompletionOutboxFull, KubernetesCompleti
 class ConfigMapCore:
     def __init__(self) -> None:
         self.version = 1
-        self.data = {"events.json": "[]"}
+        self.data = {"active-attempts.json": "{}", "events.json": "[]"}
 
     def read_namespaced_config_map(self, name, namespace):
         assert name == "gpu-fault-completion-watcher-outbox"
@@ -71,7 +71,7 @@ def test_completion_outbox_replays_without_a_new_live_event() -> None:
     assert replay.depth() == 0
 
 
-def test_routine_observation_does_not_use_critical_outbox() -> None:
+def test_successful_routine_observation_does_not_write_the_outbox() -> None:
     core = ConfigMapCore()
     sink = RecordingSink()
     outbox = KubernetesCompletionOutbox(core, sink)
@@ -80,6 +80,51 @@ def test_routine_observation_does_not_use_critical_outbox() -> None:
 
     assert sink.posts == [("/v1/workload-observations", payload())]
     assert outbox.depth() == 0
+
+
+def test_failed_routine_observation_is_durable_latest_wins() -> None:
+    core = ConfigMapCore()
+    failed = RecordingSink(fail=True)
+    outbox = KubernetesCompletionOutbox(core, failed)
+    first = {**payload(), "observed_at": "2026-09-03T06:00:00Z"}
+    latest = {**payload(), "observed_at": "2026-09-03T06:00:03Z"}
+
+    with pytest.raises(OSError, match="unavailable"):
+        outbox.post("/v1/workload-observations", first)
+    with pytest.raises(OSError, match="unavailable"):
+        outbox.post("/v1/workload-observations", latest)
+
+    records = json.loads(core.data["events.json"])
+    assert len(records) == 1
+    assert records[0]["payload"] == latest
+    recovered = RecordingSink()
+    replay = KubernetesCompletionOutbox(core, recovered)
+    assert replay.replay() == 1
+    assert recovered.posts == [("/v1/workload-observations", latest)]
+    assert replay.depth() == 0
+
+
+def test_active_attempt_state_ignores_timestamp_only_refreshes() -> None:
+    core = ConfigMapCore()
+    outbox = KubernetesCompletionOutbox(core, RecordingSink())
+    first = {
+        **payload(),
+        "workload_phase": "RUNNING",
+        "observed_at": "2026-09-03T06:00:00Z",
+        "containers": [{"node_id": "node-a", "terminated": False}],
+    }
+    refreshed = {**first, "observed_at": "2026-09-03T06:00:03Z"}
+
+    assert outbox.save_attempt_observation(first) is True
+    version = core.version
+    assert outbox.save_attempt_observation(refreshed) is False
+    assert core.version == version
+    restored = KubernetesCompletionOutbox(
+        core, RecordingSink()
+    ).load_attempt_observations()
+    assert restored == [first]
+    outbox.remove_attempt_observation(first)
+    assert json.loads(core.data["active-attempts.json"]) == {}
 
 
 def test_completion_outbox_fails_closed_instead_of_dropping_oldest() -> None:

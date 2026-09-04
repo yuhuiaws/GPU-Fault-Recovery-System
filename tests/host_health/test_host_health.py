@@ -31,6 +31,7 @@ from ._host_health_cases_1 import (
     test_zero_traffic_progress_suppression_can_be_disabled,
 )
 from ._host_health_cases_2 import (
+    test_a_tcp_retransmit_raises_no_finding_and_ships_no_batch,
     test_admin_can_accept_new_efa_baseline_and_stale_event_is_rejected,
     test_admin_can_acknowledge_transient_efa_spike,
     test_cpu_finding_requests_host_validation,
@@ -39,6 +40,7 @@ from ._host_health_cases_2 import (
     test_efa_recovery_workflow_uses_targeted_remediation,
     test_efa_traffic_anomaly_sends_fixed_email,
     test_failed_targeted_efa_recovery_escalates_to_reboot,
+    test_genuine_network_error_counters_keep_their_finding,
     test_host_telemetry_endpoint_builds_quarantine_workflow,
     test_inactive_efa_link_diagnoses_then_escalates_to_reboot,
     test_kubernetes_efa_allocatable_loss_restarts_device_plugin,

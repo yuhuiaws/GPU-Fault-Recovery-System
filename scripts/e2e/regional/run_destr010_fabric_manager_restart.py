@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
-import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 if __package__:
@@ -24,11 +23,18 @@ if __package__:
         authorize_execution,
         build_plan,
     )
+    from .regional_live_fixture import (
+        install_abort_signals,
+        run_case_main,
+    )
 else:
     from acceptance_runner_common import write_json_atomic
     from host_probe_fixture import HostProbeFixture, HostProbeSettings
     from live_driver_guard import add_live_arguments, authorize_execution, build_plan
-
+    from regional_live_fixture import (
+        install_abort_signals,
+        run_case_main,
+    )
 
 ROOT = Path(__file__).resolve().parents[3]
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "node_host_probe.py"
@@ -1026,10 +1032,6 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
     }
 
 
-def abort_on_signal(signum: int, _frame: object) -> None:
-    raise CaseError(f"received signal {signum}")
-
-
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description="Run the guarded DESTR-010 Fabric Manager restart acceptance."
@@ -1049,8 +1051,7 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     arguments = parser().parse_args()
     os.umask(0o077)
-    signal.signal(signal.SIGTERM, abort_on_signal)
-    signal.signal(signal.SIGINT, abort_on_signal)
+    install_abort_signals()
     settings = configure(arguments)
     case_dir = arguments.run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -1081,4 +1082,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_case_main(main))

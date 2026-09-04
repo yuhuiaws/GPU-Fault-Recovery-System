@@ -31,6 +31,7 @@ else:
 ROOT = Path(__file__).resolve().parents[1]
 STATE_NAME = "deploy-host-state.json"
 DEPENDENCY_STATE_NAME = "deploy-host-dependency-state.json"
+DEPENDENCY_ENTRYPOINTS = ("ruff",)
 
 
 class DeployHostSetupError(RuntimeError):
@@ -106,6 +107,46 @@ def validate_bundle_source(
     source = manifest.get("source")
     if not isinstance(source, dict):
         raise DeployHostSetupError("deploy-host bundle source identity is missing")
+    payload_identity = str(source.get("payload_identity_sha256") or "")
+    if payload_identity:
+        current_dirty = bool(
+            _run(
+                ["git", "status", "--porcelain", "--untracked-files=normal"],
+                cwd=repo_root,
+                capture=True,
+            )
+        )
+        output = _run(
+            [
+                sys.executable,
+                str(repo_root / "scripts/deploy_host_identity.py"),
+                "--root",
+                str(repo_root),
+            ],
+            cwd=repo_root,
+            capture=True,
+        )
+        try:
+            actual_identity = str(json.loads(output)["sha256"])
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise DeployHostSetupError(
+                "current deploy-host payload identity is invalid"
+            ) from exc
+        matched = (
+            len(payload_identity) == 64
+            and not current_dirty
+            and payload_identity == actual_identity
+        )
+        if not allow_source_mismatch and not matched:
+            raise DeployHostSetupError(
+                "deploy-host bundle payload does not match a clean current checkout"
+            )
+        return {
+            "expected_payload_identity_sha256": payload_identity,
+            "actual_payload_identity_sha256": actual_identity,
+            "actual_dirty": current_dirty,
+            "matched": matched,
+        }
     expected_commit = str(source.get("git_commit") or "")
     expected_dirty = source.get("dirty")
     current_commit = _run(
@@ -211,7 +252,7 @@ def _dependency_report(
         [
             str(_python_path(venv)),
             "-m",
-            "gpu_fault.admin_bootstrap_dependencies",
+            "gpu_fault.admin.bootstrap_dependencies",
             "--output",
             "json",
         ],
@@ -251,6 +292,7 @@ def deploy_host_project_report(
                 "'module_digest':module_digest()}))"
             ),
         ],
+        env=_isolated_python_environment(),
         capture=True,
     )
     try:
@@ -295,9 +337,24 @@ def check_deploy_host_venv(venv: Path) -> dict[str, Any]:
         if len(dependency_identity) != 64:
             raise DeployHostSetupError(f"deployment-host venv is incomplete: {venv}")
         _check_dependency_venv(dependency_venv, dependency_identity)
+        for name in DEPENDENCY_ENTRYPOINTS:
+            source = dependency_venv / "bin" / name
+            target = venv / "bin" / name
+            if (
+                not source.is_file()
+                or not target.is_symlink()
+                or target.resolve() != source.resolve()
+            ):
+                raise DeployHostSetupError(
+                    f"deployment-host venv is incomplete: {venv}"
+                )
     elif dependency_identity_value is not None:
         raise DeployHostSetupError(f"deployment-host venv is incomplete: {venv}")
-    _run([str(admin), "--help"], capture=True)
+    _run(
+        [str(admin), "--help"],
+        env=_isolated_python_environment(),
+        capture=True,
+    )
     return {
         "schema_version": 1,
         "healthy": True,
@@ -329,6 +386,27 @@ def _venv_site_paths(venv: Path) -> tuple[Path, ...]:
     if not isinstance(values, list) or not values:
         raise DeployHostSetupError("deployment-host venv site paths are invalid")
     return tuple(dict.fromkeys(Path(str(value)) for value in values))
+
+
+def install_dependency_entrypoints(venv: Path, dependency_venv: Path) -> None:
+    for name in DEPENDENCY_ENTRYPOINTS:
+        source = dependency_venv / "bin" / name
+        target = venv / "bin" / name
+        if not source.is_file():
+            raise DeployHostSetupError(
+                f"deployment-host dependency entrypoint is missing: {source}"
+            )
+        if target.is_symlink():
+            if target.resolve() == source.resolve():
+                continue
+            raise DeployHostSetupError(
+                f"deployment-host dependency entrypoint conflicts: {target}"
+            )
+        if target.exists():
+            raise DeployHostSetupError(
+                f"deployment-host dependency entrypoint conflicts: {target}"
+            )
+        target.symlink_to(os.path.relpath(source, target.parent))
 
 
 def _check_dependency_venv(venv: Path, expected_identity: str) -> None:
@@ -448,6 +526,7 @@ def install_from_bundle(
                 "\n".join(str(path) for path in dependency_paths) + "\n",
                 encoding="utf-8",
             )
+        install_dependency_entrypoints(venv, dependency_venv)
     project_wheel = bundle_root / str(manifest["project_wheel"])
     _run(
         [
@@ -526,29 +605,44 @@ def _install_online(
     }
 
 
-def _activate_venv(version: Path, target: Path) -> None:
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def activate_venv(version: Path, target: Path) -> Path | None:
     backup = target.with_name(f".{target.name}.previous")
     next_link = target.with_name(f".{target.name}.next")
-    if backup.is_symlink() or backup.is_file():
-        backup.unlink()
-    elif backup.exists():
-        shutil.rmtree(backup)
+    _remove_path(backup)
     next_link.unlink(missing_ok=True)
     next_link.symlink_to(
         os.path.relpath(version, target.parent),
         target_is_directory=True,
     )
-    moved_directory = target.exists() and not target.is_symlink()
-    if moved_directory:
+    had_target = target.is_symlink() or target.exists()
+    if had_target:
         os.replace(target, backup)
     try:
         os.replace(next_link, target)
     except Exception:
         next_link.unlink(missing_ok=True)
-        if moved_directory and backup.exists() and not target.exists():
+        if had_target and (backup.is_symlink() or backup.exists()):
             os.replace(backup, target)
         raise
-    shutil.rmtree(backup, ignore_errors=True)
+    return backup if had_target else None
+
+
+def restore_venv_activation(target: Path, backup: Path | None) -> None:
+    _remove_path(target)
+    if backup is not None and (backup.is_symlink() or backup.exists()):
+        os.replace(backup, target)
+
+
+def finalize_venv_activation(backup: Path | None) -> None:
+    if backup is not None:
+        _remove_path(backup)
 
 
 def setup_deploy_host(
@@ -604,6 +698,12 @@ def setup_deploy_host(
                         repo_root=repo_root,
                         allow_source_mismatch=allow_source_mismatch,
                     )
+                    dependency_path = state.get("dependency_venv")
+                    if dependency_path:
+                        install_dependency_entrypoints(
+                            venv,
+                            Path(str(dependency_path)).resolve(),
+                        )
                     try:
                         result = check_deploy_host_venv(venv)
                     except DeployHostSetupError as exc:
@@ -615,11 +715,23 @@ def setup_deploy_host(
     versions = venv.parent / f".{venv.name}.versions"
     versions.mkdir(mode=0o700, parents=True, exist_ok=True)
     if archive_sha is not None:
-        staged = versions / f"bundle-{archive_sha[:24]}"
-        shutil.rmtree(staged, ignore_errors=True)
-        staged.mkdir()
+        canonical = versions / f"bundle-{archive_sha[:24]}"
+        current = venv.resolve() if venv.is_symlink() or venv.exists() else None
+        if canonical.exists() and current == canonical.resolve():
+            staged = Path(
+                tempfile.mkdtemp(
+                    prefix=f".bundle-{archive_sha[:24]}-",
+                    dir=versions,
+                )
+            )
+        else:
+            shutil.rmtree(canonical, ignore_errors=True)
+            canonical.mkdir()
+            staged = canonical
     else:
         staged = Path(tempfile.mkdtemp(prefix="online-", dir=versions))
+    activation_backup: Path | None = None
+    activated = False
     try:
         _run([python, "-m", "venv", str(staged)])
         with tempfile.TemporaryDirectory(
@@ -690,11 +802,16 @@ def setup_deploy_host(
             encoding="utf-8",
         )
         state_path.chmod(0o600)
-        _activate_venv(staged, venv)
+        check_deploy_host_venv(staged)
+        activation_backup = activate_venv(staged, venv)
+        activated = True
+        result = check_deploy_host_venv(venv)
     except Exception:
+        if activated:
+            restore_venv_activation(venv, activation_backup)
         shutil.rmtree(staged, ignore_errors=True)
         raise
-    result = check_deploy_host_venv(venv)
+    finalize_venv_activation(activation_backup)
     result["reused"] = False
     return result
 

@@ -139,14 +139,19 @@ spec:
         # only when work exists. Pair it with the executor-side
         # last_successful_claim_at liveness marker.
         - alert: GpuFaultRemoteCommandExecutorInternalError
-          expr: increase(gpu_fault_remote_command_executor_internal_errors_total[15m]) > 0
+          expr: >-
+            time() -
+            max(gpu_fault_remote_command_executor_internal_error_last_seen_timestamp_seconds)
+            < 900
           labels:
             severity: critical
           annotations:
             summary: A cluster executor failed a command through an internal defect
             description: >-
               The failure is an executor bug, not a refused recovery action.
-              Read the executor Pod log stack trace before retrying.
+              Read the executor Pod log stack trace before retrying. The alert
+              uses the newest retained error timestamp so terminal-record cleanup
+              cannot look like a counter reset.
     - name: gpu-fault-policy-coverage
       rules:
         - alert: GpuFaultUnknownProductFamily
@@ -172,7 +177,8 @@ spec:
               {{ $value }} fresh attempts claim it. Stale observations are
               excluded from ownership and alerted separately.
         - alert: GpuFaultStaleAttemptObservation
-          expr: gpu_fault_stale_attempt_observations > 0
+          expr: max by (cluster_id, gpu_node) (gpu_fault_stale_attempt_observations) > 0
+          for: 2m
           labels:
             severity: warning
           annotations:
@@ -181,5 +187,6 @@ spec:
               Cluster {{ $labels.cluster_id }} GPU node
               {{ $labels.gpu_node }} retains {{ $value }} active-phase
               observations older than the ownership freshness window. They
-              are not eligible for node mutation ownership and should be
-              terminalized or cleaned.
+              are excluded from node mutation ownership. Check the live
+              training Pod, Completion Watcher health/logs, and observation
+              delivery; do not delete Store rows to silence this warning.

@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import yaml
 
-from gpu_fault import admin_profile_approval
-from scripts import release_deploy
+from gpu_fault.admin import profile_approval as admin_profile_approval
+from scripts import release_deploy, release_failure_recovery
 
 REGION = "us-east-1"
+READ_LIVE_RELEASE_STATE = release_deploy.read_live_release_state
 
 
 def _verification_report() -> dict[str, object]:
@@ -72,6 +76,20 @@ def _site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "claims: []\n"
         "observed: []\n",
         encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        release_deploy,
+        "read_live_release_state",
+        lambda _site: {
+            "phase": "rolled-back",
+            "rollback_result": {"status": "PASSED"},
+            "previous": {},
+        },
+    )
+    monkeypatch.setattr(
+        release_failure_recovery,
+        "reconcile_rollback_management",
+        lambda _site, _state, **_kwargs: root,
     )
     secure = tmp_path / "secure"
     secure.mkdir()
@@ -151,6 +169,32 @@ def _site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         lambda *_args, **_kwargs: "b" * 64,
     )
     return site
+
+
+def test_live_release_state_distinguishes_not_found_from_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    missing = (
+        "Error from server (NotFound): configmaps "
+        '"gpu-fault-regional-release-state" not found'
+    )
+
+    with pytest.raises(release_deploy.ReleaseStateNotFound):
+        READ_LIVE_RELEASE_STATE(
+            site,
+            runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0], 1, "", missing
+            ),
+        )
+
+    with pytest.raises(release_deploy.ReleaseDeployError, match="Forbidden"):
+        READ_LIVE_RELEASE_STATE(
+            site,
+            runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0], 1, "", "Error from server (Forbidden)"
+            ),
+        )
 
 
 def test_site_resolution_is_explicit_or_environment_driven(tmp_path: Path) -> None:
@@ -427,6 +471,7 @@ def test_execute_release_records_failure(
     assert state["phase"] == "FAILED"
     assert "verify failed" in state["error"]
     assert state["rollback"]["status"] == "PASSED"
+    assert state["rollback"]["management_state_synced"] is True
 
 
 def test_execute_release_rolls_back_after_stability_failure(
@@ -467,10 +512,295 @@ def test_execute_release_rolls_back_after_stability_failure(
     assert any(command[1] == "rollback" for command in commands), (
         "stability failure did not invoke the low-level rollback"
     )
+    assert any(command[1] == "sync-state" for command in commands), (
+        "successful rollback did not reconcile the management release state"
+    )
+    state = json.loads(
+        (site.parent / "release-deploy/release-a/state.json").read_text()
+    )
+    assert state["phase"] == "FAILED"
+    assert "stability report" in state["error"]
+    assert state["rollback"]["status"] == "PASSED"
+    assert state["rollback"]["management_state_synced"] is True
+    assert state["rollback"]["started_at"]
+    assert state["rollback"]["completed_at"]
+
+
+def test_execute_release_honors_disabled_automatic_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    document = yaml.safe_load(site.read_text(encoding="utf-8"))
+    document["spec"]["autoRollback"] = False
+    site.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        release_deploy,
+        "_run",
+        lambda arguments, **_kwargs: commands.append(list(arguments)),
+    )
+
+    def run_json(arguments, **_kwargs):
+        if "verify" in arguments:
+            raise release_deploy.ReleaseDeployError("verify failed")
+        if "release-diff" in arguments:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    with pytest.raises(release_deploy.ReleaseDeployError, match="verify failed"):
+        release_deploy.execute_release(
+            site,
+            run_checks=False,
+            live_state={
+                "runtime_profile_sha256": hashlib.sha256(
+                    profile.read_bytes()
+                ).hexdigest()
+            },
+        )
+
+    assert not any(command[1] == "rollback" for command in commands), (
+        "autoRollback=false still invoked rollback"
+    )
+    state = json.loads(
+        (site.parent / "release-deploy/release-a/state.json").read_text()
+    )
+    assert state["rollback"]["status"] == "SKIPPED_POLICY"
+
+
+def test_execute_release_aligns_a_completed_low_level_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    commands: list[list[str]] = []
+
+    def run(arguments, **_kwargs):
+        command = list(arguments)
+        commands.append(command)
+        if "gpu_fault.admin.cli" in command and "deploy" in command:
+            raise release_deploy.ReleaseDeployError("low-level deploy failed")
+
+    monkeypatch.setattr(release_deploy, "_run", run)
+    monkeypatch.setattr(
+        release_deploy,
+        "_run_json",
+        lambda arguments, **_kwargs: (
+            _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+            if "release-diff" in arguments
+            else _release_summary()
+        ),
+    )
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    with pytest.raises(release_deploy.ReleaseDeployError, match="low-level deploy"):
+        release_deploy.execute_release(
+            site,
+            run_checks=False,
+            live_state={
+                "runtime_profile_sha256": hashlib.sha256(
+                    profile.read_bytes()
+                ).hexdigest()
+            },
+        )
+
+    assert any(command[1] == "sync-state" for command in commands), (
+        "completed low-level rollback was not aligned to management state"
+    )
+    assert not any(command[1] == "rollback" for command in commands), (
+        "completed low-level rollback was executed a second time"
+    )
     state = json.loads(
         (site.parent / "release-deploy/release-a/state.json").read_text()
     )
     assert state["rollback"]["status"] == "PASSED"
+    assert state["rollback"]["management_state_synced"] is True
+
+
+def test_execute_release_does_not_rollback_a_committed_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    commands: list[list[str]] = []
+
+    def run(arguments, **_kwargs):
+        command = list(arguments)
+        commands.append(command)
+        if len(command) > 1 and command[1] == "commit":
+            raise release_deploy.ReleaseDeployError("backup cleanup failed")
+
+    def run_json(arguments, **_kwargs):
+        if "verify" in arguments:
+            return _verification_report()
+        if "stability" in arguments:
+            return _stability_report()
+        if "release-diff" in arguments:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run", run)
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    monkeypatch.setattr(
+        release_deploy,
+        "read_live_release_state",
+        lambda _site: {
+            "phase": "complete",
+            "transaction_committed": True,
+            "commit_cleanup_completed": False,
+        },
+    )
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    with pytest.raises(release_deploy.ReleaseDeployError, match="backup cleanup"):
+        release_deploy.execute_release(
+            site,
+            run_checks=False,
+            live_state={
+                "runtime_profile_sha256": hashlib.sha256(
+                    profile.read_bytes()
+                ).hexdigest()
+            },
+        )
+
+    assert not any(command[1] == "rollback" for command in commands), (
+        "committed release was rolled back after cleanup failure"
+    )
+    state = json.loads(
+        (site.parent / "release-deploy/release-a/state.json").read_text()
+    )
+    assert state["rollback"]["status"] == "SKIPPED_COMMITTED"
+
+
+def test_rollback_cleanup_finishes_before_management_alignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    prepared = release_deploy.PreparedRelease(
+        site_file=site,
+        release_id="release-a",
+        runtime_profile_version="profile-v1",
+        agent_config_digest="a" * 64,
+        profile_change_kind="UNCHANGED",
+        profile_approval=None,
+        state_dir=site.parent / "release-deploy/release-a",
+        site_changed=False,
+    )
+    states = iter(
+        (
+            {
+                "phase": "rolled-back",
+                "rollback_cleanup_completed": False,
+                "rollback_result": {"status": "PASSED"},
+            },
+            {
+                "phase": "rolled-back",
+                "rollback_cleanup_completed": True,
+                "rollback_result": {"status": "PASSED"},
+            },
+        )
+    )
+    modes: list[str] = []
+    monkeypatch.setattr(
+        release_failure_recovery,
+        "reconcile_rollback_management",
+        lambda *_args, **_kwargs: site.parent,
+    )
+
+    result = release_failure_recovery.recover_release_failure(
+        prepared,
+        site_file=site,
+        root=site.parent,
+        environment={},
+        failure_error="upgrade failed",
+        failed_at="2026-09-03T00:00:00+00:00",
+        deployment_succeeded=False,
+        commit_started=False,
+        automatic_rollback=True,
+        run_release_mode=lambda _site, *, mode, **_kwargs: modes.append(mode),
+        read_live_state=lambda _site: next(states),
+        update_phase=lambda *_args, **_kwargs: None,
+    )
+
+    assert modes == ["rollback", "sync-state"], (
+        "management alignment ran before rollback cleanup completed"
+    )
+    assert result is not None and result["status"] == "PASSED"
+
+
+def test_rollback_cleanup_failure_preserves_pending_checkpoint(tmp_path: Path) -> None:
+    prepared = SimpleNamespace(release_id="release-a", state_dir=tmp_path / "release-a")
+    modes: list[str] = []
+
+    def fail_cleanup(_site, *, mode, **_kwargs):
+        modes.append(mode)
+        raise release_deploy.ReleaseDeployError("cleanup still failed")
+
+    result = release_failure_recovery.recover_release_failure(
+        prepared,
+        site_file=tmp_path / "site.yaml",
+        root=tmp_path,
+        environment={},
+        failure_error="upgrade failed",
+        failed_at="2026-09-03T00:00:00+00:00",
+        deployment_succeeded=False,
+        commit_started=False,
+        automatic_rollback=True,
+        run_release_mode=fail_cleanup,
+        read_live_state=lambda _site: {
+            "phase": "rolled-back",
+            "rollback_cleanup_completed": False,
+            "rollback_result": {"status": "PASSED"},
+        },
+        update_phase=lambda *_args, **_kwargs: None,
+    )
+
+    assert modes == ["rollback"]
+    assert result is not None and result["status"] == "CLEANUP_PENDING"
+    assert result["management_state_synced"] is False
+
+
+def test_execute_release_persists_failure_before_interrupted_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _site(tmp_path, monkeypatch)
+    state_path = site.parent / "release-deploy/release-a/state.json"
+    monkeypatch.setattr(release_deploy, "_run", lambda *_args, **_kwargs: None)
+
+    def fail_verify(arguments, **_kwargs):
+        if "verify" in arguments:
+            raise release_deploy.ReleaseDeployError("verify failed")
+        if "release-diff" in arguments:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+        return _release_summary()
+
+    observed: dict[str, Any] = {}
+
+    def interrupt_rollback(_site_file, *, mode, **_kwargs):
+        assert mode == "rollback"
+        observed.update(json.loads(state_path.read_text(encoding="utf-8")))
+        raise KeyboardInterrupt("deployment session ended")
+
+    monkeypatch.setattr(release_deploy, "_run_json", fail_verify)
+    monkeypatch.setattr(release_deploy, "_run_release_mode", interrupt_rollback)
+
+    with pytest.raises(KeyboardInterrupt, match="session ended"):
+        profile = tmp_path / "repo/config/profile.yaml"
+        release_deploy.execute_release(
+            site,
+            run_checks=False,
+            live_state={
+                "runtime_profile_sha256": hashlib.sha256(
+                    profile.read_bytes()
+                ).hexdigest()
+            },
+        )
+
+    assert observed["phase"] == "FAILED"
+    assert "verify failed" in str(observed["error"])
+    assert observed["rollback"]["status"] == "IN_PROGRESS"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state == observed
 
 
 def test_release_summary_failure_does_not_fail_verified_deployment(

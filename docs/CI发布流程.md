@@ -41,7 +41,7 @@ main push
        -> 未命中：执行本域pytest、branch coverage和duration采集
        -> 生成当前run gate并独立签名
   -> unit: 验签六个物理shard
-       -> coverage combine + 统一78% floor
+       -> coverage combine + 统一78% floor + per-module floor
        -> 合并pytest结果、生成fault report和duration汇总
        -> 生成并签名聚合unit gate
   -> artifact: source-only canonical组件制品 + 未签名deploy-host bundle
@@ -86,9 +86,13 @@ Release workflow只接受checkout得到的clean commit，并要求其候选来�
 - 不持有 CPU/GPU kubeconfig，不接触站点 token、Node Action key 或数据库生产密码；
 - 不把 GitHub Actions artifact 自动复制到 `/secure/release/`。
 
-首次 ARN 部署可以由 `gpu-fault-admin deploy` 在受控部署机内部复用
-`release-build`。直接`release-build`仍在同一进程内执行`make check`和PostgreSQL
-stress；这是管理员首次部署或受信本地复现路径，不等同于本文描述的签名CI候选晋级。
+源码ARN部署在干净`HEAD == refs/remotes/origin/main`时也可自动下载同commit候选：
+它先验证main run、CI/unit/六个shard签名、commit/tree/repository和artifact清单，再进入
+`release-build-promoted`。dirty源码和个人clean commit不查询GitHub。候选不可用时，
+本地`release-build`把static/契约、普通pytest和PostgreSQL stress并行执行，全部通过后
+再构建artifact；这是受信本地复现路径，不等同于伪造main CI结论。
+static分支内部再并行Ruff、mypy、compile、架构、文档、部署配置、YAML、Shell、安全和
+代码契约；默认`make check`在static后并行artifact与普通pytest。
 
 ## 2. 触发、权限和输入
 
@@ -150,6 +154,11 @@ CI测试还支持以下可选repository variables：
 只有CI的`postgres` shard创建临时PostgreSQL 16 service，并设置只指向该service的
 `GPU_FAULT_TEST_POSTGRES_URL`。Release job不再创建PostgreSQL，也不重复执行已经由
 签名CI gate证明的测试。该测试连接不是生产数据库连接，不得替换为生产Aurora。
+
+部署机自动下载main CI候选时可使用权限`0600`的
+`GPU_FAULT_GITHUB_TOKEN_FILE`，也可继承受控进程中的`GITHUB_TOKEN`或`GH_TOKEN`。
+token只用于GitHub Actions只读API，不得进入命令输出、state、release artifact或site。
+候选查找不会自动`git fetch`，本地`origin/main`不是当前HEAD时直接跳过。
 
 ## 3. CI 执行步骤
 
@@ -225,6 +234,13 @@ deployment shard采集完整应用源码覆盖。这样只修改独立管理员C
 coverage不会携带变化模块的陈旧行号，只有deployment shard失效。最终`unit` job再次
 核对六个shard属于当前run、验签并执行`coverage combine`，只在合并数据达到78% floor
 后继续。
+
+per-module floor只在合并报告上执行：deployment-only模块被每个runtime shard排除，
+单个shard的数据无法说明它们真实覆盖了多少。`config/ci-unit-gate.json`的
+`coverage.module_floors`为每个族声明`group_floor`和`file_floor`，前者阻止整族被
+仓库其余部分抬起来，后者阻止族内一个覆盖良好的模块替兄弟模块背书。只有imports和
+常量、没有可度量点的模块被跳过，否则floor会把作者推向删文件而不是补测试。本地
+`make coverage`用`ci_coverage_gate.py module-floors`执行同一检查。
 
 六份pytest结果在shard身份校验后合并并改写为当前源码身份。
 `make fault-test-cases-ci`直接把这些结果映射到64条unit/component fault case，不再次
@@ -391,17 +407,23 @@ CI artifact job中的`scripts/build-deploy-host-bundle.py`：
 4. 在只安装`build.lock`的临时venv中构建独立
    `gpu_fault_deploy_host-*.whl`；
 5. 加入部署机工具清单和可选审核后二进制；
-6. 记录 Git commit、平台、Python ABI、libc 和每个文件的 SHA-256、大小、权限；
+6. 记录payload identity、平台、Python ABI、libc 和每个文件的 SHA-256、大小、权限；
 7. 生成确定性 tar.gz 和 `.sha256` sidecar。
 
 CI workflow使用`actions/cache`持久化`DEPLOY_HOST_WHEELHOUSE`。缓存miss时仍按
 hash lock下载，cache hit时只校验和补齐缺失wheel。部署机安装始终使用 `--no-index`，
 不能再次在线解析依赖。
 
-deploy-host wheel以`gpu_fault.admin_cli`为根，只安装管理员部署CLI及其Python闭包和
-`deploy-host-tools.json`。Control Plane Runtime wheel不再包含`gpu_fault.admin_cli`、
+deploy-host wheel以`gpu_fault.admin.cli`为根，只安装管理员部署CLI及其Python闭包和
+`deploy-host-tools.json`。Control Plane Runtime wheel不再包含`gpu_fault.admin.cli`、
 `gpu-fault-admin`入口或deploy-host工具清单。管理员代码变化因此只重建deploy-host
 bundle，不改变三个应用组件wheel、Runtime Image或应用release diff。
+
+archive schema v2不再把Git commit写进payload。其内容身份覆盖deploy-host Python依赖
+闭包、两个lock、构建器、管理员配置模板、工具清单、Python ABI、OS/架构/libc和可选工具
+目录；相同payload跨应用commit生成同一archive。commit/tree/repository授权由独立签名
+CI gate或部署机本地签名`source-deploy-success.json`记录承担。setup仍重新计算当前
+checkout的payload身份，不能只凭缓存路径接受archive。
 
 默认 Ubuntu x86-64、CPython 3.12 Runner 生成：
 
@@ -547,6 +569,7 @@ site和低层`release-deploy`参数不进入普通管理员命令。实际Kubern
 | GitHub artifact查询或下载临时不可用 | 安全回退fresh执行该shard；不把不可验证的历史证据当作通过 |
 | shard签名、身份、证据或历史run不合法 | fail closed；不得复用该shard，调查artifact后重新执行 |
 | coverage combine或78% floor失败 | 检查分片遗漏、陈旧数据或覆盖率回退；不得单独接受某个shard |
+| per-module floor失败 | 为该族补测试；不得调低`group_floor`/`file_floor`或收窄globs绕过 |
 | 找不到匹配main CI run | 先让目标commit通过main push CI；不得用其他commit候选代替 |
 | CI gate签名、源码或文件清单失败 | 停止晋级；不得获取AWS身份或拼接其他run文件 |
 | OIDC、AWS 凭据或 ECR 登录失败 | 修复 GitHub environment、角色信任或最小权限后重跑 |

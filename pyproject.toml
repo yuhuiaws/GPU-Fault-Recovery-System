@@ -13,6 +13,12 @@ dependencies = [
   "fastapi>=0.115,<0.142",
   "pydantic>=2.10,<3",
   "PyYAML>=6,<7",
+  # Declared directly, and narrowly, because the auth and dispatch middleware
+  # assign `request._body` and `request._receive` so the decompressed body reaches
+  # the route. FastAPI only asks for `starlette>=0.46`, so without this bound an
+  # unrelated upgrade could change what BaseHTTPMiddleware does with those two
+  # private attributes. See tests/test_body_replay_contract.py.
+  "starlette>=1.6,<1.7",
   "uvicorn>=0.34,<1",
 ]
 
@@ -63,7 +69,7 @@ gpu-fault-node-installer-reconciler = "gpu_fault.node_installer_reconciler:main"
 gpu-fault-store-migrate = "gpu_fault.store_migrate:main"
 gpu-fault-aurora-credential-refresh = "gpu_fault.aurora_credential_refresh:main"
 gpu-fault-config = "gpu_fault.config_cli:main"
-gpu-fault-admin = "gpu_fault.admin_cli:main"
+gpu-fault-admin = "gpu_fault.admin.cli:main"
 gpu-fault-workload-annotate = "gpu_fault.workload_annotate_cli:main"
 gpu-training-submit = "gpu_fault.training_submit_cli:main"
 
@@ -117,5 +123,44 @@ target-version = "py312"
 python_version = "3.12"
 strict = true
 warn_unused_ignores = true
-follow_imports = "skip"
 ignore_missing_imports = true
+# `follow_imports = "skip"` used to be set here. It turned every imported
+# module into `Any`, which both erased cross-module checking and *added* 93
+# spurious `no-any-return` / `no-untyped-call` errors to the ratchet, because a
+# function returning a well-typed value from another module looked like it was
+# returning `Any`. Removing it took `mypy src` from 1549 errors to 1456.
+#
+# The pydantic plugin was previously commented out with the note that pydantic
+# 2.13.5 "imports `ExpandTypeVisitor` from `mypy.expandtype`, which mypy 1.19
+# removed, so loading the plugin aborts mypy with an ImportError". That
+# diagnosis was wrong: the ImportError comes from importing `mypy.expandtype`
+# *directly* as the first mypy module — `mypy.types` imports `ExpandTypeVisitor`
+# back out of it, so a bare `import mypy.expandtype` trips mypy's own cycle.
+# Nothing on the plugin load path does that, and the exact locked pair
+# (pydantic 2.13.5 + mypy 1.19.1) loads the plugin fine.
+#
+# What the plugin does *not* buy is the thing it is usually enabled for.
+# pydantic already marks `ModelMetaclass` with `@dataclass_transform`, so mypy
+# synthesizes a typed `__init__` from the annotations on its own: a wrong field
+# type is `arg-type` and a misspelled field is `call-arg` with or without the
+# plugin. `init_typed` and `init_forbid_extra` are set true below to *keep* that
+# — with the plugin loaded and either one false, the synthesized `__init__`
+# widens to `**kwargs: Any` and we would lose checking we have today.
+#
+# What it does buy is two diagnostics nothing else reports:
+#   * `pydantic-field` — an un-annotated attribute in a model body is silently
+#     not a field at all. It is never validated, and `extra="forbid"` cannot
+#     catch the mistake either, because nothing is ever passed for it.
+#   * `pydantic-alias` — a required field behind a non-literal alias.
+# Both are exactly the "silently wrong, never fails loudly" shape this codebase
+# treats as a defect. `src` + `deploy` report zero new errors with the plugin
+# on, so enabling it costs nothing in `mypy-baseline.json`; it only constrains
+# models written from here on.
+# `tests/test_test_suite_contracts.py::test_pydantic_mypy_plugin_checks_models`
+# fails if either block is removed.
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_typed = true
+init_forbid_extra = true
+warn_required_dynamic_aliases = true

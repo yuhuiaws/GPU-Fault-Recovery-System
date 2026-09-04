@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from threading import Event, RLock
-from typing import Callable
+from typing import Any, Callable
 
-from gpu_fault.telemetry import collector_producer
-from gpu_fault.telemetry import CollectorMetricsSnapshotRecord
 from gpu_fault.collector_requirements import (
     agent_is_current,
     collector_silent_thresholds,
     required_collectors_for_agent,
 )
-
+from gpu_fault.telemetry import (
+    CollectorMetricsSnapshotRecord,
+    CollectorStatus,
+    collector_producer,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -139,62 +141,106 @@ class CollectorMetricsSnapshot:
                             "channel": collector.value,
                             "last_success_age_seconds": age,
                             "silent": age > silent_after[collector],
+                            "erroring": is_erroring(status),
                         }
                     )
         return rows
 
-    def _aggregate_lines(self, rows: list[dict]) -> list[str]:
-        aggregates: dict[tuple[str, str, str], dict] = {}
-        for row in rows:
-            key = (
-                row["cluster_id"],
-                row["collector"],
-                row["channel"],
-            )
-            item = aggregates.setdefault(key, {"silent": 0, "max_age": 0.0})
-            item["silent"] += int(row["silent"])
-            item["max_age"] = max(
-                item["max_age"],
-                row["last_success_age_seconds"],
-            )
-        lines = [
-            "# TYPE gpu_fault_collector_silent_nodes gauge",
-            "# TYPE gpu_fault_collector_last_success_age_seconds_max gauge",
-        ]
-        for key, values in sorted(aggregates.items()):
-            labels = _labels(*key)
-            lines.append(
-                f"gpu_fault_collector_silent_nodes{{{labels}}} {values['silent']}"
-            )
-            lines.append(
-                "gpu_fault_collector_last_success_age_seconds_max"
-                f"{{{labels}}} {values['max_age']}"
-            )
-        worst = self._top_rows(rows)
-        for rank, row in enumerate(worst, 1):
-            labels = _labels(
-                row["cluster_id"],
-                row["collector"],
-                row["channel"],
-                node_id=row["node_id"],
-                rank=rank,
-            )
-            lines.append(
-                f"gpu_fault_collector_silent_top_node{{{labels}}} {int(row['silent'])}"
-            )
-        return lines
+    def _aggregate_lines(self, rows: list[dict[str, Any]]) -> list[str]:
+        return aggregate_lines(rows, top_n=self.top_n)
 
-    def _top_rows(self, rows: list[dict]) -> list[dict]:
-        return sorted(
-            rows,
-            key=lambda row: (
-                -row["last_success_age_seconds"],
-                row["cluster_id"],
-                row["node_id"],
-                row["collector"],
-                row["channel"],
-            ),
-        )[: self.top_n]
+    def _top_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return top_rows(rows, top_n=self.top_n)
+
+
+def is_erroring(status: CollectorStatus | None) -> bool:
+    """Whether the newest thing known about this collector is a failure.
+
+    Silence and failure are different states and only one of them was
+    observable before: a collector that reports collection errors every cycle is
+    still delivering batches, so nothing about it is late, and its errors were
+    invisible until its last success aged past the silence threshold -- minutes
+    for the metrics channel, but a quarter of an hour for node logs.
+
+    ``last_error_at`` and ``last_success_at`` are both sticky (each ingest keeps
+    the previous value it does not set), so the comparison is what makes this
+    self-clearing: one successful batch moves ``last_success_at`` past the error
+    and the node stops counting.
+    """
+
+    if status is None or status.last_error_at is None:
+        return False
+    if status.last_success_at is None:
+        return True
+    return status.last_error_at >= status.last_success_at
+
+
+def aggregate_lines(rows: list[dict[str, Any]], *, top_n: int) -> list[str]:
+    """Fold per-node collector rows into the published gauge lines.
+
+    The aggregate families deliberately carry no ``node_id``: which node went
+    silent is the ``..._top_node`` family's job, and folding the count into one
+    series per cluster/collector/channel is what lets the alert stay off a label
+    the aggregate does not publish.
+    """
+
+    aggregates: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            row["cluster_id"],
+            row["collector"],
+            row["channel"],
+        )
+        item = aggregates.setdefault(key, {"silent": 0, "erroring": 0, "max_age": 0.0})
+        item["silent"] += int(row["silent"])
+        # Indexed rather than `.get`: a row builder that stops reporting this
+        # would otherwise publish a permanent zero, which reads as "no node is
+        # failing" and is the one wrong answer this gauge can give.
+        item["erroring"] += int(row["erroring"])
+        item["max_age"] = max(
+            item["max_age"],
+            row["last_success_age_seconds"],
+        )
+    lines = [
+        "# TYPE gpu_fault_collector_silent_nodes gauge",
+        "# TYPE gpu_fault_collector_erroring_nodes gauge",
+        "# TYPE gpu_fault_collector_last_success_age_seconds_max gauge",
+    ]
+    for key, values in sorted(aggregates.items()):
+        labels = _labels(*key)
+        lines.append(f"gpu_fault_collector_silent_nodes{{{labels}}} {values['silent']}")
+        lines.append(
+            f"gpu_fault_collector_erroring_nodes{{{labels}}} {values['erroring']}"
+        )
+        lines.append(
+            "gpu_fault_collector_last_success_age_seconds_max"
+            f"{{{labels}}} {values['max_age']}"
+        )
+    for rank, row in enumerate(top_rows(rows, top_n=top_n), 1):
+        labels = _labels(
+            row["cluster_id"],
+            row["collector"],
+            row["channel"],
+            node_id=row["node_id"],
+            rank=rank,
+        )
+        lines.append(
+            f"gpu_fault_collector_silent_top_node{{{labels}}} {int(row['silent'])}"
+        )
+    return lines
+
+
+def top_rows(rows: list[dict[str, Any]], *, top_n: int) -> list[dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            -row["last_success_age_seconds"],
+            row["cluster_id"],
+            row["node_id"],
+            row["collector"],
+            row["channel"],
+        ),
+    )[:top_n]
 
 
 def _labels(

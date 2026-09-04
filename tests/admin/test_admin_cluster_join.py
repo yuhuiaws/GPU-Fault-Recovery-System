@@ -1,22 +1,28 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+import threading
+import time
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 import yaml
 
-from gpu_fault import admin_cluster_join
-from gpu_fault.admin_bootstrap_common import BootstrapError, ClusterIdentity
-from gpu_fault.admin_cluster_join import (
+from gpu_fault.admin import cluster_batch_join as admin_cluster_batch_join
+from gpu_fault.admin import cluster_join as admin_cluster_join
+from gpu_fault.admin import cluster_join_commit as admin_cluster_join_commit
+from gpu_fault.admin import cluster_readiness as admin_cluster_readiness
+from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
+from gpu_fault.admin.cluster_batch_join import join_clusters
+from gpu_fault.admin.cluster_join import (
     JoinClusterRequest,
     JoinExecution,
     join_cluster,
     wait_collector_readiness,
 )
-from gpu_fault.admin_site import load_site
+from gpu_fault.admin.site import load_site
 from gpu_fault.installation_resources import (
     InstallationResource,
     InstallationResourceDeletePolicy,
@@ -26,6 +32,21 @@ from gpu_fault.installation_resources import (
 from tests.admin.test_admin_site import site_file
 
 GPU_B_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b"
+
+
+def _membership_snapshot(site) -> dict:
+    states = {
+        item["cluster_id"]: ("ACTIVE" if item["cluster_id"] == "gpu-a" else "PENDING")
+        for item in site.release_config["clusters"]
+    }
+    return {
+        "live_release_state_sha256": "a" * 64,
+        "live_release_identity_sha256": "b" * 64,
+        "registry_generation": 2,
+        "registry_content_sha256": "c" * 64,
+        "registry_cluster_states": states,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _target() -> ClusterIdentity:
@@ -129,6 +150,11 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     monkeypatch.setattr(
         admin_cluster_join, "_list_nodes", lambda *_args, **_kwargs: ["node-b"]
     )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_existing_cluster_networks",
+        lambda *_args, **_kwargs: [{"vpc_id": "vpc-gpu-a", "nat_eips": ["192.0.2.10"]}],
+    )
     prerequisites = {
         "executor_role": {
             "role_arn": "arn:aws:iam::123456789012:role/gpu-b-executor",
@@ -167,6 +193,26 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         admin_cluster_join,
         "wait_collector_readiness",
         lambda *_args, **_kwargs: {"ready": True, "nodes": [{}, {}, {}, {}]},
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "membership_runtime_snapshot", _membership_snapshot
+    )
+    monkeypatch.setattr(
+        admin_cluster_join_commit,
+        "validate_verified_membership",
+        lambda **_kwargs: _membership_snapshot(site),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join_commit,
+        "final_membership_identity",
+        lambda _site, **kwargs: {
+            **kwargs,
+            "live_release_state_sha256": "a" * 64,
+            "live_release_identity_sha256": "b" * 64,
+            "registry_generation": 3,
+            "registry_content_sha256": "c" * 64,
+            "registry_lifecycle": "ACTIVE",
+        },
     )
     monkeypatch.setattr(
         admin_cluster_join,
@@ -214,16 +260,17 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         "aws/route53/vpc-association/hp-gpu-b",
     }.issubset(keys), "Aurora registry omitted joined cluster resources"
     assert rollout_calls == [
-        ("preflight", None),
         ("verify", None),
         ("preflight", None),
         ("join-cluster", "hp-gpu-b"),
         ("verify", None),
-        ("verify", None),
+        ("activate-cluster", "hp-gpu-b"),
     ]
     assert release_state_syncs == [["gpu-a", "hp-gpu-b"]]
     state = json.loads((state_dir / "state.json").read_text())
     assert "RELEASE_STATE_UPDATED" in state["completed_steps"]
+    assert state["evidence"]["FINAL_VERIFIED"]["registry_generation"] == 3
+    assert state["evidence"]["FINAL_VERIFIED"]["live_release_state_sha256"] == "a" * 64
     assert yaml.safe_load(path.read_text())["spec"]["gpuKubeconfig"] == str(
         gpu_kubeconfig
     )
@@ -263,10 +310,11 @@ def test_join_cluster_rolls_back_before_site_commit(
     assert len(load_site(site.source).release_config["clusters"]) == 1
 
 
-def test_join_cluster_failure_after_site_commit_is_fail_forward(
+def test_join_cluster_failure_after_site_commit_restores_original_site(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = site_file(tmp_path)
+    original = path.read_bytes()
     site = load_site(path)
     state_dir = tmp_path / "join-state"
     target = _target()
@@ -307,11 +355,14 @@ def test_join_cluster_failure_after_site_commit_is_fail_forward(
         raise BootstrapError("registry unavailable")
 
     monkeypatch.setattr(admin_cluster_join, "_deploy_and_commit", fail_after_commit)
-    monkeypatch.setattr(
-        admin_cluster_join,
-        "_rollback",
-        lambda *_args, **_kwargs: pytest.fail("committed site was rolled back"),
-    )
+
+    def rollback(_request, *, state_path, state, **_kwargs):
+        path.write_bytes(original)
+        path.chmod(0o600)
+        state["phase"] = "ROLLED_BACK"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    monkeypatch.setattr(admin_cluster_join, "_rollback", rollback)
 
     with pytest.raises(BootstrapError, match="registry unavailable"):
         join_cluster(
@@ -322,8 +373,8 @@ def test_join_cluster_failure_after_site_commit_is_fail_forward(
         )
 
     state = json.loads((state_dir / "state.json").read_text())
-    assert state["phase"] == "FAILED_AFTER_COMMIT"
-    assert len(load_site(path).release_config["clusters"]) == 2
+    assert state["phase"] == "ROLLED_BACK"
+    assert len(load_site(path).release_config["clusters"]) == 1
 
 
 def test_join_waits_for_collector_freshness(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -333,8 +384,8 @@ def test_join_waits_for_collector_freshness(monkeypatch: pytest.MonkeyPatch) -> 
             {"ready": True, "nodes": [{"ready": True}]},
         ]
     )
-    monkeypatch.setitem(
-        wait_collector_readiness.__globals__,
+    monkeypatch.setattr(
+        admin_cluster_readiness,
         "_collector_readiness_report",
         lambda *_args: next(reports),
     )
@@ -450,3 +501,216 @@ def test_completed_join_repairs_missing_release_state(
     assert synced == [["gpu-a"]]
     assert updated_state["phase"] == "COMPLETED"
     assert "RELEASE_STATE_UPDATED" in updated_state["completed_steps"]
+
+
+def _batch_execution(
+    tmp_path: Path, site, request: JoinClusterRequest, index: int
+) -> JoinExecution:
+    cluster_id = f"gpu-{index}"
+    target = replace(
+        _target(),
+        input_arn=request.gpu_cluster_arn,
+        hyperpod_arn=(f"arn:aws:sagemaker:us-east-1:123456789012:cluster/{cluster_id}"),
+        hyperpod_name=cluster_id,
+        eks_arn=request.gpu_cluster_arn,
+        eks_name=cluster_id,
+        vpc_id=f"vpc-{cluster_id}",
+        context=f"context-{cluster_id}",
+    )
+    document = yaml.safe_load(site.source.read_text(encoding="utf-8"))
+    cluster = dict(document["spec"]["clusters"][0])
+    cluster.update(
+        {
+            "clusterId": cluster_id,
+            "context": target.context,
+            "hyperpodClusterName": target.hyperpod_name,
+            "eksClusterArn": target.eks_arn,
+            "executorIrsaRoleArn": (
+                f"arn:aws:iam::123456789012:role/{cluster_id}-executor"
+            ),
+        }
+    )
+    document["spec"]["clusters"].append(cluster)
+    candidate_path = tmp_path / f"{cluster_id}.yaml"
+    candidate_path.write_text(
+        yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
+    )
+    candidate_path.chmod(0o600)
+    gpu_kubeconfig = tmp_path / "gpu.kubeconfig"
+    gpu_kubeconfig.write_text("kubeconfig", encoding="utf-8")
+    gpu_kubeconfig.chmod(0o600)
+    return JoinExecution(
+        target=target,
+        cluster_id=cluster_id,
+        discovery={"registry_snapshot": str(tmp_path / "registry.json")},
+        local={"gpu_kubeconfig": str(gpu_kubeconfig)},
+        prerequisites={
+            "executor_role": {
+                "role_arn": (f"arn:aws:iam::123456789012:role/{cluster_id}-executor"),
+                "inline_policy_name": "GPUFaultRegionalExecutor",
+            },
+            "network": {
+                "vpc_id": f"vpc-{cluster_id}",
+                "existing_vpc_ids": [],
+                "nat_eips": [],
+            },
+        },
+        candidate=load_site(candidate_path, repository_root=site.repository_root),
+    )
+
+
+def test_batch_join_bounds_cluster_rollout_and_reuses_global_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = load_site(site_file(tmp_path))
+    requests = tuple(
+        JoinClusterRequest(
+            site=site,
+            gpu_cluster_arn=(f"arn:aws:eks:us-east-1:123456789012:cluster/gpu-{index}"),
+        )
+        for index in range(6)
+    )
+    executions = {
+        request.gpu_cluster_arn: _batch_execution(tmp_path, site, request, index)
+        for index, request in enumerate(requests)
+    }
+    rollout_modes: list[str] = []
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    four_started = threading.Event()
+    committed: list[str] = []
+
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_run_rollout",
+        lambda _site, mode, **_kwargs: rollout_modes.append(mode),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_prepare_execution",
+        lambda request, **_kwargs: executions[request.gpu_cluster_arn],
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_discover_join_target",
+        lambda request, _runner: (
+            executions[request.gpu_cluster_arn].target,
+            executions[request.gpu_cluster_arn].cluster_id,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "_export_registry", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "_existing_cluster_networks", lambda *_args, **_kwargs: []
+    )
+
+    def deploy(*, execution, **_kwargs) -> None:
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            if active == 4:
+                four_started.set()
+        assert four_started.wait(timeout=2), "four join workers did not start"
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(admin_cluster_join, "_deploy_cluster", deploy)
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_activate_and_commit",
+        lambda _request, *, execution, **_kwargs: committed.append(
+            execution.cluster_id
+        ),
+    )
+    monkeypatch.setattr(
+        admin_cluster_batch_join, "membership_runtime_snapshot", _membership_snapshot
+    )
+
+    result = join_clusters(requests, max_workers=4, runner_factory=Runner)
+
+    assert maximum == 4, "batch join exceeded or missed its four-cluster limit"
+    assert rollout_modes.count("preflight") == 1
+    assert rollout_modes.count("verify") == 2
+    assert committed == sorted(
+        execution.cluster_id for execution in executions.values()
+    )
+    assert result["joined"] == committed
+
+
+def test_batch_join_keeps_successful_clusters_when_one_rollout_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = load_site(site_file(tmp_path))
+    requests = tuple(
+        JoinClusterRequest(
+            site=site,
+            gpu_cluster_arn=(f"arn:aws:eks:us-east-1:123456789012:cluster/gpu-{index}"),
+        )
+        for index in range(3)
+    )
+    executions = {
+        request.gpu_cluster_arn: _batch_execution(tmp_path, site, request, index)
+        for index, request in enumerate(requests)
+    }
+    committed: list[str] = []
+    rolled_back: list[str] = []
+    monkeypatch.setattr(
+        admin_cluster_join, "_run_rollout", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_prepare_execution",
+        lambda request, **_kwargs: executions[request.gpu_cluster_arn],
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_discover_join_target",
+        lambda request, _runner: (
+            executions[request.gpu_cluster_arn].target,
+            executions[request.gpu_cluster_arn].cluster_id,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "_export_registry", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "_existing_cluster_networks", lambda *_args, **_kwargs: []
+    )
+
+    def deploy(*, execution, **_kwargs) -> None:
+        if execution.cluster_id == "gpu-1":
+            raise BootstrapError("rollout failed")
+
+    monkeypatch.setattr(admin_cluster_join, "_deploy_cluster", deploy)
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_record_join_failure",
+        lambda attempt, execution: rolled_back.append(
+            execution.cluster_id if execution is not None else "unknown"
+        ),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_activate_and_commit",
+        lambda _request, *, execution, **_kwargs: committed.append(
+            execution.cluster_id
+        ),
+    )
+    monkeypatch.setattr(
+        admin_cluster_batch_join, "membership_runtime_snapshot", _membership_snapshot
+    )
+
+    with pytest.raises(BootstrapError, match="batch join completed"):
+        join_clusters(requests, runner_factory=Runner)
+
+    assert rolled_back == ["gpu-1"]
+    assert committed == ["gpu-0", "gpu-2"]
+    batch_states = list((tmp_path / "join-cluster/batches").glob("*/state.json"))
+    assert len(batch_states) == 1
+    assert json.loads(batch_states[0].read_text())["phase"] == "PARTIAL"

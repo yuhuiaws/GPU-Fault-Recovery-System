@@ -555,3 +555,138 @@ def test_node_installer_can_read_back_its_own_gpu_metrics() -> None:
             assert "another cluster" in other_cluster.text
 
     asyncio.run(scenario())
+
+
+def fleet_rollout_fence_deployment(deployment_id: str, cluster_id: str):
+    """A rollout that has not started a wave, which is what the fence holds on."""
+
+    from gpu_fault.fleet_deployment import (
+        DeploymentNode,
+        DeploymentNodeStatus,
+        DeploymentStatus,
+        FleetDeployment,
+    )
+
+    node = DeploymentNode(
+        node_id="node-a", status=DeploymentNodeStatus.PENDING, updated_at=NOW
+    )
+    return FleetDeployment(
+        deployment_id=deployment_id,
+        cluster_id=cluster_id,
+        desired_agent_version="0.10.0",
+        desired_artifact_sha256="a" * 64,
+        desired_policy_version="catalog-a",
+        desired_runtime_profile_version="profile-a",
+        desired_config_digest="c" * 64,
+        max_unavailable=1,
+        waves=[["node-a"]],
+        nodes=[node],
+        status=DeploymentStatus.PLANNED,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def test_the_data_plane_can_read_its_own_fleet_rollout_fence() -> None:
+    """The executor owns no store, and it is the last gate before a mutation.
+
+    The control-plane fence runs before dispatch and cannot revoke a remote
+    command that already exists, so if the executor cannot ask this question
+    nothing checks it again for the life of the command. On 2026-09-04 the
+    executor asked its own storeless proxy instead, got an AttributeError, and
+    -- the fence failing closed -- held every destructive command forever.
+    """
+
+    context = build_context()
+    context.regional_mode = True
+    context.store.save_regional_cluster(registration("cluster-a", TOKEN_A))
+    context.store.save_regional_cluster(registration("cluster-b", TOKEN_B))
+    context.store.save_fleet_deployment(
+        fleet_rollout_fence_deployment("rollout-b-1", "cluster-b")
+    )
+    app = create_app(context)
+
+    class AsgiClient(RegionalExecutorClient):
+        def _get(self, path: str) -> object:
+            async def call() -> object:
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url=self.base_url
+                ) as client:
+                    response = await client.get(
+                        path,
+                        headers={
+                            "Authorization": f"Bearer {self.token}",
+                            "X-GPU-Fault-Cluster-ID": self.cluster_id,
+                        },
+                    )
+                    assert response.status_code == 200, response.text
+                    return response.json()
+
+            return asyncio.run(call())
+
+    registry_a = RegionalFleetRegistry(AsgiClient("http://test", "cluster-a", TOKEN_A))
+    registry_b = RegionalFleetRegistry(AsgiClient("http://test", "cluster-b", TOKEN_B))
+
+    # cluster-b's rollout is invisible to cluster-a and fences only cluster-b,
+    # so one cluster's upgrade cannot stall another cluster's remediation.
+    assert registry_a.fleet_rollout_fence_deployments("cluster-a") == []
+    assert registry_b.fleet_rollout_fence_deployments("cluster-b") == ["rollout-b-1"]
+
+    context.store.save_fleet_deployment(
+        fleet_rollout_fence_deployment("rollout-a-1", "cluster-a")
+    )
+    assert registry_a.fleet_rollout_fence_deployments("cluster-a") == ["rollout-a-1"]
+
+
+def test_the_fleet_rollout_fence_route_is_cluster_scoped() -> None:
+    context = build_context()
+    context.regional_mode = True
+    context.execution_token = "operator-token"
+    context.store.save_regional_cluster(registration("cluster-a", TOKEN_A))
+    context.store.save_fleet_deployment(
+        fleet_rollout_fence_deployment("rollout-a-1", "cluster-a")
+    )
+    path = "/v1/regional/executors/fleet-rollout-fence"
+
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            own = await client.get(
+                path,
+                headers={
+                    "Authorization": f"Bearer {TOKEN_A}",
+                    "X-GPU-Fault-Cluster-ID": "cluster-a",
+                },
+            )
+            assert own.status_code == 200
+            assert own.json() == {
+                "cluster_id": "cluster-a",
+                "fencing_deployment_ids": ["rollout-a-1"],
+            }
+
+            # The cluster is the authenticated identity, never an argument, so
+            # there is no query parameter to point at another cluster.
+            spoofed = await client.get(
+                path,
+                headers={
+                    "Authorization": f"Bearer {TOKEN_A}",
+                    "X-GPU-Fault-Cluster-ID": "cluster-a",
+                },
+                params={"cluster_id": "cluster-b"},
+            )
+            assert spoofed.status_code == 200
+            assert spoofed.json()["cluster_id"] == "cluster-a"
+
+            anonymous = await client.get(path)
+            assert anonymous.status_code in {401, 403}
+
+            wrong_token = await client.get(
+                path,
+                headers={
+                    "Authorization": "Bearer not-the-cluster-token",
+                    "X-GPU-Fault-Cluster-ID": "cluster-a",
+                },
+            )
+            assert wrong_token.status_code in {401, 403}
+
+    asyncio.run(scenario())

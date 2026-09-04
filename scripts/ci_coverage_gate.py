@@ -20,7 +20,12 @@ from typing import Any, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 
 if __package__:
+    from scripts.ci_coverage_floors import (
+        module_floor_violations,
+        validate_module_floors,
+    )
     from scripts.ci_gate_artifacts import (
+        CoverageGateError,
         GateArtifactError,
         canonical_sha256,
         download,
@@ -34,7 +39,12 @@ if __package__:
         write_outputs,
     )
 else:
+    from ci_coverage_floors import (
+        module_floor_violations,
+        validate_module_floors,
+    )
     from ci_gate_artifacts import (
+        CoverageGateError,
         GateArtifactError,
         canonical_sha256,
         download,
@@ -86,10 +96,6 @@ FAULT_RUNNER_FILES = {
 }
 
 
-class CoverageGateError(RuntimeError):
-    pass
-
-
 def _clean_directory(root: Path, path: Path, label: str) -> Path:
     resolved_root = root.resolve()
     resolved = path.resolve()
@@ -134,9 +140,11 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
         (tests, "shared_files"),
         (coverage, "deployment_only_globs"),
         (coverage, "application_shared_files"),
+        (coverage, "module_floors"),
     )
     if any(not isinstance(mapping.get(name), list) for mapping, name in required_lists):
         raise CoverageGateError("coverage shard config lists are incomplete")
+    validate_module_floors(coverage["module_floors"])
     for shard in SHARDS:
         raw = value["shards"][shard]
         if (
@@ -289,6 +297,13 @@ def _is_deployment_input(relative: str, deployment_only: set[str]) -> bool:
         or relative.startswith("deploy/")
         or "release" in name
         or "deploy_host" in name
+        or name
+        in {
+            "ci_candidate_receipt.py",
+            "deploy_source_identity.py",
+            "restore_ci_candidate.py",
+            "run_static_gates.py",
+        }
         or "staging_deploy" in name
         or "component_artifact" in name
     )
@@ -1259,6 +1274,17 @@ def combine_shards(
         root=root,
         environment=environment,
     )
+    # Checked on the combined report rather than per shard: the administrator
+    # modules are omitted from every runtime shard, so only the merged data
+    # knows what they actually cover.
+    violations = module_floor_violations(
+        output_root / "coverage.json",
+        config=config,
+    )
+    if violations:
+        raise CoverageGateError(
+            "coverage module floors failed:\n- " + "\n- ".join(violations)
+        )
     _merge_pytest_results(
         root,
         gates,
@@ -1306,6 +1332,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     combine.add_argument("--shards-root", type=Path, required=True)
     combine.add_argument("--output-root", type=Path, required=True)
     combine.add_argument("--require-run-id")
+    module_floors = commands.add_parser("module-floors")
+    module_floors.add_argument("--coverage-json", type=Path, required=True)
     for name in ("identity", "restore", "build", "verify"):
         command = commands.add_parser(name)
         command.add_argument("--shard", choices=SHARDS, required=True)
@@ -1359,6 +1387,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 python=options.python,
                 require_run_id=options.require_run_id,
             )
+        elif options.command == "module-floors":
+            # The same check ``combine`` runs, exposed so ``make coverage`` fails
+            # on a local run instead of leaving it to CI.
+            violations = module_floor_violations(
+                options.coverage_json.resolve(),
+                config=load_config(ROOT),
+            )
+            if violations:
+                raise CoverageGateError(
+                    "coverage module floors failed:\n- " + "\n- ".join(violations)
+                )
+            print("coverage module floors passed")
         elif options.command == "identity":
             identity = _identity_from_options(options)
             outputs = {

@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any, Callable, cast
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -17,10 +17,10 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.identity_acceptance_auth import (  # noqa: E402
     run_auth007,
     run_auth010,
-    run_auth012,
     run_auth013,
     run_auth014,
     run_auth015,
+    run_auth016,
 )
 from scripts.e2e.regional.identity_acceptance_common import (  # noqa: E402
     ClusterTarget,
@@ -49,10 +49,10 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 CASE_IDS = (
     "GF-REGIONAL-AUTH-007",
     "GF-REGIONAL-AUTH-010",
-    "GF-REGIONAL-AUTH-012",
     "GF-REGIONAL-AUTH-013",
     "GF-REGIONAL-AUTH-014",
     "GF-REGIONAL-AUTH-015",
+    "GF-REGIONAL-AUTH-016",
     "GF-REGIONAL-ISO-003",
     "GF-REGIONAL-ISO-004",
     "GF-REGIONAL-ISO-005",
@@ -72,14 +72,14 @@ def case_plan(
             "disable one test registration, roll ingress/control-worker, then restore"
         ),
         "GF-REGIONAL-AUTH-010": "anonymous read-only route matrix",
-        "GF-REGIONAL-AUTH-012": (
-            "rotate one test cluster token through the known non-zero failure window "
-            "and restore both Secrets"
-        ),
         "GF-REGIONAL-AUTH-013": "TLS handshakes with empty CA and wrong hostname",
         "GF-REGIONAL-AUTH-014": "anonymous route audit plus external SG evidence",
         "GF-REGIONAL-AUTH-015": (
             "rotate one staging node key, scan two nodes, then restore key Secrets"
+        ),
+        "GF-REGIONAL-AUTH-016": (
+            "rotate one test cluster token through a bounded overlap window, then "
+            "drop the retiring digest and restore both Secrets"
         ),
         "GF-REGIONAL-ISO-003": "cross-cluster Fleet calls that must be rejected",
         "GF-REGIONAL-ISO-004": "cross-cluster spare-health query that must be rejected",
@@ -242,7 +242,6 @@ def main() -> int:
                 site, primary, cast(ClusterTarget, secondary)
             ),
             "GF-REGIONAL-AUTH-010": lambda: run_auth010(site, primary),
-            "GF-REGIONAL-AUTH-012": lambda: run_auth012(site, primary),
             "GF-REGIONAL-AUTH-013": lambda: run_auth013(site, primary),
             "GF-REGIONAL-AUTH-014": lambda: run_auth014(
                 site,
@@ -257,6 +256,7 @@ def main() -> int:
                 host_probe_image=arguments.host_probe_image,
                 case_dir=case_dir,
             ),
+            "GF-REGIONAL-AUTH-016": lambda: run_auth016(site, primary),
             "GF-REGIONAL-ISO-003": lambda: run_iso003(
                 site, primary, cast(ClusterTarget, secondary)
             ),

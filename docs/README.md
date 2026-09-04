@@ -64,7 +64,8 @@
   作为 Release、Pages 或 CI artifact 发布，不进入源码版本控制。
 
 生成物不得手改。修改事实源后运行对应生成器的 `--check`，并运行
-`scripts/check-doc-references.py` 验证代码和测试引用。
+`scripts/check-doc-references.py` 验证代码和测试引用、
+`scripts/check-doc-anchors.py` 验证文档之间的路径与锚点链接。
 
 ## 代码与文档同步
 

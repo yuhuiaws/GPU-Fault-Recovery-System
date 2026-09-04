@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi import APIRouter, FastAPI
+from starlette.datastructures import Headers
 
 from gpu_fault.app import create_app
 from gpu_fault.app.authorization import (
@@ -11,7 +14,10 @@ from gpu_fault.app.authorization import (
     validate_direct_client_identity_environment,
 )
 from gpu_fault.app.cluster_binding import CLUSTER_IDENTIFIER_FIELDS, payload_cluster_ids
-from tests._builders import build_context
+from tests._builders import asgi_client, build_context
+from tests.regional._regional_support import TOKEN_A, registration
+
+DUAL_CREDENTIAL_PATH = "/v1/gpu-metrics/cluster-a/node-1/latest"
 
 
 def test_every_application_route_declares_authorization_bucket() -> None:
@@ -90,6 +96,108 @@ def test_cluster_identifier_aliases_are_all_bound() -> None:
             "items": [{"clusterId": "b"}, {"metadata": {"cluster": "c"}}],
         }
     ) == {"a", "b", "c"}
+
+
+def test_declared_bucket_resolution_is_memoised_and_reset_by_load() -> None:
+    """Every request resolves its bucket twice, so the Starlette match is cached.
+
+    Both regional middlewares ask for the bucket of the same request, and each
+    unmemoised answer is a linear match over every registered route. The cache
+    has to be dropped on ``load`` or a reloaded application would keep serving
+    buckets from routes it no longer has.
+    """
+
+    app = create_app(build_context())
+    registry = ExplicitAuthorizationRegistry()
+    registry.load(app.routes)
+
+    first = registry.declared(DUAL_CREDENTIAL_PATH, "GET")
+    second = registry.declared(DUAL_CREDENTIAL_PATH, "GET")
+    other_method = registry.declared(DUAL_CREDENTIAL_PATH, "POST")
+    info = registry.declared_cache_info()
+
+    assert (first, second) == ("dual-credential", "dual-credential")
+    assert other_method is None, "the bucket cache ignored the request method"
+    assert (info.hits, info.misses) == (1, 2)
+
+    registry.load(app.routes)
+
+    assert registry.declared_cache_info().hits == 0, "load kept a stale bucket cache"
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({}, "execution-token"),
+        ({"X-GPU-Fault-Execution-Token": "operator-token"}, "execution-token"),
+        (
+            {"Authorization": "Bearer cluster-token", "X-GPU-Fault-Cluster-ID": "c"},
+            "cluster-token",
+        ),
+        ({"X-GPU-Fault-Cluster-ID": "c"}, "execution-token"),
+        ({"X-GPU-Fault-Cluster-ID": " "}, "execution-token"),
+        ({"Authorization": "Bearer cluster-token"}, "execution-token"),
+        (
+            {"Authorization": "Basic abc", "X-GPU-Fault-Cluster-ID": "c"},
+            "execution-token",
+        ),
+        (
+            {
+                "X-GPU-Fault-Execution-Token": "operator-token",
+                "Authorization": "Bearer cluster-token",
+                "X-GPU-Fault-Cluster-ID": "c",
+            },
+            "execution-token",
+        ),
+    ],
+)
+def test_dual_credential_bucket_follows_the_presented_credential(
+    headers: dict[str, str], expected: str
+) -> None:
+    """A caller cannot choose its own authorization class with a hint header.
+
+    ``X-GPU-Fault-Cluster-ID`` is a routing hint, not a credential. While the
+    bucket keyed off its presence alone, anyone could send it and be handed to
+    per-cluster authentication instead of the execution-token check.
+    """
+
+    app = create_app(build_context())
+    registry = ExplicitAuthorizationRegistry()
+    registry.load(app.routes)
+
+    assert registry.effective(DUAL_CREDENTIAL_PATH, Headers(headers)) == expected
+
+
+def test_cluster_hint_without_a_credential_never_reaches_cluster_auth() -> None:
+    """A credential-less probe gets one uniform denial, not the cluster path.
+
+    Per-cluster authentication answers 401 when the bearer token is missing and
+    503 with ``Retry-After`` while the registry snapshot is stale, so a caller
+    that only sent the hint header could tell those states apart on a route that
+    has an operator credential available to fail closed with instead.
+    """
+
+    context = build_context()
+    context.regional_mode = True
+    context.execution_token = "operator-token"
+    context.store.save_regional_cluster(registration("cluster-a", TOKEN_A))
+
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            registered = await client.get(
+                DUAL_CREDENTIAL_PATH, headers={"X-GPU-Fault-Cluster-ID": "cluster-a"}
+            )
+            unregistered = await client.get(
+                DUAL_CREDENTIAL_PATH, headers={"X-GPU-Fault-Cluster-ID": "cluster-zz"}
+            )
+
+            assert registered.status_code == 403, registered.text
+            assert unregistered.json() == registered.json()
+            assert "X-GPU-Fault-Execution-Token" in registered.json()["detail"], (
+                "the cluster hint still routed the probe into cluster authentication"
+            )
+
+    asyncio.run(scenario())
 
 
 def test_proxy_derived_client_identity_is_rejected(monkeypatch) -> None:

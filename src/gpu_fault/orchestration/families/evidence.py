@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import logging
 import os
+from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.policy import SxidEvent, XidEvent
 from gpu_fault.watcher import AttemptObservation
-
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_ACTIVE_OBSERVATION_MAX_AGE_SECONDS = 120.0
@@ -61,15 +61,37 @@ class EvidenceOperationService:
         self,
         *,
         now: datetime | None = None,
+        agents: Iterable[Any] | None = None,
+        observation_states: Iterable[Any] | None = None,
     ) -> dict[str, dict[tuple[str, str], int]]:
+        """Count attempts claiming each GPU node, fresh and stale.
+
+        ``agents`` lets the caller pass a fleet listing it has already read. The
+        /metrics path renders two families that both need the whole agent table,
+        and reading it twice per scrape is the cost this avoids.
+
+        ``observation_states`` is the same arrangement for the attempt-observation
+        table, and matters more: that table holds a week of training attempts by
+        default, and this was the only caller reading all of it, uncached and
+        unbounded, on the ``/metrics`` request thread. The scrape path now passes
+        a cached newest-first slice from ``MetricScanCache``. Callers that pass
+        nothing — every non-scrape caller, and the tests — still get the exact
+        full-table answer.
+        """
+
         observed_at = now or datetime.now(timezone.utc)
         fresh: dict[tuple[str, str], set[tuple[str, str]]] = {}
         stale: dict[tuple[str, str], set[tuple[str, str]]] = {}
         keys: set[tuple[str, str]] = set()
-        for agent in self.store.list_agents():
+        for agent in self.store.list_agents() if agents is None else agents:
             if agent.cluster_id and agent.node_id:
                 keys.add((agent.cluster_id, agent.node_id))
-        for state in self.store.list_attempt_observation_states():
+        states = (
+            self.store.list_attempt_observation_states()
+            if observation_states is None
+            else observation_states
+        )
+        for state in states:
             observation = state.observation
             if observation.workload_phase.value not in {"PENDING", "RUNNING"}:
                 continue

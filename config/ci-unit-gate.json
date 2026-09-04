@@ -6,12 +6,35 @@
     "floor": 78,
     "source": "src/gpu_fault",
     "deployment_only_globs": [
-      "src/gpu_fault/admin_*.py"
+      "src/gpu_fault/admin/*.py",
+      "src/gpu_fault/release_state_snapshot.py"
     ],
     "application_shared_files": [
-      "src/gpu_fault/admin_config.py",
-      "src/gpu_fault/admin_config_parser.py",
-      "src/gpu_fault/admin_site.py"
+      "src/gpu_fault/admin/__init__.py",
+      "src/gpu_fault/admin/atomic_json.py",
+      "src/gpu_fault/admin/config.py",
+      "src/gpu_fault/admin/config_parser.py",
+      "src/gpu_fault/admin/site.py"
+    ],
+    "module_floors": [
+      {
+        "id": "administrator-tools",
+        "description": "Administrator CLI modules. They are omitted from every runtime shard, so only the combined report knows their coverage and the repository floor cannot see them.",
+        "globs": [
+          "src/gpu_fault/admin/*.py"
+        ],
+        "group_floor": 68,
+        "file_floor": 60
+      },
+      {
+        "id": "release-state-snapshot",
+        "description": "Release state snapshot, the other deployment-only module.",
+        "globs": [
+          "src/gpu_fault/release_state_snapshot.py"
+        ],
+        "group_floor": 72,
+        "file_floor": 72
+      }
     ]
   },
   "tests": {
@@ -52,6 +75,7 @@
       "tests/test_deploy_*.py",
       "tests/test_public_release.py",
       "tests/test_release_*.py",
+      "tests/test_restore_ci_candidate.py",
       "tests/test_staging_deploy.py"
     ],
     "shared_files": [
@@ -83,7 +107,9 @@
       "scripts/README.md",
       "scripts/ci_gate.py",
       "scripts/prune_artifacts.py",
-      "scripts/resolve_ci_run.py"
+      "scripts/resolve_ci_run.py",
+      "test-private-coupling-baseline.json",
+      "test-source-assertion-baseline.json"
     ],
     "protocol_files": [
       "Makefile",

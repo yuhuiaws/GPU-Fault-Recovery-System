@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
-import subprocess
 import time
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, Callable
 
 import regional_deployment_inventory as inventory
 from regional_release_config import ReleaseError
 from regional_release_diff import ReleaseComponent, ReleaseExecutionPlan
+from regional_release_gpu_rollout import agents_converged, gpu_node_items
+from regional_release_probes import probe_source
+from regional_release_progress import GPU_COMPONENTS
 from regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
+    exec_cpu_ingress_probe,
     validate_runtime_component_identity,
 )
-
 
 ROOT = Path(__file__).resolve().parents[3]
 TRANSIENT_CRITICAL_ALERTS = frozenset({"GpuFaultStoreIoRejected"})
@@ -26,6 +29,119 @@ CPU_METRIC_PORTS = {
     "gpu-fault-control-worker": 8081,
     "gpu-fault-telemetry-spool-worker": 8082,
 }
+QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
+MAX_VALIDATION_WORKERS = 8
+
+
+def _fan_out_clusters(
+    release: Any,
+    check: Callable[[Any], None],
+    *,
+    failure: str,
+    targets: Any = None,
+) -> None:
+    """Run a read-only per-cluster check with bounded parallelism.
+
+    Every check must stay read-only and confined to its own GPU cluster so the
+    fan-out never introduces cross-cluster ordering. The first failure is
+    re-raised after all in-flight checks finish, keeping the fail-closed
+    contract of the sequential form.
+    """
+
+    selected = list(release.config.clusters if targets is None else targets)
+    if not selected:
+        return
+    if len(selected) == 1 or release.runner.dry_run:
+        for target in selected:
+            try:
+                check(target)
+            except Exception as exc:
+                raise ReleaseError(
+                    f"{target.cluster_id} {failure} failed: {exc}"
+                ) from exc
+        return
+    workers = min(MAX_VALIDATION_WORKERS, len(selected))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            (target.cluster_id, executor.submit(check, target)) for target in selected
+        ]
+        errors: list[tuple[str, Exception]] = []
+        for cluster_id, future in futures:
+            try:
+                future.result()
+            except Exception as exc:  # noqa: PERF203 - collect every cluster result
+                errors.append((cluster_id, exc))
+    if errors:
+        cluster_id, exc = errors[0]
+        raise ReleaseError(f"{cluster_id} {failure} failed: {exc}") from exc
+
+
+def _fan_out_values(
+    release: Any,
+    items: Any,
+    work: Callable[[Any], Any],
+) -> list[Any]:
+    """Map a read-only probe over `items` with bounded parallelism.
+
+    Results are returned in input order so every caller keeps a deterministic
+    report and error ordering regardless of completion order, and the first
+    failure in input order is re-raised once the in-flight probes finish. That
+    keeps the fail-closed contract of the sequential form.
+    """
+
+    selected = list(items)
+    if len(selected) <= 1 or release.runner.dry_run:
+        return [work(item) for item in selected]
+    workers = min(MAX_VALIDATION_WORKERS, len(selected))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(work, item) for item in selected]
+        results: list[Any] = []
+        failure: Exception | None = None
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception as exc:  # noqa: PERF203 - collect every probe result
+                results.append(None)
+                if failure is None:
+                    failure = exc
+    if failure is not None:
+        raise failure
+    return results
+
+
+def _write_quick_validation_evidence(
+    release: Any,
+    *,
+    checks: list[str],
+) -> None:
+    raw = os.getenv(QUICK_VALIDATION_EVIDENCE_ENV, "").strip()
+    if not raw:
+        return
+    path = Path(raw).expanduser().resolve()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    value = {
+        "schema_version": 1,
+        "release_id": release.release_id,
+        "release_delivery_sha256": release.config.release_delivery_sha256,
+        "site_identity": {
+            "site_name": release.config.site_name,
+            "aws_region": release.config.aws_region,
+            "cpu_eks_arn": release.config.cpu_eks_arn,
+            "cluster_ids": sorted(
+                target.cluster_id for target in release.config.clusters
+            ),
+        },
+        "verified_at_epoch": int(time.time()),
+        "checks": sorted(checks),
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
 
 
 def ensure_profile_transition_safe(
@@ -35,81 +151,17 @@ def ensure_profile_transition_safe(
     desired = release.config.runtime_profile_version
     if not previous_profile_version or previous_profile_version == desired:
         return
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("Runtime Profile transition has no running CPU ingress Pod")
-    script = """
-import json
-import sys
-
-from gpu_fault.app import ApplicationContext
-from gpu_fault.models import WorkflowStatus
-from gpu_fault.watcher import WorkloadPhase
-
-expected = json.load(sys.stdin)
-store = ApplicationContext.from_environment().store
-nonterminal = {
-    WorkflowStatus.PENDING,
-    WorkflowStatus.SAFETY_PENDING,
-    WorkflowStatus.BLOCKED,
-    WorkflowStatus.RUNNING,
-}
-workflows = [
-    item
-    for item in store.list_workflows(statuses=nonterminal, limit=1001)
-    if item.runtime_profile_version != expected["desired"]
-]
-workloads = [
-    item.observation
-    for item in store.list_attempt_observation_states()
-    if item.observation.workload_phase
-    in {WorkloadPhase.PENDING, WorkloadPhase.RUNNING}
-    and item.observation.runtime_profile_version != expected["desired"]
-]
-print(
-    json.dumps(
-        {
-            "workflow_count": len(workflows),
-            "workload_count": len(workloads),
-            "workflow_ids": [item.request_id for item in workflows[:10]],
-            "attempt_ids": [item.attempt_id for item in workloads[:10]],
-        },
-        sort_keys=True,
-    )
-)
-"""
-    raw = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            "-i",
-            pod,
-            "--",
-            CONTROL_PLANE_PYTHON,
-            "-c",
-            script,
-        ),
+    script = probe_source("runtime_profile_transition")
+    raw = exec_cpu_ingress_probe(
+        release,
+        script=script,
+        failure="Runtime Profile transition",
         input_text=json.dumps(
             {
                 "previous": previous_profile_version,
                 "desired": desired,
             }
         ),
-        capture=True,
     )
     result = json.loads(raw)
     workflow_count = int(result.get("workflow_count", 0))
@@ -121,14 +173,15 @@ print(
         )
 
 
-def validate_release_quick(
+def validate_release_components(
     release: Any,
-    plan: ReleaseExecutionPlan,
+    *,
+    cpu: bool,
+    data_plane: bool,
+    runtime_validator: Callable[[Any], object] = validate_runtime_component_identity,
 ) -> None:
-    if plan.has(
-        ReleaseComponent.CPU_STAGE,
-        ReleaseComponent.CPU_FINALIZE,
-    ):
+    checks: list[str] = []
+    if cpu:
         release.runner.run(
             [
                 "bash",
@@ -141,16 +194,14 @@ def validate_release_quick(
                 **os.environ,
                 "KUBECONFIG": release.config.cpu_kubeconfig,
                 "GPU_FAULT_NAMESPACE": release.config.namespace,
+                "GPU_FAULT_RUNTIME_IMAGE": release.runtime_image,
+                "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": "false",
             },
         )
-    if plan.has(
-        ReleaseComponent.EXECUTOR,
-        ReleaseComponent.WATCHER,
-        ReleaseComponent.COLLECTOR,
-        ReleaseComponent.RECONCILER,
-        ReleaseComponent.AGENT,
-    ):
-        for target in release.config.clusters:
+        checks.append("control_plane_role_split")
+    if data_plane:
+
+        def verify_data_plane(target: Any) -> None:
             release.runner.run(
                 [
                     "bash",
@@ -164,63 +215,50 @@ def validate_release_quick(
                         release.config.cpu_kubeconfig
                     ),
                     "GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP": (release.executor_wheel_cm),
+                    "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": "false",
                 },
             )
-    if plan.has(
-        ReleaseComponent.CPU_STAGE,
-        ReleaseComponent.CPU_FINALIZE,
-        ReleaseComponent.EXECUTOR,
-        ReleaseComponent.WATCHER,
-        ReleaseComponent.COLLECTOR,
-        ReleaseComponent.RECONCILER,
-        ReleaseComponent.AGENT,
-    ):
-        validate_runtime_component_identity(release)
+
+        _fan_out_clusters(
+            release,
+            verify_data_plane,
+            failure="data-plane executor verification",
+        )
+        checks.extend(
+            f"data_plane_executor:{target.cluster_id}"
+            for target in release.config.clusters
+        )
+    if cpu or data_plane:
+        runtime_validator(release)
+        checks.append("runtime_component_identity")
+    _write_quick_validation_evidence(release, checks=checks)
+
+
+def validate_release_quick(
+    release: Any,
+    plan: ReleaseExecutionPlan,
+) -> None:
+    validate_release_components(
+        release,
+        cpu=plan.has(
+            ReleaseComponent.CPU_STAGE,
+            ReleaseComponent.CPU_FINALIZE,
+        ),
+        data_plane=plan.has(
+            ReleaseComponent.EXECUTOR,
+            ReleaseComponent.WATCHER,
+            ReleaseComponent.COLLECTOR,
+            ReleaseComponent.RECONCILER,
+            ReleaseComponent.AGENT,
+        ),
+    )
 
 
 def critical_amp_alerts(release: Any) -> dict[str, Any]:
     workspace_id = release.config.health.amp_workspace_id
     if not workspace_id:
         return {"count": 0, "alerts": []}
-    script = """
-import json
-import sys
-import urllib.request
-
-import boto3
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
-
-request = json.load(sys.stdin)
-region = request["region"]
-workspace_id = request["workspace_id"]
-url = (
-    f"https://aps-workspaces.{region}.amazonaws.com/workspaces/"
-    f"{workspace_id}/alertmanager/api/v2/alerts"
-    "?active=true&silenced=false&inhibited=false"
-)
-session = boto3.Session(region_name=region)
-credentials = session.get_credentials()
-if credentials is None:
-    raise RuntimeError("AWS credentials are unavailable for AMP alert query")
-signed = AWSRequest(method="GET", url=url, headers={"Accept": "application/json"})
-SigV4Auth(credentials.get_frozen_credentials(), "aps", region).add_auth(signed)
-http_request = urllib.request.Request(
-    url,
-    headers={key: str(value) for key, value in signed.headers.items()},
-)
-with urllib.request.urlopen(http_request, timeout=30) as response:
-    alerts = json.loads(response.read())
-critical = [
-    {
-        "alertname": (item.get("labels") or {}).get("alertname"),
-        "severity": (item.get("labels") or {}).get("severity"),
-    }
-    for item in alerts
-    if (item.get("labels") or {}).get("severity") == "critical"
-]
-print(json.dumps({"count": len(critical), "alerts": critical}, sort_keys=True))
-"""
+    script = probe_source("critical_amp_alerts")
     raw = release.runner.run(
         ["python3", "-c", script],
         input_text=json.dumps(
@@ -237,98 +275,98 @@ print(json.dumps({"count": len(critical), "alerts": critical}, sort_keys=True))
     return result
 
 
-def store_io_rejection_series_ready(release: Any) -> dict[str, Any]:
-    reports: dict[str, dict[str, Any]] = {}
-    errors: list[str] = []
-    for deployment, port in CPU_METRIC_PORTS.items():
-        deployed = release._get_json(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "deployment",
-                deployment,
-            )
+def _store_io_metric_pods(release: Any, deployment: str) -> tuple[int, tuple[str, ...]]:
+    deployed = release._get_json(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "deployment",
+            deployment,
         )
-        replicas = int((deployed.get("spec") or {}).get("replicas") or 0)
-        if replicas == 0:
-            continue
-        pods = release._get_json(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "pods",
-                "-l",
-                f"app={deployment}",
-                "--field-selector=status.phase=Running",
-            )
+    )
+    replicas = int((deployed.get("spec") or {}).get("replicas") or 0)
+    if replicas == 0:
+        return 0, ()
+    pods = release._get_json(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "pods",
+            "-l",
+            f"app={deployment}",
+            "--field-selector=status.phase=Running",
         )
-        names = sorted(
+    )
+    names = tuple(
+        sorted(
             str((item.get("metadata") or {}).get("name") or "")
             for item in pods.get("items", [])
             if (item.get("metadata") or {}).get("name")
         )
+    )
+    return replicas, names
+
+
+def _store_io_series_probe(release: Any, pod: str, port: int) -> dict[str, Any]:
+    script = probe_source("store_io_rejection_series")
+    return json.loads(
+        release.runner.run(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "exec",
+                pod,
+                "--",
+                CONTROL_PLANE_PYTHON,
+                "-c",
+                script,
+                json.dumps({"metric": STORE_IO_REJECTION_METRIC, "port": port}),
+            ),
+            capture=True,
+        )
+    )
+
+
+def store_io_rejection_series_ready(release: Any) -> dict[str, Any]:
+    reports: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    deployments = sorted(CPU_METRIC_PORTS)
+    # Each role inventory is two independent reads and each metric probe is its
+    # own `kubectl exec` round trip, so a settle window used to pay
+    # `roles + Pods` serial round trips per sample. Results are consumed in input
+    # order, so the report and the error list stay deterministic.
+    inventories = _fan_out_values(
+        release,
+        deployments,
+        lambda deployment: _store_io_metric_pods(release, deployment),
+    )
+    probes: list[tuple[str, str]] = []
+    for deployment, (replicas, names) in zip(deployments, inventories):
+        if replicas == 0:
+            continue
         if len(names) != replicas:
             errors.append(
                 f"{deployment} has {len(names)}/{replicas} Running metric Pods"
             )
-        script = f"""
-import json
-from urllib.request import urlopen
-
-metric = {STORE_IO_REJECTION_METRIC!r}
-text = urlopen(
-    "http://127.0.0.1:{port}/metrics",
-    timeout=10,
-).read().decode()
-series = []
-for line in text.splitlines():
-    if not (
-        line.startswith(metric + "{{")
-        or line.startswith(metric + " ")
-    ):
-        continue
-    name, raw = line.rsplit(None, 1)
-    series.append(
-        {{
-            "labeled": 'process_id="' in name,
-            "value": float(raw),
-        }}
+        probes.extend((deployment, pod) for pod in names)
+    samples = _fan_out_values(
+        release,
+        probes,
+        lambda probe: _store_io_series_probe(
+            release,
+            probe[1],
+            CPU_METRIC_PORTS[probe[0]],
+        ),
     )
-print(
-    json.dumps(
-        {{
-            "series_count": len(series),
-            "all_labeled": bool(series)
-            and all(item["labeled"] for item in series),
-            "all_zero": bool(series)
-            and all(item["value"] == 0 for item in series),
-        }},
-        sort_keys=True,
-    )
-)
-"""
-        for pod in names:
-            raw = release.runner.run(
-                release._cpu(
-                    "-n",
-                    release.config.namespace,
-                    "exec",
-                    pod,
-                    "--",
-                    CONTROL_PLANE_PYTHON,
-                    "-c",
-                    script,
-                ),
-                capture=True,
-            )
-            report = json.loads(raw)
-            reports[f"{deployment}/{pod}"] = report
-            if not report.get("all_labeled"):
-                errors.append(f"{deployment}/{pod} has unlabeled Store I/O series")
-            if not report.get("all_zero"):
-                errors.append(f"{deployment}/{pod} has nonzero Store I/O rejections")
+    for (deployment, pod), report in zip(probes, samples):
+        key = f"{deployment}/{pod}"
+        reports[key] = report
+        if not report.get("all_labeled"):
+            errors.append(f"{key} has unlabeled Store I/O series")
+        if not report.get("all_zero"):
+            errors.append(f"{key} has nonzero Store I/O rejections")
     return {
         "ready": not errors,
         "pods": reports,
@@ -422,10 +460,9 @@ def wait_for_stability_baseline(
 
 
 def stability_snapshot(release: Any) -> dict[str, Any]:
-    restarts: dict[str, int] = {}
-    not_ready: list[str] = []
-
-    def collect(plane: str, kubectl: list[str]) -> None:
+    def collect(plane: str, kubectl: list[str]) -> tuple[dict[str, int], list[str]]:
+        restarts: dict[str, int] = {}
+        not_ready: list[str] = []
         value = release._get_json(
             kubectl
             + [
@@ -455,64 +492,45 @@ def stability_snapshot(release: Any) -> dict[str, Any]:
             for container in status.get("containerStatuses", []):
                 key = f"{plane}/{name}/{container.get('name')}"
                 restarts[key] = int(container.get("restartCount") or 0)
+        return restarts, not_ready
 
-    collect("cpu", release._cpu())
-    for target in release.config.clusters:
-        collect(target.cluster_id, release._gpu(target))
-
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("stability window has no running CPU ingress Pod")
-    script = """
-import json
-from gpu_fault.app import ApplicationContext
-
-store = ApplicationContext.from_environment().store
-print(
-    json.dumps(
-        {
-            "queue": store.processor_queue_stats(),
-            "remote_commands": store.remote_command_stats(),
-        },
-        default=float,
-        sort_keys=True,
-    )
-)
-"""
-    store = json.loads(
-        release.runner.run(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "exec",
-                pod,
-                "--",
-                CONTROL_PLANE_PYTHON,
-                "-c",
-                script,
-            ),
-            capture=True,
+    def collect_store() -> dict[str, Any]:
+        script = probe_source("store_stability_snapshot")
+        return json.loads(
+            exec_cpu_ingress_probe(
+                release,
+                script=script,
+                failure="stability window",
+                interactive=False,
+            )
         )
+
+    plane_tasks = [("cpu", release._cpu())]
+    plane_tasks.extend(
+        (target.cluster_id, release._gpu(target)) for target in release.config.clusters
     )
+    workers = min(8, len(plane_tasks) + 2)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pod_futures = [
+            executor.submit(collect, plane, kubectl) for plane, kubectl in plane_tasks
+        ]
+        store_future = executor.submit(collect_store)
+        alerts_future = executor.submit(release._critical_amp_alerts)
+        pod_results = [future.result() for future in pod_futures]
+        store = store_future.result()
+        critical_alerts = alerts_future.result()
+    restarts = {
+        name: count
+        for result, _not_ready in pod_results
+        for name, count in result.items()
+    }
+    not_ready = [name for _restarts, result in pod_results for name in result]
     return {
         "restarts": restarts,
         "not_ready": sorted(not_ready),
         "queue": store.get("queue") or {},
         "remote_commands": store.get("remote_commands") or {},
-        "critical_alerts": release._critical_amp_alerts(),
+        "critical_alerts": critical_alerts,
     }
 
 
@@ -616,19 +634,14 @@ def _validate_cpu_rollback(
     )
     if _container_image(cpu, "spec", "template", "spec") != expected_runtime_image:
         raise ReleaseError("rollback CPU runtime image did not converge")
-    refresh_exists = (
-        subprocess.run(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "cronjob",
-                "gpu-fault-aurora-credential-refresh",
-            ),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+    refresh_exists = release.runner.probe(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "cronjob",
+            "gpu-fault-aurora-credential-refresh",
+        ),
     )
     if refresh_exists:
         refresh = release._get_json(
@@ -654,44 +667,111 @@ def _validate_cpu_rollback(
             raise ReleaseError("rollback Aurora refresh image did not converge")
 
 
-def _validate_gpu_rollback(
+def validate_agent_rollback_target(
+    release: Any,
+    previous: dict[str, Any],
+    target: Any,
+) -> None:
+    identity = (previous.get("agent_identities") or {}).get(target.cluster_id)
+    if not isinstance(identity, dict):
+        raise ReleaseError(f"{target.cluster_id} rollback Agent identity is missing")
+    node_names = tuple(str(value) for value in identity.get("node_ids") or [])
+    if not node_names:
+        raise ReleaseError(f"{target.cluster_id} rollback Agent node set is empty")
+    artifact = str(identity.get("artifact_sha256") or "")
+    config_digest = str(identity.get("config_digest") or "")
+    if not artifact or not config_digest:
+        raise ReleaseError(f"{target.cluster_id} rollback Agent pins are incomplete")
+    if not agents_converged(
+        gpu_node_items(release, target, fresh=True),
+        target,
+        artifact,
+        bundle_sha=identity.get("installer_bundle_sha256"),
+        template_sha=identity.get("installer_template_sha256"),
+        config_digest=config_digest,
+        require_node_uid=True,
+        node_names=frozenset(node_names),
+    ):
+        raise ReleaseError(f"{target.cluster_id} rollback node annotations mismatch")
+    if not release._agent_heartbeats_converged(
+        target,
+        node_count=len(node_names),
+        node_names=tuple(sorted(node_names)),
+        artifact_sha=artifact,
+        config_digest=config_digest,
+        runtime_profile_version=str(identity.get("runtime_profile_version") or ""),
+        bundle_sha=identity.get("installer_bundle_sha256"),
+        template_sha=identity.get("installer_template_sha256"),
+        agent_identity=identity,
+    ):
+        raise ReleaseError(f"{target.cluster_id} rollback Agent heartbeat mismatch")
+
+
+def validate_gpu_rollback_target(
     release: Any,
     previous: dict[str, Any],
     expected_runtime_image: str,
+    target: Any,
+    *,
+    components: frozenset[ReleaseComponent] = GPU_COMPONENTS,
+    run_verifier: bool = True,
 ) -> None:
-    for target in release.config.clusters:
-        old = (previous.get("clusters") or {}).get(target.cluster_id, {})
-        expected_wheel = old.get("wheel")
-        expected_reconciler = old.get("reconciler_wheel")
+    old = (previous.get("clusters") or {}).get(target.cluster_id, {})
+    expected_wheel = old.get("wheel")
+    expected_reconciler = old.get("reconciler_wheel")
+    deployment_components = (
+        (ReleaseComponent.EXECUTOR, inventory.GPU_EXECUTOR_DEPLOYMENT),
+        (ReleaseComponent.WATCHER, inventory.GPU_WATCHER_DEPLOYMENT),
+        (ReleaseComponent.COLLECTOR, inventory.GPU_COLLECTOR_DEPLOYMENT),
+    )
+    for component, deployment_name in deployment_components:
+        if component not in components:
+            continue
         if expected_wheel and (
             release._deployment_wheel(
                 release._gpu(target),
-                inventory.GPU_EXECUTOR_DEPLOYMENT,
+                deployment_name,
             )
             != expected_wheel
         ):
-            raise ReleaseError(f"{target.cluster_id} rollback Executor wheel mismatch")
-        for deployment_name in (
-            inventory.GPU_EXECUTOR_DEPLOYMENT,
-            inventory.GPU_RECONCILER_DEPLOYMENT,
-        ):
-            deployment = release._get_json(
-                release._gpu(
-                    target,
-                    "-n",
-                    release.config.namespace,
-                    "get",
-                    "deployment",
-                    deployment_name,
-                )
+            raise ReleaseError(
+                f"{target.cluster_id} rollback {deployment_name} wheel mismatch"
             )
-            if (
-                _container_image(deployment, "spec", "template", "spec")
-                != expected_runtime_image
-            ):
-                raise ReleaseError(
-                    f"{target.cluster_id} rollback runtime image mismatch"
-                )
+        deployment = release._get_json(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+                deployment_name,
+            )
+        )
+        if (
+            _container_image(deployment, "spec", "template", "spec")
+            != expected_runtime_image
+        ):
+            raise ReleaseError(
+                f"{target.cluster_id} rollback {deployment_name} image mismatch"
+            )
+    if components.intersection({ReleaseComponent.RECONCILER, ReleaseComponent.AGENT}):
+        deployment = release._get_json(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+                inventory.GPU_RECONCILER_DEPLOYMENT,
+            )
+        )
+        if (
+            _container_image(deployment, "spec", "template", "spec")
+            != expected_runtime_image
+        ):
+            raise ReleaseError(
+                f"{target.cluster_id} rollback Reconciler image mismatch"
+            )
         if expected_reconciler and (
             release._deployment_wheel(
                 release._gpu(target),
@@ -715,6 +795,7 @@ def _validate_gpu_rollback(
             and release._template_bundle(target, expected_template) != old.get("bundle")
         ):
             raise ReleaseError(f"{target.cluster_id} rollback node bundle mismatch")
+    if ReleaseComponent.DCGM in components:
         expected_dcgm = old.get("dcgm_image")
         if expected_dcgm:
             dcgm = release._get_json(
@@ -729,6 +810,17 @@ def _validate_gpu_rollback(
             )
             if _container_image(dcgm, "spec", "template", "spec") != expected_dcgm:
                 raise ReleaseError(f"{target.cluster_id} rollback DCGM image mismatch")
+    if ReleaseComponent.AGENT in components:
+        validate_agent_rollback_target(release, previous, target)
+    if run_verifier and components.intersection(
+        {
+            ReleaseComponent.EXECUTOR,
+            ReleaseComponent.WATCHER,
+            ReleaseComponent.COLLECTOR,
+            ReleaseComponent.RECONCILER,
+            ReleaseComponent.AGENT,
+        }
+    ):
         release.runner.run(
             [
                 "bash",
@@ -740,79 +832,33 @@ def _validate_gpu_rollback(
                 "GPU_FAULT_KUBE_CONTEXT": target.context,
                 "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": (release.config.cpu_kubeconfig),
                 "GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP": expected_wheel or "",
+                "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": "false",
             },
         )
+
+
+def _validate_gpu_rollback(
+    release: Any,
+    previous: dict[str, Any],
+    expected_runtime_image: str,
+) -> None:
+    _fan_out_clusters(
+        release,
+        lambda target: validate_gpu_rollback_target(
+            release,
+            previous,
+            expected_runtime_image,
+            target,
+        ),
+        failure="rollback validation",
+    )
 
 
 def _validate_agent_rollback(
     release: Any,
     previous: dict[str, Any],
 ) -> None:
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    script = """
-import json
-import sys
-from datetime import datetime, timezone
-
-from gpu_fault.app import ApplicationContext
-
-expected = json.load(sys.stdin)
-now = datetime.now(timezone.utc)
-agents = [
-    item
-    for item in ApplicationContext.from_environment().store.list_agents()
-    if getattr(item.lifecycle_state, "value", item.lifecycle_state) == "ACTIVE"
-    and item.lease_expires_at is not None
-    and item.lease_expires_at > now
-]
-mismatches = []
-for item in agents:
-    cluster = expected["clusters"].get(item.cluster_id) or {}
-    if item.agent_protocol_version != cluster.get("protocol"):
-        mismatches.append([item.node_id, "protocol"])
-    if item.agent_version != cluster.get("version"):
-        mismatches.append([item.node_id, "version"])
-    if item.artifact_sha256 != cluster.get("artifact"):
-        mismatches.append([item.node_id, "artifact"])
-    if (
-        item.compatibility_digest or item.artifact_sha256
-    ) != cluster.get("compatibility"):
-        mismatches.append([item.node_id, "compatibility"])
-    if item.policy_version != cluster.get("policy"):
-        mismatches.append([item.node_id, "policy"])
-    if item.config_digest != cluster.get("config"):
-        mismatches.append([item.node_id, "config"])
-    if item.node_action_key_version != cluster.get("key_version"):
-        mismatches.append([item.node_id, "key_version"])
-    if item.runtime_profile_version != cluster.get("profile"):
-        mismatches.append([item.node_id, "profile"])
-    if (
-        cluster.get("bundle") is not None
-        and item.installer_bundle_sha256 != cluster["bundle"]
-    ):
-        mismatches.append([item.node_id, "bundle"])
-    if (
-        cluster.get("template") is not None
-        and item.installer_template_sha256 != cluster["template"]
-    ):
-        mismatches.append([item.node_id, "template"])
-print(json.dumps({"active": len(agents), "mismatches": mismatches}))
-if not agents or mismatches:
-    raise SystemExit(1)
-"""
+    script = probe_source("agent_rollback_identity")
     identities = previous.get("agent_identities") or {}
     expected_cluster_ids = {target.cluster_id for target in release.config.clusters}
     if set(identities) != expected_cluster_ids:
@@ -834,24 +880,21 @@ if not agents or mismatches:
             for cluster_id, identity in identities.items()
         },
     }
-    release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            "-i",
-            pod,
-            "--",
-            CONTROL_PLANE_PYTHON,
-            "-c",
-            script,
-        ),
+    exec_cpu_ingress_probe(
+        release,
+        script=script,
+        failure="rollback Agent identity validation",
         input_text=json.dumps(expected),
-        capture=True,
     )
 
 
-def validate_rollback(release: Any, previous: dict[str, Any]) -> None:
+def validate_rollback(
+    release: Any,
+    previous: dict[str, Any],
+    *,
+    restore_cpu: bool = True,
+    cluster_components: dict[str, frozenset[ReleaseComponent]] | None = None,
+) -> None:
     if release.runner.dry_run:
         return
     metadata = dict(previous.get("metadata") or {})
@@ -860,27 +903,46 @@ def validate_rollback(release: Any, previous: dict[str, Any]) -> None:
         if current_metadata.get(key) != expected:
             raise ReleaseError(f"rollback release metadata mismatch: {key}")
     expected_runtime_image = previous.get("runtime_image") or release.runtime_image
-    _validate_cpu_rollback(release, previous, expected_runtime_image)
-    expected_profile = previous.get("runtime_profile_version")
-    live_profile = release._config_map_data("gpu-fault-api-ha-config-core").get(
-        "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"
-    )
-    if live_profile != expected_profile:
-        raise ReleaseError("rollback Runtime Profile did not converge")
-    release.runner.run(
-        [
-            "bash",
-            str(ROOT / "deploy/control-plane/tools/verify-control-plane-role-split.sh"),
-        ],
-        env={
-            **os.environ,
-            "KUBECONFIG": release.config.cpu_kubeconfig,
-            "GPU_FAULT_NAMESPACE": release.config.namespace,
-            "GPU_FAULT_RUNTIME_IMAGE": expected_runtime_image,
-        },
-    )
-    _validate_gpu_rollback(release, previous, expected_runtime_image)
-    _validate_agent_rollback(
+    if restore_cpu:
+        _validate_cpu_rollback(release, previous, expected_runtime_image)
+        expected_profile = previous.get("runtime_profile_version")
+        live_profile = release._config_map_data("gpu-fault-api-ha-config-core").get(
+            "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"
+        )
+        if live_profile != expected_profile:
+            raise ReleaseError("rollback Runtime Profile did not converge")
+        release.runner.run(
+            [
+                "bash",
+                str(
+                    ROOT / "deploy/control-plane/tools/"
+                    "verify-control-plane-role-split.sh"
+                ),
+            ],
+            env={
+                **os.environ,
+                "KUBECONFIG": release.config.cpu_kubeconfig,
+                "GPU_FAULT_NAMESPACE": release.config.namespace,
+                "GPU_FAULT_RUNTIME_IMAGE": expected_runtime_image,
+                "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": "false",
+            },
+        )
+    if cluster_components is None:
+        _validate_gpu_rollback(release, previous, expected_runtime_image)
+        return
+    _fan_out_clusters(
         release,
-        previous,
+        lambda target: validate_gpu_rollback_target(
+            release,
+            previous,
+            expected_runtime_image,
+            target,
+            components=cluster_components[target.cluster_id],
+        ),
+        failure="rollback validation",
+        targets=[
+            target
+            for target in release.config.clusters
+            if cluster_components.get(target.cluster_id)
+        ],
     )

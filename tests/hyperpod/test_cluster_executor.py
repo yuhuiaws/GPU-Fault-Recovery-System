@@ -18,7 +18,8 @@ from gpu_fault.cluster_executor import (
     _persistent_store_from_environment,
     executor_from_environment,
 )
-from gpu_fault.models import WorkflowOperation
+from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.regional import RemoteCommandResult, RemoteCommandStatus
 from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION
 
@@ -962,3 +963,95 @@ def test_execution_request_confirmation_is_absent_without_config() -> None:
     # An executor that owns no HyperPod mutations must not manufacture a
     # confirmation; the adapter's gate then fails closed.
     assert executor._execution_request(FakeCommand()).confirm_cluster_name is None
+
+
+class _OutcomeAdapter(FakeAdapter):
+    """An adapter that reports one fixed step status.
+
+    The idle-path tests are about what ``run_once`` concludes from a batch of
+    results, so they drive the real ``_execute`` and let the adapter decide the
+    status, rather than replacing ``_execute`` itself.
+    """
+
+    def __init__(self, status: WorkflowStepStatus) -> None:
+        super().__init__("owner-a")
+        self.status = status
+        self.calls = 0
+
+    def supports(self, _step) -> bool:
+        return True
+
+    def execute(self, _context) -> WorkflowStepOutcome:
+        self.calls += 1
+        return WorkflowStepOutcome(status=self.status)
+
+
+class _ReclaimingClient(FakeClient):
+    """Hands out the same claimed command on every claim."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claims = 0
+        self.completions: list[RemoteCommandStatus] = []
+
+    def claim(self, executor_id, **kwargs):
+        super().claim(executor_id, **kwargs)
+        self.claims += 1
+        return [_remote_command()]
+
+    def complete(self, _command, result) -> None:
+        self.completions.append(result.status)
+
+    def renew(self, *_args, **_kwargs) -> None:
+        return None
+
+
+def test_a_held_command_polls_instead_of_spinning(monkeypatch) -> None:
+    """WAITING is not progress, so it must not skip the idle sleep.
+
+    A command that reports WAITING is immediately re-claimable, so the claim
+    loop went straight back to claim() with nothing changed. On 2026-09-04 one
+    held STOP_WORKLOADS drove ~25 claim/execute/complete round trips a second
+    across two replicas and 759 identical log lines a minute -- for ten
+    minutes, against a control plane that had nothing new to say.
+    """
+
+    client = _ReclaimingClient()
+    sleeps: list[float] = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            raise StopIteration
+
+    monkeypatch.setattr("gpu_fault.cluster_executor.time.sleep", sleep)
+    executor = ClusterActionExecutor(
+        client,
+        [_OutcomeAdapter(WorkflowStepStatus.WAITING)],
+        executor_id="executor-a",
+        allowed_namespaces={"training"},
+        poll_seconds=2,
+    )
+
+    with pytest.raises(StopIteration):
+        executor.run()
+
+    assert sleeps == [2, 2, 2], "a held command must take the idle path"
+    assert client.claims == 3
+    assert executor.last_cycle_advanced is False
+
+
+def test_a_command_that_advances_does_not_wait_for_the_next_poll() -> None:
+    """The backoff must not slow a queue that is actually draining."""
+
+    client = _ReclaimingClient()
+    executor = ClusterActionExecutor(
+        client,
+        [_OutcomeAdapter(WorkflowStepStatus.SUCCEEDED)],
+        executor_id="executor-a",
+        allowed_namespaces={"training"},
+    )
+
+    assert executor.run_once() == 1
+    assert client.completions == [RemoteCommandStatus.SUCCEEDED]
+    assert executor.last_cycle_advanced is True

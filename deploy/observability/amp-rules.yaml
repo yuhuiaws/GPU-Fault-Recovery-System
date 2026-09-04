@@ -1,26 +1,123 @@
+# Every rule in this file must carry an `annotations.summary`, an
+# `annotations.description` and an `annotations.runbook_url` pointing at
+# `docs/管理员日常运维.md#<alert name lowercased>`. The value is a
+# repository-relative path rather than an absolute URL on purpose: this file is
+# published with the repository and has no single canonical hosting origin, so
+# an absolute URL would pin one fork's web address into the alert payload. An
+# on-call operator reads the section from the checkout the runbook already tells
+# them to keep. `scripts/verify-regional-alerting.py` fails the build when an
+# alert is missing the annotation, when the annotation does not match the alert
+# name, when the target heading does not exist, or when a heading exists with no
+# alert pointing at it.
 groups:
   - name: gpu-fault-collector-health
     rules:
       - alert: GpuFaultCollectorSilent
-        expr: max by (cluster_id, node_id, collector, channel) (gpu_fault_collector_silent_nodes) > 0
+        expr: max by (control_plane_cluster, region, cluster_id, collector, channel) (gpu_fault_collector_silent_nodes) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: A required GPU fault collector is missing or stale
+          runbook_url: docs/管理员日常运维.md#gpufaultcollectorsilent
           description: >-
             Check the node systemd service, TLS trust, regional token,
             collector outbox and the last successful batch timestamp.
+      # Silence and failure are different states. A collector that reports a
+      # collection error every cycle is still delivering batches on time, so
+      # `GpuFaultCollectorSilent` only notices it once its last success has aged
+      # past that channel's threshold -- and it then says "missing or stale",
+      # which sends the operator to look at connectivity instead of at the error
+      # the node already reported. `warning` rather than `critical`: the node is
+      # reachable and reporting, so the loss is partial.
+      - alert: GpuFaultCollectorCollectionErrors
+        expr: max by (control_plane_cluster, region, cluster_id, collector, channel) (gpu_fault_collector_erroring_nodes) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A GPU fault collector is reporting collection errors
+          runbook_url: docs/管理员日常运维.md#gpufaultcollectorcollectionerrors
+          description: >-
+            The collector is delivering batches whose newest state is a
+            failure. Read the per-node errors from the collector status
+            details and the node's collector journal.
       - alert: GpuFaultCollectorMetricsSnapshotStale
-        expr: absent(gpu_fault_collector_metrics_snapshot_age_seconds) or min(gpu_fault_collector_metrics_snapshot_age_seconds) > 120
+        expr: absent(gpu_fault_collector_metrics_snapshot_age_seconds) or min by (control_plane_cluster, region) (gpu_fault_collector_metrics_snapshot_age_seconds) > 120
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: GPU fault collector metrics snapshots are stale
+          runbook_url: docs/管理员日常运维.md#gpufaultcollectormetricssnapshotstale
           description: >-
             Ensure the metrics scraper targets ingress replicas and check
             ingress connectivity to the shared control-plane store.
+  # Health of the delivery path itself, read from the collector's own counters
+  # (the gpu-fault-adot-self scrape job). Every other group in this file assumes
+  # that what AMP holds is what the control plane published; when that stops
+  # being true the rules keep evaluating on holes and report nothing, so this
+  # group has to exist for any of them to mean anything.
+  - name: gpu-fault-telemetry-pipeline
+    rules:
+      # The name has no `_total`: the self-telemetry reader in the pinned
+      # aws-otel-collector v0.49.0 (core v0.156.0) publishes its counters
+      # unsuffixed, and `add_metric_suffixes: false` on the remote_write exporter
+      # means nothing adds one on the way to AMP either. Verified by running the
+      # pinned image and reading :8889; the same read is why there is no
+      # `enqueue_failed` clause here -- that counter does not exist in this
+      # version, and a queue that overflows is reported as a permanent send
+      # failure, which this expression already covers.
+      - alert: GpuFaultTelemetryRemoteWriteFailing
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (rate(otelcol_exporter_send_failed_metric_points[5m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: ADOT is dropping metric points on the way to AMP
+          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryremotewritefailing
+          description: >-
+            Points that keep failing past the exporter's 120s retry window are
+            dropped and never resent. What AMP holds is therefore incomplete, so
+            every other rule in this file is evaluating over gaps and a quiet
+            dashboard is not evidence of a quiet fleet. Check the sigv4 role and
+            the AMP workspace ingestion limits; do not treat the drop as resolved
+            because the counter stopped rising, since it also stops when the
+            collector restarts.
+      - alert: GpuFaultTelemetryRemoteWriteQueueSaturated
+        expr: >-
+          max by (control_plane_cluster, region)
+          (otelcol_exporter_queue_size / otelcol_exporter_queue_capacity) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: The ADOT export queue is close to dropping metric points
+          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryremotewritequeuesaturated
+          description: >-
+            The retry queue is over 80% full, so AMP is being written slower than
+            the control plane is scraped and the next backlog is dropped rather
+            than delayed. This is the leading edge of
+            GpuFaultTelemetryRemoteWriteFailing and the only warning before data
+            loss. Check AMP ingestion throttling first; the queue cannot be
+            enlarged for free, since the container is capped at 256Mi.
+      - alert: GpuFaultAdotSelfMetricsMissing
+        expr: absent(up{job="gpu-fault-adot-self"} == 1)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: The ADOT collector's own telemetry is missing from AMP
+          runbook_url: docs/管理员日常运维.md#gpufaultadotselfmetricsmissing
+          description: >-
+            Either the collector is not running or remote_write is failing
+            completely, and in the second case GpuFaultTelemetryRemoteWriteFailing
+            cannot fire because its own counters travel the same path. Compare
+            with GpuFaultControlPlaneMetricsMissing: both absent means the
+            collector or the write path is down, this one alone means the
+            self-telemetry reader or its keep filter changed.
   - name: gpu-fault-control-plane-capacity
     rules:
       - alert: GpuFaultControlPlaneMetricsMissing
@@ -30,6 +127,13 @@ groups:
           severity: critical
         annotations:
           summary: GPU fault control-plane metrics are missing
+          runbook_url: docs/管理员日常运维.md#gpufaultcontrolplanemetricsmissing
+          description: >-
+            The whole regional control plane is invisible to monitoring, so
+            every other rule in this file is simultaneously inert. Check the
+            ingress Pod state and startup guard log, target discovery, and the
+            namespace and port in the scrape config. Absence of alerts must not
+            be read as absence of faults while this is firing.
       - alert: GpuFaultProcessorQueueDepthHigh
         expr: max(gpu_fault_processor_queue_depth) > 7000
         for: 5m
@@ -37,6 +141,13 @@ groups:
           severity: warning
         annotations:
           summary: Regional GPU fault processor queue exceeds 70 percent
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessorqueuedepthhigh
+          description: >-
+            Nothing is rejected yet, but queueing delay is already growing.
+            Check control-worker replicas and lane occupancy, Aurora latency,
+            and whether the backlog is one cluster's fault storm rather than
+            global load. Scale through `gpu-fault-admin config`; do not lower
+            the threshold or enable a queue bypass.
       - alert: GpuFaultProcessorQueueDepthCritical
         expr: max(gpu_fault_processor_queue_depth) > 9000
         for: 2m
@@ -44,6 +155,15 @@ groups:
           severity: critical
         annotations:
           summary: Regional GPU fault processor queue exceeds 90 percent
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessorqueuedepthcritical
+          description: >-
+            One step away from admission rejection, at which point fault events
+            depend on client redelivery. Check the same signals as
+            GpuFaultProcessorQueueDepthHigh plus whether workers are blocking
+            each other on a lane
+            (gpu_fault_processor_lane_wait_seconds_max). Adding worker replicas
+            outside a maintenance window is permitted here, still with a change
+            record and a rollback plan.
       - alert: GpuFaultProcessorOldestRequestDelayed
         expr: max(gpu_fault_processor_queue_oldest_age_seconds) > 30
         for: 5m
@@ -51,6 +171,14 @@ groups:
           severity: warning
         annotations:
           summary: Oldest GPU fault processor request is delayed
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessoroldestrequestdelayed
+          description: >-
+            Queue depth may be entirely normal: this catches tail starvation,
+            usually one slow request holding a lane. Locate the phase with
+            gpu_fault_processor_phase_oldest_seconds, check whether
+            gpu_fault_processor_claimed_not_started is non-zero, and check the
+            Aurora connection pool wait. Capture the stuck phase and request ID
+            before restarting anything.
       - alert: GpuFaultProcessorClusterBacklogHigh
         expr: max by (cluster_id) (gpu_fault_processor_cluster_queue_depth) > 700
         for: 5m
@@ -58,6 +186,62 @@ groups:
           severity: warning
         annotations:
           summary: A GPU cluster processor backlog exceeds 70 percent
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessorclusterbackloghigh
+          description: >-
+            Cluster {{ $labels.cluster_id }} is using over 70 percent of its own
+            quota, so the backlog is concentrated in one cluster rather than
+            global overload. Check whether that cluster's collectors are
+            replaying, whether its executor is claiming, and whether a
+            node-level fault storm is in progress. The per-cluster quota is an
+            isolation mechanism: do not widen it to clear this alert, because
+            that spends other clusters' capacity.
+      # The workflow table outgrew the /metrics scan budget, so the step,
+      # duration and milestone families now describe only its newest slice.
+      # Without this alert those families would quietly stop being a census and
+      # nothing else in the pipeline would say so.
+      - alert: GpuFaultWorkflowMetricScanTruncated
+        expr: max by (control_plane_cluster, region) (gpu_fault_workflow_scan_truncated) == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Workflow metric scan is truncated
+          runbook_url: docs/管理员日常运维.md#gpufaultworkflowmetricscantruncated
+          description: >-
+            gpu_fault_workflow_step_total,
+            gpu_fault_workflow_duration_seconds and
+            gpu_fault_closed_loop_milestone_seconds now describe only the newest
+            slice of the workflow table, not the whole census.
+            gpu_fault_workflow_total is a database-side aggregate and stays
+            exact. Compare gpu_fault_workflow_scan_size against
+            gpu_fault_workflow_scan_limit and decide whether retention stopped
+            reclaiming or the fleet genuinely grew; raising
+            GPU_FAULT_METRICS_WORKFLOW_SCAN_LIMIT alone just moves the cost to
+            Aurora and to every scrape.
+      # The attempt-observation table is retained for a week by default
+      # (GPU_FAULT_ATTEMPT_OBSERVATION_MAX_AGE_SECONDS), so the ownership
+      # family's scan is the one most likely to hit its budget on a busy fleet.
+      # When it does, the exclusive-ownership invariant is being evaluated
+      # against a slice, and GpuFaultExclusiveNodeOwnershipInvariantViolation
+      # can go quiet without anything else saying so.
+      - alert: GpuFaultAttemptObservationMetricScanTruncated
+        expr: max by (control_plane_cluster, region) (gpu_fault_attempt_observation_scan_truncated) == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Attempt observation metric scan is truncated
+          runbook_url: docs/管理员日常运维.md#gpufaultattemptobservationmetricscantruncated
+          description: >-
+            gpu_fault_ambiguous_attempt_ownership_current and
+            gpu_fault_stale_attempt_observations are computed from the newest
+            slice of the attempt-observation table rather than all of it, so an
+            ownership conflict among older observations would not be reported.
+            Compare gpu_fault_attempt_observation_scan_size against
+            gpu_fault_attempt_observation_scan_limit and check whether the
+            observation retention sweep is still running; the slice keeps the
+            newest rows, which is where both families' signal lives, so the
+            alert is a warning rather than a loss of the invariant.
       - alert: GpuFaultProcessorAdmissionRejected
         expr: sum(rate(gpu_fault_processor_admission_rejections_total[5m])) > 0
         for: 1m
@@ -65,6 +249,15 @@ groups:
           severity: critical
         annotations:
           summary: GPU fault processor rejected requests due to capacity
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessoradmissionrejected
+          description: >-
+            Rejected fault events depend on client redelivery, so this is a real
+            detection loss window, not just a capacity signal. Check the
+            rejection distribution by path and cluster
+            (gpu_fault_processor_admission_rejections_by_path_total,
+            _by_cluster_total) and whether the telemetry spool is rejecting at
+            the same time. Restore capacity first, then go back over the window
+            for XID/SXID events that were never processed.
       - alert: GpuFaultStoreIoSaturated
         expr: max(gpu_fault_store_io_in_flight / gpu_fault_store_io_max_in_flight) > 0.9
         for: 5m
@@ -72,6 +265,14 @@ groups:
           severity: warning
         annotations:
           summary: GPU fault control-plane Store I/O exceeds 90 percent
+          runbook_url: docs/管理员日常运维.md#gpufaultstoreiosaturated
+          description: >-
+            The Store I/O lane is nearly full, so the processor may start
+            refusing Store operations at any moment. Check Aurora CPU and
+            connection pool wait, whether a full-table-scan request is in
+            flight, and gpu_fault_store_io_admission_wait_seconds_max. Confirm
+            it is not a single slow query before widening the lane; widening it
+            only moves the pressure onto Aurora.
       - alert: GpuFaultStoreIoRejected
         expr: sum(rate(gpu_fault_store_io_rejections_total[5m])) > 0
         for: 1m
@@ -79,6 +280,13 @@ groups:
           severity: critical
         annotations:
           summary: GPU fault control-plane rejected Store I/O work
+          runbook_url: docs/管理员日常运维.md#gpufaultstoreiorejected
+          description: >-
+            The write path is incomplete while this fires, so orchestration
+            state may lag the real cluster state. Check the same signals as
+            GpuFaultStoreIoSaturated and whether workflows moved to retry or
+            fail-closed as a result. After recovery, reconcile the workflows
+            from that window against actual node state.
       - alert: GpuFaultProcessorP95Slow
         expr: histogram_quantile(0.95, sum by (le) (rate(gpu_fault_processor_request_processing_seconds_bucket[5m]))) > 5
         for: 10m
@@ -86,6 +294,13 @@ groups:
           severity: warning
         annotations:
           summary: GPU fault processor p95 request duration exceeds 5 seconds
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessorp95slow
+          description: >-
+            The earliest leading indicator among the capacity alerts. Check
+            event loop lag, Aurora connection pool wait, and whether a release
+            just landed (compare the release digest). On its own this is a
+            warning; alongside a queue or Store alert, handle it at that
+            alert's priority.
       - alert: GpuFaultTelemetrySpoolListenerDown
         expr: min(gpu_fault_telemetry_spool_notifications_enabled{pod=~"gpu-fault-telemetry-spool-worker-.*"}) == 0
         for: 2m
@@ -93,24 +308,55 @@ groups:
           severity: warning
         annotations:
           summary: Telemetry spool consumer fell back to polling
+          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspoollistenerdown
+          description: >-
+            The spool consumer's LISTEN/NOTIFY connection dropped and it is
+            polling instead. Behaviour is still correct, latency is worse. Check
+            whether a middlebox cut the Aurora connection, the spool worker Pod
+            restart history, and the rate of
+            gpu_fault_telemetry_spool_fallback_polls_total. Polling is the
+            degraded path, not the target state; do not clear this by disabling
+            notifications.
       - alert: GpuFaultTelemetrySpoolDataLoss
         expr: increase(gpu_fault_telemetry_spool_dropped_total[5m]) > 0
         labels:
           severity: critical
         annotations:
           summary: Telemetry spool dropped routine samples
+          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspooldataloss
+          description: >-
+            Dropping applies to routine telemetry only, never to fault events,
+            but host and network trends now have a hole in them. Check whether
+            gpu_fault_telemetry_spool_depth and _bytes hit their ceilings and
+            whether GpuFaultTelemetrySpoolDrainDelayed fired first. Host-health
+            conclusions covering the drop window are not usable as evidence
+            afterwards.
       - alert: GpuFaultTelemetrySpoolAdmissionRejected
         expr: sum(increase(gpu_fault_telemetry_spool_rejected_total[5m])) > 0
         labels:
           severity: critical
         annotations:
           summary: Telemetry spool rejected routine samples
+          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspooladmissionrejected
+          description: >-
+            Rejection at the spool ingress is one link earlier than
+            GpuFaultTelemetrySpoolDataLoss. Check the ingress batch parameters,
+            the in-flight byte ceiling, and whether one cluster is flooding.
+            Restore capacity first, then scope the resulting telemetry hole.
       - alert: GpuFaultTelemetrySpoolReplayError
         expr: increase(gpu_fault_telemetry_spool_errors_total[5m]) > 0
         labels:
           severity: critical
         annotations:
           summary: Telemetry spool replay failed
+          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspoolreplayerror
+          description: >-
+            Samples that were already durably spooled did not make it into the
+            processing path. Read the exception type in the spool worker log,
+            compare _abandoned_total against _superseded_total, and check
+            whether the Store schema version matches the deployed wheel. Replay
+            failure is often version drift, so run the REG-10A artifact
+            consistency check before anything else.
       - alert: GpuFaultTelemetrySpoolDrainDelayed
         expr: max(gpu_fault_telemetry_spool_oldest_age_seconds) > 60
         for: 5m
@@ -118,6 +364,12 @@ groups:
           severity: warning
         annotations:
           summary: Telemetry spool has not drained within 60 seconds
+          runbook_url: docs/管理员日常运维.md#gpufaulttelemetryspooldraindelayed
+          description: >-
+            The leading indicator for both spool rejection and spool data loss.
+            Check spool worker replicas and lane occupancy, and Aurora write
+            latency. Warning severity, but treat a persistent one as a capacity
+            problem rather than waiting for GpuFaultTelemetrySpoolDataLoss.
   # The regional control plane deliberately does not run Prometheus
   # Operator, so deploy/control-plane/regional/processor-alerts.yaml is
   # never loaded here. Any alert that must fire on the CPU control plane
@@ -132,59 +384,258 @@ groups:
       # recovery silently never happens. 600s is five times the default
       # GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS of 120.
       - alert: GpuFaultRemoteCommandUnclaimed
-        expr: max by (cluster_id) (gpu_fault_remote_command_oldest_unclaimed_seconds) > 600
+        expr: >-
+          max by (control_plane_cluster, region, cluster_id)
+          (gpu_fault_remote_command_oldest_unclaimed_seconds) > 600
         for: 2m
         labels:
           severity: critical
         annotations:
           summary: A GPU cluster remote command was never claimed by an executor
+          runbook_url: docs/管理员日常运维.md#gpufaultremotecommandunclaimed
           description: >-
             Check that the runtime profile owner for the stuck step is
             advertised by an adapter the target cluster executor actually
             constructed, and that the executor can reach the control plane
             over TLS.
       - alert: GpuFaultRemoteCommandExecutorInternalError
-        expr: increase(gpu_fault_remote_command_executor_internal_errors_total[15m]) > 0
+        expr: >-
+          time() -
+          max by (control_plane_cluster, region)
+          (gpu_fault_remote_command_executor_internal_error_last_seen_timestamp_seconds)
+          < 900
         labels:
           severity: critical
         annotations:
           summary: A cluster executor failed a command through an internal defect
+          runbook_url: docs/管理员日常运维.md#gpufaultremotecommandexecutorinternalerror
           description: >-
             The failure is an executor bug, not a refused recovery action.
-            Read the executor Pod log stack trace before retrying.
+            Read the executor Pod log stack trace before retrying. The alert
+            uses the newest retained error timestamp so terminal-record cleanup
+            cannot look like a counter reset.
   - name: gpu-fault-policy-coverage
     rules:
       - alert: GpuFaultUnknownProductFamily
-        expr: sum by (product) (increase(gpu_fault_policy_unknown_product_total[15m])) > 0
+        expr: >-
+          sum by (control_plane_cluster, region, product)
+          (increase(gpu_fault_policy_unknown_product_total[15m])) > 0
         labels:
           severity: critical
         annotations:
           summary: A GPU product is not mapped to an NVIDIA Catalog family
+          runbook_url: docs/管理员日常运维.md#gpufaultunknownproductfamily
           description: >-
             Add the product prefix to spec.catalog.productFamilies in the
             pinned XID catalog before enabling automated XID recovery.
   - name: gpu-fault-orchestration-invariants
     rules:
+      # Aggregated even though the threshold is per node: every control-plane
+      # replica publishes this same Store-derived series, so an unaggregated
+      # expression turns one ambiguous node into one alert per replica and grows
+      # the notification with the replica count. `by` keeps the labels the
+      # description reads and the ones amp-alertmanager.yaml groups on.
       - alert: GpuFaultExclusiveNodeOwnershipInvariantViolation
-        expr: gpu_fault_ambiguous_attempt_ownership_current > 1
+        expr: >-
+          max by (control_plane_cluster, region, cluster_id, gpu_node)
+          (gpu_fault_ambiguous_attempt_ownership_current) > 1
         labels:
           severity: critical
         annotations:
           summary: Multiple fresh active attempts claim the same GPU node
+          runbook_url: docs/管理员日常运维.md#gpufaultexclusivenodeownershipinvariantviolation
           description: >-
             Recovery is currently fail-closed for cluster
             {{ $labels.cluster_id }} GPU node {{ $labels.gpu_node }} because
             {{ $value }} fresh attempts claim it. Stale observations are
             excluded from ownership and alerted separately.
       - alert: GpuFaultStaleAttemptObservation
-        expr: gpu_fault_stale_attempt_observations > 0
+        expr: >-
+          max by (control_plane_cluster, region, cluster_id, gpu_node)
+          (gpu_fault_stale_attempt_observations) > 0
+        for: 2m
         labels:
           severity: warning
         annotations:
           summary: Stale active attempt observations remain
+          runbook_url: docs/管理员日常运维.md#gpufaultstaleattemptobservation
           description: >-
             Cluster {{ $labels.cluster_id }} GPU node
             {{ $labels.gpu_node }} retains {{ $value }} active-phase
             observations older than the ownership freshness window. They are
-            not eligible for node mutation ownership and should be
-            terminalized or cleaned.
+            excluded from node mutation ownership. Check the live training Pod,
+            Completion Watcher health/logs, and observation delivery; do not
+            delete Store rows to silence this warning.
+      # The fleet rollout fence refuses every destructive remediation for a
+      # cluster while a fleet deployment there is non-terminal. That is the right
+      # default and it was completely silent: a WARNING on whichever worker
+      # polled, and `gpu-fault-admin status` does not mention fleet deployments
+      # at all. On 2026-09-03 an upgrade created its deployment record, died
+      # before starting a wave, and fenced a live cluster for 36 hours.
+      #
+      # Age, not a count: a healthy regional roll legitimately holds a
+      # deployment open, so a count cannot tell working from stuck. 2h is well
+      # past the longest observed roll for this fleet (about 7 minutes for four
+      # p5en nodes) and far short of the hours a real stranding costs.
+      #
+      # `_never_started` is the diagnosis, not a second alert. It separates "the
+      # rollout is stuck mid-wave" from "nothing was ever in flight", which are
+      # different runbook entries, so it is carried in the description instead of
+      # firing on its own.
+      - alert: GpuFaultFleetRolloutFenceStuck
+        expr: >-
+          max by (control_plane_cluster, region, cluster_id)
+          (gpu_fault_fleet_rollout_fence_age_seconds) > 7200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: A fleet rollout has fenced destructive remediation for hours
+          runbook_url: docs/管理员日常运维.md#gpufaultfleetrolloutfencestuck
+          description: >-
+            Cluster {{ $labels.cluster_id }} has a non-terminal fleet deployment
+            {{ $value | humanizeDuration }} old, so every destructive
+            remediation there is fenced. Read
+            gpu_fault_fleet_rollout_never_started for the same cluster: nonzero
+            means no wave was ever started and the record was abandoned by its
+            creator. Terminalize it through the release engine; do not delete
+            Store rows and do not disable the fence.
+  # Every group above alerts on a component: a collector went quiet, a queue
+  # filled up, an executor crashed. None of them fires when every component is
+  # healthy and recovery still is not finishing — a fail-closed workflow parked
+  # in BLOCKED, a closed loop that takes an hour, an escalation e-mail nobody
+  # received, a remediation budget that never releases. Those are the outcomes
+  # the system exists to deliver, so they get their own group and their own
+  # thresholds, expressed against the closed-loop metrics the control plane
+  # already publishes.
+  - name: gpu-fault-recovery-outcome
+    rules:
+      # BLOCKED is the fail-closed terminal state: the workflow stopped because
+      # evidence, identity or workload state was not conclusive enough to keep
+      # mutating a node. It is a correct outcome, and it is also a GPU node that
+      # stays out of the training pool until an administrator acts. A single
+      # BLOCKED workflow is normal; a backlog means nobody is acting on them.
+      #
+      # This used to read `gpu_fault_workflow_total{status="BLOCKED"} > 3`, which
+      # is the trap `GpuFaultClosedLoopSlow` below documents, in its absolute
+      # form. That gauge counts every workflow ever persisted, and BLOCKED is
+      # terminal, so the bucket falls only when an operator runs
+      # `gpu-fault-admin workflow-reconcile` or the incident is archived out of
+      # the table. A backlog that was handled correctly therefore kept the
+      # expression true forever and re-notified every `repeat_interval`, while
+      # the description's "each one holds a GPU node" had already stopped being
+      # true. `gpu_fault_workflow_blocked_unreconciled` counts only the BLOCKED
+      # workflows with no verified restore successor -- the same predicate the
+      # release preflight uses to decide whether a BLOCKED record still holds a
+      # node -- so it drops on its own the moment scheduling is restored, and a
+      # value that stays above the threshold is a real, current backlog.
+      #
+      # `max by` rather than a bare expression: every control-plane replica
+      # publishes this same cluster-level aggregate, so unaggregated it produced
+      # one entry per replica for one fact. The `by` labels are the two
+      # per-series labels amp-alertmanager.yaml groups on; dropping them would
+      # degrade that grouping instead.
+      - alert: GpuFaultRecoveryBlockedBacklog
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_workflow_blocked_unreconciled) > 3
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Fail-closed recovery workflows are accumulating
+          runbook_url: docs/管理员日常运维.md#gpufaultrecoveryblockedbacklog
+          description: >-
+            {{ $value }} recovery workflows are BLOCKED with no verified restore
+            successor, so each one still holds a GPU node out of the training
+            pool. Read the blocking reason per workflow; do not clear BLOCKED by
+            editing Store rows.
+      # `gpu_fault_closed_loop_milestone_seconds` is emitted as `_count`/`_sum`
+      # over every persisted workflow, so its lifetime average never recovers
+      # once one slow incident lands. `delta` over a 6h window gives the mean
+      # for the workflows that reached the milestone recently instead. The
+      # window is long because containment milestones are rare events, and
+      # `clamp_min` keeps the denominator away from zero. Record retention can
+      # move the gauge down, in which case the ratio goes negative and the alert
+      # stays silent — a missed alert, never a false one.
+      #
+      # Both halves aggregate before `delta` for the same reason as the two rules
+      # around it: the summary is a Store-derived aggregate that every replica
+      # publishes, so a per-series ratio is the same number repeated once per
+      # replica, and a replica that restarts inside the window contributes a step
+      # from zero to the whole persisted history.
+      - alert: GpuFaultClosedLoopSlow
+        expr: >-
+          delta(
+            (
+              max by (control_plane_cluster, region)
+              (gpu_fault_closed_loop_milestone_seconds_sum{milestone="containment"})
+            )[6h:5m]
+          )
+          /
+          clamp_min(
+            delta(
+              (
+                max by (control_plane_cluster, region)
+                (gpu_fault_closed_loop_milestone_seconds_count{milestone="containment"})
+              )[6h:5m]
+            ),
+            1
+          )
+          > 900
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Recent GPU fault containment took over 15 minutes on average
+          runbook_url: docs/管理员日常运维.md#gpufaultclosedloopslow
+          description: >-
+            Containment is the first closed-loop milestone: the faulty GPU node
+            stops accepting new work. Detection-to-containment above 15 minutes
+            means later training attempts kept landing on a node already known
+            to be faulty.
+      # Notifications are how an administrator learns that a workflow needs a
+      # decision (GPU count change, spare exhaustion, mechanical check). A
+      # failed delivery is therefore a silent stall of the human half of the
+      # loop, which no component alert covers.
+      # `gpu_fault_notification_total` is a Store-derived gauge, not a per-Pod
+      # counter, so `delta` has to be taken over the aggregate: applied per
+      # series it also reports the step a restarted replica makes when its first
+      # scrape publishes the whole history at once. The subquery aggregates
+      # first and then measures the 15m change of that single series.
+      - alert: GpuFaultNotificationDeliveryFailing
+        expr: >-
+          delta(
+            (
+              max by (control_plane_cluster, region)
+              (gpu_fault_notification_total{status="FAILED"})
+            )[15m:1m]
+          ) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Business notification delivery is failing
+          runbook_url: docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing
+          description: >-
+            An administrator decision request was not delivered. Check the SNS
+            topic subscription state and the notification outbox depth; a
+            workflow waiting on that decision is not progressing.
+      # The remediation budget caps how many nodes the system mutates at once.
+      # Workflows waiting on it are correct behaviour under load and a stall
+      # when the budget is never released — for instance because a claim holder
+      # died without its lease expiring.
+      - alert: GpuFaultRemediationBudgetStarved
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_remediation_budget_waiting_workflows) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Recovery workflows have waited 30 minutes for remediation capacity
+          runbook_url: docs/管理员日常运维.md#gpufaultremediationbudgetstarved
+          description: >-
+            {{ $value }} workflows are held by a remediation budget. Compare
+            gpu_fault_remediation_budget_active_claims against the configured
+            scope limits and check whether an active claim belongs to a
+            workflow that is no longer making progress.

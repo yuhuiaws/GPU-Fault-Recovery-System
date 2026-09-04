@@ -7,6 +7,7 @@ from datetime import datetime
 from gpu_fault.store.shared.errors import NotFoundError
 
 if TYPE_CHECKING:
+    from gpu_fault.fleet_deployment import FleetDeployment
     from gpu_fault.regional import (
         RegionalRegistryHead,
         RegionalRegistryMember,
@@ -163,6 +164,17 @@ class MemoryFleetMixin:
         with self._lock:
             self._fleet_deployments[deployment.deployment_id] = deployment
 
+    def replace_fleet_deployment_if_matches(
+        self,
+        replacement: FleetDeployment,
+        expected: FleetDeployment | None,
+    ) -> bool:
+        with self._lock:
+            if self._fleet_deployments.get(replacement.deployment_id) != expected:
+                return False
+            self._fleet_deployments[replacement.deployment_id] = replacement
+            return True
+
     def get_fleet_deployment(self, deployment_id: str):
         with self._lock:
             deployment = self._fleet_deployments.get(deployment_id)
@@ -187,7 +199,11 @@ class MemoryFleetMixin:
                     item
                     for item in self._fleet_deployments.values()
                     if item.cluster_id == cluster_id
-                    and item.status.value not in {"SUCCEEDED", "FAILED"}
+                    and item.status.value
+                    not in {
+                        "SUCCEEDED",
+                        "FAILED",
+                    }
                 ),
                 key=lambda item: (
                     item.created_at,

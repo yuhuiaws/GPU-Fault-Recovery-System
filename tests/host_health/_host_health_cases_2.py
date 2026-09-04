@@ -616,3 +616,43 @@ def test_node_log_endpoint_classifies_mce_and_nccl() -> None:
         ]
 
     asyncio.run(scenario())
+
+
+def test_a_tcp_retransmit_raises_no_finding_and_ships_no_batch() -> None:
+    """Retransmits are congestion control, not an error counter.
+
+    Every other METRIC_RULES entry is an error counter where a delta of 1 is
+    genuinely abnormal, and the collector reports this one as a delta of
+    /proc/net/snmp RetransSegs. A threshold of 1.0 therefore fired on every
+    collection cycle on every node -- measured at ~155 RUN_DIAGNOSTICS
+    workflows an hour across a 4-node p5en fleet, each with its own incident.
+    """
+
+    assert "tcp_retransmits_delta" not in NodeHealthPolicy.METRIC_RULES
+    policy = NodeHealthPolicy(build_store())
+
+    findings = policy.evaluate_metrics(
+        host_telemetry_batch(
+            "tcp-retransmit-only",
+            NOW,
+            [HostMetricSample(name="tcp_retransmits_delta", value=4200)],
+        )
+    )
+
+    assert findings == [], "a retransmit delta must not mint a RUN_DIAGNOSTICS workflow"
+
+
+def test_genuine_network_error_counters_keep_their_finding() -> None:
+    """The removal is one metric, not the network category."""
+
+    for name in ("network_errors_delta", "network_drops_delta", "rdma_errors_delta"):
+        policy = NodeHealthPolicy(build_store())
+        findings = policy.evaluate_metrics(
+            host_telemetry_batch(
+                f"{name}-guard",
+                NOW,
+                [HostMetricSample(name=name, value=1, device="eth0")],
+            )
+        )
+        assert [item.metric_name for item in findings] == [name], (name, findings)
+        assert findings[0].recommended_action is RecoveryAction.RUN_DIAGNOSTICS

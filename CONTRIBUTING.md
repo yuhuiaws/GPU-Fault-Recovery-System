@@ -48,10 +48,13 @@ make regional-impact-plan BASE=origin/main
 image、schema/事务变化或跨越三个以上影响域时会fail closed并升级为完整门禁。
 统一staging release内部只计算一次带摘要的影响计划，测试执行和regional计划共同消费；
 只有计划要求PostgreSQL时才启动隔离PostgreSQL 16。
-受信本地production候选仍运行`make check`；GitHub Release只晋级已经由签名main CI
-gate证明等价static、coverage、artifact和PostgreSQL stress门禁的同commit候选，不在
-Release job重复测试。完整区域验收只跟随首次上线、重大架构变化或影响计划明确要求
-执行。规则与说明见
+受信本地production候选在个人commit或main候选不可用时运行等价本地完整门禁；该门禁把
+static、普通pytest和PostgreSQL stress并行执行，static内部再把Ruff、mypy、compile、
+架构、契约、文档、部署配置、YAML、Shell和安全检查拆成独立组；全部通过后再构建artifact。
+干净`HEAD == origin/main`可先验签并消费同commit main CI候选，GitHub Release同样只晋级
+已经由签名main CI gate证明等价static、coverage、artifact和PostgreSQL stress门禁的
+候选，不重复测试。dirty源码和个人clean commit不查询GitHub。完整区域验收只跟随首次
+上线、重大架构变化或影响计划明确要求执行。规则与说明见
 [变更影响与测试选择](docs/变更影响与测试选择.md)。
 
 管理员首次部署由一个ARN命令完成基础资源、release build和应用部署：
@@ -105,25 +108,49 @@ GitHub Actions从触发、OIDC/ECR、质量门禁、制品签名到`gpu-fault-re
 
 `gpu-fault-admin`由独立deploy-host distribution交付，不属于Control Plane Runtime
 wheel。只修改管理员部署代码时必须验证deploy-host bundle和deployment影响域；不得因此
-重建或滚动未变化的应用Runtime组件。
+重建或滚动未变化的应用Runtime组件。内容寻址deploy-host payload与Git commit授权分离；
+已有站点仅deploy-host变化时只更新部署机环境并执行只读preflight。
 
 `make check`的最终全量测试和`make test-parallel`默认使用4个worker、
 `--dist=worksteal`且不连接外部PostgreSQL。`make coverage`仍是本地单进程入口：
 先采集非PostgreSQL覆盖率，再串行追加隔离PostgreSQL 16测试库覆盖率，最后统一强制
-当前78%的floor。文档和CI契约测试由`make docs-check`、`make ci-tooling-check`
+当前78%的floor，并对`config/ci-unit-gate.json`的`coverage.module_floors`执行
+per-module floor。文档和CI契约测试由`make docs-check`、`make ci-tooling-check`
 独立执行，不重复计入coverage。
+
+单一仓库floor可以被覆盖良好的多数模块抬起来，让整族模块贴近零覆盖也照样通过；
+deployment-only的管理员模块正是这种形状，因为它们被每个runtime shard排除，
+只有合并报告知道它们的真实覆盖率。因此`coverage.module_floors`为每个
+deployment-only族同时声明group floor（整族不得被仓库其余部分抬起来）和file
+floor（族内某个覆盖良好的模块不得替兄弟模块背书）。新增的deployment-only源码
+文件必须落在某个group的glob内，否则`tests/test_ci_unit_gate.py`失败；某个group
+匹配不到任何被测文件同样是失败，避免模块改名后floor被静默作废。
 
 main CI把fresh门禁分成`runtime`、`deployment`、`fault_runner`和`postgres`四个逻辑
 域；其中runtime按稳定pytest nodeid哈希拆成`runtime_0..2`，因此共有六个并行物理
 shard。每个shard按自己的源码、测试、依赖和Runner环境计算内容身份，独立恢复、验签、
-重签和上传；聚合`unit` job最后执行`coverage combine`并统一强制78% floor，再生成
+重签和上传；聚合`unit` job最后执行`coverage combine`并统一强制78% floor与
+per-module floor，再生成
 fault report和签名unit gate。deploy-host-only管理员源码只进入deployment shard；
 文档或`.github/`变化由当前static验证，可复用六个历史shard。所有pytest shard保留
 `--durations`结构化证据。仓库已配置较高规格Runner时可设置`CI_TEST_RUNNER`及匹配的
 `CI_PYTEST_WORKERS`，未设置时保持`ubuntu-latest`和4个worker。
 
-覆盖率可以提高，不能通过调低`COVERAGE_FLOOR`、跳过shard或丢弃PostgreSQL stress
-掩盖未测试的新分支。
+覆盖率可以提高，不能通过调低`COVERAGE_FLOOR`、调低`coverage.module_floors`、
+跳过shard或丢弃PostgreSQL stress掩盖未测试的新分支。`file_floor`为0、group的
+globs为空或`file_floor`高于`group_floor`都会被配置校验直接拒绝，因为这种floor
+读起来像保证却永远不会失败。
+测试质量本身也有ratchet。`make private-test-coupling-check`限制测试跨public边界
+访问私有成员；`make test-source-assertion-check`限制测试把被测代码当文本断言，
+也就是`inspect.getsource(...)`或读取`.py`文件后grep字符串。这类断言只要实现继续
+用同样的写法就通过，行为坏掉时依然green，纯改名却red，应改成调用序列spy或可观察
+结果。少数文件确实在审计静态文本（CI门禁声明的source root、gate列表、worker上限），
+它们连同理由和site数记录在`test-source-assertion-baseline.json`，只能减不能增；
+新增文件直接失败，条目降到0也失败，避免baseline被静默作废。
+
+本地`make check`先运行并行static DAG，随后并行执行普通pytest与artifact构建；
+`tests/test_artifact_consistency.py`只在artifact分支执行一次，避免与尚未生成的`dist/`
+竞争。
 Make在checkout中检测到`.venv/bin/python`时会自动使用该解释器；源码包没有`.venv`
 时回退到`python3`，显式`PYTHON=...`始终优先。
 

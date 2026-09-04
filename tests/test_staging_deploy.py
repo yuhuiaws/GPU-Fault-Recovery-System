@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import staging_deploy
 
@@ -29,6 +30,26 @@ def _signing_material(root: Path) -> staging_deploy.SigningMaterial:
         password_file=password_file,
         password="password",
     )
+
+
+def _source_identities() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "sha256": "f" * 64,
+        "application": {"sha256": "a" * 64},
+        "deploy_host": {"sha256": "b" * 64, "bundle": {"sha256": "c" * 64}},
+    }
+
+
+def _live_evidence() -> dict[str, object]:
+    return {
+        "site_sha256": "d" * 64,
+        "release_id": "release-a",
+        "state_sha256": "e" * 64,
+        "phase": "complete",
+        "transaction_committed": True,
+        "next_deploy_kind": "NOOP",
+    }
 
 
 def test_signing_material_is_generated_once(
@@ -154,6 +175,80 @@ def test_existing_bundle_is_reused_without_build(
     ), "existing complete deploy-host bundle was not reused"
 
 
+def test_deploy_host_artifacts_are_content_addressed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(staging_deploy, "bundle_platform_id", lambda: "test-platform")
+
+    first = staging_deploy.deploy_host_artifacts(
+        tmp_path, payload_identity_sha256="a" * 64
+    )
+    repeated = staging_deploy.deploy_host_artifacts(
+        tmp_path, payload_identity_sha256="a" * 64
+    )
+    changed = staging_deploy.deploy_host_artifacts(
+        tmp_path, payload_identity_sha256="b" * 64
+    )
+
+    assert first == repeated
+    assert first.archive.parent.name == "a" * 64
+    assert changed.archive.parent != first.archive.parent
+
+
+def test_source_deploy_classification_separates_application_and_host_changes() -> None:
+    source = staging_deploy.SourceCheckout(
+        repository_root=Path("/repository"),
+        git_commit="b" * 40,
+        fingerprint="b" * 64,
+        snapshot=False,
+        isolated=True,
+    )
+    current = _source_identities()
+    previous = {"identities": _source_identities(), "source": {"fingerprint": "a" * 64}}
+
+    assert (
+        staging_deploy.classify_source_deploy(
+            previous, current, source=source, site_exists=True
+        )
+        == "QUALITY_ONLY"
+    )
+    host_changed = _source_identities()
+    host_changed["deploy_host"] = {"sha256": "d" * 64, "bundle": {"sha256": "e" * 64}}
+    assert (
+        staging_deploy.classify_source_deploy(
+            previous, host_changed, source=source, site_exists=True
+        )
+        == "DEPLOY_HOST_ONLY"
+    )
+    application_changed = _source_identities()
+    application_changed["application"] = {"sha256": "e" * 64}
+    assert (
+        staging_deploy.classify_source_deploy(
+            previous, application_changed, source=source, site_exists=True
+        )
+        == "APPLICATION_RELEASE"
+    )
+    assert (
+        staging_deploy.classify_source_deploy(
+            previous, current, source=source, site_exists=False
+        )
+        == "APPLICATION_RELEASE"
+    )
+    previous["source"] = {"fingerprint": source.fingerprint}
+    assert (
+        staging_deploy.classify_source_deploy(
+            previous, current, source=source, site_exists=True
+        )
+        == "APPLICATION_RELEASE"
+    )
+    assert (
+        staging_deploy.classify_source_deploy(
+            previous, current, source=source, site_exists=True, live_matches=True
+        )
+        == "UNCHANGED"
+    )
+
+
 def test_deploy_host_wheelhouse_cache_is_lock_scoped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -213,6 +308,54 @@ def test_deploy_host_venv_is_bound_to_managed_state(
         result.joinpath("gpu-fault-managed-state-dir.json").stat().st_mode & 0o777
         == 0o600
     )
+
+
+def test_deploy_host_only_checkout_reuses_signed_application_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous = tmp_path / "previous"
+    current = tmp_path / "current"
+    state = tmp_path / "state"
+    for root in (previous, current, state):
+        root.mkdir()
+    previous_dist = previous / "dist"
+    previous_dist.mkdir()
+    for name in (
+        "current-release.json",
+        "current-attestation.json",
+        "current-attestation.bundle.json",
+    ):
+        (previous_dist / name).write_text(name, encoding="utf-8")
+    site = state / "site.yaml"
+    site.write_text(
+        yaml.safe_dump(
+            {"kind": "RegionalSite", "spec": {"repositoryRoot": str(previous)}},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    site.chmod(0o600)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        staging_deploy,
+        "_run",
+        lambda arguments, **_kwargs: commands.append(list(arguments)) or "",
+    )
+
+    original = staging_deploy.prepare_deploy_host_only_checkout(
+        repository_root=current, state_dir=state, signing=_signing_material(state)
+    )
+
+    document = yaml.safe_load(site.read_text(encoding="utf-8"))
+    assert document["spec"]["repositoryRoot"] == str(current)
+    assert (current / "dist/current-release.json").read_text(encoding="utf-8") == (
+        "current-release.json"
+    )
+    assert "--allow-staging-release" in commands[0]
+    staging_deploy.restore_site_file(state, original)
+    assert yaml.safe_load(site.read_text(encoding="utf-8"))["spec"][
+        "repositoryRoot"
+    ] == str(previous)
 
 
 def test_partial_bundle_is_removed_and_rebuilt(
@@ -281,6 +424,36 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
         staging_deploy, "ensure_signing_material", lambda *_args, **_kwargs: signing
     )
     monkeypatch.setattr(
+        staging_deploy,
+        "source_deploy_identity",
+        lambda *_args, **_kwargs: _source_identities(),
+    )
+    monkeypatch.setattr(
+        staging_deploy, "restore_trusted_ci_candidate", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        staging_deploy, "load_successful_source_deploy", lambda *_args, **_kwargs: None
+    )
+
+    class ApplyLock:
+        def __enter__(self):
+            calls.append(("lock-enter", None))
+            return 17
+
+        def __exit__(self, *_args):
+            calls.append(("lock-exit", None))
+
+    monkeypatch.setattr(
+        staging_deploy, "site_operation_lock", lambda *_args, **_kwargs: ApplyLock()
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "record_successful_source_deploy",
+        lambda *_args, **_kwargs: (
+            calls.append(("success", None)) or state / "source-deploy-success.json"
+        ),
+    )
+    monkeypatch.setattr(
         staging_deploy, "deploy_host_artifacts", lambda *_args, **_kwargs: artifacts
     )
     monkeypatch.setattr(
@@ -298,6 +471,11 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
         staging_deploy,
         "run_admin_deploy",
         lambda **kwargs: calls.append(("deploy", kwargs)),
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "collect_live_deploy_evidence",
+        lambda **_kwargs: _live_evidence(),
     )
     arguments = argparse.Namespace(
         repo_root=repository,
@@ -319,12 +497,110 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
     assert deploy_call[1]["gpu_cluster_arns"] == tuple(arguments.gpu_cluster_arn)
     assert deploy_call[1]["staging_only_release"] is False
     assert deploy_call[1]["impact_base"] == "origin/main"
+    event_names = [name for name, _value in calls]
+    assert event_names.index("lock-enter") < event_names.index("deploy"), (
+        "application deploy started before the top-level apply lock"
+    )
+    assert event_names.index("deploy") < event_names.index("success"), (
+        "source success authorization was written before application deploy"
+    )
+    assert event_names.index("success") < event_names.index("lock-exit"), (
+        "source success authorization escaped the top-level apply lock"
+    )
     state_value = json.loads(
         (state / staging_deploy.SOURCE_DEPLOY_STATE).read_text(encoding="utf-8")
     )
     assert state_value["source_repository_root"] == str(repository)
     assert state_value["release_ref"] == source.git_commit
     assert state_value["source_isolated"] is True
+
+
+def test_unchanged_successful_source_does_not_query_ci_or_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "site.yaml").write_text("kind: RegionalSite\n", encoding="utf-8")
+    venv = state / "deployer-venv/bin"
+    venv.mkdir(parents=True)
+    (venv / "gpu-fault-admin").write_text("", encoding="utf-8")
+    source = staging_deploy.SourceCheckout(
+        repository_root=repository,
+        git_commit="a" * 40,
+        fingerprint="a" * 64,
+        snapshot=False,
+        isolated=True,
+    )
+    signing = _signing_material(state)
+    previous = {
+        "schema_version": 1,
+        "status": "PASSED",
+        "identities": _source_identities(),
+        "source": {"fingerprint": source.fingerprint, "git_commit": source.git_commit},
+        "live": _live_evidence(),
+    }
+    monkeypatch.setattr(
+        staging_deploy, "prepare_source_checkout", lambda *_args, **_kwargs: source
+    )
+    monkeypatch.setattr(staging_deploy, "validate_source_checkout", lambda _root: None)
+    monkeypatch.setattr(
+        staging_deploy,
+        "source_deploy_identity",
+        lambda *_args, **_kwargs: _source_identities(),
+    )
+    monkeypatch.setattr(
+        staging_deploy, "ensure_signing_material", lambda *_args, **_kwargs: signing
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "load_successful_source_deploy",
+        lambda *_args, **_kwargs: previous,
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "restore_trusted_ci_candidate",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unchanged source queried the main CI candidate"
+        ),
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "run_source_impact_gate",
+        lambda *_args, **_kwargs: pytest.fail("unchanged source reran impact tests"),
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "run_admin_deploy",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unchanged source entered application deploy"
+        ),
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "record_successful_source_deploy",
+        lambda *_args, **_kwargs: state / "source-deploy-success.json",
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "collect_live_deploy_evidence",
+        lambda **_kwargs: _live_evidence(),
+    )
+
+    result = staging_deploy.deploy(
+        argparse.Namespace(
+            repo_root=repository,
+            state_dir=state,
+            cpu_cluster_arn="cpu",
+            gpu_cluster_arn=["gpu"],
+            admin_email="operations@example.com",
+            base="origin/main",
+        )
+    )
+
+    assert result["deploy_mode"] == "UNCHANGED"
+    assert result["trusted_ci_candidate"] is None
 
 
 def test_staging_state_must_be_outside_repository(tmp_path: Path) -> None:
@@ -397,6 +673,22 @@ def test_source_scan_runs_before_snapshot_and_bundle(
         staging_deploy, "ensure_signing_material", lambda *_args, **_kwargs: signing
     )
     monkeypatch.setattr(
+        staging_deploy,
+        "source_deploy_identity",
+        lambda *_args, **_kwargs: _source_identities(),
+    )
+    monkeypatch.setattr(
+        staging_deploy, "restore_trusted_ci_candidate", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        staging_deploy, "load_successful_source_deploy", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "record_successful_source_deploy",
+        lambda *_args, **_kwargs: state / "source-deploy-success.json",
+    )
+    monkeypatch.setattr(
         staging_deploy, "deploy_host_artifacts", lambda *_args, **_kwargs: artifacts
     )
     monkeypatch.setattr(
@@ -416,6 +708,11 @@ def test_source_scan_runs_before_snapshot_and_bundle(
         lambda *_args, **_kwargs: state / "venv",
     )
     monkeypatch.setattr(staging_deploy, "run_admin_deploy", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        staging_deploy,
+        "collect_live_deploy_evidence",
+        lambda **_kwargs: _live_evidence(),
+    )
 
     staging_deploy.deploy(
         argparse.Namespace(
@@ -452,6 +749,7 @@ def test_staging_snapshot_authorization_is_passed_to_admin(
         admin_email="operations@example.com",
         staging_only_release=True,
         impact_base="origin/release",
+        lock_fd=7,
     )
 
     assert "--profile-approval" not in commands[0]

@@ -19,7 +19,11 @@ phases:
     name: 身份边界
     maintenance_window: 分级
     entries:
-      - range: {prefix: AUTH, start: 1, end: 15}
+      # AUTH-012 is in do_not_run, not here: it is SUPERSEDED by AUTH-016 and
+      # has no driver, so leaving it in the order would make AUTH-013 wait on
+      # predecessor evidence that can never be produced.
+      - range: {prefix: AUTH, start: 1, end: 11}
+      - range: {prefix: AUTH, start: 13, end: 16}
   - sequence: 3
     name: 训练工作负载基线
     maintenance_window: 是
@@ -132,3 +136,7 @@ phases:
 do_not_run:
   - case: GF-REGIONAL-DESTR-004
     reason: provider replace 已由架构与 IAM 明确禁止，该用例已作废。
+  - case: GF-REGIONAL-AUTH-012
+    reason: >-
+      集群 token 轮换已改为重叠窗口，"测量失败窗口"的前提不再成立，
+      由 GF-REGIONAL-AUTH-016 取代。

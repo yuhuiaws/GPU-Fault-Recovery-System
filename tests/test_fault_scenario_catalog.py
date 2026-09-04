@@ -801,7 +801,7 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
         case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
     ]
 
-    assert len(regional) == 153
+    assert len(regional) == 154
     assert all((case.get("evidence") or {}).get("verdict") for case in regional)
     assert {(case["evidence"]["verdict"]) for case in regional} == {
         "NOT_RUN",
@@ -820,6 +820,7 @@ def test_regional_cases_use_their_maximum_side_effect_risk() -> None:
     expected = {
         "GF-REGIONAL-AUTH-007": "live-service-action",
         "GF-REGIONAL-AUTH-012": "live-service-action",
+        "GF-REGIONAL-AUTH-016": "live-service-action",
         "GF-REGIONAL-E2E-001": "live-workload-restart",
         "GF-REGIONAL-E2E-002": "live-workload-restart",
         "GF-REGIONAL-COLLECT-008": "destructive",
@@ -847,8 +848,189 @@ def test_catalog_has_only_structured_json_safe_evidence() -> None:
         evidence = case.get("evidence")
         if evidence is None:
             continue
-        assert set(evidence) == {"verdict"}
+        assert set(evidence) <= runner.EVIDENCE_FIELDS, case["id"]
+        assert "verdict" in evidence, case["id"]
         json.dumps(evidence)
+
+
+def test_evidence_bindings_carry_digests_and_nothing_else() -> None:
+    """The binding must not become a back door for execution details.
+
+    `docs/evidence/fault/README.md` keeps run times, report paths, cluster names
+    and operators out of the public catalog. A digest identifies a code state
+    without naming anything about the environment it ran in, which is the only
+    reason `evidence.verified` can exist here at all.
+    """
+    raw = yaml.safe_load(CATALOG.read_text(encoding="utf-8"))
+
+    for case in raw["test_cases"]:
+        verified = (case.get("evidence") or {}).get("verified")
+        if verified is None:
+            continue
+        assert set(verified) <= runner.VERIFIED_FIELDS, case["id"]
+        values = [verified["case_digest"], *(verified.get("components") or {}).values()]
+        assert all(runner.SHA256_PATTERN.match(value) for value in values), case["id"]
+
+
+def test_pass_verdicts_are_bound_to_the_current_case_definition() -> None:
+    """Every recorded `PASS` still describes the case text in the catalog."""
+    passed = [
+        case
+        for case in load_catalog(CATALOG)
+        if (case.get("evidence") or {}).get("verdict") == "PASS"
+    ]
+
+    assert passed, "the binding contract needs at least one PASS case to guard"
+    for case in passed:
+        assert case["evidence"]["verified"]["case_digest"] == (
+            runner.case_definition_digest(case)
+        ), case["id"]
+
+
+def test_case_definition_digest_ignores_verdict_and_scheduling() -> None:
+    """Recording a result or retuning the scheduler must not break a binding."""
+    case = next(case for case in load_catalog(CATALOG) if case["id"] == "GF-POL-001")
+    baseline = runner.case_definition_digest(case)
+
+    assert (
+        runner.case_definition_digest(
+            {**case, "evidence": {"verdict": "NOT_RUN"}, "execution": {"locks": []}}
+        )
+        == baseline
+    )
+    assert runner.case_definition_digest({**case, "injection": "something else"}) != (
+        baseline
+    )
+
+
+def test_unbound_pass_cases_match_the_shrinking_allowlist() -> None:
+    """The allowlist is a ratchet, so it must not keep ids that moved on."""
+    unbound = {
+        case["id"]
+        for case in load_catalog(CATALOG)
+        if (case.get("evidence") or {}).get("verdict") == "PASS"
+        and "components" not in case["evidence"]["verified"]
+    }
+
+    assert unbound == set(runner.EVIDENCE_UNBOUND_PASS_CASES)
+
+
+def test_verified_components_cover_every_shipped_component() -> None:
+    from scripts.component_wheels import APPLICATION_COMPONENT_NAMES
+
+    assert set(runner.VERIFIED_COMPONENTS) == set(APPLICATION_COMPONENT_NAMES)
+
+
+def _case_with(extra: str, *, case_id: str = "GF-STATUS-001") -> str:
+    return (
+        f"""\
+schema_version: 1
+test_cases:
+  - id: {case_id}
+    title: status contract
+    category: test
+    level: unit
+    risk: non-destructive
+    problem: invalid status
+    injection: none
+    expected: [must validate]
+    automation: manual
+    procedure: docs/故障模拟测试手册.md#1-范围
+"""
+        + extra
+    )
+
+
+# A sha256-shaped placeholder that YAML still reads as a string: `"0" * 64`
+# parses as the integer 0 and would fail the wrong assertion.
+DIGEST = "a" * 64
+
+
+@pytest.mark.parametrize(
+    ("extra", "case_id", "message"),
+    [
+        (
+            "    evidence:\n      verdict: PASS\n",
+            "GF-STATUS-001",
+            "requires an evidence.verified mapping",
+        ),
+        (
+            f"    evidence:\n      verdict: PASS\n      verified:\n"
+            f"        case_digest: {DIGEST}\n"
+            f"        components:\n          control_plane: {DIGEST}\n",
+            "GF-STATUS-001",
+            "does not describe this case any more",
+        ),
+        (
+            f"    evidence:\n      verdict: NOT_RUN\n      verified:\n"
+            f"        case_digest: {DIGEST}\n",
+            "GF-STATUS-001",
+            "evidence.verified requires evidence.verdict=PASS",
+        ),
+        (
+            "    evidence:\n      verdict: PASS\n      verified:\n"
+            "        case_digest: not-a-digest\n",
+            "GF-STATUS-001",
+            "must be a lowercase sha256 digest",
+        ),
+        (
+            f"    evidence:\n      verdict: PASS\n      verified:\n"
+            f"        case_digest: {DIGEST}\n        note: ran fine\n",
+            "GF-STATUS-001",
+            "evidence.verified has unknown fields",
+        ),
+    ],
+)
+def test_catalog_rejects_broken_pass_bindings(
+    tmp_path: Path, extra: str, case_id: str, message: str
+) -> None:
+    path = tmp_path / "fault-scenarios.yaml"
+    path.write_text(_case_with(extra, case_id=case_id), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_catalog(path)
+
+
+def test_missing_component_binding_is_rejected_outside_the_allowlist(
+    tmp_path: Path,
+) -> None:
+    """A new PASS cannot be recorded without naming the code it ran on."""
+    path = tmp_path / "fault-scenarios.yaml"
+    path.write_text(_case_with(""), encoding="utf-8")
+    case = load_catalog(path)[0]
+    digest = runner.case_definition_digest(case)
+    path.write_text(
+        _case_with(
+            f"    evidence:\n      verdict: PASS\n"
+            f"      verified:\n        case_digest: {digest}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="components must name exactly"):
+        load_catalog(path)
+
+
+def test_legacy_unbound_case_cannot_have_components_backfilled(tmp_path: Path) -> None:
+    """Stamping today's digest on a 2026-07 live run would invent evidence."""
+    case_id = sorted(runner.EVIDENCE_UNBOUND_PASS_CASES)[0]
+    path = tmp_path / "fault-scenarios.yaml"
+    path.write_text(_case_with("", case_id=case_id), encoding="utf-8")
+    digest = runner.case_definition_digest(load_catalog(path)[0])
+    path.write_text(
+        _case_with(
+            f"    evidence:\n      verdict: PASS\n      verified:\n"
+            f"        case_digest: {digest}\n        components:\n"
+            + "".join(
+                f"          {name}: {DIGEST}\n" for name in runner.VERIFIED_COMPONENTS
+            ),
+            case_id=case_id,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="cannot be backfilled"):
+        load_catalog(path)
 
 
 def test_catalog_contains_no_real_infrastructure_identities() -> None:
@@ -871,7 +1053,7 @@ def test_catalog_contains_no_real_infrastructure_identities() -> None:
         ),
         ("    evidence:\n      verdict: SUPERSEDED\n", "superseded_by"),
         (
-            "    evidence:\n      verdict: PASS\n    superseded_by: GF-OTHER\n",
+            "    evidence:\n      verdict: NOT_RUN\n    superseded_by: GF-OTHER\n",
             "superseded_by requires evidence.verdict=SUPERSEDED",
         ),
     ],
@@ -880,24 +1062,7 @@ def test_catalog_rejects_invalid_current_status_contract(
     tmp_path: Path, extra: str, message: str
 ) -> None:
     path = tmp_path / "fault-scenarios.yaml"
-    path.write_text(
-        """\
-schema_version: 1
-test_cases:
-  - id: GF-STATUS-001
-    title: status contract
-    category: test
-    level: unit
-    risk: non-destructive
-    problem: invalid status
-    injection: none
-    expected: [must validate]
-    automation: manual
-    procedure: docs/故障模拟测试手册.md#1-范围
-"""
-        + extra,
-        encoding="utf-8",
-    )
+    path.write_text(_case_with(extra), encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
         load_catalog(path)

@@ -33,8 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from gpu_fault.admin_config import AdminConfig, default_admin_config  # noqa: E402
-
+from gpu_fault.admin.config import AdminConfig, default_admin_config  # noqa: E402
 
 CONTROL_PLANE_RUNTIME_PATH = (
     "/opt/gpu-fault/control-plane/bin:/opt/app-root/bin:"

@@ -16,6 +16,7 @@ from gpu_fault.collector_requirements import (
     CollectorServices,
     ReportedCollectorServices,
 )
+from gpu_fault.digests import normalized_sha256
 from gpu_fault.fleet_compatibility import (
     CURRENT_AGENT_PROTOCOL_VERSION as CURRENT_AGENT_PROTOCOL_VERSION,
 )
@@ -26,12 +27,41 @@ from gpu_fault.fleet_compatibility import (
     NODE_ACTION_KEY_VERSION_SHARED as NODE_ACTION_KEY_VERSION_SHARED,
 )
 from gpu_fault.fleet_compatibility import (
-    SHA256_PATTERN,
+    FleetCompatibilityPolicy as FleetCompatibilityPolicy,
+)
+from gpu_fault.fleet_compatibility import (
     pin_value_is_accepted,
     rollout_compatibility_reasons,
 )
-from gpu_fault.fleet_compatibility import (
-    FleetCompatibilityPolicy as FleetCompatibilityPolicy,
+from gpu_fault.fleet_deployment import (
+    DeploymentNode as DeploymentNode,
+)
+from gpu_fault.fleet_deployment import (
+    DeploymentNodeStatus as DeploymentNodeStatus,
+)
+from gpu_fault.fleet_deployment import (
+    DeploymentNodeUpdate as DeploymentNodeUpdate,
+)
+from gpu_fault.fleet_deployment import (
+    DeploymentStatus as DeploymentStatus,
+)
+from gpu_fault.fleet_deployment import (
+    DeploymentWaveLease as DeploymentWaveLease,
+)
+from gpu_fault.fleet_deployment import (
+    FleetDeployment as FleetDeployment,
+)
+from gpu_fault.fleet_deployment import (
+    FleetDeploymentRequest as FleetDeploymentRequest,
+)
+from gpu_fault.fleet_deployment import (
+    active_deployment_wave as active_deployment_wave,
+)
+from gpu_fault.fleet_deployment import (
+    create_deployment_record as create_deployment_record,
+)
+from gpu_fault.fleet_deployment import (
+    deployment_status as deployment_status,
 )
 from gpu_fault.fleet_endpoint import (
     DEFAULT_AGENT_ENDPOINT_PORTS,
@@ -41,17 +71,23 @@ from gpu_fault.fleet_endpoint import (
 from gpu_fault.fleet_endpoint import (
     parse_endpoint_networks as parse_endpoint_networks,
 )
-from gpu_fault.fleet_deployment import (
-    DeploymentNode as DeploymentNode,
-    DeploymentNodeStatus as DeploymentNodeStatus,
-    DeploymentNodeUpdate as DeploymentNodeUpdate,
-    DeploymentStatus as DeploymentStatus,
-    DeploymentWaveLease as DeploymentWaveLease,
-    FleetDeployment as FleetDeployment,
-    FleetDeploymentRequest as FleetDeploymentRequest,
-    active_deployment_wave as active_deployment_wave,
-    create_deployment_record as create_deployment_record,
-    deployment_status as deployment_status,
+from gpu_fault.fleet_registry_deployments import (
+    cancel_deployment as cancel_fleet_deployment,
+)
+from gpu_fault.fleet_registry_deployments import (
+    reconcile_deployment as reconcile_fleet_deployment,
+)
+from gpu_fault.fleet_registry_deployments import (
+    reconcile_deployments as reconcile_fleet_deployments,
+)
+from gpu_fault.fleet_registry_deployments import (
+    retry_failed_deployment as retry_fleet_deployment,
+)
+from gpu_fault.fleet_registry_deployments import (
+    start_next_wave as start_fleet_wave,
+)
+from gpu_fault.fleet_registry_deployments import (
+    update_deployment_node as update_fleet_deployment_node,
 )
 from gpu_fault.installation_inventory import (
     InstalledUnitInventory,
@@ -130,12 +166,7 @@ class AgentHeartbeat(StrictModel):
     )
     @classmethod
     def validate_digest(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.lower()
-        if not SHA256_PATTERN.fullmatch(normalized):
-            raise ValueError("digest must be a SHA-256 hex value")
-        return normalized
+        return normalized_sha256(value)
 
 
 class SignedAgentHeartbeat(StrictModel):
@@ -389,7 +420,17 @@ class FleetRegistry:
                 existing = None
             record = self._next_agent_record(heartbeat, existing, now)
             if self.store.replace_agent_if_matches(record, existing):
-                self._reconcile_deployments(record)
+                lease_was_stale = existing is not None and (
+                    existing.lease_expires_at is None
+                    or existing.lease_expires_at <= now
+                )
+                if (
+                    existing is None
+                    or existing.identity != record.identity
+                    or existing.lifecycle_state is not record.lifecycle_state
+                    or lease_was_stale
+                ):
+                    self._reconcile_deployments(record)
                 return record
         raise ValueError("agent heartbeat conflicted with concurrent updates")
 
@@ -933,168 +974,46 @@ class FleetRegistry:
         *,
         from_heartbeat: bool = False,
     ) -> FleetDeployment:
-        deployment = self.store.get_fleet_deployment(deployment_id)
-        current = next(
-            (item for item in deployment.nodes if item.node_id == node_id),
-            None,
+        return update_fleet_deployment_node(
+            self,
+            deployment_id,
+            node_id,
+            update,
+            from_heartbeat=from_heartbeat,
         )
-        if current is None:
-            raise ValueError("node is not part of deployment")
-        if update.status is DeploymentNodeStatus.READY and not from_heartbeat:
-            raise ValueError("READY can only be set by a matching agent heartbeat")
-        if update.status is DeploymentNodeStatus.FAILED and current.status not in {
-            DeploymentNodeStatus.INSTALLING,
-            DeploymentNodeStatus.FAILED,
-        }:
-            raise ValueError("only an INSTALLING node can be marked FAILED")
-        if (
-            not from_heartbeat
-            and update.status is not current.status
-            and (
-                current.status,
-                update.status,
-            )
-            not in {
-                (
-                    DeploymentNodeStatus.PENDING,
-                    DeploymentNodeStatus.INSTALLING,
-                ),
-                (
-                    DeploymentNodeStatus.INSTALLING,
-                    DeploymentNodeStatus.FAILED,
-                ),
-            }
-        ):
-            raise ValueError(
-                f"invalid deployment node transition "
-                f"{current.status.value}->{update.status.value}"
-            )
-        if (
-            update.status is DeploymentNodeStatus.INSTALLING
-            and current.status is not DeploymentNodeStatus.INSTALLING
-        ):
-            active_wave = self._active_wave(deployment)
-            if active_wave is None or node_id not in active_wave:
-                raise ValueError("node is not in the active deployment wave")
-            installing = sum(
-                item.status is DeploymentNodeStatus.INSTALLING
-                for item in deployment.nodes
-            )
-            if installing >= deployment.max_unavailable:
-                raise ValueError("deployment max_unavailable would be exceeded")
-        now = self.now()
-        nodes = [
-            item.model_copy(
-                update={
-                    "status": update.status,
-                    "reason": update.reason,
-                    "updated_at": now,
-                }
-            )
-            if item.node_id == node_id
-            else item
-            for item in deployment.nodes
-        ]
-        deployment = deployment.model_copy(
-            update={
-                "nodes": nodes,
-                "status": self._deployment_status(nodes),
-                "updated_at": now,
-            }
-        )
-        self.store.save_fleet_deployment(deployment)
-        return deployment
 
     def start_next_wave(self, deployment_id: str) -> DeploymentWaveLease:
         with self._lock:
             return self._start_next_wave(deployment_id)
 
+    def retry_failed_deployment(self, deployment_id: str) -> FleetDeployment:
+        with self._lock:
+            return self._retry_failed_deployment(deployment_id)
+
+    def cancel_deployment(
+        self,
+        deployment_id: str,
+        *,
+        reason: str,
+    ) -> FleetDeployment:
+        with self._lock:
+            return cancel_fleet_deployment(self, deployment_id, reason=reason)
+
+    def _retry_failed_deployment(self, deployment_id: str) -> FleetDeployment:
+        return retry_fleet_deployment(self, deployment_id)
+
     def _start_next_wave(self, deployment_id: str) -> DeploymentWaveLease:
-        deployment = self.store.get_fleet_deployment(deployment_id)
-        if deployment.status is DeploymentStatus.SUCCEEDED:
-            raise ValueError("deployment is already complete")
-        failed = [
-            item.node_id
-            for item in deployment.nodes
-            if item.status is DeploymentNodeStatus.FAILED
-        ]
-        if failed:
-            raise ValueError("deployment has failed nodes: " + ",".join(failed))
-        by_node = {item.node_id: item.status for item in deployment.nodes}
-        for wave_index, wave in enumerate(deployment.waves):
-            if all(by_node[node_id] is DeploymentNodeStatus.READY for node_id in wave):
-                continue
-            installing = [
-                node_id
-                for node_id in wave
-                if by_node[node_id] is DeploymentNodeStatus.INSTALLING
-            ]
-            if installing:
-                return DeploymentWaveLease(
-                    deployment_id=deployment_id,
-                    wave_index=wave_index,
-                    node_ids=installing,
-                    issued_at=self.now(),
-                )
-            pending = [
-                node_id
-                for node_id in wave
-                if by_node[node_id] is DeploymentNodeStatus.PENDING
-            ]
-            if not pending:
-                raise ValueError("active deployment wave has no pending nodes")
-            for node_id in pending:
-                self.update_deployment_node(
-                    deployment_id,
-                    node_id,
-                    DeploymentNodeUpdate(status=DeploymentNodeStatus.INSTALLING),
-                )
-            return DeploymentWaveLease(
-                deployment_id=deployment_id,
-                wave_index=wave_index,
-                node_ids=pending,
-                issued_at=self.now(),
-            )
-        raise ValueError("deployment has no runnable wave")
+        return start_fleet_wave(self, deployment_id)
 
     def _reconcile_deployments(self, record: AgentRecord) -> None:
-        for deployment in self.store.list_active_fleet_deployments(record.cluster_id):
-            self._reconcile_deployment(deployment, record)
+        reconcile_fleet_deployments(self, record)
 
     def _reconcile_deployment(
         self,
         deployment: FleetDeployment,
         record: AgentRecord,
     ) -> None:
-        if record.lifecycle_state is not AgentLifecycleState.ACTIVE:
-            return
-        target = next(
-            (item for item in deployment.nodes if item.node_id == record.node_id),
-            None,
-        )
-        if target is None:
-            return
-        expected = (
-            deployment.desired_agent_protocol_version,
-            deployment.desired_agent_version,
-            deployment.desired_artifact_sha256,
-            deployment.desired_compatibility_digest
-            or deployment.desired_artifact_sha256,
-            deployment.desired_bundle_sha256,
-            deployment.desired_template_sha256,
-            deployment.desired_policy_version,
-            deployment.desired_runtime_profile_version,
-            deployment.desired_config_digest,
-        )
-        if record.identity != expected:
-            return
-        with self._lock:
-            self._update_deployment_node(
-                deployment.deployment_id,
-                record.node_id,
-                DeploymentNodeUpdate(status=DeploymentNodeStatus.READY),
-                from_heartbeat=True,
-            )
+        reconcile_fleet_deployment(self, deployment, record)
 
 
 class BarrierCoordinator:

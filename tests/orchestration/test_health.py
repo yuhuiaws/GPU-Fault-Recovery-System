@@ -317,6 +317,64 @@ def test_host_finding_does_not_queue_behind_evidence_only_work(
     assert reboot.predecessor_workflow_id is None
 
 
+def test_an_unqueued_reboot_does_not_take_the_incident_from_the_open_workflow(
+    context: ApplicationContext,
+) -> None:
+    """The reason this family needs no retired-generation audit of its own.
+
+    A workflow whose incident stops naming it is unclosable by anything on the
+    ingest path -- that is the 2026-09-04 wedge -- so it matters that this family
+    cannot produce one. It cannot, and not because of the predecessor link:
+    ``NodeHealthPlanBuilder`` builds a *fresh* ``FaultIncident`` per finding with
+    no workflow pointer at all, so the reboot above gets its own incident and the
+    diagnostics workflow keeps the one that names it. There is no pointer to move
+    and nothing is displaced.
+
+    Pinned because the ingest-side half of the fix rests on it. If a later change
+    lets this family re-plan an existing incident onto a new workflow -- which is
+    the shape that stranded a ``RESTART_APP`` generation with an open
+    ``STOP_WORKLOADS`` command -- it has to fail here rather than surface as a
+    record only ``WorkflowDispatcher``'s revocation sweep can clean up.
+    """
+
+    diag_incident, diagnostics = context.orchestrator.ingest_node_health(
+        node_health_finding(
+            "finding-diagnose-then-reboot",
+            "diagnose-then-reboot",
+            observed_at=NOW,
+            category=NodeHealthCategory.GPU,
+            severity="warning",
+            metric_name="dcgm_xid_errors",
+            reason="synthetic diagnostics-only finding",
+            recommended_action=RecoveryAction.RUN_DIAGNOSTICS,
+            runtime_profile_version="simulated-v1",
+            workload_state=WorkloadState.IDLE,
+        )
+    )
+    assert diagnostics is not None
+    context.store.save_workflow(
+        copy_model(
+            diagnostics,
+            status=WorkflowStatus.RUNNING,
+            not_before=None,
+            execution_owner_id="executor-1",
+        )
+    )
+
+    reboot_incident, reboot = context.orchestrator.ingest_node_health(
+        _inventory_mismatch_finding(event_id="inventory-retires-diag")
+    )
+
+    assert reboot is not None
+    assert reboot_incident.incident_id != diag_incident.incident_id
+    assert reboot_incident.workflow_request_id == reboot.request_id
+    held = context.store.get_incident(diag_incident.incident_id)
+    assert held.workflow_request_id == diagnostics.request_id, (
+        "the open workflow must keep the incident that names it, or nothing on "
+        "the ingest path can ever close it"
+    )
+
+
 def test_site_replacement_finding_creates_full_active_workflow(
     context: ApplicationContext,
 ) -> None:

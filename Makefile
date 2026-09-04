@@ -18,6 +18,7 @@ COVERAGE_SHARD ?=
 COVERAGE_SHARD_ROOT ?= artifacts/coverage-shards/$(COVERAGE_SHARD)
 COVERAGE_SHARDS_ROOT ?= artifacts/coverage-shards
 COVERAGE_COMBINED_ROOT ?= artifacts/coverage-combined
+COVERAGE_LOCAL_JSON ?= artifacts/coverage-local.json
 COVERAGE_INCLUDE_STRESS ?= 0
 BASE ?= origin/main
 COSIGN ?= cosign
@@ -65,16 +66,40 @@ POSTGRES_TESTS = \
 	tests/store/test_store_contracts.py
 COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS) $(POSTGRES_TESTS),--ignore=$(test))
 
-.PHONY: test test-postgres test-postgres-stress test-parallel test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-shuffled test-parallel test-parallel-release test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check check-static check-static-sequential python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check test-source-assertion-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check doc-anchor-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
 
 test:
 	$(PYTHON) -m pytest
 
+# Same suite as test-parallel-release, but with the collection order shuffled,
+# so a test that quietly depends on another one running first shows up here
+# instead of on the day an unrelated test is added. The seed is drawn HERE and
+# exported, never inside conftest.py: every xdist worker runs the collection
+# hook, and a seed drawn per process would make the workers disagree about the
+# collection, which xdist aborts on. Pass GPU_FAULT_TEST_SHUFFLE_SEED=<n> to
+# replay a specific red run; the seed is printed here and in the pytest header.
+test-shuffled:
+	@seed="$${GPU_FAULT_TEST_SHUFFLE_SEED:-$$($(PYTHON) -c 'import secrets; print(secrets.randbelow(2 ** 32))')}"; \
+		printf 'GPU_FAULT_TEST_SHUFFLE_SEED=%s\n' "$$seed"; \
+		GPU_FAULT_TEST_POSTGRES_URL= \
+		GPU_FAULT_TEST_SHUFFLE_SEED="$$seed" \
+		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \
+			--dist=$(PYTEST_XDIST_DIST) \
+			--durations=$(PYTEST_DURATIONS) \
+			--ignore=tests/test_artifact_consistency.py
+
 test-parallel:
 	GPU_FAULT_TEST_POSTGRES_URL= \
 		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \
-		--dist=$(PYTEST_XDIST_DIST) \
-		--durations=$(PYTEST_DURATIONS)
+			--dist=$(PYTEST_XDIST_DIST) \
+			--durations=$(PYTEST_DURATIONS)
+
+test-parallel-release:
+	GPU_FAULT_TEST_POSTGRES_URL= \
+		$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS) \
+			--dist=$(PYTEST_XDIST_DIST) \
+			--durations=$(PYTEST_DURATIONS) \
+			--ignore=tests/test_artifact_consistency.py
 
 test-impact:
 	$(PYTHON) scripts/select-affected-tests.py \
@@ -111,7 +136,10 @@ coverage:
 		--cov-fail-under=$(COVERAGE_FLOOR) \
 		--cov-report=term-missing \
 		--cov-report=html \
+		--cov-report=json:$(COVERAGE_LOCAL_JSON) \
 		--durations=$(PYTEST_DURATIONS)
+	$(PYTHON) scripts/ci_coverage_gate.py module-floors \
+		--coverage-json "$(COVERAGE_LOCAL_JSON)"
 
 coverage-shard:
 	@test -n "$(COVERAGE_SHARD)" || \
@@ -191,7 +219,13 @@ python-cache-clean:
 	find src tests deploy $(QUALITY_SCRIPTS) -depth \
 		-type d -name '__pycache__' -empty -delete
 
-check:
+check-static:
+	$(MAKE) python-cache-clean
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/run_static_gates.py \
+		--python "$(PYTHON)"
+	$(MAKE) python-cache-clean
+
+check-static-sequential:
 	$(MAKE) python-cache-clean
 	$(PYTHON) -m ruff format --check src tests deploy $(QUALITY_SCRIPTS)
 	$(PYTHON) -m ruff check src tests deploy $(QUALITY_SCRIPTS)
@@ -202,6 +236,7 @@ check:
 	$(MAKE) architecture-check
 	$(MAKE) mixin-check
 	$(MAKE) private-test-coupling-check
+	$(MAKE) test-source-assertion-check
 	$(MAKE) assert-message-check
 	$(MAKE) public-release-check
 	$(MAKE) xid-catalog-check
@@ -212,9 +247,11 @@ check:
 	$(MAKE) artifacts-safety-check
 	$(MAKE) yaml-check
 	$(MAKE) shell-check
-	$(MAKE) artifact-check
-	$(MAKE) test-parallel
-	$(MAKE) python-cache-clean
+
+check:
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/run_release_gates.py \
+		--mode check \
+		--python "$(PYTHON)"
 
 architecture-check:
 	$(PYTHON) scripts/check-python-architecture.py
@@ -240,6 +277,9 @@ mixin-check:
 private-test-coupling-check:
 	$(PYTHON) scripts/check-test-private-coupling.py
 
+test-source-assertion-check:
+	$(PYTHON) scripts/check-test-source-assertions.py
+
 assert-message-check:
 	$(PYTHON) scripts/check-assert-messages.py
 
@@ -262,6 +302,7 @@ docs-static-check:
 	$(MAKE) case-index-check
 	$(MAKE) manual-command-order-check
 	$(MAKE) doc-reference-check
+	$(MAKE) doc-anchor-check
 	$(MAKE) fault-evidence-check
 
 doc-impact-check:
@@ -281,6 +322,9 @@ manual-command-order-check:
 
 doc-reference-check:
 	$(PYTHON) scripts/check-doc-references.py
+
+doc-anchor-check:
+	$(PYTHON) scripts/check-doc-anchors.py
 
 fault-evidence-check:
 	$(PYTHON) scripts/build-fault-evidence-index.py --check
@@ -347,8 +391,8 @@ release-build:
 		(printf 'release-build requires a clean source tree\n' >&2; exit 2)
 	@command -v "$(COSIGN)" >/dev/null || \
 		(printf 'cosign is required\n' >&2; exit 2)
-	env -u COSIGN_PASSWORD $(MAKE) check PYTHON="$(PYTHON)"
-	env -u COSIGN_PASSWORD $(MAKE) test-postgres-stress PYTHON="$(PYTHON)"
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/run_release_gates.py \
+		--python "$(PYTHON)"
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-runtime-image.py \
 		--repository "$(RUNTIME_IMAGE_REPOSITORY)" \
 		--platform "$(RUNTIME_IMAGE_PLATFORM)" \
@@ -459,7 +503,7 @@ release-deploy:
 			(printf 'GPU_CLUSTER_ARNS is required\n' >&2; exit 2); \
 		test -n "$(STATE_DIR)" || \
 			(printf 'STATE_DIR is required\n' >&2; exit 2); \
-		PYTHONPATH=src $(PYTHON) -m gpu_fault.admin_cli deploy \
+		PYTHONPATH=src $(PYTHON) -m gpu_fault.admin.cli deploy \
 			--cpu-cluster-arn "$(CPU_CLUSTER_ARN)" \
 			$(foreach arn,$(GPU_CLUSTER_ARNS),--gpu-cluster-arn "$(arn)") \
 			--state-dir "$(STATE_DIR)" \

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from gpu_fault.admin_bootstrap_dependencies import (
+from gpu_fault.admin.bootstrap_dependencies import (
     deploy_host_dependency_report,
     load_deploy_host_tool_manifest,
 )
@@ -54,6 +54,7 @@ def _bundle_tree(tmp_path: Path) -> Path:
         root,
         metadata={
             "compatibility": compatibility,
+            "payload_identity_sha256": "b" * 64,
             "platform_id": deploy_host_bundle.bundle_platform_id(compatibility),
             "project_version": "1.0",
             "project_wheel": wheel.relative_to(root).as_posix(),
@@ -137,6 +138,24 @@ def test_deploy_host_bundle_rejects_incompatible_platform(tmp_path: Path) -> Non
         deploy_host_bundle.validate_host_compatibility(manifest)
 
 
+def test_deploy_host_payload_identity_allows_cross_commit_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outputs = iter(("", json.dumps({"sha256": "a" * 64})))
+    monkeypatch.setattr(
+        setup_deploy_host, "_run", lambda *_args, **_kwargs: next(outputs)
+    )
+
+    report = setup_deploy_host.validate_bundle_source(
+        {"source": {"payload_identity_sha256": "a" * 64}},
+        repo_root=tmp_path,
+        allow_source_mismatch=False,
+    )
+
+    assert report["matched"] is True
+    assert report["expected_payload_identity_sha256"] == "a" * 64
+
+
 def test_setup_requires_signed_bundle_or_explicit_network(tmp_path: Path) -> None:
     with pytest.raises(setup_deploy_host.DeployHostSetupError, match="signed --bundle"):
         setup_deploy_host.setup_deploy_host(
@@ -154,14 +173,84 @@ def test_setup_requires_signed_bundle_or_explicit_network(tmp_path: Path) -> Non
         )
 
 
-def test_bundle_setup_reinstalls_project_wheel_without_source_path_leakage() -> None:
-    source = (ROOT / "scripts/setup_deploy_host.py").read_text(encoding="utf-8")
+def test_bundle_setup_reinstalls_project_wheel_without_source_path_leakage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every pip call runs with the ambient Python path stripped.
 
-    assert '"--force-reinstall"' in source
-    assert 'environment.pop("PYTHONPATH", None)' in source
-    assert 'environment.pop("PYTHONHOME", None)' in source
-    assert '"deployment-host venv is incomplete" not in str(exc)' in source
-    assert "admin-config.example.yaml" in source
+    A deployment host that exports PYTHONPATH (a checked-out repository, say)
+    would otherwise let the admin CLI import that tree instead of the wheel the
+    signed bundle installed, so the installed digest would no longer describe
+    the code being run. ``--force-reinstall`` is what makes the wheel win over
+    an equal-version install already in the venv.
+    """
+
+    bundle = tmp_path / "bundle"
+    wheelhouse = bundle / "wheelhouse"
+    wheelhouse.mkdir(parents=True)
+    (bundle / "build.lock").write_text("", encoding="utf-8")
+    (bundle / "deploy-host.lock").write_text("", encoding="utf-8")
+    (bundle / "project.whl").write_text("", encoding="utf-8")
+    (bundle / "admin-config.example.yaml").write_text(
+        "kind: AdminConfig\n", encoding="utf-8"
+    )
+    (bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "requirements": {
+                    "build": "build.lock",
+                    "deploy_host": "deploy-host.lock",
+                },
+                "project_wheel": "project.whl",
+                "admin_config_template": "admin-config.example.yaml",
+            }
+        ),
+        encoding="utf-8",
+    )
+    commands: list[tuple[list[str], dict[str, str]]] = []
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "src"))
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "python"))
+    monkeypatch.setattr(
+        setup_deploy_host,
+        "_run",
+        lambda command, *, env=None, **_kwargs: commands.append(
+            ([str(item) for item in command], dict(env or {}))
+        )
+        or "",
+    )
+    monkeypatch.setattr(
+        setup_deploy_host, "_install_bundled_tools", lambda *_a, **_k: None
+    )
+    venv = tmp_path / "venv"
+
+    setup_deploy_host.install_from_bundle(bundle, venv=venv)
+
+    assert commands, "the bundle install ran no commands"
+    for command, environment in commands:
+        assert "PYTHONPATH" not in environment, command
+        assert "PYTHONHOME" not in environment, command
+    project_install = commands[-1][0]
+    assert "--force-reinstall" in project_install
+    assert project_install[-1] == str(bundle / "project.whl")
+    installed = venv / "share/gpu-fault/admin-config.example.yaml"
+    assert installed.read_text(encoding="utf-8") == "kind: AdminConfig\n"
+
+
+def test_incomplete_venv_state_is_reported_as_incomplete(tmp_path: Path) -> None:
+    """The reuse path keys on this exact message to fall back to a reinstall.
+
+    A venv whose recorded state has a distribution but no module digest cannot
+    be identity-checked. That is a reinstall, not a hard failure, so the message
+    has to stay recognisable to the caller that swallows it.
+    """
+
+    with pytest.raises(
+        setup_deploy_host.DeployHostSetupError,
+        match="deployment-host venv is incomplete",
+    ):
+        setup_deploy_host.deploy_host_project_report(
+            tmp_path / "venv", {"project_distribution": "gpu-fault-control-plane"}
+        )
 
 
 def test_setup_installs_admin_config_template_read_only(tmp_path: Path) -> None:
@@ -201,6 +290,11 @@ def test_layered_bundle_install_reuses_dependency_venv(
     (bundle / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     venv = tmp_path / "overlay"
     dependency_venv = tmp_path / "dependencies"
+    (venv / "bin").mkdir(parents=True)
+    (dependency_venv / "bin").mkdir(parents=True)
+    ruff = dependency_venv / "bin/ruff"
+    ruff.write_text("#!/bin/sh\n", encoding="utf-8")
+    ruff.chmod(0o755)
     commands = []
     monkeypatch.setattr(
         setup_deploy_host,
@@ -232,6 +326,7 @@ def test_layered_bundle_install_reuses_dependency_venv(
     assert pth.read_text(encoding="utf-8") == f"{tmp_path / 'dependency-site'}\n"
     assert len(commands) == 1
     assert str(project_wheel) in commands[0]
+    assert (venv / "bin/ruff").resolve() == ruff.resolve()
 
 
 def test_existing_overlay_revalidates_dependency_identity(
@@ -240,7 +335,11 @@ def test_existing_overlay_revalidates_dependency_identity(
     venv = tmp_path / "venv"
     dependency_venv = tmp_path / "dependencies"
     (venv / "bin").mkdir(parents=True)
-    dependency_venv.mkdir()
+    (dependency_venv / "bin").mkdir(parents=True)
+    dependency_ruff = dependency_venv / "bin/ruff"
+    dependency_ruff.write_text("#!/bin/sh\n", encoding="utf-8")
+    dependency_ruff.chmod(0o755)
+    (venv / "bin/ruff").symlink_to(dependency_ruff)
     (venv / "bin/python").write_text("", encoding="utf-8")
     (venv / "bin/gpu-fault-admin").write_text("", encoding="utf-8")
     (venv / "share/gpu-fault").mkdir(parents=True)
@@ -279,15 +378,20 @@ def test_deploy_host_project_identity_matches_separate_distribution(
 ) -> None:
     venv = tmp_path / "venv"
     expected = "a" * 64
+    environments = []
+    monkeypatch.setenv("PYTHONPATH", "/leaked/source")
     monkeypatch.setattr(
         setup_deploy_host,
         "_run",
-        lambda *_args, **_kwargs: json.dumps(
-            {
-                "distribution": "gpu-fault-deploy-host",
-                "module_digest": expected,
-                "version": "0.10.0",
-            }
+        lambda *_args, **kwargs: (
+            environments.append(kwargs.get("env"))
+            or json.dumps(
+                {
+                    "distribution": "gpu-fault-deploy-host",
+                    "module_digest": expected,
+                    "version": "0.10.0",
+                }
+            )
         ),
     )
 
@@ -304,6 +408,28 @@ def test_deploy_host_project_identity_matches_separate_distribution(
         "module_digest": expected,
         "version": "0.10.0",
     }
+    assert "PYTHONPATH" not in environments[0]
+
+
+def test_venv_activation_can_restore_previous_symlink(tmp_path: Path) -> None:
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    target = tmp_path / "venv"
+    target.symlink_to(old, target_is_directory=True)
+
+    backup = setup_deploy_host.activate_venv(new, target)
+
+    assert target.resolve() == new
+    assert backup is not None and backup.is_symlink()
+    setup_deploy_host.restore_venv_activation(target, backup)
+    assert target.resolve() == old
+
+    backup = setup_deploy_host.activate_venv(new, target)
+    setup_deploy_host.finalize_venv_activation(backup)
+    assert target.resolve() == new
+    assert backup is not None and not backup.exists()
 
 
 def test_deploy_host_project_identity_rejects_runtime_wheel(

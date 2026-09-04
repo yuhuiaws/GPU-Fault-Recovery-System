@@ -3,35 +3,24 @@ from __future__ import annotations
 import json
 import subprocess
 import time
-from dataclasses import replace
-from pathlib import Path
 
 import pytest
 
-from gpu_fault import (
-    admin_bootstrap,
-    admin_bootstrap_aurora,
-    admin_bootstrap_dependencies,
-    admin_release_artifacts,
-    admin_release_repositories,
-)
-from gpu_fault.admin_bootstrap import _ensure_security_group, _unused_subnet_cidrs
-from gpu_fault.admin_bootstrap_common import (
+from gpu_fault.admin import bootstrap as admin_bootstrap
+from gpu_fault.admin import bootstrap_aurora as admin_bootstrap_aurora
+from gpu_fault.admin import bootstrap_dependencies as admin_bootstrap_dependencies
+from gpu_fault.admin import release_artifacts as admin_release_artifacts
+from gpu_fault.admin import release_repositories as admin_release_repositories
+from gpu_fault.admin.bootstrap import _unused_subnet_cidrs
+from gpu_fault.admin.bootstrap_common import (
     Arn,
     BootstrapError,
     BootstrapState,
-    ClusterIdentity,
     run_parallel,
 )
-from gpu_fault.admin_bootstrap_site import (
-    existing_gpu_context,
-    preserve_existing_site_contract,
-    recover_verified_site_contract,
-    validate_existing_cluster_identity,
-)
-from gpu_fault.admin_bootstrap_site import site_identifier as _site_identifier
-from gpu_fault.admin_config import AuroraCapacityConfig
-from gpu_fault.admin_release_repositories import ensure_release_repositories
+from gpu_fault.admin.config import AuroraCapacityConfig
+from gpu_fault.admin.release_repositories import ensure_release_repositories
+from tests.admin._bootstrap_support import _cluster
 
 
 def _cache_lifecycle_policy(*, retention_days: int = 7) -> dict:
@@ -240,25 +229,6 @@ def test_bootstrap_aurora_formats_admin_config_capacity() -> None:
         )
         == "MinCapacity=8,MaxCapacity=32"
     )
-
-
-def test_parallel_bootstrap_persists_successes_when_another_task_fails(
-    tmp_path,
-) -> None:
-    state = BootstrapState(tmp_path / "state.json", site_id="test")
-
-    def fail():
-        raise BootstrapError("aurora failed")
-
-    with pytest.raises(BootstrapError, match="aurora failed"):
-        run_parallel(
-            {"aurora": fail, "pki": lambda: {"certificate_arn": "arn:certificate"}},
-            state=state,
-        )
-
-    reloaded = BootstrapState(tmp_path / "state.json", site_id="test")
-    assert reloaded.value["completed_tasks"] == ["pki"]
-    assert reloaded.value["resources"]["pki"] == {"certificate_arn": "arn:certificate"}
 
 
 def test_legacy_foundation_consumes_prebuilt_release(tmp_path, monkeypatch) -> None:
@@ -600,6 +570,11 @@ def test_admin_release_build_uses_ecr_and_state_signing_material(
         "GPU_FAULT_TEST_POSTGRES_URL", "postgresql://postgres@127.0.0.1:5432/postgres"
     )
     monkeypatch.setattr(admin_release_artifacts, "_git_output", lambda *_args: "")
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "restore_main_ci_candidate",
+        lambda *_args, **_kwargs: None,
+    )
     commands = []
 
     class Runner:
@@ -754,6 +729,91 @@ def test_admin_release_reuses_signed_release_for_same_commit(
     )
 
 
+def test_admin_release_prefers_promoted_main_candidate(tmp_path, monkeypatch) -> None:
+    signing = tmp_path / "release-signing"
+    signing.mkdir()
+    for name, value in (
+        ("cosign.key", "private"),
+        ("cosign.pub", "public"),
+        ("cosign.password", "password"),
+    ):
+        path = signing / name
+        path.write_text(value, encoding="utf-8")
+        path.chmod(0o600)
+    gate = tmp_path / "dist/ci-gate.json"
+    gate.parent.mkdir()
+    gate.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(admin_release_artifacts, "_git_output", lambda *_args: "")
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "load_verified_ci_candidate_receipt",
+        lambda *_args, **_kwargs: {
+            "available": True,
+            "ci_gate": str(gate),
+            "run_id": 123,
+        },
+    )
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "restore_main_ci_candidate",
+        lambda *_args, **_kwargs: pytest.fail(
+            "verified receipt repeated GitHub candidate restore"
+        ),
+    )
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "isolated_postgres_url",
+        lambda *_args, **_kwargs: pytest.fail(
+            "promoted candidate started local PostgreSQL"
+        ),
+    )
+    commands = []
+
+    class Runner:
+        dry_run = False
+
+        def run(self, arguments, **kwargs):
+            commands.append((list(arguments), kwargs))
+            if arguments[:3] == ["aws", "ecr", "get-login-password"]:
+                return "login-password"
+            return ""
+
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "verify_prebuilt_release",
+        lambda *args, **kwargs: commands.append((["verify"], kwargs)),
+    )
+    monkeypatch.setattr(
+        admin_release_artifacts,
+        "load_prebuilt_release",
+        lambda *args, **kwargs: {
+            "manifest": "dist/current-release.json",
+            "release_id": "release-a",
+            "images": {},
+            "agent_config_digest": "a" * 64,
+        },
+    )
+
+    result = admin_release_artifacts.build_signed_release(
+        Runner(),
+        repository_root=tmp_path,
+        state_dir=tmp_path,
+        region="us-east-1",
+        runtime_repository=(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/gpu-fault/runtime-a"
+        ),
+        cache_repository=None,
+        runtime_profile="profile-a",
+    )
+
+    make_command = next(
+        command for command, _options in commands if command and command[0] == "make"
+    )
+    assert "release-build-promoted" in make_command
+    assert f"CI_GATE={gate}" in make_command
+    assert result["release_source"] == "main_ci_candidate"
+
+
 def test_source_only_release_is_not_reused(tmp_path, monkeypatch) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
@@ -892,310 +952,5 @@ def test_legacy_bootstrap_state_revalidates_exclusive_resources(tmp_path) -> Non
 
     state = BootstrapState(path, site_id="test")
 
-    assert state.value["schema_version"] == 2, "legacy state was not upgraded"
+    assert state.value["schema_version"] == 3, "legacy state was not upgraded"
     assert state.value["completed_tasks"] == [], "ownership tasks were not invalidated"
-
-
-def _cluster() -> ClusterIdentity:
-    return ClusterIdentity(
-        input_arn="arn:aws:eks:us-east-1:123456789012:cluster/control",
-        role="cpu",
-        region="us-east-1",
-        account_id="123456789012",
-        hyperpod_arn=("arn:aws:sagemaker:us-east-1:123456789012:cluster/control"),
-        hyperpod_name="control",
-        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/control",
-        eks_name="control",
-        vpc_id="vpc-control",
-        subnet_ids=("subnet-private-a", "subnet-private-b"),
-        node_recovery="None",
-        context="control",
-    )
-
-
-def test_solution_security_group_is_never_shared() -> None:
-    class Runner:
-        dry_run = False
-
-        def aws_json(self, *_args, **_kwargs):
-            return {
-                "SecurityGroups": [
-                    {
-                        "GroupId": "sg-foreign",
-                        "Tags": [{"Key": "Name", "Value": "foreign"}],
-                    }
-                ]
-            }
-
-    with pytest.raises(BootstrapError, match="refusing to share"):
-        _ensure_security_group(
-            Runner(),
-            cluster=_cluster(),
-            group_name="gpu-fault-site",
-            description="test",
-            site_id="site-a",
-        )
-
-
-def test_public_nlb_subnets_are_dedicated_even_if_public_subnets_exist(
-    monkeypatch,
-) -> None:
-    class Runner:
-        dry_run = True
-
-        def aws_json(self, _region, service, operation, *arguments, **_kwargs):
-            if service == "ec2" and operation == "describe-subnets":
-                if "--subnet-ids" in arguments:
-                    return {
-                        "Subnets": [
-                            {
-                                "SubnetId": "subnet-private-a",
-                                "AvailabilityZone": "us-east-1a",
-                            },
-                            {
-                                "SubnetId": "subnet-private-b",
-                                "AvailabilityZone": "us-east-1b",
-                            },
-                        ]
-                    }
-                return {
-                    "Subnets": [
-                        {
-                            "SubnetId": "subnet-shared-a",
-                            "AvailabilityZone": "us-east-1a",
-                            "CidrBlock": "10.0.0.0/28",
-                            "Tags": [],
-                        },
-                        {
-                            "SubnetId": "subnet-shared-b",
-                            "AvailabilityZone": "us-east-1b",
-                            "CidrBlock": "10.0.0.16/28",
-                            "Tags": [],
-                        },
-                    ]
-                }
-            if service == "ec2" and operation == "describe-vpcs":
-                return {"Vpcs": [{"CidrBlock": "10.0.0.0/24"}]}
-            if service == "ec2" and operation == "describe-internet-gateways":
-                return {
-                    "InternetGateways": [
-                        {"InternetGatewayId": "igw-external", "Tags": []}
-                    ]
-                }
-            raise AssertionError((service, operation, arguments))
-
-    monkeypatch.setattr(
-        admin_bootstrap, "_public_subnet", lambda *_args, **_kwargs: True
-    )
-    result = admin_bootstrap._ensure_public_subnets(
-        Runner(), cluster=_cluster(), site_id="site-a"
-    )
-
-    assert result["public_subnets"] == [
-        "subnet-dryrun-public-1",
-        "subnet-dryrun-public-2",
-    ], "external public subnets were reused"
-    assert result["internet_gateway"]["ownership"] == "EXTERNAL", (
-        "the VPC-level internet gateway should remain external"
-    )
-
-
-def test_site_identifier_is_independent_of_gpu_membership() -> None:
-    cpu = _cluster()
-    gpu_a = replace(
-        cpu,
-        role="gpu",
-        hyperpod_arn=("arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-a"),
-        hyperpod_name="gpu-a",
-        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
-        eks_name="gpu-a",
-        context="gpu-a",
-    )
-    gpu_b = replace(
-        gpu_a,
-        hyperpod_arn=("arn:aws:sagemaker:us-east-1:123456789012:cluster/gpu-b"),
-        hyperpod_name="gpu-b",
-        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
-        eks_name="gpu-b",
-        context="gpu-b",
-    )
-
-    assert _site_identifier(cpu, [gpu_a]) == _site_identifier(cpu, [gpu_a, gpu_b]), (
-        "adding a GPU cluster changed the control-plane site ID"
-    )
-
-
-def test_existing_site_preserves_release_profile_and_cluster_context() -> None:
-    generated = {
-        "spec": {
-            "release": {"manifest": "/repo/dist/current-release.json"},
-            "runtimeProfile": {
-                "source": "/repo/config/profile.yaml",
-                "version": "hyperpod-v1",
-            },
-            "clusters": [
-                {
-                    "clusterId": "gpu-a",
-                    "context": "new-context",
-                    "allowedNamespaces": ["training"],
-                }
-            ],
-        }
-    }
-    existing = {
-        "spec": {
-            "release": {"manifest": "dist/current-release.json"},
-            "runtimeProfile": {
-                "source": "/secure/profiles/hyperpod-v1.yaml",
-                "templateSource": "/repo/config/profile.yaml",
-                "version": "hyperpod-v1",
-                "registrationClusterId": "gpu-a",
-            },
-            "clusters": [
-                {
-                    "clusterId": "gpu-a",
-                    "context": "stable-context",
-                    "allowedNamespaces": ["gpu-fault-system", "training"],
-                }
-            ],
-        }
-    }
-
-    result = preserve_existing_site_contract(generated, existing)
-
-    assert result["spec"]["release"] == existing["spec"]["release"]
-    assert result["spec"]["runtimeProfile"] == existing["spec"]["runtimeProfile"]
-    assert result["spec"]["clusters"][0]["context"] == "stable-context"
-    assert result["spec"]["clusters"][0]["allowedNamespaces"] == [
-        "gpu-fault-system",
-        "training",
-    ]
-
-
-def test_existing_site_recovers_latest_verified_release_contract(
-    tmp_path: Path,
-) -> None:
-    existing = {
-        "kind": "RegionalSite",
-        "metadata": {"name": "test-site"},
-        "spec": {
-            "repositoryRoot": "/repo/current",
-            "awsRegion": "us-west-2",
-            "cpu": {"eksArn": "arn:aws:eks:us-west-2:123456789012:cluster/cpu"},
-            "release": {"manifest": "/repo/current/dist/current-release.json"},
-            "runtimeProfile": {
-                "source": "/repo/current/config/profile.yaml",
-                "templateSource": "/repo/current/config/profile.yaml",
-                "version": "profile-v1",
-            },
-            "clusters": [
-                {
-                    "clusterId": "gpu-a",
-                    "eksClusterArn": (
-                        "arn:aws:eks:us-west-2:123456789012:cluster/gpu-a"
-                    ),
-                    "context": "current-context",
-                    "agentEndpointAllowedCidrs": ["192.0.2.0/24"],
-                }
-            ],
-        },
-    }
-    verified = {
-        "kind": "RegionalSite",
-        "metadata": {"name": "test-site"},
-        "spec": {
-            "repositoryRoot": "/repo/previous",
-            "awsRegion": "us-west-2",
-            "cpu": {"eksArn": "arn:aws:eks:us-west-2:123456789012:cluster/cpu"},
-            "release": {"manifest": "dist/current-release.json"},
-            "runtimeProfile": {
-                "source": "/secure/profiles/profile-v1.yaml",
-                "templateSource": "/repo/previous/config/profile.yaml",
-                "version": "profile-v1",
-            },
-            "clusters": [
-                {
-                    "clusterId": "gpu-a",
-                    "eksClusterArn": (
-                        "arn:aws:eks:us-west-2:123456789012:cluster/gpu-a"
-                    ),
-                    "context": "verified-context",
-                    "agentEndpointAllowedCidrs": ["198.51.100.0/24"],
-                }
-            ],
-        },
-    }
-    release = tmp_path / "release-deploy/release-a"
-    release.mkdir(parents=True)
-    (release / "state.json").write_text(
-        json.dumps({"phase": "COMPLETED", "verification": {"status": "PASSED"}}),
-        encoding="utf-8",
-    )
-    (release / "site.candidate.yaml").write_text(json.dumps(verified), encoding="utf-8")
-
-    recovered = recover_verified_site_contract(tmp_path, existing)
-
-    assert recovered is not None
-    assert recovered["spec"]["repositoryRoot"] == "/repo/current"
-    assert recovered["spec"]["release"] == verified["spec"]["release"]
-    assert recovered["spec"]["runtimeProfile"] == verified["spec"]["runtimeProfile"]
-    assert recovered["spec"]["clusters"][0]["context"] == "verified-context"
-    assert recovered["spec"]["clusters"][0]["agentEndpointAllowedCidrs"] == [
-        "198.51.100.0/24"
-    ]
-
-
-def test_existing_gpu_context_matches_discovered_identity() -> None:
-    cluster = replace(
-        _cluster(),
-        role="gpu",
-        hyperpod_name="hp-gpu-a",
-        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
-    )
-    site = {
-        "spec": {
-            "clusters": [
-                {
-                    "clusterId": "hp-gpu-a",
-                    "context": "stable-context",
-                    "hyperpodClusterName": "hp-gpu-a",
-                    "eksClusterArn": cluster.eks_arn,
-                }
-            ]
-        }
-    }
-
-    assert existing_gpu_context(site, cluster) == "stable-context"
-
-
-def test_existing_site_rejects_cluster_identity_changes() -> None:
-    cpu = _cluster()
-    gpu = replace(
-        _cluster(),
-        role="gpu",
-        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
-        hyperpod_name="gpu-a",
-    )
-    existing = {
-        "spec": {
-            "cpu": {"eksArn": cpu.eks_arn, "hyperpodClusterName": cpu.hyperpod_name},
-            "clusters": [
-                {"eksClusterArn": gpu.eks_arn, "hyperpodClusterName": gpu.hyperpod_name}
-            ],
-        }
-    }
-
-    validate_existing_cluster_identity(existing, cpu=cpu, gpu_clusters=[gpu])
-
-    with pytest.raises(BootstrapError, match="cluster identity differs"):
-        validate_existing_cluster_identity(
-            existing,
-            cpu=cpu,
-            gpu_clusters=[
-                replace(
-                    gpu,
-                    eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
-                    hyperpod_name="gpu-b",
-                )
-            ],
-        )

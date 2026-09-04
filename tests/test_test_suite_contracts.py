@@ -4,7 +4,13 @@ import ast
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from tests import conftest
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
@@ -134,6 +140,7 @@ def test_tests_are_covered_by_architecture_and_quality_gates() -> None:
         encoding="utf-8"
     )
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    gate_runner = (ROOT / "scripts/run_release_gates.py").read_text(encoding="utf-8")
     project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     assert "SOURCE_ROOTS = (SOURCE, DEPLOY, SCRIPTS, TOOLS, TESTS)" in architecture
@@ -141,13 +148,21 @@ def test_tests_are_covered_by_architecture_and_quality_gates() -> None:
     assert "artifacts-local-safety-check:" in makefile
     assert "coverage:" in makefile
     assert "test-parallel:" in makefile
-    parallel = makefile.split("test-parallel:\n", 1)[1].split("\ncoverage:", 1)[0]
+    assert "test-parallel-release:" in makefile
+    parallel = makefile.split("test-parallel-release:\n", 1)[1].split(
+        "\ntest-impact:", 1
+    )[0]
     check = makefile.split("check:\n", 1)[1].split("\narchitecture-check:", 1)[0]
     assert "GPU_FAULT_TEST_POSTGRES_URL=" in parallel
     assert "-n $(PYTEST_XDIST_WORKERS)" in parallel
-    assert "$(MAKE) test-parallel" in check
-    assert check.index("$(MAKE) test-parallel") < check.rindex(
-        "$(MAKE) python-cache-clean"
+    assert "--ignore=tests/test_artifact_consistency.py" in parallel
+    assert "scripts/run_release_gates.py" in check
+    assert "--mode check" in check
+    assert '"pytest": ["make", "test-parallel-release"' in gate_runner
+    assert '"artifact": ["make", "artifact-check"' in gate_runner
+    assert "max_workers=2" in gate_runner
+    assert gate_runner.index("parallel check tail failed") < gate_runner.rindex(
+        '"python-cache-clean"'
     )
     assert "pytest-cov" in project
     assert "pytest-xdist" in project
@@ -198,6 +213,146 @@ def test_tests_do_not_need_architecture_size_exceptions() -> None:
     }
 
     assert test_exceptions == {"files": [], "functions": [], "classes": []}
+
+
+def test_shuffled_order_is_seeded_and_reproducible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """打乱只由种子决定：不设种子一动不动，设了同一个种子结果必须一样。
+
+    最后那条同一种子、不同入参顺序得到同一结果的断言不是锦上添花：xdist 的每个
+    worker 都会各自跑一遍这个钩子，一旦它们的收集顺序对不上，xdist 会直接以
+    "Different tests were collected" 中止整轮，而不是报某条用例失败。
+    """
+    original = [
+        SimpleNamespace(nodeid=f"tests/test_module_{index}.py::test_case")
+        for index in range(64)
+    ]
+
+    monkeypatch.delenv(conftest.SHUFFLE_SEED_VARIABLE, raising=False)
+    untouched = list(original)
+    conftest.pytest_collection_modifyitems(untouched)
+
+    monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "11")
+    seeded = list(original)
+    conftest.pytest_collection_modifyitems(seeded)
+    from_reversed_input = list(reversed(original))
+    conftest.pytest_collection_modifyitems(from_reversed_input)
+
+    monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "12")
+    other_seed = list(original)
+    conftest.pytest_collection_modifyitems(other_seed)
+
+    assert untouched == original, "没设种子时收集顺序必须原样保留"
+    assert seeded != original, "设了种子却没有打乱"
+    assert sorted(item.nodeid for item in seeded) == sorted(
+        item.nodeid for item in original
+    ), "打乱不能增减用例"
+    assert from_reversed_input == seeded, "同一个种子必须无视入参顺序给出同一结果"
+    assert other_seed != seeded, "不同种子应当给出不同顺序"
+
+
+def test_shuffle_seed_rejects_a_non_integer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "not-a-number")
+
+    with pytest.raises(pytest.UsageError):
+        conftest.pytest_collection_modifyitems([])
+
+
+def test_shuffled_order_is_a_required_ci_gate() -> None:
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    shuffled = makefile.split("test-shuffled:\n", 1)[1].split("\ntest-parallel:", 1)[0]
+    required = workflow.split("Require all CI gates", 1)[1].split("\n      - uses:", 1)[
+        0
+    ]
+
+    assert conftest.SHUFFLE_SEED_VARIABLE in shuffled
+    assert "-n $(PYTEST_XDIST_WORKERS)" in shuffled
+    assert "make test-shuffled PYTHON=python" in workflow
+    # 只有作为必需门禁才算数：不进 needs 就只是个装饰。
+    assert 'needs.shuffle.result }}" = "success"' in required
+
+
+def test_pydantic_mypy_plugin_checks_models(tmp_path: Path) -> None:
+    """插件真的装上了，而且 ``init_typed``/``init_forbid_extra`` 没被翻掉。
+
+    这条用例直接拿仓库自己的 ``pyproject.toml`` 跑一遍 mypy，所以
+    ``plugins = ["pydantic.mypy"]`` 或 ``[tool.pydantic-mypy]`` 被摘掉它就红；
+    只断言配置文件里有那几行，是断言不出插件有没有真的加载成功的。
+
+    四个错误码分成两半，缺一半都说明配置退化了：
+
+    * ``pydantic-field`` / ``pydantic-alias`` 只有插件会报。前者是真正的坑——
+      模型体里少写注解的属性根本不是字段，它永远不参与校验，
+      ``extra="forbid"`` 也拦不住，因为压根没人给它传值。
+    * ``arg-type`` / ``call-arg`` 是 pydantic 自己的 ``dataclass_transform``
+      给的，不装插件也有；但插件一旦加载而 ``init_typed`` 或
+      ``init_forbid_extra`` 为假，合成出来的 ``__init__`` 就退化成
+      ``**kwargs: Any``，这两个码会一起消失。所以它们在这里盯的是那两个开关。
+    """
+    module = tmp_path / "construct_models.py"
+    module.write_text(
+        "from pydantic import Field\n"
+        "\n"
+        "from gpu_fault.models import StrictModel\n"
+        "\n"
+        "\n"
+        "class Probe(StrictModel):\n"
+        "    count: int\n"
+        "\n"
+        "\n"
+        "class MissingAnnotation(StrictModel):\n"
+        "    forgot_the_annotation = 3\n"
+        "\n"
+        "\n"
+        "class DynamicAlias(StrictModel):\n"
+        "    aliased: int = Field(alias=str(1))\n"
+        "\n"
+        "\n"
+        "def build() -> Probe:\n"
+        '    return Probe(count="not-an-int", typo=1)\n',
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mypy",
+            "--no-incremental",
+            "--cache-dir",
+            str(tmp_path / "mypy-cache"),
+            "--config-file",
+            str(ROOT / "pyproject.toml"),
+            str(module),
+        ],
+        cwd=ROOT,
+        env={**os.environ, "MYPYPATH": str(ROOT / "src")},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    codes = {
+        line.rsplit("[", 1)[-1].rstrip("]")
+        for line in completed.stdout.splitlines()
+        if ": error:" in line
+    }
+
+    assert "pydantic-field" in codes, (
+        f"没注解的模型属性没被拦住，pydantic.mypy 大概没加载：\n{completed.stdout}"
+    )
+    assert "pydantic-alias" in codes, (
+        f"必填字段的动态别名没被拦住，warn_required_dynamic_aliases 没生效：\n"
+        f"{completed.stdout}"
+    )
+    assert "arg-type" in codes, (
+        f"构造点的字段类型没被检查，init_typed 大概被翻成了假：\n{completed.stdout}"
+    )
+    assert "call-arg" in codes, (
+        f"构造点的多余关键字没被检查，init_forbid_extra 大概被翻成了假：\n"
+        f"{completed.stdout}"
+    )
 
 
 def test_test_suite_does_not_lose_assertion_coverage() -> None:

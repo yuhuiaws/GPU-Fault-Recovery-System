@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
-
 import json
 from contextlib import contextmanager
+from typing import Any, Iterable, Iterator
+
+from pydantic import BaseModel
 
 from gpu_fault.store.shared.errors import NotFoundError
 
@@ -12,12 +13,17 @@ class SqliteCoreMixin:
     # Attributes supplied by the composed concrete implementation.
     _db: Any
     _lock: Any
-    _models: Any
+    _models: dict[str, type[BaseModel]]
+
+    # `_get`, `_get_optional` and `_list` return `Any` on purpose: the model
+    # class is looked up in `_models` at run time from a string kind, so the
+    # result type is only knowable at the call site. Callers state it with a
+    # `cast`, which is what makes the mixins above them checkable.
 
     def close(self) -> None:
         self._db.close()
 
-    def _put(self, kind: str, key: str, value) -> None:
+    def _put(self, kind: str, key: str, value: BaseModel) -> None:
         self._db.execute(
             """
             INSERT INTO objects(kind, key, payload) VALUES (?, ?, ?)
@@ -32,7 +38,7 @@ class SqliteCoreMixin:
             (kind, key),
         )
 
-    def _get(self, kind: str, key: str):
+    def _get(self, kind: str, key: str) -> Any:
         row = self._db.execute(
             "SELECT payload FROM objects WHERE kind=? AND key=?",
             (kind, key),
@@ -41,13 +47,13 @@ class SqliteCoreMixin:
             raise NotFoundError(key)
         return self._models[kind].model_validate_json(row[0])
 
-    def _get_optional(self, kind: str, key: str):
+    def _get_optional(self, kind: str, key: str) -> Any:
         try:
             return self._get(kind, key)
         except NotFoundError:
             return None
 
-    def _list(self, kind: str):
+    def _list(self, kind: str) -> list[Any]:
         rows = self._db.execute(
             "SELECT payload FROM objects WHERE kind=?",
             (kind,),
@@ -72,7 +78,7 @@ class SqliteCoreMixin:
         return row[0] if row else None
 
     @staticmethod
-    def _state_key(parts) -> str:
+    def _state_key(parts: Iterable[Any]) -> str:
         return json.dumps(
             list(parts),
             ensure_ascii=True,
@@ -81,7 +87,7 @@ class SqliteCoreMixin:
         )
 
     @contextmanager
-    def _state_transaction(self, _lock_key: str):
+    def _state_transaction(self, _lock_key: str) -> Iterator[None]:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:

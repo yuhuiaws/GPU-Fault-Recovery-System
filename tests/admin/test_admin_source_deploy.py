@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from gpu_fault import admin_source_deploy
-from gpu_fault.admin_bootstrap_common import BootstrapError
+from gpu_fault.admin import source_deploy as admin_source_deploy
+from gpu_fault.admin.bootstrap_common import BootstrapError
 
 
 def repository(path: Path) -> Path:

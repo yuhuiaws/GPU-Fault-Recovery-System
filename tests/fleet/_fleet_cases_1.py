@@ -15,6 +15,7 @@ from gpu_fault.fleet import (
     DeploymentNodeUpdate,
     DeploymentStatus,
     FleetCompatibilityPolicy,
+    FleetDeployment,
     FleetDeploymentRequest,
     FleetRegistry,
     SignedAgentHeartbeat,
@@ -791,6 +792,193 @@ def test_deployment_waves_reconcile_from_heartbeats() -> None:
     assert {item.status for item in completed.nodes} == {DeploymentNodeStatus.READY}
 
 
+def test_deployment_waves_honor_first_wave_and_failure_domains() -> None:
+    fleet = registry()
+
+    deployment = fleet.create_deployment(
+        FleetDeploymentRequest(
+            cluster_id="cluster-a",
+            node_ids=["node-d", "node-c", "node-b", "node-a"],
+            desired_agent_version="0.9.0",
+            desired_artifact_sha256=ARTIFACT,
+            desired_policy_version="catalog-a",
+            desired_runtime_profile_version="profile-a",
+            desired_config_digest=CONFIG,
+            max_unavailable=2,
+            first_wave_max_unavailable=1,
+            max_unavailable_per_failure_domain=1,
+            node_failure_domains={
+                "node-a": "zone-a",
+                "node-b": "zone-a",
+                "node-c": "zone-b",
+                "node-d": "zone-b",
+            },
+        )
+    )
+
+    assert deployment.waves == [["node-a"], ["node-b", "node-c"], ["node-d"]]
+
+
+def test_stale_matching_agent_does_not_precomplete_deployment() -> None:
+    fleet = registry()
+    stale = heartbeat("node-a", observed_at=NOW - timedelta(seconds=100))
+    fleet.register(signed(stale))
+
+    deployment = fleet.create_deployment(
+        FleetDeploymentRequest(
+            cluster_id="cluster-a",
+            node_ids=["node-a"],
+            desired_agent_version="0.9.0",
+            desired_artifact_sha256=ARTIFACT,
+            desired_policy_version="catalog-a",
+            desired_runtime_profile_version="profile-a",
+            desired_config_digest=CONFIG,
+        )
+    )
+
+    assert deployment.status is DeploymentStatus.PLANNED
+    assert deployment.nodes[0].status is DeploymentNodeStatus.PENDING
+
+
+def test_failed_deployment_retry_resets_failed_nodes() -> None:
+    fleet = registry()
+    deployment = fleet.create_deployment(
+        FleetDeploymentRequest(
+            cluster_id="cluster-a",
+            node_ids=["node-a"],
+            desired_agent_version="0.9.0",
+            desired_artifact_sha256=ARTIFACT,
+            desired_policy_version="catalog-a",
+            desired_runtime_profile_version="profile-a",
+            desired_config_digest=CONFIG,
+        )
+    )
+    fleet.start_next_wave(deployment.deployment_id)
+    failed = fleet.update_deployment_node(
+        deployment.deployment_id,
+        "node-a",
+        DeploymentNodeUpdate(
+            status=DeploymentNodeStatus.FAILED, reason="installer failed"
+        ),
+    )
+
+    retried = fleet.retry_failed_deployment(deployment.deployment_id)
+
+    assert failed.status is DeploymentStatus.FAILED
+    assert retried.status is DeploymentStatus.PLANNED
+    assert retried.nodes[0].status is DeploymentNodeStatus.PENDING
+
+
+def test_cancelled_deployment_is_terminal_and_can_retry() -> None:
+    fleet = registry()
+    deployment = fleet.create_deployment(
+        FleetDeploymentRequest(
+            cluster_id="cluster-a",
+            node_ids=["node-a"],
+            desired_agent_version="0.9.0",
+            desired_artifact_sha256=ARTIFACT,
+            desired_policy_version="catalog-a",
+            desired_runtime_profile_version="profile-a",
+            desired_config_digest=CONFIG,
+        )
+    )
+    fleet.start_next_wave(deployment.deployment_id)
+
+    cancelled = fleet.cancel_deployment(
+        deployment.deployment_id, reason="release rolled back"
+    )
+    assert fleet.store.list_active_fleet_deployments("cluster-a") == []
+    retried = fleet.retry_failed_deployment(deployment.deployment_id)
+
+    assert cancelled.status is DeploymentStatus.FAILED
+    assert cancelled.nodes[0].status is DeploymentNodeStatus.FAILED
+    assert retried.status is DeploymentStatus.PLANNED
+    assert retried.nodes[0].status is DeploymentNodeStatus.PENDING
+
+
+def test_candidate_only_fleet_fields_normalize_to_rollback_schema() -> None:
+    deployment = FleetDeployment.model_validate(
+        {
+            "deployment_id": "release-upgrade-a",
+            "cluster_id": "cluster-a",
+            "desired_agent_protocol_version": 3,
+            "desired_agent_version": "0.9.0",
+            "desired_artifact_sha256": ARTIFACT,
+            "desired_compatibility_digest": ARTIFACT,
+            "desired_bundle_sha256": None,
+            "desired_template_sha256": None,
+            "desired_policy_version": "catalog-a",
+            "desired_runtime_profile_version": "profile-a",
+            "desired_config_digest": CONFIG,
+            "max_unavailable": 1,
+            "first_wave_max_unavailable": 1,
+            "max_unavailable_per_failure_domain": 1,
+            "node_failure_domains": {"node-a": "zone-a"},
+            "attempt_generation": 2,
+            "waves": [["node-a"]],
+            "nodes": [
+                {
+                    "node_id": "node-a",
+                    "status": "INSTALLING",
+                    "reason": "release rolled back",
+                    "updated_at": NOW,
+                }
+            ],
+            "status": "CANCELLED",
+            "created_at": NOW,
+            "updated_at": NOW,
+        }
+    )
+
+    payload = deployment.model_dump(mode="json")
+
+    assert deployment.status is DeploymentStatus.FAILED
+    assert deployment.nodes[0].status is DeploymentNodeStatus.FAILED
+    assert set(payload) == {
+        "deployment_id",
+        "cluster_id",
+        "desired_agent_protocol_version",
+        "desired_agent_version",
+        "desired_artifact_sha256",
+        "desired_compatibility_digest",
+        "desired_bundle_sha256",
+        "desired_template_sha256",
+        "desired_policy_version",
+        "desired_runtime_profile_version",
+        "desired_config_digest",
+        "max_unavailable",
+        "waves",
+        "nodes",
+        "status",
+        "created_at",
+        "updated_at",
+    }
+
+
+def test_missing_failure_domains_can_be_conservatively_grouped() -> None:
+    fleet = registry()
+
+    deployment = fleet.create_deployment(
+        FleetDeploymentRequest(
+            cluster_id="cluster-a",
+            node_ids=["node-c", "node-b", "node-a"],
+            desired_agent_version="0.9.0",
+            desired_artifact_sha256=ARTIFACT,
+            desired_policy_version="catalog-a",
+            desired_runtime_profile_version="profile-a",
+            desired_config_digest=CONFIG,
+            max_unavailable=2,
+            node_failure_domains={
+                "node-a": "UNKNOWN",
+                "node-b": "UNKNOWN",
+                "node-c": "UNKNOWN",
+            },
+        )
+    )
+
+    assert deployment.waves == [["node-a"], ["node-b"], ["node-c"]]
+
+
 def test_fleet_accepts_legacy_agent_identity_without_optional_digests() -> None:
     fleet = registry()
     fleet.register(signed(heartbeat("node-a")))
@@ -840,6 +1028,43 @@ def test_deployment_id_is_idempotent_and_contract_bound() -> None:
         fleet.create_deployment(
             request.model_copy(update={"desired_bundle_sha256": "f" * 64})
         )
+
+
+def test_the_idempotency_check_does_not_scan_every_deployment() -> None:
+    """``deployment_id`` is the store key, so the check is a lookup.
+
+    It used to scan and decode every deployment ever recorded in the region to
+    find one id -- including for a freshly generated ``uuid4`` id that cannot be
+    there.
+    """
+
+    fleet = registry()
+    scans = []
+    underlying = fleet.store.list_fleet_deployments
+
+    def recording():
+        scans.append(True)
+        return underlying()
+
+    fleet.store.list_fleet_deployments = recording  # type: ignore[method-assign]
+    request = FleetDeploymentRequest(
+        deployment_id="release-b-cluster-a",
+        cluster_id="cluster-a",
+        node_ids=["node-a"],
+        desired_agent_version="0.9.0",
+        desired_artifact_sha256=ARTIFACT,
+        desired_bundle_sha256="d" * 64,
+        desired_template_sha256="e" * 64,
+        desired_policy_version="catalog-a",
+        desired_runtime_profile_version="profile-a",
+        desired_config_digest=CONFIG,
+    )
+
+    first = fleet.create_deployment(request)
+    repeated = fleet.create_deployment(request)
+
+    assert repeated == first
+    assert scans == []
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])

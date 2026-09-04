@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import os
 
 from gpu_fault.collectors import (
@@ -19,6 +18,7 @@ from gpu_fault.collectors import (
     sink_from_environment,
 )
 from gpu_fault.env_validation import validate_gpu_fault_environment
+from gpu_fault.logging_setup import configure_logging
 
 
 def parser() -> argparse.ArgumentParser:
@@ -143,43 +143,8 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _configure_logging() -> None:
-    """Give every collector process a root logging configuration.
-
-    This is the same defect ``api.py:_configure_logging`` fixed for the
-    control plane, left unfixed on the node side: nothing in a collector
-    process ever called basicConfig, so root stayed at WARNING with no
-    handlers. Consequences observed on a live node:
-
-    * every ``LOGGER.info`` was discarded outright -- including
-      ``"delivered DCGM batch %s: %s"``, which is the only place the
-      node side reports *why* the edge filter decided to deliver. A
-      journal with zero delivery lines therefore proved nothing about
-      the filter, and looked identical to a dead collector.
-    * every ``LOGGER.warning`` / ``LOGGER.exception`` fell through to
-      ``logging.lastResort``, which prints the bare message with no
-      timestamp, level or logger name -- so tracebacks in the journal
-      could not be attributed to a collector or correlated in time.
-
-    Left alone when root already has handlers so tests and embedders
-    keep control of their own logging.
-    """
-
-    if logging.getLogger().handlers:
-        return
-    level = (
-        (os.getenv("GPU_FAULT_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO")
-        .strip()
-        .upper()
-    )
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-
-
 def main() -> None:
-    _configure_logging()
+    configure_logging()
     validate_gpu_fault_environment(process_name="gpu-fault-collector")
     args = parser().parse_args()
     os.environ.setdefault(

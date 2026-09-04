@@ -9,8 +9,11 @@ from typing import Any
 
 import yaml
 
-
 DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
+# The one copy of `gpu_fault.digests.SHA256_PATTERN` that stays a copy:
+# `scripts/build-release-artifacts.py` imports this module to compute the release
+# identity *before* the wheel it is identifying exists, so nothing here may import
+# from the package.
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 RUNTIME_COMPONENT_DISTRIBUTIONS = {
     "control_plane": "gpu-fault-control-plane",
@@ -58,6 +61,9 @@ def _component_patterns(value: object) -> dict[str, tuple[str, ...]]:
     expected = {
         "collector",
         "cpu",
+        "cpu_ingress",
+        "cpu_spool",
+        "cpu_worker",
         "dcgm",
         "endpoint",
         "executor",

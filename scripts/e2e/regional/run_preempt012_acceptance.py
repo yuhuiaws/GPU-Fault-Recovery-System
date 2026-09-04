@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
-import signal
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
-
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -32,13 +30,13 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     predecessor_path,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
-    RegionalFixtureError,
     RegionalLiveFixture,
+    install_abort_signals,
     predecessor_evidence,
     required,
+    run_case_main,
     settings_from_arguments,
 )
-
 
 CASE_ID = "GF-REGIONAL-PREEMPT-012"
 CONFIRMATION = "PREEMPT012_REAL_QUIESCE_BOUNDARIES"
@@ -402,10 +400,6 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
-def abort_on_signal(signum: int, _frame: object) -> None:
-    raise RegionalFixtureError(f"received signal {signum}")
-
-
 def execute_case(
     arguments: argparse.Namespace,
     regional: RegionalLiveFixture,
@@ -596,8 +590,7 @@ def execute_case(
 def main() -> int:
     arguments = parser().parse_args()
     os.umask(0o077)
-    signal.signal(signal.SIGTERM, abort_on_signal)
-    signal.signal(signal.SIGINT, abort_on_signal)
+    install_abort_signals()
     regional_settings = settings_from_arguments(arguments)
     node = required(
         arguments.node or os.getenv("GPU_FAULT_TARGET_NODE", ""),
@@ -675,4 +668,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_case_main(main))

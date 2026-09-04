@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 
 from gpu_fault.remote_command_models import RemoteCommandStatus
 
-
 UNCLAIMED_DEADLINE_STATUS_SOURCE = "unclaimed-deadline-exceeded"
 LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS = frozenset(
     {
@@ -65,6 +64,7 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
     unclaimed_age_by_cluster: dict[str, float] = {}
     open_by_cluster: dict[str, int] = {}
     internal_errors = 0
+    internal_error_last_seen = 0.0
     unclaimed_expired = 0
     for command in commands:
         by_status[command.status.value] = by_status.get(command.status.value, 0) + 1
@@ -73,6 +73,11 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
             and command.error not in LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS
         ):
             internal_errors += 1
+            error_at = getattr(command, "updated_at", None) or command.created_at
+            internal_error_last_seen = max(
+                internal_error_last_seen,
+                error_at.timestamp(),
+            )
         if command.status_source == UNCLAIMED_DEADLINE_STATUS_SOURCE:
             unclaimed_expired += 1
         if command.status not in pending_states:
@@ -102,5 +107,8 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
             default=0.0,
         ),
         "executor_internal_error_total": internal_errors,
+        "executor_internal_error_last_seen_timestamp_seconds": (
+            internal_error_last_seen
+        ),
         "unclaimed_expired_total": unclaimed_expired,
     }

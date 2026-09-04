@@ -11,7 +11,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
-
 from gpu_fault.node_agent.common import (
     DEFAULT_DEVICE_SWEEP_PROCESSES,
     DEFAULT_QUIESCE_CONTAINERS,
@@ -58,7 +57,7 @@ class GpuServiceQuiesceManager:
         device_sweep_processes: tuple[str, ...] = (DEFAULT_DEVICE_SWEEP_PROCESSES),
         proc_root: str = "/proc",
         restore_command: str = (
-            "/opt/gpu-fault/venv/bin/gpu-fault-restore-gpu-services"
+            "/opt/gpu-fault/current/venv/bin/gpu-fault-restore-gpu-services"
         ),
         runner: Callable[..., subprocess.CompletedProcess] = (subprocess.run),
         sleeper: Callable[[float], None] = time.sleep,

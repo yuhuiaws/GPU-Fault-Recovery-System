@@ -68,13 +68,27 @@ ADMIN_CONFIG_ROLE_FIELDS = {
     "admin_config_worker": "worker",
     "admin_config_spool": "spool",
 }
+CPU_ROLE_MANIFEST_FIELDS = {
+    "cpu_ingress_manifests": "ingress",
+    "cpu_worker_manifests": "worker",
+    "cpu_spool_manifests": "spool",
+}
 
 
 def control_plane_role_targets(diff: ReleaseDiff) -> tuple[str, ...]:
     scoped = diff.changed - {"release_delivery", "rendered_manifests"}
-    if scoped and scoped.issubset(ADMIN_CONFIG_CHANGE_FIELDS):
+    role_fields = {
+        **ADMIN_CONFIG_ROLE_FIELDS,
+        **CPU_ROLE_MANIFEST_FIELDS,
+    }
+    if scoped and scoped.issubset(set(role_fields)):
         return tuple(
-            role for field, role in ADMIN_CONFIG_ROLE_FIELDS.items() if field in scoped
+            role
+            for role in ("spool", "worker", "ingress")
+            if any(
+                field in scoped and target == role
+                for field, target in role_fields.items()
+            )
         )
     return ("spool", "worker", "ingress")
 
@@ -95,7 +109,8 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
     observability = bool(
         changed
         & {
-            "observability_manifests",
+            "observability_rules",
+            "observability_adot",
             "adot_image",
         }
     )
@@ -174,6 +189,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
         & {
             "control_plane_wheel",
             "cpu_manifests",
+            *CPU_ROLE_MANIFEST_FIELDS,
             "runtime_image",
             "notifications",
             "clusters",
@@ -183,11 +199,13 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
     cpu_stage = pin_changed or profile or bool(changed & {"clusters"})
     cpu_finalize = cpu_changed or cpu_stage
     scoped = changed - {"release_delivery", "rendered_manifests"}
-    admin_config_only = bool(scoped) and scoped.issubset(ADMIN_CONFIG_CHANGE_FIELDS)
+    role_scoped_cpu_only = bool(scoped) and scoped.issubset(
+        {*ADMIN_CONFIG_CHANGE_FIELDS, *CPU_ROLE_MANIFEST_FIELDS}
+    )
     registry = (
         cpu_stage
         or bool(changed & {"clusters"})
-        or (cpu_finalize and not admin_config_only)
+        or (cpu_finalize and not role_scoped_cpu_only)
     )
 
     for enabled, component in (
@@ -246,7 +264,10 @@ def diff_from_changed(changed: Iterable[str]) -> ReleaseDiff:
             "control_plane_wheel",
             "notifications",
             "cpu_manifests",
+            *CPU_ROLE_MANIFEST_FIELDS,
             "observability_manifests",
+            "observability_rules",
+            "observability_adot",
             "adot_image",
             *ADMIN_CONFIG_CHANGE_FIELDS,
         }
@@ -291,6 +312,15 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "admin_config_spool": release.admin_config_role_digests["spool"],
         "release_delivery": release.config.release_delivery_sha256,
         "cpu_manifests": release.config.delivery_component_digests.get("cpu"),
+        "cpu_ingress_manifests": release.config.delivery_component_digests.get(
+            "cpu_ingress"
+        ),
+        "cpu_worker_manifests": release.config.delivery_component_digests.get(
+            "cpu_worker"
+        ),
+        "cpu_spool_manifests": release.config.delivery_component_digests.get(
+            "cpu_spool"
+        ),
         "executor_manifests": release.config.delivery_component_digests.get("executor"),
         "watcher_manifests": release.config.delivery_component_digests.get("watcher"),
         "collector_manifests": release.config.delivery_component_digests.get(
@@ -301,6 +331,8 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         "observability_manifests": (
             release.config.delivery_component_digests.get("observability")
         ),
+        "observability_rules": release.observability_rules_digest,
+        "observability_adot": release.observability_adot_digest,
         "schema_manifests": release.config.delivery_component_digests.get("schema"),
         "endpoint_manifests": release.config.delivery_component_digests.get("endpoint"),
         "rendered_manifests": release.rendered_manifest_digest,
@@ -336,12 +368,24 @@ def classify_release(release: Any, state: dict[str, Any]) -> ReleaseDiff:
         ),
         "release_delivery": state.get("release_delivery_sha256"),
         "cpu_manifests": state.get("cpu_manifest_sha256"),
+        "cpu_ingress_manifests": state.get("cpu_ingress_manifest_sha256"),
+        "cpu_worker_manifests": state.get("cpu_worker_manifest_sha256"),
+        "cpu_spool_manifests": state.get("cpu_spool_manifest_sha256"),
         "executor_manifests": state.get("executor_manifest_sha256"),
         "watcher_manifests": state.get("watcher_manifest_sha256"),
         "collector_manifests": state.get("collector_manifest_sha256"),
         "dcgm_manifests": state.get("dcgm_manifest_sha256"),
         "node_manifests": state.get("node_manifest_sha256"),
         "observability_manifests": state.get("observability_manifest_sha256"),
+        "observability_rules": state.get("observability_rules_sha256"),
+        "observability_adot": (
+            state.get("observability_adot_sha256")
+            or (
+                release.observability_adot_digest
+                if state.get("observability_manifest_sha256")
+                else None
+            )
+        ),
         "schema_manifests": state.get("schema_manifest_sha256"),
         "endpoint_manifests": state.get("endpoint_manifest_sha256"),
         "rendered_manifests": state.get("rendered_manifest_sha256"),

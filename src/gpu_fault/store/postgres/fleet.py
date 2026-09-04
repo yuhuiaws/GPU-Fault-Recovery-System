@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from datetime import datetime
+from typing import TYPE_CHECKING, Any, Callable
 
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
+
+if TYPE_CHECKING:
+    from gpu_fault.fleet_deployment import FleetDeployment
 
 
 class PostgresFleetMixin:
@@ -121,6 +123,28 @@ class PostgresFleetMixin:
             )
             rows = cursor.fetchall()
         return [self._decode("fleet_deployment", row[0]) for row in rows]
+
+    def replace_fleet_deployment_if_matches(
+        self,
+        replacement: FleetDeployment,
+        expected: FleetDeployment | None,
+    ) -> bool:
+        key = replacement.deployment_id
+        with self._db.transaction():
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT pg_advisory_xact_lock(
+                        hashtextextended(%s, 0)
+                    )
+                    """,
+                    (f"fleet_deployment/{key}",),
+                )
+            current = self._get_optional("fleet_deployment", key)
+            if current != expected:
+                return False
+            self._put("fleet_deployment", key, replacement)
+            return True
 
     def cleanup_terminal_fleet_deployments(
         self,

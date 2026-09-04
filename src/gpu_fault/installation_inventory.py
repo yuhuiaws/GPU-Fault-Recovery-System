@@ -8,14 +8,13 @@ from typing import Annotated, Iterable, Protocol, Self
 
 from pydantic import AfterValidator, BeforeValidator, model_validator
 
+from gpu_fault.digests import SHA256_PATTERN
 from gpu_fault.models import StrictModel
-
 
 UNIT_PATTERN = re.compile(
     r"^gpu-fault-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
     r"\.(?:service|timer)$"
 )
-SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 MAX_INSTALLED_UNITS = 128
 DEFAULT_UNIT_INVENTORY = Path("/opt/gpu-fault/installed-units.txt")
 DEFAULT_SYSTEMD_DIRECTORY = Path("/etc/systemd/system")

@@ -1,4 +1,5 @@
 from importlib import import_module
+from typing import Any
 
 _EXPORTS = {
     "ActionDisposition": ("gpu_fault.policy.models", "ActionDisposition"),
@@ -48,7 +49,7 @@ _EXPORTS = {
 __all__ = list(_EXPORTS)
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     target = _EXPORTS.get(name)
     if target is None:
         raise AttributeError(name)

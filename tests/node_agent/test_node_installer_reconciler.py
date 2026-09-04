@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from gpu_fault.node_installer_reconciler import (
     INSTALLER_ARTIFACT_ANNOTATION,
     INSTALLER_BUNDLE_ANNOTATION,
@@ -62,8 +64,9 @@ def job(*, condition: str | None = None, age_seconds: int = 0):
 
 
 class CoreApi:
-    def __init__(self, nodes):
+    def __init__(self, nodes, *, wave_data=None):
         self.nodes = nodes
+        self.wave_data = wave_data
         self.patches = []
 
     def list_node(self, *, label_selector):
@@ -72,6 +75,11 @@ class CoreApi:
 
     def patch_node(self, name, body):
         self.patches.append((name, body))
+
+    def read_namespaced_config_map(self, name, namespace):
+        assert name == "gpu-fault-node-installer-wave"
+        assert namespace == "gpu-fault-system"
+        return SimpleNamespace(data=self.wave_data)
 
 
 class BatchApi:
@@ -334,6 +342,41 @@ def test_reconcile_limits_nodes_to_the_active_fleet_wave():
     assert batch.created[0][1]["spec"]["template"]["spec"]["nodeName"] == (
         "hyperpod-i-002"
     )
+
+
+def test_reconcile_reads_wave_without_restarting_controller():
+    core = CoreApi(
+        [
+            node(name="hyperpod-i-001", uid="node-1"),
+            node(name="hyperpod-i-002", uid="node-2"),
+        ],
+        wave_data={
+            "allowed-nodes": "hyperpod-i-001,hyperpod-i-002",
+            "max-unavailable": "2",
+        },
+    )
+    batch = BatchApi()
+    active = reconciler(core, batch)
+    active.wave_config_map = "gpu-fault-node-installer-wave"
+
+    result = active.reconcile_once()
+
+    assert result["created"] == 2
+    assert len(batch.created) == 2
+
+
+def test_invalid_wave_config_fails_closed_without_creating_jobs():
+    core = CoreApi(
+        [node()], wave_data={"allowed-nodes": "*", "max-unavailable": "invalid"}
+    )
+    batch = BatchApi()
+    active = reconciler(core, batch)
+    active.wave_config_map = "gpu-fault-node-installer-wave"
+
+    with pytest.raises(RuntimeError, match="max-unavailable"):
+        active.reconcile_once()
+
+    assert batch.created == []
 
 
 def test_failed_job_is_deleted_after_retry_delay():

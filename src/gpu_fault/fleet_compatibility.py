@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from pydantic import Field, field_validator
 
+from gpu_fault.digests import SHA256_PATTERN, normalized_sha256
 from gpu_fault.models import StrictModel, WorkflowOperation
 
-
-SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CURRENT_AGENT_PROTOCOL_VERSION = 3
 NODE_ACTION_KEY_VERSION_SHARED = 1
 NODE_ACTION_KEY_VERSION_DERIVED = 2
@@ -52,12 +50,7 @@ class FleetCompatibilityPolicy(StrictModel):
     )
     @classmethod
     def validate_optional_digest(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.lower()
-        if not SHA256_PATTERN.fullmatch(normalized):
-            raise ValueError("digest must be a SHA-256 hex value")
-        return normalized
+        return normalized_sha256(value)
 
     @field_validator("compatible_agent_protocol_versions")
     @classmethod

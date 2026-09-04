@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
-from datetime import date, datetime
 import hashlib
 import json
-from pathlib import Path
 import re
+import sys
+from collections import Counter, defaultdict
+from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_DIR = ROOT / "docs/evidence/fault"
@@ -114,6 +114,81 @@ def _catalog_report_cases() -> tuple[
         result[relative.name].append(case_id)
         owner[case_id] = relative.name
     return result, owner, case_ids, case_verdict
+
+
+def _pass_bindings() -> dict[str, dict[str, str] | None]:
+    """Return every ``PASS`` case id mapped to its recorded component digests.
+
+    ``None`` marks a case whose ``PASS`` predates the binding, so no digest was
+    ever recorded. The distinction matters operationally: a stale binding says
+    "this was true for other code", an absent one says "nobody knows".
+    """
+    catalog = _load_yaml(CATALOG)
+    bindings: dict[str, dict[str, str] | None] = {}
+    for case in catalog.get("test_cases", []):
+        if not isinstance(case, dict):
+            continue
+        evidence = case.get("evidence")
+        if not isinstance(evidence, dict) or evidence.get("verdict") != "PASS":
+            continue
+        verified = evidence.get("verified")
+        components = verified.get("components") if isinstance(verified, dict) else None
+        bindings[str(case["id"])] = components if isinstance(components, dict) else None
+    return bindings
+
+
+def live_component_digests() -> dict[str, str]:
+    """Digest the component sources as they are in this checkout.
+
+    Imported by path rather than as ``scripts.component_wheels`` so the
+    documented ``python3 scripts/build-fault-evidence-index.py`` invocation keeps
+    working from any working directory.
+    """
+    for candidate in (ROOT / "src", ROOT / "scripts"):
+        if str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+    from component_wheels import (  # noqa: PLC0415
+        APPLICATION_COMPONENT_NAMES,
+        component_source_digest,
+    )
+
+    return {name: component_source_digest(name) for name in APPLICATION_COMPONENT_NAMES}
+
+
+def evidence_freshness(
+    bindings: dict[str, dict[str, str] | None],
+    live: dict[str, str],
+) -> dict[str, list[str]]:
+    """Classify every ``PASS`` verdict against the code now in the tree.
+
+    ``STALE`` is derived here and never stored, so a verdict cannot be kept alive
+    by typing a word into the catalog. It is also deliberately not a failure:
+    these cases only run against real GPUs in a maintenance window, so blocking
+    the build on every release would just pressure people into inventing
+    evidence. Reporting is the useful half — an administrator planning the next
+    live window learns which verdicts no longer cover the shipping code.
+    """
+    result: dict[str, list[str]] = {"fresh": [], "stale": [], "unbound": []}
+    for case_id, components in sorted(bindings.items()):
+        if components is None:
+            result["unbound"].append(case_id)
+        elif components == live:
+            result["fresh"].append(case_id)
+        else:
+            result["stale"].append(case_id)
+    return result
+
+
+def _print_freshness() -> None:
+    freshness = evidence_freshness(_pass_bindings(), live_component_digests())
+    print(
+        "PASS_EVIDENCE_FRESH= {fresh} STALE= {stale} UNBOUND= {unbound}".format(
+            **{key: len(value) for key, value in freshness.items()}
+        )
+    )
+    for state in ("stale", "unbound"):
+        for case_id in freshness[state]:
+            print(f"{state.upper()}: {case_id} must be re-verified in a live window")
 
 
 def build_index() -> dict[str, Any]:
@@ -274,6 +349,13 @@ def build_index() -> dict[str, Any]:
             item["superseded_by_case"] = entry["superseded_by_case"]
         output.append(item)
 
+    # Which PASS verdicts are bound to a code state at all. The digests
+    # themselves stay out of the index: they would move with every source change
+    # and turn `--check` into a permanent diff. Whether a binding exists is a
+    # property of the catalog alone, so it is stable. Without this, the index
+    # reports an empty public evidence set while the catalog carries ten PASS
+    # verdicts, and nothing tells a reader those verdicts are unanchored.
+    bindings = _pass_bindings()
     return {
         "schema_version": 1,
         "generated_from": "docs/evidence/fault/manifest.yaml",
@@ -281,6 +363,18 @@ def build_index() -> dict[str, Any]:
         "provenance": manifest["provenance"],
         "provenance_note": manifest["provenance_note"],
         "verdict_counts": dict(sorted(verdict_counts.items())),
+        "pass_case_bindings": {
+            "bound": sorted(
+                case_id
+                for case_id, components in bindings.items()
+                if components is not None
+            ),
+            "unbound": sorted(
+                case_id
+                for case_id, components in bindings.items()
+                if components is None
+            ),
+        },
         "reports": output,
     }
 
@@ -311,9 +405,11 @@ def main() -> None:
                 "python3 scripts/build-fault-evidence-index.py"
             )
         print("Fault evidence index is current.")
+        _print_freshness()
         return
     INDEX.write_text(rendered, encoding="utf-8")
     print(f"Wrote {INDEX.relative_to(ROOT)}")
+    _print_freshness()
 
 
 if __name__ == "__main__":

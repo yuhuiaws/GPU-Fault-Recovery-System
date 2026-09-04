@@ -20,9 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "docs/evidence/fault"
 INDEX = EVIDENCE / "index.json"
 CATALOG = ROOT / "testcases/fault-scenarios.yaml"
-INDEX_SCRIPT = lazy_script_module(
-    "build_fault_evidence_index", ROOT / "scripts/build-fault-evidence-index.py"
-)
+INDEX_SCRIPT = lazy_script_module(ROOT / "scripts/build-fault-evidence-index.py")
 
 
 def test_fault_evidence_index_is_current() -> None:
@@ -117,7 +115,54 @@ def test_public_catalog_contains_no_private_report_pointers() -> None:
 
     for case in load_catalog(CATALOG):
         evidence = case.get("evidence") or {}
-        assert set(evidence) <= {"verdict"}, case["id"]
+        assert set(evidence) <= {"verdict", "verified"}, case["id"]
+
+
+def test_index_reports_which_pass_verdicts_are_bound_to_code() -> None:
+    """The index must not claim an empty evidence set while PASS verdicts exist."""
+    index = json.loads(INDEX.read_text(encoding="utf-8"))
+    bindings = index["pass_case_bindings"]
+    passed = {
+        case["id"]
+        for case in load_catalog(CATALOG)
+        if (case.get("evidence") or {}).get("verdict") == "PASS"
+    }
+
+    assert set(bindings["bound"]) | set(bindings["unbound"]) == passed
+    assert not set(bindings["bound"]) & set(bindings["unbound"])
+
+
+def test_index_records_no_component_digest_that_would_churn_on_every_edit() -> None:
+    """A live digest in the index would make `--check` a permanent diff."""
+    raw = INDEX.read_text(encoding="utf-8")
+
+    for digest in INDEX_SCRIPT.live_component_digests().values():
+        assert digest not in raw
+
+
+def test_pass_evidence_freshness_separates_drift_from_missing_bindings() -> None:
+    live = {"control_plane": "a" * 64, "executor": "b" * 64, "node_runtime": "c" * 64}
+
+    freshness = INDEX_SCRIPT.evidence_freshness(
+        {
+            "GF-FRESH": dict(live),
+            "GF-STALE": {**live, "executor": "d" * 64},
+            "GF-UNBOUND": None,
+        },
+        live,
+    )
+
+    assert freshness == {
+        "fresh": ["GF-FRESH"],
+        "stale": ["GF-STALE"],
+        "unbound": ["GF-UNBOUND"],
+    }
+
+
+def test_stale_is_derived_and_cannot_be_written_into_the_catalog() -> None:
+    """Nobody may keep a drifted verdict alive by typing a word into the YAML."""
+    assert "STALE" not in CURRENT_STATUS_VALUES
+    assert "STALE" not in set(INDEX_SCRIPT.VERDICTS)
 
 
 def test_public_fault_evidence_tree_contains_only_schema_files() -> None:

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Callable, cast
 from datetime import datetime
 
 if TYPE_CHECKING:
+    from gpu_fault.fleet_deployment import FleetDeployment
     from gpu_fault.regional import (
         RegionalRegistryHead,
         RegionalRegistryMember,
@@ -211,6 +212,32 @@ class SqliteFleetMixin:
                 deployment.deployment_id,
                 deployment,
             )
+
+    def replace_fleet_deployment_if_matches(
+        self,
+        replacement: FleetDeployment,
+        expected: FleetDeployment | None,
+    ) -> bool:
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._get_optional(
+                    "fleet_deployment",
+                    replacement.deployment_id,
+                )
+                if current != expected:
+                    self._db.execute("ROLLBACK")
+                    return False
+                self._put(
+                    "fleet_deployment",
+                    replacement.deployment_id,
+                    replacement,
+                )
+                self._db.execute("COMMIT")
+                return True
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
 
     def get_fleet_deployment(self, deployment_id: str):
         return self._get("fleet_deployment", deployment_id)

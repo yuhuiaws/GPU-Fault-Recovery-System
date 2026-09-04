@@ -63,8 +63,12 @@ from ._notifications_cases_2 import (
     test_the_shelf_life_can_be_turned_off_entirely,
 )
 from ._notifications_cases_3 import (
+    test_a_bulk_resend_within_budget_reports_no_truncation,
     test_a_negative_shelf_life_is_refused,
+    test_a_non_positive_dispatch_scan_budget_is_refused,
+    test_an_unbounded_notification_read_is_unchanged,
     test_delivery_mode_names_the_switch_that_blocks_delivery,
     test_delivery_mode_states_whether_notifications_reach_anyone,
+    test_the_bulk_resend_scan_is_bounded_and_says_when_it_truncated,
     test_the_load_suites_label_every_synthetic_fault_as_a_drill,
 )

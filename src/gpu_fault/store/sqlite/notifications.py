@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 from gpu_fault.models import (
     AdvisoryNotification,
@@ -13,6 +12,9 @@ from gpu_fault.models import (
     NotificationStatus,
 )
 from gpu_fault.store.shared.errors import WorkflowLeaseError
+from gpu_fault.store.shared.notification_helpers import (
+    bound_notifications,
+)
 from gpu_fault.store.shared.notification_helpers import (
     with_incident_drill_label as _with_incident_drill_label,
 )
@@ -71,10 +73,17 @@ class SqliteNotificationMixin:
 
     def list_notifications(
         self,
+        *,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[AdvisoryNotification]:
-        return sorted(
-            self._list("notification"),
-            key=lambda item: item.created_at,
+        return bound_notifications(
+            sorted(
+                self._list("notification"),
+                key=lambda item: item.created_at,
+            ),
+            limit=limit,
+            newest_first=newest_first,
         )
 
     def notification_status_counts(self) -> dict[NotificationStatus, int]:

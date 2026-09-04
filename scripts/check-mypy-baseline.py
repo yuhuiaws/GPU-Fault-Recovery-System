@@ -10,11 +10,15 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / "mypy-baseline.json"
-TARGETS = ("src",)
-ERROR = re.compile(r"^(src/[^:]+):\d+(?::\d+)?: error: .+ \[([a-z-]+)\]$")
+# `deploy` is checked alongside `src` because the release orchestrator lives
+# there, not in the package: ~14k lines that mutate two clusters and hold the
+# rollback path, previously outside every type gate.
+TARGETS = ("src", "deploy")
+ERROR = re.compile(
+    r"^((?:src|deploy)/[^:]+):\d+(?::\d+)?: error: .+ \[([a-z-]+)\]$",
+)
 
 
 def current_errors() -> tuple[Counter[str], str]:

@@ -46,6 +46,7 @@ from ._policy_cases_2 import (
     test_every_catalog_rule_resolves_as_the_catalog_says,
     test_every_nvlink5_decode_rule_resolves_as_the_catalog_says,
     test_nvlink5_decode_table_has_no_unreachable_rule,
+    test_only_the_known_unowned_workflows_reach_no_executor,
     test_unowned_restart_vm_workflow_remains_fail_closed,
     test_version_gate_branches_are_exact,
     test_xid74_hopper_decoder_is_not_applied_to_a100,
@@ -54,4 +55,5 @@ from ._policy_cases_2 import (
     test_xid74_register_workflow_is_deterministic,
     test_xid_45_and_48_workflow_branches_are_exact,
     test_xid_154_covers_every_official_recovery_action,
+    test_xid_154_is_routed_from_the_workflow_table,
 )

@@ -2,22 +2,79 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-from pathlib import Path
 import re
-import subprocess
 import time
+from dataclasses import dataclass
+from math import ceil
+from pathlib import Path
 from typing import Any
 
 import regional_deployment_inventory as inventory
-from regional_release_config import ClusterTarget, ReleaseError
-from regional_release_gpu_rollout import agents_converged
-from regional_release_legacy import apply_fleet_request_identity
+from regional_release_agent_convergence import (
+    agent_heartbeats_converged as agent_heartbeats_converged,
+)
+from regional_release_agent_convergence import (
+    wait_agents as wait_agents,
+)
+from regional_release_config import (
+    ClusterLocalReleaseError,
+    ClusterTarget,
+    ReleaseError,
+)
+from regional_release_gpu_rollout import gpu_node_items
+from regional_release_probes import probe_source
 from regional_release_rendering import build_reconciler_environment
-from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
-
+from regional_release_rollout_wait import wait_deployment_rollout
+from regional_release_runtime_identity import (
+    CONTROL_PLANE_PYTHON,
+    exec_cpu_ingress_probe,
+)
+from regional_release_timing import record_rollback_wave_event
 
 ROOT = Path(__file__).resolve().parents[3]
+FAILURE_DOMAIN_LABELS = (
+    "topology.kubernetes.io/zone",
+    "failure-domain.beta.kubernetes.io/zone",
+)
+CANDIDATE_CPU_HEARTBEAT_TIMEOUT_SECONDS = 75.0
+ROLLOUT_AGENT_GATE_TIMEOUT_SECONDS = 60.0
+ROLLOUT_AGENT_POLL_SECONDS = 5.0
+ROLLOUT_AGENT_LEASE_MARGIN_SECONDS = 40
+ROLLOUT_AGENT_POST_LEASE_MARGIN_SECONDS = 30
+MAX_UPGRADE_UNAVAILABLE = 32
+INSTALLER_WAVE_CONFIG_MAP_ENV = "GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP"
+INSTALLER_BUNDLE_ENV = "GPU_FAULT_INSTALLER_BUNDLE_SHA256"
+INSTALLER_TEMPLATE_ENV = "GPU_FAULT_INSTALLER_TEMPLATE_SHA256"
+
+
+@dataclass(frozen=True)
+class NodeRolloutPolicy:
+    max_unavailable: int
+    first_wave_max_unavailable: int
+    max_unavailable_per_failure_domain: int
+
+
+@dataclass(frozen=True)
+class FleetWaveContext:
+    phase: str
+    deployment_id: str
+    node_names: tuple[str, ...]
+    paused_identity: tuple[str, str]
+    wheel_cm: str
+    bundle_cm: str
+    artifact_sha: str
+    config_digest: str
+    expected_profile: str
+    executor_wheel_filename: str | None
+    expected_compatibility: str
+    desired_bundle: str
+    desired_template: str
+    template_config_map: str | None
+    max_unavailable: int
+    runtime_image: str | None
+    node_installer_image: str | None
+    allow_legacy_identity: bool
+    agent_identity: dict[str, Any] | None
 
 
 def backup_secret(
@@ -28,20 +85,15 @@ def backup_secret(
     backup: str,
     required: bool,
 ) -> str | None:
-    exists = (
-        subprocess.run(
-            kubectl
-            + [
-                "-n",
-                release.config.namespace,
-                "get",
-                "secret",
-                source,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+    exists = release.runner.probe(
+        kubectl
+        + [
+            "-n",
+            release.config.namespace,
+            "get",
+            "secret",
+            source,
+        ],
     )
     if not exists:
         if required:
@@ -207,11 +259,10 @@ def target_node_names(
     release: Any,
     target: ClusterTarget,
 ) -> tuple[str, ...]:
-    value = release._get_json(release._gpu(target, "get", "nodes"))
     names = tuple(
         sorted(
             str(item.get("metadata", {}).get("name") or "")
-            for item in value.get("items", [])
+            for item in gpu_node_items(release, target)
             if (
                 item.get("metadata", {})
                 .get("labels", {})
@@ -226,6 +277,34 @@ def target_node_names(
             f"{target.cluster_id} has no HyperPod nodes for fleet rollout"
         )
     return names
+
+
+def target_node_failure_domains(
+    release: Any,
+    target: ClusterTarget,
+    node_names: tuple[str, ...],
+) -> dict[str, str]:
+    expected = set(node_names)
+    result = {}
+    for item in gpu_node_items(release, target):
+        metadata = item.get("metadata", {})
+        node_id = str(metadata.get("name") or "")
+        if node_id not in expected:
+            continue
+        labels = metadata.get("labels") or {}
+        result[node_id] = next(
+            (
+                str(labels[label])
+                for label in FAILURE_DOMAIN_LABELS
+                if str(labels.get(label) or "").strip()
+            ),
+            "UNKNOWN",
+        )
+    if set(result) != expected:
+        raise ReleaseError(
+            f"{target.cluster_id} failure-domain inventory is incomplete"
+        )
+    return result
 
 
 def fleet_command(
@@ -249,36 +328,7 @@ def fleet_command(
     )
     if not pod:
         raise ReleaseError("no running CPU ingress Pod for fleet rollout")
-    script = """
-import json
-import sys
-
-from gpu_fault import __version__
-from gpu_fault.app import ApplicationContext
-from gpu_fault.fleet import FleetDeploymentRequest
-from gpu_fault.policy import load_xid_policy
-
-payload = json.load(sys.stdin)
-context = ApplicationContext.from_environment()
-registry = context.fleet_registry
-if registry is None:
-    raise RuntimeError("fleet registry is disabled")
-operation = payload["operation"]
-if operation == "create":
-    request = dict(payload["request"])
-    request.setdefault("desired_agent_version", __version__)
-    request.setdefault("desired_policy_version", load_xid_policy().mapping_version)
-    result = registry.create_deployment(
-        FleetDeploymentRequest.model_validate(request)
-    )
-elif operation == "get":
-    result = context.store.get_fleet_deployment(payload["deployment_id"])
-elif operation == "next-wave":
-    result = registry.start_next_wave(payload["deployment_id"])
-else:
-    raise ValueError(f"unsupported fleet operation: {operation}")
-print(result.model_dump_json())
-"""
+    script = probe_source("fleet_deployment_command")
     raw = release.runner.run(
         release._cpu(
             "-n",
@@ -339,10 +389,9 @@ def nodes_have_legacy_installer_identity(
     config_digest: str,
 ) -> bool:
     expected = set(node_names)
-    value = release._get_json(release._gpu(target, "get", "nodes"))
     selected = [
         item
-        for item in value.get("items", [])
+        for item in gpu_node_items(release, target, fresh=True)
         if str(item.get("metadata", {}).get("name") or "") in expected
     ]
     if len(selected) != len(expected):
@@ -379,6 +428,7 @@ def finish_legacy_node_runtime_rollback(
     steady_runtime_image: str | None,
     steady_template_config_map: str | None,
     node_installer_image: str | None,
+    max_unavailable: int,
 ) -> tuple[str, str] | None:
     if not enabled or not nodes_have_legacy_installer_identity(
         release,
@@ -402,6 +452,7 @@ def finish_legacy_node_runtime_rollback(
         template_sha256=desired_template,
         template_config_map=steady_template_config_map or template_config_map,
         allowed_node_names=None,
+        max_unavailable=max_unavailable,
         runtime_image=steady_runtime_image or runtime_image,
         node_installer_image=node_installer_image,
     )
@@ -410,264 +461,321 @@ def finish_legacy_node_runtime_rollback(
     return final_identity
 
 
-def node_rollout_max_unavailable(node_count: int) -> int:
-    try:
-        configured = int(os.getenv("GPU_FAULT_INSTALLER_MAX_UNAVAILABLE", "1"))
-    except ValueError as exc:
-        raise ReleaseError(
-            "GPU_FAULT_INSTALLER_MAX_UNAVAILABLE must be an integer"
-        ) from exc
-    return min(node_count, max(1, configured))
-
-
-def roll_node_runtime(
+def node_rollout_policy(
     release: Any,
-    target: ClusterTarget,
+    failure_domains: dict[str, str] | int,
     *,
     phase: str,
-    wheel_cm: str,
-    bundle_cm: str,
-    artifact_sha: str,
-    config_digest: str,
-    runtime_profile_version: str | None = None,
-    executor_wheel_filename: str | None = None,
-    node_compatibility_digest: str | None = None,
-    bundle_sha256: str | None = None,
-    template_sha256: str | None = None,
-    template_config_map: str | None = None,
-    runtime_image: str | None = None,
-    steady_runtime_image: str | None = None,
-    steady_template_config_map: str | None = None,
-    node_installer_image: str | None = None,
-    allow_legacy_identity: bool = False,
-    agent_identity: dict[str, Any] | None = None,
-) -> tuple[str, str]:
-    expected_profile = runtime_profile_version or release.config.runtime_profile_version
-    expected_compatibility = (
-        node_compatibility_digest
-        or release.config.component_digests.get("node_runtime")
-        or artifact_sha
-    )
-    if release.runner.dry_run:
-        identity = release._deploy_reconciler(
-            target,
-            wheel_cm=wheel_cm,
-            bundle_cm=bundle_cm,
-            artifact_sha=artifact_sha,
-            config_digest=config_digest,
-            runtime_profile_version=expected_profile,
-            executor_wheel_filename=executor_wheel_filename,
-            node_compatibility_digest=expected_compatibility,
-            bundle_sha256=bundle_sha256,
-            template_sha256=template_sha256,
-            template_config_map=template_config_map,
-            runtime_image=runtime_image,
-            node_installer_image=node_installer_image,
+) -> NodeRolloutPolicy:
+    if phase == "rollback":
+        raise ReleaseError("rollback rollout policy requires rollback policy")
+    if isinstance(failure_domains, int):
+        failure_domains = {
+            f"node-{index}": f"domain-{index}" for index in range(failure_domains)
+        }
+    node_count = len(failure_domains)
+    domains = set(failure_domains.values())
+    if not node_count:
+        raise ReleaseError("upgrade rollout policy has no nodes")
+    if "UNKNOWN" in domains:
+        effective = 1
+        per_domain = 1
+    else:
+        size_cap = (
+            min(node_count, 4)
+            if node_count < 64
+            else 8
+            if node_count < 256
+            else 16
+            if node_count < 512
+            else MAX_UPGRADE_UNAVAILABLE
         )
-        release._wait_agents(
-            target,
-            artifact_sha,
-            bundle_sha=identity[0],
-            template_sha=identity[1],
-            config_digest=config_digest,
-            runtime_profile_version=expected_profile,
-            legacy_identity=allow_legacy_identity,
-            agent_identity=agent_identity,
+        effective = min(
+            release.config.upgrade_max_unavailable,
+            size_cap,
+            MAX_UPGRADE_UNAVAILABLE,
         )
-        return identity
-    node_names = release._target_node_names(target)
-    paused_identity = release._deploy_reconciler(
-        target,
-        wheel_cm=wheel_cm,
-        bundle_cm=bundle_cm,
-        artifact_sha=artifact_sha,
-        config_digest=config_digest,
-        runtime_profile_version=expected_profile,
-        executor_wheel_filename=executor_wheel_filename,
-        node_compatibility_digest=expected_compatibility,
-        bundle_sha256=bundle_sha256,
-        template_sha256=template_sha256,
-        template_config_map=template_config_map,
-        allowed_node_names=(),
-        runtime_image=runtime_image,
-        node_installer_image=node_installer_image,
+        per_domain = (
+            effective if len(domains) == 1 else ceil(effective / max(1, len(domains)))
+        )
+    return NodeRolloutPolicy(
+        max_unavailable=max(1, effective),
+        first_wave_max_unavailable=1,
+        max_unavailable_per_failure_domain=max(1, per_domain),
     )
-    desired_bundle, desired_template = paused_identity
-    legacy_identity = finish_legacy_node_runtime_rollback(
-        release,
-        target,
-        enabled=allow_legacy_identity,
-        node_names=node_names,
-        paused_identity=paused_identity,
-        wheel_cm=wheel_cm,
-        bundle_cm=bundle_cm,
-        artifact_sha=artifact_sha,
-        config_digest=config_digest,
-        runtime_profile_version=expected_profile,
-        executor_wheel_filename=executor_wheel_filename,
-        node_compatibility_digest=expected_compatibility,
-        template_config_map=template_config_map,
-        runtime_image=runtime_image,
-        steady_runtime_image=steady_runtime_image,
-        steady_template_config_map=steady_template_config_map,
-        node_installer_image=node_installer_image,
+
+
+def rollback_node_rollout_policy(
+    release: Any,
+    failure_domains: dict[str, str],
+) -> NodeRolloutPolicy:
+    node_count = len(failure_domains)
+    domains = set(failure_domains.values())
+    if not node_count:
+        raise ReleaseError("rollback rollout policy has no nodes")
+    if "UNKNOWN" in domains:
+        effective = 1
+        per_domain = 1
+    else:
+        size_cap = 1 if node_count < 6 else 2 if node_count < 32 else 4
+        effective = min(release.config.rollback_max_unavailable, size_cap)
+        per_domain = effective if len(domains) == 1 else 1
+    return NodeRolloutPolicy(
+        max_unavailable=max(1, effective),
+        first_wave_max_unavailable=1,
+        max_unavailable_per_failure_domain=max(1, per_domain),
     )
-    if legacy_identity is not None:
-        return legacy_identity
-    fleet_bundle = None if allow_legacy_identity else desired_bundle
-    fleet_template = None if allow_legacy_identity else desired_template
-    max_unavailable = node_rollout_max_unavailable(len(node_names))
-    deployment_id = release._fleet_deployment_id(
-        target,
-        phase=phase,
-        artifact_sha=artifact_sha,
-        bundle_sha=fleet_bundle,
-        template_sha=fleet_template,
-        config_digest=config_digest,
-        runtime_profile_version=expected_profile,
-    )
-    request = {
-        "deployment_id": deployment_id,
-        "cluster_id": target.cluster_id,
-        "node_ids": list(node_names),
-        "desired_artifact_sha256": artifact_sha,
-        "desired_compatibility_digest": expected_compatibility,
-        "desired_bundle_sha256": fleet_bundle,
-        "desired_template_sha256": fleet_template,
-        "desired_runtime_profile_version": expected_profile,
-        "desired_config_digest": config_digest,
-        "max_unavailable": max_unavailable,
+
+
+def next_deployment_wave(deployment: dict[str, Any]) -> tuple[str, ...]:
+    statuses = {
+        str(item.get("node_id") or ""): str(item.get("status") or "")
+        for item in deployment.get("nodes") or []
     }
-    apply_fleet_request_identity(request, agent_identity)
-    deployment = release._fleet_command("create", {"request": request})
-    while deployment.get("status") != "SUCCEEDED":
-        if deployment.get("status") == "FAILED":
-            raise ReleaseError(f"{target.cluster_id} fleet deployment failed")
-        lease = release._fleet_command(
-            "next-wave",
-            {"deployment_id": deployment_id},
-        )
-        wave = tuple(str(item) for item in lease.get("node_ids", []))
-        if not wave:
-            raise ReleaseError(
-                f"{target.cluster_id} fleet deployment returned an empty wave"
+    for raw_wave in deployment.get("waves") or []:
+        wave = tuple(str(node_id) for node_id in raw_wave)
+        if any(statuses.get(node_id) != "READY" for node_id in wave):
+            return tuple(
+                node_id
+                for node_id in wave
+                if statuses.get(node_id) in {"PENDING", "INSTALLING"}
             )
-        identity = release._deploy_reconciler(
-            target,
-            wheel_cm=wheel_cm,
-            bundle_cm=bundle_cm,
-            artifact_sha=artifact_sha,
-            config_digest=config_digest,
-            runtime_profile_version=expected_profile,
-            executor_wheel_filename=executor_wheel_filename,
-            node_compatibility_digest=expected_compatibility,
-            bundle_sha256=desired_bundle,
-            template_sha256=desired_template,
-            template_config_map=template_config_map,
-            allowed_node_names=wave,
-            runtime_image=runtime_image,
-            node_installer_image=node_installer_image,
-        )
-        if identity != paused_identity:
-            raise ReleaseError(
-                f"{target.cluster_id} installer identity changed between waves"
-            )
-        release._wait_agents(
-            target,
-            artifact_sha,
-            bundle_sha=desired_bundle,
-            template_sha=desired_template,
-            config_digest=config_digest,
-            runtime_profile_version=expected_profile,
-            node_names=wave,
-            legacy_identity=allow_legacy_identity,
-            agent_identity=agent_identity,
-        )
-        deployment = release._fleet_command(
-            "get",
-            {"deployment_id": deployment_id},
-        )
+    return ()
 
-    final_identity = release._deploy_reconciler(
-        target,
-        wheel_cm=wheel_cm,
-        bundle_cm=bundle_cm,
-        artifact_sha=artifact_sha,
-        config_digest=config_digest,
-        runtime_profile_version=expected_profile,
-        executor_wheel_filename=executor_wheel_filename,
-        node_compatibility_digest=expected_compatibility,
-        bundle_sha256=desired_bundle,
-        template_sha256=desired_template,
-        template_config_map=steady_template_config_map or template_config_map,
-        allowed_node_names=None,
-        runtime_image=steady_runtime_image or runtime_image,
-        node_installer_image=node_installer_image,
+
+def candidate_agent_pin_identity(release: Any) -> dict[str, str]:
+    """The Agent identity this release's pin window narrows to on finalize.
+
+    These are the four values ``build_cpu_apply_environment`` writes into
+    ``gpu-fault-release-metadata`` as ``required-agent-*`` when ``finalize`` is
+    true, so an Agent reporting all four is one the finalized control plane
+    still accepts.
+    """
+    config = release.config
+    return {
+        "artifact_sha256": str(release.node_wheel_sha),
+        "compatibility_digest": str(
+            config.component_digests.get("node_runtime") or release.node_wheel_sha
+        ),
+        "agent_protocol_version": str(config.agent_protocol_version),
+        "config_digest": str(config.agent_config_digest),
+    }
+
+
+def wait_candidate_cpu_agent_heartbeats(
+    release: Any,
+    agent_identities: dict[str, Any],
+    *,
+    required_identity: dict[str, str] | None = None,
+    timeout_seconds: float = CANDIDATE_CPU_HEARTBEAT_TIMEOUT_SECONDS,
+    poll_seconds: float = ROLLOUT_AGENT_POLL_SECONDS,
+    minimum_lease_remaining_seconds: int = ROLLOUT_AGENT_LEASE_MARGIN_SECONDS,
+) -> None:
+    if release.runner.dry_run:
+        return
+    expected_by_cluster = {
+        str(cluster_id): sorted(
+            {
+                str(node_id)
+                for node_id in (identity or {}).get("node_ids", [])
+                if str(node_id)
+            }
+        )
+        for cluster_id, identity in agent_identities.items()
+        if isinstance(identity, dict)
+    }
+    expected_by_cluster = {
+        cluster_id: node_ids
+        for cluster_id, node_ids in expected_by_cluster.items()
+        if node_ids
+    }
+    if not expected_by_cluster:
+        return
+    raw = exec_cpu_ingress_probe(
+        release,
+        script=probe_source("agent_heartbeat_barrier"),
+        failure="release safety checks",
+        input_text=json.dumps(
+            {
+                "expected_by_cluster": expected_by_cluster,
+                "timeout_seconds": timeout_seconds,
+                "poll_seconds": poll_seconds,
+                "minimum_lease_remaining_seconds": (minimum_lease_remaining_seconds),
+                "required_identity": required_identity,
+            }
+        ),
+        timeout_seconds=max(30, int(timeout_seconds) + 30),
+        # The in-Pod barrier already spends the full window; never pay it twice.
+        retries=0,
     )
-    if final_identity != paused_identity:
+    try:
+        result = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
         raise ReleaseError(
-            f"{target.cluster_id} steady-state installer identity changed"
+            "candidate CPU Agent heartbeat barrier returned invalid evidence"
+        ) from exc
+    if not isinstance(result, dict) or result.get("status") != "PASSED":
+        diagnostics = {
+            "expected_count": result.get("expected_count"),
+            "refreshed_count": result.get("refreshed_count"),
+            "blocker_count": result.get("blocker_count"),
+            "blockers": result.get("blockers"),
+        }
+        prefix = (
+            "fleet has not reached the candidate Agent pin, so the compatibility "
+            "window stays open: "
+            if required_identity is not None
+            else "candidate CPU did not observe refreshed Agent heartbeats: "
         )
-    release._wait_agents(
-        target,
-        artifact_sha,
-        bundle_sha=desired_bundle,
-        template_sha=desired_template,
-        config_digest=config_digest,
-        runtime_profile_version=expected_profile,
-        legacy_identity=allow_legacy_identity,
-        agent_identity=agent_identity,
+        raise ReleaseError(prefix + json.dumps(diagnostics, sort_keys=True))
+
+
+def capture_active_agent_node_sets(release: Any) -> dict[str, dict[str, Any]]:
+    if release.runner.dry_run:
+        return {}
+    raw = exec_cpu_ingress_probe(
+        release,
+        script=probe_source("active_agent_node_sets"),
+        failure="release safety checks",
+        sensitive=True,
+        interactive=False,
     )
-    return final_identity
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("active Agent node inventory is invalid") from exc
+    if not isinstance(value, dict):
+        raise ReleaseError("active Agent node inventory is not an object")
+    expected = {target.cluster_id for target in release.config.clusters}
+    result = {
+        str(cluster_id): {
+            "node_ids": sorted({str(node_id) for node_id in node_ids if str(node_id)})
+        }
+        for cluster_id, node_ids in value.items()
+        if isinstance(node_ids, list)
+    }
+    missing = sorted(
+        cluster_id
+        for cluster_id in expected
+        if not (result.get(cluster_id) or {}).get("node_ids")
+    )
+    if missing:
+        raise ReleaseError(
+            "active Agent node inventory is missing clusters: " + ", ".join(missing)
+        )
+    return {cluster_id: result[cluster_id] for cluster_id in sorted(expected)}
 
 
-def deploy_reconciler(
+def rollout_wave_safety_snapshot(
     release: Any,
     target: ClusterTarget,
     *,
-    wheel_cm: str,
-    bundle_cm: str,
-    artifact_sha: str,
-    config_digest: str,
-    runtime_profile_version: str | None = None,
-    executor_wheel_filename: str | None = None,
-    node_compatibility_digest: str | None = None,
-    bundle_sha256: str | None = None,
-    template_sha256: str | None = None,
-    template_config_map: str | None = None,
-    allowed_node_names: tuple[str, ...] | None = None,
-    runtime_image: str | None = None,
-    node_installer_image: str | None = None,
-) -> tuple[str, str]:
-    release._cancel_active_installer_jobs(target)
-    release._retry_failed_installer_jobs(target)
-    environment = build_reconciler_environment(
-        release,
-        target,
-        wheel_cm=wheel_cm,
-        bundle_cm=bundle_cm,
-        artifact_sha=artifact_sha,
-        config_digest=config_digest,
-        runtime_profile_version=runtime_profile_version,
-        executor_wheel_filename=executor_wheel_filename,
-        node_compatibility_digest=node_compatibility_digest,
-        bundle_sha256=bundle_sha256,
-        template_sha256=template_sha256,
-        template_config_map=template_config_map,
-        allowed_node_names=allowed_node_names,
-        runtime_image=runtime_image,
-        node_installer_image=node_installer_image,
-    )
-    release.runner.run(
-        [str(ROOT / "deploy/node/deploy-node-installer-reconciler.sh")],
-        env=environment,
-        sensitive=bool(target.fleet_master_file),
-    )
-    if release.runner.dry_run:
-        return (
-            bundle_sha256 or release.bundle_sha,
-            template_sha256 or release.node_template_sha,
+    wave: tuple[str, ...],
+    node_names: tuple[str, ...],
+    minimum_lease_remaining_seconds: int,
+) -> dict[str, Any]:
+    executor = release._get_json(
+        release._gpu(
+            target,
+            "-n",
+            release.config.namespace,
+            "get",
+            "deployment",
+            inventory.GPU_EXECUTOR_DEPLOYMENT,
         )
+    )
+    desired = int((executor.get("spec") or {}).get("replicas") or 0)
+    ready = int((executor.get("status") or {}).get("readyReplicas") or 0)
+    if desired < 1 or ready != desired:
+        raise ClusterLocalReleaseError(
+            f"{target.cluster_id} executor coverage is not fully Ready "
+            f"(ready={ready}, desired={desired})"
+        )
+    raw = exec_cpu_ingress_probe(
+        release,
+        script=probe_source("rollout_wave_safety"),
+        failure="release safety checks",
+        input_text=json.dumps(
+            {
+                "cluster_id": target.cluster_id,
+                "wave": list(wave),
+                "nodes": list(node_names),
+                "minimum_lease_remaining_seconds": (minimum_lease_remaining_seconds),
+            }
+        ),
+    )
+    try:
+        result = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("fleet wave safety check returned invalid evidence") from exc
+    if not isinstance(result, dict):
+        raise ReleaseError("fleet wave safety check returned non-object evidence")
+    return result
+
+
+def ensure_rollout_wave_safe(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    wave: tuple[str, ...],
+    node_names: tuple[str, ...],
+    timeout_seconds: float = ROLLOUT_AGENT_GATE_TIMEOUT_SECONDS,
+    poll_seconds: float = ROLLOUT_AGENT_POLL_SECONDS,
+    minimum_lease_remaining_seconds: int = ROLLOUT_AGENT_LEASE_MARGIN_SECONDS,
+) -> None:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        snapshot = rollout_wave_safety_snapshot(
+            release,
+            target,
+            wave=wave,
+            node_names=node_names,
+            minimum_lease_remaining_seconds=(minimum_lease_remaining_seconds),
+        )
+        open_remote = {
+            str(status): int(count)
+            for status, count in (snapshot.get("open_remote") or {}).items()
+            if int(count)
+        }
+        if open_remote:
+            raise ReleaseError(
+                "fleet wave safety blocked by remote commands: "
+                + json.dumps(open_remote, sort_keys=True)
+            )
+        destructive_count = int(snapshot.get("destructive_workflow_count") or 0)
+        if destructive_count:
+            raise ReleaseError(
+                "fleet wave safety blocked by active destructive workflows: "
+                + json.dumps(
+                    {
+                        "count": destructive_count,
+                        "request_ids": snapshot.get("destructive_workflows") or [],
+                    },
+                    sort_keys=True,
+                )
+            )
+        blockers = list(snapshot.get("agent_blockers") or [])
+        blocker_count = int(snapshot.get("agent_blocker_count") or len(blockers))
+        if not blocker_count:
+            return
+        if time.monotonic() >= deadline:
+            raise ClusterLocalReleaseError(
+                f"{target.cluster_id} fleet wave Agent safety did not converge: "
+                + json.dumps(
+                    {
+                        "blocker_count": blocker_count,
+                        "blockers": blockers[:100],
+                        "minimum_lease_remaining_seconds": (
+                            minimum_lease_remaining_seconds
+                        ),
+                    },
+                    sort_keys=True,
+                )
+            )
+        time.sleep(max(0.0, poll_seconds))
+
+
+def reconciler_container_env(release: Any, target: ClusterTarget) -> dict[str, str]:
     deployment = release._get_json(
         release._gpu(
             target,
@@ -690,222 +798,304 @@ def deploy_reconciler(
     )
     if container is None:
         raise ReleaseError("Reconciler Deployment has no reconciler container")
-    current = {item.get("name"): item.get("value") for item in container.get("env", [])}
-    bundle = str(current.get("GPU_FAULT_INSTALLER_BUNDLE_SHA256") or "")
-    template = str(current.get("GPU_FAULT_INSTALLER_TEMPLATE_SHA256") or "")
+    return {
+        str(item.get("name") or ""): str(item.get("value") or "")
+        for item in container.get("env") or []
+    }
+
+
+def reconciler_installer_identity(environment: dict[str, str]) -> tuple[str, str]:
+    bundle = environment.get(INSTALLER_BUNDLE_ENV, "")
+    template = environment.get(INSTALLER_TEMPLATE_ENV, "")
     if not all(re.fullmatch(r"[0-9a-f]{64}", value) for value in (bundle, template)):
         raise ReleaseError("Reconciler installer identity is invalid")
     return bundle, template
 
 
-def wait_agents(
-    release: Any,
-    target: ClusterTarget,
+def installer_wave_generation(
     artifact_sha: str,
-    *,
-    bundle_sha: str | None = None,
-    template_sha: str | None = None,
-    config_digest: str | None = None,
-    runtime_profile_version: str | None = None,
-    node_names: tuple[str, ...] = (),
-    timeout_seconds: int = 900,
-    legacy_identity: bool = False,
-    agent_identity: dict[str, Any] | None = None,
+    max_unavailable: int,
+    wave: tuple[str, ...],
+) -> str:
+    digest = hashlib.sha256(",".join(sorted(wave)).encode()).hexdigest()[:12]
+    return f"{artifact_sha[:12]}-{max_unavailable}-{digest}"
+
+
+def hand_wave_to_reconciler(
+    release: Any,
+    target: ClusterTarget,
+    context: FleetWaveContext,
+    wave: tuple[str, ...],
+) -> tuple[str, str] | None:
+    """Hand one wave to the already running Reconciler through its ConfigMap.
+
+    The Reconciler Deployment uses the Recreate strategy because its installer
+    identity lives in its environment, so re-deploying it once per wave took the
+    only installer controller of the cluster down and back up for every wave of
+    the fleet rollout. The allowed-node set is not part of that identity: it is
+    read from `GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP` on every reconcile pass, so
+    a wave is a ConfigMap patch against an unchanged Deployment.
+
+    Returns the live installer identity, or ``None`` when the deployed
+    Reconciler predates the wave ConfigMap and the caller must fall back to the
+    per-wave redeploy. Every barrier of the redeploy path is preserved: the
+    Deployment must be fully rolled out, its installer identity must still equal
+    the paused identity, in-flight installer Jobs are cancelled before the
+    allowed set changes, and the patched wave is read back before any node is
+    allowed to move.
+    """
+
+    # A wave may only be handed to a healthy, fully rolled out Reconciler: the
+    # Pod that reads the ConfigMap has to be the one this release paused.
+    wait_deployment_rollout(
+        release,
+        target,
+        inventory.GPU_RECONCILER_DEPLOYMENT,
+        timeout_seconds=600,
+    )
+    environment = reconciler_container_env(release, target)
+    config_map = environment.get(INSTALLER_WAVE_CONFIG_MAP_ENV, "")
+    if not config_map:
+        return None
+    identity = reconciler_installer_identity(environment)
+    if identity != context.paused_identity:
+        raise ReleaseError(
+            f"{target.cluster_id} installer identity changed between waves"
+        )
+    release._cancel_active_installer_jobs(target)
+    release._retry_failed_installer_jobs(target)
+    desired = {
+        "allowed-nodes": ",".join(sorted(wave)),
+        "max-unavailable": str(context.max_unavailable),
+        "generation": installer_wave_generation(
+            context.artifact_sha,
+            context.max_unavailable,
+            wave,
+        ),
+    }
+    release.runner.run(
+        release._gpu(
+            target,
+            "-n",
+            release.config.namespace,
+            "patch",
+            "configmap",
+            config_map,
+            "--type=merge",
+            "-p",
+            json.dumps({"data": desired}, sort_keys=True),
+        )
+    )
+    observed = (
+        release._get_json(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                "configmap",
+                config_map,
+            )
+        ).get("data")
+        or {}
+    )
+    if {key: str(observed.get(key) or "") for key in desired} != desired:
+        raise ReleaseError(
+            f"{target.cluster_id} installer wave ConfigMap {config_map} did not "
+            "accept the wave"
+        )
+    return identity
+
+
+def run_fleet_waves(
+    release: Any,
+    target: ClusterTarget,
+    context: FleetWaveContext,
+    deployment: dict[str, Any],
 ) -> None:
-    expected_bundle = None
-    expected_template = None
-    if not legacy_identity:
-        expected_bundle = (
-            bundle_sha
-            if bundle_sha is not None
-            else (
-                release.bundle_sha
-                if release.config.release_manifest_schema_version >= 3
-                else None
+    while deployment.get("status") != "SUCCEEDED":
+        if deployment.get("status") == "FAILED":
+            raise ReleaseError(f"{target.cluster_id} fleet deployment failed")
+        expected_wave = next_deployment_wave(deployment)
+        if not expected_wave:
+            raise ReleaseError(
+                f"{target.cluster_id} fleet deployment has no pending wave"
             )
-        )
-        expected_template = (
-            template_sha
-            if template_sha is not None
-            else (
-                release.node_template_sha
-                if release.config.release_manifest_schema_version >= 3
-                else None
+        if context.phase == "rollback":
+            record_rollback_wave_event(
+                release,
+                cluster_id=target.cluster_id,
+                wave=expected_wave,
+                event="safety_started",
             )
-        )
-    expected_config = config_digest or release.config.agent_config_digest
-    expected_profile = runtime_profile_version or release.config.runtime_profile_version
-    expected_nodes = frozenset(node_names) if node_names else None
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        value = release._get_json(release._gpu(target, "get", "nodes"))
-        nodes = value.get("items", [])
-        selected_nodes = [
-            item
-            for item in nodes
-            if (
-                item.get("metadata", {})
-                .get("labels", {})
-                .get("sagemaker.amazonaws.com/cluster-name")
-                == target.hyperpod_cluster_name
-                and (
-                    expected_nodes is None
-                    or str(item.get("metadata", {}).get("name") or "") in expected_nodes
+        try:
+            ensure_rollout_wave_safe(
+                release,
+                target,
+                wave=expected_wave,
+                node_names=context.node_names,
+            )
+            lease = release._fleet_command(
+                "next-wave",
+                {"deployment_id": context.deployment_id},
+            )
+            wave = tuple(str(item) for item in lease.get("node_ids", []))
+            if not wave:
+                raise ReleaseError(
+                    f"{target.cluster_id} fleet deployment returned an empty wave"
                 )
-            )
-        ]
-        if agents_converged(
-            nodes,
-            target,
-            artifact_sha,
-            bundle_sha=expected_bundle,
-            template_sha=expected_template,
-            config_digest=expected_config,
-            require_node_uid=True,
-            node_names=expected_nodes,
-        ) and release._agent_heartbeats_converged(
-            target,
-            node_count=len(selected_nodes),
-            node_names=tuple(
-                sorted(
-                    str(item.get("metadata", {}).get("name") or "")
-                    for item in selected_nodes
+            if wave != expected_wave:
+                raise ReleaseError(
+                    f"{target.cluster_id} fleet wave changed after safety validation"
                 )
-            ),
-            artifact_sha=artifact_sha,
-            config_digest=expected_config,
-            runtime_profile_version=expected_profile,
-            bundle_sha=expected_bundle,
-            template_sha=expected_template,
-            agent_identity=agent_identity,
-        ):
-            return
-        if release.runner.dry_run:
-            return
-        time.sleep(5)
-    raise ReleaseError(f"{target.cluster_id} agents did not converge")
+            ensure_rollout_wave_safe(
+                release,
+                target,
+                wave=wave,
+                node_names=context.node_names,
+                timeout_seconds=0,
+                minimum_lease_remaining_seconds=(
+                    ROLLOUT_AGENT_POST_LEASE_MARGIN_SECONDS
+                ),
+            )
+            if context.phase == "rollback":
+                record_rollback_wave_event(
+                    release,
+                    cluster_id=target.cluster_id,
+                    wave=expected_wave,
+                    event="safety_completed",
+                )
+            identity = hand_wave_to_reconciler(release, target, context, wave)
+            if identity is None:
+                # Compatibility path: a Reconciler deployed before the wave
+                # ConfigMap only learns its allowed set from its environment.
+                identity = release._deploy_reconciler(
+                    target,
+                    wheel_cm=context.wheel_cm,
+                    bundle_cm=context.bundle_cm,
+                    artifact_sha=context.artifact_sha,
+                    config_digest=context.config_digest,
+                    runtime_profile_version=context.expected_profile,
+                    executor_wheel_filename=context.executor_wheel_filename,
+                    node_compatibility_digest=context.expected_compatibility,
+                    bundle_sha256=context.desired_bundle,
+                    template_sha256=context.desired_template,
+                    template_config_map=context.template_config_map,
+                    allowed_node_names=wave,
+                    max_unavailable=context.max_unavailable,
+                    sync_registry=False,
+                    runtime_image=context.runtime_image,
+                    node_installer_image=context.node_installer_image,
+                )
+            if identity != context.paused_identity:
+                raise ReleaseError(
+                    f"{target.cluster_id} installer identity changed between waves"
+                )
+            if context.phase == "rollback":
+                record_rollback_wave_event(
+                    release,
+                    cluster_id=target.cluster_id,
+                    wave=wave,
+                    event="reconciler_applied",
+                )
+            release._wait_agents(
+                target,
+                context.artifact_sha,
+                bundle_sha=context.desired_bundle,
+                template_sha=context.desired_template,
+                config_digest=context.config_digest,
+                runtime_profile_version=context.expected_profile,
+                node_names=wave,
+                legacy_identity=context.allow_legacy_identity,
+                agent_identity=context.agent_identity,
+            )
+            if context.phase == "rollback":
+                record_rollback_wave_event(
+                    release,
+                    cluster_id=target.cluster_id,
+                    wave=wave,
+                    event="agents_converged",
+                )
+            deployment = release._fleet_command(
+                "get",
+                {"deployment_id": context.deployment_id},
+            )
+            if context.phase == "rollback":
+                record_rollback_wave_event(
+                    release,
+                    cluster_id=target.cluster_id,
+                    wave=wave,
+                    event="completed",
+                )
+        except Exception as exc:
+            if context.phase == "rollback":
+                record_rollback_wave_event(
+                    release,
+                    cluster_id=target.cluster_id,
+                    wave=expected_wave,
+                    event="failed",
+                    details={"error": f"{type(exc).__name__}: {exc}"},
+                )
+            raise
 
 
-def agent_heartbeats_converged(
+def deploy_reconciler(
     release: Any,
     target: ClusterTarget,
     *,
-    node_count: int,
-    node_names: tuple[str, ...],
+    wheel_cm: str,
+    bundle_cm: str,
     artifact_sha: str,
     config_digest: str,
-    runtime_profile_version: str,
-    bundle_sha: str | None,
-    template_sha: str | None,
-    agent_identity: dict[str, Any] | None = None,
-) -> bool:
+    runtime_profile_version: str | None = None,
+    executor_wheel_filename: str | None = None,
+    node_compatibility_digest: str | None = None,
+    bundle_sha256: str | None = None,
+    template_sha256: str | None = None,
+    template_config_map: str | None = None,
+    allowed_node_names: tuple[str, ...] | None = None,
+    max_unavailable: int | None = None,
+    sync_registry: bool = True,
+    runtime_image: str | None = None,
+    node_installer_image: str | None = None,
+) -> tuple[str, str]:
+    release._cancel_active_installer_jobs(target)
+    release._retry_failed_installer_jobs(target)
+    environment = build_reconciler_environment(
+        release,
+        target,
+        wheel_cm=wheel_cm,
+        bundle_cm=bundle_cm,
+        artifact_sha=artifact_sha,
+        config_digest=config_digest,
+        runtime_profile_version=runtime_profile_version,
+        executor_wheel_filename=executor_wheel_filename,
+        node_compatibility_digest=node_compatibility_digest,
+        bundle_sha256=bundle_sha256,
+        template_sha256=template_sha256,
+        template_config_map=template_config_map,
+        allowed_node_names=allowed_node_names,
+        max_unavailable=max_unavailable,
+        sync_registry=sync_registry,
+        runtime_image=runtime_image,
+        node_installer_image=node_installer_image,
+    )
+    environment["GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT"] = "false"
+    release.runner.run(
+        [str(ROOT / "deploy/node/deploy-node-installer-reconciler.sh")],
+        env=environment,
+        sensitive=bool(target.fleet_master_file),
+        timeout_seconds=660,
+    )
+    wait_deployment_rollout(
+        release,
+        target,
+        inventory.GPU_RECONCILER_DEPLOYMENT,
+        timeout_seconds=600,
+    )
     if release.runner.dry_run:
-        return True
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    script = """
-import json
-import sys
-from datetime import datetime, timezone
-
-from gpu_fault.app import ApplicationContext
-
-expected = json.load(sys.stdin)
-expected_nodes = set(expected["node_names"])
-now = datetime.now(timezone.utc)
-agents = [
-    item
-    for item in ApplicationContext.from_environment().store.list_agents(
-        expected["cluster_id"]
-    )
-    if getattr(item.lifecycle_state, "value", item.lifecycle_state) == "ACTIVE"
-    and item.lease_expires_at is not None
-    and item.lease_expires_at > now
-    and (not expected_nodes or item.node_id in expected_nodes)
-]
-aligned = [
-    item
-    for item in agents
-    if item.artifact_sha256 == expected["artifact"]
-    and (
-        expected["protocol"] is None
-        or item.agent_protocol_version == expected["protocol"]
-    )
-    and (
-        expected["version"] is None
-        or item.agent_version == expected["version"]
-    )
-    and (
-        expected["compatibility"] is None
-        or (item.compatibility_digest or item.artifact_sha256)
-        == expected["compatibility"]
-    )
-    and (
-        expected["policy"] is None
-        or item.policy_version == expected["policy"]
-    )
-    and item.config_digest == expected["config"]
-    and item.runtime_profile_version == expected["profile"]
-    and (
-        expected["key_version"] is None
-        or item.node_action_key_version == expected["key_version"]
-    )
-    and (
-        expected["bundle"] is None
-        or item.installer_bundle_sha256 == expected["bundle"]
-    )
-    and (
-        expected["template"] is None
-        or item.installer_template_sha256 == expected["template"]
-    )
-]
-print(json.dumps({"active": len(agents), "aligned": len(aligned)}))
-"""
-    raw = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            "-i",
-            pod,
-            "--",
-            CONTROL_PLANE_PYTHON,
-            "-c",
-            script,
-        ),
-        input_text=json.dumps(
-            {
-                "cluster_id": target.cluster_id,
-                "node_names": list(node_names),
-                "artifact": artifact_sha,
-                "config": config_digest,
-                "profile": runtime_profile_version,
-                "bundle": bundle_sha,
-                "template": template_sha,
-                "protocol": (agent_identity or {}).get("agent_protocol_version"),
-                "version": (agent_identity or {}).get("agent_version"),
-                "compatibility": (agent_identity or {}).get("compatibility_digest"),
-                "policy": (agent_identity or {}).get("policy_version"),
-                "key_version": (agent_identity or {}).get("node_action_key_version"),
-            }
-        ),
-        capture=True,
-    )
-    result = json.loads(raw)
-    return (
-        node_count > 0
-        and int(result.get("active", 0)) == node_count
-        and int(result.get("aligned", 0)) == node_count
-    )
+        return (
+            bundle_sha256 or release.bundle_sha,
+            template_sha256 or release.node_template_sha,
+        )
+    return reconciler_installer_identity(reconciler_container_env(release, target))

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import RLock
 
 from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
     DiagnosticRequest,
+    FaultIncident,
+    IncidentState,
     NodeMarker,
     RecoveryAction,
     TerminalEvent,
@@ -17,8 +18,6 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepSpec,
-    FaultIncident,
-    IncidentState,
     recovery_action_sort_key,
 )
 from gpu_fault.planner import PlanBuilder
@@ -34,7 +33,6 @@ from gpu_fault.watcher import (
     FailureDetectedEvent,
     failure_containment_ids,
 )
-
 
 QUICK_CHECKS = [
     "gpu-enumeration",
@@ -455,27 +453,25 @@ class CompletionService:
         )
 
     def _matching_markers(self, event: TerminalEvent) -> list[NodeMarker]:
+        """Actionable markers that correlate with a finished training attempt.
+
+        Scope and the ``marker_window`` are pushed into the Store: the marker
+        table accumulates an entry per observation per node, so scanning it once
+        per terminal event made the cost of correlating one attempt grow with the
+        whole fleet's history. Only the expiry test stays here, because it is
+        relative to this event rather than to now.
+        """
+
         nodes = {item.node_id for item in event.allocation}
         gpus = {gpu for item in event.allocation for gpu in item.gpu_uuids}
         fabrics = {
             item.fabric_partition for item in event.allocation if item.fabric_partition
         }
-        matches: list[NodeMarker] = []
-
-        for marker in self.store.list_markers():
-            if not marker.active or not marker.trusted:
-                continue
-            if marker.recommended_action is None:
-                continue
-            if marker.expires_at < event.ended_at:
-                continue
-            if abs(marker.observed_at - event.ended_at) > self.marker_window:
-                continue
-            scope_match = (
-                bool(nodes.intersection(marker.scope.node_ids))
-                or bool(gpus.intersection(marker.scope.gpu_uuids))
-                or bool(fabrics.intersection(marker.scope.fabric_partitions))
-            )
-            if scope_match:
-                matches.append(marker)
-        return matches
+        candidates = self.store.list_markers_in_scope_window(
+            node_ids=nodes,
+            gpu_uuids=gpus,
+            fabric_partitions=fabrics,
+            observed_from=event.ended_at - self.marker_window,
+            observed_to=event.ended_at + self.marker_window,
+        )
+        return [marker for marker in candidates if marker.expires_at >= event.ended_at]

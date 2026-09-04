@@ -32,7 +32,10 @@ done
 shopt -s nullglob
 quiesce_states=(/var/lib/gpu-fault/quiesce/quiesce-*.json)
 if (( ${#quiesce_states[@]} > 0 )); then
-    restore_command=/opt/gpu-fault/venv/bin/gpu-fault-restore-gpu-services
+    restore_command=/opt/gpu-fault/current/venv/bin/gpu-fault-restore-gpu-services
+    if [[ ! -x "${restore_command}" ]]; then
+        restore_command=/opt/gpu-fault/venv/bin/gpu-fault-restore-gpu-services
+    fi
     [[ -x "${restore_command}" ]] || {
         printf 'ERROR: quiesce state exists but restore command is unavailable\n' >&2
         exit 1

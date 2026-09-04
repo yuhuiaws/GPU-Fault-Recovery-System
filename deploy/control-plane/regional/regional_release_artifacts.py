@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -51,11 +50,11 @@ def upload_config_map(
         "-o",
         "json",
     ]
-    current = subprocess.run(command, text=True, capture_output=True)
+    returncode, stdout, stderr = release.runner.probe_output(command)
     value: dict[str, Any] | None = None
-    if current.returncode == 0:
-        value = json.loads(current.stdout)
-    elif "NotFound" in current.stderr:
+    if returncode == 0:
+        value = json.loads(stdout)
+    elif "NotFound" in stderr:
         release.runner.run(
             kubectl
             + [
@@ -68,7 +67,7 @@ def upload_config_map(
             ]
         )
     else:
-        raise ReleaseError(f"cannot inspect ConfigMap {name}: {current.stderr.strip()}")
+        raise ReleaseError(f"cannot inspect ConfigMap {name}: {stderr.strip()}")
     if release.runner.dry_run:
         return
     if value is None:

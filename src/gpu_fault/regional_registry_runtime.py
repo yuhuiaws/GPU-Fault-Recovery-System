@@ -236,7 +236,10 @@ def regional_cluster_request_allowed(
     state = registration.lifecycle_state
     if state is RegionalClusterLifecycle.ACTIVE:
         return True
-    if state is RegionalClusterLifecycle.REVOKED:
+    if state in {
+        RegionalClusterLifecycle.REVOKED,
+        RegionalClusterLifecycle.ROLLED_BACK,
+    }:
         return False
     if method in {"GET", "HEAD"}:
         return True
@@ -247,7 +250,10 @@ def regional_cluster_request_allowed(
     }
     if path in bootstrap_paths:
         return True
-    if state is RegionalClusterLifecycle.PENDING:
+    if state in {
+        RegionalClusterLifecycle.PENDING,
+        RegionalClusterLifecycle.FAILED,
+    }:
         return False
     return path == "/v1/regional/executors/hyperpod-submissions/outcome" or (
         path.startswith("/v1/regional/executors/")

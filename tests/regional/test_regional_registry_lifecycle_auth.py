@@ -27,8 +27,10 @@ def headers() -> dict[str, str]:
     ("state", "expected_status"),
     [
         (RegionalClusterLifecycle.PENDING, 423),
+        (RegionalClusterLifecycle.FAILED, 423),
         (RegionalClusterLifecycle.DRAINING, 423),
         (RegionalClusterLifecycle.REVOKED, 403),
+        (RegionalClusterLifecycle.ROLLED_BACK, 403),
     ],
 )
 def test_non_active_registry_states_cannot_claim_commands(

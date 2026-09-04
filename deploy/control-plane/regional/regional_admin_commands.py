@@ -3,12 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 from pathlib import Path
 from typing import Any
 
 import regional_deployment_inventory as inventory
-from regional_admin_checks import build_health_report
+from regional_admin_checks import (
+    # The same tolerant wrapper the checks use: a release object that predates
+    # the read cache, or a test double standing in for one, has no
+    # `_read_snapshot` and gets a `nullcontext` instead of an AttributeError.
+    _read_snapshot as read_snapshot,
+)
+from regional_admin_checks import (
+    build_health_report,
+)
 from regional_release_config import ReleaseError
 from regional_release_diff import (
     ReleaseChangeKind,
@@ -37,9 +44,31 @@ RESUMABLE_PHASES = frozenset(
         "cpu-finalized",
         "verified",
         "failed",
+        "partial-convergence",
     }
 )
-RETRY_PHASES = frozenset({*RESUMABLE_PHASES, "rolled-back"})
+ROLLBACK_PHASES = frozenset(
+    {
+        "rollback-started",
+        "rollback-controller-staging",
+        "rollback-controller-staged",
+        "rollback-observability-restoring",
+        "rollback-observability-restored",
+        "rollback-endpoint-restoring",
+        "rollback-endpoint-restored",
+        "rollback-data-restoring",
+        "rollback-data-progress",
+        "rollback-data-restored",
+        "rollback-rollout-cleaning",
+        "rollback-rollout-cleaned",
+        "rollback-cpu-restoring",
+        "rollback-cpu-restored",
+        "rollback-restored",
+        "rollback-verifying",
+        "rollback-verified",
+        "rollback-failed",
+    }
+)
 BOOTSTRAP_PHASES = frozenset(
     {
         "bootstrap-started",
@@ -47,6 +76,9 @@ BOOTSTRAP_PHASES = frozenset(
         "bootstrap-endpoint-ready",
         "bootstrap-data-plane-progress",
         "bootstrap-failed",
+        "bootstrap-cleanup-started",
+        "bootstrap-cleanup-progress",
+        "bootstrap-cleanup-failed",
         "bootstrap-cleaned",
     }
 )
@@ -68,6 +100,51 @@ def release_state_sha256(state: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _rollback_pending(state: dict[str, Any]) -> bool:
+    phase = str(state.get("phase") or "")
+    return phase in ROLLBACK_PHASES or (
+        phase == "rolled-back" and state.get("rollback_cleanup_completed") is False
+    )
+
+
+def _commit_cleanup_pending(state: dict[str, Any]) -> bool:
+    return (
+        state.get("phase") == "complete"
+        and state.get("transaction_committed") is True
+        and state.get("commit_cleanup_completed") is False
+    )
+
+
+def _upgrade_resume_required(state: dict[str, Any]) -> bool:
+    phase = str(state.get("phase") or "")
+    return phase in RESUMABLE_PHASES or (
+        phase == "complete" and state.get("transaction_committed") is False
+    )
+
+
+def next_deploy(release: Any, state: dict[str, Any]) -> dict[str, Any]:
+    if _rollback_pending(state):
+        return {
+            **retry_release_diff(release, state).as_dict(),
+            "resume": True,
+            "action": "rollback",
+        }
+    if _commit_cleanup_pending(state):
+        return {
+            **retry_release_diff(release, state).as_dict(),
+            "resume": True,
+            "action": "commit",
+        }
+    phase = str(state.get("phase") or "")
+    if _upgrade_resume_required(state) or phase == "rolled-back":
+        return {
+            **retry_release_diff(release, state).as_dict(),
+            "resume": _upgrade_resume_required(state),
+            "action": "upgrade",
+        }
+    return classify_release(release, state).as_dict()
 
 
 def _require_expected_state(state: dict[str, Any]) -> None:
@@ -185,19 +262,14 @@ def bootstrap_cpu_is_current(release: Any) -> bool:
 
 
 def run_deploy(release: Any) -> None:
-    state_exists = (
-        subprocess.run(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "configmap",
-                STATE_CONFIG_MAP,
-            ),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+    state_exists = release.runner.probe(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "configmap",
+            STATE_CONFIG_MAP,
+        ),
     )
     expected_state = os.getenv(EXPECTED_STATE_SHA256_ENV, "").strip()
     if expected_state and not state_exists:
@@ -218,9 +290,18 @@ def run_deploy(release: Any) -> None:
         return
     assert state is not None
     _require_expected_state(state)
-    if state.get("phase") in RETRY_PHASES:
+    phase = str(state.get("phase") or "")
+    if _rollback_pending(state):
+        release.rollback()
+        raise ReleaseError(
+            "rollback recovery completed; rerun deploy to start a new transaction"
+        )
+    if _commit_cleanup_pending(state):
+        release.commit_release()
+        return
+    if _upgrade_resume_required(state) or phase == "rolled-back":
         release.upgrade(
-            resume=state.get("phase") in RESUMABLE_PHASES,
+            resume=_upgrade_resume_required(state),
             diff=retry_release_diff(release, state),
         )
         return
@@ -233,19 +314,10 @@ def run_deploy(release: Any) -> None:
 
 def build_release_diff(release: Any) -> dict[str, Any]:
     state = release._load_state()
-    retry_diff = (
-        retry_release_diff(release, state)
-        if state.get("phase") in RETRY_PHASES
-        else None
-    )
-    diff = retry_diff or classify_release(release, state)
     return {
         "mode": "release-diff",
         "state_sha256": release_state_sha256(state),
-        "next_deploy": {
-            **diff.as_dict(),
-            "resume": bool(retry_diff) and state.get("phase") in RESUMABLE_PHASES,
-        },
+        "next_deploy": next_deploy(release, state),
     }
 
 
@@ -274,9 +346,15 @@ def stage_noop_release(release: Any) -> None:
 def run_resume(release: Any) -> None:
     state = release._load_state()
     phase = str(state.get("phase") or "")
-    if phase not in RESUMABLE_PHASES:
+    if _rollback_pending(state):
+        release.rollback()
+        return
+    if _commit_cleanup_pending(state):
+        release.commit_release()
+        return
+    if not _upgrade_resume_required(state):
         raise ReleaseError(
-            "resume requires an incomplete upgrade transaction; "
+            "resume requires an incomplete upgrade or rollback transaction; "
             f"current phase is {phase or 'unknown'}"
         )
     release.upgrade(
@@ -297,27 +375,30 @@ def build_release_summary(release: Any) -> dict[str, Any]:
     result["mode"] = "release-summary"
     try:
         state = release._load_state()
-        retry_diff = (
-            retry_release_diff(release, state)
-            if state.get("phase") in RETRY_PHASES
-            else None
-        )
-        result["next_deploy"] = (
-            {
-                **retry_diff.as_dict(),
-                "resume": state.get("phase") in RESUMABLE_PHASES,
-            }
-            if retry_diff is not None
-            else classify_release(release, state).as_dict()
-        )
+        result["live_release"] = {
+            "release_id": state.get("release_id"),
+            "phase": state.get("phase"),
+            "transaction_committed": state.get("transaction_committed") is True,
+            "release_lifecycle": state.get("release_lifecycle"),
+            "state_sha256": release_state_sha256(state),
+        }
+        result["next_deploy"] = next_deploy(release, state)
     except Exception as exc:
         result["next_deploy_error"] = str(exc)
     return result
 
 
 def build_full_status(release: Any) -> dict[str, Any]:
-    health = build_health_report(release, mode="status")
-    result = build_release_summary(release)
+    # One snapshot for both halves. `build_health_report` opens its own, and
+    # everything `build_release_summary` reads -- the release state ConfigMap,
+    # the live Deployments behind `next_deploy` -- the health checks have already
+    # read inside it, so without this the summary re-issued each of those
+    # `kubectl get` calls after the health report's snapshot had been torn down.
+    # It also means the summary describes the same observation as the checks
+    # reported beside it, which is the whole point of a status output.
+    with read_snapshot(release):
+        health = build_health_report(release, mode="status")
+        result = build_release_summary(release)
     result["mode"] = "status"
     result["healthy"] = health["healthy"]
     result["health"] = health

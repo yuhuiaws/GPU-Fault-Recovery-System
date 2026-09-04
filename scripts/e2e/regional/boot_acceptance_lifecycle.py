@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import argparse
 import base64
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-from gpu_fault.admin_site import load_site
-
+from gpu_fault.admin.site import load_site
 from scripts.e2e.regional.boot_acceptance_common import (
     ROOT,
     BootAcceptanceError,
@@ -28,7 +27,7 @@ def admin_command(
     timeout: int = 21600,
 ) -> subprocess.CompletedProcess[str]:
     return run(
-        [sys.executable, "-m", "gpu_fault.admin_cli", *arguments],
+        [sys.executable, "-m", "gpu_fault.admin.cli", *arguments],
         check=False,
         timeout=timeout,
         env={**os.environ, "PYTHONPATH": str(ROOT / "src")},

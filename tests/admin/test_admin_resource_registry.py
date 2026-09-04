@@ -5,8 +5,8 @@ import subprocess
 
 import pytest
 
-from gpu_fault import admin_resource_registry
-from gpu_fault.admin_resource_registry import (
+from gpu_fault.admin import resource_registry as admin_resource_registry
+from gpu_fault.admin.resource_registry import (
     LegacyInstallationRegistryMissing,
     build_installation_snapshot,
     fetch_installation_resource_registry,
@@ -14,7 +14,7 @@ from gpu_fault.admin_resource_registry import (
     load_installation_resource_snapshot,
     write_installation_resource_snapshot,
 )
-from gpu_fault.admin_site import load_site
+from gpu_fault.admin.site import load_site
 from gpu_fault.installation_resources import (
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
@@ -108,6 +108,12 @@ def _bootstrap_state() -> dict:
                     "arn:aws:sns:us-east-1:123456789012:test-alerts:sub"
                 ),
                 "queue_subscription_ownership": "CREATED",
+                "email_subscription_arn": (
+                    "arn:aws:sns:us-east-1:123456789012:test-alerts:email-sub"
+                ),
+                "email_subscription_status": "CONFIRMED",
+                "email_subscription_endpoint": "ops@example.com",
+                "sns_topic_generation": "a" * 32,
             },
             "control_plane_role": {
                 "role_arn": ("arn:aws:iam::123456789012:role/gpu-fault-control"),
@@ -202,6 +208,9 @@ def test_registry_records_ownership_dependencies_and_delete_policy(tmp_path) -> 
         by_key["aws/ses/administrator-email-identity"].delete_policy
         is InstallationResourceDeletePolicy.PRESERVE
     )
+    email_subscription = by_key["aws/sns/email-subscription/af3c82544f648b38"]
+    assert email_subscription.delete_policy is (InstallationResourceDeletePolicy.DETACH)
+    assert email_subscription.attributes["status"] == "CONFIRMED"
     assert snapshot.source_sha256 == snapshot.digest()
     assert all(
         resource.ownership is not InstallationResourceOwnership.REUSED

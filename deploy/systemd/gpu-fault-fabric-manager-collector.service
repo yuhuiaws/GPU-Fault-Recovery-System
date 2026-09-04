@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/gpu-fault/collector.env
-ExecStart=/opt/gpu-fault/venv/bin/gpu-fault-collector fabric-manager
+ExecStart=/opt/gpu-fault/current/venv/bin/gpu-fault-collector fabric-manager
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

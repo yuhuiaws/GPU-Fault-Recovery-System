@@ -1,12 +1,16 @@
 from __future__ import annotations
+
 import asyncio
-import os
 import logging
+import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+
 from gpu_fault.app.admission import (
     _ProcessorAdmissionBatcher as _ProcessorAdmissionBatcher,
+)
+from gpu_fault.app.admission import (
     _StripedAdmissionScope as _StripedAdmissionScope,
 )
 from gpu_fault.app.admission_runtime import AdmissionRuntimeFactory
@@ -15,107 +19,16 @@ from gpu_fault.app.authorization import (
     iter_api_routes,
     validate_direct_client_identity_environment,
 )
-from gpu_fault.channel_registry import (
-    COLLECTOR_EVENT_PREFIX,
-    TRAINING_PROGRESS_PATH,
-    WORKLOAD_OBSERVATIONS_PATH,
-    channel_for_path,
-    is_fault_path,
-    validate_collector_routes,
+from gpu_fault.app.cluster_binding import (
+    payload_cluster_ids as payload_cluster_ids,
 )
-from gpu_fault.app.routes.admin import (
-    AdminRouterDependencies,
-    get_admin_dependencies,
-    router as admin_router,
+from gpu_fault.app.collector_metrics import CollectorMetricsSnapshot
+from gpu_fault.app.collector_silence import (
+    notify_silent_collectors,
 )
 from gpu_fault.app.context import (
     ApplicationContext,
     default_simulated_profile,
-)
-from gpu_fault.app.collector_silence import (
-    notify_silent_collectors,
-)
-from gpu_fault.app.collector_metrics import CollectorMetricsSnapshot
-from gpu_fault.app.cluster_binding import (
-    payload_cluster_ids as payload_cluster_ids,
-)
-from gpu_fault.app.routes.completion import (
-    CompletionRouterDependencies,
-    get_completion_dependencies,
-    router as completion_router,
-)
-from gpu_fault.regional_compatibility import (
-    RegionalExecutorCompatibilityPolicy,
-)
-from gpu_fault.regional_registry_runtime import RegionalRegistryRuntime
-from gpu_fault.app.routes.configuration import (
-    ConfigurationRouterDependencies,
-    get_configuration_dependencies,
-    router as configuration_router,
-)
-from gpu_fault.app.routes.collector_events import (
-    CollectorRouterDependencies,
-    get_collector_dependencies,
-    router as collector_router,
-)
-from gpu_fault.app.routes.fleet import (
-    FleetRouterDependencies,
-    get_fleet_dependencies,
-    router as fleet_router,
-)
-from gpu_fault.app.routes.gpu_events import (
-    GpuEventRouterDependencies,
-    get_gpu_event_dependencies,
-    router as gpu_event_router,
-)
-from gpu_fault.app.routes.incidents import (
-    IncidentRouterDependencies,
-    get_incident_dependencies,
-    router as incident_router,
-)
-from gpu_fault.app.routes.processor import (
-    ProcessorRouterDependencies,
-    get_processor_dependencies,
-    router as processor_router,
-)
-from gpu_fault.app.routes.regional import (
-    RegionalRouterDependencies,
-    get_regional_dependencies,
-    router as regional_router,
-)
-from gpu_fault.app.routes.regional_registry import (
-    router as regional_registry_router,
-)
-from gpu_fault.app.routes.workflows import (
-    WorkflowRouterDependencies,
-    get_workflow_dependencies,
-    router as workflow_router,
-)
-from gpu_fault.app.routes.telemetry import (
-    TelemetryRouterDependencies,
-    get_telemetry_dependencies,
-    router as telemetry_router,
-)
-from gpu_fault.app.middleware.backpressure import (
-    IngressBackpressureDependencies,
-    install_ingress_backpressure,
-    install_request_deadline,
-)
-from gpu_fault.app.middleware.auth import (
-    RegionalAuthDependencies,
-    install_regional_authorization,
-)
-from gpu_fault.app.middleware.dispatch import (
-    ProcessorDispatchDependencies,
-    install_processor_dispatch,
-)
-from gpu_fault.app.metrics import (
-    get_app_runtime,
-    router as metrics_router,
-)
-from gpu_fault.app.lifespan import (
-    LifespanDependencies,
-    create_lifespan,
 )
 from gpu_fault.app.identity import (
     pod_process_owner as _pod_process_owner,
@@ -126,12 +39,124 @@ from gpu_fault.app.ingest import (
     TelemetryContextService,
     TelemetryIngestionService,
 )
+from gpu_fault.app.lifespan import (
+    LifespanDependencies,
+    create_lifespan,
+)
+from gpu_fault.app.metric_scan_cache import MetricScanCache
+from gpu_fault.app.metrics import (
+    get_app_runtime,
+)
+from gpu_fault.app.metrics import (
+    router as metrics_router,
+)
+from gpu_fault.app.middleware.auth import (
+    RegionalAuthDependencies,
+    install_regional_authorization,
+)
+from gpu_fault.app.middleware.backpressure import (
+    IngressBackpressureDependencies,
+    install_ingress_backpressure,
+    install_request_deadline,
+)
+from gpu_fault.app.middleware.dispatch import (
+    ProcessorDispatchDependencies,
+    install_processor_dispatch,
+)
 from gpu_fault.app.processor_factory import ProcessorFactory
+from gpu_fault.app.routes.admin import (
+    AdminRouterDependencies,
+    get_admin_dependencies,
+)
+from gpu_fault.app.routes.admin import (
+    router as admin_router,
+)
+from gpu_fault.app.routes.collector_events import (
+    CollectorRouterDependencies,
+    get_collector_dependencies,
+)
+from gpu_fault.app.routes.collector_events import (
+    router as collector_router,
+)
+from gpu_fault.app.routes.completion import (
+    CompletionRouterDependencies,
+    get_completion_dependencies,
+)
+from gpu_fault.app.routes.completion import (
+    router as completion_router,
+)
+from gpu_fault.app.routes.configuration import (
+    ConfigurationRouterDependencies,
+    get_configuration_dependencies,
+)
+from gpu_fault.app.routes.configuration import (
+    router as configuration_router,
+)
+from gpu_fault.app.routes.fleet import (
+    FleetRouterDependencies,
+    get_fleet_dependencies,
+)
+from gpu_fault.app.routes.fleet import (
+    router as fleet_router,
+)
+from gpu_fault.app.routes.gpu_events import (
+    GpuEventRouterDependencies,
+    get_gpu_event_dependencies,
+)
+from gpu_fault.app.routes.gpu_events import (
+    router as gpu_event_router,
+)
+from gpu_fault.app.routes.incidents import (
+    IncidentRouterDependencies,
+    get_incident_dependencies,
+)
+from gpu_fault.app.routes.incidents import (
+    router as incident_router,
+)
+from gpu_fault.app.routes.processor import (
+    ProcessorRouterDependencies,
+    get_processor_dependencies,
+)
+from gpu_fault.app.routes.processor import (
+    router as processor_router,
+)
+from gpu_fault.app.routes.regional import (
+    RegionalRouterDependencies,
+    get_regional_dependencies,
+)
+from gpu_fault.app.routes.regional import (
+    router as regional_router,
+)
+from gpu_fault.app.routes.regional_registry import (
+    router as regional_registry_router,
+)
+from gpu_fault.app.routes.telemetry import (
+    TelemetryRouterDependencies,
+    get_telemetry_dependencies,
+)
+from gpu_fault.app.routes.telemetry import (
+    router as telemetry_router,
+)
+from gpu_fault.app.routes.workflows import (
+    WorkflowRouterDependencies,
+    get_workflow_dependencies,
+)
+from gpu_fault.app.routes.workflows import (
+    router as workflow_router,
+)
 from gpu_fault.app.runtime import (
     AppRuntime,
     EventLoopLag,
 )
 from gpu_fault.capabilities import ProfileValidationError
+from gpu_fault.channel_registry import (
+    COLLECTOR_EVENT_PREFIX,
+    TRAINING_PROGRESS_PATH,
+    WORKLOAD_OBSERVATIONS_PATH,
+    channel_for_path,
+    is_fault_path,
+    validate_collector_routes,
+)
 from gpu_fault.execution import (
     WorkflowExecutionError,
 )
@@ -139,6 +164,7 @@ from gpu_fault.lifecycle import (
     required_processor_shutdown_seconds,
     validate_lifespan_shutdown_budget,
 )
+from gpu_fault.logging_setup import configure_logging
 from gpu_fault.notification_service import (
     AdvisoryNotApplicableError,
 )
@@ -153,6 +179,11 @@ from gpu_fault.processor_diagnostics import (
     register_thread_dump_signal,
     unregister_thread_dump_signal,
 )
+from gpu_fault.regional import TOKEN_SLOT_RETIRING
+from gpu_fault.regional_compatibility import (
+    RegionalExecutorCompatibilityPolicy,
+)
+from gpu_fault.regional_registry_runtime import RegionalRegistryRuntime
 from gpu_fault.store import (
     EfaTrafficAdminConflict,
     NotFoundError,
@@ -182,34 +213,6 @@ def notification_throttle_delay(
     """
 
     return min(max(previous * 2, interval * 2), cap)
-
-
-def _configure_logging() -> None:
-    """Give the API process a root logging configuration.
-
-    uvicorn's default LOGGING_CONFIG configures only the ``uvicorn*``
-    loggers -- it has no ``root`` entry -- and nothing else in this
-    process ever called basicConfig. So root stayed at WARNING with no
-    handlers: every ``LOGGER.info`` in the control plane was discarded,
-    and every warning/exception fell through to logging.lastResort,
-    which prints the bare message with no timestamp, level or logger
-    name. That is why a misconfiguration could look like silence.
-
-    Left alone when root already has handlers, so pytest's caplog and
-    any process that embeds this app keep control of their own logging.
-    """
-
-    if logging.getLogger().handlers:
-        return
-    level = (
-        (os.getenv("GPU_FAULT_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO")
-        .strip()
-        .upper()
-    )
-    logging.basicConfig(
-        level=level,
-        format=("%(asctime)s %(levelname)s %(name)s %(message)s"),
-    )
 
 
 def _configure_service_runtime(
@@ -432,9 +435,20 @@ def _install_regional_auth(
                 status_code=403, detail="regional cluster is not registered"
             )
         token = authorization.removeprefix("Bearer ").strip()
-        if not registration.token_matches(token):
+        slot = registration.matched_token_slot(token)
+        if slot is None:
             raise HTTPException(
                 status_code=403, detail="regional cluster authentication failed"
+            )
+        if slot == TOKEN_SLOT_RETIRING:
+            # This is how an operator learns the rotation is unfinished. As long
+            # as it appears, at least one executor still holds the old token and
+            # dropping the retiring digest would lock that cluster out.
+            LOGGER.warning(
+                "regional cluster %s authenticated with the retiring token; "
+                "rotation window closes at %s",
+                registration.cluster_id,
+                registration.token_rotation_expires_at,
             )
         return registration
 
@@ -577,12 +591,7 @@ def _install_core_routes(
         event_loop_lag_snapshot=event_loop_lag.snapshot,
         dispatch_state=dispatch_state,
         collector_metrics_snapshot=collector_metrics_snapshot,
-        collector_silence_ttl_seconds=float(
-            os.getenv(
-                "GPU_FAULT_METRICS_COLLECTOR_SILENCE_TTL_SECONDS",
-                "30",
-            )
-        ),
+        metric_scan_cache=MetricScanCache(ctx.store),
     )
     app.dependency_overrides[get_app_runtime] = lambda: app_runtime
     app.include_router(metrics_router)
@@ -730,7 +739,7 @@ def _request_budgets() -> tuple[float, float, float]:
 
 def create_app(context: ApplicationContext | None = None) -> FastAPI:
     # Before ApplicationContext, whose construction already logs.
-    _configure_logging()
+    configure_logging()
     validate_direct_client_identity_environment()
     ctx = context or ApplicationContext.from_environment()
     fault_ingestion = FaultIngestionService(ctx)
@@ -757,7 +766,6 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
     processor_max_cluster_queue_depth = admission.max_cluster_queue_depth
     processor_fault_reserved_queue_depth = admission.fault_reserved_depth
     processor_fault_reserved_cluster_depth = admission.fault_reserved_cluster_depth
-    processor_retry_after_seconds = admission.retry_after_seconds
     processor_max_request_bytes = admission.max_request_bytes
     processor_global_admission_guard = admission.global_admission_guard
     processor_admission_rejections = admission.admission_rejections
@@ -918,7 +926,8 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
             ),
             processor_global_admission_guard=(processor_global_admission_guard),
             processor_max_request_bytes=processor_max_request_bytes,
-            processor_retry_after_seconds=processor_retry_after_seconds,
+            processor_retry_after_seconds=admission.retry_after_seconds,
+            processor_response_timeout_seconds=admission.response_timeout_seconds,
             processor_queue_bypass_enabled=(processor_queue_bypass_enabled),
             processor_queue_bypass_paths=processor_queue_bypass_paths,
             processor_admission_rejections=(processor_admission_rejections),

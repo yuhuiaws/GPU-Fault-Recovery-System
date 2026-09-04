@@ -27,7 +27,9 @@ from gpu_fault.models import (
     IncidentState,
     MarkerScope,
     NodeMarker,
+    PlanStatus,
     RecoveryAction,
+    RecoveryPlan,
     Severity,
     WorkflowOperation,
     WorkflowStatus,
@@ -55,6 +57,12 @@ from tests._builders import (
     gpu_metric_batch,
     workflow_request,
     workflow_step,
+)
+from tests.store._blocked_backlog_support import (
+    FLAWS,
+    blocked,
+    break_one_clause,
+    restore,
 )
 
 POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
@@ -563,6 +571,81 @@ def test_postgres_remediation_budget_claim_is_atomic() -> None:
         second.close()
 
 
+def test_postgres_restored_workflow_reconcile_is_atomic() -> None:
+    store = _store()
+    suffix = uuid4().hex
+    now = datetime.now(timezone.utc)
+    incident_id = f"incident-reconcile-{suffix}"
+    blocked_id = f"workflow-reconcile-blocked-{suffix}"
+    successor_id = f"workflow-reconcile-restored-{suffix}"
+    plan_id = f"plan-reconcile-{suffix}"
+    plan = RecoveryPlan(
+        plan_id=plan_id,
+        incident_id=incident_id,
+        attempt_id=f"attempt-{suffix}",
+        trigger="postgres reconciliation contract",
+        runtime_profile_version="profile-v1",
+        steps=[],
+        workflow_request_id=blocked_id,
+        status=PlanStatus.FAILED,
+        created_at=now - timedelta(hours=2),
+    )
+    blocked = workflow_request(
+        blocked_id,
+        incident_id,
+        WorkflowStatus.BLOCKED,
+        fencing_token=7,
+        source_plan_id=plan_id,
+        official_steps=[workflow_step(WorkflowOperation.QUARANTINE)],
+        created_at=now - timedelta(hours=2),
+        updated_at=now - timedelta(hours=1),
+    )
+    successor = workflow_request(
+        successor_id,
+        incident_id,
+        WorkflowStatus.SUCCEEDED,
+        fencing_token=7,
+        predecessor_workflow_id=blocked_id,
+        completed_operations=[WorkflowOperation.RESTORE_SCHEDULING],
+        created_at=now - timedelta(hours=1),
+        updated_at=now - timedelta(minutes=30),
+    )
+    incident = fault_incident(
+        incident_id,
+        f"event-reconcile-{suffix}",
+        state=IncidentState.RECOVERED,
+        workflow_request_id=successor_id,
+        fencing_token=7,
+        created_at=now - timedelta(hours=2),
+        updated_at=now - timedelta(minutes=30),
+    )
+    try:
+        store.save_plan(plan)
+        store.save_workflow(blocked)
+        store.save_workflow(successor)
+        store.save_incident(incident)
+
+        updated, current_incident, updated_plan = store.reconcile_restored_workflow(
+            blocked_id,
+            successor_id,
+            expected_fencing_token=blocked.fencing_token,
+            expected_workflow_updated_at=blocked.updated_at,
+            reference="CHG-POSTGRES-RECONCILE",
+            reconciled_at=now,
+        )
+
+        assert updated.status is WorkflowStatus.SUPERSEDED
+        assert current_incident.workflow_request_id == successor_id
+        assert updated_plan.resolved_by_restore_workflow_id == successor_id
+        assert store.get_workflow(blocked_id).status is WorkflowStatus.SUPERSEDED
+        assert store.get_incident(incident_id).workflow_request_id == successor_id
+        assert (
+            store.get_plan(plan_id).reconciliation_reference == "CHG-POSTGRES-RECONCILE"
+        )
+    finally:
+        store.close()
+
+
 def test_postgres_replacement_group_merge_is_concurrent() -> None:
     first = _store()
     second = _store()
@@ -1064,6 +1147,38 @@ def test_postgres_active_deployment_lookup_uses_the_scope_index() -> None:
             item.deployment_id
             for item in store.list_active_fleet_deployments(cluster_id)
         ] == [open_roll.deployment_id]
+    finally:
+        store.close()
+
+
+def test_postgres_blocked_backlog_gauge_answers_the_same_question() -> None:
+    """The ``jsonb`` rewrite of the BLOCKED backlog aggregate.
+
+    ``blocked_workflows_without_verified_restore`` is hand-written per backend,
+    and this is the one that runs in production. The records come from the same
+    builders as ``tests/store/test_blocked_backlog_gauge.py``, so a clause the
+    SQLite query checks and this one does not shows up as a disagreement rather
+    than as a quietly cleared alert.
+
+    Asserted as deltas against a baseline, and with record names scoped to a
+    uuid: the gauge is a whole-table aggregate and this database is shared with
+    every other test in the serial Postgres invocation.
+    """
+    store = _store()
+    try:
+        name = f"backlog-{uuid4().hex}"
+        base = store.blocked_workflows_without_verified_restore()
+
+        blocked(store, name)
+        assert store.blocked_workflows_without_verified_restore() == base + 1
+
+        restore(store, name)
+        assert store.blocked_workflows_without_verified_restore() == base
+
+        for flaw in FLAWS:
+            restore(store, name)
+            break_one_clause(store, flaw, name)
+            assert store.blocked_workflows_without_verified_restore() == base + 1, flaw
     finally:
         store.close()
 

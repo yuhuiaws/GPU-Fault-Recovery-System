@@ -536,6 +536,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "pydantic" },
     { name = "pyyaml" },
+    { name = "starlette" },
     { name = "uvicorn" },
 ]
 
@@ -588,6 +589,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.6,<4" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.12.11" },
+    { name = "starlette", specifier = ">=1.6,<1.7" },
     { name = "uvicorn", specifier = ">=0.34,<1" },
     { name = "uvloop", marker = "extra == 'performance'", specifier = ">=0.21,<1" },
     { name = "yamllint", marker = "extra == 'dev'", specifier = ">=1.35,<2" },

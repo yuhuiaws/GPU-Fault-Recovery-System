@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
-
 import secrets
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Iterable
 
 from gpu_fault.remote_command_models import (
     RemoteCommandStatus,
@@ -15,7 +14,11 @@ from gpu_fault.store.shared.errors import (
 )
 from gpu_fault.store.shared.remote_helpers import (
     remote_command_identity as _remote_command_identity,
+)
+from gpu_fault.store.shared.remote_helpers import (
     remote_command_stats as _remote_command_stats,
+)
+from gpu_fault.store.shared.remote_helpers import (
     unclaimed_expiry_update as _unclaimed_expiry_update,
 )
 
@@ -49,10 +52,19 @@ class MemoryRemoteCommandMixin:
                 raise NotFoundError(command_id)
             return command  # type: ignore[no-any-return]
 
-    def list_remote_commands(self) -> list[RemoteActionCommand]:
+    def list_remote_commands(
+        self,
+        *,
+        workflow_request_ids: Iterable[str] | None = None,
+    ) -> list[RemoteActionCommand]:
+        wanted = None if workflow_request_ids is None else set(workflow_request_ids)
         with self._lock:
             return sorted(
-                self._remote_commands.values(),
+                (
+                    item
+                    for item in self._remote_commands.values()
+                    if wanted is None or item.workflow_request_id in wanted
+                ),
                 key=lambda item: (item.created_at, item.command_id),
             )
 
@@ -147,7 +159,7 @@ class MemoryRemoteCommandMixin:
                     break
         return claimed
 
-    def remote_command_stats(self, *, now: datetime | None = None) -> dict:
+    def remote_command_stats(self, *, now: datetime | None = None) -> dict[str, Any]:
         with self._lock:
             commands = list(self._remote_commands.values())
         return _remote_command_stats(commands, now=now)

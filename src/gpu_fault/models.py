@@ -13,12 +13,19 @@ class StrictModel(BaseModel):
 
 
 class Environment(StrEnum):
-    EC2 = "ec2"
+    """Environments the control plane knows how to reason about.
+
+    Only these four appear: every recovery decision that consults the environment
+    branches on one of them. A member nobody branches on is worse than a missing
+    one -- a profile or watcher configured with it would load, then silently take
+    the default path -- so bare ``slurm`` and ``ec2`` are deliberately absent and
+    are rejected at parse time.
+    """
+
     EKS = "eks"
     HYPERPOD_EKS = "hyperpod-eks"
     HYPERPOD_SLURM = "hyperpod-slurm"
     KUBERNETES = "kubernetes"
-    SLURM = "slurm"
 
 
 class TerminalStatus(StrEnum):
@@ -488,6 +495,9 @@ class RecoveryPlan(StrictModel):
     )
     workflow_request_id: str | None = None
     status: PlanStatus = PlanStatus.PENDING
+    resolved_by_restore_workflow_id: str | None = None
+    reconciliation_reference: str | None = None
+    reconciled_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -801,4 +811,15 @@ class NotificationDispatchReport(StrictModel):
     Only counts drills that were already in the outbox: ``send`` keeps new
     ones out of it, so a steady non-zero value here means something is
     enqueuing deliveries without going through it.
+    """
+    scan_truncated: bool = False
+    """The synchronous path saw only the newest slice of the notification table.
+
+    ``expired`` and ``suppressed_drills`` are then counted over that slice
+    rather than over the whole history, and a deliverable notification older
+    than the slice -- only possible for a category with no shelf life -- is not
+    reached. Raising ``GPU_FAULT_NOTIFICATION_DISPATCH_SCAN_LIMIT`` moves the
+    cost back onto every call; the answer to a persistently truncated scan is
+    ``GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY``, which claims from the outbox
+    instead of scanning. Always ``False`` on the async path, which never scans.
     """

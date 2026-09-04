@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 
 import pytest
 
-from gpu_fault.admin_bootstrap_common import BootstrapError, ClusterIdentity
-from gpu_fault.admin_notifications import (
+from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
+from gpu_fault.admin.notifications import (
     ensure_email_notifications,
     resolve_admin_email,
 )
@@ -14,9 +16,10 @@ from gpu_fault.admin_notifications import (
 class Runner:
     dry_run = False
 
-    def __init__(self, responses):
+    def __init__(self, responses, *, secret_data=None):
         self.responses = list(responses)
         self.commands = []
+        self.secret_data = secret_data
 
     def aws_json(self, _region, *arguments, **_kwargs):
         self.commands.append(("aws", arguments))
@@ -27,6 +30,10 @@ class Runner:
 
     def run(self, arguments, **kwargs):
         self.commands.append(("run", tuple(arguments), kwargs))
+        if "get" in arguments and "secret" in arguments:
+            if self.secret_data is not None:
+                return json.dumps({"data": self.secret_data})
+            raise BootstrapError("NotFound")
         if "create" in arguments and "secret" in arguments:
             return "apiVersion: v1\nkind: Secret\nmetadata:\n  name: gpu-fault-email\n"
         return ""
@@ -109,13 +116,17 @@ def test_email_notifications_require_verified_ses_and_apply_secret(
     assert result["verified"] is True
     assert result["identity_ownership"] == "EXTERNAL"
     assert any(
-        command[0] == "run" and "gpu-fault-email" in command[1]
+        command[0] == "run"
+        and "create" in command[1]
+        and "gpu-fault-email" in command[1]
         for command in runner.commands
     ), "email Secret was not applied"
     secret_command = next(
         command[1]
         for command in runner.commands
-        if command[0] == "run" and "gpu-fault-email" in command[1]
+        if command[0] == "run"
+        and "create" in command[1]
+        and "gpu-fault-email" in command[1]
     )
     assert "--from-literal=email-sender=sender@example.com" in secret_command
     assert (
@@ -141,3 +152,42 @@ def test_unverified_ses_identity_blocks_deploy(tmp_path: Path) -> None:
             site_id="site-a",
             admin_email="ops@example.com",
         )
+
+
+def test_verified_email_probe_reuses_matching_secret(tmp_path: Path) -> None:
+    values = {
+        "email-sender": "sender@example.com",
+        "email-recipients": "ops@example.com,oncall@example.com",
+        "email-subject-prefix": "[PROD]",
+        "site-id": "site-a",
+        "aws-account-id": "123456789012",
+    }
+    runner = Runner(
+        [
+            {"VerifiedForSendingStatus": True, "VerificationStatus": "SUCCESS"},
+            {"SendingEnabled": True, "ProductionAccessEnabled": True},
+        ],
+        secret_data={
+            key: base64.b64encode(value.encode()).decode()
+            for key, value in values.items()
+        },
+    )
+
+    ensure_email_notifications(
+        runner,
+        cpu=_cpu(),
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+        site_id="site-a",
+        admin_email="ops@example.com",
+        sender_email="sender@example.com",
+        recipients=("ops@example.com", "oncall@example.com"),
+        subject_prefix="[PROD]",
+    )
+
+    mutating = [
+        command[2]
+        for command in runner.commands
+        if command[0] == "run" and command[2].get("mutate")
+    ]
+    assert mutating == []

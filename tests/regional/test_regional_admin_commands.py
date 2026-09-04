@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import subprocess
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,13 +10,18 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 ADMIN = lazy_script_module(
-    "regional_admin_commands_test",
-    ROOT / "deploy/control-plane/regional/regional_admin_commands.py",
+    ROOT / "deploy/control-plane/regional/regional_admin_commands.py"
+)
+CHECKS = lazy_script_module(
+    ROOT / "deploy/control-plane/regional/regional_admin_checks.py"
+)
+STATE = lazy_script_module(
+    ROOT / "deploy/control-plane/regional/regional_release_state.py"
 )
 
 
 def _admin_module():
-    return ADMIN._load()
+    return ADMIN.load()
 
 
 def test_full_status_keeps_health_when_release_summary_is_missing(monkeypatch) -> None:
@@ -72,6 +77,59 @@ def test_release_summary_does_not_repeat_health_checks(monkeypatch) -> None:
 
     assert report["mode"] == "release-summary"
     assert report["next_deploy"] == {"kind": "NOOP", "changed": []}
+
+
+def test_full_status_reads_the_cluster_once_for_both_halves(monkeypatch) -> None:
+    """The health report and the release summary share one snapshot.
+
+    `status` is the command an administrator runs while watching something go
+    wrong, so its cost matters. Both halves read the same Deployments and the
+    same ConfigMaps; the health report opens a read snapshot around its checks,
+    and until `build_full_status` opened one first, everything the summary read
+    afterwards was read against a cache that had already been torn down.
+    """
+
+    module = _admin_module()
+    calls: list[tuple[str, ...]] = []
+
+    class Runner:
+        @staticmethod
+        def run(arguments, **_kwargs):
+            calls.append(tuple(arguments))
+            return json.dumps({"data": {"state.json": "{}"}})
+
+    release = SimpleNamespace(
+        config=SimpleNamespace(site_name="test-site"), runner=Runner()
+    )
+    release._get_json = lambda args: STATE.get_json(release, args)
+    release._read_snapshot = lambda: STATE.read_snapshot(release)
+    release._load_state = lambda: {}
+    command = ["cpu", "-n", "gpu-fault-system", "get", "configmap", "release-metadata"]
+
+    # Stand in for the two builders, each reading what the other reads. The
+    # health report opens its own snapshot the way the real one does, which is
+    # the nesting this case is about.
+    def health(_release, *, mode):
+        with CHECKS._read_snapshot(release):
+            release._get_json(command)
+        return {"mode": mode, "healthy": True, "summary": {"FAIL": 0}, "checks": []}
+
+    monkeypatch.setattr(module, "build_health_report", health)
+    monkeypatch.setattr(
+        module,
+        "build_release_status",
+        lambda _release: {"release_metadata": release._get_json(command)},
+    )
+    monkeypatch.setattr(
+        module,
+        "classify_release",
+        lambda _release, _state: SimpleNamespace(as_dict=lambda: {"kind": "NOOP"}),
+    )
+
+    report = module.build_full_status(release)
+
+    assert report["healthy"] is True
+    assert len(calls) == 1
 
 
 def test_failed_release_diff_is_reused_for_resume() -> None:
@@ -141,6 +199,7 @@ def test_retry_diff_restores_physical_artifact_changes(monkeypatch) -> None:
     ("phase", "expected_resume"),
     (
         ("failed", True),
+        ("partial-convergence", True),
         ("registry-staged", True),
         ("data-plane-progress", True),
         ("rolled-back", False),
@@ -155,13 +214,9 @@ def test_deploy_only_resumes_an_unrolled_back_release(
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=lambda _args: True),
         _load_state=lambda: {"phase": phase, "release_id": "previous-candidate"},
         upgrade=lambda **kwargs: calls.append(kwargs),
-    )
-    monkeypatch.setattr(
-        module.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
     )
     monkeypatch.setattr(
         module, "retry_release_diff", lambda _release, _state: expected_diff
@@ -189,11 +244,57 @@ def test_explicit_resume_reuses_the_checkpoint_retry_diff(monkeypatch) -> None:
     assert calls == [{"resume": True, "diff": expected_diff}]
 
 
+@pytest.mark.parametrize(
+    "phase", ("rollback-data-progress", "rollback-verifying", "rollback-failed")
+)
+def test_deploy_and_resume_continue_the_existing_rollback(
+    monkeypatch, phase: str
+) -> None:
+    module = _admin_module()
+    calls: list[str] = []
+    release = SimpleNamespace(
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
+        _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=lambda _args: True),
+        _load_state=lambda: {"phase": phase, "release_id": "candidate-release"},
+        rollback=lambda: calls.append("rollback"),
+    )
+
+    with pytest.raises(module.ReleaseError, match="rollback recovery completed"):
+        module.run_deploy(release)
+    module.run_resume(release)
+
+    assert calls == ["rollback", "rollback"]
+
+
+def test_deploy_reports_completed_rollback_cleanup_as_recovery(monkeypatch) -> None:
+    module = _admin_module()
+    calls: list[str] = []
+    release = SimpleNamespace(
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
+        _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=lambda _args: True),
+        _load_state=lambda: {
+            "phase": "rolled-back",
+            "rollback_cleanup_completed": False,
+            "rollback_result": {"status": "PASSED"},
+        },
+        rollback=lambda: calls.append("rollback"),
+    )
+
+    with pytest.raises(module.ReleaseError, match="rollback recovery completed"):
+        module.run_deploy(release)
+
+    assert calls == ["rollback"]
+
+
 def test_explicit_resume_rejects_a_terminal_release() -> None:
     module = _admin_module()
     release = SimpleNamespace(_load_state=lambda: {"phase": "complete"})
 
-    with pytest.raises(module.ReleaseError, match="incomplete upgrade transaction"):
+    with pytest.raises(
+        module.ReleaseError, match="incomplete upgrade or rollback transaction"
+    ):
         module.run_resume(release)
 
 
@@ -201,6 +302,7 @@ def test_explicit_resume_rejects_a_terminal_release() -> None:
     ("phase", "expected_resume"),
     (
         ("failed", True),
+        ("partial-convergence", True),
         ("registry-staged", True),
         ("data-plane-progress", True),
         ("rolled-back", False),
@@ -228,11 +330,33 @@ def test_release_summary_reports_retry_transaction_mode(
     assert report["next_deploy"]["resume"] is expected_resume
 
 
+def test_release_summary_reports_rollback_as_the_next_action(monkeypatch) -> None:
+    module = _admin_module()
+    release = SimpleNamespace(
+        config=SimpleNamespace(site_name="test-site"),
+        _load_state=lambda: {"phase": "rollback-data-progress"},
+    )
+    monkeypatch.setattr(
+        module, "build_release_status", lambda _release: {"site_name": "test-site"}
+    )
+    monkeypatch.setattr(
+        module,
+        "retry_release_diff",
+        lambda _release, _state: module.diff_from_changed({"control_plane_wheel"}),
+    )
+
+    report = module.build_release_summary(release)
+
+    assert report["next_deploy"]["action"] == "rollback"
+    assert report["next_deploy"]["resume"] is True
+
+
 @pytest.mark.parametrize(
     ("state_exists", "phase"),
     [
         (False, None),
         (True, "bootstrap-cleaned"),
+        (True, "bootstrap-cleanup-progress"),
         (True, "bootstrap-data-plane-progress"),
     ],
 )
@@ -244,15 +368,9 @@ def test_deploy_rejects_empty_cluster_set_during_bootstrap(
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=()),
         _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=lambda _args: state_exists),
         _load_state=lambda: {"phase": phase},
         bootstrap=lambda: calls.append("bootstrap"),
-    )
-    monkeypatch.setattr(
-        module.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0], 0 if state_exists else 1
-        ),
     )
 
     with pytest.raises(
@@ -270,13 +388,9 @@ def test_deploy_allows_empty_cluster_set_after_completed_state(monkeypatch) -> N
     release = SimpleNamespace(
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=()),
         _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=lambda _args: True),
         _load_state=lambda: {"phase": "complete"},
         noop=lambda _diff: calls.append("noop"),
-    )
-    monkeypatch.setattr(
-        module.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
     )
     monkeypatch.setattr(
         module,

@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -36,8 +35,10 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    install_abort_signals,
     predecessor_evidence,
     required,
+    run_case_main,
     runtime_identity_errors,
     settings_from_arguments,
 )
@@ -537,10 +538,24 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
 def cleanup_quiescence_summary(state: dict[str, Any]) -> dict[str, Any]:
     workflow = state.get("workflow") or {}
     commands = state.get("commands") or []
+    observations = state.get("observations") or []
+    observation_phases = sorted(
+        {
+            str(item.get("workload_phase") or "")
+            for item in observations
+            if isinstance(item, dict)
+        }
+    )
     return {
         "event_observed": bool(state.get("event")),
         "workflow_request_id": workflow.get("request_id"),
         "workflow_status": workflow.get("status"),
+        "observation_phases": observation_phases,
+        "observation_terminal": bool(
+            len(observations) == 1
+            and observation_phases
+            and observation_phases[0] in {"SUCCEEDED", "FAILED", "STOPPED"}
+        ),
         "commands": [
             {
                 "operation": (item.get("step") or {}).get("operation"),
@@ -589,7 +604,10 @@ def wait_for_cleanup_quiescence(
             item.get("status") in CLEANUP_TERMINAL_COMMAND_STATUSES for item in commands
         )
         quiescent = bool(
-            summary["event_observed"] and workflow_terminal and commands_terminal
+            summary["event_observed"]
+            and workflow_terminal
+            and commands_terminal
+            and summary["observation_terminal"]
         )
         signature = json.dumps(summary, sort_keys=True, separators=(",", ":"))
         now = time.monotonic()
@@ -900,10 +918,6 @@ def execute_case(
     return 0 if result["verdict"] == "PASS" else 1
 
 
-def abort_on_signal(signum: int, _frame: object) -> None:
-    raise RegionalFixtureError(f"received signal {signum}")
-
-
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description="Run the guarded DESTR-009 workload restart acceptance."
@@ -926,8 +940,7 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     arguments = parser().parse_args()
     os.umask(0o077)
-    signal.signal(signal.SIGTERM, abort_on_signal)
-    signal.signal(signal.SIGINT, abort_on_signal)
+    install_abort_signals()
     settings = configure(arguments)
     case_dir = arguments.run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -958,4 +971,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_case_main(main))

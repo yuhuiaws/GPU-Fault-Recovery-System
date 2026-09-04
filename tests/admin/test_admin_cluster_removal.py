@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import threading
+import time
 from datetime import datetime, timezone
 
 import yaml
 
-from gpu_fault import admin_cluster_removal
-from gpu_fault.admin_cluster_removal import (
+from gpu_fault.admin import cluster_removal as admin_cluster_removal
+from gpu_fault.admin.cluster_removal import (
     RemoveClusterRequest,
     _detach_network,
+    _parallel_cluster_networks,
     _remove_target_aws_resources,
+    _verify_removal_parallel,
     _write_site_without_cluster,
     remove_cluster,
 )
-from gpu_fault.admin_resource_registry import write_installation_resource_snapshot
-from gpu_fault.admin_site import load_site
+from gpu_fault.admin.resource_registry import write_installation_resource_snapshot
+from gpu_fault.admin.site import load_site
 from gpu_fault.installation_resources import (
     InstallationResource,
     InstallationResourceDeletePolicy,
@@ -157,12 +163,19 @@ def test_cluster_network_detach_removes_only_exclusive_sources(
     site = load_site(path)
     commands = []
     waits = []
+    route53_changes = []
 
     def run(arguments, **_kwargs):
         commands.append(arguments)
         return True
 
     monkeypatch.setattr(admin_cluster_removal, "_idempotent_aws", run)
+    monkeypatch.setattr(
+        admin_cluster_removal,
+        "disassociate_vpc_from_hosted_zone",
+        lambda **kwargs: route53_changes.append(kwargs)
+        or {"changed": True, "change_id": "/change/C123", "change_status": "INSYNC"},
+    )
     monkeypatch.setattr(
         admin_cluster_removal,
         "_wait_vpc_association_absent",
@@ -184,11 +197,49 @@ def test_cluster_network_detach_removes_only_exclusive_sources(
     assert result == {
         "revoked_nat_eips": ["192.0.2.10"],
         "detached_vpc_id": "vpc-gpu-a",
+        "route53_change_id": "/change/C123",
+        "route53_change_status": "INSYNC",
     }
-    assert len(commands) == 2
-    assert "192.0.2.10/32" in commands[0]
-    assert "192.0.2.11/32" not in commands[0]
+    assert len(commands) == 1
+    permissions = json.loads(commands[0][commands[0].index("--ip-permissions") + 1])
+    cidrs = {item["CidrIp"] for item in permissions[0]["IpRanges"]}
+    assert cidrs == {"192.0.2.10/32"}
+    assert route53_changes == [
+        {"hosted_zone_id": "Z123", "region": "us-east-1", "vpc_id": "vpc-gpu-a"}
+    ]
     assert waits[0]["vpc_id"] == "vpc-gpu-a"
+
+
+def test_route53_disassociation_waits_for_change_insync(monkeypatch) -> None:
+    waits = []
+    monkeypatch.setattr(
+        admin_cluster_removal.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                {"ChangeInfo": {"Id": "/change/C123", "Status": "PENDING"}}
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        admin_cluster_removal,
+        "wait_route53_change_insync",
+        lambda change_id: waits.append(change_id),
+    )
+
+    result = admin_cluster_removal.disassociate_vpc_from_hosted_zone(
+        hosted_zone_id="Z123", region="us-east-1", vpc_id="vpc-gpu-a"
+    )
+
+    assert result == {
+        "changed": True,
+        "change_id": "/change/C123",
+        "change_status": "INSYNC",
+    }
+    assert waits == ["/change/C123"]
 
 
 def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) -> None:
@@ -230,8 +281,13 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
     )
     monkeypatch.setattr(
         admin_cluster_removal,
-        "_delete_target_namespace",
-        lambda *_args: calls.append("namespace"),
+        "_request_target_namespace_deletion",
+        lambda *_args: calls.append("namespace-request"),
+    )
+    monkeypatch.setattr(
+        admin_cluster_removal,
+        "_wait_target_namespace_absent",
+        lambda *_args: calls.append("namespace-wait"),
     )
     monkeypatch.setattr(
         admin_cluster_removal, "_remove_node_action_keys", lambda *_args: 1
@@ -271,13 +327,8 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
     )
     monkeypatch.setattr(
         admin_cluster_removal,
-        "_verify_target_absent",
-        lambda *_args: calls.append("target-verified"),
-    )
-    monkeypatch.setattr(
-        admin_cluster_removal,
-        "_verify_remaining_site",
-        lambda *_args: calls.append("site-verified"),
+        "_verify_removal_parallel",
+        lambda *_args: calls.extend(["target-verified", "site-verified"]),
     )
     monkeypatch.setattr(
         admin_cluster_removal,
@@ -302,3 +353,165 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
     assert calls.count("registry") == 1
     assert calls.count("release-state") == 1
     assert calls.count("site-verified") == 1
+
+
+def test_remove_network_discovery_is_bounded_parallel(monkeypatch) -> None:
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    four_started = threading.Event()
+
+    def network(_runner, *, region, eks_arn):
+        nonlocal active, maximum
+        del region
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            if active == 4:
+                four_started.set()
+        assert four_started.wait(timeout=2), "four network queries did not overlap"
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return {"vpc_id": eks_arn.rsplit("/", 1)[-1], "nat_eips": []}
+
+    monkeypatch.setattr(admin_cluster_removal, "_cluster_network", network)
+    target = {"eks_cluster_arn": "arn:aws:eks:us-east-1:123:cluster/target"}
+    remaining = [
+        {"eks_cluster_arn": f"arn:aws:eks:us-east-1:123:cluster/gpu-{index}"}
+        for index in range(5)
+    ]
+
+    target_network, remaining_networks, cpu_network = _parallel_cluster_networks(
+        object(),
+        region="us-east-1",
+        target=target,
+        remaining=remaining,
+        cpu_eks_arn="arn:aws:eks:us-east-1:123:cluster/cpu",
+    )
+
+    assert maximum == 4
+    assert target_network["vpc_id"] == "target"
+    assert [item["vpc_id"] for item in remaining_networks] == [
+        f"gpu-{index}" for index in range(5)
+    ]
+    assert cpu_network["vpc_id"] == "cpu"
+
+
+def test_target_resource_deletion_uses_dependency_waves(tmp_path, monkeypatch) -> None:
+    site = load_site(site_file(tmp_path))
+    now = datetime.now(timezone.utc)
+
+    def resource(key, resource_type, dependencies=()):
+        return InstallationResource(
+            site_id="test-site",
+            resource_key=key,
+            resource_type=resource_type,
+            resource_id=key,
+            region="us-east-1",
+            account_id="123456789012",
+            ownership=InstallationResourceOwnership.CREATED,
+            delete_policy=InstallationResourceDeletePolicy.DELETE,
+            dependencies=list(dependencies),
+            created_at=now,
+            updated_at=now,
+        )
+
+    oidc = resource("aws/iam/executor/gpu-a/oidc-provider", "iam_oidc_provider")
+    role = resource("aws/iam/executor/gpu-a/role", "iam_role", (oidc.resource_key,))
+    associations = [
+        resource(
+            f"aws/iam/executor/gpu-a/association-{index}",
+            "eks_pod_identity_association",
+            (role.resource_key,),
+        )
+        for index in range(2)
+    ]
+    snapshot = InstallationResourceSnapshot(
+        site_id="test-site", resources=[oidc, role, *associations]
+    )
+    snapshot = snapshot.model_copy(update={"source_sha256": snapshot.digest()})
+    calls: list[str] = []
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    two_started = threading.Event()
+
+    class Cleaner:
+        def __init__(self, _site):
+            pass
+
+        def validate_supported(self, _resources):
+            pass
+
+        def delete(self, item):
+            nonlocal active, maximum
+            with lock:
+                calls.append(item.resource_key)
+                active += 1
+                maximum = max(maximum, active)
+                if (
+                    item.resource_key.startswith("aws/iam/executor/gpu-a/association-")
+                    and active == 2
+                ):
+                    two_started.set()
+            if item.resource_key.startswith("aws/iam/executor/gpu-a/association-"):
+                assert two_started.wait(timeout=2), (
+                    "independent association deletes did not overlap"
+                )
+            time.sleep(0.01)
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(admin_cluster_removal, "ResourceCleaner", Cleaner)
+
+    _remove_target_aws_resources(
+        RemoveClusterRequest(
+            site=site, cluster_id="gpu-a", confirmation="REMOVE_GPU_CLUSTER"
+        ),
+        snapshot,
+    )
+
+    role_index = calls.index(role.resource_key)
+    oidc_index = calls.index(oidc.resource_key)
+    assert maximum == 2
+    assert all(calls.index(item.resource_key) < role_index for item in associations), (
+        "dependent IAM role was deleted before its associations"
+    )
+    assert role_index < oidc_index
+
+
+def test_remove_final_checks_run_in_parallel(tmp_path, monkeypatch) -> None:
+    site = load_site(site_file(tmp_path))
+    request = RemoveClusterRequest(
+        site=site, cluster_id="gpu-a", confirmation="REMOVE_GPU_CLUSTER"
+    )
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    five_started = threading.Event()
+
+    def check(*_args) -> None:
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            if active == 5:
+                five_started.set()
+        assert five_started.wait(timeout=2), "final checks did not all overlap"
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+
+    for name in (
+        "_verify_target_namespace_absent",
+        "_verify_control_registry_absent",
+        "_verify_preserved_gpu_eks",
+        "_verify_preserved_hyperpod",
+        "_verify_remaining_site",
+    ):
+        monkeypatch.setattr(admin_cluster_removal, name, check)
+
+    _verify_removal_parallel(request, site.release_config["clusters"][0], site)
+
+    assert maximum == 5

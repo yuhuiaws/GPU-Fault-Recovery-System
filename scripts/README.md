@@ -16,25 +16,27 @@ generic fault-case runner.
 ## Directory roles
 
 - `build-deploy-host-bundle.py`, `deploy_host_bundle.py`,
-  `deploy_host_component.py`, `setup_deploy_host.py` and
+  `deploy_host_component.py`, `deploy_host_identity.py`,
+  `deploy_source_identity.py`, `setup_deploy_host.py` and
   `setup-deploy-host.sh`: build, verify and install the signed offline
   deployment-host Python environment. The dedicated `gpu-fault-deploy-host`
   wheel owns `gpu-fault-admin` and is excluded from Runtime components.
   Dependency locks are installed once per platform-bound dependency identity;
-  release-specific project wheels use lightweight overlay venvs.
+  release-specific project wheels use lightweight overlay venvs. Bundle payloads
+  are content-addressed independently from Git commits.
 - `component_artifacts.py` and `component_artifact_cache.py`: validate canonical
   component wheels/Node bundle and persist source-only artifact sets across
   staging snapshots without reusing delivery identity.
 - `ci_coverage_gate.py`, `ci_gate_artifacts.py`, `ci_unit_gate.py`,
-  `ci_gate.py` and `resolve_ci_run.py`: partition runtime, deployment,
+  `ci_gate.py`, `resolve_ci_run.py` and `restore_ci_candidate.py`: partition runtime, deployment,
   fault-runner and PostgreSQL coverage; content-address, restore and sign each
   shard; combine branch coverage under one floor; bind duration/fault evidence
-  into the current unit and commit gates; then resolve that candidate for
-  Release promotion.
+  into the current unit and commit gates; then resolve and verify that candidate
+  for Release or eligible deployment-host promotion.
 - `staging_deploy.py`: private source preparation invoked by
   `gpu-fault-admin deploy`; it creates or reuses signing material, isolated
-  dirty-worktree commits, commit-bound deploy-host bundles and the internal
-  deployment venv. It is not a public command.
+  dirty-worktree commits, signed successful-source authorization, content-addressed
+  deploy-host bundles and the internal deployment venv. It is not a public command.
 - `release_deploy.py`: developer-facing build, site preparation, deploy,
   single-pass verify and lightweight release-summary pipeline used by
   `make release-deploy`. It persists both reports under the release state
@@ -45,6 +47,13 @@ generic fault-case runner.
   classifications fall back to deploy.
   `ADMIN_EMAIL` optionally overrides the site administrator address; otherwise
   the existing site value or AWS account email discovery is used.
+- `run_release_gates.py`: local production fallback DAG. Static/contracts,
+  ordinary pytest and PostgreSQL stress run with one to three CPU-bounded workers
+  and isolated Python/pytest caches; artifact construction starts only after all
+  three pass.
+- `run_static_gates.py`: bounded static DAG for Ruff, mypy, compileall,
+  architecture, contracts, safety, deployment/config, docs, YAML and Shell.
+  The same runner backs local `make check` and the production fallback.
 - `scripts/e2e/regional/`: regional acceptance drivers, probes, boot guards,
   recovery helpers and test-only Kubernetes inputs.
 - `scripts/e2e/hyperpod/`: focused HyperPod scenario runners.

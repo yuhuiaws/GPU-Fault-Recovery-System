@@ -36,6 +36,14 @@ from gpu_fault.execution.models import (
 from gpu_fault.execution.transient_errors import (
     transient_store_error,
 )
+from gpu_fault.execution import restart_budget_preflight
+from gpu_fault.workflow_resolution import (
+    RETIRED_GENERATION_STATUSES,
+    abandoned_generation_successor,
+    retired_generation_audit,
+    retired_generation_reasons,
+    retired_generation_successor,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -95,6 +103,8 @@ class WorkflowDispatcher:
     def run_once(self) -> WorkflowDispatchReport:
         self._reconcile_failed_workflows()
         now = datetime.now(timezone.utc)
+        self._supersede_abandoned_generations(now)
+        retired = self._revoke_retired_generations(now)
         timed_out = self._expire_stuck_workflows(now)
         workflows = self.store.list_workflows(
             self.EXECUTABLE_STATUSES,
@@ -103,7 +113,8 @@ class WorkflowDispatcher:
         workflows = [
             workflow
             for workflow in workflows
-            if workflow.not_before is None or workflow.not_before <= now
+            if workflow.request_id not in retired
+            and (workflow.not_before is None or workflow.not_before <= now)
         ]
         workflows = [
             workflow
@@ -370,6 +381,225 @@ class WorkflowDispatcher:
         return self.store.has_incomplete_processor_requests_for_scopes(
             incident.cluster_id, scope_keys
         )
+
+    def _supersede_abandoned_generations(self, now: datetime) -> list[WorkflowRequest]:
+        """Terminalize workflows their incident re-planned away from.
+
+        See ``workflow_resolution.abandoned_generation_successor`` for why these
+        records exist and why they are provably dead. Resolving them here rather
+        than in the release gate is what makes it stick: the record becomes a
+        real terminal record, so the per-incident admission slot below is freed
+        for the successor the incident is waiting on, and nothing downstream
+        needs an exception for it.
+
+        Not counted into the dispatch report. A supersession is neither an
+        execution nor a failure, and folding it into ``failed`` would alarm on
+        cleanup.
+        """
+
+        superseded: list[WorkflowRequest] = []
+        for workflow in self.store.list_workflows(
+            {WorkflowStatus.PENDING},
+            limit=1000,
+        ):
+            try:
+                successor = abandoned_generation_successor(
+                    self.store, workflow, now=now
+                )
+            except Exception:  # noqa: BLE001 - keep dispatching, do not terminalize
+                LOGGER.exception(
+                    "abandoned generation check failed, workflow left pending: %s",
+                    workflow.request_id,
+                )
+                continue
+            if successor is None:
+                continue
+            reason = (
+                f"superseded by {successor.request_id}: incident "
+                f"{workflow.incident_id} advanced to generation "
+                f"{successor.fencing_token} before any step of generation "
+                f"{workflow.fencing_token} ran"
+            )
+            try:
+                claimed = self.store.claim_workflow(
+                    workflow.request_id,
+                    self.executor.config.executor_id,
+                    workflow.fencing_token,
+                    lease_duration=timedelta(seconds=30),
+                    now=now,
+                )
+            except WorkflowLeaseError:
+                continue
+            replacement = claimed.model_copy(
+                update={
+                    "status": WorkflowStatus.SUPERSEDED,
+                    "preempted_by_workflow_id": successor.request_id,
+                    "preemption_reason": reason,
+                    "superseded_at": now,
+                    "blocked_reasons": list(
+                        dict.fromkeys([*claimed.blocked_reasons, reason])
+                    ),
+                    "execution_owner_id": None,
+                    "execution_lease_expires_at": None,
+                    "updated_at": now,
+                }
+            )
+            # Planning may already hold a restart reservation for a
+            # RESTART_WORKLOAD step no adapter ever attempted. Terminalizing
+            # without releasing it would spend that job's restart budget on a
+            # workflow that never restarted anything.
+            restart_budget_preflight.release_unattempted_restart_reservations(
+                self.store,
+                replacement,
+            )
+            self.store.save_workflow_if_leased(
+                replacement,
+                # The id the claim above succeeded with. Reading it back off the
+                # record would be ``str | None``, and a claim that returns
+                # without raising is a claim this executor holds.
+                self.executor.config.executor_id,
+                claimed.execution_epoch,
+                now=now,
+            )
+            self._sync_plan(replacement, WorkflowStatus.SUPERSEDED)
+            superseded.append(replacement)
+            LOGGER.warning(
+                "workflow superseded as an abandoned generation: "
+                "workflow=%s generation=%s incident=%s successor=%s "
+                "successor_generation=%s",
+                workflow.request_id,
+                workflow.fencing_token,
+                workflow.incident_id,
+                successor.request_id,
+                successor.fencing_token,
+            )
+        return superseded
+
+    def _revoke_retired_generations(self, now: datetime) -> set[str]:
+        """Revoke a retired generation that had already started.
+
+        ``_supersede_abandoned_generations`` above only clears the record that
+        never ran. That is the cheap case. The one that actually cost a fleet was
+        the opposite: on 2026-09-04 the retired generation was ``RUNNING``, held
+        an execution owner, a renewing lease, six remediation budget claims and
+        an unsettled ``STOP_WORKLOADS`` remote command against three nodes, and
+        the fleet rollout fence was the only thing still standing between that
+        command and a running 24-GPU job. Its incident had recovered at a higher
+        generation four hours earlier.
+
+        The order below is the whole point, and it is why this can take two
+        ticks. A remote command outlives the workflow row, so revoking the
+        workflow first would leave a destructive command behind whose next fence
+        evaluation releases it. So: cancel the commands first -- ``PENDING`` and
+        ``WAITING`` go terminal in the store immediately, and a ``LEASED`` one
+        gets a cancellation request that both bars it from ever being claimed
+        again and turns whatever the executor reports into a ``FAILED`` -- and
+        revoke the workflow only once the store shows every one of them settled.
+
+        No lease is taken. ``claim_workflow`` cannot help here: the lease holder
+        is this very dispatch loop, which renews on every tick, so a
+        lease-respecting revocation would wait forever on a record it is itself
+        keeping alive. Safety comes from
+        ``retired_generation_records`` re-deriving every condition inside the
+        store transaction. In particular a record that has already *completed* a
+        destructive operation is never revoked -- there is something real to
+        compensate for, and the release gate goes on reporting it until an
+        operator resolves it.
+
+        Not counted into the dispatch report, for the same reason a supersession
+        is not: cleanup is neither an execution nor a failure.
+
+        Returns the ids of the retired generations that are still open, which
+        ``run_once`` withholds from dispatch: a record waiting for its commands
+        to settle is one ``_validate_fencing`` would reject, and blocking it on a
+        fencing error would bury the revocation under a dispatch failure.
+        """
+
+        held: set[str] = set()
+        for workflow in self.store.list_workflows(
+            RETIRED_GENERATION_STATUSES,
+            limit=1000,
+        ):
+            try:
+                held |= self._revoke_retired_generation(workflow, now)
+            except Exception:  # noqa: BLE001 - keep dispatching, do not revoke
+                LOGGER.exception(
+                    "retired generation revocation failed, workflow left open: %s",
+                    workflow.request_id,
+                )
+                held.add(workflow.request_id)
+        return held
+
+    def _revoke_retired_generation(
+        self,
+        workflow: WorkflowRequest,
+        now: datetime,
+    ) -> set[str]:
+        successor = retired_generation_successor(self.store, workflow)
+        if successor is None:
+            return set()
+        # Asked of the record alone first -- an empty command list isolates the
+        # conditions the workflow itself fails -- so a workflow that has already
+        # mutated the fleet is refused before anything is cancelled.
+        blocking = retired_generation_reasons(workflow, successor, [])
+        if blocking:
+            LOGGER.warning(
+                "retired generation needs an operator: workflow=%s generation=%s "
+                "incident=%s reasons=%s",
+                workflow.request_id,
+                workflow.fencing_token,
+                workflow.incident_id,
+                "; ".join(blocking),
+            )
+            return {workflow.request_id}
+        commands = self.store.list_remote_commands(
+            workflow_request_ids=[workflow.request_id]
+        )
+        if retired_generation_reasons(workflow, successor, commands):
+            cancelled = self.store.cancel_remote_commands_for_workflow(
+                workflow.request_id,
+                reason=retired_generation_audit(
+                    workflow,
+                    self.store.get_incident(workflow.incident_id),
+                    successor,
+                ),
+            )
+            LOGGER.warning(
+                "retired generation remote commands cancelled, revocation "
+                "deferred: workflow=%s generation=%s incident=%s "
+                "cancelled=%s cancellation_requested=%s",
+                workflow.request_id,
+                workflow.fencing_token,
+                workflow.incident_id,
+                cancelled.get("cancelled", 0),
+                cancelled.get("cancellation_requested", 0),
+            )
+            return {workflow.request_id}
+        revoked, _ = self.store.reconcile_retired_generation_workflow(
+            workflow.request_id,
+            successor.request_id,
+            expected_fencing_token=workflow.fencing_token,
+            reference=None,
+            reconciled_at=now,
+        )
+        # Terminalizing releases the remediation budget claims on its own -- they
+        # are only counted for a RUNNING workflow holding a live lease -- but a
+        # restart reservation is a durable row and is not.
+        restart_budget_preflight.release_unattempted_restart_reservations(
+            self.store,
+            revoked,
+        )
+        self._sync_plan(revoked, WorkflowStatus.SUPERSEDED)
+        LOGGER.warning(
+            "retired generation revoked: workflow=%s generation=%s "
+            "incident=%s successor=%s successor_generation=%s",
+            workflow.request_id,
+            workflow.fencing_token,
+            workflow.incident_id,
+            successor.request_id,
+            successor.fencing_token,
+        )
+        return set()
 
     def _reconcile_failed_workflows(self) -> None:
         if self.failure_handler is None:

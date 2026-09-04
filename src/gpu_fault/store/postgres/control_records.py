@@ -1,23 +1,27 @@
 from __future__ import annotations
 
-from typing import Any, Callable, cast
-
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, cast
 
+from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     NodeMarker,
     RecoveryAction,
     TerminalEvent,
     WorkflowRequest,
 )
-from gpu_fault.installation_resources import InstallationResource
+from gpu_fault.store.shared.attempt_observation_support import (
+    AttemptObservationTerminalSupport,
+    reconcile_terminal_attempt_observations,
+    terminalize_attempt_observation,
+)
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
 
 
-class PostgresControlRecordMixin:
+class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
     # Attributes supplied by the composed concrete implementation.
     _db: Any
     _decode: Callable[..., Any]
@@ -185,6 +189,59 @@ class PostgresControlRecordMixin:
                     sorted(node_ids),
                     observed_after,
                     source_boot_id,
+                    limit,
+                ),
+            )
+            rows = cursor.fetchall()
+        return [self._decode("marker", row[0]) for row in rows]
+
+    def list_markers_in_scope_window(
+        self,
+        *,
+        node_ids: set[str],
+        gpu_uuids: set[str],
+        fabric_partitions: set[str],
+        observed_from: datetime,
+        observed_to: datetime,
+        limit: int = 1000,
+    ) -> list[NodeMarker]:
+        """Actionable markers whose scope touches an allocation, newest first.
+
+        The terminal-event correlator asks this once per completed training
+        attempt. It matches on GPU UUID and fabric partition as well as node ID,
+        because a marker raised by a fabric-level fault names the partition, not
+        the nodes attached to it. An empty scope list is passed as an empty array
+        rather than skipped, so ``?|`` simply never matches that branch and the
+        SQL stays one statement.
+        """
+        if limit < 1 or not (node_ids or gpu_uuids or fabric_partitions):
+            return []
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload
+                FROM gpu_fault_objects
+                WHERE kind='marker'
+                  AND payload->>'active'='true'
+                  AND payload->>'trusted'='true'
+                  AND payload->>'recommended_action' IS NOT NULL
+                  AND (payload->>'observed_at')::timestamptz >= %s
+                  AND (payload->>'observed_at')::timestamptz <= %s
+                  AND (
+                      payload->'scope'->'node_ids' ?| %s
+                      OR payload->'scope'->'gpu_uuids' ?| %s
+                      OR payload->'scope'->'fabric_partitions' ?| %s
+                  )
+                ORDER BY (payload->>'observed_at')::timestamptz DESC,
+                         key DESC
+                LIMIT %s
+                """,
+                (
+                    observed_from,
+                    observed_to,
+                    sorted(node_ids),
+                    sorted(gpu_uuids),
+                    sorted(fabric_partitions),
                     limit,
                 ),
             )
@@ -541,7 +598,9 @@ class PostgresControlRecordMixin:
         limit: int = 1000,
     ) -> dict[str, int]:
         observed = now or datetime.now(timezone.utc)
-        deleted = {}
+        with self._state_transaction("attempt_observation/terminal-reconcile"):
+            terminalized = reconcile_terminal_attempt_observations(self, limit)
+        deleted = {"attempt_observation_terminalized": terminalized}
         with self._state_transaction("hot_state/cleanup"):
             with self._db.cursor() as cursor:
                 cursor.execute(
@@ -637,7 +696,8 @@ class PostgresControlRecordMixin:
         return deleted
 
     def save_event_if_absent(self, event: TerminalEvent) -> bool:
-        with self._db.transaction():
+        storage_key = self._state_key((event.cluster_id, event.attempt_id))
+        with self._state_transaction(f"attempt_observation/{storage_key}"):
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """
@@ -658,4 +718,10 @@ class PostgresControlRecordMixin:
                     self._state_key((event.cluster_id, event.attempt_id)),
                     event.event_key,
                 )
+            terminal = (
+                event if inserted else self._get_optional("event", event.event_key)
+            )
+            if terminal is None:
+                raise RuntimeError("terminal event disappeared during save")
+            terminalize_attempt_observation(self, terminal)
             return inserted

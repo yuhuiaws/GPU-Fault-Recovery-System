@@ -48,6 +48,8 @@ INSTALLER_LOCK_TIMEOUT_SECONDS="$(
 )"
 NODE_NAME=""
 RENDER_ONLY="false"
+PREFLIGHT_ONLY="false"
+REQUIRE_ROLLBACK_SLOT="${GPU_FAULT_REQUIRE_ROLLBACK_SLOT:-false}"
 DIAGNOSTIC_S3_URI="${GPU_FAULT_DIAGNOSTIC_S3_URI:-}"
 ENABLE_FIELD_DIAGNOSTIC="${GPU_FAULT_ENABLE_NODE_FIELD_DIAGNOSTIC:-false}"
 FIELD_DIAGNOSTIC_COMMAND="${GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND:-}"
@@ -148,7 +150,8 @@ usage() {
         "" \
         "Deploys the GPU fault collector and Agent through a privileged," \
         "node-bound Kubernetes Job. The Job never requests GPU resources." \
-        "--render-only prints the resolved Job manifest without creating it."
+        "--render-only prints the resolved Job manifest without creating it." \
+        "--preflight-only runs read-only host and candidate checks."
 }
 
 while [[ $# -gt 0 ]]; do
@@ -163,6 +166,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --render-only)
             RENDER_ONLY="true"
+            shift
+            ;;
+        --preflight-only)
+            PREFLIGHT_ONLY="true"
             shift
             ;;
         -h|--help)
@@ -210,6 +217,10 @@ done
 }
 [[ "${ENABLE_NVIDIA_SMI_METRICS_COLLECTOR}" =~ ^(true|false)$ ]] || {
     printf 'ERROR: GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR must be true or false\n' >&2
+    exit 2
+}
+[[ "${REQUIRE_ROLLBACK_SLOT}" =~ ^(true|false)$ ]] || {
+    printf 'ERROR: GPU_FAULT_REQUIRE_ROLLBACK_SLOT must be true or false\n' >&2
     exit 2
 }
 [[ "${DCGM_EDGE_FILTER_ENABLED}" =~ ^(true|false)$ ]] || {
@@ -394,7 +405,18 @@ EOF
     CONNECTION_SECRET_MOUNT=""
     CONNECTION_SECRET_VOLUME=""
 fi
-JOB_NAME="gpu-fault-install-${NODE_NAME#hyperpod-}"
+if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
+    JOB_ID="$(
+        printf '%s\0%s' "${NODE_NAME}" "${INSTALLER_ARTIFACT_SHA256}" |
+            sha256sum |
+            awk '{print substr($1, 1, 24)}'
+    )"
+    JOB_NAME="gpu-fault-preflight-${JOB_ID}"
+    HOST_ROOT_READ_ONLY="true"
+else
+    JOB_NAME="gpu-fault-install-${NODE_NAME#hyperpod-}"
+    HOST_ROOT_READ_ONLY="false"
+fi
 MANIFEST="$(mktemp)"
 trap 'rm -f "${MANIFEST}"' EXIT
 
@@ -434,6 +456,10 @@ spec:
                   fieldPath: metadata.uid
             - name: INSTALLER_LOCK_TIMEOUT_SECONDS
               value: "${INSTALLER_LOCK_TIMEOUT_SECONDS}"
+            - name: PREFLIGHT_ONLY
+              value: "${PREFLIGHT_ONLY}"
+            - name: REQUIRE_ROLLBACK_SLOT
+              value: "${REQUIRE_ROLLBACK_SLOT}"
             - name: NODE_COMPATIBILITY_DIGEST
               value: "${NODE_COMPATIBILITY_DIGEST}"
             - name: DERIVE_NODE_ACTION_SECRET
@@ -520,6 +546,23 @@ ${CONTROL_PLANE_ENV}
           command: ["/bin/bash", "-ceu"]
           args:
             - |
+              if [[ "\${PREFLIGHT_ONLY}" == "true" ]]; then
+                chroot /host /usr/bin/env \
+                GPU_FAULT_PREFLIGHT_HOST_ROOT=/ \
+                GPU_FAULT_PREFLIGHT_CANDIDATE_BUNDLE=/run/gpu-fault-preflight-artifact/gpu-fault-node-installer-${VERSION}.tar.gz \
+                GPU_FAULT_PREFLIGHT_BUNDLE_SHA256="${INSTALLER_BUNDLE_SHA256}" \
+                GPU_FAULT_PREFLIGHT_ARTIFACT_SHA256="${INSTALLER_ARTIFACT_SHA256}" \
+                GPU_FAULT_REQUIRE_ROLLBACK_SLOT="\${REQUIRE_ROLLBACK_SLOT}" \
+                TARGET_NODE_NAME="\${TARGET_NODE_NAME}" \
+                TARGET_NODE_UID="\${TARGET_NODE_UID}" \
+                  /bin/bash -ceu '
+                    tar -xOzf \
+                      "\${GPU_FAULT_PREFLIGHT_CANDIDATE_BUNDLE}" \
+                      gpu-fault-node-installer-${VERSION}/deploy/node/preflight-gpu-fault-node.sh |
+                      /bin/bash
+                  '
+                exit 0
+              fi
               install -m 0600 \
                 /artifact/gpu-fault-node-installer-${VERSION}.tar.gz \
                 /host/tmp/gpu-fault-node-installer-${VERSION}.tar.gz
@@ -747,8 +790,12 @@ ${CONTROL_PLANE_ENV}
           volumeMounts:
             - name: host-root
               mountPath: /host
+              readOnly: ${HOST_ROOT_READ_ONLY}
             - name: installer
               mountPath: /artifact
+              readOnly: true
+            - name: installer
+              mountPath: /host/run/gpu-fault-preflight-artifact
               readOnly: true
             - name: node-secret
               mountPath: /node-secret
@@ -779,12 +826,29 @@ fi
 kubectl -n "${NAMESPACE}" delete job "${JOB_NAME}" \
     --ignore-not-found --wait=true
 kubectl apply -f "${MANIFEST}"
-if ! kubectl -n "${NAMESPACE}" wait \
-    --for=condition=complete "job/${JOB_NAME}" --timeout=15m; then
-    kubectl -n "${NAMESPACE}" logs "job/${JOB_NAME}" --all-containers
-    exit 1
-fi
+deadline=$((SECONDS + INSTALLER_ACTIVE_DEADLINE_SECONDS + 60))
+while true; do
+    condition="$(
+        kubectl -n "${NAMESPACE}" get "job/${JOB_NAME}" \
+            -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}{"\n"}{end}'
+    )"
+    [[ "${condition}" != *Complete* ]] || break
+    if [[ "${condition}" == *Failed* || "${SECONDS}" -ge "${deadline}" ]]; then
+        kubectl -n "${NAMESPACE}" logs "job/${JOB_NAME}" --all-containers
+        if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
+            kubectl -n "${NAMESPACE}" delete job "${JOB_NAME}" \
+                --ignore-not-found --wait=true
+        fi
+        exit 1
+    fi
+    sleep 2
+done
 kubectl -n "${NAMESPACE}" logs "job/${JOB_NAME}" --all-containers
+if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
+    kubectl -n "${NAMESPACE}" delete job "${JOB_NAME}" \
+        --ignore-not-found --wait=true
+    exit 0
+fi
 kubectl annotate node "${NODE_NAME}" --overwrite \
     "gpu-fault.io/installer-version=${VERSION}" \
     "gpu-fault.io/installer-config-digest=${INSTALLER_CONFIG_DIGEST}" \

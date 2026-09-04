@@ -184,6 +184,32 @@ def prune_dist(release_dir: Path) -> None:
             shutil.rmtree(path)
 
 
+def prune_abandoned_staging() -> None:
+    """Drop staging directories a killed build left inside dist.
+
+    A build stages the wheels and the node bundle under ``dist/.build-XXXXXXXX``
+    and renames the finished release into place. Every ordinary exit removes
+    that directory, a failed build included, which is why ``prune_dist`` leaves
+    dot-directories alone -- the staging directory of the build calling it is
+    live. A signal that kills the process outright skips the cleanup: an
+    interrupted deploy, an OOM kill, a host reboot.
+
+    The leftover is not inert. ``artifact-check`` counts release artifacts with
+    ``dist.rglob("*.whl")``, so the next build fails the gate with "6 wheels,
+    expected 3" and names the release it just built correctly -- an operator
+    reads that as a broken build rather than as the corpse of the one before it.
+    Concurrent builds in one tree are already unsupported, since ``prune_dist``
+    deletes every release directory but its own, so clearing these costs nothing
+    a caller could have been relying on.
+    """
+
+    if not DIST.is_dir():
+        return
+    for path in sorted(DIST.glob(".build-*")):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def prepare_component_artifacts(
     python: str,
     *,
@@ -278,6 +304,9 @@ def build(
     component_cache_root: Path | None = None,
 ) -> dict[str, object]:
     python = resolve_python_executable(python)
+    # Before the reuse shortcut below, so that a build which republishes the
+    # current release still clears a leftover the artifact gate would trip on.
+    prune_abandoned_staging()
     delivery = build_release_identity(ROOT)
     if runtime_image_descriptor is None and reuse_if_current:
         current, cached_manifest = resolve_current_component_artifacts(

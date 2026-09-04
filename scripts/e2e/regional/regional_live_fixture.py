@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,6 +114,48 @@ def runtime_identity_errors(value: dict[str, Any]) -> list[str]:
 
 class RegionalFixtureError(RuntimeError):
     pass
+
+
+class RegionalFixtureAbort(BaseException):
+    """An operator abort delivered by SIGINT/SIGTERM.
+
+    Deliberately *not* an ``Exception``. Every probe helper in this fixture
+    retries on a bare ``except Exception`` -- ``pod_python`` for three attempts,
+    the wait loops for their whole timeout -- so a signal raised as an
+    ``Exception`` is swallowed by the very loop the operator is trying to
+    interrupt, and ^C appears to do nothing until the timeout expires. On a
+    destructive case that gap is the difference between an abort and a
+    completed mutation.
+    """
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"received signal {signum}")
+        self.signum = signum
+
+
+def abort_on_signal(signum: int, _frame: object) -> None:
+    raise RegionalFixtureAbort(signum)
+
+
+def install_abort_signals() -> None:
+    signal.signal(signal.SIGTERM, abort_on_signal)
+    signal.signal(signal.SIGINT, abort_on_signal)
+
+
+def run_case_main(entry: Callable[[], int]) -> int:
+    """Run a case entry point so a signal abort exits instead of tracebacking.
+
+    ``RegionalFixtureAbort`` has to escape the retry loops, which means it also
+    escapes ``main``. Reporting it as ``128 + signum`` keeps the shell contract
+    an operator expects from ^C while still distinguishing an abort from a
+    ``FAIL`` verdict, which exits 1.
+    """
+
+    try:
+        return entry()
+    except RegionalFixtureAbort as abort:
+        print(f"aborted: {abort}", file=sys.stderr)
+        return 128 + abort.signum
 
 
 def required(value: str, label: str) -> str:

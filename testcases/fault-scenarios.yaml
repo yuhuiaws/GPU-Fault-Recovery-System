@@ -71,6 +71,8 @@ test_cases:
   - 训练持续运行且节点保持 Ready 和可调度
   evidence:
     verdict: PASS
+    verified:
+      case_digest: 325581c07686e883fcdf6caae01485aaf4c2f9f3ed441b1e5e04fa387f8463c4
   automation: manual
   procedure: docs/故障模拟测试手册.md#75-hyperpod-单独-xid-45-fabric-manager-重启
   capture_processing_trace: true
@@ -91,6 +93,8 @@ test_cases:
   - 节点保持 Ready、可调度且无 taint
   evidence:
     verdict: PASS
+    verified:
+      case_digest: 4e42608127591edffb471465595ee5fd905d8d46aacbf0a5c1b37dbae6144f61
   automation: manual
   procedure: docs/故障模拟测试手册.md#75-hyperpod-单独-xid-45-fabric-manager-重启
   capture_processing_trace: true
@@ -110,6 +114,8 @@ test_cases:
   - rank 0 和 rank 8 的 NCCL all-reduce 持续等于 136.0
   evidence:
     verdict: PASS
+    verified:
+      case_digest: cd1ea704e793bda034c923f4c328ebed687758bfc1ed6a295b8dd19207ef5d71
   automation: manual
   procedure: docs/故障模拟测试手册.md#772-双节点-xid-95-reset-与训练恢复
   capture_processing_trace: true
@@ -183,6 +189,8 @@ test_cases:
   - canary 和三个生产副本读取完全相同的 FINALIZED 结果
   evidence:
     verdict: PASS
+    verified:
+      case_digest: 6eac06f6e75adde33f1a97504834b70dc82ea7111264a95af955e666f49808d4
   automation: manual
   procedure: docs/故障模拟测试手册.md#751-xid-45-跨副本与-companion-真机关联
   manifest: scripts/e2e/regional/manifests/xid45-correlation-canary.yaml
@@ -202,6 +210,8 @@ test_cases:
   - 原训练 Pod 和 attempt 不变，rank 0/rank 8 all-reduce 持续正常
   evidence:
     verdict: PASS
+    verified:
+      case_digest: a133770e1aa0346798a00783c0c5a119cd214dedb876e855a84fb6c1b2dd44c5
   automation: manual
   manifest: scripts/e2e/regional/manifests/fault-injection/kmsg-xid45-xid14.yaml
   procedure: docs/故障模拟测试手册.md#751-xid-45-跨副本与-companion-真机关联
@@ -460,6 +470,8 @@ test_cases:
   - 节点、taint、Pod UID 和 attempt ID 均不变化
   evidence:
     verdict: PASS
+    verified:
+      case_digest: bbcf8d8d3aa9f39df0ff055ae0e671d4a11e0bfb7df3bb735a808c3f19bd61c5
   automation: manual
   procedure: docs/故障模拟测试手册.md#710-hyperpod-xid-74-寄存器分支真机验证
   operator_case: safe-only
@@ -476,6 +488,8 @@ test_cases:
   - 节点和训练 attempt 不变化
   evidence:
     verdict: PASS
+    verified:
+      case_digest: d4eed429bee1cbcf06e2db8cf1bf5ed4fa727660843e5f5fa9abeab0bfc8bfb4
   automation: manual
   procedure: docs/故障模拟测试手册.md#710-hyperpod-xid-74-寄存器分支真机验证
   operator_case: corrected-only
@@ -1698,6 +1712,8 @@ test_cases:
   - 不执行 GPU reset、node reboot 或 replacement
   evidence:
     verdict: PASS
+    verified:
+      case_digest: 5f648f9faefe25bca55d51459c93d174bce3a9ced9a055031604517255e01a57
   automation: manual
   manifest: scripts/e2e/regional/manifests/training/xid11-three-node-pytorchjob.yaml
   procedure: docs/故障模拟测试手册.md#72-hyperpod-三节点-xid-11-重启
@@ -1718,6 +1734,8 @@ test_cases:
   - passive workflow 不执行停止、重启或硬件恢复
   evidence:
     verdict: PASS
+    verified:
+      case_digest: 011c96c608a28f3fe4dde437bc8a6586f7ff8d8784970a4b045a720266898d01
   automation: manual
   manifest: scripts/e2e/regional/manifests/kernel-collector-passive-validation.yaml
   procedure: docs/故障模拟测试手册.md#73-kernellogcollector-隔离-fifo-验证
@@ -1738,6 +1756,8 @@ test_cases:
   - 测试后节点保持 Ready 且无遗留 taint
   evidence:
     verdict: PASS
+    verified:
+      case_digest: 9656e0d56321ecadc4e4743e2443ba9fd57605daf920f3f6c0c1eeb8ea6f41b8
   automation: manual
   procedure: docs/故障模拟测试手册.md#74-真实-devkmsg-用户态写入
 
@@ -2134,6 +2154,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-001
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot001_regional_mode_without_a_registry_refuses_to_start
 - id: GF-REGIONAL-BOOT-002
   title: 非法注册表必须失败且显式空列表保持健康
   category: regional-startup-guard
@@ -2150,6 +2171,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-002
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot002_a_malformed_registry_fails_and_an_explicit_empty_one_boots
 - id: GF-REGIONAL-BOOT-003
   title: 区域模式与单集群变量互斥
   category: regional-startup-guard
@@ -2164,6 +2186,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-003
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot003_regional_mode_and_the_single_cluster_variable_are_exclusive
 - id: GF-REGIONAL-BOOT-004
   title: 区域模式禁止 in-cluster Kubernetes adapter
   category: regional-startup-guard
@@ -2193,6 +2216,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-005
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot005_regional_mode_refuses_the_central_hyperpod_adapter
 - id: GF-REGIONAL-BOOT-006
   title: 区域模式禁止 in-cluster quick diagnostics
   category: regional-startup-guard
@@ -2207,6 +2231,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-006
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot006_regional_mode_refuses_in_cluster_quick_diagnostics
 - id: GF-REGIONAL-BOOT-007
   title: 集群 token 长度下界精确为 32 字符
   category: regional-startup-guard
@@ -2221,6 +2246,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-007
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot007_a_cluster_token_shorter_than_32_characters_stops_startup
 - id: GF-REGIONAL-BOOT-008
   title: 注册表字段完整性与 enabled=false 语义
   category: regional-startup-guard
@@ -2236,6 +2262,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-008
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot008_registry_field_integrity_and_disabled_cluster_semantics
 - id: GF-REGIONAL-BOOT-009
   title: managed recovery observer 的依赖门禁
   category: regional-startup-guard
@@ -2250,6 +2277,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-009
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot009_the_managed_observer_requires_the_agent_registry
 - id: GF-REGIONAL-BOOT-010
   title: 生产三副本已按区域模式正确启动
   category: regional-startup-guard
@@ -2289,6 +2317,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-011
+  related_pytest: tests/regional/test_production_safety_config.py::test_boot011_documents_all_required_executor_inputs
 - id: GF-REGIONAL-BOOT-012
   title: executor 的私有 CA 信任链必须显式且局部配置
   category: regional-deployability
@@ -2311,6 +2340,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-012
+  related_pytest: tests/regional/test_production_safety_config.py::test_cluster_executor_private_ca_does_not_replace_aws_trust
 - id: GF-REGIONAL-BOOT-013
   title: 控制面缺少 AWS_REGION 时邮件必然失败
   category: regional-deployability
@@ -2331,6 +2361,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-013
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot013_the_ses_client_region_comes_only_from_the_declared_environment
 - id: GF-REGIONAL-BOOT-014
   title: 通知 dispatcher 的开关与邮件开关必须一致
   category: regional-deployability
@@ -2350,6 +2381,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-014
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot014_the_dangerous_delivery_switch_combination_is_named_not_silent
 - id: GF-REGIONAL-BOOT-015
   title: runtime profile 声明的 owner 必须有对应的 executor adapter
   category: regional-deployability
@@ -2377,6 +2409,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-015
+  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot015_a_command_no_adapter_owns_is_skipped_silently_but_counted
 - id: GF-REGIONAL-BOOT-016
   title: ARN单命令首次部署先生成完整registry且零集群稳态可运行
   category: regional-deployability
@@ -2429,6 +2462,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-001
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth001_a_protected_route_without_the_cluster_header_answers_401
 - id: GF-REGIONAL-AUTH-002
   title: 缺少或格式错误的 Bearer token 返回 401 与 403 的精确分界
   category: regional-authentication
@@ -2444,6 +2478,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-002
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth002_absent_malformed_and_empty_bearer_stay_distinguishable
 - id: GF-REGIONAL-AUTH-003
   title: 未注册集群 ID 返回 403
   category: regional-authentication
@@ -2474,6 +2509,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-004
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth004_a_near_miss_token_is_denied_exactly_like_a_wrong_one
 - id: GF-REGIONAL-AUTH-005
   title: header 与 payload 的 cluster_id 不一致返回 403
   category: regional-authentication
@@ -2488,6 +2524,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-005
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth005_a_payload_for_another_cluster_is_403_and_writes_nothing
 - id: GF-REGIONAL-AUTH-006
   title: 嵌套 heartbeat 中的 cluster_id 同样被校验
   category: regional-authentication
@@ -2503,6 +2540,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-006
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth006_a_nested_heartbeat_cluster_id_is_checked_before_the_signature
 - id: GF-REGIONAL-AUTH-007
   title: 被停用的集群立即失去认证能力
   category: regional-authentication
@@ -2552,6 +2590,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-009
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth009_every_cluster_token_write_route_rejects_a_foreign_payload
 - id: GF-REGIONAL-AUTH-010
   title: 受保护路径矩阵完整性
   category: regional-authentication
@@ -2567,6 +2606,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-010
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth010_every_route_answers_the_denial_its_bucket_declares
 - id: GF-REGIONAL-AUTH-011
   title: 健康与指标端点不需要集群凭证但也不泄露集群清单
   category: regional-authentication
@@ -2583,22 +2623,40 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-011
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth011_health_and_metrics_do_not_expose_the_regional_inventory
 - id: GF-REGIONAL-AUTH-012
-  title: 集群 token 轮换的失败窗口测量
+  title: 已废弃：集群 token 轮换的失败窗口测量
   category: regional-authentication
   level: live
   risk: live-service-action
-  problem: 每 cluster_id 只支持一个 token_sha256，轮换必然产生失败窗口，必须测量而不是假设为零。
+  problem: 旧用例假设每 cluster_id 只有一个 token_sha256，轮换必然产生失败窗口；registry 现在支持退役 token 的重叠窗口。
   injection: 控制面先切换到新 token，数据面延后更新，全程每 2 秒发一次带时间戳的 claim。
   expected:
-  - 记录 403 窗口的起止时间与总时长
-  - 窗口内等待执行的 command 的 lease 未被误回收且状态仍为 PENDING 或 WAITING
-  - 数据面 Secret 更新并重启后恢复 200
-  - validation_limitations 记录当前实现无法零中断轮换
+  - 不再执行该旧验收口径
+  - 使用 superseded_by 指向的零中断轮换用例
+  evidence:
+    verdict: SUPERSEDED
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-012
+  superseded_by: GF-REGIONAL-AUTH-016
+- id: GF-REGIONAL-AUTH-016
+  title: 集群 token 重叠窗口的零中断轮换
+  category: regional-authentication
+  level: live
+  risk: live-service-action
+  problem: token 轮换若要求控制面和数据面同时切换，就必然产生一个数据面 401 窗口，而故障处置期间不能接受该窗口。
+  injection: 控制面先发布同时携带新 token 与 retiring_token 的注册项，数据面延后切换，全程每 2 秒用旧 token 和新 token 各 claim 一次。
+  expected:
+  - 重叠期内旧 token 和新 token 的 claim 全部返回 200
+  - 数据面切换到新 token 后仍为 200
+  - 删除 retiring_token 并重新发布后旧 token 立即返回 403
+  - 基线中的 remote command 未被误终止，状态仍为 PENDING、WAITING 或 LEASED
+  - 报告只记录 token 摘要，不记录任何明文
   evidence:
     verdict: NOT_RUN
   automation: manual
-  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-012
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-016
+  related_pytest: tests/regional/test_regional_token_rotation.py::test_overlap_window_accepts_both_tokens
 - id: GF-REGIONAL-AUTH-013
   title: 私有 CA 与主机名校验不可绕过
   category: regional-authentication
@@ -2615,6 +2673,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-013
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth013_the_executor_trusts_the_private_ca_without_replacing_aws_trust
 - id: GF-REGIONAL-AUTH-014
   title: 互联网可达 NLB 上的端点鉴权全量清单
   category: regional-authentication
@@ -2633,6 +2692,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-014
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth014_the_internet_facing_surface_is_exactly_its_declared_buckets
 - id: GF-REGIONAL-ISO-001
   title: 两个集群使用相同 node name、job ID 和 attempt ID 时状态完全隔离
   category: regional-isolation
@@ -2684,6 +2744,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-iso-003
+  related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_iso003_the_fleet_proxy_refuses_cross_cluster_reads_and_transitions
 - id: GF-REGIONAL-ISO-004
   title: spare health 端点拒绝跨集群查询
   category: regional-isolation
@@ -2754,6 +2815,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-001
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd001_max_commands_is_enforced_at_both_ends_of_its_range
 - id: GF-REGIONAL-CMD-002
   title: claim 的 lease_seconds 边界值
   category: regional-remote-command
@@ -2770,6 +2832,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-002
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd002_lease_seconds_bounds_and_the_deadline_it_returns
 - id: GF-REGIONAL-CMD-003
   title: execution_owners 校验与空列表 fail-closed 回退
   category: regional-remote-command
@@ -2803,6 +2866,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-004
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd004_a_claim_only_takes_commands_for_the_owners_it_asked_for
 - id: GF-REGIONAL-CMD-005
   title: 领取顺序为 FIFO
   category: regional-remote-command
@@ -2817,6 +2881,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-005
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd005_the_claim_order_is_fifo_and_ties_break_deterministically
 - id: GF-REGIONAL-CMD-006
   title: lease 过期后可被重新领取且只有新持有者能写结果
   category: regional-remote-command
@@ -2850,6 +2915,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-007
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd007_a_terminal_result_is_idempotent_and_cannot_be_rewritten
 - id: GF-REGIONAL-CMD-008
   title: RemoteCommandResult 的取值约束
   category: regional-remote-command
@@ -2868,6 +2934,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-008
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd008_an_illegal_result_is_rejected_and_changes_nothing
 - id: GF-REGIONAL-CMD-009
   title: 不存在的与跨集群的 command_id 都返回 404
   category: regional-remote-command
@@ -2884,6 +2951,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-009
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd009_an_unknown_and_a_foreign_command_are_the_same_404
 - id: GF-REGIONAL-CMD-010
   title: fencing token 陈旧的 command 既不可领取也不可完成
   category: regional-remote-command
@@ -2931,6 +2999,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-012
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd012_the_command_identity_is_reused_on_retry_and_new_on_a_fence
 - id: GF-REGIONAL-CMD-013
   title: WAITING 可重新领取并携带上一轮结果
   category: regional-remote-command
@@ -2947,6 +3016,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-013
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd013_waiting_can_be_reclaimed_and_carries_the_previous_details
 - id: GF-REGIONAL-CMD-014
   title: 控制面在委托期间明确声明未由控制面提交变更
   category: regional-remote-command
@@ -2962,6 +3032,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-014
+  related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd014_the_delegating_step_states_the_control_plane_did_not_mutate
 - id: GF-REGIONAL-CMD-015
   title: restart 预算在委托前被预留且耗尽时不下发 command
   category: regional-remote-command
@@ -3303,6 +3374,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-blast-002
+  related_pytest: tests/regional/test_regional_least_privilege_acceptance.py::test_blast002_the_control_plane_declares_no_gpu_write_permission
 - id: GF-REGIONAL-BLAST-003
   title: GPU executor 权限最小化且不含 SES
   category: regional-blast-radius
@@ -3320,6 +3392,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-blast-003
+  related_pytest: tests/regional/test_regional_least_privilege_acceptance.py::test_blast003_the_executor_rbac_and_iam_stay_minimal
 - id: GF-REGIONAL-BLAST-004
   title: 执行 token 与集群 token 的分离
   category: regional-blast-radius
@@ -3334,6 +3407,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-blast-004
+  related_pytest: tests/regional/test_regional_least_privilege_acceptance.py::test_blast004_the_execution_token_stays_on_the_control_plane
 - id: GF-REGIONAL-DESTR-001
   title: 经 executor 与 Node Agent 的真实 GPU reset
   category: regional-destructive-acceptance
@@ -3693,6 +3767,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-004
+  related_pytest: tests/regional/test_regional_least_privilege_acceptance.py::test_notify004_no_data_plane_identity_can_send_mail
 - id: GF-REGIONAL-NOTIFY-005
   title: 低利用率类邮件按节点或任务聚合
   category: regional-notification
@@ -3794,13 +3869,15 @@ test_cases:
   level: staging
   risk: live-service-action
   problem: 单独的滚动升级用例不能证明NOOP、CONTROL_PLANE_ONLY、DATA_PLANE_COMPATIBLE和FULL四类发布选择了正确范围，也不能证明失败后Pin和Profile完整回滚。
-  injection: 使用scripts/e2e/regional/run_boot020_release_rolling.py在隔离站点依次构造四类release diff，并在数据面兼容窗口与FULL发布中各注入一次失败，分别验证resume与自动rollback后重跑。
+  injection: 使用scripts/e2e/regional/run_boot020_release_rolling.py在隔离站点依次构造NOOP、CPU-only、Executor-only、Agent-only和FULL release diff，分别注入自动rollback，并对Executor再注入一次中断resume。
   expected:
   - NOOP不滚动任何Deployment且只执行一次最终verify
   - CONTROL_PLANE_ONLY只滚动CPU角色
   - DATA_PLANE_COMPATIBLE只滚动变化的数据面组件并保持required/compatible两阶段Pin
   - FULL按schema、控制面、数据面和Agent顺序收敛
   - 失败时恢复previous artifact、Pin和Profile；重跑从持久状态续跑且不重复已完成动作
+  - CPU-only、Executor-only、Agent-only和FULL分别满足runner固定的T_safe/T_full上限；Executor中断resume在1200秒内完成
+  - rollback state记录每组件、每集群及每Fleet wave的safety、Reconciler和Agent收敛耗时
   - FULL回滚后再次应用同一候选时必须删除并重建旧completed Installer Job，Agent heartbeat须真实收敛，不能只把节点annotation标成Succeeded
   evidence:
     verdict: NOT_RUN
@@ -3854,7 +3931,7 @@ test_cases:
   - pytest
   - -q
   - tests/admin/test_release_deploy.py::test_profile_change_requires_approval_and_generates_version
-  - tests/regional/test_regional_release_orchestrator.py::test_runtime_profile_drift_requires_a_new_version
+  - tests/regional/test_regional_release_config_and_profile.py::test_runtime_profile_drift_requires_a_new_version
   - tests/hyperpod/test_training_submit_cli.py::test_site_supplies_runtime_profile_and_rejects_mismatch
 - id: GF-REGIONAL-AUTH-015
   title: fleet master 永不进入 GPU 节点

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 
@@ -59,10 +59,7 @@ class AppRuntime:
     event_loop_lag_snapshot: Callable[[], tuple[int, float, float]]
     dispatch_state: ProcessorDispatchState
     collector_metrics_snapshot: Any
-    collector_silence_ttl_seconds: float = 30
-    collector_silence_cache: dict[str, Any] = field(
-        default_factory=lambda: {
-            "expires_at": 0.0,
-            "lines": [],
-        }
-    )
+    # Shared, bounded store scans for the /metrics render path. Left optional so
+    # a plugin contributor or a test that builds this runtime directly still
+    # renders; the accessor falls back to an unshared read.
+    metric_scan_cache: Any = None

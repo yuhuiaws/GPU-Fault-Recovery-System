@@ -30,11 +30,16 @@ from regional_admin_commands import (
     stage_noop_release,
 )
 from regional_dns import apply_control_plane_nlb
+from regional_endpoint_rollback import (
+    capture_endpoint_snapshot,
+    restore_endpoint_snapshot,
+)
 from regional_gpu_bootstrap import (
     apply_gpu_dcgm_exporter,
     cancel_active_installer_jobs,
     ensure_connection_secret,
     ensure_gpu_namespace,
+    preflight_gpu_dcgm_exporter,
     quiesce_gpu_executor,
     retry_failed_installer_jobs,
     verify_gpu_control_plane_endpoint,
@@ -43,15 +48,19 @@ from regional_notifications import (
     ensure_notification_secret,
     notification_digest,
 )
-from regional_release_config import (
-    ClusterTarget,
-    ReleaseConfig,
-    ReleaseError,
+from regional_observability_rollback import (
+    capture_observability_snapshot,
+    restore_observability_snapshot,
 )
 from regional_release_artifacts import (
     require_cpu_secrets,
     upload_config_map,
     upload_release,
+)
+from regional_release_config import (
+    ClusterTarget,
+    ReleaseConfig,
+    ReleaseError,
 )
 from regional_release_diff import (
     ReleaseChangeKind,
@@ -63,22 +72,31 @@ from regional_release_fleet_rollout import (
     agent_heartbeats_converged,
     backup_release_secrets,
     backup_secret,
-    deploy_reconciler,
+    candidate_agent_pin_identity,
+    capture_active_agent_node_sets,
     delete_release_secret_backups,
+    deploy_reconciler,
     fleet_command,
     fleet_deployment_id,
     restore_secret,
-    roll_node_runtime,
     target_node_names,
     wait_agents,
+    wait_candidate_cpu_agent_heartbeats,
 )
 from regional_release_gpu_rollout import (
     agents_converged as agents_converged,
+)
+from regional_release_gpu_rollout import (
     apply_gpu_deployments,
-    executor_pin_rejection as executor_pin_rejection,
     join_target,
-    require_executor_pin as require_executor_pin,
+    preflight_gpu_deployments,
     upgrade_gpu_target,
+)
+from regional_release_gpu_rollout import (
+    executor_pin_rejection as executor_pin_rejection,
+)
+from regional_release_gpu_rollout import (
+    require_executor_pin as require_executor_pin,
 )
 from regional_release_iam import (
     validate_executor_iam_documents as validate_executor_iam_documents,
@@ -86,28 +104,33 @@ from regional_release_iam import (
 from regional_release_iam import (
     validate_executor_iam_role,
 )
+from regional_release_node_runtime_rollout import (
+    preflight_node_runtime,
+    roll_node_runtime,
+)
+from regional_release_online_registry import (
+    activate_join_registry,
+    drain_registry_cluster,
+    fail_join_registry,
+    prepare_join_registry,
+    purge_registry_cluster,
+    revoke_registry_cluster,
+    rollback_join_registry,
+)
 from regional_release_orchestration import (
-    build_rollback_environment as build_rollback_environment,
-    commit_release,
+    bootstrap_gpu_clusters,
     rollback_release,
     upgrade_release,
 )
+from regional_release_orchestration import (
+    build_rollback_environment as build_rollback_environment,
+)
 from regional_release_preflight import ensure_region_contexts
-from regional_release_rendering import (
-    DEFAULT_DCGM_EXPORTER_IMAGE,
-    DEFAULT_RUNTIME_IMAGE,
-    build_cpu_apply_environment,
-    rendered_release_manifest_sha256,
-    stamp_gpu_deployments,
-)
-from regional_release_reporting import build_release_plan
-from regional_release_runtime_identity import (
-    CONTROL_PLANE_PYTHON,
-    validate_runtime_component_identity,
-)
+from regional_release_probes import probe_label
 from regional_release_registry import (
     commit_registry_update,
     desired_registry,
+    initialize_registry,
     registry,
     registry_config_digest,
     registry_entry,
@@ -117,18 +140,22 @@ from regional_release_registry import (
     update_registry,
     write_registry,
 )
-from regional_release_online_registry import (
-    activate_join_registry,
-    drain_registry_cluster,
-    prepare_join_registry,
-    purge_registry_cluster,
-    revoke_registry_cluster,
+from regional_release_rendering import (
+    DEFAULT_DCGM_EXPORTER_IMAGE,
+    DEFAULT_RUNTIME_IMAGE,
+    build_cpu_apply_environment,
+    rendered_release_manifest_sha256,
+    stamp_gpu_deployments,
 )
+from regional_release_reporting import build_release_plan
+from regional_release_resume_validation import validate_resume_checkpoint
+from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
 from regional_release_state import (
     STATE_CONFIG_MAP as STATE_CONFIG_MAP,
 )
 from regional_release_state import (
     capture_previous,
+    cleanup_previous_snapshots,
     config_map_binary_key,
     config_map_data,
     deployment_template_name,
@@ -140,11 +167,13 @@ from regional_release_state import (
     save_state,
     template_bundle,
 )
+from regional_release_transaction import commit_release
 from regional_release_validation import (
     critical_amp_alerts,
     ensure_profile_transition_safe,
     stability_snapshot,
     store_io_rejection_series_ready,
+    validate_release_components,
     validate_release_quick,
     validate_rollback,
     validate_stability_window,
@@ -155,10 +184,6 @@ from regional_runtime_profile import (
 )
 
 ROOT = Path(__file__).resolve().parents[3]
-CONTROL_PLANE_VERIFY_SCRIPT = (
-    ROOT / "deploy/control-plane/tools/verify-control-plane-role-split.sh"
-)
-DATA_PLANE_VERIFY_SCRIPT = ROOT / "deploy/dataplane/tools/verify-dataplane-executor.sh"
 FAST_ROLLOUT_TIMEOUT = "5m"
 SENSITIVE_CONFIG_MARKERS = (
     "SECRET",
@@ -167,6 +192,29 @@ SENSITIVE_CONFIG_MARKERS = (
     "CREDENTIAL",
     "PRIVATE_KEY",
 )
+
+
+def _echoed_arguments(arguments: list[str]) -> list[str]:
+    """Replace a probe body in the command echo with the probe's name.
+
+    Only the echo changes. ``args`` itself is untouched, so the bytes on the
+    wire and the ``-c`` calling convention are exactly what they were -- which
+    is the whole point of shipping the probe as source (``probes/README.md``).
+
+    Without this, every probe put its full body on one ``+ python3 -c ...``
+    line. The probe programs are commented, so that was 24% of the lines of an
+    upgrade, and it pushed the kubectl trace an operator actually reads off the
+    screen.
+    """
+
+    echoed = list(arguments)
+    for index, argument in enumerate(echoed):
+        if index == 0 or echoed[index - 1] != "-c":
+            continue
+        label = probe_label(argument)
+        if label is not None:
+            echoed[index] = label
+    return echoed
 
 
 class Runner:
@@ -181,8 +229,9 @@ class Runner:
         input_text: str | None = None,
         capture: bool = False,
         sensitive: bool = False,
+        timeout_seconds: float | None = None,
     ) -> str:
-        shown = [Path(args[0]).name, *args[1:]]
+        shown = [Path(args[0]).name, *_echoed_arguments(args[1:])]
         print(
             "+ " + ("<sensitive command>" if sensitive else " ".join(shown)),
             file=sys.stderr,
@@ -190,19 +239,88 @@ class Runner:
         )
         if self.dry_run and not capture:
             return ""
-        completed = subprocess.run(
-            args,
-            check=False,
-            text=True,
-            input=input_text,
-            capture_output=capture,
-            env=env,
-        )
+        try:
+            completed = subprocess.run(
+                args,
+                check=False,
+                text=True,
+                input=input_text,
+                capture_output=capture,
+                env=env,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ReleaseError(
+                f"command timed out after {timeout_seconds}s: {args[0]}"
+            ) from exc
         if completed.returncode:
-            if capture and completed.stderr:
-                print(completed.stderr, file=sys.stderr)
+            # A captured failure has to say what it found. The verifiers this
+            # runner drives report their defects on stdout and exit 1, so
+            # forwarding stderr alone turns an actionable list of findings into
+            # a bare "command failed (1): python3" -- and the release is then
+            # blocked by a reason nobody can read. Sensitive commands stay
+            # silent: their output is what they were marked sensitive for.
+            # Both go to stderr: stdout carries the machine-readable release
+            # report, and a failed command's chatter must not land in it.
+            if capture and not sensitive:
+                for text in (completed.stdout, completed.stderr):
+                    if text:
+                        print(text, file=sys.stderr)
             raise ReleaseError(f"command failed ({completed.returncode}): {args[0]}")
         return completed.stdout.strip() if capture else ""
+
+    def probe(self, args: list[str], *, timeout_seconds: float | None = None) -> bool:
+        """Return whether ``args`` exits zero, treating non-zero as "absent".
+
+        Release code needs read-only existence checks (``kubectl get`` on a
+        ConfigMap, Secret, Deployment or CronJob) whose non-zero exit is an
+        answer rather than a failure, so they cannot go through :meth:`run`.
+        They still have to go through the runner: every call site used to reach
+        ``subprocess.run`` directly, which meant a unit test holding a stub
+        runner executed a real ``kubectl`` against whatever kubeconfig the
+        release config named.
+
+        A probe runs in dry-run mode too, matching the previous behaviour of
+        those call sites. Reading cluster state is what makes a dry run's plan
+        accurate, and a ``get`` mutates nothing.
+        """
+        try:
+            completed = subprocess.run(
+                args,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ReleaseError(
+                f"probe timed out after {timeout_seconds}s: {args[0]}"
+            ) from exc
+        return completed.returncode == 0
+
+    def probe_output(
+        self, args: list[str], *, timeout_seconds: float | None = None
+    ) -> tuple[int, str, str]:
+        """Run ``args`` for its output, returning ``(returncode, stdout, stderr)``.
+
+        The two callers that need this distinguish "absent" from "unreadable" by
+        matching ``NotFound`` in stderr, so they need the streams rather than the
+        boolean :meth:`probe` returns. Like :meth:`probe`, this exists so the
+        call sites do not reach ``subprocess`` behind the runner's back.
+        """
+        try:
+            completed = subprocess.run(
+                args,
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ReleaseError(
+                f"probe timed out after {timeout_seconds}s: {args[0]}"
+            ) from exc
+        return completed.returncode, completed.stdout, completed.stderr
 
 
 def sync_release_state(release: Any) -> None:
@@ -216,6 +334,17 @@ def sync_release_state(release: Any) -> None:
             changed=frozenset(),
         ).as_dict(),
         adopted_live_runtime_image=previous["live_runtime_image"],
+        transaction_committed=True,
+        release_lifecycle="COMMITTED",
+        completed_phases=["complete"],
+        completed_cluster_ids=sorted(
+            target.cluster_id
+            for target in getattr(
+                getattr(release, "config", None),
+                "clusters",
+                (),
+            )
+        ),
     )
 
 
@@ -258,7 +387,12 @@ def bootstrap_resume_context(
     loaded_phase = str(state.get("phase") or "")
     resume_phase = str(state.get("resume_phase") or loaded_phase)
     same_release = state.get("release_id") in {None, release_id}
-    cleaned = loaded_phase == "bootstrap-cleaned"
+    cleaned = loaded_phase in {
+        "bootstrap-cleanup-started",
+        "bootstrap-cleanup-progress",
+        "bootstrap-cleanup-failed",
+        "bootstrap-cleaned",
+    }
     completed_cluster_ids = (
         {str(value) for value in state.get("completed_cluster_ids", []) if value}
         if same_release and not cleaned
@@ -286,11 +420,17 @@ class RegionalRelease:
     _deployment_snapshot_enabled = True
     _ensure_contexts = ensure_region_contexts
     _apply_gpu_dcgm_exporter = apply_gpu_dcgm_exporter
+    _preflight_gpu_dcgm_exporter = preflight_gpu_dcgm_exporter
     _cancel_active_installer_jobs = cancel_active_installer_jobs
     _apply_gpu_deployments = apply_gpu_deployments
+    _preflight_gpu_deployments = preflight_gpu_deployments
     _apply_nlb = apply_control_plane_nlb
     _bootstrap_cpu_is_current = bootstrap_cpu_is_current
     _capture_previous = capture_previous
+    _capture_observability_snapshot = capture_observability_snapshot
+    _restore_observability_snapshot = restore_observability_snapshot
+    _capture_endpoint_snapshot = capture_endpoint_snapshot
+    _restore_endpoint_snapshot = restore_endpoint_snapshot
     _config_map_binary_key = config_map_binary_key
     _config_map_data = config_map_data
     _deployment_template_name = deployment_template_name
@@ -310,6 +450,7 @@ class RegionalRelease:
     _require_cpu_secrets = require_cpu_secrets
     _restore_registry_backup = restore_registry_backup
     _save_state = save_state
+    _cleanup_previous_snapshots = cleanup_previous_snapshots
     _stage_registry = stage_registry
     _stamp_gpu_deployments = stamp_gpu_deployments
     _template_bundle = template_bundle
@@ -322,6 +463,7 @@ class RegionalRelease:
     _write_registry = write_registry
     _desired_registry = desired_registry
     _commit_registry_update = commit_registry_update
+    _initialize_registry = initialize_registry
 
     def __init__(self, config: ReleaseConfig, runner: Runner) -> None:
         self.config = config
@@ -422,6 +564,16 @@ class RegionalRelease:
                 + self._sha256(ROOT / "deploy/dataplane/dcgm-counters.csv")
             ).encode()
         ).hexdigest()
+        self.observability_rules_digest = hashlib.sha256(
+            (
+                self._sha256(ROOT / "deploy/observability/amp-rules.yaml")
+                + "\0"
+                + self._sha256(ROOT / "deploy/observability/amp-alertmanager.yaml")
+            ).encode()
+        ).hexdigest()
+        self.observability_adot_digest = self._sha256(
+            ROOT / "deploy/observability/adot-control-plane.yaml"
+        )
         self.rendered_manifest_digest = rendered_release_manifest_sha256(self)
 
     def _release_image(
@@ -527,6 +679,18 @@ class RegionalRelease:
 
     _ensure_profile_transition_safe = ensure_profile_transition_safe
 
+    def gpu_cluster_rollout_step(self) -> str:
+        # The plan is what an operator reads before approving a release, so it has
+        # to state the parallelism this site actually configured: cross-cluster
+        # parallelism is opt-in and defaults to one cluster at a time.
+        parallel = self.config.upgrade_max_parallel_clusters
+        if parallel <= 1:
+            return "roll affected GPU clusters one at a time"
+        return (
+            "roll affected GPU clusters with bounded parallelism "
+            f"(up to {parallel} at a time)"
+        )
+
     def plan(self, mode: str) -> list[str]:
         steps = build_release_plan(mode)
         if mode != "deploy":
@@ -550,7 +714,7 @@ class RegionalRelease:
             execution = [
                 "upload only changed Executor/Node artifacts",
                 "stage compatibility pins only when an artifact pin changed",
-                "roll affected GPU clusters with bounded parallelism",
+                self.gpu_cluster_rollout_step(),
                 "finalize changed pins and run verifiers",
             ]
         else:
@@ -562,7 +726,41 @@ class RegionalRelease:
         ]
 
     def status(self) -> dict[str, Any]:
+        self._apply_health_baseline()
         return build_full_status(self)
+
+    def _apply_health_baseline(self) -> None:
+        state = self._load_state()
+        previous = state.get("previous")
+        rollback_result = state.get("rollback_result")
+        if (
+            str(state.get("phase") or "") == "rolled-back"
+            and isinstance(rollback_result, dict)
+            and rollback_result.get("status") == "PASSED"
+            and isinstance(previous, dict)
+        ):
+            self.runtime_image = str(
+                previous.get("runtime_image")
+                or previous.get("live_runtime_image")
+                or self.runtime_image
+            )
+            self.node_installer_image = str(
+                previous.get("node_installer_image") or self.node_installer_image
+            )
+            self.adot_image = str(previous.get("adot_image") or self.adot_image)
+            dcgm_images = {
+                str(item.get("dcgm_image"))
+                for item in (previous.get("clusters") or {}).values()
+                if isinstance(item, dict) and item.get("dcgm_image")
+            }
+            if len(dcgm_images) > 1:
+                raise ReleaseError("rolled-back clusters disagree on the DCGM image")
+            if dcgm_images:
+                self.dcgm_exporter_image = next(iter(dcgm_images))
+            return
+        adopted_runtime = str(state.get("adopted_live_runtime_image") or "").strip()
+        if adopted_runtime:
+            self.runtime_image = adopted_runtime
 
     def _apply_cpu(
         self,
@@ -581,18 +779,16 @@ class RegionalRelease:
         if force_restart:
             environment["GPU_FAULT_FORCE_ROLE_RESTART"] = "true"
         render_and_apply_cpu_roles(self, environment)
-        cronjob = subprocess.run(
+        cronjob_exists = self.runner.probe(
             self._cpu(
                 "-n",
                 self.config.namespace,
                 "get",
                 "cronjob",
                 "gpu-fault-aurora-credential-refresh",
-            ),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            )
         )
-        if cronjob.returncode == 0:
+        if cronjob_exists:
             self.runner.run(
                 self._cpu(
                     "-n",
@@ -683,38 +879,22 @@ class RegionalRelease:
     _fleet_command = fleet_command
     _fleet_deployment_id = fleet_deployment_id
     _roll_node_runtime = roll_node_runtime
+    _preflight_node_runtime = preflight_node_runtime
 
     _deploy_reconciler = deploy_reconciler
     _wait_agents = wait_agents
     _agent_heartbeats_converged = agent_heartbeats_converged
+    _wait_candidate_cpu_agent_heartbeats = wait_candidate_cpu_agent_heartbeats
+    _capture_active_agent_node_sets = capture_active_agent_node_sets
+    _candidate_agent_pin_identity = candidate_agent_pin_identity
+    _validate_resume_checkpoint = validate_resume_checkpoint
 
     def _validate_release(self) -> None:
-        self.runner.run(
-            [
-                "bash",
-                str(CONTROL_PLANE_VERIFY_SCRIPT),
-            ],
-            env={
-                **os.environ,
-                "KUBECONFIG": self.config.cpu_kubeconfig,
-                "GPU_FAULT_NAMESPACE": self.config.namespace,
-            },
+        validate_release_components(
+            self,
+            cpu=True,
+            data_plane=True,
         )
-        for target in self.config.clusters:
-            self.runner.run(
-                [
-                    "bash",
-                    str(DATA_PLANE_VERIFY_SCRIPT),
-                ],
-                env={
-                    **os.environ,
-                    "GPU_FAULT_NAMESPACE": self.config.namespace,
-                    "GPU_FAULT_KUBE_CONTEXT": target.context,
-                    "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": (self.config.cpu_kubeconfig),
-                    "GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP": (self.executor_wheel_cm),
-                },
-            )
-        validate_runtime_component_identity(self)
 
     _validate_release_quick = validate_release_quick
     _critical_amp_alerts = critical_amp_alerts
@@ -759,6 +939,14 @@ class RegionalRelease:
 
     def bootstrap(self) -> None:
         self._ensure_contexts()
+        if self.state.get("phase") in {
+            "bootstrap-cleanup-started",
+            "bootstrap-cleanup-progress",
+            "bootstrap-cleanup-failed",
+        } or (
+            self.state.get("phase") == "bootstrap-failed" and self.config.auto_rollback
+        ):
+            self._cleanup_bootstrap()
         prerequisites = (
             (
                 ROOT
@@ -787,12 +975,12 @@ class RegionalRelease:
         self._save_state(
             checkpoint,
             previous=None,
+            transaction_committed=False,
             completed_cluster_ids=sorted(completed_cluster_ids),
         )
         try:
             self._require_cpu_secrets(include_registry=False)
-            for target in self.config.clusters:
-                self._update_registry(target, remove=False)
+            self._initialize_registry()
             self._require_cpu_secrets()
             self._upload_release()
             if not cpu_checkpoint:
@@ -812,30 +1000,9 @@ class RegionalRelease:
                 previous=None,
                 completed_cluster_ids=sorted(completed_cluster_ids),
             )
-            for target in self.config.clusters:
-                if target.cluster_id in completed_cluster_ids:
-                    continue
-                self._ensure_gpu_namespace(target)
-                self._ensure_connection_secret(target)
-                self._quiesce_gpu_executor(target)
-                self._verify_gpu_control_plane_endpoint(target)
-                self._apply_gpu_dcgm_exporter(target)
-                self._apply_gpu_deployments(target, self.executor_wheel_cm)
-                self._roll_node_runtime(
-                    target,
-                    phase="bootstrap",
-                    wheel_cm=self.executor_wheel_cm,
-                    bundle_cm=self.bundle_cm,
-                    artifact_sha=self.node_wheel_sha,
-                    config_digest=self.config.agent_config_digest,
-                )
-                completed_cluster_ids.add(target.cluster_id)
+            bootstrap_gpu_clusters(self, completed_cluster_ids)
+            if completed_cluster_ids:
                 checkpoint = "bootstrap-data-plane-progress"
-                self._save_state(
-                    checkpoint,
-                    previous=None,
-                    completed_cluster_ids=sorted(completed_cluster_ids),
-                )
             self._validate_release()
             self._save_state(
                 "complete",
@@ -854,41 +1021,77 @@ class RegionalRelease:
             raise
 
     def _cleanup_bootstrap(self) -> None:
-        for target in self.config.clusters:
-            for deployment in (
-                *inventory.DEPLOYMENTS,
-                inventory.GPU_RECONCILER_DEPLOYMENT,
-            ):
-                self._scale_if_present(self._gpu(target), deployment, 0)
-        for deployment in inventory.CPU_DEPLOYMENTS:
-            self._scale_if_present(self._cpu(), deployment, 0)
-        self._save_state(
-            "bootstrap-cleaned",
-            previous=None,
-            resume_phase="bootstrap-started",
-            completed_cluster_ids=[],
-        )
+        completed = set(self.state.get("bootstrap_cleanup_completed_steps") or [])
+
+        def save(phase: str, **updates: Any) -> None:
+            self._save_state(
+                phase,
+                previous=None,
+                resume_phase="bootstrap-started",
+                completed_cluster_ids=[],
+                bootstrap_cleanup_completed_steps=sorted(completed),
+                **updates,
+            )
+
+        save("bootstrap-cleanup-started")
+        try:
+            if "installer-jobs-cancelled" not in completed:
+                for target in self.config.clusters:
+                    self._scale_if_present(
+                        self._gpu(target),
+                        inventory.GPU_RECONCILER_DEPLOYMENT,
+                        0,
+                        wait=True,
+                    )
+                    self._cancel_active_installer_jobs(target)
+                completed.add("installer-jobs-cancelled")
+                save("bootstrap-cleanup-progress")
+            if "gpu-scaled-down" not in completed:
+                for target in self.config.clusters:
+                    for deployment in inventory.DEPLOYMENTS:
+                        self._scale_if_present(
+                            self._gpu(target),
+                            deployment,
+                            0,
+                            wait=True,
+                        )
+                completed.add("gpu-scaled-down")
+                save("bootstrap-cleanup-progress")
+            if "cpu-scaled-down" not in completed:
+                for deployment in inventory.CPU_DEPLOYMENTS:
+                    self._scale_if_present(
+                        self._cpu(),
+                        deployment,
+                        0,
+                        wait=True,
+                    )
+                completed.add("cpu-scaled-down")
+                save("bootstrap-cleanup-progress")
+        except Exception as exc:
+            save(
+                "bootstrap-cleanup-failed",
+                bootstrap_cleanup_failure=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        save("bootstrap-cleaned")
 
     def _scale_if_present(
         self,
         kubectl: list[str],
         deployment: str,
         replicas: int,
+        *,
+        wait: bool = False,
     ) -> None:
-        exists = (
-            subprocess.run(
-                kubectl
-                + [
-                    "-n",
-                    self.config.namespace,
-                    "get",
-                    "deployment",
-                    deployment,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode
-            == 0
+        exists = self.runner.probe(
+            kubectl
+            + [
+                "-n",
+                self.config.namespace,
+                "get",
+                "deployment",
+                deployment,
+            ]
         )
         if exists:
             self.runner.run(
@@ -901,6 +1104,18 @@ class RegionalRelease:
                     f"--replicas={replicas}",
                 ]
             )
+            if wait:
+                self.runner.run(
+                    kubectl
+                    + [
+                        "-n",
+                        self.config.namespace,
+                        "rollout",
+                        "status",
+                        f"deployment/{deployment}",
+                        "--timeout=5m",
+                    ]
+                )
 
     def join_cluster(self, cluster_id: str) -> None:
         target = join_target(self, cluster_id)
@@ -946,6 +1161,9 @@ class RegionalRelease:
             artifact_sha=self.node_wheel_sha,
             config_digest=self.config.agent_config_digest,
         )
+
+    def activate_cluster(self, cluster_id: str) -> None:
+        self._target(cluster_id)
         activate_join_registry(self, cluster_id)
 
     def remove_cluster(self, cluster_id: str) -> None:
@@ -958,6 +1176,14 @@ class RegionalRelease:
             self._scale_if_present(self._gpu(target), deployment, 0)
         self._update_registry(target, remove=True)
         purge_registry_cluster(self, cluster_id)
+
+    def fail_cluster(self, cluster_id: str) -> None:
+        self._target(cluster_id)
+        fail_join_registry(self, cluster_id)
+
+    def rollback_cluster(self, cluster_id: str) -> None:
+        self._target(cluster_id)
+        rollback_join_registry(self, cluster_id)
 
     def _target(self, cluster_id: str) -> ClusterTarget:
         for target in self.config.clusters:
@@ -1008,6 +1234,9 @@ def parser() -> argparse.ArgumentParser:
             "commit",
             "stage-noop",
             "join-cluster",
+            "activate-cluster",
+            "fail-cluster",
+            "rollback-cluster",
             "drain-cluster",
             "remove-cluster",
             "sync-state",
@@ -1079,6 +1308,18 @@ def main() -> int:
             if not arguments.cluster_id:
                 raise ReleaseError("--cluster-id is required")
             release.join_cluster(arguments.cluster_id)
+        elif arguments.mode == "activate-cluster":
+            if not arguments.cluster_id:
+                raise ReleaseError("--cluster-id is required")
+            release.activate_cluster(arguments.cluster_id)
+        elif arguments.mode == "fail-cluster":
+            if not arguments.cluster_id:
+                raise ReleaseError("--cluster-id is required")
+            release.fail_cluster(arguments.cluster_id)
+        elif arguments.mode == "rollback-cluster":
+            if not arguments.cluster_id:
+                raise ReleaseError("--cluster-id is required")
+            release.rollback_cluster(arguments.cluster_id)
         elif arguments.mode == "drain-cluster":
             if not arguments.cluster_id:
                 raise ReleaseError("--cluster-id is required")
@@ -1090,6 +1331,7 @@ def main() -> int:
         elif arguments.mode == "sync-state":
             sync_release_state(release)
         elif arguments.mode == "verify":
+            release._apply_health_baseline()
             report = build_health_report(release, mode="verify")
             print(json.dumps(report, indent=2, sort_keys=True))
             exit_code = report_exit_code(report)

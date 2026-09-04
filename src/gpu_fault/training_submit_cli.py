@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import yaml
 
-from gpu_fault.admin_site import SiteConfigError, load_site
+from gpu_fault.admin.site import SiteConfigError, load_site
 
 LABEL_PATTERN = re.compile(r"^(?:[A-Za-z0-9](?:[-_.A-Za-z0-9]*[A-Za-z0-9])?)$")
 MANAGED_LABEL = "gpu-fault.io/managed"

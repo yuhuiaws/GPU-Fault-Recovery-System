@@ -10,7 +10,7 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts/release-artifact-path.py"
-MODULE = lazy_script_module("release_artifact_path", MODULE_PATH)
+MODULE = lazy_script_module(MODULE_PATH)
 
 
 def release_manifest(tmp_path: Path, *, module_digest: str) -> Path:
@@ -92,10 +92,8 @@ def test_release_artifact_path_checks_the_digest_before_printing(
     manifest = release_manifest(tmp_path, module_digest=MODULE.checkout_module_digest())
     # MODULE 是 LazyScriptModule 包装器，setattr 只会落在包装器上，main()
     # 查的是脚本自己的 globals。
-    monkeypatch.setitem(
-        MODULE.main.__globals__,
-        "verify_module_digest",
-        lambda path, _key="wheel": calls.append(path),
+    monkeypatch.setattr(
+        MODULE, "verify_module_digest", lambda path, _key="wheel": calls.append(path)
     )
     monkeypatch.setattr(
         "sys.argv", ["release-artifact-path.py", "wheel", "--manifest", str(manifest)]

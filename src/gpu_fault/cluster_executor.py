@@ -21,6 +21,7 @@ from gpu_fault.aws_errors import (
 from gpu_fault.env_validation import (
     validate_gpu_fault_environment,
 )
+from gpu_fault.logging_setup import configure_logging
 from gpu_fault.transport.http_client import urlopen
 from gpu_fault.transport_errors import (
     retryable_transport_result,
@@ -60,6 +61,7 @@ from gpu_fault.regional import (
     RemoteCommandResult,
     RemoteCommandStatus,
     RemoteEvidenceCaptureRequest,
+    RemoteFleetRolloutFence,
     RemoteHyperPodSubmissionRequest,
     RemoteHyperPodSubmissionReservation,
     RemoteIncidentOwnershipReport,
@@ -297,6 +299,32 @@ class RegionalFleetRegistry:
         # too, otherwise every stabilization check raises
         # AttributeError and the executor reports the step FAILED.
         self.now = now or (lambda: datetime.now(timezone.utc))
+
+    def fleet_rollout_fence_deployments(self, cluster_id: str) -> list[str]:
+        """Ask the control plane whether a rollout fences destructive work.
+
+        ``store = self`` above lets shared code call store-shaped methods on
+        this proxy, and the fleet rollout fence used to read
+        ``store.list_active_fleet_deployments``, which this proxy does not
+        have. Because that fence fails closed, the ``AttributeError`` held
+        every destructive remote command on every regional cluster
+        indefinitely -- observed on 2026-09-04, when a ``STOP_WORKLOADS``
+        command was re-claimed and re-held for ten minutes until the workload
+        it was meant to stop had finished on its own.
+
+        Answering it here instead of adding a store method keeps the
+        supersession rule on the control plane and keeps other clusters'
+        deployment records off this cluster's wire.
+        """
+
+        if cluster_id != self.client.cluster_id:
+            raise ClusterExecutorError(
+                "cannot read the fleet rollout fence for another cluster"
+            )
+        response = self.client._get("/v1/regional/executors/fleet-rollout-fence")
+        return list(
+            RemoteFleetRolloutFence.model_validate(response).fencing_deployment_ids
+        )
 
     def list_agents(self, cluster_id: str | None = None) -> list[AgentRecord]:
         requested_cluster = cluster_id or self.client.cluster_id
@@ -617,6 +645,10 @@ class ClusterActionExecutor:
         self.unexpected_failures = 0
         self.lease_renewal_failures = 0
         self.last_successful_claim_at: datetime | None = None
+        # Whether the last claim cycle moved any command off WAITING. run()
+        # takes the idle path when it did not, so a held command polls at
+        # poll_seconds instead of as fast as the control plane will answer.
+        self.last_cycle_advanced = True
         # The readiness probe runs in a separate process (kubectl exec),
         # so the claim timestamp has to leave this one. Written to the
         # container filesystem, not the store: the default regional
@@ -672,6 +704,7 @@ class ClusterActionExecutor:
         self.last_successful_claim_at = datetime.now(timezone.utc)
         self._record_successful_claim(self.last_successful_claim_at)
         self.claimed_total += len(commands)
+        self.last_cycle_advanced = True
         if commands:
             with ThreadPoolExecutor(
                 max_workers=min(
@@ -684,11 +717,19 @@ class ClusterActionExecutor:
                     pool.submit(self._execute_and_report, command)
                     for command in commands
                 ]
-                for future in futures:
-                    future.result()
+                statuses = [future.result() for future in futures]
+            # A command that reports WAITING is re-claimable at once, so a
+            # batch that only waited puts run() straight back into claim()
+            # with nothing changed: on 2026-09-04 a single held
+            # STOP_WORKLOADS drove 25 claim/execute/complete round trips a
+            # second across two replicas, and 759 identical log lines a
+            # minute. Waiting is not progress, so it takes the idle path.
+            self.last_cycle_advanced = any(
+                status is not RemoteCommandStatus.WAITING for status in statuses
+            )
         return len(commands)
 
-    def _execute_and_report(self, command: RemoteActionCommand) -> None:
+    def _execute_and_report(self, command: RemoteActionCommand) -> RemoteCommandStatus:
         stop = Event()
         renewer = Thread(
             target=self._renew_lease,
@@ -714,6 +755,7 @@ class ClusterActionExecutor:
                     result.status.value,
                 )
                 self.reported_failures += 1
+            return result.status
         finally:
             stop.set()
             renewer.join(timeout=2)
@@ -769,7 +811,7 @@ class ClusterActionExecutor:
                     )
                 time.sleep(delay)
                 continue
-            if count == 0:
+            if count == 0 or not self.last_cycle_advanced:
                 time.sleep(self.poll_seconds)
 
     def _execute(self, command: RemoteActionCommand) -> RemoteCommandResult:
@@ -1253,7 +1295,7 @@ def readiness_probe() -> int:
     successful claim is read from the breadcrumb the claim loop writes.
     """
 
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+    configure_logging()
     client = _regional_client_from_environment(
         timeout_seconds=float(
             os.getenv(
@@ -1315,6 +1357,6 @@ def readiness_probe() -> int:
 
 
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+    configure_logging()
     validate_gpu_fault_environment(process_name="gpu-fault-cluster-executor")
     executor_from_environment().run()

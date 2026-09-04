@@ -2,23 +2,23 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
-import signal
 import sys
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
-
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional import run_collector_destructive as base  # noqa: E402
-from scripts.e2e.regional import run_destr009_workload_restart as workload_case  # noqa: E402
+from scripts.e2e.regional import (  # noqa: E402
+    run_destr009_workload_restart as workload_case,
+)
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
@@ -43,11 +43,12 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    install_abort_signals,
     predecessor_evidence,
     required,
+    run_case_main,
     settings_from_arguments,
 )
-
 
 CASE_ID = "GF-REGIONAL-COLLECT-016"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-COLLECT-014"
@@ -509,10 +510,6 @@ def execute_case(
     return 0 if result["verdict"] == "PASS" else 1
 
 
-def abort_on_signal(signum: int, _frame: object) -> None:
-    raise RegionalFixtureError(f"received signal {signum}")
-
-
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description="Run COLLECT-016 managed training recovery acceptance."
@@ -533,8 +530,7 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     arguments = parser().parse_args()
     os.umask(0o077)
-    signal.signal(signal.SIGTERM, abort_on_signal)
-    signal.signal(signal.SIGINT, abort_on_signal)
+    install_abort_signals()
     settings = configure(arguments)
     case_dir = arguments.run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -560,4 +556,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_case_main(main))

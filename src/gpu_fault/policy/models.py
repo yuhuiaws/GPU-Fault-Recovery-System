@@ -92,6 +92,35 @@ NVLINK74_REGISTER_RULES = {
     },
 }
 
+# The decode categories above, grouped by the outcome the XID 74 workflow gives
+# them. They live next to the bit table because they are that table's vocabulary:
+# a category added above but to no group here falls through to the monitor-only
+# tail, so the grouping has to be reviewed together with the bits.
+# Bits that permit continued operation.
+NVLINK74_PASSIVE_CATEGORIES = frozenset({"safe_ignore", "corrected_threshold"})
+# Bits whose outcome depends on how often the *same link* reported them, so they
+# cannot be resolved without an explicit NVLink identity.
+NVLINK74_LINK_SCOPED_CATEGORIES = frozenset(
+    {
+        "ecc_parity",
+        "mechanical_or_hardware",
+        "report_if_repeated",
+        "field_diag_if_repeated",
+        "marginal_channel",
+    }
+)
+# Bits the workflow sends to support on first sight, without counting.
+NVLINK74_SUPPORT_CATEGORIES = frozenset({"unexpected_production", "marginal_channel"})
+# Same-link occurrence count at which a category stops being monitor-only. The
+# workflow states ECC/parity as "more than two" and the repeated-report families
+# as "twice", so the inclusive thresholds are 3 and 2.
+NVLINK74_OCCURRENCE_THRESHOLDS = {
+    "ecc_parity": 3,
+    "report_if_repeated": 2,
+    "field_diag_if_repeated": 2,
+    "mechanical_or_hardware": 2,
+}
+
 
 class SxidClassification(StrEnum):
     NON_FATAL = "NON_FATAL"

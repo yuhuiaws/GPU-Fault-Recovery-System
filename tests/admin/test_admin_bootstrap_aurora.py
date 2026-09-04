@@ -1,0 +1,286 @@
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from typing import Any, Sequence
+
+import pytest
+
+from gpu_fault.admin import bootstrap_aurora as aurora
+from gpu_fault.admin.config import AdminConfigError, AuroraCapacityConfig
+from gpu_fault.admin.config_file import initialize_desired_admin_config
+
+
+class Runner:
+    """Records the mutating AWS calls instead of making them."""
+
+    dry_run = False
+
+    def __init__(self, statuses: Sequence[str] = ()) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        # Each entry is the cluster status one settle poll observes; the list is
+        # consumed in order and the last value repeats forever.
+        self.statuses = list(statuses) or ["available"]
+
+    def run(self, arguments: Sequence[str], **_keywords: Any) -> str:
+        self.calls.append(tuple(arguments))
+        return ""
+
+    def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> dict:
+        self.calls.append(("aws", *arguments))
+        if arguments[1] == "describe-db-clusters":
+            status = self.statuses[0]
+            if len(self.statuses) > 1:
+                self.statuses.pop(0)
+            return {"DBClusters": [{"Status": status}]}
+        return {"DBInstances": [{"DBInstanceStatus": "available"}]}
+
+
+def _operations(runner: Runner) -> list[str]:
+    return [arguments[2] for arguments in runner.calls]
+
+
+def test_bootstrap_reads_the_desired_capacity_rather_than_a_default(
+    tmp_path: Path,
+) -> None:
+    """Bootstrap scales Aurora to the approved desired config, not to a constant.
+
+    ``bootstrap_aurora_capacity`` is the only place the bootstrap path learns the
+    ACU window, so a hardcoded fallback here would silently undo an approved
+    capacity change on the next deploy.
+    """
+
+    initialize_desired_admin_config(tmp_path)
+
+    capacity = aurora.bootstrap_aurora_capacity(tmp_path)
+
+    assert (capacity.min_acu, capacity.max_acu) == (8.0, 32.0)
+
+
+def test_scaling_configuration_validates_before_rendering() -> None:
+    """An invalid window must fail before it reaches the AWS argument list.
+
+    ``modify-db-cluster`` accepts a syntactically valid pair, so rendering first
+    would turn a rejected config into a live capacity change.
+    """
+
+    assert (
+        aurora.scaling_configuration(AuroraCapacityConfig(min_acu=0.5, max_acu=32.0))
+        == "MinCapacity=0.5,MaxCapacity=32"
+    )
+
+    with pytest.raises(AdminConfigError, match="0.5 ACU increments"):
+        aurora.scaling_configuration(AuroraCapacityConfig(min_acu=0.7, max_acu=32.0))
+
+
+def test_reconcile_leaves_a_cluster_that_already_matches_alone() -> None:
+    """Matching capacity must issue no call at all.
+
+    ``modify-db-cluster --apply-immediately`` is a mutation on the live database
+    even when the values are unchanged, so an unconditional call would make every
+    deploy touch Aurora.
+    """
+
+    runner = Runner()
+
+    aurora.reconcile_existing_capacity(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        cluster={
+            "ServerlessV2ScalingConfiguration": {
+                "MinCapacity": 8.0,
+                "MaxCapacity": 32.0,
+            }
+        },
+        capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
+    )
+
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "cluster",
+    [
+        {"ServerlessV2ScalingConfiguration": {"MinCapacity": 0.5, "MaxCapacity": 8.0}},
+        # A cluster created before Serverless v2 reports no scaling block at all;
+        # reading that as "already correct" would leave it unscaled forever.
+        {},
+    ],
+)
+def test_reconcile_scales_a_cluster_that_does_not_match(
+    cluster: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = Runner()
+
+    aurora.reconcile_existing_capacity(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        cluster=cluster,
+        capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
+    )
+
+    assert _operations(runner)[0] == "modify-db-cluster"
+    assert "MinCapacity=8,MaxCapacity=32" in runner.calls[0]
+    assert "--apply-immediately" in runner.calls[0]
+
+
+def test_reconcile_waits_out_a_flip_that_starts_after_the_modify_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A capacity change must not hand a ``modifying`` cluster to the next step.
+
+    ``modify-db-cluster --apply-immediately`` returns while the cluster still
+    reads ``available`` and already reports the requested window, so one quiet
+    poll proves nothing. This is not hypothetical: a deploy that scaled Aurora
+    then failed its own ``aurora`` preflight check a few hundred lines later,
+    because RDS flipped to ``modifying`` in between.
+    """
+
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = Runner(["available", "modifying", "modifying", "available"])
+
+    aurora.reconcile_existing_capacity(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        cluster={
+            "ServerlessV2ScalingConfiguration": {"MinCapacity": 0.5, "MaxCapacity": 8.0}
+        },
+        capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
+    )
+
+    polls = _operations(runner).count("describe-db-clusters")
+    assert polls == 6, (
+        "the settle loop stopped on the first quiet poll instead of requiring "
+        f"{aurora.CAPACITY_SETTLE_STABLE_POLLS} consecutive ones: {polls} polls"
+    )
+
+
+def test_settle_gives_up_rather_than_polling_a_stuck_cluster_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cluster wedged in ``modifying`` has to surface, not hang the deploy."""
+
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = Runner(["modifying"])
+
+    with pytest.raises(aurora.BootstrapError, match="did not settle within"):
+        aurora.wait_for_capacity_to_settle(
+            runner, aws_region="us-east-1", cluster_id="aurora-a", timeout_seconds=0.0
+        )
+
+
+def test_a_dry_run_never_polls_for_a_change_it_did_not_make(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--dry-run`` skips the modify, so waiting for it would wait forever."""
+
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = Runner(["modifying"])
+    runner.dry_run = True
+
+    aurora.reconcile_existing_capacity(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        cluster={},
+        capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
+    )
+
+    assert _operations(runner) == ["modify-db-cluster"]
+
+
+def test_missing_instances_are_created_in_their_own_availability_zone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Writer and reader must not land in the same AZ.
+
+    Both replicas in one zone makes the Aurora failover the alerting runbook
+    depends on a no-op, and the zone is only pinned at create time.
+    """
+
+    monkeypatch.setattr(
+        aurora.subprocess,
+        "run",
+        lambda *_args, **_keywords: subprocess.CompletedProcess([], 254),
+    )
+    runner = Runner()
+
+    instance_ids = aurora.ensure_serverless_instances(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        availability_zones=["us-east-1a", "us-east-1b"],
+        safe_name=lambda value, maximum: value[:maximum],
+    )
+
+    assert instance_ids == ["aurora-a-writer", "aurora-a-reader"]
+    assert _operations(runner) == [
+        "create-db-instance",
+        "create-db-instance",
+        "wait",
+        "wait",
+    ]
+    zones = [
+        arguments[arguments.index("--availability-zone") + 1]
+        for arguments in runner.calls
+        if "--availability-zone" in arguments
+    ]
+    assert zones == ["us-east-1a", "us-east-1b"]
+
+
+def test_existing_instances_are_waited_for_but_not_recreated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-running bootstrap must be idempotent and still confirm availability.
+
+    ``create-db-instance`` on an existing identifier fails the whole bootstrap,
+    and skipping the wait would let the deploy continue against an instance still
+    in ``creating``.
+    """
+
+    monkeypatch.setattr(
+        aurora.subprocess,
+        "run",
+        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
+    )
+    runner = Runner()
+
+    aurora.ensure_serverless_instances(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        availability_zones=["us-east-1a", "us-east-1b"],
+        safe_name=lambda value, maximum: value[:maximum],
+    )
+
+    assert _operations(runner) == ["wait", "wait"]
+
+
+def test_a_missing_availability_zone_is_refused_rather_than_defaulted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One zone for two instances is a configuration error, not a placement.
+
+    ``zip`` without ``strict`` would silently create only the writer, leaving a
+    single-instance cluster that reads as a successful bootstrap.
+    """
+
+    monkeypatch.setattr(
+        aurora.subprocess,
+        "run",
+        lambda *_args, **_keywords: subprocess.CompletedProcess([], 254),
+    )
+    runner = Runner()
+
+    with pytest.raises(ValueError, match="argument 2 is shorter"):
+        aurora.ensure_serverless_instances(
+            runner,
+            aws_region="us-east-1",
+            cluster_id="aurora-a",
+            availability_zones=["us-east-1a"],
+            safe_name=lambda value, maximum: value[:maximum],
+        )

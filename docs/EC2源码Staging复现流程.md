@@ -11,7 +11,8 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 ```
 
-多个GPU集群重复传`--gpu-cluster-arn`。操作者不提供release-ref、artifact、site、
+多个GPU集群重复传`--gpu-cluster-arn`。首集群形成基线后，其余集群通过最多4路的
+独立batch join接入。操作者不提供release-ref、artifact、site、
 release-build、release-deploy、bundle或venv路径。
 
 ## 1. 前提
@@ -96,12 +97,18 @@ state中不存在站点
   -> 构建、签名并验签release
   -> 创建Aurora、NLB、DNS/PKI、监控和IAM
   -> 内部生成site
-  -> bootstrap -> deploy -> verify -> stability
+  -> 原子写完整registry -> CPU/endpoint -> 最多4路GPU bootstrap
+  -> verify -> stability
 
 state中已有站点
-  -> 验证CPU/GPU规范化身份集合完全一致
+  -> 首次多GPU接入未完成时，验证原目标未变且当前成员是其单调子集
+  -> 首次接入完成后，验证CPU/GPU规范化身份集合完全一致
   -> 扫描并固定当前源码身份
-  -> 验签或构建新的签名release
+  -> 应用身份未变:
+       -> deploy-host变化: 更新deploy-host并执行影响门禁和只读preflight
+       -> 仅测试/文档变化: 只执行影响门禁
+       -> 完全未变: 仅在site、live release、commit状态和NOOP分类均未漂移时复用授权
+  -> 应用身份变化: 验签或构建新的签名release
   -> 计算NOOP/CONTROL_PLANE_ONLY/DATA_PLANE_COMPATIBLE/FULL
   -> upgrade -> verify -> stability
 ```
@@ -114,7 +121,8 @@ GPU集合变化不会由`deploy`隐式接受。新增或移除集群必须使用
 | 当前源码 | 内部门禁 | 发布等级 |
 |---|---|---|
 | dirty工作区 | public scan、影响测试、区域影响计划；不确定时升级全量 | `staging_only=true` |
-| clean commit | 完整`make check`、PostgreSQL stress和制品一致性 | production |
+| clean commit且`HEAD != origin/main` | 本地完整production门禁 | production |
+| clean commit且`HEAD == origin/main` | 优先验签同commit main CI候选；不可用时回退本地完整门禁 | production |
 
 clean与dirty源码都会先复制到`state-dir/source-snapshots/<fingerprint>/`下的隔离
 checkout，后续build、签名、site和config-only发布只引用该checkout，不再引用可变的
@@ -131,7 +139,7 @@ release-ref由内部根据Git commit或dirty快照计算，不是公共参数。
 | 对象 | 允许复用的条件 |
 |---|---|
 | 源码快照 | HEAD、tracked diff、未跟踪源码、文件权限和准备后tree摘要完全一致 |
-| deploy-host bundle和venv | commit、平台、摘要和签名一致 |
+| deploy-host bundle和venv | deploy-host依赖闭包、两个lock、Python ABI、OS/架构/libc、工具清单和签名一致 |
 | deploy-host wheelhouse | `build.lock`、`deploy-host.lock`、平台和Python ABI一致 |
 | deploy-host依赖层 | 两个lock和平台计算的dependency identity一致且健康 |
 | source-only组件制品 | component build identity一致；delivery Manifest重新生成 |
@@ -139,6 +147,35 @@ release-ref由内部根据Git commit或dirty快照计算，不是公共参数。
 | 签名release | commit、发布等级、影响基线、签名和runtime repository一致 |
 | AWS资源 | site ownership、ARN、标签、配置和生命周期策略一致 |
 | Kubernetes发布 | release diff明确分类为NOOP或有限升级 |
+
+deploy-host archive保存在
+`STATE_DIR/deploy-host/by-content/<payload-sha256>/`，不再因无关应用commit变化重建。
+Git commit、源码fingerprint、应用/deploy-host身份和成功模式写入单独的本地Cosign签名
+`source-deploy-success.json`授权记录；记录缺失、签名不匹配或应用身份变化时不得走
+deploy-host-only快速路径。`UNCHANGED`还要求签名记录中的site摘要、live release ID、
+`phase=complete`、`transaction_committed=true`和release-state摘要与当前只读status
+完全一致，且`next_deploy.kind=NOOP`；任一漂移都回到受检application release。
+
+clean源码只有同时满足以下条件时才访问GitHub Actions：
+
+1. 工作区干净；
+2. `HEAD`与本地`refs/remotes/origin/main`完全相同；
+3. 当前隔离checkout中没有已经验签可复用的候选；
+4. 配置了权限`0600`的`GPU_FAULT_GITHUB_TOKEN_FILE`，或受控进程环境中的
+   `GITHUB_TOKEN`/`GH_TOKEN`。
+
+dirty工作区、个人clean commit或本地`origin/main`未指向当前commit时不查询GitHub，
+直接使用本地影响门禁或完整门禁；实现不会自动`git fetch`。下载候选后会在任何AWS/ECR
+动作前验证main run、commit/tree/repository、CI gate、unit gate、六个shard签名和完整
+artifact清单。没有凭据、没有候选或API临时不可用时回退本地门禁；已经下载的候选若身份
+或签名不匹配则fail closed。
+
+本地production回退把静态/契约、普通pytest和PostgreSQL stress放在三个隔离cache目录中，
+按CPU容量自适应为1至3路执行；可用
+`GPU_FAULT_RELEASE_GATE_PARALLELISM=1..3`进一步收口。全部通过后才构建和检查artifact。
+门禁集合与原`make check`加stress相同，不会降低coverage floor或省略PostgreSQL stress。
+static分支内部继续把Ruff、mypy、compile、架构、代码契约、安全、部署配置、文档、
+YAML和Shell拆成最多10路；`GPU_FAULT_STATIC_GATE_PARALLELISM=1..10`可主动收口。
 
 任何签名、commit、平台、摘要、集群身份或资源状态不确定时均fail closed。
 snapshot中的content-addressed release Manifest与签名材料会随site持续保留；
@@ -185,8 +222,9 @@ git commit -m "<change message>"
 git status --short
 ```
 
-工作区变为clean后，再重复同一四参数命令。此时内部自动切换到完整production门禁，不会
-复用此前的staging-only attestation。
+工作区变为clean后，再重复同一四参数命令。此时内部切换到production等级，不会复用此前
+的staging-only attestation；个人commit执行本地production门禁，只有
+`HEAD == origin/main`时才尝试消费同commit签名main CI候选。
 
 真实Runtime Profile变化仍必须经过独立审批。首次四参数命令会写出
 `STATE_DIR/release-deploy/profile-plan.json`并停止；审核计划和变更单后执行：
@@ -206,8 +244,10 @@ Profile baseline，不通过隐藏deploy参数注入。发布失败且计划未�
 
 ## 10. 成功和失败
 
-命令成功返回前已经完成部署、verify、稳定窗口和release summary。操作者不需要再提供
-内部site路径执行第二条部署命令。
+应用release发生变化时，命令成功返回前已经完成部署、verify、稳定窗口和release
+summary。仅deploy-host变化时只更新部署机环境、执行影响门禁和只读preflight，不生成
+应用release、不访问GPU rollout也不等待稳定窗口；仅测试/文档变化或源码完全未变时记录
+NOOP，不执行AWS/Kubernetes mutation。操作者不需要再提供内部site路径执行第二条部署命令。
 
 失败时：
 

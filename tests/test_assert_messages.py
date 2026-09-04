@@ -6,9 +6,7 @@ from pathlib import Path
 from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE = lazy_script_module(
-    "check_assert_messages", ROOT / "scripts/check-assert-messages.py"
-)
+MODULE = lazy_script_module(ROOT / "scripts/check-assert-messages.py")
 
 
 def expression(value: str) -> ast.expr:

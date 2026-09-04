@@ -29,6 +29,7 @@ from gpu_fault.notifications import (
 from gpu_fault.orchestrator import WorkflowFencingError
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
+from gpu_fault.workflow_resolution import retirement_fences_out_dispatch
 from gpu_fault.execution.config import (
     ProductionExecutorConfig,
 )
@@ -1515,21 +1516,28 @@ class ProductionWorkflowExecutor:
                 details=_failure_details(adapter, exc),
             )
 
-    @staticmethod
     def _validate_fencing(
+        self,
         workflow: WorkflowRequest,
         incident: FaultIncident,
         request: WorkflowExecutionRequest,
     ) -> None:
         expected = request.expected_fencing_token
-        if expected != workflow.fencing_token or (
-            incident.workflow_request_id in {None, workflow.request_id}
-            and expected != incident.fencing_token
+        current = incident.workflow_request_id in {None, workflow.request_id}
+        # No longer a pure comparison: an incident that names someone else and has
+        # moved on has retired this workflow, and only a Store read distinguishes
+        # that from a preemption somebody else is already resolving.
+        retired = retirement_fences_out_dispatch(self.store, workflow, incident)
+        if (
+            expected != workflow.fencing_token
+            or (current and expected != incident.fencing_token)
+            or retired
         ):
             raise WorkflowFencingError(
                 "stale fencing token: workflow="
                 f"{workflow.fencing_token}, incident="
                 f"{incident.fencing_token}, got={expected}"
+                + (f", retired by {incident.workflow_request_id}" if retired else "")
             )
 
     @staticmethod

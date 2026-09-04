@@ -7,11 +7,13 @@ from datetime import datetime, timezone
 
 import pytest
 
-from gpu_fault import admin_aws_cleanup, admin_aws_commands, admin_uninstall
-from gpu_fault.admin_aws_cleanup import ordered_aurora_instances
-from gpu_fault.admin_bootstrap_common import BootstrapError
-from gpu_fault.admin_site import load_site
-from gpu_fault.admin_uninstall import (
+from gpu_fault.admin import aws_cleanup as admin_aws_cleanup
+from gpu_fault.admin import aws_commands as admin_aws_commands
+from gpu_fault.admin import uninstall as admin_uninstall
+from gpu_fault.admin.aws_cleanup import ordered_aurora_instances
+from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.site import load_site
+from gpu_fault.admin.uninstall import (
     UninstallRequest,
     _delete_aurora_last,
     _delete_non_aurora_resources,

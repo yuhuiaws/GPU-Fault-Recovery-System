@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -18,6 +17,10 @@ if __package__:
     from .live_driver_guard import (
         authorize_execution as guard_authorize_execution,
     )
+    from .regional_live_fixture import (
+        install_abort_signals,
+        run_case_main,
+    )
 else:
     from acceptance_scope import current_acceptance_scope, scoped_case_evidence
     from live_driver_guard import (
@@ -25,6 +28,10 @@ else:
     )
     from live_driver_guard import (
         authorize_execution as guard_authorize_execution,
+    )
+    from regional_live_fixture import (
+        install_abort_signals,
+        run_case_main,
     )
 
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "ha001_probe.py"
@@ -1254,10 +1261,6 @@ def execute_case(run_dir: Path, attempt: int, confirmation: str) -> int:
     return 0 if result["verdict"] == "PASS" else 1
 
 
-def abort_on_signal(signum: int, _frame: object) -> None:
-    raise CaseError(f"received signal {signum}")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     add_live_arguments(parser, confirmation=CONFIRMATION)
@@ -1269,8 +1272,7 @@ def main() -> int:
     args = parser.parse_args()
     os.umask(0o077)
     configure(args)
-    signal.signal(signal.SIGTERM, abort_on_signal)
-    signal.signal(signal.SIGINT, abort_on_signal)
+    install_abort_signals()
     if not args.execute:
         plan = build_plan(args.run_dir, args.attempt)
         print(json.dumps(plan, sort_keys=True))
@@ -1289,4 +1291,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_case_main(main))

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from gpu_fault.admin_config import (
+from gpu_fault.admin.config import (
     AdminConfigError,
     AuroraCapacityConfig,
     admin_config_approval_path,
@@ -23,7 +23,7 @@ from gpu_fault.admin_config import (
     prepare_admin_config_apply,
     preset_admin_config,
 )
-from gpu_fault.admin_config_file import (
+from gpu_fault.admin.config_file import (
     admin_config_file_path,
     initialize_desired_admin_config,
     load_admin_config_file,
@@ -207,6 +207,7 @@ def test_failed_apply_keeps_plan_and_supports_idempotent_resume(tmp_path: Path) 
     assert admin_config_approval_path(tmp_path).is_file(), (
         "failed apply did not retain its approval"
     )
+    assert load_desired_admin_config(tmp_path) == default_admin_config()
     assert (
         prepare_admin_config_apply(
             tmp_path,

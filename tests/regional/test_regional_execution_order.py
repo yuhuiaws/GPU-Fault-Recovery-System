@@ -85,7 +85,7 @@ def test_regional_execution_order_covers_every_documented_case() -> None:
     indexed = [*ordered, *do_not_run]
     assert len(indexed) == len(set(indexed))
     assert set(indexed) == set(document_cases)
-    assert len(indexed) == len(document_cases) == 153
+    assert len(indexed) == len(document_cases) == 154
 
 
 def test_do_not_run_matches_regional_superseded_cases() -> None:
@@ -103,11 +103,16 @@ def test_do_not_run_matches_regional_superseded_cases() -> None:
         if (case.get("evidence") or {}).get("verdict") == "SUPERSEDED"
     }
 
-    assert retired == superseded == {"GF-REGIONAL-DESTR-004"}
+    assert retired == superseded == {"GF-REGIONAL-AUTH-012", "GF-REGIONAL-DESTR-004"}
     case = cases["GF-REGIONAL-DESTR-004"]
     assert case["automation"] == "manual"
     assert case["risk"] == "destructive"
     assert case["superseded_by"] == "GF-REGIONAL-DESTR-013"
+    # A superseded case keeps its ID forever and points at its replacement, so
+    # an operator reading old evidence can find the case that now covers it.
+    rotation = cases["GF-REGIONAL-AUTH-012"]
+    assert rotation["automation"] == "manual"
+    assert rotation["superseded_by"] == "GF-REGIONAL-AUTH-016"
 
 
 def test_regional_execution_order_pins_special_dependencies() -> None:

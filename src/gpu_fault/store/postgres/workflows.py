@@ -59,6 +59,69 @@ class PostgresWorkflowMixin:
             rows = cursor.fetchall()
         return [self._decode("workflow", row[0]) for row in rows]
 
+    def workflow_status_counts(self) -> dict[WorkflowStatus, int]:
+        """Count every persisted workflow by status without decoding any.
+
+        The /metrics workflow gauge must stay exact while the detail scan that
+        feeds the duration and step families is bounded, so the count is a
+        server-side aggregate rather than a by-product of that scan.
+        """
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload->>'status' AS status, COUNT(*)
+                FROM gpu_fault_objects WHERE kind='workflow' GROUP BY status
+                """
+            )
+            rows = cursor.fetchall()
+        counts = {status: 0 for status in WorkflowStatus}
+        for status, count in rows:
+            counts[WorkflowStatus(status)] = int(count)
+        return counts
+
+    def blocked_workflows_without_verified_restore(self) -> int:
+        """Count the BLOCKED workflows whose GPU node is still held.
+
+        See the SQLite implementation for why the lifetime BLOCKED count cannot
+        answer this and why the predicate is
+        ``workflow_resolution.verified_restore_successor`` negated.
+        """
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM gpu_fault_objects w
+                WHERE w.kind='workflow'
+                  AND w.payload->>'status'='BLOCKED'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM gpu_fault_objects i
+                      JOIN gpu_fault_objects s
+                        ON s.kind='workflow'
+                       AND s.key=i.payload->>'workflow_request_id'
+                      WHERE i.kind='incident'
+                        AND i.key=w.payload->>'incident_id'
+                        AND i.payload->>'state'='RECOVERED'
+                        AND s.key<>w.key
+                        AND s.payload->>'incident_id'
+                            =w.payload->>'incident_id'
+                        AND s.payload->>'status'='SUCCEEDED'
+                        AND s.payload->>'fencing_token'
+                            =w.payload->>'fencing_token'
+                        AND i.payload->>'fencing_token'
+                            =w.payload->>'fencing_token'
+                        AND jsonb_exists(
+                            s.payload->'completed_operations',
+                            'RESTORE_SCHEDULING'
+                        )
+                  )
+                """
+            )
+            row = cursor.fetchone()
+        return int(row[0])
+
     def list_unhandled_failed_workflows(
         self, *, limit: int = 1000
     ) -> list[WorkflowRequest]:

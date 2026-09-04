@@ -10,7 +10,6 @@ from typing import Any
 
 from regional_release_config import ReleaseError, render_nlb_manifest
 
-
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -307,30 +306,80 @@ def _wait_targets_healthy(release: Any, load_balancer_arn: str) -> None:
     )
 
 
-def _upsert_cname_and_wait(release: Any, hostname: str) -> None:
-    change_batch = json.dumps(
-        {
-            "Changes": [
-                {
-                    "Action": "UPSERT",
-                    "ResourceRecordSet": {
-                        "Name": release.config.dns.hostname,
-                        "Type": "CNAME",
-                        "TTL": 60,
-                        "ResourceRecords": [{"Value": hostname}],
-                    },
-                }
-            ]
-        },
-        separators=(",", ":"),
+def normalized_record_name(value: str) -> str:
+    """Route53 stores names fully qualified; compare them without the root dot."""
+
+    return str(value).rstrip(".").lower()
+
+
+def read_dns_record(
+    release: Any,
+    *,
+    hosted_zone_id: str,
+    hostname: str,
+    record_type: str = "CNAME",
+) -> dict[str, Any] | None:
+    """Return the record set a later change would overwrite, or ``None``.
+
+    Rollback needs the record exactly as Route53 holds it -- alias targets and
+    all -- so this returns the whole ``ResourceRecordSet`` rather than the value
+    the release happens to care about.
+    """
+
+    document = _aws_json(
+        release,
+        [
+            "route53",
+            "list-resource-record-sets",
+            "--hosted-zone-id",
+            str(hosted_zone_id),
+            "--start-record-name",
+            str(hostname),
+            "--start-record-type",
+            record_type,
+            "--max-items",
+            "1",
+        ],
+        regional=False,
+        sensitive=True,
     )
+    for record in document.get("ResourceRecordSets", []):
+        if not isinstance(record, dict):
+            continue
+        if normalized_record_name(
+            str(record.get("Name") or "")
+        ) == normalized_record_name(hostname) and str(record.get("Type") or "") == (
+            record_type
+        ):
+            return dict(record)
+    return None
+
+
+def submit_dns_change(
+    release: Any,
+    changes: list[dict[str, Any]],
+    *,
+    hosted_zone_id: str,
+) -> None:
+    """Submit one change batch and wait until Route53 reports it INSYNC.
+
+    Both the release and its compensation have to know the change landed before
+    they report success, so the wait belongs to the submission rather than to
+    either caller. The zone is explicit because a rollback has to change the
+    zone the candidate wrote into, which is not necessarily the one the current
+    configuration names.
+    """
+
+    if not changes:
+        return
+    change_batch = json.dumps({"Changes": changes}, separators=(",", ":"))
     response = _aws_json(
         release,
         [
             "route53",
             "change-resource-record-sets",
             "--hosted-zone-id",
-            str(release.config.dns.hosted_zone_id),
+            str(hosted_zone_id),
             "--change-batch",
             change_batch,
         ],
@@ -339,7 +388,7 @@ def _upsert_cname_and_wait(release: Any, hostname: str) -> None:
     )
     change_id = str((response.get("ChangeInfo") or {}).get("Id") or "")
     if not change_id:
-        raise ReleaseError("Route53 UPSERT did not return a change ID")
+        raise ReleaseError("Route53 change did not return a change ID")
     release.runner.run(
         [
             "aws",
@@ -363,6 +412,24 @@ def _upsert_cname_and_wait(release: Any, hostname: str) -> None:
         raise ReleaseError(
             f"Route53 change {change_id} is {change.get('Status')}, expected INSYNC"
         )
+
+
+def _upsert_cname_and_wait(release: Any, hostname: str) -> None:
+    submit_dns_change(
+        release,
+        [
+            {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                    "Name": release.config.dns.hostname,
+                    "Type": "CNAME",
+                    "TTL": 60,
+                    "ResourceRecords": [{"Value": hostname}],
+                },
+            }
+        ],
+        hosted_zone_id=str(release.config.dns.hosted_zone_id),
+    )
 
 
 def ensure_control_plane_dns(release: Any) -> None:

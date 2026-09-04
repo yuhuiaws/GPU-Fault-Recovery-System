@@ -74,6 +74,85 @@ class SqliteWorkflowMixin:
             workflows = [item for item in workflows if item.status in statuses]
         return workflows[:limit]
 
+    def workflow_status_counts(self) -> dict[WorkflowStatus, int]:
+        """Count every persisted workflow by status without decoding any.
+
+        The /metrics workflow gauge must stay exact while the detail scan that
+        feeds the duration and step families is bounded, so the count is a
+        server-side aggregate rather than a by-product of that scan.
+        """
+
+        rows = self._db.execute(
+            """
+            SELECT json_extract(payload, '$.status') AS status, COUNT(*)
+            FROM objects WHERE kind='workflow' GROUP BY status
+            """
+        ).fetchall()
+        counts = {status: 0 for status in WorkflowStatus}
+        for status, count in rows:
+            counts[WorkflowStatus(status)] = int(count)
+        return counts
+
+    def blocked_workflows_without_verified_restore(self) -> int:
+        """Count the BLOCKED workflows whose GPU node is still held.
+
+        ``workflow_status_counts`` counts every workflow ever persisted, and
+        BLOCKED is terminal, so its BLOCKED bucket only falls when an operator
+        reconciles a record or the incident is archived out of the table. That
+        makes it useless as a "there is a backlog now" signal: a BLOCKED
+        workflow whose node has already been restored by a successor keeps
+        counting forever.
+
+        This is the same predicate as
+        ``workflow_resolution.verified_restore_successor``, negated -- the
+        condition ``workflow_blocks_release`` and the release preflight already
+        use to decide whether a BLOCKED record still means a node is out of the
+        training pool. It recovers on its own the moment the successor
+        workflow restores scheduling, without waiting for
+        ``gpu-fault-admin workflow-reconcile``.
+
+        Kept as one server-side aggregate for the same reason as
+        ``workflow_status_counts``: /metrics must not decode a growing table.
+        The driving scan is over BLOCKED rows via
+        ``objects_active_workflow_scope``, and each one costs two primary-key
+        lookups.
+        """
+
+        row = self._db.execute(
+            """
+            SELECT COUNT(*)
+            FROM objects w
+            WHERE w.kind='workflow'
+              AND json_extract(w.payload, '$.status')='BLOCKED'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM objects i
+                  JOIN objects s
+                    ON s.kind='workflow'
+                   AND s.key=json_extract(i.payload, '$.workflow_request_id')
+                  WHERE i.kind='incident'
+                    AND i.key=json_extract(w.payload, '$.incident_id')
+                    AND json_extract(i.payload, '$.state')='RECOVERED'
+                    AND s.key<>w.key
+                    AND json_extract(s.payload, '$.incident_id')
+                        =json_extract(w.payload, '$.incident_id')
+                    AND json_extract(s.payload, '$.status')='SUCCEEDED'
+                    AND json_extract(s.payload, '$.fencing_token')
+                        =json_extract(w.payload, '$.fencing_token')
+                    AND json_extract(i.payload, '$.fencing_token')
+                        =json_extract(w.payload, '$.fencing_token')
+                    AND EXISTS (
+                        SELECT 1
+                        FROM json_each(
+                            s.payload, '$.completed_operations'
+                        ) operation
+                        WHERE operation.value='RESTORE_SCHEDULING'
+                    )
+              )
+            """
+        ).fetchone()
+        return int(row[0])
+
     def list_unhandled_failed_workflows(
         self, *, limit: int = 1000
     ) -> list[WorkflowRequest]:

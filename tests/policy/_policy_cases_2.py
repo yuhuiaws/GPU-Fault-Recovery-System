@@ -13,6 +13,8 @@ from gpu_fault.policy import (
     GpuFaultPolicyEngine,
     XidEvent,
 )
+from gpu_fault.policy import engine as engine_module
+from gpu_fault.policy.engine import XID_154_ACTION
 from tests.policy._support import (
     NOW,
     _catalog_matrix_cases,
@@ -40,6 +42,36 @@ def test_unowned_restart_vm_workflow_remains_fail_closed() -> None:
     assert decision.action is None
     assert decision.safety_action is RecoveryAction.QUARANTINE
     assert decision.disposition is ActionDisposition.BLOCKED_WORKFLOW
+
+
+def test_only_the_known_unowned_workflows_reach_no_executor() -> None:
+    """Pin which catalog Immediate Actions have no automated step at all.
+
+    Non-direct Immediate Actions are dispatched from a table, and a token that is
+    not in it is preserved verbatim and blocked. Blocking is the safe direction,
+    but it is silent: every event for that XID would stop at an operator. So the
+    deliberately unowned tokens are named here, and a catalog bump that adds one
+    has to be triaged instead of discovered in production. The per-branch matrix
+    below cannot see this, because both it and the engine derive the same
+    fallback from the same absence.
+    """
+
+    xid_policy, sxid_policy = _pinned_catalogs()
+    engine = GpuFaultPolicyEngine(xid_policy, sxid_policy)
+    unowned: dict[str, set[int]] = {}
+    for rule in xid_policy.catalog_rules:
+        for family in rule.products or []:
+            # Event ids are unique per case, so one engine's idempotency cache
+            # cannot answer for a rule it never evaluated.
+            decision = engine.evaluate_xid(
+                xid(rule.xid, event_id=f"owner-{rule.xid}-{family}", product=family)
+            )
+            if decision.disposition is ActionDisposition.BLOCKED_WORKFLOW:
+                unowned.setdefault(decision.official_action or "", set()).add(rule.xid)
+
+    # One entry per XID, not per product family: the same rule is evaluated once
+    # for each family it lists.
+    assert unowned == {"RESTART_VM": {151}}
 
 
 @pytest.mark.parametrize(
@@ -457,6 +489,42 @@ def test_xid_154_covers_every_official_recovery_action() -> None:
 
     assert pending.disposition is (ActionDisposition.PENDING_CORRELATION)
     assert pending.action is None
+
+
+def test_xid_154_is_routed_from_the_workflow_table(monkeypatch) -> None:
+    """XID 154 is dispatched like every other NVIDIA workflow.
+
+    Its resolver used to be reached by an ``event.xid == 154`` branch sitting
+    ahead of the table, so a token-keyed table entry alone would not prove the
+    branch is gone -- the branch would keep answering with the entry present or
+    absent. Deleting the entry has to change the answer to the fail-closed
+    ``BLOCKED_WORKFLOW`` arm, which is only true if the table is the single
+    routing point.
+    """
+
+    engine = GpuFaultPolicyEngine()
+    resolved = engine.evaluate_xid(
+        xid(
+            154,
+            event_id="xid154-table-routed",
+            xid_154_action=DynamicRecoveryAction.RESET_GPU,
+        )
+    )
+    assert resolved.disposition is ActionDisposition.EXECUTABLE
+    assert resolved.action is RecoveryAction.RESET_GPU
+
+    monkeypatch.delitem(engine_module._XID_WORKFLOW_RESOLVERS, XID_154_ACTION)
+    unrouted = engine.evaluate_xid(
+        xid(
+            154,
+            event_id="xid154-table-entry-removed",
+            xid_154_action=DynamicRecoveryAction.RESET_GPU,
+        )
+    )
+
+    assert unrouted.disposition is ActionDisposition.BLOCKED_WORKFLOW
+    assert unrouted.official_action == XID_154_ACTION
+    assert unrouted.action is None
 
 
 def test_xid_45_and_48_workflow_branches_are_exact() -> None:

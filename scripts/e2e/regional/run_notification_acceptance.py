@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
-import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, cast
 
 import yaml  # type: ignore[import-untyped]
-
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -21,15 +19,19 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.identity_acceptance_common import (  # noqa: E402
+    ClusterTarget,
+    IdentitySite,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     authorize_execution,
     build_plan,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
+    TRAINING_IMAGE,
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
-    TRAINING_IMAGE,
 )
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
@@ -37,13 +39,10 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
+    install_abort_signals,
     predecessor_evidence,
+    run_case_main,
 )
-from scripts.e2e.regional.identity_acceptance_common import (  # noqa: E402
-    ClusterTarget,
-    IdentitySite,
-)
-
 
 CASE_IDS = tuple(f"GF-REGIONAL-NOTIFY-{number:03d}" for number in range(1, 6))
 DRILL_PROBE = (Path(__file__).with_name("probes") / "notification_drill.py").read_text(
@@ -676,15 +675,10 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
-def abort_on_signal(signum: int, _frame: object) -> None:
-    raise RegionalFixtureError(f"received signal {signum}")
-
-
 def main() -> int:
     arguments = parser().parse_args()
     os.umask(0o077)
-    signal.signal(signal.SIGTERM, abort_on_signal)
-    signal.signal(signal.SIGINT, abort_on_signal)
+    install_abort_signals()
     site = IdentitySite(arguments.site)
     target = site.target(arguments.cluster_id)
     nodes = tuple(arguments.node)
@@ -798,4 +792,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_case_main(main))

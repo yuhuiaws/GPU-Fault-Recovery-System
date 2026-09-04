@@ -1,7 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from gpu_fault.admin_config import default_admin_config
+from gpu_fault.admin.config import default_admin_config
 from scripts import component_wheels
 from scripts.component_wheels import (
     COMPONENTS,
@@ -15,8 +15,10 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 DIFF = lazy_script_module(
-    "regional_release_diff",
-    ROOT / "deploy/control-plane/regional/regional_release_diff.py",
+    ROOT / "deploy/control-plane/regional/regional_release_diff.py"
+)
+CONFIG = lazy_script_module(
+    ROOT / "deploy/control-plane/regional/regional_release_config.py"
 )
 
 
@@ -33,6 +35,8 @@ def _release() -> SimpleNamespace:
         endpoint_digest="f" * 64,
         dcgm_digest="1" * 64,
         notification_digest="3" * 64,
+        observability_rules_digest="8" * 64,
+        observability_adot_digest="9" * 64,
         cluster_registry_digest="6" * 64,
         admin_config_role_digests=admin_config.role_sha256(),
         rendered_manifest_digest="7" * 64,
@@ -55,6 +59,9 @@ def _release() -> SimpleNamespace:
             release_delivery_sha256="9" * 64,
             delivery_component_digests={
                 "cpu": "a" * 64,
+                "cpu_ingress": "5" * 64,
+                "cpu_spool": "6" * 64,
+                "cpu_worker": "7" * 64,
                 "dcgm": "b" * 64,
                 "endpoint": "c" * 64,
                 "executor": "d" * 64,
@@ -92,6 +99,15 @@ def _state() -> dict:
         "cluster_ids": ["gpu-a"],
         "release_delivery_sha256": release.config.release_delivery_sha256,
         "cpu_manifest_sha256": release.config.delivery_component_digests["cpu"],
+        "cpu_ingress_manifest_sha256": (
+            release.config.delivery_component_digests["cpu_ingress"]
+        ),
+        "cpu_worker_manifest_sha256": (
+            release.config.delivery_component_digests["cpu_worker"]
+        ),
+        "cpu_spool_manifest_sha256": (
+            release.config.delivery_component_digests["cpu_spool"]
+        ),
         "dcgm_manifest_sha256": release.config.delivery_component_digests["dcgm"],
         "endpoint_manifest_sha256": (
             release.config.delivery_component_digests["endpoint"]
@@ -109,6 +125,8 @@ def _state() -> dict:
         "observability_manifest_sha256": (
             release.config.delivery_component_digests["observability"]
         ),
+        "observability_rules_sha256": release.observability_rules_digest,
+        "observability_adot_sha256": release.observability_adot_digest,
         "schema_manifest_sha256": (release.config.delivery_component_digests["schema"]),
         "rendered_manifest_sha256": release.rendered_manifest_digest,
         "node_template_sha256": release.node_template_sha,
@@ -129,6 +147,18 @@ def test_release_diff_classifies_noop_and_component_scopes() -> None:
         DIFF.classify_release(release, state).kind
         is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
     )
+
+
+def test_legacy_observability_digest_migrates_adot_but_reapplies_rules() -> None:
+    release = _release()
+    state = _state()
+    state.pop("observability_rules_sha256")
+    state.pop("observability_adot_sha256")
+
+    diff = DIFF.classify_release(release, state)
+
+    assert "observability_rules" in diff.changed
+    assert "observability_adot" not in diff.changed
     state = _state()
     state["notification_digest"] = "8" * 64
     assert (
@@ -229,6 +259,57 @@ def test_delivery_component_changes_drive_component_scope() -> None:
     assert diff.changed == {"collector_manifests"}
 
 
+def test_cpu_role_manifest_change_targets_only_that_role() -> None:
+    release = _release()
+    state = _state()
+    state["cpu_worker_manifest_sha256"] = "0" * 64
+
+    diff = DIFF.classify_release(release, state)
+    plan = DIFF.build_execution_plan(diff)
+
+    assert diff.kind is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
+    assert diff.changed == {"cpu_worker_manifests"}
+    assert plan.nodes == (
+        DIFF.ReleaseComponent.CPU_FINALIZE,
+        DIFF.ReleaseComponent.VERIFY,
+    )
+    assert DIFF.control_plane_role_targets(diff) == ("worker",)
+
+
+def test_legacy_cpu_manifest_digest_maps_to_all_roles() -> None:
+    release = _release()
+    raw = {
+        name: {"sha256": value}
+        for name, value in release.config.delivery_component_digests.items()
+        if name not in {"cpu_ingress", "cpu_worker", "cpu_spool"}
+    }
+    delivery = {
+        "schema_version": 1,
+        "runtime_prebuilt": True,
+        "components": raw,
+        "images": {
+            name: {"reference": f"registry/{name}@sha256:" + "a" * 64}
+            for name in ("runtime", "node_installer", "dcgm_exporter", "adot")
+        },
+        "node_template_inputs": {"sha256": "b" * 64},
+    }
+    delivery["sha256"] = CONFIG.canonical_sha256(delivery)
+    manifest = {
+        "deployable": True,
+        "delivery": delivery,
+        "components": {"node_bundle": {"template_sha256": "b" * 64}},
+        "database": {"rollback_compatible": False},
+    }
+
+    _, _, digests, _, _, _ = CONFIG.parse_delivery_identity(
+        manifest, manifest["components"]
+    )
+
+    assert digests["cpu_ingress"] == digests["cpu"]
+    assert digests["cpu_worker"] == digests["cpu"]
+    assert digests["cpu_spool"] == digests["cpu"]
+
+
 def test_execution_plan_selects_only_changed_component_dependencies() -> None:
     endpoint = DIFF.build_execution_plan(
         DIFF.ReleaseDiff(
@@ -313,8 +394,16 @@ def test_component_dependency_closures_are_runtime_specific() -> None:
 
     deploy_host = component_modules("deploy_host")
     assert component_definition("deploy_host").distribution == "gpu-fault-deploy-host"
-    assert "gpu_fault.admin_cli" in deploy_host
-    assert "gpu_fault.admin_cli" not in closures["control_plane"]
+    assert "gpu_fault.admin.cli" in deploy_host
+    assert "gpu_fault.admin.workflow_reconcile" in deploy_host
+    assert "gpu_fault.release_state_snapshot" in deploy_host
+    # The reconcile engine mutates the Store, so it belongs to the control-plane
+    # wheel; the deploy host only execs it there. No control-plane module imports
+    # it, which is why this asks what the wheel contains rather than what the
+    # import graph reaches.
+    assert "gpu_fault.workflow_reconcile" in component_modules("control_plane")
+    assert "gpu_fault.workflow_reconcile" not in deploy_host
+    assert "gpu_fault.admin.cli" not in closures["control_plane"]
     assert "deploy-host-tools.json" not in {
         path.name for path in component_data_files("control_plane")
     }
@@ -326,7 +415,7 @@ def test_component_dependency_closures_are_runtime_specific() -> None:
 def test_admin_source_change_only_changes_deploy_host_digest() -> None:
     control_before = component_wheels.component_source_digest("control_plane")
     deploy_before = component_wheels.component_source_digest("deploy_host")
-    source = component_wheels.MODULES["gpu_fault.admin_cli"]
+    source = component_wheels.MODULES["gpu_fault.admin.cli"]
     override = {
         source.relative_to(component_wheels.SOURCE).as_posix(): (
             source.read_bytes() + b"\n# deployment-only change\n"

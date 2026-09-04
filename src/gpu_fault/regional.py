@@ -4,7 +4,7 @@ import hashlib
 import ipaddress
 import json
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any
 
@@ -24,11 +24,11 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStepSpec,
 )
-from gpu_fault.remote_command_models import (
-    RemoteCommandStatus as RemoteCommandStatus,
-)
 from gpu_fault.regional_compatibility import (
     LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+)
+from gpu_fault.remote_command_models import (
+    RemoteCommandStatus as RemoteCommandStatus,
 )
 from gpu_fault.remote_command_models import (
     lease_deadline as lease_deadline,
@@ -36,10 +36,26 @@ from gpu_fault.remote_command_models import (
 from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import EvidenceKind
 
+TOKEN_SLOT_CURRENT = "current"
+TOKEN_SLOT_RETIRING = "retiring"
+
+# A rotation window is an interval in which a withdrawn credential still opens
+# the door, so it is bounded by construction rather than by operator discipline.
+MAX_TOKEN_ROTATION_WINDOW = timedelta(days=7)
+
+# Keys dropped from the registry content digest while unset. Registry revisions
+# are durable and their digest is re-verified on every load, so adding a field
+# to RegionalClusterRegistration would otherwise invalidate every revision
+# published before the field existed. A revision that actually arms rotation
+# carries the keys and therefore digests them.
+_ROTATION_DIGEST_KEYS = ("retiring_token_sha256", "token_rotation_expires_at")
+
 
 class RegionalClusterLifecycle(StrEnum):
     PENDING = "PENDING"
     ACTIVE = "ACTIVE"
+    FAILED = "FAILED"
+    ROLLED_BACK = "ROLLED_BACK"
     DRAINING = "DRAINING"
     REVOKED = "REVOKED"
 
@@ -50,6 +66,15 @@ class RegionalClusterRegistration(StrictModel):
     hyperpod_cluster_name: str
     eks_cluster_arn: str
     token_sha256: str = Field(min_length=64, max_length=64)
+    # The credential being retired, not the one being introduced. Rotation sets
+    # `token_sha256` to the new token immediately and parks the old digest here
+    # with a deadline, so the control plane accepts the new token before any
+    # executor presents it and the deadline lapsing converges on the intended
+    # end state instead of cutting off executors that already moved.
+    retiring_token_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64
+    )
+    token_rotation_expires_at: datetime | None = None
     enabled: bool = True
     lifecycle_state: RegionalClusterLifecycle = RegionalClusterLifecycle.ACTIVE
     synthetic: bool = False
@@ -81,6 +106,7 @@ class RegionalClusterRegistration(StrictModel):
             bytes.fromhex(self.token_sha256)
         except ValueError as exc:
             raise ValueError("token_sha256 must be hexadecimal") from exc
+        self._validate_rotation()
         if self.enabled and not self.agent_endpoint_allowed_cidrs:
             raise ValueError("enabled regional cluster requires agent endpoint CIDRs")
         if self.synthetic:
@@ -118,7 +144,11 @@ class RegionalClusterRegistration(StrictModel):
             raise ValueError("regional cluster activity check requires timezone")
         return (
             self.enabled
-            and self.lifecycle_state is not RegionalClusterLifecycle.REVOKED
+            and self.lifecycle_state
+            not in {
+                RegionalClusterLifecycle.REVOKED,
+                RegionalClusterLifecycle.ROLLED_BACK,
+            }
             and (
                 not self.synthetic
                 or (
@@ -128,26 +158,119 @@ class RegionalClusterRegistration(StrictModel):
             )
         )
 
-    def token_matches(self, token: str) -> bool:
+    def _validate_rotation(self) -> None:
+        digest = self.retiring_token_sha256
+        deadline = self.token_rotation_expires_at
+        if (digest is None) != (deadline is None):
+            raise ValueError(
+                "cluster token rotation requires both retiring_token_sha256 "
+                "and token_rotation_expires_at"
+            )
+        if digest is None or deadline is None:
+            return
+        try:
+            bytes.fromhex(digest)
+        except ValueError as exc:
+            raise ValueError("retiring_token_sha256 must be hexadecimal") from exc
+        if secrets.compare_digest(digest, self.token_sha256):
+            raise ValueError(
+                "retiring_token_sha256 must differ from token_sha256; "
+                "rotation has not issued a new token"
+            )
+        if deadline.tzinfo is None:
+            raise ValueError("token_rotation_expires_at must include timezone")
+        if self.updated_at.tzinfo is None:
+            raise ValueError("token rotation requires a timezone-aware updated_at")
+        # The window is measured against the stored `updated_at`, never against
+        # the wall clock: a durable registry revision is re-validated every time
+        # it is loaded, so a clock-dependent bound would make old revisions
+        # unloadable and take the control plane down long after the fact.
+        if deadline <= self.updated_at:
+            raise ValueError(
+                "token_rotation_expires_at must be after updated_at; drop the "
+                "retiring token instead of recording an expired window"
+            )
+        if deadline - self.updated_at > MAX_TOKEN_ROTATION_WINDOW:
+            raise ValueError(
+                "cluster token rotation window must not exceed "
+                f"{MAX_TOKEN_ROTATION_WINDOW.days} days"
+            )
+
+    def accepted_token_slots(self, now: datetime | None = None) -> tuple[str, ...]:
+        """Name the credential slots that can authenticate this cluster now."""
+
+        observed = now or datetime.now(timezone.utc)
+        if observed.tzinfo is None:
+            raise ValueError("regional cluster activity check requires timezone")
+        if (
+            self.retiring_token_sha256 is None
+            or self.token_rotation_expires_at is None
+            or self.token_rotation_expires_at <= observed
+        ):
+            return (TOKEN_SLOT_CURRENT,)
+        return (TOKEN_SLOT_CURRENT, TOKEN_SLOT_RETIRING)
+
+    def _matched_slot(self, token: str, observed: datetime) -> str | None:
         digest = hashlib.sha256(token.encode()).hexdigest()
-        return self.accepts_token() and secrets.compare_digest(
-            digest,
-            self.token_sha256,
+        candidates = {
+            TOKEN_SLOT_CURRENT: self.token_sha256,
+            TOKEN_SLOT_RETIRING: self.retiring_token_sha256,
+        }
+        matched: str | None = None
+        for slot in self.accepted_token_slots(observed):
+            candidate = candidates[slot]
+            if candidate is None:
+                continue
+            # Every accepted slot is compared instead of returning on the first
+            # hit: short-circuiting would let the response time say which token
+            # the caller holds. How many slots are live is already visible to
+            # execution-token holders, so only the ordering is hidden here.
+            if secrets.compare_digest(digest, candidate):
+                matched = slot
+        return matched
+
+    def matched_token_slot(
+        self,
+        token: str,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Return which credential slot ``token`` matched, or ``None``.
+
+        Callers use the slot name to report that an executor is still holding
+        the retiring token: while that is reported, the rotation is not finished
+        and the retiring digest must not be dropped yet.
+        """
+
+        observed = now or datetime.now(timezone.utc)
+        if not self.accepts_token(observed):
+            return None
+        return self._matched_slot(token, observed)
+
+    def token_matches(self, token: str, now: datetime | None = None) -> bool:
+        return self.matched_token_slot(token, now) is not None
+
+    def authenticates(self, token: str, now: datetime | None = None) -> bool:
+        observed = now or datetime.now(timezone.utc)
+        return (
+            self.is_active(observed) and self._matched_slot(token, observed) is not None
         )
 
-    def authenticates(self, token: str) -> bool:
-        digest = hashlib.sha256(token.encode()).hexdigest()
-        return self.is_active() and secrets.compare_digest(
-            digest,
-            self.token_sha256,
-        )
+
+def _registry_digest_payload(
+    registration: RegionalClusterRegistration,
+) -> dict[str, Any]:
+    payload = registration.model_dump(mode="json")
+    for key in _ROTATION_DIGEST_KEYS:
+        if payload.get(key) is None:
+            payload.pop(key, None)
+    return payload
 
 
 def regional_registry_content_sha256(
     registrations: list[RegionalClusterRegistration],
 ) -> str:
     payload = [
-        item.model_dump(mode="json")
+        _registry_digest_payload(item)
         for item in sorted(registrations, key=lambda value: value.cluster_id)
     ]
     encoded = json.dumps(
@@ -241,6 +364,12 @@ class RegionalRegistryPublishRequest(StrictModel):
     expected_generation: int = Field(ge=0)
     registrations: list[RegionalClusterRegistration] = Field(default_factory=list)
     required_member_ids: list[str] | None = None
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class RegionalRegistryClusterTransitionRequest(StrictModel):
+    registration: RegionalClusterRegistration
+    lifecycle_state: RegionalClusterLifecycle
     reason: str = Field(min_length=1, max_length=512)
 
 
@@ -484,6 +613,21 @@ class RemoteIncidentOwnershipReport(StrictModel):
     terminal: bool = False
     incident_state: str | None = None
     quarantine_hold: bool = False
+
+
+class RemoteFleetRolloutFence(StrictModel):
+    """Which fleet rollouts currently fence destructive work on one cluster.
+
+    The verdict, not the evidence. The executor only needs to know whether to
+    hold, so shipping the ids keeps the answer bounded and keeps the
+    supersession rule on the control plane, where the store is: the data plane
+    re-deriving it from a deployment list would be a second copy of a safety
+    predicate, free to drift. Cross-cluster records never leave the control
+    plane, because the caller is authenticated as exactly one cluster.
+    """
+
+    cluster_id: str
+    fencing_deployment_ids: list[str] = Field(default_factory=list)
 
 
 class RemoteAdvisoryNotificationRequest(StrictModel):

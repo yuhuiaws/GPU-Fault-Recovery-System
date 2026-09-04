@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+from pydantic import BaseModel
+
 from gpu_fault.models import (
     AdvisoryNotification,
     CompletionDecision,
@@ -22,11 +24,18 @@ from gpu_fault.models import (
     WorkflowRequest,
     XidMetricBaseline,
 )
+from gpu_fault.policy import Nvlink74BitOccurrenceState
+from gpu_fault.store.memory.store import InMemoryStore
 from gpu_fault.store.shared.errors import (
     EfaTrafficAdminConflict as EfaTrafficAdminConflict,
+)
+from gpu_fault.store.shared.errors import (
     NotFoundError as NotFoundError,
+)
+from gpu_fault.store.shared.errors import (
     WorkflowLeaseError as WorkflowLeaseError,
 )
+from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflowMixin
 from gpu_fault.store.sqlite.control_records import SqliteControlRecordMixin
 from gpu_fault.store.sqlite.core import SqliteCoreMixin
 from gpu_fault.store.sqlite.efa import SqliteEfaTrafficMixin
@@ -38,9 +47,6 @@ from gpu_fault.store.sqlite.remote_commands import SqliteRemoteCommandMixin
 from gpu_fault.store.sqlite.telemetry import SqliteTelemetryMixin
 from gpu_fault.store.sqlite.workflows import SqliteWorkflowMixin
 from gpu_fault.store.sqlite.xid import SqliteXidMixin
-from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflowMixin
-from gpu_fault.policy import Nvlink74BitOccurrenceState
-from gpu_fault.store.memory.store import InMemoryStore
 
 
 class SqliteStore(
@@ -65,7 +71,7 @@ class SqliteStore(
     with PostgreSQL or DynamoDB conditional writes.
     """
 
-    _MODELS = {
+    _MODELS: dict[str, type[BaseModel]] = {
         "event": TerminalEvent,
         "decision": CompletionDecision,
         "marker": NodeMarker,
@@ -88,6 +94,11 @@ class SqliteStore(
 
     def __init__(self, path: str) -> None:
         super().__init__()
+        from gpu_fault.fleet import (
+            AgentRecord,
+            FleetDeployment,
+            MultiNodeBarrier,
+        )
         from gpu_fault.gpu_metrics import (
             GpuFindingState,
             GpuHealthFinding,
@@ -95,10 +106,30 @@ class SqliteStore(
             GpuMetricLatest,
             GpuMetricsIngestionResult,
         )
-        from gpu_fault.fleet import (
-            AgentRecord,
-            FleetDeployment,
-            MultiNodeBarrier,
+        from gpu_fault.hyperpod import (
+            HyperPodSubmissionRecord,
+        )
+        from gpu_fault.installation_resources import InstallationResource
+        from gpu_fault.managed_recovery import (
+            HyperPodNodeIdentity,
+        )
+        from gpu_fault.policy import (
+            FaultPolicyDecision,
+            XidCorrelationRecord,
+            XidEvent,
+        )
+        from gpu_fault.processor import (
+            PeriodicTaskLease,
+            ProcessorLaneLease,
+            ProcessorLeadership,
+            ProcessorRequest,
+        )
+        from gpu_fault.regional import (
+            RegionalClusterRegistration,
+            RegionalRegistryHead,
+            RegionalRegistryMember,
+            RegionalRegistryRevision,
+            RemoteActionCommand,
         )
         from gpu_fault.telemetry import (
             CollectorMetricsSnapshotRecord,
@@ -109,31 +140,6 @@ class SqliteStore(
         )
         from gpu_fault.training_health import (
             TrainingProgressState,
-        )
-        from gpu_fault.managed_recovery import (
-            HyperPodNodeIdentity,
-        )
-        from gpu_fault.hyperpod import (
-            HyperPodSubmissionRecord,
-        )
-        from gpu_fault.regional import (
-            RegionalClusterRegistration,
-            RegionalRegistryHead,
-            RegionalRegistryMember,
-            RegionalRegistryRevision,
-            RemoteActionCommand,
-        )
-        from gpu_fault.installation_resources import InstallationResource
-        from gpu_fault.processor import (
-            PeriodicTaskLease,
-            ProcessorLaneLease,
-            ProcessorLeadership,
-            ProcessorRequest,
-        )
-        from gpu_fault.policy import (
-            FaultPolicyDecision,
-            XidCorrelationRecord,
-            XidEvent,
         )
 
         self._models = {

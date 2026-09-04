@@ -14,8 +14,11 @@ import pytest
 
 from gpu_fault.models import (
     AdvisoryNotification,
+    Environment,
     NotificationResult,
     NotificationStatus,
+    TerminalEvent,
+    TerminalStatus,
 )
 from gpu_fault.policy import GpuFaultPolicyEngine, SxidClassification, SxidEvent
 from gpu_fault.schema_migrations import POSTGRES_SCHEMA_MIGRATIONS
@@ -43,7 +46,13 @@ from gpu_fault.store.postgres.processor_storage import PostgresProcessorStorageM
 from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflowMixin
 from gpu_fault.store.sqlite.processor_leases import SqliteProcessorLeaseMixin
 from gpu_fault.store.sqlite.processor_queue import SqliteProcessorQueueMixin
-from tests._builders import build_store, processor_request
+from gpu_fault.watcher import WorkloadPhase
+from tests._builders import (
+    attempt_observation,
+    build_store,
+    container_observation,
+    processor_request,
+)
 
 SQLITE_INHERITED_PUBLIC = frozenset(
     {
@@ -121,6 +130,8 @@ POSTGRES_INHERITED_PUBLIC = frozenset(
         "observe_telemetry_metric",
         "record_xid74_occurrences",
         "release_job_restart",
+        "reconcile_restored_workflow",
+        "reconcile_retired_generation_workflow",
         "release_notification_delivery",
         "remote_command_cluster_health",
         "renew_remote_command_lease",
@@ -238,6 +249,8 @@ TRANSACTIONAL_WORKFLOW_PUBLIC = frozenset(
         "merge_attempt_fault_workflow",
         "merge_replacement_workflow",
         "merge_sxid_workflow",
+        "reconcile_restored_workflow",
+        "reconcile_retired_generation_workflow",
         "save_incident_and_workflow",
     }
 )
@@ -261,6 +274,7 @@ MEMORY_FLEET_PUBLIC = frozenset(
         "list_regional_registry_members",
         "publish_regional_registry_revision",
         "replace_agent_if_matches",
+        "replace_fleet_deployment_if_matches",
         "save_agent",
         "save_barrier",
         "save_fleet_deployment",
@@ -627,3 +641,169 @@ def test_policy_decision_upsert_contract(processor_store) -> None:
     )
     processor_store.save_xid_policy_decision(updated)
     assert processor_store.get_xid_policy_decision(event_id) == updated
+
+
+def _postgres_store() -> PostgresStore:
+    postgres_url = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
+    if not postgres_url:
+        pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    return LegacyPostgresStore(postgres_url)
+
+
+class LegacyPostgresStore(PostgresStore):
+    def seed_terminal_event(self, event: TerminalEvent) -> None:
+        storage_key = self._state_key((event.cluster_id, event.attempt_id))
+        with self._state_transaction(f"test-terminal/{storage_key}"):
+            self._put("event", event.event_key, event)
+            self._link("attempt_event", storage_key, event.event_key)
+
+
+def test_postgres_terminal_event_rejects_late_active_observation() -> None:
+    first = _postgres_store()
+    second = _postgres_store()
+    cluster_id = f"cluster-{uuid4()}"
+    attempt_id = f"attempt-{uuid4()}"
+    observed_at = datetime.now(timezone.utc)
+    active = attempt_observation(
+        f"job-{uuid4()}",
+        attempt_id,
+        observed_at,
+        cluster_id=cluster_id,
+        runtime_profile_version="profile-a",
+        containers=[
+            container_observation(
+                f"pod-{uuid4()}", "worker-0", 0, f"node-{uuid4()}", gpu_uuids=["GPU-a"]
+            )
+        ],
+    )
+    terminal = TerminalEvent(
+        cluster_id=cluster_id,
+        environment=Environment.HYPERPOD_EKS,
+        job_id=active.job_id,
+        attempt_id=attempt_id,
+        terminal_status=TerminalStatus.TIMED_OUT,
+        ended_at=observed_at + timedelta(seconds=30),
+        runtime_profile_version="profile-a",
+    )
+
+    try:
+        assert first.save_attempt_observation(active), (
+            "PostgreSQL did not store the active observation"
+        )
+        assert first.save_event_if_absent(terminal), (
+            "PostgreSQL did not insert the terminal event"
+        )
+        late = active.model_copy(
+            update={"observed_at": observed_at + timedelta(minutes=1)}
+        )
+
+        assert second.save_attempt_observation(late) is False
+        assert second.save_attempt_observations_batch([late]) == [False]
+        state = second.list_attempt_observation_states(cluster_id)[0]
+        assert state.observation.workload_phase is WorkloadPhase.FAILED
+    finally:
+        first.close()
+        second.close()
+
+
+def test_postgres_batch_terminalizes_historical_active_observation() -> None:
+    first = _postgres_store()
+    second = _postgres_store()
+    cluster_id = f"cluster-{uuid4()}"
+    attempt_id = f"attempt-{uuid4()}"
+    observed_at = datetime.now(timezone.utc)
+    active = attempt_observation(
+        f"job-{uuid4()}",
+        attempt_id,
+        observed_at,
+        cluster_id=cluster_id,
+        runtime_profile_version="profile-a",
+        containers=[
+            container_observation(
+                f"pod-{uuid4()}", "worker-0", 0, f"node-{uuid4()}", gpu_uuids=["GPU-a"]
+            )
+        ],
+    )
+    terminal = TerminalEvent(
+        cluster_id=cluster_id,
+        environment=Environment.HYPERPOD_EKS,
+        job_id=active.job_id,
+        attempt_id=attempt_id,
+        terminal_status=TerminalStatus.TIMED_OUT,
+        ended_at=observed_at + timedelta(seconds=30),
+        runtime_profile_version="profile-a",
+    )
+
+    try:
+        assert first.save_attempt_observation(active), (
+            "PostgreSQL did not store the historical active observation"
+        )
+        first.seed_terminal_event(terminal)
+        late = active.model_copy(
+            update={"observed_at": observed_at + timedelta(minutes=1)}
+        )
+
+        assert second.save_attempt_observations_batch([late]) == [False]
+        state = second.list_attempt_observation_states(cluster_id)[0]
+        assert state.observation.workload_phase is WorkloadPhase.FAILED
+    finally:
+        first.close()
+        second.close()
+
+
+def test_postgres_cleanup_terminal_reconcile_is_not_starved_by_old_events() -> None:
+    store = _postgres_store()
+    suffix = uuid4().hex
+    cluster_id = f"cluster-{suffix}"
+    observed_at = datetime.now(timezone.utc)
+    old = attempt_observation(
+        f"job-old-{suffix}",
+        f"attempt-old-{suffix}",
+        observed_at - timedelta(minutes=3),
+        cluster_id=cluster_id,
+        runtime_profile_version="profile-a",
+    )
+    current = attempt_observation(
+        f"job-current-{suffix}",
+        f"attempt-current-{suffix}",
+        observed_at,
+        cluster_id=cluster_id,
+        runtime_profile_version="profile-a",
+    )
+    old_terminal = TerminalEvent(
+        cluster_id=cluster_id,
+        environment=Environment.HYPERPOD_EKS,
+        job_id=old.job_id,
+        attempt_id=old.attempt_id,
+        terminal_status=TerminalStatus.SUCCEEDED,
+        ended_at=observed_at - timedelta(minutes=2),
+        runtime_profile_version="profile-a",
+    )
+    current_terminal = TerminalEvent(
+        cluster_id=cluster_id,
+        environment=Environment.HYPERPOD_EKS,
+        job_id=current.job_id,
+        attempt_id=current.attempt_id,
+        terminal_status=TerminalStatus.TIMED_OUT,
+        ended_at=observed_at + timedelta(seconds=30),
+        runtime_profile_version="profile-a",
+    )
+
+    try:
+        store.save_attempt_observation(old)
+        store.save_event_if_absent(old_terminal)
+        store.save_attempt_observation(current)
+        store.seed_terminal_event(current_terminal)
+
+        result = store.cleanup_hot_state(
+            now=observed_at + timedelta(minutes=1), limit=1
+        )
+
+        assert result["attempt_observation_terminalized"] == 1
+        states = {
+            item.observation.attempt_id: item.observation.workload_phase
+            for item in store.list_attempt_observation_states(cluster_id)
+        }
+        assert states[current.attempt_id] is WorkloadPhase.FAILED
+    finally:
+        store.close()

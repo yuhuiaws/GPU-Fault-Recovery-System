@@ -8,7 +8,7 @@ import os
 import re
 import shutil
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,108 +17,28 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import regional_deployment_inventory as inventory
+import regional_monitoring_safety as monitoring_safety
 from regional_release_config import ReleaseError
+from regional_release_probes import probe_source
 from regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
     EXECUTOR_PYTHON,
     EXECUTOR_READINESS,
     validate_runtime_component_identity,
 )
+from regional_release_state import cached_read
+from regional_release_workflow_safety import workflow_safety_snapshot
 from regional_runtime_profile import verify_runtime_profile
-
+from regional_validation_evidence import (
+    QUICK_VALIDATION_EVIDENCE_ENV,
+    read_only_verifier_details,
+)
+from regional_validation_evidence import (
+    quick_validation_evidence as _quick_validation_evidence,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
-REQUIRED_TOOLS = (
-    "aws",
-    "kubectl",
-    "helm",
-    "jq",
-    "openssl",
-    "sha256sum",
-    "python3",
-)
-CONTROL_API_SCRIPT = r"""
-import json
-import os
-import urllib.request
-
-from gpu_fault.app import ApplicationContext
-
-
-def get(path):
-    request = urllib.request.Request(
-        "http://127.0.0.1:8080" + path,
-        headers={
-            "X-GPU-Fault-Execution-Token":
-                os.environ["GPU_FAULT_EXECUTION_TOKEN"],
-        },
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.load(response)
-
-
-def post(path, body):
-    request = urllib.request.Request(
-        "http://127.0.0.1:8080" + path,
-        data=json.dumps(body).encode(),
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "X-GPU-Fault-Execution-Token":
-                os.environ["GPU_FAULT_EXECUTION_TOKEN"],
-        },
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.load(response)
-
-
-clusters = json.loads(os.environ["ADMIN_CLUSTER_IDS_JSON"])
-expected_nodes = json.loads(os.environ["ADMIN_EXPECTED_NODES_JSON"])
-result = {
-    "healthz": get("/healthz"),
-    "version": get("/v1/version"),
-    "registry": get("/v1/regional/clusters"),
-    "clusters": {},
-    "remote_commands": (
-        ApplicationContext.from_environment().store.remote_command_stats()
-    ),
-}
-for cluster_id in clusters:
-    agents = get("/v1/fleet/agents?cluster_id=" + cluster_id)
-    node_ids = sorted(expected_nodes[cluster_id])
-    result["clusters"][cluster_id] = {
-        "expected_node_ids": node_ids,
-        "agents": agents,
-        "fleet_readiness": (
-            post(
-                "/v1/fleet/readiness",
-                {"cluster_id": cluster_id, "node_ids": node_ids},
-            )
-            if node_ids
-            else None
-        ),
-        "collector_readiness": get(
-            "/v1/collector-readiness/" + cluster_id
-        ),
-    }
-print(json.dumps(result, separators=(",", ":")))
-"""
-EXECUTOR_TLS_SCRIPT = r"""
-import json
-import os
-import ssl
-import urllib.request
-
-context = ssl.create_default_context(
-    cafile=os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
-)
-with urllib.request.urlopen(
-    os.environ["GPU_FAULT_CONTROL_PLANE_URL"].rstrip("/") + "/healthz",
-    context=context,
-    timeout=15,
-) as response:
-    print(json.dumps(json.load(response), separators=(",", ":")))
-"""
+REQUIRED_TOOLS = ("aws", "kubectl", "helm", "jq", "openssl", "sha256sum", "python3")
 
 
 class CheckSkipped(RuntimeError):
@@ -474,20 +394,40 @@ def _check_load_balancer_controller(release: Any) -> CheckValue:
     return CheckValue("AWS Load Balancer Controller is Ready", matches)
 
 
+# The only AWS operations this module is allowed to serve from the snapshot.
+# Anything outside this tuple is executed every time it is asked for: caching a
+# call that changes AWS state would silently drop the second one, and caching a
+# read that a caller is polling would make it wait for a value that can never
+# arrive.
+AWS_READ_ONLY_VERBS = ("describe-", "get-", "list-")
+
+
+def _aws_read_only(arguments: list[str]) -> bool:
+    return len(arguments) >= 2 and arguments[1].startswith(AWS_READ_ONLY_VERBS)
+
+
 def _aws_json(release: Any, arguments: list[str]) -> dict[str, Any]:
-    return json.loads(
-        release.runner.run(
-            [
-                "aws",
-                *arguments,
-                "--region",
-                release.config.aws_region,
-                "--output",
-                "json",
-            ],
-            capture=True,
-        )
-    )
+    command = [
+        "aws",
+        *arguments,
+        "--region",
+        release.config.aws_region,
+        "--output",
+        "json",
+    ]
+
+    def fetch() -> dict[str, Any]:
+        return json.loads(release.runner.run(command, capture=True))
+
+    # Several checks ask AWS the same question inside one report: `_check_aurora`
+    # and the preflight NLB check both describe the ACM certificate, and the
+    # per-subnet IGW route test falls back to the same VPC main route table once
+    # per subnet. Because they run on a thread pool, those arrive concurrently,
+    # so the cache has to hold a promise rather than a value to collapse them.
+    cache = getattr(release, "_aws_read_cache", None)
+    if cache is None or not _aws_read_only(arguments):
+        return fetch()
+    return cached_read(cache, release._json_read_cache_lock, tuple(command), fetch)
 
 
 def _certificate_details(release: Any) -> dict[str, Any]:
@@ -775,19 +715,15 @@ def _check_monitoring(release: Any) -> CheckValue:
     ]
     if health.require_confirmed_sns_subscription and not confirmed:
         raise ReleaseError("SNS topic has no confirmed subscription")
-    rules_data = (rules_document.get("ruleGroupsNamespace") or {}).get("data")
-    manager_data = (manager_document.get("alertManagerDefinition") or {}).get("data")
-    if not rules_data or not manager_data:
-        raise ReleaseError("AMP live rules or Alertmanager definition has no data")
-    try:
-        rules_text = base64.b64decode(rules_data).decode()
-        manager_text = base64.b64decode(manager_data).decode()
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise ReleaseError("AMP live configuration is not valid base64") from exc
-    if health.sns_topic_arn not in manager_text:
-        raise ReleaseError(
-            "AMP Alertmanager does not reference the configured SNS topic"
-        )
+    email_summary = monitoring_safety.email_subscription_summary(
+        subscriptions,
+        release.config.notifications.admin_email,
+    )
+    rules_text, manager_text = monitoring_safety.decode_monitoring_configuration(
+        rules_document,
+        manager_document,
+        health.sns_topic_arn,
+    )
     with tempfile.TemporaryDirectory(prefix="gpu-fault-alert-verify-") as directory:
         root = Path(directory)
         rules = root / "rules.yaml"
@@ -813,6 +749,7 @@ def _check_monitoring(release: Any) -> CheckValue:
             "rule_namespace": health.amp_rule_namespace,
             "sns_topic_arn": health.sns_topic_arn,
             "confirmed_subscriptions": len(confirmed),
+            "email_subscription": email_summary,
             "verifier": verifier,
         },
     )
@@ -949,6 +886,13 @@ def build_preflight_report(release: Any) -> dict[str, Any]:
         ("aurora_credential_refresh", lambda: check_aurora_refresh(release)),
         ("email_notifications", lambda: check_email_notifications(release)),
         ("monitoring", lambda: _check_monitoring(release)),
+        (
+            "workflow_safety",
+            lambda: CheckValue(
+                "no active destructive workflow blocks release",
+                workflow_safety_snapshot(release),
+            ),
+        ),
     ]
     with _read_snapshot(release):
         with ThreadPoolExecutor(max_workers=min(8, len(specifications))) as executor:
@@ -1033,39 +977,17 @@ def _check_cpu_workloads(release: Any) -> CheckValue:
     return CheckValue("CPU control-plane workloads are at desired readiness", details)
 
 
-def _run_read_only_verifiers(release: Any) -> CheckValue:
-    control_output = release.runner.run(
-        [
-            "python3",
-            str(ROOT / "deploy/control-plane/tools/verify_control_plane_role_split.py"),
-        ],
-        env={
-            **os.environ,
-            "KUBECONFIG": release.config.cpu_kubeconfig,
-            "GPU_FAULT_NAMESPACE": release.config.namespace,
-            "GPU_FAULT_RUNTIME_IMAGE": release.runtime_image,
-        },
-        capture=True,
-    )
-    gpu_outputs = {}
-    for target in release.config.clusters:
-        gpu_outputs[target.cluster_id] = release.runner.run(
-            [
-                "python3",
-                str(ROOT / "deploy/dataplane/tools/verify_dataplane_executor.py"),
-            ],
-            env={
-                **os.environ,
-                "GPU_FAULT_NAMESPACE": release.config.namespace,
-                "GPU_FAULT_KUBE_CONTEXT": target.context,
-                "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": (release.config.cpu_kubeconfig),
-                "GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP": release.executor_wheel_cm,
-            },
-            capture=True,
-        )
+def run_read_only_verifiers(
+    release: Any,
+    *,
+    reused_checks: set[str] | None = None,
+) -> CheckValue:
     return CheckValue(
         "CPU role split and every GPU executor pass read-only verifiers",
-        {"cpu": control_output, "clusters": gpu_outputs},
+        read_only_verifier_details(
+            release,
+            reused_checks=reused_checks,
+        ),
     )
 
 
@@ -1122,7 +1044,7 @@ def _control_api_report(release: Any) -> dict[str, Any]:
                 + json.dumps(expected_nodes, separators=(",", ":")),
                 CONTROL_PLANE_PYTHON,
                 "-c",
-                CONTROL_API_SCRIPT,
+                probe_source("control_api_inspect"),
             ),
             capture=True,
             sensitive=True,
@@ -1194,7 +1116,11 @@ def _check_control_api(release: Any) -> CheckValue:
         raise ReleaseError(
             "regional executor compatibility digest window is still open"
         )
-    registered = {item.get("cluster_id") for item in report.get("registry", [])}
+    registered = {
+        item.get("cluster_id")
+        for item in report.get("registry", [])
+        if item.get("lifecycle_state", "ACTIVE") in {"ACTIVE", "PENDING"}
+    }
     configured = {item.cluster_id for item in release.config.clusters}
     if registered != configured:
         raise ReleaseError(
@@ -1234,6 +1160,29 @@ def _check_control_api(release: Any) -> CheckValue:
     current_internal_errors = int(remote.get("executor_internal_error_total", 0) or 0)
     state = release._load_state()
     previous = state.get("previous")
+    timestamp_field = "executor_internal_error_last_seen_timestamp_seconds"
+    raw_baseline_timestamp = (
+        previous.get(timestamp_field) if isinstance(previous, dict) else None
+    )
+    current_raw_timestamp = remote.get(timestamp_field)
+    if raw_baseline_timestamp is not None and current_raw_timestamp is not None:
+        try:
+            baseline_timestamp = float(raw_baseline_timestamp)
+            current_timestamp = float(current_raw_timestamp)
+        except (TypeError, ValueError) as exc:
+            raise ReleaseError(
+                "executor internal remote-command error timestamp is invalid"
+            ) from exc
+        if min(baseline_timestamp, current_timestamp) < 0:
+            raise ReleaseError(
+                "executor internal remote-command error timestamp is invalid"
+            )
+        if current_timestamp > baseline_timestamp:
+            raise ReleaseError(
+                "executor internal remote-command error observed during release: "
+                f"{baseline_timestamp:.6f}->{current_timestamp:.6f}"
+            )
+        return CheckValue("control-plane API, fleet and collectors are healthy", report)
     raw_baseline = (
         previous.get("executor_internal_error_total", 0)
         if isinstance(previous, dict)
@@ -1316,7 +1265,7 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
                 "--",
                 EXECUTOR_PYTHON,
                 "-c",
-                EXECUTOR_TLS_SCRIPT,
+                probe_source("executor_tls_healthz"),
             ),
             capture=True,
         )
@@ -1336,17 +1285,59 @@ def _check_runtime_component_identity(release: Any) -> CheckValue:
     )
 
 
+def _parallel(fetches: list[Callable[[], Any]]) -> list[Any]:
+    """Issue reads that do not depend on each other at once.
+
+    Used inside a single check, where the enclosing thread pool cannot help: one
+    check is one task, so a check made of five dependent AWS round trips takes
+    five round trips no matter how wide the report is.
+
+    Results and failures are resolved in submission order, so a check whose first
+    read is the one that fails reports the same reason it did when it was a
+    sequence of statements.
+    """
+
+    with ThreadPoolExecutor(max_workers=len(fetches)) as executor:
+        futures = [executor.submit(fetch) for fetch in fetches]
+    return [future.result() for future in futures]
+
+
+def _started(fetch: Callable[[], Any]) -> Future[Any]:
+    """Start a read now and resolve it where its value is first needed.
+
+    `_parallel` reports the failure of its first fetch, which is right for reads
+    the sequential code issued next to each other. A read the sequential code
+    issued *last* is different: overlapping it must not let its failure overtake
+    the earlier ones, or a check would start reporting the certificate when the
+    load balancer it belongs to does not exist. Starting it here and calling
+    `result()` at the original statement keeps the reason exactly where it was.
+
+    The executor is released immediately: `shutdown(wait=False)` stops it taking
+    more work without cancelling what is already running, and if an earlier check
+    raises first, the abandoned read is simply never asked for its answer.
+    """
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        return executor.submit(fetch)
+    finally:
+        executor.shutdown(wait=False)
+
+
 def _check_nlb_runtime(release: Any) -> CheckValue:
     if not release.config.nlb:
         raise CheckSkipped("NLB health configuration is missing")
     name = release.config.nlb.get("name") or (
         f"gpu-fault-regional-{release.config.aws_region}"
     )
+    # The certificate is named by configuration, not by anything the load
+    # balancer answers, so the read starts here and is collected at the bottom.
+    # The other check that wants it joins the same snapshot read.
+    certificate = _started(lambda: _certificate_details(release))
     load_balancers = (
-        _aws_json(
-            release,
-            ["elbv2", "describe-load-balancers", "--names", name],
-        ).get("LoadBalancers")
+        _aws_json(release, ["elbv2", "describe-load-balancers", "--names", name]).get(
+            "LoadBalancers"
+        )
         or []
     )
     if len(load_balancers) != 1:
@@ -1355,13 +1346,19 @@ def _check_nlb_runtime(release: Any) -> CheckValue:
     if (nlb.get("State") or {}).get("Code") != "active":
         raise ReleaseError(f"NLB {name} is not active")
     arn = nlb["LoadBalancerArn"]
-    listeners = (
-        _aws_json(
-            release,
-            ["elbv2", "describe-listeners", "--load-balancer-arn", arn],
-        ).get("Listeners")
-        or []
+    # Listeners and target groups are both keyed by the load balancer ARN and
+    # neither depends on the other; only the target health below has to wait.
+    listener_document, target_group_document = _parallel(
+        [
+            lambda: _aws_json(
+                release, ["elbv2", "describe-listeners", "--load-balancer-arn", arn]
+            ),
+            lambda: _aws_json(
+                release, ["elbv2", "describe-target-groups", "--load-balancer-arn", arn]
+            ),
+        ]
     )
+    listeners = listener_document.get("Listeners") or []
     tls = [
         item
         for item in listeners
@@ -1374,13 +1371,7 @@ def _check_nlb_runtime(release: Any) -> CheckValue:
     }
     if release.config.nlb["certificate_arn"] not in certificate_arns:
         raise ReleaseError("NLB TLS listener does not use the configured certificate")
-    target_groups = (
-        _aws_json(
-            release,
-            ["elbv2", "describe-target-groups", "--load-balancer-arn", arn],
-        ).get("TargetGroups")
-        or []
-    )
+    target_groups = target_group_document.get("TargetGroups") or []
     if not target_groups:
         raise ReleaseError("NLB has no target group")
     target_health = (
@@ -1408,12 +1399,30 @@ def _check_nlb_runtime(release: Any) -> CheckValue:
             "name": name,
             "dns": nlb.get("DNSName"),
             "healthy_targets": len(healthy),
-            "certificate": _certificate_details(release),
+            "certificate": certificate.result(),
         },
     )
 
 
 def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
+    quick_evidence, evidence_fallback = _quick_validation_evidence(release)
+    reusable_checks = (
+        set(quick_evidence.get("checks") or []) if quick_evidence is not None else set()
+    )
+
+    def runtime_component_identity() -> CheckValue:
+        if "runtime_component_identity" in reusable_checks:
+            assert quick_evidence is not None
+            return CheckValue(
+                "runtime component identity reused from the current release quick gate",
+                {
+                    "evidence": os.getenv(QUICK_VALIDATION_EVIDENCE_ENV),
+                    "verified_at_epoch": quick_evidence["verified_at_epoch"],
+                    "release_state_sha256": quick_evidence["release_state_sha256"],
+                },
+            )
+        return _check_runtime_component_identity(release)
+
     specifications = [
         ("regional_contexts", lambda: _check_contexts(release)),
         ("cpu_secrets", lambda: check_cpu_secrets(release)),
@@ -1424,10 +1433,16 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
             lambda: check_aurora_refresh(release, require_success=True),
         ),
         ("runtime_profile", lambda: _verify_profile(release)),
-        ("read_only_verifiers", lambda: _run_read_only_verifiers(release)),
+        (
+            "read_only_verifiers",
+            lambda: run_read_only_verifiers(
+                release,
+                reused_checks=reusable_checks,
+            ),
+        ),
         (
             "runtime_component_identity",
-            lambda: _check_runtime_component_identity(release),
+            runtime_component_identity,
         ),
         ("control_api", lambda: _check_control_api(release)),
     ]
@@ -1453,7 +1468,11 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
                 for name, function in specifications
             ]
             checks = [future.result() for future in futures]
-    return _report(mode, release, checks)
+    report = _report(mode, release, checks)
+    report["reused_validation_checks"] = sorted(reusable_checks)
+    if evidence_fallback is not None:
+        report["validation_evidence_fallback"] = evidence_fallback
+    return report
 
 
 def _verify_profile(release: Any) -> CheckValue:

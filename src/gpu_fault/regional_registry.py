@@ -11,7 +11,6 @@ from gpu_fault.regional import (
 )
 from gpu_fault.store import NotFoundError
 
-
 LOGGER = logging.getLogger(__name__)
 
 
@@ -41,6 +40,12 @@ def sync_regional_cluster_registry(
         token = item.pop("token", None)
         if token:
             item["token_sha256"] = cluster_token_sha256(str(token))
+        # `retiring_token` lets the config carry both credentials in plaintext
+        # during a rotation, so an operator never has to compute a digest by
+        # hand to keep executors that have not been rolled yet authenticating.
+        retiring_token = item.pop("retiring_token", None)
+        if retiring_token:
+            item["retiring_token_sha256"] = cluster_token_sha256(str(retiring_token))
         registration = RegionalClusterRegistration(**item)
         if registration.synthetic and not registration.is_active(observed):
             LOGGER.warning(

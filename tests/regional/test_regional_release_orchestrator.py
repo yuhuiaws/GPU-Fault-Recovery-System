@@ -1,65 +1,275 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
-import os
-import subprocess
-import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from gpu_fault.capabilities import compile_runtime_profile
-from gpu_fault.models import RuntimeProfile
-from gpu_fault.training_submit_cli import render_workload
 from tests._script_loader import lazy_script_module
 from tests.regional._release_orchestrator_support import (
-    RuntimeProfileRunner,
+    DNS_MODULE,
+    REGION,
+    ROOT,
     config_file,
-    manifest_config_file,
 )
+from tests.regional._release_orchestrator_support import RELEASE_MODULE as MODULE
 
-ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-MODULE = lazy_script_module("rollout_regional_release", MODULE_PATH)
-RUNTIME_PROFILE_MODULE = lazy_script_module(
-    "regional_runtime_profile",
-    ROOT / "deploy/control-plane/regional/regional_runtime_profile.py",
-)
-RENDERING_MODULE = lazy_script_module(
-    "regional_release_rendering",
-    ROOT / "deploy/control-plane/regional/regional_release_rendering.py",
-)
-ADMIN_COMMANDS_MODULE = lazy_script_module(
-    "regional_admin_commands",
-    ROOT / "deploy/control-plane/regional/regional_admin_commands.py",
-)
-DNS_MODULE = lazy_script_module(
-    "regional_dns", ROOT / "deploy/control-plane/regional/regional_dns.py"
-)
 DIFF_MODULE = lazy_script_module(
-    "regional_release_diff",
-    ROOT / "deploy/control-plane/regional/regional_release_diff.py",
+    ROOT / "deploy/control-plane/regional/regional_release_diff.py"
 )
 ORCHESTRATION_MODULE = lazy_script_module(
-    "regional_release_orchestration_tests",
-    ROOT / "deploy/control-plane/regional/regional_release_orchestration.py",
+    ROOT / "deploy/control-plane/regional/regional_release_orchestration.py"
 )
-REGION = "us-east-1"
-CPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-fault-control-plane"
-GPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
+FLEET_MODULE = lazy_script_module(
+    ROOT / "deploy/control-plane/regional/regional_release_fleet_rollout.py"
+)
 
 
-def test_upgrade_ensures_schema_before_rolling_cpu() -> None:
-    source = inspect.getsource(ORCHESTRATION_MODULE.run_upgrade_phases)
-
-    assert source.index("self._upload_release(diff)") < source.index(
-        "self._ensure_schema()"
+def test_gpu_upgrade_is_serial_and_persists_per_cluster_attempts() -> None:
+    targets = tuple(
+        SimpleNamespace(cluster_id=cluster_id)
+        for cluster_id in ("gpu-a", "gpu-b", "gpu-c")
     )
-    assert source.index("self._ensure_schema()") < source.index("self._apply_cpu(")
+    calls = []
+    release = SimpleNamespace(
+        config=SimpleNamespace(clusters=targets, upgrade_max_parallel_clusters=1),
+        state={
+            "cluster_attempts": {
+                target.cluster_id: {"state": "PENDING", "attempt_generation": 1}
+                for target in targets
+            }
+        },
+    )
+
+    def save_state(phase, **updates):
+        release.state.update({"phase": phase, **updates})
+
+    def upgrade(target, _diff, _plan, *, progress, candidate_preflighted):
+        assert candidate_preflighted is True
+        calls.append(target.cluster_id)
+        progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "STARTED", None)
+        if target.cluster_id == "gpu-b":
+            raise ORCHESTRATION_MODULE.ClusterLocalReleaseError("capacity")
+        progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "COMPLETED", None)
+
+    setattr(release, "_save_state", save_state)
+    setattr(release, "_upgrade_gpu_target", upgrade)
+    diff = ORCHESTRATION_MODULE.ReleaseDiff(
+        kind=ORCHESTRATION_MODULE.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+        changed=frozenset({"executor_wheel"}),
+    )
+    plan = ORCHESTRATION_MODULE.ReleaseExecutionPlan(
+        nodes=(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR,)
+    )
+    completed = set()
+
+    with pytest.raises(
+        ORCHESTRATION_MODULE.PartialClusterRolloutError, match="gpu-b rollout failed"
+    ):
+        ORCHESTRATION_MODULE.upgrade_gpu_clusters(
+            release,
+            diff=diff,
+            plan=plan,
+            previous={},
+            completed_phases=set(),
+            completed_clusters=completed,
+            registry_staged=False,
+        )
+
+    assert calls == ["gpu-a", "gpu-b"]
+    assert completed == {"gpu-a"}
+    assert release.state["release_lifecycle"] == "PAUSED"
+    assert release.state["cluster_attempts"]["gpu-a"]["state"] == "CONVERGED"
+    assert release.state["cluster_attempts"]["gpu-b"]["state"] == "FAILED"
+    assert release.state["cluster_attempts"]["gpu-c"]["state"] == "PENDING"
+
+
+def test_gpu_upgrade_honors_bounded_cluster_parallelism() -> None:
+    targets = tuple(
+        SimpleNamespace(cluster_id=cluster_id)
+        for cluster_id in ("gpu-a", "gpu-b", "gpu-c", "gpu-d")
+    )
+    barrier = threading.Barrier(2, timeout=30)
+    concurrent = []
+    active = []
+    active_lock = threading.Lock()
+    release = SimpleNamespace(
+        config=SimpleNamespace(clusters=targets, upgrade_max_parallel_clusters=2),
+        state={},
+    )
+
+    def save_state(phase, **updates):
+        release.state.update({"phase": phase, **updates})
+
+    def upgrade(target, _diff, _plan, *, progress, candidate_preflighted):
+        with active_lock:
+            active.append(target.cluster_id)
+            concurrent.append(len(active))
+        # Two clusters must genuinely overlap, so each one waits for a partner;
+        # a serial implementation would time out here instead of pairing up.
+        barrier.wait()
+        progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "STARTED", None)
+        progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "COMPLETED", None)
+        with active_lock:
+            active.remove(target.cluster_id)
+
+    setattr(release, "_save_state", save_state)
+    setattr(release, "_upgrade_gpu_target", upgrade)
+    diff = ORCHESTRATION_MODULE.ReleaseDiff(
+        kind=ORCHESTRATION_MODULE.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+        changed=frozenset({"executor_wheel"}),
+    )
+    plan = ORCHESTRATION_MODULE.ReleaseExecutionPlan(
+        nodes=(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR,)
+    )
+    completed = set()
+
+    ORCHESTRATION_MODULE.upgrade_gpu_clusters(
+        release,
+        diff=diff,
+        plan=plan,
+        previous={},
+        completed_phases=set(),
+        completed_clusters=completed,
+        registry_staged=False,
+    )
+
+    assert completed == {"gpu-a", "gpu-b", "gpu-c", "gpu-d"}
+    assert max(concurrent) == 2
+    assert sorted(release.state["completed_cluster_ids"]) == [
+        "gpu-a",
+        "gpu-b",
+        "gpu-c",
+        "gpu-d",
+    ]
+    attempts = release.state["cluster_attempts"]
+    assert {cluster_id: entry["state"] for cluster_id, entry in attempts.items()} == {
+        target.cluster_id: "CONVERGED" for target in targets
+    }
+    progress = release.state["component_progress"]["clusters"]
+    assert sorted(progress) == ["gpu-a", "gpu-b", "gpu-c", "gpu-d"]
+    assert {entry["executor"]["status"] for entry in progress.values()} == {"COMPLETED"}
+
+
+def test_parallel_gpu_upgrade_failure_stops_unstarted_clusters() -> None:
+    targets = tuple(
+        SimpleNamespace(cluster_id=cluster_id)
+        for cluster_id in ("gpu-a", "gpu-b", "gpu-c", "gpu-d")
+    )
+    started = []
+    started_lock = threading.Lock()
+    release = SimpleNamespace(
+        config=SimpleNamespace(clusters=targets, upgrade_max_parallel_clusters=2),
+        state={},
+    )
+
+    def save_state(phase, **updates):
+        release.state.update({"phase": phase, **updates})
+
+    def upgrade(target, _diff, _plan, *, progress, candidate_preflighted):
+        with started_lock:
+            started.append(target.cluster_id)
+        progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "STARTED", None)
+        raise ORCHESTRATION_MODULE.ClusterLocalReleaseError(f"{target.cluster_id} sick")
+
+    setattr(release, "_save_state", save_state)
+    setattr(release, "_upgrade_gpu_target", upgrade)
+    diff = ORCHESTRATION_MODULE.ReleaseDiff(
+        kind=ORCHESTRATION_MODULE.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+        changed=frozenset({"executor_wheel"}),
+    )
+    plan = ORCHESTRATION_MODULE.ReleaseExecutionPlan(
+        nodes=(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR,)
+    )
+
+    with pytest.raises(ORCHESTRATION_MODULE.PartialClusterRolloutError) as failure:
+        ORCHESTRATION_MODULE.upgrade_gpu_clusters(
+            release,
+            diff=diff,
+            plan=plan,
+            previous={},
+            completed_phases=set(),
+            completed_clusters=set(),
+            registry_staged=False,
+        )
+
+    # The first failure closes the gate, so at most the clusters already in
+    # flight are touched and every cluster that never started is reported.
+    assert len(started) <= 2
+    failed_cluster_ids = release.state["failed_cluster_ids"]
+    not_started_cluster_ids = release.state["not_started_cluster_ids"]
+    assert sorted(failed_cluster_ids) == sorted(started)
+    assert set(failed_cluster_ids).isdisjoint(not_started_cluster_ids), (
+        "a cluster was reported as both failed and never started"
+    )
+    assert set(failed_cluster_ids) | set(not_started_cluster_ids) == {
+        target.cluster_id for target in targets
+    }
+    assert release.state["failure_scope"] == "cluster-local"
+    assert release.state["release_lifecycle"] == "PAUSED"
+    assert release.state["phase"] == "data-plane-paused"
+    attempts = release.state["cluster_attempts"]
+    assert {attempts[cluster_id]["state"] for cluster_id in failed_cluster_ids} == {
+        "FAILED"
+    }
+    assert f"not_started={not_started_cluster_ids}" in str(failure.value)
+    if len(failed_cluster_ids) > 1:
+        assert "also failed: " + ", ".join(failed_cluster_ids[1:]) in str(failure.value)
+
+
+def test_cluster_local_upgrade_failure_pauses_without_auto_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = SimpleNamespace(
+        config=SimpleNamespace(auto_rollback=True, clusters=()),
+        state={},
+        _ensure_contexts=lambda: None,
+        _require_cpu_secrets=lambda: None,
+        _remote_commands_are_idle=lambda: True,
+        rollback=lambda **_kwargs: pytest.fail(
+            "cluster-local failure triggered automatic rollback"
+        ),
+    )
+
+    def save_state(phase, **updates):
+        release.state.update({"phase": phase, **updates})
+
+    setattr(release, "_save_state", save_state)
+    previous = {"metadata": {}}
+    monkeypatch.setattr(
+        ORCHESTRATION_MODULE,
+        "_validate_upgrade_transaction",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        ORCHESTRATION_MODULE,
+        "_upgrade_context",
+        lambda *_args, **_kwargs: (previous, set(), set(), False),
+    )
+    monkeypatch.setattr(
+        ORCHESTRATION_MODULE,
+        "run_upgrade_phases",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ORCHESTRATION_MODULE.PartialClusterRolloutError("gpu-a paused")
+        ),
+    )
+    diff = ORCHESTRATION_MODULE.ReleaseDiff(
+        kind=ORCHESTRATION_MODULE.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+        changed=frozenset({"executor_wheel"}),
+    )
+
+    with pytest.raises(
+        ORCHESTRATION_MODULE.PartialClusterRolloutError, match="gpu-a paused"
+    ):
+        ORCHESTRATION_MODULE.upgrade_release(release, diff=diff)
+
+    assert release.state["phase"] == "partial-convergence"
+    assert release.state["partial_convergence"] is True
+    assert release.state["release_lifecycle"] == "PAUSED"
 
 
 def test_control_plane_only_upgrade_skips_schema_and_gpu(
@@ -71,7 +281,9 @@ def test_control_plane_only_upgrade_skips_schema_and_gpu(
     monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
     monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
     monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
-    monkeypatch.setattr(release, "_capture_previous", lambda: {"metadata": {}})
+    monkeypatch.setattr(
+        release, "_capture_previous", lambda **_kwargs: {"metadata": {}}
+    )
     monkeypatch.setattr(release, "_backup_release_secrets", lambda: {})
     monkeypatch.setattr(
         release, "_save_state", lambda phase, **_updates: calls.append(phase)
@@ -90,6 +302,18 @@ def test_control_plane_only_upgrade_skips_schema_and_gpu(
         release,
         "_apply_cpu",
         lambda *, finalize, **_kwargs: calls.append(("cpu", finalize)),
+    )
+    monkeypatch.setattr(
+        release,
+        "_capture_active_agent_node_sets",
+        lambda: {"gpu-a": {"node_ids": ["node-a"]}},
+    )
+    monkeypatch.setattr(
+        release,
+        "_wait_candidate_cpu_agent_heartbeats",
+        lambda identities, **kwargs: calls.append(
+            ("agent-heartbeats", identities, bool(kwargs.get("required_identity")))
+        ),
     )
     monkeypatch.setattr(release, "_stage_registry", lambda: False)
     monkeypatch.setattr(
@@ -113,6 +337,78 @@ def test_control_plane_only_upgrade_skips_schema_and_gpu(
     assert "verify" in calls
 
 
+def test_finalize_proves_fleet_pin_before_closing_the_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pin barrier has to run before the promotion, not after.
+
+    Promoting the pin closes the compatibility window irreversibly: rollback
+    cannot reopen it and a staged resume no longer matches the live window. When
+    the barrier ran afterwards, a fleet that had not reached the candidate left
+    the transaction wedged between the two. Ordering is the whole fix, so it is
+    asserted on the interleaving rather than on the calls in isolation.
+    """
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
+    calls: list[object] = []
+    monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
+    monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
+    monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
+    monkeypatch.setattr(
+        release, "_capture_previous", lambda **_kwargs: {"metadata": {}}
+    )
+    monkeypatch.setattr(release, "_backup_release_secrets", lambda: {})
+    monkeypatch.setattr(release, "_save_state", lambda _phase, **_updates: None)
+    monkeypatch.setattr(release, "_upload_release", lambda _diff: None)
+    monkeypatch.setattr(release, "_ensure_schema", lambda: None)
+    monkeypatch.setattr(release, "_stage_registry", lambda: False)
+    monkeypatch.setattr(release, "_validate_release_quick", lambda _plan: None)
+    monkeypatch.setattr(
+        release,
+        "_capture_active_agent_node_sets",
+        lambda: {"gpu-a": {"node_ids": ["node-a"]}},
+    )
+    monkeypatch.setattr(
+        release,
+        "_apply_cpu",
+        lambda *, finalize, **_kwargs: calls.append(("cpu", finalize)),
+    )
+    monkeypatch.setattr(
+        release,
+        "_wait_candidate_cpu_agent_heartbeats",
+        lambda _identities, **kwargs: calls.append(
+            ("barrier", kwargs.get("required_identity"))
+        ),
+    )
+    diff = DIFF_MODULE.ReleaseDiff(
+        kind=DIFF_MODULE.ReleaseChangeKind.CONTROL_PLANE_ONLY,
+        changed=frozenset({"control_plane_wheel"}),
+    )
+
+    release.upgrade(diff=diff)
+
+    promotion = calls.index(("cpu", True))
+    pin_barriers = [
+        index
+        for index, call in enumerate(calls)
+        if isinstance(call, tuple) and call[0] == "barrier" and call[1] is not None
+    ]
+    assert pin_barriers, "finalize never proved the fleet reached the candidate pin"
+    assert min(pin_barriers) < promotion, (
+        "the pin barrier ran after the window closed, which is the ordering the "
+        f"fix is about: {calls}"
+    )
+    assert calls[pin_barriers[0]][1] == FLEET_MODULE.candidate_agent_pin_identity(
+        release
+    ), "the barrier that gates the promotion waited on some other identity"
+    # The liveness barrier after the cutover is still wanted; it just is not the
+    # one that guards the irreversible step.
+    assert any(
+        isinstance(call, tuple) and call[0] == "barrier" and call[1] is None
+        for call in calls[promotion:]
+    ), f"finalize no longer checks the fleet survived the cutover: {calls}"
+
+
 def test_new_upgrade_discards_stale_rollback_checkpoints(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -133,7 +429,9 @@ def test_new_upgrade_discards_stale_rollback_checkpoints(
     monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
     monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
     monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
-    monkeypatch.setattr(release, "_capture_previous", lambda: {"metadata": {}})
+    monkeypatch.setattr(
+        release, "_capture_previous", lambda **_kwargs: {"metadata": {}}
+    )
     monkeypatch.setattr(release, "_backup_release_secrets", lambda: {})
     monkeypatch.setattr(
         release,
@@ -143,6 +441,16 @@ def test_new_upgrade_discards_stale_rollback_checkpoints(
     monkeypatch.setattr(release, "_upload_release", lambda _diff: None)
     monkeypatch.setattr(release, "_ensure_schema", lambda: None)
     monkeypatch.setattr(release, "_apply_cpu", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        release,
+        "_capture_active_agent_node_sets",
+        lambda: {"gpu-a": {"node_ids": ["node-a"]}},
+    )
+    monkeypatch.setattr(
+        release,
+        "_wait_candidate_cpu_agent_heartbeats",
+        lambda _identities, **_kwargs: None,
+    )
     monkeypatch.setattr(release, "_stage_registry", lambda: False)
     monkeypatch.setattr(release, "_validate_release_quick", lambda _plan: None)
     diff = DIFF_MODULE.ReleaseDiff(
@@ -189,21 +497,50 @@ def test_endpoint_only_upgrade_skips_executor_and_node_rollout(
     assert calls == ["secret", "endpoint"]
 
 
-def test_bootstrap_gates_executor_on_gpu_dns_and_tls() -> None:
-    source = inspect.getsource(MODULE.RegionalRelease.bootstrap)
+def bootstrap_recorder() -> tuple[SimpleNamespace, list[str]]:
+    """A GPU bootstrap whose only effect is the order of its own steps."""
 
-    assert source.index("self._ensure_connection_secret(target)") < source.index(
-        "self._quiesce_gpu_executor(target)"
+    calls: list[str] = []
+    release = SimpleNamespace(
+        executor_wheel_cm="wheel",
+        bundle_cm="bundle",
+        node_wheel_sha="a" * 64,
+        config=SimpleNamespace(agent_config_digest="c" * 64),
+        _ensure_gpu_namespace=lambda _target: calls.append("namespace"),
+        _ensure_connection_secret=lambda _target: calls.append("secret"),
+        _quiesce_gpu_executor=lambda _target: calls.append("quiesce"),
+        _verify_gpu_control_plane_endpoint=lambda _target: calls.append("endpoint"),
+        _apply_gpu_dcgm_exporter=lambda _target: calls.append("dcgm"),
+        _apply_gpu_deployments=lambda _target, _wheel: calls.append("executor"),
+        _roll_node_runtime=lambda _target, **_kwargs: calls.append("node-runtime"),
     )
-    assert source.index("self._quiesce_gpu_executor(target)") < source.index(
-        "self._verify_gpu_control_plane_endpoint(target)"
+    return release, calls
+
+
+def test_bootstrap_gates_each_gpu_step_on_its_dependency() -> None:
+    """A bootstrapping cluster brings its dependencies up in dependency order.
+
+    The connection Secret and a verified control-plane endpoint must exist before
+    the Executor is allowed to reach the region, and DCGM has to be exporting
+    before the node Installer rolls, or the first nodes come up without the
+    metrics every policy decision reads.
+    """
+
+    release, calls = bootstrap_recorder()
+
+    ORCHESTRATION_MODULE.bootstrap_gpu_target(
+        release, SimpleNamespace(cluster_id="gpu-a")
     )
-    assert source.index(
-        "self._verify_gpu_control_plane_endpoint(target)"
-    ) < source.index("self._apply_gpu_dcgm_exporter(target)")
-    assert source.index("self._apply_gpu_dcgm_exporter(target)") < source.index(
-        "self._apply_gpu_deployments(target, self.executor_wheel_cm)"
-    )
+
+    assert calls == [
+        "namespace",
+        "secret",
+        "quiesce",
+        "endpoint",
+        "dcgm",
+        "executor",
+        "node-runtime",
+    ]
 
 
 def test_dcgm_exporter_is_ready_before_node_installer(tmp_path: Path) -> None:
@@ -244,12 +581,35 @@ def test_dcgm_exporter_is_ready_before_node_installer(tmp_path: Path) -> None:
     ), "DCGM DaemonSet readiness was not awaited"
 
 
-def test_node_installer_starts_after_dcgm_rollout() -> None:
-    source = inspect.getsource(MODULE.RegionalRelease.bootstrap)
+def test_node_installer_is_pinned_to_the_release_it_bootstraps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Installer roll carries the same pins the release was built from.
 
-    assert source.index("self._apply_gpu_dcgm_exporter(target)") < source.index(
-        "self._roll_node_runtime("
+    ``test_bootstrap_gates_each_gpu_step_on_its_dependency`` covers the ordering;
+    this covers what the last step is handed, because an Installer rolled with a
+    stale wheel or config digest would deploy an Agent the region rejects.
+    """
+
+    rolls: list[dict] = []
+    release, _calls = bootstrap_recorder()
+    monkeypatch.setattr(
+        release, "_roll_node_runtime", lambda _target, **kwargs: rolls.append(kwargs)
     )
+
+    ORCHESTRATION_MODULE.bootstrap_gpu_target(
+        release, SimpleNamespace(cluster_id="gpu-a")
+    )
+
+    assert rolls == [
+        {
+            "phase": "bootstrap",
+            "wheel_cm": "wheel",
+            "bundle_cm": "bundle",
+            "artifact_sha": "a" * 64,
+            "config_digest": "c" * 64,
+        }
+    ]
 
 
 def test_explicit_deploy_retries_only_failed_installer_jobs(tmp_path: Path) -> None:
@@ -305,40 +665,52 @@ def test_explicit_deploy_retries_only_failed_installer_jobs(tmp_path: Path) -> N
     assert "complete-job" not in deletes[0]
 
 
-def test_dns_gate_waits_for_nlb_before_route53_change() -> None:
-    source = inspect.getsource(DNS_MODULE.ensure_control_plane_dns)
-    upsert_source = inspect.getsource(DNS_MODULE._upsert_cname_and_wait)
+def test_nlb_service_is_created_after_dns_and_certificate_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hosted zone and certificate are checked before the NLB is applied.
 
-    assert source.index("_wait_service_hostname") < source.index("_wait_nlb_active")
-    assert source.index("_wait_nlb_active") < source.index("_wait_raw_nlb_dns")
-    assert source.index("_wait_raw_nlb_dns") < source.index("_wait_targets_healthy")
-    assert source.index("_wait_targets_healthy") < source.index(
-        "_upsert_cname_and_wait"
-    )
-    assert upsert_source.index("change-resource-record-sets") < upsert_source.index(
-        "resource-record-sets-changed"
-    )
-    assert upsert_source.index("resource-record-sets-changed") < upsert_source.index(
-        "get-change"
-    )
-    assert upsert_source.index("get-change") < upsert_source.index(
-        'change.get("Status") != "INSYNC"'
+    Applying the Service first would publish a load balancer that no name
+    resolves to and no certificate matches, and the CNAME must only follow once
+    that Service exists.
+    """
+
+    dns_module = DNS_MODULE.load()
+    calls: list[str] = []
+    for name in ("verify_control_plane_dns_prerequisites", "ensure_control_plane_dns"):
+        monkeypatch.setattr(
+            dns_module, name, lambda _release, _name=name: calls.append(_name)
+        )
+    release = SimpleNamespace(
+        runner=SimpleNamespace(
+            dry_run=False, run=lambda _arguments, **_kwargs: calls.append("apply-nlb")
+        ),
+        config=SimpleNamespace(
+            nlb={
+                "name": "gpu-fault-regional-test",
+                "public_subnets": "subnet-a,subnet-b",
+                "security_group": "sg-a",
+                "certificate_arn": (
+                    "arn:aws:acm:us-east-1:123456789012:certificate/control-plane"
+                ),
+            },
+            aws_region=REGION,
+            namespace="gpu-fault-system",
+        ),
+        _cpu=lambda *arguments: ["kubectl", *arguments],
     )
 
+    dns_module.apply_control_plane_nlb(release)
 
-def test_nlb_service_is_created_after_dns_and_certificate_gate() -> None:
-    source = inspect.getsource(DNS_MODULE.apply_control_plane_nlb)
-
-    assert source.index("verify_control_plane_dns_prerequisites") < source.index(
-        'release.runner.run(release._cpu("apply", "-f", "-")'
-    )
-    assert source.index(
-        'release.runner.run(release._cpu("apply", "-f", "-")'
-    ) < source.index("ensure_control_plane_dns")
+    assert calls == [
+        "verify_control_plane_dns_prerequisites",
+        "apply-nlb",
+        "ensure_control_plane_dns",
+    ]
 
 
 def test_dns_gate_executes_the_strict_runtime_sequence(monkeypatch) -> None:
-    dns_module = DNS_MODULE._load()
+    dns_module = DNS_MODULE.load()
     events: list[str] = []
     certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/control-plane"
     raw_hostname = "internal-nlb.elb.us-east-1.amazonaws.com"
@@ -470,26 +842,142 @@ def test_dns_gate_executes_the_strict_runtime_sequence(monkeypatch) -> None:
     ]
 
 
-@pytest.mark.parametrize("method_name", ["upgrade", "rollback", "join_cluster"])
-def test_executor_rollout_paths_require_gpu_dns_and_tls(method_name: str) -> None:
-    inspected = (
-        MODULE.upgrade_gpu_target
-        if method_name == "upgrade"
-        else (
-            ORCHESTRATION_MODULE.rollback_target
-            if method_name == "rollback"
-            else getattr(MODULE.RegionalRelease, method_name)
-        )
-    )
-    owner = "release" if method_name == "upgrade" else "self"
-    source = inspect.getsource(inspected)
+ROLLOUT_TARGET = SimpleNamespace(cluster_id="gpu-a")
+ROLLOUT_GATE = ("endpoint", "dcgm", "deployments")
 
-    assert source.index(
-        f"{owner}._verify_gpu_control_plane_endpoint(target)"
-    ) < source.index(f"{owner}._apply_gpu_dcgm_exporter(target)")
-    assert source.index(f"{owner}._apply_gpu_dcgm_exporter(target)") < source.index(
-        f"{owner}._apply_gpu_deployments"
+
+def rollout_gate_recorder(calls: list[str]) -> dict:
+    """The three steps every Executor rollout path has to order identically."""
+
+    return {
+        "executor_wheel_cm": "wheel",
+        "_ensure_connection_secret": lambda _target: None,
+        "_verify_gpu_control_plane_endpoint": lambda _target: calls.append("endpoint"),
+        "_apply_gpu_dcgm_exporter": lambda _target, **_kwargs: calls.append("dcgm"),
+        "_apply_gpu_deployments": lambda *_args, **_kwargs: calls.append("deployments"),
+    }
+
+
+def test_upgrade_requires_gpu_dns_and_tls_before_the_executor() -> None:
+    """An upgrade proves the GPU cluster can reach the region before rolling it.
+
+    Rolling the Executor first would restart the only component that reports
+    faults into a region it may not be able to authenticate to, and the cluster
+    would go dark instead of failing the release.
+    """
+
+    calls: list[str] = []
+    release = SimpleNamespace(**rollout_gate_recorder(calls))
+
+    MODULE.upgrade_gpu_target(
+        release,
+        ROLLOUT_TARGET,
+        DIFF_MODULE.ReleaseDiff(
+            kind=DIFF_MODULE.ReleaseChangeKind.FULL, changed=frozenset({"endpoint"})
+        ),
+        DIFF_MODULE.ReleaseExecutionPlan(
+            nodes=(
+                DIFF_MODULE.ReleaseComponent.ENDPOINT,
+                DIFF_MODULE.ReleaseComponent.DCGM,
+                DIFF_MODULE.ReleaseComponent.EXECUTOR,
+            )
+        ),
     )
+
+    assert tuple(calls) == ROLLOUT_GATE
+
+
+def test_rollback_requires_gpu_dns_and_tls_before_the_executor() -> None:
+    """A rollback re-checks the endpoint after restoring the previous Secret."""
+
+    calls: list[str] = []
+    release = SimpleNamespace(
+        **rollout_gate_recorder(calls),
+        config=SimpleNamespace(executor_wheel=Path("executor.whl")),
+        runtime_image="candidate-runtime",
+        _gpu=lambda _target, *arguments: ["kubectl", *arguments],
+        _restore_secret=lambda _arguments, *, source, backup: None,
+        _config_map_sha=lambda *_args: "d" * 64,
+    )
+
+    ORCHESTRATION_MODULE.rollback_target(
+        release,
+        ROLLOUT_TARGET,
+        previous={
+            "secret_backups": {
+                "clusters": {
+                    "gpu-a": {
+                        "source": "gpu-fault-regional-connection",
+                        "backup": "gpu-fault-regional-connection-previous",
+                    }
+                }
+            },
+            "clusters": {
+                "gpu-a": {
+                    "wheel": "previous-wheel",
+                    "wheel_key": "executor.whl",
+                    "dcgm_image": "registry.example/dcgm:previous",
+                }
+            },
+        },
+        artifact="artifact",
+        config_digest="config",
+        runtime_profile_version="profile-v1",
+        executor_artifact="executor",
+        executor_compatibility="executor",
+        node_compatibility="artifact",
+        runtime_image="previous-runtime",
+        node_installer_image="registry.example/installer:previous",
+        components=frozenset(
+            {
+                DIFF_MODULE.ReleaseComponent.ENDPOINT,
+                DIFF_MODULE.ReleaseComponent.DCGM,
+                DIFF_MODULE.ReleaseComponent.EXECUTOR,
+            }
+        ),
+    )
+
+    assert tuple(calls) == ROLLOUT_GATE
+
+
+def test_join_requires_gpu_dns_and_tls_before_the_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A joining cluster is proven reachable before it is given an Executor."""
+
+    calls: list[str] = []
+    for name in ("prepare_join_registry", "ensure_runtime_profile"):
+        monkeypatch.setattr(MODULE, name, lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        MODULE, "join_target", lambda _self, _cluster_id: ROLLOUT_TARGET
+    )
+    release = SimpleNamespace(
+        **rollout_gate_recorder(calls),
+        bundle_cm="bundle",
+        bundle_sha="b" * 64,
+        executor_wheel_sha="e" * 64,
+        node_wheel_sha="n" * 64,
+        config=SimpleNamespace(
+            executor_wheel=Path("executor.whl"),
+            bundle=Path("bundle.tar.gz"),
+            agent_config_digest="c" * 64,
+        ),
+        _ensure_contexts=lambda: None,
+        _update_registry=lambda _target, *, remove: None,
+        _ensure_gpu_namespace=lambda _target: None,
+        _quiesce_gpu_executor=lambda _target: None,
+        _gpu=lambda _target, *arguments: ["kubectl", *arguments],
+        _upload_config_map=lambda *_args, **_kwargs: None,
+        _config_map_data=lambda _name: {
+            "required-agent-artifact-sha256": "n" * 64,
+            "required-regional-executor-artifact-sha256": "e" * 64,
+        },
+        _roll_node_runtime=lambda _target, **_kwargs: None,
+    )
+
+    MODULE.RegionalRelease.join_cluster(release, "gpu-a")
+
+    assert tuple(calls) == ROLLOUT_GATE
 
 
 def test_gpu_endpoint_probe_checks_dns_ca_tls_and_health(tmp_path: Path) -> None:
@@ -524,7 +1012,7 @@ def test_gpu_endpoint_probe_checks_dns_ca_tls_and_health(tmp_path: Path) -> None
     assert "socket.getaddrinfo" in script
     assert "ssl.create_default_context" in script
     assert "urllib.request.urlopen" in script
-    assert "'/healthz'" in script
+    assert '"/healthz"' in script
     assert {
         item["name"]: item.get("value") for item in pod["spec"]["containers"][0]["env"]
     }["EXPECTED_HOSTNAME"] == "api.site.gpu-fault.internal"
@@ -578,910 +1066,3 @@ def test_agent_convergence_uses_hyperpod_cluster_name(tmp_path: Path) -> None:
         config_digest="config-a",
         require_node_uid=True,
     ), "agent convergence accepted a stale node UID annotation"
-
-
-def test_release_config_requires_unique_clusters(tmp_path) -> None:
-    cluster = {
-        "cluster_id": "gpu-a",
-        "context": "gpu-a-context",
-        "executor_irsa_role_arn": "arn:aws:iam::1:role/a",
-        "region": REGION,
-        "hyperpod_cluster_name": "hp-gpu-a",
-        "eks_cluster_arn": GPU_EKS_ARN,
-    }
-
-    with pytest.raises(MODULE.ReleaseError, match="unique"):
-        MODULE.ReleaseConfig.load(config_file(tmp_path, clusters=[cluster, cluster]))
-
-
-def test_release_config_requires_runtime_profile_inputs(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value.pop("runtime_profile")
-    path.write_text(json.dumps(value))
-
-    with pytest.raises(MODULE.ReleaseError, match="runtime_profile.source"):
-        MODULE.ReleaseConfig.load(path)
-
-
-def test_release_config_allows_a_stable_site_profile_anchor(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value["runtime_profile"]["registration_cluster_id"] = "missing"
-    path.write_text(json.dumps(value))
-
-    config = MODULE.ReleaseConfig.load(path)
-
-    assert config.runtime_profile_registration_cluster_id == "missing"
-
-
-def test_release_config_allows_an_empty_managed_gpu_set(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value["clusters"] = []
-    path.write_text(json.dumps(value))
-
-    config = MODULE.ReleaseConfig.load(path)
-
-    assert config.clusters == ()
-
-
-def test_release_config_requires_existing_profile_source(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value["runtime_profile"]["source"] = str(tmp_path / "missing-profile.yaml")
-    path.write_text(json.dumps(value))
-
-    with pytest.raises(MODULE.ReleaseError, match="existing file"):
-        MODULE.ReleaseConfig.load(path)
-
-
-def test_release_config_rejects_unsafe_profile_version(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value["runtime_profile"]["version"] = "hyperpod-v2&unexpected"
-    path.write_text(json.dumps(value))
-
-    with pytest.raises(MODULE.ReleaseError, match="Runtime Profile version"):
-        MODULE.ReleaseConfig.load(path)
-
-
-def test_release_config_requires_explicit_matching_region(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value["aws_region"] = "REPLACE_WITH_AWS_REGION"
-    path.write_text(json.dumps(value))
-
-    with pytest.raises(MODULE.ReleaseError, match="aws_region"):
-        MODULE.ReleaseConfig.load(path)
-
-    value["aws_region"] = REGION
-    value["clusters"][0]["region"] = "us-west-2"
-    path.write_text(json.dumps(value))
-    with pytest.raises(MODULE.ReleaseError, match="does not match aws_region"):
-        MODULE.ReleaseConfig.load(path)
-
-
-def test_release_config_rejects_cross_region_eks_arns(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value["clusters"][0]["eks_cluster_arn"] = (
-        "arn:aws:eks:us-west-2:123456789012:cluster/gpu-a"
-    )
-    path.write_text(json.dumps(value))
-
-    with pytest.raises(MODULE.ReleaseError, match="eks_cluster_arn Region"):
-        MODULE.ReleaseConfig.load(path)
-
-
-def test_release_config_rejects_cross_region_nlb_certificate(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value["nlb"] = {
-        "name": "gpu-fault-regional",
-        "public_subnets": "subnet-a,subnet-b",
-        "security_group": "sg-0123456789abcdef0",
-        "certificate_arn": ("arn:aws:acm:us-west-2:123456789012:certificate/example"),
-    }
-    path.write_text(json.dumps(value))
-
-    with pytest.raises(MODULE.ReleaseError, match="certificate_arn Region"):
-        MODULE.ReleaseConfig.load(path)
-
-
-def test_nlb_manifest_uses_explicit_name_and_region_certificate(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value["nlb"] = {
-        "name": "gpu-fault-regional-test",
-        "public_subnets": "subnet-a,subnet-b",
-        "security_group": "sg-0123456789abcdef0",
-        "certificate_arn": ("arn:aws:acm:us-east-1:123456789012:certificate/example"),
-    }
-    path.write_text(json.dumps(value))
-    config = MODULE.ReleaseConfig.load(path)
-
-    source = (
-        ROOT / "deploy/control-plane/regional/regional-control-plane-nlb.yaml"
-    ).read_text(encoding="utf-8")
-    rendered = DNS_MODULE.render_nlb_manifest(config, source)
-
-    assert "gpu-fault-regional-test" in rendered
-    assert "arn:aws:acm:us-east-1:" in rendered
-    assert "REPLACE_WITH" not in rendered
-
-
-def test_plan_covers_first_deploy_and_rollback(tmp_path) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
-
-    deploy = release.plan("deploy")
-    rollback = release.plan("rollback")
-    join = release.plan("join-cluster")
-
-    assert any("prerequisites" in step for step in deploy)
-    assert any("PostgreSQL schema" in step for step in deploy)
-    assert any("Runtime Profile" in step for step in deploy), (
-        "deploy plan must include Runtime Profile registration"
-    )
-    assert any("previous required pins" in step for step in rollback)
-    assert any("installer bundle" in step for step in rollback)
-    assert any("Runtime Profile" in step for step in join), (
-        "join plan must verify the shared Runtime Profile"
-    )
-
-
-def test_regional_parser_exposes_admin_health_commands() -> None:
-    mode = next(action for action in MODULE.parser()._actions if action.dest == "mode")
-
-    assert {"preflight", "verify", "release-summary", "status"} <= set(mode.choices)
-
-
-def test_status_keeps_health_report_when_release_summary_is_unavailable(
-    tmp_path: Path, monkeypatch
-) -> None:
-    module = MODULE._load()
-    config = module.ReleaseConfig.load(config_file(tmp_path))
-    release = module.RegionalRelease(config, module.Runner(dry_run=True))
-    monkeypatch.setattr(
-        module,
-        "build_full_status",
-        lambda _release: {
-            "healthy": False,
-            "release_status_error": "deployment is missing",
-            "health": {"mode": "status"},
-        },
-    )
-
-    report = release.status()
-
-    assert report["healthy"] is False
-    assert report["release_status_error"] == "deployment is missing"
-    assert report["health"]["mode"] == "status"
-
-
-def test_runtime_profile_payload_uses_declared_identity(tmp_path: Path) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-
-    payload = RUNTIME_PROFILE_MODULE.render_runtime_profile_payload(config)
-
-    assert payload["cluster_id"] == "gpu-a"
-    assert payload["profile_version"] == "hyperpod-v1"
-    assert payload["cluster_id"] != "hp-gpu-a"
-
-
-def test_runtime_profile_policy_digest_ignores_identity_and_yaml_order(
-    tmp_path: Path,
-) -> None:
-    first = tmp_path / "first.yaml"
-    second = tmp_path / "second.yaml"
-    first.write_text(
-        yaml.safe_dump(
-            {
-                "cluster_id": "placeholder",
-                "environment": "hyperpod-eks",
-                "profile_version": "profile-a",
-                "claims": [
-                    {
-                        "capability": "gpuReset",
-                        "mode": "OBSERVE",
-                        "owner": "gpu-fault-node-agent",
-                    },
-                    {
-                        "capability": "evidenceCapture",
-                        "mode": "OWN",
-                        "owner": "gpu-fault-control-plane",
-                        "adapter": "control-plane-evidence",
-                    },
-                ],
-                "observed": [],
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-    second.write_text(
-        yaml.safe_dump(
-            {
-                "profile_version": "profile-b",
-                "cluster_id": "gpu-a",
-                "observed": [],
-                "claims": list(reversed(yaml.safe_load(first.read_text())["claims"])),
-                "environment": "hyperpod-eks",
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-
-    assert RUNTIME_PROFILE_MODULE.runtime_profile_policy_digest(
-        first
-    ) == RUNTIME_PROFILE_MODULE.runtime_profile_policy_digest(second)
-
-
-def test_runtime_profile_is_registered_when_missing(tmp_path: Path) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    runner = RuntimeProfileRunner()
-    release = MODULE.RegionalRelease(config, runner)
-
-    MODULE.ensure_runtime_profile(release)
-
-    assert len(runner.posted) == 1
-    assert runner.posted[0]["cluster_id"] == "gpu-a"
-    assert runner.posted[0]["profile_version"] == "hyperpod-v1"
-
-
-def test_runtime_profile_registration_is_idempotent(tmp_path: Path) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    desired = compile_runtime_profile(
-        RuntimeProfile.model_validate(
-            RUNTIME_PROFILE_MODULE.render_runtime_profile_payload(config)
-        )
-    ).model_dump(mode="json")
-    runner = RuntimeProfileRunner(existing=desired)
-    release = MODULE.RegionalRelease(config, runner)
-
-    MODULE.ensure_runtime_profile(release)
-
-    assert runner.posted == []
-
-
-def test_runtime_profile_drift_requires_a_new_version(tmp_path: Path) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    existing = compile_runtime_profile(
-        RuntimeProfile.model_validate(
-            RUNTIME_PROFILE_MODULE.render_runtime_profile_payload(config)
-        )
-    ).model_dump(mode="json")
-    existing["capabilities"][0]["mode"] = "OBSERVE"
-    runner = RuntimeProfileRunner(existing=existing)
-    release = MODULE.RegionalRelease(config, runner)
-
-    with pytest.raises(MODULE.ReleaseError, match="new profile version"):
-        MODULE.ensure_runtime_profile(release)
-
-    assert runner.posted == []
-
-
-def test_runtime_profile_verify_is_read_only_when_missing(tmp_path: Path) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    runner = RuntimeProfileRunner()
-    release = MODULE.RegionalRelease(config, runner)
-
-    with pytest.raises(MODULE.ReleaseError, match="is not registered"):
-        RUNTIME_PROFILE_MODULE.verify_runtime_profile(release)
-
-    assert runner.posted == []
-
-
-def test_release_config_loads_health_targets(tmp_path: Path) -> None:
-    path = config_file(tmp_path)
-    value = json.loads(path.read_text())
-    value["site_name"] = "production"
-    value["health"] = {
-        "aurora_cluster_id": "gpu-fault-aurora",
-        "amp_workspace_id": "ws-test",
-        "amp_rule_namespace": "gpu-fault-rules",
-        "sns_topic_arn": ("arn:aws:sns:us-east-1:123456789012:gpu-fault"),
-        "certificate_min_validity_days": 45,
-        "remote_command_max_unclaimed_seconds": 240,
-        "require_confirmed_sns_subscription": True,
-    }
-    path.write_text(json.dumps(value))
-
-    config = MODULE.ReleaseConfig.load(path)
-
-    assert config.site_name == "production"
-    assert config.health.aurora_cluster_id == "gpu-fault-aurora"
-    assert config.health.amp_workspace_id == "ws-test"
-    assert config.health.certificate_min_validity_days == 45
-    assert config.health.remote_command_max_unclaimed_seconds == 240
-
-
-class PreflightRunner:
-    dry_run = False
-
-    def __init__(self, *, gpu_eks_arn=GPU_EKS_ARN, gpu_node_recovery="None") -> None:
-        self.gpu_eks_arn = gpu_eks_arn
-        self.gpu_node_recovery = gpu_node_recovery
-
-    def run(self, args, **kwargs):
-        del kwargs
-        if "config" in args and "view" in args:
-            return CPU_EKS_ARN if "--kubeconfig" in args else self.gpu_eks_arn
-        if args[:3] == ["aws", "sagemaker", "describe-cluster"]:
-            cluster_name = args[args.index("--cluster-name") + 1]
-            return json.dumps(
-                {
-                    "EksClusterArn": (
-                        GPU_EKS_ARN if cluster_name == "hp-gpu-a" else CPU_EKS_ARN
-                    ),
-                    "NodeRecovery": (
-                        self.gpu_node_recovery
-                        if cluster_name == "hp-gpu-a"
-                        else "Automatic"
-                    ),
-                }
-            )
-        if "--raw=/readyz" in args:
-            return "ok"
-        if "get" in args and "nodes" in args:
-            return (
-                '{"items":[{"metadata":{"name":"gpu-node-a"},"status":'
-                '{"addresses":[{"type":"InternalIP","address":"10.0.1.10"}]}}]}'
-            )
-        raise AssertionError(f"unexpected preflight command: {args}")
-
-
-def test_preflight_binds_contexts_and_hyperpod_to_config(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    release = MODULE.RegionalRelease(config, PreflightRunner())
-    monkeypatch.setattr(release, "_validate_executor_iam_role", lambda _target: None)
-
-    MODULE.ensure_region_contexts(release)
-
-
-def test_preflight_rejects_wrong_context_and_managed_gpu_recovery(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    wrong_context = MODULE.RegionalRelease(
-        config,
-        PreflightRunner(
-            gpu_eks_arn=("arn:aws:eks:us-east-1:123456789012:cluster/unexpected-gpu")
-        ),
-    )
-    monkeypatch.setattr(
-        wrong_context, "_validate_executor_iam_role", lambda _target: None
-    )
-
-    with pytest.raises(MODULE.ReleaseError, match="does not match"):
-        MODULE.ensure_region_contexts(wrong_context)
-
-    managed_recovery = MODULE.RegionalRelease(
-        config, PreflightRunner(gpu_node_recovery="Automatic")
-    )
-    monkeypatch.setattr(
-        managed_recovery, "_validate_executor_iam_role", lambda _target: None
-    )
-    with pytest.raises(MODULE.ReleaseError, match="NodeRecovery=None"):
-        MODULE.ensure_region_contexts(managed_recovery)
-
-
-def test_join_cluster_requires_current_release_artifact(tmp_path) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
-
-    assert release.wheel_cm.startswith("gpu-fault-control-plane-wheel-0100-")
-    assert release.bundle_cm.startswith("gpu-fault-node-installer-0100-")
-    assert MODULE.STATE_CONFIG_MAP == ("gpu-fault-regional-release-state")
-
-
-def test_sync_release_state_records_a_noop_topology() -> None:
-    calls = []
-    release = SimpleNamespace(
-        state={
-            "rollback_completed_phases": ["rollback-verified"],
-            "rollback_result": {"status": "PASSED"},
-        },
-        _capture_previous=lambda: {"live_runtime_image": "legacy-runtime:stable"},
-        _save_state=lambda phase, **updates: calls.append((phase, updates)),
-    )
-
-    MODULE.sync_release_state(release)
-
-    assert release.state == {}
-    assert calls == [
-        (
-            "complete",
-            {
-                "previous": None,
-                "release_diff": {"kind": "NOOP", "changed": []},
-                "adopted_live_runtime_image": "legacy-runtime:stable",
-            },
-        )
-    ]
-
-
-def test_join_cluster_requires_an_idle_remote_command_queue() -> None:
-    source = inspect.getsource(MODULE.join_target)
-
-    assert source.index("release._target(cluster_id)") < source.index(
-        "release._remote_commands_are_idle()"
-    )
-
-
-def test_rollback_detects_legacy_component_pins_and_preserves_alerting() -> None:
-    source = inspect.getsource(MODULE.build_rollback_environment)
-
-    assert "legacy_component_pins = not any" in source
-    assert '"GPU_FAULT_LEGACY_COMPONENT_PINS"' in source
-    assert '"GPU_FAULT_ALLOW_EMAIL"' in source
-    assert '"GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL"' in source
-
-
-def test_last_cluster_can_be_removed_from_the_cpu_registry(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-
-    class RegistryRunner:
-        dry_run = False
-
-        def __init__(self) -> None:
-            self.registrations = None
-
-        def run(self, arguments, **kwargs):
-            if "create" in arguments and "secret" in arguments:
-                source = next(
-                    item for item in arguments if item.startswith("--from-file=")
-                )
-                self.registrations = json.loads(
-                    Path(source.split("=", 2)[2]).read_text()
-                )
-                return "apiVersion: v1\nkind: Secret\nmetadata:\n  name: test\n"
-            return ""
-
-    runner = RegistryRunner()
-    release = MODULE.RegionalRelease(config, runner)
-    monkeypatch.setattr(
-        release, "_registry", lambda: [{"cluster_id": config.clusters[0].cluster_id}]
-    )
-
-    release._update_registry(config.clusters[0], remove=True)
-
-    assert runner.registrations == []
-
-
-@pytest.mark.parametrize(
-    ("state_exists", "phase", "expected"),
-    [
-        (False, None, "bootstrap"),
-        (True, "bootstrap-cleaned", "bootstrap"),
-        (True, "bootstrap-cpu-ready", "bootstrap"),
-        (True, "bootstrap-endpoint-ready", "bootstrap"),
-        (True, "bootstrap-data-plane-progress", "bootstrap"),
-        (True, "failed", "upgrade"),
-        (True, "rolled-back", "upgrade"),
-        (True, "complete", "upgrade"),
-    ],
-)
-def test_deploy_selects_initial_or_upgrade_path(
-    tmp_path: Path, monkeypatch, state_exists: bool, phase: str | None, expected: str
-) -> None:
-    module = MODULE._load()
-    admin = ADMIN_COMMANDS_MODULE._load()
-    release = module.RegionalRelease(
-        module.ReleaseConfig.load(config_file(tmp_path)), module.Runner(dry_run=False)
-    )
-    calls: list[str] = []
-    monkeypatch.setattr(
-        admin.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0], 0 if state_exists else 1
-        ),
-    )
-    monkeypatch.setattr(release, "bootstrap", lambda: calls.append("bootstrap"))
-    monkeypatch.setattr(release, "upgrade", lambda **_kwargs: calls.append("upgrade"))
-    monkeypatch.setattr(release, "noop", lambda _diff: calls.append("noop"))
-    if state_exists:
-        monkeypatch.setattr(
-            release,
-            "_load_state",
-            lambda: {
-                "phase": phase,
-                "release_diff": {
-                    "kind": "CONTROL_PLANE_ONLY",
-                    "changed": ["control_plane_wheel"],
-                },
-            },
-        )
-
-    admin.run_deploy(release)
-
-    assert calls == [expected]
-
-
-def test_bootstrap_live_checkpoint_recognizes_current_cpu_release(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
-    monkeypatch.setattr(
-        release,
-        "_config_map_data",
-        lambda _name: {
-            "required-agent-artifact-sha256": release.node_wheel_sha,
-            "required-agent-compatibility-digest": (
-                config.component_digests.get("node_runtime") or release.node_wheel_sha
-            ),
-            "required-regional-executor-artifact-sha256": (release.executor_wheel_sha),
-            "required-regional-executor-compatibility-digest": (
-                config.component_digests.get("executor") or release.executor_wheel_sha
-            ),
-            "required-agent-config-digest": config.agent_config_digest,
-            "required-runtime-profile-version": config.runtime_profile_version,
-        },
-    )
-    monkeypatch.setattr(
-        release, "_deployment_wheel", lambda _kubectl, _deployment: release.wheel_cm
-    )
-    monkeypatch.setattr(
-        release,
-        "_get_json",
-        lambda _arguments: {
-            "metadata": {"generation": 7},
-            "spec": {"replicas": 3},
-            "status": {
-                "observedGeneration": 7,
-                "readyReplicas": 3,
-                "updatedReplicas": 3,
-                "availableReplicas": 3,
-            },
-        },
-    )
-
-    assert release._bootstrap_cpu_is_current() is True
-
-
-def test_bootstrap_live_checkpoint_rejects_partial_cpu_rollout(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
-    monkeypatch.setattr(
-        release,
-        "_config_map_data",
-        lambda _name: {
-            "required-agent-artifact-sha256": release.wheel_sha,
-            "required-agent-config-digest": config.agent_config_digest,
-            "required-runtime-profile-version": config.runtime_profile_version,
-        },
-    )
-    monkeypatch.setattr(
-        release, "_deployment_wheel", lambda _kubectl, _deployment: release.wheel_cm
-    )
-    monkeypatch.setattr(
-        release,
-        "_get_json",
-        lambda _arguments: {
-            "metadata": {"generation": 7},
-            "spec": {"replicas": 3},
-            "status": {
-                "observedGeneration": 7,
-                "readyReplicas": 2,
-                "updatedReplicas": 3,
-                "availableReplicas": 2,
-            },
-        },
-    )
-
-    assert release._bootstrap_cpu_is_current() is False
-
-
-def test_regional_release_shell_has_valid_syntax() -> None:
-    subprocess.run(
-        [
-            "bash",
-            "-n",
-            str(ROOT / "deploy/control-plane/regional/rollout-regional-release.sh"),
-        ],
-        check=True,
-    )
-
-
-def test_regional_release_config_imports_with_runtime_pythonpath() -> None:
-    completed = subprocess.run(
-        [sys.executable, "-c", "import regional_release_config"],
-        cwd=ROOT / "deploy/control-plane/regional",
-        env={
-            **os.environ,
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPATH": str(ROOT / "src"),
-        },
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-
-
-def test_gpu_deployment_manifest_is_stamped_with_release_sha(tmp_path) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
-    document = {
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {"name": "executor"},
-        "spec": {
-            "template": {
-                "metadata": {"annotations": {"gpu-fault.io/artifact-sha256": "old"}}
-            }
-        },
-    }
-    rendered = release._stamp_gpu_deployments(json.dumps(document))
-    stamped = next(yaml.safe_load_all(rendered))
-    annotations = stamped["spec"]["template"]["metadata"]["annotations"]
-
-    assert annotations["gpu-fault.io/artifact-sha256"] == release.executor_wheel_sha
-    assert (
-        annotations["gpu-fault.io/executor-wheel-sha256"] == release.executor_wheel_sha
-    )
-    assert annotations["gpu-fault.io/executor-compatibility-digest"] == (
-        config.component_digests.get("executor") or release.executor_wheel_sha
-    )
-    assert "gpu-fault.io/control-plane-wheel-sha256" not in annotations
-    assert annotations["gpu-fault.io/release-rollout"] == release.release_id
-    assert annotations["gpu-fault.io/runtime-image"] == MODULE.DEFAULT_RUNTIME_IMAGE
-
-
-def test_executor_iam_boundary_accepts_minimal_role() -> None:
-    MODULE.validate_executor_iam_documents(
-        "arn:aws:iam::1:role/executor",
-        [
-            {
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "sagemaker:DescribeCluster",
-                            "sagemaker:ListClusterNodes",
-                            "sagemaker:DescribeClusterNode",
-                            "sagemaker:BatchRebootClusterNodes",
-                            "s3:PutObject",
-                        ],
-                    }
-                ]
-            }
-        ],
-    )
-
-
-@pytest.mark.parametrize(
-    "action",
-    [
-        "ses:SendEmail",
-        "sagemaker:BatchReplaceClusterNodes",
-        "sagemaker:BatchDeleteClusterNodes",
-        "sagemaker:*",
-    ],
-)
-def test_executor_iam_boundary_rejects_excess_privilege(action: str) -> None:
-    with pytest.raises(
-        MODULE.ReleaseError, match="exceeds the regional data-plane boundary"
-    ):
-        MODULE.validate_executor_iam_documents(
-            "arn:aws:iam::1:role/executor",
-            [{"Statement": [{"Effect": "Allow", "Action": action}]}],
-        )
-
-
-def test_release_config_loads_content_addressed_manifest(tmp_path) -> None:
-    config = MODULE.ReleaseConfig.load(manifest_config_file(tmp_path))
-
-    assert config.wheel.name == "release.whl"
-    assert config.bundle.name == "bundle.tar.gz"
-
-
-def test_executor_iam_boundary_rejects_allow_not_action() -> None:
-    with pytest.raises(MODULE.ReleaseError, match="Allow/NotAction"):
-        MODULE.validate_executor_iam_documents(
-            "arn:aws:iam::1:role/executor",
-            [{"Statement": [{"Effect": "Allow", "NotAction": "iam:*"}]}],
-        )
-
-
-def test_release_renders_one_runtime_image_across_gpu_roles(
-    tmp_path, monkeypatch
-) -> None:
-    runtime_image = "registry.example/gpu-fault/python@sha256:" + "a" * 64
-    monkeypatch.setenv("GPU_FAULT_RUNTIME_IMAGE", runtime_image)
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-
-    class RecordingRunner:
-        dry_run = True
-
-        def __init__(self) -> None:
-            self.calls = []
-
-        def run(self, args, **kwargs):
-            self.calls.append((args, kwargs))
-            return ""
-
-    runner = RecordingRunner()
-    release = MODULE.RegionalRelease(config, runner)
-    target = config.clusters[0]
-
-    release._apply_gpu_deployments(target, release.wheel_cm)
-    rendered = [
-        kwargs["input_text"]
-        for _args, kwargs in runner.calls
-        if kwargs.get("input_text")
-    ]
-
-    assert len(rendered) == 3
-    assert all(runtime_image in item for item in rendered)
-    assert all(MODULE.DEFAULT_RUNTIME_IMAGE not in item for item in rendered)
-    assert any(f"value: {REGION}" in item for item in rendered), (
-        "GPU manifests did not receive the configured Region"
-    )
-    assert all("REPLACE_WITH_AWS_REGION" not in item for item in rendered), (
-        "GPU manifests retained an unresolved Region placeholder"
-    )
-    release._deploy_reconciler(
-        target,
-        wheel_cm=release.wheel_cm,
-        bundle_cm=release.bundle_cm,
-        artifact_sha=release.wheel_sha,
-        config_digest=config.agent_config_digest,
-    )
-    assert runner.calls[-1][1]["env"]["GPU_FAULT_RUNTIME_IMAGE"] == runtime_image
-    assert runner.calls[-1][1]["env"]["GPU_FAULT_RUNTIME_PROFILE"] == "hyperpod-v1"
-    assert runner.calls[-1][1]["env"]["GPU_FAULT_CLUSTER_ID"] == "gpu-a"
-    assert runner.calls[-1][1]["env"]["GPU_FAULT_HYPERPOD_CLUSTER"] == "hp-gpu-a"
-
-
-def test_release_rejects_invalid_runtime_image(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("GPU_FAULT_RUNTIME_IMAGE", "registry.example/bad image")
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-
-    with pytest.raises(MODULE.ReleaseError, match="OCI image"):
-        MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
-
-
-def test_non_default_runtime_profile_reaches_every_plane(tmp_path: Path) -> None:
-    config = MODULE.ReleaseConfig.load(
-        config_file(tmp_path, profile_version="hyperpod-v2")
-    )
-
-    class RecordingRunner:
-        dry_run = True
-
-        def __init__(self) -> None:
-            self.calls = []
-
-        def run(self, args, **kwargs):
-            self.calls.append((args, kwargs))
-            return ""
-
-    runner = RecordingRunner()
-    release = MODULE.RegionalRelease(config, runner)
-    target = config.clusters[0]
-
-    cpu_environment = RENDERING_MODULE.build_cpu_apply_environment(
-        release, finalize=False
-    )
-    assert (
-        cpu_environment["GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"] == "hyperpod-v2"
-    )
-    assert cpu_environment["GPU_FAULT_ADMIN_CONFIG_SHA256"] == (
-        release.admin_config_digest
-    )
-
-    rendered_manifests = [
-        text
-        for _deployment, text in RENDERING_MODULE.render_gpu_rollout_manifests(
-            release, target, release.wheel_cm
-        )
-    ]
-    resources = [
-        document
-        for text in rendered_manifests
-        for document in yaml.safe_load_all(text)
-        if isinstance(document, dict)
-    ]
-    collector = next(
-        item
-        for item in resources
-        if item.get("kind") == "Deployment"
-        and item["metadata"]["name"] == "gpu-fault-kubernetes-node-resource-collector"
-    )
-    collector_env = {
-        item["name"]: item.get("value")
-        for item in collector["spec"]["template"]["spec"]["containers"][0]["env"]
-    }
-    assert collector_env["GPU_FAULT_RUNTIME_PROFILE_VERSION"] == "hyperpod-v2"
-    assert all(
-        "REPLACE_WITH_RUNTIME_PROFILE_VERSION" not in item
-        for item in rendered_manifests
-    ), "rendered GPU manifests retained the Runtime Profile placeholder"
-
-    reconciler_environment = RENDERING_MODULE.build_reconciler_environment(
-        release,
-        target,
-        wheel_cm=release.wheel_cm,
-        bundle_cm=release.bundle_cm,
-        artifact_sha=release.wheel_sha,
-        config_digest=config.agent_config_digest,
-    )
-    assert reconciler_environment["GPU_FAULT_RUNTIME_PROFILE"] == "hyperpod-v2"
-
-    workload = render_workload(
-        ROOT / "examples/hyperpod/three-node-pytorchjob.yaml",
-        job_id="profile-v2-job",
-        attempt_id=None,
-        attempt_number=1,
-        runtime_profile_version="hyperpod-v2",
-        expected_critical_ranks=None,
-        training_container="pytorch",
-        restart_budget=1,
-        namespace="training",
-    )
-    document = yaml.safe_load(workload.manifest)
-    for replica in document["spec"]["pytorchReplicaSpecs"].values():
-        annotations = replica["template"]["metadata"]["annotations"]
-        assert annotations["gpu-fault.io/runtime-profile-version"] == "hyperpod-v2"
-
-
-def test_runtime_profile_override_restores_rollback_version(tmp_path: Path) -> None:
-    config = MODULE.ReleaseConfig.load(
-        config_file(tmp_path, profile_version="hyperpod-v2")
-    )
-
-    class RecordingRunner:
-        dry_run = True
-
-        def __init__(self) -> None:
-            self.calls = []
-
-        def run(self, args, **kwargs):
-            self.calls.append((args, kwargs))
-            return ""
-
-    release = MODULE.RegionalRelease(config, RecordingRunner())
-    target = config.clusters[0]
-    rendered = RENDERING_MODULE.render_gpu_rollout_manifests(
-        release, target, release.wheel_cm, runtime_profile_version="hyperpod-v1"
-    )
-    resources = [
-        document
-        for _deployment, text in rendered
-        for document in yaml.safe_load_all(text)
-        if isinstance(document, dict)
-    ]
-    collector = next(
-        item
-        for item in resources
-        if item.get("kind") == "Deployment"
-        and item["metadata"]["name"] == "gpu-fault-kubernetes-node-resource-collector"
-    )
-    collector_env = {
-        item["name"]: item.get("value")
-        for item in collector["spec"]["template"]["spec"]["containers"][0]["env"]
-    }
-    assert collector_env["GPU_FAULT_RUNTIME_PROFILE_VERSION"] == "hyperpod-v1"
-
-    environment = RENDERING_MODULE.build_reconciler_environment(
-        release,
-        target,
-        wheel_cm=release.wheel_cm,
-        bundle_cm=release.bundle_cm,
-        artifact_sha=release.wheel_sha,
-        config_digest=config.agent_config_digest,
-        runtime_profile_version="hyperpod-v1",
-    )
-    assert environment["GPU_FAULT_RUNTIME_PROFILE"] == "hyperpod-v1"

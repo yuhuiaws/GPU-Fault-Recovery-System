@@ -266,6 +266,8 @@ class TelemetryIngestionService:
         findings = (
             self.context.node_health.evaluate_logs(batch) if batch.entries else []
         )
+        # See ``ingest_node_logs``: the errors decide whether this batch counts
+        # as a success, and an error-only batch must not.
         self.telemetry_context._record_collector_status(
             CollectorKind.NODE_LOGS,
             batch.cluster_id,
@@ -273,8 +275,11 @@ class TelemetryIngestionService:
             batch.collected_at,
             batch.batch_id,
             len(batch.entries),
+            batch.collection_errors,
         )
-        if batch.entries:
+        # Kept for an error-only batch as well: it carries no entries and is the
+        # only record that this node's log collection is failing.
+        if batch.entries or batch.collection_errors:
             self.telemetry_context._capture_evidence(
                 record_id=f"node-logs/{batch.batch_id}",
                 cluster_id=batch.cluster_id,

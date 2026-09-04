@@ -2,34 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
 from typing import Any
 
 import regional_deployment_inventory as inventory
 from regional_release_config import ReleaseError
+from regional_release_probes import probe_source
 from regional_release_registry import registry
-
-
-CLIENT = r"""
-import json
-import os
-import sys
-import urllib.request
-
-method, path = sys.argv[1:]
-body = sys.stdin.buffer.read()
-request = urllib.request.Request(
-    "http://127.0.0.1:8080" + path,
-    data=body or None,
-    method=method,
-    headers={
-        "Content-Type": "application/json",
-        "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"],
-    },
-)
-with urllib.request.urlopen(request, timeout=30) as response:
-    print(json.dumps(json.load(response), separators=(",", ":")))
-"""
 
 
 def _request(
@@ -64,7 +42,7 @@ def _request(
             "--",
             "python3",
             "-c",
-            CLIENT,
+            probe_source("registry_client"),
             method,
             path,
         ),
@@ -98,6 +76,77 @@ def _registrations(
     return sorted(result, key=lambda item: str(item["cluster_id"]))
 
 
+def _registration(
+    release: Any,
+    cluster_id: str,
+) -> dict[str, Any]:
+    matches = [
+        item
+        for item in _registrations(release, {})
+        if str(item["cluster_id"]) == cluster_id
+    ]
+    if len(matches) != 1:
+        raise ReleaseError(
+            f"regional registry candidate has no unique cluster {cluster_id}"
+        )
+    return matches[0]
+
+
+def _publish_and_wait(
+    release: Any,
+    *,
+    path: str,
+    payload: dict[str, Any],
+    use_current_generation: bool,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    pod = release.runner.run(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "pod",
+            "-l",
+            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ),
+        capture=True,
+    )
+    if not pod:
+        raise ReleaseError("no running CPU ingress Pod for registry update")
+    output = release.runner.run(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "exec",
+            "-i",
+            pod,
+            "--",
+            "python3",
+            "-c",
+            probe_source("registry_publish_converge"),
+        ),
+        input_text=json.dumps(
+            {
+                "path": path,
+                "payload": payload,
+                "use_current_generation": use_current_generation,
+                "timeout_seconds": timeout_seconds,
+            },
+            separators=(",", ":"),
+        ),
+        capture=True,
+        sensitive=True,
+        timeout_seconds=timeout_seconds + 60,
+    )
+    value = json.loads(output)
+    if not isinstance(value, dict):
+        raise ReleaseError("regional registry client returned a non-object")
+    return value
+
+
 def publish_current_registry(
     release: Any,
     *,
@@ -105,47 +154,75 @@ def publish_current_registry(
     lifecycle_overrides: dict[str, str] | None = None,
     timeout_seconds: float = 300,
 ) -> dict[str, Any]:
-    current = _request(release, "GET", "/v1/regional/registry/status")
-    published = _request(
+    return _publish_and_wait(
         release,
-        "POST",
-        "/v1/regional/registry/revisions",
-        {
-            "expected_generation": int(current["generation"]),
+        path="/v1/regional/registry/revisions",
+        payload={
             "registrations": _registrations(
                 release,
                 lifecycle_overrides or {},
             ),
             "reason": reason,
         },
+        use_current_generation=True,
+        timeout_seconds=timeout_seconds,
     )
-    generation = int(published["generation"])
-    digest = str(published["content_sha256"])
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        status = _request(release, "GET", "/v1/regional/registry/status")
-        if (
-            int(status["generation"]) == generation
-            and str(status["content_sha256"]) == digest
-            and status.get("converged") is True
-        ):
-            return status
-        time.sleep(1)
-    raise ReleaseError(f"regional registry generation {generation} did not converge")
+
+
+def transition_join_registry(
+    release: Any,
+    cluster_id: str,
+    lifecycle_state: str,
+    *,
+    reason: str,
+    timeout_seconds: float = 300,
+) -> dict[str, Any]:
+    return _publish_and_wait(
+        release,
+        path=f"/v1/regional/registry/clusters/{cluster_id}/transition",
+        payload={
+            "registration": _registration(release, cluster_id),
+            "lifecycle_state": lifecycle_state,
+            "reason": reason,
+        },
+        use_current_generation=False,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def prepare_join_registry(release: Any, cluster_id: str) -> None:
-    publish_current_registry(
+    transition_join_registry(
         release,
+        cluster_id,
+        "PENDING",
         reason=f"join {cluster_id} pending",
-        lifecycle_overrides={cluster_id: "PENDING"},
     )
 
 
 def activate_join_registry(release: Any, cluster_id: str) -> None:
-    publish_current_registry(
+    transition_join_registry(
         release,
+        cluster_id,
+        "ACTIVE",
         reason=f"join {cluster_id} active",
+    )
+
+
+def fail_join_registry(release: Any, cluster_id: str) -> None:
+    transition_join_registry(
+        release,
+        cluster_id,
+        "FAILED",
+        reason=f"join {cluster_id} failed",
+    )
+
+
+def rollback_join_registry(release: Any, cluster_id: str) -> None:
+    transition_join_registry(
+        release,
+        cluster_id,
+        "ROLLED_BACK",
+        reason=f"join {cluster_id} rolled back",
     )
 
 

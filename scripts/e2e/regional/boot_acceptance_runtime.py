@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import re
 import sys
 import time
-from typing import Any, cast
 import urllib.parse
 import urllib.request
+from pathlib import Path
+from typing import Any, cast
 
 import boto3
+import yaml  # type: ignore[import-untyped]
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
-import yaml  # type: ignore[import-untyped]
 
-from gpu_fault.admin_site import load_site
-
+from gpu_fault.admin.site import load_site
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
 from scripts.e2e.regional.boot_acceptance_common import (
     ROOT,

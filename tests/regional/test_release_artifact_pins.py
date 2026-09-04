@@ -5,13 +5,12 @@ from pathlib import Path
 
 import yaml
 
-from gpu_fault.admin_config import preset_admin_config
+from gpu_fault.admin.config import preset_admin_config
 from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = lazy_script_module(
-    "rollout_regional_release_artifact_pins",
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py",
+    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
 )
 REGION = "us-east-1"
 
@@ -73,6 +72,9 @@ class RecordingRunner:
     def run(self, args, **kwargs):
         self.calls.append((args, kwargs))
         return ""
+
+    def probe(self, _args, **_kwargs):
+        return True
 
 
 def test_gpu_manifest_can_restore_previous_executor_pin(tmp_path: Path) -> None:
@@ -188,8 +190,49 @@ def test_rollback_uses_previous_executor_and_node_pins(
         "_roll_node_runtime",
         lambda *args, **kwargs: reconciler_calls.append((args, kwargs)),
     )
+    monkeypatch.setattr(release, "_cancel_active_installer_jobs", lambda *_args: None)
+    monkeypatch.setattr(
+        release,
+        "_fleet_deployment_id",
+        lambda *_args, **_kwargs: "candidate-agent-deployment",
+    )
+    monkeypatch.setattr(
+        release, "_fleet_command", lambda *_args, **_kwargs: {"status": "CANCELLED"}
+    )
     monkeypatch.setattr(release, "_save_state", lambda *_args, **_kwargs: None)
     target = config.clusters[0]
+    release.state = {
+        "execution_plan": {
+            "nodes": [
+                "registry",
+                "cpu-stage",
+                "executor",
+                "watcher",
+                "collector",
+                "reconciler",
+                "agent",
+                "cpu-finalize",
+                "verify",
+            ]
+        },
+        "component_progress": {
+            "schema_version": 1,
+            "global": {
+                "registry": {"status": "STARTED"},
+                "cpu-stage": {"status": "STARTED"},
+                "cpu-finalize": {"status": "STARTED"},
+            },
+            "clusters": {
+                target.cluster_id: {
+                    "executor": {"status": "STARTED"},
+                    "watcher": {"status": "STARTED"},
+                    "collector": {"status": "STARTED"},
+                    "reconciler": {"status": "STARTED"},
+                    "agent": {"status": "STARTED"},
+                }
+            },
+        },
+    }
     previous_admin_config = preset_admin_config("32-enabled")
     previous = {
         "cpu_wheel": "old-control-wheel",

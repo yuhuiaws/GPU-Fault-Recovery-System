@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
-
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from gpu_fault.models import (
     FaultIncident,
+    IncidentState,
+    RecoveryPlan,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
@@ -20,14 +20,24 @@ from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
     blocked_by_remediation_budget,
 )
+from gpu_fault.workflow_resolution import (
+    reconciled_restore_records,
+    retired_generation_records,
+)
+
+if TYPE_CHECKING:
+    from gpu_fault.regional import RemoteActionCommand
 
 
 class MemoryWorkflowMixin:
     # Attributes supplied by the composed concrete implementation.
     _incident_by_event: Any
     _incidents: Any
+    _plans: dict[str, RecoveryPlan]
+    _remote_commands: dict[str, RemoteActionCommand]
     _workflows: Any
 
+    get_plan: Callable[[str], RecoveryPlan]
     _lock: Any
     _replacement_fault_groups: Any
     _sxid_fault_groups: Any
@@ -50,6 +60,74 @@ class MemoryWorkflowMixin:
             self._incidents[incident.incident_id] = incident
             self._workflows[workflow.request_id] = workflow
             self._incident_by_event[incident.event_id] = incident.incident_id
+
+    def reconcile_restored_workflow(
+        self,
+        workflow_request_id: str,
+        successor_workflow_id: str,
+        *,
+        expected_fencing_token: int,
+        expected_workflow_updated_at: datetime,
+        reference: str,
+        reconciled_at: datetime,
+    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
+        with self._lock:
+            workflow = self.get_workflow(workflow_request_id)
+            incident = self.get_incident(workflow.incident_id)
+            successor = self.get_workflow(successor_workflow_id)
+            if not workflow.source_plan_id:
+                raise ValueError("workflow has no source recovery plan")
+            source_plan = self.get_plan(workflow.source_plan_id)
+            updated_workflow, updated_incident, updated_plan = (
+                reconciled_restore_records(
+                    workflow,
+                    incident,
+                    successor,
+                    source_plan,
+                    list(self._remote_commands.values()),
+                    expected_fencing_token=expected_fencing_token,
+                    expected_workflow_updated_at=expected_workflow_updated_at,
+                    reference=reference,
+                    reconciled_at=reconciled_at,
+                )
+            )
+            self._workflows[workflow_request_id] = updated_workflow
+            self._incidents[incident.incident_id] = updated_incident
+            self._plans[source_plan.plan_id] = updated_plan
+            return updated_workflow, updated_incident, updated_plan
+
+    def reconcile_retired_generation_workflow(
+        self,
+        workflow_request_id: str,
+        successor_workflow_id: str,
+        *,
+        expected_fencing_token: int,
+        reference: str | None,
+        reconciled_at: datetime,
+    ) -> tuple[WorkflowRequest, FaultIncident]:
+        """Terminalize a workflow whose incident moved to a later generation.
+
+        See ``TransactionalWorkflowMixin.reconcile_retired_generation_workflow``
+        for why this takes no expected ``updated_at`` and why it releases the
+        execution lease instead of requiring it.
+        """
+
+        with self._lock:
+            workflow = self.get_workflow(workflow_request_id)
+            incident = self.get_incident(workflow.incident_id)
+            successor = self.get_workflow(successor_workflow_id)
+            updated_workflow, updated_incident = retired_generation_records(
+                workflow,
+                incident,
+                successor,
+                list(self._remote_commands.values()),
+                expected_fencing_token=expected_fencing_token,
+                reference=reference,
+                reconciled_at=reconciled_at,
+            )
+            self._workflows[workflow_request_id] = updated_workflow
+            self._incidents[incident.incident_id] = updated_incident
+            return updated_workflow, updated_incident
 
     def get_incident(self, incident_id: str) -> FaultIncident:
         with self._lock:
@@ -205,6 +283,59 @@ class MemoryWorkflowMixin:
             if statuses is not None:
                 workflows = [item for item in workflows if item.status in statuses]
             return workflows[:limit]
+
+    def workflow_status_counts(self) -> dict[WorkflowStatus, int]:
+        """Count every persisted workflow by status without decoding any.
+
+        The /metrics workflow gauge must stay exact while the detail scan that
+        feeds the duration and step families is bounded, so the count is a
+        server-side aggregate rather than a by-product of that scan.
+        """
+
+        with self._lock:
+            counts = {status: 0 for status in WorkflowStatus}
+            for workflow in self._workflows.values():
+                counts[workflow.status] += 1
+            return counts
+
+    def blocked_workflows_without_verified_restore(self) -> int:
+        """Count the BLOCKED workflows whose GPU node is still held.
+
+        See the SQLite implementation for why the lifetime BLOCKED count cannot
+        answer this. The predicate below is
+        ``workflow_resolution.verified_restore_successor`` negated;
+        ``tests/store/test_blocked_backlog_gauge.py`` pins the three backends
+        and that function to the same answer, so a change to one has to move all
+        of them.
+        """
+
+        with self._lock:
+            blocked = [
+                workflow
+                for workflow in self._workflows.values()
+                if workflow.status is WorkflowStatus.BLOCKED
+            ]
+            return sum(
+                1 for workflow in blocked if not self._restore_is_verified(workflow)
+            )
+
+    def _restore_is_verified(self, workflow: WorkflowRequest) -> bool:
+        incident = self._incidents.get(workflow.incident_id)
+        if incident is None or incident.state is not IncidentState.RECOVERED:
+            return False
+        successor_id = incident.workflow_request_id
+        if not successor_id or successor_id == workflow.request_id:
+            return False
+        successor = self._workflows.get(successor_id)
+        if successor is None:
+            return False
+        return (
+            successor.incident_id == workflow.incident_id
+            and successor.status is WorkflowStatus.SUCCEEDED
+            and successor.fencing_token == workflow.fencing_token
+            and incident.fencing_token == workflow.fencing_token
+            and WorkflowOperation.RESTORE_SCHEDULING in successor.completed_operations
+        )
 
     def list_unhandled_failed_workflows(
         self, *, limit: int = 1000

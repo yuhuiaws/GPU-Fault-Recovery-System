@@ -197,7 +197,11 @@ def test_control_plane_roles_and_adot_have_disruption_protection() -> None:
         "app": "gpu-fault-telemetry-spool-worker"
     }
     assert adot["spec"]["replicas"] >= 1
-    assert adot_pdb["spec"]["minAvailable"] == 1
+    # Not minAvailable: the collector runs one replica, so any minAvailable at
+    # all is an eviction the API server can never permit. See
+    # test_no_disruption_budget_can_block_a_drain_forever.
+    assert adot_pdb["spec"]["maxUnavailable"] == 1
+    assert "minAvailable" not in adot_pdb["spec"]
     collector_config = next(
         item
         for item in adot_documents
@@ -210,10 +214,94 @@ def test_control_plane_roles_and_adot_have_disruption_protection() -> None:
     )
     assert "GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION" in installer
     assert "has no confirmed subscription" in installer
+    assert "aws sns subscribe" not in installer
+    assert '--arg endpoint "${GPU_FAULT_ALERT_EMAIL}"' in installer
+    assert '((.Protocol // "") | ascii_downcase) == "email"' in installer
+    assert '((.Endpoint // "") | ascii_downcase)' in installer
+    assert '.SubscriptionArn == "PendingConfirmation"' in installer
+    assert "exactly one confirmed email subscription" in installer
     assert "KUBECONFIG_EKS_ARN" in installer
     assert installer.index("aws eks describe-cluster") < installer.index(
         "aws iam create-role"
     )
+
+
+def deploy_documents() -> list[tuple[Path, dict]]:
+    """Every Kubernetes object under deploy/, with the file it came from."""
+    documents: list[tuple[Path, dict]] = []
+    for path in sorted((ROOT / "deploy").rglob("*.yaml")):
+        try:
+            loaded = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+        except yaml.YAMLError:
+            # Helm-style templates and partial fragments are not our concern
+            # here; the objects this test cares about are all plain manifests.
+            continue
+        documents.extend(
+            (path, document)
+            for document in loaded
+            if isinstance(document, dict) and "kind" in document
+        )
+    return documents
+
+
+def test_no_disruption_budget_can_block_a_drain_forever() -> None:
+    """A budget must always leave at least one voluntary disruption allowed.
+
+    ``minAvailable: N`` against ``replicas: N`` is not a strict policy, it is an
+    unsatisfiable one: the API server can never admit an eviction that would drop
+    below the floor, so ``kubectl drain`` on the node hosting one of those Pods
+    never returns and node replacement and cluster upgrades both stall with no
+    error that names the budget. ``gpu-fault-adot`` shipped exactly that shape --
+    ``minAvailable: 1`` on a one-replica Deployment -- and a test asserted it,
+    which is why this scans every budget under deploy/ rather than naming one.
+    """
+
+    def pod_labels(deployment: dict) -> dict:
+        template = deployment["spec"].get("template") or {}
+        return (template.get("metadata") or {}).get("labels") or {}
+
+    documents = deploy_documents()
+    deployments = [
+        document for _path, document in documents if document["kind"] == "Deployment"
+    ]
+    budgets = [
+        (path, document)
+        for path, document in documents
+        if document["kind"] == "PodDisruptionBudget"
+    ]
+
+    assert budgets, "the budget scan found nothing; deploy/ layout moved"
+    for path, budget in budgets:
+        name = budget["metadata"]["name"]
+        namespace = budget["metadata"].get("namespace")
+        selector = budget["spec"]["selector"]["matchLabels"]
+        matched = [
+            document
+            for document in deployments
+            if document["metadata"].get("namespace") == namespace
+            and selector.items() <= pod_labels(document).items()
+        ]
+        assert matched, f"{path}: budget {name} selects no Deployment in deploy/"
+
+        floor = budget["spec"].get("minAvailable")
+        if floor is None:
+            ceiling = budget["spec"]["maxUnavailable"]
+            assert isinstance(ceiling, int) and ceiling >= 1, (
+                f"{path}: budget {name} allows no disruption: "
+                f"maxUnavailable={ceiling!r}"
+            )
+            continue
+        assert isinstance(floor, int), (
+            f"{path}: budget {name} states minAvailable as {floor!r}; a percentage "
+            "cannot be checked against the replica count here"
+        )
+        for document in matched:
+            replicas = document["spec"].get("replicas", 1)
+            assert replicas > floor, (
+                f"{path}: budget {name} requires minAvailable={floor} of the "
+                f"{replicas} replicas of {document['metadata']['name']}, so no "
+                "eviction is ever permitted and a drain of its node hangs"
+            )
 
 
 def test_ingress_has_one_nonblocking_spread_constraint() -> None:
@@ -282,6 +370,10 @@ def test_role_split_deploy_waits_for_spool_before_ingress() -> None:
     spool_ready = standalone.index("wait_for_rollout gpu-fault-telemetry-spool-worker")
     ingress_apply = standalone.index("apply_manifest gpu-fault-api-ha-ingress")
     assert spool_apply < spool_ready < ingress_apply
+    parallel = standalone.index("apply_consumer_roles")
+    ingress_call = standalone.index("apply_ingress_role", parallel)
+    assert "apply_spool_role &" in standalone[parallel:ingress_call]
+    assert "apply_worker_role &" in standalone[parallel:ingress_call]
 
     deploy = (ROOT / "deploy/hyperpod/deploy.sh").read_text(encoding="utf-8")
     spool_ready = deploy.index(
@@ -375,6 +467,7 @@ def test_regional_production_assets_have_no_implicit_region() -> None:
         "deploy/observability/adot-control-plane.yaml",
         "deploy/observability/amp-alertmanager.yaml",
         "deploy/observability/install-amp-monitoring.sh",
+        "deploy/observability/install-cloudwatch-observability.sh",
     )
 
     for relative in paths:
@@ -681,8 +774,52 @@ def test_ambiguous_attempt_ownership_has_a_prometheus_alert() -> None:
 
     assert alert["expr"] == "gpu_fault_ambiguous_attempt_ownership_current > 1"
     assert alert["labels"]["severity"] == "critical"
-    assert stale["expr"] == "gpu_fault_stale_attempt_observations > 0"
+    assert stale["expr"] == (
+        "max by (cluster_id, gpu_node) (gpu_fault_stale_attempt_observations) > 0"
+    )
+    assert stale["for"] == "2m"
     assert stale["labels"]["severity"] == "warning"
+    assert "do not delete Store rows" in stale["annotations"]["description"]
+
+
+def test_stale_attempt_alerts_group_by_gpu_node() -> None:
+    document = yaml.safe_load(
+        (ROOT / "deploy/observability/amp-alertmanager.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    config = yaml.safe_load(document["alertmanager_config"])
+
+    assert {"cluster_id", "gpu_node"}.issubset(set(config["route"]["group_by"])), (
+        "stale observation alerts are not grouped by cluster and node"
+    )
+
+
+def test_executor_internal_error_alert_uses_latest_error_timestamp() -> None:
+    documents = (
+        yaml.safe_load(
+            (ROOT / "deploy/observability/amp-rules.yaml").read_text(encoding="utf-8")
+        ),
+        yaml.safe_load(
+            (ROOT / "deploy/control-plane/regional/processor-alerts.yaml").read_text(
+                encoding="utf-8"
+            )
+        )["spec"],
+    )
+
+    for document in documents:
+        rules = {
+            rule["alert"]: rule
+            for group in document["groups"]
+            for rule in group["rules"]
+            if "alert" in rule
+        }
+        expression = rules["GpuFaultRemoteCommandExecutorInternalError"]["expr"]
+        assert (
+            "gpu_fault_remote_command_executor_internal_error_last_seen_"
+            "timestamp_seconds" in expression
+        )
+        assert "increase(" not in expression
 
 
 def test_amp_rules_cover_prometheus_rules_and_kept_metrics() -> None:
@@ -727,6 +864,90 @@ def test_amp_rules_cover_prometheus_rules_and_kept_metrics() -> None:
         for name in re.findall(r"\bgpu_fault_[a-z0-9_]+", rule["expr"])
     }
     assert {name for name in metric_names if not pattern.fullmatch(name)} == set()
+
+
+def _amp_wait_function() -> str:
+    """The installer's AMP convergence helper, on its own, ready to run."""
+
+    text = (ROOT / "deploy/observability/install-amp-monitoring.sh").read_text(
+        encoding="utf-8"
+    )
+    start = text.index("wait_for_amp_definition() {")
+    end = text.index("\n}\n", start) + len("\n}\n")
+    return text[start:end]
+
+
+def _run_amp_wait(
+    statuses: list[str], *, timeout: str = "300"
+) -> subprocess.CompletedProcess[str]:
+    """Run the helper against a scripted sequence of AMP status answers.
+
+    The counter lives in a file because the helper reads the status through a
+    command substitution, and a subshell cannot report back a variable.
+    """
+
+    script = f"""
+    set -euo pipefail
+    AMP_APPLY_TIMEOUT_SECONDS="{timeout}"
+    ANSWERS=({" ".join(statuses)})
+    COUNTER="$(mktemp)"
+    trap 'rm -f "${{COUNTER}}"' EXIT
+    printf '0' >"${{COUNTER}}"
+    amp_describe() {{
+        local index
+        index="$(cat "${{COUNTER}}")"
+        printf '%s' "$((index + 1))" >"${{COUNTER}}"
+        printf '%s\\n' "${{ANSWERS[${{index}}]}}"
+    }}
+    sleep() {{ :; }}
+    {_amp_wait_function()}
+    wait_for_amp_definition label query amp_describe
+    printf 'calls=%s\\n' "$(cat "${{COUNTER}}")"
+    """
+    return subprocess.run(
+        ["bash", "-c", script], text=True, capture_output=True, check=False
+    )
+
+
+def test_amp_installer_waits_for_the_definition_it_just_wrote() -> None:
+    """A write that returns before AMP applied it makes the next read stale.
+
+    AMP validates rule and Alertmanager definitions asynchronously and keeps
+    answering with the previous one meanwhile, so the monitoring verification
+    that runs right after this installer would see the definition being
+    replaced -- reporting a missing rule group on exactly the releases that add
+    one, and passing on the retry. A rejected definition is the same read with
+    a permanent cause: the old rules keep serving and no new alert ever fires.
+    """
+
+    settled = _run_amp_wait(["UPDATING", "UPDATING", "ACTIVE"])
+    immediate = _run_amp_wait(["ACTIVE"])
+    rejected = _run_amp_wait(["UPDATING", "UPDATE_FAILED"])
+    timed_out = _run_amp_wait(["UPDATING", "UPDATING"], timeout="0")
+
+    # It polls until the write is visible rather than accepting the first answer.
+    assert settled.returncode == 0, settled.stderr
+    assert "calls=3" in settled.stdout
+    assert immediate.returncode == 0, immediate.stderr
+    assert "calls=1" in immediate.stdout
+    # Fail closed on both terminal shapes, and name the status in the message so
+    # a rejected definition is distinguishable from a slow one.
+    assert rejected.returncode == 1
+    assert "UPDATE_FAILED" in rejected.stderr
+    assert timed_out.returncode == 1
+    assert "still UPDATING" in timed_out.stderr
+
+    installer = (ROOT / "deploy/observability/install-amp-monitoring.sh").read_text(
+        encoding="utf-8"
+    )
+    # Both writes are covered: the rule namespace and the Alertmanager
+    # definition are separate AMP resources with separate convergence.
+    assert installer.count("wait_for_amp_definition \\\n") == 2
+    for write, query in (
+        ("put-rule-groups-namespace", "ruleGroupsNamespace.status.statusCode"),
+        ("put-alert-manager-definition", "alertManagerDefinition.status.statusCode"),
+    ):
+        assert installer.index(write) < installer.index(query), write
 
 
 def test_regional_executor_never_mounts_fleet_master() -> None:

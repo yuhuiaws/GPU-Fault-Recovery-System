@@ -7,9 +7,7 @@ from pathlib import Path
 from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE = lazy_script_module(
-    "select_affected_tests", ROOT / "scripts" / "select-affected-tests.py"
-)
+MODULE = lazy_script_module(ROOT / "scripts" / "select-affected-tests.py")
 
 
 def settings():

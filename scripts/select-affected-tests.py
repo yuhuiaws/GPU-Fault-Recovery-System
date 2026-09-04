@@ -34,6 +34,7 @@ ALLOWED_CHECKS = {
     "artifact-check",
     "case-index-check",
     "check",
+    "ci-tooling-check",
     "config-check",
     "deployment-contracts-check",
     "docs-check",

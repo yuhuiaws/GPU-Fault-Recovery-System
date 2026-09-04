@@ -6,7 +6,6 @@ from typing import Any
 import regional_deployment_inventory as inventory
 from regional_release_config import ReleaseError
 
-
 BASE_RUNTIME_PATH = (
     "/opt/app-root/bin:/opt/app-root/src/.local/bin:"
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -18,6 +17,131 @@ EXECUTOR_PYTHON = "python"
 EXECUTOR_READINESS = "gpu-fault-cluster-executor-readiness"
 MODULE_DIGEST_SCRIPT = "from gpu_fault import module_digest; print(module_digest())"
 MAX_RUNTIME_IDENTITY_WORKERS = 8
+CPU_INGRESS_POD_ATTRIBUTE = "_cpu_ingress_pod"
+
+
+def resolve_cpu_ingress_pod(release: Any, *, failure: str) -> str:
+    pod = release.runner.run(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "pod",
+            "-l",
+            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ),
+        capture=True,
+    )
+    if not pod:
+        raise ReleaseError(f"no running CPU ingress Pod for {failure}")
+    return str(pod)
+
+
+def cpu_ingress_pod(
+    release: Any,
+    *,
+    failure: str,
+    refresh: bool = False,
+) -> str:
+    """Return the CPU ingress Pod name, memoised for read-only probes.
+
+    Wave safety barriers and heartbeat convergence checks re-resolve this Pod
+    every few seconds even though its name only changes when the control plane
+    itself rolls, so the lookup is cached per release run. Read-only callers
+    must retry with ``refresh=True`` once so a replaced Pod is re-resolved
+    instead of failing the release; mutating callers resolve it fresh.
+    """
+
+    if not refresh:
+        cached = str(getattr(release, CPU_INGRESS_POD_ATTRIBUTE, "") or "")
+        if cached:
+            return cached
+    pod = resolve_cpu_ingress_pod(release, failure=failure)
+    setattr(release, CPU_INGRESS_POD_ATTRIBUTE, pod)
+    return pod
+
+
+def forget_cpu_ingress_pod(release: Any) -> None:
+    setattr(release, CPU_INGRESS_POD_ATTRIBUTE, "")
+
+
+def exec_cpu_ingress_probe(
+    release: Any,
+    *,
+    script: str,
+    failure: str,
+    input_text: str | None = None,
+    sensitive: bool = False,
+    timeout_seconds: float | None = None,
+    interactive: bool = True,
+    retries: int = 1,
+) -> str:
+    """Run a read-only in-Pod probe against the memoised ingress Pod.
+
+    Only read-only probes may use this: with ``retries`` above zero a failure
+    re-resolves the Pod and runs the script again, which would be unsafe for a
+    mutating command. A failed attempt always drops the memoised name so the
+    next caller re-resolves it.
+
+    A Pod that no longer exists is not a failed attempt. The release rolls the
+    CPU ingress Deployment itself, so a memoised name can be replaced between
+    two probes -- the barrier that runs straight after CPU finalize hits exactly
+    that. ``kubectl exec`` then reports ``NotFound`` without the script ever
+    starting, which is why a vanished Pod always buys one more attempt against a
+    freshly resolved Pod, even for the callers that set ``retries=0`` because
+    their in-Pod barrier already spends its whole window: nothing was spent when
+    the exec never ran. The check is positive -- the Pod is looked up rather
+    than the failure text matched -- so it also holds for probes whose output is
+    sensitive and must not be inspected.
+    """
+
+    error: Exception | None = None
+    attempts_left = retries + 1
+    replacement_attempts_left = 1
+    refresh = False
+    while attempts_left > 0:
+        pod = cpu_ingress_pod(release, failure=failure, refresh=refresh)
+        command = release._cpu(
+            "-n",
+            release.config.namespace,
+            "exec",
+            *(("-i",) if interactive else ()),
+            pod,
+            "--",
+            CONTROL_PLANE_PYTHON,
+            "-c",
+            script,
+        )
+        try:
+            return release.runner.run(
+                command,
+                input_text=input_text,
+                capture=True,
+                sensitive=sensitive,
+                timeout_seconds=timeout_seconds,
+            )
+        except ReleaseError as exc:
+            error = exc
+            replaced = not release.runner.probe(
+                release._cpu(
+                    "-n",
+                    release.config.namespace,
+                    "get",
+                    "pod",
+                    pod,
+                )
+            )
+            forget_cpu_ingress_pod(release)
+            refresh = True
+            attempts_left -= 1
+            if attempts_left == 0 and replaced and replacement_attempts_left > 0:
+                replacement_attempts_left -= 1
+                attempts_left = 1
+    assert error is not None
+    raise error
 
 
 def _running_pods(

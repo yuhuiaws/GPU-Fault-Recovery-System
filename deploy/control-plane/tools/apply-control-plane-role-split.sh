@@ -887,6 +887,29 @@ apply_worker_role() {
     wait_for_rollout gpu-fault-control-worker
 }
 
+apply_consumer_roles() {
+    local spool_pid=""
+    local worker_pid=""
+    local failed=0
+    if role_selected spool; then
+        apply_spool_role &
+        spool_pid="$!"
+    fi
+    if role_selected worker; then
+        apply_worker_role &
+        worker_pid="$!"
+    fi
+    if [[ -n "${spool_pid}" ]] && ! wait "${spool_pid}"; then
+        echo "telemetry spool worker rollout failed" >&2
+        failed=1
+    fi
+    if [[ -n "${worker_pid}" ]] && ! wait "${worker_pid}"; then
+        echo "control worker rollout failed" >&2
+        failed=1
+    fi
+    return "${failed}"
+}
+
 apply_ingress_role() {
     role_selected ingress || return 0
     apply_manifest gpu-fault-api-ha-pdb
@@ -926,8 +949,7 @@ if [[ "${CURRENT_SPOOL_ADMISSION}" == "true" &&
 else
     # Greenfield, steady-state and enable transitions all prove the consumer
     # tier before ingress can begin writing to the spool.
-    apply_spool_role
-    apply_worker_role
+    apply_consumer_roles
     apply_ingress_role
 fi
 stamp_admin_config_metadata

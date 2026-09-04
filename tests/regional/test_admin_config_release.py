@@ -5,18 +5,16 @@ from pathlib import Path
 
 import pytest
 
-from gpu_fault.admin_config import preset_admin_config
+from gpu_fault.admin.config import preset_admin_config
 from tests._script_loader import lazy_script_module
 from tests.regional._release_orchestrator_support import config_file
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = lazy_script_module(
-    "rollout_regional_release_admin_config",
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py",
+    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
 )
 DIFF_MODULE = lazy_script_module(
-    "regional_release_diff_admin_config",
-    ROOT / "deploy/control-plane/regional/regional_release_diff.py",
+    ROOT / "deploy/control-plane/regional/regional_release_diff.py"
 )
 
 
@@ -44,12 +42,17 @@ def test_admin_config_renders_and_targets_only_changed_cpu_role(
             self.calls.append((args, kwargs))
             return ""
 
+        def probe(self, _args, **_kwargs):
+            return False
+
     runner = RecordingRunner()
     release = MODULE.RegionalRelease(config, runner)
     monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
     monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
     monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
-    monkeypatch.setattr(release, "_capture_previous", lambda: {"metadata": {}})
+    monkeypatch.setattr(
+        release, "_capture_previous", lambda **_kwargs: {"metadata": {}}
+    )
     monkeypatch.setattr(release, "_backup_release_secrets", lambda: {})
     monkeypatch.setattr(release, "_save_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(release, "_upload_release", lambda _diff: None)

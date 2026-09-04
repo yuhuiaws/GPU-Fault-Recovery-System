@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -12,6 +12,9 @@ from gpu_fault.app.routes.regional import (
 )
 from gpu_fault.async_store import StoreIoCapacityExceeded
 from gpu_fault.regional import (
+    RegionalClusterLifecycle,
+    RegionalClusterRegistration,
+    RegionalRegistryClusterTransitionRequest,
     RegionalRegistryMember,
     RegionalRegistryPublishRequest,
     RegionalRegistryRevision,
@@ -23,8 +26,31 @@ from gpu_fault.regional_registry_runtime import (
     registry_revision_converged,
 )
 
-
 router = APIRouter(prefix="/v1/regional/registry", tags=["regional-registry"])
+JOIN_TRANSITIONS = {
+    RegionalClusterLifecycle.PENDING: frozenset(
+        {
+            RegionalClusterLifecycle.PENDING,
+            RegionalClusterLifecycle.ACTIVE,
+            RegionalClusterLifecycle.FAILED,
+            RegionalClusterLifecycle.ROLLED_BACK,
+        }
+    ),
+    RegionalClusterLifecycle.ACTIVE: frozenset({RegionalClusterLifecycle.ACTIVE}),
+    RegionalClusterLifecycle.FAILED: frozenset(
+        {
+            RegionalClusterLifecycle.FAILED,
+            RegionalClusterLifecycle.ROLLED_BACK,
+            RegionalClusterLifecycle.PENDING,
+        }
+    ),
+    RegionalClusterLifecycle.ROLLED_BACK: frozenset(
+        {
+            RegionalClusterLifecycle.ROLLED_BACK,
+            RegionalClusterLifecycle.PENDING,
+        }
+    ),
+}
 
 
 async def _store_call(
@@ -59,6 +85,67 @@ async def _publish(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _registration_identity(
+    registration: RegionalClusterRegistration,
+) -> dict[str, Any]:
+    value = cast(dict[str, Any], registration.model_dump(mode="json"))
+    for field in ("lifecycle_state", "created_at", "updated_at"):
+        value.pop(field, None)
+    return value
+
+
+def _transitioned_registration(
+    current: RegionalClusterRegistration | None,
+    request: RegionalRegistryClusterTransitionRequest,
+    *,
+    observed_at: datetime,
+) -> RegionalClusterRegistration:
+    desired = request.lifecycle_state
+    if desired not in JOIN_TRANSITIONS:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{desired.value} is not a join lifecycle state",
+        )
+    if current is None:
+        if desired is not RegionalClusterLifecycle.PENDING:
+            raise HTTPException(
+                status_code=409,
+                detail="new regional cluster must enter PENDING first",
+            )
+        return cast(
+            RegionalClusterRegistration,
+            request.registration.model_copy(
+                update={
+                    "lifecycle_state": desired,
+                    "created_at": observed_at,
+                    "updated_at": observed_at,
+                }
+            ),
+        )
+    if _registration_identity(current) != _registration_identity(request.registration):
+        raise HTTPException(
+            status_code=409,
+            detail="regional cluster transition identity differs from the registry",
+        )
+    if desired not in JOIN_TRANSITIONS.get(current.lifecycle_state, frozenset()):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "invalid regional cluster lifecycle transition "
+                f"{current.lifecycle_state.value}->{desired.value}"
+            ),
+        )
+    return cast(
+        RegionalClusterRegistration,
+        current.model_copy(
+            update={
+                "lifecycle_state": desired,
+                "updated_at": observed_at,
+            }
+        ),
+    )
 
 
 def _status(
@@ -140,6 +227,76 @@ async def regional_registry_status(
     dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
 ) -> RegionalRegistryStatus:
     return await _current_status(dependencies)
+
+
+@router.post(  # type: ignore[untyped-decorator]
+    "/clusters/{cluster_id}/transition",
+    response_model=RegionalRegistryStatus,
+)
+@authorization_bucket("execution-token")
+async def transition_regional_registry_cluster(
+    cluster_id: str,
+    request: RegionalRegistryClusterTransitionRequest,
+    dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
+) -> RegionalRegistryStatus:
+    if request.registration.cluster_id != cluster_id:
+        raise HTTPException(
+            status_code=400,
+            detail="path cluster_id does not match the registration",
+        )
+    runtime = dependencies.auth_registry
+    for _attempt in range(8):
+        head = await _store_call(
+            dependencies,
+            dependencies.context.store.get_regional_registry_head,
+        )
+        current = await _store_call(
+            dependencies,
+            dependencies.context.store.get_regional_registry_revision,
+            head.generation,
+        )
+        members = await _store_call(
+            dependencies,
+            dependencies.context.store.list_regional_registry_members,
+        )
+        observed = datetime.now(timezone.utc)
+        registrations = {item.cluster_id: item for item in current.registrations}
+        registrations[cluster_id] = _transitioned_registration(
+            registrations.get(cluster_id),
+            request,
+            observed_at=observed,
+        )
+        revision = RegionalRegistryRevision.build(
+            generation=head.generation + 1,
+            registrations=list(registrations.values()),
+            previous_generation=head.generation,
+            required_member_ids=active_registry_member_ids(
+                members,
+                observed_at=observed,
+                stale_seconds=runtime.stale_seconds,
+            ),
+            reason=request.reason,
+            created_at=observed,
+        )
+        try:
+            await _store_call(
+                dependencies,
+                dependencies.context.store.publish_regional_registry_revision,
+                revision,
+                expected_generation=head.generation,
+            )
+        except ValueError:
+            continue
+        await _store_call(
+            dependencies,
+            runtime.refresh_once,
+            raise_on_failure=True,
+        )
+        return await _current_status(dependencies)
+    raise HTTPException(
+        status_code=409,
+        detail="regional registry changed repeatedly during cluster transition",
+    )
 
 
 @router.post(  # type: ignore[untyped-decorator]

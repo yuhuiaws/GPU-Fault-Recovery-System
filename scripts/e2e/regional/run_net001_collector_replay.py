@@ -261,7 +261,7 @@ class Runner:
         script = (
             "install -m 0700 /tool/net001_node_probe.py "
             "/host/tmp/gpu-fault-net001-node-probe.py; "
-            "exec chroot /host /opt/gpu-fault/venv/bin/python "
+            "exec chroot /host /opt/gpu-fault/current/venv/bin/python "
             '/tmp/gpu-fault-net001-node-probe.py "$@"'
         )
         completed = self.gpu(

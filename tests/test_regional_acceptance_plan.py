@@ -56,11 +56,15 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
     assert plan.read_only is False
     assert plan.repair_allowed is False
     assert len(plan.execution_order) == 152
-    assert len(plan.cases) == 153
+    assert len(plan.cases) == 154
     assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-011", "GF-REGIONAL-BOOT-012")
     assert plan.execution_order[-1] == "GF-REGIONAL-COLLECT-015"
-    assert plan.do_not_run_case_ids == ("GF-REGIONAL-DESTR-004",)
-    assert plan.case_ids == (*plan.execution_order, "GF-REGIONAL-DESTR-004")
+    assert plan.do_not_run_case_ids == ("GF-REGIONAL-DESTR-004", "GF-REGIONAL-AUTH-012")
+    assert plan.case_ids == (
+        *plan.execution_order,
+        "GF-REGIONAL-DESTR-004",
+        "GF-REGIONAL-AUTH-012",
+    )
 
     first = plan.case(plan.execution_order[0])
     assert first.execution.depends_on == ()
@@ -132,9 +136,20 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
     assert gate.local_proxy is True
     assert gate.command == ("python3", "scripts/check-manual-command-order.py")
 
-    human = plan.case("GF-REGIONAL-BOOT-001")
+    # A live case keeps its human run even here. BOOT-016 has no local proxy to
+    # offer, and BOOT-019 has a ``related_pytest`` that is deliberately *not*
+    # promoted to one -- the risk class decides whether a case can be answered
+    # locally, not whether some test happens to be related to it.
+    human = plan.case("GF-REGIONAL-BOOT-016")
     assert human.executor is ExecutorKind.HUMAN
+    assert human.risk == "live-non-destructive"
     assert human.blocked is True
+    live_service = plan.case("GF-REGIONAL-BOOT-019")
+    assert live_service.related_pytest is not None
+    assert live_service.risk == "live-service-action"
+    assert live_service.executor is ExecutorKind.HUMAN
+    assert live_service.local_proxy is False
+    assert live_service.blocked is True
     destructive = plan.case("GF-REGIONAL-DESTR-001")
     assert destructive.executor is ExecutorKind.HUMAN
     assert destructive.blocked is True
@@ -145,7 +160,9 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
         if case.executor in {ExecutorKind.PYTEST, ExecutorKind.COMMAND}
         and not case.blocked
     ]
-    assert len(automated) == 62
+    # 78 pytest + 22 command of the 154 cases. The number only moves when a case
+    # gains or loses a local answer, so it is stated rather than derived.
+    assert len(automated) == 100
     assert all(
         case.risk == "non-destructive" or case.local_proxy for case in automated
     ), [case.id for case in automated]

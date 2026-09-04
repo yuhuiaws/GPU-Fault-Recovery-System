@@ -1,25 +1,44 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
 import secrets
 import shutil
 import subprocess
 import sys
-from typing import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Sequence, cast
+
+import yaml
+
+from gpu_fault.admin.operation_lock import (
+    SITE_OPERATION_LOCK_FD_ENV,
+    site_operation_lock,
+)
 
 if __package__:
     from scripts.deploy_host_bundle import bundle_platform_id
+    from scripts.staging_live_evidence import (
+        LiveEvidenceError,
+        collect_live_deploy_evidence,
+        successful_source_live_matches,
+    )
 else:
     from deploy_host_bundle import bundle_platform_id
+    from staging_live_evidence import (
+        LiveEvidenceError,
+        collect_live_deploy_evidence,
+        successful_source_live_matches,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DEPLOY_STATE = "source-deploy.json"
+SOURCE_DEPLOY_SUCCESS_STATE = "source-deploy-success.json"
+SOURCE_DEPLOY_SUCCESS_SIGNATURE = "source-deploy-success.sigstore.json"
 
 
 class StagingDeployError(RuntimeError):
@@ -56,6 +75,7 @@ def _run(
     cwd: Path,
     env: Mapping[str, str] | None = None,
     capture: bool = False,
+    pass_fds: tuple[int, ...] = (),
 ) -> str:
     print("+ " + " ".join(arguments), file=sys.stderr, flush=True)
     completed = subprocess.run(
@@ -65,6 +85,7 @@ def _run(
         check=False,
         text=True,
         capture_output=capture,
+        pass_fds=pass_fds,
     )
     if completed.returncode:
         detail = (completed.stderr or "").strip() if capture else ""
@@ -516,16 +537,124 @@ def ensure_signing_material(
 def deploy_host_artifacts(
     state_dir: Path,
     *,
-    git_commit: str,
+    payload_identity_sha256: str,
 ) -> DeployHostArtifacts:
+    if len(payload_identity_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in payload_identity_sha256
+    ):
+        raise StagingDeployError("deploy-host payload identity is invalid")
     platform = bundle_platform_id()
-    output = state_dir / "deploy-host" / git_commit
+    output = state_dir / "deploy-host" / "by-content" / payload_identity_sha256
     archive = output / f"gpu-fault-deploy-host-{platform}.tar.gz"
     return DeployHostArtifacts(
         archive=archive,
         checksum=archive.with_suffix(archive.suffix + ".sha256"),
         signature_bundle=(output / f"gpu-fault-deploy-host-{platform}.sigstore.json"),
     )
+
+
+def source_deploy_identity(repository_root: Path) -> dict[str, object]:
+    output = _run(
+        [
+            sys.executable,
+            str(repository_root / "scripts/deploy_source_identity.py"),
+            "--root",
+            str(repository_root),
+        ],
+        cwd=repository_root,
+        capture=True,
+    )
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise StagingDeployError("source deploy identity output is invalid") from exc
+    if not isinstance(value, dict):
+        raise StagingDeployError("source deploy identity must be an object")
+    for name in ("application", "deploy_host"):
+        item = value.get(name)
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("sha256"), str)
+            or len(str(item["sha256"])) != 64
+        ):
+            raise StagingDeployError(f"source deploy {name} identity is invalid")
+    deploy_host = value["deploy_host"]
+    assert isinstance(deploy_host, dict)
+    bundle = deploy_host.get("bundle")
+    if (
+        not isinstance(bundle, dict)
+        or not isinstance(bundle.get("sha256"), str)
+        or len(str(bundle["sha256"])) != 64
+    ):
+        raise StagingDeployError("deploy-host bundle identity is invalid")
+    return value
+
+
+def restore_trusted_ci_candidate(
+    repository_root: Path,
+    *,
+    staging_only: bool,
+) -> dict[str, object] | None:
+    if staging_only:
+        return None
+    output = _run(
+        [
+            sys.executable,
+            str(repository_root / "scripts/restore_ci_candidate.py"),
+            "--root",
+            str(repository_root),
+            "--destination",
+            str(repository_root / "dist"),
+        ],
+        cwd=repository_root,
+        capture=True,
+    )
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise StagingDeployError("trusted CI candidate result is invalid") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("available"), bool):
+        raise StagingDeployError("trusted CI candidate result is incomplete")
+    return value if value["available"] is True else None
+
+
+def record_trusted_ci_candidate(
+    repository_root: Path,
+    *,
+    state_dir: Path,
+    signing: SigningMaterial,
+    candidate: Mapping[str, object],
+) -> None:
+    output = _run(
+        [
+            sys.executable,
+            str(repository_root / "scripts/ci_candidate_receipt.py"),
+            "write",
+            "--root",
+            str(repository_root),
+            "--state-dir",
+            str(state_dir),
+            "--gate",
+            str(candidate["ci_gate"]),
+            "--repository",
+            str(candidate["repository"]),
+            "--run-id",
+            str(candidate["run_id"]),
+            "--signing-key",
+            str(signing.private_key),
+        ],
+        cwd=repository_root,
+        env={**os.environ, "COSIGN_PASSWORD": signing.password},
+        capture=True,
+    )
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise StagingDeployError(
+            "trusted CI candidate receipt output is invalid"
+        ) from exc
+    if not isinstance(value, dict) or value.get("available") is not True:
+        raise StagingDeployError("trusted CI candidate receipt was not written")
 
 
 def deploy_host_wheelhouse_cache(
@@ -668,6 +797,347 @@ def record_source_deploy_state(
     return target
 
 
+def _source_success_paths(state_dir: Path) -> tuple[Path, Path]:
+    return (
+        state_dir / SOURCE_DEPLOY_SUCCESS_STATE,
+        state_dir / SOURCE_DEPLOY_SUCCESS_SIGNATURE,
+    )
+
+
+def load_successful_source_deploy(
+    state_dir: Path,
+    *,
+    signing: SigningMaterial,
+) -> dict[str, object] | None:
+    state_path, signature_path = _source_success_paths(state_dir)
+    present = (state_path.is_file(), signature_path.is_file())
+    if not any(present):
+        return None
+    if not all(present):
+        raise StagingDeployError("successful source deploy authorization is incomplete")
+    _run(
+        [
+            "cosign",
+            "verify-blob",
+            "--bundle",
+            str(signature_path),
+            "--key",
+            str(signing.public_key),
+            str(state_path),
+        ],
+        cwd=state_dir,
+        capture=True,
+    )
+    try:
+        value = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StagingDeployError(
+            "successful source deploy authorization is invalid"
+        ) from exc
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise StagingDeployError(
+            "successful source deploy authorization schema is invalid"
+        )
+    if value.get("status") != "PASSED":
+        raise StagingDeployError("successful source deploy authorization is not passed")
+    identities = value.get("identities")
+    source = value.get("source")
+    if not isinstance(identities, dict) or not isinstance(source, dict):
+        raise StagingDeployError("successful source deploy authorization is incomplete")
+    for name in ("application", "deploy_host"):
+        item = identities.get(name)
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("sha256"), str)
+            or len(str(item["sha256"])) != 64
+        ):
+            raise StagingDeployError(
+                f"successful source deploy {name} identity is invalid"
+            )
+    return value
+
+
+def record_successful_source_deploy(
+    state_dir: Path,
+    *,
+    source_repository_root: Path,
+    source: SourceCheckout,
+    identities: Mapping[str, object],
+    signing: SigningMaterial,
+    mode: str,
+    live_evidence: Mapping[str, object],
+) -> Path:
+    state_path, signature_path = _source_success_paths(state_dir)
+    application = identities.get("application")
+    deploy_host = identities.get("deploy_host")
+    if not isinstance(application, Mapping) or not isinstance(deploy_host, Mapping):
+        raise StagingDeployError("source deploy identities are incomplete")
+    bundle = deploy_host.get("bundle")
+    if not isinstance(bundle, Mapping):
+        raise StagingDeployError("source deploy bundle identity is incomplete")
+    value = {
+        "schema_version": 1,
+        "status": "PASSED",
+        "mode": mode,
+        "source_repository_root": str(source_repository_root),
+        "prepared_repository_root": str(source.repository_root),
+        "source": {
+            "git_commit": source.git_commit,
+            "fingerprint": source.fingerprint,
+            "snapshot": source.snapshot,
+            "isolated": source.isolated,
+        },
+        "identities": {
+            "application": {"sha256": application.get("sha256")},
+            "deploy_host": {
+                "sha256": deploy_host.get("sha256"),
+                "bundle": {"sha256": bundle.get("sha256")},
+            },
+        },
+        "site_file": str(state_dir / "site.yaml"),
+        "live": dict(live_evidence),
+    }
+    temporary_state = state_path.with_suffix(".tmp")
+    temporary_signature = signature_path.with_suffix(".tmp")
+    temporary_state.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_state.chmod(0o600)
+    temporary_signature.unlink(missing_ok=True)
+    _run(
+        [
+            "cosign",
+            "sign-blob",
+            "--yes",
+            "--key",
+            str(signing.private_key),
+            "--bundle",
+            str(temporary_signature),
+            str(temporary_state),
+        ],
+        cwd=state_dir,
+        env={**os.environ, "COSIGN_PASSWORD": signing.password},
+        capture=True,
+    )
+    temporary_signature.chmod(0o600)
+    os.replace(temporary_state, state_path)
+    os.replace(temporary_signature, signature_path)
+    return state_path
+
+
+def classify_source_deploy(
+    previous: Mapping[str, object] | None,
+    current: Mapping[str, object],
+    *,
+    source: SourceCheckout,
+    site_exists: bool,
+    live_matches: bool = False,
+) -> str:
+    if previous is None or not site_exists:
+        return "APPLICATION_RELEASE"
+    identities = previous.get("identities")
+    previous_source = previous.get("source")
+    if not isinstance(identities, dict) or not isinstance(previous_source, dict):
+        return "APPLICATION_RELEASE"
+    application = current.get("application")
+    deploy_host = current.get("deploy_host")
+    previous_application = identities.get("application")
+    previous_deploy_host = identities.get("deploy_host")
+    if not all(
+        isinstance(item, dict)
+        for item in (
+            application,
+            deploy_host,
+            previous_application,
+            previous_deploy_host,
+        )
+    ):
+        return "APPLICATION_RELEASE"
+    assert isinstance(application, dict)
+    assert isinstance(deploy_host, dict)
+    assert isinstance(previous_application, dict)
+    assert isinstance(previous_deploy_host, dict)
+    if application.get("sha256") != previous_application.get("sha256"):
+        return "APPLICATION_RELEASE"
+    if deploy_host.get("sha256") != previous_deploy_host.get("sha256"):
+        return "DEPLOY_HOST_ONLY"
+    if previous_source.get("fingerprint") == source.fingerprint and live_matches:
+        return "UNCHANGED"
+    if previous_source.get("fingerprint") == source.fingerprint:
+        return "APPLICATION_RELEASE"
+    return "QUALITY_ONLY"
+
+
+def _impact_base(
+    repository_root: Path,
+    previous: Mapping[str, object],
+    fallback: str,
+) -> str:
+    source = previous.get("source")
+    candidate = str(source.get("git_commit") or "") if isinstance(source, dict) else ""
+    if candidate:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{candidate}^{{commit}}"],
+            cwd=repository_root,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if completed.returncode == 0:
+            return candidate
+    return fallback
+
+
+def run_source_impact_gate(
+    *,
+    repository_root: Path,
+    state_dir: Path,
+    source: SourceCheckout,
+    previous: Mapping[str, object],
+    fallback_base: str,
+) -> dict[str, object]:
+    output = state_dir / "source-gates" / source.fingerprint / "impact-plan.json"
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output.parent.chmod(0o700)
+    base = _impact_base(repository_root, previous, fallback_base)
+    selector = repository_root / "scripts/select-affected-tests.py"
+    raw = _run(
+        [
+            sys.executable,
+            str(selector),
+            "--base",
+            base,
+            "--format",
+            "json",
+            "--write-plan",
+            str(output),
+        ],
+        cwd=repository_root,
+        capture=True,
+    )
+    try:
+        plan = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise StagingDeployError("source impact gate plan is invalid") from exc
+    if not isinstance(plan, dict):
+        raise StagingDeployError("source impact gate plan must be an object")
+    _run(
+        [
+            sys.executable,
+            str(selector),
+            "--base",
+            base,
+            "--read-plan",
+            str(output),
+            "--execute",
+        ],
+        cwd=repository_root,
+    )
+    return plan
+
+
+def run_admin_preflight(
+    *,
+    repository_root: Path,
+    state_dir: Path,
+    venv: Path,
+    lock_fd: int | None = None,
+) -> None:
+    environment = (
+        {**os.environ, SITE_OPERATION_LOCK_FD_ENV: str(lock_fd)}
+        if lock_fd is not None
+        else None
+    )
+    _run(
+        [
+            str(venv / "bin/gpu-fault-admin"),
+            "preflight",
+            "--state-dir",
+            str(state_dir),
+        ],
+        cwd=repository_root,
+        env=environment,
+        pass_fds=(lock_fd,) if lock_fd is not None else (),
+    )
+
+
+def _link_or_copy(source: str, destination: str) -> str:
+    path = Path(source)
+    if path.suffix == ".whl" or path.name.endswith(".tar.gz"):
+        try:
+            os.link(source, destination)
+            return destination
+        except OSError:
+            pass
+    shutil.copy2(source, destination)
+    return destination
+
+
+def prepare_deploy_host_only_checkout(
+    *,
+    repository_root: Path,
+    state_dir: Path,
+    signing: SigningMaterial,
+) -> bytes:
+    site_file = state_dir / "site.yaml"
+    original = site_file.read_bytes()
+    try:
+        document = yaml.safe_load(original)
+        configured = document["spec"]["repositoryRoot"]
+    except (KeyError, TypeError, yaml.YAMLError) as exc:
+        raise StagingDeployError(
+            "managed site has no valid repository root for host-only update"
+        ) from exc
+    previous_root = Path(str(configured)).expanduser()
+    if not previous_root.is_absolute():
+        previous_root = site_file.parent / previous_root
+    previous_root = previous_root.resolve()
+    previous_dist = previous_root / "dist"
+    if not previous_dist.is_dir():
+        raise StagingDeployError("managed site release artifacts are missing")
+    current_dist = repository_root / "dist"
+    if previous_root != repository_root:
+        if current_dist.exists():
+            shutil.rmtree(current_dist)
+        shutil.copytree(
+            previous_dist,
+            current_dist,
+            copy_function=_link_or_copy,
+        )
+    _run(
+        [
+            sys.executable,
+            str(repository_root / "scripts/verify-release-attestation.py"),
+            "--attestation",
+            str(current_dist / "current-attestation.json"),
+            "--bundle",
+            str(current_dist / "current-attestation.bundle.json"),
+            "--cosign-key",
+            str(signing.public_key),
+            "--allow-staging-release",
+        ],
+        cwd=repository_root,
+    )
+    document["spec"]["repositoryRoot"] = str(repository_root)
+    temporary = site_file.with_suffix(".tmp")
+    temporary.write_text(
+        yaml.safe_dump(document, sort_keys=False),
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, site_file)
+    return original
+
+
+def restore_site_file(state_dir: Path, content: bytes) -> None:
+    site_file = state_dir / "site.yaml"
+    temporary = site_file.with_suffix(".tmp")
+    temporary.write_bytes(content)
+    temporary.chmod(0o600)
+    os.replace(temporary, site_file)
+
+
 def run_admin_deploy(
     *,
     repository_root: Path,
@@ -678,6 +1148,7 @@ def run_admin_deploy(
     admin_email: str,
     staging_only_release: bool,
     impact_base: str,
+    lock_fd: int,
 ) -> None:
     command = [
         str(venv / "bin/gpu-fault-admin"),
@@ -702,7 +1173,105 @@ def run_admin_deploy(
     )
     if staging_only_release:
         command.append("--staging-only-release")
-    _run(command, cwd=repository_root)
+    _run(
+        command,
+        cwd=repository_root,
+        env={**os.environ, SITE_OPERATION_LOCK_FD_ENV: str(lock_fd)},
+        pass_fds=(lock_fd,),
+    )
+
+
+def apply_source_deploy(
+    *,
+    arguments: argparse.Namespace,
+    repository_root: Path,
+    state_dir: Path,
+    source: SourceCheckout,
+    identities: Mapping[str, object],
+    signing: SigningMaterial,
+    venv: Path,
+    prepared_mode: str,
+    trusted_ci_candidate: Mapping[str, object] | None,
+) -> tuple[str, dict[str, object]]:
+    with site_operation_lock(state_dir, wait=True) as lock_fd:
+        previous = load_successful_source_deploy(state_dir, signing=signing)
+        live_evidence = None
+        if previous is not None and (state_dir / "site.yaml").is_file():
+            try:
+                live_evidence = collect_live_deploy_evidence(
+                    repository_root=source.repository_root,
+                    state_dir=state_dir,
+                    venv=venv,
+                    lock_fd=lock_fd,
+                )
+            except (LiveEvidenceError, StagingDeployError):
+                pass
+        mode = classify_source_deploy(
+            previous,
+            identities,
+            source=source,
+            site_exists=(state_dir / "site.yaml").is_file(),
+            live_matches=successful_source_live_matches(previous, live_evidence),
+        )
+        if mode not in {prepared_mode, "UNCHANGED"}:
+            raise StagingDeployError(
+                "source deployment classification changed while waiting for apply lock"
+            )
+        record_source_deploy_state(
+            state_dir, source_repository_root=repository_root, source=source
+        )
+        if trusted_ci_candidate is not None and mode == "APPLICATION_RELEASE":
+            record_trusted_ci_candidate(
+                source.repository_root,
+                state_dir=state_dir,
+                signing=signing,
+                candidate=trusted_ci_candidate,
+            )
+        if mode == "DEPLOY_HOST_ONLY":
+            original_site = prepare_deploy_host_only_checkout(
+                repository_root=source.repository_root,
+                state_dir=state_dir,
+                signing=signing,
+            )
+            try:
+                run_admin_preflight(
+                    repository_root=source.repository_root,
+                    state_dir=state_dir,
+                    venv=venv,
+                    lock_fd=lock_fd,
+                )
+            except Exception:
+                restore_site_file(state_dir, original_site)
+                raise
+        elif mode == "APPLICATION_RELEASE":
+            run_admin_deploy(
+                repository_root=source.repository_root,
+                state_dir=state_dir,
+                venv=venv,
+                cpu_cluster_arn=arguments.cpu_cluster_arn,
+                gpu_cluster_arns=tuple(arguments.gpu_cluster_arn),
+                admin_email=arguments.admin_email,
+                staging_only_release=source.snapshot,
+                impact_base=arguments.base.strip(),
+                lock_fd=lock_fd,
+            )
+        if mode != "UNCHANGED" or live_evidence is None:
+            live_evidence = collect_live_deploy_evidence(
+                repository_root=source.repository_root,
+                state_dir=state_dir,
+                venv=venv,
+                lock_fd=lock_fd,
+            )
+        record_successful_source_deploy(
+            state_dir,
+            source_repository_root=repository_root,
+            source=source,
+            identities=identities,
+            signing=signing,
+            mode=mode,
+            live_evidence=live_evidence,
+        )
+        return mode, live_evidence
 
 
 def deploy(arguments: argparse.Namespace) -> dict[str, object]:
@@ -727,44 +1296,113 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
     )
     if source.repository_root != repository_root:
         validate_source_checkout(source.repository_root)
-    record_source_deploy_state(
-        state_dir,
-        source_repository_root=repository_root,
-        source=source,
-    )
+    identities = source_deploy_identity(source.repository_root)
     signing = ensure_signing_material(
         state_dir,
         repository_root=source.repository_root,
     )
+    previous = load_successful_source_deploy(state_dir, signing=signing)
+    venv = state_dir / "deployer-venv"
+    live_evidence: dict[str, object] | None = None
+    if (
+        previous is not None
+        and (state_dir / "site.yaml").is_file()
+        and (venv / "bin/gpu-fault-admin").is_file()
+    ):
+        try:
+            live_evidence = collect_live_deploy_evidence(
+                repository_root=source.repository_root,
+                state_dir=state_dir,
+                venv=venv,
+            )
+        except (LiveEvidenceError, StagingDeployError):
+            live_evidence = None
+    mode = classify_source_deploy(
+        previous,
+        identities,
+        source=source,
+        site_exists=(state_dir / "site.yaml").is_file(),
+        live_matches=successful_source_live_matches(previous, live_evidence),
+    )
+    prepared_mode = mode
+    trusted_ci_candidate = (
+        restore_trusted_ci_candidate(
+            source.repository_root,
+            staging_only=source.snapshot,
+        )
+        if mode == "APPLICATION_RELEASE"
+        else None
+    )
+    deploy_host = identities["deploy_host"]
+    assert isinstance(deploy_host, dict)
+    bundle_identity = deploy_host["bundle"]
+    assert isinstance(bundle_identity, dict)
     artifacts = deploy_host_artifacts(
         state_dir,
-        git_commit=source.git_commit,
+        payload_identity_sha256=str(bundle_identity["sha256"]),
     )
-    wheelhouse_cache = deploy_host_wheelhouse_cache(
-        state_dir,
-        repository_root=source.repository_root,
-    )
-    bundle_reused = ensure_deploy_host_bundle(
-        artifacts,
-        repository_root=source.repository_root,
-        signing=signing,
-        wheelhouse_cache=wheelhouse_cache,
-    )
-    venv = ensure_deploy_host_venv(
-        state_dir,
-        repository_root=source.repository_root,
-        signing=signing,
-        artifacts=artifacts,
-    )
-    run_admin_deploy(
-        repository_root=source.repository_root,
+    bundle_reused = True
+    if mode in {"APPLICATION_RELEASE", "DEPLOY_HOST_ONLY"}:
+        wheelhouse_cache = deploy_host_wheelhouse_cache(
+            state_dir,
+            repository_root=source.repository_root,
+        )
+        bundle_reused = ensure_deploy_host_bundle(
+            artifacts,
+            repository_root=source.repository_root,
+            signing=signing,
+            wheelhouse_cache=wheelhouse_cache,
+        )
+        venv = ensure_deploy_host_venv(
+            state_dir,
+            repository_root=source.repository_root,
+            signing=signing,
+            artifacts=artifacts,
+        )
+    elif not (venv / "bin/gpu-fault-admin").is_file():
+        mode = "APPLICATION_RELEASE"
+        wheelhouse_cache = deploy_host_wheelhouse_cache(
+            state_dir,
+            repository_root=source.repository_root,
+        )
+        bundle_reused = ensure_deploy_host_bundle(
+            artifacts,
+            repository_root=source.repository_root,
+            signing=signing,
+            wheelhouse_cache=wheelhouse_cache,
+        )
+        venv = ensure_deploy_host_venv(
+            state_dir,
+            repository_root=source.repository_root,
+            signing=signing,
+            artifacts=artifacts,
+        )
+
+    impact_plan: dict[str, object] | None = None
+    if mode in {"DEPLOY_HOST_ONLY", "QUALITY_ONLY"} and trusted_ci_candidate is None:
+        assert previous is not None
+        impact_plan = run_source_impact_gate(
+            repository_root=source.repository_root,
+            state_dir=state_dir,
+            source=source,
+            previous=previous,
+            fallback_base=arguments.base.strip(),
+        )
+    elif mode in {"DEPLOY_HOST_ONLY", "QUALITY_ONLY"}:
+        impact_plan = {
+            "source": "signed_main_ci_candidate",
+            "run_id": trusted_ci_candidate["run_id"],
+        }
+    mode, live_evidence = apply_source_deploy(
+        arguments=arguments,
+        repository_root=repository_root,
         state_dir=state_dir,
+        source=source,
+        identities=identities,
+        signing=signing,
         venv=venv,
-        cpu_cluster_arn=arguments.cpu_cluster_arn,
-        gpu_cluster_arns=tuple(arguments.gpu_cluster_arn),
-        admin_email=arguments.admin_email,
-        staging_only_release=source.snapshot,
-        impact_base=arguments.base.strip(),
+        prepared_mode=prepared_mode,
+        trusted_ci_candidate=trusted_ci_candidate,
     )
     return {
         "schema_version": 1,
@@ -773,6 +1411,13 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
         "source_checkout": str(source.repository_root),
         "source_snapshot": source.snapshot,
         "source_isolated": source.isolated,
+        "deploy_mode": mode,
+        "application_identity_sha256": str(
+            cast(Mapping[str, object], identities["application"])["sha256"]
+        ),
+        "deploy_host_identity_sha256": str(deploy_host["sha256"]),
+        "impact_plan": impact_plan,
+        "trusted_ci_candidate": trusted_ci_candidate,
         "state_dir": str(state_dir),
         "deploy_host_bundle": str(artifacts.archive),
         "deploy_host_bundle_reused": bundle_reused,
@@ -806,7 +1451,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parsed = parser().parse_args(arguments)
     try:
         result = deploy(parsed)
-    except (OSError, StagingDeployError, subprocess.SubprocessError) as exc:
+    except (
+        LiveEvidenceError,
+        OSError,
+        StagingDeployError,
+        subprocess.SubprocessError,
+    ) as exc:
         print(f"staging-deploy: {exc}", file=sys.stderr)
         return 2
     if not parsed.quiet:

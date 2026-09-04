@@ -14,7 +14,8 @@ from regional_release_config import (
     ReleaseError,
     render_nlb_manifest,
 )
-from gpu_fault.admin_config import AdminConfig
+
+from gpu_fault.admin.config import AdminConfig
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
@@ -399,6 +400,8 @@ def build_reconciler_environment(
     template_sha256: str | None = None,
     template_config_map: str | None = None,
     allowed_node_names: tuple[str, ...] | None = None,
+    max_unavailable: int | None = None,
+    sync_registry: bool = True,
     runtime_image: str | None = None,
     node_installer_image: str | None = None,
 ) -> dict[str, str]:
@@ -432,6 +435,10 @@ def build_reconciler_environment(
         "GPU_FAULT_INSTALLER_ALLOWED_NODES": (
             "*" if allowed_node_names is None else ",".join(sorted(allowed_node_names))
         ),
+        "GPU_FAULT_INSTALLER_MAX_UNAVAILABLE": str(
+            max_unavailable or config.upgrade_max_unavailable
+        ),
+        "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": str(sync_registry).lower(),
         "GPU_FAULT_RUNTIME_PROFILE": (
             runtime_profile_version or config.runtime_profile_version
         ),

@@ -7,6 +7,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +113,139 @@ def test_document_reference_scan_covers_root_markdown_and_skips_urls() -> None:
     )
     assert "gpu_healthcheck" not in masked
     assert "src/gpu_fault/policy/__init__.py" in masked
+
+
+def load_gate(name: str, relative: str) -> object:
+    """Import a hyphen-named gate script so its helpers can be tested directly."""
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses 要在 sys.modules 里找得到定义模块才能解析注解。
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_document_anchor_links_resolve() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/check-doc-anchors.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_anchor_slugs_match_the_rendered_site() -> None:
+    """The slug rule is GitHub's, and the docs already depend on every clause of it.
+
+    区域用例索引 links to ``#gf-regional-destr-009``, 管理员日常运维 links to
+    ``#81-gpu-数量变化审批`` and ``#83-check_mechanicals-...``. Get the punctuation or
+    the underscore clause wrong and the gate either passes broken links or fails good
+    ones, so the cases below are taken from links this repository actually ships.
+    """
+    module = load_gate("check_doc_anchors", "scripts/check-doc-anchors.py")
+
+    assert module.heading_slug(" 8.1 GPU 数量变化审批") == "81-gpu-数量变化审批"
+    # ``_`` 是 word 字符，渲染站点保留它；``（）`` 是标点，一个字符都不留。
+    assert (
+        module.heading_slug(" 8.3 CHECK_MECHANICALS 后由管理员提交明确处置")
+        == "83-check_mechanicals-后由管理员提交明确处置"
+    )
+    assert (
+        module.heading_slug(" 5A 区域分离生产部署（唯一生产形态）")
+        == "5a-区域分离生产部署唯一生产形态"
+    )
+    assert module.heading_slug(" GF-REGIONAL-DESTR-009") == "gf-regional-destr-009"
+    # 标题里的行内代码、强调和链接都是标记，渲染后的文字才参与 slug。
+    assert (
+        module.heading_slug(" **`policy/nvlink74.py`** 说明") == "policynvlink74py-说明"
+    )
+    assert module.heading_slug(" 见 [手册](部署和运维手册.md)") == "见-手册"
+
+
+def test_repeated_headings_and_explicit_anchors_are_both_reachable(
+    tmp_path: Path,
+) -> None:
+    document = tmp_path / "sample.md"
+    document.write_text(
+        '# 概览\n<a id="pinned-chapter"></a>\n## 步骤\n## 步骤\n## 步骤\n',
+        encoding="utf-8",
+    )
+    module = load_gate("check_doc_anchors_repeat", "scripts/check-doc-anchors.py")
+
+    assert module.anchors(document) == {
+        "概览",
+        "pinned-chapter",
+        "步骤",
+        "步骤-1",
+        "步骤-2",
+    }
+
+
+def test_fenced_code_yields_neither_headings_nor_links(tmp_path: Path) -> None:
+    """Shell comments are not headings and quoted markdown is not a link.
+
+    The manuals are mostly fenced command blocks, and those blocks are full of
+    ``# 说明`` comment lines. Treating them as headings would invent anchors that the
+    rendered page does not have, which is how a gate starts passing broken links.
+    """
+    document = tmp_path / "sample.md"
+    document.write_text(
+        "# 真标题\n"
+        "```bash\n"
+        "# 这是注释不是标题\n"
+        "echo '[见](#不存在的锚点)'\n"
+        "```\n"
+        "行内代码里的 `[见](#也不存在)` 同样不是链接。\n"
+        "真链接：[真标题](#真标题)\n",
+        encoding="utf-8",
+    )
+    module = load_gate("check_doc_anchors_fence", "scripts/check-doc-anchors.py")
+
+    assert module.anchors(document) == {"真标题"}
+    assert [link.target for link in module.local_links(document)] == ["#真标题"]
+
+
+def test_the_anchor_gate_reports_a_fragment_that_no_heading_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = tmp_path / "sample.md"
+    document.write_text(
+        "# 真标题\n[好链接](#真标题)\n[坏链接](#拼错的锚点)\n[坏路径](缺失的文件.md)\n",
+        encoding="utf-8",
+    )
+    module = load_gate("check_doc_anchors_teeth", "scripts/check-doc-anchors.py")
+    monkeypatch.setattr(module, "documents", lambda: [document])
+
+    assert [(item.line, item.link) for item in module.check_anchors()] == [
+        (3, "#拼错的锚点"),
+        (4, "缺失的文件.md"),
+    ]
+
+
+def test_the_anchor_gate_covers_the_case_index_cross_document_links() -> None:
+    """Non-vacuity: the 152 links that make 区域用例索引 navigable are in scope.
+
+    A regex or fence bug in the gate would show up as silence rather than as a
+    failure, and the case index is the largest inbound anchor surface in the
+    repository -- if these are being scanned, the gate is doing its job.
+    """
+    module = load_gate("check_doc_anchors_scope", "scripts/check-doc-anchors.py")
+    index = DOCS / "区域用例索引.md"
+    cases = DOCS / "区域模式端到端验收测试用例.md"
+
+    into_cases = [
+        link
+        for link in module.local_links(index)
+        if link.path == cases.name and link.fragment
+    ]
+
+    assert len(into_cases) >= 150, len(into_cases)
+    available = module.anchors(cases)
+    assert "gf-regional-destr-009" in available
+    for link in into_cases:
+        assert link.fragment in available, link.target
 
 
 def test_detailed_design_lists_every_console_script() -> None:

@@ -45,7 +45,6 @@ from gpu_fault.store import (
 )
 from gpu_fault.store.contracts import ControlPlaneStore
 
-
 LOGGER = logging.getLogger(__name__)
 
 
@@ -92,6 +91,28 @@ def _is_throttled(exc: BaseException) -> bool:
         if isinstance(error, dict):
             codes.add(str(error.get("Code", "")))
     return bool(codes & THROTTLE_ERROR_CODES)
+
+
+def _resolved_dispatch_scan_limit(configured: int | None) -> int:
+    """How much notification history one synchronous dispatch may read.
+
+    Nothing ever leaves that table, and nothing ever leaves the set that path
+    counts as pending either -- a drill and an expired advisory are both recorded
+    SKIPPED, and SKIPPED is picked up again -- so the read grew without bound and
+    carried one extra result lookup per row. 2000 is far above any backlog a
+    deployment running the dispatcher should hold, and a deployment that
+    genuinely exceeds it wants ``GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY``, which
+    claims from an indexed outbox instead of scanning.
+    """
+
+    limit = (
+        int(os.getenv("GPU_FAULT_NOTIFICATION_DISPATCH_SCAN_LIMIT", "2000"))
+        if configured is None
+        else configured
+    )
+    if limit < 1:
+        raise ValueError("notification dispatch scan limit must be positive")
+    return limit
 
 
 def _dispatch_remote_node_action_completion(
@@ -151,6 +172,7 @@ class AdvisoryNotificationService:
         backlog_grace_seconds: int | None = None,
         ttl_seconds: int | None = None,
         deliver_drills: bool | None = None,
+        dispatch_scan_limit: int | None = None,
     ) -> None:
         self.store = store
         self.notifier = notifier
@@ -260,6 +282,7 @@ class AdvisoryNotificationService:
             if deliver_drills is None
             else deliver_drills
         )
+        self.dispatch_scan_limit = _resolved_dispatch_scan_limit(dispatch_scan_limit)
         # Notification construction is idempotent in the store. A single
         # process-wide lock made unrelated faults wait behind one
         # notification that was reading evidence. Stripe by object key so
@@ -869,10 +892,24 @@ class AdvisoryNotificationService:
     def dispatch_pending(self, limit: int = 25) -> NotificationDispatchReport:
         if not 1 <= limit <= 100:
             raise ValueError("dispatch limit must be between 1 and 100")
+        # Newest-first, then re-ordered oldest-first below, rather than reading
+        # the oldest ``dispatch_scan_limit`` rows directly: expired advisories and
+        # drills stay pending forever and accumulate at the old end, so an
+        # oldest-first budget would eventually be spent entirely on entries that
+        # can never be sent. See ``NotificationDispatchReport.scan_truncated``.
+        scanned = self.store.list_notifications(
+            limit=self.dispatch_scan_limit + 1,
+            newest_first=True,
+        )
+        scan_truncated = len(scanned) > self.dispatch_scan_limit
+        window = sorted(
+            scanned[: self.dispatch_scan_limit],
+            key=lambda item: (item.created_at, item.notification_id),
+        )
         now = datetime.now(timezone.utc)
         pending = [
             item
-            for item in self.store.list_notifications()
+            for item in window
             if (
                 (result := self.store.get_notification_result(item.notification_id))
                 is None
@@ -906,6 +943,7 @@ class AdvisoryNotificationService:
         return NotificationDispatchReport(
             expired=expired,
             suppressed_drills=suppressed_drills,
+            scan_truncated=scan_truncated,
             attempted=len(results),
             sent=sum(item.status is NotificationStatus.SENT for item in results),
             skipped=sum(item.status is NotificationStatus.SKIPPED for item in results),

@@ -22,6 +22,13 @@ class GateArtifactError(RuntimeError):
     pass
 
 
+# The coverage gate's own failure type lives here rather than in
+# ci_coverage_gate.py so that the gate and the modules it delegates to can both
+# raise it without importing each other.
+class CoverageGateError(RuntimeError):
+    pass
+
+
 class ArtifactRedirectHandler(HTTPRedirectHandler):
     def redirect_request(
         self,
@@ -234,7 +241,8 @@ def find_reusable_artifact(
 def extract_archive(data: bytes, destination: Path) -> None:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            for member in archive.infolist():
+            members = archive.infolist()
+            for member in members:
                 path = Path(member.filename)
                 mode = member.external_attr >> 16
                 if path.is_absolute() or ".." in path.parts or stat.S_ISLNK(mode):
@@ -242,6 +250,11 @@ def extract_archive(data: bytes, destination: Path) -> None:
                         f"unsafe gate artifact member: {member.filename}"
                     )
             archive.extractall(destination)
+            for member in members:
+                mode = member.external_attr >> 16
+                path = destination / member.filename
+                if path.is_file() and mode:
+                    path.chmod(mode & 0o777)
     except zipfile.BadZipFile as exc:
         raise GateArtifactError("gate artifact archive is invalid") from exc
 

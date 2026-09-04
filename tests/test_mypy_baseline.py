@@ -7,7 +7,7 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts/check-mypy-baseline.py"
-MODULE = lazy_script_module("check_mypy_baseline", MODULE_PATH)
+MODULE = lazy_script_module(MODULE_PATH)
 
 
 def test_mypy_baseline_rejects_growth_and_slack() -> None:
@@ -22,8 +22,10 @@ def test_mypy_baseline_rejects_growth_and_slack() -> None:
     ]
 
 
-def test_mypy_target_is_the_complete_source_tree() -> None:
-    assert MODULE.TARGETS == ("src",)
+def test_mypy_targets_cover_the_package_and_the_release_orchestrator() -> None:
+    """`deploy` carries the rollback path, so it is typed like `src`."""
+
+    assert MODULE.TARGETS == ("src", "deploy")
 
 
 def test_store_consumers_depend_on_protocol() -> None:

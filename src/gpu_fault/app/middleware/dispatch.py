@@ -3,15 +3,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
+import random
 import secrets
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from gpu_fault.app.admission_runtime import max_compressed_request_bytes
 from gpu_fault.app.runtime import ProcessorDispatchState
 from gpu_fault.async_store import (
     REQUEST_DEADLINE,
@@ -26,6 +28,23 @@ from gpu_fault.processor_diagnostics import (
     report_processor_replay_phase,
     reset_processor_replay,
 )
+
+# A synchronous caller waits for the processor to complete its request by
+# polling the store. A fixed 100ms interval cost every waiter ~1150 store reads
+# across the full timeout and made all of them retry in lockstep, so a burst of
+# waiters kept the store I/O pool busy answering "not yet". Poll fast at first
+# (most requests complete in a few tens of milliseconds), then back off to a
+# tenth of that rate, with jitter so concurrent waiters spread out.
+#
+# The interval is also the upper bound on how long a waiter sits on a response
+# that is already in the store, which is why the poll is now a floor rather than
+# the only mechanism: when the request is completed by a worker of this same
+# process, ``ProcessorCompletionSignals`` ends the interval early. Nothing here
+# depends on that -- see the class for the cases it cannot cover.
+RESPONSE_POLL_INITIAL_SECONDS = 0.01
+RESPONSE_POLL_MAX_SECONDS = 0.25
+RESPONSE_POLL_GROWTH = 1.6
+RESPONSE_POLL_JITTER = 0.25
 
 
 @dataclass(frozen=True)
@@ -54,6 +73,7 @@ class ProcessorDispatchDependencies:
     processor_global_admission_guard: int
     processor_max_request_bytes: int
     processor_retry_after_seconds: int
+    processor_response_timeout_seconds: float
     processor_queue_bypass_enabled: bool
     processor_queue_bypass_paths: set[str]
     processor_admission_rejections: dict[str, int]
@@ -156,6 +176,10 @@ async def _prepare_request(
     dependencies: ProcessorDispatchDependencies,
 ) -> PreparedProcessorRequest | Response:
     server_timing = request.scope.setdefault("gpu_fault_server_timing", {})
+    oversize = _declared_oversize(request, dependencies)
+    if oversize is not None:
+        dependencies.state.oversize_rejections += 1
+        return oversize
     decode_started = time.monotonic()
     body = await request.body()
     fault_ingress = dependencies.is_fault_ingress_path(request.url.path)
@@ -233,6 +257,41 @@ async def _prepare_request(
         store_pool=store_pool,
         server_timing=server_timing,
     )
+
+
+def _declared_oversize(
+    request: Request,
+    dependencies: ProcessorDispatchDependencies,
+) -> JSONResponse | None:
+    """Reject on the declared length before buffering the body.
+
+    The size check used to run after ``await request.body()``, so a caller that
+    announced 200MB got 200MB read into memory and decoded first, and every
+    concurrent oversize request held that memory until the same 413 came back.
+
+    A compressed body used to be exempt from this check altogether, on the
+    correct observation that gzip output can exceed its input and so the wire
+    length is not itself the limit. That left it with no bound at all: an
+    announced 200MB gzip body was still buffered in full. It now gets the loosest
+    length that could still decode within budget
+    (:func:`max_compressed_request_bytes`), and the decoder remains authoritative
+    for the decompressed size.
+    """
+
+    try:
+        length = int(request.headers.get("Content-Length", ""))
+    except ValueError:
+        # No usable declaration: the HTTP parser rejects a malformed one, and a
+        # chunked body has none, so the post-decode check stays authoritative.
+        return None
+    limit = (
+        max_compressed_request_bytes(dependencies.processor_max_request_bytes)
+        if request.headers.get("Content-Encoding", "").strip()
+        else dependencies.processor_max_request_bytes
+    )
+    if length <= limit:
+        return None
+    return _oversize_response(dependencies)
 
 
 def _oversize_response(
@@ -367,13 +426,28 @@ async def _wait_for_response(
     item: ProcessorRequest,
     dependencies: ProcessorDispatchDependencies,
 ) -> Response:
-    deadline = time.monotonic() + float(
-        os.getenv(
-            "GPU_FAULT_PROCESSOR_RESPONSE_TIMEOUT_SECONDS",
-            "115",
-        )
+    signals = getattr(dependencies.processor, "completion_signals", None)
+    registration = (
+        nullcontext(None) if signals is None else signals.waiting(item.request_id)
     )
+    with registration as wake:
+        return await _poll_for_response(item, dependencies, wake)
+
+
+async def _poll_for_response(
+    item: ProcessorRequest,
+    dependencies: ProcessorDispatchDependencies,
+    wake: asyncio.Event | None,
+) -> Response:
+    deadline = time.monotonic() + dependencies.processor_response_timeout_seconds
+    interval = RESPONSE_POLL_INITIAL_SECONDS
     while time.monotonic() < deadline:
+        if wake is not None:
+            # Cleared *before* the read: a completion landing between the two is
+            # then seen by this read, and one landing after it leaves the event
+            # set, so neither can be missed. Clearing afterwards would drop a
+            # signal raised while the read was in flight.
+            wake.clear()
         try:
             current = await dependencies.store_io.run(
                 dependencies.context.store.get_processor_request,
@@ -394,7 +468,15 @@ async def _wait_for_response(
                 status_code=current.response_status or 500,
                 headers=headers,
             )
-        await asyncio.sleep(0.1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        jitter = 1.0 + random.uniform(-RESPONSE_POLL_JITTER, RESPONSE_POLL_JITTER)
+        await _wait_before_next_poll(wake, min(interval * jitter, remaining))
+        # Grown even when the wait ended in a signal: a request released for
+        # retry is signalled too, and its waiter must not drop back to reading
+        # the store every 10ms for the rest of a long retry backoff.
+        interval = min(interval * RESPONSE_POLL_GROWTH, RESPONSE_POLL_MAX_SECONDS)
     return JSONResponse(
         status_code=503,
         headers={"Retry-After": "2"},
@@ -403,6 +485,20 @@ async def _wait_for_response(
             "processor_request_id": item.request_id,
         },
     )
+
+
+async def _wait_before_next_poll(wake: asyncio.Event | None, delay: float) -> None:
+    """Hold for ``delay``, or until this request is finished in this process."""
+
+    if wake is None:
+        await asyncio.sleep(delay)
+        return
+    try:
+        await asyncio.wait_for(wake.wait(), timeout=delay)
+    except TimeoutError:
+        # The ordinary case for a request completed elsewhere: the interval
+        # expired, so poll again.
+        pass
 
 
 async def dispatch_processor_request(

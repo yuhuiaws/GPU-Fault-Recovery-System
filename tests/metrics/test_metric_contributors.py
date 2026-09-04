@@ -10,6 +10,7 @@ from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.app.builtin_metric_contributors import (
     closed_loop_metric_lines,
     orchestration_metric_lines,
+    remote_command_metric_lines,
 )
 from gpu_fault.app.collector_metrics import CollectorMetricsSnapshot
 from gpu_fault.app.metric_contributors import MetricContributorRegistry
@@ -78,6 +79,33 @@ def test_process_local_store_rejection_counter_has_process_label(
     )
 
 
+def test_remote_internal_error_metrics_do_not_treat_retention_as_a_counter() -> None:
+    runtime = SimpleNamespace(
+        context=SimpleNamespace(
+            regional_mode=True,
+            store=SimpleNamespace(
+                remote_command_stats=lambda: {
+                    "by_status": {"FAILED": 1},
+                    "oldest_unclaimed_age_seconds_by_cluster": {},
+                    "executor_internal_error_total": 1,
+                    "executor_internal_error_last_seen_timestamp_seconds": 123.5,
+                    "unclaimed_expired_total": 0,
+                }
+            ),
+        )
+    )
+
+    lines = remote_command_metric_lines(runtime)
+
+    assert (
+        "# TYPE gpu_fault_remote_command_executor_internal_errors_total gauge" in lines
+    )
+    assert (
+        "gpu_fault_remote_command_executor_internal_error_last_seen_"
+        "timestamp_seconds 123.500000" in lines
+    )
+
+
 def test_ambiguous_attempt_metric_is_exported(monkeypatch) -> None:
     context = ApplicationContext(store=build_store())
     monkeypatch.setattr(
@@ -88,7 +116,7 @@ def test_ambiguous_attempt_metric_is_exported(monkeypatch) -> None:
     monkeypatch.setattr(
         context.orchestrator._evidence_operations,
         "ownership_metric_snapshot",
-        lambda: {
+        lambda **_: {
             "current": {("cluster-a", "node-a"): 2},
             "stale": {("cluster-a", "node-a"): 1},
         },
@@ -197,6 +225,38 @@ def test_closed_loop_metrics_use_aggregate_notification_counts(monkeypatch) -> N
     assert "gpu_fault_notification_outbox_depth 0" in lines
 
 
+def test_blocked_backlog_gauge_is_a_server_side_aggregate(monkeypatch) -> None:
+    """The BLOCKED backlog alert reads this, so the scan bound must not truncate it.
+
+    The workflow detail scan is deliberately bounded, and the gauge the alert
+    thresholds has to stay exact regardless: a backlog that fell outside the
+    newest slice would read as zero and the alert would go silent while nodes
+    were still held. ``gpu_fault_workflow_total`` cannot serve instead -- it
+    counts the whole history and BLOCKED is terminal, so its bucket stays up
+    after the node returns to the training pool.
+    """
+
+    store = build_store()
+    store.save_incident(
+        fault_incident("incident-held", "event-held", state=IncidentState.QUARANTINED)
+    )
+    store.save_workflow(
+        workflow_request(
+            "workflow-held", "incident-held", status=WorkflowStatus.BLOCKED
+        )
+    )
+    monkeypatch.setattr(store, "list_workflows", lambda *_args, **_keywords: [])
+
+    lines = closed_loop_metric_lines(
+        SimpleNamespace(context=ApplicationContext(store=store))
+    )
+
+    assert "gpu_fault_workflow_blocked_unreconciled 1" in lines
+    assert "gpu_fault_workflow_scan_size 0" in lines, (
+        "the detail scan has to be empty for this to prove anything"
+    )
+
+
 def test_collector_metrics_top_n_is_bounded() -> None:
     snapshot = object.__new__(CollectorMetricsSnapshot)
     snapshot.top_n = 2
@@ -208,6 +268,7 @@ def test_collector_metrics_top_n_is_bounded() -> None:
             "channel": "GPU_METRICS",
             "last_success_age_seconds": float(index),
             "silent": True,
+            "erroring": False,
         }
         for index in range(10)
     ]
@@ -250,6 +311,7 @@ def test_collector_metrics_snapshot_persists_bounded_details() -> None:
             "channel": "GPU_METRICS",
             "last_success_age_seconds": float(index),
             "silent": True,
+            "erroring": False,
         }
         for index in range(10)
     ]

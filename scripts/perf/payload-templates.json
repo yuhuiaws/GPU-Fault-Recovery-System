@@ -541,7 +541,7 @@
   "cluster_id": "perf-template-cluster",
   "collection_errors": [],
   "edge_filter_reasons": [
-   "threshold:tcp_retransmits_delta"
+   "threshold:synthetic-host-priority"
   ],
   "evidence_ref": "host://perf-node-b",
   "node_id": "perf-node-b",

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import wraps
-import gzip
 import json
 import logging
 import os
+import zlib
+from dataclasses import dataclass
+from functools import wraps
 
 from fastapi import HTTPException
 
@@ -22,8 +22,89 @@ from gpu_fault.channel_registry import CHANNEL_REGISTRY
 from gpu_fault.processor import ProcessorCoordinator
 from gpu_fault.processor_diagnostics import report_processor_replay_phase
 
-
 LOGGER = logging.getLogger(__name__)
+
+# Worst-case deflate expansion, used to bound the *wire* length of a compressed
+# body against the same limit as a plain one. A deflate stream may store data
+# uncompressed, in which case each block carries at most 65535 bytes behind a
+# 5-byte header, so a payload of n bytes cannot need more than
+# ``n + ceil(n / 65535) * 5`` bytes of deflate output. The gzip wrapper adds a
+# 10-byte header, an 8-byte trailer, and optional FNAME/FCOMMENT fields that are
+# arbitrary length in principle; ``GZIP_ENVELOPE_SLACK_BYTES`` allows a generous
+# fixed amount for them rather than parsing the header before the size check.
+DEFLATE_STORED_BLOCK_BYTES = 65535
+DEFLATE_STORED_BLOCK_OVERHEAD_BYTES = 5
+GZIP_ENVELOPE_SLACK_BYTES = 1024
+
+
+def max_compressed_request_bytes(max_bytes: int) -> int:
+    """Largest wire length a compressed body may declare and still be in bounds.
+
+    ``_declared_oversize`` used to return early for any request carrying a
+    ``Content-Encoding``, on the correct observation that a compressed body can
+    be slightly larger than its output and so the wire length is not the limit
+    itself. The consequence was that it was not *any* bound: a caller announcing
+    a 200MB gzip body got 200MB buffered before anything looked at the size.
+
+    This is that missing bound. It is deliberately loose — a body between
+    ``max_bytes`` and this value is admitted here and then rejected by the
+    decoder on its decompressed size — because the only job at this layer is to
+    stop unbounded buffering, and nothing here can know the output size yet.
+    """
+
+    if max_bytes <= 0:
+        raise ValueError("max request bytes must be positive")
+    blocks = -(-max_bytes // DEFLATE_STORED_BLOCK_BYTES)
+    return (
+        max_bytes
+        + blocks * DEFLATE_STORED_BLOCK_OVERHEAD_BYTES
+        + GZIP_ENVELOPE_SLACK_BYTES
+    )
+
+
+def inflate_bounded(body: bytes, max_bytes: int) -> bytes:
+    """Inflate a gzip body, refusing to allocate more than ``max_bytes`` for it.
+
+    ``gzip.decompress`` places no bound on its output, and the ``len(body) >
+    max_bytes`` check downstream only runs once the whole result is already
+    resident. A few hundred kilobytes of zeros inflate to gigabytes, so a caller
+    inside the authenticated wire limit could exhaust the ingress replica's
+    memory. ``_declared_oversize`` did not help, because it deliberately skipped
+    compressed bodies entirely.
+
+    ``max_length`` caps a single ``decompress`` call, so a body whose output fits
+    is produced in one call and one that does not stops at the cap, leaving the
+    surplus input in ``unconsumed_tail`` or the stream unfinished. Either way the
+    allocation stops at ``max_bytes + 1`` and we raise instead of continuing.
+
+    Exception choice is load-bearing. Both call sites (``middleware/auth.py`` and
+    ``middleware/dispatch.py``) map ``OverflowError`` to 413 and
+    ``OSError``/``EOFError``/``ValueError`` to 400, and let everything else become
+    a 500. ``zlib.error`` derives from ``Exception`` and neither, so a truncated
+    or corrupt gzip body would turn a client mistake into a server error — hence
+    the translation to ``ValueError`` here. ``gzip.decompress`` raised
+    ``BadGzipFile`` (an ``OSError``) and ``EOFError`` for these cases, so the
+    responses are unchanged from before.
+    """
+
+    inflater = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+    try:
+        decoded = inflater.decompress(body, max_length=max_bytes + 1)
+    except zlib.error as exc:
+        raise ValueError("gzip request body is not decodable") from exc
+    if len(decoded) > max_bytes or inflater.unconsumed_tail:
+        raise OverflowError("processor request body is too large")
+    if not inflater.eof:
+        # All input consumed, output within budget, stream never finished: the
+        # body was cut short. ``gzip.decompress`` reported this as EOFError.
+        raise EOFError("gzip request body ended before the stream finished")
+    if inflater.unused_data:
+        # A member decoded cleanly and bytes remain. ``gzip.decompress`` would
+        # decode further concatenated members; a single ``decompressobj`` stops
+        # at the first one. Rejecting is the only option that neither reads an
+        # unbounded number of members nor silently drops the caller's data.
+        raise ValueError("gzip request body has trailing data after the stream")
+    return decoded
 
 
 @dataclass
@@ -33,6 +114,7 @@ class AdmissionRuntime:
     fault_reserved_depth: int
     fault_reserved_cluster_depth: int
     retry_after_seconds: int
+    response_timeout_seconds: float
     max_request_bytes: int
     global_admission_guard: int
     admission_rejections: dict[str, int]
@@ -108,6 +190,12 @@ class AdmissionRuntimeFactory:
             )
         )
         retry = int(os.getenv("GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS", "2"))
+        # Parsed here rather than inside the dispatch loop: a malformed value
+        # used to raise ValueError per request, so the deployment looked healthy
+        # and every synchronous call returned 500 instead of failing at startup.
+        response_timeout = float(
+            os.getenv("GPU_FAULT_PROCESSOR_RESPONSE_TIMEOUT_SECONDS", "115")
+        )
         if (
             max_depth <= 0
             or max_cluster <= 0
@@ -116,9 +204,11 @@ class AdmissionRuntimeFactory:
             or max_bytes <= 0
             or not 0 <= guard <= max_depth
             or retry <= 0
+            or response_timeout <= 0
         ):
             raise RuntimeError(
-                "processor queue limits, fault reserves, and retry delay are invalid"
+                "processor queue limits, fault reserves, retry delay, and "
+                "response timeout are invalid"
             )
         spool_enabled = _enabled("GPU_FAULT_TELEMETRY_SPOOL")
         spool_item_bytes = int(
@@ -162,6 +252,7 @@ class AdmissionRuntimeFactory:
             "fault_reserved_depth": reserved,
             "fault_reserved_cluster_depth": reserved_cluster,
             "retry_after_seconds": retry,
+            "response_timeout_seconds": response_timeout,
             "max_request_bytes": max_bytes,
             "global_admission_guard": guard,
             "admission_rejections": {
@@ -394,7 +485,7 @@ class AdmissionRuntimeFactory:
     def _decode_json_body(max_bytes: int):
         def decode(body: bytes, content_encoding: str):
             if content_encoding.lower() == "gzip":
-                body = gzip.decompress(body)
+                body = inflate_bounded(body, max_bytes)
             if len(body) > max_bytes:
                 raise OverflowError("processor request body is too large")
             if not body:

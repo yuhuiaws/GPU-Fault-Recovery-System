@@ -11,9 +11,7 @@ import pytest
 from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
-BUILD = lazy_script_module(
-    "atomic_release_build", ROOT / "scripts/build-release-artifacts.py"
-)
+BUILD = lazy_script_module(ROOT / "scripts/build-release-artifacts.py")
 
 
 def test_release_builder_resolves_python_from_path(
@@ -37,14 +35,13 @@ def test_failed_release_build_preserves_current_manifest(
     dist.mkdir()
     current = dist / "current-release.json"
     current.write_text('{"release_id":"stable"}\n', encoding="utf-8")
-    globals_ = BUILD.build.__globals__
-    monkeypatch.setitem(globals_, "DIST", dist)
-    monkeypatch.setitem(globals_, "BUILD", tmp_path / "build")
+    monkeypatch.setattr(BUILD, "DIST", dist)
+    monkeypatch.setattr(BUILD, "BUILD", tmp_path / "build")
 
     def fail_component(**_kwargs):
         raise RuntimeError("component build failed")
 
-    monkeypatch.setitem(globals_, "build_component", fail_component)
+    monkeypatch.setattr(BUILD, "build_component", fail_component)
 
     with pytest.raises(RuntimeError, match="component build failed"):
         BUILD.build(sys.executable)
@@ -53,11 +50,100 @@ def test_failed_release_build_preserves_current_manifest(
     assert not list(dist.glob(".build-*")), "failed staging directory was retained"
 
 
-def test_release_builder_never_deletes_published_dist() -> None:
-    source = (ROOT / "scripts/build-release-artifacts.py").read_text(encoding="utf-8")
+def test_release_builder_never_deletes_published_dist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful build swaps the manifest in without emptying dist.
 
-    assert "shutil.rmtree(DIST" not in source
-    assert 'os.replace(staged_current, DIST / "current-release.json")' in source
+    Deploys read ``dist/current-release.json`` and the release directory it
+    points at. Rebuilding by clearing dist first would leave a window where a
+    concurrent deploy resolves a manifest whose artifacts are gone, so the
+    publish is a rename over the live tree and preserved directories such as the
+    signed CI evidence survive it.
+    """
+
+    dist = tmp_path / "dist"
+    preserved = dist / "ci-domains/unit"
+    preserved.mkdir(parents=True)
+    current = dist / "current-release.json"
+    current.write_text('{"release_id":"stable"}\n', encoding="utf-8")
+    monkeypatch.setattr(BUILD, "DIST", dist)
+    monkeypatch.setattr(BUILD, "BUILD", tmp_path / "build")
+
+    def prepare(_python, *, staging: Path, reuse_artifacts_from=None):
+        names = {
+            "control_plane": "control.whl",
+            "executor": "executor.whl",
+            "node_runtime": "node.whl",
+        }
+        wheels = {}
+        for component, name in names.items():
+            path = staging / name
+            path.write_text(component, encoding="utf-8")
+            wheels[component] = path
+        bundle = staging / "node-bundle.tar.gz"
+        bundle.write_text("bundle", encoding="utf-8")
+        return BUILD.PreparedArtifacts(
+            wheels=wheels,
+            bundle=bundle,
+            module_digests=dict.fromkeys(names, "d" * 64),
+            module_counts=dict.fromkeys(names, 1),
+        )
+
+    monkeypatch.setattr(BUILD, "prepare_component_artifacts", prepare)
+    removed: list[Path] = []
+    real_rmtree = BUILD.shutil.rmtree
+    monkeypatch.setattr(
+        BUILD.shutil,
+        "rmtree",
+        lambda path, **kwargs: (
+            removed.append(Path(path)) or real_rmtree(path, **kwargs)
+        ),
+    )
+
+    manifest = BUILD.build(sys.executable, staging_only=True)
+
+    release_id = str(manifest["release_id"])
+    assert json.loads(current.read_text(encoding="utf-8"))["release_id"] == release_id
+    assert (dist / release_id / "release.json").is_file(), (
+        "the published release directory has no manifest"
+    )
+    assert preserved.is_dir(), "the signed CI evidence directory was deleted"
+    assert dist not in removed, "the builder deleted the published dist tree"
+
+
+def test_a_killed_build_does_not_wedge_the_next_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staging directory nothing cleaned up has to be cleared, not counted.
+
+    ``artifact-check`` rebuilds and then counts what is in dist, so a staging
+    directory from a build that was killed rather than failed -- an interrupted
+    deploy, an OOM, a reboot -- makes the gate report six wheels where the
+    release has three, blaming the build that is actually fine. The reuse
+    shortcut has to clear it too: a rebuild of the current release publishes
+    nothing new and would otherwise leave the leftover in place forever.
+    """
+
+    dist = tmp_path / "dist"
+    abandoned = dist / ".build-killedrun/687057570a62"
+    abandoned.mkdir(parents=True)
+    (abandoned / "gpu_fault_control_plane-0.10.0-py3-none-any.whl").write_bytes(b"old")
+    current = dist / "current-release.json"
+    current.write_text('{"release_id":"stable"}\n', encoding="utf-8")
+    monkeypatch.setattr(BUILD, "DIST", dist)
+    monkeypatch.setattr(BUILD, "BUILD", tmp_path / "build")
+    monkeypatch.setattr(
+        BUILD,
+        "resolve_current_component_artifacts",
+        lambda **_kwargs: ({"release_id": "stable"}, None),
+    )
+
+    manifest = BUILD.build(sys.executable, reuse_if_current=True)
+
+    assert manifest == {"release_id": "stable"}, "the reuse shortcut was not taken"
+    assert not list(dist.glob(".build-*")), "an abandoned staging directory survived"
+    assert current.read_text(encoding="utf-8") == '{"release_id":"stable"}\n'
 
 
 def test_release_pruning_preserves_signed_ci_domains(
@@ -69,8 +155,7 @@ def test_release_pruning_preserves_signed_ci_domains(
     stale = dist / "release-stale"
     for path in (release, domains, stale):
         path.mkdir(parents=True, exist_ok=True)
-    globals_ = BUILD.prune_dist.__globals__
-    monkeypatch.setitem(globals_, "DIST", dist)
+    monkeypatch.setattr(BUILD, "DIST", dist)
 
     BUILD.prune_dist(release)
 
@@ -124,11 +209,10 @@ def test_release_builder_reuses_validated_component_artifacts(
         },
         module_counts={"control_plane": 10, "executor": 11, "node_runtime": 12},
     )
-    globals_ = BUILD.build.__globals__
-    monkeypatch.setitem(globals_, "DIST", dist)
-    monkeypatch.setitem(globals_, "BUILD", tmp_path / "build")
-    monkeypatch.setitem(
-        globals_,
+    monkeypatch.setattr(BUILD, "DIST", dist)
+    monkeypatch.setattr(BUILD, "BUILD", tmp_path / "build")
+    monkeypatch.setattr(
+        BUILD,
         "build_release_identity",
         lambda _root: {
             "sha256": "d" * 64,
@@ -137,20 +221,18 @@ def test_release_builder_reuses_validated_component_artifacts(
             "node_template_inputs": {"sha256": "e" * 64},
         },
     )
-    monkeypatch.setitem(
-        globals_, "load_component_artifacts", lambda *_args, **_kwargs: cached
+    monkeypatch.setattr(
+        BUILD, "load_component_artifacts", lambda *_args, **_kwargs: cached
     )
-    monkeypatch.setitem(
-        globals_,
+    monkeypatch.setattr(
+        BUILD,
         "build_component",
         lambda **_kwargs: pytest.fail("validated component artifact was rebuilt"),
     )
-    monkeypatch.setitem(
-        globals_,
-        "run",
-        lambda *_args, **_kwargs: pytest.fail("node bundle was rebuilt"),
+    monkeypatch.setattr(
+        BUILD, "run", lambda *_args, **_kwargs: pytest.fail("node bundle was rebuilt")
     )
-    monkeypatch.setitem(globals_, "project_version", lambda: "0.10.0")
+    monkeypatch.setattr(BUILD, "project_version", lambda: "0.10.0")
 
     def run(command, **_kwargs):
         script = command[-1]
@@ -188,8 +270,7 @@ def test_repository_local_component_cache_uses_its_own_artifact_root(
     bundle = cache_entry / "node-bundle.tar.gz"
     bundle.write_bytes(b"bundle")
     observed: dict[str, object] = {}
-    globals_ = BUILD.prepare_component_artifacts.__globals__
-    monkeypatch.setitem(globals_, "ROOT", root)
+    monkeypatch.setattr(BUILD, "ROOT", root)
 
     def load(_root, path, **kwargs):
         observed["path"] = path
@@ -201,7 +282,7 @@ def test_repository_local_component_cache_uses_its_own_artifact_root(
             module_counts={name: 1 for name in wheels},
         )
 
-    monkeypatch.setitem(globals_, "load_component_artifacts", load)
+    monkeypatch.setattr(BUILD, "load_component_artifacts", load)
     staging = tmp_path / "staging"
     staging.mkdir()
 

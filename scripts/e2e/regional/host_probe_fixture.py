@@ -172,7 +172,7 @@ class HostProbeFixture:
         command = (
             f"install -m 0700 /probe/{self.settings.probe_script.name} "
             f"/host{self.host_script}; "
-            "exec chroot /host /opt/gpu-fault/venv/bin/python "
+            "exec chroot /host /opt/gpu-fault/current/venv/bin/python "
             f'{self.host_script} "$@"'
         )
         completed = self._kubectl(

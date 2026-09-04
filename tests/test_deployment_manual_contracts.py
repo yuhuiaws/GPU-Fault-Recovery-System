@@ -299,13 +299,25 @@ def test_legacy_kubernetes_examples_cannot_be_mistaken_for_deployment() -> None:
     assert "恒为 `false`" in detail
 
 
-def test_make_check_rebuilds_wheel_before_parallel_full_pytest() -> None:
+def test_make_check_runs_static_then_parallel_artifact_and_pytest() -> None:
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     check = makefile.split("check:\n", 1)[1].split("\narchitecture-check:", 1)[0]
+    runner = (ROOT / "scripts/run_release_gates.py").read_text(encoding="utf-8")
+    static_runner = (ROOT / "scripts/run_static_gates.py").read_text(encoding="utf-8")
 
-    assert check.index("$(MAKE) artifact-check") < check.index("$(MAKE) test-parallel")
-    parallel = makefile.split("test-parallel:\n", 1)[1].split("\ncoverage:", 1)[0]
+    assert "scripts/run_release_gates.py" in check
+    assert "--mode check" in check
+    assert '"artifact": ["make", "artifact-check"' in runner
+    assert '"pytest": ["make", "test-parallel-release"' in runner
+    assert "max_workers=2" in runner
+    assert "scripts/run_static_gates.py" in makefile
+    for gate in ("ruff", "mypy", "architecture", "docs", "yaml", "shell"):
+        assert f'"{gate}"' in static_runner
+    parallel = makefile.split("test-parallel-release:\n", 1)[1].split(
+        "\ntest-impact:", 1
+    )[0]
     assert "$(PYTHON) -m pytest -n $(PYTEST_XDIST_WORKERS)" in parallel
+    assert "--ignore=tests/test_artifact_consistency.py" in parallel
 
 
 def test_release_preflight_is_required_and_load_bearing() -> None:
@@ -351,7 +363,7 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "--prebuilt-certificate" in target
     assert "PREBUILT_ATTESTATION ?= $(RELEASE_ATTESTATION)" in makefile
     assert "PREBUILT_BUNDLE ?= $(RELEASE_ATTESTATION_BUNDLE)" in makefile
-    assert "gpu_fault.admin_cli deploy" in target
+    assert "gpu_fault.admin.cli deploy" in target
     assert "CPU_CLUSTER_ARN" in target
     assert "GPU_CLUSTER_ARNS" in target
     assert "STATE_DIR" in target

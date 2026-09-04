@@ -7,7 +7,7 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/check-python-architecture.py"
-architecture = lazy_script_module("check_python_architecture", SCRIPT)
+architecture = lazy_script_module(SCRIPT)
 
 
 def test_generated_architecture_baseline_is_exact_and_minimal() -> None:

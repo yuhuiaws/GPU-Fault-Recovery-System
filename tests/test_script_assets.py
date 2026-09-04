@@ -292,7 +292,20 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
         "Verify unit domain content identity",
         "Upload signed unit domain gate",
     } <= names
-    assert workflow["jobs"]["test"]["needs"] == ["static", "unit", "artifact"]
+    # 打乱顺序那一轮必须真的进 needs：CI 其余几轮的收集顺序是固定的，
+    # 只有它会碰到"某条用例依赖别人先跑"这类问题。
+    shuffle_job = workflow["jobs"]["shuffle"]
+    assert shuffle_job["env"]["GPU_FAULT_TEST_SHUFFLE_SEED"] == "${{ github.run_id }}"
+    assert any(
+        "make test-shuffled PYTHON=python" in step.get("run", "")
+        for step in shuffle_job["steps"]
+    ), "shuffle job must run the shuffled suite, not just install dependencies"
+    assert workflow["jobs"]["test"]["needs"] == [
+        "static",
+        "unit",
+        "shuffle",
+        "artifact",
+    ]
     assert "gpu-fault-ci-candidate" in (ROOT / ".github/workflows/ci.yml").read_text(
         encoding="utf-8"
     )

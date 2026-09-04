@@ -9,16 +9,14 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = lazy_script_module(
-    "sync_installed_resource_registry",
-    ROOT / "deploy" / "control-plane" / "tools" / "sync_installed_resource_registry.py",
+    ROOT / "deploy" / "control-plane" / "tools" / "sync_installed_resource_registry.py"
 )
 COLLECT_MODULE = lazy_script_module(
-    "collect_installed_resource_registry",
     ROOT
     / "deploy"
     / "control-plane"
     / "tools"
-    / "collect_installed_resource_registry.py",
+    / "collect_installed_resource_registry.py"
 )
 
 

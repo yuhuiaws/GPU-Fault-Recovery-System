@@ -77,6 +77,11 @@ class NodeLogBatch(StrictModel):
     workload_state: WorkloadState = WorkloadState.UNKNOWN
     affected_workload_ids: list[str] = Field(default_factory=list)
     edge_filter_reasons: list[str] = Field(default_factory=list)
+    # What the collector could not read for this batch: a journalctl that exited
+    # non-zero, a window it had to move forward, a rotated training log. Without
+    # this an empty `entries` means "the node is quiet" and "the node's log
+    # collection is broken" equally well, and the second one used to be silent.
+    collection_errors: list[str] = Field(default_factory=list)
 
 
 class NodeHealthCategory(StrEnum):
@@ -421,13 +426,19 @@ class NodeHealthPolicy:
             RecoveryAction.RUN_DIAGNOSTICS,
             "network packet drops increased",
         ),
-        "tcp_retransmits_delta": (
-            1.0,
-            NodeHealthCategory.NETWORK,
-            Severity.WARNING,
-            RecoveryAction.RUN_DIAGNOSTICS,
-            "TCP retransmissions increased",
-        ),
+        # tcp_retransmits_delta deliberately has no rule. Every other entry in
+        # this table is an error counter, where a delta of 1 really is
+        # abnormal. A TCP retransmit is normal congestion control, not an
+        # error, and the collector reports the metric as a delta of
+        # /proc/net/snmp RetransSegs -- so a threshold of 1.0 fired on every
+        # collection cycle on every node. Measured on a 4-node p5en fleet on
+        # 2026-09-04 that minted ~155 RUN_DIAGNOSTICS workflows an hour
+        # (~3700/day), each with its own incident, and kept the processor queue
+        # non-empty often enough to flake any preflight that requires an idle
+        # queue. The samples are still collected and still ride along in any
+        # batch that ships for a real reason, which is where they have
+        # diagnostic value; what is removed is the finding and the edge-filter
+        # trigger (collectors/host/collector.py reads METRIC_RULES for both).
         "rdma_errors_delta": (
             1.0,
             NodeHealthCategory.RDMA,

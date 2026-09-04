@@ -1,7 +1,12 @@
 from importlib import import_module
+from typing import Any
 
 _EXPORTS = {
     "PeriodicTaskLease": ("gpu_fault.processor.models", "PeriodicTaskLease"),
+    "ProcessorCompletionSignals": (
+        "gpu_fault.processor.completion_signals",
+        "ProcessorCompletionSignals",
+    ),
     "ProcessorCoordinator": ("gpu_fault.processor.coordinator", "ProcessorCoordinator"),
     "ProcessorLaneLease": ("gpu_fault.processor.models", "ProcessorLaneLease"),
     "ProcessorLeadership": ("gpu_fault.processor.models", "ProcessorLeadership"),
@@ -26,7 +31,7 @@ _EXPORTS = {
 __all__ = list(_EXPORTS)
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     target = _EXPORTS.get(name)
     if target is None:
         raise AttributeError(name)

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from datetime import datetime, timedelta, timezone
-
+from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     CompletionDecision,
     DiagnosticRequest,
@@ -17,11 +17,15 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
-from gpu_fault.installation_resources import InstallationResource
+from gpu_fault.store.shared.attempt_observation_support import (
+    AttemptObservationTerminalSupport,
+    reconcile_terminal_attempt_observations,
+    terminalize_attempt_observation,
+)
 from gpu_fault.store.shared.errors import NotFoundError
 
 
-class MemoryControlRecordMixin:
+class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     # Attributes supplied by the composed concrete implementation.
     _decisions: Any
     _diagnostics: Any
@@ -137,6 +141,7 @@ class MemoryControlRecordMixin:
         observed = now or datetime.now(timezone.utc)
         cutoff = observed - finding_history_retention
         with self._lock:
+            terminalized = reconcile_terminal_attempt_observations(self, limit)
             expired = sorted(
                 (
                     (key, finding)
@@ -150,17 +155,23 @@ class MemoryControlRecordMixin:
             )[:limit]
             for key, _finding in expired:
                 self._gpu_finding_history.pop(key, None)
-        return {"gpu_finding_history": len(expired)}
+        return {
+            "gpu_finding_history": len(expired),
+            "attempt_observation_terminalized": terminalized,
+        }
 
     def save_event_if_absent(self, event: TerminalEvent) -> bool:
         with self._lock:
-            if event.event_key in self._events:
-                return False
-            self._events[event.event_key] = event
-            self._attempt_event_keys[(event.cluster_id, event.attempt_id)] = (
-                event.event_key
-            )
-            return True
+            existing = self._events.get(event.event_key)
+            inserted = existing is None
+            terminal = existing or event
+            if inserted:
+                self._events[event.event_key] = event
+                self._attempt_event_keys[(event.cluster_id, event.attempt_id)] = (
+                    event.event_key
+                )
+            terminalize_attempt_observation(self, terminal)
+            return inserted
 
     def reserve_job_restart(
         self,
@@ -309,6 +320,46 @@ class MemoryControlRecordMixin:
                     marker.observed_at,
                     marker.marker_id,
                 ),
+                reverse=True,
+            )[:limit]
+
+    def list_markers_in_scope_window(
+        self,
+        *,
+        node_ids: set[str],
+        gpu_uuids: set[str],
+        fabric_partitions: set[str],
+        observed_from: datetime,
+        observed_to: datetime,
+        limit: int = 1000,
+    ) -> list[NodeMarker]:
+        """Actionable markers whose scope touches an allocation, newest first.
+
+        The terminal-event correlator asks this once per completed training
+        attempt. It matches on GPU UUID and fabric partition as well as node ID,
+        because a marker raised by a fabric-level fault names the partition, not
+        the nodes attached to it.
+        """
+        if limit < 1 or not (node_ids or gpu_uuids or fabric_partitions):
+            return []
+        with self._lock:
+            return sorted(
+                (
+                    marker
+                    for marker in self._markers.values()
+                    if marker.active
+                    and marker.trusted
+                    and marker.recommended_action is not None
+                    and observed_from <= marker.observed_at <= observed_to
+                    and (
+                        set(marker.scope.node_ids).intersection(node_ids)
+                        or set(marker.scope.gpu_uuids).intersection(gpu_uuids)
+                        or set(marker.scope.fabric_partitions).intersection(
+                            fabric_partitions
+                        )
+                    )
+                ),
+                key=lambda marker: (marker.observed_at, marker.marker_id),
                 reverse=True,
             )[:limit]
 

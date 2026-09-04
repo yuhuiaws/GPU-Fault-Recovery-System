@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from gpu_fault.logging_setup import configure_logging
+
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NAMESPACE = "gpu-fault-system"
@@ -280,10 +282,7 @@ def main() -> None:
 
     from kubernetes import client, config
 
-    logging.basicConfig(
-        level=os.environ.get("GPU_FAULT_LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    configure_logging()
     region_name = (
         os.environ.get("GPU_FAULT_AWS_REGION")
         or os.environ.get("AWS_REGION")

@@ -1,23 +1,28 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from datetime import datetime, timedelta
+from typing import Any, Callable, Iterable, Sequence
 
-from gpu_fault.models import XidMetricBaseline
+from gpu_fault.models import HealthSignalState, XidMetricBaseline
+from gpu_fault.policy import (
+    XidCorrelationRecord,
+    XidEvent,
+)
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
 
 
 class PostgresXidMixin:
-    # Attributes supplied by the composed concrete implementation.
+    # Attributes supplied by the composed concrete implementation. `_decode` and
+    # `_get_optional` stay `Any` because the model class is resolved at run time
+    # from a string kind.
     _db: Any
-    _decode: Callable[..., Any]
-    _get_optional: Callable[..., Any]
-    _next_health_signal_state: Callable[..., Any]
-    _put: Callable[..., Any]
-    _xid_metric_key: Callable[..., Any]
+    _decode: Callable[[str, Any], Any]
+    _get_optional: Callable[[str, str], Any]
+    _next_health_signal_state: Callable[..., tuple[HealthSignalState, bool]]
+    _put: Callable[..., None]
+    _xid_metric_key: Callable[[str, str, str], str]
 
     def claim_due_xid_correlations(
         self,
@@ -26,7 +31,7 @@ class PostgresXidMixin:
         now: datetime,
         lease_duration: timedelta,
         limit: int,
-    ):
+    ) -> list[XidCorrelationRecord]:
         with self._db.transaction():
             with self._db.cursor() as cursor:
                 cursor.execute(
@@ -67,7 +72,7 @@ class PostgresXidMixin:
         return [self._decode("xid_correlation", row[0]) for row in rows]
 
     def save_xid_event_if_absent(
-        self, event, *, retain_from: datetime | None = None
+        self, event: XidEvent, *, retain_from: datetime | None = None
     ) -> bool:
         with self._db.transaction():
             with self._db.cursor() as cursor:
@@ -108,7 +113,7 @@ class PostgresXidMixin:
         *,
         observed_after: datetime | None = None,
         observed_before: datetime | None = None,
-    ):
+    ) -> list[XidEvent]:
         clauses = [
             "kind='xid_correlation_event'",
             "payload->>'cluster_id'=%s",
@@ -129,7 +134,7 @@ class PostgresXidMixin:
             rows = cursor.fetchall()
         return [self._decode("xid_correlation_event", row[0]) for row in rows]
 
-    def get_xid_events(self, event_ids) -> dict:
+    def get_xid_events(self, event_ids: Iterable[str]) -> dict[str, XidEvent]:
         keys = list(dict.fromkeys(event_ids))
         if not keys:
             return {}
@@ -145,7 +150,10 @@ class PostgresXidMixin:
             rows = cursor.fetchall()
         return {row[0]: self._decode("xid_correlation_event", row[1]) for row in rows}
 
-    def list_xid_events_for_scopes(self, scopes) -> dict:
+    def list_xid_events_for_scopes(
+        self,
+        scopes: Iterable[tuple[str, str, datetime | None, datetime | None]],
+    ) -> dict[tuple[str, str], list[XidEvent]]:
         # One statement for the whole claimed batch instead of one per
         # event. Each scope keeps its own time bounds so
         # gpu_fault_xid_correlation_lookup still drives every branch;
@@ -179,7 +187,7 @@ class PostgresXidMixin:
                 parameters,
             )
             rows = cursor.fetchall()
-        found: dict[tuple[str, str], dict[str, object]] = {
+        found: dict[tuple[str, str], dict[str, XidEvent]] = {
             scope: {} for scope in groups
         }
         for row in rows:
@@ -190,7 +198,7 @@ class PostgresXidMixin:
             bucket[item.event_id] = item
         return {scope: list(bucket.values()) for scope, bucket in found.items()}
 
-    def save_xid_correlation_if_absent(self, correlation) -> bool:
+    def save_xid_correlation_if_absent(self, correlation: XidCorrelationRecord) -> bool:
         with self._db.transaction():
             with self._db.cursor() as cursor:
                 cursor.execute(
@@ -239,7 +247,9 @@ class PostgresXidMixin:
             self._put("xid_metric_baseline", key, baseline)
             return previous is not None and xid > 0 and xid != previous.xid
 
-    def claim_health_signal_transitions(self, items) -> list[bool]:
+    def claim_health_signal_transitions(
+        self, items: Sequence[tuple[str, bool, datetime, float]]
+    ) -> list[bool]:
         if not items:
             return []
         keys = [item[0] for item in items]
@@ -259,8 +269,8 @@ class PostgresXidMixin:
                 key: self._decode("health_signal_state", payload)
                 for key, payload in cursor.fetchall()
             }
-        results = []
-        final_by_key = {}
+        results: list[bool] = []
+        final_by_key: dict[str, HealthSignalState] = {}
         for (
             signal_key,
             active,

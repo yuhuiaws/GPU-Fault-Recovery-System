@@ -11,10 +11,9 @@ import tarfile
 from pathlib import Path
 from typing import Any, Mapping
 
-
 BUNDLE_ROOT = "gpu-fault-deploy-host"
 MANIFEST_NAME = "manifest.json"
-BUNDLE_SCHEMA_VERSION = 1
+BUNDLE_SCHEMA_VERSION = 2
 
 
 class DeployHostBundleError(RuntimeError):
@@ -153,8 +152,19 @@ def verify_bundle_tree(root: Path) -> dict[str, Any]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DeployHostBundleError("deploy-host bundle manifest is invalid") from exc
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
-        raise DeployHostBundleError("deploy-host bundle schema_version must be 1")
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in {
+        1,
+        BUNDLE_SCHEMA_VERSION,
+    }:
+        raise DeployHostBundleError("deploy-host bundle schema_version is unsupported")
+    if manifest.get("schema_version") == BUNDLE_SCHEMA_VERSION:
+        payload_identity = str(manifest.get("payload_identity_sha256") or "")
+        if len(payload_identity) != 64 or any(
+            character not in "0123456789abcdef" for character in payload_identity
+        ):
+            raise DeployHostBundleError(
+                "deploy-host bundle payload identity is missing"
+            )
     expected = manifest.get("files")
     if not isinstance(expected, dict):
         raise DeployHostBundleError("deploy-host bundle file inventory is missing")

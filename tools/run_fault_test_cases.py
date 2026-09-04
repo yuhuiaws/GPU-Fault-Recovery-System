@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from functools import lru_cache
+import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -73,6 +75,38 @@ CURRENT_STATUS_VALUES = {
     "BLOCKED",
     "SUPERSEDED",
 }
+EVIDENCE_FIELDS = {"verdict", "verified"}
+VERIFIED_FIELDS = {"case_digest", "components"}
+# `case_digest` 覆盖 case 的规范性内容。排除的两个字段不属于「这条 case 断言了
+# 什么」：`evidence` 是结论本身，`execution` 只是调度元数据（并行、锁、依赖），
+# 调整并行度不应让一次真机 PASS 失效。用排除法而不是白名单：以后新增的规范字段
+# 会自动进入摘要，白名单会静默漏掉它。
+DIGEST_EXCLUDED_CASE_FIELDS = {"evidence", "execution"}
+# 与 scripts/component_wheels.py 的 APPLICATION_COMPONENT_NAMES 一致，由
+# tests/test_fault_scenario_catalog.py 双向守卫。live PASS 都是端到端用例，
+# 信号从节点经 executor 到控制面，因此三个组件全部记录：过宽的失效判定只会多说
+# 一句「请重新验证」，漏记的组件会让一条已经不成立的 PASS 继续显示为有效。
+VERIFIED_COMPONENTS = ("control_plane", "executor", "node_runtime")
+# 下列 live PASS 早于组件摘要绑定：真机执行发生在 2026-07，当时没有记录被验证的
+# 代码摘要，事后补一个「今天」的摘要等于把没有做过的复核写成证据。它们只带
+# `case_digest`，`scripts/build-fault-evidence-index.py` 把它们报成 UNBOUND
+# （下次真机窗口必须重新验证）；新增 PASS 必须带 `components`。
+# 这是单向棘轮，只允许变短。
+EVIDENCE_UNBOUND_PASS_CASES = frozenset(
+    {
+        "GF-LIVE-KERNEL-COLLECTOR-001",
+        "GF-LIVE-KMSG-XID11-001",
+        "GF-LIVE-KMSG-XID45-FM-EMAIL-20260724",
+        "GF-LIVE-KMSG-XID45-SOLO-FM-20260724",
+        "GF-LIVE-KMSG-XID45-XID14-20260724",
+        "GF-LIVE-XID11-001",
+        "GF-LIVE-XID45-AURORA-HA-20260724",
+        "GF-LIVE-XID74-CORRECTED-20260726",
+        "GF-LIVE-XID74-SAFE-20260726",
+        "GF-LIVE-XID95-DUAL-RESET-RESUME-20260724",
+    }
+)
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 LEGACY_EVIDENCE_FIELDS = {
     "current_status",
     "result",
@@ -175,6 +209,78 @@ def _validate_nonempty_string(value: Any, field: str) -> None:
         raise ValueError(f"test case field {field} must be a non-empty string")
 
 
+def case_definition_digest(case: Mapping[str, Any]) -> str:
+    """Digest what a case asserts, ignoring its verdict and its scheduling.
+
+    A manual `PASS` is a human statement about one specific claim, but nothing
+    stopped that claim from being rewritten afterwards: widen `expected`, change
+    the `injection`, point `procedure` at another section, and the old verdict
+    silently keeps vouching for text nobody ever executed. Binding the verdict
+    to a digest of the claim turns that into a load-time failure.
+    """
+    payload = {
+        key: value
+        for key, value in case.items()
+        if key not in DIGEST_EXCLUDED_CASE_FIELDS
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_sha256(value: Any, field: str) -> None:
+    _validate_nonempty_string(value, field)
+    if not SHA256_PATTERN.match(value):
+        raise ValueError(f"test case field {field} must be a lowercase sha256 digest")
+
+
+def _validate_verified(case: dict[str, Any], evidence: dict[str, Any]) -> None:
+    """Require every `PASS` to name the claim and the code it was proven on.
+
+    `PASS` is the only verdict a reader acts on, and it is the only one no gate
+    can reproduce: the live cases run against real GPUs in a maintenance window.
+    Without this binding a `PASS` is immortal — it survives edits to the case and
+    every subsequent release of the code it was supposed to prove.
+    """
+    verified = evidence.get("verified")
+    if evidence["verdict"] != "PASS":
+        if verified is not None:
+            raise ValueError("evidence.verified requires evidence.verdict=PASS")
+        return
+    if not isinstance(verified, dict):
+        raise ValueError("evidence.verdict=PASS requires an evidence.verified mapping")
+    unknown = set(verified) - VERIFIED_FIELDS
+    if unknown:
+        raise ValueError(f"evidence.verified has unknown fields: {sorted(unknown)}")
+    _validate_sha256(verified.get("case_digest"), "evidence.verified.case_digest")
+    expected = case_definition_digest(case)
+    if verified["case_digest"] != expected:
+        raise ValueError(
+            "evidence.verified.case_digest does not describe this case any more, "
+            f"so its PASS no longer applies; re-run the case (expected {expected})"
+        )
+    components = verified.get("components")
+    if case["id"] in EVIDENCE_UNBOUND_PASS_CASES:
+        if components is not None:
+            raise ValueError(
+                "evidence.verified.components cannot be backfilled for "
+                f"{case['id']}: re-run the case and drop it from "
+                "EVIDENCE_UNBOUND_PASS_CASES"
+            )
+        return
+    if not isinstance(components, dict) or set(components) != set(VERIFIED_COMPONENTS):
+        raise ValueError(
+            "evidence.verified.components must name exactly "
+            + ", ".join(VERIFIED_COMPONENTS)
+        )
+    for name, digest in sorted(components.items()):
+        _validate_sha256(digest, f"evidence.verified.components.{name}")
+
+
 def _validate_evidence(case: dict[str, Any]) -> str | None:
     legacy = LEGACY_EVIDENCE_FIELDS.intersection(case)
     if legacy:
@@ -187,14 +293,14 @@ def _validate_evidence(case: dict[str, Any]) -> str | None:
         return None
     if not isinstance(evidence, dict):
         raise ValueError("test case evidence must be a mapping")
-    allowed = {"verdict"}
-    unknown = set(evidence) - allowed
+    unknown = set(evidence) - EVIDENCE_FIELDS
     if unknown:
         raise ValueError(f"test case evidence has unknown fields: {sorted(unknown)}")
     verdict = evidence.get("verdict")
     _validate_nonempty_string(verdict, "evidence.verdict")
     if verdict not in CURRENT_STATUS_VALUES:
         raise ValueError(f"unsupported test case evidence verdict: {verdict}")
+    _validate_verified(case, evidence)
     return verdict
 
 

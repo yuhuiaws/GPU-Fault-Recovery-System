@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import importlib
 import json
 import os
-from pathlib import Path
 import sys
+import time
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, Protocol
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -23,8 +24,15 @@ CONFIRMATION = "RUN_BOOT020_RELEASE_ROLLING"
 EXPECTED_KINDS = {
     "noop": "NOOP",
     "control_plane": "CONTROL_PLANE_ONLY",
-    "data_plane": "DATA_PLANE_COMPATIBLE",
+    "executor": "DATA_PLANE_COMPATIBLE",
+    "agent": "DATA_PLANE_COMPATIBLE",
     "full": "FULL",
+}
+RTO_LIMITS = {
+    "control_plane": {"safe": 1200.0, "full": 1500.0},
+    "executor": {"safe": 900.0, "full": 1200.0, "resume": 1200.0},
+    "agent": {"safe": 1800.0, "full": 2100.0},
+    "full": {"safe": 2700.0, "full": 3000.0},
 }
 
 
@@ -96,6 +104,43 @@ def _assert_data_plane_changed(
     assert changed, "DATA_PLANE_COMPATIBLE did not change any GPU data plane"
 
 
+def _assert_rollback_rto(scenario: str, result: dict[str, Any]) -> None:
+    timing = result.get("rollback_timing")
+    assert isinstance(timing, dict), (scenario, result)
+    safe = float(timing["t_safe_seconds"])
+    full = float(timing["t_full_seconds"])
+    assert 0 <= safe <= full, (scenario, timing)
+    assert safe <= RTO_LIMITS[scenario]["safe"], (scenario, timing)
+    assert full <= RTO_LIMITS[scenario]["full"], (scenario, timing)
+
+
+def _assert_rollback_scope(scenario: str, result: dict[str, Any]) -> None:
+    plan = result.get("rollback_plan")
+    assert isinstance(plan, dict), (scenario, result)
+    clusters = plan.get("clusters") or {}
+    components = {component for values in clusters.values() for component in values}
+    if scenario == "control_plane":
+        assert plan.get("restores_data_plane") is False, plan
+    elif scenario == "executor":
+        assert "EXECUTOR" in components, plan
+        assert "AGENT" not in components, plan
+    elif scenario == "agent":
+        assert "AGENT" in components, plan
+        assert plan.get("needs_controller") is True, plan
+
+
+def _assert_resume_rto(scenario: str, result: dict[str, Any]) -> None:
+    duration = float(result["operation_duration_seconds"])
+    assert duration <= RTO_LIMITS[scenario]["resume"], (scenario, result)
+
+
+def _assert_rollback_snapshot(
+    before: dict[str, Any],
+    rolled_back: dict[str, Any],
+) -> None:
+    assert rolled_back["live"] == before["live"], (before, rolled_back)
+
+
 def run_release_rolling(
     backend: ReleaseRollingBackend,
     recorder: EvidenceRecorder,
@@ -123,6 +168,23 @@ def run_release_rolling(
             "control_plane_before",
             lambda: backend.snapshot("control_plane"),
         )
+        control_failed = recorder.stage(
+            "control_plane_injected_failure_and_rollback",
+            lambda: backend.deploy(
+                "control_plane",
+                diff=control_diff,
+                fault_phase="cpu-finalized",
+                auto_rollback=True,
+            ),
+        )
+        assert control_failed["phase"] == "rolled-back", control_failed
+        _assert_rollback_scope("control_plane", control_failed)
+        _assert_rollback_rto("control_plane", control_failed)
+        control_rolled_back = recorder.stage(
+            "control_plane_rollback_snapshot",
+            lambda: backend.snapshot("control_plane"),
+        )
+        _assert_rollback_snapshot(control_before, control_rolled_back)
         control_apply = recorder.stage(
             "control_plane_apply",
             lambda: backend.deploy("control_plane", diff=control_diff),
@@ -136,43 +198,100 @@ def run_release_rolling(
         control_next = backend.classify("control_plane")
         assert control_next["kind"] == "NOOP", control_next
 
-        data_diff = recorder.stage(
-            "data_plane_classification",
-            lambda: backend.classify("data_plane"),
+        executor_diff = recorder.stage(
+            "executor_classification",
+            lambda: backend.classify("executor"),
         )
-        _assert_kind("data_plane", data_diff)
-        data_before = recorder.stage(
-            "data_plane_before",
-            lambda: backend.snapshot("data_plane"),
+        _assert_kind("executor", executor_diff)
+        executor_before = recorder.stage(
+            "executor_before",
+            lambda: backend.snapshot("executor"),
         )
-        data_failed = recorder.stage(
-            "data_plane_injected_failure",
+        executor_rolled_back = recorder.stage(
+            "executor_injected_failure_and_rollback",
             lambda: backend.deploy(
-                "data_plane",
-                diff=data_diff,
+                "executor",
+                diff=executor_diff,
+                fault_phase="data-converged",
+                auto_rollback=True,
+            ),
+        )
+        assert executor_rolled_back["phase"] == "rolled-back", executor_rolled_back
+        _assert_rollback_scope("executor", executor_rolled_back)
+        _assert_rollback_rto("executor", executor_rolled_back)
+        executor_rollback_snapshot = recorder.stage(
+            "executor_rollback_snapshot",
+            lambda: backend.snapshot("executor"),
+        )
+        _assert_rollback_snapshot(executor_before, executor_rollback_snapshot)
+        executor_failed = recorder.stage(
+            "executor_interrupted_failure",
+            lambda: backend.deploy(
+                "executor",
+                diff=executor_diff,
                 fault_phase="cpu-staged",
                 auto_rollback=False,
             ),
         )
-        assert data_failed["phase"] == "failed", data_failed
-        assert data_failed["injected_failure"] == "cpu-staged", data_failed
-        data_resumed = recorder.stage(
-            "data_plane_resumed",
+        assert executor_failed["phase"] == "failed", executor_failed
+        assert executor_failed["injected_failure"] == "cpu-staged", executor_failed
+        executor_resumed = recorder.stage(
+            "executor_resumed",
             lambda: backend.deploy(
-                "data_plane",
-                diff=data_diff,
+                "executor",
+                diff=executor_diff,
                 resume=True,
                 auto_rollback=False,
             ),
         )
-        assert data_resumed["phase"] == "complete", data_resumed
-        data_after = recorder.stage(
-            "data_plane_after",
-            lambda: backend.snapshot("data_plane"),
+        assert executor_resumed["phase"] == "complete", executor_resumed
+        _assert_resume_rto("executor", executor_resumed)
+        executor_after = recorder.stage(
+            "executor_after",
+            lambda: backend.snapshot("executor"),
         )
-        _assert_data_plane_changed(data_before, data_after)
-        data_next = backend.classify("data_plane")
-        assert data_next["kind"] == "NOOP", data_next
+        _assert_data_plane_changed(executor_before, executor_after)
+        executor_next = backend.classify("executor")
+        assert executor_next["kind"] == "NOOP", executor_next
+
+        agent_diff = recorder.stage(
+            "agent_classification",
+            lambda: backend.classify("agent"),
+        )
+        _assert_kind("agent", agent_diff)
+        agent_before = recorder.stage(
+            "agent_before",
+            lambda: backend.snapshot("agent"),
+        )
+        agent_failed = recorder.stage(
+            "agent_injected_failure_and_rollback",
+            lambda: backend.deploy(
+                "agent",
+                diff=agent_diff,
+                fault_phase="data-converged",
+                auto_rollback=True,
+            ),
+        )
+        assert agent_failed["phase"] == "rolled-back", agent_failed
+        _assert_rollback_scope("agent", agent_failed)
+        _assert_rollback_rto("agent", agent_failed)
+        agent_rolled_back = recorder.stage(
+            "agent_rollback_snapshot",
+            lambda: backend.snapshot("agent"),
+        )
+        _assert_rollback_snapshot(agent_before, agent_rolled_back)
+        agent_apply = recorder.stage(
+            "agent_apply_after_rollback",
+            lambda: backend.deploy("agent", diff=agent_diff),
+        )
+        assert agent_apply["phase"] == "complete", agent_apply
+        agent_after = recorder.stage(
+            "agent_after",
+            lambda: backend.snapshot("agent"),
+        )
+        _assert_data_plane_changed(agent_before, agent_after)
+        agent_next = backend.classify("agent")
+        assert agent_next["kind"] == "NOOP", agent_next
 
         full_diff = recorder.stage(
             "full_classification",
@@ -194,14 +313,12 @@ def run_release_rolling(
         )
         assert full_failed["phase"] == "rolled-back", full_failed
         assert full_failed["injected_failure"] == "data-converged", full_failed
+        _assert_rollback_rto("full", full_failed)
         full_rolled_back = recorder.stage(
             "full_rollback_snapshot",
             lambda: backend.snapshot("full"),
         )
-        assert full_rolled_back["live"] == full_before["live"], (
-            full_before,
-            full_rolled_back,
-        )
+        _assert_rollback_snapshot(full_before, full_rolled_back)
         full_apply = recorder.stage(
             "full_apply_after_rollback",
             lambda: backend.deploy("full", diff=full_diff),
@@ -313,6 +430,7 @@ class LiveReleaseRollingBackend:
         active_diff = self._diff(diff)
         original_save = release._save_state
         injected = False
+        started = time.monotonic()
 
         def save_with_injection(phase: str, **updates: Any) -> None:
             nonlocal injected
@@ -337,6 +455,9 @@ class LiveReleaseRollingBackend:
                 "release_id": state.get("release_id"),
                 "injected_failure": fault_phase,
                 "release_diff": diff,
+                "rollback_plan": state.get("rollback_plan"),
+                "rollback_timing": state.get("rollback_timing"),
+                "operation_duration_seconds": time.monotonic() - started,
             }
         state = release._load_state()
         return {
@@ -344,6 +465,9 @@ class LiveReleaseRollingBackend:
             "release_id": state.get("release_id"),
             "injected_failure": None,
             "release_diff": diff,
+            "rollback_plan": state.get("rollback_plan"),
+            "rollback_timing": state.get("rollback_timing"),
+            "operation_duration_seconds": time.monotonic() - started,
         }
 
 
@@ -352,6 +476,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--noop-config", required=True, type=Path)
     value.add_argument("--control-plane-config", required=True, type=Path)
     value.add_argument("--data-plane-config", required=True, type=Path)
+    value.add_argument("--agent-config", required=True, type=Path)
     value.add_argument("--full-config", required=True, type=Path)
     value.add_argument("--run-dir", required=True, type=Path)
     value.add_argument("--gpu-kubeconfig", type=Path)
@@ -365,12 +490,13 @@ def main() -> int:
     configs = {
         "noop": arguments.noop_config.resolve(),
         "control_plane": arguments.control_plane_config.resolve(),
-        "data_plane": arguments.data_plane_config.resolve(),
+        "executor": arguments.data_plane_config.resolve(),
+        "agent": arguments.agent_config.resolve(),
         "full": arguments.full_config.resolve(),
     }
-    if len(set(configs.values())) != 4:
+    if len(set(configs.values())) != 5:
         raise SystemExit(
-            "the four release scenarios require four distinct config files"
+            "the five release scenarios require five distinct config files"
         )
     for path in configs.values():
         if not path.is_file():
@@ -386,9 +512,10 @@ def main() -> int:
         "configs": {name: str(path) for name, path in configs.items()},
         "stages": [
             "verify NOOP makes no live artifact change",
-            "verify CONTROL_PLANE_ONLY preserves every GPU data plane",
-            "inject DATA_PLANE_COMPATIBLE failure after cpu-staged and resume",
-            "inject FULL failure after data-converged and verify automatic rollback",
+            "assert CPU-only rollback T_safe and T_full",
+            "assert Executor-only rollback plus interrupted resume RTO",
+            "assert Agent-only rollback T_safe and T_full",
+            "assert FULL rollback T_safe and T_full",
             "apply FULL successfully and verify the next classification is NOOP",
         ],
     }

@@ -7,7 +7,7 @@ from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts/capture_release_evidence.py"
-MODULE = lazy_script_module("capture_release_evidence", MODULE_PATH)
+MODULE = lazy_script_module(MODULE_PATH)
 
 
 def encoded(value: str) -> str:

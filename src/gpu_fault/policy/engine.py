@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 from datetime import timedelta
-import re
 from threading import RLock
+from typing import Callable, NamedTuple
 
 from gpu_fault.models import (
     MarkerScope,
@@ -16,20 +17,19 @@ from gpu_fault.policy.catalog import (
     load_xid_policy,
 )
 from gpu_fault.policy.models import (
-    ActionDisposition,
-    ActionSource,
     CONTAINMENT_SEVERITY_RANK,
-    CatalogRule,
-    Containment,
     DEFAULT_DECISION_CACHE_SIZE,
     DIRECT_ACTION_MAP,
+    OPERATOR_SEVERITY_RANK,
+    RECOVERY_ACTION_SEVERITY_RANK,
+    ActionDisposition,
+    ActionSource,
+    CatalogRule,
+    Containment,
     DynamicRecoveryAction,
     FaultEventType,
     FaultPolicyDecision,
-    NVLINK74_REGISTER_RULES,
     NvlinkDecodeRule,
-    OPERATOR_SEVERITY_RANK,
-    RECOVERY_ACTION_SEVERITY_RANK,
     SxidCatalogRule,
     SxidClassification,
     SxidEvent,
@@ -39,10 +39,38 @@ from gpu_fault.policy.models import (
     XidPolicy,
     _Resolution,
 )
+from gpu_fault.policy.nvlink74 import resolve_nvlink74
 from gpu_fault.policy.product_families import (
     ProductFamilyPolicyMixin,
     ProductFamilyResolver,
 )
+
+# The catalog's Immediate Action token for XID 154. It is a workflow like any
+# other NVIDIA workflow -- it is dispatched from _XID_WORKFLOW_RESOLVERS rather
+# than from a hardcoded ``event.xid == 154`` branch in the middle of
+# ``_resolve_xid``'s guard sequence -- but it is also the one token whose
+# resolver consumes the recovery action parsed off the event itself.
+#
+# That action is propagated onto the companion events XID 154 summarises, where
+# it overrides their own Immediate Action; on the XID 154 event it must not,
+# because ``_workflow_xid_154`` additionally refuses to act while the correlation
+# window is still open. So the propagation guard tests the catalog token, which
+# keeps every piece of XID 154 routing keyed the same way as the table.
+XID_154_ACTION = "XID_154"
+
+
+class _XidCorrelation(NamedTuple):
+    """The correlation evidence the caller read out of the store for one event.
+
+    The engine never queries the store itself, so everything a workflow needs
+    beyond the event and its catalog rule arrives here. Passing one value keeps
+    every workflow resolver on the same signature, which is what lets them be
+    dispatched from a table instead of a branch per NVIDIA action.
+    """
+
+    companion_events: list[XidEvent]
+    xid45_window_closed: bool
+    xid154_window_closed: bool
 
 
 class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
@@ -145,6 +173,20 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         xid45_window_closed: bool = True,
         xid154_window_closed: bool = True,
     ) -> _Resolution:
+        """Resolve one XID into exactly one NVIDIA-sourced outcome.
+
+        The guards run before any workflow and in a fixed order: an XID outside
+        the pinned catalog, one that does not apply to this product, and one
+        whose evidence does not meet the catalog's version linkage can never
+        reach a recovery action. Everything after them is dispatched by the
+        catalog's own Immediate Action text.
+        """
+
+        correlation = _XidCorrelation(
+            companion_events=companion_events or [],
+            xid45_window_closed=xid45_window_closed,
+            xid154_window_closed=xid154_window_closed,
+        )
         rule = self._rules.get(event.xid)
         if rule is None:
             return _Resolution(
@@ -161,40 +203,17 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 requires_operator=True,
             )
 
-        if not self._product_families.supports(
-            event.product,
-            rule.products,
-            record_unknown=True,
-        ):
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.NOT_APPLICABLE,
-                official_action=rule.immediate_action,
-                investigatory_action=rule.investigatory_action,
-                action=None,
-                containment=Containment.UNKNOWN,
-                reasons=[
-                    f"Catalog XID {event.xid} is not applicable to "
-                    f"product {event.product or 'UNKNOWN'}"
-                ],
-                requires_operator=True,
-            )
-
-        version_gate = self._version_gate(event, rule)
-        if version_gate is not None:
-            return version_gate
-
-        if event.xid == 154:
-            return self._workflow_xid_154(
-                event,
-                rule,
-                companion_events=companion_events,
-                window_closed=xid154_window_closed,
-            )
-        if event.xid_154_action is not None:
-            return self._dynamic_recovery_resolution(event.xid_154_action, rule)
+        for gate in (self._product_gate, self._version_gate):
+            blocked = gate(event, rule)
+            if blocked is not None:
+                return blocked
 
         official = rule.immediate_action
+        # The annotated action overrides a *companion* event's own Immediate
+        # Action, never the XID 154 event carrying it; see XID_154_ACTION.
+        if event.xid_154_action is not None and official != XID_154_ACTION:
+            return self._dynamic_recovery_resolution(event.xid_154_action, rule)
+
         if official is None:
             return _Resolution(
                 source=ActionSource.NVIDIA_CATALOG,
@@ -224,50 +243,11 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             return self._with_xid_48_backlink(
                 event,
                 resolution,
-                candidates=companion_events or [],
+                candidates=correlation.companion_events,
             )
-        if official == "WORKFLOW_XID_45":
-            return self._workflow_xid_45(
-                event,
-                rule,
-                companion_events=companion_events,
-                window_closed=xid45_window_closed,
-            )
-        if official == "WORKFLOW_XID_48":
-            return self._workflow_xid_48(
-                event,
-                rule,
-                companion_events=companion_events,
-            )
-        if official == "WORKFLOW_NVLINK_ERR":
-            return self._workflow_nvlink74(event, rule)
-        if official == "WORKFLOW_NVLINK5_ERR":
-            return self._workflow_nvlink5(
-                event,
-                rule,
-                companion_events=companion_events,
-                window_closed=xid154_window_closed,
-            )
-        if official == "CHECK_UVM":
-            return self._workflow_check_uvm(event, rule)
-        if official in {
-            "CONTACT_SUPPORT",
-            "CHECK_MECHANICALS",
-            "UPDATE_SWFW",
-        }:
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.EXECUTABLE,
-                official_action=official,
-                investigatory_action=rule.investigatory_action,
-                action=None,
-                containment=self._xid_containment(event.xid),
-                reasons=[
-                    f"exact NVIDIA Catalog {self.policy.catalog_version} "
-                    f"workflow for XID {event.xid}: {official}"
-                ],
-                requires_operator=official in {"CONTACT_SUPPORT", "CHECK_MECHANICALS"},
-            )
+        resolver = _XID_WORKFLOW_RESOLVERS.get(official)
+        if resolver is not None:
+            return resolver(self, event, rule, correlation)
 
         return _Resolution(
             source=ActionSource.NVIDIA_CATALOG,
@@ -283,247 +263,67 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             requires_operator=True,
         )
 
-    def _workflow_nvlink74(self, event: XidEvent, rule: CatalogRule) -> _Resolution:
-        if len(event.registers) != 7:
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=(ActionDisposition.BLOCKED_MISSING_EVIDENCE),
-                official_action="WORKFLOW_NVLINK_ERR",
-                investigatory_action=rule.investigatory_action,
-                action=RecoveryAction.STOP_WORKLOAD,
-                containment=Containment.GPU,
-                reasons=[
-                    "XID 74 decode requires exactly seven register "
-                    "fields from the kernel event"
-                ],
-                requires_operator=True,
-            )
-        if self._product_families.family(event.product) != "H100":
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.EXECUTABLE,
-                official_action="WORKFLOW_NVLINK_ERR",
-                investigatory_action="CONTACT_SUPPORT",
-                action=RecoveryAction.ESCALATE_OPERATOR,
-                containment=Containment.GPU,
-                reasons=[
-                    "the pinned XID 74 register bit workflow identifies "
-                    "the first, third, fourth and fifth registers as "
-                    "valid for Hopper products; refusing to apply the "
-                    f"Hopper decoder to {event.product or 'UNKNOWN'}"
-                ],
-                requires_operator=True,
-            )
-
-        matches = []
-        unknown = []
-        for register_index, value in enumerate(event.registers):
-            rules = NVLINK74_REGISTER_RULES.get(register_index, {})
-            for bit in range(max(32, value.bit_length())):
-                if not value & (1 << bit):
-                    continue
-                bit_categories = [
-                    category for category, bits in rules.items() if bit in bits
-                ]
-                if not bit_categories:
-                    unknown.append(f"register{register_index + 1}.bit{bit}")
-                    continue
-                matches.extend(
-                    f"register{register_index + 1}.bit{bit}:{category}"
-                    for category in bit_categories
-                )
-
-        categories = {item.rsplit(":", 1)[1] for item in matches}
-        evidence = ", ".join(matches) if matches else "no populated bits"
-        if unknown or not matches:
-            detail = ", ".join(unknown) if unknown else "all seven registers are zero"
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.EXECUTABLE,
-                official_action="WORKFLOW_NVLINK_ERR",
-                investigatory_action="CONTACT_SUPPORT",
-                action=RecoveryAction.ESCALATE_OPERATOR,
-                containment=Containment.GPU,
-                reasons=[
-                    "NVIDIA XID 74 workflow requires reporting unknown "
-                    f"or unexpected register state: {detail}"
-                ],
-                matched_decode_rules=matches,
-                requires_operator=True,
-            )
-
-        passive = {"safe_ignore", "corrected_threshold"}
-        if categories.issubset(passive):
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.MONITOR_ONLY,
-                official_action="IGNORE",
-                investigatory_action=(
-                    "OPTIONAL_FIELDDIAG"
-                    if "corrected_threshold" in categories
-                    else None
-                ),
-                action=RecoveryAction.NO_ACTION,
-                containment=Containment.GPU,
-                reasons=[
-                    "NVIDIA XID 74 register decode permits continued "
-                    f"operation: {evidence}"
-                ],
-                matched_decode_rules=matches,
-            )
-
-        counted_categories = {
-            "ecc_parity",
-            "mechanical_or_hardware",
-            "report_if_repeated",
-            "field_diag_if_repeated",
-            "marginal_channel",
-        }
-        if categories.intersection(counted_categories) and event.nvlink_link_id is None:
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=(ActionDisposition.BLOCKED_MISSING_EVIDENCE),
-                official_action="WORKFLOW_NVLINK_ERR",
-                investigatory_action=rule.investigatory_action,
-                action=None,
-                containment=Containment.GPU,
-                reasons=[
-                    "XID 74 link-scoped resolution requires an explicit "
-                    "NVLink identity in the source evidence; refusing "
-                    f"to aggregate or reset at GPU scope: {evidence}"
-                ],
-                matched_decode_rules=matches,
-                requires_operator=True,
-            )
-
-        if "fabric_reset_required" in categories:
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.EXECUTABLE,
-                official_action="WORKFLOW_NVLINK_ERR",
-                investigatory_action="CONTACT_SUPPORT",
-                action=RecoveryAction.ESCALATE_OPERATOR,
-                containment=Containment.FABRIC_PARTITION,
-                reasons=[
-                    "NVIDIA XID 74 fourth-register bit 18 requires a "
-                    "fabric reset; complete local fabric inventory is "
-                    f"not present in an XID event: {evidence}"
-                ],
-                matched_decode_rules=matches,
-                requires_operator=True,
-            )
-
-        counts = event.nvlink_occurrence_counts
-        matched_counts = {
-            item.rsplit(":", 1)[0]: counts.get(item.rsplit(":", 1)[0], 0)
-            for item in matches
-        }
-        count_evidence = ", ".join(
-            f"{key}=count{value}" for key, value in sorted(matched_counts.items())
-        )
-
-        direct_support = {
-            "unexpected_production",
-            "marginal_channel",
-        }
-        if categories.intersection(direct_support):
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.EXECUTABLE,
-                official_action="WORKFLOW_NVLINK_ERR",
-                investigatory_action="CONTACT_SUPPORT",
-                action=RecoveryAction.ESCALATE_OPERATOR,
-                containment=Containment.GPU,
-                reasons=[
-                    "NVIDIA XID 74 register decode requires link "
-                    f"diagnostics and support review: {evidence}"
-                ],
-                matched_decode_rules=matches,
-                requires_operator=True,
-            )
-
-        if categories.difference(passive) == {"secondary"}:
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.EXECUTABLE,
-                official_action="WORKFLOW_NVLINK_ERR",
-                investigatory_action="CONTACT_SUPPORT",
-                action=RecoveryAction.ESCALATE_OPERATOR,
-                containment=Containment.GPU,
-                reasons=[
-                    "NVIDIA XID 74 contains only sympathetic/secondary "
-                    f"bits and requires reporting when seen solo: {evidence}"
-                ],
-                matched_decode_rules=matches,
-                requires_operator=True,
-            )
-
-        support_threshold_reached = any(
-            (category == "ecc_parity" and matched_counts.get(key, 0) > 2)
-            or (
-                category
-                in {
-                    "report_if_repeated",
-                    "field_diag_if_repeated",
-                }
-                and matched_counts.get(key, 0) >= 2
-            )
-            or (
-                category == "mechanical_or_hardware" and matched_counts.get(key, 0) >= 2
-            )
-            for item in matches
-            for key, category in [item.rsplit(":", 1)]
-        )
-        mechanical = "mechanical_or_hardware" in categories
-        if support_threshold_reached:
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.EXECUTABLE,
-                official_action="WORKFLOW_NVLINK_ERR",
-                investigatory_action="CONTACT_SUPPORT_AFTER_REMEDIATION",
-                action=RecoveryAction.RESET_GPU,
-                containment=Containment.GPU,
-                reasons=[
-                    "NVIDIA XID 74 same-link threshold reached on "
-                    f"NVLink {event.nvlink_link_id}: {count_evidence}; "
-                    "reset the affected GPU first; contact support only "
-                    "if reset/reboot fails to clear the condition"
-                ],
-                matched_decode_rules=matches,
-                requires_operator=False,
-            )
-
-        if mechanical:
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.EXECUTABLE,
-                official_action="WORKFLOW_NVLINK_ERR",
-                investigatory_action="CHECK_MECHANICALS_AFTER_REMEDIATION",
-                action=RecoveryAction.RESET_GPU,
-                containment=Containment.GPU,
-                reasons=[
-                    "NVIDIA XID 74 requires reset of the affected GPU "
-                    f"on NVLink {event.nvlink_link_id}: "
-                    f"{count_evidence}; inspect hardware only if reset "
-                    "or node reboot does not clear the condition"
-                ],
-                matched_decode_rules=matches,
-                requires_operator=False,
-            )
-
+    def _product_gate(self, event: XidEvent, rule: CatalogRule) -> _Resolution | None:
+        if self._product_families.supports(
+            event.product,
+            rule.products,
+            record_unknown=True,
+        ):
+            return None
         return _Resolution(
             source=ActionSource.NVIDIA_CATALOG,
-            disposition=ActionDisposition.MONITOR_ONLY,
-            official_action="IGNORE",
+            disposition=ActionDisposition.NOT_APPLICABLE,
+            official_action=rule.immediate_action,
             investigatory_action=rule.investigatory_action,
-            action=RecoveryAction.NO_ACTION,
-            containment=Containment.GPU,
+            action=None,
+            containment=Containment.UNKNOWN,
             reasons=[
-                "NVIDIA XID 74 same-link reporting threshold has not "
-                f"been reached on NVLink {event.nvlink_link_id}: "
-                f"{count_evidence}; continue monitoring"
+                f"Catalog XID {event.xid} is not applicable to "
+                f"product {event.product or 'UNKNOWN'}"
             ],
-            matched_decode_rules=matches,
+            requires_operator=True,
+        )
+
+    def _workflow_operator_review(
+        self,
+        event: XidEvent,
+        rule: CatalogRule,
+        correlation: _XidCorrelation,
+    ) -> _Resolution:
+        """Hand an NVIDIA action that has no automated step to an operator.
+
+        ``UPDATE_SWFW`` is included because the update itself is a maintenance
+        activity, but unlike the two inspection workflows it does not by itself
+        require an operator to close the incident.
+        """
+
+        official = rule.immediate_action
+        return _Resolution(
+            source=ActionSource.NVIDIA_CATALOG,
+            disposition=ActionDisposition.EXECUTABLE,
+            official_action=official,
+            investigatory_action=rule.investigatory_action,
+            action=None,
+            containment=self._xid_containment(event.xid),
+            reasons=[
+                f"exact NVIDIA Catalog {self.policy.catalog_version} "
+                f"workflow for XID {event.xid}: {official}"
+            ],
+            requires_operator=official in {"CONTACT_SUPPORT", "CHECK_MECHANICALS"},
+        )
+
+    def _workflow_nvlink74(
+        self,
+        event: XidEvent,
+        rule: CatalogRule,
+        correlation: _XidCorrelation,
+    ) -> _Resolution:
+        """Delegate to the XID 74 register decode in ``policy/nvlink74.py``."""
+
+        return resolve_nvlink74(
+            event,
+            rule,
+            family=self._product_families.family(event.product),
         )
 
     def _version_gate(self, event: XidEvent, rule: CatalogRule) -> _Resolution | None:
@@ -663,15 +463,14 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         self,
         event: XidEvent,
         rule: CatalogRule,
-        *,
-        companion_events: list[XidEvent] | None,
-        window_closed: bool,
+        correlation: _XidCorrelation,
     ) -> _Resolution:
+        window_closed = correlation.xid154_window_closed
         if event.xid_154_action is None:
             return _Resolution(
                 source=ActionSource.NVIDIA_CATALOG,
                 disposition=ActionDisposition.BLOCKED_MISSING_EVIDENCE,
-                official_action="XID_154",
+                official_action=XID_154_ACTION,
                 investigatory_action=rule.investigatory_action,
                 action=None,
                 containment=self._xid_containment(event.xid),
@@ -681,7 +480,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 ],
                 requires_operator=True,
             )
-        companion = self._find_xid154_companion(event, companion_events or [])
+        companion = self._find_xid154_companion(event, correlation.companion_events)
         if not window_closed:
             return _Resolution(
                 source=ActionSource.NVIDIA_XID_154,
@@ -705,11 +504,9 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         self,
         event: XidEvent,
         rule: CatalogRule,
-        *,
-        companion_events: list[XidEvent] | None,
-        window_closed: bool,
+        correlation: _XidCorrelation,
     ) -> _Resolution:
-        if not window_closed:
+        if not correlation.xid45_window_closed:
             return _Resolution(
                 source=ActionSource.NVIDIA_CATALOG,
                 disposition=ActionDisposition.PENDING_CORRELATION,
@@ -719,8 +516,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 containment=Containment.APPLICATION,
                 reasons=["XID 45 correlation window is still open"],
             )
-        candidates = companion_events or []
-        companion_match = self._find_companion(event, candidates)
+        companion_match = self._find_companion(event, correlation.companion_events)
         if companion_match is not None:
             companion, companion_resolution = companion_match
             companion_resolution.reasons.insert(
@@ -747,14 +543,10 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         self,
         event: XidEvent,
         rule: CatalogRule,
-        *,
-        companion_events: list[XidEvent] | None = None,
+        correlation: _XidCorrelation,
     ) -> _Resolution:
-        companions = self._find_related(
-            event,
-            {63, 64},
-            candidates=companion_events or [],
-        )
+        candidates = correlation.companion_events
+        companions = self._find_related(event, {63, 64}, candidates=candidates)
         if companions:
             return _Resolution(
                 source=ActionSource.NVIDIA_CATALOG,
@@ -769,7 +561,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 pre_actions=[RecoveryAction.MARK_UNSCHEDULABLE],
                 correlated_event_id=self._reset_equivalent_companion(
                     companions,
-                    candidates=companion_events or [],
+                    candidates=candidates,
                 ),
             )
         return _Resolution(
@@ -876,7 +668,12 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         resolution.correlated_event_id = companion.event_id
         return resolution
 
-    def _workflow_check_uvm(self, event: XidEvent, rule: CatalogRule) -> _Resolution:
+    def _workflow_check_uvm(
+        self,
+        event: XidEvent,
+        rule: CatalogRule,
+        correlation: _XidCorrelation,
+    ) -> _Resolution:
         if event.uvm_in_use is None:
             return _Resolution(
                 source=ActionSource.NVIDIA_CATALOG,
@@ -901,9 +698,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         self,
         event: XidEvent,
         rule: CatalogRule,
-        *,
-        companion_events: list[XidEvent] | None,
-        window_closed: bool,
+        correlation: _XidCorrelation,
     ) -> _Resolution:
         if (
             event.driver_branch is None
@@ -964,13 +759,13 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         recovery_actions = {item.recovery_action for item in matched}.union(action2)
         xid154_action = event.xid_154_action
         if xid154_action is None:
-            xid154 = self._find_xid154_event(event, companion_events or [])
+            xid154 = self._find_xid154_event(event, correlation.companion_events)
             if xid154 is not None:
                 xid154_action = xid154.xid_154_action
         if (
             "XID_154_EVAL" in recovery_actions
             and xid154_action is None
-            and not window_closed
+            and not correlation.xid154_window_closed
         ):
             return _Resolution(
                 source=ActionSource.NVIDIA_CATALOG,
@@ -1653,3 +1448,28 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         if xid == 95:
             return Containment.ALL_APPLICATIONS
         return Containment.GPU
+
+
+_XidWorkflowResolver = Callable[
+    [GpuFaultPolicyEngine, XidEvent, CatalogRule, _XidCorrelation],
+    _Resolution,
+]
+
+# Every catalog Immediate Action that is a workflow rather than a direct action
+# (those are in DIRECT_ACTION_MAP) is routed from here, so adding an NVIDIA
+# workflow is a table entry plus a resolver instead of another branch in the
+# middle of _resolve_xid's guard sequence. A token absent from the table is
+# deliberately BLOCKED_WORKFLOW: preserving the NVIDIA action verbatim without
+# executing it is the fail-closed outcome, so a resolver nobody registered can
+# never silently execute.
+_XID_WORKFLOW_RESOLVERS: dict[str, _XidWorkflowResolver] = {
+    XID_154_ACTION: GpuFaultPolicyEngine._workflow_xid_154,
+    "WORKFLOW_XID_45": GpuFaultPolicyEngine._workflow_xid_45,
+    "WORKFLOW_XID_48": GpuFaultPolicyEngine._workflow_xid_48,
+    "WORKFLOW_NVLINK_ERR": GpuFaultPolicyEngine._workflow_nvlink74,
+    "WORKFLOW_NVLINK5_ERR": GpuFaultPolicyEngine._workflow_nvlink5,
+    "CHECK_UVM": GpuFaultPolicyEngine._workflow_check_uvm,
+    "CONTACT_SUPPORT": GpuFaultPolicyEngine._workflow_operator_review,
+    "CHECK_MECHANICALS": GpuFaultPolicyEngine._workflow_operator_review,
+    "UPDATE_SWFW": GpuFaultPolicyEngine._workflow_operator_review,
+}

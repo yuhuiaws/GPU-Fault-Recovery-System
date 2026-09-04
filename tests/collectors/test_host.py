@@ -84,25 +84,7 @@ def test_host_edge_filter_suppresses_health_and_delivers_edges(
         health_summary_seconds=300,
         history_max_points=3,
     )
-    collectors = (
-        "_cpu",
-        "_memory",
-        "_filesystems",
-        "_shared_filesystems",
-        "_lustre",
-        "_diskstats",
-        "_network",
-        "_tcp",
-        "_gpu_utilization",
-        "_gpu_inventory",
-        "_efa_inventory",
-        "_rdma",
-        "_efa_network",
-        "_nvswitch_topology",
-        "_smart",
-        "_bmc",
-    )
-    for name in collectors:
+    for name in HostTelemetryCollector.CONTRIBUTORS:
         monkeypatch.setattr(collector, name, lambda _observed_at: [])
     monkeypatch.setattr(
         collector,
@@ -144,24 +126,7 @@ def test_host_edge_filter_suppresses_persistent_edge_until_summary(
         now=lambda: next(times),
         health_summary_seconds=300,
     )
-    for name in (
-        "_cpu",
-        "_memory",
-        "_filesystems",
-        "_shared_filesystems",
-        "_lustre",
-        "_diskstats",
-        "_network",
-        "_tcp",
-        "_gpu_utilization",
-        "_gpu_inventory",
-        "_efa_inventory",
-        "_rdma",
-        "_efa_network",
-        "_nvswitch_topology",
-        "_smart",
-        "_bmc",
-    ):
+    for name in HostTelemetryCollector.CONTRIBUTORS:
         monkeypatch.setattr(collector, name, lambda _observed_at: [])
     monkeypatch.setattr(
         collector,
