@@ -60,6 +60,7 @@ def _item(**overrides) -> dict:
         "status": "RUNNING",
         "fencing_token": 1,
         "incident_fencing_token": 4,
+        "workflow_updated_at": "2026-09-04T19:25:59+00:00",
         "successor_workflow_id": SUCCESSOR,
         "open_remote_commands": [],
         "unsettled_local_steps": [],
@@ -323,6 +324,34 @@ def test_apply_refuses_an_item_that_needs_an_operator(
     assert (tmp_path / reconcile.RETIRED_GENERATION_PLAN_PATH).is_file(), (
         f"the plan must survive a refusal when {name}"
     )
+
+
+def test_a_dispatch_tick_does_not_invalidate_the_reviewed_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The admin digest hashes the items a second time, so it needs the same rule.
+
+    Fixing only the runtime digest would have left the apply just as unwinnable,
+    because this layer re-hashes the item dicts it was handed -- timestamp
+    included. Pinned here as well as in ``tests/execution`` because the two
+    digests are computed by different code that a change can easily desynchronize.
+    """
+
+    _fake_runner(monkeypatch)
+    site = _site(tmp_path)
+    plan = reconcile.plan_retired_generation_reconcile(
+        site, tmp_path, workflow_ids=(WORKFLOW,)
+    )
+    _fake_runner(monkeypatch, _item(workflow_updated_at="2026-09-04T19:26:54+00:00"))
+
+    result = reconcile.apply_retired_generation_reconcile(
+        site,
+        tmp_path,
+        expected_plan_sha256=plan["plan_sha256"],
+        reference="pre-deploy-6459c07ea279",
+    )
+
+    assert result["applied_workflow_ids"] == [WORKFLOW]
 
 
 def test_apply_refuses_a_plan_that_changed_under_it(

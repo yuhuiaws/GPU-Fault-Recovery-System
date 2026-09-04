@@ -395,13 +395,14 @@ def _finalize_retired_generation_plan(
         isinstance(item, dict) for item in raw_items
     ):
         raise BootstrapError("retired generation reconcile runtime plan is invalid")
+    items: list[dict[str, Any]] = [dict(item) for item in raw_items]
     plan = {
         "schema_version": 1,
         "mode": "retired-generation-plan",
         "evaluated_at": runtime_plan.get("evaluated_at"),
         "site_identity": _site_identity(site),
         "runtime_plan_sha256": runtime_plan.get("plan_sha256"),
-        "items": [dict(item) for item in raw_items],
+        "items": items,
     }
     plan["plan_sha256"] = _canonical_sha256(
         {
@@ -409,7 +410,11 @@ def _finalize_retired_generation_plan(
             "mode": plan["mode"],
             "site_identity": plan["site_identity"],
             "runtime_plan_sha256": plan["runtime_plan_sha256"],
-            "items": plan["items"],
+            # Same exclusion as the runtime digest, and for the same reason: a
+            # record still being dispatched restamps ``updated_at`` every tick,
+            # and hashing it here would leave the apply unwinnable no matter what
+            # the runtime digest did. See DIGEST_EXCLUDED_ITEM_FIELDS.
+            "items": retired_generation.plan_digest_items(items),
         }
     )
     return plan

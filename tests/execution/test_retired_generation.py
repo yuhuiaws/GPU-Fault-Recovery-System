@@ -559,6 +559,87 @@ def test_the_operator_apply_cancels_then_revokes_in_one_pass() -> None:
     assert store.get_remote_command(COMMAND).status is RemoteCommandStatus.FAILED
 
 
+def test_the_digest_survives_the_dispatch_it_is_racing() -> None:
+    """The gate has to be winnable, or it is not a gate.
+
+    A retired generation is being dispatched on a loop -- that is the complaint
+    against it -- and every tick renews the lease and restamps ``updated_at``.
+    While that timestamp was in the digest the apply refused every time: on
+    2026-09-04 ``workflow-45c6b6b7`` was refused with "plan changed before apply"
+    when the sole difference between the two evaluations was 19:25:59 vs
+    19:26:54. An operator cannot outrun a once-a-minute write, so the only
+    outcomes were give up or reach for ``--allow-...`` something.
+
+    The timestamp is still reported, because "touched four seconds ago" is how
+    the operator tells a live wedge from a historical one. It just does not
+    participate in what their approval binds.
+    """
+
+    store = build_store()
+    scenario(store)
+    plan = build_retired_generation_plan(store, [RETIRED])
+
+    workflow = store.get_workflow(RETIRED)
+    store.save_workflow(
+        workflow.model_copy(
+            update={
+                "updated_at": workflow.updated_at + timedelta(minutes=1),
+                "execution_lease_expires_at": (
+                    workflow.updated_at + timedelta(minutes=6)
+                ),
+            }
+        )
+    )
+    again = build_retired_generation_plan(store, [RETIRED])
+
+    assert (
+        again["items"][0]["workflow_updated_at"]
+        != (plan["items"][0]["workflow_updated_at"])
+    ), "the fixture did not actually simulate a dispatch tick"
+    assert again["plan_sha256"] == plan["plan_sha256"], (
+        "a dispatch tick invalidated the reviewed plan, so the operator can never "
+        "apply one -- which is the failure this test exists to catch"
+    )
+
+    result = apply_retired_generation_plan(
+        store,
+        workflow_ids=[RETIRED],
+        expected_plan_sha256=plan["plan_sha256"],
+        reference="pre-deploy-6459c07ea279",
+    )
+    assert result["applied_workflow_ids"] == [RETIRED]
+
+
+def test_the_digest_still_refuses_a_change_that_alters_the_decision() -> None:
+    """What the exclusion above must not cost.
+
+    Dropping ``updated_at`` is only safe because every field the revocation
+    actually reasons about is still hashed. The incident advancing again is the
+    case that matters most: it means somebody else has moved on from the
+    successor this plan named, so the approved write is no longer the write the
+    operator approved.
+    """
+
+    store = build_store()
+    scenario(store)
+    plan = build_retired_generation_plan(store, [RETIRED])
+
+    incident = store.get_incident(INCIDENT)
+    store.save_incident(incident.model_copy(update={"fencing_token": 9}))
+
+    assert (
+        build_retired_generation_plan(store, [RETIRED])["plan_sha256"]
+        != (plan["plan_sha256"])
+    ), "the incident advanced and the digest did not notice"
+    with pytest.raises(ValueError, match="plan changed before apply"):
+        apply_retired_generation_plan(
+            store,
+            workflow_ids=[RETIRED],
+            expected_plan_sha256=plan["plan_sha256"],
+            reference="pre-deploy-6459c07ea279",
+        )
+
+
 def test_the_operator_apply_refuses_a_digest_that_no_longer_describes_the_store() -> (
     None
 ):

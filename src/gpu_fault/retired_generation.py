@@ -421,6 +421,40 @@ def _canonical_sha256(value: object) -> str:
     ).hexdigest()
 
 
+# Reported for the operator to read, but kept out of the plan digest.
+#
+# A retired generation is being dispatched on a loop -- that is the whole
+# complaint against it -- and every tick renews a lease and stamps
+# ``updated_at``. Including it made the digest change roughly once a minute, so
+# the plan an operator had just reviewed could never be applied: on 2026-09-04
+# the apply refused ``workflow-45c6b6b7`` with "plan changed before apply" when
+# the only difference between the two evaluations was 19:25:59 -> 19:26:54.
+#
+# Dropping it costs nothing, because it never carried a decision. Everything the
+# revocation depends on -- status, both fencing tokens, incident state, the
+# successor's identity and generation, completed and pending destructive
+# operations, unsettled local steps, budget claims, open commands -- stays in the
+# digest, so any material change still refuses. And the write itself is guarded
+# where a timestamp could not guard it anyway: ``_revoke_planned_item`` compares
+# the fencing token inside the transaction. ``updated_at`` is still printed,
+# because "this record was touched seconds ago" is exactly what tells an operator
+# the wedge is live rather than historical.
+DIGEST_EXCLUDED_ITEM_FIELDS = frozenset({"workflow_updated_at"})
+
+
+def plan_digest_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The plan items reduced to the fields the operator's approval binds."""
+
+    return [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in DIGEST_EXCLUDED_ITEM_FIELDS
+        }
+        for item in items
+    ]
+
+
 def build_retired_generation_plan(
     store: Any,
     workflow_ids: Iterable[str] | None = None,
@@ -428,17 +462,18 @@ def build_retired_generation_plan(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     evaluated_at = now or datetime.now(timezone.utc)
+    items = retired_generation_plan_items(store, workflow_ids)
     plan = {
         "schema_version": 1,
         "mode": "retired-generation-plan",
         "evaluated_at": evaluated_at.isoformat(),
-        "items": retired_generation_plan_items(store, workflow_ids),
+        "items": items,
     }
     plan["plan_sha256"] = _canonical_sha256(
         {
             "schema_version": plan["schema_version"],
             "mode": plan["mode"],
-            "items": plan["items"],
+            "items": plan_digest_items(items),
         }
     )
     return plan
