@@ -226,7 +226,14 @@ def test_public_spec_points_to_every_new_runner_family() -> None:
 def test_external_notification_evidence_is_structured(tmp_path: Path) -> None:
     receipt = tmp_path / "receipt.json"
     receipt.write_text(
-        json.dumps({"received": True, "reference": "mailbox-audit-1"}), encoding="utf-8"
+        json.dumps(
+            {
+                "received": True,
+                "reference": "mailbox-audit-1",
+                "method": "inbox-screenshot",
+            }
+        ),
+        encoding="utf-8",
     )
     dedup = tmp_path / "dedup.json"
     dedup.write_text(
@@ -240,3 +247,15 @@ def test_external_notification_evidence_is_structured(tmp_path: Path) -> None:
     assert notification.validate_external_evidence(dedup, "dedup")["valid"], (
         "valid deduplication evidence was rejected"
     )
+
+    # `method` is required, and this is the reason: a human inbox check and a
+    # windowed SES `Delivery` count both answer NOTIFY-001's question, but they
+    # are not interchangeable to whoever audits the report later. Without a
+    # named method a bare `received: true` cannot be told apart from a guess.
+    unmethodical = tmp_path / "unmethodical.json"
+    unmethodical.write_text(
+        json.dumps({"received": True, "reference": "mailbox-audit-1"}), encoding="utf-8"
+    )
+    assert not notification.validate_external_evidence(unmethodical, "receipt")[
+        "valid"
+    ], "receipt evidence was accepted without saying how delivery was established"

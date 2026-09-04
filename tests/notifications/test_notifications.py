@@ -55,12 +55,14 @@ from ._notifications_cases_2 import (
     test_first_dispatch_suppresses_the_pre_enable_backlog,
     test_notification_worker_reclaims_expired_lease_and_stops,
     test_one_items_bookkeeping_failure_does_not_abandon_the_batch,
+    test_only_the_worker_role_dispatches_the_outbox_through_the_lifespan,
     test_recent_notifications_survive_the_backlog_grace_window,
     test_releasing_a_lease_someone_else_holds_is_a_no_op,
     test_stale_notifications_are_not_mailed_when_the_outbox_drains,
     test_suppressed_backlog_can_be_requeued_on_demand,
     test_the_dispatch_loop_backs_off_while_it_is_being_throttled,
     test_the_shelf_life_can_be_turned_off_entirely,
+    test_throttled_replicas_back_off_on_independent_schedules,
 )
 from ._notifications_cases_3 import (
     test_a_bulk_resend_within_budget_reports_no_truncation,

@@ -803,11 +803,27 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
 
     assert len(regional) == 154
     assert all((case.get("evidence") or {}).get("verdict") for case in regional)
-    assert {(case["evidence"]["verdict"]) for case in regional} == {
-        "NOT_RUN",
-        "BLOCKED",
-        "SUPERSEDED",
-    }
+    # Membership, not equality. The equality form froze the catalog at "no
+    # regional case has ever passed", so the first recorded PASS failed this
+    # test rather than the catalog validator -- and the only way to keep it
+    # green was to not record results, which is the opposite of what a
+    # machine-readable verdict is for.
+    assert {case["evidence"]["verdict"] for case in regional} <= set(
+        runner.CURRENT_STATUS_VALUES
+    )
+    # A PASS is the one verdict that carries an audit trail, so it may not be
+    # written as a bare word: it has to name the case digest it was recorded
+    # against and the component builds it was observed on.
+    for case in regional:
+        if case["evidence"]["verdict"] != "PASS":
+            continue
+        verified = case["evidence"]["verified"]
+        assert verified["case_digest"] == runner.case_definition_digest(case), case[
+            "id"
+        ]
+        assert set(verified["components"]) == set(runner.VERIFIED_COMPONENTS), case[
+            "id"
+        ]
 
 
 def test_regional_cases_use_their_maximum_side_effect_risk() -> None:

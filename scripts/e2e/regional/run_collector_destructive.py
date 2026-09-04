@@ -22,6 +22,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 )
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     CollectorAcceptanceFixture,
+    collector_setting,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
@@ -579,8 +580,8 @@ def run_collect004(
 ) -> dict[str, Any]:
     baseline = collector.snapshot()
     env = baseline["collector_env"]
-    expected = int(env["GPU_FAULT_EXPECTED_GPU_COUNT"])
-    interval = int(env["GPU_FAULT_HOST_INTERVAL_SECONDS"])
+    expected = collector_setting(env, "GPU_FAULT_EXPECTED_GPU_COUNT")
+    interval = collector_setting(env, "GPU_FAULT_HOST_INTERVAL_SECONDS")
     run_id = f"c004-{attempt}"
     started_at = datetime.now(timezone.utc)
     collector.execute(

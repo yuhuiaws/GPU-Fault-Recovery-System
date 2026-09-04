@@ -363,11 +363,45 @@ STORE_PROBE = r"""
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 from gpu_fault.app import ApplicationContext
 from gpu_fault.hyperpod import hyperpod_submission_idempotency_key
 from gpu_fault.store import NotFoundError
+
+
+# Report the processor queue as a backlog check, not an instant sample.
+#
+# Every destructive preflight refuses to start while the queue is non-empty, and
+# the depth it reads counts PENDING plus LEASED rows. On a live cluster the
+# collectors post continuously, so a healthy queue is almost never observably
+# empty: on 2026-09-04 four consecutive DESTR-012 plans were refused with
+# "processor queue is not empty" on depth=1 whose oldest entry was 0.42 seconds
+# old, while the control-plane gauge read 0 moments later. That is in-flight
+# work, not a backlog, and gating on a single sample turns a normal cluster into
+# an unrunnable one.
+#
+# Sampling until the queue drains keeps the gate's real meaning -- the case's
+# injected event must not queue behind unrelated work -- because a genuine
+# backlog does not clear within the bound and still fails. max_sampled_depth and
+# samples are recorded so the evidence shows a busy queue that drained rather
+# than a queue that happened to look idle.
+def drained_queue_stats(store, attempts=20, pause=0.5):
+    samples = []
+    for index in range(attempts):
+        stats = store.processor_queue_stats()
+        samples.append(stats)
+        if not int(stats.get("depth") or 0):
+            break
+        if index + 1 < attempts:
+            time.sleep(pause)
+    result = dict(samples[-1])
+    result["samples"] = len(samples)
+    result["max_sampled_depth"] = max(
+        int(item.get("depth") or 0) for item in samples
+    )
+    return result
 
 (
     cluster_id,
@@ -505,7 +539,7 @@ print(json.dumps({
         submission.model_dump(mode="json")
         if submission is not None else None
     ),
-    "queue": store.processor_queue_stats(),
+    "queue": drained_queue_stats(store),
     "remote_commands": store.remote_command_stats(),
 }, sort_keys=True, default=str))
 """

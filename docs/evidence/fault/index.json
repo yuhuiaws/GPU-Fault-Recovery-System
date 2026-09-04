@@ -6,7 +6,19 @@
   "provenance_note": "Raw execution reports are retained in a private evidence store. The public source tree intentionally contains no environment-specific fault reports.",
   "verdict_counts": {},
   "pass_case_bindings": {
-    "bound": [],
+    "bound": [
+      "GF-REGIONAL-DESTR-009",
+      "GF-REGIONAL-DESTR-010",
+      "GF-REGIONAL-DESTR-011",
+      "GF-REGIONAL-DESTR-012",
+      "GF-REGIONAL-DESTR-013",
+      "GF-REGIONAL-NOTIFY-001",
+      "GF-REGIONAL-NOTIFY-002",
+      "GF-REGIONAL-NOTIFY-003",
+      "GF-REGIONAL-NOTIFY-004",
+      "GF-REGIONAL-NOTIFY-005",
+      "GF-REGIONAL-NOTIFY-006"
+    ],
     "unbound": [
       "GF-LIVE-KERNEL-COLLECTOR-001",
       "GF-LIVE-KMSG-XID11-001",

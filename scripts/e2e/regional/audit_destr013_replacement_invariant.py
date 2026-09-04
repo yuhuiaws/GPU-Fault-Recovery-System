@@ -110,6 +110,7 @@ def cluster_recovery(region: str, cluster_name: str) -> dict[str, Any]:
     )
     return {
         "cluster_name": value.get("ClusterName"),
+        "cluster_arn": value.get("ClusterArn"),
         "cluster_status": value.get("ClusterStatus"),
         "node_recovery": value.get("NodeRecovery"),
         "orchestrator": value.get("Orchestrator"),
@@ -203,7 +204,14 @@ def executor_environment(
     return sorted(result, key=lambda item: str(item["pod"]))
 
 
-def iam_decisions(region: str, role_arn: str) -> dict[str, str]:
+def iam_decisions(region: str, role_arn: str, cluster_arn: str) -> dict[str, str]:
+    # Simulate against this cluster, not the default `*` resource. The Executor
+    # policy scopes its SageMaker grants to one cluster ARN, so a `*` simulation
+    # answers "implicitDeny" for every action -- including the reboot this case
+    # relies on staying usable, and including a replace the policy might actually
+    # grant on this very cluster. An unscoped deny would therefore satisfy the
+    # replace assertion below without testing anything, which is exactly the
+    # defect DESTR-011 hit on 2026-09-04.
     value = json.loads(
         run(
             [
@@ -215,6 +223,8 @@ def iam_decisions(region: str, role_arn: str) -> dict[str, str]:
                 "--action-names",
                 "sagemaker:BatchReplaceClusterNodes",
                 "sagemaker:BatchRebootClusterNodes",
+                "--resource-arns",
+                cluster_arn,
                 "--region",
                 region,
                 "--output",
@@ -332,7 +342,7 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
         "test_replace_env_is_rejected_by_the_design_invariant",
         "tests/hyperpod/test_hyperpod.py::"
         "test_provider_replace_can_be_disabled_without_disabling_reboot",
-        "tests/regional/test_regional_release_orchestrator.py::"
+        "tests/regional/test_regional_release_commands.py::"
         "test_executor_iam_boundary_rejects_excess_privilege",
     ]
     completed = run(command, timeout=300)
@@ -430,7 +440,10 @@ def main() -> int:
             context,
             arguments.namespace,
         )
-        decisions = iam_decisions(region, role_arn)
+        cluster_arn = str(recovery.get("cluster_arn") or "")
+        if not cluster_arn:
+            raise AuditError("describe-cluster did not return a cluster ARN")
+        decisions = iam_decisions(region, role_arn, cluster_arn)
         events = cloudtrail_events(region, started_at, ended_at)
         manifests = manifest_invariants()
         tests = focused_tests(case_dir)
@@ -458,6 +471,12 @@ def main() -> int:
             "explicitDeny",
         }:
             errors.append("executor IAM permits BatchReplaceClusterNodes")
+        # Prove the deny above is specific to replace. A policy that denied every
+        # SageMaker verb on this cluster would satisfy the assertion while making
+        # the reboot path DESTR-002 depends on impossible, so the scoped
+        # simulation has to show reboot is still allowed.
+        if decisions.get("sagemaker:BatchRebootClusterNodes") != "allowed":
+            errors.append("executor IAM does not allow BatchRebootClusterNodes")
         replace_events = [
             item
             for name in ("BatchReplaceClusterNodes", "ReplaceClusterNodes")

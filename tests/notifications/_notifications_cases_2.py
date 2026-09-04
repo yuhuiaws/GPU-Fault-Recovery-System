@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from threading import Event
 
 import pytest
+from fastapi.testclient import TestClient
 
+from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.app.lifespan_workers import start_notification_worker
 from gpu_fault.models import (
     NotificationDeliveryStatus,
+    NotificationDispatchReport,
     NotificationResult,
     NotificationStatus,
 )
@@ -26,6 +30,8 @@ from tests.notifications._support import (
     _watermark_already_drawn,
     advisory,
 )
+
+LIFESPAN_TOKEN = "notification-lifespan-token-" + "x" * 40
 
 
 @pytest.mark.parametrize("durable", [False, True])
@@ -886,3 +892,180 @@ def test_delivery_mode_states_whether_drills_are_mailed(monkeypatch) -> None:
             build_store(), RecordingNotifier(), async_delivery=True
         ).describe_delivery_mode()
     )
+
+
+def _live_dispatcher_threads() -> int:
+    return sum(
+        thread.name == "gpu-fault-notification-dispatcher"
+        for thread in threading.enumerate()
+    )
+
+
+def test_only_the_worker_role_dispatches_the_outbox_through_the_lifespan(
+    monkeypatch,
+) -> None:
+    """The service role decides who drains the outbox, not the switch.
+
+    ``dispatch_outbox`` has unit coverage, and the manifests have coverage that
+    they set ``GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED``; neither shows that
+    the ``worker`` deployment actually starts the background dispatcher, or that
+    ``ingress`` and ``spool-worker`` refrain from starting one while carrying the
+    identical switch. That gap is the whole point of splitting the roles: two
+    extra dispatchers would mean the same notification is claimed by three
+    replicas, which is how a throttled provider turns one advisory into a retry
+    storm.
+
+    So the three roles are assembled through the real lifespan, against one
+    shared store holding one PENDING notification, with the delivery switches
+    set identically for all three. Shutdown is asserted as well: a dispatcher
+    that outlived its lifespan would keep claiming from a process Kubernetes has
+    already been told is gone.
+    """
+
+    store = build_store()
+    notifier = RecordingNotifier()
+    notification = store.save_notification_if_absent(
+        HyperPodAdvisoryEmailBuilder().build(
+            advisory(),
+            cluster_name="hp-cluster",
+            incident_id="incident-role-assembly",
+            node_ids=["worker-1"],
+            issue_summary="notification dispatcher role assembly",
+        )
+    )
+    monkeypatch.setenv("GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY", "true")
+    monkeypatch.setenv("GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED", "true")
+    monkeypatch.setenv("GPU_FAULT_NOTIFICATION_POLL_SECONDS", "0.01")
+    # Counted as a delta: another test in this worker process may legitimately
+    # hold a dispatcher thread, and blaming this test for that would hide the
+    # residue this test exists to detect.
+    baseline = _live_dispatcher_threads()
+    observed: dict[str, dict[str, int]] = {}
+    for role in ("ingress", "spool-worker", "worker"):
+        monkeypatch.setenv("GPU_FAULT_SERVICE_ROLE", role)
+        monkeypatch.setenv("POD_UID", f"pod-{role}")
+        if role == "spool-worker":
+            # The role refuses to start without them, and that refusal is not
+            # what is under test here.
+            monkeypatch.setenv("GPU_FAULT_PROCESSOR_MODE", "active-active")
+            monkeypatch.setenv("GPU_FAULT_TELEMETRY_SPOOL", "true")
+        else:
+            monkeypatch.delenv("GPU_FAULT_PROCESSOR_MODE", raising=False)
+            monkeypatch.delenv("GPU_FAULT_TELEMETRY_SPOOL", raising=False)
+        app = create_app(
+            ApplicationContext(notifier, store=store, execution_token=LIFESPAN_TOKEN)
+        )
+        with TestClient(app):
+            deadline = time.monotonic() + 2
+            while (
+                store.get_notification_result(notification.notification_id) is None
+                and time.monotonic() < deadline
+                and role == "worker"
+            ):
+                time.sleep(0.01)
+            if role != "worker":
+                # Long enough for a dispatcher that had been started to have
+                # polled the outbox many times at a 10ms interval.
+                time.sleep(0.2)
+            observed[role] = {
+                "dispatchers": _live_dispatcher_threads() - baseline,
+                "sent": len(notifier.notifications),
+            }
+        assert _live_dispatcher_threads() == baseline, (
+            f"{role} left a notification dispatcher behind after shutdown"
+        )
+
+    assert observed["ingress"]["dispatchers"] == 0
+    assert observed["spool-worker"]["dispatchers"] == 0
+    assert observed["worker"]["dispatchers"] >= 1
+    assert observed["ingress"]["sent"] == 0
+    assert observed["spool-worker"]["sent"] == 0
+    # Sent once, by the one role that runs a dispatcher: the shared store means
+    # the two earlier roles had the same claimable row in front of them.
+    assert len(notifier.notifications) == 1
+    result = store.get_notification_result(notification.notification_id)
+    assert result is not None
+    assert result.status is NotificationStatus.SENT
+
+
+class _RecordingStop(Event):
+    """An ``Event`` that records what the dispatch loop waited for.
+
+    The delay is computed inside the loop and handed straight to
+    ``stop.wait``, so it is otherwise unobservable -- and it is the delay,
+    not the backoff function, that decides whether two replicas come back
+    together.
+    """
+
+    def __init__(self, *, stop_after: int) -> None:
+        super().__init__()
+        self.delays: list[float | None] = []
+        self._stop_after = stop_after
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.delays.append(timeout)
+        if len(self.delays) >= self._stop_after:
+            self.set()
+        return super().wait(0)
+
+
+def test_throttled_replicas_back_off_on_independent_schedules(monkeypatch) -> None:
+    """A shared backoff curve is still a synchronized retry storm.
+
+    ``notification_throttle_delay`` has coverage that the curve grows and caps,
+    which stops one replica from hammering a throttled provider. It says nothing
+    about six replicas that started together: they compute the same curve from
+    the same throttle, so without jitter they return in lockstep and the
+    provider sees the same burst it was already refusing, just spaced out.
+
+    The loop multiplies the backoff by a per-cycle random factor for exactly
+    that reason. This asserts the applied delay stays inside the declared jitter
+    band and that two independently running workers do not produce the same
+    schedule.
+    """
+
+    from gpu_fault.app import notification_throttle_delay
+
+    monkeypatch.setenv("GPU_FAULT_NOTIFICATION_POLL_SECONDS", "2")
+    # A store-driven throttle only produces one throttled cycle: the release
+    # puts the delivery back 15s out, so the next cycle finds nothing to claim
+    # and the loop resets. What has to be exercised here is a throttle that
+    # persists across cycles, which is the case the storm came from.
+    throttled = NotificationDispatchReport(
+        attempted=1, sent=0, skipped=0, failed=0, results=[], throttled=1
+    )
+
+    schedules = []
+    for owner in ("owner-a", "owner-b"):
+        service = type(
+            "ThrottledService",
+            (),
+            {
+                "dispatch_outbox": lambda _self, _owner, **_kwargs: throttled,
+                "owner": owner,
+            },
+        )()
+        context = type("Context", (), {"advisory_notifications": service})()
+        stop = _RecordingStop(stop_after=4)
+        worker = start_notification_worker(
+            context=context,
+            stop=stop,
+            owner=owner,
+            throttle_delay=notification_throttle_delay,
+        )
+        worker.join(timeout=5)
+        assert not worker.is_alive(), (
+            f"the {owner} dispatch loop did not stop when its stop event was set"
+        )
+        schedules.append([item for item in stop.delays if item is not None])
+
+    for delays in schedules:
+        assert len(delays) == 4
+        for index, expected in enumerate((4.0, 8.0, 16.0, 32.0)):
+            assert 0.8 * expected <= delays[index] <= 1.2 * expected, (
+                f"cycle {index} waited {delays[index]}s, outside the "
+                f"jitter band around {expected}s"
+            )
+    # Same curve, different schedule: identical sequences would mean the two
+    # replicas come back to a throttled provider at the same moment.
+    assert schedules[0] != schedules[1]

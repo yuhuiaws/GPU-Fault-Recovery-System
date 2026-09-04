@@ -141,7 +141,7 @@ def run_case(run_dir: Path, attempt: int) -> int:
                 "test_provider_replace_can_be_disabled_without_disabling_reboot",
                 "tests/hyperpod/test_hyperpod.py::"
                 "test_replace_env_is_rejected_by_the_design_invariant",
-                "tests/regional/test_regional_release_orchestrator.py::"
+                "tests/regional/test_regional_release_commands.py::"
                 "test_executor_iam_boundary_rejects_excess_privilege",
             ]
         )
@@ -196,6 +196,30 @@ def run_case(run_dir: Path, attempt: int) -> int:
             )
             executor_env.append(value)
 
+        # Simulate against the cluster this site actually operates, not the
+        # default `*` resource. The Executor policy scopes its grants to one
+        # cluster ARN, so a `*` simulation reports `implicitDeny` for everything
+        # it is allowed to do -- which made the reboot decision recorded here
+        # read as "denied" while the role could reboot the cluster all along, and,
+        # far worse, would have let the replace assertion pass even if the policy
+        # did grant replace on this cluster. The falsification target is "the
+        # Executor cannot replace *this* cluster", so it has to be evaluated
+        # against this cluster.
+        cluster_arn = json.loads(
+            command(
+                [
+                    "aws",
+                    "sagemaker",
+                    "describe-cluster",
+                    "--region",
+                    AWS_REGION,
+                    "--cluster-name",
+                    HYPERPOD_CLUSTER,
+                    "--output",
+                    "json",
+                ]
+            )
+        )["ClusterArn"]
         simulation = json.loads(
             command(
                 [
@@ -207,6 +231,8 @@ def run_case(run_dir: Path, attempt: int) -> int:
                     "--action-names",
                     "sagemaker:BatchReplaceClusterNodes",
                     "sagemaker:BatchRebootClusterNodes",
+                    "--resource-arns",
+                    cluster_arn,
                     "--output",
                     "json",
                 ]
@@ -256,6 +282,12 @@ def run_case(run_dir: Path, attempt: int) -> int:
             errors.append("reboot was not independently enabled")
         if decisions.get("sagemaker:BatchReplaceClusterNodes") != "implicitDeny":
             errors.append("IAM does not implicitDeny BatchReplaceClusterNodes")
+        # The case asserts reboot stays independently usable, so the scoped
+        # simulation has to prove the deny above is a deny of replace and not of
+        # every SageMaker verb: a policy that denied both would satisfy the line
+        # above while making DESTR-002 impossible.
+        if decisions.get("sagemaker:BatchRebootClusterNodes") != "allowed":
+            errors.append("IAM does not allow BatchRebootClusterNodes")
         if replace_events:
             errors.append("CloudTrail contains a provider replace event")
         if inventory_before != inventory_after:

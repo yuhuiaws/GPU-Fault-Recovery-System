@@ -30,7 +30,11 @@ ALLOWED_SERVICES = {
 ENV_KEYS = {
     "GPU_FAULT_DCGM_EDGE_FILTER_ENABLED",
     "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS",
-    "GPU_FAULT_DCGM_INTERVAL_SECONDS",
+    # The metrics collector's sampling interval. It is *not* named
+    # `GPU_FAULT_DCGM_INTERVAL_SECONDS`: the installer never writes such a key
+    # and `collectors_cli` never reads one, so asking for that name silently
+    # produced an env snapshot with a hole in it.
+    "GPU_FAULT_METRICS_INTERVAL_SECONDS",
     "GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT",
     "GPU_FAULT_EXPECTED_GPU_COUNT",
     "GPU_FAULT_HOST_EDGE_FILTER_ENABLED",

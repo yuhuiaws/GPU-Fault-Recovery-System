@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 from pathlib import Path
 
@@ -12,12 +13,14 @@ from scripts.e2e.regional import run_collector_acceptance as collect
 from scripts.e2e.regional import run_collector_destructive as collect_destructive
 from scripts.e2e.regional import run_e2e002_multicluster_fault as e2e002
 from scripts.e2e.regional import run_iso006_cluster_offline as iso006
+from scripts.e2e.regional.collector_acceptance_fixture import collector_setting
 from scripts.e2e.regional.multi_cluster_fixture import (
     ClusterTarget,
     MultiClusterSettings,
     registrations_are_distinct_physical_clusters,
 )
 from scripts.e2e.regional.probes import cluster_network_probe, collector_node_probe
+from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -87,6 +90,34 @@ def test_collector_host_probe_has_narrow_action_allowlists() -> None:
         "gpu-fault-host-collector.service",
         "gpu-fault-kernel-collector.service",
     }, collector_node_probe.ALLOWED_SERVICES
+
+
+def test_collector_probe_only_reads_env_keys_the_installer_writes() -> None:
+    # The COLLECT group's whole claim is that it judges against the values the
+    # node is really running with, so every key it asks `collector.env` for has
+    # to be one the installer actually writes there. `run_collector_acceptance`
+    # read `GPU_FAULT_DCGM_INTERVAL_SECONDS` -- a name that appears nowhere in
+    # the installer or in `collectors_cli` -- and the case died on a bare
+    # KeyError against a live node instead of at review time.
+    installer = (ROOT / "deploy/node/install-gpu-fault-collector.sh").read_text(
+        encoding="utf-8"
+    )
+    written = set(re.findall(r"write_env\s+(GPU_FAULT_[A-Z0-9_]+)", installer))
+    missing = sorted(collector_node_probe.ENV_KEYS - written)
+    assert not missing, (
+        "the collector probe reads collector.env keys the node installer never "
+        f"writes: {missing}"
+    )
+
+
+def test_collector_setting_names_the_missing_key() -> None:
+    with pytest.raises(RegionalFixtureError) as caught:
+        collector_setting({"GPU_FAULT_HOST_INTERVAL_SECONDS": "15"}, "GPU_FAULT_ABSENT")
+    message = str(caught.value)
+    assert "GPU_FAULT_ABSENT" in message, message
+    # And what the node did have, because the next question after "which key"
+    # is always "so what is on the node".
+    assert "GPU_FAULT_HOST_INTERVAL_SECONDS" in message, message
 
 
 def test_cluster_network_probe_chain_and_restore_unit_are_deterministic() -> None:

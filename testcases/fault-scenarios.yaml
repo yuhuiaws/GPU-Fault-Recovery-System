@@ -3607,7 +3607,13 @@ test_cases:
   - 未执行 GPU reset、reboot 或 replacement，CloudTrail 为空且节点无 quarantine taint
   - 控制面 EKS 比对结果为 IDENTICAL
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: be158abe7d58d89bb7897ba493be3ea858040f7174bbede839e5aad0f8c37044
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-009
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr009_workflow_contract_scales_to_expected_gpu_count
@@ -3627,7 +3633,13 @@ test_cases:
   - 终态workflow重放返回缓存的 SUCCEEDED，Node Agent ledger、MainPID 与 Started 计数不再变化
   - 同一incident恰有一条ACTION_COMPLETED Fabric Manager通知，重放不新增notification；drill可为SKIPPED，真实邮件启用时为SENT
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: cc2d97bc8c9d5c631079543f9538da024a9102c9bc23aecdf384c470eec8d5b6
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-010
 
@@ -3648,7 +3660,13 @@ test_cases:
   - 报告记录所有副本ALLOW_HYPERPOD_REPLACE=false
   - Executor IAM中不存在BatchReplaceClusterNodes，区域发布编排器的最小权限审计保持通过
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f29067102487c5f8e511e3e56b9a9c23c4e088e4887f7d5c92133a7f69b91c84
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-011
   related_pytest: tests/hyperpod/test_hyperpod.py::test_replace_env_is_rejected_by_the_design_invariant
@@ -3677,7 +3695,13 @@ test_cases:
   - C 组 owner 必须在 GPU_FAULT_MANAGED_RECOVERY_OWNERS 内且不在 GPU_FAULT_REMOTE_EXECUTION_OWNERS 内，否则 step 会被 RegionalRemoteWorkflowAdapter 抢走真去动 K8s
   - C组结束后删除隔离测试数据库；当前site profile内容与指纹必须始终未变
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 313e54c783bcf8057db7a66f12039b2d96f35e32866a0b756be300c8395808c9
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-012
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr012_group_d_requires_prewrite_failure_details
@@ -3697,7 +3721,13 @@ test_cases:
   - executor role 不具备 sagemaker:BatchReplaceClusterNodes；权限存在直接判FAIL
   - 报告须说明 CloudTrail 的空结论只覆盖所查时间窗，需配置类证据支撑“将来也不会调用”
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 693f1e9794ff77973c7e28a05f04d2d416ffb4fd46774e74d3a7f77c61f41fe3
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-013
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr013_manifest_audit_keeps_provider_replace_disabled
@@ -3715,7 +3745,13 @@ test_cases:
   - MessageId 可在 SES 侧核对到
   - 人工确认收件箱真的收到邮件
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: bc16ea5ade7bc0de05912fbb44db82c9198bf7ee28594e5fd16cfaf4f2f536e5
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-001
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_api_sends_executor_workload_restart_notification
@@ -3732,7 +3768,13 @@ test_cases:
   - SES 发送计数不增加
   - 收件箱不出现第二封
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 3683bc005f85dbb6e86645a88d0eb06bc714b01163c526b7060d6b02f2375357
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-002
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_api_sends_gpu_reset_completion_once
@@ -3749,7 +3791,13 @@ test_cases:
   - 启用后 grace window 内产生的新通知正常 SENT
   - 被抑制的通知可通过按需发送接口补发
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: d23fdd0488db7ad35e4e9e3d7d0284e7c8de135c6d3278b7fef509a006210182
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-003
   related_pytest: tests/notifications/test_notifications.py::test_first_dispatch_suppresses_the_pre_enable_backlog
@@ -3764,7 +3812,13 @@ test_cases:
   - 返回 AccessDenied
   - 不返回 MessageRejected 或 NotFound，那说明权限是有的
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f2006247a9cd5d541d7d7bc3407f11b6e301b47e13cebf72896fe414d06167bf
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-004
   related_pytest: tests/regional/test_regional_least_privilege_acceptance.py::test_notify004_no_data_plane_identity_can_send_mail
@@ -3779,7 +3833,13 @@ test_cases:
   - 通知条数按节点数或任务数增长且不超过 3 条
   - 通知条数不按 GPU 数增长
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 02ab42261cd5ab3cea37959b6c6993e6f8c356f2778aa3dfb4e1aff415e1dc66
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-005
 - id: GF-REGIONAL-E2E-001
@@ -4027,10 +4087,16 @@ test_cases:
   - shutdown 后不残留 dispatcher 线程
   - 多副本 throttling 不形成同步重试风暴
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 2b5fbaa621213e6a84347aaa484a94095ef10261967edd32f949dc348661a557
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
+        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-006
-  pytest_nodeid: tests/notifications/test_notifications.py::test_notification_worker_reclaims_expired_lease_and_stops
+  pytest_nodeid: tests/notifications/test_notifications.py::test_only_the_worker_role_dispatches_the_outbox_through_the_lifespan
 - id: GF-REGIONAL-CAP-005
   title: 生产 PostgreSQL 测试零 skip 门禁
   category: regional-capacity

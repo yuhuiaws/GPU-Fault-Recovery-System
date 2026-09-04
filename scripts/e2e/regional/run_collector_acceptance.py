@@ -20,6 +20,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 )
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     CollectorAcceptanceFixture,
+    collector_setting,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
@@ -258,12 +259,12 @@ def run_collect001(
     baseline = fixture.snapshot()
     env = baseline["collector_env"]
     interval = max(
-        int(env["GPU_FAULT_DCGM_INTERVAL_SECONDS"]),
-        int(env["GPU_FAULT_HOST_INTERVAL_SECONDS"]),
+        collector_setting(env, "GPU_FAULT_METRICS_INTERVAL_SECONDS"),
+        collector_setting(env, "GPU_FAULT_HOST_INTERVAL_SECONDS"),
     )
     summary = max(
-        int(env["GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS"]),
-        int(env["GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS"]),
+        collector_setting(env, "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS"),
+        collector_setting(env, "GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS"),
     )
     started_at = datetime.now(timezone.utc)
     duration = summary * 2 + interval * 2
@@ -307,7 +308,7 @@ def run_collect002(
 ) -> dict[str, Any]:
     baseline = fixture.snapshot()
     env = baseline["collector_env"]
-    interval = int(env["GPU_FAULT_DCGM_INTERVAL_SECONDS"])
+    interval = collector_setting(env, "GPU_FAULT_METRICS_INTERVAL_SECONDS")
     persistence = baseline.get("persistence_mode")
     if persistence is None:
         raise RegionalFixtureError("cannot determine baseline persistence mode")
@@ -350,8 +351,8 @@ def run_collect003(
     env = snapshot["collector_env"]
     gpu_actual = len(snapshot["gpu_inventory"])
     efa = snapshot["efa_inventory"]
-    expected_gpu = int(env["GPU_FAULT_EXPECTED_GPU_COUNT"])
-    expected_efa = int(env["GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT"])
+    expected_gpu = collector_setting(env, "GPU_FAULT_EXPECTED_GPU_COUNT")
+    expected_efa = collector_setting(env, "GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT")
     errors = []
     if gpu_actual != expected_gpu:
         errors.append("actual GPU count differs from collector configuration")

@@ -116,7 +116,20 @@ def validate_external_evidence(path: Path | None, kind: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {"valid": False, "error": "external evidence is not an object"}
     if kind == "receipt":
-        valid = bool(value.get("received")) and bool(value.get("reference"))
+        # `method` is required so the evidence says how delivery was established.
+        # Both a human inbox check and an SES-side delivery record answer the
+        # case's question ("the mail left the solution and arrived"), but they are
+        # not interchangeable when someone later audits the report -- and without
+        # a named method a bare `received: true` is indistinguishable from a
+        # guess. The account has no SES configuration set, so there is no
+        # per-MessageId event destination and the SES-side answer is necessarily
+        # a windowed CloudWatch `Delivery` count; the reference has to pin that
+        # window down.
+        valid = (
+            bool(value.get("received"))
+            and bool(value.get("reference"))
+            and bool(value.get("method"))
+        )
     else:
         valid = (
             int(value.get("send_count_delta", -1)) == 0
@@ -152,7 +165,12 @@ def run_notify001(
         and restart["provider_message_id_present"],
         "gpu_reset_deduplicated": reset["provider_message_id_stable"],
         "workload_restart_deduplicated": restart["provider_message_id_stable"],
-        "human_receipt_confirmed": receipt["valid"],
+        # Renamed from `human_receipt_confirmed`: the gate is "delivery was
+        # confirmed by something outside this solution", and an SES-side delivery
+        # record satisfies that as well as a human inbox check does. The old name
+        # claimed the evidence was a human attestation regardless of what the file
+        # actually contained.
+        "receipt_confirmed_outside_the_solution": receipt["valid"],
     }
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
@@ -201,29 +219,102 @@ def run_notify002(
     }
 
 
+NOTIFICATION_ENV_PROBE = r"""
+import json
+import os
+
+print(json.dumps({
+    "service_role": os.environ.get("GPU_FAULT_SERVICE_ROLE"),
+    "dispatcher_enabled": os.environ.get(
+        "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED"
+    ),
+    "async_delivery": os.environ.get("GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY"),
+}, sort_keys=True))
+"""
+
+NOTIFICATION_CONFIG_KEYS = ("service_role", "dispatcher_enabled", "async_delivery")
+
+NOTIFICATION_DEPLOYMENTS = (
+    "gpu-fault-api-ha",
+    "gpu-fault-control-worker",
+    "gpu-fault-telemetry-spool-worker",
+)
+
+
+NOTIFICATION_ENV_NAMES = {
+    "service_role": "GPU_FAULT_SERVICE_ROLE",
+    "dispatcher_enabled": "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED",
+    "async_delivery": "GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY",
+}
+
+
+def deployment_environment(site: IdentitySite, app: str) -> tuple[dict[str, str], int]:
+    """Resolve a Deployment's env the way the kubelet does, ``envFrom`` included.
+
+    Reading only ``containers[0].env`` reported ``None`` for all three settings on
+    every control-plane Deployment, because the release renders them into
+    ``envFrom`` ConfigMaps. That left ``only_worker_has_worker_role``
+    unsatisfiable -- NOTIFY-003 could not pass on a correctly configured cluster,
+    which is how it failed on 2026-09-04. Inline ``env`` is applied last because
+    Kubernetes lets it override ``envFrom``.
+    """
+
+    deployment = json.loads(site.cpu("get", "deployment", app, "-o", "json"))
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    environment: dict[str, str] = {}
+    for source in container.get("envFrom", []):
+        name = (source.get("configMapRef") or {}).get("name")
+        if not name:
+            continue
+        value = json.loads(site.cpu("get", "configmap", name, "-o", "json"))
+        environment.update(
+            {str(key): str(item) for key, item in (value.get("data") or {}).items()}
+        )
+    for item in container.get("env", []):
+        if "value" in item:
+            environment[str(item["name"])] = str(item["value"])
+    return environment, int(deployment["spec"].get("replicas") or 0)
+
+
 def deployment_notification_config(
     site: IdentitySite,
     target: ClusterTarget,
 ) -> dict[str, Any]:
-    values = {}
-    for app in (
-        "gpu-fault-api-ha",
-        "gpu-fault-control-worker",
-        "gpu-fault-telemetry-spool-worker",
-    ):
-        deployment = json.loads(site.cpu("get", "deployment", app, "-o", "json"))
-        container = deployment["spec"]["template"]["spec"]["containers"][0]
-        environment = {
-            item["name"]: item.get("value")
-            for item in container.get("env", [])
-            if "value" in item
+    """The three dispatcher settings per control-plane Deployment.
+
+    The Deployment is the only source that answers for a Deployment scaled to
+    zero -- ``gpu-fault-telemetry-spool-worker`` runs 0 replicas on this site, and
+    "it has no Pod" is not evidence that its service role would refrain from
+    starting the dispatcher. Where replicas do run, they are exec'd as well and
+    required to agree, because the template is a desired value and a half-finished
+    rollout is exactly the disagreement the case treats as worse than a wrong one.
+    """
+
+    values: dict[str, Any] = {}
+    for app in NOTIFICATION_DEPLOYMENTS:
+        environment, desired_replicas = deployment_environment(site, app)
+        declared = {
+            key: environment.get(name) for key, name in NOTIFICATION_ENV_NAMES.items()
         }
+        replicas = []
+        for pod in site.ready_pods("cpu", app, target):
+            observed = site.pod_json("cpu", target, pod, NOTIFICATION_ENV_PROBE)
+            replicas.append(
+                {
+                    "pod": pod,
+                    **{key: observed.get(key) for key in NOTIFICATION_CONFIG_KEYS},
+                }
+            )
+        agree = all(
+            all(replica[key] == declared[key] for key in NOTIFICATION_CONFIG_KEYS)
+            for replica in replicas
+        )
         values[app] = {
-            "service_role": environment.get("GPU_FAULT_SERVICE_ROLE"),
-            "dispatcher_enabled": environment.get(
-                "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED"
-            ),
-            "async_delivery": environment.get("GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY"),
+            "desired_replicas": desired_replicas,
+            "ready_replicas": len(replicas),
+            "replicas": replicas,
+            "replicas_agree": agree,
+            **declared,
         }
     return values
 
@@ -267,6 +358,13 @@ def run_notify003(
             }
         )
         == 1,
+        # Replica disagreement within one Deployment is worse than a wrong value
+        # (docs/区域模式端到端验收测试用例.md: "副本间不一致本身即为 FAIL"), and it is
+        # only visible now that the values come from the Pods rather than the
+        # shared template.
+        "replicas_agree_within_each_deployment": all(
+            value["replicas_agree"] for value in config.values()
+        ),
     }
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
@@ -327,10 +425,19 @@ def run_notify004(
 
 NOTIFICATION_QUERY_PROBE = r"""
 import json
+import re
 import sys
 from datetime import datetime
 from gpu_fault.app import ApplicationContext
 
+GPU_UUID = re.compile(
+    r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
+# Selected by node, not by workload name. A low-utilization notification is
+# host-resource scoped ("<cluster> <node> host_gpu_utilization_percent"), so
+# filtering on the fixture's job name only finds the ones whose body happens to
+# list the workload -- and it hides the notifications this case has to count.
 needle, observed_after_text, *nodes = sys.argv[1:]
 observed_after = datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
 store = ApplicationContext.from_environment().store
@@ -345,7 +452,8 @@ for notification in store.list_notifications():
             notification.body_text,
         )
     )
-    if needle not in searchable:
+    matched = sorted(node for node in nodes if node in searchable)
+    if not matched:
         continue
     result = store.get_notification_result(notification.notification_id)
     records.append({
@@ -353,13 +461,95 @@ for notification in store.list_notifications():
         "created_at": notification.created_at.isoformat(),
         "category": notification.category,
         "low_gpu_utilization": "LOW_GPU_UTILIZATION" in searchable,
-        "matched_nodes": sorted(node for node in nodes if node in searchable),
+        "matched_nodes": matched,
+        # Every GPU the message speaks for. The sustained low-utilization signal
+        # is tracked per device, so a node with 8 GPUs raises 8 findings; the
+        # count here is what proves they were aggregated into one message
+        # instead of fanned out one message per GPU.
+        "gpu_devices": sorted(set(GPU_UUID.findall(searchable))),
+        "names_workload": needle in searchable,
+        "deduplication_key": notification.deduplication_key,
         "status": result.status.value if result else None,
         "provider_message_id_present": bool(
             result is not None and result.provider_message_id
         ),
     })
 print(json.dumps({"records": records}, sort_keys=True))
+"""
+
+
+ATTEMPT_OBSERVATION_PROBE = r"""
+import json
+import sys
+from gpu_fault.app import ApplicationContext
+
+# Only read when a phase times out. The sustained low-utilization rule is gated
+# on the batch reporting an ACTIVE workload, so a node whose containers the
+# control plane never observed cannot raise the signal no matter how long the
+# case waits -- and this is the difference between a detector defect and a
+# workload that never landed where the case thinks it did.
+cluster_id, *nodes = sys.argv[1:]
+store = ApplicationContext.from_environment().store
+records = []
+for observation in store.list_attempt_observations(cluster_id):
+    containers = [
+        {
+            "node_id": container.node_id,
+            "pod_name": container.pod_name,
+            "gpu_count": container.gpu_count,
+            "terminated": container.terminated,
+        }
+        for container in observation.containers
+        if container.node_id in nodes
+    ]
+    if not containers:
+        continue
+    records.append({
+        "job_id": observation.job_id,
+        "attempt_id": observation.attempt_id,
+        "workload_phase": observation.workload_phase.value,
+        "observed_at": observation.observed_at.isoformat(),
+        "workload_ids": list(observation.workload_ids),
+        "containers": containers,
+    })
+print(json.dumps({"records": records}, sort_keys=True))
+"""
+
+
+LATCH_STATE_PROBE = r"""
+import json
+import sys
+from gpu_fault.app import ApplicationContext
+
+# The disarm state of the sustained low-utilization signal on the selected
+# nodes. This is what the inter-phase quiet gap is actually waiting for, so the
+# runner reads it instead of assuming a sleep was long enough: the latch is
+# per GPU device, it clears only on a batch that reports no active workload, and
+# an idle node delivers those batches one health summary apart.
+cluster_id, *nodes = sys.argv[1:]
+store = ApplicationContext.from_environment().store
+records = []
+for item in store._list("health_signal_state"):
+    document = item if isinstance(item, dict) else item.model_dump(mode="json")
+    key = str(document.get("signal_key", ""))
+    parts = key.split("/")
+    if len(parts) < 5:
+        continue
+    if parts[0] != cluster_id or parts[1] not in nodes:
+        continue
+    if parts[2] != "host_gpu_utilization_percent":
+        continue
+    records.append({
+        "node_id": parts[1],
+        "device": parts[3],
+        "rule_id": parts[4],
+        "active": bool(document.get("active")),
+        "notified": bool(document.get("notified")),
+        "active_since": document.get("active_since"),
+    })
+print(json.dumps({"records": sorted(
+    records, key=lambda value: (value["node_id"], value["device"])
+)}, sort_keys=True))
 """
 
 
@@ -510,6 +700,134 @@ def wait_running_pods(
     raise RegionalFixtureError(f"low-utilization workload did not run: {last}")
 
 
+def foreign_gpu_reservations(
+    regional: Any,
+    nodes: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Running Pods that already hold a GPU on one of the selected nodes.
+
+    The sustained low-utilization signal latches: it fires once per activation
+    episode and stays quiet until the node stops reporting an active workload.
+    So an unrelated Pod that reserves a GPU and then idles keeps the node's
+    signal permanently notified, and no fixture this case submits can ever
+    produce a notification there. That is not a detector defect and it is not
+    something a longer wait fixes, so it has to be refused up front instead of
+    surfacing as an unattributable FAIL 15 minutes later.
+    """
+
+    value = json.loads(
+        regional.kubectl("gpu", "get", "pod", "-o", "json", all_namespaces=True)
+    )
+    holders = []
+    for item in value.get("items", []):
+        spec = item.get("spec", {})
+        if item.get("status", {}).get("phase") != "Running":
+            continue
+        if spec.get("nodeName") not in nodes:
+            continue
+        reserved = sum(
+            int(
+                container.get("resources", {})
+                .get("requests", {})
+                .get("nvidia.com/gpu", 0)
+                or 0
+            )
+            for container in spec.get("containers", [])
+        )
+        if not reserved:
+            continue
+        holders.append(
+            {
+                "namespace": item["metadata"]["namespace"],
+                "name": item["metadata"]["name"],
+                "node": spec.get("nodeName"),
+                "reserved_gpus": reserved,
+            }
+        )
+    return sorted(holders, key=lambda item: (str(item["node"]), str(item["name"])))
+
+
+def wait_low_utilization_latch_disarmed(
+    regional: Any,
+    *,
+    cluster_id: str,
+    nodes: tuple[str, ...],
+    deadline_seconds: int,
+    poll_seconds: int = 30,
+) -> list[dict[str, Any]]:
+    """Wait until no selected node still holds a notified low-utilization latch.
+
+    A fixed quiet gap between the phases is the same coin flip the fixed sleep
+    before the notification query was: the latch clears on the first batch that
+    reports no active workload, an idle node only sends those on its health
+    summary, and one live run cleared with 25 seconds to spare. So poll the
+    state the gap exists to reach, and let a phase start as soon as its nodes
+    are actually re-armed rather than when a timer says they should be.
+    """
+
+    deadline = time.monotonic() + deadline_seconds
+    polls: list[dict[str, Any]] = []
+    while True:
+        records = regional.cpu_python(LATCH_STATE_PROBE, cluster_id, *nodes)["records"]
+        latched = sorted(
+            {item["node_id"] for item in records if item["notified"] or item["active"]}
+        )
+        polls.append({"observed_at": utc_now(), "latched_nodes": latched})
+        if not latched:
+            return polls
+        if time.monotonic() >= deadline:
+            raise NotificationAcceptanceError(
+                "selected nodes still hold a notified low-utilization latch after "
+                f"{deadline_seconds} seconds, so this phase could not raise a new "
+                f"notification for them: {latched}"
+            )
+        time.sleep(poll_seconds)
+
+
+def wait_low_utilization_notifications(
+    regional: Any,
+    *,
+    needle: str,
+    nodes: tuple[str, ...],
+    observed_after: datetime,
+    deadline_seconds: int,
+    poll_seconds: int = 30,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Poll until every selected node has reported, or the deadline passes.
+
+    The previous fixed ``sleep(duration + 90)`` raced the detector and lost: the
+    signal only becomes active once a delivered batch reports both an ACTIVE
+    workload and near-zero GPU utilization, and it emits on the first batch at
+    least ``duration`` seconds later. On 2026-09-04 the same fixture produced a
+    notification 356 seconds after submission in one attempt and nothing at all
+    within 409 seconds in the next, so the budget decided the verdict rather
+    than the behaviour. Polling to a generous deadline removes that coin flip
+    and records when each node actually reported.
+    """
+
+    deadline = time.monotonic() + deadline_seconds
+    polls: list[dict[str, Any]] = []
+    while True:
+        query = regional.cpu_python(
+            NOTIFICATION_QUERY_PROBE,
+            needle,
+            observed_after.isoformat(),
+            *nodes,
+        )
+        records = [item for item in query["records"] if item["low_gpu_utilization"]]
+        reported = {node for item in records for node in item["matched_nodes"]}
+        polls.append(
+            {
+                "observed_at": utc_now(),
+                "notification_count": len(records),
+                "reported_nodes": sorted(reported),
+            }
+        )
+        if set(nodes) <= reported or time.monotonic() >= deadline:
+            return records, polls
+        time.sleep(poll_seconds)
+
+
 def run_notify005(
     site: IdentitySite,
     target: ClusterTarget,
@@ -529,13 +847,59 @@ def run_notify005(
         worker_pods[0],
         LOW_UTILIZATION_CONFIG_PROBE,
     )
-    wait_seconds = int(config["duration_seconds"]) + 90
-    started_at = datetime.now(timezone.utc)
+    duration_seconds = int(config["duration_seconds"])
+    # Three times the sustained window plus five minutes, because the wait is
+    # two stages in series rather than one window. The signal needs a delivered
+    # batch that reports an active workload with near-zero GPU use before the
+    # window starts counting, and the host edge filter subtracts an already
+    # active edge reason from its delivery reasons, so once the low-utilization
+    # edge has been delivered the next batch only arrives on the periodic health
+    # summary. The window therefore expires unobserved and is judged one summary
+    # cycle later: interval + duration + summary, on top of however long the
+    # workload takes to register as active. Live worst case was 748 seconds
+    # against a 900-second budget, which is too little margin to keep.
+    phase_deadline_seconds = duration_seconds * 3 + 300
+    # The two phases share nodes, and the latch only clears once the node
+    # reports no active workload. Deleting the fixture is not enough: an idle
+    # node stops delivering on every collection interval and falls back to its
+    # health summary, so the clearing batch can be several minutes out. Without
+    # that quiet gap the second phase inherits phase one's notified latch and
+    # the node stays silent for a reason that has nothing to do with the case.
+    # The gap is polled rather than slept: a fixed `duration + 90` once cleared
+    # with 25 seconds to spare, which is a flake waiting to be recorded as a
+    # FAIL against the detector.
+    quiesce_deadline_seconds = duration_seconds * 3 + 300
+    # Record what these nodes were already reported for, over the whole history
+    # rather than a recent window: the latch has no expiry, so an episode from
+    # hours earlier is exactly the one that would suppress this run.
+    baseline = regional.cpu_python(
+        NOTIFICATION_QUERY_PROBE,
+        "",
+        datetime(1970, 1, 1, tzinfo=timezone.utc).isoformat(),
+        *nodes,
+    )
+    pre_existing = [item for item in baseline["records"] if item["low_gpu_utilization"]]
     fixtures = []
     observations = []
     result: dict[str, Any] = {"verdict": "FAIL"}
     try:
         for count, selected in ((1, nodes[:1]), (3, nodes)):
+            # Foreign GPU holders first, because that latch never clears and
+            # waiting on it would spend the whole gap to report the wrong cause.
+            holders = foreign_gpu_reservations(regional, selected)
+            if holders:
+                raise NotificationAcceptanceError(
+                    "selected nodes already hold GPUs for unrelated workloads, "
+                    "whose idle reservation latches the low-utilization signal: "
+                    f"{holders}"
+                )
+            quiesce_polls = wait_low_utilization_latch_disarmed(
+                regional,
+                cluster_id=target.cluster_id,
+                nodes=selected,
+                deadline_seconds=quiesce_deadline_seconds,
+            )
+            phase_started_at = datetime.now(timezone.utc)
             name = f"notify005-{count}n-{attempt}-{int(time.time())}"
             source = case_dir / f"{name}.source.yaml"
             source.write_text(
@@ -565,34 +929,73 @@ def run_notify005(
             fixtures.append(fixture)
             fixture.submit()
             running = wait_running_pods(fixture, count)
-            time.sleep(wait_seconds)
-            query = regional.cpu_python(
-                NOTIFICATION_QUERY_PROBE,
-                name,
-                started_at.isoformat(),
-                *selected,
+            records, polls = wait_low_utilization_notifications(
+                regional,
+                needle=name,
+                nodes=selected,
+                observed_after=phase_started_at,
+                deadline_seconds=phase_deadline_seconds,
             )
-            records = [item for item in query["records"] if item["low_gpu_utilization"]]
-            observations.append(
-                {
-                    "node_count": count,
-                    "nodes": list(selected),
-                    "pods": running["pods"],
-                    "notifications": records,
-                }
-            )
+            observation: dict[str, Any] = {
+                "node_count": count,
+                "nodes": list(selected),
+                "pods": running["pods"],
+                "quiesce_polls": quiesce_polls,
+                "polls": polls,
+                "notifications": records,
+            }
+            reported = {node for item in records for node in item["matched_nodes"]}
+            if set(selected) - reported:
+                observation["silent_nodes"] = sorted(set(selected) - reported)
+                observation["attempt_observations"] = regional.cpu_python(
+                    ATTEMPT_OBSERVATION_PROBE,
+                    target.cluster_id,
+                    *selected,
+                )["records"]
+            observations.append(observation)
             fixture.delete()
         single_count = len(observations[0]["notifications"])
         three_count = len(observations[1]["notifications"])
+        observed = [item for value in observations for item in value["notifications"]]
         checks = {
-            "single_node_notification_is_aggregated": 1 <= single_count <= 1,
-            "three_node_notifications_do_not_scale_by_gpu": 1 <= three_count <= 3,
+            # The 判定 is an upper bound -- "通知条数按节点数或任务数增长（≤3 条），
+            # 不是按 GPU 数（不应是 24 条）" -- so these three are stated as bounds
+            # rather than as an exact count.
+            "single_node_count_at_most_one": single_count <= 1,
+            "three_node_count_at_most_node_count": three_count <= len(nodes),
             "three_node_count_not_twenty_four": three_count != 24,
+            # An upper bound on its own is satisfied by a detector that never
+            # fires, so every node the fixture occupied has to have reported
+            # within its own phase.
+            "every_selected_node_reported_in_its_phase": all(
+                {
+                    node
+                    for item in value["notifications"]
+                    for node in item["matched_nodes"]
+                }
+                >= set(value["nodes"])
+                for value in observations
+            ),
+            # Each message speaks for exactly one node, which is why the count
+            # tracks nodes rather than GPUs.
+            "every_notification_is_node_scoped": all(
+                len(item["matched_nodes"]) == 1 for item in observed
+            ),
+            # And the aggregation itself: the sustained signal is tracked per
+            # GPU, so an 8-GPU node raises 8 findings. One message naming
+            # several of them is the direct evidence that they were folded
+            # together instead of mailed one by one -- that is where the 24 in
+            # the 判定 would have come from.
+            "notifications_aggregate_multiple_gpu_devices": bool(observed)
+            and all(len(item["gpu_devices"]) > 1 for item in observed),
         }
         result = {
             "verdict": "PASS" if all(checks.values()) else "FAIL",
             "checks": checks,
             "policy_config": config,
+            "phase_deadline_seconds": phase_deadline_seconds,
+            "quiesce_deadline_seconds": quiesce_deadline_seconds,
+            "pre_existing_notifications": pre_existing,
             "observations": observations,
         }
     finally:
@@ -607,7 +1010,13 @@ def run_notify005(
             result["verdict"] = "FAIL"
     result["limitations"] = [
         "The workloads intentionally reserve one GPU while performing CPU work; "
-        "they validate notification aggregation without damaging hardware."
+        "they validate notification aggregation without damaging hardware.",
+        "The sustained low-utilization signal latches per GPU and re-arms only "
+        "after the node reports no active workload, so the case refuses nodes "
+        "that already hold a GPU for an unrelated workload and waits for each "
+        "phase's nodes to be observably re-armed before submitting; "
+        "quiesce_polls records that wait and pre_existing_notifications records "
+        "the episodes that preceded the run.",
     ]
     return result
 

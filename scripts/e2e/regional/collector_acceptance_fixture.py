@@ -30,6 +30,24 @@ from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "collector_node_probe.py"
 
 
+def collector_setting(env: dict[str, str], key: str) -> int:
+    """One integer setting out of the target node's live ``collector.env``.
+
+    The whole point of the COLLECT group is that the judgement uses the values
+    the node is really running with rather than a hardcoded 15/300, so a key
+    that is not in the snapshot has to say which key and what the node did
+    have. A bare ``KeyError`` from a dict lookup once reported a runner typo
+    (``GPU_FAULT_DCGM_INTERVAL_SECONDS``, a name neither the installer writes
+    nor the collector reads) as an unattributable case failure.
+    """
+
+    if key not in env:
+        raise RegionalFixtureError(
+            f"{key} is absent from the node's collector.env; it holds {sorted(env)}"
+        )
+    return int(env[key])
+
+
 STORE_PROBE = r"""
 import json
 import sys

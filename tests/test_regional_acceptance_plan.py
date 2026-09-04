@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import ast
 import hashlib
+import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -106,6 +110,75 @@ def test_formal_plan_merges_catalog_metadata_and_execution() -> None:
         "test_regional_context_rejects_local_kubernetes_adapter"
     )
     assert related.executor is ExecutorKind.HUMAN
+
+
+def _referenced_pytest_node_ids() -> dict[str, list[str]]:
+    """Every ``tests/...::name`` literal the acceptance runners hand to pytest.
+
+    Implicit concatenation is already merged by the parser, so each node ID
+    arrives as one ``ast.Constant``; joining a module's literals instead would
+    glue unrelated strings together and invent node IDs nobody references.
+    """
+
+    pattern = re.compile(r"^(tests/[\w/]+\.py::[\w\[\]\-.]+)$")
+    referenced: dict[str, list[str]] = {}
+    for path in sorted((ROOT / "scripts" / "e2e").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if pattern.match(node.value.strip()):
+                referenced.setdefault(node.value.strip(), []).append(
+                    str(path.relative_to(ROOT))
+                )
+    return referenced
+
+
+def test_every_focused_regression_an_acceptance_runner_names_still_exists() -> None:
+    """A renamed test must not turn into a maintenance-window discovery.
+
+    Each real-machine runner shells out to a handful of focused regressions
+    before it is allowed to touch hardware, and it names them as literal pytest
+    node IDs. Nothing in the suite binds those literals to the tests, so a
+    refactor that moves a test to another module leaves the runner pointing at a
+    node ID pytest cannot collect -- and it exits 4 in preflight. That happened:
+    ``test_executor_iam_boundary_rejects_excess_privilege`` was split out of
+    ``test_regional_release_orchestrator.py`` into
+    ``test_regional_release_commands.py``, and both DESTR-011 and DESTR-013 kept
+    the old path until DESTR-011 was actually run on 2026-09-04.
+
+    Collection is delegated to pytest rather than reimplemented, because these
+    modules re-export cases from ``_*_cases_*.py`` helpers: a test named in one
+    file is frequently defined in another, so checking for a ``def`` in the named
+    file would reject node IDs that collect perfectly well -- and would have
+    missed this defect, where the name did exist, just in the wrong module.
+    """
+
+    referenced = _referenced_pytest_node_ids()
+    assert len(referenced) > 50, "the node ID scan stopped seeing the runners"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--collect-only",
+            "-p",
+            "no:cacheprovider",
+            *sorted(referenced),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert completed.returncode == 0, (
+        "an acceptance runner names a pytest node ID that no longer collects, so "
+        "that case fails preflight instead of running:\n"
+        + completed.stdout[-4000:]
+        + completed.stderr[-4000:]
+    )
 
 
 def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
