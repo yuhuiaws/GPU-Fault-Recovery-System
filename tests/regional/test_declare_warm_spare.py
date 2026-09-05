@@ -258,6 +258,18 @@ def test_helper_is_read_only_by_default() -> None:
     assert helper.RELEASE_CONFIRMATION == "RELEASE_WARM_SPARE_UNCORDON"
 
 
+def test_the_report_is_serialisable_after_a_declaration() -> None:
+    # The baseline record embeds the survey and the survey is the report, so
+    # attaching the record back unfiltered makes the report contain itself. That
+    # only fails at the closing `json.dumps` -- after the node was cordoned --
+    # so the operator would see a traceback for a declaration that succeeded.
+    report: dict[str, Any] = {"observed_at": "2026-09-05T00:00:00Z"}
+    record = {"node": "node-spare", "pre_declaration_survey": report}
+    report["declaration"] = helper.without_survey(record)
+
+    assert json.loads(json.dumps(report))["declaration"] == {"node": "node-spare"}
+
+
 def test_the_spare_is_never_named_by_the_shared_node_flag() -> None:
     # A site profile's `node` is the collector cases' target, a different machine
     # from the spare. If this helper accepted --node it would inherit that value

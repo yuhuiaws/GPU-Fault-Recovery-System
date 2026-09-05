@@ -196,6 +196,16 @@ def survey(settings: Settings, warm: WarmSpareLiveFixture, regional) -> dict[str
     return result
 
 
+def without_survey(record: dict[str, Any]) -> dict[str, Any]:
+    # The baseline record embeds the survey so it can be read back on its own,
+    # and the survey is also this run's report. Attaching the record to the
+    # report unfiltered therefore makes the report contain itself, and the final
+    # `json.dumps` raises "Circular reference detected" -- after the node has
+    # already been mutated, so the operator sees a traceback for a declaration
+    # that in fact succeeded.
+    return {key: value for key, value in record.items() if not key.endswith("_survey")}
+
+
 def read_baseline(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise RegionalFixtureError(f"no warm-spare baseline record at {path}")
@@ -343,7 +353,7 @@ def main() -> int:
             raise RegionalFixtureError(
                 "node cannot be declared a warm spare: " + "; ".join(refusals)
             )
-        report["declaration"] = declare(settings, warm, report)
+        report["declaration"] = without_survey(declare(settings, warm, report))
     elif arguments.release:
         if arguments.confirm != RELEASE_CONFIRMATION:
             raise RegionalFixtureError(
@@ -355,7 +365,7 @@ def main() -> int:
             raise RegionalFixtureError(
                 "node cannot be released: " + "; ".join(refusals)
             )
-        report["release"] = release(settings, warm, report)
+        report["release"] = without_survey(release(settings, warm, report))
     else:
         report["refusals"] = declare_refusals(
             settings,
