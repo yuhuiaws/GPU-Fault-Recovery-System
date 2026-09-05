@@ -27,9 +27,10 @@ class _Regional:
         self.value_from = value_from
         self.container = container
         self.pods = pods
-        # A rollout that has not reached every replica: the Deployment carries
-        # the variable but a still-running old Pod does not.
+        # A rollout that has not reached every replica: the Deployment says one
+        # thing and a still-running old Pod reports another.
         self.gate_lags = gate_lags
+        self.lagging_value: str | None = None
         self.commands: list[tuple[str, ...]] = []
         self.settings = type("_S", (), {"cluster_id": "cluster-a"})()
 
@@ -74,7 +75,7 @@ class _Regional:
             return "deployment rolled out\n"
         if arguments[0] == "exec":
             if self.gate_lags:
-                return json.dumps({"enabled": None})
+                return json.dumps({"enabled": self.lagging_value})
             return json.dumps({"enabled": self.value if self.present else None})
         raise AssertionError(arguments)
 
@@ -83,9 +84,15 @@ class _Regional:
         return [{"name": name} for name in self.pods]
 
 
+def _no_sleep(seconds: float) -> None:
+    """Settle immediately: these tests exercise the loop, not the clock."""
+
+
 def _settings(tmp_path: Path) -> helper.Settings:
+    # Zero, so a fleet that never settles fails on the first poll instead of
+    # holding the suite for a real wall-clock timeout.
     return helper.Settings(
-        baseline=tmp_path / "synthetic-route.json", rollout_timeout_seconds=5
+        baseline=tmp_path / "synthetic-route.json", rollout_timeout_seconds=0
     )
 
 
@@ -130,15 +137,43 @@ def test_opening_refuses_a_route_someone_else_already_enabled(tmp_path: Path) ->
         helper.open_window(_settings(tmp_path), regional, helper.survey(regional))
 
 
-def test_opening_refuses_while_an_earlier_window_is_unclosed(tmp_path: Path) -> None:
+def test_opening_refuses_a_record_whose_window_is_not_actually_open(
+    tmp_path: Path,
+) -> None:
+    # A record saying "open" over a Deployment that is not is a record about some
+    # other cluster or some other release. Opening on top of it would overwrite
+    # the only description of the state to restore.
     settings = _settings(tmp_path)
     settings.baseline.write_text(
         json.dumps({"opened_at": "2026-09-05T00:00:00Z"}), encoding="utf-8"
     )
     regional = _Regional(present=False)
 
-    with pytest.raises(helper.RegionalFixtureError, match="still records an open"):
+    with pytest.raises(helper.RegionalFixtureError, match="records an open window"):
         helper.open_window(settings, regional, helper.survey(regional))
+
+
+def test_an_interrupted_open_is_resumed_rather_than_refused(tmp_path: Path) -> None:
+    # An open that set the variable and then died waiting for the rollout leaves
+    # the operator between an open that refuses (a record exists) and a close
+    # that has not verified anything. The record already owns this window, so the
+    # second --open finishes it instead of starting a second one.
+    regional = _Regional(present=False, gate_lags=True)
+    settings = _settings(tmp_path)
+    with pytest.raises(helper.RegionalFixtureError):
+        helper.open_window(settings, regional, helper.survey(regional), sleep=_no_sleep)
+    first = json.loads(settings.baseline.read_text(encoding="utf-8"))
+    regional.gate_lags = False
+
+    resumed = helper.open_window(
+        settings, regional, helper.survey(regional), sleep=_no_sleep
+    )
+
+    assert resumed["opened_at"] == first["opened_at"]
+    assert resumed["baseline"]["route_env_present"] is False
+    assert resumed["resumed_at"] > ""
+    assignments = [item[-1] for item in regional.commands if item[0] == "set"]
+    assert assignments == [f"{helper.ROUTE_ENV}=true"], assignments
 
 
 def test_closing_refuses_without_a_record(tmp_path: Path) -> None:
@@ -161,11 +196,32 @@ def test_closing_twice_is_refused(tmp_path: Path) -> None:
 def test_a_replica_that_missed_the_rollout_fails_the_open(tmp_path: Path) -> None:
     # `preflight_errors` grades every ready replica, so an open that reports
     # success while one Pod still answers 404 turns into a mid-case failure with
-    # a workload already submitted to a real node.
+    # a workload already submitted to a real node. `kubectl rollout status`
+    # returns before the old Pods are gone, and they are still Ready, so the
+    # rollout returning is not the condition to check.
     regional = _Regional(present=False, gate_lags=True)
 
-    with pytest.raises(helper.RegionalFixtureError, match="not enabled on every"):
-        helper.open_window(_settings(tmp_path), regional, helper.survey(regional))
+    with pytest.raises(helper.RegionalFixtureError, match="report the route enabled"):
+        helper.open_window(
+            _settings(tmp_path), regional, helper.survey(regional), sleep=_no_sleep
+        )
+
+
+def test_a_replica_still_serving_the_route_fails_the_close(tmp_path: Path) -> None:
+    # The mirror image, and the one that matters for residual: the Deployment is
+    # restored but an old replica is still Ready and still serving the route.
+    # Reporting that as closed is reporting a live route as retired.
+    regional = _Regional(present=False)
+    settings = _settings(tmp_path)
+    helper.open_window(settings, regional, helper.survey(regional), sleep=_no_sleep)
+    survey = helper.survey(regional)
+    regional.gate_lags = True
+    regional.lagging_value = "true"
+
+    with pytest.raises(helper.RegionalFixtureError, match="report the route disabled"):
+        helper.close_window(settings, regional, survey, sleep=_no_sleep)
+
+    assert json.loads(settings.baseline.read_text(encoding="utf-8"))["closed_at"] > ""
 
 
 def test_a_referenced_value_is_refused(tmp_path: Path) -> None:

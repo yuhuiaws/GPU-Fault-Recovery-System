@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -171,47 +172,92 @@ def wait_rollout(settings: Settings, regional: RegionalLiveFixture) -> str:
     ).strip()
 
 
+def converge_gates(
+    settings: Settings,
+    regional: RegionalLiveFixture,
+    *,
+    enabled: bool,
+    sleep: Any = time.sleep,
+) -> list[dict[str, str | None]]:
+    """Wait until every ready replica agrees the route is on (or off).
+
+    `kubectl rollout status` returns as soon as the new ReplicaSet is fully
+    available, which is before the old Pods are gone -- and during a rolling
+    update those old Pods are still Ready, so they are still in the set that
+    DESTR-003's `preflight_errors` grades. Declaring the window open there would
+    hand the case a fleet where a third of the replicas still answer 404;
+    declaring it closed there would report a route still live as retired.
+    """
+
+    deadline = time.monotonic() + settings.rollout_timeout_seconds
+    while True:
+        gates = pod_gates(regional)
+        settled = bool(gates) and all(
+            (item["enabled"] == "true") is enabled for item in gates
+        )
+        if settled:
+            return gates
+        if time.monotonic() >= deadline:
+            raise RegionalFixtureError(
+                f"after the rollout and {settings.rollout_timeout_seconds}s of "
+                "settling, the ready replicas do not all report the route "
+                f"{'enabled' if enabled else 'disabled'}: "
+                + json.dumps(gates, sort_keys=True)
+            )
+        sleep(5)
+
+
 def open_window(
     settings: Settings,
     regional: RegionalLiveFixture,
     report: dict[str, Any],
+    sleep: Any = time.sleep,
 ) -> dict[str, Any]:
-    if settings.baseline.is_file() and not read_baseline(settings.baseline).get(
-        "closed_at"
-    ):
-        raise RegionalFixtureError(
-            f"{settings.baseline} still records an open window; close it first"
-        )
-    if report["deployment"]["route_env_value"] == "true":
+    live = report["deployment"]
+    record: dict[str, Any] = {}
+    if settings.baseline.is_file():
+        record = read_baseline(settings.baseline)
+        if not record.get("closed_at") and live["route_env_value"] != "true":
+            raise RegionalFixtureError(
+                f"{settings.baseline} records an open window but {ROUTE_ENV} is "
+                f"{live['route_env_value']!r} on {DEPLOYMENT}; close the record "
+                "before opening a new window"
+            )
+        if record.get("closed_at"):
+            record = {}
+    if record:
+        # Resuming the window this record already owns: the variable is set and
+        # the pre-window state is on file, so the only thing left to do is what
+        # an interrupted open did not finish -- wait for the replicas. Refusing
+        # here would leave the operator between an open that will not open and a
+        # close whose record is already the right one.
+        record["resumed_at"] = now()
+    elif live["route_env_value"] == "true":
         raise RegionalFixtureError(
             f"{ROUTE_ENV} is already true on {DEPLOYMENT} without a record here; "
             "find out who opened it before adding a second owner"
         )
-    # Written before the mutation, so an interrupted open still leaves an exact
-    # record of what to put back -- including "the variable was absent".
-    record = {
-        "opened_at": now(),
-        "confirmation": OPEN_CONFIRMATION,
-        "baseline": report["deployment"],
-        "pre_window_survey": report,
-    }
-    write_json_atomic(settings.baseline, record)
-    regional.kubectl(
-        "cpu",
-        "set",
-        "env",
-        f"deployment/{DEPLOYMENT}",
-        f"--containers={CONTAINER}",
-        f"{ROUTE_ENV}=true",
-    )
-    record["rollout"] = wait_rollout(settings, regional)
-    gates = pod_gates(regional)
-    record["pod_gates"] = gates
-    if not gates or any(item["enabled"] != "true" for item in gates):
-        raise RegionalFixtureError(
-            "the route is not enabled on every ready replica after the rollout: "
-            + json.dumps(gates, sort_keys=True)
+    else:
+        # Written before the mutation, so an interrupted open still leaves an
+        # exact record of what to put back -- including "the variable was
+        # absent".
+        record = {
+            "opened_at": now(),
+            "confirmation": OPEN_CONFIRMATION,
+            "baseline": live,
+            "pre_window_survey": report,
+        }
+        write_json_atomic(settings.baseline, record)
+        regional.kubectl(
+            "cpu",
+            "set",
+            "env",
+            f"deployment/{DEPLOYMENT}",
+            f"--containers={CONTAINER}",
+            f"{ROUTE_ENV}=true",
         )
+        record["rollout"] = wait_rollout(settings, regional)
+    record["pod_gates"] = converge_gates(settings, regional, enabled=True, sleep=sleep)
     record["opened_state"] = deployment_env(regional)
     write_json_atomic(settings.baseline, record)
     return record
@@ -221,6 +267,7 @@ def close_window(
     settings: Settings,
     regional: RegionalLiveFixture,
     report: dict[str, Any],
+    sleep: Any = time.sleep,
 ) -> dict[str, Any]:
     record = read_baseline(settings.baseline)
     if record.get("closed_at"):
@@ -253,8 +300,6 @@ def close_window(
     record["rollout_after_close"] = wait_rollout(settings, regional)
     restored = deployment_env(regional)
     record["restored_state"] = restored
-    gates = pod_gates(regional)
-    record["pod_gates_after_close"] = gates
     write_json_atomic(settings.baseline, record)
     if restored["route_env_present"] != baseline.get("route_env_present") or restored[
         "route_env_value"
@@ -263,11 +308,13 @@ def close_window(
             "the restored env does not match the recorded baseline: "
             + json.dumps({"baseline": baseline, "restored": restored}, sort_keys=True)
         )
-    if any(item["enabled"] == "true" for item in gates):
-        raise RegionalFixtureError(
-            "a replica still has the route enabled after the close: "
-            + json.dumps(gates, sort_keys=True)
-        )
+    # The closed_at above is already on disk: the mutation happened, so the
+    # record must say so even if the fleet takes longer than the timeout to
+    # settle. What must not happen is reporting a still-live route as retired.
+    record["pod_gates_after_close"] = converge_gates(
+        settings, regional, enabled=False, sleep=sleep
+    )
+    write_json_atomic(settings.baseline, record)
     return record
 
 
