@@ -89,7 +89,11 @@ def load_site_profile(path: Path) -> dict[str, Any]:
     return document
 
 
-def profile_argv(profile: dict[str, Any], argv: list[str]) -> list[str]:
+def profile_argv(
+    profile: dict[str, Any],
+    argv: list[str],
+    accepted: set[str] | None = None,
+) -> list[str]:
     """Expand profile arguments the caller did not already pass on the line.
 
     A flag typed on the command line suppresses the profile's entry for it
@@ -97,6 +101,13 @@ def profile_argv(profile: dict[str, Any], argv: list[str]) -> list[str]:
     ``--node`` replaces the profile's node list rather than adding to it,
     because a case that requires exactly two distinct nodes must not silently
     receive three.
+
+    ``accepted`` restricts the expansion to flags a particular runner actually
+    defines. One profile describes the site, not one case, and the cases do not
+    agree on flag names -- the collector runners take ``--node`` while
+    ``DESTR-003`` takes ``--fault-node`` and ``--spare-node``. Without the
+    filter, sharing a profile makes every runner that lacks one of its keys exit
+    2 on an unrecognised argument.
     """
 
     supplied = {item.split("=", 1)[0] for item in argv if item.startswith("--")}
@@ -105,10 +116,44 @@ def profile_argv(profile: dict[str, Any], argv: list[str]) -> list[str]:
         flag = "--" + str(dest).replace("_", "-")
         if flag in supplied:
             continue
+        if accepted is not None and flag not in accepted:
+            continue
         items = value if isinstance(value, list) else [value]
         for item in items:
             extra.extend([flag, str(item)])
     return extra
+
+
+def parser_flags(parser: argparse.ArgumentParser) -> set[str]:
+    # argparse exposes no public accessor for the option strings it knows, and
+    # the alternative -- parse_known_args and discard the rest -- would swallow
+    # a typo in the profile instead of reporting it.
+    return {option for action in parser._actions for option in action.option_strings}
+
+
+def bind_site_profile(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Make ``parser`` fill its unsupplied flags from the installed profile.
+
+    Bound at parser-construction time but evaluated at ``parse_args`` time, so a
+    runner that adds its own flags after this call still has them considered.
+    """
+
+    raw = os.environ.get(SITE_PROFILE_ENV, "").strip()
+    if not raw:
+        return parser
+    profile = load_site_profile(Path(raw))
+    original = parser.parse_args
+
+    def parse_args(  # type: ignore[override]
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        values = list(sys.argv[1:] if args is None else args)
+        extra = profile_argv(profile, values, accepted=parser_flags(parser))
+        return original([*extra, *values], namespace)
+
+    parser.parse_args = parse_args  # type: ignore[method-assign]
+    return parser
 
 
 def apply_site_environment(
@@ -144,15 +189,18 @@ def applied_site_profile(
 
 
 def install_site_profile(argv: list[str] | None = None) -> dict[str, str] | None:
-    """Fold the site profile into ``sys.argv`` and ``os.environ``, in place.
+    """Publish the site profile to ``os.environ``, in place.
 
     Called as the first statement of a runner's ``main`` so it lands before the
     parser exists: several flags read their default from the environment at
     construction time -- ``--maintenance-window-end`` most importantly -- and a
-    profile that only arrived after parsing could not supply them. Rewriting
-    argv rather than post-processing a namespace also keeps one behaviour for
-    the runners that build their parser inline and the ones that use a factory,
-    and keeps ``--help`` working.
+    profile that only arrived after parsing could not supply them.
+
+    The profile's *arguments* are applied later, by `bind_site_profile`, which
+    `add_live_arguments` calls on every live runner's parser. They cannot be
+    folded into ``sys.argv`` here: at this point nothing knows which flags this
+    runner defines, and a profile naming ``node`` would make every case that
+    calls it ``--fault-node`` exit 2.
     """
 
     values = list(sys.argv[1:] if argv is None else argv)
@@ -162,5 +210,4 @@ def install_site_profile(argv: list[str] | None = None) -> dict[str, str] | None
     profile = load_site_profile(path)
     apply_site_environment(profile)
     os.environ[SITE_PROFILE_ENV] = str(path)
-    sys.argv = [sys.argv[0], *profile_argv(profile, values), *values]
     return applied_site_profile()

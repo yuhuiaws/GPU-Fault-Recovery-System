@@ -53,7 +53,10 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     settings_from_arguments,
 )
-from scripts.e2e.regional.site_profile import install_site_profile  # noqa: E402
+from scripts.e2e.regional.site_profile import (  # noqa: E402
+    bind_site_profile,
+    install_site_profile,
+)
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     HYPERPOD_HEALTH_LABEL,
     INSTANCE_GROUP_LABEL,
@@ -303,7 +306,8 @@ def parser() -> argparse.ArgumentParser:
             f"--release requires exactly {RELEASE_CONFIRMATION}"
         ),
     )
-    return value
+    # Not a live_driver_guard runner, so it binds the profile itself.
+    return bind_site_profile(value)
 
 
 def main() -> int:

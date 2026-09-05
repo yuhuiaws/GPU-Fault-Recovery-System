@@ -13,6 +13,7 @@ if __package__:
     from .site_profile import (
         SITE_PROFILE_ENV,
         applied_site_profile,
+        bind_site_profile,
         install_site_profile,
     )
 else:
@@ -21,6 +22,7 @@ else:
     from site_profile import (
         SITE_PROFILE_ENV,
         applied_site_profile,
+        bind_site_profile,
         install_site_profile,
     )
 
@@ -28,6 +30,7 @@ else:
 # every one of them already imports `add_live_arguments` from here.
 __all__ = [
     "add_live_arguments",
+    "bind_site_profile",
     "authorize_execution",
     "build_plan",
     "environment_snapshot",
@@ -73,6 +76,10 @@ def add_live_arguments(
         default=os.getenv("GPU_FAULT_ACCEPTANCE_WINDOW_END", ""),
         help="UTC ISO-8601 deadline required by execute mode",
     )
+    # Every live runner passes through here, so this is the one place that has
+    # to know the profile supplies arguments. It is evaluated at parse time, so
+    # flags the runner adds after this call are still filled from the profile.
+    bind_site_profile(parser)
 
 
 def environment_snapshot(

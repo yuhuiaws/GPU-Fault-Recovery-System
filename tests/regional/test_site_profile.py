@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -108,7 +109,42 @@ def test_profile_path_prefers_the_flag_over_the_environment(tmp_path: Path) -> N
     assert site_profile_path([], {}) is None
 
 
-def test_install_rewrites_argv_and_records_a_digest(
+def test_profile_only_supplies_flags_the_runner_actually_defines() -> None:
+    # One profile describes the site, not one case, and the cases disagree on
+    # flag names: the collector runners take --node, DESTR-003 takes
+    # --fault-node/--spare-node. Injecting every key would make every runner
+    # missing one of them exit 2 on an unrecognised argument.
+    profile = {"arguments": {"node": "node-a", "region": "us-west-2"}}
+
+    accepted = {"--fault-node", "--spare-node", "--region"}
+    assert profile_argv(profile, [], accepted=accepted) == ["--region", "us-west-2"]
+    assert profile_argv(profile, [], accepted={"--node"}) == ["--node", "node-a"]
+
+
+def test_bind_lets_a_runner_read_profile_arguments_without_rewriting_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _profile(
+        tmp_path,
+        {"arguments": {"node": "node-a", "region": "us-west-2", "absent-flag": "x"}},
+    )
+    monkeypatch.setenv(SITE_PROFILE_ENV, str(path))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--region", default="")
+    from scripts.e2e.regional.site_profile import bind_site_profile
+
+    bind_site_profile(parser)
+    # Added after the bind: the flag set is read at parse time, not at bind time,
+    # so a runner that adds its own flags later is still filled from the profile.
+    parser.add_argument("--node", default="")
+
+    arguments = parser.parse_args([])
+
+    assert arguments.region == "us-west-2"
+    assert arguments.node == "node-a"
+
+
+def test_install_records_a_digest_without_touching_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _profile(
@@ -133,16 +169,11 @@ def test_install_rewrites_argv_and_records_a_digest(
     assert record is not None
     assert record["path"] == str(path)
     assert len(record["sha256"]) == 64
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--site-profile", default="")
-    parser.add_argument("--case", default="")
-    parser.add_argument("--region", default="")
-    parser.add_argument("--node", action="append", default=[])
-    arguments = parser.parse_args(sys.argv[1:])
-    assert arguments.region == "us-west-2"
-    assert arguments.node == ["node-a"]
-    assert arguments.case == "CASE"
-    # And the environment the parser defaults are built from.
+    # argv is left alone: at this point nothing knows which flags this runner
+    # defines, so the arguments are applied later by `bind_site_profile`.
+    assert sys.argv[1:] == ["--site-profile", str(path), "--case", "CASE"]
+    # What install does own is the environment the parser defaults read from.
+    assert os.environ["AWS_REGION"] == "us-west-2"
     assert applied_site_profile() == record
 
 
@@ -191,9 +222,9 @@ def test_every_live_runner_installs_the_profile_before_parsing() -> None:
     # ignores the operator's single source of site values -- so this is checked
     # for all of them rather than for the ones in use today.
     missing = []
-    for path in sorted((ROOT / "scripts/e2e/regional").glob("*.py")):
+    for path in sorted((ROOT / "scripts/e2e/regional").glob("run_*.py")):
         source = path.read_text(encoding="utf-8")
-        if "add_live_arguments" not in source or path.name == "live_driver_guard.py":
+        if "add_live_arguments(" not in source:
             continue
         if "install_site_profile()" not in source:
             missing.append(path.name)
@@ -201,8 +232,8 @@ def test_every_live_runner_installs_the_profile_before_parsing() -> None:
 
 
 def test_runner_help_still_works_without_a_profile() -> None:
-    # install_site_profile rewrites sys.argv, so the cheapest regression it
-    # could cause is breaking every runner's --help.
+    # The profile hooks both the environment and `parse_args`, so the cheapest
+    # regression it could cause is breaking every runner's --help.
     completed = subprocess.run(
         [sys.executable, "scripts/e2e/regional/run_collector_acceptance.py", "--help"],
         cwd=ROOT,
