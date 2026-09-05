@@ -270,13 +270,22 @@ class HyperPodConfirmationMixin:
                 ),
             )
             outcome = self.node_action_adapter.execute(check_context)
+            details = outcome.details or {}
             if outcome.status is WorkflowStepStatus.SUCCEEDED:
                 return []
             if outcome.status is WorkflowStepStatus.WAITING:
+                if "gpu_client_quiesce_attempt" in details:
+                    # The agent answered, and the answer is that the spare
+                    # is busy. Only a missing answer is pending; a definitive
+                    # one must reject the candidate so the shortage surfaces.
+                    return [
+                        "node agent GPU client check rejected the spare: "
+                        + str(details.get("reason") or outcome.status.value)
+                    ]
                 raise SpareHealthPending(
                     "node agent GPU client check is pending: "
                     + str(
-                        (outcome.details or {}).get("reason")
+                        details.get("reason")
                         or outcome.adapter_operation_id
                         or outcome.status.value
                     )
@@ -285,7 +294,7 @@ class HyperPodConfirmationMixin:
                 "node agent GPU client check failed: "
                 + (
                     outcome.error
-                    or str((outcome.details or {}).get("reason") or "")
+                    or str(details.get("reason") or "")
                     or outcome.status.value
                 )
             ]

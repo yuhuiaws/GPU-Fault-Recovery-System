@@ -15,11 +15,13 @@ from ._node_action_cases_1 import (
     test_remote_waiting_step_is_not_preempted,
     test_restart_workload_remote_waiting_is_not_preempted,
     test_safe_remote_waiting_is_cancelled_before_preemption,
+    test_spare_checker_rejects_a_definitively_busy_answer,
     test_unclaimed_remote_command_is_cancelled_before_preemption,
     test_warm_spare_rejects_automatic_node_recovery_before_allocation,
     test_warm_spare_requires_enabled_coordinator_before_submission,
 )
 from ._node_action_cases_2 import (
+    test_busy_spare_client_check_fails_instead_of_waiting,
     test_completed_spare_failover_keeps_old_node_safety_hold,
     test_hyperpod_preflight_credential_error_is_a_configuration_failure,
     test_hyperpod_preflight_defect_still_propagates,

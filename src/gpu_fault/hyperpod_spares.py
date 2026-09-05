@@ -422,7 +422,12 @@ class HyperPodSpareCoordinator:
         if not reservation and not self._unschedulable(kubernetes_node):
             reasons.append("unreserved spare is schedulable")
         reasons.extend(self._active_gpu_pod_reasons(node_name))
-        if gpu_client_checker is not None:
+        if gpu_client_checker is not None and not reasons:
+            # The checker may raise SpareHealthPending, which discards every
+            # reason gathered above and re-casts the candidate as "not yet
+            # decided". A spare this loop has already disqualified must stay
+            # disqualified, so only ask the agent when nothing else rejected
+            # it -- which also saves a round trip to a spare we cannot use.
             reasons.extend(gpu_client_checker(node, node_name, "candidate"))
         if self.remote_health_provider is not None:
             reasons.extend(
@@ -487,7 +492,10 @@ class HyperPodSpareCoordinator:
         if reservation:
             raise ValueError(f"node {node_name} is reserved by {reservation}")
         occupancy_reasons = self._active_gpu_pod_reasons(node_name)
-        if gpu_client_checker is not None:
+        if gpu_client_checker is not None and not occupancy_reasons:
+            # Same ordering rule as health_reasons: a spare Kubernetes already
+            # shows as occupied must not be downgraded to "pending" by the
+            # agent check raising SpareHealthPending.
             occupancy_reasons.extend(
                 gpu_client_checker(provider_node, node_name, "activation")
             )

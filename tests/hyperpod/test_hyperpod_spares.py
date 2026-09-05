@@ -522,6 +522,96 @@ def test_activation_rechecks_gpu_pods_before_uncordon():
     assert len(store.list_notifications()) == 1
 
 
+def test_occupied_candidate_is_not_downgraded_to_pending():
+    nodes = [
+        hyperpod_node("worker-1", "i-fault1"),
+        hyperpod_node("worker-2", "i-spare1", spare=True),
+    ]
+    core_nodes = {"hyperpod-i-spare1": kubernetes_node()}
+    core = FakeCore(
+        core_nodes, pod_batches=[[pod("training", requests={"nvidia.com/gpu": "1"})]]
+    )
+    service, store = coordinator(nodes, core_nodes, core=core)
+    phases = []
+
+    def checker(_node, _name, phase):
+        phases.append(phase)
+        raise SpareHealthPending("node agent GPU client check is pending")
+
+    result = service.allocate(
+        cluster_id="hp-cluster",
+        incident_id="incident-occupied-pending",
+        fault_node_ids=["worker-1"],
+        gpu_client_checker=checker,
+    )
+
+    # Kubernetes already disqualified the spare, so the agent is never asked
+    # and its pending answer can never mask the shortage.
+    assert phases == []
+    assert not result.sufficient, "expected result.sufficient to be falsy"
+    assert "active GPU resource pods exist" in result.reason
+    assert result.notification_id is not None
+    assert len(store.list_notifications()) == 1
+    assert core.patches == []
+
+
+def test_occupied_activation_is_not_downgraded_to_pending():
+    nodes = [
+        hyperpod_node("worker-1", "i-fault1"),
+        hyperpod_node("worker-2", "i-spare1", spare=True),
+    ]
+    core_nodes = {"hyperpod-i-spare1": kubernetes_node()}
+    core = FakeCore(
+        core_nodes, pod_batches=[[], [pod("racing", requests={"nvidia.com/gpu": "1"})]]
+    )
+    service, store = coordinator(nodes, core_nodes, core=core)
+    phases = []
+
+    def checker(_node, _name, phase):
+        phases.append(phase)
+        if phase == "activation":
+            raise SpareHealthPending("node agent GPU client check is pending")
+        return []
+
+    result = service.allocate(
+        cluster_id="hp-cluster",
+        incident_id="incident-race-pending",
+        fault_node_ids=["worker-1"],
+        gpu_client_checker=checker,
+    )
+
+    assert phases == ["candidate"]
+    assert not result.sufficient, "expected result.sufficient to be falsy"
+    assert "became occupied" in result.reason
+    assert len(store.list_notifications()) == 1
+    assert core.patches == []
+
+
+def test_busy_spare_rejection_reason_alerts_instead_of_waiting():
+    nodes = [
+        hyperpod_node("worker-1", "i-fault1"),
+        hyperpod_node("worker-2", "i-spare1", spare=True),
+    ]
+    core_nodes = {"hyperpod-i-spare1": kubernetes_node()}
+    service, store = coordinator(nodes, core_nodes)
+
+    result = service.allocate(
+        cluster_id="hp-cluster",
+        incident_id="incident-busy-spare",
+        fault_node_ids=["worker-1"],
+        gpu_client_checker=lambda _node, _name, _phase: [
+            "node agent GPU client check rejected the spare: "
+            "GPU compute clients are still active: GPU-abc:4242"
+        ],
+    )
+
+    assert not result.sufficient, "expected result.sufficient to be falsy"
+    assert "insufficient healthy HyperPod spares" in result.reason
+    assert "GPU compute clients are still active" in result.reason
+    assert result.notification_id is not None
+    assert len(store.list_notifications()) == 1
+
+
 def test_gpu_client_checker_runs_for_candidate_and_activation():
     nodes = [
         hyperpod_node("worker-1", "i-fault1"),

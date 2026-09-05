@@ -237,6 +237,11 @@ class NodeActionExecutionService:
             and result.error
             and "clients are still active" in result.error
             and state.verify_attempt < self.adapter.verify_max_attempts
+            # Waiting for clients to exit is the faulted node's quiesce
+            # contract. A warm-spare candidate is never quiesced by this
+            # workflow, so somebody else's live GPU work on it is a
+            # definitive "not eligible", not a transient state to outwait.
+            and not context.step.parameters.get("spare_health_check")
         ):
             return WorkflowStepOutcome.waiting(
                 operation_id=context.idempotency_key,

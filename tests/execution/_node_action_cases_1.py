@@ -32,6 +32,7 @@ from ._support import (
     WorkflowStepOutcome,
     WorkflowStepStatus,
     _preempting_successor,
+    pytest,
     sign_agent_heartbeat,
     workflow_state,
 )
@@ -687,6 +688,96 @@ def test_hyperpod_spare_checker_uses_node_agent_for_each_phase():
         node_actions.contexts[1].idempotency_key
         != node_actions.contexts[2].idempotency_key
     )
+
+
+def test_spare_checker_rejects_a_definitively_busy_answer():
+    """A WAITING that already carries the agent's answer is not pending.
+
+    Defense in depth for the same defect the node-action adapter now
+    refuses to create: whatever route produces it, an outcome carrying
+    gpu_client_quiesce_attempt means the agent answered "busy", and the
+    candidate must be rejected so the shortage alert fires. Only a
+    genuinely undecided outcome may raise SpareHealthPending.
+    """
+
+    class BusySpareAdapter(RecordingNodeActionAdapter):
+        def execute(self, context):
+            self.contexts.append(context)
+            if context.step.operation is not WorkflowOperation.VERIFY_NO_GPU_CLIENTS:
+                return WorkflowStepOutcome.succeeded(
+                    operation_id=context.idempotency_key,
+                    details={"snapshot_triggered": True},
+                )
+            return WorkflowStepOutcome.waiting(
+                operation_id=context.idempotency_key,
+                details={
+                    "gpu_client_quiesce_attempt": 1,
+                    "waiting_node": "hyperpod-i-spare",
+                    "reason": ("GPU compute clients are still active: GPU-abc:4242"),
+                },
+            )
+
+    class PendingSpareAdapter(BusySpareAdapter):
+        def execute(self, context):
+            if context.step.operation is WorkflowOperation.VERIFY_NO_GPU_CLIENTS:
+                self.contexts.append(context)
+                return WorkflowStepOutcome.waiting(
+                    operation_id=context.idempotency_key,
+                    details={
+                        "retryable_node_action": True,
+                        "reason": "command is still running",
+                    },
+                )
+            return super().execute(context)
+
+    provider_node = HyperPodNode(
+        node_logical_id="logical-spare", instance_id="i-spare", status="Running"
+    )
+
+    def checker_for(node_actions):
+        store = build_store()
+        _, workflow = workflow_state(store, [WorkflowOperation.REPLACE_NODE])
+        spares = FakeSpareCoordinator(
+            SpareAllocation(
+                applicable=True,
+                sufficient=True,
+                required=1,
+                selected_node_ids=("spare-a",),
+            )
+        )
+        adapter = HyperPodLifecycleStepAdapter(
+            FakeHyperPodLifecycle(),
+            spare_coordinator=spares,
+            node_action_adapter=node_actions,
+        )
+        step = copy_model(
+            workflow.official_steps[0],
+            execution_owner=adapter.owner,
+            parameters={"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"},
+        )
+        store.save_workflow(copy_model(workflow, official_steps=[step]))
+        execute_workflow(
+            active_workflow_executor(
+                store, [adapter], {WorkflowOperation.REPLACE_NODE}
+            ),
+            workflow.request_id,
+            isolation_verified_nodes=["node-a"],
+            confirm_cluster_name="hp-cluster",
+        )
+        return spares.calls[0]["gpu_client_checker"]
+
+    reasons = checker_for(BusySpareAdapter())(
+        provider_node, "hyperpod-i-spare", "candidate"
+    )
+    assert reasons == [
+        "node agent GPU client check rejected the spare: "
+        "GPU compute clients are still active: GPU-abc:4242"
+    ]
+
+    with pytest.raises(SpareHealthPending):
+        checker_for(PendingSpareAdapter())(
+            provider_node, "hyperpod-i-spare", "candidate"
+        )
 
 
 def test_hyperpod_replace_maps_two_fault_nodes_to_two_warm_spares():

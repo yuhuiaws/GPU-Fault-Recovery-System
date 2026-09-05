@@ -654,6 +654,68 @@ def test_retryable_node_action_failure_returns_waiting() -> None:
     assert outcome.details["retryable_node_action"] is True
 
 
+@pytest.mark.parametrize("spare_health_check", [False, True])
+def test_busy_spare_client_check_fails_instead_of_waiting(spare_health_check) -> None:
+    """Quiesce-waiting belongs to the faulted node, not to a spare candidate.
+
+    Regression: the warm-spare eligibility check dispatched
+    VERIFY_NO_GPU_CLIENTS to the spare's agent, and the agent's definitive
+    "somebody else's GPU work is running here" answer was mapped to
+    WAITING. The eligibility check then re-cast that as SpareHealthPending,
+    so REPLACE_NODE waited out its whole execution deadline, no
+    hyperpod-spare-insufficient alert was raised, and the retry counter
+    never advanced because the synthetic check borrows the parent step's
+    index -- making verify_max_attempts unreachable and replaying one
+    finished command record forever.
+    """
+
+    store = build_store()
+    incident, workflow = workflow_state(
+        store, [WorkflowOperation.VERIFY_NO_GPU_CLIENTS]
+    )
+    registry = StubFleetRegistry({"node-a": "http://node-a:9099"})
+
+    def sender(_endpoint, envelope):
+        return node_action_result(
+            envelope.command.command_id,
+            envelope.command.operation,
+            NodeActionStatus.FAILED,
+            error=("RuntimeError: GPU compute clients are still active: GPU-abc:4242"),
+        )
+
+    adapter = NodeActionWorkflowAdapter({}, "s" * 32, sender=sender, registry=registry)
+    parameters = {"compute_clients_only": True}
+    if spare_health_check:
+        parameters["spare_health_check"] = True
+    step = copy_model(
+        workflow.official_steps[0],
+        execution_owner=adapter.owner,
+        node_ids=["node-a"],
+        gpu_uuids=["GPU-a"],
+        parameters=parameters,
+    )
+    outcome = adapter.execute(
+        WorkflowStepContext(
+            workflow=copy_model(workflow, official_steps=[step]),
+            incident=incident,
+            step=step,
+            step_index=0,
+            request=WorkflowExecutionRequest(
+                expected_fencing_token=workflow.fencing_token
+            ),
+            idempotency_key="workflow/busy-clients",
+        )
+    )
+
+    assert outcome.details["gpu_client_quiesce_attempt"] == 1
+    if spare_health_check:
+        assert outcome.status is WorkflowStepStatus.FAILED
+        assert "clients are still active" in (outcome.error or "")
+    else:
+        assert outcome.status is WorkflowStepStatus.WAITING
+        assert "clients are still active" in outcome.details["reason"]
+
+
 def test_node_action_adapter_addresses_via_registry_not_static_map() -> None:
     """A stale endpoint map must not decide where actions are sent.
 
