@@ -3463,7 +3463,7 @@ test_cases:
   level: staging
   risk: destructive-warm-spare
   problem: warm spare 路径必须只使用客户预先提供并纳入监控的热备节点，故障节点被隔离但不被销毁，provider 侧无任何变更。
-  injection: 维护窗口内在运行训练任务的故障节点触发带 replacement_strategy=HEALTHY_WARM_SPARE_ONLY 的 REPLACE_NODE，且刻意保持 GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false。
+  injection: 维护窗口内在运行 8 卡训练任务的故障节点上，通过执行令牌保护的合成替换端点触发带 replacement_strategy=HEALTHY_WARM_SPARE_ONLY 的 REPLACE_NODE（不损坏硬件，报告须记录 synthetic_trigger=true），且刻意保持 GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false。
   expected:
   - 下发的 step 参数含 replacement_strategy 为 HEALTHY_WARM_SPARE_ONLY
   - 热备分配使用 local_only=True 只从 Kubernetes 标签枚举候选而不走 provider 枚举
@@ -3477,7 +3477,13 @@ test_cases:
   - HyperPod 集群节点总数与基线一致
   - 控制面 EKS 比对结果为 IDENTICAL
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 236e13dc556a3744a39d5761372a3f72c15d348c196605ef546c141c636c0e8d
+      components:
+        control_plane: e83ac83c4f778130ed7c6cdfad5e2a50fdcae944f7cbfe463a28150e44f728c7
+        executor: bdca2144e5d9880d63190fb698523dfa0d65b9e52bb05cb932d5fc755924e7ef
+        node_runtime: bc636274bb8542723ab546d4a3743227099e641dc2bc4c15e62ed4ca1cb70f36
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-003
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr003_requires_local_warm_spare_rebinding_and_notification
