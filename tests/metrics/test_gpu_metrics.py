@@ -432,6 +432,33 @@ def test_thermal_violation_escalates_after_consecutive_growth() -> None:
     assert not unchanged.findings, "expected unchanged.findings to be falsy"
 
 
+def test_thermal_violation_faster_than_the_clock_is_not_graded() -> None:
+    """A counter claiming more violation time than elapsed must not DRAIN a node.
+
+    Live H200 nodes advance the power violation counter slightly faster than
+    wall clock while completely idle. The same shape on the thermal counter
+    would reach ``DRAIN`` after two samples, evicting a healthy node on the
+    strength of a counter that cannot be holding microseconds.
+    """
+
+    service = GpuMetricsService()
+    # 16.5 s of claimed violation per 15 s interval, in microseconds.
+    per_sample = 16_500_000
+    service.ingest(batch("outrun-baseline", [sample("thermal_violation_total_us", 0)]))
+    results = [
+        service.ingest(
+            batch(
+                f"outrun-{index}",
+                [sample("thermal_violation_total_us", per_sample * index)],
+                observed_at=NOW + timedelta(seconds=15 * index),
+            )
+        )
+        for index in (1, 2, 3)
+    ]
+
+    assert [result.new_findings for result in results] == [[], [], []]
+
+
 def test_thermal_clock_throttling_composite_escalates() -> None:
     service = GpuMetricsService()
     thermal_samples = [

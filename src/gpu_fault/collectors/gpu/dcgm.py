@@ -33,6 +33,9 @@ from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
 LOGGER = logging.getLogger(__name__)
 
 DCGM_BLANK_MAGNITUDE = 9.0e18
+# A violation counter cannot accumulate more time than has elapsed. The small
+# margin absorbs the skew between the exporter's own sampling and ours.
+DUTY_CYCLE_MAX_PLAUSIBLE = 1.05
 DCGM_NANOSECOND_DURATION_FIELDS = {
     "power_violation_total_us",
     "thermal_violation_total_us",
@@ -262,6 +265,7 @@ class DcgmMetricsCollector:
         self._history: deque[GpuMetricHistoryPoint] = deque(maxlen=history_points)
         self._previous_values: OrderedDict[str, float] = OrderedDict()
         self._candidate_streaks: dict[str, int] = {}
+        self._implausible_duty_cycle_keys: set[str] = set()
         self._last_observed_at: datetime | None = None
         self._last_delivered_at: datetime | None = None
         self._last_inventory_delivered_at: datetime | None = None
@@ -437,6 +441,44 @@ class DcgmMetricsCollector:
             return 0.0
         return delta / (elapsed * 1_000_000)
 
+    def _duty_cycle_breached(
+        self,
+        sample: GpuMetricSample,
+        duty_cycle: float,
+    ) -> bool:
+        """Whether a violation-duration counter is a candidate this sample.
+
+        A duty cycle above 100% is not a hot GPU, it is a counter that does not
+        hold the duration this code assumes. Live H200 nodes report
+        ``DCGM_FI_DEV_POWER_VIOLATION`` advancing slightly *faster* than wall
+        clock on a completely idle GPU, which made the duty cycle permanently
+        breach the threshold: every GPU became a confirmed candidate about
+        `edge_confirmation_samples` samples after the collector started, and
+        because a confirmed candidate is announced once, real power throttling
+        afterwards could never produce a delivery edge again. That is exactly
+        the failure `GF-REGIONAL-COLLECT-002` exists to catch, reached through
+        the counter rather than through the summary phase. Refusing to grade an
+        impossible duty cycle keeps the noise guard without letting an unusable
+        counter mask the fault it is supposed to reveal.
+        """
+
+        if duty_cycle < self.violation_duty_cycle_threshold:
+            return False
+        if duty_cycle <= DUTY_CYCLE_MAX_PLAUSIBLE:
+            return True
+        key = self._sample_key(sample)
+        if key not in self._implausible_duty_cycle_keys:
+            self._implausible_duty_cycle_keys.add(key)
+            LOGGER.warning(
+                "ignoring %s for edge detection on %s: duty cycle %.2f exceeds "
+                "the elapsed interval, so the counter is not a duration in "
+                "microseconds on this device",
+                sample.canonical_name,
+                key,
+                duty_cycle,
+            )
+        return False
+
     def _candidate_keys(self, batch: GpuMetricBatch) -> set[str]:
         candidates: set[str] = set()
         values_by_device: dict[str, dict[str, float]] = {}
@@ -467,10 +509,7 @@ class DcgmMetricsCollector:
                 or (name == "xid_last_error" and sample.value > 0)
             )
             duty_cycle = self._duty_cycle(sample, batch.observed_at)
-            if (
-                duty_cycle is not None
-                and duty_cycle >= self.violation_duty_cycle_threshold
-            ):
+            if duty_cycle is not None and self._duty_cycle_breached(sample, duty_cycle):
                 breached = True
             if breached:
                 candidates.add(self._sample_key(sample))

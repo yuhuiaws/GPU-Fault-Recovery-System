@@ -447,44 +447,151 @@ def run_collect001(
     }
 
 
+def gpu_metrics_stamp(fixture: CollectorAcceptanceFixture) -> str | None:
+    """The GPU chain's latest delivery stamp, or ``None`` if it has never spoken.
+
+    Split by ``batch_id`` prefix for the same reason COLLECT-001 does it: the
+    status row is keyed by (cluster, node, collector) and more than one producer
+    can land on a channel.
+    """
+
+    prefix = COLLECT001_PRODUCERS["GPU_METRICS"]
+    stamps = [
+        str(record.get("observed_at"))
+        for record in collector_statuses(fixture.regional, node=fixture.node)
+        if str(record.get("collector")) == "GPU_METRICS"
+        and str(record.get("batch_id")).startswith(prefix)
+    ]
+    return max(stamps) if stamps else None
+
+
 def run_collect002(
     fixture: CollectorAcceptanceFixture,
+    case_dir: Path,
+    attempt: int,
 ) -> dict[str, Any]:
     baseline = fixture.snapshot()
     env = baseline["collector_env"]
     interval = collector_setting(env, "GPU_FAULT_METRICS_INTERVAL_SECONDS")
-    persistence = baseline.get("persistence_mode")
-    if persistence is None:
-        raise RegionalFixtureError("cannot determine baseline persistence mode")
+    summary = collector_setting(env, "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS")
+    confirmation = collector_setting(env, "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES")
+    if not baseline.get("gpu_power"):
+        raise RegionalFixtureError("host probe could not read GPU power limits")
+    run_id = f"collect002-a{attempt}"
+    # Step one of the procedure: begin from a delivery that just happened, so the
+    # next health summary is a whole summary period away. Injecting just before a
+    # summary would let the periodic delivery masquerade as the anomaly edge.
+    opening = gpu_metrics_stamp(fixture)
+    settle_deadline = time.monotonic() + summary + interval * 2
+    while True:
+        current = gpu_metrics_stamp(fixture)
+        if current is not None and current != opening:
+            break
+        if time.monotonic() >= settle_deadline:
+            raise RegionalFixtureError(
+                "GPU metrics chain did not deliver within a summary period, so "
+                "the case cannot start from a known-quiet point"
+            )
+        time.sleep(interval)
+    quiet_stamp = cast(str, current)
+    # The edge filter deliberately confirms a candidate over
+    # `confirmation` consecutive samples before it speaks, so the earliest
+    # honest bound is that many intervals plus the one the anomaly appeared in.
+    # Anything past that is the filter waiting for its summary, which is the P0.
+    allowed_latency = interval * (confirmation + 1)
+    load_seconds = interval * (confirmation + 6)
     started_at = datetime.now(timezone.utc)
-    fixture.execute("set-persistence-mode", "--enabled", "false")
+    injection = fixture.execute(
+        "throttle-gpu",
+        "--run-id",
+        run_id,
+        "--gpu-index",
+        str(int(baseline["gpu_power"][0]["index"])),
+        "--load-seconds",
+        str(load_seconds),
+        "--restore-seconds",
+        str(load_seconds + interval * 8),
+        timeout=300,
+    )
+    timeline: list[dict[str, Any]] = []
+    delivered_at: str | None = None
     try:
-        time.sleep(interval * 2)
-        records = recent_evidence(
-            fixture.regional,
-            node=fixture.node,
-            observed_after=started_at,
-        )
+        deadline = time.monotonic() + load_seconds
+        while True:
+            current = gpu_metrics_stamp(fixture)
+            timeline.append(
+                {
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                    "gpu_metrics_stamp": current,
+                }
+            )
+            write_json_atomic(case_dir / "timeline.json", {"entries": timeline})
+            if current is not None and current != quiet_stamp:
+                delivered_at = current
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(interval)
     finally:
-        fixture.execute(
-            "set-persistence-mode",
-            "--enabled",
-            "true" if persistence else "false",
+        restore = fixture.execute(
+            "restore-gpu-power-limit", "--run-id", run_id, timeout=300
         )
+    records = recent_evidence(
+        fixture.regional,
+        node=fixture.node,
+        observed_after=started_at,
+    )
     gpu = evidence_kinds(records).get("GPU_METRICS", [])
     candidate = [
         item
         for item in gpu
         if any(
             "candidate" in str(reason).lower() or "threshold" in str(reason).lower()
-            for reason in item.get("payload", {}).get("edge_filter_reasons", [])
+            for reason in item.get("payload", {}).get("edge_filter_reasons") or []
         )
     ]
-    errors = [] if candidate else ["DCGM anomaly did not bypass the edge filter"]
+    errors = []
+    latency: float | None = None
+    if delivered_at is None:
+        errors.append(
+            "GPU metrics chain delivered nothing while the GPU was pinned at a "
+            f"lowered power limit for {load_seconds}s"
+        )
+    else:
+        latency = (
+            datetime.fromisoformat(delivered_at.replace("Z", "+00:00")) - started_at
+        ).total_seconds()
+        if latency > allowed_latency:
+            errors.append(
+                f"the anomaly took {latency:.1f}s to deliver, more than the "
+                f"{allowed_latency}s that {confirmation} confirmation samples at "
+                f"a {interval}s interval allow"
+            )
+    if not candidate:
+        errors.append("no delivered evidence names a candidate or threshold reason")
+    after = fixture.snapshot()
+    defaults = {
+        item["power_default_limit_w"] for item in after.get("gpu_power") or [{}]
+    }
+    if (
+        len(defaults) != 1
+        or {item["power_limit_w"] for item in after.get("gpu_power") or [{}]}
+        != defaults
+    ):
+        errors.append("GPU power limits did not return to the driver default")
     return {
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
+        "collector_env": env,
+        "quiet_stamp": quiet_stamp,
+        "injection": injection,
+        "restore": restore,
+        "allowed_latency_seconds": allowed_latency,
+        "summary_seconds": summary,
+        "delivered_at": delivered_at,
+        "delivery_latency_seconds": latency,
         "candidate_records": candidate,
+        "gpu_power_after": after.get("gpu_power"),
     }
 
 
@@ -855,7 +962,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "nodes": list(settings.nodes),
         "mutation": {
             "GF-REGIONAL-COLLECT-001": "read evidence history for two summary cycles",
-            "GF-REGIONAL-COLLECT-002": "temporarily toggle NVIDIA persistence mode",
+            "GF-REGIONAL-COLLECT-002": (
+                "lower every GPU's enforced power limit to the driver minimum "
+                "and load one GPU against it, with a deadman restore"
+            ),
             "GF-REGIONAL-COLLECT-003": "read live GPU/EFA inventory and env",
             "GF-REGIONAL-COLLECT-005": "append one unknown non-fatal SXID and restart collector",
             "GF-REGIONAL-COLLECT-009": "inject XID54 and write exact acknowledgement annotation",
@@ -921,7 +1031,9 @@ def execute_case(
         )
         handlers = {
             "GF-REGIONAL-COLLECT-001": lambda: run_collect001(fixtures[0], case_dir),
-            "GF-REGIONAL-COLLECT-002": lambda: run_collect002(fixtures[0]),
+            "GF-REGIONAL-COLLECT-002": lambda: run_collect002(
+                fixtures[0], case_dir, attempt
+            ),
             "GF-REGIONAL-COLLECT-003": lambda: run_collect003(fixtures[0]),
             "GF-REGIONAL-COLLECT-005": lambda: run_collect005(
                 fixtures[0], case_dir, attempt

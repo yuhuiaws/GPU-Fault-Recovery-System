@@ -38,6 +38,10 @@ NVIDIA_NVML_TEMPERATURE_REFERENCE = (
 )
 SITE_CORRELATION_POLICY_VERSION = "site-dcgm-correlation/v1"
 THERMAL_CLOCK_THROTTLE_MASK = 0x20 | 0x40
+# One minute of violation per minute, plus a margin for sampling skew. A
+# violation-duration counter cannot exceed this without meaning something other
+# than microseconds spent in violation.
+MAX_PLAUSIBLE_VIOLATION_US_PER_MINUTE = 60_000_000 * 1.05
 
 
 class GpuMetricSource(StrEnum):
@@ -1433,7 +1437,7 @@ class GpuMetricsService:
             }
         return None
 
-    def _throttle_decision(self, sample, delta, _rate, _limits, previous):
+    def _throttle_decision(self, sample, delta, rate, _limits, previous):
         name = sample.canonical_name
         if (
             name == "clock_throttle_reasons"
@@ -1453,6 +1457,12 @@ class GpuMetricsService:
             "thermal_violation_total_us": self.thresholds.thermal_violation_delta_warning_us
         }
         if name not in limits or delta is None or delta < limits[name]:
+            return None
+        if rate is not None and rate > MAX_PLAUSIBLE_VIOLATION_US_PER_MINUTE:
+            # The counter claims more throttled time than has elapsed, so it is
+            # not microseconds on this device. Two consecutive breaches here
+            # escalate to DRAIN, so grading an impossible rate evicts healthy
+            # nodes on the strength of a counter nobody can interpret.
             return None
         threshold = limits[name]
         severity, reason, action = (

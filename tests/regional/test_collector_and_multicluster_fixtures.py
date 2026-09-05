@@ -92,6 +92,79 @@ def test_collector_host_probe_has_narrow_action_allowlists() -> None:
     }, collector_node_probe.ALLOWED_SERVICES
 
 
+def test_collector_probe_arms_the_power_limit_restore_before_capping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # COLLECT-002 needs a real correlated power throttle, which means leaving the
+    # node with a lowered enforced power limit for a couple of minutes. If the
+    # runner dies in that window nothing else will put the limit back, so the
+    # deadman timer has to exist before the cap is applied.
+    calls: list[list[str]] = []
+    query = (
+        "0, GPU-a, 128.0, 700.0, 200.0, 700.0, 0\n"
+        "1, GPU-b, 127.0, 700.0, 200.0, 700.0, 0\n"
+    )
+
+    def fake_run(command: list[str], *, check: bool = True, timeout: int = 180):
+        del check, timeout
+        calls.append(command)
+        stdout = (
+            query if command[0] == "nvidia-smi" and "--format" in command[2] else ""
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(collector_node_probe, "run", fake_run)
+    monkeypatch.setattr(
+        collector_node_probe, "proftester_binary", lambda: "/usr/bin/dcgmproftester13"
+    )
+
+    collector_node_probe.throttle_gpu(
+        argparse.Namespace(
+            run_id="collect002-run-a",
+            gpu_index=0,
+            load_seconds=180,
+            restore_seconds=600,
+        )
+    )
+
+    timer_index = next(
+        index
+        for index, command in enumerate(calls)
+        if command[0] == "systemd-run" and "--on-active=600s" in command
+    )
+    cap_index = next(
+        index
+        for index, command in enumerate(calls)
+        if command[:2] == ["nvidia-smi", "-pl"]
+    )
+    assert timer_index < cap_index
+    # The cap is the driver's own minimum, and the deadman restores the default.
+    assert calls[cap_index] == ["nvidia-smi", "-pl", "200"]
+    assert calls[timer_index][-3:] == ["/usr/bin/nvidia-smi", "-pl", "700"]
+
+
+def test_collector_probe_refuses_a_load_that_outlives_its_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(command: list[str], *, check: bool = True, timeout: int = 180):
+        del check, timeout
+        return subprocess.CompletedProcess(
+            command, 0, stdout="0, GPU-a, 128.0, 700.0, 200.0, 700.0, 0\n", stderr=""
+        )
+
+    monkeypatch.setattr(collector_node_probe, "run", fake_run)
+
+    with pytest.raises(collector_node_probe.ProbeError, match="deadman"):
+        collector_node_probe.throttle_gpu(
+            argparse.Namespace(
+                run_id="collect002-run-a",
+                gpu_index=0,
+                load_seconds=900,
+                restore_seconds=600,
+            )
+        )
+
+
 def test_collector_probe_only_reads_env_keys_the_installer_writes() -> None:
     # The COLLECT group's whole claim is that it judges against the values the
     # node is really running with, so every key it asks `collector.env` for has

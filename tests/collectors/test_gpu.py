@@ -280,6 +280,55 @@ def test_dcgm_edge_filter_confirms_sustained_power_throttling() -> None:
     ]
 
 
+def test_dcgm_edge_filter_ignores_a_violation_counter_that_outruns_the_clock() -> None:
+    sink = RecordingSink()
+    times = iter([NOW + timedelta(seconds=15 * index) for index in range(8)])
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        health_summary_seconds=300,
+        edge_confirmation_samples=3,
+        violation_duty_cycle_threshold=0.05,
+    )
+
+    def text(violation: int, power: float, limit: float, utilization: int) -> str:
+        return (
+            'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 70\n'
+            "DCGM_FI_DEV_POWER_VIOLATION"
+            f'{{gpu="0",UUID="GPU-a"}} {violation}\n'
+            "DCGM_FI_DEV_POWER_USAGE"
+            f'{{gpu="0",UUID="GPU-a"}} {power}\n'
+            "DCGM_FI_DEV_POWER_MGMT_LIMIT"
+            f'{{gpu="0",UUID="GPU-a"}} {limit}\n'
+            "DCGM_FI_DEV_GPU_UTIL"
+            f'{{gpu="0",UUID="GPU-a"}} {utilization}\n'
+        )
+
+    # Live H200 nodes advance DCGM_FI_DEV_POWER_VIOLATION by about 1.1e9 ns per
+    # second on a completely idle GPU: 16.5 s of claimed throttling per 15 s
+    # interval. Grading that as a 110% duty cycle latched every GPU as a
+    # confirmed candidate for the life of the collector.
+    idle = 1_080_000_000_000_000
+    for index in range(4):
+        collector.collect_text(text(idle + 16_500_000_000 * index, 128.0, 700.0, 0))
+
+    assert [payload["edge_filter_reasons"] for _path, payload in sink.requests] == [
+        ["initial-baseline"]
+    ]
+
+    # The real condition COLLECT-002 injects: power pinned at a lowered limit
+    # under full utilization. It must still produce a delivery edge.
+    for index in range(4, 7):
+        collector.collect_text(text(idle + 16_500_000_000 * index, 210.0, 200.0, 99))
+
+    reasons = [payload["edge_filter_reasons"] for _path, payload in sink.requests]
+    assert len(reasons) == 2
+    assert reasons[0] == ["initial-baseline"]
+    assert "candidate-confirmed" in reasons[1]
+
+
 def test_dcgm_violation_duty_cycle_threshold_is_validated() -> None:
     with pytest.raises(ValueError, match="duty cycle threshold"):
         DcgmMetricsCollector(

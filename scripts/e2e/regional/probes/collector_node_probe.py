@@ -28,6 +28,7 @@ ALLOWED_SERVICES = {
     "gpu-fault-kernel-collector.service",
 }
 ENV_KEYS = {
+    "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES",
     "GPU_FAULT_DCGM_EDGE_FILTER_ENABLED",
     "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS",
     # The metrics collector's sampling interval. It is *not* named
@@ -228,6 +229,169 @@ def kernel_collector_fd() -> dict[str, Any]:
     return {"pid": pid, "kmsg_fds": sorted(matches)}
 
 
+def gpu_power_state() -> list[dict[str, Any]]:
+    """Per-GPU power limits and load, the inputs of the throttle candidate.
+
+    The control plane only calls a power violation a candidate when the draw sits
+    at the enforced limit *and* utilization is high, so the acceptance run has to
+    be able to read all three from the node rather than assume them.
+    """
+
+    completed = run(
+        [
+            "nvidia-smi",
+            (
+                "--query-gpu=index,uuid,power.draw,power.limit,"
+                "power.min_limit,power.default_limit,utilization.gpu"
+            ),
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+    )
+    fields = (
+        "index",
+        "uuid",
+        "power_draw_w",
+        "power_limit_w",
+        "power_min_limit_w",
+        "power_default_limit_w",
+        "utilization_percent",
+    )
+    result = []
+    for line in completed.stdout.splitlines():
+        values = [item.strip() for item in line.split(",")]
+        if len(values) != len(fields):
+            continue
+        entry: dict[str, Any] = {}
+        for name, value in zip(fields, values, strict=True):
+            if name == "uuid":
+                entry[name] = value
+            elif name == "index":
+                entry[name] = int(value)
+            else:
+                try:
+                    entry[name] = float(value)
+                except ValueError:
+                    entry[name] = None
+        result.append(entry)
+    return result
+
+
+def proftester_binary() -> str:
+    """The DCGM load generator installed on this node.
+
+    The binary carries the DCGM major version in its name
+    (``dcgmproftester13``), so the acceptance run must discover it instead of
+    pinning a version that a driver bump will rename.
+    """
+
+    candidates = sorted(
+        (path for path in Path("/usr/bin").glob("dcgmproftester*") if path.is_file()),
+        key=lambda path: path.name,
+    )
+    if not candidates:
+        raise ProbeError("no dcgmproftester binary is installed on this node")
+    return str(candidates[-1])
+
+
+def power_limit_restore_unit(run_id: str) -> str:
+    digest = hashlib.sha256(safe_id(run_id, "run ID").encode()).hexdigest()[:16]
+    return f"gpu-fault-power-limit-restore-{digest}"
+
+
+def throttle_gpu(arguments: argparse.Namespace) -> None:
+    """Lower every GPU's power limit and load one GPU up against that limit.
+
+    This is the only non-destructive way to produce a *real* correlated power
+    throttle: the enforced limit drops to the driver's own minimum, so a tensor
+    load pins the draw at the limit under full utilization. It makes the card
+    cooler than a stock load rather than hotter, and a single ``nvidia-smi -pl``
+    restores it -- both a deadman timer and the runner's own cleanup do that.
+    """
+
+    run_id = safe_id(arguments.run_id, "run ID")
+    state = gpu_power_state()
+    if not state:
+        raise ProbeError("cannot read GPU power limits")
+    indexes = {item["index"] for item in state}
+    if arguments.gpu_index not in indexes:
+        raise ProbeError("GPU index is not present on this node")
+    minimums = [item["power_min_limit_w"] for item in state]
+    defaults = {item["power_default_limit_w"] for item in state}
+    if None in minimums or None in defaults or len(defaults) != 1:
+        raise ProbeError("node does not report a single default GPU power limit")
+    target = int(max(float(value) for value in minimums))
+    default = int(next(iter(defaults)) or 0)
+    if not 0 < target < default:
+        raise ProbeError("GPU minimum power limit is not below the default")
+    if arguments.load_seconds > arguments.restore_seconds:
+        raise ProbeError("GPU load must end before the deadman restore fires")
+    unit = power_limit_restore_unit(run_id)
+    load_unit = f"{unit}-load"
+    run(
+        [
+            "systemd-run",
+            "--unit",
+            unit,
+            f"--on-active={arguments.restore_seconds}s",
+            "/usr/bin/nvidia-smi",
+            "-pl",
+            str(default),
+        ]
+    )
+    run(["nvidia-smi", "-pl", str(target)])
+    run(
+        [
+            "systemd-run",
+            "--unit",
+            load_unit,
+            "/usr/bin/timeout",
+            str(arguments.load_seconds + 60),
+            proftester_binary(),
+            "--no-dcgm-validation",
+            "-t",
+            "1004",
+            "-d",
+            str(arguments.load_seconds),
+            "-i",
+            str(arguments.gpu_index),
+        ]
+    )
+    emit(
+        {
+            "run_id": run_id,
+            "gpu_index": arguments.gpu_index,
+            "power_limit_w": target,
+            "default_power_limit_w": default,
+            "load_seconds": arguments.load_seconds,
+            "load_unit": f"{load_unit}.service",
+            "restore_unit": f"{unit}.timer",
+            "restore_seconds": arguments.restore_seconds,
+            "gpu_power": gpu_power_state(),
+        }
+    )
+
+
+def restore_gpu_power_limit(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id, "run ID")
+    unit = power_limit_restore_unit(run_id)
+    load_unit = f"{unit}-load"
+    run(["systemctl", "stop", f"{load_unit}.service"], check=False)
+    run(["systemctl", "stop", f"{unit}.timer"], check=False)
+    for name in (f"{unit}.service", f"{load_unit}.service"):
+        run(["systemctl", "reset-failed", name], check=False)
+    state = gpu_power_state()
+    defaults = {item["power_default_limit_w"] for item in state}
+    if len(defaults) != 1 or None in defaults:
+        raise ProbeError("node does not report a single default GPU power limit")
+    default = int(next(iter(defaults)) or 0)
+    run(["nvidia-smi", "-pl", str(default)])
+    after = gpu_power_state()
+    if any(item["power_limit_w"] != float(default) for item in after):
+        raise ProbeError("GPU power limits are not back at the driver default")
+    emit({"run_id": run_id, "default_power_limit_w": default, "gpu_power": after})
+
+
 def persistence_mode() -> bool | None:
     completed = run(
         ["nvidia-smi", "--query-gpu=persistence_mode", "--format=csv,noheader"],
@@ -270,6 +434,7 @@ def snapshot(_arguments: argparse.Namespace) -> None:
             "collector_env": parse_env(),
             "services": service_snapshot(),
             "gpu_inventory": gpu_inventory(),
+            "gpu_power": gpu_power_state(),
             "persistence_mode": persistence_mode(),
             "efa_inventory": efa_inventory(),
             "kernel_collector": kernel_collector_fd(),
@@ -546,6 +711,17 @@ def parser() -> argparse.ArgumentParser:
     persistence = commands.add_parser("set-persistence-mode")
     persistence.add_argument("--enabled", choices=("true", "false"), required=True)
     persistence.set_defaults(handler=set_persistence_mode)
+
+    throttle = commands.add_parser("throttle-gpu")
+    throttle.add_argument("--run-id", required=True)
+    throttle.add_argument("--gpu-index", type=int, default=0)
+    throttle.add_argument("--load-seconds", type=int, default=180)
+    throttle.add_argument("--restore-seconds", type=int, default=600)
+    throttle.set_defaults(handler=throttle_gpu)
+
+    restore_power = commands.add_parser("restore-gpu-power-limit")
+    restore_power.add_argument("--run-id", required=True)
+    restore_power.set_defaults(handler=restore_gpu_power_limit)
 
     override = commands.add_parser("override-expected-gpu-count")
     override.add_argument("--run-id", required=True)

@@ -2,7 +2,7 @@
   "classes": {
     "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 937,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1553,
-    "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 1264,
+    "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 1270,
     "src/gpu_fault/host_health.py:NodeHealthPolicy": 984,
     "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1565,
     "src/gpu_fault/policy/engine.py:GpuFaultPolicyEngine": 1375,
@@ -15,7 +15,7 @@
     "src/gpu_fault/admin/cli.py": 1522,
     "src/gpu_fault/completion_controller.py": 1515,
     "src/gpu_fault/execution/executor.py": 1606,
-    "src/gpu_fault/gpu_metrics.py": 1536,
+    "src/gpu_fault/gpu_metrics.py": 1546,
     "src/gpu_fault/orchestration/coordinator.py": 1683,
     "src/gpu_fault/processor/coordinator.py": 1639,
     "src/gpu_fault/store/postgres/ddl.py": 1523

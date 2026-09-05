@@ -4956,23 +4956,28 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-001
   related_pytest: tests/regional/test_collector_and_multicluster_fixtures.py::test_collector_case_registries_cover_the_requested_order
 - id: GF-REGIONAL-COLLECT-002
-  title: edge filter异常沿必须在一个采集周期内投递
+  title: edge filter异常沿必须在确认样本数加一个采集周期内投递
   category: regional-collector
   level: live
   risk: live-non-destructive
   problem: >-
     稳态抑制若过度就会把真实故障一起压掉，等满health-summary周期才上报属于P0。
   injection: >-
-    等 observed_at 刚跳变后在节点上制造一个 DCGM candidate 条件， 观测下一次 observed_at 的跳变延迟。
+    先按dcgm-前缀的collector status等GPU链投递一次得到已知静默起点，再把节点上每张GPU的
+    enforced power limit降到驱动最小值并对其中一张跑dcgmproftester -t 1004施加负载，
+    形成真实的power_limit_correlation candidate；降限前先用systemd-run布好deadman还原，
+    收尾无条件还原并逐卡校验power.limit回到power.default_limit。
   expected:
-  - 异常出现后不超过两个live采集周期出现新的observed_at
-  - 投递理由包含 candidate 相关项
+  - 注入后GPU链出现新的observed_at
+  - 投递延迟不超过METRICS_INTERVAL_SECONDS乘以DCGM_EDGE_CONFIRMATION_SAMPLES加一
+  - 窗口内存在edge_filter_reasons含candidate或threshold的GPU_METRICS证据
   - 不需要等满配置的health-summary周期
+  - 收尾时每张GPU的power.limit都等于power.default_limit
   evidence:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-002
-  related_pytest: tests/regional/test_collector_and_multicluster_fixtures.py::test_collector_host_probe_has_narrow_action_allowlists
+  related_pytest: tests/regional/test_collector_and_multicluster_fixtures.py::test_collector_probe_arms_the_power_limit_restore_before_capping
 - id: GF-REGIONAL-COLLECT-003
   title: EXPECTED_GPU_COUNT 与 EXPECTED_EFA_DEVICE_COUNT 真机核对
   category: regional-collector
