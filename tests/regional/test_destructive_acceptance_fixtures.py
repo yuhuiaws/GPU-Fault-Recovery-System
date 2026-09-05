@@ -734,10 +734,17 @@ def test_destr003_requires_local_warm_spare_rebinding_and_notification(
                 {
                     "operation": "RESTART_WORKLOAD",
                     "status": "SUCCEEDED",
+                    # Nested exactly as `KubernetesWorkloadOperations` emits it.
+                    # A flat fixture made this test and the runner agree with
+                    # each other and both disagree with the product: the live
+                    # DESTR-003 run failed on three counts that were in fact
+                    # correct, one level down.
                     "details": {
-                        "source_gpu_count": 8,
-                        "target_gpu_count": 8,
-                        "restart_count": 1,
+                        "notification_context": {
+                            "source_gpu_count": 8,
+                            "target_gpu_count": 8,
+                            "restart_count": 1,
+                        }
                     },
                 },
             ],
@@ -751,6 +758,36 @@ def test_destr003_requires_local_warm_spare_rebinding_and_notification(
     ] = True
     errors = destr003.workflow_errors(state, settings)
     assert any("provider mutation" in error for error in errors), errors
+
+
+def test_destr003_rejects_a_restart_that_reported_no_gpu_counts(tmp_path: Path) -> None:
+    # The adapter emits `notification_context` only once the restart produced a
+    # restarted attempt, so its absence means the workload did not come back --
+    # which must read as one clear failure, not as three "is not 8" complaints
+    # about keys that were never there.
+    settings = _destr003_settings(tmp_path)
+    state: dict[str, Any] = {
+        "workflow": {
+            "status": "SUCCEEDED",
+            "official_steps": [
+                {"operation": operation, "parameters": {}}
+                for operation in destr003.EXPECTED_OPERATIONS
+            ],
+            "step_executions": [
+                {
+                    "operation": "RESTART_WORKLOAD",
+                    "status": "SUCCEEDED",
+                    "details": {"workloads": ["ns/pytorchjob/job"], "suspended": False},
+                }
+            ],
+        },
+        "notifications": [],
+    }
+
+    errors = destr003.workflow_errors(state, settings)
+
+    assert "RESTART_WORKLOAD reported no restart notification context" in errors, errors
+    assert not [item for item in errors if "count is not" in item], errors
 
 
 def _destr008_settings(tmp_path: Path) -> destr008.Settings:

@@ -466,12 +466,22 @@ def workflow_errors(
     restart_details = restart.get("details") or {}
     if restart.get("status") != "SUCCEEDED":
         errors.append("RESTART_WORKLOAD did not reach SUCCEEDED")
-    if restart_details.get("source_gpu_count") != 8:
-        errors.append("source GPU count is not 8")
-    if restart_details.get("target_gpu_count") != 8:
-        errors.append("target GPU count is not 8")
-    if restart_details.get("restart_count") != 1:
-        errors.append("restart count is not one")
+    # The GPU counts and the restart count live under `notification_context`,
+    # which `KubernetesWorkloadOperations` only emits once the restart actually
+    # produced a restarted attempt -- so its absence is itself the failure to
+    # report, rather than three separate "is not 8" complaints about a key that
+    # was never at the top level of `details`.
+    restart_context = restart_details.get("notification_context")
+    if not isinstance(restart_context, dict):
+        errors.append("RESTART_WORKLOAD reported no restart notification context")
+        restart_context = {}
+    else:
+        if restart_context.get("source_gpu_count") != 8:
+            errors.append("source GPU count is not 8")
+        if restart_context.get("target_gpu_count") != 8:
+            errors.append("target GPU count is not 8")
+        if restart_context.get("restart_count") != 1:
+            errors.append("restart count is not one")
     notification_id = details.get("notification_id")
     if not notification_id:
         errors.append("warm-spare success notification ID is missing")
