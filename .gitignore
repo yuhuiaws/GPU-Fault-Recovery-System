@@ -44,6 +44,7 @@ artifacts/*
 /internal-docs/
 /internal-assets/
 /docs/history/
+/docs/review/
 /docs/security/
 /docs/evidence/perf/
 /docs/架构重构批次.md
