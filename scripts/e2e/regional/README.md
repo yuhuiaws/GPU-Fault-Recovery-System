@@ -6,6 +6,47 @@ This directory owns the executable fixtures referenced by
 All regional-only executable fixtures belong here. Do not add new regional
 probes under `scripts/`, `tests/manifests/`, or the `scripts/e2e/` root.
 
+## Site values: `--site-profile`
+
+These runners must not contain site topology — account IDs, kubeconfig paths,
+EKS contexts, node names — and
+`tests/regional/test_collector_and_multicluster_fixtures.py::test_collector_promoted_scripts_contain_no_site_specific_topology`
+enforces it. Supply those values with one file the operator keeps outside the
+repository, normally in the private state directory:
+
+```yaml
+# /secure/.../acceptance-site-profile.yaml   (0600)
+arguments:            # keys are the runner's long flags, minus the leading --
+  cluster-id: ...
+  gpu-context: ...
+  node: ...           # a list here becomes repeated --node flags
+environment:          # only keys that are not already exported
+  GPU_FAULT_ACCEPTANCE_WINDOW_END: ...
+```
+
+```bash
+python scripts/e2e/regional/run_collector_acceptance.py \
+  --site-profile /secure/.../acceptance-site-profile.yaml \
+  --run-dir ... --case GF-REGIONAL-COLLECT-002 --plan
+```
+
+Precedence is the one the runners already use for environment fallbacks: an
+explicit flag on the command line wins, then the profile, then the ambient
+environment. A flag typed on the line suppresses the profile's entry for it
+entirely — including `append` flags such as `--node`, so an explicit `--node`
+replaces the profile's list rather than adding to it.
+
+`install_site_profile()` is the first statement of every runner's `main`,
+because flags such as `--maintenance-window-end` read their default from the
+environment while the parser is being built.
+`build_plan` records the profile's path and sha256 in `plan.json`, and
+`authorize_execution` refuses an `--execute` whose profile differs from the one
+`--plan` was built against — a plan names the target it was approved for.
+
+The profile is refused if it is group- or world-writable, or if it has a section
+other than `arguments`/`environment`: it decides which node a destructive case
+reboots, and a typo in a section name would silently drop every value in it.
+
 ## Live and staging drivers
 
 - `run_regional_boot_guard_cases.sh`

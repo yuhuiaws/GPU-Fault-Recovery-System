@@ -10,9 +10,29 @@ from typing import Any
 if __package__:
     from .acceptance_runner_common import write_json_atomic
     from .acceptance_scope import current_acceptance_scope
+    from .site_profile import (
+        SITE_PROFILE_ENV,
+        applied_site_profile,
+        install_site_profile,
+    )
 else:
     from acceptance_runner_common import write_json_atomic
     from acceptance_scope import current_acceptance_scope
+    from site_profile import (
+        SITE_PROFILE_ENV,
+        applied_site_profile,
+        install_site_profile,
+    )
+
+# Re-exported so the runners keep one import site for the live-driver contract:
+# every one of them already imports `add_live_arguments` from here.
+__all__ = [
+    "add_live_arguments",
+    "authorize_execution",
+    "build_plan",
+    "environment_snapshot",
+    "install_site_profile",
+]
 
 
 COMMON_ENVIRONMENT_KEYS = (
@@ -32,6 +52,14 @@ def add_live_arguments(
 ) -> None:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--attempt", type=int, default=1)
+    parser.add_argument(
+        "--site-profile",
+        default=os.getenv(SITE_PROFILE_ENV, ""),
+        help=(
+            "private file naming this site's clusters, contexts and nodes; "
+            "explicit flags on this command line override it"
+        ),
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true")
     mode.add_argument("--execute", action="store_true")
@@ -85,6 +113,7 @@ def build_plan(
         "attempt": attempt,
         "confirmation": confirmation,
         "environment": environment or environment_snapshot(),
+        "site_profile": applied_site_profile(),
         **scope.plan_fields(),
         "details": details,
         "mutation_performed": False,
@@ -118,6 +147,10 @@ def authorize_execution(
         "attempt": arguments.attempt,
         "confirmation": confirmation,
         "environment": environment or environment_snapshot(),
+        # A plan built against one site profile must not be executed under
+        # another. Absent on both sides when no profile is in use, so plans
+        # written before profiles existed still compare equal.
+        "site_profile": applied_site_profile(),
         **scope.plan_fields(),
     }
     for key, value in expected.items():

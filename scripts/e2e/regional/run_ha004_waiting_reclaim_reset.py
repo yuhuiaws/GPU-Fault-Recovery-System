@@ -29,6 +29,7 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     authorize_execution,
     build_plan,
+    install_site_profile,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
@@ -789,6 +790,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    install_site_profile()
     arguments = parser().parse_args()
     os.umask(0o077)
     install_abort_signals()

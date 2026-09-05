@@ -30,7 +30,12 @@ if __package__:
 else:
     from acceptance_runner_common import write_json_atomic
     from host_probe_fixture import HostProbeFixture, HostProbeSettings
-    from live_driver_guard import add_live_arguments, authorize_execution, build_plan
+    from live_driver_guard import (
+        add_live_arguments,
+        authorize_execution,
+        build_plan,
+        install_site_profile,
+    )
     from regional_live_fixture import (
         install_abort_signals,
         run_case_main,
@@ -1049,6 +1054,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    install_site_profile()
     arguments = parser().parse_args()
     os.umask(0o077)
     install_abort_signals()

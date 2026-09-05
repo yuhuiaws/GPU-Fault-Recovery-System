@@ -14,6 +14,7 @@ if __package__:
     from .acceptance_scope import current_acceptance_scope, scoped_case_evidence
     from .live_driver_guard import (
         add_live_arguments,
+        install_site_profile,
     )
     from .live_driver_guard import (
         authorize_execution as guard_authorize_execution,
@@ -22,6 +23,7 @@ else:
     from acceptance_scope import current_acceptance_scope, scoped_case_evidence
     from live_driver_guard import (
         add_live_arguments,
+        install_site_profile,
     )
     from live_driver_guard import (
         authorize_execution as guard_authorize_execution,
@@ -755,6 +757,7 @@ def execute(run_dir: Path, attempt: int, confirmation: str) -> int:
 
 
 def main() -> int:
+    install_site_profile()
     parser = argparse.ArgumentParser()
     add_live_arguments(parser, confirmation=CONFIRMATION)
     parser.add_argument("--cpu-kubeconfig", default="")

@@ -37,6 +37,7 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     authorize_execution,
     build_plan,
+    install_site_profile,
 )
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
@@ -180,6 +181,7 @@ def validate_case_arguments(
 
 
 def main() -> int:
+    install_site_profile()
     arguments = parser().parse_args()
     os.umask(0o077)
     site = IdentitySite(arguments.site)

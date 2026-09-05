@@ -357,6 +357,10 @@ def test_collector_promoted_scripts_contain_no_site_specific_topology() -> None:
         ROOT / "scripts/e2e/regional/run_collect017_efa_plugin.py",
         ROOT / "scripts/e2e/regional/run_iso006_cluster_offline.py",
         ROOT / "scripts/e2e/regional/run_e2e002_multicluster_fault.py",
+        # The site profile exists to hold exactly these values, so it is the
+        # first place they would leak back into the repository.
+        ROOT / "scripts/e2e/regional/site_profile.py",
+        ROOT / "scripts/e2e/regional/live_driver_guard.py",
     )
 
     for path in paths:

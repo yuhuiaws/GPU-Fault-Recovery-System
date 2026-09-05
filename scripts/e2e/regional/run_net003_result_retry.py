@@ -17,6 +17,7 @@ if __package__:
         add_live_arguments,
         authorize_execution,
         build_plan,
+        install_site_profile,
     )
 else:
     from acceptance_scope import scoped_case_evidence
@@ -24,6 +25,7 @@ else:
         add_live_arguments,
         authorize_execution,
         build_plan,
+        install_site_profile,
     )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -931,6 +933,7 @@ def run_case(
 
 
 def main() -> int:
+    install_site_profile()
     parser = argparse.ArgumentParser()
     add_live_arguments(parser, confirmation=CONFIRMATION)
     args = parser.parse_args()

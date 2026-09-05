@@ -18,6 +18,7 @@ if __package__:
         authorize_execution,
         build_plan,
         environment_snapshot,
+        install_site_profile,
     )
 else:
     import run_ha005_rollout_continuity as BASE
@@ -27,6 +28,7 @@ else:
         authorize_execution,
         build_plan,
         environment_snapshot,
+        install_site_profile,
     )
 
 CASE_ID = "GF-REGIONAL-HA-009"
@@ -894,6 +896,7 @@ def run_case(
 
 
 def main() -> int:
+    install_site_profile()
     parser = argparse.ArgumentParser(
         description="Run the HA-009 managed Aurora credential rotation case."
     )

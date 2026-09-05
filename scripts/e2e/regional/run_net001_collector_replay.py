@@ -22,6 +22,7 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     authorize_execution,
     build_plan,
+    install_site_profile,
 )
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     predecessor_path,
@@ -952,6 +953,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    install_site_profile()
     args = parse_args()
     os.umask(0o077)
     predecessor_id, path = predecessor_path(
