@@ -4936,14 +4936,22 @@ test_cases:
   problem: >-
     DCGM_EDGE_FILTER_ENABLED与HOST_EDGE_FILTER_ENABLED可能写在env文件里却没被真正读取，稳态上报仍按采集周期全量投递。
   injection: >-
-    从live collector.env读取采集间隔与health-summary周期，连续观测至少两个summary周期，使用/v1/evidence记录observed_at与edge_filter_reasons，不做任何注入。
+    从live collector.env读取采集间隔与health-summary周期，按采集周期轮询collector_status并按batch_id前缀区分节点主机采集器与控制面allocatable采集器，观测两个summary周期，不做任何注入。
   expected:
-  - 相邻observed_at差值聚集在配置的summary周期正负一个采集周期，不连续按采集周期投递
-  - 实际投递数符合观测窗口除以summary周期的计算值
+  - 两条采集链在窗口内各投递至少两次，且次数不超过窗口除以summary周期加一，远低于窗口除以采集周期
+  - 最大相邻间隔不小于summary周期减两个采集周期，即确实观测到一整个summary窗口没有投递
+  - 窗口内不存在只有health-summary理由的evidence记录
+  - 窗口内不存在带recovered资源前缀理由的evidence记录，因为开窗时各资源都健康
   - 判据只用 observed_at 的变化，不用 latest 的当前值
   - 判据不依赖采集器日志
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: b3358f5d5ca710cea7bdbeb781645e96d64fdecef8d0a1cf483a6b4c96b91a1f
+      components:
+        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
+        executor: 066a8a68385b9d64674dfe631108729baccd27004be8927c583da0f28254c456
+        node_runtime: 0ad979a72fb775eea4a8cc69a8b4c4a8bb4d42e9453f92acd91b81069cdc36d3
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-001
   related_pytest: tests/regional/test_collector_and_multicluster_fixtures.py::test_collector_case_registries_cover_the_requested_order
