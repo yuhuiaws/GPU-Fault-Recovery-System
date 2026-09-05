@@ -249,13 +249,21 @@ def test_declare_refuses_to_overwrite_an_unreleased_record(tmp_path: Path) -> No
 
 
 def test_helper_is_read_only_by_default() -> None:
-    arguments = helper.parser().parse_args(["--node", "node-spare"])
+    arguments = helper.parser().parse_args(["--spare-node", "node-spare"])
 
     assert arguments.declare is False
     assert arguments.release is False
     assert arguments.confirm == ""
     assert helper.DECLARE_CONFIRMATION == "DECLARE_WARM_SPARE_CORDON"
     assert helper.RELEASE_CONFIRMATION == "RELEASE_WARM_SPARE_UNCORDON"
+
+
+def test_the_spare_is_never_named_by_the_shared_node_flag() -> None:
+    # A site profile's `node` is the collector cases' target, a different machine
+    # from the spare. If this helper accepted --node it would inherit that value
+    # from the profile and cordon the wrong node.
+    with pytest.raises(SystemExit):
+        helper.parser().parse_args(["--node", "node-spare"])
 
 
 def test_helper_carries_no_site_topology() -> None:

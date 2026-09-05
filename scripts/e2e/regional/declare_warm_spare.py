@@ -87,7 +87,7 @@ class Settings:
 def configure(arguments: argparse.Namespace) -> Settings:
     return Settings(
         node=required(
-            arguments.node or os.getenv("GPU_FAULT_SPARE_NODE", ""),
+            arguments.spare_node or os.getenv("GPU_FAULT_SPARE_NODE", ""),
             "spare node",
         ),
         fault_node=arguments.fault_node.strip()
@@ -283,7 +283,13 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--cluster-id", default="")
     value.add_argument("--region", default="")
     value.add_argument("--hyperpod-cluster", default="")
-    value.add_argument("--node", default="", help="the node to declare as a spare")
+    # --spare-node, not --node: this shares a site profile with the collector
+    # cases, whose --node is an entirely different machine. A helper that cordons
+    # whichever node happened to be in the profile under the shorter name is a
+    # way to take the wrong node out of schedulable capacity.
+    value.add_argument(
+        "--spare-node", default="", help="the node to declare as a spare"
+    )
     value.add_argument(
         "--fault-node",
         default="",
