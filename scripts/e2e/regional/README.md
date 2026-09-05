@@ -266,6 +266,22 @@ in order to catch a site with a stray label elsewhere, and a case that created
 its own spare would satisfy that assertion by construction even if
 `HyperPodSpareCoordinator.allocate(local_only=True)` had drifted away from it.
 
+`synthetic_replacement_route.py` opens and closes DESTR-003's other precondition:
+`POST /v1/admin/test/node-replacement` answers 404 unless
+`GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS=true` on every API replica, and the
+shipped regional manifest never sets it. `--open` records the Deployment's env
+first, then sets the variable and refuses unless the rollout reached every ready
+replica; `--close` restores what the baseline recorded, so a variable that was
+absent goes back to absent rather than to `false`. The variable name is compiled
+in — this is a test-window switch for one route, not a way to set arbitrary env
+on a live control plane.
+
+The route fabricates a `REPLACE_NODE` finding for any node in the cluster. It is
+protected by the workflow execution token, which is why a bounded window is
+acceptable at all, but leaving it open is a standing way to have a healthy
+machine quarantined and failed over — hence the recorded baseline rather than a
+hand `kubectl set env` and a note to remember.
+
 ## Manifests
 
 All regional E2E Kubernetes inputs live under `manifests/`, split into
