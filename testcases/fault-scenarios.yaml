@@ -3126,10 +3126,16 @@ test_cases:
   - Aurora连接类OperationalError不把workflow写成BLOCKED
   - processor内部重放的新鲜5xx响应释放lane并重试而不是标记COMPLETED
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 010a9ba4e45b69c9add73e50429b645aeddfdf88122ce11d4cab0b36778df771
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-003
-  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_ha003_waits_for_reset_claim_before_failover
+  related_pytest: tests/regional/test_ha_reset_window_fixtures.py::test_ha003_waits_for_reset_claim_before_failover
 - id: GF-REGIONAL-HA-004
   title: 双 executor 副本对 WAITING command 重领时不产生重复物理动作
   category: regional-destructive-acceptance
@@ -3144,10 +3150,16 @@ test_cases:
   - 显式in-flight锁测试必须在并发执行模型下通过，不能依赖ASGI handler恰好同步
   - lease续租保持有效；强制续租失败时仍由command_id幂等防止重复物理动作
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 0232e1f4b4d49c142da3502e898789d1575e6ccbe87788e541aa717d9dfb589a
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-004
-  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_ha004_reclaim_timeline_keeps_one_command_id
+  related_pytest: tests/regional/test_ha_reset_window_fixtures.py::test_ha004_reclaim_timeline_keeps_one_command_id
 - id: GF-REGIONAL-HA-005
   title: 控制面滚动升级期间数据面只观察到可重试错误
   category: regional-high-availability
@@ -3612,7 +3624,13 @@ test_cases:
   - incident 上恰好只有被注入 finding 自己的 marker-<event_id>，且它指向真正落库的 incident
   - 已被部分分配的热备节点回滚到 AVAILABLE，不留下半分配状态
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: e79a81ac4ccfe9aff6b4e35602346de6991ed126587e1f57e25a6d65035b6c97
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-008
   related_pytest: tests/regional/test_destr008_shortage_matrix.py::test_notification_semantics_distinguish_no_pool_from_shortage
@@ -3639,9 +3657,9 @@ test_cases:
     verified:
       case_digest: be158abe7d58d89bb7897ba493be3ea858040f7174bbede839e5aad0f8c37044
       components:
-        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
-        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
-        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-009
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr009_workflow_contract_scales_to_expected_gpu_count

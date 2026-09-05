@@ -35,6 +35,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    WaitingEvidence,
     install_abort_signals,
     predecessor_evidence,
     required,
@@ -342,6 +343,7 @@ def command_timeline(
     observed_after: datetime,
     timeout_seconds: int,
     kill_owner: Callable[[str], None],
+    evidence: WaitingEvidence | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     deadline = time.monotonic() + timeout_seconds
     timeline = []
@@ -353,7 +355,10 @@ def command_timeline(
             node=settings.node,
             marker=marker,
             observed_after=observed_after,
+            queue_attempts=1,
         )
+        if evidence is not None:
+            evidence.observe(state)
         commands = [
             item
             for item in state.get("commands") or []
@@ -370,10 +375,21 @@ def command_timeline(
             "lease_expires_at": command.get("lease_expires_at"),
         }
         timeline.append(sample)
-        if command.get("status") == "LEASED" and not killed:
-            first_owner = str(command.get("lease_owner") or "")
+        # The reset is in flight from the first claim until the Node Agent's
+        # result lands, but the remote command is LEASED only for each claim
+        # round trip: the executor hands the action to the Node Agent, reports
+        # WAITING, releases the lease and re-claims on its next cycle. A
+        # sampler that needs seconds per store read therefore sees WAITING,
+        # with the dispatching replica in `last_lease_owner`. That replica is
+        # the one to remove: with it gone, only the other replica can claim
+        # the same command ID, which is exactly the reclaim this case must
+        # observe (2026-09-05: a 45s reset never showed LEASED to the sampler).
+        if command.get("status") in {"LEASED", "WAITING"} and not killed:
+            first_owner = str(
+                command.get("lease_owner") or command.get("last_lease_owner") or ""
+            )
             if not first_owner:
-                raise RegionalFixtureError("LEASED command has no owner")
+                raise RegionalFixtureError("in-flight command has no owner")
             kill_owner(first_owner)
             killed = True
         if killed and command.get("status") in {"SUCCEEDED", "FAILED"}:
@@ -430,7 +446,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "HA-003 predecessor evidence is not PASS",
             "target node or executor Deployment baseline drifts",
             "rollback watchdog cannot be armed",
-            "RESET_GPU command is not observed LEASED",
+            "RESET_GPU command is not observed in flight (LEASED or WAITING) "
+            "with an identifiable executor owner",
             "a second executor never reclaims the same command ID",
             "Node Agent ledger/journal show more than one physical reset",
             "Deployment, node ownership or services cannot be restored",
@@ -463,6 +480,35 @@ def verify_plan_identity(
     }
     if current != planned:
         raise RegionalFixtureError(f"HA-004 plan drifted: {planned} != {current}")
+
+
+def lease_reissue_observed(
+    timeline: list[dict[str, Any]],
+    *,
+    first_owner: str,
+) -> bool:
+    """Whether the timeline proves a second lease was granted after the kill.
+
+    A lease token is readable only while the command is LEASED; the store
+    clears it the moment the executor reports WAITING or a terminal result. A
+    sampler that sees the command through WAITING therefore usually sees no
+    token at all, although every claim mints a fresh one. Two distinct tokens
+    remain the direct proof. Failing that, the same command carrying an
+    executor identity other than the one that was removed is the same fact
+    seen from the owner side: a claim never keeps the previous token.
+    """
+
+    tokens = {
+        str(item.get("lease_token")) for item in timeline if item.get("lease_token")
+    }
+    if len(tokens) >= 2:
+        return True
+    owners = {
+        str(item.get("lease_owner") or item.get("last_lease_owner") or "")
+        for item in timeline
+        if item.get("lease_owner") or item.get("last_lease_owner")
+    }
+    return bool(first_owner) and any(owner != first_owner for owner in owners)
 
 
 def evaluate_reclaim(
@@ -503,8 +549,11 @@ def evaluate_reclaim(
         errors.append("remote command ID changed across reclaim")
     if len(owners) < 2:
         errors.append("a second executor did not reclaim the command")
-    if len(tokens) < 2:
-        errors.append("lease token did not change across reclaim")
+    if not lease_reissue_observed(
+        timeline,
+        first_owner=str(state.get("ha004_first_owner") or ""),
+    ):
+        errors.append("no second lease was observed after the first owner was removed")
     after = host.execute(
         "snapshot",
         "--since-epoch",
@@ -706,22 +755,34 @@ def execute_case(
                 timeout=180,
             )
 
-        state, timeline = command_timeline(
+        # The command timeline samples the store through the whole reset, so
+        # it also has to keep the WAITING records of the steps that finish
+        # before `wait_for_workflow` starts polling.
+        waiting_evidence = WaitingEvidence()
+        claimed_state, timeline = command_timeline(
             regional,
             settings,
             marker=marker,
             observed_after=injected_at,
             timeout_seconds=900,
             kill_owner=kill,
+            evidence=waiting_evidence,
         )
         write_json_atomic(case_dir / "command-timeline.json", {"entries": timeline})
-        state = regional.wait_for_workflow(
-            node=settings.node,
-            marker=marker,
-            observed_after=injected_at,
-            case_dir=case_dir,
-            timeout_seconds=1200,
+        state = waiting_evidence.merged_into(
+            regional.wait_for_workflow(
+                node=settings.node,
+                marker=marker,
+                observed_after=injected_at,
+                case_dir=case_dir,
+                timeout_seconds=1200,
+            )
         )
+        # The workflow wait re-reads the store, so the facts only the command
+        # timeline knew -- which replica was removed, which ones held the
+        # command -- have to be carried across explicitly.
+        state["ha004_first_owner"] = claimed_state.get("ha004_first_owner")
+        state["ha004_owners"] = claimed_state.get("ha004_owners")
         write_json_atomic(case_dir / "workflow-state.json", state)
         incident_id = str((state.get("incident") or {}).get("incident_id") or "")
         errors, evidence = evaluate_reclaim(

@@ -18,8 +18,6 @@ from scripts.e2e.regional import run_destr003_warm_spare_failover as destr003
 from scripts.e2e.regional import run_destr008_warm_spare_shortage as destr008
 from scripts.e2e.regional import run_destr009_workload_restart as destr009
 from scripts.e2e.regional import run_destr012_managed_recovery_guard as destr012
-from scripts.e2e.regional import run_ha003_aurora_failover_reset as ha003
-from scripts.e2e.regional import run_ha004_waiting_reclaim_reset as ha004
 from scripts.e2e.regional import run_workload_acceptance as workload_acceptance
 from scripts.e2e.regional.acceptance_scope import (
     EXECUTION_SCOPE_ENV,
@@ -1207,112 +1205,6 @@ def test_runtime_identity_verification_records_and_rejects_drift(
         )
 
     assert json.loads(evidence.read_text(encoding="utf-8")) == current
-
-
-def _ha003_settings(tmp_path: Path) -> ha003.Settings:
-    return ha003.Settings(
-        regional=_regional(tmp_path).settings,
-        node="node-a",
-        host_probe_image="registry.example/probe@sha256:" + "a" * 64,
-        rds_cluster_id="aurora-a",
-        predecessor_path=tmp_path / "predecessor.json",
-    )
-
-
-def test_ha003_waits_for_reset_claim_before_failover(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    regional = _regional(tmp_path)
-    snapshots = iter(
-        [
-            {"commands": [{"step": {"operation": "RESET_GPU"}, "status": "PENDING"}]},
-            {
-                "commands": [
-                    {
-                        "command_id": "remote-a",
-                        "step": {"operation": "RESET_GPU"},
-                        "status": "LEASED",
-                    }
-                ]
-            },
-        ]
-    )
-    monkeypatch.setattr(regional, "store_snapshot", lambda **_kwargs: next(snapshots))
-    state, command = ha003.wait_reset_claim(
-        regional,
-        _ha003_settings(tmp_path),
-        marker="marker-a",
-        observed_after=datetime.now(timezone.utc),
-        timeout_seconds=5,
-    )
-
-    assert command["command_id"] == "remote-a", command
-    assert state["commands"][0]["status"] == "LEASED", state
-
-
-def _ha004_settings(tmp_path: Path) -> ha004.Settings:
-    return ha004.Settings(
-        regional=_regional(tmp_path).settings,
-        node="node-a",
-        host_probe_image="registry.example/probe@sha256:" + "a" * 64,
-        predecessor_path=tmp_path / "predecessor.json",
-    )
-
-
-def test_ha004_reclaim_timeline_keeps_one_command_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    regional = _regional(tmp_path)
-    snapshots = iter(
-        [
-            {
-                "commands": [
-                    {
-                        "command_id": "remote-a",
-                        "status": "LEASED",
-                        "lease_owner": "cluster/pod-a",
-                        "lease_token": "token-a",
-                        "step": {"operation": "RESET_GPU"},
-                    }
-                ]
-            },
-            {
-                "commands": [
-                    {
-                        "command_id": "remote-a",
-                        "status": "LEASED",
-                        "lease_owner": "cluster/pod-b",
-                        "lease_token": "token-b",
-                        "step": {"operation": "RESET_GPU"},
-                    }
-                ]
-            },
-            {
-                "commands": [
-                    {
-                        "command_id": "remote-a",
-                        "status": "SUCCEEDED",
-                        "last_lease_owner": "cluster/pod-b",
-                        "step": {"operation": "RESET_GPU"},
-                    }
-                ]
-            },
-        ]
-    )
-    killed: list[str] = []
-    monkeypatch.setattr(regional, "store_snapshot", lambda **_kwargs: next(snapshots))
-    state, timeline = ha004.command_timeline(
-        regional,
-        _ha004_settings(tmp_path),
-        marker="marker-a",
-        observed_after=datetime.now(timezone.utc),
-        timeout_seconds=5,
-        kill_owner=killed.append,
-    )
-
-    assert killed == ["cluster/pod-a"], killed
-    assert {item["command_id"] for item in timeline} == {"remote-a"}, timeline
-    assert state["commands"][0]["status"] == "SUCCEEDED", state
 
 
 def test_destr013_manifest_audit_keeps_provider_replace_disabled() -> None:

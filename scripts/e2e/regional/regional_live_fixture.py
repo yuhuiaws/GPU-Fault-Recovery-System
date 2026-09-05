@@ -276,6 +276,57 @@ def waiting_step_executions(workflow: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+class WaitingEvidence:
+    """WAITING step executions seen across every store read a case makes.
+
+    The workflow keeps one execution record per step, so a step's WAITING
+    record -- the one carrying `mutation_submitted_by_control_plane: False` --
+    exists only until the step succeeds. `wait_for_workflow` accumulates those
+    while it polls, but a case that does its own polling first (waiting for a
+    lease to appear, timing a failover) reaches `wait_for_workflow` after the
+    early steps have already been replaced by their SUCCEEDED record, and the
+    evidence check then reports them missing although they happened. Feed
+    every snapshot through `observe` and `merged_into` the final state before
+    evaluating it.
+    """
+
+    def __init__(self) -> None:
+        self._seen: dict[tuple[int, str], dict[str, Any]] = {}
+
+    def observe(self, snapshot: dict[str, Any]) -> None:
+        for execution in waiting_step_executions(snapshot.get("workflow") or {}):
+            step_index = execution.get("step_index")
+            self._seen[
+                (
+                    step_index if isinstance(step_index, int) else -1,
+                    str(execution.get("operation") or ""),
+                )
+            ] = execution
+
+    def evidence(self) -> list[dict[str, Any]]:
+        return [self._seen[key] for key in sorted(self._seen)]
+
+    def merged_into(self, state: dict[str, Any]) -> dict[str, Any]:
+        """The state with its own WAITING evidence plus everything seen here.
+
+        The later observation wins for a step seen twice; both carry the same
+        control-plane details, so the choice only affects timestamps.
+        """
+
+        combined = WaitingEvidence()
+        combined.observe({"workflow": {"step_executions": self.evidence()}})
+        combined.observe(
+            {
+                "workflow": {
+                    "step_executions": (
+                        state.get("observed_waiting_step_executions") or []
+                    )
+                }
+            }
+        )
+        return {**state, "observed_waiting_step_executions": combined.evidence()}
+
+
 @dataclass(frozen=True)
 class RegionalLiveSettings:
     cpu_kubeconfig: Path
@@ -411,7 +462,12 @@ def drained_queue_stats(store, attempts=20, pause=0.5):
     job_id,
     attempt_id,
     hyperpod_cluster,
+    queue_attempts_text,
 ) = sys.argv[1:]
+# A preflight wants the drained backlog reading above; a wait loop wants the
+# cheapest read that still reports the queue, because the drain sampling alone
+# is ~10s per call and a step's WAITING record can come and go inside that.
+queue_attempts = int(queue_attempts_text or 20)
 store = ApplicationContext.from_environment().store
 observed_after = (
     datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
@@ -539,7 +595,7 @@ print(json.dumps({
         submission.model_dump(mode="json")
         if submission is not None else None
     ),
-    "queue": drained_queue_stats(store),
+    "queue": drained_queue_stats(store, attempts=queue_attempts),
     "remote_commands": store.remote_command_stats(),
 }, sort_keys=True, default=str))
 """
@@ -772,7 +828,17 @@ class RegionalLiveFixture:
         job_id: str = "",
         attempt_id: str = "",
         hyperpod_cluster: str = "",
+        queue_attempts: int = 20,
     ) -> dict[str, Any]:
+        """One store read; `queue_attempts=1` for wait loops, the default for gates.
+
+        The default drains the processor queue for up to ~10s so a preflight
+        does not refuse a healthy cluster on in-flight rows. A loop that polls
+        the workflow does not need that reading and cannot afford it: with it,
+        samples land 15s apart and a ten-second step's WAITING record is never
+        seen.
+        """
+
         result = self.cpu_python(
             STORE_PROBE,
             self.settings.cluster_id,
@@ -782,6 +848,7 @@ class RegionalLiveFixture:
             job_id,
             attempt_id,
             hyperpod_cluster,
+            str(queue_attempts),
         )
         if not result.get("release_id"):
             result["release_id"] = self.release_id()
@@ -937,6 +1004,7 @@ class RegionalLiveFixture:
                 job_id=job_id,
                 attempt_id=attempt_id,
                 hyperpod_cluster=hyperpod_cluster,
+                queue_attempts=1,
             )
             workflow = last.get("workflow") or {}
             current_waiting = waiting_step_executions(workflow)

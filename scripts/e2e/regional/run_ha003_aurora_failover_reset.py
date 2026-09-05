@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -34,6 +34,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
+    WaitingEvidence,
     install_abort_signals,
     predecessor_evidence,
     required,
@@ -153,6 +154,7 @@ def wait_rds_failover(
     *,
     previous_writer: str,
     timeout_seconds: int = 900,
+    observe: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     last: dict[str, Any] = {}
@@ -164,6 +166,11 @@ def wait_rds_failover(
             and last.get("writer") != previous_writer
         ):
             return last
+        # The workflow keeps moving while Aurora fails over; whoever wants the
+        # WAITING records of the steps that finish in this window has to read
+        # them now.
+        if observe is not None:
+            observe()
         time.sleep(5)
     raise RegionalFixtureError(f"Aurora failover did not converge: {last}")
 
@@ -264,6 +271,7 @@ def wait_reset_claim(
     marker: str,
     observed_after: datetime,
     timeout_seconds: int = 120,
+    evidence: WaitingEvidence | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     deadline = time.monotonic() + timeout_seconds
     last: dict[str, Any] = {}
@@ -272,13 +280,29 @@ def wait_reset_claim(
             node=settings.node,
             marker=marker,
             observed_after=observed_after,
+            queue_attempts=1,
         )
+        if evidence is not None:
+            evidence.observe(last)
         commands = [
             item
             for item in last.get("commands") or []
             if item.get("step", {}).get("operation") == "RESET_GPU"
         ]
-        if len(commands) == 1 and commands[0].get("status") == "LEASED":
+        # The reset is in flight on the node from the first claim until the
+        # Node Agent's result lands. The remote command is LEASED only for the
+        # claim round trip: the executor hands the action to the Node Agent,
+        # which answers "pending", and the executor reports WAITING and lets
+        # the command be re-claimed on its next cycle. On 2026-09-05 a 45s
+        # RESET_GPU never showed LEASED to a sampler that needs ~6s per store
+        # read, so the window has to be recognised by either non-terminal
+        # state. What must still be true afterwards -- one physical reset,
+        # one SUCCEEDED execution, one terminal status, the same command
+        # identity -- is judged unchanged below.
+        if len(commands) == 1 and commands[0].get("status") in {
+            "LEASED",
+            "WAITING",
+        }:
             return last, cast(dict[str, Any], commands[0])
         if commands and commands[0].get("status") in {
             "SUCCEEDED",
@@ -288,7 +312,7 @@ def wait_reset_claim(
                 "RESET_GPU completed before the Aurora failover window was captured"
             )
         time.sleep(0.25)
-    raise RegionalFixtureError(f"RESET_GPU was not observed LEASED: {last}")
+    raise RegionalFixtureError(f"RESET_GPU was not observed in flight: {last}")
 
 
 def control_logs(
@@ -343,8 +367,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "target_node": settings.node,
         "rds_cluster_id": settings.rds_cluster_id,
         "mutation": (
-            "execute one real GPU reset and call RDS failover-db-cluster after "
-            "the RESET_GPU remote command is observed LEASED"
+            "execute one real GPU reset and call RDS failover-db-cluster while "
+            "the RESET_GPU remote command is observed in flight (LEASED, or "
+            "WAITING on the Node Agent) and before it reaches a terminal state"
         ),
         "preflight_identity": {
             "release_id": preflight["release_id"],
@@ -359,7 +384,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "DESTR-008 predecessor evidence is not PASS",
             "target node is not Ready, cordoned and idle",
             "Aurora has no available reader or writer identity drifts",
-            "RESET_GPU is not observed in LEASED state",
+            "RESET_GPU is not observed in flight (LEASED or WAITING) before it "
+            "reaches a terminal state",
             "Aurora failover does not change writer and return available",
             "workflow becomes BLOCKED or reset ledger/journal count differs from one",
             "cleanup cannot restore quiesce state or node ownership",
@@ -604,11 +630,17 @@ def execute_case(
             target_bdf,
         )
         write_json_atomic(case_dir / "injection.json", injection)
+        # Every store read from injection onwards feeds the WAITING evidence:
+        # the steps before and during the failover finish long before
+        # `wait_for_workflow` starts polling, and their WAITING records are
+        # gone by then.
+        waiting_evidence = WaitingEvidence()
         claimed_state, command = wait_reset_claim(
             regional,
             settings,
             marker=marker,
             observed_after=injected_at,
+            evidence=waiting_evidence,
         )
         write_json_atomic(case_dir / "reset-claimed.json", claimed_state)
         failover_requested_at = datetime.now(timezone.utc)
@@ -622,14 +654,24 @@ def execute_case(
         rds_after = wait_rds_failover(
             settings,
             previous_writer=str(preflight["rds"]["writer"]),
+            observe=lambda: waiting_evidence.observe(
+                regional.store_snapshot(
+                    node=settings.node,
+                    marker=marker,
+                    observed_after=injected_at,
+                    queue_attempts=1,
+                )
+            ),
         )
         write_json_atomic(case_dir / "rds-after.json", rds_after)
-        state = regional.wait_for_workflow(
-            node=settings.node,
-            marker=marker,
-            observed_after=injected_at,
-            case_dir=case_dir,
-            timeout_seconds=1800,
+        state = waiting_evidence.merged_into(
+            regional.wait_for_workflow(
+                node=settings.node,
+                marker=marker,
+                observed_after=injected_at,
+                case_dir=case_dir,
+                timeout_seconds=1800,
+            )
         )
         write_json_atomic(case_dir / "workflow-state.json", state)
         incident_id = str((state.get("incident") or {}).get("incident_id") or "")
