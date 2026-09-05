@@ -235,7 +235,18 @@ def test_an_unchanged_wait_is_not_narrated_twice(
     assert len(lines) == 1, lines
 
 
-def test_polling_backs_off_while_nothing_moves(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_polling_keeps_a_constant_cadence_while_nothing_moves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each poll is one `get nodes`; five seconds is cheap and stays five seconds.
+
+    Backing off to fifteen seconds bought nothing on a quiet wave and cost
+    every install up to ten idle seconds after it had already finished: four
+    live waves measured 48.4s each with the final fifteen-second slot provably
+    empty. The cap therefore equals the base interval, and the cadence must
+    not drift.
+    """
+
     pending = [_node("node-a", state="Running", aligned=False)]
     slept = _wait_agents(
         monkeypatch,
@@ -245,18 +256,17 @@ def test_polling_backs_off_while_nothing_moves(monkeypatch: pytest.MonkeyPatch) 
         [_node("node-a", state="Succeeded", aligned=True)],
     )
 
-    assert slept == [5.0, 7.5, 11.25], slept
+    assert slept == [5.0, 5.0, 5.0], slept
 
 
-def test_polling_speeds_back_up_when_a_node_finishes(
+def test_polling_stays_prompt_when_a_node_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A finished node means the next one starts now, not in fifteen seconds.
 
-    The backoff exists so a quiet fifteen-minute window does not re-list every
-    node every five seconds, but held across a wave it also spends the tail of
-    every install asleep -- on a fleet rolled one node at a time that is the
-    difference between polling granularity and real convergence time.
+    Progress on one node used to reset an escalated interval; with the
+    interval already at its floor, the guarantee that matters is that nothing
+    about a partially converged wave slows the poll down.
     """
 
     both_pending = [
@@ -279,7 +289,7 @@ def test_polling_speeds_back_up_when_a_node_finishes(
         ],
     )
 
-    assert slept == [5.0, 7.5, 5.0, 7.5], slept
+    assert slept == [5.0, 5.0, 5.0, 5.0], slept
 
 
 def _fleet_release(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[str]]:

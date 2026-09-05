@@ -738,6 +738,9 @@ def test_dns_gate_executes_the_strict_runtime_sequence(monkeypatch) -> None:
                         ]
                     }
                 )
+            if "route53 list-resource-record-sets" in command:
+                events.append("cname-read")
+                return json.dumps({"ResourceRecordSets": []})
             if "route53 change-resource-record-sets" in command:
                 events.append("cname-upsert")
                 return json.dumps({"ChangeInfo": {"Id": "/change/C123"}})
@@ -783,10 +786,87 @@ def test_dns_gate_executes_the_strict_runtime_sequence(monkeypatch) -> None:
         "expected-targets",
         "target-group",
         "targets-healthy",
+        "cname-read",
         "cname-upsert",
         "route53-wait",
         "route53-insync",
     ]
+
+
+def _cname_record(value: str, *, ttl: int = 60) -> dict:
+    return {
+        "Name": "api.site.gpu-fault.internal.",
+        "Type": "CNAME",
+        "TTL": ttl,
+        "ResourceRecords": [{"Value": value}],
+    }
+
+
+def test_dns_upsert_is_skipped_only_when_the_live_cname_already_matches() -> None:
+    """A no-op UPSERT still costs Route53's propagation wait, so read first."""
+
+    dns_module = DNS_MODULE.load()
+    raw_hostname = "internal-nlb.elb.us-east-1.amazonaws.com"
+
+    def release_with(record: dict | None) -> tuple[SimpleNamespace, list[str]]:
+        events: list[str] = []
+
+        class DnsRunner:
+            dry_run = False
+
+            def run(self, arguments, **_kwargs):
+                command = " ".join(arguments)
+                if "route53 list-resource-record-sets" in command:
+                    events.append("cname-read")
+                    return json.dumps(
+                        {"ResourceRecordSets": [record] if record else []}
+                    )
+                if "route53 change-resource-record-sets" in command:
+                    events.append("cname-upsert")
+                    return json.dumps({"ChangeInfo": {"Id": "/change/C123"}})
+                if "route53 wait resource-record-sets-changed" in command:
+                    events.append("route53-wait")
+                    return ""
+                if "route53 get-change" in command:
+                    events.append("route53-insync")
+                    return json.dumps({"ChangeInfo": {"Status": "INSYNC"}})
+                raise AssertionError(f"unexpected command: {command}")
+
+        release = SimpleNamespace(
+            runner=DnsRunner(),
+            config=SimpleNamespace(
+                aws_region=REGION,
+                dns=SimpleNamespace(
+                    hosted_zone_id="Z123", hostname="api.site.gpu-fault.internal"
+                ),
+            ),
+        )
+        return release, events
+
+    # Identical record, fully qualified the way Route53 returns it: no change.
+    release, events = release_with(_cname_record(raw_hostname + "."))
+    dns_module.ensure_cname_points_at(release, raw_hostname)
+    assert events == ["cname-read"], events
+
+    # Anything the release owns that differs still goes through the full
+    # submit-and-wait sequence: the value, the TTL, or a missing record.
+    for record in (
+        _cname_record("previous-nlb.elb.us-east-1.amazonaws.com"),
+        _cname_record(raw_hostname, ttl=300),
+        None,
+    ):
+        release, events = release_with(record)
+        dns_module.ensure_cname_points_at(release, raw_hostname)
+        assert events == [
+            "cname-read",
+            "cname-upsert",
+            "route53-wait",
+            "route53-insync",
+        ], record
+
+    assert not dns_module.cname_already_points_at(
+        {**_cname_record(raw_hostname), "Type": "A"}, raw_hostname
+    ), "a non-CNAME record must never satisfy the CNAME check"
 
 
 ROLLOUT_TARGET = SimpleNamespace(cluster_id="gpu-a")

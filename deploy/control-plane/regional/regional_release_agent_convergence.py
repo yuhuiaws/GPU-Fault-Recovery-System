@@ -15,7 +15,11 @@ from regional_release_probes import probe_source
 from regional_release_runtime_identity import exec_cpu_ingress_probe
 
 WAIT_AGENTS_POLL_SECONDS = 5
-WAIT_AGENTS_MAX_POLL_SECONDS = 15
+# Each poll is one `get nodes` (~2s on the live cluster), cheap enough to keep
+# at a constant 5s. Backing off to 15s bought nothing and cost every wave up to
+# 10s of idle after the installer had already finished: four waves measured
+# 48.4s each with the last 15s slot provably empty.
+WAIT_AGENTS_MAX_POLL_SECONDS = 5
 WAIT_AGENTS_POLL_BACKOFF = 1.5
 WAIT_AGENTS_NARRATION_SECONDS = 30.0
 WAIT_AGENTS_NARRATED_NODES = 5

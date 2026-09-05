@@ -246,77 +246,59 @@ append_csv_value() {
     fi
 }
 
-if kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-    gpu-fault-release-metadata >/dev/null 2>&1; then
+# One read serves every field below. The fourteen values must describe the
+# same ConfigMap revision anyway, and fourteen separate jsonpath round trips
+# cost ~20s per run on the live control plane (this script runs twice per
+# release), so the document is fetched once and the fields taken locally.
+release_metadata_value() {
+    jq -r --arg key "$1" '.data[$key] // ""' <<<"${RELEASE_METADATA_JSON}"
+}
+
+if RELEASE_METADATA_JSON="$(
+    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
+        gpu-fault-release-metadata -o json 2>/dev/null
+)"; then
     CURRENT_REQUIRED_AGENT_ARTIFACT_SHA256="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.required-agent-artifact-sha256}'
+        release_metadata_value required-agent-artifact-sha256
     )"
     CURRENT_REQUIRED_AGENT_PROTOCOL_VERSION="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.required-agent-protocol-version}'
+        release_metadata_value required-agent-protocol-version
     )"
     CURRENT_REQUIRED_AGENT_CONFIG_DIGEST="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.required-agent-config-digest}'
+        release_metadata_value required-agent-config-digest
     )"
     CURRENT_COMPATIBLE_AGENT_ARTIFACT_SHA256S="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.compatible-agent-artifact-sha256s}'
+        release_metadata_value compatible-agent-artifact-sha256s
     )"
     CURRENT_REQUIRED_AGENT_COMPATIBILITY_DIGEST="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.required-agent-compatibility-digest}'
+        release_metadata_value required-agent-compatibility-digest
     )"
     CURRENT_COMPATIBLE_AGENT_COMPATIBILITY_DIGESTS="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.compatible-agent-compatibility-digests}'
+        release_metadata_value compatible-agent-compatibility-digests
     )"
     CURRENT_COMPATIBLE_AGENT_PROTOCOL_VERSIONS="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.compatible-agent-protocol-versions}'
+        release_metadata_value compatible-agent-protocol-versions
     )"
     CURRENT_COMPATIBLE_AGENT_CONFIG_DIGESTS="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.compatible-agent-config-digests}'
+        release_metadata_value compatible-agent-config-digests
     )"
     CURRENT_REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.required-regional-executor-protocol-version}'
+        release_metadata_value required-regional-executor-protocol-version
     )"
     CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_PROTOCOL_VERSIONS="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.compatible-regional-executor-protocol-versions}'
+        release_metadata_value compatible-regional-executor-protocol-versions
     )"
     CURRENT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.required-regional-executor-artifact-sha256}'
+        release_metadata_value required-regional-executor-artifact-sha256
     )"
     CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_ARTIFACT_SHA256S="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.compatible-regional-executor-artifact-sha256s}'
+        release_metadata_value compatible-regional-executor-artifact-sha256s
     )"
     CURRENT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.required-regional-executor-compatibility-digest}'
+        release_metadata_value required-regional-executor-compatibility-digest
     )"
     CURRENT_COMPATIBLE_REGIONAL_EXECUTOR_COMPATIBILITY_DIGESTS="$(
-        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            gpu-fault-release-metadata \
-            -o jsonpath='{.data.compatible-regional-executor-compatibility-digests}'
+        release_metadata_value compatible-regional-executor-compatibility-digests
     )"
     CURRENT_REQUIRED_AGENT_PROTOCOL_VERSION="${CURRENT_REQUIRED_AGENT_PROTOCOL_VERSION:-${GPU_FAULT_EXISTING_AGENT_PROTOCOL_VERSION:-3}}"
     if [[ "${FINALIZE_AGENT_PIN}" != "true" ]]; then
@@ -561,7 +543,7 @@ fi
 PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}" python3 -m \
     gpu_fault.config_cli validate "${GENERATED}"
 
-apply_manifest() {
+render_manifest_for_apply() {
     local manifest="$1"
     render_manifest "${manifest}" |
         if [[ "${LEGACY_COMPONENT_PINS}" == "true" ]]; then
@@ -569,7 +551,12 @@ apply_manifest() {
                 "${SCRIPT_DIR}/filter_legacy_release_env.py"
         else
             cat
-        fi |
+        fi
+}
+
+apply_manifest() {
+    local manifest="$1"
+    render_manifest_for_apply "${manifest}" |
         kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply -f -
 }
 
@@ -846,13 +833,24 @@ fi
 }
 
 if [[ "${PRESERVE_ROLE_CONFIG_MAPS}" != "true" ]]; then
+    # The selected role ConfigMaps go to the API server as one multi-document
+    # stream: eighteen separate kubectl processes cost ~15s per run, one prints
+    # the same per-object result lines. Rendered into a file first so an empty
+    # selection applies nothing instead of failing on an empty stream.
+    ROLE_CONFIG_STREAM="$(mktemp)"
     for config in "${GENERATED}"/gpu-fault-*-config-*.yaml; do
         name="$(basename "${config}" .yaml)"
         role="$(manifest_role "${name}" || true)"
         if [[ -n "${role}" ]] && role_selected "${role}"; then
-            apply_manifest "${name}"
+            render_manifest_for_apply "${name}" >>"${ROLE_CONFIG_STREAM}"
+            printf '\n---\n' >>"${ROLE_CONFIG_STREAM}"
         fi
     done
+    if [[ -s "${ROLE_CONFIG_STREAM}" ]]; then
+        kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply \
+            -f "${ROLE_CONFIG_STREAM}"
+    fi
+    rm -f "${ROLE_CONFIG_STREAM}"
 fi
 
 apply_spool_role() {

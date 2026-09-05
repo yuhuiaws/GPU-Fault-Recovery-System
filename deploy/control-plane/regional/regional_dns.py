@@ -426,7 +426,39 @@ def submit_dns_change(
         )
 
 
-def _upsert_cname_and_wait(release: Any, hostname: str) -> None:
+def cname_already_points_at(record: dict[str, Any] | None, hostname: str) -> bool:
+    """True when the live CNAME already carries exactly what the release wants.
+
+    Route53 hands the name and the value back fully qualified, so both sides are
+    compared without the trailing dot; the TTL has to match too, because the
+    release owns it.
+    """
+
+    if not record or str(record.get("Type") or "") != "CNAME":
+        return False
+    if str(record.get("TTL") or "") != "60":
+        return False
+    values = [
+        normalized_record_name(str(item.get("Value") or ""))
+        for item in record.get("ResourceRecords") or []
+        if isinstance(item, dict)
+    ]
+    return values == [normalized_record_name(hostname)]
+
+
+def ensure_cname_points_at(release: Any, hostname: str) -> None:
+    # A release whose NLB kept its hostname would otherwise submit a no-op
+    # UPSERT and then sit through Route53's 30s change-propagation wait for a
+    # record that never changed. Read first; only a real difference is worth
+    # the change batch. Rollback is unaffected: it restores a different value,
+    # so it always submits.
+    current = read_dns_record(
+        release,
+        hosted_zone_id=str(release.config.dns.hosted_zone_id),
+        hostname=str(release.config.dns.hostname),
+    )
+    if cname_already_points_at(current, hostname):
+        return
     submit_dns_change(
         release,
         [
@@ -451,7 +483,7 @@ def ensure_control_plane_dns(release: Any) -> None:
     load_balancer_arn = _wait_nlb_active(release, hostname)
     _wait_raw_nlb_dns(release, hostname)
     _wait_targets_healthy(release, load_balancer_arn)
-    _upsert_cname_and_wait(release, hostname)
+    ensure_cname_points_at(release, hostname)
 
 
 def apply_control_plane_nlb(release: Any) -> None:

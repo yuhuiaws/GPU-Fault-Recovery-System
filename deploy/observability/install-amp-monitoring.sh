@@ -100,6 +100,35 @@ wait_for_amp_definition() {
     done
 }
 
+# AMP hands a definition back exactly as stored, so comparing the decoded bytes
+# with the file about to be written says whether a put would change anything.
+# An identical, ACTIVE definition is left alone: the put itself is cheap, but
+# AMP then revalidates asynchronously and the release would wait out
+# UPDATING -> ACTIVE for a definition that did not change.
+amp_definition_is_current() {
+    local file="$1" root="$2"
+    shift 2
+    local document status
+    document="$("$@" --output json 2>/dev/null)" || return 1
+    status="$(
+        jq -r --arg root "${root}" '.[$root].status.statusCode // ""' \
+            <<<"${document}"
+    )"
+    [[ "${status}" == "ACTIVE" ]] || return 1
+    cmp -s "${file}" <(
+        jq -r --arg root "${root}" '.[$root].data // ""' <<<"${document}" |
+            base64 -d
+    )
+}
+
+# Per-step wall clock on stderr, next to the release narration, so a slow run
+# of this installer can be attributed without re-running it under a profiler.
+STEP_STARTED_AT="${SECONDS}"
+step_done() {
+    printf 'amp-step-elapsed %ss %s\n' "$((SECONDS - STEP_STARTED_AT))" "$1" >&2
+    STEP_STARTED_AT="${SECONDS}"
+}
+
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 WORKSPACE_ARN="arn:aws:aps:${AWS_REGION}:${ACCOUNT_ID}:workspace/${AMP_WORKSPACE_ID}"
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${IAM_ROLE_NAME}"
@@ -138,6 +167,7 @@ aws iam put-role-policy \
     --role-name "${IAM_ROLE_NAME}" \
     --policy-name gpu-fault-amp-remote-write \
     --policy-document "file://${TMP_DIR}/amp-write-policy.json"
+step_done iam-role
 
 SNS_TOPIC_ARN="$(
     aws sns create-topic \
@@ -178,6 +208,7 @@ aws sns set-topic-attributes \
     --topic-arn "${SNS_TOPIC_ARN}" \
     --attribute-name Policy \
     --attribute-value "${SNS_POLICY}"
+step_done sns-topic
 
 sed \
     -e "s/REPLACE_WITH_AMP_WORKSPACE_ID/${AMP_WORKSPACE_ID}/g" \
@@ -196,8 +227,22 @@ if [[ "${GPU_FAULT_ENABLE_ADOT}" != "true" \
         "s/^  replicas: 1$/  replicas: ${CURRENT_ADOT_REPLICAS}/" \
         "${TMP_DIR}/adot-control-plane.yaml"
 fi
-kubectl --kubeconfig "${CPU_KUBECONFIG}" \
-    apply -f "${TMP_DIR}/adot-control-plane.yaml"
+ADOT_APPLY_OUTPUT="$(
+    kubectl --kubeconfig "${CPU_KUBECONFIG}" \
+        apply -f "${TMP_DIR}/adot-control-plane.yaml"
+)"
+printf '%s\n' "${ADOT_APPLY_OUTPUT}"
+# The collector reads its ConfigMap once at start, so a changed ConfigMap or
+# Deployment needs a restart. An unchanged pair does not, and restarting it
+# anyway costs the old Pod's termination grace on every release. Pod identity
+# changes below can still flip this back on.
+ADOT_RESTART_REQUIRED="true"
+if [[ "$(
+    grep -Ec '^(configmap/gpu-fault-adot|deployment\.apps/gpu-fault-adot) unchanged$' \
+        <<<"${ADOT_APPLY_OUTPUT}" || true
+)" == "2" ]]; then
+    ADOT_RESTART_REQUIRED="false"
+fi
 if [[ "${GPU_FAULT_ENABLE_ADOT}" != "true" \
     && -n "${CURRENT_ADOT_REPLICAS}" \
     && "${CURRENT_ADOT_REPLICAS}" != "0" ]]; then
@@ -205,6 +250,7 @@ if [[ "${GPU_FAULT_ENABLE_ADOT}" != "true" \
         -n "${NAMESPACE}" scale deployment/gpu-fault-adot \
         --replicas="${CURRENT_ADOT_REPLICAS}"
 fi
+step_done adot-apply
 
 ASSOCIATION_ID="$(
     aws eks list-pod-identity-associations \
@@ -222,15 +268,40 @@ if [[ "${ASSOCIATION_ID}" == "None" ]]; then
         --namespace "${NAMESPACE}" \
         --service-account "${SERVICE_ACCOUNT}" \
         --role-arn "${ROLE_ARN}" >/dev/null
+    # Fresh credentials reach the Pod only through a restart.
+    ADOT_RESTART_REQUIRED="true"
 else
-    aws eks update-pod-identity-association \
-        --region "${AWS_REGION}" \
-        --cluster-name "${CPU_EKS_CLUSTER}" \
-        --association-id "${ASSOCIATION_ID}" \
-        --role-arn "${ROLE_ARN}" >/dev/null
+    CURRENT_ASSOCIATION_ROLE_ARN="$(
+        aws eks describe-pod-identity-association \
+            --region "${AWS_REGION}" \
+            --cluster-name "${CPU_EKS_CLUSTER}" \
+            --association-id "${ASSOCIATION_ID}" \
+            --query 'association.roleArn' \
+            --output text
+    )"
+    if [[ "${CURRENT_ASSOCIATION_ROLE_ARN}" != "${ROLE_ARN}" ]]; then
+        aws eks update-pod-identity-association \
+            --region "${AWS_REGION}" \
+            --cluster-name "${CPU_EKS_CLUSTER}" \
+            --association-id "${ASSOCIATION_ID}" \
+            --role-arn "${ROLE_ARN}" >/dev/null
+        ADOT_RESTART_REQUIRED="true"
+    fi
 fi
+step_done pod-identity
 
-if aws amp describe-rule-groups-namespace \
+RULES_DEFINITION_CURRENT="false"
+if amp_definition_is_current \
+    "${REPO_DIR}/deploy/observability/amp-rules.yaml" \
+    ruleGroupsNamespace \
+    aws amp describe-rule-groups-namespace \
+    --region "${AWS_REGION}" \
+    --workspace-id "${AMP_WORKSPACE_ID}" \
+    --name "${RULE_NAMESPACE}"; then
+    RULES_DEFINITION_CURRENT="true"
+    printf 'AMP rule namespace %s already matches the checked-in rules.\n' \
+        "${RULE_NAMESPACE}"
+elif aws amp describe-rule-groups-namespace \
     --region "${AWS_REGION}" \
     --workspace-id "${AMP_WORKSPACE_ID}" \
     --name "${RULE_NAMESPACE}" >/dev/null 2>&1; then
@@ -248,20 +319,32 @@ else
         --data "fileb://${REPO_DIR}/deploy/observability/amp-rules.yaml" \
         >/dev/null
 fi
-wait_for_amp_definition \
-    "AMP rule namespace ${RULE_NAMESPACE}" \
-    'ruleGroupsNamespace.status.statusCode' \
-    aws amp describe-rule-groups-namespace \
-    --region "${AWS_REGION}" \
-    --workspace-id "${AMP_WORKSPACE_ID}" \
-    --name "${RULE_NAMESPACE}"
+if [[ "${RULES_DEFINITION_CURRENT}" != "true" ]]; then
+    wait_for_amp_definition \
+        "AMP rule namespace ${RULE_NAMESPACE}" \
+        'ruleGroupsNamespace.status.statusCode' \
+        aws amp describe-rule-groups-namespace \
+        --region "${AWS_REGION}" \
+        --workspace-id "${AMP_WORKSPACE_ID}" \
+        --name "${RULE_NAMESPACE}"
+fi
+step_done amp-rules
 
 sed \
     -e "s#REPLACE_WITH_SNS_TOPIC_ARN#${SNS_TOPIC_ARN}#g" \
     -e "s/REPLACE_WITH_AWS_REGION/${AWS_REGION}/g" \
     "${REPO_DIR}/deploy/observability/amp-alertmanager.yaml" \
     >"${TMP_DIR}/amp-alertmanager.yaml"
-if aws amp describe-alert-manager-definition \
+ALERTMANAGER_DEFINITION_CURRENT="false"
+if amp_definition_is_current \
+    "${TMP_DIR}/amp-alertmanager.yaml" \
+    alertManagerDefinition \
+    aws amp describe-alert-manager-definition \
+    --region "${AWS_REGION}" \
+    --workspace-id "${AMP_WORKSPACE_ID}"; then
+    ALERTMANAGER_DEFINITION_CURRENT="true"
+    printf 'AMP Alertmanager definition already matches the rendered one.\n'
+elif aws amp describe-alert-manager-definition \
     --region "${AWS_REGION}" \
     --workspace-id "${AMP_WORKSPACE_ID}" >/dev/null 2>&1; then
     aws amp put-alert-manager-definition \
@@ -276,12 +359,15 @@ else
         --data "fileb://${TMP_DIR}/amp-alertmanager.yaml" \
         >/dev/null
 fi
-wait_for_amp_definition \
-    "AMP Alertmanager definition" \
-    'alertManagerDefinition.status.statusCode' \
-    aws amp describe-alert-manager-definition \
-    --region "${AWS_REGION}" \
-    --workspace-id "${AMP_WORKSPACE_ID}"
+if [[ "${ALERTMANAGER_DEFINITION_CURRENT}" != "true" ]]; then
+    wait_for_amp_definition \
+        "AMP Alertmanager definition" \
+        'alertManagerDefinition.status.statusCode' \
+        aws amp describe-alert-manager-definition \
+        --region "${AWS_REGION}" \
+        --workspace-id "${AMP_WORKSPACE_ID}"
+fi
+step_done amp-alertmanager
 
 if [[ "${GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION}" == "true" ]]; then
     if [[ -n "${GPU_FAULT_ALERT_EMAIL:-}" ]]; then
@@ -339,13 +425,28 @@ if [[ "${GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION}" == "true" ]]; then
 fi
 
 if [[ "${GPU_FAULT_ENABLE_ADOT}" == "true" ]]; then
+    step_done sns-subscription-check
     kubectl --kubeconfig "${CPU_KUBECONFIG}" \
         -n "${NAMESPACE}" scale deployment/gpu-fault-adot --replicas=1
-    kubectl --kubeconfig "${CPU_KUBECONFIG}" \
-        -n "${NAMESPACE}" rollout restart deployment/gpu-fault-adot
+    # Restart when something the Pod reads changed, or when a Deployment that
+    # was already meant to be running is not fully available (a restart is the
+    # repair for that). Scaling up from zero creates a fresh Pod by itself.
+    if [[ "${ADOT_RESTART_REQUIRED}" == "true" ]]; then
+        kubectl --kubeconfig "${CPU_KUBECONFIG}" \
+            -n "${NAMESPACE}" rollout restart deployment/gpu-fault-adot
+    elif [[ "${CURRENT_ADOT_REPLICAS:-0}" != "0" ]] &&
+        ! kubectl --kubeconfig "${CPU_KUBECONFIG}" \
+            -n "${NAMESPACE}" rollout status deployment/gpu-fault-adot \
+            --timeout=5s >/dev/null 2>&1; then
+        kubectl --kubeconfig "${CPU_KUBECONFIG}" \
+            -n "${NAMESPACE}" rollout restart deployment/gpu-fault-adot
+    else
+        printf 'ADOT collector unchanged and available; restart skipped.\n'
+    fi
     kubectl --kubeconfig "${CPU_KUBECONFIG}" \
         -n "${NAMESPACE}" rollout status deployment/gpu-fault-adot \
         --timeout=300s
+    step_done adot-rollout
 else
     # Do not scale down an already-enabled collector: an operator who turned
     # it on should not have it silently disabled by re-running the installer.
@@ -365,3 +466,4 @@ PYTHONDONTWRITEBYTECODE=1 python3 \
     --kubeconfig "${CPU_KUBECONFIG}" \
     --namespace "${NAMESPACE}" \
     --release-id "${GPU_FAULT_RELEASE_ID:-observability}"
+step_done installed-resource-registry

@@ -516,7 +516,11 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert "rollout restart" in script
     assert 'PRESERVE_ROLE_CONFIG_MAPS}" != "true"' in script
     assert 'name="$(basename "${config}" .yaml)"' in script
-    assert 'apply_manifest "${name}"' in script
+    # The selected role ConfigMaps travel as one multi-document apply; the
+    # legacy-pin filter still runs per manifest on the way in.
+    assert 'render_manifest_for_apply "${name}" >>"${ROLE_CONFIG_STREAM}"' in script
+    assert 'apply \\\n            -f "${ROLE_CONFIG_STREAM}"' in script
+    assert 'if [[ -s "${ROLE_CONFIG_STREAM}" ]]' in script
     ingress_role = script.index("apply_ingress_role()")
     ingress_exists = script.index(
         "get deployment \\\n        gpu-fault-api-ha >/dev/null 2>&1", ingress_role

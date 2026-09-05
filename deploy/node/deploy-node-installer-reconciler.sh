@@ -344,9 +344,36 @@ if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
         kubectl_context apply --dry-run=server \
             -f "${JOB_MANIFEST}" >/dev/null
     done
+    # One read-only preflight Job per node, all at once. The Jobs are
+    # independent: each is pinned to its node and named after node + artifact,
+    # and none of them mutates the host. Each one spends most of its ~35s on
+    # Pod scheduling and its own 2s poll, so a serial loop cost the fleet size
+    # times that for no ordering benefit (measured 148.8s for four nodes).
+    # Output is captured per node so the verdict below stays the last line of
+    # stdout, which the caller parses.
+    PREFLIGHT_OUTPUT_DIR="$(mktemp -d)"
+    trap 'rm -f "${MANIFEST}" "${CONFIG_MAP_MANIFEST}" "${RECONCILER_MANIFEST}" "${JOB_MANIFEST}"; rm -rf "${PREFLIGHT_OUTPUT_DIR}"' EXIT
+    preflight_pids=()
     for node in "${NODES[@]}"; do
-        render_installer_job "${node}" --preflight-only
+        render_installer_job "${node}" --preflight-only \
+            >"${PREFLIGHT_OUTPUT_DIR}/${node}.log" 2>&1 &
+        preflight_pids+=("$!")
     done
+    preflight_failed=()
+    for index in "${!NODES[@]}"; do
+        if ! wait "${preflight_pids[${index}]}"; then
+            preflight_failed+=("${NODES[${index}]}")
+        fi
+    done
+    for node in "${NODES[@]}"; do
+        printf -- '--- node preflight %s ---\n' "${node}"
+        cat "${PREFLIGHT_OUTPUT_DIR}/${node}.log"
+    done
+    if ((${#preflight_failed[@]})); then
+        printf 'ERROR: node preflight failed on: %s\n' \
+            "${preflight_failed[*]}" >&2
+        exit 1
+    fi
     printf '{"node_count":%d,"status":"PASSED","template_config_map":"%s"}\n' \
         "${#NODES[@]}" "${TEMPLATE_CONFIG_MAP}"
     exit 0
