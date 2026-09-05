@@ -4974,7 +4974,13 @@ test_cases:
   - 不需要等满配置的health-summary周期
   - 收尾时每张GPU的power.limit都等于power.default_limit
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: cf11d9c66d5bc1d7c3173716d0cde8fe79d11b94554260cd3d3dd575da4df99b
+      components:
+        control_plane: e83ac83c4f778130ed7c6cdfad5e2a50fdcae944f7cbfe463a28150e44f728c7
+        executor: bdca2144e5d9880d63190fb698523dfa0d65b9e52bb05cb932d5fc755924e7ef
+        node_runtime: bc636274bb8542723ab546d4a3743227099e641dc2bc4c15e62ed4ca1cb70f36
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-002
   related_pytest: tests/regional/test_collector_and_multicluster_fixtures.py::test_collector_probe_arms_the_power_limit_restore_before_capping
