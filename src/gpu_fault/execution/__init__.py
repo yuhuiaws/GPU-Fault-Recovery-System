@@ -2,6 +2,10 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    "managed_recovery_timeout_seconds": (
+        "gpu_fault.execution.config",
+        "managed_recovery_timeout_seconds",
+    ),
     "ProductionExecutorConfig": (
         "gpu_fault.execution.config",
         "ProductionExecutorConfig",

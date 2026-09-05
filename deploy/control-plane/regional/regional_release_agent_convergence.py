@@ -10,12 +10,68 @@ from regional_release_config import (
     ReleaseError,
 )
 from regional_release_gpu_rollout import agents_converged, gpu_node_items
+from regional_release_narration import narrate_step
 from regional_release_probes import probe_source
 from regional_release_runtime_identity import exec_cpu_ingress_probe
 
 WAIT_AGENTS_POLL_SECONDS = 5
 WAIT_AGENTS_MAX_POLL_SECONDS = 15
 WAIT_AGENTS_POLL_BACKOFF = 1.5
+WAIT_AGENTS_NARRATION_SECONDS = 30.0
+WAIT_AGENTS_NARRATED_NODES = 5
+
+
+def installer_node_states(
+    nodes: list[dict[str, Any]],
+    target: ClusterTarget,
+    artifact_sha: str,
+    *,
+    bundle_sha: str | None,
+    template_sha: str | None,
+    config_digest: str | None,
+    node_names: frozenset[str] | None,
+) -> dict[str, str]:
+    """The installer state of every node this wait is still waiting for.
+
+    Keyed by node name, valued by the node's `installer-state` annotation, so
+    the narration says whether the Reconciler has even created the Job yet
+    (`<none>`), is running it (`Running`), or has finished one that does not
+    carry this release's identity (`Succeeded`, on the previous artifact). The
+    membership decision is delegated to `agents_converged` one node at a time
+    rather than re-implemented, so a node this reports as pending is exactly a
+    node the gate is not satisfied by.
+    """
+
+    pending: dict[str, str] = {}
+    for item in nodes:
+        metadata = item.get("metadata") or {}
+        name = str(metadata.get("name") or "")
+        if not name or (node_names is not None and name not in node_names):
+            continue
+        if agents_converged(
+            [item],
+            target,
+            artifact_sha,
+            bundle_sha=bundle_sha,
+            template_sha=template_sha,
+            config_digest=config_digest,
+            require_node_uid=True,
+            node_names=frozenset({name}),
+        ):
+            continue
+        pending[name] = str(
+            (metadata.get("annotations") or {}).get("gpu-fault.io/installer-state")
+            or "<none>"
+        )
+    return pending
+
+
+def _narrated_states(states: dict[str, str]) -> str:
+    shown = sorted(states)[:WAIT_AGENTS_NARRATED_NODES]
+    rendered = ",".join(f"{name}:{states[name]}" for name in shown)
+    if len(states) > len(shown):
+        rendered += f",+{len(states) - len(shown)}"
+    return rendered or "-"
 
 
 def wait_agents(
@@ -56,8 +112,11 @@ def wait_agents(
     expected_config = config_digest or release.config.agent_config_digest
     expected_profile = runtime_profile_version or release.config.runtime_profile_version
     expected_nodes = frozenset(node_names) if node_names else None
-    deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    deadline = started + timeout_seconds
     poll_seconds = float(WAIT_AGENTS_POLL_SECONDS)
+    narrated: dict[str, str] | None = None
+    narrated_at = started
     while time.monotonic() < deadline:
         nodes = gpu_node_items(release, target, fresh=True)
         selected_nodes = [
@@ -88,7 +147,7 @@ def wait_agents(
             raise ClusterLocalReleaseError(
                 f"{target.cluster_id} installer failed on: " + ", ".join(failed_nodes)
             )
-        if agents_converged(
+        installers_aligned = agents_converged(
             nodes,
             target,
             artifact_sha,
@@ -97,7 +156,8 @@ def wait_agents(
             config_digest=expected_config,
             require_node_uid=True,
             node_names=expected_nodes,
-        ) and release._agent_heartbeats_converged(
+        )
+        if installers_aligned and release._agent_heartbeats_converged(
             target,
             node_count=len(selected_nodes),
             node_names=tuple(
@@ -119,6 +179,40 @@ def wait_agents(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
+        pending = installer_node_states(
+            nodes,
+            target,
+            artifact_sha,
+            bundle_sha=expected_bundle,
+            template_sha=expected_template,
+            config_digest=expected_config,
+            node_names=expected_nodes,
+        )
+        now = time.monotonic()
+        changed = pending != narrated
+        if changed or now - narrated_at >= WAIT_AGENTS_NARRATION_SECONDS:
+            # This wait is the whole of the silence an operator sees inside
+            # `data-plane-progress`, so it says what it is waiting for often
+            # enough to look alive, and repeats on a heartbeat so a wait where
+            # nothing changes for minutes is still distinguishable from a hang.
+            narrate_step(
+                "installer-wait",
+                cluster=target.cluster_id,
+                nodes=len(selected_nodes),
+                aligned=len(selected_nodes) - len(pending),
+                waiting="installers" if pending else "heartbeats",
+                pending=_narrated_states(pending),
+                elapsed=f"{now - started:.1f}s",
+            )
+            narrated_at = now
+        progressed = narrated is not None and set(pending) < set(narrated)
+        narrated = pending
+        if progressed:
+            # A node just finished, so the Reconciler starts the next one now and
+            # the fleet is moving: the backed-off interval would sleep through
+            # most of the next node's install and then charge the wave up to 15s
+            # of pure idling on top of it.
+            poll_seconds = float(WAIT_AGENTS_POLL_SECONDS)
         time.sleep(min(poll_seconds, remaining))
         # Installer waves take minutes, so back off after the fast early polls
         # instead of re-listing every node every 5s for the whole window.

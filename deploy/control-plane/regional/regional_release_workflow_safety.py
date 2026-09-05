@@ -3,42 +3,18 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import regional_deployment_inventory as inventory
 from regional_release_config import ReleaseError
 from regional_release_probes import probe_source
-from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
+from regional_release_runtime_identity import exec_cpu_ingress_probe
 
 
 def workflow_safety_snapshot(release: Any) -> dict[str, Any]:
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("no Running CPU ingress Pod")
-    raw = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            pod,
-            "--",
-            CONTROL_PLANE_PYTHON,
-            "-c",
-            probe_source("workflow_safety"),
-        ),
-        capture=True,
+    raw = exec_cpu_ingress_probe(
+        release,
+        script=probe_source("workflow_safety"),
+        failure="the workflow safety check",
         sensitive=True,
+        interactive=False,
     )
     try:
         result = json.loads(raw)

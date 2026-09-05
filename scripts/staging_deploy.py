@@ -21,6 +21,10 @@ from gpu_fault.admin.operation_lock import (
 
 if __package__:
     from scripts.deploy_host_bundle import bundle_platform_id
+    from scripts.staging_gate_caches import (
+        public_release_verdict_cache,
+        tool_cache_environment,
+    )
     from scripts.staging_live_evidence import (
         LiveEvidenceError,
         collect_live_deploy_evidence,
@@ -28,6 +32,10 @@ if __package__:
     )
 else:
     from deploy_host_bundle import bundle_platform_id
+    from staging_gate_caches import (
+        public_release_verdict_cache,
+        tool_cache_environment,
+    )
     from staging_live_evidence import (
         LiveEvidenceError,
         collect_live_deploy_evidence,
@@ -133,13 +141,27 @@ def _repository_head(repository_root: Path) -> str:
     return _git_output(repository_root, "rev-parse", "HEAD")
 
 
-def validate_source_checkout(repository_root: Path) -> None:
+def validate_source_checkout(
+    repository_root: Path,
+    *,
+    verdict_cache: Path | None = None,
+) -> None:
+    """Refuse to deploy a tree that carries live-environment identity.
+
+    ``verdict_cache`` lets the second call in a deploy -- the prepared snapshot,
+    whose content is a copy of the live tree the first call already cleared --
+    prove it is scanning identical bytes instead of scanning them again. The gate
+    still walks and hashes every public file each time; only the pattern matching
+    is skipped, and only on an exact content match.
+    """
+
     _run(
         [
             sys.executable,
             str(repository_root / "scripts/check-public-release.py"),
             "--root",
             str(repository_root),
+            *(("--verdict-cache", str(verdict_cache)) if verdict_cache else ()),
         ],
         cwd=repository_root,
     )
@@ -1002,6 +1024,7 @@ def run_source_impact_gate(
     output.parent.chmod(0o700)
     base = _impact_base(repository_root, previous, fallback_base)
     selector = repository_root / "scripts/select-affected-tests.py"
+    environment = tool_cache_environment(state_dir)
     raw = _run(
         [
             sys.executable,
@@ -1015,6 +1038,7 @@ def run_source_impact_gate(
         ],
         cwd=repository_root,
         capture=True,
+        env=environment,
     )
     try:
         plan = json.loads(raw)
@@ -1033,6 +1057,7 @@ def run_source_impact_gate(
             "--execute",
         ],
         cwd=repository_root,
+        env=environment,
     )
     return plan
 
@@ -1287,15 +1312,19 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
         raise StagingDeployError(
             "staging state directory must be outside the Git repository"
         )
-    validate_source_checkout(repository_root)
+    # Created before the gate runs so the gate has somewhere to record its
+    # verdict; the directory is empty and 0700 either way, and nothing is
+    # deployed from it until the gate has passed.
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     state_dir.chmod(0o700)
+    verdict_cache = public_release_verdict_cache(state_dir)
+    validate_source_checkout(repository_root, verdict_cache=verdict_cache)
     source = prepare_source_checkout(
         repository_root,
         state_dir=state_dir,
     )
     if source.repository_root != repository_root:
-        validate_source_checkout(source.repository_root)
+        validate_source_checkout(source.repository_root, verdict_cache=verdict_cache)
     identities = source_deploy_identity(source.repository_root)
     signing = ensure_signing_material(
         state_dir,

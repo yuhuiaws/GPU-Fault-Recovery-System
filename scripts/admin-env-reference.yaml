@@ -216,7 +216,11 @@ categories:
       - name: GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS
         description: "Workflow execution lease；过期后其他 worker 递增 epoch 接管。"
       - name: GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS
-        description: "整条 workflow 执行总上限。"
+        description: "整条 workflow 执行总上限；首次 claim 时写入 execution_deadline，由持租的 executor 自己执行。"
+      - name: GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS
+        description: "单个 step 停留在非终态的上限；超过就让该 step FAILED，不依赖任何适配器重试计数。"
+      - name: GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS
+        description: "单个 step 等待多久开始告警；必须小于 step 上限，只影响告警不影响判定。"
       - name: GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS
         description: "持久 workflow 兜底扫描间隔；事件完成也会主动唤醒。"
       - name: GPU_FAULT_WORKFLOW_BATCH_SIZE

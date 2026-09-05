@@ -5,11 +5,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-import regional_deployment_inventory as inventory
 import yaml
 from regional_release_config import ReleaseConfig, ReleaseError
 from regional_release_probes import probe_source
-from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
+from regional_release_runtime_identity import (
+    CONTROL_PLANE_PYTHON,
+    exec_cpu_ingress_command,
+    exec_cpu_ingress_probe,
+)
 
 
 def render_runtime_profile_payload(config: ReleaseConfig) -> dict[str, Any]:
@@ -52,41 +55,15 @@ def runtime_profile_policy_digest(path: Path) -> str:
 
 
 def inspect_runtime_profile(release: Any) -> dict[str, Any]:
-    runner = release.runner
     config = release.config
-    pod = runner.run(
-        release._cpu(
-            "-n",
-            config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("cannot inspect the Runtime Profile: no CPU ingress Pod")
     payload = render_runtime_profile_payload(config)
     payload_text = json.dumps(payload, separators=(",", ":"))
     return json.loads(
-        runner.run(
-            release._cpu(
-                "-n",
-                config.namespace,
-                "exec",
-                "-i",
-                pod,
-                "--",
-                CONTROL_PLANE_PYTHON,
-                "-c",
-                probe_source("runtime_profile_inspect"),
-            ),
+        exec_cpu_ingress_probe(
+            release,
+            script=probe_source("runtime_profile_inspect"),
+            failure="Runtime Profile inspection",
             input_text=payload_text,
-            capture=True,
             sensitive=True,
         )
     )
@@ -139,41 +116,20 @@ def ensure_runtime_profile(release: Any) -> None:
                 "instead of overwriting a live policy"
             )
         return
-    pod = runner.run(
-        release._cpu(
-            "-n",
-            config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("cannot register the Runtime Profile: no CPU ingress Pod")
     payload_text = json.dumps(
         render_runtime_profile_payload(config),
         separators=(",", ":"),
     )
     registered = json.loads(
-        runner.run(
-            release._cpu(
-                "-n",
-                config.namespace,
-                "exec",
-                "-i",
-                pod,
-                "--",
+        exec_cpu_ingress_command(
+            release,
+            arguments=(
                 CONTROL_PLANE_PYTHON,
                 "-c",
                 probe_source("runtime_profile_register"),
             ),
+            failure="Runtime Profile registration",
             input_text=payload_text,
-            capture=True,
             sensitive=True,
         )
     )

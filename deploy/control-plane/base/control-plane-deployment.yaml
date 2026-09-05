@@ -342,7 +342,7 @@ spec:
             - name: GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS
               value: "20"
             - name: GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS
-              value: "2700"
+              value: "1800"
             - name: GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS
               value: "60"
             - name: GPU_FAULT_HYPERPOD_SPARE_LABEL

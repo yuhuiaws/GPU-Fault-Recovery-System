@@ -1,7 +1,7 @@
 {
   "classes": {
     "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 937,
-    "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1553,
+    "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1535,
     "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 1270,
     "src/gpu_fault/host_health.py:NodeHealthPolicy": 984,
     "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1565,
@@ -14,7 +14,7 @@
     "src/gpu_fault/admin/bootstrap.py": 2076,
     "src/gpu_fault/admin/cli.py": 1522,
     "src/gpu_fault/completion_controller.py": 1515,
-    "src/gpu_fault/execution/executor.py": 1606,
+    "src/gpu_fault/execution/executor.py": 1589,
     "src/gpu_fault/gpu_metrics.py": 1546,
     "src/gpu_fault/orchestration/coordinator.py": 1683,
     "src/gpu_fault/processor/coordinator.py": 1639,
@@ -28,7 +28,7 @@
     "src/gpu_fault/admin/legacy_site.py:discover_legacy_site": 291,
     "src/gpu_fault/app/factory.py:create_app": 285,
     "src/gpu_fault/app/metrics.py:render_prometheus_metrics": 218,
-    "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor.execute": 213,
+    "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor.execute": 212,
     "src/gpu_fault/node_agent/app.py:create_node_agent_app": 216,
     "src/gpu_fault/node_agent/operations/diagnostics.py:DiagnosticOperationsMixin._collect_diagnostic_bundle": 221,
     "src/gpu_fault/node_agent/operations/hung_triage.py:HungTriageOperationsMixin._collect_hung_triage": 218,

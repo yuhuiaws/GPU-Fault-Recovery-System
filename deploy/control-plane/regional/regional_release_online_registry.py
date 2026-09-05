@@ -4,10 +4,10 @@ import hashlib
 import json
 from typing import Any
 
-import regional_deployment_inventory as inventory
 from regional_release_config import ReleaseError
 from regional_release_probes import probe_source
 from regional_release_registry import registry
+from regional_release_runtime_identity import exec_cpu_ingress_command
 
 
 def _request(
@@ -16,38 +16,20 @@ def _request(
     path: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("no running CPU ingress Pod for registry update")
-    output = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            "-i",
-            pod,
-            "--",
+    # The mutating helper for every method: this drives the registry API, and a
+    # GET here is only ever a step of a revision publish, so re-running one on a
+    # different replica would read a generation the caller did not write.
+    output = exec_cpu_ingress_command(
+        release,
+        arguments=(
             "python3",
             "-c",
             probe_source("registry_client"),
             method,
             path,
         ),
+        failure="a registry update",
         input_text=json.dumps(payload or {}, separators=(",", ":")),
-        capture=True,
         sensitive=True,
     )
     value = json.loads(output)
@@ -100,34 +82,10 @@ def _publish_and_wait(
     use_current_generation: bool,
     timeout_seconds: float,
 ) -> dict[str, Any]:
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("no running CPU ingress Pod for registry update")
-    output = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            "-i",
-            pod,
-            "--",
-            "python3",
-            "-c",
-            probe_source("registry_publish_converge"),
-        ),
+    output = exec_cpu_ingress_command(
+        release,
+        arguments=("python3", "-c", probe_source("registry_publish_converge")),
+        failure="a registry revision publish",
         input_text=json.dumps(
             {
                 "path": path,
@@ -137,7 +95,6 @@ def _publish_and_wait(
             },
             separators=(",", ":"),
         ),
-        capture=True,
         sensitive=True,
         timeout_seconds=timeout_seconds + 60,
     )

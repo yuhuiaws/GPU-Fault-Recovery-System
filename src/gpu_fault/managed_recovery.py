@@ -22,6 +22,8 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 
+WORKFLOW_DEADLINE_MARGIN_SECONDS = 60
+
 
 class HyperPodNodeIdentity(StrictModel):
     cluster_name: str
@@ -130,7 +132,7 @@ class HyperPodManagedRecoveryObserver:
         *,
         registry: FleetRegistry | None,
         kubernetes_adapter=None,
-        timeout: timedelta = timedelta(minutes=45),
+        timeout: timedelta = timedelta(minutes=30),
         alert_sender: Callable[[str], object] | None = None,
     ) -> None:
         self.identities = identities
@@ -139,6 +141,35 @@ class HyperPodManagedRecoveryObserver:
         self.kubernetes_adapter = kubernetes_adapter
         self.timeout = timeout
         self.alert_sender = alert_sender
+
+    def _deadline(
+        self,
+        context: WorkflowStepContext,
+        started_at: datetime,
+    ) -> datetime:
+        """When this observation gives up, never later than the workflow does.
+
+        The provider window and the workflow budget are set independently, so the
+        workflow can be the shorter of the two -- and then the workflow deadline
+        would terminalize the step first, on the generic failure path, without
+        the escalation this observer sends. Clamping means the observer is the
+        one that reports giving up, whichever bound is actually binding.
+
+        The margin is what makes the clamp effective rather than decorative: the
+        workflow deadline is checked before a step is dispatched, so an observer
+        that gave up exactly at that deadline would never be reached. One minute
+        is twelve dispatches at the default five-second poll interval, so the
+        observation gets its say even if most of them are lost.
+        """
+
+        deadline = started_at + self.timeout
+        workflow_deadline: datetime | None = context.workflow.execution_deadline
+        if workflow_deadline is None:
+            return deadline
+        return min(
+            deadline,
+            workflow_deadline - timedelta(seconds=WORKFLOW_DEADLINE_MARGIN_SECONDS),
+        )
 
     def observe(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
         identities = self.identities.refresh()
@@ -218,7 +249,8 @@ class HyperPodManagedRecoveryObserver:
         started_at = datetime.fromisoformat(
             previous.details["managed_recovery_started_at"]
         )
-        if datetime.now(timezone.utc) - started_at > self.timeout:
+        deadline = self._deadline(context, started_at)
+        if datetime.now(timezone.utc) > deadline:
             notification = self._alert_timeout(context)
             return WorkflowStepOutcome.failed(
                 "HyperPod managed recovery timed out; notification="

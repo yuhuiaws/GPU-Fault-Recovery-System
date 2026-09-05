@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Container, Sequence
 from datetime import datetime, timezone
 
 from gpu_fault.app.metric_scan_cache import metric_scan_cache
 from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.collector_requirements import agent_is_current
+from gpu_fault.execution import ProductionExecutorConfig
 from gpu_fault.fleet_deployment import DeploymentStatus
 from gpu_fault.models import (
     NotificationStatus,
     WorkflowOperation,
+    WorkflowRequest,
     WorkflowStatus,
+    WorkflowStepStatus,
 )
 from gpu_fault.store.contracts import ControlPlaneStore
 
@@ -213,6 +217,88 @@ def orchestration_metric_lines(
     return lines
 
 
+def workflow_stall_metric_lines(
+    workflows: Sequence[WorkflowRequest],
+    now: datetime,
+    terminal: Container[WorkflowStatus],
+    config: ProductionExecutorConfig,
+) -> list[str]:
+    """Report a step that cannot finish, and a deadline that was not enforced.
+
+    Step metrics were counts by status, so a step re-asking the same question
+    forever looked exactly like a step that had just started waiting; and
+    ``execution_deadline`` had no metric at all, which is why a workflow ten
+    minutes past it could keep running with every dashboard green. Both are
+    scoped to non-terminal workflows: a WAITING execution left on a workflow that
+    has already ended is history, not a stall.
+
+    The age is published next to the threshold that applies to it because the
+    threshold is per-operation: a delegated replacement's ceiling is the provider
+    window, everything else's is the default cap. An alert carrying its own copy
+    of one number could only be right for one of those, and would go stale the
+    first time either is retuned.
+    """
+
+    step_waiting_ages: dict[str, float] = {}
+    warning_limits: dict[str, int] = {}
+    overdue_seconds = 0.0
+    for workflow in workflows:
+        if workflow.status in terminal:
+            continue
+        if workflow.execution_deadline is not None:
+            overdue_seconds = max(
+                overdue_seconds,
+                (now - workflow.execution_deadline).total_seconds(),
+            )
+        for execution in workflow.step_executions:
+            if execution.status is not WorkflowStepStatus.WAITING:
+                continue
+            operation = execution.operation.value
+            step_waiting_ages[operation] = max(
+                step_waiting_ages.get(operation, 0.0),
+                max(0.0, (now - execution.started_at).total_seconds()),
+            )
+            warning_limits[operation] = config.step_waiting_warning_limit(
+                execution.operation
+            )
+    lines = [
+        "# HELP gpu_fault_workflow_step_waiting_seconds Age of the oldest step "
+        "still WAITING in a non-terminal workflow, by operation. A step whose "
+        "own retry counter has stopped advancing shows up here and nowhere "
+        "else.",
+        "# TYPE gpu_fault_workflow_step_waiting_seconds gauge",
+    ]
+    lines.extend(
+        "gpu_fault_workflow_step_waiting_seconds"
+        f'{{operation="{_escape_label(operation)}"}} {age:.3f}'
+        for operation, age in sorted(step_waiting_ages.items())
+    )
+    lines.extend(
+        [
+            "# HELP gpu_fault_workflow_step_waiting_warning_seconds How long this "
+            "operation may wait before the wait itself is the problem. Emitted "
+            "with the same labels as the age above so an alert compares the two "
+            "series instead of hard-coding either threshold.",
+            "# TYPE gpu_fault_workflow_step_waiting_warning_seconds gauge",
+        ]
+    )
+    lines.extend(
+        "gpu_fault_workflow_step_waiting_warning_seconds"
+        f'{{operation="{_escape_label(operation)}"}} {limit}'
+        for operation, limit in sorted(warning_limits.items())
+    )
+    lines.extend(
+        [
+            "# HELP gpu_fault_workflow_overdue_seconds How far the most overdue "
+            "non-terminal workflow is past its execution deadline. Above zero "
+            "means a deadline was not enforced.",
+            "# TYPE gpu_fault_workflow_overdue_seconds gauge",
+            f"gpu_fault_workflow_overdue_seconds {max(0.0, overdue_seconds):.3f}",
+        ]
+    )
+    return lines
+
+
 def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     store = runtime.context.store
     scan = metric_scan_cache(runtime).workflows()
@@ -329,6 +415,11 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
             "gpu_fault_workflow_step_total"
             f'{{operation="{operation}",status="{step_status}"}} {count}'
         )
+    lines.extend(
+        workflow_stall_metric_lines(
+            workflows, now, terminal, runtime.context.production_executor_config
+        )
+    )
     lines.extend(
         [
             "# HELP gpu_fault_workflow_duration_seconds Terminal workflow duration.",

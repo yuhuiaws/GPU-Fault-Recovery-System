@@ -612,59 +612,6 @@ def test_node_installer_is_pinned_to_the_release_it_bootstraps(
     ]
 
 
-def test_explicit_deploy_retries_only_failed_installer_jobs(tmp_path: Path) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-
-    class RetryRunner:
-        dry_run = False
-
-        def __init__(self) -> None:
-            self.calls = []
-
-        def run(self, arguments, **_kwargs):
-            self.calls.append(arguments)
-            if "get" in arguments and "jobs" in arguments:
-                return json.dumps(
-                    {
-                        "items": [
-                            {
-                                "metadata": {"name": "failed-job"},
-                                "status": {
-                                    "conditions": [{"type": "Failed", "status": "True"}]
-                                },
-                            },
-                            {
-                                "metadata": {"name": "running-job"},
-                                "status": {"conditions": []},
-                            },
-                            {
-                                "metadata": {"name": "complete-job"},
-                                "status": {
-                                    "conditions": [
-                                        {"type": "Complete", "status": "True"}
-                                    ]
-                                },
-                            },
-                        ]
-                    }
-                )
-            return ""
-
-    runner = RetryRunner()
-    release = MODULE.RegionalRelease(config, runner)
-    release._retry_failed_installer_jobs(config.clusters[0])
-
-    deletes = [
-        arguments
-        for arguments in runner.calls
-        if "delete" in arguments and "job" in arguments
-    ]
-    assert len(deletes) == 1
-    assert "failed-job" in deletes[0]
-    assert "running-job" not in deletes[0]
-    assert "complete-job" not in deletes[0]
-
-
 def test_nlb_service_is_created_after_dns_and_certificate_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

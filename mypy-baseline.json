@@ -1,6 +1,6 @@
 {
   "deploy/control-plane/regional/regional_admin_checks.py:misc": 1,
-  "deploy/control-plane/regional/regional_admin_checks.py:no-any-return": 4,
+  "deploy/control-plane/regional/regional_admin_checks.py:no-any-return": 2,
   "deploy/control-plane/regional/regional_admin_checks.py:no-untyped-def": 1,
   "deploy/control-plane/regional/regional_dns.py:no-any-return": 2,
   "deploy/control-plane/regional/regional_gpu_bootstrap.py:arg-type": 2,

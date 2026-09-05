@@ -22,11 +22,13 @@ from regional_release_config import (
     ReleaseError,
 )
 from regional_release_gpu_rollout import gpu_node_items
+from regional_release_narration import narrate_step
 from regional_release_probes import probe_source
 from regional_release_rendering import build_reconciler_environment
 from regional_release_rollout_wait import wait_deployment_rollout
 from regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
+    exec_cpu_ingress_command,
     exec_cpu_ingress_probe,
 )
 from regional_release_timing import record_rollback_wave_event
@@ -312,37 +314,19 @@ def fleet_command(
     operation: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("no running CPU ingress Pod for fleet rollout")
-    script = probe_source("fleet_deployment_command")
-    raw = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            "-i",
-            pod,
-            "--",
+    # Through the mutating helper for every operation, including the read-only
+    # ``get``: the wave loop interleaves them with ``next-wave``, which takes a
+    # lease, so one shared memoised Pod name is what keeps the whole sequence
+    # talking to the same replica.
+    raw = exec_cpu_ingress_command(
+        release,
+        arguments=(
             CONTROL_PLANE_PYTHON,
             "-c",
-            script,
+            probe_source("fleet_deployment_command"),
         ),
+        failure="fleet rollout",
         input_text=json.dumps({"operation": operation, **payload}),
-        capture=True,
     )
     result = json.loads(raw)
     if not isinstance(result, dict):
@@ -541,6 +525,33 @@ def next_deployment_wave(deployment: dict[str, Any]) -> tuple[str, ...]:
                 if statuses.get(node_id) in {"PENDING", "INSTALLING"}
             )
     return ()
+
+
+def deployment_wave_position(deployment: dict[str, Any], wave: tuple[str, ...]) -> str:
+    """Where this wave sits in the plan, as ``index/total``.
+
+    A wave is named by its nodes, and a rollout of one-node waves therefore
+    narrates a different opaque instance id every time; the position is what says
+    whether the release is a quarter or three quarters through the fleet. The
+    match is by containment because the wave actually leased is the still-pending
+    subset of a planned wave.
+    """
+
+    waves = [
+        tuple(str(node_id) for node_id in raw) for raw in deployment.get("waves") or []
+    ]
+    for index, planned in enumerate(waves, start=1):
+        if wave and set(wave) <= set(planned):
+            return f"{index}/{len(waves)}"
+    return f"?/{len(waves)}"
+
+
+def deployment_node_progress(deployment: dict[str, Any]) -> str:
+    """How much of the fleet is already on the new identity, as ``ready/total``."""
+
+    nodes = deployment.get("nodes") or []
+    ready = sum(1 for item in nodes if str(item.get("status") or "") == "READY")
+    return f"{ready}/{len(nodes)}"
 
 
 def candidate_agent_pin_identity(release: Any) -> dict[str, str]:
@@ -775,17 +786,30 @@ def ensure_rollout_wave_safe(
         time.sleep(max(0.0, poll_seconds))
 
 
-def reconciler_container_env(release: Any, target: ClusterTarget) -> dict[str, str]:
-    deployment = release._get_json(
-        release._gpu(
-            target,
-            "-n",
-            release.config.namespace,
-            "get",
-            "deployment",
-            inventory.GPU_RECONCILER_DEPLOYMENT,
+def reconciler_container_env(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    deployment: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """The Reconciler container's environment, read once per caller.
+
+    ``deployment`` lets a caller that already holds the Deployment -- because it
+    just waited for it to roll out -- hand it over instead of paying a second
+    identical read.
+    """
+
+    if deployment is None:
+        deployment = release._get_json(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+                inventory.GPU_RECONCILER_DEPLOYMENT,
+            )
         )
-    )
     containers = (
         deployment.get("spec", {})
         .get("template", {})
@@ -847,13 +871,19 @@ def hand_wave_to_reconciler(
 
     # A wave may only be handed to a healthy, fully rolled out Reconciler: the
     # Pod that reads the ConfigMap has to be the one this release paused.
-    wait_deployment_rollout(
+    rollout = wait_deployment_rollout(
         release,
         target,
         inventory.GPU_RECONCILER_DEPLOYMENT,
         timeout_seconds=600,
     )
-    environment = reconciler_container_env(release, target)
+    # The identity is read out of the Deployment the wait just proved rolled out,
+    # rather than from a second `get deployment` of the same object: one read per
+    # wave less, and the identity provably belongs to the generation that passed
+    # the barrier instead of to whatever the next read happens to return.
+    environment = reconciler_container_env(
+        release, target, deployment=rollout.get("object")
+    )
     config_map = environment.get(INSTALLER_WAVE_CONFIG_MAP_ENV, "")
     if not config_map:
         return None
@@ -862,8 +892,7 @@ def hand_wave_to_reconciler(
         raise ReleaseError(
             f"{target.cluster_id} installer identity changed between waves"
         )
-    release._cancel_active_installer_jobs(target)
-    release._retry_failed_installer_jobs(target)
+    release._settle_installer_jobs(target)
     desired = {
         "allowed-nodes": ",".join(sorted(wave)),
         "max-unavailable": str(context.max_unavailable),
@@ -921,6 +950,20 @@ def run_fleet_waves(
             raise ReleaseError(
                 f"{target.cluster_id} fleet deployment has no pending wave"
             )
+        wave_started = time.monotonic()
+        # A wave is the unit of work of this loop, and until it finishes nothing
+        # is checkpointed: `data-plane-progress` is written once per cluster, so
+        # on a fleet of one-node waves the release goes minutes per node without
+        # a line. This says which wave, which nodes, and how much of the fleet is
+        # already done -- the answer to "is it stuck or is it working".
+        narrate_step(
+            "fleet-wave",
+            cluster=target.cluster_id,
+            phase=context.phase,
+            wave=deployment_wave_position(deployment, expected_wave),
+            ready=deployment_node_progress(deployment),
+            nodes=",".join(sorted(expected_wave)),
+        )
         if context.phase == "rollback":
             record_rollback_wave_event(
                 release,
@@ -958,6 +1001,7 @@ def run_fleet_waves(
                     ROLLOUT_AGENT_POST_LEASE_MARGIN_SECONDS
                 ),
             )
+            safety_seconds = time.monotonic() - wave_started
             if context.phase == "rollback":
                 record_rollback_wave_event(
                     release,
@@ -965,6 +1009,7 @@ def run_fleet_waves(
                     wave=expected_wave,
                     event="safety_completed",
                 )
+            handoff_started = time.monotonic()
             identity = hand_wave_to_reconciler(release, target, context, wave)
             if identity is None:
                 # Compatibility path: a Reconciler deployed before the wave
@@ -998,6 +1043,7 @@ def run_fleet_waves(
                     wave=wave,
                     event="reconciler_applied",
                 )
+            install_started = time.monotonic()
             release._wait_agents(
                 target,
                 context.artifact_sha,
@@ -1009,6 +1055,7 @@ def run_fleet_waves(
                 legacy_identity=context.allow_legacy_identity,
                 agent_identity=context.agent_identity,
             )
+            install_seconds = time.monotonic() - install_started
             if context.phase == "rollback":
                 record_rollback_wave_event(
                     release,
@@ -1019,6 +1066,20 @@ def run_fleet_waves(
             deployment = release._fleet_command(
                 "get",
                 {"deployment_id": context.deployment_id},
+            )
+            # Split three ways because the three are fixed by different things:
+            # `safety` by the Agent leases and open commands, `handoff` by the
+            # Reconciler rollout and the Jobs of the previous wave, `install` by
+            # the node itself. Only the last one is the cluster doing real work.
+            narrate_step(
+                "fleet-wave-done",
+                cluster=target.cluster_id,
+                wave=deployment_wave_position(deployment, wave),
+                ready=deployment_node_progress(deployment),
+                safety=f"{safety_seconds:.1f}s",
+                handoff=f"{install_started - handoff_started:.1f}s",
+                install=f"{install_seconds:.1f}s",
+                elapsed=f"{time.monotonic() - wave_started:.1f}s",
             )
             if context.phase == "rollback":
                 record_rollback_wave_event(
@@ -1059,8 +1120,7 @@ def deploy_reconciler(
     runtime_image: str | None = None,
     node_installer_image: str | None = None,
 ) -> tuple[str, str]:
-    release._cancel_active_installer_jobs(target)
-    release._retry_failed_installer_jobs(target)
+    release._settle_installer_jobs(target)
     environment = build_reconciler_environment(
         release,
         target,

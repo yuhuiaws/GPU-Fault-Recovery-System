@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from regional_release_config import ClusterTarget, ReleaseError
+from regional_release_state import aws_json
 
 EXECUTOR_SAGEMAKER_ACTIONS = frozenset(
     {
@@ -47,10 +47,15 @@ def validate_executor_iam_documents(
 
 
 def _iam_json(release: Any, arguments: list[str]) -> dict[str, Any]:
-    value: dict[str, Any] = json.loads(
-        release.runner.run(["aws", "iam", *arguments, "--output", "json"], capture=True)
-    )
-    return value
+    # No `--region`: IAM is global, and passing one would make the cache key
+    # differ from the command actually issued.
+    #
+    # Through the snapshot cache because a fleet's roles overlap. Every cluster's
+    # executor role tends to attach the same managed policies, so expanding role
+    # N repeats the `get-policy` and `get-policy-version` pair that role N-1
+    # already resolved -- and the expansions run concurrently, on a thread pool
+    # per cluster inside a thread pool over clusters.
+    return aws_json(release, ["iam", *arguments], region=False)
 
 
 def _fan_out(release: Any, fetches: list[Callable[[], dict[str, Any]]]) -> list[Any]:

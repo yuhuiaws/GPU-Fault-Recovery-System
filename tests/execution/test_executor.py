@@ -27,6 +27,8 @@ from ._executor_cases_1 import (
     test_terminal_quarantine_dag_finishes_without_shared_restart,
 )
 from ._executor_cases_2 import (
+    test_a_delegated_operation_waits_on_its_own_clock,
+    test_an_override_below_the_default_cap_is_refused,
     test_dispatcher_background_loop_executes_and_stops,
     test_dispatcher_background_loop_survives_transient_store_error,
     test_dispatcher_reconciles_previously_failed_workflow,
@@ -34,8 +36,15 @@ from ._executor_cases_2 import (
     test_dispatcher_wake_interrupts_poll_wait,
     test_executor_identity_is_unique_by_default,
     test_hung_triage_result_and_dag_rewrite_are_saved_together,
+    test_inherited_step_start_time_cannot_fire_the_cap_early,
+    test_lease_holder_enforces_deadline_the_watchdog_cannot_claim,
     test_preemption_survives_store_failover_and_lease_takeover,
     test_sqlite_store_persists_workflow_and_atomic_claim,
+    test_step_cap_settings_are_checked_where_the_operator_is_watching,
+    test_step_start_time_survives_retries_but_not_a_rebound_index,
+    test_step_waiting_cap_fails_a_step_no_retry_counter_can_bound,
+    test_step_waiting_warning_latches_so_it_reports_once,
+    test_the_shipped_defaults_start_without_a_configuration_warning,
     test_transient_store_error_does_not_block_active_workflow,
     test_workflow_preemption_config_is_enabled_by_default,
 )

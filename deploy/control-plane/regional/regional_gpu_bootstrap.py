@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ from regional_release_probes import probe_source
 from regional_release_rendering import DEFAULT_DCGM_EXPORTER_IMAGE
 
 ROOT = Path(__file__).resolve().parents[3]
+INSTALLER_JOB_SELECTOR = "gpu-fault.io/node-installer=true"
+TERMINAL_JOB_CONDITIONS = frozenset({"Complete", "Failed"})
 
 
 def _render_gpu_dcgm_exporter(
@@ -100,93 +103,116 @@ def apply_gpu_dcgm_exporter(
     )
 
 
-def retry_failed_installer_jobs(release: Any, target: ClusterTarget) -> None:
-    jobs = release._get_json(
+def _installer_jobs(release: Any, target: ClusterTarget) -> list[dict[str, Any]]:
+    return list(
+        release._get_json(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                "jobs",
+                "-l",
+                INSTALLER_JOB_SELECTOR,
+            )
+        ).get("items", [])
+    )
+
+
+def _true_conditions(item: dict[str, Any]) -> set[str]:
+    return {
+        str(condition.get("type") or "")
+        for condition in (item.get("status") or {}).get("conditions") or []
+        if condition.get("status") == "True"
+    }
+
+
+def _installer_job_names(
+    jobs: list[dict[str, Any]], *, matching: Callable[[set[str]], bool]
+) -> list[str]:
+    names = [
+        str((item.get("metadata") or {}).get("name") or "")
+        for item in jobs
+        if matching(_true_conditions(item))
+    ]
+    return sorted(name for name in names if name)
+
+
+def _active_installer_jobs(jobs: list[dict[str, Any]]) -> list[str]:
+    return _installer_job_names(
+        jobs, matching=lambda conditions: not conditions & TERMINAL_JOB_CONDITIONS
+    )
+
+
+def _failed_installer_jobs(jobs: list[dict[str, Any]]) -> list[str]:
+    return _installer_job_names(
+        jobs, matching=lambda conditions: "Failed" in conditions
+    )
+
+
+def _delete_installer_job(release: Any, target: ClusterTarget, name: str) -> None:
+    release.runner.run(
         release._gpu(
             target,
             "-n",
             release.config.namespace,
-            "get",
-            "jobs",
-            "-l",
-            "gpu-fault.io/node-installer=true",
+            "delete",
+            "job",
+            name,
+            "--wait=true",
         )
-    ).get("items", [])
-    for item in jobs:
-        conditions = (item.get("status") or {}).get("conditions") or []
-        failed = any(
-            condition.get("type") == "Failed" and condition.get("status") == "True"
-            for condition in conditions
-        )
-        if not failed:
-            continue
-        name = str((item.get("metadata") or {}).get("name") or "")
-        if not name:
-            continue
-        release.runner.run(
-            release._gpu(
-                target,
-                "-n",
-                release.config.namespace,
-                "delete",
-                "job",
-                name,
-                "--wait=true",
-            )
+    )
+
+
+def _cancel_installer_jobs(
+    release: Any, target: ClusterTarget, jobs: list[dict[str, Any]]
+) -> None:
+    """Delete every in-flight installer Job in ``jobs``, then prove none is left.
+
+    The re-read is the fail-closed half of the cancellation and stays, but it
+    only runs when something was actually deleted: a pass that deleted nothing
+    has already proved the fleet is quiet with the listing it was handed, and
+    re-reading it was a second identical `get jobs` on every wave of every
+    rollout.
+    """
+
+    active = _active_installer_jobs(jobs)
+    if not active:
+        return
+    for name in active:
+        _delete_installer_job(release, target, name)
+    remaining = _active_installer_jobs(_installer_jobs(release, target))
+    if remaining:
+        raise ReleaseError(
+            f"{target.cluster_id} active installer Jobs remain after cancellation: "
+            + ", ".join(remaining)
         )
 
 
 def cancel_active_installer_jobs(release: Any, target: ClusterTarget) -> None:
-    command = release._gpu(
-        target,
-        "-n",
-        release.config.namespace,
-        "get",
-        "jobs",
-        "-l",
-        "gpu-fault.io/node-installer=true",
-    )
-    jobs = release._get_json(command).get("items", [])
-    for item in jobs:
-        conditions = (item.get("status") or {}).get("conditions") or []
-        terminal = any(
-            condition.get("type") in {"Complete", "Failed"}
-            and condition.get("status") == "True"
-            for condition in conditions
-        )
-        if terminal:
-            continue
-        name = str((item.get("metadata") or {}).get("name") or "")
-        if not name:
-            continue
-        release.runner.run(
-            release._gpu(
-                target,
-                "-n",
-                release.config.namespace,
-                "delete",
-                "job",
-                name,
-                "--wait=true",
-            )
-        )
-    remaining = []
-    for item in release._get_json(command).get("items", []):
-        conditions = (item.get("status") or {}).get("conditions") or []
-        terminal = any(
-            condition.get("type") in {"Complete", "Failed"}
-            and condition.get("status") == "True"
-            for condition in conditions
-        )
-        if not terminal:
-            name = str((item.get("metadata") or {}).get("name") or "")
-            if name:
-                remaining.append(name)
-    if remaining:
-        raise ReleaseError(
-            f"{target.cluster_id} active installer Jobs remain after cancellation: "
-            + ", ".join(sorted(remaining))
-        )
+    _cancel_installer_jobs(release, target, _installer_jobs(release, target))
+
+
+def settle_installer_jobs(release: Any, target: ClusterTarget) -> None:
+    """Clear the installer Jobs standing between this cluster and a new wave.
+
+    Both things have to happen before the allowed-node set changes: an in-flight
+    Job would install the previous wave's identity onto a node the new wave has
+    not cleared, and a Job left behind as ``Failed`` would keep the Reconciler
+    from creating the replacement this wave is waiting for.
+
+    They used to be two functions that each listed the Jobs for themselves, and
+    the cancelling one listed twice -- three identical `get jobs` calls against
+    one label selector per wave, so twelve on a four-wave rollout, all of them
+    inside the stretch of a release that prints nothing. One listing decides
+    both, in the same order as before: cancel first and verify, then clear the
+    failures.
+    """
+
+    jobs = _installer_jobs(release, target)
+    _cancel_installer_jobs(release, target, jobs)
+    for name in _failed_installer_jobs(jobs):
+        _delete_installer_job(release, target, name)
 
 
 def ensure_gpu_namespace(release: Any, target: ClusterTarget) -> None:

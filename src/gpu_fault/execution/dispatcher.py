@@ -299,6 +299,19 @@ class WorkflowDispatcher:
         return blocked
 
     def _expire_stuck_workflows(self, now: datetime) -> list[WorkflowRequest]:
+        """Reap a workflow whose executor stopped touching it.
+
+        This covers the abandoned record only, and cannot cover the looping one.
+        It has to take the lease to act, and a workflow still being redispatched
+        renews its lease every tick, so the claim below loses every time against
+        exactly the workflow the deadline was written for. That case is enforced
+        by the lease holder instead, in
+        ``ProductionWorkflowExecutor._workflow_deadline_failure``; the pair is
+        what makes ``execution_deadline`` real. The lost claim is logged rather
+        than passed over in silence, because for the four hours before that fix
+        the only visible symptom was a workflow that never ended.
+        """
+
         expired = []
         for workflow in self.store.list_workflows(
             {WorkflowStatus.RUNNING},
@@ -315,6 +328,21 @@ class WorkflowDispatcher:
                     now=now,
                 )
             except WorkflowLeaseError:
+                LOGGER.warning(
+                    "workflow is past its execution deadline but held by its "
+                    "executor, so the watchdog cannot reap it; the lease holder "
+                    "enforces the deadline: workflow=%s deadline=%s "
+                    "overdue_seconds=%s owner=%s lease_expires_at=%s",
+                    workflow.request_id,
+                    workflow.execution_deadline.isoformat(),
+                    int((now - workflow.execution_deadline).total_seconds()),
+                    workflow.execution_owner_id,
+                    (
+                        workflow.execution_lease_expires_at.isoformat()
+                        if workflow.execution_lease_expires_at is not None
+                        else None
+                    ),
+                )
                 continue
             cancellation = self.store.cancel_remote_commands_for_workflow(
                 workflow.request_id,

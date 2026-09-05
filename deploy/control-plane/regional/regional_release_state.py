@@ -4,13 +4,12 @@ import copy
 import hashlib
 import json
 import re
-import sys
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,8 +18,9 @@ import yaml
 from regional_release_config import ClusterTarget, ReleaseError
 from regional_release_diff import ReleaseComponent, ReleaseExecutionPlan
 from regional_release_legacy import AGENT_IDENTITY_FIELDS
+from regional_release_narration import narrate_phase
 from regional_release_probes import probe_source
-from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
+from regional_release_runtime_identity import exec_cpu_ingress_probe
 
 from gpu_fault.admin.config import (
     AdminConfig,
@@ -45,36 +45,13 @@ DIGEST_IMAGE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 
 
 def remote_command_stats(release: Any) -> dict[str, Any]:
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("no Running CPU ingress Pod")
     return json.loads(
-        release.runner.run(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "exec",
-                pod,
-                "--",
-                CONTROL_PLANE_PYTHON,
-                "-c",
-                probe_source("remote_command_stats"),
-            ),
-            capture=True,
+        exec_cpu_ingress_probe(
+            release,
+            script=probe_source("remote_command_stats"),
+            failure="remote command statistics",
             sensitive=True,
+            interactive=False,
         )
     )
 
@@ -143,6 +120,58 @@ def cached_read(
         raise
     future.set_result(value)
     return copy.deepcopy(value)
+
+
+# Anything else -- `create-`, `put-`, `change-`, `modify-` -- must reach AWS every
+# time, and a verb this list has not seen is treated as one of those until it can
+# be reviewed.
+AWS_READ_ONLY_VERBS = ("describe-", "get-", "list-")
+
+
+def aws_read_only(arguments: Sequence[str]) -> bool:
+    return len(arguments) >= 2 and arguments[1].startswith(AWS_READ_ONLY_VERBS)
+
+
+def aws_json(
+    release: Any,
+    arguments: Sequence[str],
+    *,
+    region: bool = True,
+    sensitive: bool = False,
+    cached: bool = True,
+) -> dict[str, Any]:
+    """One read-only `aws` call, served from the open snapshot when there is one.
+
+    Every AWS read in a release funnels through here so that a question asked
+    twice inside one snapshot costs one round trip. Because the callers fan out
+    over thread pools -- the preflight validates clusters in parallel, and one
+    IAM role expansion is a tree of small reads -- the collapse has to hold for
+    concurrent askers too, which is why `cached_read` publishes a promise before
+    it reads.
+
+    What this deliberately does not do is dedupe across snapshots. Two admin
+    reports in one deploy ask `sesv2 get-account` again on purpose: the later
+    report exists to observe what the release changed, and a cache that outlived
+    the snapshot would answer it with the reading from before.
+
+    `cached=False` is for a read inside a wait loop, where serving the previous
+    answer would turn "not converged yet" into a loop that can never end.
+    """
+
+    command = ["aws", *arguments]
+    if region:
+        command.extend(["--region", release.config.aws_region])
+    command.extend(["--output", "json"])
+
+    def fetch() -> dict[str, Any]:
+        raw = release.runner.run(command, capture=True, sensitive=sensitive)
+        value: dict[str, Any] = json.loads(raw) if raw else {}
+        return value
+
+    cache = getattr(release, "_aws_read_cache", None)
+    if cache is None or not cached or not aws_read_only(arguments):
+        return fetch()
+    return cached_read(cache, release._json_read_cache_lock, tuple(command), fetch)
 
 
 def get_json(release: Any, args: list[str]) -> dict[str, Any]:
@@ -653,35 +682,10 @@ def captured_admin_config(
 
 
 def capture_agent_identities(release: Any) -> dict[str, dict[str, Any]]:
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("cannot capture previous Agent identity without CPU ingress")
-    raw = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            "-i",
-            pod,
-            "--",
-            CONTROL_PLANE_PYTHON,
-            "-c",
-            probe_source("active_agent_identities"),
-        ),
-        capture=True,
+    raw = exec_cpu_ingress_probe(
+        release,
+        script=probe_source("active_agent_identities"),
+        failure="previous Agent identity capture",
     )
     records = json.loads(raw)
     result: dict[str, dict[str, Any]] = {}
@@ -1255,37 +1259,6 @@ def template_bundle(
             if volume.get("name") == "installer":
                 return (volume.get("configMap") or {}).get("name")
     return None
-
-
-def narrate_phase(release: Any, phase: str) -> None:
-    """Announce a durable checkpoint on the stream the operator is watching.
-
-    `save_state` is the only funnel for release state, but it writes a ConfigMap
-    and prints nothing, so an upgrade narrates thousands of `+ kubectl` lines
-    without ever saying which of its dozen transaction phases it is in. Reading
-    the state back does not recover that either: `completed_phases` is stored
-    sorted alphabetically, so `registry-staged` appears before `schema-ready`
-    even though the orchestrator reaches them the other way round. A real
-    upgrade checkpoints sixteen times, so one line each is cheap next to the
-    command trace, and it is the only timestamp in the log -- without it there
-    is no way to tell which phase is the slow one.
-
-    Printed after the write rather than before, so a line is a promise that the
-    checkpoint survived: resume and rollback both key off persisted phases.
-    """
-
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    fields = [f"release-phase {stamp} {phase}"]
-    lifecycle = release.state.get("release_lifecycle")
-    if lifecycle:
-        fields.append(f"lifecycle={lifecycle}")
-    expected = release.state.get("cluster_ids") or []
-    if expected:
-        done = release.state.get("completed_cluster_ids") or []
-        # Several checkpoints share one phase name and differ only in which
-        # cluster just converged, so the phase alone cannot show progress.
-        fields.append(f"clusters={len(done)}/{len(expected)}")
-    print(" ".join(fields), file=sys.stderr, flush=True)
 
 
 def save_state(release: Any, phase: str, **updates: Any) -> None:

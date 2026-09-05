@@ -934,10 +934,10 @@ def _aws_cache_release(calls: list[tuple[str, ...]], *, delay: float = 0.0):
 def test_repeated_aws_reads_are_served_once_per_snapshot() -> None:
     """One report asks AWS the same question from several checks.
 
-    `_check_aurora` and the preflight NLB check both describe the same ACM
-    certificate, and the per-subnet route test falls back to the same VPC main
-    route table once per subnet. Those are reads of one observation, so the
-    snapshot answers them once -- and stops answering when it closes, because
+    The per-subnet IGW route test falls back to the same VPC main route table
+    once per public subnet, and the executor role expansion resolves the same
+    managed policy once per GPU cluster. Those are reads of one observation, so
+    the snapshot answers them once -- and stops answering when it closes, because
     outside a snapshot there is no observation to be consistent with.
     """
 
@@ -989,6 +989,7 @@ def test_state_changing_aws_calls_are_never_cached() -> None:
     """
 
     module = CHECKS.load()
+    state = STATE.load()
     calls: list[tuple[str, ...]] = []
     release = _aws_cache_release(calls)
     mutation = ["ec2", "create-tags", "--resources", "i-abc"]
@@ -998,9 +999,7 @@ def test_state_changing_aws_calls_are_never_cached() -> None:
         module._aws_json(release, mutation)
 
     assert len(calls) == 2
-    assert not module._aws_read_only(mutation), "create-tags mutates and cannot cache"
-    assert module._aws_read_only(["acm", "describe-certificate"]), "describe- is read"
-    assert module._aws_read_only(["sesv2", "get-account"]), "get- is read"
-    assert module._aws_read_only(["sns", "list-subscriptions-by-topic"]), (
-        "list- is read"
-    )
+    assert not state.aws_read_only(mutation), "create-tags mutates and cannot cache"
+    assert state.aws_read_only(["acm", "describe-certificate"]), "describe- is read"
+    assert state.aws_read_only(["sesv2", "get-account"]), "get- is read"
+    assert state.aws_read_only(["sns", "list-subscriptions-by-topic"]), "list- is read"

@@ -17,6 +17,7 @@ from gpu_fault.models import (
 from gpu_fault.store import NotFoundError
 from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.execution.remediation_budget import remediation_budget_claims
+import gpu_fault.execution.step_bounds as step_bounds
 
 
 LOGGER = logging.getLogger(__name__)
@@ -219,13 +220,11 @@ def fail_restart_preflight(
 ) -> Any:
     """Persist a restart preflight failure without invoking an adapter."""
 
-    workflow = executor._record_execution(
+    workflow = step_bounds.record_attempt(
         workflow,
-        executor._execution(
-            failure.step_index,
-            failure.step,
-            failure.outcome,
-        ),
+        failure.step,
+        failure.step_index,
+        failure.outcome,
     )
     now = datetime.now(timezone.utc)
     workflow = workflow.model_copy(

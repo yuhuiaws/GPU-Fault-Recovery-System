@@ -316,6 +316,58 @@ def test_managed_recovery_timeout_creates_one_notification() -> None:
     assert len(store.list_notifications()) == 1
 
 
+def test_a_delegated_wait_gives_up_before_the_workflow_does() -> None:
+    """The escalation has to be sent by whoever notices, and this is the noticer.
+
+    The provider window and the workflow budget are configured independently, so
+    the workflow can be the shorter of the two -- and at the shipped defaults it
+    is, because the two are the same length and the workflow has already spent
+    time on the steps before this one. Left unclamped, the workflow deadline
+    reaches the step first, on the generic failure path, and the operator never
+    gets the support-case notification that is the only actionable output of a
+    recovery the provider did not complete.
+    """
+
+    (store, _, identities, _, _, incident, workflow, step, request) = observer_fixture()
+    observer = HyperPodManagedRecoveryObserver(
+        identities, store, registry=None, timeout=timedelta(minutes=30)
+    )
+    first = observer.observe(
+        WorkflowStepContext(
+            workflow=workflow,
+            incident=incident,
+            step=step,
+            step_index=0,
+            request=request,
+            idempotency_key="workflow-managed/0/clamped",
+        )
+    )
+    waiting = context_with_previous(incident, workflow, step, request, first)
+    # Inside the margin, so the observation is out of time while the workflow
+    # itself still has some -- which is the whole point of the margin: the
+    # deadline is checked before a step is dispatched, so an observation that
+    # expired exactly with the workflow would never run.
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
+
+    failed = observer.observe(
+        WorkflowStepContext(
+            workflow=copy_model(waiting.workflow, execution_deadline=deadline),
+            incident=incident,
+            step=step,
+            step_index=0,
+            request=request,
+            idempotency_key="workflow-managed/0/clamped",
+        )
+    )
+
+    assert deadline > datetime.now(timezone.utc), (
+        "the workflow's own deadline must not have passed, or this proves nothing"
+    )
+    assert failed.status is WorkflowStepStatus.FAILED
+    assert "timed out" in failed.error
+    assert len(store.list_notifications()) == 1
+
+
 def test_sqlite_persists_hyperpod_identity(tmp_path) -> None:
     path = tmp_path / "managed.db"
     first = SqliteStore(str(path))

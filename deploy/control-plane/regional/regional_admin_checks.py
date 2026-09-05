@@ -24,9 +24,10 @@ from regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
     EXECUTOR_PYTHON,
     EXECUTOR_READINESS,
+    exec_cpu_ingress,
     validate_runtime_component_identity,
 )
-from regional_release_state import cached_read
+from regional_release_state import aws_json
 from regional_release_workflow_safety import workflow_safety_snapshot
 from regional_runtime_profile import verify_runtime_profile
 from regional_validation_evidence import (
@@ -394,40 +395,19 @@ def _check_load_balancer_controller(release: Any) -> CheckValue:
     return CheckValue("AWS Load Balancer Controller is Ready", matches)
 
 
-# The only AWS operations this module is allowed to serve from the snapshot.
-# Anything outside this tuple is executed every time it is asked for: caching a
-# call that changes AWS state would silently drop the second one, and caching a
-# read that a caller is polling would make it wait for a value that can never
-# arrive.
-AWS_READ_ONLY_VERBS = ("describe-", "get-", "list-")
-
-
-def _aws_read_only(arguments: list[str]) -> bool:
-    return len(arguments) >= 2 and arguments[1].startswith(AWS_READ_ONLY_VERBS)
-
-
 def _aws_json(release: Any, arguments: list[str]) -> dict[str, Any]:
-    command = [
-        "aws",
-        *arguments,
-        "--region",
-        release.config.aws_region,
-        "--output",
-        "json",
-    ]
-
-    def fetch() -> dict[str, Any]:
-        return json.loads(release.runner.run(command, capture=True))
-
-    # Several checks ask AWS the same question inside one report: `_check_aurora`
-    # and the preflight NLB check both describe the ACM certificate, and the
-    # per-subnet IGW route test falls back to the same VPC main route table once
-    # per subnet. Because they run on a thread pool, those arrive concurrently,
-    # so the cache has to hold a promise rather than a value to collapse them.
-    cache = getattr(release, "_aws_read_cache", None)
-    if cache is None or not _aws_read_only(arguments):
-        return fetch()
-    return cached_read(cache, release._json_read_cache_lock, tuple(command), fetch)
+    # A question repeated inside one report costs one round trip. The two that
+    # actually repeat are the IGW default-route test, which falls back to the same
+    # VPC main route table once per public subnet, and the executor role expansion
+    # `regional_contexts` drives, where every GPU cluster attaches the same managed
+    # policies. The second of those arrives from a thread pool inside a thread
+    # pool, which is what the shared helper's promise-before-read is built for.
+    #
+    # It stops at the report boundary on purpose. `_check_nlb_inputs` and
+    # `_check_nlb_runtime` both describe the ACM certificate, but they belong to
+    # the preflight and the verify report respectively, and the verify report
+    # exists to observe what the release changed.
+    return aws_json(release, arguments)
 
 
 def _certificate_details(release: Any) -> dict[str, Any]:
@@ -991,26 +971,6 @@ def run_read_only_verifiers(
     )
 
 
-def _cpu_ingress_pod(release: Any) -> str:
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("no Running CPU ingress Pod")
-    return pod
-
-
 def _control_api_report(release: Any) -> dict[str, Any]:
     expected_nodes = {}
     for target in release.config.clusters:
@@ -1027,13 +987,9 @@ def _control_api_report(release: Any) -> dict[str, Any]:
             item["metadata"]["name"] for item in _ready_nodes(nodes)
         )
     return json.loads(
-        release.runner.run(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "exec",
-                _cpu_ingress_pod(release),
-                "--",
+        exec_cpu_ingress(
+            release,
+            arguments=(
                 "env",
                 "ADMIN_CLUSTER_IDS_JSON="
                 + json.dumps(
@@ -1046,8 +1002,9 @@ def _control_api_report(release: Any) -> dict[str, Any]:
                 "-c",
                 probe_source("control_api_inspect"),
             ),
-            capture=True,
+            failure="the control API report",
             sensitive=True,
+            interactive=False,
         )
     )
 

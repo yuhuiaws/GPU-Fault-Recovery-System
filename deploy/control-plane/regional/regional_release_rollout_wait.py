@@ -158,6 +158,11 @@ def wait_deployment_rollout(
                 "deployment": deployment_name,
                 "duration_seconds": max(0.0, observed_at - started),
                 "progress": list(progress),
+                # The generation that satisfied the barrier, so a caller that
+                # needs to read something off the Deployment -- its container
+                # environment, say -- does not have to fetch it again and hope it
+                # is still the same one.
+                "object": deployment,
             }
         pods = release._get_json(
             release._gpu(

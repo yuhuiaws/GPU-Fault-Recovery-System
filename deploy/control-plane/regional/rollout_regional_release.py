@@ -41,7 +41,7 @@ from regional_gpu_bootstrap import (
     ensure_gpu_namespace,
     preflight_gpu_dcgm_exporter,
     quiesce_gpu_executor,
-    retry_failed_installer_jobs,
+    settle_installer_jobs,
     verify_gpu_control_plane_endpoint,
 )
 from regional_notifications import (
@@ -126,6 +126,10 @@ from regional_release_orchestration import (
     build_rollback_environment as build_rollback_environment,
 )
 from regional_release_preflight import ensure_region_contexts
+from regional_release_narration import (
+    narrate_release_end,
+    narrate_release_start,
+)
 from regional_release_probes import probe_label
 from regional_release_registry import (
     commit_registry_update,
@@ -149,7 +153,10 @@ from regional_release_rendering import (
 )
 from regional_release_reporting import build_release_plan
 from regional_release_resume_validation import validate_resume_checkpoint
-from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
+from regional_release_runtime_identity import (
+    cpu_ingress_pod_if_running,
+    exec_cpu_ingress_probe,
+)
 from regional_release_state import (
     STATE_CONFIG_MAP as STATE_CONFIG_MAP,
 )
@@ -185,6 +192,8 @@ from regional_runtime_profile import (
 
 ROOT = Path(__file__).resolve().parents[3]
 FAST_ROLLOUT_TIMEOUT = "5m"
+SLOW_COMMAND_SECONDS = 15.0
+SLOW_COMMAND_LABEL_LIMIT = 160
 SENSITIVE_CONFIG_MARKERS = (
     "SECRET",
     "TOKEN",
@@ -217,9 +226,50 @@ def _echoed_arguments(arguments: list[str]) -> list[str]:
     return echoed
 
 
+def _command_label(args: list[str], *, sensitive: bool = False) -> str:
+    """The command exactly as the ``+`` echo has always shown it.
+
+    Not shortened: an argument that is not a probe body is the release's real
+    input -- a manifest, a selector, a node name -- and the trace an operator
+    reads to reconstruct what ran has to keep it whole. Shortening belongs to the
+    elapsed line, which is a pointer rather than a record.
+    """
+
+    if sensitive:
+        return "<sensitive command>"
+    return " ".join([Path(args[0]).name, *_echoed_arguments(args[1:])])
+
+
 class Runner:
     def __init__(self, *, dry_run: bool = False) -> None:
         self.dry_run = dry_run
+
+    def _narrate_elapsed(self, label: str, started: float) -> None:
+        """Name the command that ate the wall clock, when it ate enough of it.
+
+        The `+ command` echo says what ran, never how long it took, so a
+        five-minute gap between two `release-phase` lines is spread over a dozen
+        commands with nothing to say which one held it -- measured on the
+        2026-09-05 upgrade: 2m43s across ten lines, then 4m58s across another
+        block, both unattributable. Only slow commands are annotated: a release
+        issues thousands of sub-second kubectl calls and a duration on each would
+        bury the trace this exists to explain.
+
+        The label is shortened here and not in the echo: this line points back at
+        a command the echo already recorded in full, and some of them carry a
+        rendered manifest as an argument.
+        """
+
+        elapsed = time.monotonic() - started
+        if elapsed < SLOW_COMMAND_SECONDS:
+            return
+        if len(label) > SLOW_COMMAND_LABEL_LIMIT:
+            label = label[:SLOW_COMMAND_LABEL_LIMIT] + "..."
+        print(
+            f"command-elapsed {elapsed:.1f}s {label}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def run(
         self,
@@ -231,14 +281,11 @@ class Runner:
         sensitive: bool = False,
         timeout_seconds: float | None = None,
     ) -> str:
-        shown = [Path(args[0]).name, *_echoed_arguments(args[1:])]
-        print(
-            "+ " + ("<sensitive command>" if sensitive else " ".join(shown)),
-            file=sys.stderr,
-            flush=True,
-        )
+        label = _command_label(args, sensitive=sensitive)
+        print("+ " + label, file=sys.stderr, flush=True)
         if self.dry_run and not capture:
             return ""
+        started = time.monotonic()
         try:
             completed = subprocess.run(
                 args,
@@ -253,6 +300,10 @@ class Runner:
             raise ReleaseError(
                 f"command timed out after {timeout_seconds}s: {args[0]}"
             ) from exc
+        finally:
+            # In a `finally` because a command that failed after four minutes is
+            # exactly the one whose duration the reader needs.
+            self._narrate_elapsed(label, started)
         if completed.returncode:
             # A captured failure has to say what it found. The verifiers this
             # runner drives report their defects on stdout and exit 1, so
@@ -283,7 +334,12 @@ class Runner:
         A probe runs in dry-run mode too, matching the previous behaviour of
         those call sites. Reading cluster state is what makes a dry run's plan
         accurate, and a ``get`` mutates nothing.
+
+        A probe echoes nothing on the way in -- there are hundreds of them and
+        their answers are visible in what the release does next -- so a slow one
+        is a wholly silent gap, which is why the elapsed line still applies.
         """
+        started = time.monotonic()
         try:
             completed = subprocess.run(
                 args,
@@ -296,6 +352,8 @@ class Runner:
             raise ReleaseError(
                 f"probe timed out after {timeout_seconds}s: {args[0]}"
             ) from exc
+        finally:
+            self._narrate_elapsed(_command_label(args), started)
         return completed.returncode == 0
 
     def probe_output(
@@ -308,6 +366,7 @@ class Runner:
         boolean :meth:`probe` returns. Like :meth:`probe`, this exists so the
         call sites do not reach ``subprocess`` behind the runner's back.
         """
+        started = time.monotonic()
         try:
             completed = subprocess.run(
                 args,
@@ -320,6 +379,8 @@ class Runner:
             raise ReleaseError(
                 f"probe timed out after {timeout_seconds}s: {args[0]}"
             ) from exc
+        finally:
+            self._narrate_elapsed(_command_label(args), started)
         return completed.returncode, completed.stdout, completed.stderr
 
 
@@ -445,7 +506,7 @@ class RegionalRelease:
     _registry = registry
     _registry_entry = staticmethod(registry_entry)
     _registry_payloads = registry_payloads
-    _retry_failed_installer_jobs = retry_failed_installer_jobs
+    _settle_installer_jobs = settle_installer_jobs
     _read_snapshot = read_snapshot
     _require_cpu_secrets = require_cpu_secrets
     _restore_registry_backup = restore_registry_backup
@@ -638,36 +699,21 @@ class RegionalRelease:
             "if int(stats['by_status'].get(name,0))};"
             "print(bad if bad else '')"
         )
+        # Asked once, outside the retry loop: a control plane with no Running
+        # ingress Pod has nothing dispatching, so the absence answers the
+        # question rather than failing it, which is why this cannot use the
+        # probe helper's resolver -- for every other caller an absent Pod is a
+        # check that could not be made.
+        if not cpu_ingress_pod_if_running(self):
+            return True
         for attempt in range(3):
-            pod = self.runner.run(
-                self._cpu(
-                    "-n",
-                    self.config.namespace,
-                    "get",
-                    "pod",
-                    "-l",
-                    f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-                    "--field-selector=status.phase=Running",
-                    "-o",
-                    "jsonpath={.items[0].metadata.name}",
-                ),
-                capture=True,
-            )
-            if not pod:
-                return True
             try:
-                output = self.runner.run(
-                    self._cpu(
-                        "-n",
-                        self.config.namespace,
-                        "exec",
-                        pod,
-                        "--",
-                        CONTROL_PLANE_PYTHON,
-                        "-c",
-                        script,
-                    ),
-                    capture=True,
+                output = exec_cpu_ingress_probe(
+                    self,
+                    script=script,
+                    failure="the remote command idle check",
+                    interactive=False,
+                    retries=0,
                 )
             except ReleaseError:
                 if attempt == 2:
@@ -1262,83 +1308,89 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def _run_mode(arguments: argparse.Namespace) -> int:
+    config = ReleaseConfig.load(arguments.config)
+    release = RegionalRelease(config, Runner(dry_run=arguments.dry_run))
+    exit_code = 0
+    if arguments.mode == "plan":
+        print(
+            json.dumps(
+                release.plan(arguments.plan_mode),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    elif arguments.mode == "preflight":
+        report = build_preflight_report(release)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        exit_code = report_exit_code(report)
+    elif arguments.mode == "status":
+        report = release.status()
+        print(json.dumps(report, indent=2, sort_keys=True))
+        exit_code = 0 if report.get("healthy") else 1
+    elif arguments.mode == "release-summary":
+        report = build_release_summary(release)
+        print(json.dumps(report, indent=2, sort_keys=True))
+    elif arguments.mode == "release-diff":
+        report = build_release_diff(release)
+        print(json.dumps(report, indent=2, sort_keys=True))
+    elif arguments.mode == "bootstrap":
+        release.bootstrap()
+    elif arguments.mode == "deploy":
+        run_deploy(release)
+    elif arguments.mode == "upgrade":
+        release.upgrade()
+    elif arguments.mode == "resume":
+        run_resume(release)
+    elif arguments.mode == "rollback":
+        release.rollback()
+    elif arguments.mode == "commit":
+        release.commit_release()
+    elif arguments.mode == "stage-noop":
+        stage_noop_release(release)
+    elif arguments.mode == "join-cluster":
+        if not arguments.cluster_id:
+            raise ReleaseError("--cluster-id is required")
+        release.join_cluster(arguments.cluster_id)
+    elif arguments.mode == "activate-cluster":
+        if not arguments.cluster_id:
+            raise ReleaseError("--cluster-id is required")
+        release.activate_cluster(arguments.cluster_id)
+    elif arguments.mode == "fail-cluster":
+        if not arguments.cluster_id:
+            raise ReleaseError("--cluster-id is required")
+        release.fail_cluster(arguments.cluster_id)
+    elif arguments.mode == "rollback-cluster":
+        if not arguments.cluster_id:
+            raise ReleaseError("--cluster-id is required")
+        release.rollback_cluster(arguments.cluster_id)
+    elif arguments.mode == "drain-cluster":
+        if not arguments.cluster_id:
+            raise ReleaseError("--cluster-id is required")
+        drain_registry_cluster(release, arguments.cluster_id)
+    elif arguments.mode == "remove-cluster":
+        if not arguments.cluster_id:
+            raise ReleaseError("--cluster-id is required")
+        release.remove_cluster(arguments.cluster_id)
+    elif arguments.mode == "sync-state":
+        sync_release_state(release)
+    elif arguments.mode == "verify":
+        release._apply_health_baseline()
+        report = build_health_report(release, mode="verify")
+        print(json.dumps(report, indent=2, sort_keys=True))
+        exit_code = report_exit_code(report)
+    elif arguments.mode == "stability":
+        report = release.validate_stability_window()
+        print(json.dumps(report, indent=2, sort_keys=True))
+    return exit_code
+
+
 def main() -> int:
     arguments = parser().parse_args()
+    narrate_release_start(arguments.mode, dry_run=arguments.dry_run)
+    exit_code = 2
     try:
-        config = ReleaseConfig.load(arguments.config)
-        release = RegionalRelease(config, Runner(dry_run=arguments.dry_run))
-        exit_code = 0
-        if arguments.mode == "plan":
-            print(
-                json.dumps(
-                    release.plan(arguments.plan_mode),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
-        elif arguments.mode == "preflight":
-            report = build_preflight_report(release)
-            print(json.dumps(report, indent=2, sort_keys=True))
-            exit_code = report_exit_code(report)
-        elif arguments.mode == "status":
-            report = release.status()
-            print(json.dumps(report, indent=2, sort_keys=True))
-            exit_code = 0 if report.get("healthy") else 1
-        elif arguments.mode == "release-summary":
-            report = build_release_summary(release)
-            print(json.dumps(report, indent=2, sort_keys=True))
-        elif arguments.mode == "release-diff":
-            report = build_release_diff(release)
-            print(json.dumps(report, indent=2, sort_keys=True))
-        elif arguments.mode == "bootstrap":
-            release.bootstrap()
-        elif arguments.mode == "deploy":
-            run_deploy(release)
-        elif arguments.mode == "upgrade":
-            release.upgrade()
-        elif arguments.mode == "resume":
-            run_resume(release)
-        elif arguments.mode == "rollback":
-            release.rollback()
-        elif arguments.mode == "commit":
-            release.commit_release()
-        elif arguments.mode == "stage-noop":
-            stage_noop_release(release)
-        elif arguments.mode == "join-cluster":
-            if not arguments.cluster_id:
-                raise ReleaseError("--cluster-id is required")
-            release.join_cluster(arguments.cluster_id)
-        elif arguments.mode == "activate-cluster":
-            if not arguments.cluster_id:
-                raise ReleaseError("--cluster-id is required")
-            release.activate_cluster(arguments.cluster_id)
-        elif arguments.mode == "fail-cluster":
-            if not arguments.cluster_id:
-                raise ReleaseError("--cluster-id is required")
-            release.fail_cluster(arguments.cluster_id)
-        elif arguments.mode == "rollback-cluster":
-            if not arguments.cluster_id:
-                raise ReleaseError("--cluster-id is required")
-            release.rollback_cluster(arguments.cluster_id)
-        elif arguments.mode == "drain-cluster":
-            if not arguments.cluster_id:
-                raise ReleaseError("--cluster-id is required")
-            drain_registry_cluster(release, arguments.cluster_id)
-        elif arguments.mode == "remove-cluster":
-            if not arguments.cluster_id:
-                raise ReleaseError("--cluster-id is required")
-            release.remove_cluster(arguments.cluster_id)
-        elif arguments.mode == "sync-state":
-            sync_release_state(release)
-        elif arguments.mode == "verify":
-            release._apply_health_baseline()
-            report = build_health_report(release, mode="verify")
-            print(json.dumps(report, indent=2, sort_keys=True))
-            exit_code = report_exit_code(report)
-        elif arguments.mode == "stability":
-            report = release.validate_stability_window()
-            print(json.dumps(report, indent=2, sort_keys=True))
-        return exit_code
+        exit_code = _run_mode(arguments)
     except (
         ReleaseError,
         OSError,
@@ -1346,7 +1398,12 @@ def main() -> int:
         json.JSONDecodeError,
     ) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
+    finally:
+        # `finally` rather than the success path, so an invocation that died --
+        # the case where an operator most needs to know it is over and how long
+        # it lasted -- still closes its own block of the log.
+        narrate_release_end(arguments.mode, exit_code=exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":

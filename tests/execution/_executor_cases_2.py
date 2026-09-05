@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from tests._builders import (
     active_workflow_executor,
     build_store,
@@ -8,6 +10,7 @@ from tests._builders import (
     fault_incident,
     workflow_request,
     workflow_step,
+    workflow_step_execution,
 )
 
 from ._support import (
@@ -15,9 +18,12 @@ from ._support import (
     IncidentState,
     InMemoryStore,
     ProductionExecutorConfig,
+    RemoteActionCommand,
+    RemoteCommandStatus,
     SqliteStore,
     WorkflowDispatcher,
     WorkflowDispatcherConfig,
+    WorkflowExecutionError,
     WorkflowLeaseError,
     WorkflowOperation,
     WorkflowRequest,
@@ -487,3 +493,393 @@ def test_dispatcher_treats_lease_contention_as_waiting() -> None:
     assert report.waiting == 1
     assert report.failed == 0
     assert report.failures == []
+
+
+def test_lease_holder_enforces_deadline_the_watchdog_cannot_claim(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The overdue workflow the watchdog can never reap.
+
+    ``WorkflowDispatcher._expire_stuck_workflows`` has to ``claim_workflow`` to
+    act, and the store refuses a claim from a different owner while the lease is
+    live. A workflow that is being redispatched renews that lease every few
+    seconds, so the watchdog loses every race: the only records it can reap are
+    the ones whose executor already stopped touching them. That left the looping
+    workflow -- the one the deadline exists for -- immune to its own deadline.
+    Enforcement therefore lives in the lease holder, and the watchdog's lost
+    claim is logged instead of silently skipped.
+    """
+
+    store = build_store()
+    operation = WorkflowOperation.FREEZE_EVIDENCE
+    _, workflow = workflow_state(store, [operation])
+    now = datetime.now(timezone.utc)
+    workflow = copy_model(
+        workflow,
+        status=WorkflowStatus.RUNNING,
+        execution_owner_id="executor-a",
+        execution_epoch=1,
+        execution_lease_expires_at=now + timedelta(seconds=180),
+        execution_deadline=now - timedelta(seconds=600),
+    )
+    store.save_workflow(workflow)
+    incident = store.get_incident(workflow.incident_id)
+    store.ensure_remote_command(
+        RemoteActionCommand(
+            command_id="remote-live",
+            cluster_id=incident.cluster_id,
+            workflow_request_id=workflow.request_id,
+            incident_id=incident.incident_id,
+            step_index=0,
+            fencing_token=workflow.fencing_token,
+            idempotency_key="remote/live",
+            step=workflow.official_steps[0],
+            workflow=workflow,
+            incident=incident,
+        )
+    )
+    handled = []
+    adapter = FakeAdapter({operation: WorkflowStepOutcome.succeeded()})
+    dispatcher = WorkflowDispatcher(
+        store,
+        executor(store, adapter, [operation]),
+        WorkflowDispatcherConfig(enabled=True),
+        failure_handler=handled.append,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.execution.dispatcher"):
+        report = dispatcher.run_once()
+
+    assert report.failed == 1
+    # The step itself never ran: the deadline is checked before dispatch.
+    assert adapter.calls == []
+    final = store.get_workflow(workflow.request_id)
+    assert final.status is WorkflowStatus.FAILED
+    execution = final.step_executions[-1]
+    assert execution.status is WorkflowStepStatus.FAILED
+    assert execution.details["workflow_deadline_overdue_seconds"] >= 600
+    assert execution.details["workflow_deadline_remote_command_cancellation"] == {
+        "cancelled": 1,
+        "cancellation_requested": 0,
+    }
+    assert handled[0].request_id == workflow.request_id
+    assert store.get_remote_command("remote-live").status is RemoteCommandStatus.FAILED
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if "watchdog cannot reap it" in record.getMessage()
+    ]
+
+
+def _waiting_workflow_past(
+    store: InMemoryStore,
+    operation: WorkflowOperation,
+    *,
+    waited_seconds: int,
+    window_seconds: int = 200,
+) -> WorkflowRequest:
+    """A workflow that has been WAITING on step 0 for ``waited_seconds``.
+
+    The deadline is placed so the execution window opened ``window_seconds`` ago,
+    which is what lets ``waited_seconds`` be measured at all: the per-step clock
+    is clamped to the start of the window, recovered from the deadline minus the
+    workflow budget. Taking the budget from the config rather than repeating it
+    keeps that placement correct when the budget is retuned.
+    """
+
+    _, workflow = workflow_state(store, [operation])
+    now = datetime.now(timezone.utc)
+    budget = ProductionExecutorConfig.workflow_execution_timeout_seconds
+    workflow = copy_model(
+        workflow,
+        status=WorkflowStatus.RUNNING,
+        execution_deadline=now + timedelta(seconds=budget - window_seconds),
+        step_executions=[
+            workflow_step_execution(
+                0,
+                operation,
+                WorkflowStepStatus.WAITING,
+                adapter_operation_id="provider-op-1",
+                started_at=now - timedelta(seconds=waited_seconds),
+            )
+        ],
+    )
+    store.save_workflow(workflow)
+    return workflow
+
+
+def test_step_waiting_cap_fails_a_step_no_retry_counter_can_bound() -> None:
+    """Elapsed time, not another attempt count.
+
+    Every per-operation bound in the engine is a counter an adapter reads back
+    out of its own step execution record, so a record whose key never advances
+    -- a synthetic check borrowing its parent's ``step_index``, an outcome that
+    is never persisted -- takes the counter's ceiling away with it. Live on
+    2026-09-05 that left a REPLACE_NODE step re-asking the same question for
+    hours with ``verify_max_attempts=60`` stuck at 1.
+
+    Driven through a quiesce rather than that REPLACE_NODE, because the default
+    cap is what is under test and the delegated node operations answer to the
+    provider window instead -- which is also what this shows: the override does
+    not leak onto everything else.
+    """
+
+    store = build_store()
+    operation = WorkflowOperation.QUIESCE_GPU_SERVICES
+    workflow = _waiting_workflow_past(store, operation, waited_seconds=150)
+    adapter = FakeAdapter(
+        {operation: WorkflowStepOutcome.waiting(operation_id="provider-op-1")}
+    )
+    active = active_workflow_executor(
+        store,
+        [adapter],
+        [operation],
+        step_waiting_timeout_seconds=120,
+        step_waiting_warning_seconds=60,
+    )
+
+    result = execute_workflow(active, workflow.request_id)
+
+    assert result.status is WorkflowStatus.FAILED
+    execution = store.get_workflow(workflow.request_id).step_executions[-1]
+    assert execution.status is WorkflowStepStatus.FAILED
+    assert "per-step cap" in execution.error
+    assert execution.details["step_waiting_seconds"] >= 150
+    assert execution.details["step_waiting_timeout_seconds"] == 120
+
+
+def test_step_waiting_warning_latches_so_it_reports_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Warn on the crossing, not on every redispatch after it.
+
+    The step keeps waiting, and the poll interval is seconds, so an unlatched
+    warning would be one line every few seconds until the cap fires -- the shape
+    that trains an operator to filter the logger out.
+    """
+
+    store = build_store()
+    operation = WorkflowOperation.QUIESCE_GPU_SERVICES
+    workflow = _waiting_workflow_past(store, operation, waited_seconds=90)
+    adapter = FakeAdapter(
+        {operation: WorkflowStepOutcome.waiting(operation_id="provider-op-1")}
+    )
+    active = active_workflow_executor(
+        store,
+        [adapter],
+        [operation],
+        step_waiting_timeout_seconds=120,
+        step_waiting_warning_seconds=60,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.execution.executor"):
+        first = execute_workflow(active, workflow.request_id)
+        second = execute_workflow(active, workflow.request_id)
+
+    assert first.status is WorkflowStatus.RUNNING
+    assert first.waiting_step_index == 0
+    assert second.status is WorkflowStatus.RUNNING
+    execution = store.get_workflow(workflow.request_id).step_executions[-1]
+    assert execution.status is WorkflowStepStatus.WAITING
+    assert execution.details["step_waiting_slow"] is True
+    assert execution.details["step_waiting_seconds"] >= 90
+    assert (
+        len(
+            [
+                record
+                for record in caplog.records
+                if "waiting far longer than expected" in record.getMessage()
+            ]
+        )
+        == 1
+    )
+
+
+def test_inherited_step_start_time_cannot_fire_the_cap_early() -> None:
+    """A start time older than this execution window only delays the cap.
+
+    A merged or branched workflow inherits the step executions of the record it
+    absorbed, so ``started_at`` can predate the current window by hours. Measured
+    raw, the first dispatch after such a merge would fail the step immediately on
+    time the current executor never spent.
+    """
+
+    store = build_store()
+    operation = WorkflowOperation.QUIESCE_GPU_SERVICES
+    _, workflow = workflow_state(store, [operation])
+    now = datetime.now(timezone.utc)
+    workflow = copy_model(
+        workflow,
+        step_executions=[
+            workflow_step_execution(
+                0,
+                operation,
+                WorkflowStepStatus.WAITING,
+                adapter_operation_id="provider-op-1",
+                started_at=now - timedelta(hours=6),
+            )
+        ],
+    )
+    store.save_workflow(workflow)
+    adapter = FakeAdapter(
+        {operation: WorkflowStepOutcome.waiting(operation_id="provider-op-1")}
+    )
+    active = active_workflow_executor(
+        store,
+        [adapter],
+        [operation],
+        step_waiting_timeout_seconds=120,
+        step_waiting_warning_seconds=60,
+    )
+
+    result = execute_workflow(active, workflow.request_id)
+
+    assert result.status is WorkflowStatus.RUNNING
+    execution = store.get_workflow(workflow.request_id).step_executions[-1]
+    assert execution.status is WorkflowStepStatus.WAITING
+    # The deadline was written by this claim, so the window starts now.
+    assert execution.details["step_waiting_seconds"] < 60
+    assert "step_waiting_slow" not in execution.details
+
+
+def test_step_start_time_survives_retries_but_not_a_rebound_index() -> None:
+    """``started_at`` is the step's clock, and only while it is the same step.
+
+    It used to be re-defaulted on every attempt, which made it a second copy of
+    ``updated_at`` that nothing read. Kept across attempts it becomes the value
+    the per-step cap measures. It must still reset when a workflow falls back to
+    ``safety_steps``, because that reuses the same indexes for other operations.
+    """
+
+    store = build_store()
+    operation = WorkflowOperation.RESTART_NODE
+    _, workflow = workflow_state(store, [operation])
+    adapter = FakeAdapter(
+        {operation: WorkflowStepOutcome.waiting(operation_id="provider-op-1")}
+    )
+    active = executor(store, adapter, [operation])
+
+    execute_workflow(active, workflow.request_id)
+    first = store.get_workflow(workflow.request_id).step_executions[0]
+    execute_workflow(active, workflow.request_id)
+    second = store.get_workflow(workflow.request_id).step_executions[0]
+
+    assert second.started_at == first.started_at
+
+    rebound_at = datetime.now(timezone.utc)
+    store.save_workflow(
+        copy_model(
+            store.get_workflow(workflow.request_id),
+            step_executions=[
+                workflow_step_execution(
+                    0,
+                    WorkflowOperation.VALIDATE_GPU,
+                    WorkflowStepStatus.WAITING,
+                    started_at=rebound_at - timedelta(hours=2),
+                )
+            ],
+        )
+    )
+    execute_workflow(active, workflow.request_id)
+    rebound = store.get_workflow(workflow.request_id).step_executions[0]
+
+    assert rebound.operation is operation
+    assert rebound.started_at >= rebound_at
+
+
+def test_step_cap_settings_are_checked_where_the_operator_is_watching(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A cap that cannot fire is a configuration defect, not a runtime surprise.
+
+    The impossible orderings are refused at start-up. The remaining one -- the
+    default cap at or above the workflow budget -- is only reported, because
+    lowering the workflow budget for a drill is legitimate and refusing it would
+    turn a drill into an outage; but it silently restores the unbounded state this
+    setting exists to end, so it cannot pass unremarked.
+    """
+
+    with pytest.raises(WorkflowExecutionError, match="must not exceed"):
+        ProductionExecutorConfig.from_mapping(
+            {"GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS": "601"}
+        )
+    with pytest.raises(WorkflowExecutionError, match="step timeout must be positive"):
+        ProductionExecutorConfig.from_mapping(
+            {"GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS": "0"}
+        )
+    with pytest.raises(WorkflowExecutionError, match="warning threshold must be"):
+        ProductionExecutorConfig.from_mapping(
+            {"GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS": "0"}
+        )
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.execution.config"):
+        config = ProductionExecutorConfig.from_mapping(
+            {"GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS": "600"}
+        )
+
+    assert config.step_waiting_timeout_seconds == 600
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if "no step will ever be capped" in record.getMessage()
+    ]
+
+
+def test_an_override_below_the_default_cap_is_refused() -> None:
+    """The ordering that silently replaces an adapter's own timeout handling.
+
+    An override exists to raise a ceiling for an operation that legitimately
+    waits longer, so one below the default cap can only be a mistake -- and a
+    damaging one: the generic per-step failure would pre-empt the managed
+    recovery observer's escalation notification, which is the only thing that
+    tells an operator to open a provider support case.
+    """
+
+    with pytest.raises(WorkflowExecutionError, match="below the default step timeout"):
+        ProductionExecutorConfig.from_mapping(
+            {
+                "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS": "900",
+                "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS": "600",
+            }
+        )
+
+
+def test_the_shipped_defaults_start_without_a_configuration_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The managed recovery window and the workflow budget are both 1800s.
+
+    That is deliberate: the observer clamps its own deadline inside the workflow
+    deadline, so a delegated step is bounded by the workflow and reports through
+    the observer. A check that warned about it would fire on every start-up of
+    every replica, which is how a real warning stops being read.
+    """
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.execution.config"):
+        config = ProductionExecutorConfig.from_mapping({})
+
+    assert config.step_waiting_limit(WorkflowOperation.REPLACE_NODE) == 1800
+    assert config.workflow_execution_timeout_seconds == 1800
+    assert caplog.records == []
+
+
+def test_a_delegated_operation_waits_on_its_own_clock() -> None:
+    """One ceiling for every operation can only be the largest of them.
+
+    A quiesce that has not answered in ten minutes is already wrong, while a
+    delegated node replacement waits on the provider for as long as the provider
+    takes. Collapsing the two would either fail the replacement early or leave
+    everything else effectively unbounded.
+    """
+
+    config = ProductionExecutorConfig.from_mapping({})
+
+    assert config.step_waiting_limit(WorkflowOperation.REPLACE_NODE) == 1800
+    assert config.step_waiting_limit(WorkflowOperation.RESTART_NODE) == 1800
+    assert config.step_waiting_limit(WorkflowOperation.QUIESCE_GPU_SERVICES) == 600
+    # The lead time the configured pair defines, carried onto the raised ceiling
+    # rather than warning five minutes into a healthy twenty-minute replacement.
+    assert (
+        config.step_waiting_warning_limit(WorkflowOperation.QUIESCE_GPU_SERVICES) == 300
+    )
+    assert config.step_waiting_warning_limit(WorkflowOperation.REPLACE_NODE) == 1500

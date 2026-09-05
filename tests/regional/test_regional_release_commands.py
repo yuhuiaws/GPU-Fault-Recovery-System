@@ -44,6 +44,12 @@ ORCHESTRATION_MODULE = lazy_script_module(
 ROLLBACK_CONTEXT_MODULE = lazy_script_module(
     ROOT / "deploy/control-plane/regional/regional_release_rollback_context.py"
 )
+IAM_MODULE = lazy_script_module(
+    ROOT / "deploy/control-plane/regional/regional_release_iam.py"
+)
+STATE_MODULE = lazy_script_module(
+    ROOT / "deploy/control-plane/regional/regional_release_state.py"
+)
 
 
 class PreflightRunner:
@@ -545,6 +551,88 @@ def test_release_config_loads_content_addressed_manifest(tmp_path) -> None:
 
     assert config.wheel.name == "release.whl"
     assert config.bundle.name == "bundle.tar.gz"
+
+
+def _iam_release(calls: list[tuple[str, ...]]):
+    """A release whose IAM reads are recorded, with a shared managed policy.
+
+    Both roles attach ``arn:aws:iam::1:policy/shared``, which is what a real
+    fleet looks like: one policy authored once and attached to every cluster's
+    executor role.
+    """
+
+    documents = {
+        "list-role-policies": {"PolicyNames": []},
+        "list-attached-role-policies": {
+            "AttachedPolicies": [{"PolicyArn": "arn:aws:iam::1:policy/shared"}]
+        },
+        "get-policy": {"Policy": {"DefaultVersionId": "v3"}},
+        "get-policy-version": {
+            "PolicyVersion": {
+                "Document": {
+                    "Statement": [
+                        {"Effect": "Allow", "Action": "sagemaker:DescribeCluster"}
+                    ]
+                }
+            }
+        },
+    }
+
+    class Runner:
+        @staticmethod
+        def run(arguments, **_kwargs):
+            calls.append(tuple(arguments))
+            return json.dumps(documents[arguments[2]])
+
+    return SimpleNamespace(config=SimpleNamespace(aws_region=REGION), runner=Runner())
+
+
+def _iam_target(cluster_id: str):
+    return SimpleNamespace(
+        executor_irsa_role_arn=f"arn:aws:iam::1:role/executor-{cluster_id}"
+    )
+
+
+def test_shared_executor_policy_is_read_once_per_fleet_snapshot() -> None:
+    """Expanding two roles that share a policy costs one expansion, not two.
+
+    Every cluster's executor role tends to attach the same managed policies, and
+    each attached one costs a ``get-policy``/``get-policy-version`` pair. Inside
+    one snapshot the second role reuses what the first resolved, so the cost of
+    the check grows with the number of distinct policies rather than with the
+    size of the fleet.
+    """
+
+    calls: list[tuple[str, ...]] = []
+    release = _iam_release(calls)
+
+    with STATE_MODULE.read_snapshot(release):
+        for cluster_id in ("gpu-a", "gpu-b"):
+            IAM_MODULE.validate_executor_iam_role(release, _iam_target(cluster_id))
+
+    verbs = [item[2] for item in calls]
+
+    assert verbs.count("get-policy") == 1, verbs
+    assert verbs.count("get-policy-version") == 1, verbs
+    # The role listings are per role and must not collapse: the roles differ.
+    assert verbs.count("list-attached-role-policies") == 2, verbs
+    assert not any("--region" in item for item in calls), (
+        "IAM is global, and a --region would make the cache key differ from the "
+        "command actually issued"
+    )
+
+
+def test_executor_policy_reads_do_not_survive_the_snapshot() -> None:
+    """A later phase re-reads the role, because it may have been changed."""
+
+    calls: list[tuple[str, ...]] = []
+    release = _iam_release(calls)
+
+    for _ in range(2):
+        with STATE_MODULE.read_snapshot(release):
+            IAM_MODULE.validate_executor_iam_role(release, _iam_target("gpu-a"))
+
+    assert [item[2] for item in calls].count("get-policy-version") == 2
 
 
 def test_executor_iam_boundary_rejects_allow_not_action() -> None:

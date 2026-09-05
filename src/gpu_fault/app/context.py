@@ -15,6 +15,7 @@ from gpu_fault.execution import (
     ProductionWorkflowExecutor,
     WorkflowDispatcher,
     WorkflowDispatcherConfig,
+    managed_recovery_timeout_seconds,
 )
 from gpu_fault.fleet import (
     BarrierCoordinator,
@@ -622,14 +623,9 @@ class ApplicationContext:
                     "HyperPod managed recovery observer requires "
                     "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER=true"
                 )
-            timeout = timedelta(
-                seconds=int(
-                    os.getenv(
-                        "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS",
-                        "2700",
-                    )
-                )
-            )
+            # The same reader the executor's per-operation waiting cap uses, so
+            # the observer's window and the cap in front of it cannot drift.
+            timeout = timedelta(seconds=managed_recovery_timeout_seconds(os.environ))
             if context.regional_mode:
                 assert regional_remote_adapter is not None
                 observers = {}

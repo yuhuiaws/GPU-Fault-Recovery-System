@@ -345,3 +345,143 @@ def test_disabled_role_does_not_export_collector_snapshot_metrics() -> None:
     )
 
     assert snapshot.lines() == []
+
+
+def test_the_waiting_threshold_is_published_next_to_the_age() -> None:
+    """The alert subtracts one series from the other, so both must exist per step.
+
+    The threshold is per-operation -- a delegated replacement waits on the
+    provider, everything else on the default cap -- so an alert carrying a single
+    literal could only be right for one of them, and at the default cap it would
+    fire on every healthy node replacement. Publishing the applicable threshold
+    with the same labels is what lets the rule compare rather than hard-code, and
+    what keeps it correct when either window is retuned.
+    """
+
+    store = build_store()
+    now = datetime.now(timezone.utc)
+    incident = fault_incident(
+        "incident-waiting",
+        "event-waiting",
+        state=IncidentState.ACTION_PENDING,
+        created_at=now - timedelta(seconds=900),
+        updated_at=now,
+    )
+    operations = (
+        WorkflowOperation.REPLACE_NODE,
+        WorkflowOperation.QUIESCE_GPU_SERVICES,
+    )
+    workflow = workflow_request(
+        "workflow-waiting",
+        incident.incident_id,
+        WorkflowStatus.RUNNING,
+        official_steps=[workflow_step(operation) for operation in operations],
+        step_executions=[
+            workflow_step_execution(
+                index,
+                operation,
+                WorkflowStepStatus.WAITING,
+                started_at=now - timedelta(seconds=900),
+                updated_at=now,
+            )
+            for index, operation in enumerate(operations)
+        ],
+        created_at=now - timedelta(seconds=900),
+        updated_at=now,
+    )
+    store.save_incident_and_workflow(
+        incident.model_copy(update={"workflow_request_id": workflow.request_id}),
+        workflow,
+    )
+
+    lines = closed_loop_metric_lines(
+        SimpleNamespace(context=ApplicationContext(store=store))
+    )
+
+    thresholds = dict(
+        line.removeprefix("gpu_fault_workflow_step_waiting_warning_seconds").split(" ")
+        for line in lines
+        if line.startswith("gpu_fault_workflow_step_waiting_warning_seconds{")
+    )
+    assert thresholds == {
+        '{operation="QUIESCE_GPU_SERVICES"}': "300",
+        '{operation="REPLACE_NODE"}': "1500",
+    }
+    ages = {
+        line.partition(" ")[0].removeprefix("gpu_fault_workflow_step_waiting_seconds")
+        for line in lines
+        if line.startswith("gpu_fault_workflow_step_waiting_seconds{")
+    }
+    assert ages == set(thresholds), (
+        "the two families must carry identical label sets or the rule's vector "
+        "match silently drops the step it was meant to alert on"
+    )
+
+
+def test_waiting_step_age_and_unenforced_deadline_are_exported() -> None:
+    """The two numbers a stalled step used to have nowhere to appear.
+
+    Step metrics were counts by status, so a step re-asking the same question
+    forever looked exactly like a step that had just started waiting; and the
+    workflow's own deadline had no metric at all, which is why a workflow ten
+    minutes past it could keep running with every dashboard green. Both are
+    scoped to non-terminal workflows: a WAITING execution left behind on a
+    workflow that has already ended is history, not a stall.
+    """
+
+    store = build_store()
+    now = datetime.now(timezone.utc)
+    for suffix, status, waiting_seconds, overdue in (
+        ("stalled", WorkflowStatus.RUNNING, 1800, 600),
+        ("done", WorkflowStatus.SUCCEEDED, 90000, 90000),
+    ):
+        incident = fault_incident(
+            f"incident-{suffix}",
+            f"event-{suffix}",
+            state=IncidentState.ACTION_PENDING,
+            created_at=now - timedelta(seconds=waiting_seconds),
+            updated_at=now,
+        )
+        workflow = workflow_request(
+            f"workflow-{suffix}",
+            incident.incident_id,
+            status,
+            official_steps=[workflow_step(WorkflowOperation.REPLACE_NODE)],
+            step_executions=[
+                workflow_step_execution(
+                    0,
+                    WorkflowOperation.REPLACE_NODE,
+                    WorkflowStepStatus.WAITING,
+                    started_at=now - timedelta(seconds=waiting_seconds),
+                    updated_at=now,
+                )
+            ],
+            execution_deadline=now - timedelta(seconds=overdue),
+            created_at=now - timedelta(seconds=waiting_seconds),
+            updated_at=now,
+        )
+        store.save_incident_and_workflow(
+            incident.model_copy(update={"workflow_request_id": workflow.request_id}),
+            workflow,
+        )
+
+    lines = closed_loop_metric_lines(
+        SimpleNamespace(context=ApplicationContext(store=store))
+    )
+
+    waiting = [
+        line
+        for line in lines
+        if line.startswith("gpu_fault_workflow_step_waiting_seconds{")
+    ]
+    assert len(waiting) == 1
+    series, _, age = waiting[0].partition(" ")
+    assert series == (
+        'gpu_fault_workflow_step_waiting_seconds{operation="REPLACE_NODE"}'
+    )
+    assert 1800 <= float(age) < 90000
+    overdue_lines = [
+        line for line in lines if line.startswith("gpu_fault_workflow_overdue_seconds ")
+    ]
+    assert len(overdue_lines) == 1
+    assert 600 <= float(overdue_lines[0].split()[1]) < 90000

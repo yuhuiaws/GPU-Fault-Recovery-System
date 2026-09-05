@@ -10,9 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/check-public-release.py"
 
 
-def run_check(root: Path) -> subprocess.CompletedProcess[str]:
+def run_check(root: Path, *extra: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(SCRIPT), "--root", str(root)],
+        [sys.executable, str(SCRIPT), "--root", str(root), *extra],
         cwd=ROOT,
         text=True,
         capture_output=True,
@@ -21,6 +21,7 @@ def run_check(root: Path) -> subprocess.CompletedProcess[str]:
 
 
 def public_tree(tmp_path: Path, content: str) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / ".gitignore").write_text("", encoding="utf-8")
     docs = tmp_path / "docs"
     docs.mkdir()
@@ -110,6 +111,91 @@ def test_public_release_gate_allows_documented_placeholders(tmp_path: Path) -> N
     result = run_check(public_tree(tmp_path, content))
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# Comfortably more than one shard's worth of bytes, so the scan has to cut the
+# file up and stitch the line numbers back together.
+SHARDED_FILE_LINES = 2000
+SHARDED_FILE_LINE = "node i-0305bbcc538883eb6 " + "x" * 700
+
+
+def sharded_tree(tmp_path: Path, *, filler_files: int) -> Path:
+    (tmp_path / ".gitignore").write_text("", encoding="utf-8")
+    (tmp_path / "big.txt").write_text(
+        "".join(f"{SHARDED_FILE_LINE}\n" for _ in range(SHARDED_FILE_LINES)),
+        encoding="utf-8",
+    )
+    for index in range(filler_files):
+        (tmp_path / f"filler-{index}.txt").write_text(
+            "public documentation\n", encoding="utf-8"
+        )
+    return tmp_path
+
+
+def reported_lines(stderr: str) -> list[int]:
+    return [
+        int(line.split(":")[1])
+        for line in stderr.splitlines()
+        if line.startswith("- big.txt:")
+    ]
+
+
+@pytest.mark.parametrize("filler_files", [0, 64])
+def test_public_release_gate_reports_true_lines_across_shards(
+    tmp_path: Path, filler_files: int
+) -> None:
+    """Sharding a large file must not move the line a violation is reported on.
+
+    Every line of the file is a violation, so whichever offsets the scan cuts
+    on, a shard that lost its place would show up as a wrong number here. The
+    filler files decide whether the scan fans out across processes, and both
+    paths have to agree with the file on disk.
+    """
+
+    result = run_check(sharded_tree(tmp_path, filler_files=filler_files))
+
+    assert result.returncode == 1
+    assert reported_lines(result.stderr) == list(range(1, SHARDED_FILE_LINES + 1))
+
+
+def test_public_release_verdict_cache_reuses_only_identical_content(
+    tmp_path: Path,
+) -> None:
+    """A recorded pass is reused for the same bytes and dropped for any other.
+
+    This is what lets a deploy scan the prepared snapshot without matching it a
+    second time, so the invalidation is the part that matters: a tree that gained
+    a live identity after the pass was recorded must still be rejected.
+    """
+
+    tree = public_tree(tmp_path / "tree", "public documentation\n")
+    cache = tmp_path / "verdict.json"
+
+    first = run_check(tree, "--verdict-cache", str(cache))
+    second = run_check(tree, "--verdict-cache", str(cache))
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "scanned" in first.stdout
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "reused" in second.stdout
+
+    (tree / "docs/public.md").write_text("node i-0305bbcc538883eb6\n", encoding="utf-8")
+    third = run_check(tree, "--verdict-cache", str(cache))
+
+    assert third.returncode == 1
+    assert "concrete EC2 instance ID" in third.stderr
+
+
+def test_public_release_verdict_cache_records_nothing_on_failure(
+    tmp_path: Path,
+) -> None:
+    tree = public_tree(tmp_path / "tree", "node i-0305bbcc538883eb6\n")
+    cache = tmp_path / "verdict.json"
+
+    result = run_check(tree, "--verdict-cache", str(cache))
+
+    assert result.returncode == 1
+    assert not cache.exists(), "a failing scan must not record a reusable pass"
 
 
 def test_public_release_gate_is_wired_into_local_and_ci_checks() -> None:

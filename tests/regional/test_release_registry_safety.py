@@ -250,6 +250,16 @@ class IdleProbe:
             return result
         return self.pod
 
+    def probe(self, _arguments) -> bool:
+        """The memoised Pod is still there, so a failed exec really failed.
+
+        A replaced Pod is the other case, and it buys an extra attempt on a
+        freshly resolved name; these tests are about the retry budget for an exec
+        that reached the Pod and died, so the Pod has to still exist.
+        """
+
+        return True
+
 
 def idle_release(probe: IdleProbe):
     return SimpleNamespace(

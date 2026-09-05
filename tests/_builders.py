@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -10,6 +10,7 @@ import httpx
 
 from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.execution import ProductionExecutorConfig, ProductionWorkflowExecutor
+from gpu_fault.execution.config import managed_recovery_step_overrides
 from gpu_fault.gpu_metrics import GpuMetricBatch
 from gpu_fault.host_health import HostTelemetryBatch, NodeHealthFinding
 from gpu_fault.models import (
@@ -254,7 +255,10 @@ def active_workflow_executor(
     *,
     executor_id: str = "executor-a",
     lease_duration_seconds: int = 180,
-    workflow_execution_timeout_seconds: int = 3600,
+    workflow_execution_timeout_seconds: int = 1800,
+    step_waiting_timeout_seconds: int = 600,
+    step_waiting_warning_seconds: int = 300,
+    step_waiting_timeout_overrides: Mapping[WorkflowOperation, int] | None = None,
     workflow_preemption_enabled: bool = True,
     notification_sender: Any = None,
 ) -> ProductionWorkflowExecutor:
@@ -267,6 +271,13 @@ def active_workflow_executor(
             allowed_operations=frozenset(operations),
             lease_duration_seconds=lease_duration_seconds,
             workflow_execution_timeout_seconds=(workflow_execution_timeout_seconds),
+            step_waiting_timeout_seconds=step_waiting_timeout_seconds,
+            step_waiting_warning_seconds=step_waiting_warning_seconds,
+            step_waiting_timeout_overrides=(
+                managed_recovery_step_overrides({})
+                if step_waiting_timeout_overrides is None
+                else dict(step_waiting_timeout_overrides)
+            ),
             workflow_preemption_enabled=workflow_preemption_enabled,
         ),
         notification_sender=notification_sender,

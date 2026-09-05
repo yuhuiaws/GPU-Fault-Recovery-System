@@ -93,7 +93,7 @@ def test_node_runtime_rollout_uses_fleet_waves(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(
         FLEET_MODULE,
         "reconciler_container_env",
-        lambda *_args: {
+        lambda *_args, **_kwargs: {
             "GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP": "gpu-fault-node-installer-wave",
             "GPU_FAULT_INSTALLER_BUNDLE_SHA256": "b" * 64,
             "GPU_FAULT_INSTALLER_TEMPLATE_SHA256": "e" * 64,
@@ -101,13 +101,8 @@ def test_node_runtime_rollout_uses_fleet_waves(tmp_path: Path, monkeypatch) -> N
     )
     monkeypatch.setattr(
         release,
-        "_cancel_active_installer_jobs",
-        lambda _target: installer_job_calls.append("cancel"),
-    )
-    monkeypatch.setattr(
-        release,
-        "_retry_failed_installer_jobs",
-        lambda _target: installer_job_calls.append("retry"),
+        "_settle_installer_jobs",
+        lambda _target: installer_job_calls.append("settle"),
     )
 
     def record_patch(args, **_kwargs):
@@ -154,7 +149,9 @@ def test_node_runtime_rollout_uses_fleet_waves(tmp_path: Path, monkeypatch) -> N
     ]
     assert {item["data"]["max-unavailable"] for item in wave_patches} == {"2"}
     assert len({item["data"]["generation"] for item in wave_patches}) == 2
-    assert installer_job_calls == ["cancel", "retry", "cancel", "retry"]
+    # One settling pass per wave, and one listing inside it: the in-flight and
+    # the failed Jobs are decided from the same read.
+    assert installer_job_calls == ["settle", "settle"]
     assert wait_calls == [("node-a", "node-b"), ("node-c",), None]
     assert [item.get("minimum_lease_remaining_seconds") for item in safety_calls] == [
         None,
@@ -215,8 +212,7 @@ def _wave_release(monkeypatch, environment: dict[str, str], observed: object):
         config=SimpleNamespace(namespace="gpu-fault-system"),
         _gpu=lambda _target, *args: list(args),
         _get_json=lambda _args: observed,
-        _cancel_active_installer_jobs=lambda _target: calls.append(["cancel"]),
-        _retry_failed_installer_jobs=lambda _target: calls.append(["retry"]),
+        _settle_installer_jobs=lambda _target: calls.append(["settle"]),
     )
     monkeypatch.setattr(
         FLEET_MODULE,
@@ -224,7 +220,7 @@ def _wave_release(monkeypatch, environment: dict[str, str], observed: object):
         lambda *_args, **_kwargs: {"deployment": "reconciler"},
     )
     monkeypatch.setattr(
-        FLEET_MODULE, "reconciler_container_env", lambda *_args: environment
+        FLEET_MODULE, "reconciler_container_env", lambda *_args, **_kwargs: environment
     )
     return release, calls
 
@@ -288,7 +284,9 @@ def test_wave_handoff_requires_the_patched_wave_to_be_observed(
             release, SimpleNamespace(cluster_id="gpu-a"), _wave_context(), ("node-a",)
         )
 
-    assert ["cancel"] in calls and ["retry"] in calls
+    assert ["settle"] in calls, (
+        "the wave was patched without settling the previous wave's installer Jobs"
+    )
     patch = next(item for item in calls if "patch" in item)
     assert patch[:5] == [
         "-n",

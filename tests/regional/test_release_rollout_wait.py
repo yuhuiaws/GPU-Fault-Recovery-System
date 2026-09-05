@@ -215,8 +215,7 @@ def test_reconciler_deploy_uses_progress_aware_wait(
         runner=Runner(),
         bundle_sha="b" * 64,
         node_template_sha="t" * 64,
-        _cancel_active_installer_jobs=lambda _target: sequence.append("cancel"),
-        _retry_failed_installer_jobs=lambda _target: sequence.append("retry"),
+        _settle_installer_jobs=lambda _target: sequence.append("settle"),
     )
     monkeypatch.setattr(
         FLEET_ROLLOUT, "build_reconciler_environment", lambda *_a, **_k: {}
@@ -238,12 +237,7 @@ def test_reconciler_deploy_uses_progress_aware_wait(
         config_digest="c" * 64,
     )
 
-    assert sequence == [
-        "cancel",
-        "retry",
-        "run:deploy-node-installer-reconciler.sh",
-        "wait",
-    ]
+    assert sequence == ["settle", "run:deploy-node-installer-reconciler.sh", "wait"]
     assert environments == [{"GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT": "false"}]
     assert waited == [(FLEET_ROLLOUT.inventory.GPU_RECONCILER_DEPLOYMENT, 600)]
 

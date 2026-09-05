@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -20,21 +21,22 @@ MAX_RUNTIME_IDENTITY_WORKERS = 8
 CPU_INGRESS_POD_ATTRIBUTE = "_cpu_ingress_pod"
 
 
-def resolve_cpu_ingress_pod(release: Any, *, failure: str) -> str:
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
+def _cpu_ingress_pod_command(release: Any) -> list[str]:
+    return release._cpu(
+        "-n",
+        release.config.namespace,
+        "get",
+        "pod",
+        "-l",
+        f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
+        "--field-selector=status.phase=Running",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
     )
+
+
+def resolve_cpu_ingress_pod(release: Any, *, failure: str) -> str:
+    pod = release.runner.run(_cpu_ingress_pod_command(release), capture=True)
     if not pod:
         raise ReleaseError(f"no running CPU ingress Pod for {failure}")
     return str(pod)
@@ -64,8 +66,106 @@ def cpu_ingress_pod(
     return pod
 
 
+def cpu_ingress_pod_if_running(release: Any) -> str:
+    """The memoised ingress Pod name, or ``""`` when the fleet has none.
+
+    For the one caller whose question the absence already answers: with no
+    Running ingress Pod there is nothing left dispatching remote commands. The
+    resolvers above raise instead, because for every other caller a missing
+    control plane means the check could not be made at all.
+    """
+
+    cached = str(getattr(release, CPU_INGRESS_POD_ATTRIBUTE, "") or "")
+    if cached:
+        return cached
+    pod = str(release.runner.run(_cpu_ingress_pod_command(release), capture=True) or "")
+    if pod:
+        setattr(release, CPU_INGRESS_POD_ATTRIBUTE, pod)
+    return pod
+
+
 def forget_cpu_ingress_pod(release: Any) -> None:
     setattr(release, CPU_INGRESS_POD_ATTRIBUTE, "")
+
+
+def exec_cpu_ingress(
+    release: Any,
+    *,
+    arguments: Sequence[str],
+    failure: str,
+    input_text: str | None = None,
+    sensitive: bool = False,
+    timeout_seconds: float | None = None,
+    interactive: bool = True,
+    retries: int = 1,
+    retry_replaced: bool = True,
+) -> str:
+    """Exec ``arguments`` in the memoised ingress Pod.
+
+    ``arguments`` is everything after ``kubectl exec <pod> --``, so a caller can
+    prefix ``env`` assignments or pass a different interpreter; the two wrappers
+    below are what call sites should reach for.
+
+    With ``retries`` above zero a failure re-resolves the Pod and runs the
+    command again, which is only sound for a read-only probe. A failed attempt
+    always drops the memoised name so the next caller re-resolves it.
+
+    A Pod that no longer exists is not a failed attempt, when ``retry_replaced``
+    allows it. The release rolls the CPU ingress Deployment itself, so a
+    memoised name can be replaced between two probes -- the barrier that runs
+    straight after CPU finalize hits exactly that. ``kubectl exec`` then reports
+    ``NotFound`` without the command ever starting, which is why a vanished Pod
+    always buys one more attempt against a freshly resolved Pod, even for the
+    callers that set ``retries=0`` because their in-Pod barrier already spends
+    its whole window: nothing was spent when the exec never ran. The check is
+    positive -- the Pod is looked up rather than the failure text matched -- so
+    it also holds for commands whose output is sensitive and must not be
+    inspected.
+    """
+
+    error: Exception | None = None
+    attempts_left = retries + 1
+    replacement_attempts_left = 1 if retry_replaced else 0
+    refresh = False
+    while attempts_left > 0:
+        pod = cpu_ingress_pod(release, failure=failure, refresh=refresh)
+        command = release._cpu(
+            "-n",
+            release.config.namespace,
+            "exec",
+            *(("-i",) if interactive else ()),
+            pod,
+            "--",
+            *arguments,
+        )
+        try:
+            output = release.runner.run(
+                command,
+                input_text=input_text,
+                capture=True,
+                sensitive=sensitive,
+                timeout_seconds=timeout_seconds,
+            )
+            return str(output or "")
+        except ReleaseError as exc:
+            error = exc
+            replaced = replacement_attempts_left > 0 and not release.runner.probe(
+                release._cpu(
+                    "-n",
+                    release.config.namespace,
+                    "get",
+                    "pod",
+                    pod,
+                )
+            )
+            forget_cpu_ingress_pod(release)
+            refresh = True
+            attempts_left -= 1
+            if attempts_left == 0 and replaced:
+                replacement_attempts_left -= 1
+                attempts_left = 1
+    assert error is not None
+    raise error
 
 
 def exec_cpu_ingress_probe(
@@ -81,67 +181,61 @@ def exec_cpu_ingress_probe(
 ) -> str:
     """Run a read-only in-Pod probe against the memoised ingress Pod.
 
-    Only read-only probes may use this: with ``retries`` above zero a failure
-    re-resolves the Pod and runs the script again, which would be unsafe for a
-    mutating command. A failed attempt always drops the memoised name so the
-    next caller re-resolves it.
-
-    A Pod that no longer exists is not a failed attempt. The release rolls the
-    CPU ingress Deployment itself, so a memoised name can be replaced between
-    two probes -- the barrier that runs straight after CPU finalize hits exactly
-    that. ``kubectl exec`` then reports ``NotFound`` without the script ever
-    starting, which is why a vanished Pod always buys one more attempt against a
-    freshly resolved Pod, even for the callers that set ``retries=0`` because
-    their in-Pod barrier already spends its whole window: nothing was spent when
-    the exec never ran. The check is positive -- the Pod is looked up rather
-    than the failure text matched -- so it also holds for probes whose output is
-    sensitive and must not be inspected.
+    Only read-only probes may use this: a failure here re-runs the script, which
+    would be unsafe for a mutating command. Those use
+    :func:`exec_cpu_ingress_command`.
     """
 
-    error: Exception | None = None
-    attempts_left = retries + 1
-    replacement_attempts_left = 1
-    refresh = False
-    while attempts_left > 0:
-        pod = cpu_ingress_pod(release, failure=failure, refresh=refresh)
-        command = release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            *(("-i",) if interactive else ()),
-            pod,
-            "--",
-            CONTROL_PLANE_PYTHON,
-            "-c",
-            script,
-        )
-        try:
-            return release.runner.run(
-                command,
-                input_text=input_text,
-                capture=True,
-                sensitive=sensitive,
-                timeout_seconds=timeout_seconds,
-            )
-        except ReleaseError as exc:
-            error = exc
-            replaced = not release.runner.probe(
-                release._cpu(
-                    "-n",
-                    release.config.namespace,
-                    "get",
-                    "pod",
-                    pod,
-                )
-            )
-            forget_cpu_ingress_pod(release)
-            refresh = True
-            attempts_left -= 1
-            if attempts_left == 0 and replaced and replacement_attempts_left > 0:
-                replacement_attempts_left -= 1
-                attempts_left = 1
-    assert error is not None
-    raise error
+    return exec_cpu_ingress(
+        release,
+        arguments=(CONTROL_PLANE_PYTHON, "-c", script),
+        failure=failure,
+        input_text=input_text,
+        sensitive=sensitive,
+        timeout_seconds=timeout_seconds,
+        interactive=interactive,
+        retries=retries,
+    )
+
+
+def exec_cpu_ingress_command(
+    release: Any,
+    *,
+    arguments: Sequence[str],
+    failure: str,
+    input_text: str | None = None,
+    sensitive: bool = False,
+    timeout_seconds: float | None = None,
+    interactive: bool = True,
+) -> str:
+    """Run a mutating in-Pod command against the memoised ingress Pod, once.
+
+    Mutating callers get the memoisation -- which is the whole point, a release
+    resolved this Pod nineteen times in one run purely to build an exec command
+    -- but never a second attempt. Neither retry the probe path grants is sound
+    here: re-running is a second mutation, and the vanished-Pod allowance rests
+    on "the command never started", which a ``get pod`` issued *after* the
+    failure cannot establish. A Pod deleted midway through a write looks
+    identical to one that was already gone.
+
+    So a failure drops the memoised name and propagates. The cost of the
+    memoisation is that an exec can now land on a name replaced since the last
+    call and fail where a fresh resolution would have succeeded; the release
+    aborts with a readable error and is resumable, and the CPU ingress
+    Deployment only rolls in a phase these callers do not run in.
+    """
+
+    return exec_cpu_ingress(
+        release,
+        arguments=arguments,
+        failure=failure,
+        input_text=input_text,
+        sensitive=sensitive,
+        timeout_seconds=timeout_seconds,
+        interactive=interactive,
+        retries=0,
+        retry_replaced=False,
+    )
 
 
 def _running_pods(

@@ -20,6 +20,18 @@ def _aws_json(
     regional: bool = True,
     sensitive: bool = False,
 ) -> dict[str, Any]:
+    """One `aws` call, deliberately outside the release's read snapshot.
+
+    Unlike the administrator checks, nothing here asks the same question twice
+    for the same answer. Most of these reads are the bodies of wait loops -- the
+    NLB becoming active, its targets becoming healthy, a Route53 change reaching
+    INSYNC -- and a cache that served the previous reading would turn "not
+    converged yet" into a loop that can never end, or worse, into a pass. The
+    two that are not loops, the hosted-zone and certificate checks in
+    `verify_control_plane_dns_prerequisites`, run once each per release, so
+    routing them through the snapshot would add a key and save nothing.
+    """
+
     command = ["aws", *arguments]
     if regional:
         command.extend(["--region", release.config.aws_region])

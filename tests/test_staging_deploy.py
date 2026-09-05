@@ -418,7 +418,7 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
     monkeypatch.setattr(
         staging_deploy,
         "validate_source_checkout",
-        lambda root: calls.append(("scan", root)),
+        lambda root, **_kwargs: calls.append(("scan", root)),
     )
     monkeypatch.setattr(
         staging_deploy, "ensure_signing_material", lambda *_args, **_kwargs: signing
@@ -544,7 +544,9 @@ def test_unchanged_successful_source_does_not_query_ci_or_deploy(
     monkeypatch.setattr(
         staging_deploy, "prepare_source_checkout", lambda *_args, **_kwargs: source
     )
-    monkeypatch.setattr(staging_deploy, "validate_source_checkout", lambda _root: None)
+    monkeypatch.setattr(
+        staging_deploy, "validate_source_checkout", lambda _root, **_kwargs: None
+    )
     monkeypatch.setattr(
         staging_deploy,
         "source_deploy_identity",
@@ -664,7 +666,7 @@ def test_source_scan_runs_before_snapshot_and_bundle(
     monkeypatch.setattr(
         staging_deploy,
         "validate_source_checkout",
-        lambda root: events.append(("scan", root)),
+        lambda root, **_kwargs: events.append(("scan", root)),
     )
     monkeypatch.setattr(
         staging_deploy, "prepare_source_checkout", lambda *_args, **_kwargs: source

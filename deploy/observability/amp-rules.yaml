@@ -620,6 +620,75 @@ groups:
             An administrator decision request was not delivered. Check the SNS
             topic subscription state and the notification outbox depth; a
             workflow waiting on that decision is not progressing.
+      # Between a step's own retry counter and the workflow's hour-long
+      # execution budget there was nothing: no per-step bound and no signal. On
+      # 2026-09-05 one occupied warm spare parked a REPLACE_NODE step
+      # indefinitely because the counter it was bounded by was read back from a
+      # record whose key never advanced, so the count never rose and the step
+      # never failed. Every component was healthy throughout and no alert fired.
+      #
+      # Age of a still-WAITING step, not a count of them: waiting is normal and a
+      # count cannot separate a node that is rebooting from one that will never
+      # answer.
+      #
+      # Compared against the exported threshold rather than a literal, because the
+      # threshold is per-operation: a delegated REPLACE_NODE waits on the provider
+      # for GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS while everything
+      # else is capped at GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS, and one literal
+      # can only be right for one of them -- at the default cap it would fire on
+      # every healthy node replacement. The control plane publishes
+      # gpu_fault_workflow_step_waiting_warning_seconds with the same labels, so
+      # this expression cannot go stale when either window is retuned.
+      #
+      # `for` is well inside the lead time the two settings define (the cap minus
+      # the warning, 300s at the defaults), so the alert still arrives while the
+      # step is waiting rather than after the cap has already failed it -- the
+      # point is to reach an operator before the recovery is abandoned.
+      - alert: GpuFaultWorkflowStepStalled
+        expr: >-
+          max by (control_plane_cluster, region, operation)
+          (gpu_fault_workflow_step_waiting_seconds
+          - gpu_fault_workflow_step_waiting_warning_seconds) > 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: A recovery workflow step has been waiting far too long
+          runbook_url: docs/管理员日常运维.md#gpufaultworkflowstepstalled
+          description: >-
+            A {{ $labels.operation }} step has been WAITING
+            {{ $value | humanizeDuration }} longer than that operation is
+            expected to wait, without reaching a terminal outcome, so the faulted
+            node is still held and its workload is still suspended. Read that
+            step's details for what it is waiting on and whether the thing it
+            polls has already answered; do not raise the per-step cap to clear
+            this.
+      # The companion invariant. The per-step cap above is what should end a
+      # stalled step, and execution_deadline is the outer bound behind it -- but
+      # for the whole life of this system that outer bound could not fire against
+      # a workflow that was still being redispatched, because the only thing
+      # enforcing it had to take a lease that the dispatch loop renewed on every
+      # tick. Anything above zero here for more than a few minutes means a
+      # deadline passed and neither the lease holder nor the watchdog acted on it,
+      # which is the condition that made a 60-minute stall look like a 60-minute
+      # timeout.
+      - alert: GpuFaultWorkflowDeadlineNotEnforced
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_workflow_overdue_seconds) > 300
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: A recovery workflow outlived its execution deadline
+          runbook_url: docs/管理员日常运维.md#gpufaultworkflowdeadlinenotenforced
+          description: >-
+            A non-terminal workflow is {{ $value | humanizeDuration }} past its
+            execution_deadline, so the bound that is supposed to terminalize it
+            is not working. Check whether its executor is still claiming it
+            (execution_owner_id with a lease in the future) and read the
+            control-worker log for the deadline and watchdog lines. Do not edit
+            execution_deadline or delete the record to clear this.
       # The remediation budget caps how many nodes the system mutates at once.
       # Workflows waiting on it are correct behaviour under load and a stall
       # when the budget is never released — for instance because a claim holder

@@ -11,7 +11,7 @@ from regional_release_diff import (
 )
 from regional_release_gpu_rollout import agents_converged, gpu_node_items
 from regional_release_probes import probe_source
-from regional_release_runtime_identity import CONTROL_PLANE_PYTHON
+from regional_release_runtime_identity import exec_cpu_ingress_probe
 from regional_release_validation import validate_gpu_rollback_target
 
 GPU_COMPONENTS = frozenset(
@@ -358,34 +358,10 @@ def _validate_incomplete_agent_state(
         config_digest=release.config.agent_config_digest,
         runtime_profile_version=release.config.runtime_profile_version,
     )
-    pod = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ),
-        capture=True,
-    )
-    if not pod:
-        raise ReleaseError("resume validation has no running CPU ingress Pod")
-    raw = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "exec",
-            "-i",
-            pod,
-            "--",
-            CONTROL_PLANE_PYTHON,
-            "-c",
-            probe_source("mixed_cluster_state"),
-        ),
+    raw = exec_cpu_ingress_probe(
+        release,
+        script=probe_source("mixed_cluster_state"),
+        failure="resume validation",
         input_text=json.dumps(
             {
                 "cluster_id": target.cluster_id,
@@ -416,7 +392,6 @@ def _validate_incomplete_agent_state(
                 ],
             }
         ),
-        capture=True,
     )
     result = json.loads(raw)
     if int(result.get("agent_blocker_count") or 0):

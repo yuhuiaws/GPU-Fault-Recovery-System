@@ -6,12 +6,25 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
+SLOW_COMMAND_SECONDS = 5.0
+
+
+def _command_label(command: Sequence[str]) -> str:
+    """Name a gate's command by the script it runs, not by the interpreter.
+
+    Every gate command starts with the same interpreter path, so the first token
+    identifies nothing; the argument after it is what an operator recognises.
+    """
+
+    parts = [Path(command[0]).name, *command[1:]]
+    return " ".join(part for part in parts if part != "-m")
 
 
 class StaticGateError(RuntimeError):
@@ -126,7 +139,7 @@ def gate_groups(python: str) -> dict[str, GateGroup]:
     }
 
 
-def _run_group(
+def run_gate_group(
     name: str,
     group: GateGroup,
     *,
@@ -148,7 +161,9 @@ def _run_group(
     }
     with output_lock:
         print(f"static-gates: starting {name}", file=sys.stderr, flush=True)
+    group_started = time.monotonic()
     for command in group.commands:
+        command_started = time.monotonic()
         process = subprocess.Popen(
             list(command),
             cwd=ROOT,
@@ -163,16 +178,32 @@ def _run_group(
             with output_lock:
                 print(f"[static:{name}] {line}", end="", flush=True)
         status = process.wait()
+        elapsed = time.monotonic() - command_started
         if status:
             with output_lock:
                 print(
-                    f"static-gates: {name} exited with status {status}",
+                    f"static-gates: {name} exited with status {status} "
+                    f"after {elapsed:.1f}s: {_command_label(command)}",
                     file=sys.stderr,
                     flush=True,
                 )
             return status
+        if elapsed >= SLOW_COMMAND_SECONDS and len(group.commands) > 1:
+            # A group is one gate but several commands, so its own total cannot
+            # say which of them is the long pole.
+            with output_lock:
+                print(
+                    f"static-gates: {name} step took {elapsed:.1f}s: "
+                    f"{_command_label(command)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     with output_lock:
-        print(f"static-gates: {name} passed", file=sys.stderr, flush=True)
+        print(
+            f"static-gates: {name} passed in {time.monotonic() - group_started:.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
     return 0
 
 
@@ -184,7 +215,7 @@ def run_static_gates(python: str) -> None:
         with ThreadPoolExecutor(max_workers=gate_parallelism()) as executor:
             futures = {
                 executor.submit(
-                    _run_group,
+                    run_gate_group,
                     name,
                     group,
                     cache_root=cache_root,

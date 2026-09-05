@@ -47,6 +47,7 @@ from gpu_fault.execution.models import (
     _failure_details,
 )
 import gpu_fault.execution.restart_budget_preflight as restart_preflight
+import gpu_fault.execution.step_bounds as step_bounds
 
 LOGGER = logging.getLogger(__name__)
 
@@ -165,8 +166,7 @@ class ProductionWorkflowExecutor:
                     execution_epoch,
                     lease_duration=self._lease_duration,
                 )
-                execution = self._execution(index, step, outcome)
-                workflow = self._record_execution(workflow, execution)
+                workflow = step_bounds.record_attempt(workflow, step, index, outcome)
                 if outcome.status is WorkflowStepStatus.WAITING:
                     self._save_leased(workflow, execution_epoch)
                     return self._result(
@@ -359,10 +359,7 @@ class ProductionWorkflowExecutor:
                     execution_epoch,
                     lease_duration=self._lease_duration,
                 )
-                workflow = self._record_execution(
-                    workflow,
-                    self._execution(index, step, outcome),
-                )
+                workflow = step_bounds.record_attempt(workflow, step, index, outcome)
                 if (
                     outcome.status is WorkflowStepStatus.SUCCEEDED
                     and step.operation is WorkflowOperation.COLLECT_HUNG_TRIAGE
@@ -529,9 +526,8 @@ class ProductionWorkflowExecutor:
             execution_epoch,
             lease_duration=self._lease_duration,
         )
-        workflow = self._record_execution(
-            workflow,
-            self._execution(restore_index, restore_step, outcome),
+        workflow = step_bounds.record_attempt(
+            workflow, restore_step, restore_index, outcome
         )
         if outcome.status is WorkflowStepStatus.WAITING:
             self._save_leased(workflow, execution_epoch)
@@ -1088,8 +1084,9 @@ class ProductionWorkflowExecutor:
             execution_epoch,
             lease_duration=self._lease_duration,
         )
-        execution = self._execution(restore_index, restore_step, outcome)
-        workflow = self._record_execution(workflow, execution)
+        workflow = step_bounds.record_attempt(
+            workflow, restore_step, restore_index, outcome
+        )
         if outcome.status is WorkflowStepStatus.WAITING:
             self._save_leased(workflow, execution_epoch)
             return self._result(
@@ -1477,6 +1474,28 @@ class ProductionWorkflowExecutor:
         step: WorkflowStepSpec,
         index: int,
     ) -> WorkflowStepOutcome:
+        """Dispatch one step, bounded by the workflow and per-step deadlines.
+
+        Both bounds are applied here rather than in the two loops above because
+        this is the single funnel every step outcome passes through, including
+        the compensation and preemption-restore steps. Why the lease holder is
+        the one enforcing the workflow deadline is in ``step_bounds``.
+        """
+
+        expired = step_bounds.workflow_deadline_failure(self, workflow, step, index)
+        if expired is not None:
+            return expired
+        outcome = self._dispatch_step(workflow, incident, request, step, index)
+        return step_bounds.bounded_waiting_outcome(self, workflow, step, index, outcome)
+
+    def _dispatch_step(
+        self,
+        workflow: WorkflowRequest,
+        incident: FaultIncident,
+        request: WorkflowExecutionRequest,
+        step: WorkflowStepSpec,
+        index: int,
+    ) -> WorkflowStepOutcome:
         if step.operation not in self.config.allowed_operations:
             return WorkflowStepOutcome.failed(
                 f"operation {step.operation.value} is not in "
@@ -1539,42 +1558,6 @@ class ProductionWorkflowExecutor:
                 f"{incident.fencing_token}, got={expected}"
                 + (f", retired by {incident.workflow_request_id}" if retired else "")
             )
-
-    @staticmethod
-    def _execution(
-        index: int,
-        step: WorkflowStepSpec,
-        outcome: WorkflowStepOutcome,
-    ) -> WorkflowStepExecution:
-        return WorkflowStepExecution(
-            step_index=index,
-            operation=step.operation,
-            status=outcome.status,
-            adapter_operation_id=outcome.adapter_operation_id,
-            error=outcome.error,
-            details=outcome.details or {},
-        )
-
-    @staticmethod
-    def _record_execution(
-        workflow: WorkflowRequest,
-        execution: WorkflowStepExecution,
-    ) -> WorkflowRequest:
-        executions = [
-            item
-            for item in workflow.step_executions
-            if item.step_index != execution.step_index
-        ]
-        executions.append(execution)
-        return workflow.model_copy(
-            update={
-                "step_executions": sorted(
-                    executions,
-                    key=lambda item: item.step_index,
-                ),
-                "updated_at": datetime.now(timezone.utc),
-            }
-        )
 
     @staticmethod
     def _failure_incident_state(
