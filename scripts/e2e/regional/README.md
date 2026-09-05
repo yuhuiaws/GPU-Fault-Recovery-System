@@ -246,11 +246,25 @@ marker/evidence/workflow lookup plus allowlisted XID, SXID, collector cursor,
 EFA and expected-count operations. `multi_cluster_fixture.py` owns the
 redacted two-cluster registration and context binding used by ISO/E2E cases.
 
-## Recovery helper
+## Recovery and preparation helpers
 
 `restore_validated_quarantine.py` creates the validation-first workflow used to
 restore a quarantined node. Direct taint or ownership-annotation deletion is
 not an equivalent cleanup.
+
+`declare_warm_spare.py` declares or releases the one warm spare node
+`DESTR-003`/`DESTR-008` require. It is read-only unless `--declare` or
+`--release` is given, each with its own confirmation string, and it records the
+node's pre-declaration labels and cordon state in a `--baseline` file so the
+release restores exactly that — a node that was already cordoned stays cordoned.
+
+It mutates only the spare label and the cordon. It does not write
+`gpu-fault.io/spare-pool-state`, which the control plane owns and DESTR-003
+accepts absent. Nor is the declaration folded into DESTR-003 itself:
+`preflight_errors` asserts the declared spare set is exactly the requested node
+in order to catch a site with a stray label elsewhere, and a case that created
+its own spare would satisfy that assertion by construction even if
+`HyperPodSpareCoordinator.allocate(local_only=True)` had drifted away from it.
 
 ## Manifests
 

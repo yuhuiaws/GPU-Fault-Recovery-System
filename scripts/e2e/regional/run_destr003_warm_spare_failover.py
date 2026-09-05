@@ -44,7 +44,6 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     HYPERPOD_HEALTH_LABEL,
     INSTANCE_GROUP_LABEL,
-    INSTANCE_TYPE_LABELS,
     OWNERSHIP_ANNOTATIONS,
     PROVIDER_REPLACE_EVENTS,
     QUARANTINE_TAINT,
@@ -52,6 +51,8 @@ from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     SPARE_POOL_STATE_ANNOTATION,
     SPARE_RESERVATION_ANNOTATION,
     WarmSpareLiveFixture,
+    agent_by_node,
+    instance_type,
 )
 
 DEFAULT_MANIFEST = (
@@ -191,24 +192,6 @@ def capability(profile: dict[str, Any] | None, name: str) -> dict[str, Any] | No
         if isinstance(item, dict) and item.get("capability") == name:
             return cast(dict[str, Any], item)
     return None
-
-
-def agent_by_node(state: dict[str, Any], node: str) -> dict[str, Any] | None:
-    matches = [
-        item for item in state.get("agents") or [] if item.get("node_id") == node
-    ]
-    return cast(dict[str, Any], matches[0]) if len(matches) == 1 else None
-
-
-def instance_type(snapshot: dict[str, Any]) -> str | None:
-    return next(
-        (
-            snapshot["labels"].get(key)
-            for key in INSTANCE_TYPE_LABELS
-            if snapshot["labels"].get(key)
-        ),
-        None,
-    )
 
 
 def profile_errors(profile: dict[str, Any] | None) -> list[str]:

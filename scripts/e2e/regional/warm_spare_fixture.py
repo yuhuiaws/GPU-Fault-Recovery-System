@@ -316,6 +316,27 @@ class NodePatch:
     unschedulable: bool | None = None
 
 
+def agent_by_node(state: dict[str, Any], node: str) -> dict[str, Any] | None:
+    # Exactly one match or nothing: two Agents claiming one node is the case a
+    # warm spare must never be built on, so an ambiguous fleet reads as absent
+    # rather than as the first row that happened to come back.
+    matches = [
+        item for item in state.get("agents") or [] if item.get("node_id") == node
+    ]
+    return cast(dict[str, Any], matches[0]) if len(matches) == 1 else None
+
+
+def instance_type(snapshot: dict[str, Any]) -> str | None:
+    return next(
+        (
+            snapshot["labels"].get(key)
+            for key in INSTANCE_TYPE_LABELS
+            if snapshot["labels"].get(key)
+        ),
+        None,
+    )
+
+
 class WarmSpareLiveFixture:
     def __init__(self, regional: RegionalLiveFixture, hyperpod_cluster: str) -> None:
         self.regional = regional
