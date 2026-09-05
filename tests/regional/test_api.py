@@ -14,7 +14,13 @@ from gpu_fault.installation_resources import (
 )
 from gpu_fault.models import CapabilityMode, CapabilityName, TerminalEvent
 from gpu_fault.watcher import AllocationCompleteness, FailureDetectedEvent
-from tests._builders import asgi_client, build_context, copy_model
+from tests._builders import (
+    asgi_client,
+    attempt_observation,
+    build_context,
+    container_observation,
+    copy_model,
+)
 
 
 def test_installation_resource_registry_api_is_execution_token_protected() -> None:
@@ -123,6 +129,84 @@ def test_synthetic_replacement_requires_flag_and_execution_token(monkeypatch) ->
             }
 
     asyncio.run(run_scenario())
+
+
+def test_a_grouped_node_health_marker_points_at_the_surviving_incident(
+    monkeypatch,
+) -> None:
+    """A merged finding's marker has to name the incident that owns it.
+
+    ``NodeHealthFinding.marker()`` guesses ``inc-<event_id>`` because it is
+    built before ingestion picks an incident, and a finding that lands on a node
+    with a running attempt is grouped into that attempt's incident, which keeps
+    its own generated id. The marker was then left pointing at a record nobody
+    ever persisted, which defeats both guards that read it: the completion
+    handler cannot see that recovery is already owned by the incident's
+    workflow, so a terminal attempt inside the marker window starts a *second*
+    replacement for the same fault, and ``marker_blocks_spare`` can never reach
+    the ``SUCCEEDED`` workflow that would return the node to the spare pool.
+    """
+    monkeypatch.setenv("GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS", "true")
+    token = "synthetic-replacement-token-" + "x" * 32
+    context = ApplicationContext(execution_token=token)
+    context.store.save_attempt_observation(
+        attempt_observation(
+            "train",
+            "train-a001",
+            datetime.now(timezone.utc),
+            containers=[
+                container_observation(
+                    "pod-train-a001",
+                    "trainer-train-a001",
+                    0,
+                    "node-a",
+                    gpu_uuids=["GPU-a"],
+                )
+            ],
+            workload_ids=["gpu-fault-system/pytorchjob/train"],
+        )
+    )
+    payload = {
+        "event_id": "warm-spare-grouped",
+        "cluster_id": "cluster-a",
+        "node_id": "node-a",
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "runtime_profile_version": "simulated-v1",
+        "job_id": "train",
+        "attempt_id": "train-a001",
+        "affected_workload_ids": ["gpu-fault-system/pytorchjob/train"],
+        "gpu_uuids": ["GPU-a"],
+        "reason": "synthetic warm-spare E2E",
+        "synthetic": True,
+    }
+
+    async def run_scenario() -> None:
+        async with asgi_client(context) as client:
+            accepted = await client.post(
+                "/v1/admin/test/node-replacement",
+                json=payload,
+                headers={"X-GPU-Fault-Execution-Token": token},
+            )
+            assert accepted.status_code == 200, accepted.text
+
+    asyncio.run(run_scenario())
+
+    incident = context.store.get_incident_by_event("warm-spare-grouped")
+    assert incident is not None, "grouped finding did not produce an incident"
+    assert incident.incident_id != "inc-warm-spare-grouped", (
+        "finding was not grouped into the attempt's incident"
+    )
+    marker = next(
+        item
+        for item in context.store.list_markers()
+        if item.marker_id == "marker-warm-spare-grouped"
+    )
+    assert marker.incident_id == incident.incident_id, (
+        "marker points at an incident that was never persisted"
+    )
+    assert context.store.list_markers_for_incident(incident.incident_id) == [marker], (
+        "marker is not reachable from the incident that owns the finding"
+    )
 
 
 def test_http_failure_detection_creates_one_containment_workflow(

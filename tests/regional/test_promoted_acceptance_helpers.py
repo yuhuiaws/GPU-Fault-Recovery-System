@@ -369,6 +369,95 @@ def test_warm_spare_audit_requires_exact_node_postflight() -> None:
     )
 
 
+_AUTOMATIC_GUARD_ERROR = warm_spare.AUTOMATIC_GUARD_ERROR
+_AUTOMATIC_GATE_ERROR = (
+    "HyperPod preflight failed: HyperPod automatic node recovery is "
+    "enabled; direct batch mutation would create a second lifecycle trigger"
+)
+
+
+def _automatic_probe(**overrides: Any) -> dict[str, Any]:
+    probe = {
+        "cluster_name": "automatic-test",
+        "observed_node_recovery": "Automatic",
+        "probed_node_status": "Running",
+        "warm_spare_guard": {"status": "FAILED", "error": _AUTOMATIC_GUARD_ERROR},
+        "control_without_warm_spare_strategy": {
+            "status": "FAILED",
+            "error": _AUTOMATIC_GATE_ERROR,
+        },
+    }
+    probe.update(overrides)
+    return probe
+
+
+def test_destr006_accepts_only_a_guard_that_fired_on_an_observed_automatic() -> None:
+    probe = _automatic_probe()
+
+    assert warm_spare.probe_errors("GF-REGIONAL-DESTR-006", None, None, probe) == [], (
+        probe
+    )
+
+
+def test_destr006_rejects_a_guard_that_never_saw_an_automatic_cluster() -> None:
+    # The guard refusing is only evidence if what it refused was a real
+    # Automatic cluster. A stubbed preflight produces exactly this error while
+    # proving nothing about the deployed adapter's view of the provider.
+    probe = _automatic_probe(observed_node_recovery="None")
+
+    errors = warm_spare.probe_errors("GF-REGIONAL-DESTR-006", None, None, probe)
+
+    assert any("did not observe NodeRecovery=Automatic" in item for item in errors), (
+        errors
+    )
+
+
+def test_destr006_rejects_a_guard_that_failed_for_another_reason() -> None:
+    # An AccessDenied on DescribeCluster also ends in FAILED, and reporting that
+    # as the NodeRecovery guard would record a missing IAM permission as proof
+    # the guard works.
+    probe = _automatic_probe(
+        warm_spare_guard={
+            "status": "FAILED",
+            "error": "HyperPod preflight failed: AccessDeniedException",
+        }
+    )
+
+    errors = warm_spare.probe_errors("GF-REGIONAL-DESTR-006", None, None, probe)
+
+    assert errors == [
+        "deployed automatic-recovery guard returned an unexpected result"
+    ], errors
+
+
+def test_destr006_rejects_a_control_arm_that_refused_for_no_stated_reason() -> None:
+    # If the step fails the same way with and without the warm-spare strategy,
+    # or fails without the preflight naming the automatic recovery it read,
+    # the recorded refusal cannot be attributed to the observed NodeRecovery.
+    for control in (
+        {"status": "FAILED", "error": _AUTOMATIC_GUARD_ERROR},
+        {"status": "FAILED", "error": "HyperPod preflight failed: unrelated gate"},
+        {"status": "SUCCEEDED", "error": None},
+    ):
+        errors = warm_spare.probe_errors(
+            "GF-REGIONAL-DESTR-006",
+            None,
+            None,
+            _automatic_probe(control_without_warm_spare_strategy=control),
+        )
+
+        assert errors == [
+            "deployed control probe did not attribute the refusal to "
+            "the observed NodeRecovery"
+        ], control
+
+
+def test_destr006_requires_the_deployed_probe_to_have_run() -> None:
+    errors = warm_spare.probe_errors("GF-REGIONAL-DESTR-006", None, None, None)
+
+    assert errors == ["deployed automatic-recovery guard probe did not run"], errors
+
+
 def test_warm_spare_audit_allows_unchanged_preexisting_business_taint() -> None:
     taints = [{"key": "workload.example/dedicated", "effect": "NoSchedule"}]
     baseline = [_gpu_node("node-a", unschedulable=True, taints=taints)]
@@ -383,6 +472,7 @@ def test_warm_spare_audit_records_postflight_after_probe_failure(
     baseline = [_gpu_node("node-a")]
     snapshots = iter([baseline, baseline])
     monkeypatch.setattr(warm_spare, "node_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(warm_spare, "run_pytest", lambda _dir, _nodeids: True)
     monkeypatch.setattr(
         warm_spare,
         "cluster_recovery",
@@ -404,4 +494,35 @@ def test_warm_spare_audit_records_postflight_after_probe_failure(
     assert result["verdict"] == "FAIL"
     assert result["node_state_identical"] is True
     assert "RuntimeError: probe unavailable" in result["errors"]
+    # A live probe blowing up says nothing about the focused pytest, which ran
+    # and passed. Reporting it as a pytest failure sent the last DESTR-006 run
+    # looking for a repo-side regression that did not exist.
+    assert "focused pytest failed" not in result["errors"], result["errors"]
     assert postflight == baseline
+
+
+def test_warm_spare_audit_separates_an_unrun_pytest_from_a_failed_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baseline = [_gpu_node("node-a")]
+    snapshots = iter([baseline, baseline])
+    monkeypatch.setattr(warm_spare, "node_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        warm_spare,
+        "run_pytest",
+        lambda _dir, _nodeids: (_ for _ in ()).throw(
+            RuntimeError("pytest unavailable")
+        ),
+    )
+    monkeypatch.setattr(warm_spare, "replace_events", lambda _start, _end: [])
+
+    exit_code = warm_spare.run_audit(tmp_path, ["GF-REGIONAL-DESTR-005"])
+
+    result = json.loads(
+        (tmp_path / "cases/GF-REGIONAL-DESTR-005/GF-REGIONAL-DESTR-005.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert exit_code == 1
+    assert "focused pytest did not run" in result["errors"], result["errors"]
+    assert "focused pytest failed" not in result["errors"], result["errors"]

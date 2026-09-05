@@ -85,6 +85,17 @@ EXPECTED_REASON = {
     "agent-unavailable": "node agent is not fleet-ready",
 }
 ALERT_SCENARIOS = set(SCENARIOS) - {"no-spare"}
+SERVICE_UNIT = {
+    "kubernetes-not-ready": "kubelet.service",
+    "agent-unavailable": "gpu-fault-node-agent.service",
+}
+# kubelet serves the probe's own `kubectl exec` channel, so its stop is handed
+# to a systemd timer that fires after the probe has already answered.
+SERVICE_STOP_DELAY_SECONDS = {
+    "kubernetes-not-ready": 15,
+    "agent-unavailable": 0,
+}
+SERVICE_RESTORE_SECONDS = 420
 
 
 @dataclass(frozen=True)
@@ -475,7 +486,7 @@ class ScenarioFixture:
             )
             self.holder.create()
             return {"holder_pod": self.holder.name}
-        if self.scenario in {"kubernetes-not-ready", "agent-unavailable"}:
+        if self.scenario in SERVICE_UNIT:
             self.service = WarmSpareServiceFixture(
                 self.warm,
                 node=self.settings.spare_node,
@@ -484,26 +495,42 @@ class ScenarioFixture:
                 run_id=self.run_id,
             )
             self.service.create()
-            unit = (
-                "kubelet.service"
-                if self.scenario == "kubernetes-not-ready"
-                else "gpu-fault-node-agent.service"
-            )
-            stopped = self.service.stop(unit, restore_seconds=90)
-            if self.scenario == "kubernetes-not-ready":
-                self.warm.wait_node_ready(
-                    self.settings.spare_node,
-                    ready=False,
-                    timeout_seconds=180,
-                )
-            else:
-                self.warm.wait_fleet_readiness(
-                    self.settings.spare_node,
-                    ready=False,
-                    timeout_seconds=180,
-                )
-            return {"service": unit, "stopped": stopped}
+            return {"service": SERVICE_UNIT[self.scenario], "host_probe": "created"}
         raise ValueError(f"unknown scenario: {self.scenario}")
+
+    def apply_late(self) -> dict[str, Any]:
+        """Take the spare's service down once the workload is already running.
+
+        Label, annotation and Pod mutations hold indefinitely, so `apply()`
+        makes them before the workload starts. A stopped systemd unit does
+        not: it is bounded by the failsafe timer that restores it. Submitting
+        the workload and waiting for its observation first can take minutes,
+        which would burn most of that window before the workflow ever reaches
+        `REPLACE_NODE` -- so the stop happens here, immediately before the
+        replacement signal, and the window only has to cover the workflow.
+        """
+
+        if self.service is None:
+            return {}
+        unit = SERVICE_UNIT[self.scenario]
+        stopped = self.service.stop(
+            unit,
+            restore_seconds=SERVICE_RESTORE_SECONDS,
+            delay_seconds=SERVICE_STOP_DELAY_SECONDS[self.scenario],
+        )
+        if self.scenario == "kubernetes-not-ready":
+            self.warm.wait_node_ready(
+                self.settings.spare_node,
+                ready=False,
+                timeout_seconds=180,
+            )
+        else:
+            self.warm.wait_fleet_readiness(
+                self.settings.spare_node,
+                ready=False,
+                timeout_seconds=180,
+            )
+        return {"service": unit, "stopped": stopped}
 
     def restore(self) -> dict[str, Any]:
         errors = []
@@ -519,10 +546,13 @@ class ScenarioFixture:
         if self.service is not None:
             try:
                 if self.scenario == "kubernetes-not-ready":
+                    # Nothing can be executed on the node until kubelet is
+                    # back, and only the failsafe timer can bring it back, so
+                    # this wait has to outlast the failsafe by a real margin.
                     self.warm.wait_node_ready(
                         self.settings.spare_node,
                         ready=True,
-                        timeout_seconds=240,
+                        timeout_seconds=SERVICE_RESTORE_SECONDS + 180,
                     )
                 result["service_restore"] = self.service.restore()
                 if self.scenario == "agent-unavailable":
@@ -578,6 +608,8 @@ def scenario_errors(
     state: dict[str, Any],
     settings: Settings,
     scenario: str,
+    *,
+    event_id: str,
 ) -> list[str]:
     workflow = state.get("workflow") or {}
     incident = state.get("incident") or {}
@@ -614,8 +646,20 @@ def scenario_errors(
         errors.append(
             f"expected {expected_alerts} spare-insufficient alerts, got {len(alerts)}"
         )
-    if state.get("markers"):
-        errors.append("shortage path created a NodeMarker")
+    # The injected finding's own marker belongs to this incident, and has to:
+    # a marker pointing at an incident nobody persisted lets a terminal attempt
+    # inside the marker window open a second recovery for the same fault, which
+    # is what re-quarantined the fault node minutes into the next scenario. What
+    # the shortage path must not do is add any *other* marker -- handing the node
+    # to a different replacement mechanism once warm-spare replacement failed.
+    marker_ids = sorted(
+        str(item.get("marker_id") or "") for item in state.get("markers") or []
+    )
+    if marker_ids != [f"marker-{event_id}"]:
+        errors.append(
+            "incident markers are not exactly the injected finding's own marker: "
+            f"{marker_ids}"
+        )
     fault = state.get("fault_node") or {}
     if not fault.get("unschedulable") or not any(
         item.get("key") == QUARANTINE_TAINT for item in fault.get("taints") or []
@@ -651,9 +695,21 @@ def restore_fault_node(
         result["errors"].append(f"agent cleanup: {type(exc).__name__}: {exc}")
     try:
         fault = warm.node_snapshot(settings.fault_node)
-        if fault["annotations"].get("gpu-fault.io/incident-id") == incident_id:
+        owner = str(fault["annotations"].get("gpu-fault.io/incident-id") or "")
+        result["quarantine_owner"] = owner or None
+        if owner and owner != incident_id:
+            # A shortage that blocks recovery is escalated by the product
+            # itself: the escalation engine opens a successor support incident
+            # over the same node, re-quarantines it and files a ticket, so the
+            # node ends up owned by that incident rather than by ours. Cleanup
+            # that recognised only its own incident restored nothing and
+            # recorded no error at all, and the case then failed in postflight
+            # for a condition the cleanup had already seen and skipped.
+            result["successor_incident"] = owner
+        if owner:
+            warm.wait_incident_idle(owner)
             created = warm.create_restore_workflow(
-                incident_id=incident_id,
+                incident_id=owner,
                 node=settings.fault_node,
                 profile_version=profile_version,
                 reason="DESTR-008 scenario cleanup",
@@ -727,6 +783,10 @@ def run_scenario(
             raise RegionalFixtureError(
                 f"maintenance window ended before scenario {scenario}"
             )
+        late = fixture.apply_late()
+        if late:
+            mutation = {**mutation, "late": late}
+            write_json_atomic(scenario_dir / "scenario-mutation.json", mutation)
         event_id = f"destr008-{scenario}-{int(time.time())}"
         started_at = datetime.now(timezone.utc)
         injection = warm.post_synthetic_replacement(
@@ -755,7 +815,7 @@ def run_scenario(
         state["fault_node"] = warm.node_snapshot(settings.fault_node)
         state["spare_node"] = warm.node_snapshot(settings.spare_node)
         write_json_atomic(scenario_dir / "workflow-state.json", state)
-        errors = scenario_errors(state, settings, scenario)
+        errors = scenario_errors(state, settings, scenario, event_id=event_id)
         provider_after = warm.provider_inventory()
         if provider_after != provider_baseline:
             errors.append("HyperPod provider inventory changed")
@@ -855,8 +915,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "mutation": (
             "run each selected warm-spare shortage scenario with a unique "
             "node-pinned workload and real failed REPLACE_NODE workflow; "
-            "S3 stops kubelet and S6 stops Node Agent only after arming a "
-            "host-side automatic restore timer"
+            "S3 stops kubelet and S6 stops Node Agent once the workload is "
+            "already Running and only after arming a host-side automatic "
+            "restore timer, and kubelet's stop is handed to a systemd timer "
+            "because the host probe answers over kubelet's own exec channel"
         ),
         "preflight_identity": {
             "release_id": preflight["release_id"],
@@ -873,7 +935,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "scenario mutation cannot arm or verify rollback",
             "STOP_WORKLOADS does not complete before REPLACE_NODE failure",
             "failure reason or notification count differs from the scenario",
-            "any marker, provider replace/delete or spare allocation remains",
+            "a marker other than the injected finding's own, a provider "
+            "replace/delete, or a spare allocation remains",
             "fault-node validation/restore cleanup fails",
         ],
         "rollback": {

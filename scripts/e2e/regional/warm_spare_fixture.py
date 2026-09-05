@@ -294,6 +294,17 @@ print(json.dumps(workflow.model_dump(mode="json"), sort_keys=True, default=str))
 """
 
 
+INCIDENT_BY_ID = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+
+incident = ApplicationContext.from_environment().store.get_incident(sys.argv[1])
+print(json.dumps(incident.model_dump(mode="json"), sort_keys=True, default=str))
+"""
+
+
 FLEET_READINESS = r"""
 import json
 import sys
@@ -621,6 +632,41 @@ class WarmSpareLiveFixture:
             ),
         )
 
+    def incident_by_id(self, incident_id: str) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            self.regional.cpu_python(INCIDENT_BY_ID, incident_id),
+        )
+
+    def wait_incident_idle(
+        self,
+        incident_id: str,
+        *,
+        timeout_seconds: int = 900,
+    ) -> dict[str, Any]:
+        """Wait until the incident has no workflow a restore would race.
+
+        The validated-restore path refuses an incident whose workflow is still
+        PENDING/RUNNING/SAFETY_PENDING, and rightly so: two workflows on one
+        node is exactly what fencing exists to prevent. A caller that wants to
+        restore has to wait the current one out instead of forcing it.
+        """
+
+        deadline = time.monotonic() + timeout_seconds
+        last: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            last = self.incident_by_id(incident_id)
+            workflow_id = str(last.get("workflow_request_id") or "")
+            if not workflow_id:
+                return last
+            workflow = self.regional.cpu_python(WORKFLOW_BY_ID, workflow_id)
+            if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED"}:
+                return last
+            time.sleep(5)
+        raise RegionalFixtureError(
+            f"incident workflow did not reach a terminal state: {last}"
+        )
+
     def create_restore_workflow(
         self,
         *,
@@ -711,9 +757,21 @@ class WarmSpareLiveFixture:
         ready: bool,
         timeout_seconds: int,
     ) -> dict[str, Any]:
+        """Wait for the node's Ready condition to reach (or leave) ``True``.
+
+        ``ready=False`` accepts ``Unknown`` as well, and has to: stopping
+        kubelet does not make it report unhealthy, it makes it stop reporting,
+        so the node lifecycle controller sets ``Ready=Unknown`` and taints the
+        node unreachable. Insisting on the literal string ``False`` waited out
+        the whole window while the node was already unreachable, and failed
+        with "node did not reach Ready=False" over a snapshot that plainly
+        showed it was not Ready. Everything downstream -- the scheduler, and
+        the warm-spare candidate gate this case exercises -- treats anything
+        other than ``True`` as not Ready.
+        """
+
         deadline = time.monotonic() + timeout_seconds
         last: dict[str, Any] = {}
-        expected = "True" if ready else "False"
         while time.monotonic() < deadline:
             try:
                 last = self.node_snapshot(node)
@@ -722,9 +780,10 @@ class WarmSpareLiveFixture:
                     return {"name": node, "ready": "Unknown"}
                 time.sleep(5)
                 continue
-            if last.get("ready") == expected:
+            if (last.get("ready") == "True") is ready:
                 return last
             time.sleep(5)
+        expected = "True" if ready else "not True"
         raise RegionalFixtureError(f"node did not reach Ready={expected}: {last}")
 
 
@@ -918,7 +977,22 @@ class WarmSpareServiceFixture:
     def create(self) -> None:
         self.host.create()
 
-    def stop(self, service: str, *, restore_seconds: int = 180) -> dict[str, Any]:
+    def stop(
+        self,
+        service: str,
+        *,
+        restore_seconds: int = 180,
+        delay_seconds: int = 0,
+    ) -> dict[str, Any]:
+        """Stop one allowlisted unit, with a systemd failsafe that restores it.
+
+        ``delay_seconds`` hands the stop to a systemd timer instead of running
+        it inline. That is required for ``kubelet.service``: the probe answers
+        over ``kubectl exec``, which kubelet itself serves, so an inline stop
+        cannot reply until the failsafe brings kubelet back -- long after the
+        NotReady window the caller wanted to watch.
+        """
+
         self.service = service
         return cast(
             dict[str, Any],
@@ -930,6 +1004,8 @@ class WarmSpareServiceFixture:
                 self.run_id,
                 "--restore-seconds",
                 str(restore_seconds),
+                "--stop-delay-seconds",
+                str(delay_seconds),
                 timeout=180,
             ),
         )

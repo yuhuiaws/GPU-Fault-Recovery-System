@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -31,6 +32,10 @@ CASE_IDS = (
     "GF-REGIONAL-DESTR-005",
     "GF-REGIONAL-DESTR-006",
     "GF-REGIONAL-DESTR-007",
+)
+AUTOMATIC_GUARD_ERROR = (
+    "healthy warm-spare replacement requires HyperPod "
+    "NodeRecovery=None; provider replacement is disabled"
 )
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
 OWNERSHIP_ANNOTATIONS = (
@@ -448,6 +453,312 @@ print(json.dumps({
     return _pod_python(CPU_KUBECONFIG, CPU_CONTEXT, pods[0], script)
 
 
+CLUSTER_FIELDS = ("ClusterName", "ClusterStatus", "NodeRecovery")
+NODE_SUMMARY_FIELDS = (
+    "InstanceGroupName",
+    "InstanceId",
+    "NodeLogicalId",
+    "InstanceType",
+    "InstanceStatus",
+)
+NODE_DETAIL_FIELDS = (
+    "NodeLogicalId",
+    "InstanceId",
+    "InstanceGroupName",
+    "InstanceType",
+    "InstanceStatus",
+    "PrivateDnsHostname",
+    "PrivatePrimaryIp",
+    "Placement",
+    "CapacityType",
+    "KubernetesConfig",
+)
+
+
+def _project(value: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return {key: value[key] for key in fields if key in value}
+
+
+def record_provider_snapshot(cluster_name: str) -> dict[str, Any]:
+    """Record the negative cluster's real provider payloads, read-only.
+
+    The auditor host holds SageMaker read rights on every cluster in the
+    region; the deployed executor deliberately does not, because its IRSA role
+    is scoped to the managed cluster alone (the boundary DESTR-011 and
+    DESTR-013 assert). So the payloads DESTR-006's guard must judge are
+    fetched here and replayed into the pod, rather than widening that role to
+    make the probe convenient.
+
+    Only the fields the deployed adapter actually reads are kept: the point is
+    real provider data, not a copy of the cluster's network and IAM identity.
+    """
+
+    described = json.loads(
+        command(
+            [
+                "aws",
+                "sagemaker",
+                "describe-cluster",
+                "--region",
+                AWS_REGION,
+                "--cluster-name",
+                cluster_name,
+                "--output",
+                "json",
+            ]
+        )
+    )
+    pages: list[dict[str, Any]] = []
+    next_token: str | None = None
+    while True:
+        argv = [
+            "aws",
+            "sagemaker",
+            "list-cluster-nodes",
+            "--region",
+            AWS_REGION,
+            "--cluster-name",
+            cluster_name,
+            "--include-node-logical-ids",
+            "--max-results",
+            "100",
+            "--output",
+            "json",
+        ]
+        if next_token:
+            argv += ["--next-token", next_token]
+        listed = json.loads(command(argv))
+        pages.append(
+            {
+                "ClusterNodeSummaries": [
+                    _project(item, NODE_SUMMARY_FIELDS)
+                    for item in listed.get("ClusterNodeSummaries", [])
+                ],
+                "NextToken": listed.get("NextToken"),
+            }
+        )
+        next_token = listed.get("NextToken")
+        if not next_token:
+            break
+    details: dict[str, Any] = {}
+    for page in pages:
+        for item in page["ClusterNodeSummaries"]:
+            logical_id = item["NodeLogicalId"]
+            node = json.loads(
+                command(
+                    [
+                        "aws",
+                        "sagemaker",
+                        "describe-cluster-node",
+                        "--region",
+                        AWS_REGION,
+                        "--cluster-name",
+                        cluster_name,
+                        "--node-logical-id",
+                        logical_id,
+                        "--output",
+                        "json",
+                    ]
+                )
+            )
+            details[logical_id] = _project(node["NodeDetails"], NODE_DETAIL_FIELDS)
+    payloads = {
+        "cluster_name": cluster_name,
+        "describe_cluster": _project(described, CLUSTER_FIELDS),
+        "list_cluster_nodes": pages,
+        "describe_cluster_node": details,
+    }
+    serialized = json.dumps(payloads, sort_keys=True, separators=(",", ":"))
+    return {
+        "payloads": payloads,
+        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "payload_digest": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        "recorded_by": "acceptance auditor host (SageMaker read-only)",
+    }
+
+
+def deployed_automatic_recovery_probe(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Fire DESTR-006's guard in the deployed executor, on a real Automatic cluster.
+
+    Reading `NodeRecovery` off two clusters and running a repo-side unit test
+    says nothing about the code that is deployed. This case's whole claim is
+    that the shipped adapter refuses a warm-spare replacement the moment the
+    provider's own recovery controller is armed, so the `Automatic` it refuses
+    on has to be observed, not stubbed: the deployed adapter parses the real
+    recorded DescribeCluster / ListClusterNodes / DescribeClusterNode payloads
+    of the unmanaged Automatic cluster and its own preflight decides.
+
+    A second arm runs the identical step without
+    `replacement_strategy=HEALTHY_WARM_SPARE_ONLY`, where the warm-spare guard
+    must not be what refuses. Without it a probe that failed for any reason at
+    all would read as proof, and the recorded refusal could not be attributed
+    to the observed `NodeRecovery`.
+
+    Nothing here can mutate: the replayed client implements the three read
+    calls and nothing else, no spare coordinator is attached, and the negative
+    cluster's `NodeRecovery` is never touched.
+    """
+
+    pods = _running_pods(
+        GPU_KUBECONFIG,
+        GPU_CONTEXT,
+        "app=gpu-fault-cluster-executor",
+    )
+    if not pods:
+        raise RuntimeError("no running cluster executor for DESTR-006 deployed probe")
+    script = r"""
+import json
+import os
+from datetime import datetime, timezone
+
+from gpu_fault.adapters.hyperpod.lifecycle import HyperPodLifecycleStepAdapter
+from gpu_fault.execution import WorkflowStepContext
+from gpu_fault.hyperpod import HyperPodAdapterConfig, HyperPodLifecycleAdapter
+from gpu_fault.models import (
+    FaultIncident,
+    IncidentState,
+    WorkflowExecutionRequest,
+    WorkflowOperation,
+    WorkflowRequest,
+    WorkflowStatus,
+    WorkflowStepSpec,
+)
+
+
+class RecordedProviderClient:
+    # Replays one recorded read-only SageMaker snapshot, and nothing else.
+    # The three read calls the adapter makes are served verbatim from what
+    # the auditor recorded off the live cluster. Every other API -- every
+    # mutation -- is simply absent, so this probe cannot submit a
+    # replacement even by mistake.
+
+    def __init__(self, recorded):
+        self._recorded = recorded
+
+    def _check(self, cluster_name):
+        if cluster_name != self._recorded["cluster_name"]:
+            raise AssertionError(
+                "recorded snapshot is for another cluster: " + str(cluster_name)
+            )
+
+    def describe_cluster(self, *, ClusterName):
+        self._check(ClusterName)
+        return dict(self._recorded["describe_cluster"])
+
+    def list_cluster_nodes(
+        self,
+        *,
+        ClusterName,
+        MaxResults=None,
+        IncludeNodeLogicalIds=False,
+        NextToken=None,
+    ):
+        self._check(ClusterName)
+        if not IncludeNodeLogicalIds:
+            raise AssertionError("recorded snapshot only covers logical-id listing")
+        pages = self._recorded["list_cluster_nodes"]
+        index = 0
+        if NextToken is not None:
+            tokens = [page.get("NextToken") for page in pages]
+            if NextToken not in tokens:
+                raise AssertionError("unrecorded ListClusterNodes page token")
+            index = tokens.index(NextToken) + 1
+        page = pages[index]
+        result = {"ClusterNodeSummaries": list(page["ClusterNodeSummaries"])}
+        if page.get("NextToken"):
+            result["NextToken"] = page["NextToken"]
+        return result
+
+    def describe_cluster_node(self, *, ClusterName, NodeLogicalId):
+        self._check(ClusterName)
+        details = self._recorded["describe_cluster_node"].get(NodeLogicalId)
+        if details is None:
+            raise AssertionError("unrecorded node: " + str(NodeLogicalId))
+        return {"NodeDetails": dict(details)}
+
+
+cluster = RECORDED["cluster_name"]
+config = HyperPodAdapterConfig.from_environment(cluster_name=cluster)
+adapter = HyperPodLifecycleAdapter(config, client=RecordedProviderClient(RECORDED))
+described = adapter.client.describe_cluster(ClusterName=cluster)
+nodes = adapter.list_nodes(enrich=True)
+target = next((item for item in nodes if item.status == "Running"), None)
+if target is None:
+    raise SystemExit("the Automatic negative cluster has no Running node to preflight")
+
+now = datetime.now(timezone.utc)
+
+
+def guard_outcome(parameters):
+    step = WorkflowStepSpec(
+        operation=WorkflowOperation.REPLACE_NODE,
+        execution_owner="gpu-fault-hyperpod-adapter",
+        node_ids=[target.node_logical_id],
+        parameters=parameters,
+    )
+    incident = FaultIncident(
+        incident_id="incident-destr006-deployed-probe",
+        event_id="event-destr006-deployed-probe",
+        event_type="REGIONAL_ACCEPTANCE",
+        cluster_id=os.environ["GPU_FAULT_CLUSTER_ID"],
+        node_ids=[target.node_logical_id],
+        policy_version="destr006-deployed-probe/v1",
+        policy_source="ACCEPTANCE",
+        state=IncidentState.ACTION_PENDING,
+        workflow_request_id="workflow-destr006-deployed-probe",
+        fencing_token=1,
+        created_at=now,
+        updated_at=now,
+    )
+    workflow = WorkflowRequest(
+        request_id="workflow-destr006-deployed-probe",
+        incident_id=incident.incident_id,
+        status=WorkflowStatus.RUNNING,
+        official_action="REPLACE_NODE",
+        fencing_token=1,
+        official_steps=[step],
+        completed_operations=[WorkflowOperation.MARK_UNSCHEDULABLE],
+        created_at=now,
+        updated_at=now,
+    )
+    outcome = HyperPodLifecycleStepAdapter(adapter).execute(
+        WorkflowStepContext(
+            workflow=workflow,
+            incident=incident,
+            step=step,
+            step_index=0,
+            request=WorkflowExecutionRequest(
+                expected_fencing_token=1,
+                confirm_cluster_name=cluster,
+                isolation_verified_nodes=sorted(target.aliases),
+            ),
+            idempotency_key="workflow-destr006-deployed-probe/0/REPLACE_NODE",
+        )
+    )
+    return {"status": outcome.status.value, "error": outcome.error}
+
+
+print(json.dumps({
+    "cluster_name": described.get("ClusterName"),
+    "observed_node_recovery": described.get("NodeRecovery"),
+    "probed_node_status": target.status,
+    "probed_node_count": len(nodes),
+    "warm_spare_guard": guard_outcome(
+        {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"}
+    ),
+    "control_without_warm_spare_strategy": guard_outcome({}),
+}, sort_keys=True))
+"""
+    header = (
+        f"import json\nRECORDED = json.loads({json.dumps(snapshot['payloads'])!r})\n"
+    )
+    probe = _pod_python(GPU_KUBECONFIG, GPU_CONTEXT, pods[0], header + script)
+    probe["payload_provenance"] = {
+        key: snapshot[key] for key in ("recorded_at", "payload_digest", "recorded_by")
+    }
+    return probe
+
+
 def deployed_executor_guard_probes() -> dict[str, Any]:
     pods = _running_pods(
         GPU_KUBECONFIG,
@@ -591,12 +902,46 @@ def case_definitions() -> dict[str, list[str]]:
     }
 
 
-def _probe_errors(
+def probe_errors(
     case_id: str,
     managed_probe: dict[str, Any] | None,
     executor_probes: dict[str, Any] | None,
+    automatic_probe: dict[str, Any] | None = None,
 ) -> list[str]:
     errors = []
+    if case_id == "GF-REGIONAL-DESTR-006":
+        if automatic_probe is None:
+            errors.append("deployed automatic-recovery guard probe did not run")
+        else:
+            if automatic_probe.get("observed_node_recovery") != "Automatic":
+                # Without this the probe still "passes" its error check while
+                # having proved the guard on a cluster that was never Automatic.
+                errors.append(
+                    "deployed probe did not observe NodeRecovery=Automatic: "
+                    + json.dumps(automatic_probe, sort_keys=True)
+                )
+            if automatic_probe.get("warm_spare_guard") != {
+                "status": "FAILED",
+                "error": AUTOMATIC_GUARD_ERROR,
+            }:
+                errors.append(
+                    "deployed automatic-recovery guard returned an unexpected result"
+                )
+            control = automatic_probe.get("control_without_warm_spare_strategy") or {}
+            control_error = str(control.get("error") or "")
+            if (
+                control.get("status") != "FAILED"
+                or control_error == AUTOMATIC_GUARD_ERROR
+                or "HyperPod automatic node recovery is enabled" not in control_error
+            ):
+                # The refusal has to be attributable to the NodeRecovery the
+                # deployed preflight read. A probe that fails for any reason at
+                # all, or one whose warm-spare message appears without the
+                # strategy that gates it, proves nothing.
+                errors.append(
+                    "deployed control probe did not attribute the refusal to "
+                    "the observed NodeRecovery"
+                )
     if case_id == "GF-REGIONAL-DESTR-005":
         if managed_probe is None:
             errors.append("deployed managed-owner guard probe did not run")
@@ -645,6 +990,7 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
     automatic: dict[str, Any] | None = None
     env: list[dict[str, Any]] = []
     managed_probe: dict[str, Any] | None = None
+    automatic_probe: dict[str, Any] | None = None
     executor_probes: dict[str, Any] | None = None
     test_results: dict[str, bool] = {}
     fatal_error = None
@@ -652,18 +998,25 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
     drift_errors: list[str] = []
     events: list[dict[str, Any]] = []
     try:
+        # The focused pytest first: it is independent of every live probe, and
+        # running it afterwards meant one probe exception left it unrun and
+        # reported as "focused pytest failed" -- a deployment problem disguised
+        # as a repo-side regression.
+        for case_id in selected_cases:
+            case_dir = run_dir / "cases" / case_id
+            case_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            test_results[case_id] = run_pytest(case_dir, definitions[case_id])
         gpu = cluster_recovery(MANAGED_GPU_CLUSTER)
         if "GF-REGIONAL-DESTR-006" in selected_cases:
             automatic = cluster_recovery(AUTOMATIC_NEGATIVE_CLUSTER)
+            snapshot = record_provider_snapshot(AUTOMATIC_NEGATIVE_CLUSTER)
+            write_json(run_dir / "automatic-negative-cluster-payloads.json", snapshot)
+            automatic_probe = deployed_automatic_recovery_probe(snapshot)
         env = executor_env()
         if "GF-REGIONAL-DESTR-005" in selected_cases:
             managed_probe = deployed_managed_owner_probe()
         if "GF-REGIONAL-DESTR-007" in selected_cases:
             executor_probes = deployed_executor_guard_probes()
-        for case_id in selected_cases:
-            case_dir = run_dir / "cases" / case_id
-            case_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            test_results[case_id] = run_pytest(case_dir, definitions[case_id])
     except Exception as exc:
         fatal_error = f"{type(exc).__name__}: {exc}"
     finally:
@@ -682,14 +1035,18 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
     failed = False
     for case_id in selected_cases:
         errors = list(preflight_errors)
-        if not test_results.get(case_id, False):
+        if case_id not in test_results:
+            errors.append("focused pytest did not run")
+        elif not test_results[case_id]:
             errors.append("focused pytest failed")
         if fatal_error:
             errors.append(fatal_error)
         if events:
             errors.append("CloudTrail contains provider replace")
         errors.extend(drift_errors)
-        errors.extend(_probe_errors(case_id, managed_probe, executor_probes))
+        errors.extend(
+            probe_errors(case_id, managed_probe, executor_probes, automatic_probe)
+        )
         if gpu.get("node_recovery") != "None":
             errors.append("managed GPU cluster NodeRecovery is not None")
         if case_id == "GF-REGIONAL-DESTR-006":
@@ -715,6 +1072,7 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
             "automatic_negative_cluster": automatic,
             "executor_env": env,
             "deployed_managed_owner_probe": managed_probe,
+            "deployed_automatic_recovery_probe": automatic_probe,
             "deployed_executor_guard_probes": executor_probes,
             "replace_events": events,
             "node_baseline": baseline,

@@ -3521,7 +3521,13 @@ test_cases:
   - finally 中全体 GPU 节点的 UID、Ready、GPU allocatable、taints、unschedulable 与 ownership annotation 逐字段等于基线
   - 用例不创建 workload、临时 Profile、持久 workflow 或 Kubernetes mutation
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: ab42a43cbf92f92f8d5243ba3f4ab83a55f604579e56f83d6f0da6cb6e46f966
+      components:
+        control_plane: e83ac83c4f778130ed7c6cdfad5e2a50fdcae944f7cbfe463a28150e44f728c7
+        executor: bdca2144e5d9880d63190fb698523dfa0d65b9e52bb05cb932d5fc755924e7ef
+        node_runtime: bc636274bb8542723ab546d4a3743227099e641dc2bc4c15e62ed4ca1cb70f36
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-005
   command:
@@ -3535,14 +3541,23 @@ test_cases:
   level: staging
   risk: live-non-destructive
   problem: NodeRecovery=Automatic 时 provider 会自己替换节点，与客户自备热备的语义冲突，必须 fail-closed。
-  injection: 对一个本来就是NodeRecovery=Automatic且不受管的测试/CPU HyperPod集群执行隔离进程只读preflight；不得修改任何集群的NodeRecovery。
+  injection: >-
+    对一个本来就是 NodeRecovery=Automatic 且不受管的测试/CPU HyperPod 集群只读取证：由审计主机 （对全区域只读）录制真实的 DescribeCluster / ListClusterNodes / DescribeClusterNode 响应， 再在已部署 Executor Pod 的隔离进程中把这份录制回放给已部署适配器，由它自己的 preflight 判定。 Executor 的 IRSA 角色刻意只覆盖受管集群，不为跑通这条用例而放宽——那正是 DESTR-011/013 要守的边界； 回放客户端只实现这三个读调用，不含任何变更 API。不得修改任何集群的 NodeRecovery。
   expected:
   - 执行前所有 GPU 节点均无 gpu-fault quarantine taint 与 ownership annotation，否则用例 FAIL/INCOMPLETE
+  - 已部署适配器自录制响应中读到的 NodeRecovery 必须是 Automatic，否则用例 FAIL
   - step FAILED 且 error 为 healthy warm-spare replacement requires HyperPod NodeRecovery=None; provider replacement is disabled
+  - 同一份录制下去掉 replacement_strategy=HEALTHY_WARM_SPARE_ONLY 的对照步不得给出上面那句 warm-spare error，而必须给出含 HyperPod automatic node recovery is enabled 的 preflight 失败
   - 没有热备节点被分配且 spare pool 状态未变
   - finally 中全体 GPU 节点调度状态与 ownership 逐字段等于基线
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 2e123d0f2f0cd3e8fe15d7142ea62212356cdc490a436493e22a5d0dd374c6d3
+      components:
+        control_plane: e83ac83c4f778130ed7c6cdfad5e2a50fdcae944f7cbfe463a28150e44f728c7
+        executor: bdca2144e5d9880d63190fb698523dfa0d65b9e52bb05cb932d5fc755924e7ef
+        node_runtime: bc636274bb8542723ab546d4a3743227099e641dc2bc4c15e62ed4ca1cb70f36
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-006
   command:
@@ -3566,7 +3581,13 @@ test_cases:
   - 生产 Executor 两副本的 SPARE_FAILOVER=true、REMOTE_STATE=true、ALLOW_HYPERPOD_REPLACE=false 全程未变化
   - finally 中全体 GPU 节点调度状态与 ownership 逐字段等于基线
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 8424763bca0af650a568fd69a97fe1e597df2f01d572c7e459680cb70d6a8f4c
+      components:
+        control_plane: e83ac83c4f778130ed7c6cdfad5e2a50fdcae944f7cbfe463a28150e44f728c7
+        executor: bdca2144e5d9880d63190fb698523dfa0d65b9e52bb05cb932d5fc755924e7ef
+        node_runtime: bc636274bb8542723ab546d4a3743227099e641dc2bc4c15e62ed4ca1cb70f36
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-007
   command:
@@ -3587,13 +3608,14 @@ test_cases:
   - 每种场景 step 都 FAILED 且给出可区分的 reason
   - 每种场景 CloudTrail 中都没有 BatchReplaceClusterNodes
   - 故障节点保持隔离且不被销毁
-  - S2至S6生成 hyperpod-spare-insufficient 告警通知，S1不生成；该路径不创建 marker
+  - S2至S6生成 hyperpod-spare-insufficient 告警通知，S1不生成；该路径自身不新增 marker
+  - incident 上恰好只有被注入 finding 自己的 marker-<event_id>，且它指向真正落库的 incident
   - 已被部分分配的热备节点回滚到 AVAILABLE，不留下半分配状态
   evidence:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-008
-  related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr008_notification_semantics_distinguish_no_pool_from_shortage
+  related_pytest: tests/regional/test_destr008_shortage_matrix.py::test_notification_semantics_distinguish_no_pool_from_shortage
 
 - id: GF-REGIONAL-DESTR-009
   title: workload 停止与重启经 executor 本地执行
