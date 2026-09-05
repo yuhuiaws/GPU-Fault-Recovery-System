@@ -6,15 +6,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.hyperpod_spares import (
+    SPARE_POOL_STATE_ANNOTATION,
+    SPARE_RESERVATION_ANNOTATION,
+    SparePoolState,
+)
 from regional_release_config import ClusterTarget, ReleaseError
 from regional_release_gpu_rollout import gpu_node_items
 from regional_release_rendering import build_reconciler_environment
 
 ROOT = Path(__file__).resolve().parents[3]
+CORDON_TAINT = "node.kubernetes.io/unschedulable"
 BLOCKING_TAINT_KEYS = frozenset(
     {
         "gpu-fault.io/quarantined",
-        "node.kubernetes.io/unschedulable",
+        CORDON_TAINT,
     }
 )
 HYPERPOD_HEALTH_TAINT = "sagemaker.amazonaws.com/node-health-status"
@@ -37,6 +43,36 @@ class NodeMutationPreflight:
     max_unavailable: int
     runtime_image: str | None
     node_installer_image: str | None
+
+
+def is_parked_warm_spare(metadata: dict[str, Any]) -> bool:
+    """Is this node cordoned only because it is waiting in the warm-spare pool?
+
+    A warm spare has to be cordoned: `HyperPodSpareCoordinator` rejects an
+    unreserved candidate whose node is schedulable ("unreserved spare is
+    schedulable"), because a spare that accepts ordinary Pods cannot be handed
+    to a failover intact. So the pool's steady state and this gate's original
+    reading of a cordon -- "somebody is draining or repairing this node, keep
+    the release off it" -- disagree: with a pool declared, every upgrade failed
+    the barrier and rolled back, which means a site could keep spares or keep
+    receiving fixes, but not both.
+
+    A parked spare is safe to mutate, and has to be: it holds no workloads,
+    and it is only allocatable while its node agent stays fleet-ready on the
+    current node runtime. The installer already tolerates the cordon taint
+    (`regional_gpu_bootstrap.py`) and nothing in the rollout uncordons a node,
+    so the pool invariant survives the wave. Only the cordon is forgiven --
+    a quarantine taint, an unready node, a deletion or an active installer
+    still blocks, and so does a spare that is reserved or in any pool state
+    other than AVAILABLE, because those mean an allocation is in flight.
+    """
+
+    annotations = metadata.get("annotations") or {}
+    if str(annotations.get(SPARE_RESERVATION_ANNOTATION) or ""):
+        return False
+    return str(annotations.get(SPARE_POOL_STATE_ANNOTATION) or "") == (
+        SparePoolState.AVAILABLE.value
+    )
 
 
 def validate_target_node_state(
@@ -78,13 +114,16 @@ def validate_target_node_state(
             blockers.append({"node_id": node_name, "reason": "not-ready"})
         if metadata.get("deletionTimestamp"):
             blockers.append({"node_id": node_name, "reason": "deleting"})
-        if bool(spec.get("unschedulable")):
+        parked_spare = is_parked_warm_spare(metadata)
+        if bool(spec.get("unschedulable")) and not parked_spare:
             blockers.append({"node_id": node_name, "reason": "cordoned"})
         for taint in spec.get("taints") or []:
             if not isinstance(taint, dict):
                 continue
             key = str(taint.get("key") or "")
             value = str(taint.get("value") or "")
+            if key == CORDON_TAINT and parked_spare:
+                continue
             if key in BLOCKING_TAINT_KEYS or (
                 key == HYPERPOD_HEALTH_TAINT and value == "Unschedulable"
             ):

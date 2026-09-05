@@ -387,6 +387,94 @@ def test_pre_node_inventory_rejects_cordoned_or_quarantined_nodes() -> None:
     assert "installer-active" in message
 
 
+def _spare_node_items(
+    annotations: dict[str, str], *, extra_taints: list[dict[str, str]] | None = None
+) -> SimpleNamespace:
+    taints = [{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}]
+    taints.extend(extra_taints or [])
+    return SimpleNamespace(
+        _gpu=lambda _target, *args: list(args),
+        _get_json=lambda _args: {
+            "items": [
+                {
+                    "metadata": {
+                        "name": "spare-a",
+                        "uid": "uid-spare-a",
+                        "annotations": {
+                            "gpu-fault.io/installer-state": "Succeeded",
+                            **annotations,
+                        },
+                    },
+                    "spec": {"unschedulable": True, "taints": taints},
+                    "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                }
+            ]
+        },
+    )
+
+
+def test_a_parked_warm_spare_does_not_block_the_node_wave() -> None:
+    """A declared warm spare is cordoned by design, and must still be upgraded.
+
+    `HyperPodSpareCoordinator` refuses an unreserved spare whose node is
+    schedulable, so every pool member is permanently cordoned. Reading that
+    cordon as "a node is being drained or repaired" made the pre-node-mutation
+    barrier fail for the whole cluster, roll the release back, and leave the
+    site unable to take any fix while it kept spares.
+    """
+
+    NODE_PREFLIGHT_MODULE.validate_target_node_state(
+        _spare_node_items({"gpu-fault.io/spare-pool-state": "AVAILABLE"}),
+        SimpleNamespace(cluster_id="gpu-a", hyperpod_cluster_name="hp-gpu-a"),
+        ("spare-a",),
+    )
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        {},
+        {"gpu-fault.io/spare-pool-state": "ALLOCATED"},
+        {
+            "gpu-fault.io/spare-pool-state": "AVAILABLE",
+            "gpu-fault.io/spare-reservation": "incident-a",
+        },
+    ],
+)
+def test_only_an_unreserved_available_spare_is_forgiven_its_cordon(
+    annotations: dict[str, str],
+) -> None:
+    # An ordinary cordoned node, a spare mid-allocation and a reserved spare all
+    # mean somebody else is acting on the machine, so the cordon still blocks.
+    with pytest.raises(NODE_PREFLIGHT_MODULE.ReleaseError) as caught:
+        NODE_PREFLIGHT_MODULE.validate_target_node_state(
+            _spare_node_items(annotations),
+            SimpleNamespace(cluster_id="gpu-a", hyperpod_cluster_name="hp-gpu-a"),
+            ("spare-a",),
+        )
+
+    assert "cordoned" in str(caught.value), str(caught.value)
+
+
+def test_a_parked_spare_still_blocks_on_quarantine() -> None:
+    # Forgiving the cordon must not forgive the taint that says "under repair".
+    release = _spare_node_items(
+        {"gpu-fault.io/spare-pool-state": "AVAILABLE"},
+        extra_taints=[{"key": "gpu-fault.io/quarantined", "effect": "NoSchedule"}],
+    )
+
+    with pytest.raises(NODE_PREFLIGHT_MODULE.ReleaseError) as caught:
+        NODE_PREFLIGHT_MODULE.validate_target_node_state(
+            release,
+            SimpleNamespace(cluster_id="gpu-a", hyperpod_cluster_name="hp-gpu-a"),
+            ("spare-a",),
+        )
+
+    message = str(caught.value)
+    assert "gpu-fault.io/quarantined" in message, message
+    assert "cordoned" not in message, message
+
+
 def test_rollback_parallelism_is_separate_and_small_clusters_stay_serial(
     tmp_path: Path,
 ) -> None:
