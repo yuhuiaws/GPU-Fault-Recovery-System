@@ -51,10 +51,16 @@ def collector_setting(env: dict[str, str], key: str) -> int:
 STORE_PROBE = r"""
 import json
 import sys
+from datetime import datetime
 
 from gpu_fault.app import ApplicationContext
 
-cluster_id, node_id, marker = sys.argv[1:]
+cluster_id, node_id, marker, observed_after_text = (sys.argv[1:] + [""])[:4]
+observed_after = (
+    datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
+    if observed_after_text
+    else None
+)
 store = ApplicationContext.from_environment().store
 evidence = [
     item.model_dump(mode="json")
@@ -73,6 +79,19 @@ for item in events:
     except Exception:
         continue
     decisions.append(decision.model_dump(mode="json"))
+# A kmsg-injected XID carries the marker only in the raw kernel line. The
+# incident and workflow it produces never quote that line, so matching them by
+# marker text alone finds nothing (COLLECT-009 watched a workflow sit in WAITING
+# for ten minutes while its own snapshot reported "workflows: []"). The event
+# and decision records are already selected by marker above; a workflow belongs
+# to this injection when its incident points at one of those events, or when a
+# marked decision names it.
+marked_event_ids = {item["event_id"] for item in events}
+marked_workflow_ids = {
+    item.get("workflow_request_id")
+    for item in decisions
+    if item.get("workflow_request_id")
+}
 incidents = []
 workflows = []
 for workflow in store.list_workflows(limit=500, newest_first=True):
@@ -86,7 +105,18 @@ for workflow in store.list_workflows(limit=500, newest_first=True):
         "incident": incident.model_dump(mode="json"),
         "workflow": workflow.model_dump(mode="json"),
     }, sort_keys=True, default=str)
-    if marker not in encoded:
+    # A Fabric Manager SXID is not an XID event: nothing the marker can reach
+    # (raw evidence aside) names its workflow, so the caller passes the moment
+    # it injected and every workflow this node grew since then is its own.
+    injected_since = (
+        observed_after is not None and workflow.created_at >= observed_after
+    )
+    if (
+        marker not in encoded
+        and incident.event_id not in marked_event_ids
+        and workflow.request_id not in marked_workflow_ids
+        and not injected_since
+    ):
         continue
     incidents.append(incident.model_dump(mode="json"))
     workflows.append(workflow.model_dump(mode="json"))
@@ -138,6 +168,18 @@ class CollectorAcceptanceFixture:
     def create(self) -> None:
         self.host.create()
 
+    def recreate(self) -> None:
+        """Replace the probe Pod after the node it ran on rebooted.
+
+        A host probe is a plain Pod pinned to one node; a RESTART_NODE takes it
+        down with the node and leaves it Failed, and `kubectl exec` into a
+        Failed Pod is refused. Deleting and re-applying is the only way back to
+        a Pod that can still restore what the case changed on the host.
+        """
+
+        self.host.cleanup()
+        self.host.create()
+
     def snapshot(self) -> dict[str, Any]:
         return cast(dict[str, Any], self.host.execute("snapshot", timeout=180))
 
@@ -147,7 +189,12 @@ class CollectorAcceptanceFixture:
             self.host.execute(*arguments, timeout=timeout),
         )
 
-    def store_snapshot(self, marker: str) -> dict[str, Any]:
+    def store_snapshot(
+        self,
+        marker: str,
+        *,
+        observed_after: datetime | None = None,
+    ) -> dict[str, Any]:
         return cast(
             dict[str, Any],
             self.regional.cpu_python(
@@ -155,6 +202,7 @@ class CollectorAcceptanceFixture:
                 self.regional.settings.cluster_id,
                 self.node,
                 marker,
+                observed_after.isoformat() if observed_after is not None else "",
             ),
         )
 
@@ -166,12 +214,13 @@ class CollectorAcceptanceFixture:
         minimum_evidence: int = 1,
         timeout_seconds: int = 300,
         terminal_workflow: bool = False,
+        observed_after: datetime | None = None,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_seconds
         timeline = []
         last: dict[str, Any] = {}
         while time.monotonic() < deadline:
-            last = self.store_snapshot(marker)
+            last = self.store_snapshot(marker, observed_after=observed_after)
             statuses = [item.get("status") for item in last.get("workflows") or []]
             timeline.append(
                 {

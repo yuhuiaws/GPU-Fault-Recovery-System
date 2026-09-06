@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 from tests._builders import (
     active_workflow_executor,
     build_store,
@@ -417,6 +419,88 @@ def test_restore_removes_stale_quarantine_taint_after_ownership_check() -> None:
         }
     ]
     assert core.node["metadata"]["annotations"] == {}
+
+
+def test_restore_of_a_node_nobody_isolated_is_an_idempotent_success() -> None:
+    """A workflow that fail-closed at compile time never ran
+    MARK_UNSCHEDULABLE, so the validated restore that closes its incident meets
+    a node with no gpu-fault isolation at all. Refusing it left the incident
+    ESCALATED forever (2026-09-06, REMEDIATE_EFA_DRIVER without a profile
+    owner); there is nothing to undo, so the step succeeds and says so."""
+
+    core = FakeCoreApi()
+    store = build_store()
+    incident, workflow = workflow_state(store, [WorkflowOperation.RESTORE_SCHEDULING])
+    adapter = KubernetesWorkflowAdapter(
+        core_api=core, batch_api=UnusedApi(), custom_api=UnusedApi()
+    )
+    workflow = copy_model(
+        workflow,
+        official_steps=[
+            copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
+        ],
+    )
+    store.save_workflow(workflow)
+    core.node["metadata"]["annotations"] = {}
+    core.node["spec"]["unschedulable"] = False
+    core.node["spec"]["taints"] = [
+        item
+        for item in core.node["spec"]["taints"]
+        if item.get("key") != "gpu-fault.io/quarantined"
+    ]
+    before = copy.deepcopy(core.node)
+
+    result = execute_workflow(
+        active_workflow_executor(
+            store, [adapter], {WorkflowOperation.RESTORE_SCHEDULING}
+        ),
+        workflow.request_id,
+    )
+
+    assert result.status is WorkflowStatus.SUCCEEDED
+    # The node was not touched: no taint, annotation or cordon changed.
+    assert core.node["spec"] == before["spec"]
+    assert core.node["metadata"]["annotations"] == {}
+    restore = next(
+        item
+        for item in store.get_workflow(workflow.request_id).step_executions
+        if item.operation is WorkflowOperation.RESTORE_SCHEDULING
+    )
+    assert restore.details["already_restored_nodes"] == restore.details["restored_nodes"]
+
+
+def test_restore_still_refuses_a_node_another_incident_isolated() -> None:
+    core = FakeCoreApi()
+    store = build_store()
+    incident, workflow = workflow_state(store, [WorkflowOperation.RESTORE_SCHEDULING])
+    adapter = KubernetesWorkflowAdapter(
+        core_api=core, batch_api=UnusedApi(), custom_api=UnusedApi()
+    )
+    workflow = copy_model(
+        workflow,
+        official_steps=[
+            copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
+        ],
+    )
+    store.save_workflow(workflow)
+    core.node["metadata"]["annotations"] = {
+        "gpu-fault.io/incident-id": "inc-someone-else",
+        "gpu-fault.io/fencing-token": "999",
+    }
+    core.node["spec"]["unschedulable"] = True
+
+    result = execute_workflow(
+        active_workflow_executor(
+            store, [adapter], {WorkflowOperation.RESTORE_SCHEDULING}
+        ),
+        workflow.request_id,
+    )
+
+    assert result.status is WorkflowStatus.FAILED
+    assert core.node["spec"]["unschedulable"] is True
+    assert core.node["metadata"]["annotations"]["gpu-fault.io/incident-id"] == (
+        "inc-someone-else"
+    )
 
 
 def test_kubernetes_adapter_preserves_initial_schedulability_across_isolation_steps() -> (

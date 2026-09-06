@@ -75,6 +75,15 @@ claims:
     mode: OWN
     owner: gpu-fault-node-agent
     adapter: node-action
+  # REMEDIATE_EFA_DRIVER (EFA PCI function present, efa driver unbound). The
+  # Node Agent ships it enabled (ALLOW_EFA_DRIVER_REMEDIATION=true) but until
+  # 2026-09-06 no regional profile claimed the capability, so every such
+  # incident fail-closed with "no executable owner for efaDriverRemediation"
+  # (GF-REGIONAL-COLLECT-017 A, live).
+  - capability: efaDriverRemediation
+    mode: OWN
+    owner: gpu-fault-node-agent
+    adapter: node-action
   - capability: nvlinkDiagnostics
     mode: OBSERVE
     owner: gpu-fault-node-agent
@@ -141,6 +150,10 @@ observed:
     available: true
     version: node-action-v1
   - capability: fabricReset
+    owner: gpu-fault-node-agent
+    available: true
+    version: node-action-v1
+  - capability: efaDriverRemediation
     owner: gpu-fault-node-agent
     available: true
     version: node-action-v1

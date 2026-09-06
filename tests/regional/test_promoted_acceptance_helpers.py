@@ -526,3 +526,42 @@ def test_warm_spare_audit_separates_an_unrun_pytest_from_a_failed_one(
     assert exit_code == 1
     assert "focused pytest did not run" in result["errors"], result["errors"]
     assert "focused pytest failed" not in result["errors"], result["errors"]
+
+
+def test_host_probe_create_deletes_a_leftover_pod_before_applying(
+    tmp_path: Path,
+) -> None:
+    """The pod name is a digest of (case, run, node), so a rerun after an
+    operator abort meets the previous pod, by then Failed on its
+    activeDeadlineSeconds; `apply` onto it is a no-op and the Ready wait can
+    only time out. create() has to delete whatever carries the name first."""
+
+    kubeconfig = tmp_path / "gpu.kubeconfig"
+    kubeconfig.write_text("apiVersion: v1\n", encoding="utf-8")
+    probe = tmp_path / "probe.py"
+    probe.write_text("print('{}')\n", encoding="utf-8")
+    fixture = HostProbeFixture(
+        HostProbeSettings(
+            kubeconfig=kubeconfig,
+            context="gpu-context",
+            namespace="gpu-fault-system",
+            node="node-a",
+            image="registry.example/probe@sha256:" + "a" * 64,
+            case_id="GF-REGIONAL-COLLECT-014",
+            run_id="run-a",
+            probe_script=probe,
+        )
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kubectl(*arguments: str, **_kwargs: Any) -> Any:
+        calls.append(arguments)
+        return None
+
+    fixture._kubectl = fake_kubectl  # type: ignore[method-assign]
+    fixture.create()
+
+    verbs = [call[0] for call in calls]
+    assert verbs == ["delete", "apply", "apply", "wait"], verbs
+    assert calls[0][1:3] == ("pod", fixture.pod), calls[0]
+    assert "--ignore-not-found" in calls[0], calls[0]

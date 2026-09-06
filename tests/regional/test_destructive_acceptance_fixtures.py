@@ -488,11 +488,43 @@ def test_destr001_requires_the_exact_reset_contract() -> None:
     state = _reset_state()
 
     assert destr001.workflow_errors(state) == [], state
+    # A step that finished inside one poll is never seen WAITING; its terminal
+    # `remote/` adapter id is equivalent evidence that the GPU-side executor,
+    # not the control plane, performed the mutation (COLLECT-016 D, QUIESCE).
     state["observed_waiting_step_executions"] = state[
         "observed_waiting_step_executions"
     ][:-1]
+    assert destr001.workflow_errors(state) == [], state
+    # Without either form of evidence the contract still fails.
+    for execution in state["workflow"]["step_executions"]:
+        if execution["operation"] == "RESTORE_GPU_SERVICES":
+            execution["adapter_operation_id"] = "workflow-local/6"
     errors = destr001.workflow_errors(state)
     assert any("WAITING evidence" in error for error in errors), errors
+
+
+def test_destr001_reset_contract_takes_the_workload_step_sequence() -> None:
+    """COLLECT-016 D resets a node that runs the managed workload: the
+    compiler wraps the idle-node sequence in STOP_WORKLOADS/RESTART_WORKLOAD,
+    and the contract must be told so instead of failing on the extra steps."""
+
+    from scripts.e2e.regional import run_collect016_training_recovery as collect016
+
+    steps = collect016.WORKLOAD_RESET_STEPS
+    assert [s for s in steps if s not in {"STOP_WORKLOADS", "RESTART_WORKLOAD"}] == list(
+        destr001.EXPECTED_STEPS
+    )
+    assert steps.index("STOP_WORKLOADS") < steps.index("QUIESCE_GPU_SERVICES")
+    assert steps[-1] == "RESTART_WORKLOAD"
+
+    state = _reset_state()
+    state["event"]["xid"] = 109
+    state["workflow"]["official_steps"] = [{"operation": s} for s in steps]
+    state["workflow"]["completed_operations"] = list(steps)
+    assert any(
+        "reset contract" in error for error in destr001.workflow_errors(state, xid=109)
+    )
+    assert destr001.workflow_errors(state, xid=109, expected_steps=steps) == [], state
 
 
 def test_destr002_preflight_and_reboot_contract() -> None:
@@ -850,6 +882,15 @@ def test_destr009_workflow_contract_scales_to_expected_gpu_count() -> None:
     state = _restart_state(24)
 
     assert destr009.workflow_errors(state, expected_gpu_count=24) == [], state
+    # COLLECT-016 A reaches the same RESTART_APP contract from a real kmsg
+    # XID 31, so the event the contract names is a parameter.
+    state["event"]["xid"] = 31
+    assert any(
+        "not XID 11" in error
+        for error in destr009.workflow_errors(state, expected_gpu_count=24)
+    )
+    assert destr009.workflow_errors(state, expected_gpu_count=24, xid=31) == [], state
+    state["event"]["xid"] = 11
     errors = destr009.workflow_errors(state, expected_gpu_count=1)
     assert any("source GPU count is not 1" in error for error in errors), errors
 
@@ -1280,3 +1321,141 @@ def test_every_regional_runner_installs_the_shared_abort_handler() -> None:
             offenders.append(f"{path.name}: entry point bypasses run_case_main")
 
     assert offenders == [], offenders
+
+
+def test_collect004_finds_restart_node_anywhere_in_the_nodes_workflow_chain() -> None:
+    """The reboot lives in the mismatch workflow, not in the escalation after it."""
+
+    mismatch = {
+        "request_id": "workflow-mismatch",
+        "status": "FAILED",
+        "official_steps": [
+            {"operation": "FREEZE_EVIDENCE"},
+            {"operation": "RESTART_NODE"},
+            {"operation": "VALIDATE_GPU"},
+        ],
+    }
+    replace_after = {
+        "request_id": "workflow-replace-after",
+        "status": "FAILED",
+        "official_steps": [
+            {"operation": "FREEZE_EVIDENCE"},
+            {"operation": "REPLACE_NODE"},
+        ],
+    }
+    state = {
+        "workflow": replace_after,
+        "matches": [{"workflow": replace_after}, {"workflow": mismatch}],
+    }
+
+    planned = collector_destructive.workflow_planning(state, "RESTART_NODE")
+    assert planned is not None and planned["request_id"] == "workflow-mismatch", planned
+    assert collector_destructive.workflow_planning(state, "REPLACE_NODE")[
+        "request_id"
+    ] == ("workflow-replace-after")
+    assert (
+        collector_destructive.workflow_planning(
+            {"workflow": replace_after}, "RESTART_NODE"
+        )
+        is None
+    ), "a state without the chain still answers from the one workflow it has"
+
+
+def test_collect004_restores_the_collector_env_through_a_fresh_probe_after_a_reboot() -> (
+    None
+):
+    calls: list[str] = []
+
+    class Collector:
+        def __init__(self) -> None:
+            self.alive = False
+
+        def execute(self, *arguments: str, timeout: int = 180) -> dict:
+            calls.append("execute" if self.alive else "execute-dead")
+            if not self.alive:
+                raise (
+                    live_fixture_module.HostProbeError(
+                        "cannot exec into a container in a completed pod"
+                    )
+                    if hasattr(live_fixture_module, "HostProbeError")
+                    else (
+                        collector_destructive.HostProbeError(
+                            "cannot exec into a container in a completed pod"
+                        )
+                    )
+                )
+            return {"restored": True, "arguments": arguments}
+
+        def recreate(self) -> None:
+            calls.append("recreate")
+            self.alive = True
+
+    result = collector_destructive.restore_collector_env(Collector(), "c004-1")
+
+    assert result["restored"] is True, result
+    assert calls == ["execute-dead", "recreate", "execute"], (
+        "the dead Pod is replaced exactly once and the restore then goes through it"
+    )
+
+
+def test_reset_contract_is_parametrised_for_the_xid48_companion_drill() -> None:
+    state = _reset_state()
+    state["event"]["xid"] = 48
+    state["decision"]["official_action"] = "DRAIN_AND_RESET"
+
+    assert (
+        destr001.workflow_errors(state, xid=48, official_action="DRAIN_AND_RESET") == []
+    )
+    errors = destr001.workflow_errors(state)
+    assert "matched event is not XID 46" in errors, errors
+    assert "policy did not finalize XID 46 as RESET_GPU" in errors, errors
+
+
+def _reset_host_pair(
+    *, minimum: int, last: int, journal_resets: int = 0
+) -> tuple[dict, dict]:
+    ledger_before = [
+        {"command_id": "cmd-old", "operation": "QUIESCE_GPU_SERVICES", "attempt": 1}
+    ]
+    baseline = {
+        "gpu_inventory": [{"pci_bdf": f"0000:{index:02x}:00.0"} for index in range(8)],
+        "ledger": list(ledger_before),
+        "services": {"kubelet.service": {"ActiveState": "active"}},
+        "gpu_fault_timers": ["gpu-fault-certificate-check.timer"],
+    }
+    after = {
+        **baseline,
+        "compute_clients": [],
+        "quiesce_states": [],
+        "ledger": ledger_before
+        + [{"command_id": "cmd-reset", "operation": "RESET_GPU", "attempt": 1}],
+        "kernel_reset_journal": {"target_reset_count": journal_resets},
+        "sampler": {
+            "sample_count": 40,
+            "min_gpu_count": minimum,
+            "last": {"gpu_count": last},
+        },
+    }
+    return baseline, after
+
+
+def test_physical_reset_is_proven_by_the_sampler_dip_not_by_journal_text() -> None:
+    baseline, after = _reset_host_pair(minimum=7, last=8)
+    assert (
+        destr001.host_errors(
+            baseline, after, expected_gpu_count=8, target_bdf="0000:59:00"
+        )
+        == []
+    )
+
+    baseline, flat = _reset_host_pair(minimum=8, last=8)
+    errors = destr001.host_errors(
+        baseline, flat, expected_gpu_count=8, target_bdf="0000:59:00"
+    )
+    assert any("leave and return" in error for error in errors), errors
+
+    baseline, twice = _reset_host_pair(minimum=7, last=8, journal_resets=2)
+    errors = destr001.host_errors(
+        baseline, twice, expected_gpu_count=8, target_bdf="0000:59:00"
+    )
+    assert any("more than one reset" in error for error in errors), errors

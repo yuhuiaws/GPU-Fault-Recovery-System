@@ -435,15 +435,20 @@ def workflow_errors(
     state: dict[str, Any],
     *,
     expected_gpu_count: int = 24,
+    xid: int = 11,
 ) -> list[str]:
+    """DESTR-009 replays XID 11; COLLECT-016 A reaches the same RESTART_APP
+    contract from a real kmsg XID 31, so the event it must name is a
+    parameter."""
+
     errors = []
     event = state.get("event") or {}
     decision = state.get("decision") or {}
     workflow = state.get("workflow") or {}
-    if event.get("xid") != 11:
-        errors.append("matched event is not XID 11")
+    if event.get("xid") != xid:
+        errors.append(f"matched event is not XID {xid}")
     if decision.get("official_action") != "RESTART_APP":
-        errors.append("policy did not resolve XID 11 to RESTART_APP")
+        errors.append(f"policy did not resolve XID {xid} to RESTART_APP")
     if workflow.get("status") != "SUCCEEDED":
         errors.append("workload restart workflow is not SUCCEEDED")
     operations = [item.get("operation") for item in workflow.get("official_steps", [])]

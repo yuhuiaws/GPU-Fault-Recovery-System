@@ -93,6 +93,15 @@ def _run_branch(evidence_dir: Path, name: str, *, fail_release: bool) -> dict:
                 delay = (lease_expires_at - datetime.now(timezone.utc)).total_seconds()
                 if delay > 0:
                     time.sleep(delay + 0.2)
+            # F-D7 charges the deadline to the request: the release carries a
+            # retry backoff, so the takeover has to wait it out like a real
+            # second owner would.
+            if request.not_before is not None:
+                delay = (
+                    request.not_before - datetime.now(timezone.utc)
+                ).total_seconds()
+                if delay > 0:
+                    time.sleep(delay + 0.2)
             claimed = store.claim_active_processor_requests(
                 f"ha008-takeover-{name}",
                 now=datetime.now(timezone.utc),

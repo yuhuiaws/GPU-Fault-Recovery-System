@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.e2e.regional import collector_acceptance_fixture
 from scripts.e2e.regional import run_collect016_training_recovery as collect016
 from scripts.e2e.regional import run_collect017_efa_plugin as collect017
 from scripts.e2e.regional import run_collector_acceptance as collect
@@ -368,3 +369,469 @@ def test_collector_promoted_scripts_contain_no_site_specific_topology() -> None:
         assert "/secure/gpu-fault-bootstrap" not in source, path
         assert "514385905925" not in source, path
         assert "gpu-fault-gpu-1-" not in source, path
+
+
+def test_collector_probe_canonicalises_every_bdf_spelling_the_node_emits() -> None:
+    """nvidia-smi, the host probe and sysfs spell one device three ways."""
+
+    canonical = "0000:59:00.0"
+    assert collector_node_probe.normalize_bdf("00000000:59:00.0") == canonical, (
+        "nvidia-smi's eight-digit domain must collapse to the four-digit form"
+    )
+    assert collector_node_probe.normalize_bdf("0000:59:00") == canonical, (
+        "a BDF without the function digit is the same device, function 0"
+    )
+    assert collector_node_probe.normalize_bdf("0000:59:00.0") == canonical, (
+        "the canonical spelling is unchanged"
+    )
+    assert collector_node_probe.normalize_bdf("0000:5E:00.0") == canonical.replace(
+        "59", "5e"
+    ), "case is folded before validation"
+    for unsafe in ("0000:59:00.0; rm -rf /", "0001:59:00.0", "59:00.0", "0000:59:00.9"):
+        with pytest.raises(collector_node_probe.ProbeError, match="unsafe PCI BDF"):
+            collector_node_probe.normalize_bdf(unsafe)
+    assert collector_node_probe.normalized_bdf_or_raw("garbage") == "garbage", (
+        "an inventory line the probe cannot canonicalise is reported as-is"
+    )
+
+
+def test_collector_store_probe_links_workflows_to_marked_events_and_decisions() -> None:
+    """A kmsg marker never appears in the workflow record, so text matching is not enough."""
+
+    probe = collector_acceptance_fixture.STORE_PROBE
+    assert 'marked_event_ids = {item["event_id"] for item in events}' in probe
+    assert "incident.event_id not in marked_event_ids" in probe
+    assert "workflow.request_id not in marked_workflow_ids" in probe
+    assert probe.index("marked_event_ids") < probe.index(
+        "for workflow in store.list_workflows"
+    ), "the marked sets must exist before the workflow scan that consults them"
+
+
+def test_collect011_injects_an_nvswitch_address_that_is_not_a_gpu_slot() -> None:
+    """A GPU's own BDF in the SXid line makes the reset executable; the case must not."""
+
+    inventory = [{"pci_bdf": "0000:59:00.0"}, {"pci_bdf": "0000:ab:00.0"}]
+    chosen = collect.nvswitch_pci_bdf(inventory)
+    assert chosen == "0000:ac:00.0", chosen
+    assert chosen.split(".")[0] not in {
+        item["pci_bdf"].split(".")[0] for item in inventory
+    }, "the injected switch address must never coincide with a GPU slot"
+    assert collect.nvswitch_pci_bdf([{"pci_bdf": "0000:59:00.0"}]) == "0000:ab:00.0", (
+        "the documented NVSwitch example address is used when it is free"
+    )
+
+
+def test_collector_store_probe_scopes_fabric_manager_workflows_by_injection_time() -> (
+    None
+):
+    """SXID workflows carry neither the marker nor an XID event; the injection time links them."""
+
+    probe = collector_acceptance_fixture.STORE_PROBE
+    assert (
+        'cluster_id, node_id, marker, observed_after_text = (sys.argv[1:] + [""])[:4]'
+        in probe
+    )
+    assert "workflow.created_at >= observed_after" in probe
+    assert "and not injected_since" in probe
+
+
+def test_collect012_restores_the_quarantine_before_injecting_the_second_xid(
+    tmp_path: Path,
+) -> None:
+    """XID 31 must reach BLOCKED on a node XID 13 no longer owns."""
+
+    calls: list[str] = []
+
+    class Fixture:
+        def snapshot(self) -> dict:
+            return {"gpu_inventory": [{"pci_bdf": "0000:59:00.0"}]}
+
+        def execute(self, *arguments: str, timeout: int = 180) -> dict:
+            calls.append("inject:" + arguments[arguments.index("--xid") + 1])
+            return {}
+
+        def wait_marker(self, marker: str, **_kwargs: object) -> dict:
+            return {
+                "evidence": [{"record_id": f"kmsg-{marker}"}],
+                "workflows": [{"status": "BLOCKED"}],
+                "incidents": [{"incident_id": f"inc-{marker}"}],
+            }
+
+        def restore_incidents(self, state: dict, **_kwargs: object) -> list:
+            calls.append("restore")
+            return [{"status": "SUCCEEDED"}]
+
+    result = collect.run_collect012(Fixture(), tmp_path, 1, "hyperpod-v1")
+
+    assert result["verdict"] == "PASS", result
+    assert calls == ["inject:13", "inject:13", "restore", "inject:31", "restore"], calls
+    assert len(result["restore_workflows"]) == 2, result["restore_workflows"]
+
+
+def test_destructive_probe_does_not_count_its_own_injected_lines_as_resets() -> None:
+    from scripts.e2e.regional.probes import destructive_node_probe
+
+    injected = (
+        "gpu-fault GF-REGIONAL-DESTR-001 marker=m drill_id=d NVRM: Xid (PCI:0000:59:00): 46, "
+        "GPU stopped processing, reset acceptance event"
+    )
+    assert (
+        destructive_node_probe.counts_as_target_reset(injected, "0000:59:00") is False
+    ), "the drill's own kmsg line is injection text, not a kernel reset record"
+    assert (
+        destructive_node_probe.counts_as_target_reset(
+            "NVRM: GPU at PCI:0000:59:00: reset complete", "0000:59:00"
+        )
+        is True
+    )
+    assert (
+        destructive_node_probe.counts_as_target_reset(
+            "NVRM: GPU at PCI:0000:5a:00: reset complete", "0000:59:00"
+        )
+        is False
+    )
+
+
+def _collect014_harness(*, fail_status: str = "BLOCKED", fail_reasons=None,
+                        ledger_after_fail: int = 0, positive_raises: bool = False):
+    """Stub the four collaborators run_collect014 drives and record calls."""
+
+    from datetime import datetime, timezone
+
+    calls: list[str] = []
+    seen: dict[str, object] = {}
+
+    class Settings:
+        class regional:  # noqa: N801 - stub attribute holder
+            cluster_id = "hp-cluster"
+
+        node = "hyperpod-node"
+
+    class Regional:
+        def executor_python(self, _script: str, payload: str) -> dict:
+            import json
+
+            seen["fail_observed_at"] = datetime.fromisoformat(
+                json.loads(payload)["observed_at"]
+            )
+            seen["posted_at"] = datetime.now(timezone.utc)
+            calls.append("fabric-post")
+            return {}
+
+    class ResetHost:
+        host_script = "/probe.py"
+        snapshots = 0
+
+        def execute(self, *arguments: str, timeout: int = 180) -> dict:
+            if "start-reset-sampler" in arguments:
+                calls.append("sampler-start")
+                return {}
+            if "stop-reset-sampler" in arguments:
+                calls.append("sampler-stop")
+                return {}
+            # The probe returns the node's whole results ledger: an earlier
+            # full reset on this node is always present, before and after.
+            old_reset = {
+                "operation": "RESET_ALL_GPUS_NVSWITCHES",
+                "command_id": "workflow-old/5/RESET_ALL_GPUS_NVSWITCHES/node",
+            }
+            if "--since-epoch" in arguments:
+                return {
+                    "gpu_inventory": [{"pci_bdf": "0000:59:00.0"}],
+                    "ledger": [
+                        old_reset,
+                        {
+                            "operation": "RESET_ALL_GPUS_NVSWITCHES",
+                            "command_id": (
+                                "workflow-new/5/RESET_ALL_GPUS_NVSWITCHES/node"
+                            ),
+                        },
+                    ],
+                    "boot_id": "boot-1",
+                }
+            self.snapshots += 1
+            ledger = [old_reset] + (
+                [] if self.snapshots == 1 else [{}] * ledger_after_fail
+            )
+            return {
+                "gpu_inventory": [{"pci_bdf": "0000:59:00.0"}],
+                "ledger": ledger,
+                "boot_id": "boot-1",
+            }
+
+    class Collector:
+        def wait_marker(self, marker: str, **kwargs: object) -> dict:
+            if marker.startswith("c014-fail-"):
+                calls.append("wait-fail")
+                return {
+                    "workflows": [
+                        {
+                            "status": fail_status,
+                            "blocked_reasons": (
+                                fail_reasons
+                                if fail_reasons is not None
+                                else [
+                                    "SXID 10003 requires fabric_partition and "
+                                    "complete node GPU inventory"
+                                ]
+                            ),
+                        }
+                    ],
+                    "incidents": [{"incident_id": "inc-fail"}],
+                }
+            calls.append("wait-positive")
+            seen["positive_kwargs"] = kwargs
+            if positive_raises:
+                raise RuntimeError("store unreachable")
+            return {
+                "workflows": [
+                    {
+                        "status": "SUCCEEDED",
+                        "step_executions": [
+                            {
+                                "operation": "RESET_ALL_GPUS_NVSWITCHES",
+                                "status": "SUCCEEDED",
+                            }
+                        ],
+                    }
+                ],
+                "incidents": [{"incident_id": "inc-positive"}],
+            }
+
+        def execute(self, *arguments: str, timeout: int = 180) -> dict:
+            calls.append("append-sxid")
+            return {}
+
+        def restore_incidents(self, state: dict, **_kwargs: object) -> list:
+            calls.append("restore")
+            return [{"status": "SUCCEEDED"}]
+
+    return Settings(), Regional(), ResetHost(), Collector(), calls, seen
+
+
+def test_collect014_restores_the_node_before_the_positive_injection(
+    tmp_path: Path,
+) -> None:
+    """The positive full-fabric SXID must run on a node the fail-closed
+    incident no longer isolates, and its workflow is matched by injection
+    time because FABRIC_MANAGER_LOG evidence carries no marker."""
+
+    from datetime import timedelta
+
+    settings, regional, host, collector, calls, seen = _collect014_harness()
+    result = collect_destructive.run_collect014(
+        settings, regional, host, collector, tmp_path, 1, "hyperpod-v1"
+    )
+
+    # PASS even though the ledger already held a full reset from an earlier
+    # run: only rows the injection added count (2026-09-06 08:51Z FAIL).
+    assert result["verdict"] == "PASS", result
+    assert calls.index("wait-fail") < calls.index("restore") < calls.index(
+        "append-sxid"
+    ), calls
+    assert len(result["restore_workflows"]) == 2, result["restore_workflows"]
+    assert seen["positive_kwargs"].get("observed_after") is not None, seen
+    # The fail-closed event is back-dated far enough that a stored inventory
+    # sample up to 7.5 min old is still newer than event + 30s, yet it stays
+    # under the 900s stale-generation fence.
+    age = seen["posted_at"] - seen["fail_observed_at"]
+    assert timedelta(minutes=8) <= age < timedelta(minutes=9), age
+    assert collect_destructive.FAIL_CLOSED_EVENT_AGE < timedelta(seconds=900)
+
+
+@pytest.mark.parametrize(
+    ("fail_status", "fail_reasons", "ledger_after_fail", "expected"),
+    [
+        ("SUCCEEDED", None, 0, "did not fail closed"),
+        ("BLOCKED", ["some other reason"], 0, "not the dual-evidence gate"),
+        ("BLOCKED", None, 3, "produced node-side actions"),
+    ],
+)
+def test_collect014_never_injects_the_positive_sxid_after_a_bad_fail_closed(
+    tmp_path: Path,
+    fail_status: str,
+    fail_reasons: list[str] | None,
+    ledger_after_fail: int,
+    expected: str,
+) -> None:
+    """A fail-closed direction that acted on the node has already spent the
+    one full fabric reset the case may perform (2026-09-06 05:11Z/05:17Z ran
+    two real resets this way). The runner must FAIL without the positive."""
+
+    settings, regional, host, collector, calls, _ = _collect014_harness(
+        fail_status=fail_status,
+        fail_reasons=fail_reasons,
+        ledger_after_fail=ledger_after_fail,
+    )
+    result = collect_destructive.run_collect014(
+        settings, regional, host, collector, tmp_path, 1, "hyperpod-v1"
+    )
+
+    assert result["verdict"] == "FAIL", result
+    assert any(expected in error for error in result["errors"]), result["errors"]
+    assert "append-sxid" not in calls, calls
+    assert "sampler-start" not in calls, calls
+    assert calls.count("restore") == 1, calls
+    assert result["positive"] is None
+
+
+def test_collect014_stops_the_sampler_when_the_positive_path_raises(
+    tmp_path: Path,
+) -> None:
+    settings, regional, host, collector, calls, _ = _collect014_harness(
+        positive_raises=True
+    )
+    with pytest.raises(RuntimeError):
+        collect_destructive.run_collect014(
+            settings, regional, host, collector, tmp_path, 1, "hyperpod-v1"
+        )
+    assert calls[-1] == "sampler-stop", calls
+
+
+def test_reset_sampler_start_clears_a_stale_unit_before_systemd_run(
+    tmp_path: Path,
+) -> None:
+    """A prior run that raised before stop-reset-sampler leaves its transient
+    unit loaded; the deterministic unit name means the rerun would collide with
+    "already loaded or has a fragment file". start_sampler must clear it first."""
+
+    from argparse import Namespace
+
+    from scripts.e2e.regional.probes import destructive_node_probe as probe
+
+    unit = "gpu-fault-reset-sampler-deadbeefdeadbeef"
+    ndjson = tmp_path / "reset-sampler.ndjson"
+    commands: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> object:
+        commands.append(list(argv))
+        return None
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(probe, "sampler_paths", lambda _run_id: (unit, ndjson))
+        monkeypatch.setattr(probe, "run", fake_run)
+        monkeypatch.setattr(probe, "emit", lambda _payload: None)
+        monkeypatch.setattr(
+            probe, "sampler_summary", lambda _run_id: {"sample_count": 2}
+        )
+        probe.start_sampler(
+            Namespace(
+                run_id="c014-1",
+                probe_script=str(Path(probe.__file__).resolve()),
+                duration_seconds=1800,
+                interval_seconds=0.25,
+            )
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert ["systemctl", "stop", unit + ".service"] in commands, commands
+    assert ["systemctl", "reset-failed", unit + ".service"] in commands, commands
+    systemd_run_index = next(
+        i for i, argv in enumerate(commands) if argv and argv[0] == "systemd-run"
+    )
+    stop_index = commands.index(["systemctl", "stop", unit + ".service"])
+    reset_index = commands.index(["systemctl", "reset-failed", unit + ".service"])
+    assert stop_index < systemd_run_index, commands
+    assert reset_index < systemd_run_index, commands
+
+
+def test_collect015_matches_the_reboot_workflow_by_injection_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ALWAYS_FATAL SXID is FABRIC_MANAGER_LOG evidence, which never
+    carries the marker into the workflow; the wait must be time-scoped."""
+
+    seen: dict[str, object] = {}
+
+    class Settings:
+        node = "hyperpod-node"
+        hyperpod_cluster = "hp"
+        executor_role_arn = "arn:aws:iam::1:role/executor"
+
+    class Regional:
+        def node_snapshot(self, _node: str) -> dict:
+            return {"boot_id": "boot-1"}
+
+        def wait_node_ready(self, _node: str, **_kwargs: object) -> dict:
+            return {"boot_id": "boot-2"}
+
+        def provider_events(self, *_args: object) -> list:
+            return [
+                {
+                    "event_name": "BatchRebootClusterNodes",
+                    "user_identity": {"session_issuer_arn": Settings.executor_role_arn},
+                }
+            ]
+
+    class Collector:
+        def snapshot(self) -> dict:
+            return {"gpu_inventory": [{"pci_bdf": "0000:59:00.0"}]}
+
+        def execute(self, *_arguments: str, timeout: int = 180) -> dict:
+            return {}
+
+        def wait_marker(self, marker: str, **kwargs: object) -> dict:
+            seen.update(kwargs)
+            return {"workflows": [{"status": "SUCCEEDED"}]}
+
+    class Provider:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def provider_inventory(self) -> dict:
+            return {"nodes": ["a"]}
+
+    monkeypatch.setattr(collect_destructive, "WarmSpareLiveFixture", Provider)
+    monkeypatch.setattr(
+        collect_destructive, "provider_event_actor_matches_role", lambda *_: True
+    )
+    result = collect_destructive.run_collect015(
+        Settings(), Regional(), Collector(), tmp_path, 1
+    )
+
+    assert result["verdict"] == "PASS", result
+    assert seen.get("observed_after") is not None, seen
+    assert seen.get("terminal_workflow") is True, seen
+
+
+def _daemonset(namespace: str, name: str, desired: int) -> dict:
+    return {
+        "metadata": {"namespace": namespace, "name": name},
+        "spec": {"template": {"spec": {"affinity": {"nodeAffinity": {}}}}},
+        "status": {"desiredNumberScheduled": desired},
+    }
+
+
+def test_device_plugin_discovery_ignores_daemonsets_that_schedule_nowhere() -> None:
+    """The HyperPod chart ships `<plugin>-mps-control-daemon` next to the
+    plugin; it carries the token but has desired 0. Only a DaemonSet that
+    places Pods can change a node's allocatable, so it is the one and only
+    candidate (2026-09-06 09:52Z: "expected one nvidia-device-plugin
+    DaemonSet, found 2")."""
+
+    import json
+
+    items = [
+        _daemonset("kube-system", "hyperpod-dependencies-nvidia-device-plugin", 4),
+        _daemonset(
+            "kube-system",
+            "hyperpod-dependencies-nvidia-device-plugin-mps-control-daemon",
+            0,
+        ),
+    ]
+
+    class Regional:
+        def kubectl(self, *_arguments: str, **_kwargs: object) -> str:
+            return json.dumps({"items": items})
+
+    plugin = collect_destructive.DevicePluginFixture(
+        Regional(), token="nvidia-device-plugin", node="node-a", resource="nvidia.com/gpu"
+    )
+    found = plugin.discover()
+    assert found["name"] == "hyperpod-dependencies-nvidia-device-plugin", found
+
+    items[1]["status"]["desiredNumberScheduled"] = 4
+    with pytest.raises(RegionalFixtureError, match="found 2"):
+        plugin.discover()

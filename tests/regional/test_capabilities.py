@@ -144,6 +144,9 @@ def test_regional_hyperpod_safe_profile_matches_enabled_adapters() -> None:
         CapabilityName.GPU_RESET,
         CapabilityName.FABRIC_MANAGER_RESTART,
         CapabilityName.FABRIC_RESET,
+        # REMEDIATE_EFA_DRIVER: the agent enables it by default; without this
+        # claim the incident could only fail closed (COLLECT-017 A, live).
+        CapabilityName.EFA_DRIVER_REMEDIATION,
     ):
         assert executable[capability] == "gpu-fault-node-agent"
     assert CapabilityName.NVLINK_DIAGNOSTICS not in executable

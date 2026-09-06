@@ -45,6 +45,38 @@ ENV_KEYS = {
 }
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SAFE_BDF = re.compile(r"^0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+
+
+def normalize_bdf(value: str) -> str:
+    """The one `0000:bb:dd.f` spelling for every way the node writes a BDF.
+
+    `nvidia-smi --query-gpu=pci.bus_id` prints an eight-digit domain
+    (`00000000:59:00.0`), the destructive host probe and the collector's own
+    inventory print `0000:59:00` without the function, and sysfs prints
+    `0000:5e:00.0`. This probe's actions all validate against SAFE_BDF, so a
+    snapshot taken by this very probe used to hand back a value its own
+    `append-sxid` rejected as "unsafe PCI BDF" (COLLECT-005, 2026-09-06).
+    Canonicalise first; the allowlist stays as strict as before.
+    """
+
+    text = value.strip().lower()
+    parts = text.split(":")
+    if len(parts) == 3 and len(parts[0]) == 8 and parts[0].startswith("0000"):
+        text = ":".join([parts[0][4:], parts[1], parts[2]])
+    if re.fullmatch(r"0000:[0-9a-f]{2}:[0-9a-f]{2}", text):
+        text += ".0"
+    if SAFE_BDF.fullmatch(text) is None:
+        raise ProbeError("unsafe PCI BDF")
+    return text
+
+
+def normalized_bdf_or_raw(value: str) -> str:
+    try:
+        return normalize_bdf(value)
+    except ProbeError:
+        return value.strip().lower()
+
+
 ACCEPTANCE_STATE = Path("/var/lib/gpu-fault/acceptance")
 
 
@@ -155,7 +187,7 @@ def gpu_inventory() -> list[dict[str, str]]:
             {
                 "index": values[0],
                 "uuid": values[1],
-                "pci_bdf": values[2].lower(),
+                "pci_bdf": normalized_bdf_or_raw(values[2]),
                 "name": values[3],
             }
         )
@@ -453,9 +485,7 @@ def write_xid(arguments: argparse.Namespace) -> None:
     if xid not in ALLOWED_XIDS:
         raise ProbeError("XID is not allowlisted")
     marker = safe_id(arguments.marker, "marker")
-    bdf = arguments.pci_bdf.lower()
-    if SAFE_BDF.fullmatch(bdf) is None:
-        raise ProbeError("unsafe PCI BDF")
+    bdf = normalize_bdf(arguments.pci_bdf)
     message = (
         f"<3>NVRM: Xid (PCI:{bdf.rsplit('.', 1)[0]}): {xid}, "
         f"pid={arguments.pid}, name=python, {arguments.message} marker={marker}\n"
@@ -480,9 +510,7 @@ def append_sxid(arguments: argparse.Namespace) -> None:
     if sxid not in ALLOWED_SXIDS:
         raise ProbeError("SXID is not allowlisted")
     marker = safe_id(arguments.marker, "marker")
-    bdf = arguments.pci_bdf.lower()
-    if SAFE_BDF.fullmatch(bdf) is None:
-        raise ProbeError("unsafe PCI BDF")
+    bdf = normalize_bdf(arguments.pci_bdf)
     prefix = (
         f"nvidia-nvswitch{arguments.switch}: "
         if arguments.include_switch
@@ -635,9 +663,7 @@ def efa_restore_unit(run_id: str, bdf: str) -> str:
 
 def unbind_efa(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id, "run ID")
-    bdf = arguments.pci_bdf.lower()
-    if SAFE_BDF.fullmatch(bdf) is None:
-        raise ProbeError("unsafe EFA BDF")
+    bdf = normalize_bdf(arguments.pci_bdf)
     driver = Path("/sys/bus/pci/drivers/efa")
     if not driver.joinpath(bdf).exists():
         raise ProbeError("EFA BDF is not currently bound")
@@ -665,9 +691,7 @@ def unbind_efa(arguments: argparse.Namespace) -> None:
 
 def restore_efa(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id, "run ID")
-    bdf = arguments.pci_bdf.lower()
-    if SAFE_BDF.fullmatch(bdf) is None:
-        raise ProbeError("unsafe EFA BDF")
+    bdf = normalize_bdf(arguments.pci_bdf)
     driver = Path("/sys/bus/pci/drivers/efa")
     if not driver.joinpath(bdf).exists():
         driver.joinpath("bind").write_text(bdf + "\n")

@@ -848,6 +848,24 @@ def run_collect010(
     }
 
 
+def nvswitch_pci_bdf(gpu_inventory: list[dict[str, Any]]) -> str:
+    """A PCI address for the injected SXid line that is not one of the node's GPUs.
+
+    The acceptance text uses `0000:ab:00.0`, the NVSwitch address NVIDIA's own
+    examples carry. It is only usable while no GPU sits in that slot, so the
+    live inventory is checked and the next free bus taken otherwise.
+    """
+
+    taken = {
+        str(item.get("pci_bdf") or "").lower().split(".")[0] for item in gpu_inventory
+    }
+    for bus in ("ab", "ac", "ad", "ae", "af", "ba", "bb", "bc"):
+        candidate = f"0000:{bus}:00"
+        if candidate not in taken:
+            return candidate + ".0"
+    raise RegionalFixtureError("no PCI slot free of GPUs for the SXid line")
+
+
 def run_collect011(
     fixtures: list[CollectorAcceptanceFixture],
     case_dir: Path,
@@ -860,7 +878,14 @@ def run_collect011(
     ]
     states = []
     for index, (fixture, marker) in enumerate(zip(fixtures, markers, strict=True)):
-        gpu = fixture.snapshot()["gpu_inventory"][0]
+        inventory = fixture.snapshot()["gpu_inventory"]
+        # The SXid line names the NVSwitch, never a GPU. With a GPU's own BDF
+        # here the control plane resolves the ACCESS scope to that GPU
+        # (`FaultIngestionService._enrich_sxid_scope`), the reset becomes
+        # executable, and the case that exists to prove the fail-closed gate
+        # instead resets a production GPU (observed 2026-09-06 02:13Z).
+        switch_bdf = nvswitch_pci_bdf(inventory)
+        injected_at = datetime.now(timezone.utc)
         fixture.execute(
             "append-sxid",
             "--sxid",
@@ -868,7 +893,7 @@ def run_collect011(
             "--marker",
             marker,
             "--pci-bdf",
-            str(gpu["pci_bdf"]),
+            switch_bdf,
             "--classification",
             "Fatal",
             "--message",
@@ -881,6 +906,7 @@ def run_collect011(
                 case_dir=case_dir / f"direction-{index + 1}",
                 timeout_seconds=300,
                 terminal_workflow=True,
+                observed_after=injected_at,
             )
         )
     errors = []
@@ -914,7 +940,26 @@ def run_collect012(
 ) -> dict[str, Any]:
     markers = []
     states = []
+    restores = []
+    # Samples 1 and 2 are the same XID 13 text written twice: the second write
+    # must earn its own kmsg sequence (distinct evidence) and is expected to
+    # correlate into the first incident's BLOCKED workflow. Sample 3 is the
+    # second XID (31) and has to reach BLOCKED on its own. It cannot while the
+    # node is still quarantined by sample 1: MARK_UNSCHEDULABLE then fails
+    # with "node is already isolated by another incident/token" and the
+    # workflow is FAILED/ESCALATED, which is the ownership fence doing its job,
+    # not the RESTART_APP gate (observed 2026-09-06 02:42Z). So the node is
+    # restored through the validated path between the two XIDs, exactly as
+    # the cleanup does at the end.
     for offset, xid in enumerate((13, 13, 31), start=1):
+        if xid == 31 and states:
+            restores.append(
+                fixture.restore_incidents(
+                    states[-1],
+                    profile_version=profile_version,
+                    reason="COLLECT-012 restore before the second XID",
+                )
+            )
         marker = f"c012-{xid}-{offset}-{int(time.time())}-a{attempt}"
         markers.append(marker)
         states.append(
@@ -938,14 +983,13 @@ def run_collect012(
         workflows = state.get("workflows") or []
         if not workflows or workflows[0].get("status") != "BLOCKED":
             errors.append("RESTART_APP without workload did not fail closed")
-    restores = [
+    restores.append(
         fixture.restore_incidents(
-            state,
+            states[-1],
             profile_version=profile_version,
             reason="COLLECT-012 validated cleanup",
         )
-        for state in states
-    ]
+    )
     return {
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,

@@ -54,6 +54,22 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 CASE_ID = "GF-REGIONAL-COLLECT-016"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-COLLECT-014"
 CONFIRMATION = "COLLECT016_EXECUTE"
+# D section: RESET_GPU on a node that is running the managed workload. The
+# compiler wraps the idle-node reset (run_destr001_gpu_reset.EXPECTED_STEPS)
+# in STOP_WORKLOADS before the quiesce and RESTART_WORKLOAD after scheduling
+# is restored (observed live 2026-09-06 09:29Z, workflow-bec004a7).
+WORKLOAD_RESET_STEPS = [
+    "FREEZE_EVIDENCE",
+    "MARK_UNSCHEDULABLE",
+    "STOP_WORKLOADS",
+    "QUIESCE_GPU_SERVICES",
+    "VERIFY_NO_GPU_CLIENTS",
+    "RESET_GPU",
+    "RESTORE_GPU_SERVICES",
+    "VALIDATE_GPU",
+    "RESTORE_SCHEDULING",
+    "RESTART_WORKLOAD",
+]
 
 
 @dataclass(frozen=True)
@@ -261,7 +277,7 @@ def run_restart_budget_sections(
         job_id=job_id,
         attempt_id=attempt_id,
     )
-    errors = workload_case.workflow_errors(state_a, expected_gpu_count=24)
+    errors = workload_case.workflow_errors(state_a, expected_gpu_count=24, xid=31)
     target = workload.wait_restarted(source_uids, timeout_seconds=900)
     marker_b = f"c016-b-{int(time.time())}"
     injected_b = datetime.now(timezone.utc)
@@ -375,6 +391,7 @@ def run_reset_section(
         marker=marker,
         run_id=f"c016-d-{suffix}",
         node=target_node,
+        expected_steps=WORKLOAD_RESET_STEPS,
     )
     target = workload.wait_restarted(source_uids, timeout_seconds=900)
     return (

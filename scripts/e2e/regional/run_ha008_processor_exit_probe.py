@@ -27,6 +27,10 @@ def main() -> None:
     os.environ.update(
         {
             "GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE": "true",
+            # HA-008 exercises the fatal-exit branch itself; F-D7 made the
+            # process give up only after several distinct requests time out,
+            # so the scenario pins the threshold to one strike.
+            "GPU_FAULT_PROCESSOR_DEADLINE_EXCEEDED_PROCESS_THRESHOLD": "1",
             "GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS": "1",
             "GPU_FAULT_PROCESSOR_REQUEST_RENEW_SECONDS": "0.2",
             "GPU_FAULT_PROCESSOR_REQUEST_MAX_EXECUTION_SECONDS": "1",
@@ -79,7 +83,7 @@ def main() -> None:
     )
     processor._request_started(claimed)
     if args.fail_release:
-        processor._release = lambda _item: (_ for _ in ()).throw(
+        processor._release = lambda _item, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("HA008 injected release failure")
         )
     print(

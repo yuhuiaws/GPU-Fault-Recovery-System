@@ -335,9 +335,27 @@ class KubernetesNodeOperationsMixin:
         )
 
     def _restore(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        already_restored = []
         for node_id in context.step.node_ids:
             node = self.core.read_node(node_id)
             annotations = self._annotations(node)
+            if (
+                ANNOTATION_INCIDENT not in annotations
+                and ANNOTATION_FENCING not in annotations
+                and not any(
+                    item.get("key") == QUARANTINE_TAINT for item in self._taints(node)
+                )
+            ):
+                # Nothing on the node says gpu-fault isolated it. A workflow
+                # that fail-closed at compile time never reached
+                # MARK_UNSCHEDULABLE, so the validated restore that closes its
+                # incident has nothing to undo here; refusing left such
+                # incidents ESCALATED forever (2026-09-06, REMEDIATE_EFA_DRIVER
+                # with no profile owner). Restoring a node nobody isolated is
+                # a no-op, not a theft of another incident's isolation, which
+                # the ownership check below still refuses.
+                already_restored.append(node_id)
+                continue
             if annotations.get(
                 ANNOTATION_INCIDENT
             ) != context.incident.incident_id or annotations.get(
@@ -378,7 +396,10 @@ class KubernetesNodeOperationsMixin:
             )
         return WorkflowStepOutcome.succeeded(
             operation_id=context.idempotency_key,
-            details={"restored_nodes": context.step.node_ids},
+            details={
+                "restored_nodes": context.step.node_ids,
+                "already_restored_nodes": already_restored,
+            },
         )
 
     def _incident_workflow_is_terminal(self, incident_id: str) -> bool:

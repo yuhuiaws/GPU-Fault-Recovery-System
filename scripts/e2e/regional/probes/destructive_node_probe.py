@@ -231,6 +231,23 @@ def quiesce_states() -> list[dict[str, Any]]:
     return result
 
 
+def counts_as_target_reset(message: str, target: str) -> bool:
+    """A kernel line that reports a reset of the target device.
+
+    The lines this probe itself writes to /dev/kmsg start with `gpu-fault ` and
+    carry the case's marker; their text is whatever the case chose, and the
+    XID 46 drill happens to say "reset". Counting them made every single-shot
+    drill read as "one reset" and the two-line XID 63/48 drill as "none", so
+    the count measured injection text, never the kernel. Injected lines stay
+    in the journal excerpt as evidence; only kernel-origin lines count.
+    """
+
+    lowered = message.lower()
+    if lowered.startswith("gpu-fault "):
+        return False
+    return bool(target) and target in lowered and "reset" in lowered
+
+
 def kernel_reset_journal(
     since_epoch: float | None,
     pci_bdf: str | None,
@@ -281,10 +298,7 @@ def kernel_reset_journal(
     return {
         "entry_count": len(messages),
         "target_reset_count": sum(
-            bool(target)
-            and target in item["message"].lower()
-            and "reset" in item["message"].lower()
-            for item in messages
+            counts_as_target_reset(item["message"], target) for item in messages
         ),
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "messages": messages[-30:],
@@ -452,6 +466,13 @@ def start_sampler(arguments: argparse.Namespace) -> None:
         raise ProbeError("sampler probe script identity mismatch")
     path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
     path.unlink(missing_ok=True)
+    # A prior run that raised before stop-reset-sampler leaves its transient
+    # unit loaded on the node. The unit name is a deterministic digest of the
+    # run ID, so systemd-run then refuses with "already loaded or has a
+    # fragment file". Clear any leftover of the same name first, exactly as
+    # stop_sampler does, so a sampler start is idempotent across reruns.
+    run(["systemctl", "stop", unit + ".service"], check=False)
+    run(["systemctl", "reset-failed", unit + ".service"], check=False)
     run(
         [
             "systemd-run",

@@ -237,27 +237,54 @@ def waiting_details_present(state: dict[str, Any]) -> bool:
         and (item.get("details") or {}).get("mutation_submitted_by_control_plane")
         is False
     }
+    # A step that finishes inside one store poll (~11s) is never seen WAITING,
+    # and the terminal record drops the flag. Its adapter_operation_id keeps
+    # the same fact: `remote/...` means the GPU-side executor carried out the
+    # mutation, not the control plane. COLLECT-016 D observed QUIESCE that way
+    # on 2026-09-06 09:29Z with every other remote step WAITING as required.
+    observed |= {
+        str(item.get("operation"))
+        for item in workflow.get("step_executions") or []
+        if item.get("status") == "SUCCEEDED"
+        and str(item.get("adapter_operation_id") or "").startswith("remote/")
+    }
     return required_operations <= observed
 
 
-def workflow_errors(state: dict[str, Any]) -> list[str]:
+def workflow_errors(
+    state: dict[str, Any],
+    *,
+    xid: int = 46,
+    official_action: str = "RESET_GPU",
+    expected_steps: list[str] | None = None,
+) -> list[str]:
+    """The reset contract every kmsg-driven single-GPU reset case shares.
+
+    DESTR-001 drives it with XID 46 / RESET_GPU; the XID 63+48 companion drill
+    (COLLECT-008/013) reaches the same eight steps through DRAIN_AND_RESET,
+    so the event and the decision it must name are parameters. A node that is
+    running a managed workload compiles STOP_WORKLOADS/RESTART_WORKLOAD around
+    the same reset (COLLECT-016 D), so the step sequence is one as well.
+    """
+
+    expected = list(expected_steps) if expected_steps is not None else EXPECTED_STEPS
     errors = []
     event = state.get("event") or {}
     decision = state.get("decision") or {}
     workflow = state.get("workflow") or {}
-    if event.get("xid") != 46:
-        errors.append("matched event is not XID 46")
+    if event.get("xid") != xid:
+        errors.append(f"matched event is not XID {xid}")
     if not str(event.get("evidence_ref") or "").startswith("kmsg://"):
         errors.append("XID evidence is not backed by kmsg://")
-    if decision.get("official_action") != "RESET_GPU":
-        errors.append("policy did not finalize XID 46 as RESET_GPU")
+    if decision.get("official_action") != official_action:
+        errors.append(f"policy did not finalize XID {xid} as {official_action}")
     steps = [item.get("operation") for item in workflow.get("official_steps", [])]
-    if steps != EXPECTED_STEPS:
+    if steps != expected:
         errors.append("workflow step sequence differs from the reset contract")
     if workflow.get("status") != "SUCCEEDED":
         errors.append("reset workflow is not SUCCEEDED")
     completed = workflow.get("completed_operations") or []
-    if completed != EXPECTED_STEPS:
+    if completed != expected:
         errors.append("completed operation sequence differs from the reset contract")
     if not waiting_details_present(state):
         errors.append("remote WAITING evidence lacks control-plane mutation=false")
@@ -317,12 +344,31 @@ def host_errors(
         current = (after.get("services") or {}).get(unit, {})
         if current.get("ActiveState") != "active":
             errors.append(f"service did not return active: {unit}")
+    # The physical proof is the detached host sampler: the target GPU stops
+    # enumerating while the driver resets it and is back at the end, so the
+    # sample series has to dip below the expected count and finish on it. The
+    # kernel journal used to be asserted to show exactly one reset line, but
+    # the only lines it ever matched were this drill's own injected XID text
+    # (see `counts_as_target_reset`); kernel-origin lines are still recorded
+    # and more than one of them is still a failure.
     journal = after.get("kernel_reset_journal") or {}
-    if journal.get("target_reset_count") != 1:
-        errors.append(f"kernel journal does not show one reset for {target_bdf}")
+    if int(journal.get("target_reset_count") or 0) > 1:
+        errors.append(f"kernel journal shows more than one reset for {target_bdf}")
     sampler = after.get("sampler") or {}
     if int(sampler.get("sample_count") or 0) < 2:
         errors.append("detached host GPU sampler has insufficient samples")
+    else:
+        minimum = sampler.get("min_gpu_count")
+        last = (sampler.get("last") or {}).get("gpu_count")
+        if (
+            minimum is None
+            or int(minimum) >= expected_gpu_count
+            or last != expected_gpu_count
+        ):
+            errors.append(
+                "detached host GPU sampler did not see the target GPU leave and "
+                f"return (min={minimum}, last={last}, expected={expected_gpu_count})"
+            )
     return errors
 
 

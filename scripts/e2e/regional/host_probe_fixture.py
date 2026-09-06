@@ -158,6 +158,22 @@ class HostProbeFixture:
 
     def create(self) -> None:
         configmap, pod = self.manifests()
+        # The pod name is a digest of (case, run, node), so a rerun reuses it.
+        # An operator abort deliberately skips cleanup, and the previous pod
+        # then outlives its activeDeadlineSeconds as phase Failed. `apply`
+        # onto that object is a no-op and `wait --for=condition=Ready` can
+        # only time out (observed 2026-09-06 06:34Z after a SIGTERM at
+        # 05:22Z). Delete whatever carries our name first; a Running pod of
+        # this name can only be a dead runner's, never this fixture's.
+        self._kubectl(
+            "delete",
+            "pod",
+            self.pod,
+            "--ignore-not-found",
+            "--wait=true",
+            check=False,
+            timeout=180,
+        )
         self._kubectl("apply", "-f", "-", input_text=json.dumps(configmap))
         self._kubectl("apply", "-f", "-", input_text=json.dumps(pod))
         self._kubectl(
