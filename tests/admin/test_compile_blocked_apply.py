@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from gpu_fault.compile_blocked import (
+from gpu_fault.admin.compile_blocked import (
     APPLY_MODE,
     CLOSE_MARKER,
     PLAN_MODE,

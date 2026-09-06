@@ -8,7 +8,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Sequence
 
-from gpu_fault import compile_blocked, retired_generation
+from gpu_fault import retired_generation
+from gpu_fault.admin import compile_blocked
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite
@@ -150,7 +151,7 @@ print(_json.dumps(_result, sort_keys=True))
 
 
 def compile_blocked_script() -> str:
-    """``gpu_fault.compile_blocked``'s own source, plus a stdin/stdout driver.
+    """``gpu_fault.admin.compile_blocked``'s own source, plus a stdin/stdout driver.
 
     Same arrangement as ``retired_generation_script`` and for the same reason:
     a compile-time BLOCKED destructive workflow is what the release preflight

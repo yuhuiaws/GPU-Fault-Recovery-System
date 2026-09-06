@@ -11,7 +11,7 @@ from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any, cast
 
-import yaml  # type: ignore[import-untyped]
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.aurora_capacity import (
     aurora_capacity_changed,

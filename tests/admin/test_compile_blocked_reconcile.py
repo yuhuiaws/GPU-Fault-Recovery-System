@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gpu_fault import compile_blocked
+from gpu_fault.admin import compile_blocked
 from gpu_fault.admin import workflow_reconcile as reconcile
 from gpu_fault.admin.bootstrap_common import BootstrapError
 
