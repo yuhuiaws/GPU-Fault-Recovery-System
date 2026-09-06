@@ -80,6 +80,7 @@ from gpu_fault.admin.source_deploy import run_source_deploy
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
 from gpu_fault.models import BlockedKind
 from gpu_fault.admin.workflow_reconcile import (
+    RECONCILE_MODES,
     run_workflow_reconcile_mode,
 )
 
@@ -295,14 +296,10 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
         "workflow-reconcile",
         usage=(
             "gpu-fault-admin workflow-reconcile --state-dir STATE_DIR "
-            "[--mode {restore,retired-generation,compile-blocked}] "
+            f"[--mode {{{','.join(RECONCILE_MODES)}}}] "
             "(--plan | --apply --plan-sha256 SHA256 --reference REFERENCE)"
         ),
-        help=(
-            "plan or apply audited reconciliation of restored BLOCKED workflows, "
-            "of workflow generations their incident has retired, or of "
-            "workflows that BLOCKED at compile time and never reached a node"
-        ),
+        help="plan or apply an audited reconciliation of stuck workflow records",
     )
     _add_managed_site_arguments(reconcile)
     reconcile_mode = reconcile.add_mutually_exclusive_group(required=True)
@@ -310,7 +307,12 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
     reconcile_mode.add_argument("--apply", action="store_true")
     reconcile.add_argument(
         "--mode",
-        choices=("restore", "retired-generation", "compile-blocked"),
+        choices=(
+            "restore",
+            "retired-generation",
+            "compile-blocked",
+            "orphaned-commands",
+        ),
         default="restore",
     )
     reconcile.add_argument("--workflow-id", action="append", default=[])
@@ -790,9 +792,7 @@ def _run_workflow_reconcile(arguments: argparse.Namespace) -> int:
         except BootstrapError as exc:
             raise SiteConfigError(str(exc)) from exc
     print(json.dumps(result, indent=2, sort_keys=True))
-    # A partial apply is reported in full and exits non-zero: the rows that
-    # were written are named under ``applied_workflow_ids``, the rest under
-    # ``failures``, and the operator reruns the same command for the rest.
+    # A partial apply is reported in full and exits non-zero (see ``failures``).
     return 1 if result.get("failed_workflow_ids") else 0
 
 

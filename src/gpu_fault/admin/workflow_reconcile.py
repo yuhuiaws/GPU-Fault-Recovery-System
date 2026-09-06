@@ -9,19 +9,27 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from gpu_fault import retired_generation
-from gpu_fault.admin import compile_blocked
+from gpu_fault.admin import compile_blocked, orphaned_commands
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.digests import SHA256_PATTERN
 
 REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
+RECONCILE_MODES = (
+    "restore",
+    "retired-generation",
+    "compile-blocked",
+    "orphaned-commands",
+)
 PLAN_PATH = Path("workflow-reconcile/plan.json")
 HISTORY_PATH = Path("workflow-reconcile/history")
 RETIRED_GENERATION_PLAN_PATH = Path("workflow-reconcile/retired-generation/plan.json")
 RETIRED_GENERATION_HISTORY_PATH = Path("workflow-reconcile/retired-generation/history")
 COMPILE_BLOCKED_PLAN_PATH = Path("workflow-reconcile/compile-blocked/plan.json")
 COMPILE_BLOCKED_HISTORY_PATH = Path("workflow-reconcile/compile-blocked/history")
+ORPHANED_COMMANDS_PLAN_PATH = Path("workflow-reconcile/orphaned-commands/plan.json")
+ORPHANED_COMMANDS_HISTORY_PATH = Path("workflow-reconcile/orphaned-commands/history")
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
 ISOLATION_ANNOTATIONS = (
     "gpu-fault.io/incident-id",
@@ -164,6 +172,38 @@ def compile_blocked_script() -> str:
 
     source = Path(compile_blocked.__file__).read_text(encoding="utf-8")
     return source + COMPILE_BLOCKED_DRIVER
+
+
+ORPHANED_COMMANDS_DRIVER = """
+
+import json as _json
+import sys as _sys
+
+from gpu_fault.app import ApplicationContext
+
+_payload = _json.load(_sys.stdin)
+_store = ApplicationContext.from_environment().store
+if _payload["mode"] == "plan":
+    _result = build_orphaned_commands_plan(_store, _payload["workflow_ids"])
+elif _payload["mode"] == "apply":
+    _result = apply_orphaned_commands_plan(
+        _store,
+        workflow_ids=_payload["workflow_ids"],
+        expected_plan_sha256=_payload["plan_sha256"],
+        reference=_payload["reference"],
+    )
+else:
+    raise ValueError("unsupported orphaned-commands reconcile mode")
+print(_json.dumps(_result, sort_keys=True))
+"""
+
+
+def orphaned_commands_script() -> str:
+    """``gpu_fault.admin.orphaned_commands``'s source plus a stdin/stdout driver,
+    shipped to the Pod for the same reason as the other two pre-deploy modes."""
+
+    source = Path(orphaned_commands.__file__).read_text(encoding="utf-8")
+    return source + ORPHANED_COMMANDS_DRIVER
 
 
 def _canonical_sha256(value: object) -> str:
@@ -844,6 +884,127 @@ def apply_compile_blocked_reconcile(
     return result
 
 
+def _finalize_orphaned_commands_plan(
+    site: RenderedSite,
+    runtime_plan: dict[str, Any],
+) -> dict[str, Any]:
+    raw_items = runtime_plan.get("items")
+    if not isinstance(raw_items, list) or not all(
+        isinstance(item, dict) for item in raw_items
+    ):
+        raise BootstrapError("orphaned-commands reconcile runtime plan is invalid")
+    items: list[dict[str, Any]] = [dict(item) for item in raw_items]
+    plan = {
+        "schema_version": 1,
+        "mode": orphaned_commands.PLAN_MODE,
+        "evaluated_at": runtime_plan.get("evaluated_at"),
+        "site_identity": _site_identity(site),
+        "runtime_plan_sha256": runtime_plan.get("plan_sha256"),
+        "items": items,
+    }
+    plan["plan_sha256"] = _canonical_sha256(
+        {
+            "schema_version": plan["schema_version"],
+            "mode": plan["mode"],
+            "site_identity": plan["site_identity"],
+            "runtime_plan_sha256": plan["runtime_plan_sha256"],
+            "items": items,
+        }
+    )
+    return plan
+
+
+def plan_orphaned_commands_reconcile(
+    site: RenderedSite,
+    state_dir: Path,
+    *,
+    workflow_ids: Sequence[str],
+) -> dict[str, Any]:
+    if not [item for item in workflow_ids if str(item).strip()]:
+        raise BootstrapError(
+            "--mode orphaned-commands --plan requires at least one --workflow-id"
+        )
+    runtime_plan = _run_reconcile(
+        site,
+        {"mode": "plan", "workflow_ids": list(workflow_ids)},
+        script=orphaned_commands_script(),
+    )
+    plan = _finalize_orphaned_commands_plan(site, runtime_plan)
+    write_json_atomic(state_dir / ORPHANED_COMMANDS_PLAN_PATH, plan)
+    return plan
+
+
+def apply_orphaned_commands_reconcile(
+    site: RenderedSite,
+    state_dir: Path,
+    *,
+    expected_plan_sha256: str,
+    reference: str,
+) -> dict[str, Any]:
+    digest = expected_plan_sha256.strip()
+    normalized_reference = reference.strip()
+    if not SHA256_PATTERN.fullmatch(digest):
+        raise BootstrapError("orphaned-commands reconcile plan SHA-256 is invalid")
+    if not REFERENCE_PATTERN.fullmatch(normalized_reference):
+        raise BootstrapError("orphaned-commands reconcile reference is invalid")
+    plan_path = state_dir / ORPHANED_COMMANDS_PLAN_PATH
+    if not plan_path.is_file():
+        raise BootstrapError("orphaned-commands reconcile has no saved plan")
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BootstrapError(
+            "orphaned-commands reconcile saved plan is invalid"
+        ) from exc
+    if not isinstance(plan, dict) or plan.get("plan_sha256") != digest:
+        raise BootstrapError(
+            "orphaned-commands reconcile saved plan SHA-256 does not match"
+        )
+    if plan.get("mode") != orphaned_commands.PLAN_MODE:
+        raise BootstrapError("saved plan is not an orphaned-commands plan")
+    if plan.get("site_identity") != _site_identity(site):
+        raise BootstrapError(
+            "orphaned-commands reconcile managed site identity changed"
+        )
+    items = plan.get("items")
+    if not isinstance(items, list) or not items:
+        raise BootstrapError("orphaned-commands reconcile saved plan has no workflows")
+    workflow_ids = [str(item["request_id"]) for item in items]
+    script = orphaned_commands_script()
+    runtime_plan = _run_reconcile(
+        site, {"mode": "plan", "workflow_ids": workflow_ids}, script=script
+    )
+    current = _finalize_orphaned_commands_plan(site, runtime_plan)
+    if current["plan_sha256"] != digest:
+        raise _changed_before_apply("orphaned-commands reconcile", plan, current)
+    blocked = [
+        f"{item.get('request_id')}: " + "; ".join(item.get("reasons") or [])
+        for item in current["items"]
+        if not item.get("eligible")
+    ]
+    if blocked:
+        raise BootstrapError(
+            "orphaned-commands reconcile plan contains ineligible records: "
+            + " | ".join(blocked)
+        )
+    result = _run_reconcile(
+        site,
+        {
+            "mode": "apply",
+            "workflow_ids": workflow_ids,
+            "plan_sha256": current["runtime_plan_sha256"],
+            "reference": normalized_reference,
+        },
+        script=script,
+    )
+    result["admin_plan_sha256"] = digest
+    archive = state_dir / ORPHANED_COMMANDS_HISTORY_PATH / digest
+    write_json_atomic(archive / "plan.json", plan)
+    write_json_atomic(archive / "applied.json", result)
+    plan_path.unlink(missing_ok=True)
+    return result
+
+
 def run_workflow_reconcile_mode(
     site: RenderedSite,
     state_dir: Path,
@@ -865,7 +1026,7 @@ def run_workflow_reconcile_mode(
     rather than silently ignored.
     """
 
-    if mode not in ("restore", "retired-generation", "compile-blocked"):
+    if mode not in RECONCILE_MODES:
         raise BootstrapError(f"unsupported workflow-reconcile mode {mode!r}")
     if mode != "restore" and (incident_ids or blocked_kinds or max_items is not None):
         raise BootstrapError(
@@ -875,6 +1036,10 @@ def run_workflow_reconcile_mode(
     if max_items is not None and max_items < 1:
         raise BootstrapError("--max-items must be at least 1")
     if plan:
+        if mode == "orphaned-commands":
+            return plan_orphaned_commands_reconcile(
+                site, state_dir, workflow_ids=tuple(workflow_ids)
+            )
         if mode == "compile-blocked":
             return plan_compile_blocked_reconcile(
                 site, state_dir, workflow_ids=tuple(workflow_ids)
@@ -896,6 +1061,7 @@ def run_workflow_reconcile_mode(
             "workflow-reconcile --apply requires --plan-sha256 and --reference"
         )
     applier = {
+        "orphaned-commands": apply_orphaned_commands_reconcile,
         "compile-blocked": apply_compile_blocked_reconcile,
         "retired-generation": apply_retired_generation_reconcile,
         "restore": apply_workflow_reconcile,
