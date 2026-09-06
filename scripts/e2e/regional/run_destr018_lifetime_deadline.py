@@ -582,6 +582,12 @@ class _LiveRun:
     profile_version: str = ""
     baseline_command_ids: set[str] = field(default_factory=set)
     in_window_identity: dict[str, Any] = field(default_factory=dict)
+    target_bdf: str = ""
+    device: str = ""
+    metrics_before: dict[str, Any] = field(default_factory=dict)
+    window_record: dict[str, Any] = field(default_factory=dict)
+    t_cancel: datetime | None = None
+    cadence_sample: dict[str, Any] = field(default_factory=dict)
 
 
 def _probe(settings: Settings, run_id: str, script: Path) -> HostProbeFixture:
@@ -681,12 +687,11 @@ def _absorb(run: _LiveRun, target_bdf: str) -> dict[str, Any]:
     return snapshot
 
 
-def execute_case(
+def _prepare_live_run(
     settings: Settings,
     run_dir: Path,
     attempt: int,
-    maintenance_window_end: datetime,
-) -> int:
+) -> _LiveRun:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
     preflight = read_only_preflight(settings, case_dir)
@@ -695,12 +700,10 @@ def execute_case(
             "preflight failed: " + "; ".join(preflight["errors"])
         )
     verify_plan_identity(case_dir, preflight)
-
-    regional = RegionalLiveFixture(settings.regional)
     run_id = f"destr018-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     run = _LiveRun(
         settings=settings,
-        regional=regional,
+        regional=RegionalLiveFixture(settings.regional),
         case_dir=case_dir,
         preflight=preflight,
         run_id=run_id,
@@ -717,6 +720,233 @@ def execute_case(
         (preflight["store"].get("profile") or {}).get("profile_version") or ""
     )
     run.marker = f"destr018-{int(time.time())}-a{attempt}"
+    return run
+
+
+def _baseline_host(run: _LiveRun, maintenance_window_end: datetime) -> None:
+    """Create both probes, snapshot the idle node and pick the target GPU."""
+
+    run.injector.create()
+    run.holder.create()
+    baseline_host = run.injector.execute("snapshot")
+    write_json_atomic(run.case_dir / "host-baseline.json", baseline_host)
+    expected_gpu_count = int(run.preflight["node"]["gpu_allocatable"])
+    inventory = baseline_host["gpu_inventory"]
+    if len(inventory) != expected_gpu_count:
+        raise RegionalFixtureError("host GPU inventory differs from Node allocatable")
+    if baseline_host["compute_clients"]:
+        raise RegionalFixtureError("target node has active NVIDIA compute clients")
+    if baseline_host["quiesce_states"]:
+        raise RegionalFixtureError("target node has a pre-existing quiesce state")
+    if not baseline_host["kmsg_writable"]:
+        raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
+    run.baseline_command_ids = {
+        str(item["command_id"]) for item in baseline_host.get("ledger") or []
+    }
+    target = inventory[0]
+    run.target_bdf = str(target["pci_bdf"])
+    run.device = f"/dev/nvidia{int(target['index'])}"
+    if datetime.now(timezone.utc) >= maintenance_window_end:
+        raise RegionalFixtureError("approved maintenance window ended before injection")
+
+
+def _open_and_arm(run: _LiveRun) -> None:
+    """The env window first (it rolls the worker Deployment), then the
+    holder, both before the fault is written."""
+
+    run.window_record = _open_window(run)
+    in_window_identity = run.regional.runtime_identity()
+    write_json_atomic(
+        run.case_dir / "runtime-identity-in-window.json", in_window_identity
+    )
+    drift = identity_errors(
+        run.preflight["runtime_identity"],
+        in_window_identity,
+        worker_generation_delta=1,
+    )
+    if drift:
+        raise RegionalFixtureError(
+            "the open env window changed more than the two managed "
+            f"variables: {'; '.join(drift)}"
+        )
+    run.in_window_identity = in_window_identity
+    run.metrics_before = worker_metrics(run.regional)
+    _arm_holder(run, run.device)
+
+
+def _inject_and_observe(run: _LiveRun) -> dict[str, Any]:
+    run.injected_at = datetime.now(timezone.utc)
+    injection = run.injector.execute(
+        "write-xid46",
+        "--marker",
+        run.marker,
+        "--drill-id",
+        run.run_id,
+        "--pci-bdf",
+        run.target_bdf,
+    )
+    write_json_atomic(run.case_dir / "injection.json", injection)
+    state = run.regional.wait_for_workflow(
+        node=run.settings.node,
+        marker=run.marker,
+        observed_after=run.injected_at,
+        case_dir=run.case_dir,
+        timeout_seconds=WORKFLOW_TIMEOUT_SECONDS,
+    )
+    write_json_atomic(run.case_dir / "workflow-state.json", state)
+    workflow = state.get("workflow") or {}
+    incident = state.get("incident") or {}
+    run.incident_id = str(incident.get("incident_id") or "")
+    run.workflow_request_id = str(workflow.get("request_id") or "")
+    return state
+
+
+def _control_plane_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
+    workflow = state.get("workflow") or {}
+    incident = state.get("incident") or {}
+    commands = state.get("commands") or []
+    errors: list[str] = []
+    if (state.get("event") or {}).get("xid") != verdicts.EXPECTED_XID:
+        errors.append(f"matched event is not XID {verdicts.EXPECTED_XID}")
+    if [item.get("operation") for item in workflow.get("official_steps") or []] != (
+        EXPECTED_STEPS
+    ):
+        errors.append("workflow step sequence differs from the reset contract")
+    errors.extend(verdicts.workflow_errors(workflow, incident, node=run.settings.node))
+    run.t_cancel = verdicts.cancellation_moment(commands)
+    if run.t_cancel is None:
+        errors.append(
+            "no remote command records a cancellation moment; the deadline "
+            "never reached the command queue"
+        )
+    else:
+        errors.extend(verdicts.remote_command_errors(commands, t_cancel=run.t_cancel))
+    return errors
+
+
+def _host_snapshot(run: _LiveRun, name: str) -> dict[str, Any]:
+    if run.injected_at is None:
+        raise RegionalFixtureError("host snapshots follow the injection")
+    snapshot = run.injector.execute(
+        "snapshot",
+        "--since-epoch",
+        str(run.injected_at.timestamp()),
+        "--pci-bdf",
+        run.target_bdf,
+        timeout=180,
+    )
+    write_json_atomic(run.case_dir / name, snapshot)
+    return snapshot
+
+
+def _data_plane_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
+    """Ledger, kernel journal and the cadence the run actually saw."""
+
+    after_host = _host_snapshot(run, "host-after.json")
+    ledger = after_host.get("ledger") or []
+    errors: list[str] = []
+    if run.t_cancel is not None:
+        errors.extend(
+            verdicts.data_plane_errors(
+                ledger,
+                t_cancel=run.t_cancel,
+                baseline_command_ids=run.baseline_command_ids,
+                kernel_journal=after_host.get("kernel_reset_journal") or {},
+                commands=state.get("commands") or [],
+            )
+        )
+    # Re-assert the arithmetic against the cadence the run actually saw.
+    run.cadence_sample = verdicts.cadence_sample(
+        ledger, baseline_command_ids=run.baseline_command_ids
+    )
+    cadence_errors = verdicts.cadence_errors(run.cadence_sample)
+    errors.extend(cadence_errors)
+    if not cadence_errors:
+        errors.extend(
+            verdicts.lifetime_margin_errors(
+                lifetime_seconds=run.settings.lifetime_seconds,
+                execution_timeout_seconds=run.settings.execution_timeout_seconds,
+                cadence_seconds=float(run.cadence_sample["min_gap_seconds"]),
+                step_waiting_cap_seconds=int(
+                    run.preflight["observed_step_cap_seconds"]
+                    or verdicts.STEP_WAITING_CAP_SECONDS
+                ),
+            )
+        )
+    return errors
+
+
+def _escalation_and_absorb_errors(run: _LiveRun) -> list[str]:
+    """The hand-off to the operator, the node's quarantine, and the later
+    XID 79 that must be absorbed record-only."""
+
+    regional, settings, case_dir = run.regional, run.settings, run.case_dir
+    errors: list[str] = []
+    escalation = regional.cpu_python(ESCALATION_CHAIN, run.workflow_request_id)
+    write_json_atomic(case_dir / "escalation.json", escalation)
+    run.support_incident_id = str(
+        ((escalation.get("incident") or {}).get("incident_id")) or ""
+    )
+    errors.extend(verdicts.escalation_errors(escalation, node=settings.node))
+    node_after = regional.node_snapshot(settings.node)
+    write_json_atomic(case_dir / "node-after.json", node_after)
+    errors.extend(verdicts.quarantine_errors(node_after))
+
+    absorb = _absorb(run, run.target_bdf)
+    errors.extend(
+        verdicts.absorb_errors(
+            absorb,
+            incident_id=run.incident_id,
+            workflow_request_id=run.workflow_request_id,
+            official_step_count=len(EXPECTED_STEPS),
+        )
+    )
+    absorb_chain = regional.cpu_python(ESCALATION_CHAIN, run.workflow_request_id)
+    write_json_atomic(case_dir / "escalation-after-absorb.json", absorb_chain)
+    errors.extend(
+        verdicts.new_executable_workflow_errors(
+            absorb_chain.get("executable_workflows") or [],
+            known_request_ids={
+                run.workflow_request_id,
+                f"workflow-support-after-{run.workflow_request_id}",
+            },
+        )
+    )
+    absorb_ledger = _host_snapshot(run, "host-after-absorb.json")
+    if run.t_cancel is not None:
+        errors.extend(
+            verdicts.late_row_errors(
+                absorb_ledger.get("ledger") or [],
+                t_cancel=run.t_cancel,
+                baseline_command_ids=run.baseline_command_ids,
+            )
+        )
+    return errors
+
+
+def _provider_and_metric_errors(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
+    if run.injected_at is None:
+        raise RegionalFixtureError("provider events follow the injection")
+    provider = run.regional.provider_events(run.injected_at, datetime.now(timezone.utc))
+    write_json_atomic(run.case_dir / "provider-events.json", {"events": provider})
+    errors: list[str] = []
+    if provider:
+        errors.append("provider mutation appeared during the lifetime drill")
+    metrics = verdicts.metric_evidence(run.metrics_before, worker_metrics(run.regional))
+    errors.extend(verdicts.metric_errors(metrics))
+    return errors, metrics
+
+
+def execute_case(
+    settings: Settings,
+    run_dir: Path,
+    attempt: int,
+    maintenance_window_end: datetime,
+) -> int:
+    """Drive the live case. Not exercised by the unit suite; the verdicts it
+    calls are. Every cleanup failure downgrades the verdict to FAIL."""
+
+    run = _prepare_live_run(settings, run_dir, attempt)
     result: dict[str, Any] = {
         "case_id": CASE_ID,
         "attempt": attempt,
@@ -725,191 +955,14 @@ def execute_case(
         "maintenance_window_end": maintenance_window_end.isoformat(),
     }
     try:
-        run.injector.create()
-        run.holder.create()
-        baseline_host = run.injector.execute("snapshot")
-        write_json_atomic(case_dir / "host-baseline.json", baseline_host)
-        expected_gpu_count = int(preflight["node"]["gpu_allocatable"])
-        inventory = baseline_host["gpu_inventory"]
-        if len(inventory) != expected_gpu_count:
-            raise RegionalFixtureError(
-                "host GPU inventory differs from Node allocatable"
-            )
-        if baseline_host["compute_clients"]:
-            raise RegionalFixtureError("target node has active NVIDIA compute clients")
-        if baseline_host["quiesce_states"]:
-            raise RegionalFixtureError("target node has a pre-existing quiesce state")
-        if not baseline_host["kmsg_writable"]:
-            raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
-        run.baseline_command_ids = {
-            str(item["command_id"]) for item in baseline_host.get("ledger") or []
-        }
-        target = inventory[0]
-        target_bdf = str(target["pci_bdf"])
-        device = f"/dev/nvidia{int(target['index'])}"
-        if datetime.now(timezone.utc) >= maintenance_window_end:
-            raise RegionalFixtureError(
-                "approved maintenance window ended before injection"
-            )
-
-        # 1. The window first: it rolls the worker Deployment.
-        window_record = _open_window(run)
-        in_window_identity = regional.runtime_identity()
-        write_json_atomic(
-            case_dir / "runtime-identity-in-window.json", in_window_identity
-        )
-        drift = identity_errors(
-            preflight["runtime_identity"],
-            in_window_identity,
-            worker_generation_delta=1,
-        )
-        if drift:
-            raise RegionalFixtureError(
-                "the open env window changed more than the two managed "
-                f"variables: {'; '.join(drift)}"
-            )
-        run.in_window_identity = in_window_identity
-        metrics_before = worker_metrics(regional)
-        # 2. Then the holder, still before injection.
-        _arm_holder(run, device)
-        # 3. Only then the fault.
-        run.injected_at = datetime.now(timezone.utc)
-        injection = run.injector.execute(
-            "write-xid46",
-            "--marker",
-            run.marker,
-            "--drill-id",
-            run.run_id,
-            "--pci-bdf",
-            target_bdf,
-        )
-        write_json_atomic(case_dir / "injection.json", injection)
-
-        state = regional.wait_for_workflow(
-            node=settings.node,
-            marker=run.marker,
-            observed_after=run.injected_at,
-            case_dir=case_dir,
-            timeout_seconds=WORKFLOW_TIMEOUT_SECONDS,
-        )
-        write_json_atomic(case_dir / "workflow-state.json", state)
-        workflow = state.get("workflow") or {}
-        incident = state.get("incident") or {}
-        commands = state.get("commands") or []
-        run.incident_id = str(incident.get("incident_id") or "")
-        run.workflow_request_id = str(workflow.get("request_id") or "")
-
-        errors: list[str] = []
-        if (state.get("event") or {}).get("xid") != verdicts.EXPECTED_XID:
-            errors.append(f"matched event is not XID {verdicts.EXPECTED_XID}")
-        if [item.get("operation") for item in workflow.get("official_steps") or []] != (
-            EXPECTED_STEPS
-        ):
-            errors.append("workflow step sequence differs from the reset contract")
-        errors.extend(verdicts.workflow_errors(workflow, incident, node=settings.node))
-        t_cancel = verdicts.cancellation_moment(commands)
-        if t_cancel is None:
-            errors.append(
-                "no remote command records a cancellation moment; the deadline "
-                "never reached the command queue"
-            )
-        else:
-            errors.extend(verdicts.remote_command_errors(commands, t_cancel=t_cancel))
-
-        after_host = run.injector.execute(
-            "snapshot",
-            "--since-epoch",
-            str(run.injected_at.timestamp()),
-            "--pci-bdf",
-            target_bdf,
-            timeout=180,
-        )
-        write_json_atomic(case_dir / "host-after.json", after_host)
-        ledger = after_host.get("ledger") or []
-        journal = after_host.get("kernel_reset_journal") or {}
-        if t_cancel is not None:
-            errors.extend(
-                verdicts.data_plane_errors(
-                    ledger,
-                    t_cancel=t_cancel,
-                    baseline_command_ids=run.baseline_command_ids,
-                    kernel_journal=journal,
-                    commands=commands,
-                )
-            )
-        # Re-assert the arithmetic against the cadence the run actually saw.
-        sample = verdicts.cadence_sample(
-            ledger,
-            baseline_command_ids=run.baseline_command_ids,
-        )
-        errors.extend(verdicts.cadence_errors(sample))
-        if not verdicts.cadence_errors(sample):
-            errors.extend(
-                verdicts.lifetime_margin_errors(
-                    lifetime_seconds=settings.lifetime_seconds,
-                    execution_timeout_seconds=settings.execution_timeout_seconds,
-                    cadence_seconds=float(sample["min_gap_seconds"]),
-                    step_waiting_cap_seconds=int(
-                        preflight["observed_step_cap_seconds"]
-                        or verdicts.STEP_WAITING_CAP_SECONDS
-                    ),
-                )
-            )
-
-        escalation = regional.cpu_python(ESCALATION_CHAIN, run.workflow_request_id)
-        write_json_atomic(case_dir / "escalation.json", escalation)
-        run.support_incident_id = str(
-            ((escalation.get("incident") or {}).get("incident_id")) or ""
-        )
-        errors.extend(verdicts.escalation_errors(escalation, node=settings.node))
-        node_after = regional.node_snapshot(settings.node)
-        write_json_atomic(case_dir / "node-after.json", node_after)
-        errors.extend(verdicts.quarantine_errors(node_after))
-
-        absorb = _absorb(run, target_bdf)
-        errors.extend(
-            verdicts.absorb_errors(
-                absorb,
-                incident_id=run.incident_id,
-                workflow_request_id=run.workflow_request_id,
-                official_step_count=len(EXPECTED_STEPS),
-            )
-        )
-        absorb_chain = regional.cpu_python(ESCALATION_CHAIN, run.workflow_request_id)
-        write_json_atomic(case_dir / "escalation-after-absorb.json", absorb_chain)
-        errors.extend(
-            verdicts.new_executable_workflow_errors(
-                absorb_chain.get("executable_workflows") or [],
-                known_request_ids={
-                    run.workflow_request_id,
-                    f"workflow-support-after-{run.workflow_request_id}",
-                },
-            )
-        )
-        absorb_ledger = run.injector.execute(
-            "snapshot",
-            "--since-epoch",
-            str(run.injected_at.timestamp()),
-            "--pci-bdf",
-            target_bdf,
-            timeout=180,
-        )
-        write_json_atomic(case_dir / "host-after-absorb.json", absorb_ledger)
-        if t_cancel is not None:
-            errors.extend(
-                verdicts.late_row_errors(
-                    absorb_ledger.get("ledger") or [],
-                    t_cancel=t_cancel,
-                    baseline_command_ids=run.baseline_command_ids,
-                )
-            )
-
-        provider = regional.provider_events(run.injected_at, datetime.now(timezone.utc))
-        write_json_atomic(case_dir / "provider-events.json", {"events": provider})
-        if provider:
-            errors.append("provider mutation appeared during the lifetime drill")
-        metrics = verdicts.metric_evidence(metrics_before, worker_metrics(regional))
-        errors.extend(verdicts.metric_errors(metrics))
+        _baseline_host(run, maintenance_window_end)
+        _open_and_arm(run)
+        state = _inject_and_observe(run)
+        errors = _control_plane_errors(run, state)
+        errors.extend(_data_plane_errors(run, state))
+        errors.extend(_escalation_and_absorb_errors(run))
+        provider_errors, metrics = _provider_and_metric_errors(run)
+        errors.extend(provider_errors)
         result.update(
             {
                 "verdict": "PASS" if not errors else "FAIL",
@@ -918,16 +971,16 @@ def execute_case(
                 "incident_id": run.incident_id,
                 "support_incident_id": run.support_incident_id,
                 "workflow_request_id": run.workflow_request_id,
-                "injected_at": run.injected_at.isoformat(),
-                "cancelled_at": t_cancel.isoformat() if t_cancel else None,
-                "cadence_sample": sample,
+                "injected_at": run.injected_at.isoformat() if run.injected_at else None,
+                "cancelled_at": run.t_cancel.isoformat() if run.t_cancel else None,
+                "cadence_sample": run.cadence_sample,
                 "timing": verdicts.timing_evidence(
                     lifetime_seconds=settings.lifetime_seconds,
                     execution_timeout_seconds=settings.execution_timeout_seconds,
-                    cadence_seconds=sample.get("min_gap_seconds"),
+                    cadence_seconds=run.cadence_sample.get("min_gap_seconds"),
                 ),
                 "metrics": metrics,
-                "env_window": env_window.without_survey(window_record),
+                "env_window": env_window.without_survey(run.window_record),
             }
         )
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
@@ -937,7 +990,7 @@ def execute_case(
         result["cleanup"] = cleanup
         if cleanup["errors"]:
             result["verdict"] = "FAIL"
-    write_json_atomic(case_dir / f"{CASE_ID}.json", result)
+    write_json_atomic(run.case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
 
