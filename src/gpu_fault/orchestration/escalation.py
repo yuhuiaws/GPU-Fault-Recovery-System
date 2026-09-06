@@ -697,8 +697,9 @@ class HardwareEscalationService:
             official_steps=replacement_steps,
             blocked_reasons=errors,
             blocked_kind=(BlockedKind.NEEDS_OPERATOR if errors else None),
-            # The chain shares one lifetime (F-N1).
-            lifetime_deadline_at=workflow.lifetime_deadline_at,
+            lifetime_deadline_at=self._successor_lifetime(
+                workflow, next_action, next_operation, now
+            ),
             created_at=now,
             updated_at=now,
         )
@@ -721,6 +722,39 @@ class HardwareEscalationService:
             )
         )
         return created_incident, created_workflow
+
+    @staticmethod
+    def _successor_lifetime(
+        workflow: WorkflowRequest,
+        next_action: RecoveryAction,
+        next_operation: WorkflowOperation | None,
+        now: datetime,
+    ) -> datetime | None:
+        """The lifetime the escalation successor starts with.
+
+        The hard lifetime (F-N1) bounds *automatic* remediation: a reboot or a
+        replacement emitted after a failed reset shares the chain's single
+        clock, so an escalation ladder cannot outlive the window by re-issuing
+        itself. An operator hand-off -- the support ticket, a drain -- is the
+        thing the window ends *in*: inheriting an already-expired deadline
+        failed the support workflow at its first claim, before
+        FREEZE_EVIDENCE ran, and the node never reached an operator
+        (DESTR-018). Hand-offs therefore start their own clock; ``None`` lets
+        the first claim stamp the node lifetime (and, for CHECK_MECHANICALS,
+        the operator-acknowledgement floor). An automatic rung emitted while
+        the chain's lifetime is still ahead keeps it; one emitted after the
+        lifetime passed keeps the expired value on purpose, so it fails closed
+        instead of running hardware actions past the window.
+        """
+
+        operator_hand_off = (
+            next_operation is WorkflowOperation.ESCALATE_SUPPORT
+            or next_operation is WorkflowOperation.CHECK_MECHANICALS
+            or next_action in {RecoveryAction.ESCALATE_OPERATOR, RecoveryAction.DRAIN}
+        )
+        if operator_hand_off:
+            return None
+        return workflow.lifetime_deadline_at
 
     def escalate(
         self, workflow: WorkflowRequest
