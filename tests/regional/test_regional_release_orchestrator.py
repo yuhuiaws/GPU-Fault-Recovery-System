@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from tests.regional._release_orchestrator_support import (
     REGION,
     ROOT,
     config_file,
+    phase_release,
 )
 from tests.regional._release_orchestrator_support import RELEASE_MODULE as MODULE
 
@@ -26,6 +28,9 @@ ORCHESTRATION_MODULE = lazy_script_module(
 )
 FLEET_MODULE = lazy_script_module(
     ROOT / "deploy/control-plane/regional/regional_release_fleet_rollout.py"
+)
+CONVERGENCE_MODULE = lazy_script_module(
+    ROOT / "deploy/control-plane/regional/regional_release_agent_convergence.py"
 )
 
 
@@ -88,10 +93,65 @@ def test_gpu_upgrade_is_serial_and_persists_per_cluster_attempts() -> None:
     assert release.state["cluster_attempts"]["gpu-c"]["state"] == "PENDING"
 
 
+def test_converged_cluster_records_when_it_stopped_being_restarted() -> None:
+    """A converged cluster records the epoch, and does not claim more than that.
+
+    `converged_at_epoch` is the only thing that tells a later reader how long ago
+    this release restarted the data plane, which is what bounds the window where
+    restart-shaped alerts are excused. `identity_verified` stays false because
+    nothing here has proven the full candidate pin: per-cluster convergence
+    compares the artifact and config digests, not the protocol version or the
+    compatibility digest, so the pre-finalize heartbeat barrier is still the only
+    evidence that may stand in for itself.
+    """
+
+    target = SimpleNamespace(cluster_id="gpu-a")
+    release = SimpleNamespace(
+        config=SimpleNamespace(clusters=(target,), upgrade_max_parallel_clusters=1),
+        state={},
+    )
+    setattr(
+        release,
+        "_save_state",
+        lambda phase, **updates: release.state.update({"phase": phase, **updates}),
+    )
+    setattr(
+        release,
+        "_upgrade_gpu_target",
+        lambda _target, _diff, _plan, *, progress, candidate_preflighted: progress(
+            ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "COMPLETED", None
+        ),
+    )
+    before = time.time()
+
+    ORCHESTRATION_MODULE.upgrade_gpu_clusters(
+        release,
+        diff=ORCHESTRATION_MODULE.ReleaseDiff(
+            kind=ORCHESTRATION_MODULE.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+            changed=frozenset({"executor_wheel"}),
+        ),
+        plan=ORCHESTRATION_MODULE.ReleaseExecutionPlan(
+            nodes=(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR,)
+        ),
+        previous={},
+        completed_phases=set(),
+        completed_clusters=set(),
+        registry_staged=False,
+    )
+
+    attempt = release.state["cluster_attempts"]["gpu-a"]
+    assert attempt["state"] == "CONVERGED"
+    assert before <= float(attempt["converged_at_epoch"]) <= time.time()
+    assert attempt["identity_verified"] is False
+
+
 def test_gpu_upgrade_honors_bounded_cluster_parallelism() -> None:
+    # Five clusters: the canary rolls alone (see
+    # `test_parallel_clusters_start_after_first_converges`) and the four that
+    # follow it pair up twice, which is what the barrier below counts.
     targets = tuple(
         SimpleNamespace(cluster_id=cluster_id)
-        for cluster_id in ("gpu-a", "gpu-b", "gpu-c", "gpu-d")
+        for cluster_id in ("gpu-a", "gpu-b", "gpu-c", "gpu-d", "gpu-e")
     )
     barrier = threading.Barrier(2, timeout=30)
     concurrent = []
@@ -110,8 +170,10 @@ def test_gpu_upgrade_honors_bounded_cluster_parallelism() -> None:
             active.append(target.cluster_id)
             concurrent.append(len(active))
         # Two clusters must genuinely overlap, so each one waits for a partner;
-        # a serial implementation would time out here instead of pairing up.
-        barrier.wait()
+        # a serial implementation would time out here instead of pairing up. The
+        # canary has no partner by design.
+        if target.cluster_id != "gpu-a":
+            barrier.wait()
         progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "STARTED", None)
         progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "COMPLETED", None)
         with active_lock:
@@ -138,21 +200,91 @@ def test_gpu_upgrade_honors_bounded_cluster_parallelism() -> None:
         registry_staged=False,
     )
 
-    assert completed == {"gpu-a", "gpu-b", "gpu-c", "gpu-d"}
+    assert completed == {"gpu-a", "gpu-b", "gpu-c", "gpu-d", "gpu-e"}
     assert max(concurrent) == 2
     assert sorted(release.state["completed_cluster_ids"]) == [
         "gpu-a",
         "gpu-b",
         "gpu-c",
         "gpu-d",
+        "gpu-e",
     ]
     attempts = release.state["cluster_attempts"]
     assert {cluster_id: entry["state"] for cluster_id, entry in attempts.items()} == {
         target.cluster_id: "CONVERGED" for target in targets
     }
     progress = release.state["component_progress"]["clusters"]
-    assert sorted(progress) == ["gpu-a", "gpu-b", "gpu-c", "gpu-d"]
+    assert sorted(progress) == ["gpu-a", "gpu-b", "gpu-c", "gpu-d", "gpu-e"]
     assert {entry["executor"]["status"] for entry in progress.values()} == {"COMPLETED"}
+
+
+def test_parallel_clusters_start_after_first_converges() -> None:
+    """With parallelism on, the first cluster still rolls alone.
+
+    A failure the engine cannot attribute to one cluster rolls back every cluster
+    that already converged, so the widest blast radius is bought by starting
+    every cluster at once. The first pending cluster is the canary: it proves the
+    candidate against a real cluster before the rest may overlap.
+    """
+
+    targets = tuple(
+        SimpleNamespace(cluster_id=cluster_id)
+        for cluster_id in ("gpu-a", "gpu-b", "gpu-c")
+    )
+    # Only the clusters after the canary pair up, so the canary must not join
+    # this barrier -- and the two that follow it must.
+    paired = threading.Barrier(2, timeout=30)
+    others_started = threading.Event()
+    order: list[str] = []
+    order_lock = threading.Lock()
+    release = SimpleNamespace(
+        config=SimpleNamespace(clusters=targets, upgrade_max_parallel_clusters=3),
+        state={},
+    )
+
+    def save_state(phase, **updates):
+        release.state.update({"phase": phase, **updates})
+
+    def upgrade(target, _diff, _plan, *, progress, candidate_preflighted):
+        with order_lock:
+            order.append(target.cluster_id)
+        if target.cluster_id == "gpu-a":
+            # Long enough that a rollout which starts everything at once is
+            # caught by the assertion below instead of racing past it.
+            others_started.wait(timeout=0.2)
+        else:
+            attempts = release.state.get("cluster_attempts") or {}
+            assert attempts.get("gpu-a", {}).get("state") == "CONVERGED", (
+                "a cluster started before the canary converged"
+            )
+            others_started.set()
+            paired.wait()
+        progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "STARTED", None)
+        progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "COMPLETED", None)
+
+    setattr(release, "_save_state", save_state)
+    setattr(release, "_upgrade_gpu_target", upgrade)
+    diff = ORCHESTRATION_MODULE.ReleaseDiff(
+        kind=ORCHESTRATION_MODULE.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+        changed=frozenset({"executor_wheel"}),
+    )
+    plan = ORCHESTRATION_MODULE.ReleaseExecutionPlan(
+        nodes=(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR,)
+    )
+    completed: set[str] = set()
+
+    ORCHESTRATION_MODULE.upgrade_gpu_clusters(
+        release,
+        diff=diff,
+        plan=plan,
+        previous={},
+        completed_phases=set(),
+        completed_clusters=completed,
+        registry_staged=False,
+    )
+
+    assert order[0] == "gpu-a"
+    assert completed == {"gpu-a", "gpu-b", "gpu-c"}
 
 
 def test_parallel_gpu_upgrade_failure_stops_unstarted_clusters() -> None:
@@ -272,6 +404,100 @@ def test_cluster_local_upgrade_failure_pauses_without_auto_rollback(
     assert release.state["release_lifecycle"] == "PAUSED"
 
 
+def test_agent_convergence_timeout_pauses_only_its_own_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One cluster whose fleet never converges must not revert the others.
+
+    A convergence timeout is the most common way a rollout stops: one node's
+    installer is stuck, or a node is cordoned. It says nothing about the
+    candidate, so treating it as a global failure rolled back every cluster that
+    had already converged -- an outage bought for a single stuck node. The real
+    `wait_agents` timeout is driven here, so the test is bound to the exception
+    the engine actually raises rather than to a hand-made one.
+    """
+
+    calls: list[str] = []
+    targets = tuple(
+        SimpleNamespace(cluster_id=cluster_id, hyperpod_cluster_name=f"hp-{cluster_id}")
+        for cluster_id in ("gpu-a", "gpu-b")
+    )
+
+    def wait_for_agents(target) -> None:
+        CONVERGENCE_MODULE.wait_agents(
+            SimpleNamespace(
+                runner=SimpleNamespace(dry_run=False),
+                bundle_sha="b" * 64,
+                node_template_sha="e" * 64,
+                config=SimpleNamespace(
+                    agent_config_digest="c" * 64,
+                    runtime_profile_version="profile-v1",
+                    release_manifest_schema_version=3,
+                ),
+                _agent_heartbeats_converged=lambda *_args, **_kwargs: False,
+            ),
+            target,
+            "a" * 64,
+            node_names=("node-b",),
+            # The wait is over before it starts: this test is about what the
+            # expiry raises, not about how long it waits.
+            timeout_seconds=0,
+        )
+
+    def upgrade_target(target, _diff, _plan, *, progress, candidate_preflighted):
+        calls.append(f"gpu:{target.cluster_id}")
+        progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "STARTED", None)
+        if target.cluster_id == "gpu-b":
+            wait_for_agents(target)
+        progress(ORCHESTRATION_MODULE.ReleaseComponent.EXECUTOR, "COMPLETED", None)
+
+    release = phase_release(
+        calls,
+        clusters=targets,
+        _upgrade_gpu_target=upgrade_target,
+        _ensure_contexts=lambda: None,
+        _require_cpu_secrets=lambda: None,
+        _remote_commands_are_idle=lambda: True,
+        rollback=lambda **_kwargs: pytest.fail(
+            "a single cluster's convergence timeout rolled the release back"
+        ),
+    )
+    release.config.auto_rollback = True
+    monkeypatch.setattr(
+        ORCHESTRATION_MODULE, "preflight_upgrade_mutations", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        ORCHESTRATION_MODULE,
+        "_validate_upgrade_transaction",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        ORCHESTRATION_MODULE,
+        "_upgrade_context",
+        lambda *_args, **_kwargs: ({"metadata": {}}, set(), set(), False),
+    )
+
+    with pytest.raises(
+        ORCHESTRATION_MODULE.PartialClusterRolloutError,
+        match="gpu-b agents did not converge",
+    ):
+        ORCHESTRATION_MODULE.upgrade_release(
+            release,
+            diff=ORCHESTRATION_MODULE.ReleaseDiff(
+                kind=ORCHESTRATION_MODULE.ReleaseChangeKind.DATA_PLANE_COMPATIBLE,
+                changed=frozenset({"executor_wheel"}),
+            ),
+        )
+
+    assert calls.count("gpu:gpu-a") == 1
+    attempts = release.state["cluster_attempts"]
+    assert attempts["gpu-a"]["state"] == "CONVERGED"
+    assert attempts["gpu-b"]["state"] == "FAILED"
+    assert release.state["failure_scope"] == "cluster-local"
+    assert release.state["release_lifecycle"] == "PAUSED"
+    assert release.state["partial_convergence"] is True
+
+
 def test_control_plane_only_upgrade_skips_schema_and_gpu(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -333,7 +559,10 @@ def test_control_plane_only_upgrade_skips_schema_and_gpu(
 
     assert ("cpu", True) in calls
     assert ("cpu", False) not in calls
-    assert "schema-ready" in calls
+    # A plan with no schema change writes no `schema-ready` checkpoint at all:
+    # claiming a phase this release never ran is what made `completed_phases`
+    # unreadable for the gates that consume it.
+    assert "schema-ready" not in calls
     assert "verify" in calls
 
 

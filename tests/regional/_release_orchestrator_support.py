@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.models import RuntimeProfile
@@ -136,3 +138,66 @@ class RuntimeProfileRunner:
             self.posted.append(json.loads(kwargs["input_text"]))
             return json.dumps(desired)
         raise AssertionError(f"unexpected Runtime Profile command: {args}")
+
+
+def phase_release(
+    calls: list,
+    saves: list | None = None,
+    *,
+    clusters: tuple = (),
+    max_parallel_clusters: int = 1,
+    **overrides: Any,
+) -> SimpleNamespace:
+    """A release whose only behaviour is recording what the phases did.
+
+    Every hook `run_upgrade_phases` may reach is present, so one stand-in serves
+    plans that include the schema, the registry, the CPU stage and the finalize
+    barriers alike; the plan passed to `run_upgrade_phases` decides which of them
+    actually run. Pass `**overrides` to replace individual hooks -- that is how a
+    test makes one phase block, fail, or record its own ordering.
+    """
+
+    release: SimpleNamespace
+
+    def save_state(phase, **updates):
+        release.state.update({"phase": phase, **updates})
+        if saves is not None:
+            saves.append(json.loads(json.dumps(release.state, default=str)))
+
+    def stage_registry():
+        calls.append("registry")
+        return False
+
+    fields: dict[str, Any] = {
+        "state": {"phase": "preflight"},
+        "config": SimpleNamespace(
+            clusters=clusters,
+            upgrade_max_parallel_clusters=max_parallel_clusters,
+            agent_config_digest="config-a",
+        ),
+        "executor_wheel_cm": "wheel",
+        "bundle_cm": "bundle",
+        "node_wheel_sha": "a" * 64,
+        "_upload_release": lambda _diff: calls.append("upload"),
+        "_ensure_schema": lambda: calls.append("schema"),
+        "_stage_registry": stage_registry,
+        "_apply_cpu": lambda **kwargs: calls.append(
+            "cpu-finalize" if kwargs.get("finalize") else "cpu-stage"
+        ),
+        "_apply_nlb": lambda: calls.append("endpoint"),
+        "_apply_observability": lambda: calls.append("observability"),
+        "_ensure_profile_transition_safe": lambda _version: None,
+        "_capture_active_agent_node_sets": lambda: {"gpu-a": {"node_ids": ["node-a"]}},
+        "_wait_candidate_cpu_agent_heartbeats": (
+            lambda _expected, **kwargs: calls.append(
+                "pin-barrier" if kwargs.get("required_identity") else "barrier"
+            )
+        ),
+        "_candidate_agent_pin_identity": lambda: {"artifact_sha256": "a" * 64},
+        "_validate_release_quick": lambda _plan: calls.append("verify"),
+        "_commit_registry_update": lambda: calls.append("commit-registry"),
+        "_save_state": save_state,
+    }
+    fields.update(overrides)
+    release = SimpleNamespace(**fields)
+    return release

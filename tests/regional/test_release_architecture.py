@@ -153,6 +153,9 @@ def test_node_runtime_rollout_uses_fleet_waves(tmp_path: Path, monkeypatch) -> N
     # the failed Jobs are decided from the same read.
     assert installer_job_calls == ["settle", "settle"]
     assert wait_calls == [("node-a", "node-b"), ("node-c",), None]
+    # The double answers `None` for the lease minimum, so every wave takes the
+    # fail-closed fallback and re-probes after the lease; the single-probe path
+    # is pinned in tests/regional/test_release_fleet_wave_cost.py.
     assert [item.get("minimum_lease_remaining_seconds") for item in safety_calls] == [
         None,
         30,

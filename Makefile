@@ -6,7 +6,9 @@ PYTHON ?= $(firstword $(wildcard .venv/bin/python) python3)
 # of the checkout so a prior gate cannot poison the later deploy layout check.
 PYTHONPYCACHEPREFIX ?= /tmp/gpu-fault-pycache
 export PYTHONPYCACHEPREFIX
-PYTEST_XDIST_WORKERS ?= 4
+# Default to a quarter of the cores, bounded to 4..16: the release gate runs
+# this suite next to the artifact build and (in release mode) the static gates.
+PYTEST_XDIST_WORKERS ?= $(shell $(PYTHON) -c "import os;print(max(4,min(16,(os.cpu_count() or 4)//4)))")
 PYTEST_XDIST_DIST ?= worksteal
 PYTEST_DURATIONS ?= 50
 FAULT_TEST_WORKERS ?= 1

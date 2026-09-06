@@ -52,6 +52,10 @@ FORBIDDEN_ACTIONS = (
 )
 
 
+def _role_name(argv: list[str]) -> str:
+    return argv[argv.index("--role-name") + 1]
+
+
 def _gpu() -> ClusterIdentity:
     return replace(_cluster(), role="gpu", hyperpod_name="hp-gpu-a", eks_name="gpu-a")
 
@@ -70,6 +74,12 @@ class Account:
     Every ``exists`` flag is a separate attribute because the interesting cases
     are the mixtures: a role that exists but is untagged, an add-on installed by
     someone else, an association pointing at a role from a previous attempt.
+
+    Absence is expressed the way AWS expresses it: the read fails with the error
+    the CLI prints. The ensure paths make one read per resource and decide from
+    its outcome, so a fake that answered a "does it exist" question separately
+    from the "what does it look like" question could no longer be wrong in the
+    way the real account can.
     """
 
     def __init__(self) -> None:
@@ -77,6 +87,7 @@ class Account:
         self.addon_site: str | None = SITE
         self.service_account_exists = False
         self.role_exists = False
+        self.role_read_error: str | None = None
         self.role_tags: list[dict[str, str]] | None = None
         self.role_trust: dict[str, Any] | None = None
         self.role_policy: dict[str, Any] | None = None
@@ -101,8 +112,21 @@ class Account:
                 )
             return "apiVersion: v1\nkind: ServiceAccount\n"
         if "get-role-policy" in argv:
+            returncode, stderr = self.policy_lookup
+            if returncode:
+                raise BootstrapError(f"command failed ({returncode}): aws: {stderr}")
             return json.dumps({"PolicyDocument": self.role_policy})
         if "iam get-role" in line:
+            if self.role_read_error is not None:
+                raise BootstrapError(
+                    f"command failed (254): aws: {self.role_read_error}"
+                )
+            if not self.role_exists:
+                raise BootstrapError(
+                    "command failed (254): aws: An error occurred (NoSuchEntity) "
+                    f"when calling the GetRole operation: Role {_role_name(argv)} "
+                    "cannot be found."
+                )
             return json.dumps(
                 {
                     "Role": {
@@ -124,6 +148,12 @@ class Account:
         self.calls.append(["aws", *arguments])
         operation = arguments[1]
         if operation == "describe-addon":
+            if not self.addon_installed:
+                raise BootstrapError(
+                    "command failed (254): aws: An error occurred "
+                    "(ResourceNotFoundException) when calling the DescribeAddon "
+                    "operation: No addon: eks-pod-identity-agent found in cluster"
+                )
             return {"addon": {"addonArn": f"arn:aws:eks:{REGION}:{ACCOUNT}:addon/a"}}
         if operation == "list-tags-for-resource":
             return {
@@ -145,19 +175,17 @@ class Account:
 
     # -- process boundary --------------------------------------------------
     def process(self, arguments: Sequence[Any], **_keywords: Any) -> Any:
+        """The one existence probe left that does not go through the runner.
+
+        IAM roles, inline policies and the Pod Identity add-on are read through
+        ``run``/``aws_json`` above, once each. Only the account-wide OIDC provider
+        is still probed with a bare process, so anything else arriving here is a
+        read that was meant to be deduplicated.
+        """
+
         argv = [str(item) for item in arguments]
-        line = " ".join(argv)
-        if "describe-addon" in line:
-            return subprocess.CompletedProcess(argv, 0 if self.addon_installed else 254)
-        if "get-open-id-connect-provider" in line:
+        if "get-open-id-connect-provider" in " ".join(argv):
             return subprocess.CompletedProcess(argv, 0 if self.provider_exists else 254)
-        if "get-role-policy" in line:
-            returncode, stderr = self.policy_lookup
-            return subprocess.CompletedProcess(
-                argv, returncode, stdout="", stderr=stderr
-            )
-        if "get-role" in line:
-            return subprocess.CompletedProcess(argv, 0 if self.role_exists else 254)
         raise AssertionError(f"unexpected process: {argv}")
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -391,6 +419,33 @@ def test_an_inline_policy_that_cannot_be_read_stops_bootstrap(
 
     with pytest.raises(BootstrapError, match="cannot inspect inline policy"):
         account.control_plane(tmp_path)
+
+
+def test_a_role_that_cannot_be_read_stops_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only NoSuchEntity means the role is absent.
+
+    One read now answers both whether the role exists and whether it drifted, so
+    the error handling around that read is the whole existence decision. Reading
+    an AccessDenied as "absent" would send the run into ``create-role`` against a
+    role that is already there, and the failure would name the wrong problem.
+    """
+
+    account = Account()
+    account.addon_installed = True
+    account.service_account_exists = True
+    account.role_read_error = (
+        "An error occurred (AccessDenied) when calling the GetRole operation"
+    )
+    account.install(monkeypatch)
+
+    with pytest.raises(BootstrapError, match="AccessDenied"):
+        account.control_plane(tmp_path)
+
+    assert not account.mutations("create-role"), (
+        "an unreadable role was recreated instead of stopping the bootstrap"
+    )
 
 
 def test_a_role_belonging_to_another_site_is_refused(

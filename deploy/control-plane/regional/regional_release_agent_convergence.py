@@ -7,7 +7,6 @@ from typing import Any
 from regional_release_config import (
     ClusterLocalReleaseError,
     ClusterTarget,
-    ReleaseError,
 )
 from regional_release_gpu_rollout import agents_converged, gpu_node_items
 from regional_release_narration import narrate_step
@@ -23,6 +22,44 @@ WAIT_AGENTS_MAX_POLL_SECONDS = 5
 WAIT_AGENTS_POLL_BACKOFF = 1.5
 WAIT_AGENTS_NARRATION_SECONDS = 30.0
 WAIT_AGENTS_NARRATED_NODES = 5
+# Above this many nodes the names stop being the cheaper request and the label
+# selector wins again: the wave is then most of the fleet anyway.
+WAIT_AGENTS_NAMED_NODE_LIMIT = 16
+
+
+def wave_node_items(
+    release: Any,
+    target: ClusterTarget,
+    node_names: frozenset[str] | None,
+) -> list[dict[str, Any]]:
+    """The live node objects this wait is about, read as narrowly as possible.
+
+    A wave of one or two nodes used to be polled with `get nodes -l
+    <cluster-name>` every five seconds for the whole install window, which ships
+    every node in the cluster over the wire to answer a question about one of
+    them. Naming the nodes asks the API server for exactly the wave.
+
+    `--ignore-not-found` keeps the previous semantics of a node that is not
+    there: it is absent from the listing and the wait stays unsatisfied, rather
+    than the release failing on `kubectl`'s NotFound. A single name answers with
+    the object instead of a list, which is the common case on this fleet.
+    """
+
+    if not node_names or len(node_names) > WAIT_AGENTS_NAMED_NODE_LIMIT:
+        return gpu_node_items(release, target, fresh=True)
+    value = release._get_json(
+        release._gpu(
+            target,
+            "get",
+            "nodes",
+            *sorted(node_names),
+            "--ignore-not-found",
+        )
+    )
+    items = value.get("items")
+    if isinstance(items, list):
+        return [item for item in items if isinstance(item, dict)]
+    return [value] if (value.get("metadata") or {}).get("name") else []
 
 
 def installer_node_states(
@@ -122,7 +159,7 @@ def wait_agents(
     narrated: dict[str, str] | None = None
     narrated_at = started
     while time.monotonic() < deadline:
-        nodes = gpu_node_items(release, target, fresh=True)
+        nodes = wave_node_items(release, target, expected_nodes)
         selected_nodes = [
             item
             for item in nodes
@@ -224,7 +261,10 @@ def wait_agents(
             WAIT_AGENTS_MAX_POLL_SECONDS,
             poll_seconds * WAIT_AGENTS_POLL_BACKOFF,
         )
-    raise ReleaseError(f"{target.cluster_id} agents did not converge")
+    # Cluster-local: the timeout says one cluster's fleet is stuck (a wedged
+    # installer, a cordoned node), not that the candidate is bad. A global
+    # failure here would roll back every cluster that had already converged.
+    raise ClusterLocalReleaseError(f"{target.cluster_id} agents did not converge")
 
 
 def agent_heartbeats_converged(

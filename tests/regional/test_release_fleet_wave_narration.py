@@ -71,7 +71,7 @@ def _wait_agents(
     listings = iter(polls)
     slept: list[float] = []
     monkeypatch.setattr(
-        CONVERGENCE, "gpu_node_items", lambda *_args, **_kwargs: next(listings)
+        CONVERGENCE, "wave_node_items", lambda *_args, **_kwargs: next(listings)
     )
     monkeypatch.setattr(
         CONVERGENCE.time, "sleep", lambda seconds: slept.append(seconds)
@@ -173,7 +173,7 @@ def test_a_wait_on_heartbeats_alone_says_so(
         )
     )
     monkeypatch.setattr(
-        CONVERGENCE, "gpu_node_items", lambda *_args, **_kwargs: next(listings)
+        CONVERGENCE, "wave_node_items", lambda *_args, **_kwargs: next(listings)
     )
     monkeypatch.setattr(CONVERGENCE.time, "sleep", lambda _seconds: None)
     release = SimpleNamespace(
@@ -294,10 +294,20 @@ def test_polling_stays_prompt_when_a_node_finishes(
 
 def _fleet_release(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[str]]:
     stages: list[str] = []
+    # The wave-safety probe reports the minimum Agent lease it observed, and a
+    # wave that still has minutes of it does not re-exec the probe to learn the
+    # same number again.
+    safe = {
+        "open_remote": {},
+        "destructive_workflow_count": 0,
+        "agent_blocker_count": 0,
+        "agent_blockers": [],
+        "minimum_lease_remaining_seconds": 300.0,
+    }
     monkeypatch.setattr(
         FLEET,
         "ensure_rollout_wave_safe",
-        lambda *_args, **_kwargs: stages.append("safety"),
+        lambda *_args, **_kwargs: stages.append("safety") or safe,
     )
     monkeypatch.setattr(
         FLEET,
@@ -376,7 +386,7 @@ def test_a_finished_wave_reports_where_its_time_went(
         release, TARGET, _wave_context(), dict(_DEPLOYMENT_IN_PROGRESS)
     )
 
-    assert stages == ["safety", "safety", "handoff", "install"]
+    assert stages == ["safety", "handoff", "install"]
     done = next(
         line
         for line in capsys.readouterr().err.splitlines()

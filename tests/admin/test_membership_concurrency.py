@@ -65,6 +65,33 @@ def test_site_operation_lock_accepts_verified_inherited_descriptor(
             )
 
 
+def test_auto_upgrade_max_unavailable_counts_against_the_node_budget() -> None:
+    """`0` is auto, and auto is not one node per cluster.
+
+    The wave engine reads 0 as "take the size cap the node count allows", so a
+    thousand-node cluster can have 32 nodes down at once. Reading the same 0 here
+    as a per-cluster limit of 1 made the 64-node global budget divide by 1 and
+    admit four such clusters in parallel -- a budget of 64 spending 128.
+    """
+
+    context = SimpleNamespace(
+        site=SimpleNamespace(
+            release_config={"release": {"upgrade_max_unavailable": 0}}
+        ),
+        concurrency=4,
+    )
+    attempts = [
+        SimpleNamespace(
+            execution=SimpleNamespace(
+                local={"nodes": [f"node-{index}" for index in range(1000)]}
+            )
+        )
+        for _ in range(4)
+    ]
+
+    assert effective_deploy_concurrency(context, attempts) == 2
+
+
 def test_large_batch_join_respects_global_node_budget() -> None:
     context = SimpleNamespace(
         site=SimpleNamespace(

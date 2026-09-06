@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -542,3 +543,104 @@ def test_dependency_report_records_versions_without_credentials() -> None:
             "version": "example 1.2.3",
         }
     ]
+
+
+def test_prune_venv_versions_keeps_bound_and_newest_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Installed versions are 1 GB each and nothing removed them (12 GB found).
+
+    What may not be removed is what can still be activated: the version the
+    ``deployer-venv`` symlink points at, and the activation backup a crashed
+    setup left behind, which is the only way back to the previous install. The
+    dependency venv is a different directory and is never a candidate here, so
+    the state file that names it protects nothing and is not read.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    root = tmp_path / "state"
+    versions = root / ".deployer-venv.versions"
+    versions.mkdir(parents=True)
+    installed = []
+    for index in range(7):
+        version = versions / f"bundle-{index:024d}"
+        version.mkdir()
+        (version / "marker").write_text("installed\n", encoding="utf-8")
+        stamp = 1_700_000_000 + index
+        os.utime(version, (stamp, stamp))
+        installed.append(version)
+    venv = root / "deployer-venv"
+    venv.symlink_to(installed[0], target_is_directory=True)
+    root.joinpath(".deployer-venv.previous").symlink_to(
+        installed[1], target_is_directory=True
+    )
+    dependencies = root / ".deployer-venv.dependencies/deps-0"
+    dependencies.mkdir(parents=True)
+    os.utime(dependencies, (1_600_000_000, 1_600_000_000))
+    installed[0].joinpath(setup_deploy_host.STATE_NAME).write_text(
+        json.dumps({"dependency_venv": str(dependencies)}) + "\n", encoding="utf-8"
+    )
+    os.utime(installed[0], (1_700_000_000, 1_700_000_000))
+    handle = (root / "site-operation.lock").open("w")
+
+    removed = setup_deploy_host.prune_venv_versions(venv, lock_fd=handle.fileno())
+
+    assert set(removed) == {installed[2], installed[3]}
+    for index in (0, 1, 4, 5, 6):
+        assert installed[index].is_dir(), index
+    for index in (2, 3):
+        assert not installed[index].exists(), index
+
+    assert dependencies.is_dir(), "pruning reached outside the versions directory"
+
+    monkeypatch.setenv("GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED", "1")
+
+    assert set(
+        setup_deploy_host.prune_venv_versions(venv, lock_fd=handle.fileno())
+    ) == {installed[4], installed[5]}
+    assert installed[0].is_dir() and installed[1].is_dir() and installed[6].is_dir()
+
+    monkeypatch.setenv("GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED", "0")
+
+    with pytest.raises(
+        setup_deploy_host.DeployHostSetupError, match="positive integer"
+    ):
+        setup_deploy_host.prune_venv_versions(venv, lock_fd=handle.fileno())
+
+    handle.close()
+
+
+def test_prune_venv_versions_requires_the_site_operation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the lock descriptor nothing is deleted and the caller is told.
+
+    ``scripts/setup-deploy-host.sh`` can be hand-run with no site lock at all, so
+    that path never prunes; the deploy path holds the lock and hands the
+    descriptor down. A closed descriptor makes the same claim as no lock, and a
+    version another install is writing into would be the thing deleted.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    monkeypatch.setenv("GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED", "1")
+    root = tmp_path / "state"
+    versions = root / ".deployer-venv.versions"
+    versions.mkdir(parents=True)
+    installed = []
+    for index in range(3):
+        version = versions / f"bundle-{index:024d}"
+        version.mkdir()
+        stamp = 1_700_000_000 + index
+        os.utime(version, (stamp, stamp))
+        installed.append(version)
+    venv = root / "deployer-venv"
+    venv.symlink_to(installed[2], target_is_directory=True)
+    handle = (root / "site-operation.lock").open("w")
+    unheld = handle.fileno()
+    handle.close()
+
+    with pytest.raises(setup_deploy_host.DeployHostSetupError, match="site operation"):
+        setup_deploy_host.prune_venv_versions(venv, lock_fd=unheld)
+
+    for index in range(3):
+        assert installed[index].is_dir(), index

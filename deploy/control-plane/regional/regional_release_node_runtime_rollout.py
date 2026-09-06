@@ -23,6 +23,18 @@ from regional_release_node_preflight import (
 )
 
 
+def _ensure_runtime_safe(*args: Any, **kwargs: Any) -> None:
+    """The barrier's safety gate: raise or return, never hand back evidence.
+
+    ``ensure_rollout_wave_safe`` returns the snapshot it decided on so the wave
+    loop can re-decide the post-lease margin from it without a second exec. The
+    pre-mutation barrier has no wave lease to take, so it wants the gate and not
+    the evidence.
+    """
+
+    ensure_rollout_wave_safe(*args, **kwargs)
+
+
 def _create_fleet_rollout(
     release: Any,
     target: ClusterTarget,
@@ -198,7 +210,9 @@ def _node_runtime_candidate(
         )
     policy = (
         NodeRolloutPolicy(
-            max_unavailable=release.config.upgrade_max_unavailable,
+            # A dry run lists no nodes, so there is no cap to resolve "auto"
+            # against: it reports the one-node floor rather than the sentinel.
+            max_unavailable=max(1, release.config.upgrade_max_unavailable),
             first_wave_max_unavailable=1,
             max_unavailable_per_failure_domain=1,
         )
@@ -326,7 +340,7 @@ def roll_node_runtime(
         release,
         target,
         candidate,
-        ensure_runtime_safe=ensure_rollout_wave_safe,
+        ensure_runtime_safe=_ensure_runtime_safe,
     )
     if mutation_started is not None:
         mutation_started()

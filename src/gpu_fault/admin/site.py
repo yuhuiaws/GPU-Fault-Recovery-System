@@ -193,11 +193,15 @@ class ReleaseSiteConfig:
                 "spec.release.manifest",
             ),
             agent_config_digest=digest,
+            # 0 is the default and means "auto": the release computes the wave
+            # size from the node count (4/8/16/32) and keeps the first wave a
+            # one-node canary. A hard-coded 1 defeated that cap and turned a
+            # four-node cluster into four full wave round trips.
             upgrade_max_unavailable=_integer(
                 data.get("upgradeMaxUnavailable"),
                 "spec.release.upgradeMaxUnavailable",
-                default=1,
-                minimum=1,
+                default=0,
+                minimum=0,
                 maximum=32,
             ),
             rollback_max_unavailable=_integer(

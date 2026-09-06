@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from tests._script_loader import lazy_script_module
+from tests.regional._release_orchestrator_support import phase_release
 
 ROOT = Path(__file__).resolve().parents[2]
 ORCHESTRATION = lazy_script_module(
@@ -14,6 +16,9 @@ ORCHESTRATION = lazy_script_module(
 )
 GPU_ROLLOUT = lazy_script_module(
     ROOT / "deploy/control-plane/regional/regional_release_gpu_rollout.py"
+)
+PROGRESS = lazy_script_module(
+    ROOT / "deploy/control-plane/regional/regional_release_progress.py"
 )
 
 
@@ -27,10 +32,10 @@ def test_upgrade_ensures_schema_before_rolling_cpu(
     """
 
     calls: list[str] = []
+    # The preflight runs in the background now, so it is not part of the order
+    # under test here; `test_release_orchestration_concurrency.py` owns that.
     monkeypatch.setattr(
-        ORCHESTRATION,
-        "preflight_upgrade_mutations",
-        lambda _self, _plan: calls.append("preflight"),
+        ORCHESTRATION, "preflight_upgrade_mutations", lambda _self, _plan: None
     )
     release: SimpleNamespace = SimpleNamespace(
         state={"phase": "preflight"},
@@ -65,7 +70,7 @@ def test_upgrade_ensures_schema_before_rolling_cpu(
         registry_staged=False,
     )
 
-    assert calls == ["upload", "preflight", "schema", "cpu", "verify"]
+    assert calls == ["upload", "schema", "cpu", "verify"]
 
 
 def test_completed_component_progress_is_flushed_by_phase_checkpoint() -> None:
@@ -118,7 +123,10 @@ def test_completed_component_progress_is_flushed_by_phase_checkpoint() -> None:
         .get("status")
         == "COMPLETED"
     )
-    assert schema_started["phase"] == "candidate-preflight-ready"
+    # The schema no longer waits behind the candidate node preflight, so the
+    # write that carries its STARTED marker is stamped with the last phase that
+    # really completed before it.
+    assert schema_started["phase"] == "uploaded"
     assert schema_completed["phase"] == "schema-ready"
 
 
@@ -266,9 +274,29 @@ def test_agent_progress_starts_only_after_node_barrier() -> None:
     ]
 
 
-def test_candidate_host_preflight_runs_before_schema_and_cpu() -> None:
+def test_candidate_host_preflight_covers_every_mutation_it_gates() -> None:
+    """Each cluster is preflighted in dependency order before it is mutated.
+
+    The preflight now runs beside the control-plane phases instead of in front of
+    them (see `test_release_orchestration_concurrency.py` for the overlap and the
+    join), so the schema here waits for the preflight to finish before it fails:
+    the ordering under test is the one *inside* the preflight, and a race would
+    otherwise decide it.
+    """
+
     target = SimpleNamespace(cluster_id="gpu-a")
     calls = []
+    preflighted = threading.Event()
+
+    def ensure_schema():
+        assert preflighted.wait(timeout=10), "the candidate preflight never ran"
+        calls.append("schema")
+        raise RuntimeError("stop after schema")
+
+    def preflight_node_runtime(*_args, **_kwargs):
+        calls.append("host-preflight")
+        preflighted.set()
+
     release = SimpleNamespace(
         state={"phase": "preflight"},
         config=SimpleNamespace(clusters=(target,), agent_config_digest="config-a"),
@@ -280,13 +308,8 @@ def test_candidate_host_preflight_runs_before_schema_and_cpu() -> None:
         _preflight_gpu_deployments=lambda *_args, **_kwargs: calls.append(
             "gpu-preflight"
         ),
-        _preflight_node_runtime=lambda *_args, **_kwargs: calls.append(
-            "host-preflight"
-        ),
-        _ensure_schema=lambda: (
-            calls.append("schema"),
-            (_ for _ in ()).throw(RuntimeError("stop after schema")),
-        ),
+        _preflight_node_runtime=preflight_node_runtime,
+        _ensure_schema=ensure_schema,
         _save_state=lambda phase, **updates: release.state.update(
             {"phase": phase, **updates}
         ),
@@ -326,8 +349,27 @@ def test_candidate_host_preflight_runs_before_schema_and_cpu() -> None:
 
 
 def test_resume_revalidates_candidate_preflight_before_pending_mutations() -> None:
+    """A resumed release re-proves the candidate on the nodes it will mutate.
+
+    `candidate-preflight-ready` being recorded does not make it true any more:
+    the fleet may have changed between the two attempts, and the data plane is
+    told it was already preflighted. The schema waits for the preflight here for
+    the same reason as in the test above -- the two now run concurrently.
+    """
+
     target = SimpleNamespace(cluster_id="gpu-a")
     calls = []
+    preflighted = threading.Event()
+
+    def ensure_schema():
+        assert preflighted.wait(timeout=10), "resume skipped the candidate preflight"
+        calls.append("schema")
+        raise RuntimeError("stop after schema")
+
+    def preflight_node_runtime(*_args, **_kwargs):
+        calls.append("host-preflight")
+        preflighted.set()
+
     release = SimpleNamespace(
         state={"phase": "candidate-preflight-ready"},
         config=SimpleNamespace(clusters=(target,), agent_config_digest="config-a"),
@@ -337,13 +379,8 @@ def test_resume_revalidates_candidate_preflight_before_pending_mutations() -> No
         _upload_release=lambda _diff: pytest.fail(
             "resume repeated the completed upload"
         ),
-        _preflight_node_runtime=lambda *_args, **_kwargs: calls.append(
-            "host-preflight"
-        ),
-        _ensure_schema=lambda: (
-            calls.append("schema"),
-            (_ for _ in ()).throw(RuntimeError("stop after schema")),
-        ),
+        _preflight_node_runtime=preflight_node_runtime,
+        _ensure_schema=ensure_schema,
         _save_state=lambda phase, **updates: release.state.update(
             {"phase": phase, **updates}
         ),
@@ -371,3 +408,143 @@ def test_resume_revalidates_candidate_preflight_before_pending_mutations() -> No
         )
 
     assert calls == ["host-preflight", "schema"]
+
+
+CPU_SIDE_PLAN = ("SCHEMA", "REGISTRY", "CPU_STAGE", "VERIFY")
+
+
+def test_started_marker_shares_the_phase_checkpoint_write() -> None:
+    """Each component's STARTED marker rides on the previous phase checkpoint.
+
+    Every state write is a ConfigMap apply of the whole transaction (~2.5 s on
+    the production control plane), and the pair "phase x complete" / "component y
+    started" describes one instant. Writing them separately doubled the writes
+    without recording anything a resume can tell apart.
+    """
+
+    calls: list[str] = []
+    saves: list[dict] = []
+    release = phase_release(calls, saves)
+    plan = ORCHESTRATION.ReleaseExecutionPlan(
+        nodes=tuple(
+            getattr(ORCHESTRATION.ReleaseComponent, name) for name in CPU_SIDE_PLAN
+        )
+    )
+
+    ORCHESTRATION.run_upgrade_phases(
+        release,
+        diff=ORCHESTRATION.ReleaseDiff(
+            kind=ORCHESTRATION.ReleaseChangeKind.FULL,
+            changed=frozenset({"database_schema", "control_plane_wheel"}),
+        ),
+        plan=plan,
+        previous={},
+        completed_phases=set(),
+        completed_clusters=set(),
+        registry_staged=False,
+    )
+
+    # `uploaded`, one merged write per planned component, the write that opens
+    # the data plane, and `complete`.
+    assert len(saves) == 1 + len(CPU_SIDE_PLAN) + 2, [item["phase"] for item in saves]
+    registry_started = next(
+        item
+        for item in saves
+        if ((item.get("component_progress") or {}).get("global") or {})
+        .get("registry", {})
+        .get("status")
+        == "STARTED"
+    )
+    assert registry_started["phase"] == "schema-ready"
+    assert "schema-ready" in registry_started["completed_phases"]
+
+
+def test_schema_ready_not_written_without_schema_component() -> None:
+    """A plan without a schema change must not claim the schema is ready.
+
+    The claim used to be written unconditionally, so a control-plane-only
+    release recorded a phase it never ran, and every consumer of
+    `completed_phases` had to treat that stamp as meaningless.
+    """
+
+    calls: list[str] = []
+    saves: list[dict] = []
+    release = phase_release(calls, saves)
+
+    ORCHESTRATION.run_upgrade_phases(
+        release,
+        diff=ORCHESTRATION.ReleaseDiff(
+            kind=ORCHESTRATION.ReleaseChangeKind.CONTROL_PLANE_ONLY,
+            changed=frozenset({"control_plane_wheel"}),
+        ),
+        plan=ORCHESTRATION.ReleaseExecutionPlan(
+            nodes=(
+                ORCHESTRATION.ReleaseComponent.CPU_STAGE,
+                ORCHESTRATION.ReleaseComponent.VERIFY,
+            )
+        ),
+        previous={},
+        completed_phases=set(),
+        completed_clusters=set(),
+        registry_staged=False,
+    )
+
+    assert "schema" not in calls, "schema must not be loaded without a SCHEMA component"
+    assert [item for item in saves if item["phase"] == "schema-ready"] == [], (
+        "schema-ready must not be saved without a SCHEMA component"
+    )
+    assert all("schema-ready" not in item["completed_phases"] for item in saves), (
+        "schema-ready must not be checkpointed without a SCHEMA component"
+    )
+
+
+def test_resume_without_schema_component_needs_no_schema_checkpoint() -> None:
+    """A resumed release must not wait for a checkpoint nobody will write.
+
+    Treating "the phase's component is not in the plan" as satisfied is what
+    lets the phases after the schema run at all once the unconditional
+    `schema-ready` checkpoint is gone.
+    """
+
+    calls: list[str] = []
+    saves: list[dict] = []
+    release = phase_release(calls, saves)
+
+    ORCHESTRATION.run_upgrade_phases(
+        release,
+        diff=ORCHESTRATION.ReleaseDiff(
+            kind=ORCHESTRATION.ReleaseChangeKind.CONTROL_PLANE_ONLY,
+            changed=frozenset({"control_plane_wheel"}),
+        ),
+        plan=ORCHESTRATION.ReleaseExecutionPlan(
+            nodes=(
+                ORCHESTRATION.ReleaseComponent.CPU_STAGE,
+                ORCHESTRATION.ReleaseComponent.VERIFY,
+            )
+        ),
+        previous={},
+        completed_phases={"uploaded", "candidate-preflight-ready"},
+        completed_clusters=set(),
+        registry_staged=False,
+    )
+
+    assert calls[0] == "cpu-stage"
+    assert "barrier" in calls
+    assert calls.index("cpu-stage") < calls.index("verify")
+    assert release.state["phase"] == "complete"
+    assert release.state["release_lifecycle"] == "COMMITTED"
+
+
+def test_cluster_attempts_with_rejects_reserved_fields() -> None:
+    """The fields parameter cannot smuggle validated control keys."""
+    state = {"cluster_attempts": {}}
+    for forbidden_key in ("state", "attempt_generation", "updated_at_epoch"):
+        with pytest.raises(ValueError, match=f"reserved keys: \\['{forbidden_key}'\\]"):
+            PROGRESS.cluster_attempts_with(
+                state, "cluster-a", "PENDING", fields={forbidden_key: "smuggled"}
+            )
+    # Allowed fields go through fine.
+    result = PROGRESS.cluster_attempts_with(
+        state, "cluster-a", "PENDING", fields={"converged_at_epoch": 1234.5}
+    )
+    assert result["cluster-a"]["converged_at_epoch"] == 1234.5

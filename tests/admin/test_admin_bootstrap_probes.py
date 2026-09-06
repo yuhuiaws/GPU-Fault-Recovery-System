@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -508,6 +509,107 @@ def test_probe_before_ensure_tasks_survive_a_release_identity_change(
     )
 
 
+# The tasks `bootstrap_tasks.py` re-proves with a read-only probe on every
+# deploy, plus `aurora`, whose reconcilable inputs are the admin config digest and
+# the CPU subnet ids and whose ensure path writes to RDS unconditionally.
+PROBE_COVERED_TASKS = (
+    "pod_identity_agent",
+    "monitoring_install",
+    "aurora_refresh",
+    "load_balancer_controller",
+    "control_plane_role",
+    "email_notifications",
+    "monitoring_resources",
+    "aurora",
+)
+# The tasks with no probe: the digest is their only re-convergence trigger, so it
+# still binds the bytes of `bootstrap.py`.
+UNPROBED_TASKS = ("nlb_network", "pki")
+
+
+def _refactored_repository_root(tmp_path: Path, name: str) -> Path:
+    root = _mirror_repository_root(tmp_path, name)
+    for relative in admin_bootstrap_checkpoint.BOOTSTRAP_RECONCILE_SOURCES:
+        source = root / relative
+        source.write_text(
+            source.read_text(encoding="utf-8") + "\n# a refactor\n", encoding="utf-8"
+        )
+    return root
+
+
+def test_task_digests_ignore_orchestration_source_edits(tmp_path: Path) -> None:
+    """Editing the bootstrap code must not re-run what a probe already re-proves.
+
+    Every task digest embedded the bytes of `bootstrap.py` and its siblings, so
+    any refactor of the orchestration re-ran the heavy ensure paths -- an
+    unconditional `rds modify-db-subnet-group` and its `rds wait`, a PKI
+    regeneration, an NLB reconcile -- on a deploy where no desired resource
+    changed. For a task that `bootstrap_tasks.py` revalidates, the read-only probe
+    is the re-convergence trigger and the module bytes are noise.
+    """
+
+    baseline = _bind_release_inputs(tmp_path, release_id="0100-a")
+    edited_root = _refactored_repository_root(tmp_path, "repository-edited-source")
+
+    refactored = _bind_release_inputs(
+        tmp_path, release_id="0100-a", repository_root=edited_root
+    )
+
+    unchanged = {name: refactored[name] for name in PROBE_COVERED_TASKS}
+    assert unchanged == {name: baseline[name] for name in PROBE_COVERED_TASKS}, (
+        "a code edit alone re-runs probe-covered bootstrap tasks: "
+        + repr(
+            sorted(
+                name
+                for name in PROBE_COVERED_TASKS
+                if baseline[name] != refactored[name]
+            )
+        )
+    )
+    for name in baseline:
+        if name.startswith(("node_keys:", "executor_role:")):
+            assert baseline[name] == refactored[name], (
+                f"a code edit alone re-runs {name}, which a probe re-proves"
+            )
+
+
+def test_unprobed_task_digests_still_track_the_code_that_converges_them(
+    tmp_path: Path,
+) -> None:
+    """`nlb_network` and `pki` have no probe, so the digest is the only trigger.
+
+    `bootstrap_tasks.py` revalidates the platform, notification and role tasks
+    with a read-only probe, but never these two. Dropping `bootstrap.py` from
+    their digests would leave a change to how the NLB or the PKI is converged with
+    nothing at all to re-run it on the next deploy.
+    """
+
+    baseline = _bind_release_inputs(tmp_path, release_id="0100-a")
+    edited_root = _refactored_repository_root(tmp_path, "repository-edited-unprobed")
+
+    refactored = _bind_release_inputs(
+        tmp_path, release_id="0100-a", repository_root=edited_root
+    )
+
+    for name in UNPROBED_TASKS:
+        assert baseline[name] != refactored[name], (
+            f"{name} has no probe and no source binding, so nothing re-runs it"
+        )
+
+
+def test_each_task_has_its_own_digest(tmp_path: Path) -> None:
+    """Two tasks with the same inputs must still be checkpointed separately.
+
+    Two notification tasks are built from the same routing identity, and a shared
+    digest would let one task's checkpoint answer for the other the next time
+    only one of them changes.
+    """
+
+    digests = _bind_release_inputs(tmp_path, release_id="0100-a")
+
+    assert len(set(digests.values())) == len(digests), "two tasks share one digest"
+
+
 def test_monitoring_install_digest_tracks_its_amp_assets(tmp_path: Path) -> None:
     baseline = _bind_release_inputs(tmp_path, release_id="0100-a")
     edited_root = _mirror_repository_root(tmp_path, "repository-edited-rules")
@@ -681,24 +783,109 @@ def test_monitoring_install_probe_requires_ensure_on_drift(
         )
 
 
-def test_aurora_refresh_probe_requires_ensure_on_wheel_drift(tmp_path: Path) -> None:
+AURORA_IMAGE = "runtime@sha256:aaa"
+AURORA_WHEEL = "gpu-fault-control-plane-wheel-0100-abcdef123456"
+AURORA_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:m"
+
+
+def _aurora_cronjob_runner(
+    *,
+    image: str = AURORA_IMAGE,
+    wheel_configmap: str = AURORA_WHEEL,
+    master_secret_arn: str = AURORA_SECRET_ARN,
+):
+    """A kubectl that answers a jsonpath only when it names a single field.
+
+    kubectl evaluates every ``{...}`` group in ``-o jsonpath=`` against the root
+    document and concatenates the results, so a probe that glues a pod-spec
+    prefix and a field expression together reads the whole pod spec instead of
+    the field. This fake reproduces exactly that: it answers the three
+    single-expression projections the probe is allowed to use, and returns the
+    serialized pod spec for anything else -- which is what the live cluster
+    returns for the concatenated form.
+    """
+
+    spec = {
+        "containers": [
+            {
+                "image": image,
+                "env": [
+                    {
+                        "name": "GPU_FAULT_AURORA_MASTER_SECRET_ARN",
+                        "value": master_secret_arn,
+                    }
+                ],
+            }
+        ],
+        "volumes": [{"name": "artifact", "configMap": {"name": wheel_configmap}}],
+    }
+    root = "{.spec.jobTemplate.spec.template.spec"
+    answers = {
+        f"jsonpath={root}.containers[0].image}}": image,
+        f'jsonpath={root}.volumes[?(@.name=="artifact")].configMap.name}}': (
+            wheel_configmap
+        ),
+        f"jsonpath={root}.containers[0]"
+        '.env[?(@.name=="GPU_FAULT_AURORA_MASTER_SECRET_ARN")].value}': (
+            master_secret_arn
+        ),
+    }
+
     class Runner:
         dry_run = False
 
         def run(self, arguments, **kwargs):
-            if "jsonpath" in " ".join(arguments) and "image}" in " ".join(arguments):
-                return "runtime@sha256:aaa"
-            return "gpu-fault-control-plane-wheel-0100-stale0000000"
+            requested = [item for item in arguments if item.startswith("jsonpath=")]
+            assert len(requested) == 1, arguments
+            return answers.get(requested[0], json.dumps(spec))
+
+    return Runner()
+
+
+def _assert_aurora_refresh(runner, tmp_path: Path) -> None:
+    admin_bootstrap_platform_probes.assert_aurora_refresh_current(
+        ReadOnlyProbeRunner(runner),
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+        wheel_configmap=AURORA_WHEEL,
+        runtime_image=AURORA_IMAGE,
+        master_secret_arn=AURORA_SECRET_ARN,
+    )
+
+
+def test_aurora_refresh_probe_passes_when_live_matches(tmp_path: Path) -> None:
+    """A CronJob that already matches must not send the release into ensure.
+
+    Every deploy paid for an apply, a verify Job and a 420s ``kubectl wait``
+    because the probe's jsonpath read the pod spec instead of the image, so the
+    comparison could never match. Reading a field back is the whole point of the
+    probe: if this passes only by accident the ensure path runs forever.
+    """
+
+    _assert_aurora_refresh(_aurora_cronjob_runner(), tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("drift", "detail"),
+    [
+        ({"image": "runtime@sha256:old"}, "a rolled-back runtime image"),
+        (
+            {"wheel_configmap": "gpu-fault-control-plane-wheel-0100-stale0000000"},
+            "a stale wheel ConfigMap",
+        ),
+        (
+            {"master_secret_arn": "arn:aws:secretsmanager:us-east-1:1:secret:other"},
+            "a different master Secret",
+        ),
+    ],
+)
+def test_aurora_refresh_probe_requires_ensure_on_drift(
+    tmp_path: Path, drift: dict[str, str], detail: str
+) -> None:
+    """Each of the three projections must be read, and each must fail closed."""
 
     with pytest.raises(BootstrapMutationRequired):
-        admin_bootstrap_platform_probes.assert_aurora_refresh_current(
-            ReadOnlyProbeRunner(Runner()),
-            cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
-            namespace="gpu-fault-system",
-            wheel_configmap="gpu-fault-control-plane-wheel-0100-abcdef123456",
-            runtime_image="runtime@sha256:aaa",
-            master_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:m",
-        )
+        _assert_aurora_refresh(_aurora_cronjob_runner(**drift), tmp_path)
 
 
 def _node_key_probe_runner(
@@ -831,3 +1018,162 @@ def test_bootstrap_input_digest_invalidates_only_stale_task_checkpoints(
     state.bind_inputs("b" * 64, {"pki": "1" * 64, "aurora": "3" * 64})
     assert state.value["completed_tasks"] == ["pki"]
     assert state.value["resources"]["pki"] == {"certificate_arn": "arn:certificate"}
+
+
+def _control_plane_identity_runner(calls: list[list[str]]):
+    """A control plane whose identity already matches, recording every read.
+
+    The interesting number in the tests below is how many times a converged
+    deploy asks AWS the same question, so this fake answers every read of the
+    healthy path and refuses any mutation.
+    """
+
+    trust = admin_bootstrap_services.pod_identity_trust()
+    policy = admin_bootstrap_services.control_plane_policy_document(
+        region="us-east-1", account_id="123456789012"
+    )
+    role_arn = "arn:aws:iam::123456789012:role/gpu-fault-site-a-control"
+
+    class Runner:
+        dry_run = False
+
+        def run(self, arguments, **kwargs):
+            argv = list(arguments)
+            calls.append(argv)
+            if kwargs.get("mutate"):
+                raise AssertionError(f"a converged identity was rewritten: {argv}")
+            if argv[0] == "kubectl":
+                return "serviceaccount/gpu-fault-control-plane"
+            if "describe-addon" in argv:
+                return json.dumps(
+                    {
+                        "addon": {
+                            "addonArn": (
+                                "arn:aws:eks:us-east-1:123456789012:addon/control/a"
+                            )
+                        }
+                    }
+                )
+            if "list-tags-for-resource" in argv:
+                return json.dumps(
+                    {"tags": {admin_bootstrap_services.SITE_TAG_KEY: "site-a"}}
+                )
+            if "wait" in argv:
+                return ""
+            if "get-role-policy" in argv:
+                return json.dumps({"PolicyDocument": policy})
+            if "get-role" in argv:
+                return json.dumps(
+                    {
+                        "Role": {
+                            "AssumeRolePolicyDocument": trust,
+                            "Tags": [
+                                {
+                                    "Key": admin_bootstrap_services.SITE_TAG_KEY,
+                                    "Value": "site-a",
+                                }
+                            ],
+                        }
+                    }
+                )
+            if "list-pod-identity-associations" in argv:
+                return json.dumps({"associations": [{"associationId": "assoc-a"}]})
+            if "describe-pod-identity-association" in argv:
+                return json.dumps(
+                    {"association": {"associationId": "assoc-a", "roleArn": role_arn}}
+                )
+            raise AssertionError(argv)
+
+        def aws_json(self, region, *arguments, **kwargs):
+            return json.loads(
+                self.run(
+                    ["aws", *arguments, "--region", region, "--output", "json"],
+                    **kwargs,
+                )
+            )
+
+    return Runner()
+
+
+def _forbidden_subprocess(calls: list[list[str]]):
+    def run(arguments, **_kwargs):
+        calls.append(list(arguments))
+        raise AssertionError(
+            f"a bootstrap read bypassed the command runner: {list(arguments)}"
+        )
+
+    return run
+
+
+def test_pod_identity_agent_is_probed_once_per_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The add-on is described and waited for once, not once per caller.
+
+    `revalidate_pod_identity_agent`, the control-plane role and the load balancer
+    controller each ensured the add-on, and each one paid for a describe plus an
+    `aws eks wait addon-active`. The add-on cannot change between two calls in
+    one deploy, so the first successful read is the evidence for the rest of the
+    run -- including for the ensure that follows a healthy read-only probe.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    calls: list[list[str]] = []
+    runner = _control_plane_identity_runner(calls)
+    monkeypatch.setattr(
+        admin_bootstrap_services.subprocess, "run", _forbidden_subprocess(calls)
+    )
+    arguments: dict[str, Any] = {
+        "cpu": _cluster(),
+        "cpu_kubeconfig": tmp_path / "cpu.kubeconfig",
+        "namespace": "gpu-fault-system",
+        "site_id": "site-a",
+    }
+
+    probed = admin_bootstrap_services.ensure_control_plane_role(
+        ReadOnlyProbeRunner(runner), **arguments
+    )
+    ensured = admin_bootstrap_services.ensure_control_plane_role(runner, **arguments)
+
+    assert probed["role_arn"] == ensured["role_arn"]
+    assert len([argv for argv in calls if "describe-addon" in argv]) == 1, (
+        "the Pod Identity add-on was described more than once in one run"
+    )
+    assert len([argv for argv in calls if "addon-active" in argv]) == 1, (
+        "the run waited for the same add-on to become active more than once"
+    )
+
+
+def test_ensure_role_reads_each_role_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One IAM read answers both the existence question and the drift question.
+
+    The silent `aws iam get-role` existence probe and the logged read returned
+    the same document, and so did the two `get-role-policy` calls, so every role
+    in the deploy cost four IAM reads to decide it was already correct.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    calls: list[list[str]] = []
+    runner = _control_plane_identity_runner(calls)
+    monkeypatch.setattr(
+        admin_bootstrap_services.subprocess, "run", _forbidden_subprocess(calls)
+    )
+
+    admin_bootstrap_services.probe_iam_role(
+        runner,
+        account_id="123456789012",
+        role_name="gpu-fault-site-a-control",
+        trust=admin_bootstrap_services.pod_identity_trust(),
+        policy_name="GPUFaultRegionalObserve",
+        policy=admin_bootstrap_services.control_plane_policy_document(
+            region="us-east-1", account_id="123456789012"
+        ),
+        site_id="site-a",
+    )
+
+    assert len([argv for argv in calls if "get-role" in argv]) == 1, (
+        "the role document was read twice to answer one question"
+    )
+    assert len([argv for argv in calls if "get-role-policy" in argv]) == 1, (
+        "the inline policy was read twice to answer one question"
+    )

@@ -732,8 +732,13 @@ class ReleaseConfig:
             raise ReleaseError(
                 "release rollout max unavailable values must be integers"
             ) from exc
-        if not 1 <= upgrade_max_unavailable <= 32:
-            raise ReleaseError("release.upgrade_max_unavailable must be within 1..32")
+        # 0 means "auto": the rollout policy uses the built-in size cap it
+        # already computes from the node count, instead of a number the site
+        # had to guess. A configured value still caps the cap.
+        if not 0 <= upgrade_max_unavailable <= 32:
+            raise ReleaseError(
+                "release.upgrade_max_unavailable must be within 0..32 (0 = auto)"
+            )
         if not 1 <= rollback_max_unavailable <= 4:
             raise ReleaseError("release.rollback_max_unavailable must be within 1..4")
         # Cross-cluster parallelism multiplies the blast radius of one release, so

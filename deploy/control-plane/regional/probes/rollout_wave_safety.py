@@ -19,6 +19,13 @@ Three independent things make a wave unsafe, and each is counted separately:
   waiting to be closed rather than live danger;
 * nodes *outside* the wave whose agent is not healthy -- taking the wave down
   then leaves the cluster with no margin at all.
+
+The report also carries ``minimum_lease_remaining_seconds``: the smallest lease
+remaining across those outside nodes, in the same units as the request's
+threshold of the same name. It is what lets the engine re-decide the same
+question against a *larger* margin -- the one that must still hold after the
+wave lease is taken -- by subtracting the time since this read instead of
+paying for a second identical exec.
 """
 
 import json
@@ -68,6 +75,7 @@ def main() -> None:
     }
     agent_blockers: list[dict[str, Any]] = []
     agent_blocker_count = 0
+    lease_remaining_seconds: list[float] = []
     for node_id in sorted(required):
         agent = agents.get(node_id)
         if agent is None:
@@ -81,6 +89,8 @@ def main() -> None:
             if agent.lease_expires_at is None
             else (agent.lease_expires_at - now).total_seconds()
         )
+        if lease_remaining is not None:
+            lease_remaining_seconds.append(lease_remaining)
         if lifecycle != "ACTIVE":
             reason = "lifecycle-" + str(lifecycle)
         elif lease_remaining is None:
@@ -112,6 +122,9 @@ def main() -> None:
         "resolved_destructive_workflows": resolved_destructive[:20],
         "agent_blocker_count": agent_blocker_count,
         "agent_blockers": agent_blockers,
+        "minimum_lease_remaining_seconds": (
+            min(lease_remaining_seconds) if lease_remaining_seconds else None
+        ),
     }
     print(json.dumps(result, sort_keys=True))
 

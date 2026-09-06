@@ -406,7 +406,7 @@ def main() -> None:
         "GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP",
         "gpu-fault-node-installer-template",
     )
-    poll_seconds = int(os.environ.get("GPU_FAULT_RECONCILE_SECONDS", "15"))
+    poll_seconds = int(os.environ.get("GPU_FAULT_RECONCILE_SECONDS", "5"))
     retry_seconds = int(os.environ.get("GPU_FAULT_INSTALL_RETRY_SECONDS", "300"))
     max_unavailable = int(os.environ.get("GPU_FAULT_INSTALLER_MAX_UNAVAILABLE", "1"))
     active_deadline_seconds = int(

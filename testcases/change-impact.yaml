@@ -154,9 +154,11 @@ rules:
       - src/gpu_fault/fleet_deployment.py
       - scripts/capture_release_evidence.py
       - scripts/release_deploy.py
+      - scripts/release_deploy_evidence.py
       - scripts/deploy_source_identity.py
       - scripts/restore_ci_candidate.py
       - scripts/staging_deploy.py
+      - scripts/staging_state_hygiene.py
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
       - tests/test_staging_deploy.py
@@ -209,6 +211,7 @@ rules:
       - scripts/setup-deploy-host.sh
       - scripts/setup_deploy_host.py
       - scripts/staging_deploy.py
+      - scripts/staging_state_hygiene.py
       - config/admin-config.example.yaml
       - src/gpu_fault/admin/bootstrap_dependencies.py
       - src/gpu_fault/data/deploy-host-tools.json

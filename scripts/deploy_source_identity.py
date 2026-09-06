@@ -31,6 +31,7 @@ DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "scripts/ci_candidate_receipt.py",
     "scripts/deploy_source_identity.py",
     "scripts/release_deploy.py",
+    "scripts/release_deploy_evidence.py",
     "scripts/release_failure_recovery.py",
     "scripts/release_live_state.py",
     "scripts/run_release_gates.py",
@@ -39,7 +40,9 @@ DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "scripts/setup-deploy-host.sh",
     "scripts/setup_deploy_host.py",
     "scripts/staging_deploy.py",
+    "scripts/staging_gate_caches.py",
     "scripts/staging_live_evidence.py",
+    "scripts/staging_state_hygiene.py",
 )
 APPLICATION_IDENTITY_PROTOCOL_INPUTS = (
     "config/release-identity.yaml",

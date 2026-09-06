@@ -139,7 +139,14 @@ def assert_monitoring_install_current(
 
 
 AURORA_REFRESH_CRONJOB = "gpu-fault-aurora-credential-refresh"
-_AURORA_REFRESH_POD = "{.spec.jobTemplate.spec.template.spec}"
+# One kubectl jsonpath expression, deliberately left unterminated so each
+# projection below closes it. `{a}{b}` is not "b inside a": kubectl evaluates
+# both groups against the root document and concatenates the results, so the
+# earlier `"{...spec}" + "{.containers[0].image}"` printed the whole pod spec
+# and every comparison in this probe failed. A failing probe is not visible as
+# an error -- it just means the apply, the verify Job and its 420s wait ran on
+# every deploy.
+_AURORA_REFRESH_POD = "{.spec.jobTemplate.spec.template.spec"
 
 
 def assert_aurora_refresh_current(
@@ -160,6 +167,12 @@ def assert_aurora_refresh_current(
     """
 
     def projection(expression: str) -> str:
+        """Read one field of the CronJob's pod spec.
+
+        `expression` continues `_AURORA_REFRESH_POD`: it starts with a `.` and
+        closes the single jsonpath group with `}`.
+        """
+
         return kubectl_projection(
             runner,
             kubeconfig=cpu_kubeconfig,
@@ -173,14 +186,14 @@ def assert_aurora_refresh_current(
             ],
         )
 
-    image = projection("{.containers[0].image}")
+    image = projection(".containers[0].image}")
     if image != runtime_image:
         raise BootstrapMutationRequired(f"{AURORA_REFRESH_CRONJOB} image")
-    artifact = projection('{.volumes[?(@.name=="artifact")].configMap.name}')
+    artifact = projection('.volumes[?(@.name=="artifact")].configMap.name}')
     if artifact != wheel_configmap:
         raise BootstrapMutationRequired(f"{AURORA_REFRESH_CRONJOB} wheel")
     secret_arn = projection(
-        '{.containers[0].env[?(@.name=="GPU_FAULT_AURORA_MASTER_SECRET_ARN")].value}'
+        '.containers[0].env[?(@.name=="GPU_FAULT_AURORA_MASTER_SECRET_ARN")].value}'
     )
     if secret_arn != master_secret_arn:
         raise BootstrapMutationRequired(f"{AURORA_REFRESH_CRONJOB} master secret")

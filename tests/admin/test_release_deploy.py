@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -44,6 +45,30 @@ def _release_diff(
         "mode": "release-diff",
         "state_sha256": "a" * 64,
         "next_deploy": {"kind": kind, "changed": changed or [], "resume": False},
+    }
+
+
+def _pending_commit_diff(
+    *, state_sha256: str = "b" * 64, release_id: str = "release-a"
+) -> dict[str, object]:
+    """The diff a successful `rollout deploy` leaves behind.
+
+    Everything is applied and quick validation passed; the commit is the only
+    outstanding step, which is why `next_deploy` calls it a resume and names the
+    release the evidence has to match.
+    """
+
+    return {
+        "mode": "release-diff",
+        "state_sha256": state_sha256,
+        "next_deploy": {
+            "kind": "CONTROL_PLANE_ONLY",
+            "changed": ["control_plane_wheel"],
+            "resume": True,
+            "action": "upgrade",
+            "pending_commit": True,
+            "release_id": release_id,
+        },
     }
 
 
@@ -415,8 +440,13 @@ def test_execute_release_falls_back_to_deploy_for_non_noop_change(
 
     assert calls[0][1][1] == "release-diff"
     assert calls[1][1][3] == "deploy"
-    assert calls[2][1][3] == "verify"
-    assert calls[3][1][1] == "stability"
+    # verify and the stability window are independent read-only phases and now
+    # run on two threads, so which of them reaches the fake first is not part of
+    # the contract. That both precede the commit is.
+    assert sorted(
+        "stability" if "stability" in command else "verify"
+        for _kind, command in calls[2:4]
+    ) == ["stability", "verify"]
     assert calls[4][0] == "run"
     assert calls[4][1][1] == "commit"
     assert calls[5][1][1] == "release-summary"
@@ -1008,3 +1038,180 @@ def test_profile_approval_survives_failed_release_and_resumes(
     )
     consumed = json.loads((archive / "consumed.json").read_text())
     assert consumed["relation"] == "PREPARED_RESUME"
+
+
+def test_verify_and_stability_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`cli verify` and `rollout stability` run at the same time.
+
+    Both are read-only, neither reads anything the other writes, and on
+    production they cost 44 s and 128 s -- the stability window being almost
+    entirely sleep. Run serially that is nearly three minutes of the release
+    spent waiting twice. Each fake below refuses to return until it has seen the
+    other start, so a serial driver cannot get past this case.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    site = _site(tmp_path, monkeypatch)
+    verify_started = threading.Event()
+    stability_started = threading.Event()
+    monkeypatch.setattr(release_deploy, "_run", lambda *_args, **_kwargs: None)
+
+    def run_json(arguments, **_kwargs):
+        command = list(arguments)
+        if "verify" in command:
+            verify_started.set()
+            assert stability_started.wait(timeout=10), (
+                "the stability window had not started while verify was running"
+            )
+            return _verification_report()
+        if "stability" in command:
+            stability_started.set()
+            assert verify_started.wait(timeout=10), (
+                "verify had not started while the stability window was running"
+            )
+            return _stability_report()
+        if "release-diff" in command:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    prepared = release_deploy.execute_release(
+        site,
+        run_checks=False,
+        live_state={
+            "release_id": "release-a",
+            "runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
+        },
+    )
+
+    state = json.loads((prepared.state_dir / "state.json").read_text())
+    assert state["phase"] == "COMPLETED", "the release must reach COMPLETED phase"
+    assert state["verification"]["status"] == "PASSED", "verification must pass"
+    assert state["stability"]["status"] == "PASSED", "stability must pass"
+    assert (prepared.state_dir / release_deploy.VERIFICATION_REPORT).is_file(), (
+        "verification report must be written"
+    )
+    assert (prepared.state_dir / release_deploy.STABILITY_REPORT).is_file(), (
+        "stability report must be written"
+    )
+
+
+@pytest.mark.parametrize("failing", ["verify", "stability"])
+def test_a_concurrent_phase_failure_rolls_back_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    """Two phases in flight, one rollback.
+
+    Running them together must not turn one failure into two recoveries, and the
+    surviving phase must not be able to drive the release forward past a failure
+    in the other.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    site = _site(tmp_path, monkeypatch)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        release_deploy,
+        "_run",
+        lambda arguments, **_kwargs: commands.append(list(arguments)),
+    )
+
+    def run_json(arguments, **_kwargs):
+        command = list(arguments)
+        if "verify" in command:
+            if failing == "verify":
+                raise release_deploy.ReleaseDeployError("verify failed")
+            return _verification_report()
+        if "stability" in command:
+            if failing == "stability":
+                return {"mode": "stability", "healthy": False, "window_seconds": 120}
+            return _stability_report()
+        if "release-diff" in command:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    with pytest.raises(release_deploy.ReleaseDeployError):
+        release_deploy.execute_release(
+            site,
+            run_checks=False,
+            live_state={
+                "release_id": "release-a",
+                "runtime_profile_sha256": hashlib.sha256(
+                    profile.read_bytes()
+                ).hexdigest(),
+            },
+        )
+
+    assert [command[1] for command in commands].count("rollback") == 1
+    assert not any(command[1] == "commit" for command in commands), (
+        "a failed phase let the release commit"
+    )
+    state = json.loads(
+        (site.parent / "release-deploy/release-a/state.json").read_text()
+    )
+    assert state["phase"] == "FAILED"
+    assert state["rollback"]["status"] == "PASSED"
+
+
+def test_a_stability_failure_still_records_the_verification_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify produced a result, so the failed release keeps it.
+
+    Serially the verification report was always on disk by the time the stability
+    window ran, so a stability failure left an operator able to see that the fleet
+    had verified. Running the two phases together must not cost that: the report
+    the release paid 44 s for is written, and the VERIFIED phase recorded, before
+    the stability failure is re-raised.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    site = _site(tmp_path, monkeypatch)
+    monkeypatch.setattr(release_deploy, "_run", lambda *_args, **_kwargs: None)
+
+    def run_json(arguments, **_kwargs):
+        command = list(arguments)
+        if "verify" in command:
+            return _verification_report()
+        if "stability" in command:
+            return {"mode": "stability", "healthy": False, "window_seconds": 120}
+        if "release-diff" in command:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    with pytest.raises(release_deploy.ReleaseDeployError, match="stability"):
+        release_deploy.execute_release(
+            site,
+            run_checks=False,
+            live_state={
+                "release_id": "release-a",
+                "runtime_profile_sha256": hashlib.sha256(
+                    profile.read_bytes()
+                ).hexdigest(),
+            },
+        )
+
+    state_dir = site.parent / "release-deploy/release-a"
+    assert (state_dir / release_deploy.VERIFICATION_REPORT).is_file(), (
+        "the verification report the release produced was thrown away"
+    )
+    state = json.loads((state_dir / "state.json").read_text())
+    assert state["verification"]["status"] == "PASSED", (
+        "verification must pass before stability fails"
+    )
+    assert state["phase"] == "FAILED", (
+        "the release must fail after stability check fails"
+    )
+    assert not (state_dir / release_deploy.STABILITY_REPORT).exists(), (
+        "a failed stability window must not leave a stability report"
+    )

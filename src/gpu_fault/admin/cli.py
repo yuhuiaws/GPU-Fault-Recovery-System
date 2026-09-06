@@ -1054,6 +1054,10 @@ def _validate_live_release_identity(
     if phase not in {
         "complete",
         "completed",
+        # Mirrors `regional_admin_commands.RESUMABLE_PHASES`: every phase an
+        # upgrade can be resumed from is a phase an approved admin-config plan
+        # may find live.
+        "candidate-preflight-ready",
         "cpu-staged",
         "cpu-finalized",
         "data-plane-progress",

@@ -177,6 +177,13 @@ artifact清单。没有凭据、没有候选或API临时不可用时回退本地
 static分支内部继续把Ruff、mypy、compile、架构、代码契约、安全、部署配置、文档、
 YAML和Shell拆成最多10路；`GPU_FAULT_STATIC_GATE_PARALLELISM=1..10`可主动收口。
 
+门禁的mypy/ruff/pytest缓存目录位于`state-dir`下，dirty与clean路径都会复用。每次成功部署后
+按保留规则清理`state-dir/source-snapshots/<fingerprint>/`与`state-dir/.deployer-venv.versions/*`：
+被`source-deploy.json`、`source-deploy-success.json`引用的快照、当前部署的快照以及最新
+`GPU_FAULT_SOURCE_SNAPSHOT_RETAINED`个（默认5，不要低于2）保留；venv版本保留当前激活、state绑定、
+`.deployer-venv.previous`所指以及最新`GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED`个（默认3）。
+同一次deploy只在站点锁内收集一次部署前live evidence，部署成功后再收集一次作为成功记录。
+
 任何签名、commit、平台、摘要、集群身份或资源状态不确定时均fail closed。
 snapshot中的content-addressed release Manifest与签名材料会随site持续保留；
 开发checkout后续运行测试或生成新的`dist/`不会改变已部署站点的

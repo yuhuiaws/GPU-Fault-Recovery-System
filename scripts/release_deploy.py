@@ -4,11 +4,10 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -43,6 +42,20 @@ from gpu_fault.models import CapabilityMode, RuntimeProfile
 
 if __package__:
     from scripts.release_attestation import verify_attestation
+    from scripts.release_deploy_evidence import (
+        PreparedRelease,
+        ReleaseDeployError,
+        is_clean_noop_diff,
+        is_pending_commit_diff,
+        release_manifest,
+        release_summary_warnings,
+        sha256_file,
+        update_phase,
+        utc_now,
+        validate_stability_report,
+        validate_verification_report,
+        verification_metadata,
+    )
     from scripts.release_failure_recovery import (
         recover_release_failure,
     )
@@ -57,6 +70,20 @@ if __package__:
     )
 else:
     from release_attestation import verify_attestation
+    from release_deploy_evidence import (
+        PreparedRelease,
+        ReleaseDeployError,
+        is_clean_noop_diff,
+        is_pending_commit_diff,
+        release_manifest,
+        release_summary_warnings,
+        sha256_file,
+        update_phase,
+        utc_now,
+        validate_stability_report,
+        validate_verification_report,
+        verification_metadata,
+    )
     from release_failure_recovery import (
         recover_release_failure,
     )
@@ -72,27 +99,10 @@ STABILITY_REPORT = "stability-report.json"
 RELEASE_SUMMARY_REPORT = "release-summary.json"
 EXPECTED_STATE_SHA256_ENV = "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256"
 QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
-RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-
-
-class ReleaseDeployError(RuntimeError):
-    pass
 
 
 class ReleaseStateNotFound(ReleaseDeployError):
     pass
-
-
-@dataclass(frozen=True)
-class PreparedRelease:
-    site_file: Path
-    release_id: str
-    runtime_profile_version: str
-    agent_config_digest: str
-    profile_change_kind: str
-    profile_approval: str | None
-    state_dir: Path
-    site_changed: bool
 
 
 @dataclass(frozen=True)
@@ -179,10 +189,6 @@ def _resolve_profile_path(root: Path, value: str) -> Path:
     return (path if path.is_absolute() else root / path).resolve()
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _profile_definition(
     path: Path,
     *,
@@ -235,7 +241,7 @@ def _profile_definition(
     digest = hashlib.sha256(
         json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    return profile, digest, _sha256(path), normalized
+    return profile, digest, sha256_file(path), normalized
 
 
 def _mode_rank(mode: CapabilityMode) -> int:
@@ -368,14 +374,14 @@ def plan_runtime_profile(
 
     current: RuntimeProfile | None = None
     current_document: dict[str, Any] | None = None
-    active_sha = _sha256(active_source) if active_source.is_file() else None
+    active_sha = sha256_file(active_source) if active_source.is_file() else None
     active_is_live = live_profile_sha256 is None or active_sha == live_profile_sha256
     if not active_is_live and live_profile_sha256 is not None:
         recovered_source = (
             site_file.parent / "profiles" / f"{current_version}.yaml"
         ).resolve()
         recovered_sha = (
-            _sha256(recovered_source) if recovered_source.is_file() else None
+            sha256_file(recovered_source) if recovered_source.is_file() else None
         )
         if recovered_sha == live_profile_sha256:
             active_source = recovered_source
@@ -494,31 +500,6 @@ def _write_profile_snapshot(plan: ProfilePlan) -> None:
     temporary.replace(path)
 
 
-def _release_manifest(root: Path) -> tuple[dict[str, Any], str]:
-    path = root / "dist/current-release.json"
-    if not path.is_file():
-        raise ReleaseDeployError(
-            "dist/current-release.json is missing; the build gate did not produce a release"
-        )
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ReleaseDeployError(f"invalid release manifest {path}: {exc}") from exc
-    release_id = str(manifest.get("release_id") or "").strip()
-    if not RELEASE_ID_PATTERN.fullmatch(release_id):
-        raise ReleaseDeployError("release manifest has no valid release_id")
-    immutable = root / "dist" / release_id / "release.json"
-    if not immutable.is_file():
-        raise ReleaseDeployError(
-            f"content-addressed release manifest is missing: {immutable}"
-        )
-    if immutable.read_bytes() != path.read_bytes():
-        raise ReleaseDeployError(
-            "current-release.json differs from its content-addressed release.json"
-        )
-    return manifest, release_id
-
-
 def prepare_site_release(
     site_file: Path,
     *,
@@ -530,7 +511,7 @@ def prepare_site_release(
         raise ReleaseDeployError(
             "site repositoryRoot changed during release preparation"
         )
-    manifest, release_id = _release_manifest(rendered.repository_root)
+    manifest, release_id = release_manifest(rendered.repository_root)
     document = _read_site_document(site_file)
     spec = _mapping(document.get("spec"), "site spec")
     release = _mapping(spec.get("release"), "site spec.release")
@@ -697,39 +678,6 @@ def _run_json(
     return value
 
 
-def _utc_now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
-
-def _verification_metadata(path: Path, report: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "status": "PASSED",
-        "path": str(path),
-        "sha256": _sha256(path),
-        "verified_at": _utc_now(),
-        "summary": report.get("summary"),
-    }
-
-
-def _validate_verification_report(report: dict[str, Any]) -> None:
-    if report.get("mode") != "verify":
-        raise ReleaseDeployError("verification command returned the wrong report mode")
-    if report.get("healthy") is not True:
-        raise ReleaseDeployError("verification report is not healthy")
-    summary = report.get("summary")
-    if not isinstance(summary, dict) or summary.get("FAIL") != 0:
-        raise ReleaseDeployError("verification report has an invalid summary")
-    if not isinstance(report.get("checks"), list):
-        raise ReleaseDeployError("verification report has no check evidence")
-
-
-def _validate_stability_report(report: dict[str, Any]) -> None:
-    if report.get("mode") != "stability" or report.get("healthy") is not True:
-        raise ReleaseDeployError("release stability report is not healthy")
-    if int(report.get("window_seconds") or 0) < 120:
-        raise ReleaseDeployError("release stability report has an invalid window")
-
-
 def _collect_release_summary(
     site_file: Path,
     *,
@@ -839,45 +787,6 @@ def _run_release_mode(
         )
 
 
-def _release_summary_warnings(report: dict[str, Any]) -> list[str]:
-    warnings: list[str] = []
-    for field in ("release_status_error", "next_deploy_error"):
-        if report.get(field):
-            warnings.append(f"{field}: {report[field]}")
-    next_deploy = report.get("next_deploy")
-    if not isinstance(next_deploy, dict):
-        warnings.append("release summary has no next_deploy classification")
-    elif next_deploy.get("kind") != "NOOP":
-        warnings.append(
-            "release summary reports a non-NOOP next deploy: "
-            + json.dumps(next_deploy, sort_keys=True)
-        )
-    return warnings
-
-
-def _is_clean_noop_diff(report: dict[str, Any]) -> bool:
-    next_deploy = report.get("next_deploy")
-    changed = next_deploy.get("changed") if isinstance(next_deploy, dict) else None
-    return (
-        report.get("mode") == "release-diff"
-        and isinstance(next_deploy, dict)
-        and next_deploy.get("kind") == "NOOP"
-        and next_deploy.get("action", "upgrade") == "upgrade"
-        and next_deploy.get("resume", False) is False
-        and isinstance(changed, list)
-        and set(changed).issubset({"release_delivery", "rendered_manifests"})
-        and isinstance(report.get("state_sha256"), str)
-        and len(str(report["state_sha256"])) == 64
-    )
-
-
-def _update_phase(prepared: PreparedRelease, phase: str, **values: Any) -> None:
-    state_path = prepared.state_dir / "state.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    state.update({"phase": phase, **values})
-    write_json_atomic(state_path, state)
-
-
 def _complete_release(
     prepared: PreparedRelease,
     *,
@@ -897,17 +806,17 @@ def _complete_release(
                 root=root,
                 environment=environment,
             )
-            summary_generated_at = _utc_now()
+            summary_generated_at = utc_now()
         summary_path = prepared.state_dir / RELEASE_SUMMARY_REPORT
         write_json_atomic(summary_path, summary_report)
-        completion_warnings.extend(_release_summary_warnings(summary_report))
+        completion_warnings.extend(release_summary_warnings(summary_report))
         release_summary = {
             "status": (
                 "AVAILABLE_WITH_WARNINGS" if completion_warnings else "AVAILABLE"
             ),
             "path": str(summary_path),
-            "sha256": _sha256(summary_path),
-            "generated_at": summary_generated_at or _utc_now(),
+            "sha256": sha256_file(summary_path),
+            "generated_at": summary_generated_at or utc_now(),
             "next_deploy": summary_report.get("next_deploy"),
         }
     except Exception as exc:
@@ -915,11 +824,11 @@ def _complete_release(
         completion_warnings.append(warning)
         release_summary = {
             "status": "UNAVAILABLE",
-            "generated_at": _utc_now(),
+            "generated_at": utc_now(),
             "error": warning,
         }
         print(f"release-deploy: warning: {warning}", file=sys.stderr)
-    _update_phase(
+    update_phase(
         prepared,
         "COMPLETED",
         verification=verification,
@@ -997,7 +906,7 @@ def _consume_profile_approval_state(
             relation=resolution.relation,
         )
     except ProfileApprovalError as exc:
-        _update_phase(
+        update_phase(
             prepared,
             "COMPLETED",
             profile_approval_audit={
@@ -1008,7 +917,7 @@ def _consume_profile_approval_state(
         raise ReleaseDeployError(
             "release completed but Profile approval archival failed: " + str(exc)
         ) from exc
-    _update_phase(
+    update_phase(
         prepared,
         "COMPLETED",
         profile_approval_audit={
@@ -1054,7 +963,7 @@ def _deployment_decision(
             },
             None,
         )
-    if not _is_clean_noop_diff(candidate_diff):
+    if not is_clean_noop_diff(candidate_diff):
         return (
             {
                 "status": "APPLIED",
@@ -1107,10 +1016,16 @@ def _finalize_quick_validation_evidence(
             root=root,
             environment=environment,
         )
-        if not _is_clean_noop_diff(diff):
-            raise ValueError("post-deploy release state is not NOOP")
+        if not (
+            is_pending_commit_diff(diff, prepared.release_id)
+            or is_clean_noop_diff(diff)
+        ):
+            raise ValueError(
+                "post-deploy release state is neither a pending commit for "
+                f"{prepared.release_id} nor a clean NOOP"
+            )
         value["release_state_sha256"] = diff["state_sha256"]
-        value["finalized_at"] = _utc_now()
+        value["finalized_at"] = utc_now()
         write_json_atomic(path, value)
         path.chmod(0o600)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -1121,6 +1036,152 @@ def _finalize_quick_validation_evidence(
         )
         return None
     return path
+
+
+def _run_verification_and_stability(
+    prepared: PreparedRelease,
+    *,
+    site_file: Path,
+    root: Path,
+    environment: Mapping[str, str],
+    deployment: Mapping[str, Any],
+    reusable_quick_evidence: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Verify the fleet and watch it hold steady, then record both reports.
+
+    Returns the recorded ``(verification, stability)`` metadata. The first
+    failure is raised -- verify ahead of the stability window -- and only after
+    both phases have finished, so nothing is still probing a cluster the
+    caller's rollback is about to move.
+    """
+
+    def run_verification() -> dict[str, Any]:
+        report = _run_json(
+            [
+                sys.executable,
+                "-m",
+                "gpu_fault.admin.cli",
+                "verify",
+                "-f",
+                str(site_file),
+            ],
+            cwd=root,
+            environment={
+                **environment,
+                **(
+                    {QUICK_VALIDATION_EVIDENCE_ENV: str(reusable_quick_evidence)}
+                    if reusable_quick_evidence is not None
+                    else {}
+                ),
+            },
+        )
+        validate_verification_report(report)
+        return report
+
+    def run_stability() -> dict[str, Any] | None:
+        if deployment["fast_path"]:
+            return None
+        report = _collect_stability_report(
+            site_file,
+            root=root,
+            environment=environment,
+        )
+        validate_stability_report(report)
+        return report
+
+    # Both phases are read-only and neither reads anything the other writes,
+    # but on production verify costs 44 s and the stability window 128 s --
+    # nearly all of it sleeping between samples. Serially that is most of
+    # three minutes of the release spent waiting twice.
+    #
+    # Every result is awaited before any is acted on: a failure in one phase
+    # must not leave the other's subprocess still probing a cluster the
+    # caller's rollback is about to move. A verify failure is the one raised when
+    # both fail, so verify keeps reporting itself ahead of a stability window
+    # that was doomed the moment verify failed.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        verification_future = executor.submit(run_verification)
+        stability_future = executor.submit(run_stability)
+        verification_report: dict[str, Any] | None = None
+        stability_report: dict[str, Any] | None = None
+        verification_error: Exception | None = None
+        stability_error: Exception | None = None
+        try:
+            verification_report = verification_future.result()
+        except Exception as error:
+            verification_error = error
+        try:
+            stability_report = stability_future.result()
+        except Exception as error:
+            stability_error = error
+    # A verify result that was produced is recorded even when the stability
+    # window then fails. Serially it always was, and an operator reading the
+    # failed release still needs to know whether the fleet verified before it
+    # went unstable -- losing that to the concurrency would be a report the
+    # release paid 44 s for and then threw away.
+    if verification_report is not None:
+        verification_path = prepared.state_dir / VERIFICATION_REPORT
+        write_json_atomic(verification_path, verification_report)
+        verification = verification_metadata(
+            verification_path,
+            verification_report,
+        )
+        update_phase(prepared, "VERIFIED", verification=verification)
+    if verification_error is not None:
+        raise verification_error
+    if stability_error is not None:
+        raise stability_error
+    if stability_report is None:
+        stability = {
+            "status": "SKIPPED_NOOP",
+            "reason": "no release mutation occurred",
+        }
+    else:
+        stability_path = prepared.state_dir / STABILITY_REPORT
+        write_json_atomic(stability_path, stability_report)
+        stability = verification_metadata(
+            stability_path,
+            stability_report,
+        )
+        update_phase(
+            prepared,
+            "STABLE",
+            verification=verification,
+            stability=stability,
+        )
+    return verification, stability
+
+
+def _commit_and_complete(
+    prepared: PreparedRelease,
+    *,
+    site_file: Path,
+    root: Path,
+    environment: Mapping[str, str],
+    verification: dict[str, Any],
+    stability: dict[str, Any],
+    summary_report: dict[str, Any] | None,
+    summary_generated_at: str | None,
+) -> None:
+    """Commit the release transaction, then write the completion record."""
+
+    _run_release_mode(
+        site_file,
+        mode="commit",
+        root=root,
+        environment=environment,
+    )
+
+    _complete_release(
+        prepared,
+        site_file=site_file,
+        root=root,
+        environment=environment,
+        verification=verification,
+        stability=stability,
+        summary_report=summary_report,
+        summary_generated_at=summary_generated_at,
+    )
 
 
 def _execute_release_locked(
@@ -1212,67 +1273,18 @@ def _execute_release_locked(
             )
         else:
             reusable_quick_evidence = None
-        _update_phase(prepared, "DEPLOYED", deployment=deployment)
-        verification_report = _run_json(
-            [
-                sys.executable,
-                "-m",
-                "gpu_fault.admin.cli",
-                "verify",
-                "-f",
-                str(site_file),
-            ],
-            cwd=root,
-            environment={
-                **environment,
-                **(
-                    {QUICK_VALIDATION_EVIDENCE_ENV: str(reusable_quick_evidence)}
-                    if reusable_quick_evidence is not None
-                    else {}
-                ),
-            },
-        )
-        _validate_verification_report(verification_report)
-        verification_path = prepared.state_dir / VERIFICATION_REPORT
-        write_json_atomic(verification_path, verification_report)
-        verification = _verification_metadata(
-            verification_path,
-            verification_report,
-        )
-        _update_phase(prepared, "VERIFIED", verification=verification)
-        if deployment["fast_path"]:
-            stability = {
-                "status": "SKIPPED_NOOP",
-                "reason": "no release mutation occurred",
-            }
-        else:
-            stability_report = _collect_stability_report(
-                site_file,
-                root=root,
-                environment=environment,
-            )
-            _validate_stability_report(stability_report)
-            stability_path = prepared.state_dir / STABILITY_REPORT
-            write_json_atomic(stability_path, stability_report)
-            stability = _verification_metadata(
-                stability_path,
-                stability_report,
-            )
-            _update_phase(
-                prepared,
-                "STABLE",
-                verification=verification,
-                stability=stability,
-            )
-        commit_started = True
-        _run_release_mode(
-            site_file,
-            mode="commit",
+        update_phase(prepared, "DEPLOYED", deployment=deployment)
+
+        verification, stability = _run_verification_and_stability(
+            prepared,
+            site_file=site_file,
             root=root,
             environment=environment,
+            deployment=deployment,
+            reusable_quick_evidence=reusable_quick_evidence,
         )
-
-        _complete_release(
+        commit_started = True
+        _commit_and_complete(
             prepared,
             site_file=site_file,
             root=root,
@@ -1284,7 +1296,7 @@ def _execute_release_locked(
         )
     except Exception as exc:
         failure_error = f"{type(exc).__name__}: {exc}"
-        failed_at = _utc_now()
+        failed_at = utc_now()
         rollback = recover_release_failure(
             prepared,
             site_file=site_file,
@@ -1297,9 +1309,9 @@ def _execute_release_locked(
             automatic_rollback=automatic_rollback,
             run_release_mode=_run_release_mode,
             read_live_state=read_live_release_state,
-            update_phase=_update_phase,
+            update_phase=update_phase,
         )
-        _update_phase(
+        update_phase(
             prepared,
             "FAILED",
             error=failure_error,
@@ -1401,12 +1413,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             certificate_oidc_issuer=(arguments.certificate_oidc_issuer),
             allow_staging=arguments.allow_staging_release,
         )
-        _manifest, current_release_id = _release_manifest(ROOT)
+        _manifest, current_release_id = release_manifest(ROOT)
         subject = dict(attestation.get("subject") or {})
         current_manifest = ROOT / "dist/current-release.json"
         if subject.get("release_id") != current_release_id or subject.get(
             "manifest_sha256"
-        ) != _sha256(current_manifest):
+        ) != sha256_file(current_manifest):
             raise ReleaseDeployError(
                 "verified attestation does not bind dist/current-release.json"
             )

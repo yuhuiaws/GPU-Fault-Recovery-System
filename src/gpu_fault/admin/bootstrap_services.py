@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
@@ -34,6 +35,41 @@ from gpu_fault.admin.monitoring_subscriptions import (
 )
 
 SNS_TOPIC_GENERATION_TAG = "gpu-fault:topic-generation"
+# One Pod Identity add-on result per deploy run, keyed by the runner the run was
+# handed. Three call sites ensure the same add-on (`revalidate_pod_identity_agent`,
+# the control-plane role and the load balancer controller) and each one used to
+# pay for a describe and an `aws eks wait addon-active`; the add-on cannot change
+# between two of those calls, so the first successful read is the evidence for
+# the rest of the run. The key is weak so a test's fake runner takes its cache
+# with it, and so nothing here keeps a finished run's runner alive.
+_POD_IDENTITY_AGENTS: WeakKeyDictionary[
+    Any, dict[tuple[str, str, str], dict[str, str]]
+] = WeakKeyDictionary()
+
+
+def _pod_identity_agent_cache(
+    runner: CommandRunner,
+) -> dict[tuple[str, str, str], dict[str, str]]:
+    """The add-on cache belonging to this run, found through probe wrappers.
+
+    `run_parallel` wraps the run's runner in a fresh `ReadOnlyProbeRunner` for
+    every probe, so caching against the wrapper would cache nothing that the
+    following ensure could reuse. Unwrapping to the runner the deploy created
+    makes a healthy read-only probe count as the read for the ensure that
+    follows it in the same transaction.
+    """
+
+    root: Any = runner
+    while isinstance(root, ReadOnlyProbeRunner):
+        root = root._delegate
+    # `setdefault`, not get-then-insert: `run_parallel` calls the tasks from a
+    # thread pool, and two tasks reaching a get-then-insert at the same time would
+    # each install their own dict, so one of the two add-on reads would not be
+    # deduplicated after all.
+    cache: dict[tuple[str, str, str], dict[str, str]] = _POD_IDENTITY_AGENTS.setdefault(
+        root, {}
+    )
+    return cache
 
 
 def _ensure_service_account(
@@ -86,26 +122,21 @@ def _ensure_pod_identity_agent(
     cluster: ClusterIdentity,
     site_id: str,
 ) -> dict[str, str]:
-    exists = (
-        subprocess.run(
-            [
-                "aws",
-                "eks",
-                "describe-addon",
-                "--region",
-                cluster.region,
-                "--cluster-name",
-                cluster.eks_name,
-                "--addon-name",
-                "eks-pod-identity-agent",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
-    )
-    ownership = "CREATED"
-    if exists:
+    cache = _pod_identity_agent_cache(runner)
+    # `site_id` is in the key because the ensure asserts the add-on's site tag: a
+    # cached result must not answer for a different site's ownership check.
+    cache_key = (cluster.eks_name, cluster.region, site_id)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    # One describe answers both questions the ensure has: whether the add-on is
+    # there at all, and which site owns it. A separate silent existence probe
+    # asked the same thing a second time. Only a not-found error means absent;
+    # anything else (AccessDenied, a throttled call) stays fail-closed, because
+    # reading it as absent would send the run into `create-addon`, which fails on
+    # an add-on that already exists.
+    addon: dict[str, Any] | None = None
+    try:
         addon = runner.aws_json(
             cluster.region,
             "eks",
@@ -115,6 +146,11 @@ def _ensure_pod_identity_agent(
             "--addon-name",
             "eks-pod-identity-agent",
         )["addon"]
+    except BootstrapError as exc:
+        if "notfound" not in str(exc).lower():
+            raise
+    ownership = "CREATED"
+    if addon is not None:
         tags = runner.aws_json(
             cluster.region,
             "eks",
@@ -157,11 +193,13 @@ def _ensure_pod_identity_agent(
         ],
         capture=False,
     )
-    return {
+    result = {
         "cluster_name": cluster.eks_name,
         "addon_name": "eks-pod-identity-agent",
         "ownership": ownership,
     }
+    cache[cache_key] = dict(result)
+    return result
 
 
 def _pod_identity_trust() -> dict[str, Any]:
@@ -200,6 +238,53 @@ def _documents_match(left: object, right: object) -> bool:
     return _normalized_document(left) == _normalized_document(right)
 
 
+def _read_role(runner: CommandRunner, *, role_name: str) -> dict[str, Any] | None:
+    """The role document, or None when IAM says the role does not exist."""
+
+    try:
+        raw = runner.run(
+            ["aws", "iam", "get-role", "--role-name", role_name, "--output", "json"]
+        )
+    except BootstrapError as exc:
+        if "nosuchentity" not in str(exc).lower():
+            raise
+        return None
+    return cast(dict[str, Any], json.loads(raw)["Role"])
+
+
+def _read_inline_policy(
+    runner: CommandRunner, *, role_name: str, policy_name: str
+) -> Any:
+    """The inline policy document, or None when it is absent.
+
+    Absent means exactly `NoSuchEntity`. On any other error the current document
+    is unknown, and writing over it could replace a narrower policy with a wider
+    one with nothing in the log to say so.
+    """
+
+    try:
+        raw = runner.run(
+            [
+                "aws",
+                "iam",
+                "get-role-policy",
+                "--role-name",
+                role_name,
+                "--policy-name",
+                policy_name,
+                "--output",
+                "json",
+            ]
+        )
+    except BootstrapError as exc:
+        if "nosuchentity" in str(exc).lower():
+            return None
+        raise BootstrapError(
+            f"cannot inspect inline policy {role_name}/{policy_name}: {exc}"
+        ) from exc
+    return json.loads(raw).get("PolicyDocument")
+
+
 def _ensure_role(
     runner: CommandRunner,
     *,
@@ -210,29 +295,14 @@ def _ensure_role(
     policy: dict[str, Any] | None,
     site_id: str,
 ) -> dict[str, str]:
-    exists = (
-        subprocess.run(
-            ["aws", "iam", "get-role", "--role-name", role_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
-    )
     trust_text = json.dumps(trust, separators=(",", ":"))
-    if exists:
-        role = json.loads(
-            runner.run(
-                [
-                    "aws",
-                    "iam",
-                    "get-role",
-                    "--role-name",
-                    role_name,
-                    "--output",
-                    "json",
-                ]
-            )
-        )["Role"]
+    # One read decides both whether the role exists and whether it has drifted;
+    # the silent existence probe that used to run first asked IAM for the same
+    # document. `NoSuchEntity` is the only answer that means absent: on any other
+    # failure the current trust policy is unknown, and treating that as absent
+    # would send the run into `create-role` on a role that is already there.
+    role = _read_role(runner, role_name=role_name)
+    if role is not None:
         tagged = assert_site_tag(
             role.get("Tags"),
             site_id=site_id,
@@ -285,41 +355,10 @@ def _ensure_role(
         )
     if policy_name and policy is not None:
         existing_policy = None
-        if exists:
-            lookup = subprocess.run(
-                [
-                    "aws",
-                    "iam",
-                    "get-role-policy",
-                    "--role-name",
-                    role_name,
-                    "--policy-name",
-                    policy_name,
-                ],
-                text=True,
-                capture_output=True,
+        if role is not None:
+            existing_policy = _read_inline_policy(
+                runner, role_name=role_name, policy_name=policy_name
             )
-            if lookup.returncode == 0:
-                existing_policy = json.loads(
-                    runner.run(
-                        [
-                            "aws",
-                            "iam",
-                            "get-role-policy",
-                            "--role-name",
-                            role_name,
-                            "--policy-name",
-                            policy_name,
-                            "--output",
-                            "json",
-                        ]
-                    )
-                ).get("PolicyDocument")
-            elif "nosuchentity" not in lookup.stderr.lower():
-                raise BootstrapError(
-                    f"cannot inspect inline policy {role_name}/{policy_name}: "
-                    + lookup.stderr.strip()
-                )
         if not _documents_match(existing_policy, policy):
             runner.run(
                 [

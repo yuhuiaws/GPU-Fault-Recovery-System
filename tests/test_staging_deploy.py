@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import subprocess
@@ -9,7 +10,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from scripts import staging_deploy
+from gpu_fault.admin.operation_lock import SITE_OPERATION_LOCK_FD_ENV
+from scripts import staging_deploy, staging_gate_caches, staging_state_hygiene
 
 
 def _signing_material(root: Path) -> staging_deploy.SigningMaterial:
@@ -178,7 +180,9 @@ def test_existing_bundle_is_reused_without_build(
 def test_deploy_host_artifacts_are_content_addressed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(staging_deploy, "bundle_platform_id", lambda: "test-platform")
+    monkeypatch.setattr(
+        staging_state_hygiene, "bundle_platform_id", lambda: "test-platform"
+    )
 
     first = staging_deploy.deploy_host_artifacts(
         tmp_path, payload_identity_sha256="a" * 64
@@ -257,7 +261,9 @@ def test_deploy_host_wheelhouse_cache_is_lock_scoped(
     requirements.mkdir(parents=True)
     (requirements / "build.lock").write_text("build-a\n", encoding="utf-8")
     (requirements / "deploy-host.lock").write_text("host-a\n", encoding="utf-8")
-    monkeypatch.setattr(staging_deploy, "bundle_platform_id", lambda: "test-platform")
+    monkeypatch.setattr(
+        staging_state_hygiene, "bundle_platform_id", lambda: "test-platform"
+    )
 
     first = staging_deploy.deploy_host_wheelhouse_cache(
         tmp_path / "state", repository_root=repository
@@ -292,12 +298,14 @@ def test_deploy_host_venv_is_bound_to_managed_state(
         return ""
 
     monkeypatch.setattr(staging_deploy, "_run", run)
+    monkeypatch.setattr(staging_deploy, "prune_venv_versions", lambda *_a, **_k: ())
 
     result = staging_deploy.ensure_deploy_host_venv(
         state,
         repository_root=tmp_path,
         signing=_signing_material(state),
         artifacts=artifacts,
+        lock_fd=STUB_LOCK_FD,
     )
 
     binding = json.loads(
@@ -308,6 +316,50 @@ def test_deploy_host_venv_is_bound_to_managed_state(
         result.joinpath("gpu-fault-managed-state-dir.json").stat().st_mode & 0o777
         == 0o600
     )
+
+
+def test_deploy_host_venv_prunes_versions_under_the_held_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Old venv versions are deleted here, where the site lock is already held.
+
+    The hand-run ``scripts/setup-deploy-host.sh`` has no lock to give, and a tree
+    another install is still writing into cannot be told from one it abandoned,
+    so the setup path prunes nothing: the deploy does, handing its descriptor
+    down as the proof that it holds the lock.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    state = tmp_path / "state"
+    venv = state / "deployer-venv"
+    artifacts = staging_deploy.DeployHostArtifacts(
+        archive=state / "bundle.tar.gz",
+        checksum=state / "bundle.tar.gz.sha256",
+        signature_bundle=state / "bundle.sigstore.json",
+    )
+    pruned: list[tuple[Path, int]] = []
+
+    def run(_arguments, **_kwargs):
+        venv.joinpath("bin").mkdir(parents=True)
+        venv.joinpath("bin/gpu-fault-admin").write_text("", encoding="utf-8")
+        return ""
+
+    monkeypatch.setattr(staging_deploy, "_run", run)
+    monkeypatch.setattr(
+        staging_deploy,
+        "prune_venv_versions",
+        lambda target, *, lock_fd: pruned.append((target, lock_fd)) or (),
+    )
+
+    staging_deploy.ensure_deploy_host_venv(
+        state,
+        repository_root=tmp_path,
+        signing=_signing_material(state),
+        artifacts=artifacts,
+        lock_fd=STUB_LOCK_FD,
+    )
+
+    assert pruned == [(venv, STUB_LOCK_FD)]
 
 
 def test_deploy_host_only_checkout_reuses_signed_application_release(
@@ -508,7 +560,7 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
         "source success authorization escaped the top-level apply lock"
     )
     state_value = json.loads(
-        (state / staging_deploy.SOURCE_DEPLOY_STATE).read_text(encoding="utf-8")
+        (state / staging_state_hygiene.SOURCE_DEPLOY_STATE).read_text(encoding="utf-8")
     )
     assert state_value["source_repository_root"] == str(repository)
     assert state_value["release_ref"] == source.git_commit
@@ -926,3 +978,455 @@ def test_snapshot_prepared_tree_must_remain_unchanged(tmp_path: Path) -> None:
         staging_deploy.StagingDeployError, match="prepared tree does not match"
     ):
         staging_deploy.prepare_source_checkout(repository, state_dir=state)
+
+
+def _deploy_arguments(repository: Path, state: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        repo_root=repository,
+        state_dir=state,
+        cpu_cluster_arn="arn:aws:eks:us-east-1:123456789012:cluster/cpu",
+        gpu_cluster_arn=["arn:aws:eks:us-east-1:123456789012:cluster/gpu"],
+        admin_email="operations@example.com",
+        base="origin/main",
+    )
+
+
+def _managed_state(tmp_path: Path) -> tuple[Path, Path]:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "site.yaml").write_text("kind: RegionalSite\n", encoding="utf-8")
+    return repository, state
+
+
+def _install_admin_stub(state: Path) -> None:
+    admin = state / "deployer-venv/bin"
+    admin.mkdir(parents=True)
+    (admin / "gpu-fault-admin").write_text("", encoding="utf-8")
+
+
+# The descriptor the stubbed lock hands out. It is carried into the recorded
+# event names because a child that collects live evidence without it opens the
+# lock file a second time and blocks on the lock this process already holds.
+STUB_LOCK_FD = 17
+EVIDENCE_EVENT = f"evidence(lock_fd={STUB_LOCK_FD})"
+DEPLOY_EVENT = f"deploy(lock_fd={STUB_LOCK_FD})"
+
+
+def _stub_deploy_orchestration(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    state: Path,
+    source: staging_deploy.SourceCheckout,
+    signing: staging_deploy.SigningMaterial,
+    previous: dict[str, object] | None,
+    events: list[str],
+) -> None:
+    """Everything ``deploy`` shells out to, recorded as an ordered event log.
+
+    The log is what the ordering assertions read: the point of collecting live
+    evidence once is *when* each call happens, not what it returns.
+    """
+
+    artifacts = staging_deploy.DeployHostArtifacts(
+        archive=state / "bundle.tar.gz",
+        checksum=state / "bundle.tar.gz.sha256",
+        signature_bundle=state / "bundle.sigstore.json",
+    )
+
+    class Lock:
+        def __enter__(self) -> int:
+            events.append("lock-enter")
+            return STUB_LOCK_FD
+
+        def __exit__(self, *_arguments: object) -> None:
+            events.append("lock-exit")
+
+    def evidence(**kwargs: object) -> dict[str, object]:
+        events.append(f"evidence(lock_fd={kwargs.get('lock_fd')})")
+        return _live_evidence()
+
+    def admin_deploy(**kwargs: object) -> None:
+        events.append(f"deploy(lock_fd={kwargs.get('lock_fd')})")
+
+    monkeypatch.setattr(
+        staging_deploy, "prepare_source_checkout", lambda *_a, **_k: source
+    )
+    monkeypatch.setattr(
+        staging_deploy, "validate_source_checkout", lambda _root, **_k: None
+    )
+    monkeypatch.setattr(
+        staging_deploy, "ensure_signing_material", lambda *_a, **_k: signing
+    )
+    monkeypatch.setattr(
+        staging_deploy, "source_deploy_identity", lambda *_a, **_k: _source_identities()
+    )
+    monkeypatch.setattr(
+        staging_deploy, "load_successful_source_deploy", lambda *_a, **_k: previous
+    )
+    monkeypatch.setattr(
+        staging_deploy, "restore_trusted_ci_candidate", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(staging_deploy, "site_operation_lock", lambda *_a, **_k: Lock())
+    monkeypatch.setattr(
+        staging_deploy, "deploy_host_artifacts", lambda *_a, **_k: artifacts
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "deploy_host_wheelhouse_cache",
+        lambda *_a, **_k: state / "wheelhouse",
+    )
+    monkeypatch.setattr(
+        staging_deploy, "ensure_deploy_host_bundle", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "ensure_deploy_host_venv",
+        lambda *_a, **_k: state / "deployer-venv",
+    )
+    monkeypatch.setattr(staging_deploy, "run_admin_deploy", admin_deploy)
+    monkeypatch.setattr(staging_deploy, "collect_live_deploy_evidence", evidence)
+    monkeypatch.setattr(
+        staging_deploy,
+        "prune_source_snapshots",
+        lambda *_a, **_k: events.append("prune") or (),
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "record_successful_source_deploy",
+        lambda *_a, **_k: (
+            events.append("success") or state / "source-deploy-success.json"
+        ),
+    )
+
+
+def test_apply_source_deploy_has_no_lockless_path() -> None:
+    """One classification per deploy, and it is made under the lock.
+
+    The apply used to re-read the live site and re-classify whenever it was
+    called without a lock: a second 45-second ``status`` and a second, divergent
+    decision path that no test covered. Requiring the descriptor is what keeps
+    that path from growing back.
+    """
+
+    parameter = inspect.signature(staging_deploy.apply_source_deploy).parameters[
+        "lock_fd"
+    ]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty, (
+        "an apply without the caller's lock classifies the site a second time"
+    )
+
+
+def test_deploy_collects_live_evidence_once_under_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One pre-apply ``status``, taken under the lock, plus the success one.
+
+    ``gpu-fault-admin status`` costs about 45 seconds. The classification it
+    feeds is only trustworthy while nothing else can change the site, so the
+    lock comes first and the answer is reused instead of re-derived.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    repository, state = _managed_state(tmp_path)
+    _install_admin_stub(state)
+    signing = _signing_material(state)
+    source = staging_deploy.SourceCheckout(
+        repository_root=repository,
+        git_commit="a" * 40,
+        fingerprint="a" * 64,
+        snapshot=False,
+        isolated=True,
+    )
+    previous = {
+        "schema_version": 1,
+        "status": "PASSED",
+        "identities": {
+            "schema_version": 1,
+            "sha256": "f" * 64,
+            "application": {"sha256": "9" * 64},
+            "deploy_host": {"sha256": "b" * 64, "bundle": {"sha256": "c" * 64}},
+        },
+        "source": {"fingerprint": "0" * 64, "git_commit": "b" * 40},
+        "live": _live_evidence(),
+    }
+    events: list[str] = []
+    _stub_deploy_orchestration(
+        monkeypatch,
+        state=state,
+        source=source,
+        signing=signing,
+        previous=previous,
+        events=events,
+    )
+
+    result = staging_deploy.deploy(_deploy_arguments(repository, state))
+
+    assert result["deploy_mode"] == "APPLICATION_RELEASE"
+    assert events == [
+        "lock-enter",
+        EVIDENCE_EVENT,
+        DEPLOY_EVENT,
+        EVIDENCE_EVENT,
+        "success",
+        "prune",
+        "lock-exit",
+    ]
+
+
+def test_unchanged_deploy_reuses_its_single_live_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    repository, state = _managed_state(tmp_path)
+    _install_admin_stub(state)
+    signing = _signing_material(state)
+    source = staging_deploy.SourceCheckout(
+        repository_root=repository,
+        git_commit="a" * 40,
+        fingerprint="a" * 64,
+        snapshot=False,
+        isolated=True,
+    )
+    previous = {
+        "schema_version": 1,
+        "status": "PASSED",
+        "identities": _source_identities(),
+        "source": {"fingerprint": source.fingerprint, "git_commit": source.git_commit},
+        "live": _live_evidence(),
+    }
+    events: list[str] = []
+    _stub_deploy_orchestration(
+        monkeypatch,
+        state=state,
+        source=source,
+        signing=signing,
+        previous=previous,
+        events=events,
+    )
+
+    result = staging_deploy.deploy(_deploy_arguments(repository, state))
+
+    assert result["deploy_mode"] == "UNCHANGED"
+    assert events == ["lock-enter", EVIDENCE_EVENT, "success", "prune", "lock-exit"]
+
+
+def test_run_admin_deploy_passes_tool_cache_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real deploy path gets the same warm mypy/ruff caches the gate uses.
+
+    The admin deploy re-runs the static gates inside a snapshot that cannot hold
+    a cache, so without this the 17-second mypy analysis is paid from cold on
+    every deploy while an identical answer sits in the state directory.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    # The deploy's own gate suite runs with these caches already exported (that
+    # is the point of A2), and an ambient value wins over the state-dir path; the
+    # assertion below is about the path the deploy derives, so start clean.
+    for name, _subdirectory in staging_gate_caches.TOOL_CACHE_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GPU_FAULT_TEST_AMBIENT", "inherited")
+    state = tmp_path / "state"
+    state.mkdir()
+    captured: dict[str, object] = {}
+
+    def run(
+        arguments: object,
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        capture: bool = False,
+        pass_fds: tuple[int, ...] = (),
+    ) -> str:
+        captured["env"] = dict(env or {})
+        captured["pass_fds"] = pass_fds
+        return ""
+
+    monkeypatch.setattr(staging_deploy, "_run", run)
+    lock_fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        staging_deploy.run_admin_deploy(
+            repository_root=tmp_path / "repo",
+            state_dir=state,
+            venv=tmp_path / "venv",
+            cpu_cluster_arn="cpu",
+            gpu_cluster_arns=("gpu",),
+            admin_email="operations@example.com",
+            staging_only_release=False,
+            impact_base="origin/main",
+            lock_fd=lock_fd,
+        )
+    finally:
+        os.close(lock_fd)
+
+    environment = captured["env"]
+    assert isinstance(environment, dict), "the admin deploy must receive an env dict"
+    expected = staging_gate_caches.tool_cache_environment(state)
+    for name, _subdirectory in staging_gate_caches.TOOL_CACHE_VARIABLES:
+        assert environment[name] == expected[name], name
+        assert Path(environment[name]).is_relative_to(state), name
+    assert environment[SITE_OPERATION_LOCK_FD_ENV] == str(lock_fd), (
+        "lock FD must be passed in environment"
+    )
+    assert captured["pass_fds"] == (lock_fd,), "lock FD must be passed to subprocess"
+    assert environment["GPU_FAULT_TEST_AMBIENT"] == "inherited", (
+        "ambient test variable must be inherited"
+    )
+
+
+def test_missing_venv_promotes_prepared_mode_and_deploys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuilt deploy host is an application release, not a silent no-op.
+
+    Promoting only the local ``mode`` left ``prepared_mode`` at QUALITY_ONLY, so
+    the impact gate was skipped as if a release were coming and the apply then
+    ran no release at all -- and still recorded success.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    repository, state = _managed_state(tmp_path)
+    signing = _signing_material(state)
+    source = staging_deploy.SourceCheckout(
+        repository_root=repository,
+        git_commit="a" * 40,
+        fingerprint="a" * 64,
+        snapshot=False,
+        isolated=True,
+    )
+    previous = {
+        "schema_version": 1,
+        "status": "PASSED",
+        "identities": _source_identities(),
+        "source": {"fingerprint": "0" * 64, "git_commit": "b" * 40},
+        "live": _live_evidence(),
+    }
+    events: list[str] = []
+    _stub_deploy_orchestration(
+        monkeypatch,
+        state=state,
+        source=source,
+        signing=signing,
+        previous=previous,
+        events=events,
+    )
+    monkeypatch.setattr(
+        staging_deploy,
+        "run_source_impact_gate",
+        lambda **_kwargs: events.append("gate") or {"source": "impact"},
+    )
+
+    result = staging_deploy.deploy(_deploy_arguments(repository, state))
+
+    assert result["deploy_mode"] == "APPLICATION_RELEASE"
+    assert DEPLOY_EVENT in events, (
+        "a missing deploy-host venv gated nothing and deployed nothing"
+    )
+    assert "gate" not in events
+    assert events.index(DEPLOY_EVENT) < events.index("success")
+
+
+def _snapshot_tree(root: Path, index: int) -> Path:
+    """One ``source-snapshots/<fingerprint>/repository-*`` pair, mtime by index."""
+
+    fingerprint = f"{index:064d}"
+    worktree = root / fingerprint / f"repository-{index}"
+    worktree.mkdir(parents=True)
+    (worktree / "tracked.txt").write_text("release\n", encoding="utf-8")
+    (root / fingerprint / "snapshot.json").write_text("{}", encoding="utf-8")
+    stamp = 1_700_000_000 + index
+    os.utime(root / fingerprint, (stamp, stamp))
+    return worktree
+
+
+def test_prune_source_snapshots_keeps_referenced_and_newest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The snapshots a deploy can still be asked to reproduce always survive.
+
+    Production had 59 snapshots and 3.5 GB in this directory because nothing
+    removed them. What may not be removed is what the recorded state points at:
+    the pending deploy, the last success, and the tree running right now.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    monkeypatch.setenv("GPU_FAULT_SOURCE_SNAPSHOT_RETAINED", "3")
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    state = tmp_path / "state"
+    snapshots = state / "source-snapshots"
+    trees = [_snapshot_tree(snapshots, index) for index in range(8)]
+    (state / staging_state_hygiene.SOURCE_DEPLOY_STATE).write_text(
+        json.dumps({"prepared_repository_root": str(trees[0])}), encoding="utf-8"
+    )
+    (state / staging_state_hygiene.SOURCE_DEPLOY_SUCCESS_STATE).write_text(
+        json.dumps({"prepared_repository_root": str(trees[1])}), encoding="utf-8"
+    )
+
+    removed = staging_deploy.prune_source_snapshots(
+        state, source_repository_root=repository, current=trees[2]
+    )
+
+    assert set(removed) == {trees[3].parent, trees[4].parent}
+    for index in (0, 1, 2, 5, 6, 7):
+        assert trees[index].is_dir(), index
+    for index in (3, 4):
+        assert not trees[index].parent.exists(), index
+
+    monkeypatch.delenv("GPU_FAULT_SOURCE_SNAPSHOT_RETAINED")
+
+    assert (
+        staging_deploy.prune_source_snapshots(
+            state, source_repository_root=repository, current=trees[2]
+        )
+        == ()
+    ), "the default retention removed a snapshot it should have kept"
+
+    monkeypatch.setenv("GPU_FAULT_SOURCE_SNAPSHOT_RETAINED", "0")
+
+    with pytest.raises(staging_deploy.StagingDeployError, match="positive integer"):
+        staging_deploy.prune_source_snapshots(
+            state, source_repository_root=repository, current=trees[2]
+        )
+
+
+def test_prune_source_snapshots_unregisters_git_worktrees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot is a worktree of the source repository, so Git has to be told.
+
+    ``shutil.rmtree`` alone leaves the registration behind in the source
+    repository, and the next ``git worktree add`` for the same path fails.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    monkeypatch.setenv("GPU_FAULT_SOURCE_SNAPSHOT_RETAINED", "1")
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init")
+    _git(repository, "config", "user.name", "Test")
+    _git(repository, "config", "user.email", "test@example.com")
+    (repository / "tracked.txt").write_text("release\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-m", "initial")
+    state = tmp_path / "state"
+    stale = staging_deploy.prepare_source_checkout(repository, state_dir=state)
+    (repository / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-m", "second")
+    current = staging_deploy.prepare_source_checkout(repository, state_dir=state)
+    assert current.repository_root != stale.repository_root
+
+    removed = staging_deploy.prune_source_snapshots(
+        state, source_repository_root=repository, current=current.repository_root
+    )
+
+    assert removed == (stale.repository_root.parent,)
+    assert not stale.repository_root.exists(), "the stale snapshot must be pruned"
+    assert current.repository_root.is_dir(), "the current snapshot must survive pruning"
+    assert str(stale.repository_root) not in _git(repository, "worktree", "list")

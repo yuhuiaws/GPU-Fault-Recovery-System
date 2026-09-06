@@ -17,6 +17,10 @@ GPU_FAULT_ENABLE_ADOT="${GPU_FAULT_ENABLE_ADOT:-true}"
 GPU_FAULT_ENABLE_AMP="${GPU_FAULT_ENABLE_AMP:-true}"
 GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION="${GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION:-true}"
 ADOT_IMAGE="${GPU_FAULT_ADOT_IMAGE:?GPU_FAULT_ADOT_IMAGE is required}"
+# The collector restart below is skipped when nothing it reads changed. This is
+# the escape hatch for what an apply cannot describe: a Pod running the right
+# manifest with stale credentials or a wedged exporter.
+GPU_FAULT_FORCE_ADOT_RESTART="${GPU_FAULT_FORCE_ADOT_RESTART:-false}"
 
 if [[ "${GPU_FAULT_ENABLE_AMP}" != "true" ]]; then
     printf 'AMP integration disabled; built-in collector silence alerts remain active.\n'
@@ -121,11 +125,13 @@ amp_definition_is_current() {
     )
 }
 
-# Per-step wall clock on stderr, next to the release narration, so a slow run
-# of this installer can be attributed without re-running it under a profiler.
+# Per-step wall clock, so a slow run of this installer can be attributed without
+# re-running it under a profiler. On stdout, because the admin CLI runs this
+# script with the output captured and only keeps stdout: on stderr these lines
+# were discarded on every successful run, i.e. exactly the runs worth measuring.
 STEP_STARTED_AT="${SECONDS}"
 step_done() {
-    printf 'amp-step-elapsed %ss %s\n' "$((SECONDS - STEP_STARTED_AT))" "$1" >&2
+    printf 'amp-step-elapsed %ss %s\n' "$((SECONDS - STEP_STARTED_AT))" "$1"
     STEP_STARTED_AT="${SECONDS}"
 }
 
@@ -157,31 +163,62 @@ cat >"${TMP_DIR}/amp-write-policy.json" <<EOF
 }
 EOF
 
-if ! aws iam get-role --role-name "${IAM_ROLE_NAME}" >/dev/null 2>&1; then
+# `put-role-policy` is an audited IAM mutation, and this installer issued one on
+# every deploy for a document that changes only when the workspace does. Reading
+# the inline policy first also answers whether the role exists at all: on a
+# missing role the read fails the same way, so the create path below is entered
+# without a second `get-role` in the steady state.
+CURRENT_AMP_POLICY="$(
+    aws iam get-role-policy \
+        --role-name "${IAM_ROLE_NAME}" \
+        --policy-name gpu-fault-amp-remote-write \
+        --query PolicyDocument \
+        --output json 2>/dev/null || true
+)"
+AMP_POLICY_CURRENT="false"
+DESIRED_AMP_POLICY="$(jq -S -c . "${TMP_DIR}/amp-write-policy.json")"
+if [[ -n "${CURRENT_AMP_POLICY}" ]]; then
+    LIVE_AMP_POLICY="$(jq -S -c . <<<"${CURRENT_AMP_POLICY}" 2>/dev/null || true)"
+    if [[ "${LIVE_AMP_POLICY}" == "${DESIRED_AMP_POLICY}" ]]; then
+        AMP_POLICY_CURRENT="true"
+        printf 'IAM role %s already grants remote write to this workspace.\n' \
+            "${IAM_ROLE_NAME}"
+    fi
+elif ! aws iam get-role --role-name "${IAM_ROLE_NAME}" >/dev/null 2>&1; then
     aws iam create-role \
         --role-name "${IAM_ROLE_NAME}" \
         --assume-role-policy-document \
         "file://${TMP_DIR}/pod-identity-trust.json" >/dev/null
 fi
-aws iam put-role-policy \
-    --role-name "${IAM_ROLE_NAME}" \
-    --policy-name gpu-fault-amp-remote-write \
-    --policy-document "file://${TMP_DIR}/amp-write-policy.json"
+if [[ "${AMP_POLICY_CURRENT}" != "true" ]]; then
+    aws iam put-role-policy \
+        --role-name "${IAM_ROLE_NAME}" \
+        --policy-name gpu-fault-amp-remote-write \
+        --policy-document "file://${TMP_DIR}/amp-write-policy.json"
+fi
 step_done iam-role
 
-SNS_TOPIC_ARN="$(
-    aws sns create-topic \
-        --region "${AWS_REGION}" \
-        --name "${SNS_TOPIC_NAME}" \
-        --query TopicArn --output text
-)"
-CURRENT_SNS_POLICY="$(
+# `create-topic` is idempotent but not free, and the topic ARN is derivable, so
+# the read comes first: an existing topic answers with its policy and the create
+# is skipped. A topic that does not answer is created and then read.
+SNS_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${ACCOUNT_ID}:${SNS_TOPIC_NAME}"
+read_sns_policy() {
     aws sns get-topic-attributes \
         --region "${AWS_REGION}" \
         --topic-arn "${SNS_TOPIC_ARN}" \
         --query 'Attributes.Policy' \
         --output text
-)"
+}
+CURRENT_SNS_POLICY="$(read_sns_policy 2>/dev/null || true)"
+if [[ -z "${CURRENT_SNS_POLICY}" || "${CURRENT_SNS_POLICY}" == "None" ]]; then
+    SNS_TOPIC_ARN="$(
+        aws sns create-topic \
+            --region "${AWS_REGION}" \
+            --name "${SNS_TOPIC_NAME}" \
+            --query TopicArn --output text
+    )"
+    CURRENT_SNS_POLICY="$(read_sns_policy)"
+fi
 jq \
     --arg account_id "${ACCOUNT_ID}" \
     --arg topic_arn "${SNS_TOPIC_ARN}" \
@@ -203,11 +240,29 @@ jq \
       )
     ' <<<"${CURRENT_SNS_POLICY}" >"${TMP_DIR}/sns-policy.json"
 SNS_POLICY="$(jq -c . "${TMP_DIR}/sns-policy.json")"
-aws sns set-topic-attributes \
-    --region "${AWS_REGION}" \
-    --topic-arn "${SNS_TOPIC_ARN}" \
-    --attribute-name Policy \
-    --attribute-value "${SNS_POLICY}"
+# The transform above only adds the Alertmanager publish statement, so a topic
+# that already carries it is left alone: rewriting the policy on every deploy
+# both hides real changes in CloudTrail and briefly republishes a policy that
+# other statements (a queue subscription, an operator grant) live in.
+# Statement order carries no meaning in an SNS policy, and SNS is free to hand
+# the list back in a different order than it was written, so the comparison sorts
+# by Sid first. Comparing the raw order would rewrite the policy on every deploy
+# for a topic that already says exactly what it should.
+canonical_sns_policy() {
+    jq -S -c '.Statement |= sort_by(.Sid // "")'
+}
+DESIRED_SNS_POLICY="$(canonical_sns_policy <<<"${SNS_POLICY}")"
+LIVE_SNS_POLICY="$(canonical_sns_policy <<<"${CURRENT_SNS_POLICY}" 2>/dev/null || true)"
+if [[ "${DESIRED_SNS_POLICY}" == "${LIVE_SNS_POLICY}" ]]; then
+    printf 'SNS topic %s already allows Alertmanager to publish.\n' \
+        "${SNS_TOPIC_ARN}"
+else
+    aws sns set-topic-attributes \
+        --region "${AWS_REGION}" \
+        --topic-arn "${SNS_TOPIC_ARN}" \
+        --attribute-name Policy \
+        --attribute-value "${SNS_POLICY}"
+fi
 step_done sns-topic
 
 sed \
@@ -242,6 +297,13 @@ if [[ "$(
         <<<"${ADOT_APPLY_OUTPUT}" || true
 )" == "2" ]]; then
     ADOT_RESTART_REQUIRED="false"
+fi
+# The gate above skips the restart only for a pair that apply itself called
+# `unchanged`; a `configured`, a `created`, or output it cannot parse all keep
+# it. The override exists for what apply cannot describe: a Pod on the right
+# manifest with stale credentials, or an exporter that stopped writing.
+if [[ "${GPU_FAULT_FORCE_ADOT_RESTART}" == "true" ]]; then
+    ADOT_RESTART_REQUIRED="true"
 fi
 if [[ "${GPU_FAULT_ENABLE_ADOT}" != "true" \
     && -n "${CURRENT_ADOT_REPLICAS}" \

@@ -215,6 +215,7 @@ def test_reconciler_deploy_uses_progress_aware_wait(
         runner=Runner(),
         bundle_sha="b" * 64,
         node_template_sha="t" * 64,
+        config=SimpleNamespace(upgrade_max_unavailable=0),
         _settle_installer_jobs=lambda _target: sequence.append("settle"),
     )
     monkeypatch.setattr(

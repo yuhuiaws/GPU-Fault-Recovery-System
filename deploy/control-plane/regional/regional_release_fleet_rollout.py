@@ -474,8 +474,13 @@ def node_rollout_policy(
             if node_count < 512
             else MAX_UPGRADE_UNAVAILABLE
         )
+        configured = int(release.config.upgrade_max_unavailable)
+        # 0 is "auto": take the cap this function already derived from the node
+        # count. A site that configured 1 paid a full safety, Reconciler and
+        # convergence round trip per node -- four waves for four nodes -- while
+        # the cap said all four could move together.
         effective = min(
-            release.config.upgrade_max_unavailable,
+            configured if configured > 0 else size_cap,
             size_cap,
             MAX_UPGRADE_UNAVAILABLE,
         )
@@ -733,7 +738,15 @@ def ensure_rollout_wave_safe(
     timeout_seconds: float = ROLLOUT_AGENT_GATE_TIMEOUT_SECONDS,
     poll_seconds: float = ROLLOUT_AGENT_POLL_SECONDS,
     minimum_lease_remaining_seconds: int = ROLLOUT_AGENT_LEASE_MARGIN_SECONDS,
-) -> None:
+) -> dict[str, Any]:
+    """Block until the wave is safe to take down, and return the evidence.
+
+    The returned snapshot is the observation the decision was made on, so a
+    caller that needs the same question answered against a wider margin can
+    re-decide it from this evidence -- see ``wave_lease_margin_holds`` -- rather
+    than paying for a second identical exec into the cluster.
+    """
+
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     while True:
         snapshot = rollout_wave_safety_snapshot(
@@ -768,7 +781,7 @@ def ensure_rollout_wave_safe(
         blockers = list(snapshot.get("agent_blockers") or [])
         blocker_count = int(snapshot.get("agent_blocker_count") or len(blockers))
         if not blocker_count:
-            return
+            return snapshot
         if time.monotonic() >= deadline:
             raise ClusterLocalReleaseError(
                 f"{target.cluster_id} fleet wave Agent safety did not converge: "
@@ -784,6 +797,32 @@ def ensure_rollout_wave_safe(
                 )
             )
         time.sleep(max(0.0, poll_seconds))
+
+
+def wave_lease_margin_holds(
+    snapshot: dict[str, Any] | None,
+    *,
+    elapsed_seconds: float,
+    required_seconds: int = ROLLOUT_AGENT_POST_LEASE_MARGIN_SECONDS,
+) -> bool:
+    """Does the safety evidence still prove the post-lease Agent lease margin?
+
+    Taking the wave lease costs one control-plane call, and the margin the
+    Agents must retain *after* it is wider than the one the safety gate itself
+    requires. That used to be a second exec of the same probe about five
+    seconds later -- the same leases, re-read, per wave. A lease shrinks by
+    exactly the time that passed, so the first probe's reported minimum minus
+    the elapsed time answers it. Anything the probe did not report (an older
+    probe, or a wave that is the whole cluster and leaves no node outside it)
+    is not evidence, so it fails closed and the caller re-probes.
+    """
+
+    if not isinstance(snapshot, dict):
+        return False
+    minimum = snapshot.get("minimum_lease_remaining_seconds")
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        return False
+    return float(minimum) - max(0.0, elapsed_seconds) >= required_seconds
 
 
 def reconciler_container_env(
@@ -972,7 +1011,12 @@ def run_fleet_waves(
                 event="safety_started",
             )
         try:
-            ensure_rollout_wave_safe(
+            # A second clock on purpose: `wave_started` measures the whole safety
+            # stage for the narration below, and also covers the wave line and --
+            # in a rollback -- a control-plane write. This one measures how much
+            # the lease evidence has aged, which starts at the probe.
+            probe_started = time.monotonic()
+            safety = ensure_rollout_wave_safe(
                 release,
                 target,
                 wave=expected_wave,
@@ -991,16 +1035,20 @@ def run_fleet_waves(
                 raise ReleaseError(
                     f"{target.cluster_id} fleet wave changed after safety validation"
                 )
-            ensure_rollout_wave_safe(
-                release,
-                target,
-                wave=wave,
-                node_names=context.node_names,
-                timeout_seconds=0,
-                minimum_lease_remaining_seconds=(
-                    ROLLOUT_AGENT_POST_LEASE_MARGIN_SECONDS
-                ),
-            )
+            if not wave_lease_margin_holds(
+                safety,
+                elapsed_seconds=time.monotonic() - probe_started,
+            ):
+                ensure_rollout_wave_safe(
+                    release,
+                    target,
+                    wave=wave,
+                    node_names=context.node_names,
+                    timeout_seconds=0,
+                    minimum_lease_remaining_seconds=(
+                        ROLLOUT_AGENT_POST_LEASE_MARGIN_SECONDS
+                    ),
+                )
             safety_seconds = time.monotonic() - wave_started
             if context.phase == "rollback":
                 record_rollback_wave_event(
@@ -1121,6 +1169,11 @@ def deploy_reconciler(
     node_installer_image: str | None = None,
 ) -> tuple[str, str]:
     release._settle_installer_jobs(target)
+    # The Reconciler's own knob is a count of nodes it may install on at once,
+    # so it can never be the "auto" sentinel: a caller that does not hand a
+    # wave policy (the Reconciler-only component path) gets the conservative
+    # one-at-a-time the site default used to spell out.
+    max_unavailable = max_unavailable or release.config.upgrade_max_unavailable or 1
     environment = build_reconciler_environment(
         release,
         target,

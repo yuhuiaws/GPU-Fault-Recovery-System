@@ -4,7 +4,7 @@ import json
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +29,7 @@ from regional_release_legacy import (
     validate_rollback_agent_identity,
 )
 from regional_release_mutation_preflight import preflight_upgrade_mutations
+from regional_release_narration import narrate_phase, narrate_step
 from regional_release_progress import (
     PROGRESS_COMPLETED,
     PROGRESS_FAILED,
@@ -333,7 +334,13 @@ def upgrade_gpu_clusters(
                     component_progress=progress,
                 )
 
-    def cluster_checkpoint(phase: str, cluster_id: str, lifecycle: str) -> None:
+    def cluster_checkpoint(
+        phase: str,
+        cluster_id: str,
+        lifecycle: str,
+        *,
+        fields: dict[str, Any] | None = None,
+    ) -> None:
         with state_transaction(self):
             self._save_state(
                 phase,
@@ -346,6 +353,7 @@ def upgrade_gpu_clusters(
                     self.state,
                     cluster_id,
                     lifecycle,
+                    fields=fields,
                 ),
                 release_lifecycle="ROLLING_CLUSTERS",
                 registry_staged=registry_staged,
@@ -390,18 +398,44 @@ def upgrade_gpu_clusters(
             return
         with state_transaction(self):
             completed_clusters.add(cluster_id)
-            cluster_checkpoint("data-plane-progress", cluster_id, "CONVERGED")
+            cluster_checkpoint(
+                "data-plane-progress",
+                cluster_id,
+                "CONVERGED",
+                # When this cluster stopped being restarted, for the readers that
+                # have to excuse restart-shaped alerts for a bounded window.
+                # `identity_verified` stays false on purpose: convergence here
+                # compares the artifact and config digests, not the protocol
+                # version or the compatibility digest, so nothing yet proves the
+                # full candidate pin -- only the pre-finalize heartbeat barrier
+                # does, and it is still the gate that must run.
+                fields={
+                    "converged_at_epoch": time.time(),
+                    "identity_verified": False,
+                },
+            )
 
     workers = min(
         self.config.upgrade_max_parallel_clusters,
         len(pending_targets),
     )
     if workers > 1:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            for future in as_completed(
-                [executor.submit(roll_cluster, target) for target in pending_targets]
-            ):
-                future.result()
+        # Canary first, in site order. A failure the engine cannot attribute to
+        # one cluster is a *global* failure, and rolling that back reverts every
+        # cluster that already converged -- so the first cluster proves the
+        # candidate alone, and only then does the fleet overlap. The canary is
+        # the same cluster a serial rollout would have done first, so this costs
+        # nothing a serial release did not already pay.
+        canary, remaining = pending_targets[0], pending_targets[1:]
+        roll_cluster(canary)
+        if remaining and canary.cluster_id in completed_clusters:
+            with ThreadPoolExecutor(
+                max_workers=min(workers, len(remaining))
+            ) as executor:
+                for future in as_completed(
+                    [executor.submit(roll_cluster, target) for target in remaining]
+                ):
+                    future.result()
     else:
         for target in pending_targets:
             roll_cluster(target)
@@ -510,6 +544,74 @@ def bootstrap_gpu_clusters(
         ) from first_error
 
 
+# The order the upgrade completes its phases in, used to stamp a state write
+# that carries more than one completed phase with the furthest one it proves.
+# The stamp is what `regional_admin_commands.RESUMABLE_PHASES` reads, so it has
+# to name the phase an operator would resume from, not the first phase that
+# happened to finish.
+UPGRADE_PHASE_ORDER = (
+    "uploaded",
+    "candidate-preflight-ready",
+    "schema-ready",
+    "registry-staged",
+    "cpu-staged",
+    "profile-ready",
+    "endpoint-ready",
+    "observability-ready",
+    "data-converged",
+    "cpu-finalized",
+    "verified",
+    "complete",
+)
+# One worker per phase that may run beside the others: the candidate node
+# preflight, the control-plane endpoint, and the observability install. Each
+# touches a cluster or an AWS resource none of the others do, and each is joined
+# at the phase that genuinely depends on it. The pool is sized so no submit can
+# ever queue behind a peer -- a queued future joined before its queue-mate
+# finishes would be a deadlock that only shows up under a slow phase.
+UPGRADE_PHASE_WORKERS = 3
+# The component whose work a phase checkpoint attests to. A release whose plan
+# omits the component has nothing to do for the phase and writes no checkpoint
+# for it, so every downstream gate has to read "not planned" as satisfied
+# (`phase_done`) rather than waiting for a stamp that will never arrive.
+PHASE_COMPONENT_GATES = {
+    "schema-ready": ReleaseComponent.SCHEMA,
+    "registry-staged": ReleaseComponent.REGISTRY,
+    "cpu-staged": ReleaseComponent.CPU_STAGE,
+    "profile-ready": ReleaseComponent.RUNTIME_PROFILE,
+    "endpoint-ready": ReleaseComponent.ENDPOINT,
+    "observability-ready": ReleaseComponent.OBSERVABILITY,
+    "cpu-finalized": ReleaseComponent.CPU_FINALIZE,
+}
+
+
+# The names the background phases are tracked and narrated under. They are not
+# checkpoint phases: `candidate-preflight-ready` is written when the future is
+# joined, not when it is submitted.
+PHASE_CANDIDATE_PREFLIGHT = "candidate-preflight"
+PHASE_ENDPOINT = "endpoint"
+PHASE_OBSERVABILITY = "observability"
+
+
+def _annotate_with_background_failures(
+    error: BaseException,
+    notes: list[str],
+) -> None:
+    """Fold background-phase failures into the error the caller will report.
+
+    Appended to the same exception object rather than raised in its place:
+    `upgrade_release` decides between a pause and a full rollback from the
+    error's *type*, and a cluster-local pause must not become a global rollback
+    just because a phase running beside it also died.
+    """
+
+    if not notes:
+        return
+    suffix = "; ".join(notes)
+    head = str(error.args[0]) if error.args else ""
+    error.args = (f"{head}; {suffix}" if head else suffix,) + tuple(error.args[1:])
+
+
 def run_upgrade_phases(
     self: Any,
     *,
@@ -520,175 +622,323 @@ def run_upgrade_phases(
     completed_clusters: set[str],
     registry_staged: bool,
 ) -> bool:
-    def checkpoint(phase: str, **updates: Any) -> None:
-        completed_phases.add(phase)
+    # Phases that have completed but are not in the ConfigMap yet, oldest first.
+    # Nothing is allowed to depend on a phase being *durable* until the next
+    # state write returns, which is why every mutation is followed by one.
+    pending_phases: dict[str, dict[str, Any]] = {}
+
+    def phase_done(name: str) -> bool:
+        """True when this release has nothing left to do for `name`."""
+
+        if name in completed_phases:
+            return True
+        gate = PHASE_COMPONENT_GATES.get(name)
+        return gate is not None and not plan.has(gate)
+
+    def write_state(stamp: str, **updates: Any) -> None:
+        merged: dict[str, Any] = {}
+        carried = sorted(
+            (
+                phase
+                for phase in pending_phases
+                if phase != stamp and phase in UPGRADE_PHASE_ORDER
+            ),
+            key=UPGRADE_PHASE_ORDER.index,
+        )
+        for values in pending_phases.values():
+            merged.update(values)
+        pending_phases.clear()
+        merged.update(updates)
         self._save_state(
-            phase,
+            stamp,
             previous=previous,
             release_diff=diff.as_dict(),
             execution_plan=plan.as_dict(),
             completed_phases=sorted(completed_phases),
             completed_cluster_ids=sorted(completed_clusters),
             registry_staged=registry_staged,
-            **updates,
+            **merged,
         )
+        # `save_state` narrates the stamp and nothing else, so the phases this
+        # one write also made durable would have no line at all -- and those are
+        # exactly the phases an operator reads the log to time. They follow the
+        # stamp because the write is what makes them true, and they carry
+        # `elapsed=0.0` for the same reason: the interval they were reached in is
+        # charged to the checkpoint that persisted all of them.
+        for phase in carried:
+            narrate_phase(self, phase)
 
-    def run_component(
-        component: ReleaseComponent,
-        action: Callable[[], Any],
-    ) -> Any:
-        progress = update_component_progress(
-            self.state,
-            component,
-            PROGRESS_STARTED,
-        )
+    def phase_complete(name: str, **updates: Any) -> None:
+        """Mark `name` complete; the next state write is what persists it."""
+
+        completed_phases.add(name)
+        pending_phases[name] = updates
+
+    def flush_phases(**updates: Any) -> None:
+        with state_transaction(self):
+            current = str(self.state.get("phase") or "")
+            # The phase already on record counts towards the stamp, not just the
+            # phases this write carries. Without it a write whose only pending
+            # phase is an early one (the candidate preflight, joined late) would
+            # move the recorded phase *backwards*, and a phase outside
+            # `RESUMABLE_PHASES` -- or simply an earlier one -- makes a crash
+            # here look like a release that must start over.
+            ranked = [
+                phase
+                for phase in {*pending_phases, current}
+                if phase in UPGRADE_PHASE_ORDER
+            ]
+            stamp = (
+                max(ranked, key=UPGRADE_PHASE_ORDER.index)
+                if ranked
+                else (current or "preflight")
+            )
+            write_state(stamp, **updates)
+
+    def checkpoint(phase: str, **updates: Any) -> None:
+        with state_transaction(self):
+            phase_complete(phase)
+            flush_phases(**updates)
+
+    def mark_component(component: ReleaseComponent, status: str) -> dict[str, Any]:
+        progress = update_component_progress(self.state, component, status)
         self.state["component_progress"] = progress
-        self._save_state(
-            str(self.state.get("phase") or "preflight"),
-            component_progress=progress,
-        )
+        return progress
+
+    def start_component(component: ReleaseComponent) -> None:
+        # One write says "the phases before this are complete" and "this
+        # component has started". Both describe the same instant, and a crash
+        # between them could not be told apart from a crash after them, so
+        # splitting the write bought nothing but another ConfigMap apply.
+        with state_transaction(self):
+            flush_phases(component_progress=mark_component(component, PROGRESS_STARTED))
+
+    def fail_component(component: ReleaseComponent) -> None:
+        with state_transaction(self):
+            flush_phases(component_progress=mark_component(component, PROGRESS_FAILED))
+
+    def finish_component(component: ReleaseComponent) -> None:
+        with state_transaction(self):
+            mark_component(component, PROGRESS_COMPLETED)
+
+    # The phases running in the pool, by name, until the main thread joins one.
+    # A future nobody joins is a failure nobody sees: its exception is never
+    # retrieved, so it never reaches the log or the failure record.
+    pending_futures: dict[str, Future[Any]] = {}
+
+    def submit_phase(name: str, action: Callable[..., Any], *args: Any) -> None:
+        pending_futures[name] = pool.submit(action, *args)
+
+    def join_phase(name: str) -> None:
+        pending_futures.pop(name).result()
+
+    def drain_background_phases() -> list[str]:
+        """Wait out the phases still in the pool and report what they raised.
+
+        Called only on the failure path, for two reasons: a rollback must not run
+        while a mutation from this transaction is still in flight, and the
+        exception of an unjoined future would otherwise be discarded with the
+        pool -- unlogged, and absent from the error the operator is handed.
+        """
+
+        notes: list[str] = []
+        for name in list(pending_futures):
+            future = pending_futures.pop(name)
+            try:
+                future.result()
+            except Exception as exc:
+                narrate_step(
+                    "release-phase-failed",
+                    phase=name,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                notes.append(f"{name} also failed: {type(exc).__name__}: {exc}")
+        return notes
+
+    def join_component(
+        component: ReleaseComponent,
+        name: str,
+        completes_phase: str,
+        **phase_updates: Any,
+    ) -> None:
+        """Wait for a component that ran in the pool and record its outcome.
+
+        The STARTED marker was written before the future was submitted, so a
+        crash while it ran is already compensated by the rollback plan; this is
+        where the same component becomes COMPLETED or FAILED, on the main thread,
+        inside the transaction that is about to depend on it.
+        """
+
+        try:
+            join_phase(name)
+        except Exception:
+            fail_component(component)
+            raise
+        finish_component(component)
+        phase_complete(completes_phase, **phase_updates)
+
+    def run_component(component: ReleaseComponent, action: Callable[[], Any]) -> Any:
+        start_component(component)
         try:
             result = action()
         except Exception:
-            progress = update_component_progress(
-                self.state,
-                component,
-                PROGRESS_FAILED,
-            )
-            self.state["component_progress"] = progress
-            self._save_state(
-                str(self.state.get("phase") or "preflight"),
-                component_progress=progress,
-            )
+            fail_component(component)
             raise
-        progress = update_component_progress(
-            self.state,
-            component,
-            PROGRESS_COMPLETED,
-        )
-        self.state["component_progress"] = progress
+        finish_component(component)
         return result
 
-    if "uploaded" not in completed_phases:
-        self._upload_release(diff)
-        checkpoint("uploaded")
-    if "data-converged" not in completed_phases:
-        preflight_upgrade_mutations(self, plan)
-        if "candidate-preflight-ready" not in completed_phases:
-            checkpoint("candidate-preflight-ready")
-    if plan.has(ReleaseComponent.SCHEMA) and ("schema-ready" not in completed_phases):
-        run_component(ReleaseComponent.SCHEMA, self._ensure_schema)
-    if "schema-ready" not in completed_phases:
-        checkpoint("schema-ready")
-    if plan.has(ReleaseComponent.REGISTRY) and (
-        "registry-staged" not in completed_phases
-    ):
-        registry_staged = bool(
-            run_component(ReleaseComponent.REGISTRY, self._stage_registry)
-        )
-        checkpoint("registry-staged")
-    if plan.has(ReleaseComponent.CPU_STAGE) and ("cpu-staged" not in completed_phases):
+    # A phase that runs in the pool never writes state from its own thread:
+    # it is joined at the phase that depends on it, and the join is what
+    # checkpoints it. Leaving the pool waits for whatever is still running, so
+    # a failure on the main thread cannot be recorded while a mutation from
+    # this transaction is still in flight.
+    with ThreadPoolExecutor(
+        max_workers=UPGRADE_PHASE_WORKERS,
+        thread_name_prefix="gpu-fault-release-phase",
+    ) as pool:
+        try:
+            if not phase_done("uploaded"):
+                self._upload_release(diff)
+                checkpoint("uploaded")
+            if not phase_done("data-converged"):
+                # Read-only Jobs on GPU nodes; nothing the control-plane phases
+                # below touch, and nothing that writes release state.
+                submit_phase(
+                    PHASE_CANDIDATE_PREFLIGHT, preflight_upgrade_mutations, self, plan
+                )
+            if not phase_done("schema-ready"):
+                run_component(ReleaseComponent.SCHEMA, self._ensure_schema)
+                phase_complete("schema-ready")
+            if not phase_done("registry-staged"):
+                registry_staged = bool(
+                    run_component(ReleaseComponent.REGISTRY, self._stage_registry)
+                )
+                phase_complete("registry-staged")
+            if not phase_done("cpu-staged"):
 
-        def apply_staged_cpu() -> None:
-            ingress_rollout = "ingress" in control_plane_role_targets(diff)
-            expected_agents = (
-                previous.get("agent_identities")
-                or self._capture_active_agent_node_sets()
-                if ingress_rollout
-                else {}
-            )
-            self._apply_cpu(
-                finalize=False,
-                force_restart=registry_staged,
+                def apply_staged_cpu() -> None:
+                    ingress_rollout = "ingress" in control_plane_role_targets(diff)
+                    expected_agents = (
+                        previous.get("agent_identities")
+                        or self._capture_active_agent_node_sets()
+                        if ingress_rollout
+                        else {}
+                    )
+                    # One apply, every role, on the main thread. The role split
+                    # cannot be invoked per role while the image changes: its
+                    # post-apply verifier checks all three tiers against the
+                    # candidate image and compares the ingress and spool
+                    # ConfigMaps against each other, and the first invocation
+                    # consumes the pin-metadata change that tells the *other*
+                    # roles to restart onto the new compatibility window.
+                    self._apply_cpu(
+                        finalize=False,
+                        force_restart=registry_staged,
+                        diff=diff,
+                    )
+                    if ingress_rollout:
+                        self._wait_candidate_cpu_agent_heartbeats(expected_agents)
+
+                run_component(ReleaseComponent.CPU_STAGE, apply_staged_cpu)
+                phase_complete("cpu-staged", release_lifecycle="CPU_STAGED")
+            if not phase_done("profile-ready"):
+                run_component(
+                    ReleaseComponent.RUNTIME_PROFILE,
+                    lambda: ensure_runtime_profile(self),
+                )
+                phase_complete("profile-ready")
+            if not phase_done("endpoint-ready"):
+                # Submitted only once the staged apply and its heartbeat barrier
+                # have returned: the endpoint wait counts *healthy NLB targets*,
+                # and the ingress Pods are cycling for the whole staged restart,
+                # so overlapping the two would let the wait pass on a target set
+                # that is about to be replaced. What it does overlap is whatever
+                # is left of the candidate node preflight, and the data plane
+                # still waits for it -- every cluster verifies the control-plane
+                # endpoint before it is mutated.
+                start_component(ReleaseComponent.ENDPOINT)
+                submit_phase(PHASE_ENDPOINT, self._apply_nlb)
+            if not phase_done("observability-ready"):
+                # Nothing in the rollout reads what the monitoring install
+                # writes, so it rolls beside the clusters; it is joined before
+                # the finalize, which is the step no rollback can undo.
+                start_component(ReleaseComponent.OBSERVABILITY)
+                submit_phase(PHASE_OBSERVABILITY, self._apply_observability)
+            if PHASE_ENDPOINT in pending_futures:
+                join_component(
+                    ReleaseComponent.ENDPOINT, PHASE_ENDPOINT, "endpoint-ready"
+                )
+            if PHASE_CANDIDATE_PREFLIGHT in pending_futures:
+                # The join, not the submit, is the gate: no GPU cluster may be
+                # mutated until the candidate has been proven usable on its nodes.
+                join_phase(PHASE_CANDIDATE_PREFLIGHT)
+                if not phase_done("candidate-preflight-ready"):
+                    phase_complete("candidate-preflight-ready")
+            if not phase_done("data-converged"):
+                flush_phases(release_lifecycle="ROLLING_CLUSTERS")
+            upgrade_gpu_clusters(
+                self,
                 diff=diff,
+                plan=plan,
+                previous=previous,
+                completed_phases=completed_phases,
+                completed_clusters=completed_clusters,
+                registry_staged=registry_staged,
             )
-            if ingress_rollout:
-                self._wait_candidate_cpu_agent_heartbeats(expected_agents)
+            if PHASE_OBSERVABILITY in pending_futures:
+                join_component(
+                    ReleaseComponent.OBSERVABILITY,
+                    PHASE_OBSERVABILITY,
+                    "observability-ready",
+                )
+            if not phase_done("data-converged"):
+                phase_complete("data-converged", release_lifecycle="FINALIZING")
+            if not phase_done("cpu-finalized"):
+                if plan.has(ReleaseComponent.RUNTIME_PROFILE):
+                    self._ensure_profile_transition_safe(
+                        previous.get("runtime_profile_version")
+                    )
 
-        run_component(
-            ReleaseComponent.CPU_STAGE,
-            apply_staged_cpu,
-        )
-        checkpoint("cpu-staged", release_lifecycle="CPU_STAGED")
-    if plan.has(ReleaseComponent.RUNTIME_PROFILE) and (
-        "profile-ready" not in completed_phases
-    ):
-        run_component(
-            ReleaseComponent.RUNTIME_PROFILE,
-            lambda: ensure_runtime_profile(self),
-        )
-        checkpoint("profile-ready")
-    if plan.has(ReleaseComponent.ENDPOINT) and (
-        "endpoint-ready" not in completed_phases
-    ):
-        run_component(ReleaseComponent.ENDPOINT, self._apply_nlb)
-        checkpoint("endpoint-ready")
-    if plan.has(ReleaseComponent.OBSERVABILITY) and (
-        "observability-ready" not in completed_phases
-    ):
-        run_component(ReleaseComponent.OBSERVABILITY, self._apply_observability)
-        checkpoint("observability-ready")
-    if "data-converged" not in completed_phases:
-        self._save_state(
-            str(self.state.get("phase") or "preflight"),
-            release_lifecycle="ROLLING_CLUSTERS",
-        )
-    upgrade_gpu_clusters(
-        self,
-        diff=diff,
-        plan=plan,
-        previous=previous,
-        completed_phases=completed_phases,
-        completed_clusters=completed_clusters,
-        registry_staged=registry_staged,
-    )
-    if "data-converged" not in completed_phases:
-        checkpoint("data-converged", release_lifecycle="FINALIZING")
-    if plan.has(ReleaseComponent.CPU_FINALIZE) and (
-        "cpu-finalized" not in completed_phases
-    ):
-        if plan.has(ReleaseComponent.RUNTIME_PROFILE):
-            self._ensure_profile_transition_safe(
-                previous.get("runtime_profile_version")
-            )
+                def apply_final_cpu() -> None:
+                    if "ingress" not in control_plane_role_targets(diff):
+                        self._apply_cpu(finalize=True, diff=diff)
+                        return
+                    expected_agents = (
+                        previous.get("agent_identities")
+                        or self._capture_active_agent_node_sets()
+                    )
+                    # Closing the compatibility window is the transaction's one
+                    # irreversible step: afterwards the control plane rejects every Agent
+                    # still on the previous pin, and neither rollback nor a staged resume
+                    # can reopen it. So prove the whole fleet already reports the
+                    # candidate identity *before* promoting, the way
+                    # deploy/hyperpod/deploy.sh does. A failure here leaves the window
+                    # open and the transaction still compensable.
+                    self._wait_candidate_cpu_agent_heartbeats(
+                        expected_agents,
+                        required_identity=self._candidate_agent_pin_identity(),
+                    )
+                    self._apply_cpu(finalize=True, diff=diff)
+                    # And prove the cutover itself did not cost us the fleet.
+                    self._wait_candidate_cpu_agent_heartbeats(expected_agents)
 
-        def apply_final_cpu() -> None:
-            if "ingress" not in control_plane_role_targets(diff):
-                self._apply_cpu(finalize=True, diff=diff)
-                return
-            expected_agents = (
-                previous.get("agent_identities")
-                or self._capture_active_agent_node_sets()
-            )
-            # Closing the compatibility window is the transaction's one
-            # irreversible step: afterwards the control plane rejects every Agent
-            # still on the previous pin, and neither rollback nor a staged resume
-            # can reopen it. So prove the whole fleet already reports the
-            # candidate identity *before* promoting, the way
-            # deploy/hyperpod/deploy.sh does. A failure here leaves the window
-            # open and the transaction still compensable.
-            self._wait_candidate_cpu_agent_heartbeats(
-                expected_agents,
-                required_identity=self._candidate_agent_pin_identity(),
-            )
-            self._apply_cpu(finalize=True, diff=diff)
-            # And prove the cutover itself did not cost us the fleet.
-            self._wait_candidate_cpu_agent_heartbeats(expected_agents)
-
-        run_component(
-            ReleaseComponent.CPU_FINALIZE,
-            apply_final_cpu,
-        )
-        checkpoint("cpu-finalized", release_lifecycle="FINALIZING")
-    if "verified" not in completed_phases:
-        run_component(
-            ReleaseComponent.VERIFY,
-            lambda: self._validate_release_quick(plan),
-        )
-        checkpoint("verified")
-    if registry_staged:
-        self._commit_registry_update()
-    checkpoint("complete", release_lifecycle="COMMITTED")
+                run_component(
+                    ReleaseComponent.CPU_FINALIZE,
+                    apply_final_cpu,
+                )
+                phase_complete("cpu-finalized", release_lifecycle="FINALIZING")
+            if not phase_done("verified"):
+                run_component(
+                    ReleaseComponent.VERIFY,
+                    lambda: self._validate_release_quick(plan),
+                )
+                phase_complete("verified")
+            if registry_staged:
+                self._commit_registry_update()
+            checkpoint("complete", release_lifecycle="COMMITTED")
+        except Exception as error:
+            _annotate_with_background_failures(error, drain_background_phases())
+            raise
     return registry_staged
 
 

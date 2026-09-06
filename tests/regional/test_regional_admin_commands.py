@@ -201,6 +201,11 @@ def test_retry_diff_restores_physical_artifact_changes(monkeypatch) -> None:
         ("failed", True),
         ("partial-convergence", True),
         ("registry-staged", True),
+        # The candidate node preflight is joined after the control-plane phases
+        # have run, so it is a phase a crashed release can be sitting on with
+        # mutations already applied. Resuming is what preserves them; a fresh
+        # upgrade would discard `completed_phases` and repeat the lot.
+        ("candidate-preflight-ready", True),
         ("data-plane-progress", True),
         ("rolled-back", False),
     ),
@@ -304,6 +309,11 @@ def test_explicit_resume_rejects_a_terminal_release() -> None:
         ("failed", True),
         ("partial-convergence", True),
         ("registry-staged", True),
+        # The candidate node preflight is joined after the control-plane phases
+        # have run, so it is a phase a crashed release can be sitting on with
+        # mutations already applied. Resuming is what preserves them; a fresh
+        # upgrade would discard `completed_phases` and repeat the lot.
+        ("candidate-preflight-ready", True),
         ("data-plane-progress", True),
         ("rolled-back", False),
     ),

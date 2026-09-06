@@ -815,6 +815,16 @@ class RegionalRelease:
         force_restart: bool = False,
         diff: ReleaseDiff | None = None,
     ) -> None:
+        """Apply the control-plane roles this release changes.
+
+        Whole roles, one invocation. The apply script cannot be driven per role
+        while the image moves: it verifies all three tiers against the candidate
+        image afterwards, compares the ingress and spool ConfigMaps against each
+        other, and consumes the pin-metadata change in the first invocation --
+        so a second, narrower invocation would see no pin change and skip the
+        restart that puts those roles on the new compatibility window.
+        """
+
         ensure_notification_secret(self)
         environment = build_cpu_apply_environment(self, finalize=finalize)
         environment["GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS"] = ",".join(

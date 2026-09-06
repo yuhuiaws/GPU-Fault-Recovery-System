@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[3]
 TRANSIENT_CRITICAL_ALERTS = frozenset({"GpuFaultStoreIoRejected"})
 CRITICAL_CLEAR_TIMEOUT_SECONDS = 420
 CRITICAL_CLEAR_SAMPLE_SECONDS = 15
+DATA_CONVERGED_GRACE_SECONDS = 600
 STORE_IO_REJECTION_METRIC = "gpu_fault_store_io_rejections_total"
 CPU_METRIC_PORTS = {
     "gpu-fault-api-ha": 8080,
@@ -392,21 +393,128 @@ def _nonterminal_remote_commands(snapshot: dict[str, Any]) -> bool:
     )
 
 
+def _data_converged_epoch(release: Any) -> float | None:
+    """When the last GPU cluster this release restarted reached data-converged.
+
+    The release engine records `converged_at_epoch` per cluster in
+    `cluster_attempts`, so the newest of them is when the data plane stopped
+    being restarted. Read defensively: a state written before that field existed,
+    or a control-plane-only deploy that restarted no data plane, has no epoch,
+    and no epoch means no grace rather than unbounded grace.
+    """
+
+    try:
+        state = dict(release.state) if getattr(release, "state", None) else None
+        if state is None:
+            state = release._load_state()
+    except Exception:
+        return None
+    attempts = state.get("cluster_attempts")
+    if not isinstance(attempts, dict):
+        return None
+    epochs: list[float] = []
+    for entry in attempts.values():
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("converged_at_epoch")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        epochs.append(float(value))
+    return max(epochs) if epochs else None
+
+
+def _restart_grace_alerts() -> frozenset[str]:
+    raw = os.getenv(
+        "GPU_FAULT_RELEASE_STABILITY_GRACE_ALERTS",
+        "GpuFaultCollectorSilent,GpuFaultCollectorMetricsSnapshotStale",
+    )
+    return frozenset(name.strip() for name in raw.split(",") if name.strip())
+
+
+class _RestartGrace:
+    """Which critical alerts this release's own data-plane restart may excuse.
+
+    `GpuFaultCollectorSilent` and `GpuFaultCollectorMetricsSnapshotStale` are
+    caused by the restart the release just performed and clear on their own once
+    the new Pods report, so failing on them rolled healthy releases back. Excusing
+    them needs the restart to be both recent and recorded by the release itself,
+    which is what bounds this: no recorded convergence, or one older than
+    `DATA_CONVERGED_GRACE_SECONDS`, means no grace at all rather than unbounded
+    grace.
+
+    One instance is shared by the baseline and the window so the two cannot
+    disagree, and the convergence epoch is read at most once and only when a
+    named alert is actually firing -- the ordinary silent window pays for no extra
+    release-state read.
+    """
+
+    def __init__(self, release: Any) -> None:
+        self._release = release
+        self._alerts = _restart_grace_alerts()
+        self._epoch: float | None = None
+        self._read = False
+
+    @property
+    def alerts(self) -> frozenset[str]:
+        return self._alerts
+
+    @property
+    def converged_at_epoch(self) -> float | None:
+        """The epoch this grace was decided against, or None if it never looked."""
+
+        return self._epoch
+
+    def filter(self, firing: set[str]) -> set[str]:
+        """`firing` minus the alerts a recent restart explains."""
+
+        if not firing & self._alerts:
+            return firing
+        if not self._read:
+            self._read = True
+            self._epoch = _data_converged_epoch(self._release)
+        if (
+            self._epoch is None
+            or time.time() - self._epoch >= DATA_CONVERGED_GRACE_SECONDS
+        ):
+            return firing
+        return firing - self._alerts
+
+
 def wait_for_stability_baseline(
     release: Any,
     baseline: dict[str, Any],
     *,
     timeout_seconds: int = CRITICAL_CLEAR_TIMEOUT_SECONDS,
     sample_seconds: int = CRITICAL_CLEAR_SAMPLE_SECONDS,
+    grace: _RestartGrace | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Open the window, waiting out only the alerts that are allowed to settle.
+
+    The baseline is taken immediately after the release restarted the data plane,
+    so it is the *first* place the alerts that restart causes appear -- excusing
+    them only inside the window would have left the grace ineffective for the
+    sample most likely to carry them. `grace` decides that, and it decides it the
+    same way here and in the window: by name, and only while the recorded
+    convergence is recent.
+    """
+
+    restart_grace = _RestartGrace(release) if grace is None else grace
     alerts = _critical_alert_names(baseline)
     report = {
         "initial_alerts": sorted(alerts),
         "wait_seconds": 0,
         "sample_count": 1,
         "metric_series": None,
+        "graced_alerts": [],
     }
     if not alerts:
+        return baseline, report
+    alerts = restart_grace.filter(alerts)
+    report["graced_alerts"] = sorted(_critical_alert_names(baseline) - alerts)
+    if not alerts:
+        # Everything firing is a consequence of this release's own restart and the
+        # restart is recent: the window itself is the thing that decides whether
+        # they clear, and it holds them to the same bound.
         return baseline, report
     unexpected = alerts - TRANSIENT_CRITICAL_ALERTS
     if unexpected:
@@ -444,7 +552,7 @@ def wait_for_stability_baseline(
             raise ReleaseError(
                 "release critical-clear wait has non-terminal remote commands"
             )
-        current = _critical_alert_names(sample)
+        current = restart_grace.filter(_critical_alert_names(sample))
         unexpected = current - TRANSIENT_CRITICAL_ALERTS
         if unexpected:
             raise ReleaseError(
@@ -534,6 +642,68 @@ def stability_snapshot(release: Any) -> dict[str, Any]:
     }
 
 
+def _queue_growth_floor() -> int:
+    """The absolute depth increase below which queue growth is never a rollback.
+
+    Parsed before the window opens, not after it: a typo here used to surface as a
+    bare `ValueError` two minutes into the window, after the release had already
+    paid for the whole wait and with no `ReleaseError` for the driver to attribute.
+    """
+
+    raw = os.getenv("GPU_FAULT_RELEASE_QUEUE_GROWTH_MIN_DEPTH", "8").strip()
+    try:
+        floor = int(raw)
+    except ValueError:
+        raise ReleaseError(
+            "GPU_FAULT_RELEASE_QUEUE_GROWTH_MIN_DEPTH must be a non-negative "
+            f"integer, got {raw!r}"
+        ) from None
+    if floor < 0:
+        raise ReleaseError(
+            "GPU_FAULT_RELEASE_QUEUE_GROWTH_MIN_DEPTH must be a non-negative "
+            f"integer, got {raw!r}"
+        )
+    return floor
+
+
+def _queue_growth_verdict(
+    queue_samples: list[dict[str, Any]],
+    *,
+    sample_seconds: int,
+    floor: int,
+) -> dict[str, Any]:
+    """Does the tail of the window show a queue that is running away?
+
+    The old rule -- any strictly-then-weakly increasing triple of depths and ages
+    -- has no notion of magnitude, so a four-node repeat deploy whose queue went
+    0 -> 1 -> 1 while the restarted Agents re-posted inventory was read as a
+    backlog and cost a ten-minute rollback. Three things now have to hold
+    together: the growth is large in absolute *or* relative terms, depth never
+    recovered across the tail, and the head of the queue is older than two sample
+    intervals, which is what says the queue is not merely full but unserved.
+    """
+
+    if len(queue_samples) < 3:
+        return {"evaluated": False, "failed": False}
+    tail = queue_samples[-3:]
+    depths = [int(item.get("depth", 0)) for item in tail]
+    ages = [float(item.get("oldest_age_seconds", 0.0)) for item in tail]
+    threshold = max(float(floor), 0.5 * depths[0])
+    growth = depths[-1] - depths[0]
+    non_decreasing = depths[0] <= depths[1] <= depths[2]
+    unserved = ages[-1] > 2 * sample_seconds
+    return {
+        "evaluated": True,
+        "failed": growth >= threshold and non_decreasing and unserved,
+        "depths": depths,
+        "oldest_age_seconds": ages,
+        "growth": growth,
+        "threshold": threshold,
+        "non_decreasing": non_decreasing,
+        "oldest_age_exceeds_two_samples": unserved,
+    }
+
+
 def validate_stability_window(
     release: Any,
     *,
@@ -551,6 +721,10 @@ def validate_stability_window(
         raise ReleaseError("release stability window must be within 120..300 seconds")
     if sample_seconds < 1 or sample_seconds > configured:
         raise ReleaseError("release stability sample interval is invalid")
+    # Every configured value is parsed here, before the first sleep: a bad one has
+    # to fail the release now, not after the window has been paid for.
+    queue_growth_floor = _queue_growth_floor()
+    grace = _RestartGrace(release)
     baseline = release._stability_snapshot()
     if baseline["not_ready"]:
         raise ReleaseError("release stability baseline has non-Ready Pods")
@@ -559,6 +733,7 @@ def validate_stability_window(
         baseline,
         timeout_seconds=critical_clear_timeout_seconds,
         sample_seconds=critical_clear_sample_seconds,
+        grace=grace,
     )
     samples = [baseline]
     deadline = time.monotonic() + configured
@@ -567,8 +742,18 @@ def validate_stability_window(
         sample = release._stability_snapshot()
         if sample["not_ready"]:
             raise ReleaseError("release stability window has non-Ready Pods")
-        if int(sample["critical_alerts"].get("count", 0)):
-            raise ReleaseError("release stability window has critical alerts")
+        # The collector going silent and its metrics snapshot going stale are
+        # consequences of the data-plane restart this release just performed, and
+        # both clear once the new Pods report. Ignoring them needs the restart to
+        # be recent and recorded, so the window stays a gate for everything else:
+        # any other critical alert -- and these two outside the grace, or with no
+        # recorded convergence at all -- still fails on the sample it appears in.
+        firing = grace.filter(_critical_alert_names(sample))
+        if firing:
+            raise ReleaseError(
+                "release stability window has critical alerts: "
+                + ", ".join(sorted(firing))
+            )
         for key, count in sample["restarts"].items():
             if count > int(baseline["restarts"].get(key, 0)):
                 raise ReleaseError(
@@ -582,16 +767,13 @@ def validate_stability_window(
                 "release stability window has non-terminal remote commands"
             )
         samples.append(sample)
-    queue_samples = [item["queue"] for item in samples]
-    if len(queue_samples) >= 3:
-        depths = [int(item.get("depth", 0)) for item in queue_samples[-3:]]
-        ages = [
-            float(item.get("oldest_age_seconds", 0.0)) for item in queue_samples[-3:]
-        ]
-        if depths[0] < depths[1] <= depths[2] and ages[0] < ages[1] <= ages[2]:
-            raise ReleaseError(
-                "release stability window observed sustained queue growth"
-            )
+    queue_growth = _queue_growth_verdict(
+        [item["queue"] for item in samples],
+        sample_seconds=sample_seconds,
+        floor=queue_growth_floor,
+    )
+    if queue_growth["failed"]:
+        raise ReleaseError("release stability window observed sustained queue growth")
     return {
         "mode": "stability",
         "healthy": True,
@@ -602,6 +784,12 @@ def validate_stability_window(
         "restart_total": sum(samples[-1]["restarts"].values()),
         "critical_alert_count": int(samples[-1]["critical_alerts"].get("count", 0)),
         "critical_clear": critical_clear,
+        "queue_growth": queue_growth,
+        "restart_grace": {
+            "converged_at_epoch": grace.converged_at_epoch,
+            "grace_seconds": DATA_CONVERGED_GRACE_SECONDS,
+            "alerts": sorted(grace.alerts),
+        },
     }
 
 

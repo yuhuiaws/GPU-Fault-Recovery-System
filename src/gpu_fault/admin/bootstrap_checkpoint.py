@@ -13,8 +13,11 @@ from gpu_fault.admin.bootstrap_common import (
     safe_name,
 )
 
+# The one module still bound into a task digest, for the two tasks below that no
+# read-only probe re-proves.
+_ORCHESTRATION_SOURCE = "src/gpu_fault/admin/bootstrap.py"
 BOOTSTRAP_RECONCILE_SOURCES = (
-    "src/gpu_fault/admin/bootstrap.py",
+    _ORCHESTRATION_SOURCE,
     "src/gpu_fault/admin/bootstrap_aurora.py",
     "src/gpu_fault/admin/bootstrap_checkpoint.py",
     "src/gpu_fault/admin/bootstrap_common.py",
@@ -69,9 +72,8 @@ def _manifest_wheel_sha256(root: Path, manifest: Path) -> str | None:
 
 
 def _platform_task_digests(
-    task_digest: Callable[[object], str],
+    task_digest: Callable[[str, object], str],
     *,
-    services_source: str | None,
     assets: Mapping[str, str | None],
     images: Mapping[str, Any],
     alert_email: str | None,
@@ -90,8 +92,8 @@ def _platform_task_digests(
 
     digests = {
         "monitoring_install": task_digest(
+            "monitoring_install",
             {
-                "source": services_source,
                 "assets": {
                     "installer": assets[
                         "deploy/observability/install-amp-monitoring.sh"
@@ -104,27 +106,28 @@ def _platform_task_digests(
                 },
                 "adot_image": images.get("adot"),
                 "alert_email": alert_email,
-            }
+            },
         ),
         "aurora_refresh": task_digest(
+            "aurora_refresh",
             {
-                "source": services_source,
                 "asset": assets[
                     "deploy/control-plane/regional/aurora-credential-refresh.yaml"
                 ],
                 "control_plane_wheel_sha256": control_plane_wheel_sha256,
                 "runtime_image": images.get("runtime"),
-            }
+            },
         ),
     }
     for cluster_identity in gpu_identity:
         cluster_id = safe_name(str(cluster_identity["hyperpod_name"]))
-        digests[f"node_keys:{cluster_id}"] = task_digest(
+        name = f"node_keys:{cluster_id}"
+        digests[name] = task_digest(
+            name,
             {
-                "source": services_source,
                 "asset": assets["deploy/node/provision-node-action-keys.sh"],
                 "cluster": cluster_identity,
-            }
+            },
         )
     return digests
 
@@ -196,108 +199,91 @@ def bind_bootstrap_inputs(
     common = {
         "cpu": cpu_identity,
         "site_id": state.value["site_id"],
-        "common_source_sha256": {
-            name: sources[name]
-            for name in (
-                "src/gpu_fault/admin/bootstrap_checkpoint.py",
-                "src/gpu_fault/admin/bootstrap_common.py",
-            )
-        },
     }
 
-    def task_digest(value: object) -> str:
+    def task_digest(name: str, value: object) -> str:
+        """Digest one task's desired state.
+
+        The task name is part of the digest because two tasks can legitimately
+        describe the same inputs -- `nlb_network` and `pki` both describe the same
+        clusters -- and a shared digest would let one task's checkpoint answer for
+        the other.
+
+        What is deliberately *not* here is the bytes of the modules that do the
+        work. Embedding them meant any refactor of `bootstrap.py` and its siblings
+        re-ran every ensure path on the next deploy, including the unconditional
+        `rds modify-db-subnet-group` and its `rds wait`, for a site where no
+        desired resource had changed.
+
+        That is only safe for a task whose completion is re-proved on every
+        deploy. `bootstrap_tasks.py` revalidates `pod_identity_agent`,
+        `monitoring_install`, `aurora_refresh`, `node_keys:*`,
+        `load_balancer_controller`, `control_plane_role`, `email_notifications`,
+        `monitoring_resources` and `executor_role:*` through a read-only probe
+        that enters ensure on detected drift, so for those the probe is the
+        re-convergence trigger and the module bytes are noise.
+
+        `nlb_network` and `pki` have no probe, so the digest is their only
+        trigger: `_ORCHESTRATION_SOURCE` (the `bootstrap.py` bytes) stays in
+        those two, and a change to how they converge still re-runs them.
+        `aurora` has no probe either but is deliberately left source-free: its
+        reconcilable inputs are covered by `admin_config_sha256` and the CPU
+        subnet ids, and its ensure path writes to RDS unconditionally, which is
+        exactly what a refactor must not re-trigger.
+        """
+
         return hashlib.sha256(
             json.dumps(
-                {"common": common, "task": value},
+                {"common": common, "name": name, "task": value},
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
         ).hexdigest()
 
-    bootstrap_source = sources["src/gpu_fault/admin/bootstrap.py"]
-    services_source = sources["src/gpu_fault/admin/bootstrap_services.py"]
-    notification_sources = {
-        name: sources[name]
-        for name in (
-            "src/gpu_fault/admin/notification_bootstrap.py",
-            "src/gpu_fault/admin/notifications.py",
-        )
-    }
     task_digests = {
         "release_repositories": task_digest(
-            {
-                "source": sources["src/gpu_fault/admin/release_repositories.py"],
-                "region": cpu.region,
-                "account_id": cpu.account_id,
-            }
+            "release_repositories",
+            {"region": cpu.region, "account_id": cpu.account_id},
         ),
-        "release": task_digest(
-            {
-                "sources": {
-                    "artifacts": sources["src/gpu_fault/admin/release_artifacts.py"],
-                    "repositories": sources[
-                        "src/gpu_fault/admin/release_repositories.py"
-                    ],
-                },
-                "release": release_identity,
-            }
-        ),
+        "release": task_digest("release", {"release": release_identity}),
         "pod_identity_agent": task_digest(
-            {"source": services_source, "eks_arn": cpu.eks_arn}
+            "pod_identity_agent", {"eks_arn": cpu.eks_arn}
         ),
+        # These two are the tasks no read-only probe re-proves; see `task_digest`.
         "nlb_network": task_digest(
+            "nlb_network",
             {
-                "source": bootstrap_source,
                 "cpu": cpu_identity,
                 "gpu_clusters": gpu_identity,
-            }
+                "source": sources[_ORCHESTRATION_SOURCE],
+            },
         ),
         "pki": task_digest(
+            "pki",
             {
-                "source": bootstrap_source,
                 "cpu": cpu_identity,
                 "gpu_clusters": gpu_identity,
-            }
+                "source": sources[_ORCHESTRATION_SOURCE],
+            },
         ),
         "aurora": task_digest(
-            {
-                "sources": {
-                    "bootstrap": bootstrap_source,
-                    "aurora": sources["src/gpu_fault/admin/bootstrap_aurora.py"],
-                },
-                "admin_config_sha256": payload["admin_config_sha256"],
-            }
+            "aurora",
+            {"admin_config_sha256": payload["admin_config_sha256"]},
         ),
         "load_balancer_controller": task_digest(
-            {"source": services_source, "eks_arn": cpu.eks_arn}
+            "load_balancer_controller", {"eks_arn": cpu.eks_arn}
         ),
         "control_plane_role": task_digest(
-            {
-                "source": services_source,
-                "notifications": notification_identity,
-            }
+            "control_plane_role", {"notifications": notification_identity}
         ),
         "email_notifications": task_digest(
-            {
-                "sources": notification_sources,
-                "notifications": notification_identity,
-            }
+            "email_notifications", {"notifications": notification_identity}
         ),
         "monitoring_resources": task_digest(
-            {
-                "sources": {
-                    **notification_sources,
-                    "subscriptions": sources[
-                        "src/gpu_fault/admin/monitoring_subscriptions.py"
-                    ],
-                    "services": services_source,
-                },
-                "admin_email": request.alert_email,
-            }
+            "monitoring_resources", {"admin_email": request.alert_email}
         ),
         **_platform_task_digests(
             task_digest,
-            services_source=services_source,
             assets=assets,
             images=images,
             alert_email=request.alert_email,
@@ -307,8 +293,7 @@ def bind_bootstrap_inputs(
     }
     for cluster_identity in gpu_identity:
         cluster_id = safe_name(str(cluster_identity["hyperpod_name"]))
-        task_digests[f"executor_role:{cluster_id}"] = task_digest(
-            {"source": services_source, "cluster": cluster_identity}
-        )
+        name = f"executor_role:{cluster_id}"
+        task_digests[name] = task_digest(name, {"cluster": cluster_identity})
     state.bind_inputs(digest, task_digests)
     return digest

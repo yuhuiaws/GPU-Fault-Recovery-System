@@ -118,7 +118,7 @@ spec:
             - name: GPU_FAULT_DCGM_METRICS_URL
               value: REPLACE_WITH_DCGM_METRICS_URL
             - name: GPU_FAULT_RECONCILE_SECONDS
-              value: "15"
+              value: "5"
             - name: GPU_FAULT_INSTALL_RETRY_SECONDS
               value: "300"
             - name: GPU_FAULT_INSTALLER_MAX_UNAVAILABLE

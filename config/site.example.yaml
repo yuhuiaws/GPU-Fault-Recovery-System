@@ -17,7 +17,7 @@ spec:
   release:
     manifest: dist/current-release.json
     agentConfigDigest: REPLACE_WITH_64_HEX_CONFIG_DIGEST
-    upgradeMaxUnavailable: 1
+    upgradeMaxUnavailable: 0
     rollbackMaxUnavailable: 2
     # 1 keeps a shared release rolling one GPU cluster at a time; raise to at most
     # 8 only when the site accepts several GPU clusters being touched at once.

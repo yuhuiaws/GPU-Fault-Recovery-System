@@ -28,7 +28,15 @@ def cluster_attempts_with(
     lifecycle: str,
     *,
     details: dict[str, Any] | None = None,
+    fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """The attempt ledger with this cluster's entry advanced to `lifecycle`.
+
+    `details` is operator-facing context and is nested; `fields` are attempt
+    facts other code *reads* (`converged_at_epoch`), so they sit beside `state`
+    where a reader can find them without knowing which release wrote them.
+    """
+
     if lifecycle not in CLUSTER_ATTEMPT_STATES:
         raise ValueError(f"unsupported cluster attempt state: {lifecycle}")
     attempts = {
@@ -55,6 +63,13 @@ def cluster_attempts_with(
             **dict(previous.get("details") or {}),
             **details,
         }
+    if fields:
+        reserved = {"state", "attempt_generation", "updated_at_epoch"}
+        if forbidden := reserved & fields.keys():
+            raise ValueError(
+                f"fields must not contain reserved keys: {sorted(forbidden)}"
+            )
+        entry.update(fields)
     attempts[cluster_id] = entry
     return attempts
 
@@ -310,7 +325,20 @@ def _legacy_gpu_may_have_started(
 ) -> bool:
     if not execution_components.intersection(GPU_COMPONENTS):
         return False
-    required = {"schema-ready"}
+    # Only the phases this release both checkpoints *and* reaches before the
+    # data plane can gate the data plane. Two ways that goes wrong: a plan
+    # without a schema change writes no `schema-ready`, so requiring it
+    # unconditionally reads every such state as "the GPU rollout never started"
+    # and compensates nothing; and `observability-ready` is now recorded *after*
+    # the clusters roll (the install runs beside them and is joined before the
+    # finalize), so requiring it would do the same to every state that crashed
+    # mid-rollout. `uploaded` is the floor: it is the last phase before the data
+    # plane may run in a plan with no control-plane work. Being wrong in this
+    # direction means compensating a cluster that never started, which is a
+    # replay of the previous release's manifests -- the safe direction.
+    required = {"uploaded"}
+    if ReleaseComponent.SCHEMA in execution_components:
+        required.add("schema-ready")
     if ReleaseComponent.REGISTRY in execution_components:
         required.add("registry-staged")
     if ReleaseComponent.CPU_STAGE in execution_components:
@@ -319,8 +347,6 @@ def _legacy_gpu_may_have_started(
         required.add("profile-ready")
     if ReleaseComponent.ENDPOINT in execution_components:
         required.add("endpoint-ready")
-    if ReleaseComponent.OBSERVABILITY in execution_components:
-        required.add("observability-ready")
     return required.issubset(completed_phases)
 
 

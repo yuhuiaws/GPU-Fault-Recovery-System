@@ -199,7 +199,9 @@ def test_site_yaml_renders_the_existing_release_contract(tmp_path: Path) -> None
     assert rendered.release_config["nlb"]["public_subnets"] == "subnet-a,subnet-b"
     assert rendered.release_config["health"]["amp_workspace_id"] == "ws-test"
     assert rendered.release_config["clusters"][0]["region"] == REGION
-    assert rendered.release_config["release"]["upgrade_max_unavailable"] == 1
+    # 0 is "auto": the release derives the wave size from the node count
+    # instead of the site pinning a 1 that defeats the built-in cap.
+    assert rendered.release_config["release"]["upgrade_max_unavailable"] == 0
     assert rendered.release_config["release"]["rollback_max_unavailable"] == 2
     assert rendered.release_config["release"]["upgrade_max_parallel_clusters"] == 1
     assert rendered.environment["GPU_FAULT_RUNTIME_IMAGE"].startswith(
@@ -1013,8 +1015,19 @@ def test_config_rejects_uncommitted_live_state_without_active_approval(
         admin_cli.run(arguments)
 
 
+@pytest.mark.parametrize(
+    "phase",
+    # Every phase here is one `regional_admin_commands.RESUMABLE_PHASES` accepts,
+    # so the admin CLI has to accept it too: a phase the release engine can
+    # resume from but this list rejects turns an approved config apply into a
+    # dead end.
+    ("cpu-staged", "candidate-preflight-ready"),
+)
 def test_config_resumes_matching_approved_uncommitted_live_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    phase: str,
 ) -> None:
     path = site_file(tmp_path)
     initialize_desired_admin_config(tmp_path)
@@ -1046,7 +1059,7 @@ def test_config_resumes_matching_approved_uncommitted_live_state(
     mock_live_release(
         monkeypatch,
         committed=False,
-        phase="cpu-staged",
+        phase=phase,
         admin_config_sha256=desired.sha256(),
         release_diff_kind="CONTROL_PLANE_ONLY",
     )

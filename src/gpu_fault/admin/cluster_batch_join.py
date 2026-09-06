@@ -414,7 +414,13 @@ def effective_deploy_concurrency(
             if node_count < 512
             else 32
         )
-        per_cluster_limits.append(max(1, min(configured, size_cap)))
+        # 0 is "auto" in the release config: the wave engine takes the size cap
+        # it derives from the node count, so the budget divisor has to count
+        # those nodes too. Reading auto as 1 here divided a 64-node budget by 1
+        # and admitted clusters that each take `size_cap` nodes down at once.
+        per_cluster_limits.append(
+            size_cap if configured <= 0 else max(1, min(configured, size_cap))
+        )
     return min(
         context.concurrency,
         len(attempts),

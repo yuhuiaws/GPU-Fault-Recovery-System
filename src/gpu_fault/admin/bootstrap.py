@@ -1885,7 +1885,9 @@ def _site_document(
             "release": {
                 "manifest": release["manifest"],
                 "agentConfigDigest": release["agent_config_digest"],
-                "upgradeMaxUnavailable": 1,
+                # 0 = auto: follow the fleet-size cap (4/8/16/32) after the
+                # single-node canary wave.
+                "upgradeMaxUnavailable": 0,
                 "rollbackMaxUnavailable": 2,
             },
             "runtimeProfile": {

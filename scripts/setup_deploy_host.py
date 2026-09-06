@@ -645,6 +645,75 @@ def finalize_venv_activation(backup: Path | None) -> None:
         _remove_path(backup)
 
 
+def prune_venv_versions(venv: Path, *, lock_fd: int) -> tuple[Path, ...]:
+    """Delete installed venv versions nothing can still activate.
+
+    Every deploy-host change installs a fresh tree under ``.<venv>.versions`` and
+    nothing removed the old ones, so a long-lived state directory reached 12 GB.
+    Kept: the version the symlink points at, the activation backup a crashed
+    setup may have left (the only way back), and the newest
+    ``GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED`` (3) by modification time.
+    The dependency venv named by the state file needs no protection: it lives
+    under ``.<venv>.dependencies`` and is never a candidate here.
+
+    ``lock_fd`` is the site operation lock the caller holds, and it is required:
+    a version another process is installing into cannot be told from one it
+    abandoned, so nothing here may run unlocked. The hand-run
+    ``scripts/setup-deploy-host.sh`` has no lock to give and therefore never
+    prunes -- the deploy does, under the lock it took before classifying.
+    """
+
+    try:
+        os.fstat(lock_fd)
+    except OSError as exc:
+        raise DeployHostSetupError(
+            "deploy-host venv versions are prunable only while the site operation "
+            "lock is held"
+        ) from exc
+    versions = venv.parent / f".{venv.name}.versions"
+    if not versions.is_dir():
+        return ()
+    raw = os.getenv("GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED", "").strip()
+    retained = 3
+    if raw:
+        try:
+            retained = int(raw)
+        except ValueError as exc:
+            raise DeployHostSetupError(
+                "GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED must be a positive "
+                "integer"
+            ) from exc
+        if retained < 1:
+            raise DeployHostSetupError(
+                "GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED must be a positive "
+                f"integer, not {raw}"
+            )
+    keep: set[Path] = set()
+    for link in (venv, venv.with_name(f".{venv.name}.previous")):
+        if not (link.is_symlink() or link.exists()):
+            continue
+        try:
+            keep.add(link.resolve())
+        except OSError:
+            continue
+    candidates = sorted(
+        (
+            path
+            for path in versions.iterdir()
+            if path.is_dir() and not path.is_symlink()
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    removed: list[Path] = []
+    for position, candidate in enumerate(candidates):
+        if position < retained or candidate in keep or candidate.resolve() in keep:
+            continue
+        shutil.rmtree(candidate, ignore_errors=True)
+        removed.append(candidate)
+    return tuple(removed)
+
+
 def setup_deploy_host(
     *,
     repo_root: Path,
@@ -812,6 +881,10 @@ def setup_deploy_host(
         shutil.rmtree(staged, ignore_errors=True)
         raise
     finalize_venv_activation(activation_backup)
+    # Versions are not pruned here. This entry point is also hand-run without any
+    # site lock, and deleting a tree a concurrent install is writing into is the
+    # failure that costs more than the disk: ``staging_deploy`` prunes instead,
+    # under the lock it holds across the whole deploy.
     result["reused"] = False
     return result
 

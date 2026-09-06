@@ -33,6 +33,12 @@ RESUMABLE_PHASES = frozenset(
     {
         "preflight",
         "uploaded",
+        # The candidate node preflight runs beside the control-plane phases and
+        # is joined before the data plane, so it can be the recorded phase of a
+        # release that has already staged the CPU roles. Omitting it made a crash
+        # there look terminal, which discards `completed_phases` and
+        # `cluster_attempts` and starts the whole transaction over.
+        "candidate-preflight-ready",
         "schema-ready",
         "registry-staged",
         "cpu-staged",
@@ -117,11 +123,15 @@ def _commit_cleanup_pending(state: dict[str, Any]) -> bool:
     )
 
 
-def _upgrade_resume_required(state: dict[str, Any]) -> bool:
-    phase = str(state.get("phase") or "")
-    return phase in RESUMABLE_PHASES or (
-        phase == "complete" and state.get("transaction_committed") is False
+def _commit_pending(state: dict[str, Any]) -> bool:
+    return (
+        str(state.get("phase") or "") == "complete"
+        and state.get("transaction_committed") is False
     )
+
+
+def _upgrade_resume_required(state: dict[str, Any]) -> bool:
+    return str(state.get("phase") or "") in RESUMABLE_PHASES or _commit_pending(state)
 
 
 def next_deploy(release: Any, state: dict[str, Any]) -> dict[str, Any]:
@@ -143,6 +153,18 @@ def next_deploy(release: Any, state: dict[str, Any]) -> dict[str, Any]:
             **retry_release_diff(release, state).as_dict(),
             "resume": _upgrade_resume_required(state),
             "action": "upgrade",
+            # `complete` with an open transaction is a resume, but a resume of
+            # one step: the commit. Everything is applied and quick validation
+            # already passed, so the release driver may reuse the read-only
+            # verifier evidence that deploy produced instead of re-running the
+            # same probes a minute later. Naming the release the evidence has to
+            # match is half of what makes that reuse safe; the other half is the
+            # live-state digest `quick_validation_evidence` compares.
+            **(
+                {"pending_commit": True, "release_id": state.get("release_id")}
+                if _commit_pending(state)
+                else {}
+            ),
         }
     return classify_release(release, state).as_dict()
 
