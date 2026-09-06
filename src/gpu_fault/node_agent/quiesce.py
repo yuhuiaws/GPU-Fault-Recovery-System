@@ -37,8 +37,28 @@ def restore_gpu_services() -> None:
     LOGGER.info("GPU service restore result: %s", result)
 
 
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def read_boot_id(path: Path = BOOT_ID_PATH) -> str:
+    """The kernel boot id, or "" where it cannot be read (tests, containers)."""
+
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 class GpuServiceQuiesceManager:
-    """Quiesces host GPU services with an independent systemd restore timer."""
+    """Quiesces host GPU services with an independent systemd restore timer.
+
+    The timer is a transient unit, so a reboot takes it with it while the
+    ``quiesce-*.json`` state file survives on disk. ``reconcile_after_boot``
+    restores such a file when the agent starts on a boot other than the one
+    that wrote it, so the node neither reports quiesce residue forever nor
+    lets the same incident pass ``assert_quiesced`` on a boot that never
+    quiesced.
+    """
 
     def __init__(
         self,
@@ -61,6 +81,7 @@ class GpuServiceQuiesceManager:
         ),
         runner: Callable[..., subprocess.CompletedProcess] = (subprocess.run),
         sleeper: Callable[[float], None] = time.sleep,
+        boot_id_reader: Callable[[], str] = read_boot_id,
     ) -> None:
         if not 30 <= failsafe_seconds <= 3600:
             raise ValueError("quiesce fail-safe seconds must be between 30 and 3600")
@@ -121,6 +142,7 @@ class GpuServiceQuiesceManager:
         self.restore_command = restore_command
         self.runner = runner
         self.sleeper = sleeper
+        self.boot_id_reader = boot_id_reader
 
     @staticmethod
     def _key(incident_id: str) -> str:
@@ -533,6 +555,7 @@ class GpuServiceQuiesceManager:
                 "target_device_paths": normalized_target_paths,
                 "workload_cgroup_paths": sorted(workload_cgroup_paths),
                 "timer_unit": timer_unit,
+                "boot_id": self.boot_id_reader(),
             }
             self._write_state(state_path, state)
             try:
@@ -601,6 +624,69 @@ class GpuServiceQuiesceManager:
             state = self._read_state(state_path)
             if state is None or state.get("phase") != "QUIESCED":
                 raise RuntimeError("GPU reset requires an active service quiesce state")
+
+    def reconcile_after_boot(self) -> dict[str, Any]:
+        """Restore quiesce state files that a reboot orphaned.
+
+        A state file is stale when it was written on another boot, or -- for a
+        file from before the boot id was recorded -- when its fail-safe timer no
+        longer exists. A stale file's services were re-enabled by systemd at
+        boot, so restoring is mostly bookkeeping: start what the file names
+        (idempotent), drop the dead timer and remove the file. A file of the
+        current boot whose timer is still armed is an in-flight quiesce and is
+        left alone; an agent restart must not undo a maintenance window.
+        """
+
+        boot_id = self.boot_id_reader()
+        report: dict[str, Any] = {
+            "boot_id": boot_id,
+            "restored": [],
+            "kept": [],
+            "failed": [],
+        }
+        if not self.state_dir.is_dir():
+            return report
+        for state_path in sorted(self.state_dir.glob("quiesce-*.json")):
+            try:
+                state = self._read_state(state_path) or {}
+            except RuntimeError as exc:
+                report["failed"].append(
+                    {"state_path": str(state_path), "error": str(exc)}
+                )
+                continue
+            recorded = state.get("boot_id")
+            timer_unit = str(state.get("timer_unit") or "")
+            entry = {
+                "state_path": str(state_path),
+                "incident_id": state.get("incident_id"),
+                "recorded_boot_id": recorded,
+                "phase": state.get("phase"),
+            }
+            if recorded is not None and recorded == boot_id:
+                report["kept"].append(entry)
+                continue
+            if (
+                recorded is None
+                and timer_unit
+                and self._service_active(timer_unit + ".timer")
+            ):
+                report["kept"].append(entry)
+                continue
+            try:
+                self.restore_state_file(
+                    state_path,
+                    runner=self.runner,
+                    container_restore_timeout_seconds=(
+                        self.container_restore_timeout_seconds
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - one file must not stop the sweep
+                report["failed"].append(
+                    {**entry, "error": f"{type(exc).__name__}: {exc}"}
+                )
+                continue
+            report["restored"].append(entry)
+        return report
 
     def restore(self, *, incident_id: str) -> dict[str, Any]:
         result = self.restore_state_file(

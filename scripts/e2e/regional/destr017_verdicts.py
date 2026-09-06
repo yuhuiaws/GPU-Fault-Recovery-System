@@ -549,6 +549,25 @@ def ledger_errors(
     return errors
 
 
+def boot_reconcile_errors(after: dict[str, Any], *, node: str) -> list[str]:
+    """The Node Agent restores a quiesce the reboot orphaned when it starts.
+
+    The fail-safe timer is transient and dies with the boot; the state file
+    does not. ``GpuServiceQuiesceManager.reconcile_after_boot`` restores and
+    removes it on the first start of the new boot, so by the time the agent is
+    ACTIVE again the post-reboot snapshot must show no quiesce residue -- before
+    the runner's own restore-quiesce cleanup ever runs.
+    """
+
+    residue = [item.get("name") for item in after.get("quiesce_states") or []]
+    if residue:
+        return [
+            f"{node} Node Agent did not reconcile the quiesce state the reboot "
+            f"orphaned: {residue}"
+        ]
+    return []
+
+
 def reset_journal_errors(
     after: dict[str, Any],
     *,

@@ -754,6 +754,17 @@ def test_the_ledger_after_the_reboot_has_no_reset_and_no_new_success() -> None:
     assert verdicts.ledger_errors(host_before(), host_after(), node=NODE) == []
 
 
+def test_the_agent_reconciled_the_quiesce_state_the_reboot_orphaned() -> None:
+    assert verdicts.boot_reconcile_errors(host_after(), node=NODE) == []
+
+
+def test_a_quiesce_state_file_surviving_the_reboot_fails_the_case() -> None:
+    after = host_after()
+    after["quiesce_states"] = [{"name": "quiesce-abc.json", "phase": "QUIESCED"}]
+    errors = verdicts.boot_reconcile_errors(after, node=NODE)
+    assert any("did not reconcile" in item for item in errors), errors
+
+
 def test_a_reset_row_in_the_ledger_fails_the_case() -> None:
     after = host_after()
     after["ledger"] = [

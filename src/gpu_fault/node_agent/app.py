@@ -155,11 +155,44 @@ def _node_action_rejection(
     )
 
 
+def _reconcile_quiesce_after_boot(agent: NodeActionExecutor) -> None:
+    """Undo a quiesce that a reboot interrupted before serving any command.
+
+    The fail-safe timer is transient and dies with the boot; the state file does
+    not. Left alone it blocks the incident's next quiesce and would let a
+    RESET_GPU pass ``assert_quiesced`` on a boot that never quiesced.
+    """
+
+    manager = getattr(agent, "quiesce_manager", None)
+    reconcile = getattr(manager, "reconcile_after_boot", None)
+    if reconcile is None:
+        return
+    try:
+        report = reconcile()
+    except Exception:  # noqa: BLE001 - startup must still serve; the file stays
+        LOGGER.exception("quiesce state reconcile after boot failed")
+        return
+    if report["restored"] or report["failed"]:
+        LOGGER.warning(
+            "quiesce state reconciled after boot %s: restored=%s failed=%s kept=%s",
+            report["boot_id"],
+            [item.get("incident_id") for item in report["restored"]],
+            [item.get("incident_id") for item in report["failed"]],
+            [item.get("incident_id") for item in report["kept"]],
+        )
+
+
+def _reconciled_agent(executor: NodeActionExecutor | None) -> NodeActionExecutor:
+    agent = executor or executor_from_environment()
+    _reconcile_quiesce_after_boot(agent)
+    return agent
+
+
 def create_node_agent_app(
     executor: NodeActionExecutor | None = None,
     heartbeat_reporter: AgentHeartbeatReporter | None = None,
 ) -> FastAPI:
-    agent = executor or executor_from_environment()
+    agent = _reconciled_agent(executor)
     reporter = (
         heartbeat_reporter
         if heartbeat_reporter is not None

@@ -58,6 +58,7 @@ from scripts.e2e.regional.destr017_verdicts import (  # noqa: E402
     fence_evidence,
     holder_errors,
     host_final_errors,
+    boot_reconcile_errors,
     ledger_errors,
     lifetime_errors,
     preflight_errors,
@@ -1005,6 +1006,7 @@ def _data_plane_errors(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
     holder = run.fence.execute("holder-status", "--run-id", run.run_id, timeout=120)
     write_json_atomic(run.case_dir / "holder-status.json", holder)
     errors.extend(ledger_errors(run.baseline, after, node=run.settings.node))
+    errors.extend(boot_reconcile_errors(after, node=run.settings.node))
     errors.extend(reset_journal_errors(after, node=run.settings.node))
     errors.extend(holder_errors(holder, node=run.settings.node))
     node_after = run.regional.node_snapshot(run.settings.node)

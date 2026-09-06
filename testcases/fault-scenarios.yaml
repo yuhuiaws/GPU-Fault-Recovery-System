@@ -3854,6 +3854,7 @@ test_cases:
   - 失败的 RESTORE_GPU_SERVICES 补偿恰开出一个 support 升级 workflow-support-after-<W>（步骤 FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、QUARANTINE、ESCALATE_SUPPORT，official_action=ESCALATE_OPERATOR）；reboot-after-、replace-after-、drain-after- 一个都不存在
   - 节点 boot_id 恰变化一次，由两个独立见证：宿主探针 marker 文件的 observed_boot_ids 恰两条，与 Kubernetes 节点状态一致；marker 记录的 boot_id_before_reboot 等于基线
   - Node Agent ledger（跨 reboot 持久）新增行里无任何 RESET 行、无第二条 SUCCEEDED（除本轮 QUIESCE_GPU_SERVICES）、无重复 command_id；新 boot 的 kernel_reset_journal 中目标 BDF 的 reset 行数为 0
+  - Node Agent 在新 boot 上启动时重放遗留的 QUIESCED 状态文件：reboot 后、清理前的宿主快照 quiesce_states 为空，且同一 incident 可再次 quiesce
   - CloudTrail 中 provider 变更动词集合为空：OS reboot 不是 BatchRebootClusterNodes，也不是任何 provider 调用（枚举动词，不用 contains）
   - retired-generation reconcile 只以 plan 模式运行并记 NOT_APPLIED；plan 的 items 中不得出现本用例的 workflow（fence 自己收尾，不留待人工撤销的 wedged 记录）
   - 清理后：未点火的 reboot 定时器已取消、设备占用已解除、节点 Ready 且 schedulable、无 gpu-fault taint 与 ownership 注解、GPU 数与基线一致、基线 active 的服务全部回到 active、quiesce state 与 gpu-fault timer 无残留、探针 Pod/ConfigMap 零残留
