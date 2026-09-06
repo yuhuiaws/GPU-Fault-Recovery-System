@@ -55,6 +55,13 @@ OPEN_REMOTE_STATUSES = frozenset(
     }
 )
 MAX_WORKFLOW_IDS = 1000
+# An orphaned command is not static: the executor keeps re-leasing a WAITING
+# CHECK_MECHANICALS to poll for an acknowledgement that will never come, so its
+# status flips WAITING <-> LEASED and the lease owner comes and goes between the
+# operator's review and the apply. Both are shown, neither is bound; the
+# approval binds which commands (by id, step and operation) of which terminal
+# workflow are cancelled.
+DIGEST_EXCLUDED_COMMAND_FIELDS = frozenset({"status", "lease_owner"})
 
 
 def _canonical_sha256(value: object) -> str:
@@ -72,6 +79,24 @@ def requested_workflow_ids(requested: Iterable[str]) -> list[str]:
             f"orphaned-commands reconcile accepts at most {MAX_WORKFLOW_IDS} workflow IDs"
         )
     return values
+
+
+def plan_digest_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The plan items reduced to the fields the operator's approval binds."""
+
+    digest_items = []
+    for item in items:
+        reduced = dict(item)
+        reduced["open_commands"] = [
+            {
+                key: value
+                for key, value in command.items()
+                if key not in DIGEST_EXCLUDED_COMMAND_FIELDS
+            }
+            for command in item.get("open_commands") or []
+        ]
+        digest_items.append(reduced)
+    return digest_items
 
 
 def _plan_item(store: Any, request_id: str, commands: list[Any]) -> dict[str, Any]:
@@ -140,7 +165,7 @@ def build_orphaned_commands_plan(
         "items": items,
     }
     plan["plan_sha256"] = _canonical_sha256(
-        {"schema_version": 1, "mode": PLAN_MODE, "items": items}
+        {"schema_version": 1, "mode": PLAN_MODE, "items": plan_digest_items(items)}
     )
     return plan
 

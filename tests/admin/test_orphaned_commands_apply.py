@@ -150,3 +150,31 @@ def test_plan_requires_explicit_workflow_ids_and_reports_unknown_ones() -> None:
     (item,) = build_orphaned_commands_plan(store, ["workflow-missing"])["items"]
     assert item["eligible"] is False, item
     assert item["reasons"] == ["workflow does not exist"], item
+
+
+def test_a_lease_flap_between_review_and_apply_does_not_change_the_digest() -> None:
+    """The executor keeps re-leasing an orphaned CHECK_MECHANICALS to poll for
+    an acknowledgement, so the command flips WAITING <-> LEASED under the
+    operator; the approval binds which command is cancelled, not its phase."""
+
+    store = build_store()
+    _orphan(store)
+    reviewed = build_orphaned_commands_plan(store, [WORKFLOW])
+    # A WAITING command is re-claimable; the executor's poll is exactly this.
+    claimed = store.claim_remote_commands(
+        "cluster-a", "executor-a", limit=1, lease_seconds=60
+    )
+    assert [item.command_id for item in claimed] == ["remote-2cbdab99"], claimed
+    flapped = build_orphaned_commands_plan(store, [WORKFLOW])
+    assert flapped["items"][0]["open_commands"][0]["status"] == "LEASED", flapped
+    assert flapped["plan_sha256"] == reviewed["plan_sha256"], (
+        "a lease flap must not invalidate the review"
+    )
+
+    result = apply_orphaned_commands_plan(
+        store,
+        workflow_ids=[WORKFLOW],
+        expected_plan_sha256=reviewed["plan_sha256"],
+        reference=REFERENCE,
+    )
+    assert result["applied_workflow_ids"] == [WORKFLOW], result

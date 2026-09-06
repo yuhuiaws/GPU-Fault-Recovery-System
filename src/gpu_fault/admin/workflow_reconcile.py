@@ -908,7 +908,7 @@ def _finalize_orphaned_commands_plan(
             "mode": plan["mode"],
             "site_identity": plan["site_identity"],
             "runtime_plan_sha256": plan["runtime_plan_sha256"],
-            "items": items,
+            "items": orphaned_commands.plan_digest_items(items),
         }
     )
     return plan
