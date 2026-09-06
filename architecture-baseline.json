@@ -16,7 +16,7 @@
   "files": {
     "src/gpu_fault/admin/aws_cleanup.py": 1540,
     "src/gpu_fault/admin/bootstrap.py": 2076,
-    "src/gpu_fault/admin/cli.py": 1551,
+    "src/gpu_fault/admin/cli.py": 1521,
     "src/gpu_fault/completion_controller.py": 1634,
     "src/gpu_fault/execution/executor.py": 1956,
     "src/gpu_fault/gpu_metrics.py": 1555,

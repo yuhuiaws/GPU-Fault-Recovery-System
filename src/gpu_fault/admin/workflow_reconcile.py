@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Sequence
 
-from gpu_fault import retired_generation
+from gpu_fault import compile_blocked, retired_generation
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite
@@ -19,6 +19,8 @@ PLAN_PATH = Path("workflow-reconcile/plan.json")
 HISTORY_PATH = Path("workflow-reconcile/history")
 RETIRED_GENERATION_PLAN_PATH = Path("workflow-reconcile/retired-generation/plan.json")
 RETIRED_GENERATION_HISTORY_PATH = Path("workflow-reconcile/retired-generation/history")
+COMPILE_BLOCKED_PLAN_PATH = Path("workflow-reconcile/compile-blocked/plan.json")
+COMPILE_BLOCKED_HISTORY_PATH = Path("workflow-reconcile/compile-blocked/history")
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
 ISOLATION_ANNOTATIONS = (
     "gpu-fault.io/incident-id",
@@ -121,6 +123,46 @@ def retired_generation_script() -> str:
 
     source = Path(retired_generation.__file__).read_text(encoding="utf-8")
     return source + RETIRED_GENERATION_DRIVER
+
+
+COMPILE_BLOCKED_DRIVER = """
+
+import json as _json
+import sys as _sys
+
+from gpu_fault.app import ApplicationContext
+
+_payload = _json.load(_sys.stdin)
+_store = ApplicationContext.from_environment().store
+if _payload["mode"] == "plan":
+    _result = build_compile_blocked_plan(_store, _payload["workflow_ids"])
+elif _payload["mode"] == "apply":
+    _result = apply_compile_blocked_plan(
+        _store,
+        workflow_ids=_payload["workflow_ids"],
+        expected_plan_sha256=_payload["plan_sha256"],
+        reference=_payload["reference"],
+    )
+else:
+    raise ValueError("unsupported compile-blocked reconcile mode")
+print(_json.dumps(_result, sort_keys=True))
+"""
+
+
+def compile_blocked_script() -> str:
+    """``gpu_fault.compile_blocked``'s own source, plus a stdin/stdout driver.
+
+    Same arrangement as ``retired_generation_script`` and for the same reason:
+    a compile-time BLOCKED destructive workflow is what the release preflight
+    refuses to roll past, so it has to be closed against the image that is
+    already deployed, which does not have this module.
+    ``tests/admin/test_compile_blocked_reconcile.py`` pins that the shipped
+    source still compiles, calls both entry points and imports nothing the
+    deployed image may lack.
+    """
+
+    source = Path(compile_blocked.__file__).read_text(encoding="utf-8")
+    return source + COMPILE_BLOCKED_DRIVER
 
 
 def _canonical_sha256(value: object) -> str:
@@ -666,3 +708,197 @@ def apply_workflow_reconcile(
     write_json_atomic(archive / "applied.json", result)
     plan_path.unlink(missing_ok=True)
     return result
+
+
+def _finalize_compile_blocked_plan(
+    site: RenderedSite,
+    runtime_plan: dict[str, Any],
+) -> dict[str, Any]:
+    raw_items = runtime_plan.get("items")
+    if not isinstance(raw_items, list) or not all(
+        isinstance(item, dict) for item in raw_items
+    ):
+        raise BootstrapError("compile-blocked reconcile runtime plan is invalid")
+    items: list[dict[str, Any]] = [dict(item) for item in raw_items]
+    # The one condition the runtime cannot see: the node carries no gpu-fault
+    # isolation at all. A record that blocked at compile time never isolated
+    # anything, so any isolation present belongs to someone else and closing
+    # the record would leave it unexplained.
+    scheduling = _scheduling_evidence(site, items)
+    for item in items:
+        evidence = scheduling[str(item.get("request_id") or "")]
+        item["scheduling_evidence"] = evidence
+        if not evidence["restored"] and not item.get("already_closed"):
+            item["eligible"] = False
+            item["reasons"] = [
+                *list(item.get("reasons") or []),
+                "GPU node scheduling state has not been restored",
+            ]
+    plan = {
+        "schema_version": 1,
+        "mode": compile_blocked.PLAN_MODE,
+        "evaluated_at": runtime_plan.get("evaluated_at"),
+        "site_identity": _site_identity(site),
+        "runtime_plan_sha256": runtime_plan.get("plan_sha256"),
+        "items": items,
+    }
+    plan["plan_sha256"] = _canonical_sha256(
+        {
+            "schema_version": plan["schema_version"],
+            "mode": plan["mode"],
+            "site_identity": plan["site_identity"],
+            "runtime_plan_sha256": plan["runtime_plan_sha256"],
+            "items": compile_blocked.plan_digest_items(items),
+        }
+    )
+    return plan
+
+
+def plan_compile_blocked_reconcile(
+    site: RenderedSite,
+    state_dir: Path,
+    *,
+    workflow_ids: Sequence[str],
+) -> dict[str, Any]:
+    if not [item for item in workflow_ids if str(item).strip()]:
+        raise BootstrapError(
+            "--mode compile-blocked --plan requires at least one --workflow-id"
+        )
+    runtime_plan = _run_reconcile(
+        site,
+        {"mode": "plan", "workflow_ids": list(workflow_ids)},
+        script=compile_blocked_script(),
+    )
+    plan = _finalize_compile_blocked_plan(site, runtime_plan)
+    write_json_atomic(state_dir / COMPILE_BLOCKED_PLAN_PATH, plan)
+    return plan
+
+
+def apply_compile_blocked_reconcile(
+    site: RenderedSite,
+    state_dir: Path,
+    *,
+    expected_plan_sha256: str,
+    reference: str,
+) -> dict[str, Any]:
+    digest = expected_plan_sha256.strip()
+    normalized_reference = reference.strip()
+    if not SHA256_PATTERN.fullmatch(digest):
+        raise BootstrapError("compile-blocked reconcile plan SHA-256 is invalid")
+    if not REFERENCE_PATTERN.fullmatch(normalized_reference):
+        raise BootstrapError("compile-blocked reconcile reference is invalid")
+    plan_path = state_dir / COMPILE_BLOCKED_PLAN_PATH
+    if not plan_path.is_file():
+        raise BootstrapError("compile-blocked reconcile has no saved plan")
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BootstrapError("compile-blocked reconcile saved plan is invalid") from exc
+    if not isinstance(plan, dict) or plan.get("plan_sha256") != digest:
+        raise BootstrapError(
+            "compile-blocked reconcile saved plan SHA-256 does not match"
+        )
+    if plan.get("mode") != compile_blocked.PLAN_MODE:
+        raise BootstrapError("saved plan is not a compile-blocked plan")
+    if plan.get("site_identity") != _site_identity(site):
+        raise BootstrapError("compile-blocked reconcile managed site identity changed")
+    items = plan.get("items")
+    if not isinstance(items, list) or not items:
+        raise BootstrapError("compile-blocked reconcile saved plan has no workflows")
+    workflow_ids = [str(item["request_id"]) for item in items]
+    script = compile_blocked_script()
+    runtime_plan = _run_reconcile(
+        site,
+        {"mode": "plan", "workflow_ids": workflow_ids},
+        script=script,
+    )
+    current = _finalize_compile_blocked_plan(site, runtime_plan)
+    if current["plan_sha256"] != digest:
+        raise _changed_before_apply("compile-blocked reconcile", plan, current)
+    blocked = [
+        f"{item.get('request_id')}: " + "; ".join(item.get("reasons") or [])
+        for item in current["items"]
+        if not item.get("eligible") and not item.get("already_closed")
+    ]
+    if blocked:
+        raise BootstrapError(
+            "compile-blocked reconcile plan contains ineligible records: "
+            + " | ".join(blocked)
+        )
+    result = _run_reconcile(
+        site,
+        {
+            "mode": "apply",
+            "workflow_ids": workflow_ids,
+            "plan_sha256": current["runtime_plan_sha256"],
+            "reference": normalized_reference,
+        },
+        script=script,
+    )
+    result["admin_plan_sha256"] = digest
+    archive = state_dir / COMPILE_BLOCKED_HISTORY_PATH / digest
+    write_json_atomic(archive / "plan.json", plan)
+    write_json_atomic(archive / "applied.json", result)
+    plan_path.unlink(missing_ok=True)
+    return result
+
+
+def run_workflow_reconcile_mode(
+    site: RenderedSite,
+    state_dir: Path,
+    *,
+    mode: str,
+    plan: bool,
+    workflow_ids: Sequence[str],
+    incident_ids: Sequence[str] = (),
+    blocked_kinds: Sequence[str] = (),
+    max_items: int | None = None,
+    plan_sha256: str | None = None,
+    reference: str | None = None,
+) -> dict[str, Any]:
+    """Dispatch one ``workflow-reconcile`` invocation to its mode.
+
+    The batch selectors (``--incident-id``, ``--blocked-kind``, ``--max-items``)
+    only mean something to ``--mode restore --plan`` discovery; the other two
+    modes take explicit workflow ids, so passing a selector with them is refused
+    rather than silently ignored.
+    """
+
+    if mode not in ("restore", "retired-generation", "compile-blocked"):
+        raise BootstrapError(f"unsupported workflow-reconcile mode {mode!r}")
+    if mode != "restore" and (incident_ids or blocked_kinds or max_items is not None):
+        raise BootstrapError(
+            "--incident-id, --blocked-kind and --max-items select BLOCKED records "
+            "for --mode restore --plan only"
+        )
+    if max_items is not None and max_items < 1:
+        raise BootstrapError("--max-items must be at least 1")
+    if plan:
+        if mode == "compile-blocked":
+            return plan_compile_blocked_reconcile(
+                site, state_dir, workflow_ids=tuple(workflow_ids)
+            )
+        if mode == "retired-generation":
+            return plan_retired_generation_reconcile(
+                site, state_dir, workflow_ids=tuple(workflow_ids)
+            )
+        return plan_workflow_reconcile(
+            site,
+            state_dir,
+            workflow_ids=tuple(workflow_ids),
+            incident_ids=tuple(incident_ids),
+            blocked_kinds=tuple(blocked_kinds),
+            max_items=max_items,
+        )
+    if not plan_sha256 or not reference:
+        raise BootstrapError(
+            "workflow-reconcile --apply requires --plan-sha256 and --reference"
+        )
+    applier = {
+        "compile-blocked": apply_compile_blocked_reconcile,
+        "retired-generation": apply_retired_generation_reconcile,
+        "restore": apply_workflow_reconcile,
+    }[mode]
+    return applier(
+        site, state_dir, expected_plan_sha256=plan_sha256, reference=reference
+    )

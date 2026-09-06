@@ -80,10 +80,7 @@ from gpu_fault.admin.source_deploy import run_source_deploy
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
 from gpu_fault.models import BlockedKind
 from gpu_fault.admin.workflow_reconcile import (
-    apply_retired_generation_reconcile,
-    apply_workflow_reconcile,
-    plan_retired_generation_reconcile,
-    plan_workflow_reconcile,
+    run_workflow_reconcile_mode,
 )
 
 COMMANDS = {
@@ -298,12 +295,13 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
         "workflow-reconcile",
         usage=(
             "gpu-fault-admin workflow-reconcile --state-dir STATE_DIR "
-            "[--mode {restore,retired-generation}] "
+            "[--mode {restore,retired-generation,compile-blocked}] "
             "(--plan | --apply --plan-sha256 SHA256 --reference REFERENCE)"
         ),
         help=(
             "plan or apply audited reconciliation of restored BLOCKED workflows, "
-            "or of workflow generations their incident has retired"
+            "of workflow generations their incident has retired, or of "
+            "workflows that BLOCKED at compile time and never reached a node"
         ),
     )
     _add_managed_site_arguments(reconcile)
@@ -312,7 +310,7 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
     reconcile_mode.add_argument("--apply", action="store_true")
     reconcile.add_argument(
         "--mode",
-        choices=("restore", "retired-generation"),
+        choices=("restore", "retired-generation", "compile-blocked"),
         default="restore",
     )
     reconcile.add_argument("--workflow-id", action="append", default=[])
@@ -774,51 +772,23 @@ def _run_workflow_reconcile(arguments: argparse.Namespace) -> int:
     state_dir = arguments.state_dir.expanduser().resolve()
     site_file = _managed_site_file(arguments, command="workflow-reconcile")
     assert site_file is not None
-    retired = getattr(arguments, "mode", "restore") == "retired-generation"
-    incident_ids = tuple(getattr(arguments, "incident_id", ()) or ())
-    blocked_kinds = tuple(getattr(arguments, "blocked_kind", ()) or ())
-    max_items = getattr(arguments, "max_items", None)
-    if retired and (incident_ids or blocked_kinds or max_items is not None):
-        raise SiteConfigError(
-            "--incident-id, --blocked-kind and --max-items select BLOCKED records "
-            "for --mode restore --plan only"
-        )
-    if max_items is not None and max_items < 1:
-        raise SiteConfigError("--max-items must be at least 1")
     with administrator_operation_lock(state_dir):
         site = load_site(site_file, repository_root=arguments.repo_root)
-        if arguments.plan:
-            if retired:
-                result = plan_retired_generation_reconcile(
-                    site,
-                    state_dir,
-                    workflow_ids=tuple(arguments.workflow_id),
-                )
-            else:
-                result = plan_workflow_reconcile(
-                    site,
-                    state_dir,
-                    workflow_ids=tuple(arguments.workflow_id),
-                    incident_ids=incident_ids,
-                    blocked_kinds=blocked_kinds,
-                    max_items=max_items,
-                )
-        else:
-            if not arguments.plan_sha256 or not arguments.reference:
-                raise SiteConfigError(
-                    "workflow-reconcile --apply requires --plan-sha256 and --reference"
-                )
-            applier = (
-                apply_retired_generation_reconcile
-                if retired
-                else apply_workflow_reconcile
-            )
-            result = applier(
+        try:
+            result = run_workflow_reconcile_mode(
                 site,
                 state_dir,
-                expected_plan_sha256=arguments.plan_sha256,
+                mode=getattr(arguments, "mode", "restore"),
+                plan=bool(arguments.plan),
+                workflow_ids=tuple(arguments.workflow_id),
+                incident_ids=tuple(getattr(arguments, "incident_id", ()) or ()),
+                blocked_kinds=tuple(getattr(arguments, "blocked_kind", ()) or ()),
+                max_items=getattr(arguments, "max_items", None),
+                plan_sha256=arguments.plan_sha256,
                 reference=arguments.reference,
             )
+        except BootstrapError as exc:
+            raise SiteConfigError(str(exc)) from exc
     print(json.dumps(result, indent=2, sort_keys=True))
     # A partial apply is reported in full and exits non-zero: the rows that
     # were written are named under ``applied_workflow_ids``, the rest under
