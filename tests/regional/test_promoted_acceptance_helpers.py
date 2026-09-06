@@ -20,6 +20,10 @@ from scripts.e2e.regional import run_destr008_warm_spare_shortage as destr008
 from scripts.e2e.regional import run_destr009_workload_restart as destr009
 from scripts.e2e.regional import run_destr010_fabric_manager_restart as destr010
 from scripts.e2e.regional import run_destr012_managed_recovery_guard as destr012
+from scripts.e2e.regional import run_destr015_parallel_branch_join as destr015
+from scripts.e2e.regional import run_destr016_preempting_reboot as destr016
+from scripts.e2e.regional import run_destr017_out_of_band_reboot_fence as destr017
+from scripts.e2e.regional import run_destr018_lifetime_deadline as destr018
 from scripts.e2e.regional import run_ha003_aurora_failover_reset as ha003
 from scripts.e2e.regional import run_ha004_waiting_reclaim_reset as ha004
 from scripts.e2e.regional import run_ha009_aurora_credential_rotation as ha009
@@ -46,6 +50,15 @@ def test_promoted_ha_and_destructive_helpers_exist() -> None:
         "run_destr009_workload_restart.py",
         "run_destr010_fabric_manager_restart.py",
         "run_destr012_managed_recovery_guard.py",
+        "run_destr015_parallel_branch_join.py",
+        "destr015_verdicts.py",
+        "run_destr016_preempting_reboot.py",
+        "destr016_verdicts.py",
+        "run_destr017_out_of_band_reboot_fence.py",
+        "destr017_verdicts.py",
+        "run_destr018_lifetime_deadline.py",
+        "destr018_verdicts.py",
+        "control_plane_env_window.py",
         "host_probe_fixture.py",
         "regional_live_fixture.py",
         "managed_workload_fixture.py",
@@ -84,6 +97,15 @@ def test_promoted_helpers_contain_no_site_specific_topology() -> None:
         REGIONAL / "run_destr009_workload_restart.py",
         REGIONAL / "run_destr010_fabric_manager_restart.py",
         REGIONAL / "run_destr012_managed_recovery_guard.py",
+        REGIONAL / "run_destr015_parallel_branch_join.py",
+        REGIONAL / "destr015_verdicts.py",
+        REGIONAL / "run_destr016_preempting_reboot.py",
+        REGIONAL / "destr016_verdicts.py",
+        REGIONAL / "run_destr017_out_of_band_reboot_fence.py",
+        REGIONAL / "destr017_verdicts.py",
+        REGIONAL / "run_destr018_lifetime_deadline.py",
+        REGIONAL / "destr018_verdicts.py",
+        REGIONAL / "control_plane_env_window.py",
         REGIONAL / "host_probe_fixture.py",
         REGIONAL / "regional_live_fixture.py",
         REGIONAL / "managed_workload_fixture.py",
@@ -270,7 +292,20 @@ def test_destr010_parser_is_plan_only_by_default(tmp_path: Path) -> None:
 
 
 def test_destructive_sequence_parsers_are_plan_only(tmp_path: Path) -> None:
-    modules = (destr001, destr002, destr003, destr008, destr009, destr012, ha003, ha004)
+    modules = (
+        destr001,
+        destr002,
+        destr003,
+        destr008,
+        destr009,
+        destr012,
+        destr015,
+        destr016,
+        destr017,
+        destr018,
+        ha003,
+        ha004,
+    )
 
     for module in modules:
         arguments = module.parser().parse_args(["--run-dir", str(tmp_path)])

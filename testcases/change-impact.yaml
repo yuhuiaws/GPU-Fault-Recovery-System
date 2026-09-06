@@ -69,7 +69,8 @@ rules:
       - tests/store/test_store_contracts.py
       - tests/regional/test_authorization_registry.py
       - tests/test_operation_registry.py
-    regional_cases: []
+    regional_cases:
+      - GF-REGIONAL-DESTR-017
     checks:
       - architecture-check
       - mypy-check
@@ -306,6 +307,7 @@ rules:
       - GF-REGIONAL-HA-004
       - GF-REGIONAL-HA-006
       - GF-REGIONAL-NET-002..003
+      - GF-REGIONAL-DESTR-018
     checks:
       - config-check
 
@@ -327,6 +329,10 @@ rules:
       - tests/execution
     regional_cases:
       - GF-REGIONAL-PREEMPT-001..035
+      - GF-REGIONAL-DESTR-015
+      - GF-REGIONAL-DESTR-016
+      - GF-REGIONAL-DESTR-017
+      - GF-REGIONAL-DESTR-018
     checks:
       - architecture-check
 
@@ -383,6 +389,7 @@ rules:
       - GF-REGIONAL-CMD-015
       - GF-REGIONAL-DESTR-009
       - GF-REGIONAL-DESTR-012
+      - GF-REGIONAL-DESTR-015
       - GF-REGIONAL-E2E-001
     checks:
       - config-check
@@ -441,6 +448,10 @@ rules:
       - GF-REGIONAL-DESTR-001
       - GF-REGIONAL-DESTR-010
       - GF-REGIONAL-DESTR-014
+      - GF-REGIONAL-DESTR-015
+      - GF-REGIONAL-DESTR-016
+      - GF-REGIONAL-DESTR-017
+      - GF-REGIONAL-DESTR-018
       - GF-REGIONAL-COLLECT-013..014
     checks:
       - config-check
@@ -463,6 +474,7 @@ rules:
       - GF-REGIONAL-DESTR-005..008
       - GF-REGIONAL-DESTR-011
       - GF-REGIONAL-DESTR-013..014
+      - GF-REGIONAL-DESTR-016
       - GF-REGIONAL-ISO-004
 
   - id: notifications
@@ -637,7 +649,7 @@ rules:
     fallback: true
 
   - id: workflow-reconcile
-    description: Operator reconcile of stuck, BLOCKED and retired-generation workflows (offline admin tooling; no live acceptance case drives it).
+    description: Operator reconcile of stuck, BLOCKED and retired-generation workflows (offline admin tooling; PREEMPT-036 drives it against an isolated store).
     paths:
       - src/gpu_fault/workflow_reconcile.py
       - src/gpu_fault/workflow_resolution.py
@@ -670,7 +682,9 @@ rules:
       - tests/store/test_reconcile_epoch_cas.py
       - tests/store/test_reconcile_narrow_reads.py
       - tests/store/test_blocked_backlog_gauge.py
-    regional_cases: []
+      - tests/regional/test_preempt036_stuck_workflow_reconcile.py
+    regional_cases:
+      - GF-REGIONAL-PREEMPT-036
 
   - id: admin-operations
     description: Administrator CLI and AWS integration not owned by a narrower domain.

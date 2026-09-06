@@ -3751,6 +3751,169 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-012
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr012_group_d_requires_prewrite_failure_details
+- id: GF-REGIONAL-DESTR-015
+  title: 同一作业两节点同窗故障：双分支并行 GPU reset，单次 join 重启作业
+  category: regional-destructive-acceptance
+  level: staging
+  risk: destructive
+  problem: >-
+    多节点训练是本方案的核心承诺，但同一作业两节点同时故障后"两支并行修复、一次 join 重启"的正向路径
+    只有单元与 integration 证据：DESTR-014 证明的是分支耗尽、join 绝不执行的反向路径。
+    真机才能证明两条 XID 经真实 Collector 落进同一 job DAG、两条分支在真实 executor 上并行下发、
+    共享 STOP 只停一次、join 只在两支都 RESTORE_SCHEDULING 之后重启一次、restart budget 只扣一次，
+    以及两台节点都无残留隔离。任何一处漂移都会让作业被重启两次、在一台仍隔离的节点上重启、或永远等不到重启。
+  injection: >-
+    对固定到 node-a、node-b 的两副本 16-GPU PyTorchJob，用两个宿主探针并发向两台节点的 /dev/kmsg
+    各写入一条 XID 46（同一 marker、不同 drill id），使两条事件落在多节点聚合窗口内；
+    不改任何 executor 或控制面环境变量，不声明 warm spare，不触发任何 provider 动作。
+  expected:
+  - 两条 XID 46 事件的 incident 指向同一 workflow_request_id，dag_enabled=true，dag_revision>=1；两次写入时间差小于聚合窗口
+  - official_steps 恰含一个 STOP_WORKLOADS 与一个 RESTART_WORKLOAD；STOP_WORKLOADS 的 node_ids 覆盖两台节点
+  - 每台节点各有一条分支，MARK_UNSCHEDULABLE、QUIESCE_GPU_SERVICES、VERIFY_NO_GPU_CLIENTS、RESET_GPU、RESTORE_GPU_SERVICES、VALIDATE_GPU、RESTORE_SCHEDULING 各恰一次且全部 SUCCEEDED
+  - 两条分支的执行时间区间重叠（并行下发，而非串行）；不出现 RESTART_NODE、REPLACE_NODE、RESET_ALL_GPUS_NVSWITCHES、QUARANTINE、ESCALATE_SUPPORT
+  - join 的 depends_on_step_indexes 同时含两条分支的 RESTORE_SCHEDULING；RESTART_WORKLOAD 恰执行一次且 started_at 不早于两条 RESTORE_SCHEDULING 完成时间
+  - RESTART_WORKLOAD details 的 source/target GPU 数均为 16；restart budget 为 budget=1、restart_count=1；superseded_step_indexes 为空、无分支升级、未 withdrawn、未触发生命周期上限
+  - workflow SUCCEEDED，incident RECOVERED；新 attempt 的两个 Pod UID 与源 attempt 不同且仍落在同两台节点，全部 Running 且 Ready
+  - 两台节点 boot_id 不变；各自 Node Agent ledger 新增恰一条 SUCCEEDED 的 RESET_GPU 与各一条 QUIESCE/RESTORE_GPU_SERVICES，无 RESET_ALL 行、无重复 command_id、quiesce state 与 fail-safe timer 无残留、基线 active 的服务全部回到 active
+  - 两台节点 Ready、schedulable、无 gpu-fault taint 与 ownership 注解
+  - CloudTrail 中 BatchRebootClusterNodes、BatchReplaceClusterNodes、BatchDeleteClusterNodes 均为空；控制面日志无 Kubernetes workload 写操作；控制面 EKS 比对结果为 IDENTICAL
+  - 清理后：测试作业已删除且远端命令静默；探针 Pod/ConfigMap 与预热 Pod 无残留；若某分支失败留下隔离，只允许经 validated-restore 工作流解除
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-015
+  related_pytest: tests/regional/test_destr015_parallel_branch_join.py::test_destr015_workflow_contract_requires_one_join_after_parallel_branches
+- id: GF-REGIONAL-DESTR-016
+  title: 同一节点第二个故障在物理步骤进行中到达：同级 XID 被吸收，更高级 XID 79 抢占 reset 工作流、接管 quiesce 并完成真实 reboot
+  category: regional-destructive-acceptance
+  level: staging
+  risk: destructive-provider-reboot
+  problem: >-
+    真实故障很少单独到达：同一节点常在物理修复已经开始、GPU 服务已被 quiesce 之后再报一条。
+    这时两件事必须同时成立：同级事件被吸收进同一工作流（不能开出第二条并行修复），
+    更高级事件必须在"脏边界"上抢占——把已经 quiesce 的节点交给会真机重启的后继工作流，
+    由后继在 reboot 之后补做 RESTORE_GPU_SERVICES，而不是让被抢占的 reset 半途丢下一台
+    仍被 quiesce 的节点。抢占与 quiesce handoff 目前只有单元与 integration 证据；
+    只有真机能证明屏障上的远端命令被真的取消、handoff 步骤真的在 reboot 之后跑、
+    且被抢占的 reset 一次 GPU reset 都没提交。任何一处漂移都会留下一台隔离且无人负责的节点。
+  injection: >-
+    在一台空闲 GPU 节点上用宿主探针向 /dev/kmsg 写入一条 XID 46 开出 RESET_GPU 工作流；
+    在 Node Agent ledger 出现本次演练的 QUIESCE_GPU_SERVICES 成功行之后，由 systemd 瞬态单元
+    打开一个有时限的 GPU 设备持有者，使 VERIFY_NO_GPU_CLIENTS 屏障持续 WAITING；
+    随后写入第二条同级 XID 46（必须被吸收），再写入一条 XID 79（必须抢占）。
+    不改任何控制面或 executor 环境变量，不声明 warm spare，只授权一次 provider reboot。
+  expected:
+  - 第一条 XID 46 的 incident 开出 RESET_GPU 工作流，official_steps 恰为 FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、QUIESCE_GPU_SERVICES、VERIFY_NO_GPU_CLIENTS、RESET_GPU、RESTORE_GPU_SERVICES、VALIDATE_GPU、RESTORE_SCHEDULING 八步
+  - 边界是"脏"的：QUIESCE_GPU_SERVICES 已 SUCCEEDED 且未被 RESTORE，VERIFY_NO_GPU_CLIENTS 停在 WAITING 且带远端命令 id，RESET_GPU 从未执行
+  - 屏障远端命令 status=WAITING，result_details 的 gpu_client_quiesce_attempt>=1 且 reason 含"clients are still active"；该 step 在本工作流下只有一条远端命令
+  - 第二条同级 XID 46 落在同一 incident 与同一 workflow_request_id：不新建工作流、不新建 incident、official_steps 与 step_executions 数量都不增加，official_action 仍为 RESET_GPU
+  - XID 79 抢占成立：reset 工作流 SUPERSEDED，incident 指向新的 RESTART_NODE 工作流，后继的 preemption_reason 含"strictly stronger recovery action"（rank 30 -> 50），且没有为该事件新建第二个 incident
+  - 后继工作流 dag_enabled=true、dag_revision>=1，inherited_step_indexes 含 MARK_UNSCHEDULABLE，quiesce_handoff_from_workflow_id 指向被抢占的 reset 工作流
+  - 后继末步是带 preemption_quiesce_handoff_after_reboot 参数的 RESTORE_GPU_SERVICES，依赖 RESTART_NODE；VALIDATE_GPU 依赖该 RESTORE 步而不是直接依赖 RESTART_NODE
+  - 被抢占工作流的屏障远端命令变为 FAILED、status_source=workflow-preempted、error 指向后继 request_id；被抢占工作流从未下发过 RESET_GPU 远端命令，其 WAITING 的 step 记录本身不被改写
+  - 真机 reboot 恰一次：CloudTrail 中 BatchRebootClusterNodes 恰一条且 actor 为 executor role；BatchReplaceClusterNodes、BatchDeleteClusterNodes 为空
+  - 宿主 boot_id 与 Kubernetes Node 的 boot id 均变化、Node UID 不变；GPU 持有者随 reboot 消失（其 systemd 单元不再 active）；Node Agent 以新 boot_id 重新注册，artifact 摘要不变且状态 ACTIVE
+  - RESTART_NODE、handoff 的 RESTORE_GPU_SERVICES、VALIDATE_GPU、VALIDATE_HOST、VALIDATE_FABRIC、RESTORE_SCHEDULING 全部 SUCCEEDED（RESTART_NODE 允许先 WAITING 轮询再成功，但成功行各恰一条）；workflow SUCCEEDED、incident RECOVERED、无 terminal_failure_reason
+  - Node Agent ledger 无任何 SUCCEEDED 的 RESET_GPU 或 RESET_ALL_GPUS_NVSWITCHES 行；QUIESCE_GPU_SERVICES、RESTORE_GPU_SERVICES、VALIDATE_GPU 各有成功行；VERIFY_NO_GPU_CLIENTS 至少有一条失败行（证明持有者真的挡住过屏障）
+  - 节点回到 Ready、schedulable、无 gpu-fault taint 与 ownership 注解；GPU 容量回到基线；quiesce state 文件与 NVIDIA compute client 无残留，基线 active 的服务全部回到 active
+  - 清理后：持有者与 arm 单元已幂等解除、探针 Pod 与 ConfigMap 无残留、远端命令静默；若节点仍隔离，只允许经 validated-restore 工作流解除，任何清理失败直接判 FAIL
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-016
+  related_pytest: tests/regional/test_destr016_preempting_reboot.py::test_destr016_workflow_contract_preempts_the_reset_and_reboots_once
+- id: GF-REGIONAL-DESTR-017
+  title: 带外 reboot 后的 generation fence：节点在 RESET_GPU 等待期间被系统外重启，旧代际的在飞命令被拒绝，新 boot 上不执行任何 reset
+  category: regional-destructive-acceptance
+  level: staging
+  risk: destructive
+  problem: >-
+    generation / boot-id fence 是"节点在维护窗口中途换了一个 boot、旧代际命令一律作废"这条安全承诺的唯一实现，
+    但它此前只有单元证据（GF-ATTEMPT-GENERATION-FENCE-*、test_same_incident_stale_node_generation_is_always_rejected、
+    test_registry_addressing_fences_on_agent_generation、tests/execution/test_retired_generation.py、
+    tests/execution/test_abandoned_generation.py）：没有任何真机用例在工作流在飞期间真正改变过节点的 boot_id。
+    真机才能证明 quiesce 成功时钉住的 agent generation 在新 boot 上确实对不上、等待中的维护步骤 fail closed、
+    新 boot 上一次 GPU reset 都没有执行、旧代际命令不会被补记成 SUCCEEDED，
+    并且带外 OS reboot 不会被误当成 provider 动作或升级成 reboot/replace 台阶。
+    任何一处漂移都会让一台已经换了内核状态的节点上执行旧代际的 reset，或让一条作废命令的结果被当成真的。
+  injection: >-
+    在一台空闲 GPU 节点上用宿主探针向 /dev/kmsg 写入一条 XID 46，开出常规 RESET_GPU 工作流；
+    在本轮 QUIESCE_GPU_SERVICES 的 Node Agent ledger 成功行出现后由探针打开一个有界 GPU 设备占用，
+    使 VERIFY_NO_GPU_CLIENTS 持续 WAITING；在该步等待期间由探针 arm 一个有界 systemd 瞬态定时器
+    （systemd-run --on-active=<30..600>s /bin/systemctl reboot）在控制面之外重启该节点。
+    reboot 不是任何工作流步骤、不是 Node Agent 命令、不调用任何 provider API；不改任何 executor 或控制面环境变量。
+  expected:
+  - QUIESCE_GPU_SERVICES 成功执行的 details 同时含 agent_generations（本节点为 N）与 maintenance_window_expires_at；runner 从记录里读这两个值，不自行推算
+  - VERIFY_NO_GPU_CLIENTS 进入 WAITING 且从不 SUCCEEDED；reboot 在该步仍等待、且仍在钉住的维护窗口内落地（否则本轮记 INCOMPLETE）
+  - 节点带新 boot_id 返回，Node Agent 以 generation N+1 重新注册且回到 ACTIVE，retired_incarnation_ids 恰新增一条且等于 reboot 前的 incarnation_id
+  - 等待中的维护步骤 fail closed（可接受的拒绝：agent generation changed from、quiesce maintenance window expired at、GPU device clients are still active、per-step waiting 上限、maintenance agent fence 解析不到端点），变体记入证据而不写死
+  - 终态记录里必有 agent generation changed from N to N+1：窗口豁免但仍受 generation 校验的 RESTORE_GPU_SERVICES 补偿是这条断言的落点；只出现窗口或等待上限拒绝而补偿成功即为不成立
+  - workflow FAILED，incident QUARANTINED；superseded_step_indexes 为空、blocked_kind 为空（既不被 retired-generation 清扫接管，也不落 BLOCKED）
+  - official_steps 恰为 FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、QUIESCE_GPU_SERVICES、VERIFY_NO_GPU_CLIENTS、RESET_GPU、RESTORE_GPU_SERVICES、VALIDATE_GPU、RESTORE_SCHEDULING，且每步只针对本节点；RESET_GPU、RESET_ALL_GPUS_NVSWITCHES、RESTART_NODE、REPLACE_NODE、RESTART_VM 一次都不执行
+  - 远端命令中没有任何 reset 下发；旧代际的 VERIFY_NO_GPU_CLIENTS 命令不得记为 SUCCEEDED（refused/expired 均可）
+  - 失败的 RESTORE_GPU_SERVICES 补偿恰开出一个 support 升级 workflow-support-after-<W>（步骤 FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、QUARANTINE、ESCALATE_SUPPORT，official_action=ESCALATE_OPERATOR）；reboot-after-、replace-after-、drain-after- 一个都不存在
+  - 节点 boot_id 恰变化一次，由两个独立见证：宿主探针 marker 文件的 observed_boot_ids 恰两条，与 Kubernetes 节点状态一致；marker 记录的 boot_id_before_reboot 等于基线
+  - Node Agent ledger（跨 reboot 持久）新增行里无任何 RESET 行、无第二条 SUCCEEDED（除本轮 QUIESCE_GPU_SERVICES）、无重复 command_id；新 boot 的 kernel_reset_journal 中目标 BDF 的 reset 行数为 0
+  - CloudTrail 中 provider 变更动词集合为空：OS reboot 不是 BatchRebootClusterNodes，也不是任何 provider 调用（枚举动词，不用 contains）
+  - retired-generation reconcile 只以 plan 模式运行并记 NOT_APPLIED；plan 的 items 中不得出现本用例的 workflow（fence 自己收尾，不留待人工撤销的 wedged 记录）
+  - 清理后：未点火的 reboot 定时器已取消、设备占用已解除、节点 Ready 且 schedulable、无 gpu-fault taint 与 ownership 注解、GPU 数与基线一致、基线 active 的服务全部回到 active、quiesce state 与 gpu-fault timer 无残留、探针 Pod/ConfigMap 零残留
+  - 隔离只允许经 validated-restore 工作流解除（先 support 后继 incident、再原 incident 走 already_restored 空操作路径），任何情况下不得手工删除 taint 或注解
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-017
+  related_pytest: tests/regional/test_destr017_out_of_band_reboot_fence.py::test_the_fenced_workflow_contract_accepts_the_expected_terminal_record
+- id: GF-REGIONAL-DESTR-018
+  title: 工作流生命周期硬截止真机验收：RESET_GPU 持续 WAITING 到生命周期到期，整条 FAILED、在飞命令 workflow-timeout、只升级到人工，节点侧 ledger 在取消后不再新增 RESET 行
+  category: regional-destructive-acceptance
+  level: staging
+  risk: live-service-action
+  problem: >-
+    硬生命周期（F-N1）是"一条节点工作流不会无限期霸占一台 GPU 节点"的唯一保证，但它此前只有单元证据，
+    且 PREEMPT-032 用的是合成 ingest 与 1 秒生命周期、节点侧完全不回结果。真机要证明单元证明不了的四件事：
+    压到 180 秒的生命周期真的被首次领取时盖进 workflow 并到点生效；到点时在飞的远端命令真的被取消为
+    status_source=workflow-timeout 而不是继续等 60 次 client 校验；唯一被放行的补偿 RESTORE_GPU_SERVICES
+    真的把节点 GPU 服务带回基线；以及取消之后节点侧真的不再开始任何变更动作——Node Agent 没有取消通道，
+    所以这一条只能用 ledger 的 started_at 与内核日志证明。任何一处漂移都意味着一台被放弃的节点上仍在跑
+    reset，或者一条超期工作流爬到 reboot/replace。
+  injection: >-
+    在一台空闲 GPU 节点上：先经 control_plane_env_window.py 在 CPU 面 gpu-fault-control-worker Deployment 上
+    开一个临时环境窗口（GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS=180、
+    GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS=180，记录基线并等每个 ready 副本收敛）；
+    再用宿主探针以 systemd 瞬态单元持有一张 GPU 设备（/dev/nvidiaN），使 VERIFY_NO_GPU_CLIENTS 每次都以
+    "clients are still active" 失败并保持 WAITING；然后向真实 /dev/kmsg 写入一条 XID 46 开出 RESET_GPU 工作流；
+    到点后再向同节点写入一条 XID 79。不降低 GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS，不调用任何 provider API，
+    不重启节点。
+  expected:
+  - 首次领取时盖 lifetime_deadline_at，execution_deadline 不晚于它；preflight 用实测 redispatch 周期算出最坏
+    verify 次数并要求至少留 15 次余量，算不出就拒绝执行
+  - 生命周期到点后整条 workflow FAILED，失败的执行记录落在 VERIFY_NO_GPU_CLIENTS 上且带
+    details.workflow_lifetime_exceeded=true 与 workflow_execution_deadline、workflow_deadline_overdue_seconds、
+    workflow_deadline_remote_command_cancellation
+  - 在飞远端命令终态 FAILED、status_source=workflow-timeout（若取消时命令已 LEASED 则为
+    completed-after-cancellation，且 result_details.post_cancellation_status 等于节点侧那一行的 state）
+  - 恰一条成功的 RESTORE_GPU_SERVICES（截止后唯一放行的补偿）；不出现 RESTART_NODE、REPLACE_NODE、
+    RESET_ALL_GPUS_NVSWITCHES、VALIDATE_*、RESTORE_SCHEDULING、RESTART_WORKLOAD
+  - incident 为 ESCALATED 或 QUARANTINED；硬件升级把这次失败判为 lifetime_exceeded 阶段、
+    effective_action=ESCALATE_OPERATOR，支持工单工作流步骤恰为
+    FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE → ESCALATE_SUPPORT，可达、不继承已过期的
+    生命周期、且不再二次升级
+  - 节点最终 unschedulable 且带 gpu-fault.io/quarantined taint
+  - 到点后同节点的 XID 79 落在同一 incident/workflow 上做 record-only 吸收：不新增步骤、不复活已 FAILED 的
+    workflow、集群内不出现新的 PENDING/RUNNING 工作流
+  - 数据面：ledger 中不存在 started_at > T_cancel 的变更行（QUIESCE_GPU_SERVICES、
+    VERIFY_NO_GPU_CLIENTS、RESET_GPU、RESET_ALL_GPUS_NVSWITCHES、VALIDATE_GPU）；跨界行（started_at < T_cancel < completed_at）
+    至多一行且其 state 与 kernel_reset_journal 一致（本用例持有者压成 FAILED，内核日志必为空）；
+    T_cancel 之后恰一行成功的 RESTORE_GPU_SERVICES；无 started_at 的变更行判为不可判定即 FAIL
+  - gpu_fault_workflow_lifetime_exceeded_total 与
+    gpu_fault_workflow_merge_record_only_total{reason="lifetime_exceeded"} 各 +1（可读到时才判定）
+  - 清理后：持有者单元已解除、隔离只经 validated-restore 工作流解除、环境窗口回到记录的基线、
+    探针零残留、control-worker 模板摘要回到开窗前的值（只允许 generation 前进两次写入）
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-018
+  related_pytest: tests/regional/test_destr018_lifetime_deadline.py::test_the_lifetime_contract_passes_on_the_intended_terminal_state
 - id: GF-REGIONAL-DESTR-013
   title: 硬约束否证 NodeRecovery 恒为 None 且全程不存在 BatchReplaceClusterNodes
   category: regional-destructive-acceptance
@@ -5108,6 +5271,49 @@ test_cases:
   - tests/execution/test_placement_hold_dispatch.py
   - tests/orchestration/test_placement_hold.py
   related_pytest: tests/execution/test_placement_hold_dispatch.py::test_preempt035_a_hold_waits_then_dissolves_when_the_node_is_freed
+- id: GF-REGIONAL-PREEMPT-036
+  title: 卡死工作流由运维审计关闭：compile-blocked、orphaned-commands、retired-generation 三种 workflow-reconcile 模式各自 plan→apply，绑定摘要，拒绝在飞工作流与漂移计划
+  category: regional-preemption
+  level: integration
+  risk: non-destructive
+  problem: >-
+    三类工作流会卡在没人能关闭的状态，各自堵过一次发布：compile 阶段就 BLOCKED（没有可执行负责人，例如
+    efaDriverRemediation）的记录被升级前置当成在飞的破坏性作业；FAILED 工作流留下的远程命令 WAITING 了 13 小时；
+    被改判掉的旧代仍在派发。修复以 gpu-fault-admin workflow-reconcile 三种模式发货，但目录里没有任何用例覆盖这条运维路径。
+  injection: >-
+    每种模式一套隔离存储（优先 docker 一次性 PostgreSQL 16，退化到临时 SqliteStore），只经 Store 公共 API 造出
+    「一条合格记录 + 一条不合格孪生记录」，然后在本地子进程里执行 admin 真实发货的模块源码与驱动，先 --plan 再 --apply，
+    并用发货的 workflow_safety、remote_command_stats 探针源码在 apply 前后各测一次。
+  expected:
+  - plan 恰好覆盖被点名的记录，合格项按 eligible or cancellable 判定，不合格孪生被点名并带自己的理由
+  - 含不合格项的 plan 执行 apply 被拒，拒绝语点名 contains ineligible records
+  - 篡改 plan_sha256 被拒为 plan 漂移；apply 绑定运维批准的摘要（retired-generation 绑 plan_sha256，其 settled_plan_sha256 是取消远程命令后的二次摘要）
+  - records_deleted 恒为 0
+  - compile-blocked 记录变 SUPERSEDED，preemption_reason 带 reference、never changed a node 与原 blocked_reasons
+  - 孤儿远程命令变 FAILED、status_source=workflow-timeout、error 带 reference、租约清空；不写 workflow 与 incident
+  - retired-generation 旧代 SUPERSEDED、preempted_by_workflow_id 指向后继、执行者与租约清空
+  - RUNNING 孪生的在飞命令逐字段不变
+  - workflow_safety 阻塞列表精确匹配：compile-blocked 1→0，orphaned-commands 1→1，retired-generation 3→2，只有计划内记录离开列表
+  - remote_command_stats.by_status 的 PENDING+LEASED+WAITING 恰好减少被取消的条数
+  - 重跑：compile-blocked/retired-generation 得到 already_closed/already_revoked 且 apply 空操作，orphaned-commands 的 apply 被拒且记录不变
+  - 证据记录 store_backend（postgres 或 sqlite）与执行文本以模块源码为前缀，且只含摘要、不含 URL 与口令
+  evidence:
+    verdict: NOT_RUN
+  automation: command
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-036卡死工作流由运维审计关闭
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
+  command:
+  - python3
+  - scripts/e2e/regional/run_preempt036_stuck_workflow_reconcile.py
+  - --run-dir
+  - artifacts/regional-acceptance/preempt036
+  related_pytest: tests/regional/test_preempt036_stuck_workflow_reconcile.py::test_apply_closes_the_record_and_leaves_live_work_alone
 - id: GF-REGIONAL-WORKLOAD-001
   title: 用 gpu-training-submit 提交三节点 managed PyTorchJob
   category: regional-workload

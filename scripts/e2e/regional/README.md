@@ -80,6 +80,11 @@ reboots, and a typo in a section name would silently drop every value in it.
 - `run_destr009_workload_restart.py`
 - `run_destr010_fabric_manager_restart.py`
 - `run_destr012_managed_recovery_guard.py`
+- `run_destr015_parallel_branch_join.py`
+- `run_destr016_preempting_reboot.py`
+- `run_destr017_out_of_band_reboot_fence.py`
+- `run_destr018_lifetime_deadline.py`
+- `run_preempt036_stuck_workflow_reconcile.py`
 - `run_collector_acceptance.py`
 - `run_collector_destructive.py`
 - `run_collect016_training_recovery.py`
@@ -164,6 +169,24 @@ Current classification:
 - PREEMPT-001..009 use `run_preemption_contracts.py`; PREEMPT-012 combines a
   real fail-safe quiesce/restore cycle with the deployed executor state
   machine and live PostgreSQL.
+- PREEMPT-036 uses `run_preempt036_stuck_workflow_reconcile.py`. It is fully
+  isolated and never contacts a cluster: per reconcile mode it creates its own
+  store (a throwaway `postgres:16` container on a random loopback port, removed
+  with `docker rm -f` in `finally`; a temporary SqliteStore when docker cannot
+  start one, recorded as `store_backend` in the evidence), seeds the stuck
+  workflow shape through Store APIs only, and then executes the text the admin
+  layer actually ships -- the reconcile module's own source plus its
+  stdin/stdout driver, the same string `workflow-reconcile` sends into the CPU
+  ingress Pod -- in a local subprocess. The release verdict is measured with the
+  shipped `workflow_safety` and `remote_command_stats` probe sources before and
+  after each apply. `--run-dir` is required and evidence lands in
+  `<run-dir>/cases/GF-REGIONAL-PREEMPT-036/`; unlike HA-008 there is no
+  temporary-directory default, because the evidence is the point of the case.
+  Its verdicts and seeding live in `preempt036_verdicts.py` and are unit tested
+  in `tests/regional/test_preempt036_stuck_workflow_reconcile.py`. The runner
+  uses only store URLs it created itself and refuses any other, including an
+  ambient `GPU_FAULT_STORE_URL`: a fixture whose job is to manufacture wedged
+  workflows must not be able to aim at a real database.
 - NOTIFY-001..005 share `run_notification_acceptance.py`. Reset/restart email
   cases use labeled drills rather than repeating physical actions.
 - CAP-001..004 share `run_capacity_acceptance.py`, promoted from the isolated
@@ -188,6 +211,69 @@ Current classification:
   DESTR-012 executes groups B, A and D in order. Optional group C remains
   `NOT_RUN` unless a separately reviewed isolated control plane and database
   are provisioned; the runner never edits the production Runtime Profile.
+- DESTR-015 has a reusable manual live driver for the happy side of the
+  two-node job DAG that DESTR-014 fails on purpose. It requires DESTR-012
+  PASS, pins one two-node 16-GPU PyTorchJob, writes one XID 46 to each
+  node's `/dev/kmsg` concurrently so both faults land in one DAG inside the
+  aggregation window, and requires two parallel reset branches, a single
+  join that restarts the job once, and both nodes schedulable afterwards.
+  Its verdicts live in `destr015_verdicts.py`; a node a failed branch left
+  isolated is restored only through the validation-first workflow.
+- DESTR-016 has a reusable manual live driver for the second fault that arrives
+  while a physical step is already in progress. It requires DESTR-002 PASS,
+  pins one idle GPU node, and writes one XID 46 through the shared host probe
+  to open a RESET_GPU workflow. A bounded GPU device holder, armed off *this
+  drill's* QUIESCE_GPU_SERVICES ledger row by a second probe
+  (`probes/destr016_node_probe.py`), keeps VERIFY_NO_GPU_CLIENTS WAITING with
+  GPU services already quiesced -- the dirty boundary the case needs. It then
+  writes a second XID 46, which must be absorbed by the same workflow without
+  adding a step, and one XID 79, which must preempt: the reset workflow goes
+  SUPERSEDED, its barrier command is cancelled with
+  `status_source=workflow-preempted`, and the successor RESTART_NODE workflow
+  carries `quiesce_handoff_from_workflow_id` plus a
+  `preemption_quiesce_handoff_after_reboot` RESTORE_GPU_SERVICES step that runs
+  *after* the real HyperPod reboot. The runner asserts exactly one
+  BatchRebootClusterNodes by the executor role, that the holder vanished with
+  the reboot, that the Node Agent re-registered with a new boot id, and that no
+  successful RESET_GPU row ever reached the on-node ledger. Its verdicts live in
+  `destr016_verdicts.py`. Both probe Pods are recreated after the reboot
+  (`restartPolicy: Never`), the holder is disarmed idempotently before anything
+  else in cleanup, and a node the case left isolated is restored only through
+  the validation-first workflow -- never by deleting a taint.
+- DESTR-017 has a reusable manual live driver for the generation fence. It
+  requires DESTR-002 PASS, pins one idle GPU node, writes one XID 46 through
+  the shared host probe to open a RESET_GPU workflow, holds the workflow in
+  WAITING with a bounded GPU device holder armed off this drill's
+  `QUIESCE_GPU_SERVICES` ledger row, and then reboots the node out of band
+  with a bounded `systemd-run --on-active` timer -- no provider API is
+  involved, and the runner asserts the CloudTrail mutation verb set is empty.
+  The node returns with a new boot id and the Node Agent re-registers one
+  generation higher than the one `QUIESCE_GPU_SERVICES` pinned into the
+  maintenance window, so no RESET_GPU is ever posted on the new boot and the
+  old generation's command is never completed as SUCCEEDED. Its verdicts live
+  in `destr017_verdicts.py`, its node-local work in
+  `probes/destr017_node_probe.py` (the reboot must be armed and returned from,
+  never run synchronously, because it kills the probe's own exec channel), and
+  the retired-generation reconcile view is run in plan mode only and recorded
+  `NOT_APPLIED`. The isolation the failed workflow leaves behind is restored
+  only through the validation-first workflow, successor incident first.
+- DESTR-018 has a reusable manual live driver for the workflow lifetime hard
+  deadline. It requires DESTR-010 PASS, opens a temporary env window on the CPU
+  control-worker Deployment that compresses
+  `GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS` and
+  `GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS` to 180s, holds one
+  `/dev/nvidiaN` open on one idle node so `VERIFY_NO_GPU_CLIENTS` stays WAITING
+  without burning its 60 attempts, writes one XID 46 to `/dev/kmsg`, and
+  requires the whole workflow to fail on the lifetime, the in-flight command to
+  end FAILED with `status_source=workflow-timeout`, exactly one successful
+  `RESTORE_GPU_SERVICES`, an `ESCALATE_SUPPORT` handoff, and a later XID 79 to
+  be absorbed record-only. It never lowers
+  `GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS`: the runner measures the real
+  redispatch cadence from the ledger and refuses to execute unless
+  `lifetime < attempts x cadence` holds with margin. Its verdicts live in
+  `destr018_verdicts.py`, including the three data-plane verdicts that read the
+  Node Agent ledger against the cancellation moment. A node the deadline left
+  isolated is restored only through the validation-first workflow.
 - DESTR-003/008 have reusable manual warm-spare live drivers. DESTR-003
   requires DESTR-012 PASS and one already-declared, cordoned, topology-matched
   healthy spare. DESTR-008 requires DESTR-003 PASS and runs six independently
@@ -245,6 +331,29 @@ always arms a bounded host-side automatic restore timer before doing so.
 marker/evidence/workflow lookup plus allowlisted XID, SXID, collector cursor,
 EFA and expected-count operations. `multi_cluster_fixture.py` owns the
 redacted two-cluster registration and context binding used by ISO/E2E cases.
+
+`control_plane_env_window.py` opens and closes the one env window DESTR-018
+needs. It is read-only unless `--open` or `--close` is given, each with its own
+confirmation string (`OPEN_CONTROL_PLANE_ENV_WINDOW` /
+`CLOSE_CONTROL_PLANE_ENV_WINDOW`). It touches exactly one container
+(`control-worker` of the CPU-plane `gpu-fault-control-worker` Deployment),
+accepts only the two allowlisted variable names as positive integers of at least
+60 seconds, records the pre-window env plus the Deployment's template digest in a
+`--baseline` file, and restores exactly that on close — a variable that was unset
+before the window is unset again, not set to the shipped default. It also
+surveys the values every ready replica actually runs, so a half-finished rollout
+is reported as disagreement rather than averaged.
+
+`probes/destr018_node_probe.py` holds one GPU device open. `arm-holder` starts a
+bounded systemd transient unit that opens `/dev/nvidiaN` and sleeps, so the
+Agent's device-client check keeps seeing the same pid on the same device;
+`watch-ledger`, `holder-status`, `disarm-holder` and `snapshot` report and
+release it. Devices are allowlisted to `/dev/nvidia<N>` (never `nvidiactl`,
+`nvidia-uvm` or a block device), the unit name is a digest of the run id so the
+probe can only stop units it created, and the hold is capped so a lost runner
+cannot leave a device held. XID injection is not its job: DESTR-018 runs a
+second `host_probe_fixture.py` instance with
+`probes/destructive_node_probe.py` for that.
 
 ## Recovery and preparation helpers
 

@@ -46,7 +46,7 @@ phases:
     name: Workflow 抢占与 DAG
     maintenance_window: 分级
     entries:
-      - range: {prefix: PREEMPT, start: 1, end: 35}
+      - range: {prefix: PREEMPT, start: 1, end: 36}
   - sequence: 7
     name: 单集群闭环
     maintenance_window: 是
@@ -92,10 +92,24 @@ phases:
       - case: GF-REGIONAL-DESTR-002
       - case: GF-REGIONAL-DESTR-009
       - case: GF-REGIONAL-DESTR-012
+      - case: GF-REGIONAL-DESTR-015
+      - case: GF-REGIONAL-DESTR-016
+      - case: GF-REGIONAL-DESTR-017
+      - case: GF-REGIONAL-DESTR-018
     notes:
       - DESTR-011 必须先证明 provider replace 开关关闭。
       - DESTR-009 必须先于 DESTR-012。
       - DESTR-012 子用例严格按 B、A、D、C 执行。
+      - DESTR-015 以 DESTR-012 PASS 为前置（同时依赖 DESTR-001 的真实 reset 与
+        DESTR-009 的作业重启已各自成立），两台节点各做一次真实 GPU reset，不含 reboot。
+      - DESTR-016 以 DESTR-002 PASS 为前置，在 RESET_GPU 的 VERIFY_NO_GPU_CLIENTS 屏障上
+        先吸收一条同级 XID 46，再由 XID 79 抢占为 RESTART_NODE，只授权一次 provider reboot。
+      - DESTR-017 以 DESTR-002 PASS 为前置，在 RESET_GPU 等待期间由带外 systemd 定时器重启
+        节点一次，不调用任何 provider 动作。
+      - DESTR-018 以 DESTR-010 PASS 为前置，在 CPU 面 gpu-fault-control-worker 上开临时
+        环境窗口把 GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS 与
+        GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS 压到 180 s；窗口在注入前打开、
+        静默后关闭，不得与其他区域用例同窗执行。
   - sequence: 14
     name: Warm spare
     maintenance_window: 是

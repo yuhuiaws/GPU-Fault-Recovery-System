@@ -71,9 +71,10 @@ def test_workflow_reconcile_change_selects_its_own_domain_not_full() -> None:
         assert plan.domains == ("workflow-reconcile",), (path, plan.domains)
         assert "tests/test_workflow_reconcile.py" in plan.pytest_targets, path
         assert "tests/admin/test_admin_workflow_reconcile.py" in plan.pytest_targets
-        assert plan.safe_cases == () and plan.approval_cases == (), (
-            "reconcile tooling has no live acceptance case"
-        )
+        # The only acceptance case that drives the reconcile tooling is the
+        # isolated, self-provisioning PREEMPT-036; nothing here needs approval.
+        assert plan.safe_cases == ("GF-REGIONAL-PREEMPT-036",), (path, plan.safe_cases)
+        assert plan.approval_cases == (), (path, plan.approval_cases)
 
 
 def test_unmatched_file_escalates_to_full_acceptance() -> None:
