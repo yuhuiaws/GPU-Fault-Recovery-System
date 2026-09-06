@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 
 ROOT = Path(__file__).resolve().parents[1]

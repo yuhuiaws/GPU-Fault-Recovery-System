@@ -10,7 +10,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_DIR = ROOT / "docs/evidence/fault"

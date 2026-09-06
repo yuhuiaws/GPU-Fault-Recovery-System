@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.logging_setup import configure_logging
 

@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 EXPECTED_GROUPS = {
     "gpu-fault-collector-health",

@@ -16,7 +16,7 @@ import subprocess
 import sys
 from typing import Any, Callable, Sequence
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 
 ROOT = Path(__file__).resolve().parents[1]

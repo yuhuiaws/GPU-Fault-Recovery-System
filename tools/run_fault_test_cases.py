@@ -15,7 +15,7 @@ import tempfile
 import time
 from typing import Any, Iterable, Mapping
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.policy import load_xid_policy
 

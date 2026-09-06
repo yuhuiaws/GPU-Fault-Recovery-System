@@ -27,7 +27,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "src") not in sys.path:

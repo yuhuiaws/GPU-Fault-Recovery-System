@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib.resources import files
 from pathlib import Path
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 
 from gpu_fault.policy.catalog_integrity import (

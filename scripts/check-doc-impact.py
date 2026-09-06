@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONTRACTS = ROOT / "docs" / "code-doc-contracts.yaml"

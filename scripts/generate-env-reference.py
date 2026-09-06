@@ -8,7 +8,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src" / "gpu_fault"

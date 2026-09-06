@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import regional_deployment_inventory as inventory
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 from regional_release_config import (
     ClusterTarget,
     ReleaseError,

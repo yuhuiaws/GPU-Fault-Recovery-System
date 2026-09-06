@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.site import SiteConfigError, load_site
 

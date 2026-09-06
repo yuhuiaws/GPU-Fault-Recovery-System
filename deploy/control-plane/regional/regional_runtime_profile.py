@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 from regional_release_config import ReleaseConfig, ReleaseError
 from regional_release_probes import probe_source
 from regional_release_runtime_identity import (

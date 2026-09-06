@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import regional_deployment_inventory as inventory
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 from regional_notifications import notification_digest
 from regional_release_config import (
     ClusterTarget,

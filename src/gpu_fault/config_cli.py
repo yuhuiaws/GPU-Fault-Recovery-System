@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from urllib import request as urllib_request
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.operation_registry import (

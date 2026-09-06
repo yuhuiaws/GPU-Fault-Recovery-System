@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 COMPONENT_PIN_ENV = frozenset(
     {

@@ -7,7 +7,7 @@ import re
 import copy
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 # The one copy of `gpu_fault.digests.SHA256_PATTERN` that stays a copy:

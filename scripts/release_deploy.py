@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import (

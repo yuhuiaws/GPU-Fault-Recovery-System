@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import regional_deployment_inventory as inventory
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 from regional_release_config import ClusterTarget, ReleaseError
 from regional_release_diff import ReleaseComponent, ReleaseExecutionPlan
 from regional_release_legacy import AGENT_IDENTITY_FIELDS

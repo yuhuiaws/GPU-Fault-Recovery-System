@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Mapping, Sequence, cast
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.operation_lock import (
     SITE_OPERATION_LOCK_FD_ENV,

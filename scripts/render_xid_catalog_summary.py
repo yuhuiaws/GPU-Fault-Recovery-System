@@ -5,7 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.policy.catalog_integrity import (
     validate_xid_catalog_document,

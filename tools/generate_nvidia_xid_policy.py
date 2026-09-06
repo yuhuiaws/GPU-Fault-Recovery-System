@@ -5,7 +5,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 from openpyxl import load_workbook
 
 from gpu_fault.policy.catalog_integrity import (

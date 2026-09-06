@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import sys
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 
 WHEEL_CONFIGMAP_PLACEHOLDER = "REPLACE_WITH_WHEEL_CONFIGMAP"

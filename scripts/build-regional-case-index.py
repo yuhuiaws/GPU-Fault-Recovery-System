@@ -22,7 +22,7 @@ import argparse
 from pathlib import Path
 import sys
 
-import yaml
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 
 ROOT = Path(__file__).resolve().parents[1]
