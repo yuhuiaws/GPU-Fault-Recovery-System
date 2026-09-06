@@ -4,6 +4,24 @@
 > canary validation. New production deployments use the regional workflow in
 > `docs/部署和运维手册.md`.
 
+> **Reminder for anyone editing `deploy.sh` (verified against the code on the
+> regional architecture):** nothing in `src/gpu_fault/`, the `Makefile`,
+> `scripts/` or `deploy/control-plane/regional/` executes this script. The only
+> production path is `gpu-fault-admin deploy` → `scripts/staging_deploy.py` →
+> `deploy/control-plane/regional/rollout-regional-release.sh`. A change made
+> only here never reaches a regional site. The file still changes because
+> contract tests read its text as a specification
+> (`tests/regional/test_production_safety_config.py`,
+> `tests/regional/test_performance_defaults.py`,
+> `tests/node_agent/test_node_deployment.py`), so when you add behaviour here,
+> land the regional equivalent first — schema Jobs in
+> `deploy/control-plane/regional/regional_release_rendering.py`, rollout
+> phases in `deploy/control-plane/regional/regional_release_orchestration.py`,
+> Runtime Profile claims in
+> `config/runtime-profile.regional-hyperpod-safe.example.yaml` — and treat the
+> edit here as parity, not as a deployment. Do not debug a regional release by
+> reading this script.
+
 The deployment entry point installs the GPU fault control plane on a
 HyperPod EKS cluster and verifies the complete passive recovery path.
 
