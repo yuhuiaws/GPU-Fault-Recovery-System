@@ -761,7 +761,10 @@ class ClusterActionExecutor:
             renewer.join(timeout=2)
 
     def _renew_lease(self, command: RemoteActionCommand, stop: Event) -> None:
-        interval = max(1.0, min(30.0, self.lease_seconds / 3))
+        # ``lease_seconds`` is validated to 10..7200 at construction, so a third
+        # of it is never below 3.3s; the only clamp that can bind is the 30s
+        # ceiling that keeps a long lease from going unrenewed for minutes.
+        interval = min(30.0, self.lease_seconds / 3)
         while not stop.wait(interval):
             try:
                 self.client.renew(
@@ -892,11 +895,25 @@ class ClusterActionExecutor:
                 WorkflowStepStatus.SUCCEEDED: (RemoteCommandStatus.SUCCEEDED),
                 WorkflowStepStatus.FAILED: (RemoteCommandStatus.FAILED),
             }[outcome.status]
+            details = dict(outcome.details or {})
+            error = outcome.error
+            if status is RemoteCommandStatus.FAILED and not error:
+                # A FAILED outcome without a message is still the adapter's
+                # verdict, not an executor defect. Left as None it failed the
+                # result model's validation inside this try block and was
+                # caught below as an executor-internal-error -- a stack trace,
+                # an unexpected-failure count and an alert for a refusal the
+                # adapter merely forgot to describe.
+                error = (
+                    f"{command.step.operation.value} adapter reported FAILED "
+                    "without an error message"
+                )
+                details["error_message_missing"] = True
             return RemoteCommandResult(
                 lease_token=lease_token,
                 status=status,
-                details=outcome.details or {},
-                error=outcome.error,
+                details=details,
+                error=error,
             )
         except ClusterExecutorError as exc:
             retryable = self._retryable_control_plane_result(exc, command, lease_token)

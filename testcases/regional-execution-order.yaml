@@ -46,7 +46,7 @@ phases:
     name: Workflow 抢占与 DAG
     maintenance_window: 分级
     entries:
-      - range: {prefix: PREEMPT, start: 1, end: 34}
+      - range: {prefix: PREEMPT, start: 1, end: 35}
   - sequence: 7
     name: 单集群闭环
     maintenance_window: 是
@@ -102,6 +102,12 @@ phases:
     entries:
       - case: GF-REGIONAL-DESTR-003
       - case: GF-REGIONAL-DESTR-008
+      - case: GF-REGIONAL-DESTR-014
+    notes:
+      - DESTR-014 不声明任何 warm spare（它要的正是 REPLACE_NODE 因热备不足而失败），
+        执行前必须先按 DESTR-003 的 --release 归还已声明的 spare。
+      - DESTR-014 含两次真实 BatchRebootClusterNodes，必须先于 DESTR-013 执行，
+        使其落在 DESTR-013 覆盖的 CloudTrail 时间窗内。
   - sequence: 15
     name: 故障转移与约束否证
     maintenance_window: 分级

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal
@@ -681,6 +681,91 @@ class FaultIncident(StrictModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+# Upper bounds on the audit trail: one event is small and the list is
+# capped, so a long-lived workflow cannot squeeze its own row.
+WORKFLOW_EVENTS_LIMIT = 500
+WORKFLOW_EVENT_REASON_LIMIT = 512
+
+
+class WorkflowEventKind(StrEnum):
+    """What happened to a workflow, as an append-only audit event.
+
+    ``step_executions`` keeps one record per step identity and replaces it on
+    every attempt, and the DAG rewrites (branch escalation, node-busy
+    collapse, withdrawal trim, hung-triage rewrite, preemption) mutate
+    ``official_steps`` in place. Both are the right shape for *execution*;
+    neither reconstructs *history*. Events are the history: bounded,
+    structured, stamped with the control-plane clock, never rewritten.
+    """
+
+    CLAIM = "CLAIM"
+    STEP_ATTEMPT = "STEP_ATTEMPT"
+    PLAN_REWRITE = "PLAN_REWRITE"
+    BRANCH_ESCALATION = "BRANCH_ESCALATION"
+    PREEMPTION = "PREEMPTION"
+    HOLD = "HOLD"
+    TERMINAL = "TERMINAL"
+
+
+class WorkflowEventCode(StrEnum):
+    """The stable, machine-readable reason behind a workflow event.
+
+    ``incident.reasons`` and ``WorkflowEvent.reason`` are prose for people; the
+    code is what a report, an alert or a test keys on. One vocabulary here so
+    the executor, the dispatcher, the brancher, the escalator and the merge
+    service spell the same thing the same way. Names equal values so a code
+    reads the same in Python and on the wire.
+    """
+
+    # Lease / lifecycle (executor, dispatcher)
+    CLAIMED = "CLAIMED"
+    TERMINALIZED = "TERMINALIZED"
+    INVARIANT_VIOLATION = "INVARIANT_VIOLATION"
+    # One attempt at one step (``step_bounds.record_attempt``)
+    STEP_WAITING = "STEP_WAITING"
+    STEP_FAILED = "STEP_FAILED"
+    STEP_SUCCEEDED = "STEP_SUCCEEDED"
+    STEP_WAITING_TIMEOUT = "STEP_WAITING_TIMEOUT"
+    DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED"
+    LIFETIME_EXCEEDED = "LIFETIME_EXCEEDED"
+    # DAG rewrites (``DagBrancher``, ``DispositionApplier``)
+    BRANCH_APPENDED = "BRANCH_APPENDED"
+    BRANCH_REPLACED = "BRANCH_REPLACED"
+    BRANCH_WIDENED = "BRANCH_WIDENED"
+    BRANCH_SUCCESSOR_QUEUED = "BRANCH_SUCCESSOR_QUEUED"
+    PLAN_WIDENED = "PLAN_WIDENED"
+    PLAN_REPLACED = "PLAN_REPLACED"
+    # Ladder (``BranchEscalator``)
+    BRANCH_ESCALATED = "BRANCH_ESCALATED"
+    BRANCH_EXHAUSTED = "BRANCH_EXHAUSTED"
+    # Preemption (``WorkflowMergeService``, executor step boundary)
+    PREEMPTED = "PREEMPTED"
+    PREEMPTION_BOUNDARY_CLOSED = "PREEMPTION_BOUNDARY_CLOSED"
+    # Holds (executor / dispatcher)
+    NODE_UNDER_REMEDIATION = "NODE_UNDER_REMEDIATION"
+    NODE_REMEDIATION_TIMEOUT = "NODE_REMEDIATION_TIMEOUT"
+    WORKLOAD_WITHDRAWN = "WORKLOAD_WITHDRAWN"
+    # Placement hold (orchestrator opens, dispatcher dissolves)
+    PLACEMENT_HOLD_OPENED = "PLACEMENT_HOLD_OPENED"
+    PLACEMENT_HOLD_DISSOLVED = "PLACEMENT_HOLD_DISSOLVED"
+
+
+class WorkflowEvent(StrictModel):
+    kind: WorkflowEventKind
+    at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # A ``WorkflowEventCode`` value; typed as ``str`` so a row written by a
+    # newer release still loads here. ``None`` on rows written before it.
+    code: str | None = Field(default=None, max_length=64)
+    actor: str | None = None
+    step_index: int | None = Field(default=None, ge=0)
+    operation: WorkflowOperation | None = None
+    phase: StepPhase | None = None
+    status: str | None = None
+    reason: str | None = Field(default=None, max_length=WORKFLOW_EVENT_REASON_LIMIT)
+    dag_revision: int | None = Field(default=None, ge=0)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class WorkflowRequest(StrictModel):
     request_id: str = Field(default_factory=lambda: f"workflow-{uuid4()}")
     incident_id: str
@@ -734,6 +819,11 @@ class WorkflowRequest(StrictModel):
     # created SAFETY_PENDING). Explicit so that a warning appended to
     # ``blocked_reasons`` can never switch the executor's step set (F-C8).
     safety_only: bool = False
+    # A job workflow created because a running attempt was observed on a node
+    # under another remediation (rule A, case 2). It waits under rule A like
+    # any job workflow and DISSOLVES when the nodes are freed inside the
+    # window instead of executing; past the window its STOP runs.
+    placement_hold: bool = False
     completed_operations: list[WorkflowOperation] = Field(default_factory=list)
     completed_step_indexes: list[int] = Field(default_factory=list)
     superseded_step_indexes: list[int] = Field(default_factory=list)
@@ -742,6 +832,9 @@ class WorkflowRequest(StrictModel):
     failure_handled_at: datetime | None = None
     failure_handling_attempts: int = Field(default=0, ge=0)
     step_executions: list[WorkflowStepExecution] = Field(default_factory=list)
+    # Append-only audit trail (see WorkflowEventKind); bounded by
+    # ``record_workflow_event``.
+    events: list[WorkflowEvent] = Field(default_factory=list)
     execution_owner_id: str | None = None
     execution_epoch: int = Field(default=0, ge=0)
     execution_lease_expires_at: datetime | None = None
@@ -836,6 +929,56 @@ def resolved_step_indexes(workflow: "WorkflowRequest") -> frozenset[int]:
     return frozenset(workflow.completed_step_indexes) | frozenset(
         workflow.superseded_step_indexes
     )
+
+
+def record_workflow_event(
+    workflow: "WorkflowRequest",
+    kind: WorkflowEventKind,
+    *,
+    code: str | None = None,
+    reason: str | None = None,
+    actor: str | None = None,
+    step_index: int | None = None,
+    operation: WorkflowOperation | None = None,
+    phase: StepPhase | None = None,
+    status: str | None = None,
+    details: Mapping[str, Any] | None = None,
+    at: datetime | None = None,
+) -> "WorkflowRequest":
+    """Return ``workflow`` with one more audit event appended.
+
+    The list is bounded like ``bounded_reasons``: the first fifth of the budget
+    keeps the events the workflow opened with (claim, first attempts), the rest
+    the most recent, so a runaway retry loop cannot erase how the workflow
+    started. Reasons are truncated to ``WORKFLOW_EVENT_REASON_LIMIT``; details
+    are meant for ids and digests, not payloads. ``code`` is a
+    ``WorkflowEventCode``: the machine-readable twin of ``reason``.
+    """
+
+    event = WorkflowEvent(
+        kind=kind,
+        at=at or datetime.now(timezone.utc),
+        code=None if code is None else str(code),
+        actor=actor,
+        step_index=step_index,
+        operation=operation,
+        phase=phase,
+        status=status,
+        reason=(
+            None
+            if reason is None
+            else reason
+            if len(reason) <= WORKFLOW_EVENT_REASON_LIMIT
+            else reason[: WORKFLOW_EVENT_REASON_LIMIT - 1] + "\u2026"
+        ),
+        dag_revision=workflow.dag_revision,
+        details=dict(details or {}),
+    )
+    events = [*workflow.events, event]
+    if len(events) > WORKFLOW_EVENTS_LIMIT:
+        head = WORKFLOW_EVENTS_LIMIT // 5
+        events = [*events[:head], *events[-(WORKFLOW_EVENTS_LIMIT - head) :]]
+    return workflow.model_copy(update={"events": events})
 
 
 def execution_phase(workflow: "WorkflowRequest") -> StepPhase:

@@ -241,6 +241,15 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     archiver = getattr(ctx, "control_record_archiver", None)
     lines.extend(
         [
+            "# HELP gpu_fault_workflow_placement_holds_opened_total Job workflows opened because a running attempt was observed on a node under another remediation (rule A, case 2).",
+            "# TYPE gpu_fault_workflow_placement_holds_opened_total counter",
+            f"gpu_fault_workflow_placement_holds_opened_total {getattr(orchestrator, 'placement_holds_opened_total', 0) if orchestrator else 0}",
+            "# HELP gpu_fault_workflow_placement_holds_dissolved_total Placement holds ended without executing because their nodes were freed inside the window (rule A, case 2).",
+            "# TYPE gpu_fault_workflow_placement_holds_dissolved_total counter",
+            f"gpu_fault_workflow_placement_holds_dissolved_total {getattr(dispatcher, 'placement_holds_dissolved_total', 0) if dispatcher else 0}",
+            "# HELP gpu_fault_workflow_placement_holds_failed_total Workload observations whose placement hold could not be opened; the observation itself was still accepted (rule A, case 2).",
+            "# TYPE gpu_fault_workflow_placement_holds_failed_total counter",
+            f"gpu_fault_workflow_placement_holds_failed_total {getattr(orchestrator, 'placement_holds_failed_total', 0) if orchestrator else 0}",
             "# HELP gpu_fault_workflow_dispatch_deferred_total Rows a dispatch cycle scanned but never started because its deadline passed; they stayed PENDING (F-C7).",
             "# TYPE gpu_fault_workflow_dispatch_deferred_total counter",
             f"gpu_fault_workflow_dispatch_deferred_total {getattr(dispatcher, 'deferred_total', 0) if dispatcher else 0}",

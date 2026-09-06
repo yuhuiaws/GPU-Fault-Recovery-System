@@ -9,6 +9,7 @@ from uuid import uuid4
 from gpu_fault.models import (
     WorkflowOperation,
 )
+from gpu_fault.execution.invariants import InvariantMode
 from gpu_fault.execution.models import WorkflowExecutionError
 from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
 
@@ -80,6 +81,22 @@ def operator_acknowledgement_timeout_seconds(values: Mapping[str, str]) -> int:
     return value
 
 
+def node_busy_wait_seconds(values: Mapping[str, str]) -> float:
+    """Rule A's one window: how long a job waits on a node another remediation
+    is repairing before it is stopped instead of restarted.
+
+    Read here for both readers -- the dispatcher, which holds a job workflow
+    that has not started, and the executor, which caps the ``after_incident``
+    restart premise once its step is running -- so the two cannot drift apart.
+    The key and the default are written out for ``generate-env-reference.py``.
+    """
+
+    value = float(values.get("GPU_FAULT_JOB_WORKFLOW_NODE_BUSY_WAIT_SECONDS", "240"))
+    if value <= 0:
+        raise WorkflowExecutionError("job workflow node-busy wait must be positive")
+    return value
+
+
 def default_step_waiting_overrides(
     values: Mapping[str, str],
 ) -> dict[WorkflowOperation, int]:
@@ -93,6 +110,18 @@ def default_step_waiting_overrides(
             for operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
         },
     }
+
+
+def workflow_invariant_mode(values: Mapping[str, str]) -> InvariantMode:
+    """How strictly the executor checks workflow invariants after each write."""
+
+    raw = values.get("GPU_FAULT_WORKFLOW_INVARIANT_CHECKS", "log").strip().lower()
+    try:
+        return InvariantMode(raw)
+    except ValueError as exc:
+        raise WorkflowExecutionError(
+            "GPU_FAULT_WORKFLOW_INVARIANT_CHECKS must be one of off, log, raise"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -109,6 +138,9 @@ class ProductionExecutorConfig:
     operator_acknowledgement_timeout_seconds: int = (
         DEFAULT_OPERATOR_ACKNOWLEDGEMENT_TIMEOUT_SECONDS
     )
+    # Review item 6: state-machine invariants are checked after every leased
+    # write; ``log`` reports, ``raise`` fails the write (tests, staging).
+    workflow_invariant_mode: InvariantMode = InvariantMode.LOG
     # F-N1: hard lifetime of a remediation, by kind. A job workflow (one that
     # stops and restarts a training job, usually multi-node) and a single-node
     # workflow without a job each get one budget for their whole escalation
@@ -142,6 +174,12 @@ class ProductionExecutorConfig:
     step_waiting_timeout_overrides: Mapping[WorkflowOperation, int] = field(
         default_factory=lambda: managed_recovery_step_overrides({})
     )
+    # Rule A: the window a job waits on a node under another remediation. The
+    # same variable as ``WorkflowDispatcherConfig.node_busy_wait_seconds``;
+    # here it caps the ``after_incident`` restart premise (a WAITING outcome
+    # with ``reason=NODE_UNDER_REMEDIATION``) in ``bounded_waiting_outcome``,
+    # since the dispatcher's hold only covers a workflow that has not started.
+    node_busy_wait_seconds: float = 240.0
     workflow_preemption_enabled: bool = True
     remediation_budget: RemediationBudgetPolicy = RemediationBudgetPolicy()
 
@@ -267,6 +305,7 @@ class ProductionExecutorConfig:
             step_waiting_timeout_seconds=step_timeout,
             step_waiting_warning_seconds=step_warning,
             step_waiting_timeout_overrides=overrides,
+            node_busy_wait_seconds=node_busy_wait_seconds(values),
             workflow_preemption_enabled=(
                 values.get("GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION", "true")
                 .strip()
@@ -274,6 +313,7 @@ class ProductionExecutorConfig:
                 == "true"
             ),
             remediation_budget=RemediationBudgetPolicy.from_mapping(values),
+            workflow_invariant_mode=workflow_invariant_mode(values),
         )
 
 
@@ -294,9 +334,11 @@ class WorkflowDispatcherConfig:
     # Backoff written into ``not_before`` after an unrecognised internal error,
     # so the record stays executable without being retried every tick.
     internal_error_backoff_seconds: float = 60.0
-    # F-N1 §8: how long a not-yet-started job workflow waits for another
-    # remediation on one of its nodes before it gives up by stopping the job.
-    node_busy_wait_seconds: float = 300.0
+    # F-N1 §8 / rule A: how long a not-yet-started job workflow waits for
+    # another remediation on one of its nodes before it gives up by stopping
+    # the job. One variable with ``ProductionExecutorConfig``'s field of the
+    # same name; ``validate_timing_relationships`` refuses a pair that differs.
+    node_busy_wait_seconds: float = 240.0
     # F-C7: how long one dispatch cycle waits for its batch before it stops
     # queuing more work and scans again. Rows not started by then stay
     # PENDING for the next cycle; running ones finish. 0 waits for the batch.
@@ -310,35 +352,267 @@ class WorkflowDispatcherConfig:
 
     @classmethod
     def from_environment(cls, executor_enabled: bool) -> WorkflowDispatcherConfig:
-        raw_enabled = os.getenv("GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER", "true")
+        return cls.from_mapping(os.environ, executor_enabled)
+
+    @classmethod
+    def from_mapping(
+        cls, values: Mapping[str, str], executor_enabled: bool
+    ) -> WorkflowDispatcherConfig:
+        raw_enabled = values.get("GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER", "true")
         poll_interval_seconds = float(
-            os.getenv("GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS", "5")
+            values.get("GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS", "5")
         )
         return cls(
             enabled=(executor_enabled and raw_enabled.strip().lower() == "true"),
             poll_interval_seconds=poll_interval_seconds,
-            batch_size=int(os.getenv("GPU_FAULT_WORKFLOW_BATCH_SIZE", "100")),
-            max_workers=int(os.getenv("GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS", "8")),
-            confirm_cluster_name=(os.getenv("GPU_FAULT_HYPERPOD_CLUSTER") or None),
+            batch_size=int(values.get("GPU_FAULT_WORKFLOW_BATCH_SIZE", "100")),
+            max_workers=int(values.get("GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS", "8")),
+            confirm_cluster_name=(values.get("GPU_FAULT_HYPERPOD_CLUSTER") or None),
             dispatch_lease_seconds=float(
-                os.getenv(
+                values.get(
                     "GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS",
                     str(max(15.0, poll_interval_seconds * 3)),
                 )
             ),
             failure_handling_max_attempts=int(
-                os.getenv("GPU_FAULT_WORKFLOW_FAILURE_HANDLING_MAX_ATTEMPTS", "5")
+                values.get("GPU_FAULT_WORKFLOW_FAILURE_HANDLING_MAX_ATTEMPTS", "5")
             ),
             internal_error_backoff_seconds=float(
-                os.getenv("GPU_FAULT_WORKFLOW_INTERNAL_ERROR_BACKOFF_SECONDS", "60")
+                values.get("GPU_FAULT_WORKFLOW_INTERNAL_ERROR_BACKOFF_SECONDS", "60")
             ),
-            node_busy_wait_seconds=float(
-                os.getenv("GPU_FAULT_JOB_WORKFLOW_NODE_BUSY_WAIT_SECONDS", "300")
-            ),
+            node_busy_wait_seconds=node_busy_wait_seconds(values),
             cycle_deadline_seconds=float(
-                os.getenv("GPU_FAULT_WORKFLOW_DISPATCH_CYCLE_SECONDS", "0")
+                values.get("GPU_FAULT_WORKFLOW_DISPATCH_CYCLE_SECONDS", "0")
             ),
             pending_age_warning_seconds=float(
-                os.getenv("GPU_FAULT_WORKFLOW_PENDING_AGE_WARNING_SECONDS", "900")
+                values.get("GPU_FAULT_WORKFLOW_PENDING_AGE_WARNING_SECONDS", "900")
             ),
         )
+
+
+class TimingConfigurationError(WorkflowExecutionError):
+    """Two or more timing knobs are ordered so one can never do its job."""
+
+
+def _seconds(value: float) -> str:
+    return f"{int(value) if float(value).is_integer() else value}s"
+
+
+def validate_timing_relationships(
+    executor: ProductionExecutorConfig,
+    dispatcher: WorkflowDispatcherConfig,
+    *,
+    verify_max_attempts: int | None,
+    branch_max_rungs: int,
+) -> list[str]:
+    """One sentence per timing relationship the two configs break (review item 3).
+
+    A sentence prefixed ``warning:`` is not a violation: it names a relationship
+    that could not be checked from what the caller knew. The rules, each
+    derived from the code that consumes the pair:
+
+    * every step waiting ceiling <= the node workflow lifetime.
+      ``step_bounds.bounded_waiting_outcome`` (step_bounds.py:148) fails a
+      step at ``step_waiting_limit``, but ``step_bounds.deadline_outcome``
+      (step_bounds.py:66-71) fails it at ``lifetime_deadline_at`` first, so a
+      ceiling above the lifetime never fires and the adapter's own timeout
+      handling -- for managed recovery, the escalation notification -- is
+      skipped. ``OPERATOR_ACKNOWLEDGEMENT_OPERATIONS`` are exempt because
+      ``claim_deadlines`` (restart_budget_preflight.py:124-130) floors the
+      lifetime at that ceiling.
+    * the managed recovery window plus one reboot allowance <= the job
+      lifetime. A job workflow's branch that fails its reset reboots the node
+      and, on a further failure, delegates its replacement
+      (branch_escalation.py:105-124); both waits are the managed window
+      (``managed_recovery_step_overrides``), stamped once per workflow by
+      ``claim_deadlines`` (restart_budget_preflight.py:109-117).
+    * the workflow execution timeout <= both lifetimes. ``claim_deadlines``
+      returns ``min(execution, lifetime)`` (restart_budget_preflight.py:131),
+      so a longer timeout is silently truncated and the configured value lies.
+    * the lease duration < the execution timeout. The lease is renewed once
+      per step (executor.py:207-212, ``_lease_duration`` executor.py:1661);
+      a lease at or above the timeout means an executor that died mid-step
+      holds the record past the point the deadline should have failed it.
+    * the executor's node-busy wait == the dispatcher's. They are one knob
+      (``GPU_FAULT_JOB_WORKFLOW_NODE_BUSY_WAIT_SECONDS``, rule A): the
+      dispatcher holds a job workflow that has not started
+      (dispatcher.py:467-478) and the executor caps the running restart
+      premise (``step_bounds.bounded_waiting_outcome``) for the same window.
+      Two values would give one job two different deadlines for one wait.
+    * the node-busy wait < the VERIFY_NO_GPU_CLIENTS total wait. A job
+      workflow whose node is under another remediation gives up at
+      ``created_at + node_busy_wait_seconds`` by stopping its job
+      (dispatcher.py:459-468); the other remediation's verify retries once
+      per dispatch (barriers.py:36-52, step_execution.py:239) and each
+      dispatch is one poll interval apart (dispatcher.py:1333), so its total
+      wait is ``verify_max_attempts x poll_interval_seconds``. The verify
+      started earlier, so a busy wait that is not strictly shorter can never
+      stop the job before the verify gives up.
+    * the job lifetime >= ``branch_max_rungs`` x the managed window. Each rung
+      the escalator takes (branch_escalation.py:107) is one more delegated
+      recovery inside the same lifetime.
+    * the dispatch lease >= 3 x the poll interval. ``from_mapping`` defaults it
+      to ``max(15, 3 x poll)`` so one missed tick does not lose the fleet-wide
+      lease (dispatcher.py:145, 280-288); an explicit override below that
+      re-opens the two-dispatcher window. 0 disables the lease and is not
+      compared.
+    * the cycle deadline (when > 0) >= the poll interval, or the cycle stops
+      queuing work before the next scan would have run (dispatcher.py:176-180).
+    """
+
+    violations: list[str] = []
+    node_lifetime = executor.node_workflow_lifetime_seconds
+    job_lifetime = executor.job_workflow_lifetime_seconds
+    execution = executor.workflow_execution_timeout_seconds
+
+    ceilings: list[tuple[str, int]] = [
+        ("default", executor.step_waiting_timeout_seconds)
+    ]
+    ceilings.extend(
+        (operation.value, limit)
+        for operation, limit in sorted(
+            executor.step_waiting_timeout_overrides.items(),
+            key=lambda item: item[0].value,
+        )
+        if operation not in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
+    )
+    over_node = [
+        f"{name} {_seconds(limit)}" for name, limit in ceilings if limit > node_lifetime
+    ]
+    if over_node:
+        violations.append(
+            "step waiting ceilings exceed the node workflow lifetime "
+            f"({_seconds(node_lifetime)}): {', '.join(over_node)}, so the lifetime "
+            "fails those steps before their own cap and skips the adapter's "
+            "timeout handling"
+        )
+
+    managed_window = executor.step_waiting_limit(WorkflowOperation.REPLACE_NODE)
+    reboot_allowance = executor.step_waiting_limit(WorkflowOperation.RESTART_NODE)
+    if managed_window + reboot_allowance > job_lifetime:
+        violations.append(
+            f"the managed recovery window ({_seconds(managed_window)}) plus one "
+            f"reboot allowance ({_seconds(reboot_allowance)}) exceeds the job "
+            f"workflow lifetime ({_seconds(job_lifetime)}), so a branch that "
+            "reboots and then delegates a replacement is failed by the lifetime"
+        )
+
+    exceeded = [
+        f"the {kind} workflow lifetime ({_seconds(lifetime)})"
+        for kind, lifetime in (("job", job_lifetime), ("node", node_lifetime))
+        if execution > lifetime
+    ]
+    if exceeded:
+        violations.append(
+            f"the workflow execution timeout ({_seconds(execution)}) exceeds "
+            + " and ".join(exceeded)
+            + ", so claim_deadlines silently truncates it"
+        )
+
+    if executor.lease_duration_seconds >= execution:
+        violations.append(
+            f"the workflow lease duration ({_seconds(executor.lease_duration_seconds)}) "
+            f"is not below the workflow execution timeout ({_seconds(execution)}), "
+            "so a dead executor holds the record past its deadline"
+        )
+
+    busy = dispatcher.node_busy_wait_seconds
+    if executor.node_busy_wait_seconds != busy:
+        violations.append(
+            "the executor's job workflow node-busy wait "
+            f"({_seconds(executor.node_busy_wait_seconds)}) differs from the "
+            f"dispatcher's ({_seconds(busy)}); both must read "
+            "GPU_FAULT_JOB_WORKFLOW_NODE_BUSY_WAIT_SECONDS, or a job waiting "
+            "on a node under repair gets two deadlines for one wait"
+        )
+    poll = dispatcher.poll_interval_seconds
+    if verify_max_attempts is None:
+        violations.append(
+            "warning: the VERIFY_NO_GPU_CLIENTS total wait is unknown "
+            "(verify_max_attempts not given), so the job workflow node-busy wait "
+            f"({_seconds(busy)}) cannot be checked against it"
+        )
+    else:
+        verify_total = verify_max_attempts * poll
+        if busy >= verify_total:
+            violations.append(
+                f"the job workflow node-busy wait ({_seconds(busy)}) is not below "
+                f"the VERIFY_NO_GPU_CLIENTS total wait ({verify_max_attempts} "
+                f"attempts x {_seconds(poll)} poll = {_seconds(verify_total)}), so "
+                "a waiting job workflow cannot stop its job before the node "
+                "remediation's verify gives up"
+            )
+
+    rungs_total = branch_max_rungs * managed_window
+    if rungs_total > job_lifetime:
+        violations.append(
+            f"the job workflow lifetime ({_seconds(job_lifetime)}) cannot hold "
+            f"{branch_max_rungs} escalation rungs of the managed recovery window "
+            f"({_seconds(managed_window)} each, {_seconds(rungs_total)} in all): "
+            f"the escalated branch can take up to {branch_max_rungs} delegated "
+            "recoveries"
+        )
+
+    lease = dispatcher.dispatch_lease_seconds
+    if lease > 0 and lease < 3 * poll:
+        violations.append(
+            f"the dispatch lease ({_seconds(lease)}) is below three poll intervals "
+            f"({_seconds(3 * poll)}), so one missed tick hands the fleet-wide "
+            "scan to a second dispatcher"
+        )
+
+    cycle = dispatcher.cycle_deadline_seconds
+    if cycle > 0 and cycle < poll:
+        violations.append(
+            f"the dispatch cycle deadline ({_seconds(cycle)}) is below the poll "
+            f"interval ({_seconds(poll)}), so a cycle stops queuing work before "
+            "the next scan is due"
+        )
+    return violations
+
+
+def validate_timing_or_raise(
+    executor: ProductionExecutorConfig,
+    dispatcher: WorkflowDispatcherConfig,
+    *,
+    verify_max_attempts: int | None,
+    branch_max_rungs: int,
+) -> list[str]:
+    """Fail closed on every violation; return the ``warning:`` strings to log."""
+
+    reported = validate_timing_relationships(
+        executor,
+        dispatcher,
+        verify_max_attempts=verify_max_attempts,
+        branch_max_rungs=branch_max_rungs,
+    )
+    warnings = [line for line in reported if line.startswith("warning: ")]
+    violations = [line for line in reported if not line.startswith("warning: ")]
+    if violations:
+        raise TimingConfigurationError(
+            "timing configuration is inconsistent: " + "; ".join(violations)
+        )
+    return warnings
+
+
+def validate_timing_from_environment(values: Mapping[str, str]) -> list[str]:
+    """Build both configs from ``values`` and validate them together.
+
+    Reads the two knobs owned elsewhere exactly as their owners do:
+    ``GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS`` (node-action adapter) and
+    ``GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS`` (``app.context._branch_escalator``).
+    Raises ``TimingConfigurationError`` on a violation; returns the warnings.
+    """
+
+    executor = ProductionExecutorConfig.from_mapping(values)
+    dispatcher = WorkflowDispatcherConfig.from_mapping(values, executor.enabled)
+    verify_max_attempts = int(
+        values.get("GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS", "60")
+    )
+    branch_max_rungs = int(values.get("GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS", "2"))
+    return validate_timing_or_raise(
+        executor,
+        dispatcher,
+        verify_max_attempts=verify_max_attempts,
+        branch_max_rungs=branch_max_rungs,
+    )

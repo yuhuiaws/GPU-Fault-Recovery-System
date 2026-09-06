@@ -10,6 +10,7 @@ from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.control_record_archive import ControlRecordArchiver
 from gpu_fault.diagnostics import KubernetesDcgmDiagnosticAdapter
 from gpu_fault.execution.branch_escalation import BranchEscalator
+from gpu_fault.execution.config import validate_timing_from_environment
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.execution import (
     ProductionExecutorConfig,
@@ -319,6 +320,11 @@ class ApplicationContext:
             WorkflowDispatcherConfig.from_environment(config.enabled),
             failure_handler=(context.orchestrator.escalate_failed_hardware_remediation),
         )
+        # Review item 3: the timing knobs of executor, dispatcher, node-action
+        # verification and branch escalation only make sense in a fixed order;
+        # a violation refuses to start, a warning is logged once here.
+        for line in validate_timing_from_environment(os.environ):
+            LOGGER.warning(line)
         return context
 
     @classmethod

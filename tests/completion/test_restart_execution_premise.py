@@ -142,7 +142,10 @@ def test_restart_waits_until_the_source_incident_is_recovered() -> None:
     waiting = adapter(batch, store).execute(context)
 
     assert waiting.status is WorkflowStepStatus.WAITING
-    assert waiting.details["reason"] == "INCIDENT_NOT_RECOVERED"
+    # RF-4: the hold speaks the shared "node under remediation" vocabulary;
+    # the premise it waits on is kept beside it.
+    assert waiting.details["reason"] == "NODE_UNDER_REMEDIATION"
+    assert waiting.details["premise_reason"] == "INCIDENT_NOT_RECOVERED"
     assert waiting.details["incident_state"] == "ACTION_PENDING"
     assert batch.created == {}
 

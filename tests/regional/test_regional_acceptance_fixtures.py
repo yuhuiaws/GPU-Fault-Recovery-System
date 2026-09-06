@@ -49,6 +49,7 @@ PROMOTED_MANUAL_DRIVERS = {
     "GF-REGIONAL-DESTR-008": "run_destr008_warm_spare_shortage.py",
     "GF-REGIONAL-DESTR-009": "run_destr009_workload_restart.py",
     "GF-REGIONAL-DESTR-012": "run_destr012_managed_recovery_guard.py",
+    "GF-REGIONAL-DESTR-014": "run_destr014_branch_exhaustion.py",
     "GF-REGIONAL-ISO-006": "run_iso006_cluster_offline.py",
     "GF-REGIONAL-E2E-002": "run_e2e002_multicluster_fault.py",
     "GF-REGIONAL-COLLECT-001": "run_collector_acceptance.py",

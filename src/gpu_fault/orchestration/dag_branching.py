@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 
 from gpu_fault.models import (
+    WorkflowEventCode,
+    WorkflowEventKind,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStepSpec,
     lifetime_exceeded,
+    record_workflow_event,
     resolved_step_indexes,
 )
 from gpu_fault.operation_registry import SHARED_DAG_OPERATIONS
@@ -17,6 +23,84 @@ from gpu_fault.orchestration.arbitration import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# --------------------------------------------------------- branch identity
+#
+# A node branch's id is minted here and parsed here, so the two cannot drift
+# (RF-7): ``branch_escalation_counts`` is keyed by node id while
+# ``exhausted_branch_ids`` holds branch ids, and joining them means inverting
+# the minting.
+
+BRANCH_ID_PREFIX = "branch:"
+# Stamped on legacy flat steps when a DAG is first grown around them; it
+# names no node.
+INITIAL_BRANCH_ID = "branch:initial"
+_SUCCESSOR_MARK = "successor"
+
+
+def mint_branch_id(
+    nodes: Iterable[str], *, successor_revision: int | None = None
+) -> str:
+    """``branch:<node>[,<node>...][:successor:<revision>]``.
+
+    Node ids are Kubernetes names, so neither ``,`` nor ``:`` can occur in
+    them. ``append_parallel_job_branch`` may add one more ``:<revision>`` when
+    a second, different branch lands on the same node set (F-C3); everything
+    after the node list is qualification and ``branch_node_ids`` ignores it.
+    """
+
+    branch_id = BRANCH_ID_PREFIX + ",".join(sorted(set(nodes)))
+    if successor_revision is not None:
+        branch_id += f":{_SUCCESSOR_MARK}:{successor_revision}"
+    return branch_id
+
+
+def branch_node_ids(branch_id: str | None) -> tuple[str, ...]:
+    """The nodes a branch id was minted for; empty for job-level ids."""
+
+    if (
+        branch_id is None
+        or branch_id == INITIAL_BRANCH_ID
+        or not branch_id.startswith(BRANCH_ID_PREFIX)
+    ):
+        return ()
+    nodes = branch_id[len(BRANCH_ID_PREFIX) :].split(":", 1)[0]
+    return tuple(node for node in nodes.split(",") if node)
+
+
+def branch_node_id(branch_id: str | None) -> str | None:
+    """The one node of a single-node branch, else ``None``."""
+
+    nodes = branch_node_ids(branch_id)
+    return nodes[0] if len(nodes) == 1 else None
+
+
+def plan_digest(steps: Sequence[WorkflowStepSpec]) -> str:
+    """Sixteen hex characters naming the shape of a plan (RF-5).
+
+    Operations, nodes, GPUs and edges: what a rewrite changes. Parameters are
+    left out because they can hold payloads and a widened or re-wired plan is
+    already visible without them.
+    """
+
+    shape = [
+        {
+            "operation": step.operation.value,
+            "node_ids": list(step.node_ids),
+            "gpu_uuids": list(step.gpu_uuids),
+            "depends_on_step_indexes": list(step.depends_on_step_indexes),
+        }
+        for step in steps
+    ]
+    encoded = json.dumps(shape, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+_REWRITE_PHRASES = {
+    WorkflowEventCode.BRANCH_APPENDED: "parallel branch appended",
+    WorkflowEventCode.BRANCH_REPLACED: "branch replaced",
+    WorkflowEventCode.BRANCH_SUCCESSOR_QUEUED: "branch successor queued",
+}
 
 
 class DagBrancher:
@@ -165,7 +249,7 @@ class DagBrancher:
             branch_id = step.branch_id or (
                 "shared"
                 if step.operation in self._SHARED_OPERATIONS
-                else "branch:initial"
+                else INITIAL_BRANCH_ID
             )
             steps.append(
                 step.model_copy(
@@ -223,9 +307,12 @@ class DagBrancher:
         ]
         steps = [step for _, step in indexed]
         nodes = sorted({node for step in steps for node in step.node_ids})
-        branch_id = "branch:" + ",".join(nodes)
-        if predecessor_step_index is not None:
-            branch_id += f":successor:{revision + 1}"
+        branch_id = mint_branch_id(
+            nodes,
+            successor_revision=(
+                revision + 1 if predecessor_step_index is not None else None
+            ),
+        )
         operations = {step.operation for step in candidate.official_steps}
         # A candidate that isolates the node or hands it to support ends the
         # node's part in the job; the branch it replaces owes no release and
@@ -513,7 +600,7 @@ class DagBrancher:
         if appended:
             self._reconnect_join(steps, tail, superseded)
         rank = self.arbiter.workflow_recovery_rank
-        return existing.model_copy(
+        rewritten = existing.model_copy(
             update={
                 "dag_enabled": True,
                 "dag_revision": existing.dag_revision + 1,
@@ -528,6 +615,41 @@ class DagBrancher:
                 "official_steps": steps,
                 "updated_at": datetime.now(timezone.utc),
             }
+        )
+        # One event per revision (RF-5): what was retired, what was appended,
+        # what the join now waits for, and a digest of the plan that resulted.
+        code = (
+            WorkflowEventCode.BRANCH_REPLACED
+            if replaced_step_indexes
+            else WorkflowEventCode.BRANCH_SUCCESSOR_QUEUED
+            if predecessor_step_index is not None
+            else WorkflowEventCode.BRANCH_APPENDED
+        )
+        return record_workflow_event(
+            rewritten,
+            WorkflowEventKind.PLAN_REWRITE,
+            code=code,
+            reason=(
+                f"{_REWRITE_PHRASES[code]}: {branch_id} from {candidate.request_id}"
+            ),
+            details={
+                "node_id": branch_node_id(branch_id),
+                "node_ids": list(branch_nodes),
+                "branch_id": branch_id,
+                "candidate_workflow_id": candidate.request_id,
+                "predecessor_step_index": predecessor_step_index,
+                "appended_indexes": list(appended),
+                "superseded_indexes": sorted(superseded),
+                "join_dependencies": sorted(
+                    {
+                        dependency
+                        for step in steps
+                        if step.operation is WorkflowOperation.RESTART_WORKLOAD
+                        for dependency in step.depends_on_step_indexes
+                    }
+                ),
+                "steps_digest": plan_digest(steps),
+            },
         )
 
     def widen_parallel_job_branch(
@@ -552,6 +674,7 @@ class DagBrancher:
             and step.operation not in self.arbiter.WORKLOAD_SCOPED_OPERATIONS
         }
         steps = []
+        widened: list[int] = []
         for index, step in enumerate(existing.official_steps):
             if index not in indexes or index in untouchable:
                 steps.append(step)
@@ -574,6 +697,7 @@ class DagBrancher:
                 if widened_gpus:
                     mapping[node_id] = sorted(widened_gpus)
                 parameters["gpu_uuids_by_node"] = mapping
+            widened.append(index)
             steps.append(
                 step.model_copy(
                     update={
@@ -582,12 +706,28 @@ class DagBrancher:
                     }
                 )
             )
-        return existing.model_copy(
+        rewritten = existing.model_copy(
             update={
                 "dag_revision": existing.dag_revision + 1,
                 "official_steps": steps,
                 "updated_at": datetime.now(timezone.utc),
             }
+        )
+        return record_workflow_event(
+            rewritten,
+            WorkflowEventKind.PLAN_REWRITE,
+            code=WorkflowEventCode.BRANCH_WIDENED,
+            reason=(
+                f"branch of {node_id} widened by {len(gpu_uuids)} GPU(s) from "
+                f"{candidate.request_id}"
+            ),
+            details={
+                "node_id": node_id,
+                "candidate_workflow_id": candidate.request_id,
+                "gpu_uuids": sorted(gpu_uuids),
+                "widened_indexes": widened,
+                "steps_digest": plan_digest(steps),
+            },
         )
 
     def replace_parallel_job_branch(

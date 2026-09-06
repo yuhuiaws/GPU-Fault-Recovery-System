@@ -55,6 +55,27 @@ def test_remote_command_change_does_not_select_boot_or_collect() -> None:
     assert "COLLECT" in plan.not_selected_families
 
 
+def test_workflow_reconcile_change_selects_its_own_domain_not_full() -> None:
+    """The four reconcile modules fell through to the fail-closed fallback,
+    so a one-line admin tooling change scheduled the whole acceptance run."""
+
+    for path in (
+        "src/gpu_fault/workflow_reconcile.py",
+        "src/gpu_fault/workflow_resolution.py",
+        "src/gpu_fault/retired_generation.py",
+        "src/gpu_fault/admin/workflow_reconcile.py",
+    ):
+        plan = MODULE.build_plan([path], settings())
+
+        assert plan.full is False, path
+        assert plan.domains == ("workflow-reconcile",), (path, plan.domains)
+        assert "tests/test_workflow_reconcile.py" in plan.pytest_targets, path
+        assert "tests/admin/test_admin_workflow_reconcile.py" in plan.pytest_targets
+        assert plan.safe_cases == () and plan.approval_cases == (), (
+            "reconcile tooling has no live acceptance case"
+        )
+
+
 def test_unmatched_file_escalates_to_full_acceptance() -> None:
     plan = MODULE.build_plan(["unknown/new-surface.xyz"], settings())
     ordered, do_not_run = MODULE.ordered_regional_cases()

@@ -18,6 +18,7 @@ from scripts.e2e.regional import run_destr003_warm_spare_failover as destr003
 from scripts.e2e.regional import run_destr008_warm_spare_shortage as destr008
 from scripts.e2e.regional import run_destr009_workload_restart as destr009
 from scripts.e2e.regional import run_destr012_managed_recovery_guard as destr012
+from scripts.e2e.regional import run_destr014_branch_exhaustion as destr014
 from scripts.e2e.regional import run_workload_acceptance as workload_acceptance
 from scripts.e2e.regional.acceptance_scope import (
     EXECUTION_SCOPE_ENV,
@@ -74,6 +75,7 @@ def test_destructive_live_drivers_are_promoted_and_plan_only() -> None:
         "run_destr008_warm_spare_shortage.py": destr008.CONFIRMATION,
         "run_destr009_workload_restart.py": destr009.CONFIRMATION,
         "run_destr012_managed_recovery_guard.py": destr012.CONFIRMATION,
+        "run_destr014_branch_exhaustion.py": destr014.CONFIRMATION,
     }
 
     for name, confirmation in expected.items():
@@ -89,6 +91,7 @@ def test_destructive_live_drivers_are_promoted_and_plan_only() -> None:
             "run_destr008_warm_spare_shortage.py": destr008,
             "run_destr009_workload_restart.py": destr009,
             "run_destr012_managed_recovery_guard.py": destr012,
+            "run_destr014_branch_exhaustion.py": destr014,
         }[name]
         arguments = module.parser().parse_args(["--run-dir", "/tmp/test-run"])
         assert arguments.execute is False, name

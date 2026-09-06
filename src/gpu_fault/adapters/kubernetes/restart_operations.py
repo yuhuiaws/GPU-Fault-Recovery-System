@@ -11,6 +11,7 @@ from gpu_fault.execution import (
 )
 from gpu_fault.models import (
     IncidentState,
+    WorkflowEventCode,
     WorkflowOperation,
     WorkflowStepStatus,
 )
@@ -56,6 +57,13 @@ class KubernetesRestartOperationsMixin:
     _UNRECOVERABLE_INCIDENT_STATES = frozenset(
         {IncidentState.QUARANTINED.value, IncidentState.ESCALATED.value}
     )
+    #: The shared "node under repair" vocabulary (review item 4). The
+    #: dispatcher's busy-node hold uses the same code; the executor turns a
+    #: WAITING outcome carrying it into one HOLD audit event.
+    HOLD_REASON_NODE_UNDER_REMEDIATION = WorkflowEventCode.NODE_UNDER_REMEDIATION.value
+    HOLD_REASON_INCIDENT_NOT_RECOVERABLE = "INCIDENT_NOT_RECOVERABLE"
+    #: The premise this adapter is waiting on, kept beside the shared code.
+    PREMISE_REASON_INCIDENT_NOT_RECOVERED = "INCIDENT_NOT_RECOVERED"
 
     def _restart_guard(
         self,
@@ -294,11 +302,14 @@ class KubernetesRestartOperationsMixin:
             return None
         required_state = str(required)
         incident_id = str(parameters.get("incident_id") or context.incident.incident_id)
-        state = self._incident_state(incident_id)
+        state, remediation_workflow_id = self._incident_snapshot(incident_id)
         details: dict[str, Any] = {
             "incident_id": incident_id,
             "required_incident_state": required_state,
             "incident_state": state,
+            # The workflow repairing the nodes: the same object the
+            # dispatcher's busy-node hold names, so both waits point at it.
+            "remediation_workflow_id": remediation_workflow_id,
         }
         if state is None:
             return WorkflowStepOutcome.failed(
@@ -312,32 +323,53 @@ class KubernetesRestartOperationsMixin:
             return WorkflowStepOutcome.failed(
                 f"incident {incident_id} is {state}; it will never be "
                 f"{required_state}, so the workload cannot be restarted on its nodes",
-                details={**details, "reason": "INCIDENT_NOT_RECOVERABLE"},
+                details={
+                    **details,
+                    "reason": self.HOLD_REASON_INCIDENT_NOT_RECOVERABLE,
+                },
             )
         return WorkflowStepOutcome.waiting(
             operation_id=context.idempotency_key,
-            details={**details, "reason": "INCIDENT_NOT_RECOVERED"},
+            details={
+                **details,
+                "reason": self.HOLD_REASON_NODE_UNDER_REMEDIATION,
+                "premise_reason": self.PREMISE_REASON_INCIDENT_NOT_RECOVERED,
+            },
         )
 
     def _incident_state(self, incident_id: str) -> str | None:
+        return self._incident_snapshot(incident_id)[0]
+
+    def _incident_snapshot(self, incident_id: str) -> tuple[str | None, str | None]:
+        """``(state, workflow_request_id)`` of an incident, or ``(None, None)``
+        when nothing here can answer -- the premise then fails closed."""
+
         if self.store is not None:
             try:
                 incident = self.store.get_incident(incident_id)
             except Exception:  # noqa: BLE001 - unknown incident is "unverifiable"
-                return None
+                return None, None
             state = incident.state
-            return str(getattr(state, "value", state))
+            workflow_id = incident.workflow_request_id
+            return (
+                str(getattr(state, "value", state)),
+                None if workflow_id is None else str(workflow_id),
+            )
         provider = getattr(self, "ownership_provider", None)
         if provider is None or not hasattr(provider, "incident_ownership"):
             # Older providers answer only incident_workflow_is_terminal.
-            return None
+            return None, None
         try:
             report = provider.incident_ownership(incident_id)
         except Exception:  # noqa: BLE001 - a failed lookup is "unverifiable"
-            return None
+            return None, None
         if not report.known:
-            return None
-        return str(report.incident_state) if report.incident_state else None
+            return None, None
+        workflow_id = getattr(report, "workflow_request_id", None)
+        return (
+            str(report.incident_state) if report.incident_state else None,
+            None if workflow_id is None else str(workflow_id),
+        )
 
     @staticmethod
     def _avoid_node_ids(context: WorkflowStepContext) -> list[str]:

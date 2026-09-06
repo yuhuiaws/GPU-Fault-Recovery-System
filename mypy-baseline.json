@@ -322,7 +322,7 @@
   "src/gpu_fault/orchestration/ingest/sxid.py:union-attr": 8,
   "src/gpu_fault/orchestration/workflow_builder.py:no-any-return": 1,
   "src/gpu_fault/orchestration/workflow_builder.py:no-untyped-def": 3,
-  "src/gpu_fault/orchestration/workflow_merge.py:no-any-return": 3,
+  "src/gpu_fault/orchestration/workflow_merge.py:no-any-return": 2,
   "src/gpu_fault/orchestration/workflow_merge.py:no-untyped-def": 2,
   "src/gpu_fault/orchestration/workflow_merge.py:type-arg": 4,
   "src/gpu_fault/passive.py:no-untyped-def": 1,

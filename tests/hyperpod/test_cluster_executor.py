@@ -375,6 +375,57 @@ def test_cluster_executor_renews_remote_command_lease() -> None:
     assert client.renewals == [("command-a", "executor-a", 120)]
 
 
+def test_lease_renewal_interval_is_a_third_of_the_lease_capped_at_thirty() -> None:
+    """``lease_seconds`` is validated to 10..7200, so the interval's only live
+    clamp is the 30s ceiling; the old ``max(1.0, ...)`` floor was dead code."""
+
+    class RecordingStop:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def wait(self, seconds: float) -> bool:
+            self.waits.append(seconds)
+            return True
+
+    for lease_seconds, expected in ((10, 10 / 3), (90, 30.0), (7200, 30.0)):
+        executor = ClusterActionExecutor(
+            FakeClient(),
+            [FakeAdapter("owner-a")],
+            executor_id="executor-a",
+            allowed_namespaces={"training"},
+            lease_seconds=lease_seconds,
+        )
+        stop = RecordingStop()
+        executor._renew_lease(
+            SimpleNamespace(command_id="c", cluster_id="cluster-a", lease_token="l"),
+            stop,
+        )
+        assert stop.waits == [expected], (lease_seconds, stop.waits)
+
+
+def test_a_failed_outcome_without_a_message_is_not_an_executor_internal_error() -> None:
+    """The adapter's FAILED verdict with ``error=None`` used to fail the result
+    model inside the try block and surface as executor-internal-error."""
+
+    class SilentAdapter(FakeAdapter):
+        def supports(self, step) -> bool:
+            return True
+
+        def execute(self, context) -> WorkflowStepOutcome:
+            return WorkflowStepOutcome(status=WorkflowStepStatus.FAILED, error=None)
+
+    executor = _executor(SilentAdapter("owner-a"))
+
+    result = executor._execute(_remote_command())
+
+    assert result.status is RemoteCommandStatus.FAILED
+    assert result.status_source is None
+    assert "without an error message" in (result.error or "")
+    assert result.details["error_message_missing"] is True
+    assert "executor_internal_error" not in result.details
+    assert executor.unexpected_failures == 0
+
+
 def test_cluster_executor_rejects_duplicate_adapter_owner() -> None:
     with pytest.raises(ClusterExecutorError, match="unique owner"):
         ClusterActionExecutor(

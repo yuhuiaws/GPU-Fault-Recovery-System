@@ -20,7 +20,13 @@ from gpu_fault.execution.config import (
     WorkflowDispatcherConfig,
 )
 from gpu_fault.execution.executor import (
+    DISPATCHER_ACTOR,
+    DISPATCHER_INTERNAL_ERROR_ACTOR,
+    DISPATCHER_WATCHDOG_ACTOR,
+    HOLD_REASON_NODE_REMEDIATION_TIMEOUT,
+    HOLD_REASON_NODE_UNDER_REMEDIATION,
     ProductionWorkflowExecutor,
+    record_hold_event,
 )
 from gpu_fault.execution.models import (
     WorkflowExecutionError,
@@ -31,10 +37,13 @@ from gpu_fault.execution.transient_errors import (
 from gpu_fault.models import (
     EXECUTABLE_WORKFLOW_STATUSES,
     BlockedKind,
+    FaultIncident,
     IncidentState,
     PlanStatus,
     WorkflowDispatchFailure,
     WorkflowDispatchReport,
+    WorkflowEventCode,
+    WorkflowEventKind,
     WorkflowExecutionRequest,
     WorkflowOperation,
     WorkflowRequest,
@@ -44,6 +53,7 @@ from gpu_fault.models import (
     bounded_reasons,
     execution_matches_step,
     execution_phase,
+    record_workflow_event,
     workflow_is_open,
 )
 from gpu_fault.orchestrator import WorkflowFencingError
@@ -62,6 +72,9 @@ from gpu_fault.workflow_resolution import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+DISPATCHER_PLACEMENT_HOLD_ACTOR = "dispatcher-placement-hold"
+HOLD_REASON_PLACEMENT_HOLD_DISSOLVED_TEXT = "placement hold dissolved: nodes freed"
 
 
 class WorkflowDispatcher:
@@ -100,6 +113,9 @@ class WorkflowDispatcher:
         self.failure_handling_abandoned_total = 0
         self.plan_sync_misses_total = 0
         self.node_busy_timeouts_total = 0
+        # Placement holds ended because the nodes they waited on were freed
+        # inside the window (rule A, case 2); nothing reached the data plane.
+        self.placement_holds_dissolved_total = 0
         self.internal_errors_total = 0
         self.deferred_total = 0
         self.preemption_pending_seen_total = 0
@@ -456,9 +472,16 @@ class WorkflowDispatcher:
                         held("predecessor")
                         continue
             busy = self._nodes_under_other_remediation(workflow)
+            if not busy and self._is_unstarted_placement_hold(workflow):
+                # The repair the hold waited on ended inside the window: the
+                # job keeps running and the hold has nothing left to do.
+                if self._dissolve_placement_hold(workflow):
+                    held("placement_hold_dissolved")
+                    continue
             if busy:
                 wait = timedelta(seconds=self.config.node_busy_wait_seconds)
                 if now < workflow.created_at + wait:
+                    self._record_node_busy_hold(workflow, busy)
                     held("node_busy")
                     continue
                 # F-N1 §8: waited long enough. The job workflow gives up by
@@ -483,12 +506,10 @@ class WorkflowDispatcher:
         """Nodes of a not-yet-started job workflow that another open workflow
         is repairing, mapped to that workflow's id (F-N1 §8)."""
 
-        if (
-            workflow.completed_step_indexes
-            or workflow.step_executions
-            or workflow.execution_owner_id is not None
-            or workflow.terminal_failure_reason
-            or not any(
+        if self._has_started(workflow) or not (
+            # A placement hold has only a STOP; it waits like a job workflow.
+            workflow.placement_hold
+            or any(
                 step.operation is WorkflowOperation.RESTART_WORKLOAD
                 for step in workflow.official_steps
             )
@@ -514,10 +535,136 @@ class WorkflowDispatcher:
                 busy.setdefault(node, other.request_id)
         return busy
 
+    @staticmethod
+    def _has_started(workflow: WorkflowRequest) -> bool:
+        """Whether the row is past the point where a rule A hold may act on it:
+        a step ran or is leased, or the timeout already rewrote the plan."""
+
+        return bool(
+            workflow.completed_step_indexes
+            or workflow.step_executions
+            or workflow.execution_owner_id is not None
+            or workflow.terminal_failure_reason
+        )
+
+    def _is_unstarted_placement_hold(self, workflow: WorkflowRequest) -> bool:
+        return (
+            workflow.placement_hold
+            and workflow.status is WorkflowStatus.PENDING
+            and not self._has_started(workflow)
+        )
+
+    def _dissolve_placement_hold(self, workflow: WorkflowRequest) -> bool:
+        """End a placement hold whose nodes were freed inside the window.
+
+        Claimed as this executor's id and ended through the executor's
+        terminal funnel, like the watchdog reap: SUPERSEDED (nothing ran),
+        incident RECOVERED (the job was never touched). A claim lost to a
+        concurrent executor leaves the row alone; it is looked at again.
+        """
+
+        try:
+            claimed = self.store.claim_workflow(
+                workflow.request_id,
+                self.executor.config.executor_id,
+                workflow.fencing_token,
+                lease_duration=timedelta(seconds=30),
+            )
+        except (NotFoundError, WorkflowLeaseError, WorkflowFencingError):
+            return False
+        except Exception as exc:  # noqa: BLE001 - a stale token is a store error type
+            if transient_store_error(exc):
+                raise
+            LOGGER.warning(
+                "placement hold %s could not be claimed for dissolution: %s",
+                workflow.request_id,
+                exc,
+            )
+            return False
+        if claimed.execution_owner_id != self.executor.config.executor_id:
+            return False
+        incident: FaultIncident | None
+        try:
+            incident = self.store.get_incident(claimed.incident_id)
+        except NotFoundError:
+            incident = None
+        reason = HOLD_REASON_PLACEMENT_HOLD_DISSOLVED_TEXT
+        events = record_workflow_event(
+            claimed,
+            WorkflowEventKind.HOLD,
+            code=WorkflowEventCode.PLACEMENT_HOLD_DISSOLVED.value,
+            reason=reason,
+            actor=DISPATCHER_PLACEMENT_HOLD_ACTOR,
+            details={
+                "reason": WorkflowEventCode.PLACEMENT_HOLD_DISSOLVED.value,
+                "remediation_workflow_id": None,
+                "node_ids": sorted(
+                    {node for step in claimed.official_steps for node in step.node_ids}
+                ),
+            },
+        ).events
+        self.executor.terminalize_claimed(
+            claimed,
+            incident,
+            WorkflowStatus.SUPERSEDED,
+            claimed.execution_epoch,
+            reason=reason,
+            actor=DISPATCHER_PLACEMENT_HOLD_ACTOR,
+            incident_state=IncidentState.RECOVERED,
+            updates={"events": events},
+        )
+        self.placement_holds_dissolved_total += 1
+        LOGGER.info(
+            "placement hold %s dissolved: its nodes were freed inside the window",
+            claimed.request_id,
+        )
+        return True
+
+    @staticmethod
+    def _remediation_ids(busy: dict[str, str]) -> tuple[str, list[str]]:
+        """The remediation workflow(s) a busy-node hold waits on: the first
+        sorted id as the one both wait paths name, and the full list."""
+
+        ids = sorted(set(busy.values()))
+        return ids[0], ids
+
+    def _record_node_busy_hold(
+        self, workflow: WorkflowRequest, busy: dict[str, str]
+    ) -> None:
+        """Write one HOLD event for a PENDING row the dispatcher does not own.
+
+        The row has no lease holder, so the write goes through
+        ``amend_workflow`` (it bumps ``merge_revision``, which is harmless
+        here: nobody is executing it). ``record_hold_event`` dedupes against
+        the last HOLD, so a 300 s wait polled every tick writes once, and once
+        more only if the remediation it waits on changes.
+        """
+
+        primary, ids = self._remediation_ids(busy)
+        held = record_hold_event(
+            workflow,
+            reason=HOLD_REASON_NODE_UNDER_REMEDIATION,
+            remediation_workflow_id=primary,
+            actor=DISPATCHER_ACTOR,
+            details={
+                "remediation_workflow_ids": ids,
+                "node_ids": sorted(busy),
+                "node_busy_wait_seconds": int(self.config.node_busy_wait_seconds),
+                "held_since": workflow.created_at.isoformat(),
+            },
+        )
+        if held is None:
+            return
+        try:
+            self.store.amend_workflow(workflow.request_id, {"events": held.events})
+        except NotFoundError:
+            return
+
     def _fail_node_busy(self, workflow: WorkflowRequest, busy: dict[str, str]) -> None:
+        primary, remediation_ids = self._remediation_ids(busy)
         reason = (
-            "nodes still under remediation after "
-            f"{int(self.config.node_busy_wait_seconds)}s: "
+            f"{HOLD_REASON_NODE_REMEDIATION_TIMEOUT}: nodes still under "
+            f"remediation after {int(self.config.node_busy_wait_seconds)}s: "
             + ", ".join(f"{node} ({other})" for node, other in sorted(busy.items()))
         )
         stop_steps = [
@@ -533,6 +680,16 @@ class WorkflowDispatcher:
             )
             for step in workflow.official_steps
             if step.operation is WorkflowOperation.STOP_WORKLOADS
+        ]
+        kept_indexes = [
+            index
+            for index, step in enumerate(workflow.official_steps)
+            if step.operation is WorkflowOperation.STOP_WORKLOADS
+        ]
+        superseded_indexes = [
+            index
+            for index in range(len(workflow.official_steps))
+            if index not in kept_indexes
         ]
         updates: dict[str, object] = {"terminal_failure_reason": reason}
         if stop_steps:
@@ -550,6 +707,21 @@ class WorkflowDispatcher:
             updates["superseded_step_indexes"] = list(
                 range(len(workflow.official_steps))
             )
+        updates["events"] = record_workflow_event(
+            workflow,
+            WorkflowEventKind.PLAN_REWRITE,
+            code=HOLD_REASON_NODE_REMEDIATION_TIMEOUT,
+            reason=reason,
+            actor=DISPATCHER_ACTOR,
+            details={
+                "reason": HOLD_REASON_NODE_REMEDIATION_TIMEOUT,
+                "remediation_workflow_id": primary,
+                "remediation_workflow_ids": remediation_ids,
+                "node_ids": sorted(busy),
+                "kept_step_indexes": kept_indexes,
+                "superseded_step_indexes": superseded_indexes,
+            },
+        ).events
         try:
             self.store.amend_workflow(workflow.request_id, updates)
         except NotFoundError:
@@ -672,51 +844,38 @@ class WorkflowDispatcher:
                 f"it is leased by {owner}"
             )
         reason = f"dispatcher internal error: {type(error).__name__}: {error}"
-        now = datetime.now(timezone.utc)
-        blocked = current.model_copy(
-            update={
-                "status": WorkflowStatus.BLOCKED,
+        incident: FaultIncident | None
+        try:
+            incident = self.store.get_incident(current.incident_id)
+        except NotFoundError:
+            incident = None
+        if incident is not None:
+            # The funnel decides whether the incident is still this
+            # workflow's to end; the audit line is prepared either way.
+            incident = incident.model_copy(
+                update={"reasons": list(dict.fromkeys([*incident.reasons, reason]))}
+            )
+        # BLOCKED for an internal error is terminal until an operator acts;
+        # the funnel releases the unattempted restart reservations, and the
+        # preflight re-reserves if the record is ever unblocked (F-C9). The
+        # incident is named ESCALATED, not the BLOCKED default QUARANTINED:
+        # an internal error is an operator matter, not a settled safety phase.
+        self.executor.terminalize_claimed(
+            current,
+            incident,
+            WorkflowStatus.BLOCKED,
+            current.execution_epoch,
+            reason=reason,
+            actor=DISPATCHER_INTERNAL_ERROR_ACTOR,
+            incident_state=IncidentState.ESCALATED,
+            updates={
                 "blocked_kind": BlockedKind.INTERNAL_ERROR,
                 "blocked_reasons": list(
                     dict.fromkeys([*current.blocked_reasons, reason])
                 ),
-                "execution_owner_id": None,
-                "execution_lease_expires_at": None,
-                "updated_at": now,
-            }
+            },
         )
-        # BLOCKED for an internal error is terminal until an operator acts;
-        # the preflight re-reserves if the record is ever unblocked (F-C9).
-        restart_budget_preflight.release_unattempted_restart_reservations(
-            self.store,
-            blocked,
-            waiting_ttl=self._restart_waiting_ttl,
-        )
-        incident = self.store.get_incident(blocked.incident_id)
-        if (
-            incident.workflow_request_id is None
-            or incident.workflow_request_id == blocked.request_id
-        ):
-            incident = incident.model_copy(
-                update={
-                    "state": IncidentState.ESCALATED,
-                    "reasons": list(dict.fromkeys([*incident.reasons, reason])),
-                    "updated_at": now,
-                }
-            )
-            self.store.save_workflow_and_incident_if_leased(
-                blocked,
-                incident,
-                owner,
-                current.execution_epoch,
-            )
-        else:
-            self.store.save_workflow_if_leased(
-                blocked,
-                owner,
-                current.execution_epoch,
-            )
-        return blocked
+        return self.store.get_workflow(current.request_id)
 
     def _expire_stuck_workflows(self, now: datetime) -> list[WorkflowRequest]:
         """Reap a workflow whose executor stopped touching it.
@@ -825,44 +984,42 @@ class WorkflowDispatcher:
         # is one the hardware escalation classifier cannot classify
         # (P0-46C).
         overdue = int((now - deadline).total_seconds())
-        failed = claimed.model_copy(
-            update={
-                "status": WorkflowStatus.FAILED,
+        error = (
+            "workflow execution deadline exceeded at "
+            f"{deadline.isoformat()} "
+            f"({overdue}s overdue); reaped by the dispatcher watchdog"
+        )
+        incident: FaultIncident | None
+        try:
+            incident = self.store.get_incident(claimed.incident_id)
+        except NotFoundError:
+            incident = None
+        # The claim above succeeded as ``executor.config.executor_id``, so the
+        # executor's own terminal funnel owns the write: it drops the owner,
+        # derives the incident state from what the workflow completed (F-C9
+        # release of unattempted restart reservations included), and records
+        # the TERMINAL event under the watchdog's name.
+        self.executor.terminalize_claimed(
+            claimed,
+            incident,
+            WorkflowStatus.FAILED,
+            claimed.execution_epoch,
+            reason=error,
+            actor=DISPATCHER_WATCHDOG_ACTOR,
+            updates={
                 "step_executions": self._deadline_step_executions(
                     claimed,
                     now,
-                    error=(
-                        "workflow execution deadline exceeded at "
-                        f"{deadline.isoformat()} "
-                        f"({overdue}s overdue); reaped by the dispatcher watchdog"
-                    ),
+                    error=error,
                     details={
                         "workflow_execution_deadline": (deadline.isoformat()),
                         "workflow_deadline_overdue_seconds": overdue,
                         "workflow_deadline_remote_command_cancellation": (cancellation),
                     },
                 ),
-                "execution_owner_id": None,
-                "execution_lease_expires_at": None,
-                "updated_at": now,
-            }
+            },
         )
-        # A restart reservation is a durable row; terminalizing without
-        # releasing the ones no adapter attempted spends the job's budget on a
-        # workflow that never restarted anything (F-C9).
-        restart_budget_preflight.release_unattempted_restart_reservations(
-            self.store,
-            failed,
-            waiting_ttl=self._restart_waiting_ttl,
-        )
-        self.store.save_workflow_if_leased(
-            failed,
-            # The id the claim above succeeded with; reading it back off the
-            # record would be ``str | None``.
-            self.executor.config.executor_id,
-            claimed.execution_epoch,
-            now=now,
-        )
+        failed = self.store.get_workflow(workflow.request_id)
         self._sync_plan(failed, WorkflowStatus.FAILED)
         self._handle_failed_workflow(failed)
         return failed

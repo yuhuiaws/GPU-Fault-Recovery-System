@@ -25,6 +25,10 @@ from typing import Any
 
 from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import (
+    StepPhase,
+    WorkflowEvent,
+    WorkflowEventCode,
+    WorkflowEventKind,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStepExecution,
@@ -32,9 +36,22 @@ from gpu_fault.models import (
     WorkflowStepStatus,
     execution_matches_step,
     execution_phase,
+    record_workflow_event,
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# The outcome-detail keys a STEP_ATTEMPT event may carry. An allow-list, not a
+# copy: ``outcome.details`` can hold payloads (a bundle manifest, a command's
+# last lines) and the audit trail is small and bounded. ``reason`` is the
+# adapter's own machine code for a wait or a refusal.
+ATTEMPT_DETAIL_KEYS = (
+    "reason",
+    "gpu_reset_commit_attempt",
+    "gpu_client_quiesce_attempt",
+    "step_waiting_seconds",
+)
+_ATTEMPT_DETAIL_STRING_LIMIT = 128
 
 
 # Compensation that restores what the workflow itself stopped. It never
@@ -147,6 +164,13 @@ def bounded_waiting_outcome(
     # larger, which is the same as having none for everything else.
     limit = executor.config.step_waiting_limit(step.operation)
     details = dict(outcome.details or {})
+    # Rule A: a restart held on its ``requires_incident_state`` premise is a
+    # job waiting on a node another remediation is repairing, and that wait
+    # has one window -- the same ``node_busy_wait_seconds`` the dispatcher
+    # applies before the workflow starts. Past it the job is not restarted.
+    premise_hold = details.get("reason") == WorkflowEventCode.NODE_UNDER_REMEDIATION
+    if premise_hold:
+        limit = min(limit, int(executor.config.node_busy_wait_seconds))
     details["step_waiting_seconds"] = waited
     if waited >= limit:
         LOGGER.error(
@@ -160,6 +184,15 @@ def bounded_waiting_outcome(
             outcome.details or {},
         )
         details["step_waiting_timeout_seconds"] = limit
+        if premise_hold:
+            details["reason"] = WorkflowEventCode.NODE_REMEDIATION_TIMEOUT.value
+            return WorkflowStepOutcome.failed(
+                f"{WorkflowEventCode.NODE_REMEDIATION_TIMEOUT.value}: step "
+                f"{index}/{step.operation.value} waited {waited}s for the node "
+                f"remediation, past the {limit}s window; the job is not restarted"
+                + (f"; last reported: {outcome.error}" if outcome.error else ""),
+                details=details,
+            )
         return WorkflowStepOutcome.failed(
             f"step {index}/{step.operation.value} stayed non-terminal for "
             f"{waited}s, past the {limit}s per-step cap"
@@ -204,6 +237,9 @@ def record_attempt(
 
     phase = execution_phase(workflow)
     previous = previous_execution(workflow, step, index)
+    # The record below replaces this step's last one; the event is what keeps
+    # the attempts that came before it (RF-2).
+    workflow = _record_attempt_event(workflow, step, index, outcome, phase)
     execution = WorkflowStepExecution(
         step_index=index,
         operation=step.operation,
@@ -242,6 +278,89 @@ def record_attempt(
             "step_executions": sorted(executions, key=lambda item: item.step_index),
             "updated_at": datetime.now(timezone.utc),
         }
+    )
+
+
+def attempt_event_code(outcome: WorkflowStepOutcome) -> WorkflowEventCode:
+    """The machine code for one attempt's outcome.
+
+    A failure the bounds in this module produced (deadline, lifetime, waiting
+    cap) is told apart from an adapter's own failure by the detail keys those
+    bounds stamp, so a report can count "ran out of time" separately from
+    "the node refused".
+    """
+
+    if outcome.status is WorkflowStepStatus.WAITING:
+        return WorkflowEventCode.STEP_WAITING
+    if outcome.status is WorkflowStepStatus.SUCCEEDED:
+        return WorkflowEventCode.STEP_SUCCEEDED
+    details = outcome.details or {}
+    if details.get("workflow_lifetime_exceeded"):
+        return WorkflowEventCode.LIFETIME_EXCEEDED
+    if "workflow_execution_deadline" in details:
+        return WorkflowEventCode.DEADLINE_EXCEEDED
+    if details.get("reason") == WorkflowEventCode.NODE_REMEDIATION_TIMEOUT:
+        # Rule A's give-up, spelt the same way the dispatcher spells its own.
+        return WorkflowEventCode.NODE_REMEDIATION_TIMEOUT
+    if "step_waiting_timeout_seconds" in details:
+        return WorkflowEventCode.STEP_WAITING_TIMEOUT
+    return WorkflowEventCode.STEP_FAILED
+
+
+def step_attempt_history(
+    workflow: WorkflowRequest,
+    step_index: int,
+    operation: WorkflowOperation,
+    phase: StepPhase | None = None,
+) -> list[WorkflowEvent]:
+    """Every recorded attempt at one step identity, oldest first.
+
+    Same dual read as ``execution_matches_step``: an event or a caller without
+    a phase matches either phase. Bounded by ``WORKFLOW_EVENTS_LIMIT``, so on a
+    workflow that outlived its budget the middle of a long retry run is gone
+    and the ``attempt`` numbers restart from what survived.
+    """
+
+    return [
+        event
+        for event in workflow.events
+        if event.kind is WorkflowEventKind.STEP_ATTEMPT
+        and event.step_index == step_index
+        and event.operation is operation
+        and (phase is None or event.phase is None or event.phase == phase)
+    ]
+
+
+def _record_attempt_event(
+    workflow: WorkflowRequest,
+    step: WorkflowStepSpec,
+    index: int,
+    outcome: WorkflowStepOutcome,
+    phase: StepPhase,
+) -> WorkflowRequest:
+    source = outcome.details or {}
+    details: dict[str, Any] = {
+        "attempt": len(step_attempt_history(workflow, index, step.operation, phase))
+        + 1,
+    }
+    if outcome.adapter_operation_id is not None:
+        details["adapter_operation_id"] = outcome.adapter_operation_id
+    for key in ATTEMPT_DETAIL_KEYS:
+        value = source.get(key)
+        if isinstance(value, str):
+            details[key] = value[:_ATTEMPT_DETAIL_STRING_LIMIT]
+        elif isinstance(value, (bool, int, float)):
+            details[key] = value
+    return record_workflow_event(
+        workflow,
+        WorkflowEventKind.STEP_ATTEMPT,
+        code=attempt_event_code(outcome),
+        step_index=index,
+        operation=step.operation,
+        phase=phase,
+        status=outcome.status.value,
+        reason=outcome.error,
+        details=details,
     )
 
 

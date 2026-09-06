@@ -19,13 +19,16 @@ from enum import StrEnum
 
 from gpu_fault.models import (
     FaultIncident,
+    WorkflowEventCode,
+    WorkflowEventKind,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStepSpec,
+    record_workflow_event,
     resolved_step_indexes,
 )
 from gpu_fault.orchestration.arbitration import RecoveryArbiter
-from gpu_fault.orchestration.dag_branching import DagBrancher
+from gpu_fault.orchestration.dag_branching import DagBrancher, plan_digest
 
 AggregationDeadlines = Callable[[datetime, WorkflowRequest], tuple[datetime, datetime]]
 PrepareSuccessor = Callable[[WorkflowRequest, WorkflowRequest], WorkflowRequest]
@@ -166,18 +169,9 @@ class DispositionApplier:
             case Disposition.ABSORB:
                 return self._absorb(existing_incident, existing_workflow, mutable, now)
             case Disposition.WIDEN_IN_PLACE:
-                steps = widen_in_place(
-                    existing_workflow,
-                    candidate_workflow,
-                    node_id,
-                    gpu_uuids,
-                    workload_scoped_operations=(
-                        self.arbiter.WORKLOAD_SCOPED_OPERATIONS
-                    ),
-                )
                 return (
-                    existing_workflow.model_copy(
-                        update={"official_steps": steps, "updated_at": now}
+                    self._widen_in_place(
+                        node_id, candidate_workflow, existing_workflow, gpu_uuids, now
                     ),
                     existing_incident,
                 )
@@ -267,6 +261,52 @@ class DispositionApplier:
             node_id,
         )
 
+    def _widen_in_place(
+        self,
+        node_id: str,
+        candidate: WorkflowRequest,
+        existing: WorkflowRequest,
+        gpu_uuids: set[str],
+        now: datetime,
+    ) -> WorkflowRequest:
+        steps = widen_in_place(
+            existing,
+            candidate,
+            node_id,
+            gpu_uuids,
+            workload_scoped_operations=self.arbiter.WORKLOAD_SCOPED_OPERATIONS,
+        )
+        widened = [
+            index
+            for index, (before, after) in enumerate(
+                zip(existing.official_steps, steps, strict=True)
+            )
+            if before != after
+        ]
+        workflow = existing.model_copy(
+            update={"official_steps": steps, "updated_at": now}
+        )
+        if not widened:
+            # Nothing pending took the new GPUs: not a rewrite, no event.
+            return workflow
+        return record_workflow_event(
+            workflow,
+            WorkflowEventKind.PLAN_REWRITE,
+            code=WorkflowEventCode.PLAN_WIDENED,
+            at=now,
+            reason=(
+                f"pending steps on {node_id} widened by {len(gpu_uuids)} GPU(s) "
+                f"from {candidate.request_id}"
+            ),
+            details={
+                "node_id": node_id,
+                "candidate_workflow_id": candidate.request_id,
+                "gpu_uuids": sorted(gpu_uuids),
+                "widened_indexes": widened,
+                "steps_digest": plan_digest(steps),
+            },
+        )
+
     def _absorb(
         self,
         incident: FaultIncident,
@@ -291,23 +331,45 @@ class DispositionApplier:
         now: datetime,
     ) -> tuple[WorkflowRequest, FaultIncident]:
         not_before, maximum = self.aggregation_deadlines(now, existing_workflow)
+        replaced = candidate_workflow.model_copy(
+            update={
+                "request_id": existing_workflow.request_id,
+                "incident_id": existing_incident.incident_id,
+                # The plan changes; its place in the serialization chain
+                # and its lifetime do not (F-B5, F-N1).
+                "predecessor_workflow_id": (existing_workflow.predecessor_workflow_id),
+                "lifetime_deadline_at": existing_workflow.lifetime_deadline_at,
+                "fencing_token": existing_workflow.fencing_token + 1,
+                "not_before": not_before,
+                "aggregation_max_deadline": maximum,
+                "created_at": existing_workflow.created_at,
+                "updated_at": now,
+                # The record keeps its id, so it keeps its history (RF-5): the
+                # old plan's events stay, and the swap is one more of them.
+                "events": [*existing_workflow.events, *candidate_workflow.events],
+            }
+        )
         return (
-            candidate_workflow.model_copy(
-                update={
-                    "request_id": existing_workflow.request_id,
-                    "incident_id": existing_incident.incident_id,
-                    # The plan changes; its place in the serialization chain
-                    # and its lifetime do not (F-B5, F-N1).
-                    "predecessor_workflow_id": (
-                        existing_workflow.predecessor_workflow_id
+            record_workflow_event(
+                replaced,
+                WorkflowEventKind.PLAN_REWRITE,
+                code=WorkflowEventCode.PLAN_REPLACED,
+                at=now,
+                reason=(
+                    "plan replaced in place: "
+                    f"{existing_workflow.official_action} -> "
+                    f"{candidate_workflow.official_action} "
+                    f"from {candidate_workflow.request_id}"
+                ),
+                details={
+                    "candidate_workflow_id": candidate_workflow.request_id,
+                    "from_action": existing_workflow.official_action,
+                    "to_action": candidate_workflow.official_action,
+                    "previous_steps_digest": plan_digest(
+                        existing_workflow.official_steps
                     ),
-                    "lifetime_deadline_at": existing_workflow.lifetime_deadline_at,
-                    "fencing_token": existing_workflow.fencing_token + 1,
-                    "not_before": not_before,
-                    "aggregation_max_deadline": maximum,
-                    "created_at": existing_workflow.created_at,
-                    "updated_at": now,
-                }
+                    "steps_digest": plan_digest(candidate_workflow.official_steps),
+                },
             ),
             candidate,
         )

@@ -21,6 +21,7 @@ from gpu_fault.execution.fleet_preflight import (
 from gpu_fault.execution.hung_classification import (
     classify_hung_signals,
 )
+from gpu_fault.execution.invariants import check_workflow_invariants
 from gpu_fault.execution.models import (
     WorkflowExecutionError,
     WorkflowStepAdapter,
@@ -34,6 +35,8 @@ from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
     IncidentState,
+    WorkflowEventCode,
+    WorkflowEventKind,
     WorkflowExecutionRequest,
     WorkflowExecutionResult,
     WorkflowOperation,
@@ -42,6 +45,7 @@ from gpu_fault.models import (
     WorkflowStepExecution,
     WorkflowStepSpec,
     WorkflowStepStatus,
+    record_workflow_event,
     resolved_step_indexes,
 )
 from gpu_fault.notifications import (
@@ -61,6 +65,73 @@ LOGGER = logging.getLogger(__name__)
 # both quadratic in its size, so a graph with no bound is a runaway
 # workflow's way of pinning a dispatcher worker (F-C6).
 MAX_DAG_STEPS = 256
+
+# One vocabulary for "this workflow is waiting on a node someone else is
+# repairing" (review item 4). The dispatcher's busy-node hold and the restart
+# adapter's ``requires_incident_state`` premise are different product
+# decisions and stay separate mechanisms; they share these codes in
+# ``details["reason"]`` and the ``HOLD`` audit event below so an operator can
+# follow either wait to the remediation workflow it is waiting on. The codes
+# are ``WorkflowEventCode`` values so the Kubernetes restart adapter, which
+# must not depend on this module, spells them from ``gpu_fault.models``.
+HOLD_REASON_NODE_UNDER_REMEDIATION = WorkflowEventCode.NODE_UNDER_REMEDIATION.value
+HOLD_REASON_NODE_REMEDIATION_TIMEOUT = WorkflowEventCode.NODE_REMEDIATION_TIMEOUT.value
+# No event is written for this one: the step fails and TERMINAL follows.
+HOLD_REASON_INCIDENT_NOT_RECOVERABLE = "INCIDENT_NOT_RECOVERABLE"
+
+# Actors stamped on TERMINAL events written from outside the executor's own
+# ``execute()``; the executor itself signs with its ``executor_id``.
+DISPATCHER_WATCHDOG_ACTOR = "dispatcher-watchdog"
+DISPATCHER_INTERNAL_ERROR_ACTOR = "dispatcher-internal-error"
+DISPATCHER_ACTOR = "dispatcher"
+
+
+def record_hold_event(
+    workflow: WorkflowRequest,
+    *,
+    reason: str,
+    remediation_workflow_id: str | None,
+    actor: str,
+    step_index: int | None = None,
+    operation: WorkflowOperation | None = None,
+    details: Mapping[str, object] | None = None,
+) -> WorkflowRequest | None:
+    """Append one ``HOLD`` event, or ``None`` when the last HOLD already says it.
+
+    A hold is polled -- every dispatcher tick, every re-dispatch of a WAITING
+    step -- so recording each observation would write sixty events for one
+    five-minute wait. The key is (reason, remediation workflow): a new event
+    is worth having only when the wait changed what it waits on.
+    """
+
+    last = next(
+        (
+            event
+            for event in reversed(workflow.events)
+            if event.kind is WorkflowEventKind.HOLD
+        ),
+        None,
+    )
+    if (
+        last is not None
+        and last.details.get("reason") == reason
+        and last.details.get("remediation_workflow_id") == remediation_workflow_id
+    ):
+        return None
+    return record_workflow_event(
+        workflow,
+        WorkflowEventKind.HOLD,
+        code=reason,
+        reason=reason,
+        actor=actor,
+        step_index=step_index,
+        operation=operation,
+        details={
+            **(dict(details) if details else {}),
+            "reason": reason,
+            "remediation_workflow_id": remediation_workflow_id,
+        },
+    )
 
 
 class ProductionWorkflowExecutor:
@@ -158,8 +229,20 @@ class ProductionWorkflowExecutor:
             )
             if prepared.result is not None:
                 return prepared.result
-            workflow = prepared.workflow
             execution_epoch = prepared.execution_epoch
+            # The claim itself happens inside the preflight, which is not this
+            # module's to edit; the event is written here, in its own leased
+            # save, because the loops below re-read the row on their first
+            # lease renewal and would drop an unsaved event.
+            workflow = record_workflow_event(
+                prepared.workflow,
+                WorkflowEventKind.CLAIM,
+                code=WorkflowEventCode.CLAIMED.value,
+                actor=self.config.executor_id,
+                status=prepared.workflow.status.value,
+                details={"execution_epoch": execution_epoch},
+            )
+            self._save_leased(workflow, execution_epoch)
             steps = workflow.safety_steps if is_safety else workflow.official_steps
             if workflow.dag_enabled:
                 return self._execute_dag(
@@ -212,6 +295,7 @@ class ProductionWorkflowExecutor:
                 )
                 workflow = step_bounds.record_attempt(workflow, step, index, outcome)
                 if outcome.status is WorkflowStepStatus.WAITING:
+                    workflow = self._record_hold(workflow, step, index, outcome)
                     self._save_leased(workflow, execution_epoch)
                     return self._result(
                         workflow,
@@ -416,6 +500,7 @@ class ProductionWorkflowExecutor:
                         workflow.safety_steps if is_safety else workflow.official_steps
                     )
                 if outcome.status is WorkflowStepStatus.WAITING:
+                    workflow = self._record_hold(workflow, step, index, outcome)
                     self._save_leased(workflow, execution_epoch)
                     continue
                 if outcome.status is WorkflowStepStatus.FAILED:
@@ -1041,6 +1126,20 @@ class ProductionWorkflowExecutor:
                 "execution_lease_expires_at": None,
                 "updated_at": now,
             }
+        )
+        superseded = record_workflow_event(
+            superseded,
+            WorkflowEventKind.TERMINAL,
+            code=WorkflowEventCode.TERMINALIZED.value,
+            reason=successor.preemption_reason,
+            actor=self.config.executor_id,
+            status=WorkflowStatus.SUPERSEDED.value,
+            step_index=next_index,
+            operation=next_step.operation,
+            details={
+                "execution_epoch": execution_epoch,
+                "preempted_by_workflow_id": successor.request_id,
+            },
         )
         restart_preflight.release_unattempted_restart_reservations(
             self.store,
@@ -1669,11 +1768,17 @@ class ProductionWorkflowExecutor:
             seconds=self.config.step_waiting_limit(WorkflowOperation.RESTART_WORKLOAD)
         )
 
+    def _check_invariants(self, workflow: WorkflowRequest) -> None:
+        """Every write the executor owns passes here first (review item 6)."""
+
+        check_workflow_invariants(workflow, self.config.workflow_invariant_mode)
+
     def _save_leased(
         self,
         workflow: WorkflowRequest,
         execution_epoch: int,
     ) -> None:
+        self._check_invariants(workflow)
         self.store.save_workflow_if_leased(
             workflow,
             self.config.executor_id,
@@ -1686,12 +1791,17 @@ class ProductionWorkflowExecutor:
         incident: FaultIncident,
         execution_epoch: int,
     ) -> None:
+        self._check_invariants(workflow)
         current_incident = self.store.get_incident(incident.incident_id)
         if (
             current_incident.workflow_request_id is not None
             and current_incident.workflow_request_id != workflow.request_id
         ):
-            self._save_leased(workflow, execution_epoch)
+            self.store.save_workflow_if_leased(
+                workflow,
+                self.config.executor_id,
+                execution_epoch,
+            )
             return
         self.store.save_workflow_and_incident_if_leased(
             workflow,
@@ -1700,16 +1810,85 @@ class ProductionWorkflowExecutor:
             execution_epoch,
         )
 
+    def _record_hold(
+        self,
+        workflow: WorkflowRequest,
+        step: WorkflowStepSpec,
+        index: int,
+        outcome: WorkflowStepOutcome,
+    ) -> WorkflowRequest:
+        """Turn an adapter's "node under remediation" WAITING into a HOLD event.
+
+        Only the shared hold code is recorded here; a step waiting on its own
+        remote command is a STEP_ATTEMPT, not a hold.
+        """
+
+        details = outcome.details or {}
+        if details.get("reason") != HOLD_REASON_NODE_UNDER_REMEDIATION:
+            return workflow
+        remediation = details.get("remediation_workflow_id")
+        held = record_hold_event(
+            workflow,
+            reason=HOLD_REASON_NODE_UNDER_REMEDIATION,
+            remediation_workflow_id=(
+                str(remediation) if remediation is not None else None
+            ),
+            actor=self.config.executor_id,
+            step_index=index,
+            operation=step.operation,
+            details={
+                key: value
+                for key, value in details.items()
+                if key in {"premise_reason", "incident_id", "incident_state"}
+            },
+        )
+        return workflow if held is None else held
+
+    def terminalize_claimed(
+        self,
+        workflow: WorkflowRequest,
+        incident: FaultIncident | None,
+        status: WorkflowStatus,
+        execution_epoch: int,
+        *,
+        reason: str | None,
+        actor: str,
+        incident_state: IncidentState | None = None,
+        updates: Mapping[str, object] | None = None,
+    ) -> WorkflowExecutionResult:
+        """End a workflow this executor's id already holds the lease on.
+
+        The dispatcher's deadline watchdog and its internal-error BLOCK claim
+        the record as ``config.executor_id`` and used to write their own
+        terminal copies -- the reap never touched the incident, so it stayed
+        ACTION_PENDING behind a FAILED workflow. They now come through the
+        same funnel as the executor's own endings; ``actor`` names them on
+        the TERMINAL event. ``incident`` may be ``None`` when the incident row
+        is gone: the workflow still ends, and nothing is written for it.
+        """
+
+        return self._terminalize(
+            workflow,
+            incident,
+            status,
+            execution_epoch,
+            reason=reason,
+            incident_state=incident_state,
+            updates=updates,
+            actor=actor,
+        )
+
     def _terminalize(
         self,
         workflow: WorkflowRequest,
-        incident: FaultIncident,
+        incident: FaultIncident | None,
         status: WorkflowStatus,
         execution_epoch: int,
         *,
         reason: str | None = None,
         incident_state: IncidentState | None = None,
         updates: Mapping[str, object] | None = None,
+        actor: str | None = None,
     ) -> WorkflowExecutionResult:
         """The one way a claimed workflow ends (F-C9).
 
@@ -1719,9 +1898,10 @@ class ProductionWorkflowExecutor:
         ``status``, drops the owner and lease, applies the path's own
         ``updates`` (a blocked kind, a preemption reason, cleared compensation
         markers), derives the incident state from the status unless the path
-        names one, and saves through ``_save_terminal`` -- which is where the
-        unattempted restart reservations are released. ``reason`` is the
-        error the result carries.
+        names one, appends the one ``TERMINAL`` audit event, and saves
+        through ``_save_terminal`` -- which is where the unattempted restart
+        reservations are released. ``reason`` is the error the result
+        carries; ``actor`` defaults to this executor.
         """
 
         now = datetime.now(timezone.utc)
@@ -1734,15 +1914,27 @@ class ProductionWorkflowExecutor:
                 "updated_at": now,
             }
         )
-        incident = incident.model_copy(
-            update={
-                "state": (
-                    incident_state
-                    if incident_state is not None
-                    else self._terminal_incident_state(ended, status)
-                ),
-                "updated_at": now,
-            }
+        derived_state = (
+            incident_state
+            if incident_state is not None
+            else self._terminal_incident_state(ended, status)
+        )
+        if incident is not None:
+            incident = incident.model_copy(
+                update={"state": derived_state, "updated_at": now}
+            )
+        ended = record_workflow_event(
+            ended,
+            WorkflowEventKind.TERMINAL,
+            code=WorkflowEventCode.TERMINALIZED.value,
+            reason=reason,
+            actor=actor or self.config.executor_id,
+            status=status.value,
+            details={
+                "execution_epoch": execution_epoch,
+                "incident_state": derived_state.value,
+            },
+            at=now,
         )
         self._save_terminal(ended, incident, execution_epoch)
         return self._result(ended, incident, error=reason)
@@ -1781,25 +1973,33 @@ class ProductionWorkflowExecutor:
     def _save_terminal(
         self,
         workflow: WorkflowRequest,
-        incident: FaultIncident,
+        incident: FaultIncident | None,
         execution_epoch: int,
     ) -> None:
+        self._check_invariants(workflow)
         restart_preflight.release_unattempted_restart_reservations(
             self.store,
             workflow,
             waiting_ttl=self._restart_waiting_ttl,
         )
-        current_incident = self.store.get_incident(incident.incident_id)
-        if (
-            current_incident.workflow_request_id is not None
+        current_incident = (
+            None if incident is None else self.store.get_incident(incident.incident_id)
+        )
+        if incident is None or (
+            current_incident is not None
+            and current_incident.workflow_request_id is not None
             and current_incident.workflow_request_id != workflow.request_id
         ):
-            # A stronger successor became the incident's current plan
-            # while this predecessor was executing. Persist only the
-            # predecessor terminal state; its stale incident snapshot
-            # must not steal the pointer or mark the successor's
+            # No incident row to end, or a stronger successor became the
+            # incident's current plan while this predecessor was executing.
+            # Persist only the predecessor terminal state; a stale incident
+            # snapshot must not steal the pointer or mark the successor's
             # incident recovered/failed.
-            self._save_leased(workflow, execution_epoch)
+            self.store.save_workflow_if_leased(
+                workflow,
+                self.config.executor_id,
+                execution_epoch,
+            )
             return
         self.store.save_workflow_and_incident_if_leased(
             workflow,
@@ -1939,7 +2139,7 @@ class ProductionWorkflowExecutor:
     @staticmethod
     def _result(
         workflow: WorkflowRequest,
-        incident: FaultIncident,
+        incident: FaultIncident | None,
         *,
         waiting_step_index: int | None = None,
         error: str | None = None,
@@ -1947,7 +2147,9 @@ class ProductionWorkflowExecutor:
         return WorkflowExecutionResult(
             operation_id=f"workflow-op-{uuid4()}",
             workflow_request_id=workflow.request_id,
-            incident_id=incident.incident_id,
+            incident_id=(
+                workflow.incident_id if incident is None else incident.incident_id
+            ),
             status=workflow.status,
             completed_operations=workflow.completed_operations,
             simulation_only=False,

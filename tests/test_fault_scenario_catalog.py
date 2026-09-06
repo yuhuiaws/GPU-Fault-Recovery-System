@@ -405,6 +405,7 @@ def test_promoted_live_drivers_remain_manual_until_revalidated() -> None:
         "GF-REGIONAL-DESTR-009": "run_destr009_workload_restart.py",
         "GF-REGIONAL-DESTR-012": "run_destr012_managed_recovery_guard.py",
         "GF-REGIONAL-DESTR-013": "audit_destr013_replacement_invariant.py",
+        "GF-REGIONAL-DESTR-014": "run_destr014_branch_exhaustion.py",
         "GF-REGIONAL-ISO-006": "run_iso006_cluster_offline.py",
         "GF-REGIONAL-E2E-002": "run_e2e002_multicluster_fault.py",
         "GF-REGIONAL-COLLECT-001": "run_collector_acceptance.py",
@@ -448,6 +449,7 @@ def test_parallel_command_cases_declare_resource_locks() -> None:
         "GF-REGIONAL-PREEMPT-032",
         "GF-REGIONAL-PREEMPT-033",
         "GF-REGIONAL-PREEMPT-034",
+        "GF-REGIONAL-PREEMPT-035",
     }
 
     for case_id in local_cases:
@@ -804,7 +806,7 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
         case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
     ]
 
-    assert len(regional) == 157
+    assert len(regional) == 159
     assert all((case.get("evidence") or {}).get("verdict") for case in regional)
     # Membership, not equality. The equality form froze the catalog at "no
     # regional case has ever passed", so the first recorded PASS failed this

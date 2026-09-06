@@ -18,14 +18,18 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Sequence
 
 from gpu_fault.models import (
+    WorkflowEventCode,
+    WorkflowEventKind,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepExecution,
     WorkflowStepSpec,
     WorkflowStepStatus,
+    record_workflow_event,
     resolved_step_indexes,
 )
+from gpu_fault.orchestration.dag_branching import branch_node_ids
 from gpu_fault.orchestration.escalation import next_rung
 
 if TYPE_CHECKING:
@@ -119,6 +123,8 @@ class BranchEscalator:
                         else f"{taken} rung(s) already taken"
                     )
                 ),
+                step_index=failed_index,
+                operation=step.operation,
             )
         candidate_steps = self.compile_steps(
             workflow, [rung, *ESCALATION_TAIL], node_id, list(step.gpu_uuids)
@@ -164,16 +170,47 @@ class BranchEscalator:
                 "updated_at": datetime.now(timezone.utc),
             }
         )
+        reason = (
+            f"{step.operation.value} failed on {node_id}"
+            f" ({error or 'no error detail'}); escalating to {rung.value}"
+        )
+        # The brancher recorded the PLAN_REWRITE; this is the rung itself,
+        # with both spellings of the branch's identity (RF-5, RF-7).
+        replaced = record_workflow_event(
+            replaced,
+            WorkflowEventKind.BRANCH_ESCALATION,
+            code=WorkflowEventCode.BRANCH_ESCALATED,
+            step_index=failed_index,
+            operation=step.operation,
+            phase="official",
+            status=WorkflowStepStatus.FAILED.value,
+            reason=reason,
+            details={
+                "node_id": node_id,
+                "branch_id": branch_id,
+                "to_branch_id": next(
+                    (
+                        item.branch_id
+                        for item in replaced.official_steps[
+                            len(workflow.official_steps) :
+                        ]
+                        if item.branch_id is not None
+                    ),
+                    None,
+                ),
+                "from_operation": step.operation.value,
+                "to_operation": rung.value,
+                "rung_count": taken + 1,
+                "max_rungs": self.max_rungs,
+            },
+        )
         return BranchEscalation(
             workflow=replaced,
             outcome="escalated",
             node_id=node_id,
             branch_id=branch_id,
             next_operation=rung,
-            reason=(
-                f"{step.operation.value} failed on {node_id}"
-                f" ({error or 'no error detail'}); escalating to {rung.value}"
-            ),
+            reason=reason,
         )
 
     def exhaust_branch(
@@ -213,6 +250,8 @@ class BranchEscalator:
         branch_indexes: set[int],
         *,
         reason: str,
+        step_index: int | None = None,
+        operation: WorkflowOperation | None = None,
     ) -> BranchEscalation:
         pending = branch_indexes - set(resolved_step_indexes(workflow))
         exhausted = workflow.model_copy(
@@ -224,6 +263,22 @@ class BranchEscalator:
                 "updated_at": datetime.now(timezone.utc),
             }
         )
+        exhausted = record_workflow_event(
+            exhausted,
+            WorkflowEventKind.BRANCH_ESCALATION,
+            code=WorkflowEventCode.BRANCH_EXHAUSTED,
+            step_index=step_index,
+            operation=operation,
+            phase="official",
+            reason=reason,
+            details={
+                "node_id": node_id,
+                "branch_id": branch_id,
+                "exhausted": True,
+                "rung_count": workflow.branch_escalation_counts.get(node_id, 0),
+                "superseded_indexes": sorted(pending),
+            },
+        )
         return BranchEscalation(
             workflow=exhausted,
             outcome="exhausted",
@@ -232,6 +287,21 @@ class BranchEscalator:
             next_operation=None,
             reason=reason,
         )
+
+
+def exhausted_node_ids(workflow: WorkflowRequest) -> frozenset[str]:
+    """The nodes whose ladder is exhausted, from ``exhausted_branch_ids``.
+
+    ``branch_escalation_counts`` is keyed by node id and ``exhausted_branch_ids``
+    by branch id; this is the join (RF-7). The parse is the inverse of the
+    minting in ``dag_branching``, not a guess at the shape.
+    """
+
+    return frozenset(
+        node
+        for branch_id in workflow.exhausted_branch_ids
+        for node in branch_node_ids(branch_id)
+    )
 
 
 def failed_execution(execution: WorkflowStepExecution) -> bool:

@@ -22,6 +22,9 @@ from gpu_fault.models import (
     TerminalEvent,
     TriageReport,
 )
+from gpu_fault.app.ingest.workload_observations import (
+    ingest_workload_observation,
+)
 from gpu_fault.service import CompletionPendingError
 from gpu_fault.watcher import (
     AttemptObservation,
@@ -71,7 +74,8 @@ async def observe_workload(
 ) -> AttemptObservation:
     await _store_call(
         dependencies,
-        dependencies.context.topology.observe,
+        ingest_workload_observation,
+        dependencies.context,
         observation,
     )
     return observation

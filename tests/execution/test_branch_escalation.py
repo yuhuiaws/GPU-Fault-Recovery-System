@@ -235,3 +235,74 @@ def test_without_an_escalator_the_old_failure_path_is_kept():
         "workflow-active/1/RESET_GPU",
         "workflow-active/2/RESTART_NODE",
     ]
+
+
+class _PerNodeAdapter(FakeAdapter):
+    """Outcomes keyed by (operation, node): the two branches of one job
+    disagree about the same rung, which is the DESTR-014 shape."""
+
+    def __init__(self, outcomes, per_node):
+        super().__init__(outcomes)
+        self.per_node = per_node
+
+    def execute(self, context):
+        self.calls.append(context.idempotency_key)
+        key = (context.step.operation, tuple(context.step.node_ids))
+        if key in self.per_node:
+            return self.per_node[key]
+        return self.outcomes[context.step.operation]
+
+
+def test_a_sibling_finishing_normally_does_not_restart_a_job_whose_other_branch_exhausted():
+    """DESTR-014 (agreed 2026-09-06): node-b RESET fails, its reboot succeeds
+    and the branch ends normally; node-c's reboot fails, its warm-spare
+    replacement fails, the branch is exhausted. Nothing timed out. The
+    workflow fails safely and the job is *not* restarted on the healthy
+    node-b + anything else -- the operator owns the outcome."""
+
+    store = build_store()
+    incident, workflow = _job_dag(store, node_c_operation=REBOOT)
+    adapter = _PerNodeAdapter(
+        {
+            **_ok(STOP, RESET, REBOOT, RESTART_JOB, *VALIDATIONS),
+            REPLACE: WorkflowStepOutcome.failed("insufficient healthy HyperPod spares"),
+        },
+        {
+            (RESET, ("node-b",)): WorkflowStepOutcome.failed(
+                "node agent node-b: GPU device clients are still active"
+            ),
+            (REBOOT, ("node-b",)): WorkflowStepOutcome.succeeded(),
+            (REBOOT, ("node-c",)): WorkflowStepOutcome.failed(
+                "step waited 300s past its limit; last reported: awaiting boot id"
+            ),
+        },
+    )
+    executor = active_workflow_executor(store, [adapter], ALL_OPERATIONS)
+    executor.branch_escalator = _escalator()
+
+    result = executor.execute(
+        workflow.request_id,
+        WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token),
+    )
+    saved = store.get_workflow(workflow.request_id)
+
+    assert result.status is WorkflowStatus.FAILED
+    assert saved.branch_escalation_counts == {"node-b": 1, "node-c": 1}
+    assert len(saved.exhausted_branch_ids) == 1
+    assert saved.exhausted_branch_ids[0].startswith("branch:node-c"), (
+        saved.exhausted_branch_ids
+    )
+    assert not any("RESTART_WORKLOAD" in call for call in adapter.calls), adapter.calls
+    node_b_ops = [
+        step.operation
+        for index, step in enumerate(saved.official_steps)
+        if step.node_ids == ["node-b"] and index in saved.completed_step_indexes
+    ]
+    assert node_b_ops == [REBOOT, *VALIDATIONS], node_b_ops
+    node_c_replace = [
+        item
+        for item in saved.step_executions
+        if item.operation is REPLACE and item.status.value == "FAILED"
+    ]
+    assert len(node_c_replace) == 1, saved.step_executions
+    assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED

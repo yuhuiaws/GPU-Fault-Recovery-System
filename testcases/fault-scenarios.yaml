@@ -3778,6 +3778,43 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-013
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr013_manifest_audit_keeps_provider_replace_disabled
 
+- id: GF-REGIONAL-DESTR-014
+  title: 同一作业两节点并行修复：一支就地升级到真实 reboot 并收口，另一支耗尽后整条 FAILED 且不重启作业
+  category: regional-destructive-acceptance
+  level: staging
+  risk: destructive-provider-reboot
+  problem: >-
+    同一作业的两个节点分支在一个 DAG 里各自失败、各自升级；单元层钉住了梯子与计数，
+    但真实 Node Agent 让 RESET_GPU 失败的形态、真实 HyperPod reboot 后"节点回来了但 Agent 没回来"
+    被归类为 FAILED 而不是无限 WAITING、以及兄弟分支耗尽时 join 绝不执行，只有真机能证明。
+    任何一处漂移都会把一个应交给运维的作业重新拉起，或让工作流永远不闭合。
+  injection: >-
+    对固定到 node-b、node-c 的两副本 16-GPU PyTorchJob，在多节点聚合窗口内先后写入 XID 79（node-c，裁决 RESTART_NODE）
+    与 XID 46（node-b，裁决 RESET_GPU），使两节点进入同一 job DAG。node-b 上的宿主探针在 Node Agent ledger 出现本次
+    drill 的 VERIFY_NO_GPU_CLIENTS 成功行后以 systemd 瞬态单元持有 /dev/nvidiaN，让 reset 提交持续报
+    clients are still active 直到 GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS；node-c 上的探针在注入前
+    systemctl disable gpu-fault-node-agent.service（不带 --now），让真实 reboot 后 Node Agent 不再注册。
+    executor 侧以带基线的开窗 helper 把 GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS 压到 6、
+    GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS 压到 300；本用例不声明任何 warm spare。
+  expected:
+  - 两条 XID 落到同一 workflow_request_id，dag_enabled=true，shared STOP_WORKLOADS 的 node_ids 恰为 node-b 与 node-c
+  - node-b 分支 RESET_GPU FAILED，error 含 clients are still active 与 gpu_reset_commit_attempt；原分支剩余步骤进入 superseded_step_indexes
+  - node-b 就地升级出的 RESTART_NODE 为真实 HyperPod reboot 且 SUCCEEDED；持有者随重启消失；Node Agent 以新 boot_id 重新注册；VALIDATE_GPU、VALIDATE_HOST、VALIDATE_FABRIC、RESTORE_SCHEDULING 全部 SUCCEEDED，node-b 恢复可调度
+  - node-c 分支 RESTART_NODE 为真实 HyperPod reboot，节点回到 Ready 但始终没有新的 boot_id 上报；该步在 GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS 到期后 FAILED，details 含 step_waiting_timeout_seconds
+  - node-c 分支升级出的 REPLACE_NODE 参数 replacement_strategy=HEALTHY_WARM_SPARE_ONLY，FAILED 且 error 含 insufficient healthy HyperPod spares；exhausted_branch_ids 恰含 node-c 的 branch
+  - branch_escalation_counts 为 node-b=1、node-c=1；全部非 join 步骤到终态后 workflow FAILED，error 含 node branch escalation exhausted 与 node-c 的 branch id；未触发生命周期上限
+  - RESTART_WORKLOAD 从未执行，作业未重启，旧 Pod 未被新 attempt 取代，restart budget 不变
+  - incident QUARANTINED；node-c 保持 cordon 且带 gpu-fault.io/quarantined taint，值为 sha256(incident_id) 前 24 位；node-b 无 quarantine taint 且 schedulable
+  - 硬件升级把 incident 交给运维（后继 support incident 或 ESCALATE_SUPPORT 分类），不再开出新的 reboot 或 replace workflow
+  - CloudTrail 中 BatchRebootClusterNodes 恰好两次且 Username 为 executor role；BatchReplaceClusterNodes 与 BatchDeleteClusterNodes 均为空；HyperPod 节点总数与基线一致
+  - 控制面 EKS 比对结果为 IDENTICAL
+  - 清理后：持有者瞬态单元不存在；node-c 的 Node Agent 已重新 enable 并 active；node-c 隔离按 DESTR-003 的 validated-restore 方式解除；两个 executor 环境变量按基线还原并覆盖每个 ready 副本；作业已删除且远端命令静默
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-014
+  related_pytest: tests/regional/test_destr014_branch_exhaustion.py::test_destr014_workflow_contract_requires_sibling_exhaustion_without_restart
+
 - id: GF-REGIONAL-NOTIFY-001
   title: 关键动作各有一封 SENT 邮件且含非空 SES MessageId
   category: regional-notification
@@ -5037,6 +5074,40 @@ test_cases:
   - tests/execution/test_workflow_lifecycle_scenarios.py::test_preempt034_a_job_on_a_node_under_repair_waits_then_stops_the_job
   - tests/execution/test_node_busy_wait.py
   related_pytest: tests/execution/test_node_busy_wait.py::test_past_the_wait_the_job_workflow_stops_the_job_and_fails
+- id: GF-REGIONAL-PREEMPT-035
+  title: 新作业被观察到落在修复中节点：开出安置保留，窗口内节点释放即消散，超时只执行 STOP_WORKLOADS 并 FAILED/ESCALATED
+  category: regional-preemption
+  level: integration
+  risk: non-destructive
+  problem: >-
+    新的分布式训练尝试在节点被隔离前的竞态（或 nodeName 钉死）下落到 GPU 正在修复的节点上，控制面只通过 POST /v1/workload-observations 观察到它，无人查该节点的活动工作流；作业撞进修复，节点工作流的 VERIFY_NO_GPU_CLIENTS 反而让给作业的 GPU 进程。
+  injection: >-
+    node-a 上有他人持有的 RUNNING reboot 工作流；提交一条 RUNNING attempt 观察（容器落在 node-a 与 node-b）让 orchestrator 开出 placement_hold=True 的单步 STOP 工作流。分两路：(1) 立即派发一次后把节点工作流写成 SUCCEEDED 再派发；(2) 把 hold 的 created_at 回拨到窗口之外、节点仍忙，连续派发两次。
+  expected:
+  - 观察后存在 incident hold-<cluster>-<attempt>（event_type=WORKLOAD_PLACED_ON_REPAIRING_NODE，policy_source=SITE_PLACEMENT_HOLD），工作流 PENDING、placement_hold=true、只有一步 STOP_WORKLOADS，参数含 termination_initiator_incident_id=hold incident
+  - 等待期内 filtered.node_busy=1，不执行任何步骤
+  - 节点工作流在窗口内结束后，下一次派发 filtered.placement_hold_dissolved=1，hold 工作流 SUPERSEDED、incident RECOVERED，adapter 未被调用，placement_holds_dissolved_total 计 1
+  - 超时路径：STOP 执行且带发起者标记，工作流 FAILED、incident ESCALATED，node_busy_timeouts_total 计 1
+  - 两条路径中节点自己的工作流保持 RUNNING、持有者不变
+  evidence:
+    verdict: NOT_RUN
+  automation: command
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-035新作业被观察到落在修复中节点的安置保留
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
+  command:
+  - python3
+  - -m
+  - pytest
+  - -q
+  - tests/execution/test_placement_hold_dispatch.py
+  - tests/orchestration/test_placement_hold.py
+  related_pytest: tests/execution/test_placement_hold_dispatch.py::test_preempt035_a_hold_waits_then_dissolves_when_the_node_is_freed
 - id: GF-REGIONAL-WORKLOAD-001
   title: 用 gpu-training-submit 提交三节点 managed PyTorchJob
   category: regional-workload

@@ -7,6 +7,8 @@ from typing import Callable
 from gpu_fault.models import (
     EXECUTABLE_WORKFLOW_STATUSES,
     FaultIncident,
+    WorkflowEventCode,
+    WorkflowEventKind,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
@@ -14,6 +16,7 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     WorkflowStepStatus,
     lifetime_exceeded,
+    record_workflow_event,
 )
 from gpu_fault.operation_registry import (
     NODE_MUTATING_OPERATIONS,
@@ -372,11 +375,37 @@ class WorkflowMergeService:
             candidate,
             indexes,
         )
-        return self.brancher.append_parallel_job_branch(
+        combined = self.brancher.append_parallel_job_branch(
             existing,
             candidate,
             predecessor_step_index=boundary.predecessor,
             replaced_step_indexes=boundary.replaceable,
+        )
+        if combined is existing:
+            # The brancher found the branch already there; nothing was
+            # preempted and nothing is recorded.
+            return existing
+        # Beside the brancher's PLAN_REWRITE: who preempted whom, at which
+        # boundary, and why the boundary sat where it did (RF-5, RF-8). A
+        # closed boundary still retires the pending tail behind it; the code
+        # says a wait held the line, ``replaced_indexes`` says what went.
+        return record_workflow_event(
+            combined,
+            WorkflowEventKind.PREEMPTION,
+            code=(
+                WorkflowEventCode.PREEMPTED
+                if boundary.open
+                else WorkflowEventCode.PREEMPTION_BOUNDARY_CLOSED
+            ),
+            reason=boundary.reason,
+            details={
+                "predecessor_workflow_id": existing.request_id,
+                "successor_workflow_id": candidate.request_id,
+                "node_id": node_id,
+                "replaced_indexes": sorted(boundary.replaceable),
+                "boundary_step_index": boundary.predecessor,
+                "blocking_indexes": sorted(boundary.blocking),
+            },
         )
 
     @staticmethod
@@ -473,19 +502,35 @@ class WorkflowMergeService:
         ):
             return candidate
         inherited = self._inherited_containment(existing, candidate)
-        return candidate.model_copy(
+        reason = (
+            "strictly stronger recovery action: "
+            f"rank {existing_rank} -> {candidate_rank}"
+        )
+        successor = candidate.model_copy(
             update={
                 "preempt_predecessor": True,
-                "preemption_reason": (
-                    "strictly stronger recovery action: "
-                    f"rank {existing_rank} -> {candidate_rank}"
-                ),
+                "preemption_reason": reason,
                 "completed_step_indexes": inherited[0],
                 "completed_operations": inherited[1],
                 "step_executions": inherited[2],
                 "inherited_step_indexes": inherited[0],
                 "updated_at": datetime.now(timezone.utc),
             }
+        )
+        # On the successor's own trail: the predecessor's record ends with the
+        # executor's TERMINAL event once the preemption lands (RF-5, RF-8).
+        return record_workflow_event(
+            successor,
+            WorkflowEventKind.PREEMPTION,
+            code=WorkflowEventCode.PREEMPTED,
+            reason=reason,
+            details={
+                "predecessor_workflow_id": existing.request_id,
+                "successor_workflow_id": candidate.request_id,
+                "from_rank": existing_rank,
+                "to_rank": candidate_rank,
+                "inherited_step_indexes": list(inherited[0]),
+            },
         )
 
     def _exclusive_nodes(

@@ -46,6 +46,7 @@ from gpu_fault.policy import (
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 from gpu_fault.host_health import NodeHealthFinding
+from gpu_fault.watcher import AttemptObservation
 from gpu_fault.orchestration import (
     DagBrancher,
     HardwareEscalationService,
@@ -73,6 +74,7 @@ from gpu_fault.orchestration.families import (
     ResetOperationService,
     ValidationOperationService,
 )
+from gpu_fault.orchestration.placement_hold import PlacementHoldService
 from gpu_fault.orchestration.workflow_merge import (
     WorkflowMergeService,
 )
@@ -259,6 +261,11 @@ class IncidentOrchestrator:
         self._reset_operations = ResetOperationService(
             self.store, self._builder, self._lock
         )
+        self._placement_holds = PlacementHoldService(self.store, self._builder)
+        # Rule A, case 2: holds opened here, and holds the observation ingest
+        # could not open (logged there; the observation is still accepted).
+        self.placement_holds_opened_total = 0
+        self.placement_holds_failed_total = 0
         self._node_lifecycle_operations = self._create_node_lifecycle_service()
         self._escalation = HardwareEscalationService(self.store, self._builder)
         self._sxid_ingestion = SxidIngestionService(
@@ -1058,6 +1065,19 @@ class IncidentOrchestrator:
             ):
                 return str(execution.details["restart_attempt_id"])
         return None
+
+    def hold_attempt_on_repairing_nodes(
+        self, observation: AttemptObservation
+    ) -> tuple[FaultIncident, WorkflowRequest] | None:
+        """Open a placement hold for an attempt observed on nodes another
+        incident is repairing (rule A, case 2); ``None`` when nothing was
+        opened. See ``orchestration.placement_hold``."""
+
+        with self._lock:
+            held = self._placement_holds.hold(observation)
+        if held is not None:
+            self.placement_holds_opened_total += 1
+        return held
 
     def _job_recovery_workflow(
         self, observation
