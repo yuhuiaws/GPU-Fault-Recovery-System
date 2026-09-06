@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from typing import Mapping
 
-import yaml  # type: ignore[import-untyped]
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import (
     ADMIN_CONFIG_API_VERSION,

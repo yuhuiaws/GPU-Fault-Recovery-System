@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
 
-import yaml  # type: ignore[import-untyped]
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.aws_cleanup import ResourceCleaner

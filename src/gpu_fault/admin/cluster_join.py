@@ -14,7 +14,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, cast
 
-import yaml  # type: ignore[import-untyped]
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap import (

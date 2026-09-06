@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Iterator, cast
 
-import yaml  # type: ignore[import-untyped]
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin import cluster_join as join
 from gpu_fault.admin.bootstrap_common import BootstrapError

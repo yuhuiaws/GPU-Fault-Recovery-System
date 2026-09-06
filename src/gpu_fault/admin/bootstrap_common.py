@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
 
-import yaml  # type: ignore[import-untyped]
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 ARN_PATTERN = re.compile(
     r"^arn:(?P<partition>[^:]+):(?P<service>[^:]+):"

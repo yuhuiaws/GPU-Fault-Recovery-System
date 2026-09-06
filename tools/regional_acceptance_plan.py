@@ -34,7 +34,7 @@ from pathlib import Path
 import re
 from typing import Any, cast
 
-import yaml  # type: ignore[import-untyped]
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 
 ROOT = Path(__file__).resolve().parents[1]
