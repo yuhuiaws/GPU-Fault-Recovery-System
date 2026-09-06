@@ -406,6 +406,8 @@ def test_dag_branch_failure_still_dispatches_other_ready_branch() -> None:
     result = execute_workflow(active, workflow.request_id)
 
     assert result.status is WorkflowStatus.FAILED
+    # A sibling node's repair still runs when another branch fails: the
+    # per-node escalation planned as F-N1 builds on exactly this.
     assert adapter.calls == [
         "workflow-active/1/RESET_GPU",
         "workflow-active/2/RESTART_NODE",
@@ -606,13 +608,20 @@ def test_dispatcher_internal_error_blocks_workflow_without_hot_loop() -> None:
     first = dispatcher.run_once()
     second = dispatcher.run_once()
 
-    blocked = store.get_workflow(workflow.request_id)
-    assert first.failed == 1
+    current = store.get_workflow(workflow.request_id)
+    # F-B4 (3): an unrecognised internal error says nothing about the record,
+    # so it stays executable and is retried instead of being written BLOCKED.
+    assert first.internal_errors == 1
+    assert first.failed == 0
     assert second.scanned == 0
     assert adapter.calls == 1
-    assert blocked.status is WorkflowStatus.BLOCKED
-    assert "dispatcher internal error: AttributeError" in (blocked.blocked_reasons[-1])
-    assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED
+    assert current.status is WorkflowStatus.PENDING
+    assert current.execution_owner_id is None
+    assert current.not_before is not None
+    assert current.blocked_reasons == []
+    assert (
+        store.get_incident(incident.incident_id).state is IncidentState.ACTION_PENDING
+    )
 
 
 def test_dag_rebind_persists_incident_before_later_step_waits() -> None:

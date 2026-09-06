@@ -477,7 +477,9 @@ def test_managed_recovery_observer_never_submits_mutation() -> None:
     )
 
     assert waiting.status is WorkflowStatus.RUNNING
-    assert operation_id.startswith("delegated/")
+    assert operation_id.startswith("delegated/"), (
+        'expected operation_id.startswith("delegated/") to be true'
+    )
     assert completed.status is WorkflowStatus.SUCCEEDED
 
 

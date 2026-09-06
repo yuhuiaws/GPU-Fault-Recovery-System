@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from gpu_fault.store.postgres.ddl_processor_retry import (
     upgrade_processor_retry_schedule,
 )
@@ -291,6 +294,53 @@ def _create_domain_indexes_one(cursor) -> None:
         )
         WHERE kind='workflow'
           AND payload->>'status'='FAILED'
+        """
+    )
+    # Dispatcher hot queries (F-A9). Each partial index carries exactly the
+    # predicate its query uses, and the queries spell the status list as
+    # literals so the planner can prove the predicate (P0-73C). Text order on
+    # ``payload->>'updated_at'`` is deliberate: the stored value is
+    # ``isoformat()`` and a ``::timestamptz`` cast would bypass the index.
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        gpu_fault_executable_workflow_order
+        ON gpu_fault_objects (
+            (payload->>'updated_at'),
+            key
+        )
+        WHERE kind='workflow'
+          AND payload->>'status' IN (
+              'PENDING', 'RUNNING', 'SAFETY_PENDING'
+          )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        gpu_fault_unhandled_failed_workflow_updated
+        ON gpu_fault_objects (
+            (payload->>'updated_at'),
+            key
+        )
+        WHERE kind='workflow'
+          AND payload->>'status'='FAILED'
+          AND (
+              payload->>'failure_handled_at' IS NULL
+              OR payload->>'failure_handled_at'=''
+          )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        gpu_fault_blocked_workflow_updated
+        ON gpu_fault_objects (
+            (payload->>'updated_at'),
+            key
+        )
+        WHERE kind='workflow'
+          AND payload->>'status'='BLOCKED'
         """
     )
     cursor.execute(
@@ -1093,7 +1143,7 @@ def _create_priority_counter_function(cursor) -> None:
                         ) AS scope,
                         (
                             CASE
-                                WHEN priority=0 THEN 0
+                                WHEN priority <= 10 THEN 0
                                 WHEN priority <= 50 THEN 50
                                 ELSE 100
                             END
@@ -1136,7 +1186,7 @@ def _create_priority_counter_function(cursor) -> None:
                         ) AS scope,
                         (
                             CASE
-                                WHEN priority=0 THEN 0
+                                WHEN priority <= 10 THEN 0
                                 WHEN priority <= 50 THEN 50
                                 ELSE 100
                             END
@@ -1185,7 +1235,7 @@ def _create_priority_counter_function(cursor) -> None:
                             ) AS scope,
                             (
                                 CASE
-                                    WHEN priority=0 THEN 0
+                                    WHEN priority <= 10 THEN 0
                                     WHEN priority <= 50 THEN 50
                                     ELSE 100
                                 END
@@ -1207,7 +1257,7 @@ def _create_priority_counter_function(cursor) -> None:
                             ),
                             (
                                 CASE
-                                    WHEN priority=0 THEN 0
+                                    WHEN priority <= 10 THEN 0
                                     WHEN priority <= 50 THEN 50
                                     ELSE 100
                                 END
@@ -1364,7 +1414,7 @@ def _seed_processor_counters(cursor) -> None:
                 coalesce(cluster_id, '__unscoped__'),
                 (
                     CASE
-                        WHEN priority=0 THEN 0
+                        WHEN priority <= 10 THEN 0
                         WHEN priority <= 50 THEN 50
                         ELSE 100
                     END
@@ -1452,7 +1502,11 @@ def _seed_processor_counters(cursor) -> None:
 
 def _create_processor_indexes(cursor) -> None:
     # The claim window orders by (priority, created_at, request_id)
-    # with no partition or path predicate.
+    # with no partition or path predicate. This is the index the two ordered
+    # walks of the claim window (F-D2) rely on: partial on the two claimable
+    # statuses so COMPLETED history never enters it. F-D2 briefly declared an
+    # identical twin (``..._claim_order``); the planner picked either at
+    # random, so v11 drops the twin and this one stays the only declaration.
     cursor.execute(
         """
         CREATE INDEX IF NOT EXISTS
@@ -1521,3 +1575,22 @@ def _create_processor_indexes(cursor) -> None:
         WHERE status='COMPLETED'
         """
     )
+
+
+_CREATE_INDEX = re.compile(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)")
+
+
+def declared_index_names() -> frozenset[str]:
+    """Every index the DDL modules declare, read from their source.
+
+    The schema check compares this set with ``pg_indexes`` so a forgotten
+    ``CREATE INDEX CONCURRENTLY`` (the three-step method of F-J3) fails the
+    replica at startup instead of degrading every hot query to a sequential
+    scan. Derived from the source rather than maintained by hand so a new
+    index cannot be declared without also being validated.
+    """
+
+    names: set[str] = set()
+    for path in sorted(Path(__file__).parent.glob("ddl*.py")):
+        names.update(_CREATE_INDEX.findall(path.read_text(encoding="utf-8")))
+    return frozenset(names)

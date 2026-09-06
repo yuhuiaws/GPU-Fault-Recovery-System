@@ -117,6 +117,11 @@ class TelemetrySpoolCoordinatorMixin:
                 claimed_any = False
                 claim_failed = False
                 empty_paths: set[str] = set()
+                # Derived from the registry, not written down: the schedule
+                # repeats weighted paths, and "every path came back empty"
+                # means every distinct one (F-E6 - a literal 3 against four
+                # spoolable paths left the fourth to the fallback sleep).
+                spool_paths = frozenset(self._TELEMETRY_SPOOL_PATH_SCHEDULE)
                 for _slot in range(available):
                     in_flight_bytes = sum(in_flight.values())
                     available_bytes = (
@@ -173,7 +178,7 @@ class TelemetrySpoolCoordinatorMixin:
                         if rows:
                             break
                         empty_paths.add(selected_path)
-                        if len(empty_paths) == 3:
+                        if empty_paths >= spool_paths:
                             break
                     if claim_failed:
                         break

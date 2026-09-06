@@ -629,7 +629,7 @@ def test_postgres_restored_workflow_reconcile_is_atomic() -> None:
             blocked_id,
             successor_id,
             expected_fencing_token=blocked.fencing_token,
-            expected_workflow_updated_at=blocked.updated_at,
+            expected_execution_epoch=blocked.execution_epoch,
             reference="CHG-POSTGRES-RECONCILE",
             reconciled_at=now,
         )
@@ -1098,6 +1098,20 @@ def test_postgres_active_deployment_lookup_uses_the_scope_index() -> None:
         failed = deployment(DeploymentStatus.FAILED)
         for record in (open_roll, done, failed):
             store.save_fleet_deployment(record)
+        # The index earns its keep on a fleet with many clusters' deployments;
+        # with only this cluster's three rows the primary key's ``kind=``
+        # probe estimates one row too and the planner's pick depends on
+        # whichever autoanalyze ran last. Give it the shape it exists for.
+        for other in range(40):
+            # Open rolls, so the retention assertions below still see exactly
+            # this cluster's two terminal rows.
+            store.save_fleet_deployment(
+                deployment(DeploymentStatus.IN_PROGRESS).model_copy(
+                    update={"cluster_id": f"cluster-other-{other}"}
+                )
+            )
+        with store._db.cursor() as cursor:
+            cursor.execute("ANALYZE gpu_fault_objects")
 
         assert [
             item.deployment_id

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections import Counter
 from datetime import datetime, timedelta
 from enum import StrEnum
 from threading import RLock
@@ -326,6 +327,11 @@ class GpuMetricsService:
         self.store = store
         self.thresholds = thresholds or GpuMetricsThresholds()
         self._node_locks = tuple(RLock() for _ in range(64))
+        # New findings that deliberately end without an incident of their own,
+        # by reason. The only reason today is a component activated in the same
+        # batch as the composite that explains it (F-M1: a CRITICAL finding
+        # either becomes an incident or is counted here).
+        self.findings_without_incident: Counter[str] = Counter()
 
     def ingest(self, batch: GpuMetricBatch) -> GpuMetricsIngestionResult:
         findings: list[GpuHealthFinding] = []
@@ -494,6 +500,9 @@ class GpuMetricsService:
                 for finding in new_findings
                 if finding.finding_id not in suppressed
             ]
+            self.findings_without_incident["suppressed_by_composite"] += len(
+                new_findings
+            ) - len(effective_new_findings)
             effective_new_findings.extend(new_composite_findings)
             result = GpuMetricsIngestionResult(
                 batch_id=batch.batch_id,

@@ -61,7 +61,17 @@ def test_hyperpod_deploy_runs_schema_ddl_in_a_job() -> None:
 
     assert "GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT:-false" in script
     assert "postgres-schema-ensure-job.yaml" in script
-    assert "job/gpu-fault-postgres-schema-ensure --timeout=12m" in script
+    # The three Jobs run in order through one helper: online index build
+    # (F-J3), transactional ensure, read-only preflight gate.
+    assert "run_postgres_job gpu-fault-postgres-index-build" in script
+    assert "run_postgres_job gpu-fault-postgres-schema-ensure" in script
+    assert "run_postgres_job gpu-fault-postgres-schema-preflight" in script
+    assert 'postgres-schema-ensure-job.yaml" 12m' in script
+    assert (
+        script.index("postgres-index-build-job.yaml")
+        < script.index('postgres-schema-ensure-job.yaml" 12m')
+        < script.index("postgres-schema-preflight-job.yaml")
+    )
     for relative in (
         "deploy/control-plane/base/control-plane-deployment.yaml",
         "deploy/control-plane/regional/regional-control-plane-patch.yaml",

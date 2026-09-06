@@ -301,6 +301,67 @@ groups:
             just landed (compare the release digest). On its own this is a
             warning; alongside a queue or Store alert, handle it at that
             alert's priority.
+      # Two lease-and-counter invariants of the processor queue that used to be
+      # repaired silently. A queued request is LEASED to one worker for
+      # GPU_FAULT_PROCESSOR_LEASE_SECONDS; if that worker dies or stalls, the
+      # periodic reclaim job (GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS) returns
+      # the request to PENDING and counts it. Every non-zero increase is a
+      # worker that did not finish what it claimed, and the request was
+      # delayed by at least one lease -- a fact no queue-depth rule can see,
+      # because the depth does not change when a lease is reclaimed.
+      #
+      # `sum by` over `increase`: the counter is per process, so a worker that
+      # restarts resets its own series and every replica reclaims on behalf of
+      # the same queue. Ten minutes is long enough that one lease expiry from a
+      # rolling restart is still visible and short enough to name the deploy.
+      - alert: GpuFaultProcessorExpiredLeasesReclaimed
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_processor_expired_leases_reclaimed_total[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Expired processor leases were returned to PENDING
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessorexpiredleasesreclaimed
+          description: >-
+            {{ $value }} queued request(s) sat LEASED past their lease and were
+            reclaimed by the periodic job, so a processor worker died or
+            stalled mid-request. The requests are not lost, but each waited at
+            least one lease longer. Find the worker Pod that restarted or the
+            request phase that hung; do not lengthen the lease to quiet this.
+      # The per-cluster queue depth gauges are read from shard counters, not
+      # from a COUNT(*) over the queue table, and the two can drift when a
+      # batch commit touches the table without its counter row. Drift makes
+      # every quota decision (GpuFaultProcessorClusterBacklogHigh, admission by
+      # cluster) act on the wrong number. Both gauges are refreshed by one
+      # periodic job (GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS) rather
+      # than in the scrape, and a single sample can straddle a commit, so
+      # `min_over_time` over five minutes asks for drift that never returned
+      # to zero in the window. Two clauses because the two gauges answer
+      # different questions -- how far, and how many clusters -- and either
+      # alone being non-zero is the defect.
+      - alert: GpuFaultProcessorCounterDrift
+        expr: >-
+          max by (control_plane_cluster, region)
+          (min_over_time(gpu_fault_processor_counter_drift_abs[5m])) > 0
+          or
+          max by (control_plane_cluster, region)
+          (min_over_time(gpu_fault_processor_counter_mismatched_clusters[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Processor queue shard counters disagree with the queue table
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessorcounterdrift
+          description: >-
+            For five minutes the shard counters have not matched a real count
+            of PENDING/LEASED rows, so per-cluster queue depth and quota
+            decisions are being made on a wrong number. Read
+            gpu_fault_processor_counter_drift_abs for the size and
+            gpu_fault_processor_counter_mismatched_clusters for the spread;
+            the counters are rebuilt from the table by the backfill path, not
+            by editing counter rows.
       - alert: GpuFaultTelemetrySpoolListenerDown
         expr: min(gpu_fault_telemetry_spool_notifications_enabled{pod=~"gpu-fault-telemetry-spool-worker-.*"}) == 0
         for: 2m
@@ -550,6 +611,79 @@ groups:
             successor, so each one still holds a GPU node out of the training
             pool. Read the blocking reason per workflow; do not clear BLOCKED by
             editing Store rows.
+      - alert: GpuFaultPostgresPoolOversubscribed
+        expr: >-
+          max by (control_plane_cluster, region, role)
+          (gpu_fault_postgres_pool_oversubscription_ratio) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: A control-plane role can hold more connections than its pool has
+          runbook_url: docs/管理员日常运维.md#gpufaultpostgrespooloversubscribed
+          description: >-
+            The role's threads that can each hold a pooled PostgreSQL connection
+            outnumber the pool ceiling by {{ $value }}x; under load callers queue
+            on checkout and the request deadline, not the database, becomes the
+            limit.
+      - alert: GpuFaultBranchEscalationBudgetRefused
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_workflow_branch_escalation_budget_refusals_total[30m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: A node branch went to an operator because the cluster budget was full
+          runbook_url: docs/管理员日常运维.md#gpufaultbranchescalationbudgetrefused
+          description: >-
+            {{ $value }} node branch(es) could not take their next rung
+            (reboot or replacement) because the cluster remediation budget was
+            full, and were retired to an operator instead of exceeding it.
+      - alert: GpuFaultWorkflowLifetimeExceeded
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_workflow_lifetime_exceeded_total[30m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: A recovery workflow ran out of its hard lifetime
+          runbook_url: docs/管理员日常运维.md#gpufaultworkflowlifetimeexceeded
+          description: >-
+            {{ $value }} workflow(s) failed in the last 30 minutes because their
+            lifetime deadline passed. Each is now ESCALATED to an operator and
+            later events for the same node or job are only recorded on the
+            incident until it is closed.
+      - alert: GpuFaultJobWorkflowNodeBusyTimeout
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_workflow_dispatch_node_busy_timeouts_total[30m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: A training job was stopped because its nodes stayed under repair
+          runbook_url: docs/管理员日常运维.md#gpufaultjobworkflownodebusytimeout
+          description: >-
+            {{ $value }} job workflow(s) waited out the node-busy window and were
+            failed by suspending the job. The job owner sees a controller-initiated
+            stop; the node remediation that held the node keeps running.
+      - alert: GpuFaultProcessorRetryHorizonFailures
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_processor_retry_horizon_failures_total[30m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Processor requests kept failing past the retry horizon
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessorretryhorizonfailures
+          description: >-
+            {{ $value }} queued request(s) were completed as failed (503) because
+            their releases kept failing for longer than the retry horizon. The
+            lane is no longer blocked, but the request's side effects were never
+            confirmed; read the completion body for the failure reason.
       # `gpu_fault_closed_loop_milestone_seconds` is emitted as `_count`/`_sum`
       # over every persisted workflow, so its lifetime average never recovers
       # once one slow incident lands. `delta` over a 6h window gives the mean
@@ -708,3 +842,97 @@ groups:
             gpu_fault_remediation_budget_active_claims against the configured
             scope limits and check whether an active claim belongs to a
             workflow that is no longer making progress.
+      # The completion path records every attempt outcome as a decision. A
+      # decision left in PENDING_TRIAGE is one the system could not classify
+      # on arrival and parked for a bounded look
+      # (GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS, default 900s); a periodic
+      # job (GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS) is meant to resolve each
+      # one once its deadline passes. `for` is twice the default deadline, so
+      # the job has had one full deadline plus a scan to act and did not --
+      # the residue is a stall in triage, not a slow attempt.
+      - alert: GpuFaultCompletionPendingTriageBacklog
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_completion_decisions{status="PENDING_TRIAGE"}) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Completion decisions are stuck in PENDING_TRIAGE
+          runbook_url: docs/管理员日常运维.md#gpufaultcompletionpendingtriagebacklog
+          description: >-
+            {{ $value }} attempt decision(s) have stayed PENDING_TRIAGE for
+            longer than twice the triage deadline, so the reconcile job is not
+            resolving them and the attempts they describe have neither a plan
+            nor a no-action verdict. Check
+            gpu_fault_completion_pending_triage_reconciled_total is still
+            moving and read the periodic job errors before touching a decision.
+      # The other half of the same invariant: a completion event with no
+      # decision row at all. Every persisted event is meant to be decided in
+      # the same transaction; one without a decision was recorded and then
+      # never judged, and nothing downstream will ever look at it again. The
+      # same 30m: an event can legitimately be a scrape ahead of its decision,
+      # never half an hour ahead.
+      - alert: GpuFaultCompletionEventsWithoutDecision
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_completion_events_without_decision) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Completion events were recorded but never decided
+          runbook_url: docs/管理员日常运维.md#gpufaultcompletioneventswithoutdecision
+          description: >-
+            {{ $value }} completion event(s) have had no decision for 30
+            minutes. The attempt outcome was stored and then dropped by the
+            triage step, so a failed attempt may be sitting with no recovery
+            planned. Match the events to their attempts before replaying them;
+            do not delete the event rows.
+      # ESCALATED is where an incident parks when the system has handed a
+      # decision to a person: budget refused the next rung, the lifetime ran
+      # out, a mechanical check is needed. It is a designed, correct state and
+      # it is never auto-resolved, so a count is not a fault -- but an
+      # escalation that nobody has acted on for a day is a GPU node (or a job)
+      # that everyone has forgotten. A day, warning, and no `critical` route:
+      # this is a reminder that a queue of human work exists.
+      - alert: GpuFaultIncidentsAwaitingOperator
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_incidents_by_state{state="ESCALATED"}) > 0
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: Escalated incidents have waited a day for an operator
+          runbook_url: docs/管理员日常运维.md#gpufaultincidentsawaitingoperator
+          description: >-
+            {{ $value }} incident(s) have been ESCALATED for at least 24 hours.
+            Each one is a decision the control plane deliberately handed to a
+            person and will not take back. Work the list in §9; an incident
+            leaves this state only through an operator action, never through a
+            retention sweep.
+      # PENDING is the state a workflow waits in for a dispatcher to pick it up.
+      # The dispatcher observes the age of the oldest PENDING workflow on every
+      # tick and warns past a threshold; this is the same fact in AMP. Thirty
+      # minutes of nothing claiming it is not queueing delay -- the dispatcher
+      # ticks in seconds -- it is a workflow no dispatcher will take: a
+      # predecessor that never terminalized, a retired generation awaiting an
+      # operator, or a dispatcher that is itself stuck.
+      - alert: GpuFaultWorkflowPendingAge
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_workflow_pending_age_seconds_max) > 1800
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: A recovery workflow has waited over 30 minutes to be dispatched
+          runbook_url: docs/管理员日常运维.md#gpufaultworkflowpendingage
+          description: >-
+            The oldest PENDING workflow is {{ $value | humanizeDuration }} old
+            and no dispatcher has claimed it. Read its predecessor_workflow_id
+            and the retired-generation gauge
+            (gpu_fault_workflow_retired_generation_awaiting_operator) before
+            looking at dispatcher health; do not delete or hand-edit the
+            workflow row.

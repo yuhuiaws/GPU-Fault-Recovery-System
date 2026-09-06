@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from datetime import datetime
+from typing import Any, Callable
 
 from gpu_fault.execution import (
     WorkflowStepContext,
@@ -42,6 +41,7 @@ class NodeActionBarrierMixin:
                 item
                 for item in reversed(context.workflow.step_executions)
                 if item.step_index == context.step_index
+                and item.operation is context.step.operation
                 and "gpu_client_quiesce_attempt" in item.details
             ),
             None,
@@ -335,6 +335,7 @@ class NodeActionBarrierMixin:
                 item
                 for item in reversed(context.workflow.step_executions)
                 if item.step_index == context.step_index
+                and item.operation is context.step.operation
                 and "gpu_reset_commit_attempt" in item.details
             ),
             None,

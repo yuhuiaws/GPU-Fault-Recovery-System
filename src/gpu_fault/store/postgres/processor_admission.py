@@ -5,6 +5,8 @@ from typing import Any, Callable
 from dataclasses import dataclass
 
 from gpu_fault.processor import ProcessorRequestStatus
+from gpu_fault.processor.models import ROUTINE_PRIORITY
+from gpu_fault.store.shared.processor_helpers import PartialEnqueueError
 
 
 @dataclass
@@ -21,7 +23,6 @@ class PostgresProcessorAdmissionMixin:
     # Attributes supplied by the composed concrete implementation.
     _db: Any
     _decode: Callable[..., Any]
-    _maybe_reconcile_legacy_processor_requests: Callable[..., Any]
     _persist_processor_request: Callable[..., Any]
     _processor_counter_depths: Callable[..., Any]
     _processor_counter_mode: Callable[..., Any]
@@ -39,7 +40,6 @@ class PostgresProcessorAdmissionMixin:
         reserved_cluster_fault_depth: int = 0,
         global_admission_guard: int = 256,
     ):
-        self._maybe_reconcile_legacy_processor_requests()
         with self._db.transaction():
             with self._db.cursor() as cursor:
                 cursor.execute(
@@ -76,11 +76,13 @@ class PostgresProcessorAdmissionMixin:
                         FROM gpu_fault_processor_queue
                         WHERE status='PENDING'
                           AND ordering_key=%s
+                          AND priority=%s
+                          AND payload->>'path'=%s
                         ORDER BY created_at, request_id
                         LIMIT 1
                         FOR UPDATE
                         """,
-                        (request.ordering_key(),),
+                        (request.ordering_key(), ROUTINE_PRIORITY, request.path),
                     )
                     row = cursor.fetchone()
                 if row is not None:
@@ -129,7 +131,7 @@ class PostgresProcessorAdmissionMixin:
                     cluster_depth = depths[counter_scope]
             global_limit = (
                 max_depth
-                if request.queue_priority() == 0
+                if request.is_reserved_tier()
                 else max_depth - reserved_fault_depth
             )
             if global_admission_guard > 0 and global_depth >= max(
@@ -161,14 +163,14 @@ class PostgresProcessorAdmissionMixin:
             if global_depth >= max_depth:
                 return None, "global"
             if (
-                request.queue_priority() != 0
+                not request.is_reserved_tier()
                 and global_depth >= max_depth - reserved_fault_depth
             ):
                 return None, "global_reserved"
             if cluster_depth >= max_cluster_depth:
                 return None, "cluster"
             if (
-                request.queue_priority() != 0
+                not request.is_reserved_tier()
                 and cluster_depth >= max_cluster_depth - reserved_cluster_fault_depth
             ):
                 return None, "cluster_reserved"
@@ -195,19 +197,29 @@ class PostgresProcessorAdmissionMixin:
         reserved_cluster_fault_depth: int,
         global_admission_guard: int,
     ):
-        combined = [None] * len(requests)
+        # One transaction per cluster scope. The only caller today groups by
+        # the same key, so a mixed batch never reaches this loop -- but the
+        # signature allows one, and a group that fails after an earlier group
+        # committed must say so rather than look like nothing landed (F-D9).
+        combined: list[tuple[object | None, str | None] | None] = [None] * len(requests)
+        committed: list[str] = []
         for indexes in indexes_by_scope.values():
             group = [requests[index] for index in indexes]
-            group_results = self.try_enqueue_processor_requests_batch(
-                group,
-                max_depth=max_depth,
-                max_cluster_depth=max_cluster_depth,
-                reserved_fault_depth=reserved_fault_depth,
-                reserved_cluster_fault_depth=(reserved_cluster_fault_depth),
-                global_admission_guard=global_admission_guard,
-            )
+            try:
+                group_results = self.try_enqueue_processor_requests_batch(
+                    group,
+                    max_depth=max_depth,
+                    max_cluster_depth=max_cluster_depth,
+                    reserved_fault_depth=reserved_fault_depth,
+                    reserved_cluster_fault_depth=(reserved_cluster_fault_depth),
+                    global_admission_guard=global_admission_guard,
+                )
+            except Exception as exc:
+                raise PartialEnqueueError(committed=committed, cause=exc) from exc
             for index, result in zip(indexes, group_results, strict=True):
                 combined[index] = result
+                if result[0] is not None:
+                    committed.append(result[0].request_id)
         return combined
 
     def _load_processor_admission_rows(self, requests):
@@ -225,6 +237,11 @@ class PostgresProcessorAdmissionMixin:
                 """,
                 (request_ids,),
             )
+            # ``FOR UPDATE`` so this path and ``try_enqueue_processor_request``
+            # (which locks the row, not the advisory key) exclude each
+            # other on the same request id (F-D10). The advisory locks
+            # above already fix the order, so the row locks add no new
+            # deadlock face.
             cursor.execute(
                 f"""
                 SELECT request_id, {
@@ -232,6 +249,8 @@ class PostgresProcessorAdmissionMixin:
                 }
                 FROM gpu_fault_processor_queue
                 WHERE request_id=ANY(%s)
+                ORDER BY request_id
+                FOR UPDATE
                 """,
                 (request_ids,),
             )
@@ -242,20 +261,25 @@ class PostgresProcessorAdmissionMixin:
         ordering_keys = sorted(
             {request.ordering_key() for request in requests if request.coalescable()}
         )
-        pending_by_ordering = {}
+        pending_by_ordering: dict[tuple[str, str], object] = {}
         if not ordering_keys:
             return existing_by_id, pending_by_ordering
+        # Keyed by (lane, path): a lane is shared by every channel that
+        # resolves to the node, and only the previous routine sample of the
+        # same path may be superseded (F-D8).
         with self._db.cursor() as cursor:
             cursor.execute(
                 f"""
                 WITH candidates AS MATERIALIZED (
-                    SELECT DISTINCT ON (ordering_key)
+                    SELECT DISTINCT ON (ordering_key, payload->>'path')
                         request_id
                     FROM gpu_fault_processor_queue
                     WHERE status='PENDING'
+                      AND priority=%s
                       AND ordering_key=ANY(%s)
                     ORDER BY
                         ordering_key,
+                        payload->>'path',
                         created_at,
                         request_id
                 ),
@@ -271,13 +295,11 @@ class PostgresProcessorAdmissionMixin:
                 FROM locked
                 ORDER BY ordering_key
                 """,
-                (ordering_keys,),
+                (ROUTINE_PRIORITY, ordering_keys),
             )
             for ordering_key, payload in cursor.fetchall():
-                pending_by_ordering.setdefault(
-                    ordering_key,
-                    self._decode("processor_request", payload),
-                )
+                pending = self._decode("processor_request", payload)
+                pending_by_ordering.setdefault((ordering_key, pending.path), pending)
         return existing_by_id, pending_by_ordering
 
     @staticmethod
@@ -296,7 +318,7 @@ class PostgresProcessorAdmissionMixin:
             if existing is not None:
                 results[index] = (existing, None)
                 continue
-            ordering_key = request.ordering_key()
+            ordering_key = (request.ordering_key(), request.path)
             coalescable = request.coalescable()
             pending = pending_by_ordering.get(ordering_key) if coalescable else None
             if pending is not None:
@@ -386,7 +408,7 @@ class PostgresProcessorAdmissionMixin:
                 min(
                     (
                         max_depth
-                        if request.queue_priority() == 0
+                        if request.is_reserved_tier()
                         else max_depth - reserved_fault_depth
                     )
                     for request in requests
@@ -435,24 +457,24 @@ class PostgresProcessorAdmissionMixin:
             scope = request.cluster_id or "__unscoped__"
             global_limit = (
                 max_depth
-                if request.queue_priority() == 0
+                if request.is_reserved_tier()
                 else max_depth - reserved_fault_depth
             )
             cluster_limit = (
                 max_cluster_depth
-                if request.queue_priority() == 0
+                if request.is_reserved_tier()
                 else max_cluster_depth - reserved_cluster_fault_depth
             )
             if global_depth >= max_depth:
                 rejected_by_base[request.request_id] = "global"
                 continue
-            if request.queue_priority() != 0 and global_depth >= global_limit:
+            if not request.is_reserved_tier() and global_depth >= global_limit:
                 rejected_by_base[request.request_id] = "global_reserved"
                 continue
             if depths[scope] >= max_cluster_depth:
                 rejected_by_base[request.request_id] = "cluster"
                 continue
-            if request.queue_priority() != 0 and depths[scope] >= cluster_limit:
+            if not request.is_reserved_tier() and depths[scope] >= cluster_limit:
                 rejected_by_base[request.request_id] = "cluster_reserved"
                 continue
             accepted_new_ids.add(request.request_id)
@@ -512,7 +534,6 @@ class PostgresProcessorAdmissionMixin:
                 reserved_cluster_fault_depth=(reserved_cluster_fault_depth),
                 global_admission_guard=global_admission_guard,
             )
-        self._maybe_reconcile_legacy_processor_requests()
         with self._db.transaction():
             existing, pending = self._load_processor_admission_rows(requests)
             plan = self._plan_processor_admission(requests, existing, pending)

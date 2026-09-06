@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -21,9 +22,11 @@ from gpu_fault.completion_attempt_state import (
     publish_attempt_observation,
     restore_persisted_attempt_observations,
 )
+from gpu_fault.completion_metrics_server import start_completion_metrics_server
 from gpu_fault.completion_observation import (
     MissingAttemptTracker,
     ObservationOnlyTracker,
+    _clear_attempt,
     completion_list_arguments,
     is_unknown_profile_rejection,
     list_completion_pods,
@@ -93,10 +96,16 @@ class KubernetesWorkloadStopper:
         workload_log_s3_max_bytes: int = 104857600,
         workload_log_annotation_tail_bytes: int = 8192,
         workload_log_uploader=None,
+        workload_log_timeout_seconds: float = 30.0,
     ) -> None:
+        if workload_log_timeout_seconds <= 0:
+            raise CompletionControllerError(
+                "workload log capture timeout must be positive"
+            )
         self.batch = batch_api
         self.custom = custom_api
         self.core = core_api
+        self.workload_log_timeout_seconds = workload_log_timeout_seconds
         self.workload_log_tail_lines = workload_log_tail_lines
         self.workload_log_max_bytes = workload_log_max_bytes
         uri = workload_log_s3_uri
@@ -254,14 +263,46 @@ class KubernetesWorkloadStopper:
                 }
             return pod, snapshot
 
+        # Bounded: each read carries ``_request_timeout`` and the whole batch
+        # gets one budget per wave of workers. A capture that has not finished
+        # by then is recorded as an error and left to finish on its own thread;
+        # the reconcile loop that called us must not wait for a hung kubelet.
         completed: list[tuple[Any, dict[str, Any]]] = []
-        with ThreadPoolExecutor(
-            max_workers=min(8, len(items)),
+        max_workers = min(8, len(items))
+        budget = self.workload_log_timeout_seconds * math.ceil(len(items) / max_workers)
+        executor = ThreadPoolExecutor(
+            max_workers=max_workers,
             thread_name_prefix="gpu-fault-workload-log",
-        ) as executor:
-            futures = [executor.submit(capture, pod) for pod in items]
-            for future in as_completed(futures):
+        )
+        futures = {executor.submit(capture, pod): pod for pod in items}
+        try:
+            for future in as_completed(futures, timeout=budget):
                 completed.append(future.result())
+        except TimeoutError:
+            for future, pod in futures.items():
+                if future.done():
+                    continue
+                name, namespace, _pod_uid = self._pod_identity(pod)
+                LOGGER.error(
+                    "workload log capture for %s/%s timed out after %ss",
+                    namespace,
+                    name,
+                    budget,
+                )
+                completed.append(
+                    (
+                        pod,
+                        {
+                            "pod_name": name,
+                            "namespace": namespace,
+                            "capture_error": (
+                                f"workload log capture timed out after {budget}s"
+                            ),
+                        },
+                    )
+                )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         snapshots = []
         for pod, snapshot in completed:
@@ -336,6 +377,7 @@ class KubernetesWorkloadStopper:
                 container=container_name,
                 timestamps=True,
                 limit_bytes=self.workload_log_s3_max_bytes,
+                _request_timeout=self.workload_log_timeout_seconds,
             )
             raw = str(value).encode("utf-8", errors="replace")
             archive_truncated = len(raw) >= self.workload_log_s3_max_bytes
@@ -346,6 +388,7 @@ class KubernetesWorkloadStopper:
                 container=container_name,
                 timestamps=True,
                 tail_lines=self.workload_log_tail_lines,
+                _request_timeout=self.workload_log_timeout_seconds,
             )
             raw = str(value).encode("utf-8", errors="replace")
             archive_truncated = len(raw.splitlines()) >= self.workload_log_tail_lines
@@ -477,6 +520,8 @@ class KubernetesCompletionController:
         observation_runtime_profile_version: str | None = None,
         observation_only_retention_cycles: int = 3,
         gpu_uuid_resolver: (Callable[[dict[str, Any], str], list[str]] | None) = None,
+        terminal_retention_seconds: int = 3600,
+        watcher_max_attempts: int = 10000,
     ) -> None:
         if not cluster_id:
             raise CompletionControllerError("cluster_id is required")
@@ -513,7 +558,13 @@ class KubernetesCompletionController:
             observation_only_retention_cycles,
         )
         self.gpu_uuid_resolver = gpu_uuid_resolver
-        self.watcher = CompletionWatcher()
+        try:
+            self.watcher = CompletionWatcher(
+                terminal_retention_seconds=terminal_retention_seconds,
+                max_attempts=watcher_max_attempts,
+            )
+        except ValueError as exc:
+            raise CompletionControllerError(str(exc)) from exc
         self._attempt_specs: dict[str, AttemptSpec] = {}
         self._last_observations: dict[str, AttemptObservation] = {}
         self._terminal_observations: dict[str, AttemptObservation] = {}
@@ -529,6 +580,14 @@ class KubernetesCompletionController:
         self.metadata_takeovers_total = 0
         self.reconcile_runs_total = 0
         self.reconciled_attempts_total = 0
+        # One attempt's reconcile raising is logged and counted here; it no
+        # longer aborts the pass for every other attempt (F-G4 / P1-47A).
+        self.reconcile_failures_total = 0
+        # Attempts whose controller-side state was dropped because the watcher
+        # core pruned them and no Pod of theirs is left (F-G4 / P1-50C).
+        self.evicted_attempts_total = 0
+        # Persisted attempt records skipped at start-up (set by the restore).
+        self.restore_skipped_total = 0
         try:
             restore_persisted_attempt_observations(self)
         except ValueError as exc:
@@ -569,7 +628,7 @@ class KubernetesCompletionController:
                 for key, value in self._gpu_uuid_failures.items()
                 if key in active_pod_keys
             }
-        results = []
+        results: list[dict[str, Any]] = []
         attempt_ids = (
             set(grouped).union(self._attempt_specs)
             if attempt_filter is None
@@ -580,122 +639,161 @@ class KubernetesCompletionController:
         observed_at = self.now()
         for attempt_id in sorted(attempt_ids):
             attempt_pods = grouped.get(attempt_id, [])
+            # The whole body is isolated, not just the observation step: a
+            # failure anywhere in one attempt's handling used to abort the
+            # pass for every attempt after it in sort order (P1-47A).
             try:
-                observation = reconcile_attempt_observation(
-                    self, attempt_id, attempt_pods, observed_at
-                )
-                if observation is None:
-                    continue
-                result = self.watcher.observe(observation)
-                if result.terminal_event is not None:
-                    # Unknown live ranks cannot survive a terminal observation.
-                    observation = cache_terminal_attempt_observation(
-                        self, attempt_id, result.terminal_event, observation
-                    )
-                self._last_observations[attempt_id] = observation
-            except (CompletionControllerError, ValueError):
+                self._reconcile_attempt(attempt_id, attempt_pods, observed_at, results)
+            except Exception:
+                self.reconcile_failures_total += 1
                 LOGGER.exception("cannot reconcile attempt %s", attempt_id)
+        if attempt_filter is None:
+            self._evict_pruned_attempts(grouped)
+        return results
+
+    def _evict_pruned_attempts(self, grouped: dict[str, list[dict[str, Any]]]) -> None:
+        """Drop controller state for attempts the watcher core has pruned.
+
+        Only attempts with no live Pod are evicted: one whose Pods are still
+        listed is rebuilt from them on the next pass anyway, and dropping its
+        sent-keys would re-post its terminal. The watcher accumulates pruned
+        ids across filtered passes; a full pass drains them.
+        """
+        for attempt_id in sorted(self.watcher.take_pruned_attempt_ids()):
+            if attempt_id in grouped:
                 continue
-            if self.publish_observations:
-                publish_attempt_observation(self, observation, attempt_id)
-            if self.observation_only.contains(attempt_id):
-                results.append(
-                    {
-                        "attempt_id": attempt_id,
-                        "observation_only": True,
-                    }
+            _clear_attempt(self, attempt_id)
+            self.evicted_attempts_total += 1
+            LOGGER.info(
+                "evicted terminal attempt state after retention: attempt=%s",
+                attempt_id,
+            )
+
+    def _reconcile_attempt(
+        self,
+        attempt_id: str,
+        attempt_pods: list[dict[str, Any]],
+        observed_at: datetime,
+        results: list[dict[str, Any]],
+    ) -> None:
+        try:
+            observation = reconcile_attempt_observation(
+                self, attempt_id, attempt_pods, observed_at
+            )
+            if observation is None:
+                return
+            result = self.watcher.observe(observation)
+            if result.terminal_event is not None:
+                # Unknown live ranks cannot survive a terminal observation.
+                observation = cache_terminal_attempt_observation(
+                    self, attempt_id, result.terminal_event, observation
                 )
-                continue
-            if result.failure_detected is not None:
-                failure_event = result.failure_detected
-                if self.workload_stopper is not None and hasattr(
-                    self.workload_stopper, "capture_logs"
-                ):
-                    incident_id, _ = failure_containment_ids(failure_event.event_key)
-                    try:
-                        snapshots = self.workload_stopper.capture_logs(
-                            attempt_id,
-                            incident_id,
-                            pods=attempt_pods,
-                        )
-                    except Exception:
-                        LOGGER.exception(
-                            "cannot capture failure logs for attempt %s",
-                            attempt_id,
-                        )
-                    else:
-                        if snapshots:
-                            failure_event = failure_event.model_copy(
-                                update={"workload_log_snapshots": snapshots}
-                            )
-                self._failure_events[attempt_id] = failure_event
-            if attempt_id in self._failure_events:
-                failure_event = self._failure_events[attempt_id]
-                passive_incident_id, _ = failure_containment_ids(
-                    failure_event.event_key
-                )
-                initiator = self._attempt_specs[
-                    attempt_id
-                ].termination_initiator_incident_id
-                if initiator is None or initiator == passive_incident_id:
-                    self._deliver_failure_containment(attempt_id)
-            if result.failure_detected is not None:
-                LOGGER.warning(
-                    "training failure detected: attempt=%s rank=%s "
-                    "node=%s exit_code=%s",
-                    attempt_id,
-                    result.failure_detected.first_failed_rank,
-                    result.failure_detected.node_id,
-                    result.failure_detected.exit_code,
-                )
-            if (
-                result.terminal_event is not None
-                and result.terminal_event.event_key not in self._terminal_sent
+            self._last_observations[attempt_id] = observation
+        except (CompletionControllerError, ValueError):
+            self.reconcile_failures_total += 1
+            LOGGER.exception("cannot reconcile attempt %s", attempt_id)
+            return
+        if self.publish_observations:
+            publish_attempt_observation(self, observation, attempt_id)
+        if self.observation_only.contains(attempt_id):
+            results.append(
+                {
+                    "attempt_id": attempt_id,
+                    "observation_only": True,
+                }
+            )
+            return
+        if result.failure_detected is not None:
+            failure_event = result.failure_detected
+            if self.workload_stopper is not None and hasattr(
+                self.workload_stopper, "capture_logs"
             ):
+                incident_id, _ = failure_containment_ids(failure_event.event_key)
                 try:
-                    response = self.sink.post(
-                        "/v1/attempts/terminal",
-                        result.terminal_event.model_dump(mode="json"),
+                    snapshots = self.workload_stopper.capture_logs(
+                        attempt_id,
+                        incident_id,
+                        pods=attempt_pods,
                     )
-                except Exception as exc:
-                    # A 404 here means the control plane has no such
-                    # runtime profile. Retrying is still correct (an
-                    # operator can register it and the next poll
-                    # succeeds), but the generic "will retry" message
-                    # buries the one thing that has to be fixed, so the
-                    # loop just reprints an opaque traceback every poll
-                    # while the attempt never reaches a decision.
-                    if is_unknown_profile_rejection(exc):
-                        LOGGER.error(
-                            "control plane does not know runtime "
-                            "profile %r declared by attempt %s "
-                            "(annotation %s); the terminal event "
-                            "cannot be accepted until that profile is "
-                            "registered via "
-                            "POST /v1/runtime-profiles. Retrying, but "
-                            "this will not clear on its own: %s",
-                            self._attempt_specs[attempt_id].runtime_profile_version,
-                            attempt_id,
-                            RUNTIME_PROFILE_ANNOTATION,
-                            exc,
-                        )
-                        continue
+                except Exception:
                     LOGGER.exception(
-                        "cannot submit training terminal for "
-                        "attempt %s; will retry without blocking "
-                        "other attempts",
+                        "cannot capture failure logs for attempt %s",
                         attempt_id,
                     )
-                    continue
-                self._terminal_sent.add(result.terminal_event.event_key)
-                LOGGER.info(
-                    "training terminal submitted: attempt=%s status=%s event_key=%s",
-                    attempt_id,
-                    result.terminal_event.terminal_status.value,
-                    result.terminal_event.event_key,
+                else:
+                    if snapshots:
+                        failure_event = failure_event.model_copy(
+                            update={"workload_log_snapshots": snapshots}
+                        )
+            self._failure_events[attempt_id] = failure_event
+        if attempt_id in self._failure_events:
+            failure_event = self._failure_events[attempt_id]
+            passive_incident_id, _ = failure_containment_ids(failure_event.event_key)
+            spec = self._attempt_specs.get(attempt_id)
+            initiator = (
+                spec.termination_initiator_incident_id if spec is not None else None
+            )
+            if initiator is None or initiator == passive_incident_id:
+                self._deliver_failure_containment(attempt_id)
+        if result.failure_detected is not None:
+            LOGGER.warning(
+                "training failure detected: attempt=%s rank=%s node=%s exit_code=%s",
+                attempt_id,
+                result.failure_detected.first_failed_rank,
+                result.failure_detected.node_id,
+                result.failure_detected.exit_code,
+            )
+        if (
+            result.terminal_event is not None
+            and result.terminal_event.event_key not in self._terminal_sent
+        ):
+            try:
+                response = self.sink.post(
+                    "/v1/attempts/terminal",
+                    result.terminal_event.model_dump(mode="json"),
                 )
-                results.append(response)
-        return results
+            except Exception as exc:
+                # A 404 here means the control plane has no such
+                # runtime profile. Retrying is still correct (an
+                # operator can register it and the next poll
+                # succeeds), but the generic "will retry" message
+                # buries the one thing that has to be fixed, so the
+                # loop just reprints an opaque traceback every poll
+                # while the attempt never reaches a decision.
+                if is_unknown_profile_rejection(exc):
+                    LOGGER.error(
+                        "control plane does not know runtime "
+                        "profile %r declared by attempt %s "
+                        "(annotation %s); the terminal event "
+                        "cannot be accepted until that profile is "
+                        "registered via "
+                        "POST /v1/runtime-profiles. Retrying, but "
+                        "this will not clear on its own: %s",
+                        self._runtime_profile_version(attempt_id),
+                        attempt_id,
+                        RUNTIME_PROFILE_ANNOTATION,
+                        exc,
+                    )
+                    return
+                LOGGER.exception(
+                    "cannot submit training terminal for "
+                    "attempt %s; will retry without blocking "
+                    "other attempts",
+                    attempt_id,
+                )
+                return
+            self._terminal_sent.add(result.terminal_event.event_key)
+            LOGGER.info(
+                "training terminal submitted: attempt=%s status=%s event_key=%s",
+                attempt_id,
+                result.terminal_event.terminal_status.value,
+                result.terminal_event.event_key,
+            )
+            results.append(response)
+
+    def _runtime_profile_version(self, attempt_id: str) -> str | None:
+        spec = self._attempt_specs.get(attempt_id)
+        return spec.runtime_profile_version if spec is not None else None
 
     def _deliver_failure_containment(self, attempt_id: str) -> None:
         if attempt_id in self._failure_sent:
@@ -720,7 +818,7 @@ class KubernetesCompletionController:
                     "registered via POST /v1/runtime-profiles. The "
                     "emergency workload stop below is the only "
                     "remaining protection: %s",
-                    self._attempt_specs[attempt_id].runtime_profile_version,
+                    self._runtime_profile_version(attempt_id),
                     attempt_id,
                     RUNTIME_PROFILE_ANNOTATION,
                     exc,
@@ -739,7 +837,13 @@ class KubernetesCompletionController:
                 < self.emergency_fallback_seconds
             ):
                 return
-            spec = self._attempt_specs[attempt_id]
+            spec = self._attempt_specs.get(attempt_id)
+            if spec is None:
+                LOGGER.error(
+                    "emergency workload stop skipped: attempt %s has no spec",
+                    attempt_id,
+                )
+                return
             if not spec.workload_ids:
                 return
             try:
@@ -791,6 +895,15 @@ class KubernetesCompletionController:
         )
 
     def run(self) -> None:
+        # Best-effort: a bind failure is logged and the loop runs unmetered.
+        metrics_server = start_completion_metrics_server(self)
+        try:
+            self._run_forever()
+        finally:
+            if metrics_server is not None:
+                metrics_server.stop()
+
+    def _run_forever(self) -> None:
         if self.watch_factory is None:
             LOGGER.warning("watch client is unavailable; using polling fallback")
             self._run_polling()
@@ -1476,6 +1589,12 @@ def controller_from_environment() -> KubernetesCompletionController:
                     "8192",
                 )
             ),
+            workload_log_timeout_seconds=float(
+                os.getenv("GPU_FAULT_WORKLOAD_LOG_TIMEOUT_SECONDS", "30")
+            ),
+        ),
+        terminal_retention_seconds=int(
+            os.getenv("GPU_FAULT_WATCHER_TERMINAL_RETENTION_SECONDS", "3600")
         ),
         emergency_fallback_seconds=fallback_seconds,
         reconcile_debounce_seconds=float(

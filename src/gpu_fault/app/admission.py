@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Callable
 
+from gpu_fault.store.shared.errors import operation_should_retry
 from gpu_fault.async_store import (
     REQUEST_DEADLINE,
     AsyncStoreExecutor,
@@ -228,18 +229,31 @@ class _ProcessorAdmissionBatcher:
         rounds_ahead = 1 + ahead // self.round_capacity
         return rounds_ahead * self.round_seconds_ewma * self.projection_margin
 
+    def _projected_scope_wait_seconds(self, ahead: int) -> float:
+        """Rounds this scope still needs before a new entry is flushed."""
+        if self.round_seconds_ewma <= 0:
+            return 0.0
+        rounds_ahead = 1 + ahead // self.max_batch_size
+        return rounds_ahead * self.round_seconds_ewma * self.projection_margin
+
     async def submit(self, item):
         future = asyncio.get_running_loop().create_future()
         deadline = REQUEST_DEADLINE.get()
+        scope = self.scope_key(item)
         if deadline is not None and self.projection_margin > 0:
-            projected = self._projected_wait_seconds(self._pending_count)
+            # Queues are per scope and one flush is in flight per scope, so
+            # the wait this request faces is its own scope's backlog over
+            # ``max_batch_size`` -- not the process-wide backlog over the
+            # fleet-wide capacity, which let one stalled cluster shed a
+            # healthy cluster's requests (F-E2).
+            ahead = len(self._pending_by_scope.get(scope, ()))
+            projected = self._projected_scope_wait_seconds(ahead)
             if projected > deadline - time.monotonic():
                 self.shed_total += 1
                 raise StoreIoCapacityExceeded(
                     "processor admission batch cannot reach this "
                     "request within its deadline"
                 )
-        scope = self.scope_key(item)
         async with self._lock:
             self._pending_by_scope.setdefault(scope, []).append(
                 _AdmissionEntry(
@@ -397,7 +411,19 @@ class _ProcessorAdmissionBatcher:
                     f"{self.label} batch returned the wrong number of results"
                 )
         except Exception as exc:  # noqa: BLE001 - reported per entry
-            error = exc
+            # A retryable store failure (serialization, deadlock, lost
+            # connection) is a capacity answer for every request in the
+            # group -- a 503 with Retry-After -- not a 500 (F-E3). Anything
+            # else is a bug and surfaces as itself.
+            if not isinstance(exc, StoreIoCapacityExceeded) and operation_should_retry(
+                exc
+            ):
+                error = StoreIoCapacityExceeded(
+                    "PostgreSQL writer is temporarily unavailable"
+                )
+                error.__cause__ = exc
+            else:
+                error = exc
             results = []
         finally:
             REQUEST_DEADLINE.reset(token)
@@ -440,6 +466,31 @@ class _ProcessorAdmissionBatcher:
         # keep that request's deadline: every store call below runs under
         # the deadline of the group it is serving, set in _run_group.
         REQUEST_DEADLINE.set(None)
+        try:
+            await self._flush_loop()
+        except Exception as exc:  # noqa: BLE001 - the loop itself broke
+            # Nothing below _run_group answers the futures; if the loop's
+            # own bookkeeping raised, every pending waiter would hang until
+            # its client gave up (F-E3). Fail them, then let the next
+            # submit start a fresh loop.
+            LOGGER.exception(
+                "%s flush loop failed; failing pending entries", self.label
+            )
+            async with self._lock:
+                pending = [
+                    entry
+                    for entries in self._pending_by_scope.values()
+                    for entry in entries
+                ]
+                self._pending_by_scope.clear()
+                self._pending_count = 0
+                self.pending_depth = 0
+                self._flush_task = None
+            for entry in pending:
+                if not entry.future.done():
+                    entry.future.set_exception(exc)
+
+    async def _flush_loop(self) -> None:
         while True:
             # One coalescing window per pass rather than one per
             # dispatcher. Under the barrier a round lasted seconds, so

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from datetime import datetime, timedelta
 from typing import Any, Iterable, Sequence
 
@@ -15,10 +17,19 @@ from gpu_fault.policy import (
     XidEvent,
 )
 from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.store.shared.health_signals import (
+    latched_health_signal_state,
+    previous_clock,
+    sample_disposition,
+    signal_clock,
+)
 
 # One NVLink bit's identity: the scope from `_xid74_scope` plus the register
 # index and bit position inside it.
 _Xid74StateKey = tuple[str, str, int, int, int]
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MemoryXidMixin:
@@ -260,7 +271,10 @@ class MemoryXidMixin:
             return completed
 
     def claim_health_signal_transitions(
-        self, items: Sequence[tuple[str, bool, datetime, float]]
+        self,
+        items: Sequence[tuple[str, bool, datetime, float]],
+        *,
+        received_at: datetime | None = None,
     ) -> list[bool]:
         with self._lock:
             results: list[bool] = []
@@ -271,7 +285,12 @@ class MemoryXidMixin:
                 minimum_active_seconds,
             ) in items:
                 previous = self._health_signal_states.get(signal_key)
-                if previous is not None and observed_at <= previous.observed_at:
+                accept, regressed = sample_disposition(
+                    previous, observed_at, received_at
+                )
+                if regressed:
+                    self._note_health_signal_clock_regression(signal_key, observed_at)
+                if not accept:
                     results.append(False)
                     continue
                 if previous is None and not active:
@@ -283,6 +302,7 @@ class MemoryXidMixin:
                     observed_at,
                     previous,
                     minimum_active_seconds,
+                    clock=signal_clock(observed_at, received_at),
                 )
                 self._health_signal_states[signal_key] = state
                 results.append(emit)
@@ -295,6 +315,9 @@ class MemoryXidMixin:
         observed_at: datetime,
         minimum_active_seconds: float = 0,
     ) -> bool:
+        # The single form is the training-progress path. Like the plural form
+        # it only decides to emit; ``TrainingHealthService.mark_notified``
+        # latches once the finding's incident has been written (P0-38B).
         return self.claim_health_signal_transitions(
             [
                 (
@@ -305,6 +328,20 @@ class MemoryXidMixin:
                 )
             ]
         )[0]
+
+    def get_health_signal_state(self, signal_key: str) -> HealthSignalState | None:
+        with self._lock:
+            return self._health_signal_states.get(signal_key)
+
+    def mark_health_signal_notified(
+        self, signal_key: str, *, notified_at: datetime
+    ) -> None:
+        with self._lock:
+            latched = latched_health_signal_state(
+                self._health_signal_states.get(signal_key), notified_at
+            )
+            if latched is not None:
+                self._health_signal_states[signal_key] = latched
 
     def observe_xid_metric(
         self,
@@ -330,6 +367,21 @@ class MemoryXidMixin:
             self._xid_metric_baselines[key] = baseline
             return previous is not None and xid > 0 and xid != previous.xid
 
+    # Node clocks that stepped backwards while the control plane's moved on
+    # (F-M2). The sample is still judged; this only says it happened.
+    health_signal_clock_regressions_total: int = 0
+
+    def _note_health_signal_clock_regression(
+        self, signal_key: str, observed_at: datetime
+    ) -> None:
+        self.health_signal_clock_regressions_total += 1
+        LOGGER.warning(
+            "health signal %s reported a node time (%s) not after its previous "
+            "sample; judged on control-plane time instead",
+            signal_key,
+            observed_at.isoformat(),
+        )
+
     @staticmethod
     def _next_health_signal_state(
         signal_key: str,
@@ -337,8 +389,20 @@ class MemoryXidMixin:
         observed_at: datetime,
         previous: HealthSignalState | None,
         minimum_active_seconds: float,
+        *,
+        clock: datetime | None = None,
     ) -> tuple[HealthSignalState, bool]:
+        """Advance one signal. ``clock`` is the time durations are measured on
+        (the control plane's receive time when the caller has it); it defaults
+        to the node's ``observed_at`` for callers without one.
+
+        The ``notified`` latch is carried over, never set here (P0-38B): the
+        claim decides to emit, the deliverer latches through
+        ``mark_health_signal_notified`` once the incident has committed. Until
+        then a still-active signal emits again on its next sample."""
+
         minimum_active_seconds = max(0.0, minimum_active_seconds)
+        now_on_clock = clock if clock is not None else observed_at
         if not active:
             return (
                 HealthSignalState(
@@ -347,20 +411,21 @@ class MemoryXidMixin:
                     observed_at=observed_at,
                     active_since=None,
                     notified=False,
+                    clock_at=now_on_clock,
                 ),
                 False,
             )
         active_since = (
-            previous.active_since or previous.observed_at
+            previous.active_since or previous_clock(previous)
             if previous is not None and previous.active
-            else observed_at
+            else now_on_clock
         )
         previously_notified = (
             (previous.notified if previous.notified is not None else previous.active)
             if previous is not None
             else False
         )
-        duration = (observed_at - active_since).total_seconds()
+        duration = (now_on_clock - active_since).total_seconds()
         emit = not previously_notified and duration >= minimum_active_seconds
         return (
             HealthSignalState(
@@ -368,7 +433,8 @@ class MemoryXidMixin:
                 active=True,
                 observed_at=observed_at,
                 active_since=active_since,
-                notified=previously_notified or emit,
+                notified=previously_notified,
+                clock_at=now_on_clock,
             ),
             emit,
         )

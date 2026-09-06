@@ -85,6 +85,8 @@ def start_processor_threads(
         ingest_node_health_findings=ingest_node_health_findings,
         notify_silent_collectors=notify_silent_collectors,
     )
+    # Exposed so /metrics can read its counters (F-L1).
+    context.periodic_runner = periodic_runner
     threads = [
         Thread(
             target=processor.run_processor,
@@ -208,6 +210,7 @@ def _start_training_worker(context, stop, ingest):
                 result = context.training_health.scan_all()
                 if result.findings:
                     ingest("training-health-monitor", result.findings)
+                    context.training_health.mark_notified(result.findings)
             except Exception:
                 LOGGER.exception("training health scan failed")
 

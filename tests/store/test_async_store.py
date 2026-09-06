@@ -46,8 +46,8 @@ def test_store_io_executor_bounds_in_flight_work() -> None:
             if first.done():
                 break
             await asyncio.sleep(0.001)
-        assert first.done()
-        assert first.result()
+        assert first.done(), "expected first.done() to be true"
+        assert first.result(), "expected first.result() to be true"
         assert executor.in_flight == 0
 
     try:
@@ -174,7 +174,7 @@ def test_admission_wait_is_clamped_to_the_request_deadline() -> None:
             if first.done():
                 break
             await asyncio.sleep(0.001)
-        assert first.done()
+        assert first.done(), "expected first.done() to be true"
 
     try:
         asyncio.run(scenario())
@@ -545,7 +545,7 @@ def test_admission_batch_scope_stall_does_not_delay_another_scope() -> None:
         # The stalled cluster is still stalled; the point is that this
         # one did not have to wait for it.
         assert time.monotonic() - started < 2
-        assert not stuck.done()
+        assert not stuck.done(), "expected stuck.done() to be false"
         assert batcher.in_flight_max >= 2
         release.set()
         assert await asyncio.wait_for(stuck, timeout=5) == (slow, None)
@@ -661,8 +661,8 @@ def test_admission_batch_rejects_a_stalled_entry_at_its_own_deadline() -> None:
             await asyncio.wait_for(doomed, timeout=3)
         # Answered at its own deadline, not when the stall cleared.
         assert time.monotonic() - started < 2
-        assert not stuck.done()
-        assert not patient.done()
+        assert not stuck.done(), "expected stuck.done() to be false"
+        assert not patient.done(), "expected patient.done() to be false"
         release.set()
         assert await asyncio.wait_for(stuck, timeout=5) == (blocking, None)
         assert await asyncio.wait_for(patient, timeout=5) == (patient_item, None)
@@ -840,6 +840,69 @@ def test_admission_batch_still_coalesces_arrivals_into_one_transaction() -> None
             (item, None) for item in items
         ]
         assert sizes == [10]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        executor.close()
+
+
+def test_admission_projection_uses_the_items_own_scope_queue() -> None:
+    """A stalled cluster must not shed a healthy cluster's requests (F-E2).
+
+    Queues are per scope and one flush is in flight per scope, so the wait a
+    request faces is its *own* scope's backlog over ``max_batch_size`` -- not
+    the whole process's backlog over the fleet-wide capacity, which is the
+    coupling the per-scope queues were introduced to remove.
+    """
+    from types import SimpleNamespace
+
+    executor = AsyncStoreExecutor(
+        workers=1, max_in_flight=1, admission_timeout_seconds=2
+    )
+    batcher = _admission_batcher(
+        SimpleNamespace(),
+        executor,
+        flush_delay_seconds=0,
+        max_batch_size=1,
+        max_flush_groups=1,
+    )
+    batcher.store.try_enqueue_processor_requests_batch = lambda items, **_kwargs: [
+        (item, None) for item in items
+    ]
+    batcher.round_seconds_ewma = 0.5
+
+    async def scenario() -> None:
+        from gpu_fault.app.admission import _AdmissionEntry
+
+        # Cluster "a" has ten requests queued; each round takes half a second.
+        loop = asyncio.get_running_loop()
+        stalled_entries = [
+            _AdmissionEntry(
+                item=SimpleNamespace(cluster_id="a", path="/v1/x"),
+                future=loop.create_future(),
+                deadline=None,
+                enqueued_at=time.monotonic(),
+            )
+            for _ in range(10)
+        ]
+        batcher._pending_by_scope["a"] = list(stalled_entries)
+        batcher._pending_count = len(stalled_entries)
+        healthy = SimpleNamespace(cluster_id="b", path="/v1/x")
+        token = REQUEST_DEADLINE.set(time.monotonic() + 2)
+        try:
+            assert await batcher.submit(healthy) == (healthy, None)
+            assert batcher.shed_total == 0
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        stalled = SimpleNamespace(cluster_id="a", path="/v1/x")
+        token = REQUEST_DEADLINE.set(time.monotonic() + 2)
+        try:
+            with pytest.raises(StoreIoCapacityExceeded):
+                await batcher.submit(stalled)
+        finally:
+            REQUEST_DEADLINE.reset(token)
+        assert batcher.shed_total == 1
 
     try:
         asyncio.run(scenario())

@@ -1,35 +1,14 @@
 from __future__ import annotations
 
-
-_TRANSIENT_PSYCOPG_ERRORS = frozenset(
-    {
-        "ConnectionTimeout",
-        "InterfaceError",
-        "OperationalError",
-        "PoolClosed",
-        "PoolTimeout",
-        "TooManyRequests",
-    }
-)
-_MAX_CHAIN_DEPTH = 5
+from gpu_fault.store.shared.errors import operation_should_retry
 
 
 def transient_store_error(exc: BaseException) -> bool:
-    """Return true for database connectivity errors safe to retry."""
+    """Whether a failed store operation should simply be retried.
 
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    for _ in range(_MAX_CHAIN_DEPTH):
-        if current is None or id(current) in seen:
-            return False
-        seen.add(id(current))
-        module = type(current).__module__ or ""
-        name = type(current).__name__
-        sqlstate = getattr(current, "sqlstate", None)
-        if module.startswith(("psycopg", "psycopg_pool")) and (
-            name in _TRANSIENT_PSYCOPG_ERRORS
-            or (isinstance(sqlstate, str) and sqlstate.startswith("08"))
-        ):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
+    The one shared classifier (``gpu_fault.store.shared.errors``): a
+    serialization failure, a deadlock or a statement timeout is a retry, not a
+    reason to write the workflow BLOCKED (F-J1).
+    """
+
+    return operation_should_retry(exc)

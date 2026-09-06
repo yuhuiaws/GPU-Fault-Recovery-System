@@ -26,28 +26,52 @@ ISOLATION_ANNOTATIONS = (
     "gpu-fault.io/previous-unschedulable",
 )
 RECONCILE_SCRIPT = """
+import inspect
 import json
 import sys
+from datetime import timedelta
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.models import WorkflowOperation
 from gpu_fault.workflow_reconcile import (
     apply_workflow_reconcile_plan,
     build_workflow_reconcile_plan,
 )
 
 payload = json.load(sys.stdin)
-store = ApplicationContext.from_environment().store
+context = ApplicationContext.from_environment()
+store = context.store
 if payload["mode"] == "plan":
+    # Batch options are passed only when given, so the script still runs
+    # against a deployed image whose planner predates them.
+    options = {
+        key: payload[key]
+        for key in ("incident_ids", "blocked_kinds", "max_items")
+        if payload.get(key) is not None
+    }
     result = build_workflow_reconcile_plan(
         store,
         payload.get("workflow_ids"),
+        **options,
     )
 elif payload["mode"] == "apply":
+    options = {}
+    # The executor's RESTART_WORKLOAD waiting cap decides which WAITING
+    # restart reservations the terminalization releases; the module has no
+    # executor config of its own, and an older deployed image's apply does
+    # not take it.
+    if "waiting_ttl" in inspect.signature(apply_workflow_reconcile_plan).parameters:
+        options["waiting_ttl"] = timedelta(
+            seconds=context.production_executor_config.step_waiting_limit(
+                WorkflowOperation.RESTART_WORKLOAD
+            )
+        )
     result = apply_workflow_reconcile_plan(
         store,
         workflow_ids=payload["workflow_ids"],
         expected_plan_sha256=payload["plan_sha256"],
         reference=payload["reference"],
+        **options,
     )
 else:
     raise ValueError("unsupported workflow reconcile mode")
@@ -331,6 +355,70 @@ def _scheduling_evidence(
     return result
 
 
+def _plan_drift(
+    saved_items: list[dict[str, Any]],
+    current_items: list[dict[str, Any]],
+) -> list[str]:
+    """Which item fields moved between the approved plan and the re-plan.
+
+    "plan changed before apply" on its own told the operator nothing: the record
+    is live, so the plan changing is the expected case, and the useful question
+    is *what* changed -- a dispatch tick, a re-plan, or a node whose state
+    drifted. Compared over the digest fields, so a field the digest ignores is
+    never named as the cause.
+    """
+
+    saved = {
+        str(item.get("request_id")): item for item in plan_digest_items(saved_items)
+    }
+    current = {
+        str(item.get("request_id")): item for item in plan_digest_items(current_items)
+    }
+    drift: list[str] = []
+    for request_id in sorted(set(saved) - set(current)):
+        drift.append(f"{request_id}: no longer in the plan")
+    for request_id in sorted(set(current) - set(saved)):
+        drift.append(f"{request_id}: newly in the plan")
+    for request_id in sorted(set(saved) & set(current)):
+        before, after = saved[request_id], current[request_id]
+        for field in sorted(set(before) | set(after)):
+            if before.get(field) != after.get(field):
+                drift.append(
+                    f"{request_id}: {field} {before.get(field)!r} -> "
+                    f"{after.get(field)!r}"
+                )
+    return drift
+
+
+def _changed_before_apply(
+    what: str,
+    saved: dict[str, Any],
+    current: dict[str, Any],
+) -> BootstrapError:
+    drift = _plan_drift(
+        list(saved.get("items") or []), list(current.get("items") or [])
+    )
+    if saved.get("runtime_plan_sha256") != current.get("runtime_plan_sha256") and (
+        not drift
+    ):
+        drift.append("the runtime plan digest changed outside the item fields")
+    return BootstrapError(
+        f"{what} plan changed before apply: " + (" | ".join(drift) or "plan differs")
+    )
+
+
+def plan_digest_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Both modes hash their items under the retired-generation rule.
+
+    The admin layer re-hashes the runtime items with the site identity and the
+    node evidence, so it needed the same trimming: hashing ``workflow_updated_at``
+    here left the apply unwinnable no matter what the runtime digest did
+    (P0-72A). See ``retired_generation.DIGEST_EXCLUDED_ITEM_FIELDS``.
+    """
+
+    return retired_generation.plan_digest_items(items)
+
+
 def _finalize_plan(
     site: RenderedSite,
     runtime_plan: dict[str, Any],
@@ -357,6 +445,7 @@ def _finalize_plan(
         "evaluated_at": runtime_plan.get("evaluated_at"),
         "site_identity": _site_identity(site),
         "runtime_plan_sha256": runtime_plan.get("plan_sha256"),
+        "discovery": runtime_plan.get("discovery"),
         "items": items,
     }
     plan["plan_sha256"] = _canonical_sha256(
@@ -365,7 +454,7 @@ def _finalize_plan(
             "mode": plan["mode"],
             "site_identity": plan["site_identity"],
             "runtime_plan_sha256": plan["runtime_plan_sha256"],
-            "items": plan["items"],
+            "items": plan_digest_items(items),
         }
     )
     return plan
@@ -376,11 +465,18 @@ def plan_workflow_reconcile(
     state_dir: Path,
     *,
     workflow_ids: Sequence[str],
+    incident_ids: Sequence[str] = (),
+    blocked_kinds: Sequence[str] = (),
+    max_items: int | None = None,
 ) -> dict[str, Any]:
-    runtime_plan = _run_reconcile(
-        site,
-        {"mode": "plan", "workflow_ids": list(workflow_ids)},
-    )
+    payload: dict[str, Any] = {"mode": "plan", "workflow_ids": list(workflow_ids)}
+    if incident_ids:
+        payload["incident_ids"] = list(incident_ids)
+    if blocked_kinds:
+        payload["blocked_kinds"] = list(blocked_kinds)
+    if max_items is not None:
+        payload["max_items"] = int(max_items)
+    runtime_plan = _run_reconcile(site, payload)
     plan = _finalize_plan(site, runtime_plan)
     write_json_atomic(state_dir / PLAN_PATH, plan)
     return plan
@@ -402,6 +498,7 @@ def _finalize_retired_generation_plan(
         "evaluated_at": runtime_plan.get("evaluated_at"),
         "site_identity": _site_identity(site),
         "runtime_plan_sha256": runtime_plan.get("plan_sha256"),
+        "discovery": runtime_plan.get("discovery"),
         "items": items,
     }
     plan["plan_sha256"] = _canonical_sha256(
@@ -414,7 +511,7 @@ def _finalize_retired_generation_plan(
             # record still being dispatched restamps ``updated_at`` every tick,
             # and hashing it here would leave the apply unwinnable no matter what
             # the runtime digest did. See DIGEST_EXCLUDED_ITEM_FIELDS.
-            "items": retired_generation.plan_digest_items(items),
+            "items": plan_digest_items(items),
         }
     )
     return plan
@@ -480,15 +577,18 @@ def apply_retired_generation_reconcile(
     )
     current = _finalize_retired_generation_plan(site, runtime_plan)
     if current["plan_sha256"] != digest:
-        raise BootstrapError("retired generation reconcile plan changed before apply")
+        raise _changed_before_apply("retired generation reconcile", plan, current)
     # Refused here as well as in the runtime, so the operator reads the reasons
     # from the plan they approved instead of from a Pod's stderr. An item whose
     # only blocker is an open remote command is *not* refused: cancelling those
-    # is the first half of the apply.
+    # is the first half of the apply. Nor is one an earlier, partial apply
+    # already revoked: the runtime skips it and names it in the result.
     blocked = [
         f"{item.get('request_id')}: " + "; ".join(item.get("reasons") or [])
         for item in current["items"]
-        if not item.get("eligible") and not item.get("cancellable")
+        if not item.get("eligible")
+        and not item.get("cancellable")
+        and not item.get("already_revoked")
     ]
     if blocked:
         raise BootstrapError(
@@ -547,7 +647,7 @@ def apply_workflow_reconcile(
     )
     current = _finalize_plan(site, runtime_plan)
     if current["plan_sha256"] != digest:
-        raise BootstrapError("workflow reconcile plan changed before apply")
+        raise _changed_before_apply("workflow reconcile", plan, current)
     rejected = [item for item in current["items"] if not item.get("eligible")]
     if rejected:
         raise BootstrapError("workflow reconcile plan contains ineligible records")

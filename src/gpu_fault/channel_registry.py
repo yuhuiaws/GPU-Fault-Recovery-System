@@ -41,6 +41,10 @@ class ProcessorChannel:
     batchable: bool = False
     receipt: bool = False
     correlated_fault: bool = False
+    # Payloads on this channel can end up in ``incident.node_ids``; the
+    # processor must give them node correlation keys so the aggregation gate
+    # sees them in flight (F-B8).
+    incident_scoped: bool = False
     snapshot_bypass: bool = False
     spool_weight: int = 0
     summary_lane_suffix: str | None = None
@@ -105,6 +109,7 @@ TRAINING_PROGRESS_PATH = "/v1/training-progress"
 CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
     NVIDIA_KERNEL_PATH: ProcessorChannel(
         path=NVIDIA_KERNEL_PATH,
+        incident_scoped=True,
         priority_mode=ChannelPriorityMode.FAULT,
         pool=ChannelPool.FAULT,
         lane=ChannelLane.NODE,
@@ -113,6 +118,7 @@ CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
     ),
     FABRIC_MANAGER_PATH: ProcessorChannel(
         path=FABRIC_MANAGER_PATH,
+        incident_scoped=True,
         priority_mode=ChannelPriorityMode.FAULT,
         pool=ChannelPool.FAULT,
         lane=ChannelLane.NODE,
@@ -121,6 +127,7 @@ CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
     ),
     GPU_INVENTORY_PATH: ProcessorChannel(
         path=GPU_INVENTORY_PATH,
+        incident_scoped=True,
         priority_mode=ChannelPriorityMode.ROUTINE,
         pool=ChannelPool.GPU,
         lane=ChannelLane.GPU_INVENTORY,
@@ -133,6 +140,7 @@ CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
     ),
     GPU_METRICS_PATH: ProcessorChannel(
         path=GPU_METRICS_PATH,
+        incident_scoped=True,
         priority_mode=ChannelPriorityMode.EDGE_FILTERED,
         pool=ChannelPool.GPU,
         lane=ChannelLane.EDGE_SUMMARY,
@@ -148,6 +156,7 @@ CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
     ),
     HOST_TELEMETRY_PATH: ProcessorChannel(
         path=HOST_TELEMETRY_PATH,
+        incident_scoped=True,
         priority_mode=ChannelPriorityMode.EDGE_FILTERED,
         pool=ChannelPool.HOST,
         lane=ChannelLane.EDGE_SUMMARY,
@@ -163,6 +172,7 @@ CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
     ),
     NODE_LOG_PATH: ProcessorChannel(
         path=NODE_LOG_PATH,
+        incident_scoped=True,
         priority_mode=ChannelPriorityMode.EDGE_FILTERED,
         pool=ChannelPool.HOST,
         lane=ChannelLane.EDGE_SUMMARY,
@@ -221,14 +231,22 @@ TELEMETRY_SPOOL_PATH_SCHEDULE = tuple(
     for path, channel in CHANNEL_REGISTRY.items()
     for _ in range(channel.spool_weight)
 )
-FAULT_PATH_PREFIXES = (
+# A decided fault reported by a node or a provider: the raw material of a
+# storm. Tier 10 -- reserved depth, fault pool, never spooled -- but ordered
+# after the control-plane actions below so a storm cannot starve its own cure.
+DEVICE_EVENT_PATH_PREFIXES = (
     "/v1/gpu-events/",
     "/v1/provider-events/",
+)
+# The control plane acting on a decided fault, and the attempt lifecycle events
+# that finalize a workflow. Tier 0: claimed before any device event.
+CONTROL_PLANE_ACTION_PATH_PREFIXES = (
     "/v1/incidents/",
     "/v1/workflows/",
     "/v1/attempts/",
     "/v1/recovery-plans/",
 )
+FAULT_PATH_PREFIXES = DEVICE_EVENT_PATH_PREFIXES + CONTROL_PLANE_ACTION_PATH_PREFIXES
 
 
 def validate_channel_registry() -> None:
@@ -252,6 +270,19 @@ def validate_channel_registry() -> None:
             raise RuntimeError(f"{path}: summary suffix requires EDGE_SUMMARY lane")
         if channel.spool_weight < 0:
             raise RuntimeError(f"{path}: spool weight cannot be negative")
+        if channel.correlated_fault and not channel.incident_scoped:
+            raise RuntimeError(f"{path}: a correlated fault channel is incident-scoped")
+        if (
+            channel.pool in {ChannelPool.FAULT, ChannelPool.GPU, ChannelPool.HOST}
+            and path != COLLECTOR_HEALTH_PATH
+            and not channel.incident_scoped
+        ):
+            # Every channel whose findings can name a node in an incident must
+            # produce node correlation keys, or the aggregation gate cannot see
+            # its in-flight requests (F-B8).
+            raise RuntimeError(
+                f"{path}: channel writes incident nodes without node keys"
+            )
 
 
 def validate_collector_routes(paths: set[str]) -> None:
@@ -275,6 +306,10 @@ def is_fault_path(path: str) -> bool:
         path.startswith(FAULT_PATH_PREFIXES)
         or (channel is not None and channel.priority_mode is ChannelPriorityMode.FAULT)
     )
+
+
+def is_control_plane_action_path(path: str) -> bool:
+    return path.startswith(CONTROL_PLANE_ACTION_PATH_PREFIXES)
 
 
 def paths_for_pool(pool: ChannelPool) -> frozenset[str]:

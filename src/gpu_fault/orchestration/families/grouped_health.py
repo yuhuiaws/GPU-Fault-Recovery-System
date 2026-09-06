@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
+    bounded_reasons,
     FaultIncident,
     RecoveryAction,
     WorkflowOperation,
@@ -13,6 +14,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkloadState,
 )
+from gpu_fault.orchestration.disposition import DispositionApplier
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,9 @@ class GroupedHealthCallbacks:
     is_attempt_grouped_health_finding: Callable
     merge_disposition: Callable
     prepare_preempting_successor: Callable
+    preempt_parallel_job_branch: Callable[
+        [WorkflowRequest, WorkflowRequest, str], WorkflowRequest
+    ]
     quiesce_parameters: Callable
     reopen_if_terminal: Callable
     utc: Callable
@@ -52,11 +57,20 @@ class GroupedHealthService:
         callbacks: GroupedHealthCallbacks,
         *,
         aggregation_window_seconds: int,
+        workflow_preemption_enabled: bool,
     ) -> None:
         self.store = store
         self.arbiter = arbiter
         self.brancher = brancher
         self.callbacks = callbacks
+        self.dispositions = DispositionApplier(
+            arbiter=arbiter,
+            brancher=brancher,
+            aggregation_deadlines=callbacks.aggregation_deadlines,
+            prepare_preempting_successor=callbacks.prepare_preempting_successor,
+            preempt_parallel_job_branch=callbacks.preempt_parallel_job_branch,
+            workflow_preemption_enabled=workflow_preemption_enabled,
+        )
         self.aggregation_window_seconds = aggregation_window_seconds
 
     def ingest(
@@ -326,7 +340,7 @@ class GroupedHealthService:
         return (
             incident.model_copy(
                 update={
-                    "reasons": list(dict.fromkeys([*incident.reasons, reason])),
+                    "reasons": bounded_reasons([*incident.reasons, reason]),
                     "updated_at": now,
                 }
             ),
@@ -405,13 +419,11 @@ class GroupedHealthService:
                 "official_action": winner.official_action,
                 "effective_action": winner.effective_action,
                 "safety_action": winner.safety_action,
-                "reasons": list(
-                    dict.fromkeys(
-                        [
-                            *existing_incident.reasons,
-                            (f"{finding.node_id}: {finding_name}: {finding.reason}"),
-                        ]
-                    )
+                "reasons": bounded_reasons(
+                    [
+                        *existing_incident.reasons,
+                        (f"{finding.node_id}: {finding_name}: {finding.reason}"),
+                    ]
                 ),
                 "updated_at": now,
             }
@@ -430,151 +442,17 @@ class GroupedHealthService:
         mutable: bool,
         now: datetime,
     ) -> tuple[WorkflowRequest, FaultIncident]:
-        node_id = context.finding.node_id
-        if disposition == "PARALLEL_BRANCH":
-            workflow = self.brancher.append_parallel_job_branch(
-                existing_workflow,
-                candidate_workflow,
-            )
-        elif disposition == "WIDEN_BRANCH":
-            return (
-                self.brancher.widen_parallel_job_branch(
-                    existing_workflow,
-                    candidate_workflow,
-                    node_id,
-                    gpus,
-                ),
-                existing_incident,
-            )
-        elif disposition == "WIDEN_IN_PLACE":
-            return (
-                existing_workflow.model_copy(update={"updated_at": now}),
-                existing_incident,
-            )
-        elif disposition == "REPLACE_BRANCH":
-            workflow = self.brancher.replace_parallel_job_branch(
-                existing_workflow,
-                candidate_workflow,
-                node_id,
-            )
-        elif disposition == "QUEUE_BRANCH_SUCCESSOR":
-            workflow = self.brancher.append_parallel_job_branch_successor(
-                existing_workflow,
-                candidate_workflow,
-                node_id,
-            )
-        elif disposition == "ABSORB":
-            return self._absorb(
-                existing_incident,
-                existing_workflow,
-                mutable,
-                now,
-            )
-        elif disposition == "REPLACE_IN_PLACE":
-            return self._replace_in_place(
-                candidate,
-                candidate_workflow,
-                existing_incident,
-                existing_workflow,
-                now,
-            )
-        else:
-            return self._successor(
-                candidate,
-                candidate_workflow,
-                existing_incident,
-                existing_workflow,
-                now,
-            )
-        return workflow, self._winner(
-            candidate,
-            candidate_workflow,
-            existing_incident,
-            existing_workflow,
+        return self.dispositions.apply(
+            disposition,
+            node_id=context.finding.node_id,
+            candidate=candidate,
+            candidate_workflow=candidate_workflow,
+            existing_incident=existing_incident,
+            existing_workflow=existing_workflow,
+            gpu_uuids=gpus,
+            mutable=mutable,
+            now=now,
         )
-
-    def _absorb(
-        self,
-        incident: FaultIncident,
-        workflow: WorkflowRequest,
-        mutable: bool,
-        now: datetime,
-    ) -> tuple[WorkflowRequest, FaultIncident]:
-        updates = {"updated_at": now}
-        if mutable:
-            not_before, maximum = self.callbacks.aggregation_deadlines(now, workflow)
-            updates.update(
-                {
-                    "not_before": not_before,
-                    "aggregation_max_deadline": maximum,
-                }
-            )
-        return workflow.model_copy(update=updates), incident
-
-    def _replace_in_place(
-        self,
-        candidate: FaultIncident,
-        candidate_workflow: WorkflowRequest,
-        existing_incident: FaultIncident,
-        existing_workflow: WorkflowRequest,
-        now: datetime,
-    ) -> tuple[WorkflowRequest, FaultIncident]:
-        not_before, maximum = self.callbacks.aggregation_deadlines(
-            now,
-            existing_workflow,
-        )
-        return (
-            candidate_workflow.model_copy(
-                update={
-                    "request_id": existing_workflow.request_id,
-                    "incident_id": existing_incident.incident_id,
-                    "fencing_token": existing_workflow.fencing_token + 1,
-                    "not_before": not_before,
-                    "aggregation_max_deadline": maximum,
-                    "created_at": existing_workflow.created_at,
-                    "updated_at": now,
-                }
-            ),
-            candidate,
-        )
-
-    def _successor(
-        self,
-        candidate: FaultIncident,
-        candidate_workflow: WorkflowRequest,
-        existing_incident: FaultIncident,
-        existing_workflow: WorkflowRequest,
-        now: datetime,
-    ) -> tuple[WorkflowRequest, FaultIncident]:
-        workflow = candidate_workflow.model_copy(
-            update={
-                "incident_id": existing_incident.incident_id,
-                "predecessor_workflow_id": (existing_workflow.request_id),
-                "fencing_token": existing_workflow.fencing_token,
-                "not_before": None,
-                "updated_at": now,
-            }
-        )
-        return (
-            self.callbacks.prepare_preempting_successor(
-                existing_workflow,
-                workflow,
-            ),
-            candidate,
-        )
-
-    def _winner(
-        self,
-        candidate: FaultIncident,
-        candidate_workflow: WorkflowRequest,
-        existing_incident: FaultIncident,
-        existing_workflow: WorkflowRequest,
-    ) -> FaultIncident:
-        if self.arbiter.workflow_recovery_rank(
-            candidate_workflow
-        ) > self.arbiter.workflow_recovery_rank(existing_workflow):
-            return candidate
-        return existing_incident
 
     def _finalize(
         self,

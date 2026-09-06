@@ -492,8 +492,13 @@ def test_destructive_probe_does_not_count_its_own_injected_lines_as_resets() -> 
     )
 
 
-def _collect014_harness(*, fail_status: str = "BLOCKED", fail_reasons=None,
-                        ledger_after_fail: int = 0, positive_raises: bool = False):
+def _collect014_harness(
+    *,
+    fail_status: str = "BLOCKED",
+    fail_reasons=None,
+    ledger_after_fail: int = 0,
+    positive_raises: bool = False,
+):
     """Stub the four collaborators run_collect014 drives and record calls."""
 
     from datetime import datetime, timezone
@@ -626,8 +631,8 @@ def test_collect014_restores_the_node_before_the_positive_injection(
     # PASS even though the ledger already held a full reset from an earlier
     # run: only rows the injection added count (2026-09-06 08:51Z FAIL).
     assert result["verdict"] == "PASS", result
-    assert calls.index("wait-fail") < calls.index("restore") < calls.index(
-        "append-sxid"
+    assert (
+        calls.index("wait-fail") < calls.index("restore") < calls.index("append-sxid")
     ), calls
     assert len(result["restore_workflows"]) == 2, result["restore_workflows"]
     assert seen["positive_kwargs"].get("observed_after") is not None, seen
@@ -827,7 +832,10 @@ def test_device_plugin_discovery_ignores_daemonsets_that_schedule_nowhere() -> N
             return json.dumps({"items": items})
 
     plugin = collect_destructive.DevicePluginFixture(
-        Regional(), token="nvidia-device-plugin", node="node-a", resource="nvidia.com/gpu"
+        Regional(),
+        token="nvidia-device-plugin",
+        node="node-a",
+        resource="nvidia.com/gpu",
     )
     found = plugin.discover()
     assert found["name"] == "hyperpod-dependencies-nvidia-device-plugin", found

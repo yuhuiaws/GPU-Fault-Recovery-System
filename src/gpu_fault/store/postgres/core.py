@@ -5,7 +5,11 @@ from typing import Any, Iterator, cast
 
 from pydantic import BaseModel
 
-from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.store.shared.errors import (
+    NotFoundError,
+    StaleWriteError,
+    TransactionRequiredError,
+)
 
 
 class PostgresCoreMixin:
@@ -27,17 +31,46 @@ class PostgresCoreMixin:
     def pool_metrics(self) -> dict[str, Any]:
         return cast("dict[str, Any]", self._db.metrics_snapshot())
 
-    def _put(self, kind: str, key: str, value: BaseModel) -> None:
+    def _put(
+        self,
+        kind: str,
+        key: str,
+        value: BaseModel,
+        *,
+        expected: BaseModel | None = None,
+    ) -> None:
+        """Write one row; with ``expected`` only if the row still equals it.
+
+        The unconditional form is the historical whole-row upsert. The
+        conditional form is the CAS a writer uses when it read the row without
+        a lock and must not overwrite a concurrent change (F-J4): the update
+        matches on the full JSON payload it read, and a miss -- changed or
+        deleted -- raises :class:`StaleWriteError` instead of landing.
+        """
+
+        if expected is None:
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO gpu_fault_objects(kind, key, payload)
+                    VALUES (%s, %s, %s::jsonb)
+                    ON CONFLICT(kind, key)
+                    DO UPDATE SET payload=excluded.payload
+                    """,
+                    (kind, key, value.model_dump_json()),
+                )
+            return
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO gpu_fault_objects(kind, key, payload)
-                VALUES (%s, %s, %s::jsonb)
-                ON CONFLICT(kind, key)
-                DO UPDATE SET payload=excluded.payload
+                UPDATE gpu_fault_objects
+                SET payload=%s::jsonb
+                WHERE kind=%s AND key=%s AND payload=%s::jsonb
                 """,
-                (kind, key, value.model_dump_json()),
+                (value.model_dump_json(), kind, key, expected.model_dump_json()),
             )
+            if cursor.rowcount != 1:
+                raise StaleWriteError(f"{kind}/{key} changed since it was read")
 
     def _delete(self, kind: str, key: str) -> None:
         with self._db.cursor() as cursor:
@@ -69,6 +102,12 @@ class PostgresCoreMixin:
         return self._decode(kind, row[0])
 
     def _get_for_update(self, kind: str, key: str) -> Any:
+        # The row lock lives as long as the transaction. Outside one, the
+        # autocommit pool releases it before the caller sees the row (F-J4).
+        if not getattr(self._db, "in_transaction", True):
+            raise TransactionRequiredError(
+                f"_get_for_update({kind}/{key}) requires an enclosing transaction"
+            )
         with self._db.cursor() as cursor:
             cursor.execute(
                 """

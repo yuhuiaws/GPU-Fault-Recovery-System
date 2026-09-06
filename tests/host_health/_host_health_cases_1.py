@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.app.ingest import telemetry as telemetry_ingest
 from gpu_fault.host_health import (
     HostMetricSample,
     HostTelemetryBatch,
@@ -21,6 +22,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from gpu_fault.store import InMemoryStore, SqliteStore
+from gpu_fault.store.shared.health_signals import finding_health_signal_key
 from tests._builders import (
     asgi_client,
     build_store,
@@ -289,6 +291,11 @@ def test_metric_policy_emits_only_active_transition() -> None:
     initial = first.evaluate_metrics(
         telemetry("batch-1", "filesystem_used_percent", 99)
     )
+    # The claim no longer latches ``notified``; the deliverer does, after commit
+    # (F-D11 P0-38B), so the test plays the delivery half here.
+    store.mark_health_signal_notified(
+        finding_health_signal_key(initial[0]), notified_at=NOW
+    )
     repeated = second.evaluate_metrics(
         telemetry("batch-2", "filesystem_used_percent", 99, NOW + timedelta(seconds=15))
     )
@@ -372,6 +379,9 @@ def test_sustained_host_resource_risk_emits_once_and_rearms(
     assert len(finding) == 1
     assert finding[0].policy_source == "SITE_HOST_RESOURCE_HEALTH"
     assert finding[0].recommended_action is RecoveryAction.RUN_DIAGNOSTICS
+    policy.store.mark_health_signal_notified(
+        finding_health_signal_key(finding[0]), notified_at=NOW + timedelta(seconds=15)
+    )
     assert not policy.evaluate_metrics(
         batch("duplicate", value, NOW + timedelta(seconds=30))
     ), (
@@ -487,10 +497,32 @@ def test_sustained_host_resource_state_survives_sqlite_restart(
         second_store.close()
 
 
+class _IngestionClock:
+    """Drive the control plane's receive time for host telemetry (F-M2).
+
+    Sustained-signal windows are measured on the time the control plane
+    accepted each batch, not on the node's ``observed_at``; a test that
+    wants "fifteen seconds later" has to move this clock, not just the
+    payload timestamp.
+    """
+
+    def __init__(self, monkeypatch, start: datetime) -> None:
+        self.now = start
+        clock = self
+
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return clock.now if tz is not None else clock.now.replace(tzinfo=None)
+
+        monkeypatch.setattr(telemetry_ingest, "datetime", _Frozen)
+
+
 def test_sustained_host_resource_risk_sends_fixed_email(monkeypatch) -> None:
     monkeypatch.setenv("GPU_FAULT_MEMORY_PRESSURE_DURATION_SECONDS", "15")
     notifier = RecordingNotifier()
     context = ApplicationContext(notification_notifier=notifier)
+    clock = _IngestionClock(monkeypatch, NOW)
 
     async def scenario() -> None:
         async with asgi_client(context) as client:
@@ -500,6 +532,7 @@ def test_sustained_host_resource_risk_sends_fixed_email(monkeypatch) -> None:
                     "memory-low-initial", "memory_available_percent", 2
                 ).model_dump(mode="json"),
             )
+            clock.now = NOW + timedelta(seconds=15)
             sustained = await client.post(
                 "/v1/collector-events/host-telemetry",
                 json=telemetry(
@@ -578,6 +611,7 @@ def test_gpu_low_utilization_email_is_aggregated_per_node(monkeypatch) -> None:
     monkeypatch.setenv("GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS", "15")
     notifier = RecordingNotifier()
     context = ApplicationContext(notification_notifier=notifier)
+    clock = _IngestionClock(monkeypatch, NOW)
 
     def batch(batch_id: str, observed_at: datetime):
         return host_telemetry_batch(
@@ -607,6 +641,7 @@ def test_gpu_low_utilization_email_is_aggregated_per_node(monkeypatch) -> None:
                 "/v1/collector-events/host-telemetry",
                 json=batch("gpu-low-initial", NOW).model_dump(mode="json"),
             )
+            clock.now = NOW + timedelta(seconds=15)
             sustained = await client.post(
                 "/v1/collector-events/host-telemetry",
                 json=batch("gpu-low-sustained", NOW + timedelta(seconds=15)).model_dump(
@@ -751,10 +786,20 @@ def test_inventory_card_loss_reboots_then_escalates_to_replacement(
                 == requirement["metrics"]
             )
 
+        reboot_index = next(
+            index
+            for index, step in enumerate(workflow.official_steps)
+            if step.operation is WorkflowOperation.RESTART_NODE
+        )
         failed = copy_model(
             workflow,
             status=WorkflowStatus.FAILED,
+            # The reboot ran and completed before the validation failed; the
+            # classifier reads that from the record, not from list position.
+            completed_step_indexes=[reboot_index],
+            completed_operations=[WorkflowOperation.RESTART_NODE],
             step_executions=[
+                workflow_step_execution(reboot_index, WorkflowOperation.RESTART_NODE),
                 workflow_step_execution(
                     validation_index,
                     validation_operation,
@@ -764,7 +809,7 @@ def test_inventory_card_loss_reboots_then_escalates_to_replacement(
                         "failed_nodes": ["node-a"],
                         "node_failures": {"node-a": ["post-reboot inventory mismatch"]},
                     },
-                )
+                ),
             ],
         )
         context.store.save_workflow(failed)

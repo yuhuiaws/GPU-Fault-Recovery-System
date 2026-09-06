@@ -478,3 +478,29 @@ def test_apply_refuses_when_no_plan_was_reviewed(
             expected_plan_sha256="d" * 64,
             reference="pre-deploy-6459c07ea279",
         )
+
+
+def test_a_changed_plan_names_the_field_that_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "plan changed before apply" told the operator nothing about what changed.
+
+    The record is live, so the plan changing is the expected case, not the
+    exceptional one; the refusal has to say which field of which item moved so
+    the operator can tell a dispatch tick from a re-plan.
+    """
+
+    _fake_runner(monkeypatch)
+    site = _site(tmp_path)
+    plan = reconcile.plan_retired_generation_reconcile(
+        site, tmp_path, workflow_ids=(WORKFLOW,)
+    )
+    _fake_runner(monkeypatch, _item(fencing_token=2))
+
+    with pytest.raises(BootstrapError, match=rf"{WORKFLOW}.*fencing_token.*1.*2"):
+        reconcile.apply_retired_generation_reconcile(
+            site,
+            tmp_path,
+            expected_plan_sha256=plan["plan_sha256"],
+            reference="pre-deploy-6459c07ea279",
+        )

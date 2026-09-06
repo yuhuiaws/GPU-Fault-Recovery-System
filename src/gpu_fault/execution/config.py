@@ -53,6 +53,48 @@ def managed_recovery_step_overrides(
     return {operation: window for operation in MANAGED_RECOVERY_OPERATIONS}
 
 
+# Steps whose whole purpose is to wait for a human to act and confirm
+# (a mechanical inspection). Their waiting ceiling and the deadlines of the
+# workflow that contains them follow the operator's clock, not the machine's.
+OPERATOR_ACKNOWLEDGEMENT_OPERATIONS = frozenset({WorkflowOperation.CHECK_MECHANICALS})
+DEFAULT_OPERATOR_ACKNOWLEDGEMENT_TIMEOUT_SECONDS = 86400
+
+
+def operator_acknowledgement_timeout_seconds(values: Mapping[str, str]) -> int:
+    """How long a step may wait for an operator's acknowledgement.
+
+    One working day by default: long enough for a mechanical check, finite so
+    the workflow cannot hang for ever. Still a gate -- it can be tightened by
+    ``GPU_FAULT_OPERATOR_ACKNOWLEDGEMENT_TIMEOUT_SECONDS`` -- just one whose
+    threshold matches the operation's meaning instead of the ten minutes a
+    reset or a restore is allowed.
+    """
+
+    value = int(
+        values.get("GPU_FAULT_OPERATOR_ACKNOWLEDGEMENT_TIMEOUT_SECONDS", "86400")
+    )
+    if value <= 0:
+        raise WorkflowExecutionError(
+            "operator acknowledgement timeout must be positive"
+        )
+    return value
+
+
+def default_step_waiting_overrides(
+    values: Mapping[str, str],
+) -> dict[WorkflowOperation, int]:
+    """Every per-operation waiting ceiling the environment implies."""
+
+    acknowledgement = operator_acknowledgement_timeout_seconds(values)
+    return {
+        **managed_recovery_step_overrides(values),
+        **{
+            operation: acknowledgement
+            for operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
+        },
+    }
+
+
 @dataclass(frozen=True)
 class ProductionExecutorConfig:
     enabled: bool
@@ -60,6 +102,19 @@ class ProductionExecutorConfig:
     allowed_operations: frozenset[WorkflowOperation]
     lease_duration_seconds: int = 180
     workflow_execution_timeout_seconds: int = 1800
+    # A workflow that contains an operator-acknowledgement step (see
+    # OPERATOR_ACKNOWLEDGEMENT_OPERATIONS) gets at least this long before its
+    # execution deadline and its F-N1 lifetime, from the claim that admitted
+    # the step; the step itself waits at most this long.
+    operator_acknowledgement_timeout_seconds: int = (
+        DEFAULT_OPERATOR_ACKNOWLEDGEMENT_TIMEOUT_SECONDS
+    )
+    # F-N1: hard lifetime of a remediation, by kind. A job workflow (one that
+    # stops and restarts a training job, usually multi-node) and a single-node
+    # workflow without a job each get one budget for their whole escalation
+    # chain; at the deadline the workflow fails and goes to an operator.
+    job_workflow_lifetime_seconds: int = 3600
+    node_workflow_lifetime_seconds: int = 3600
     # A single step's own bound, held independently of whatever retry counter
     # that step's adapter keeps. Every per-operation counter
     # (``verify_max_attempts``, ``gpu_reset_commit_attempt``) is read back out
@@ -150,6 +205,14 @@ class ProductionExecutorConfig:
             )
         )
         step_timeout = int(values.get("GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS", "600"))
+        job_lifetime = int(
+            values.get("GPU_FAULT_JOB_WORKFLOW_MAX_LIFETIME_SECONDS", "3600")
+        )
+        node_lifetime = int(
+            values.get("GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS", "3600")
+        )
+        if job_lifetime <= 0 or node_lifetime <= 0:
+            raise RuntimeError("workflow lifetimes must be positive")
         step_warning = int(values.get("GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS", "300"))
         if step_timeout <= 0:
             raise WorkflowExecutionError("workflow step timeout must be positive")
@@ -161,7 +224,8 @@ class ProductionExecutorConfig:
             raise WorkflowExecutionError(
                 "workflow step warning threshold must not exceed the step timeout"
             )
-        overrides = managed_recovery_step_overrides(values)
+        overrides = default_step_waiting_overrides(values)
+        acknowledgement = operator_acknowledgement_timeout_seconds(values)
         for operation, limit in sorted(overrides.items()):
             if limit < step_timeout:
                 raise WorkflowExecutionError(
@@ -197,6 +261,9 @@ class ProductionExecutorConfig:
             allowed_operations=allowed,
             lease_duration_seconds=lease_duration,
             workflow_execution_timeout_seconds=workflow_timeout,
+            operator_acknowledgement_timeout_seconds=acknowledgement,
+            job_workflow_lifetime_seconds=job_lifetime,
+            node_workflow_lifetime_seconds=node_lifetime,
             step_waiting_timeout_seconds=step_timeout,
             step_waiting_warning_seconds=step_warning,
             step_waiting_timeout_overrides=overrides,
@@ -217,16 +284,61 @@ class WorkflowDispatcherConfig:
     batch_size: int = 100
     max_workers: int = 8
     confirm_cluster_name: str | None = None
+    # Seconds one process holds the fleet-wide dispatch lease; 0 disables the
+    # lease and every process scans (the pre-F-A1 behaviour, kept for direct
+    # construction in tests). Production enables it from the environment.
+    dispatch_lease_seconds: float = 0.0
+    # How many times the failure handler may raise for one FAILED workflow
+    # before the record is stamped handled and counted as abandoned (F-A6).
+    failure_handling_max_attempts: int = 5
+    # Backoff written into ``not_before`` after an unrecognised internal error,
+    # so the record stays executable without being retried every tick.
+    internal_error_backoff_seconds: float = 60.0
+    # F-N1 §8: how long a not-yet-started job workflow waits for another
+    # remediation on one of its nodes before it gives up by stopping the job.
+    node_busy_wait_seconds: float = 300.0
+    # F-C7: how long one dispatch cycle waits for its batch before it stops
+    # queuing more work and scans again. Rows not started by then stay
+    # PENDING for the next cycle; running ones finish. 0 waits for the batch.
+    cycle_deadline_seconds: float = 0.0
+    # F-A5: the PENDING watchdog observes and never terminalizes. When the
+    # oldest dispatchable PENDING / SAFETY_PENDING row the scan saw has been
+    # eligible for longer than this, the tick logs a warning naming it and
+    # counts ``pending_age_warnings_total``; ``pending_age_seconds_max`` is
+    # the gauge behind it. 0 disables the warning, never the gauge.
+    pending_age_warning_seconds: float = 900.0
 
     @classmethod
     def from_environment(cls, executor_enabled: bool) -> WorkflowDispatcherConfig:
         raw_enabled = os.getenv("GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER", "true")
+        poll_interval_seconds = float(
+            os.getenv("GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS", "5")
+        )
         return cls(
             enabled=(executor_enabled and raw_enabled.strip().lower() == "true"),
-            poll_interval_seconds=float(
-                os.getenv("GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS", "5")
-            ),
+            poll_interval_seconds=poll_interval_seconds,
             batch_size=int(os.getenv("GPU_FAULT_WORKFLOW_BATCH_SIZE", "100")),
             max_workers=int(os.getenv("GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS", "8")),
             confirm_cluster_name=(os.getenv("GPU_FAULT_HYPERPOD_CLUSTER") or None),
+            dispatch_lease_seconds=float(
+                os.getenv(
+                    "GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS",
+                    str(max(15.0, poll_interval_seconds * 3)),
+                )
+            ),
+            failure_handling_max_attempts=int(
+                os.getenv("GPU_FAULT_WORKFLOW_FAILURE_HANDLING_MAX_ATTEMPTS", "5")
+            ),
+            internal_error_backoff_seconds=float(
+                os.getenv("GPU_FAULT_WORKFLOW_INTERNAL_ERROR_BACKOFF_SECONDS", "60")
+            ),
+            node_busy_wait_seconds=float(
+                os.getenv("GPU_FAULT_JOB_WORKFLOW_NODE_BUSY_WAIT_SECONDS", "300")
+            ),
+            cycle_deadline_seconds=float(
+                os.getenv("GPU_FAULT_WORKFLOW_DISPATCH_CYCLE_SECONDS", "0")
+            ),
+            pending_age_warning_seconds=float(
+                os.getenv("GPU_FAULT_WORKFLOW_PENDING_AGE_WARNING_SECONDS", "900")
+            ),
         )

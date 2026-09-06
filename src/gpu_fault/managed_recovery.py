@@ -179,6 +179,7 @@ class HyperPodManagedRecoveryObserver:
                 item
                 for item in context.workflow.step_executions
                 if item.step_index == context.step_index
+                and item.operation is context.step.operation
                 and item.status is WorkflowStepStatus.WAITING
             ),
             None,

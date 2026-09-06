@@ -320,12 +320,16 @@ def test_processor_discards_result_after_hard_deadline(monkeypatch) -> None:
 
     current = store.get_processor_request(request.request_id)
     metrics = processor.metrics_snapshot()
-    assert current.status is ProcessorRequestStatus.LEASED
-    assert not processor.is_healthy()
+    # F-D7: the deadline is charged to the request (released with a retry
+    # count and a backoff); one timeout does not make the process unhealthy.
+    assert current.status is ProcessorRequestStatus.PENDING
+    assert current.retry_count == 1
+    assert current.not_before is not None
+    assert processor.is_healthy()
     assert metrics["in_flight"] == 0
     assert metrics["deadline_exceeded_total"] == 1
-    assert metrics["healthy"] == 0
-    assert unhealthy_reasons == ["processor request execution deadline exceeded"]
+    assert metrics["healthy"] == 1
+    assert unhealthy_reasons == []
 
 
 def test_processor_retries_completion_without_replaying_handler(monkeypatch) -> None:
@@ -673,7 +677,7 @@ def test_processor_notifications_wake_claims_and_extend_fallback(monkeypatch) ->
     request_id = "request-notification-test"
     shard = processor_partition_id(request_id, 8)
 
-    def listen(stop, owner_id, shard_count, notify, on_state):
+    def listen(stop, owner_id, shard_count, notify, on_state, **_kwargs):
         assert owner_id == "pod-a:1"
         assert shard_count == 8
         on_state(True, shard)
@@ -912,6 +916,7 @@ def test_processor_only_expires_healthy_telemetry_summaries() -> None:
         build_store(),
         owner_id="processor-a",
         internal_token="token-" + "x" * 32,
+        active_consumers=False,
         health_summary_stale_seconds=60,
     )
     observed_at = datetime.now(timezone.utc) - timedelta(minutes=5)
@@ -964,6 +969,7 @@ def test_processor_expires_context_only_after_newer_state_exists() -> None:
         store,
         owner_id="processor-a",
         internal_token="token-" + "x" * 32,
+        active_consumers=False,
         observation_stale_seconds=60,
         training_progress_stale_seconds=60,
     )

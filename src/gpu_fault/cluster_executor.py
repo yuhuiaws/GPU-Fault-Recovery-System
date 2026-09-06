@@ -21,15 +21,17 @@ from gpu_fault.aws_errors import (
 from gpu_fault.env_validation import (
     validate_gpu_fault_environment,
 )
-from gpu_fault.logging_setup import configure_logging
-from gpu_fault.transport.http_client import urlopen
-from gpu_fault.transport_errors import (
-    retryable_transport_result,
-)
 from gpu_fault.execution import WorkflowStepContext
 from gpu_fault.execution.fleet_preflight import (
     command_requires_fleet_preflight,
     fleet_preflight_reason,
+)
+from gpu_fault.fleet import (
+    AgentLifecycleState,
+    AgentRecord,
+    AgentTransitionRequest,
+    FleetReadinessReport,
+    FleetReadinessRequest,
 )
 from gpu_fault.hyperpod import (
     HyperPodAdapterConfig,
@@ -39,17 +41,12 @@ from gpu_fault.hyperpod import (
 from gpu_fault.hyperpod_spares import (
     HyperPodSpareCoordinator,
 )
-from gpu_fault.fleet import (
-    AgentLifecycleState,
-    AgentRecord,
-    AgentTransitionRequest,
-    FleetReadinessReport,
-    FleetReadinessRequest,
-)
+from gpu_fault.logging_setup import configure_logging
 from gpu_fault.models import (
     AdvisoryNotification,
     WorkflowStepExecution,
     WorkflowStepStatus,
+    execution_phase,
 )
 from gpu_fault.regional import (
     RegionalExecutorReadinessRequest,
@@ -71,13 +68,16 @@ from gpu_fault.regional import (
 from gpu_fault.regional_compatibility import (
     CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
 )
-from gpu_fault.telemetry import RawEvidenceRecord
 from gpu_fault.runtime_adapters import (
     HyperPodLifecycleStepAdapter,
     KubernetesWorkflowAdapter,
     NodeActionWorkflowAdapter,
 )
-
+from gpu_fault.telemetry import RawEvidenceRecord
+from gpu_fault.transport.http_client import urlopen
+from gpu_fault.transport_errors import (
+    retryable_transport_result,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -825,7 +825,7 @@ class ClusterActionExecutor:
             ):
                 steps = (
                     command.workflow.safety_steps
-                    if command.workflow.blocked_reasons
+                    if command.workflow.executes_safety_steps
                     else command.workflow.official_steps
                 )
                 preflight_error = fleet_preflight_reason(
@@ -865,6 +865,7 @@ class ClusterActionExecutor:
                     step_index=command.step_index,
                     operation=command.step.operation,
                     status=WorkflowStepStatus.WAITING,
+                    phase=execution_phase(workflow),
                     adapter_operation_id=(f"remote/{command.command_id}"),
                     details=command.result_details,
                 )

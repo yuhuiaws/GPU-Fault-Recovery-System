@@ -12,6 +12,10 @@ class ProcessorMetricsMixin:
     # Attributes supplied by the composed concrete implementation.
     _completion_failures_total: Any
     _completion_retries_total: Any
+    _completion_failure_releases_total: int
+    _retry_horizon_failures_total: int
+    _renewal_errors_total: int
+    _renewal_fenced_total: int
     _claimed_not_started: dict[str, ProcessorRequest]
     _claimed_not_started_released_total: int
     _deadline_exceeded_total: Any
@@ -22,11 +26,16 @@ class ProcessorMetricsMixin:
     _in_flight: Any
     _lane_wait: dict[str, dict[str, float | int]]
     _lane_holder_by_path: dict[str, dict[str, float | int]]
-    _notification_reconnects_total: Any
-    _notification_shard: Any
-    _notifications_enabled: Any
-    _notifications_filtered_total: Any
-    _notifications_received_total: Any
+    _notification_reconnects_total: int
+    _notification_shard: int | None
+    _notification_listener_connected: bool
+    _notification_shardless_episodes_total: int
+    _notifications_enabled: bool
+    _notifications_filtered_total: int
+    _notifications_received_total: int
+    _fault_rows_skipped_by_observation_total: int
+    _fault_rows_blocked_by_observation: int
+    _interlock_probes_total: int
     _processed: dict[str, int]
     _retry_delay_seconds_max: float
     _retry_rescheduled_by_path: dict[str, int]
@@ -133,6 +142,12 @@ class ProcessorMetricsMixin:
                 "deadline_exceeded_total": (self._deadline_exceeded_total),
                 "completion_retries_total": (self._completion_retries_total),
                 "completion_failures_total": (self._completion_failures_total),
+                "completion_failure_releases_total": (
+                    self._completion_failure_releases_total
+                ),
+                "retry_horizon_failures_total": (self._retry_horizon_failures_total),
+                "renewal_errors_total": self._renewal_errors_total,
+                "renewal_fenced_total": self._renewal_fenced_total,
                 "retry_rescheduled_total": self._retry_rescheduled_total,
                 "retry_rescheduled_by_path": dict(self._retry_rescheduled_by_path),
                 "retry_delay_seconds_max": self._retry_delay_seconds_max,
@@ -145,6 +160,22 @@ class ProcessorMetricsMixin:
                     else -1
                 ),
                 "notification_shard_count": (self.processor_notification_shard_count),
+                # F-D11: connected and enabled are different facts once
+                # there are more consumer processes than shards.
+                "notification_listener_connected": int(
+                    self._notification_listener_connected
+                ),
+                "notification_shardless_episodes_total": (
+                    self._notification_shardless_episodes_total
+                ),
+                # F-D3: liveness of the fault <-> observation interlock.
+                "fault_rows_skipped_by_observation_total": (
+                    self._fault_rows_skipped_by_observation_total
+                ),
+                "fault_rows_blocked_by_observation": (
+                    self._fault_rows_blocked_by_observation
+                ),
+                "interlock_probes_total": self._interlock_probes_total,
                 "fault_pressure": {
                     "active": int(self._processor_fault_pressure_active),
                     "evidence_workers": (self.fault_pressure_evidence_workers),

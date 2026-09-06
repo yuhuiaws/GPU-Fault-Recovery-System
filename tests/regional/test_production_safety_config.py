@@ -606,6 +606,34 @@ def test_completion_watcher_outbox_defaults_are_rollback_compatible() -> None:
     assert "GPU_FAULT_COMPLETION_OUTBOX_REPLAY_BATCH_SIZE" not in names
 
 
+def test_completion_watcher_exposes_controller_metrics() -> None:
+    """The watcher's counters are scraped like every other GPU-fault workload.
+
+    A standalone watch loop has no HTTP surface, so the port, the env var that
+    sets it and the scrape annotations must all be present or the counters
+    stay invisible.
+    """
+    documents = list(
+        yaml.safe_load_all(
+            (ROOT / "deploy/dataplane/completion-watcher.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    deployment = next(item for item in documents if item.get("kind") == "Deployment")
+    annotations = deployment["spec"]["template"]["metadata"]["annotations"]
+    watcher = container(deployment)
+    env = {item["name"]: item.get("value") for item in watcher.get("env", [])}
+    ports = {item.get("name"): item for item in watcher.get("ports", [])}
+
+    assert annotations["prometheus.io/scrape"] == "true", annotations
+    assert annotations["prometheus.io/port"] == "9109", annotations
+    assert annotations["prometheus.io/path"] == "/metrics", annotations
+    assert env["GPU_FAULT_COMPLETION_WATCHER_METRICS_PORT"] == "9109", env
+    assert ports["metrics"]["containerPort"] == 9109, ports
+    assert ports["metrics"].get("protocol", "TCP") == "TCP", ports
+
+
 def test_aurora_rotation_restarts_every_database_consumer() -> None:
     documents = list(
         yaml.safe_load_all(
@@ -693,6 +721,8 @@ def test_control_plane_jobs_select_control_plane_component() -> None:
     for relative in (
         "deploy/control-plane/regional/aurora-credential-refresh.yaml",
         "deploy/migrations/postgres-schema-ensure-job.yaml",
+        "deploy/migrations/postgres-index-build-job.yaml",
+        "deploy/migrations/postgres-schema-preflight-job.yaml",
         "deploy/migrations/postgres-counter-shards-finalize-job.yaml",
         "deploy/migrations/postgres-counter-shards-rollback-job.yaml",
     ):

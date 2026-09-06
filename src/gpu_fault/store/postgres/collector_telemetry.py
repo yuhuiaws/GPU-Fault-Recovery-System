@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event as ThreadEvent
 from typing import Any, Callable
 
 from gpu_fault.attempt_observation_state import (
+    TERMINAL_WORKLOAD_PHASES,
     terminal_attempt_observation_state,
 )
 from gpu_fault.models import TerminalEvent
@@ -16,6 +18,104 @@ from gpu_fault.telemetry_models import (
     WorkloadObservationState,
 )
 from gpu_fault.training_models import TrainingProgressState
+from gpu_fault.store.shared.group_commit import submit_group_commit
+
+LOGGER = logging.getLogger(__name__)
+
+_TERMINAL_PHASE_LIST = ", ".join(
+    f"'{phase.value}'" for phase in sorted(TERMINAL_WORKLOAD_PHASES)
+)
+_TERMINAL_EVENT_KEY = (
+    "{cluster_id} || '/' || {attempt_id} || '/TrainingAttemptTerminal'"
+)
+
+# One statement per hot-state mode. Each is driven by the observation rows that
+# are still non-terminal (or, in dual mode, present on one side only) and joins
+# the terminal event to them -- never the other way round. Driving from the
+# event kind made the sweep scan every terminal event the cluster ever
+# recorded, and read "event without observation row" as an inconsistency to
+# repair, re-creating rows that retention had just deleted (F-G7 / P1-50D,
+# P2-50G). ``%(cursor)s`` is the progress cursor: the observation key the
+# previous sweep stopped at, or NULL.
+_SWEEP_CANDIDATES = {
+    "dedicated": f"""
+        SELECT dedicated.key, event.payload
+        FROM gpu_fault_attempt_observations AS dedicated
+        JOIN gpu_fault_objects AS event
+          ON event.kind='event'
+         AND event.key={
+        _TERMINAL_EVENT_KEY.format(
+            cluster_id="dedicated.cluster_id", attempt_id="dedicated.attempt_id"
+        )
+    }
+        WHERE dedicated.payload->'observation'->>'workload_phase'
+              NOT IN ({_TERMINAL_PHASE_LIST})
+          AND (%(cursor)s::text IS NULL OR dedicated.key > %(cursor)s)
+        ORDER BY dedicated.key
+        LIMIT %(limit)s
+    """,
+    "legacy": f"""
+        SELECT legacy.key, event.payload
+        FROM gpu_fault_objects AS legacy
+        JOIN gpu_fault_objects AS event
+          ON event.kind='event'
+         AND event.key={
+        _TERMINAL_EVENT_KEY.format(
+            cluster_id="(legacy.payload->'observation'->>'cluster_id')",
+            attempt_id="(legacy.payload->'observation'->>'attempt_id')",
+        )
+    }
+        WHERE legacy.kind='attempt_observation'
+          AND legacy.payload->'observation'->>'workload_phase'
+              NOT IN ({_TERMINAL_PHASE_LIST})
+          AND (%(cursor)s::text IS NULL OR legacy.key > %(cursor)s)
+        ORDER BY legacy.key
+        LIMIT %(limit)s
+    """,
+    "dual": f"""
+        WITH legacy AS (
+            SELECT key, payload
+            FROM gpu_fault_objects
+            WHERE kind='attempt_observation'
+        ),
+        rows AS (
+            SELECT
+                COALESCE(dedicated.key, legacy.key) AS key,
+                COALESCE(
+                    dedicated.cluster_id,
+                    legacy.payload->'observation'->>'cluster_id'
+                ) AS cluster_id,
+                COALESCE(
+                    dedicated.attempt_id,
+                    legacy.payload->'observation'->>'attempt_id'
+                ) AS attempt_id,
+                dedicated.payload->'observation'->>'workload_phase'
+                    AS dedicated_phase,
+                legacy.payload->'observation'->>'workload_phase'
+                    AS legacy_phase
+            FROM gpu_fault_attempt_observations AS dedicated
+            FULL OUTER JOIN legacy ON legacy.key=dedicated.key
+        )
+        SELECT rows.key, event.payload
+        FROM rows
+        JOIN gpu_fault_objects AS event
+          ON event.kind='event'
+         AND event.key={
+        _TERMINAL_EVENT_KEY.format(
+            cluster_id="rows.cluster_id", attempt_id="rows.attempt_id"
+        )
+    }
+        WHERE (
+              rows.dedicated_phase IS NULL
+              OR rows.dedicated_phase NOT IN ({_TERMINAL_PHASE_LIST})
+              OR rows.legacy_phase IS NULL
+              OR rows.legacy_phase NOT IN ({_TERMINAL_PHASE_LIST})
+          )
+          AND (%(cursor)s::text IS NULL OR rows.key > %(cursor)s)
+        ORDER BY rows.key
+        LIMIT %(limit)s
+    """,
+}
 
 
 @dataclass(frozen=True)
@@ -77,6 +177,11 @@ class PostgresCollectorTelemetryMixin:
     _attempt_observation_queue: Any
 
     _attempt_observation_condition: Any
+    _attempt_observation_leader_active: bool = False
+    # Where the terminalization sweep stopped last time (observation key), or
+    # None once it has wrapped. Per store instance; a lost cursor only costs
+    # one pass from the start.
+    _attempt_observation_sweep_cursor: str | None = None
     _db: Any
     _decode: Callable[..., Any]
     _get_optional: Callable[..., Any]
@@ -367,16 +472,8 @@ class PostgresCollectorTelemetryMixin:
                 "result": False,
                 "error": None,
             }
-            with self._attempt_observation_condition:
-                leader = not self._attempt_observation_queue
-                self._attempt_observation_queue.append(entry)
-                if not leader:
-                    self._attempt_observation_condition.notify()
-            if leader:
-                with self._attempt_observation_condition:
-                    self._attempt_observation_condition.wait(timeout=0.01)
-                    batch = self._attempt_observation_queue[:64]
-                    del self._attempt_observation_queue[: len(batch)]
+
+            def flush(batch: list[Any]) -> None:
                 try:
                     accepted = self._save_attempt_observations_batch(
                         [item["observation"] for item in batch]
@@ -388,11 +485,21 @@ class PostgresCollectorTelemetryMixin:
                         item["error"] = exc
                 for item in batch:
                     item["event"].set()
-            if not entry["event"].wait(timeout=30):
-                raise TimeoutError("attempt observation batch did not flush")
+
+            try:
+                submit_group_commit(
+                    entry,
+                    condition=self._attempt_observation_condition,
+                    queue=self._attempt_observation_queue,
+                    host=self,
+                    active_attr="_attempt_observation_leader_active",
+                    flush=flush,
+                )
+            except TimeoutError as exc:
+                raise TimeoutError("attempt observation batch did not flush") from exc
             if entry["error"] is not None:
                 raise entry["error"]
-            return entry["result"]
+            return bool(entry["result"])
         return self._save_attempt_observation_now(observation)
 
     def _save_attempt_observation_now(self, observation) -> bool:
@@ -466,28 +573,45 @@ class PostgresCollectorTelemetryMixin:
                 )
             return True
 
+    def _read_dedicated_observation(self, storage_key: str) -> Any:
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload
+                FROM gpu_fault_attempt_observations
+                WHERE key=%s
+                """,
+                (storage_key,),
+            )
+            row = cursor.fetchone()
+        return self._decode("attempt_observation", row[0]) if row is not None else None
+
     def _terminalize_attempt_observation(self, event: TerminalEvent) -> bool:
+        """Write the terminal observation state for ``event`` where it differs.
+
+        In ``dual`` mode the two tables are compared and written separately:
+        comparing only against the dedicated row meant a stale legacy row (or a
+        legacy row with no dedicated twin) was never rewritten, so the sweep
+        selected it again on every tick and never converged (F-G7 / P1-50E).
+        """
+
         storage_key = self._state_key((event.cluster_id, event.attempt_id))
-        previous = None
-        if self.hot_state_mode != "legacy":
-            with self._db.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT payload
-                    FROM gpu_fault_attempt_observations
-                    WHERE key=%s
-                    """,
-                    (storage_key,),
-                )
-                row = cursor.fetchone()
-            if row is not None:
-                previous = self._decode("attempt_observation", row[0])
-        if previous is None and self.hot_state_mode in {"legacy", "dual"}:
-            previous = self._get_optional("attempt_observation", storage_key)
+        writes_dedicated = self.hot_state_mode != "legacy"
+        writes_legacy = self.hot_state_mode != "dedicated"
+        dedicated_previous = (
+            self._read_dedicated_observation(storage_key) if writes_dedicated else None
+        )
+        legacy_previous = (
+            self._get_optional("attempt_observation", storage_key)
+            if writes_legacy
+            else None
+        )
+        previous = (
+            dedicated_previous if dedicated_previous is not None else legacy_previous
+        )
         terminal = terminal_attempt_observation_state(event, previous)
-        if terminal == previous:
-            return False
-        if self.hot_state_mode != "legacy":
+        written = False
+        if writes_dedicated and terminal != dedicated_previous:
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """
@@ -510,73 +634,49 @@ class PostgresCollectorTelemetryMixin:
                         terminal.model_dump_json(),
                     ),
                 )
-        if self.hot_state_mode in {"legacy", "dual"}:
+            written = True
+        if writes_legacy and terminal != legacy_previous:
             self._put("attempt_observation", storage_key, terminal)
-        return True
+            written = True
+        return written
 
     def _reconcile_terminal_attempt_observations(self, limit: int) -> int:
-        if self.hot_state_mode == "legacy":
-            joins = """
-                LEFT JOIN gpu_fault_objects AS legacy
-                  ON legacy.kind='attempt_observation'
-                 AND legacy.payload->'observation'->>'cluster_id'=
-                     event.payload->>'cluster_id'
-                 AND legacy.payload->'observation'->>'attempt_id'=
-                     event.payload->>'attempt_id'
-            """
-            inconsistent = """
-                legacy.key IS NULL
-                OR legacy.payload->'observation'->>'workload_phase'
-                   IN ('PENDING', 'RUNNING')
-            """
-        elif self.hot_state_mode == "dedicated":
-            joins = """
-                LEFT JOIN gpu_fault_attempt_observations AS dedicated
-                  ON dedicated.cluster_id=event.payload->>'cluster_id'
-                 AND dedicated.attempt_id=event.payload->>'attempt_id'
-            """
-            inconsistent = """
-                dedicated.key IS NULL
-                OR dedicated.payload->'observation'->>'workload_phase'
-                   IN ('PENDING', 'RUNNING')
-            """
-        else:
-            joins = """
-                LEFT JOIN gpu_fault_objects AS legacy
-                  ON legacy.kind='attempt_observation'
-                 AND legacy.payload->'observation'->>'cluster_id'=
-                     event.payload->>'cluster_id'
-                 AND legacy.payload->'observation'->>'attempt_id'=
-                     event.payload->>'attempt_id'
-                LEFT JOIN gpu_fault_attempt_observations AS dedicated
-                  ON dedicated.cluster_id=event.payload->>'cluster_id'
-                 AND dedicated.attempt_id=event.payload->>'attempt_id'
-            """
-            inconsistent = """
-                legacy.key IS NULL
-                OR legacy.payload->'observation'->>'workload_phase'
-                   IN ('PENDING', 'RUNNING')
-                OR dedicated.key IS NULL
-                OR dedicated.payload->'observation'->>'workload_phase'
-                   IN ('PENDING', 'RUNNING')
-            """
+        """Terminalize observation rows contradicted by a terminal event.
+
+        Bounded by the non-terminal observation rows, not by the event history
+        (see ``_SWEEP_CANDIDATES``). Each row is rewritten under its own
+        ``attempt_observation/<key>`` advisory lock -- the lock every other
+        writer of that row takes (P1-44L) -- and a row that cannot be processed
+        is logged and skipped rather than aborting the sweep: the progress
+        cursor moves past it, so one poisoned row no longer pins the head of
+        every subsequent sweep.
+        """
+
+        if limit < 1:
+            return 0
+        cursor_key = self._attempt_observation_sweep_cursor
         with self._db.cursor() as cursor:
             cursor.execute(
-                f"""
-                SELECT event.payload
-                FROM gpu_fault_objects AS event
-                {joins}
-                WHERE event.kind='event'
-                  AND ({inconsistent})
-                ORDER BY event.payload->>'ended_at', event.key
-                LIMIT %s
-                """,
-                (limit,),
+                _SWEEP_CANDIDATES[self.hot_state_mode],
+                {"cursor": cursor_key, "limit": limit},
             )
-            events = [self._decode("event", row[0]) for row in cursor.fetchall()]
-        return sum(
-            int(self._terminalize_attempt_observation(event)) for event in events
+            rows = cursor.fetchall()
+        self._attempt_observation_sweep_cursor = (
+            rows[-1][0] if len(rows) >= limit else None
         )
+        terminalized = 0
+        for storage_key, payload in rows:
+            try:
+                event = self._decode("event", payload)
+                with self._state_transaction(f"attempt_observation/{storage_key}"):
+                    terminalized += int(self._terminalize_attempt_observation(event))
+            except Exception:
+                LOGGER.exception(
+                    "attempt observation sweep skipped %s; it will be retried "
+                    "after the cursor wraps",
+                    storage_key,
+                )
+        return terminalized
 
     def _save_attempt_observations_batch(self, observations) -> list[bool]:
         if not observations:

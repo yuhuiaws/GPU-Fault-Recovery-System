@@ -421,7 +421,7 @@ def test_only_routine_samples_on_three_paths_can_be_spooled() -> None:
     )
     control = make_request("/v1/node-actions/act-1/claim", {}, "req-control")
 
-    assert (fault.queue_priority(), fault.spoolable()) == (0, False)
+    assert (fault.queue_priority(), fault.spoolable()) == (10, False)
     assert (control.queue_priority(), control.spoolable()) == (50, False)
     for path, payload in (
         (INVENTORY_PATH, inventory_payload()),
@@ -718,6 +718,7 @@ def test_spool_replay_batches_are_bounded_by_bytes() -> None:
         store,
         owner_id=OWNER,
         internal_token=TOKEN,
+        active_consumers=False,
         telemetry_spool_enabled=True,
         telemetry_spool_max_in_flight_bytes=one_item_limit * 4,
         telemetry_spool_replay_batch_max_bytes=one_item_limit,
@@ -743,6 +744,7 @@ def test_spool_consumer_claims_only_immediately_executable_batches(monkeypatch) 
         store,
         owner_id=OWNER,
         internal_token=TOKEN,
+        active_consumers=False,
         telemetry_spool_enabled=True,
         telemetry_spool_workers=2,
         poll_seconds=0.01,
@@ -789,6 +791,7 @@ def test_spool_notification_listener_wakes_the_consumer(monkeypatch) -> None:
         store,
         owner_id=OWNER,
         internal_token=TOKEN,
+        active_consumers=False,
         telemetry_spool_enabled=True,
         telemetry_spool_workers=1,
         telemetry_spool_notification_fallback_seconds=5,
@@ -833,6 +836,7 @@ def test_spool_fallback_poll_recovers_a_missed_notification(monkeypatch) -> None
         store,
         owner_id=OWNER,
         internal_token=TOKEN,
+        active_consumers=False,
         telemetry_spool_enabled=True,
         telemetry_spool_workers=1,
         telemetry_spool_notification_fallback_seconds=2,
@@ -882,6 +886,7 @@ def test_spool_listener_reports_connection_state() -> None:
         ListenerStore(),
         owner_id=OWNER,
         internal_token=TOKEN,
+        active_consumers=False,
         telemetry_spool_enabled=True,
     )
     thread = Thread(target=processor.run_telemetry_spool_notifications)
@@ -939,6 +944,7 @@ def test_spool_consumer_weights_paths_and_borrows_idle_slots(monkeypatch) -> Non
         store,
         owner_id=OWNER,
         internal_token=TOKEN,
+        active_consumers=False,
         telemetry_spool_enabled=True,
         telemetry_spool_workers=4,
         poll_seconds=0.01,
@@ -997,6 +1003,7 @@ def test_fault_backlog_throttles_spool_replay_workers(monkeypatch) -> None:
         store,
         owner_id=OWNER,
         internal_token=TOKEN,
+        active_consumers=False,
         telemetry_spool_enabled=True,
         telemetry_spool_workers=2,
         telemetry_spool_fault_pressure_workers=1,

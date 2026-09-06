@@ -63,6 +63,40 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_store.py \
 	tests/store/test_postgres_processor_claim.py \
 	tests/store/test_postgres_reconnect.py \
+	tests/store/test_postgres_stuck_workflow_audit.py \
+	tests/store/test_store_error_classification.py \
+	tests/store/test_merge_executor_isolation.py \
+	tests/store/test_postgres_merge_vs_executor.py \
+	tests/store/test_postgres_workflow_indexes.py \
+	tests/store/test_postgres_lane_claim_guard.py \
+	tests/store/test_reconcile_narrow_reads.py \
+	tests/store/test_active_workflow_incidents_bound.py \
+	tests/store/test_postgres_claim_window.py \
+	tests/store/test_workflow_scan_pushdown.py \
+	tests/store/test_postgres_remote_claim_cancellation.py \
+	tests/execution/test_workload_withdrawal.py \
+	tests/execution/test_branch_settlement.py \
+	tests/store/test_control_record_archive.py \
+	tests/store/test_incident_state_counts.py \
+	tests/store/test_reconcile_epoch_cas.py \
+	tests/store/test_health_signal_notified_latch.py \
+	tests/store/test_postgres_core_guards.py \
+	tests/processor/test_observation_interlock_liveness.py \
+	tests/store/test_duplicate_event_fast_path.py \
+	tests/store/test_preemption_pending_marker.py \
+	tests/app_services/test_collector_ingestion_transaction.py \
+	tests/store/test_orphan_workflow_inspection.py \
+	tests/store/test_completion_decision_reads.py \
+	tests/store/test_postgres_observation_sweep.py \
+	tests/store/test_postgres_processor_legacy_paths.py \
+	tests/store/test_postgres_processor_expired_leases.py \
+	tests/store/test_postgres_remote_sweeper.py \
+	tests/store/test_postgres_processor_counters.py \
+	tests/store/test_workflow_scan_cursor.py \
+	tests/store/test_schema_trigger_definitions.py \
+	tests/store/test_postgres_index_builder.py \
+	tests/processor/test_queue_priority_tiers.py \
+	tests/processor/test_routine_coalescing_boundaries.py \
 	tests/store/test_store_contracts.py
 COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS) $(POSTGRES_TESTS),--ignore=$(test))
 

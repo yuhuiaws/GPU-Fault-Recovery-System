@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import sqlite3
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
 
 class SqliteRemoteCommandMixin:
     # Attributes supplied by the composed concrete implementation.
+    _db: sqlite3.Connection
+    _models: dict[str, Any]
     _delete: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _list: Callable[..., Any]
@@ -58,13 +61,25 @@ class SqliteRemoteCommandMixin:
         *,
         workflow_request_ids: Iterable[str] | None = None,
     ) -> list[RemoteActionCommand]:
-        wanted = None if workflow_request_ids is None else set(workflow_request_ids)
+        # Narrow in SQL (F-J5): the reconcile transactions call this while
+        # holding the workflow's lock, so the read must scale with the
+        # requested workflows, not with every command ever written.
+        query = "SELECT payload FROM objects WHERE kind='remote_command'"
+        parameters: list[Any] = []
+        if workflow_request_ids is not None:
+            wanted = sorted(set(workflow_request_ids))
+            if not wanted:
+                return []
+            placeholders = ", ".join("?" for _ in wanted)
+            query += (
+                " AND json_extract(payload, '$.workflow_request_id')"
+                f" IN ({placeholders})"
+            )
+            parameters.extend(wanted)
+        rows = self._db.execute(query, parameters).fetchall()
+        model = self._models["remote_command"]
         return sorted(
-            (
-                item
-                for item in self._list("remote_command")
-                if wanted is None or item.workflow_request_id in wanted
-            ),
+            (model.model_validate_json(row[0]) for row in rows),
             key=lambda item: (item.created_at, item.command_id),
         )
 

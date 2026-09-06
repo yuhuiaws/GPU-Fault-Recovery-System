@@ -60,6 +60,23 @@ def excluded_journal_units() -> frozenset[str]:
     )
 
 
+def _read_boot_id() -> str:
+    """The kernel's boot id, or a marker that says it could not be read.
+
+    It goes into every entry id this collector mints (see ``_entry_identity``),
+    so a missing ``/proc`` must not stop log collection: the marker keeps the
+    ids unique per node and per file, it only stops distinguishing boots.
+    """
+
+    try:
+        return (
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+            or "unknown-boot"
+        )
+    except OSError:
+        return "unknown-boot"
+
+
 @dataclass(frozen=True)
 class _JournalRead:
     """What one `journalctl` invocation produced, and what may be committed.
@@ -84,6 +101,7 @@ class NodeLogCollector:
         context: CollectorContext,
         *,
         node_id: str,
+        boot_id: str | None = None,
         interval_seconds: float = 10,
         training_log_paths: list[str] | None = None,
         state_path: str | None = None,
@@ -98,6 +116,7 @@ class NodeLogCollector:
         self.sink = sink
         self.context = context
         self.node_id = node_id
+        self.boot_id = boot_id or _read_boot_id()
         self.interval_seconds = interval_seconds
         self.training_log_paths = training_log_paths or []
         self.now = now or (lambda: datetime.now(timezone.utc))
@@ -531,9 +550,11 @@ class NodeLogCollector:
             except json.JSONDecodeError:
                 continue
             message = self._bounded_message(str(item.get("MESSAGE") or ""))
-            cursor = str(
-                item.get("__CURSOR") or hashlib.sha256(line.encode()).hexdigest()
-            )
+            # A journal cursor carries the boot id and the journal file id, so
+            # it is unique across nodes on its own. The fallback for a line
+            # without one used to hash the raw line, and two nodes printing the
+            # same ``NVRM: Xid`` text verbatim then shared one id (P0-38A).
+            cursor = str(item.get("__CURSOR") or self._entry_identity(line))
             timestamp = datetime.fromtimestamp(
                 int(item.get("__REALTIME_TIMESTAMP", "0")) / 1_000_000,
                 tz=timezone.utc,
@@ -554,6 +575,28 @@ class NodeLogCollector:
                 )
             )
         return entries
+
+    def _entry_identity(self, *parts: object) -> str:
+        """An entry id that says which node, which boot, and then what.
+
+        Every id this collector mints starts from the node's identity. A
+        training-log line used to be ``sha256(path:offset)`` -- every rank of a
+        distributed job writes the same path on its own node, so the same
+        offset on two nodes was one id, and the second node's fault was folded
+        into the first node's incident and never recovered (P0-38A). The boot
+        id and the file identity keep a rotated file, or a reused inode after a
+        reboot, from restarting the offsets under ids that were already used.
+        The parts are JSON-encoded so no two part lists can spell one string.
+        """
+
+        return hashlib.sha256(
+            json.dumps(
+                [self.context.cluster_id, self.node_id, self.boot_id, *parts],
+                ensure_ascii=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
 
     def _bounded_message(self, message: str) -> str:
         raw = message.encode("utf-8", errors="replace")
@@ -804,7 +847,9 @@ class NodeLogCollector:
                     line = stream.readline()
                     if not line:
                         break
-                    entry_id = hashlib.sha256(f"{key}:{start}".encode()).hexdigest()
+                    entry_id = self._entry_identity(
+                        stat.st_dev, stat.st_ino, key, start
+                    )
                     entry = NodeLogEntry(
                         entry_id=entry_id,
                         source="training-log",

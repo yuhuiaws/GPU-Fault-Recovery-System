@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from typing import Any, Callable
-from uuid import uuid4
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
+    bounded_reasons,
+    BlockedKind,
     FaultIncident,
     IncidentState,
     RecoveryAction,
@@ -16,6 +17,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkloadState,
 )
+from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.store import NotFoundError
 
 
@@ -211,10 +213,16 @@ class NodeLifecycleOperationService:
                 primary_event_id=existing_incident.event_id,
             )
         not_before, maximum = self.callbacks.aggregation_deadlines(now)
+        # Derived from the finding's event: a re-post whose link went stale is
+        # rebuilt into the same records rather than a second pair (F-B7).
         return ReplacementState(
             merge_existing=False,
-            incident_id=f"incident-{uuid4()}",
-            workflow_id=f"workflow-{uuid4()}",
+            incident_id=derived_record_id(
+                "incident", "node-replacement", context.finding.event_id
+            ),
+            workflow_id=derived_record_id(
+                "workflow", "node-replacement", context.finding.event_id
+            ),
             opened_at=now,
             not_before=not_before,
             aggregation_max_deadline=maximum,
@@ -349,7 +357,16 @@ class NodeLifecycleOperationService:
                     "serialized behind in-flight node-exclusive "
                     f"workflow {incumbent.request_id}"
                 )
-        incident = self._incident(context, state, errors, now)
+        # A workflow this family emits must never sit below its incident's
+        # generation: ``fencing_token=1`` on an incident already at generation 4
+        # is exactly the record the abandoned-generation sweep terminalizes
+        # as left behind (P0-59B).
+        generation = max(
+            1,
+            existing_incident.fencing_token if existing_incident is not None else 1,
+            existing_workflow.fencing_token if existing_workflow is not None else 1,
+        )
+        incident = self._incident(context, state, errors, now, generation=generation)
         workflow = self._workflow(
             context,
             state,
@@ -357,6 +374,7 @@ class NodeLifecycleOperationService:
             errors,
             predecessor,
             now,
+            generation=generation,
         )
         parallel = self._parallel_branch(
             context,
@@ -364,6 +382,7 @@ class NodeLifecycleOperationService:
             incident,
             workflow,
             now,
+            incumbent=incumbent,
         )
         if parallel is not None:
             return parallel
@@ -383,6 +402,8 @@ class NodeLifecycleOperationService:
         state: ReplacementState,
         errors: list[str],
         now: datetime,
+        *,
+        generation: int = 1,
     ) -> FaultIncident:
         finding = context.finding
         return FaultIncident(
@@ -402,7 +423,7 @@ class NodeLifecycleOperationService:
             drill_id=finding.drill_id,
             state=(IncidentState.ESCALATED if errors else IncidentState.ACTION_PENDING),
             workflow_request_id=state.workflow_id,
-            fencing_token=1,
+            fencing_token=generation,
             reasons=state.reasons,
             created_at=state.opened_at,
             updated_at=now,
@@ -416,6 +437,8 @@ class NodeLifecycleOperationService:
         errors: list[str],
         predecessor: str | None,
         now: datetime,
+        *,
+        generation: int = 1,
     ) -> WorkflowRequest:
         status = WorkflowStatus.BLOCKED if errors else WorkflowStatus.PENDING
         return WorkflowRequest(
@@ -424,10 +447,11 @@ class NodeLifecycleOperationService:
             runtime_profile_version=context.profile_version,
             status=status,
             official_action=context.finding.recommended_action.value,
-            fencing_token=1,
+            fencing_token=generation,
             official_steps=steps,
             predecessor_workflow_id=predecessor,
             blocked_reasons=errors,
+            blocked_kind=(BlockedKind.NEEDS_OPERATOR if errors else None),
             not_before=state.not_before,
             aggregation_max_deadline=state.aggregation_max_deadline,
             created_at=state.opened_at,
@@ -441,8 +465,15 @@ class NodeLifecycleOperationService:
         incident: FaultIncident,
         workflow: WorkflowRequest,
         now: datetime,
+        *,
+        incumbent: WorkflowRequest | None = None,
     ) -> tuple[FaultIncident, WorkflowRequest] | None:
         if state.merge_existing:
+            return None
+        if incumbent is not None:
+            # The candidate is serialized behind an in-flight node-exclusive
+            # workflow; branching it into the active job workflow as well
+            # would run it twice (P0-55B).
             return None
         active = self.callbacks.active_job_recovery_workflow(context.observation)
         if (
@@ -479,13 +510,11 @@ class NodeLifecycleOperationService:
                     "official_action": winner.official_action,
                     "effective_action": winner.effective_action,
                     "workflow_request_id": parallel.request_id,
-                    "reasons": list(
-                        dict.fromkeys(
-                            [
-                                *active_incident.reasons,
-                                *incident.reasons,
-                            ]
-                        )
+                    "reasons": bounded_reasons(
+                        [
+                            *active_incident.reasons,
+                            *incident.reasons,
+                        ]
                     ),
                     "updated_at": now,
                 }

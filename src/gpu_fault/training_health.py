@@ -62,10 +62,60 @@ class TrainingHealthPolicy(StrictModel):
         )
 
 
+TRAINING_EVIDENCE_SCHEME = "training-progress://"
+
+
+def _training_signal_key(cluster_id: str, attempt_id: str, rank: int, kind: str) -> str:
+    return f"{cluster_id}/{attempt_id}/rank-{rank}/training-{kind}"
+
+
+def training_health_signal_key(finding: NodeHealthFinding) -> str | None:
+    """The health-signal key ``TrainingHealthService`` claimed for a finding.
+
+    Rebuilt from the fields the finding carries -- ``evidence_ref`` names the
+    attempt and rank, ``metric_name`` the kind -- so the deliverer can latch
+    it after the incident commit (P0-38B). None for a finding this service did
+    not produce.
+    """
+
+    evidence_ref = finding.evidence_ref or ""
+    metric_name = str(finding.metric_name)
+    if not evidence_ref.startswith(TRAINING_EVIDENCE_SCHEME):
+        return None
+    if not metric_name.startswith("training_"):
+        return None
+    attempt_id, separator, rank = evidence_ref[
+        len(TRAINING_EVIDENCE_SCHEME) :
+    ].rpartition("/rank-")
+    if not separator or not attempt_id or not rank.isdigit():
+        return None
+    return _training_signal_key(
+        finding.cluster_id,
+        attempt_id,
+        int(rank),
+        metric_name[len("training_") :],
+    )
+
+
 class TrainingHealthService:
     def __init__(self, store, policy: TrainingHealthPolicy | None = None) -> None:
         self.store = store
         self.policy = policy or TrainingHealthPolicy()
+
+    def mark_notified(self, findings: list[NodeHealthFinding]) -> None:
+        """Latch the signals behind delivered findings (P0-38B).
+
+        The claim in ``_claim`` only decides to emit; the caller that persisted
+        the findings' incidents calls this afterwards. A finding whose write
+        failed is never marked and is emitted again on the next evaluation.
+        """
+
+        for finding in findings:
+            signal_key = training_health_signal_key(finding)
+            if signal_key is not None:
+                self.store.mark_health_signal_notified(
+                    signal_key, notified_at=finding.observed_at
+                )
 
     def ingest(self, heartbeat: TrainingProgressHeartbeat) -> TrainingHealthResult:
         state, container = self._allocation(
@@ -306,10 +356,11 @@ class TrainingHealthService:
         reason=None,
         severity=Severity.WARNING,
     ):
-        signal_key = (
-            f"{heartbeat.cluster_id}/{heartbeat.attempt_id}/"
-            f"rank-{heartbeat.rank}/training-{kind}"
+        signal_key = _training_signal_key(
+            heartbeat.cluster_id, heartbeat.attempt_id, heartbeat.rank, kind
         )
+        # Decides to emit, does not latch ``notified``: ``mark_notified`` does,
+        # once the caller has persisted the finding (P0-38B).
         if not self.store.claim_health_signal_transition(
             signal_key, active, observed_at
         ):

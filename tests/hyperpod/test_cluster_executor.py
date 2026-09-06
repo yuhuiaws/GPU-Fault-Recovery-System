@@ -408,7 +408,11 @@ def _remote_command(operation=WorkflowOperation.VALIDATE_HOST):
             node_ids=["node-a"],
             execution_owner="owner-a",
         ),
-        workflow=SimpleNamespace(fencing_token=7, step_executions=[]),
+        # ``executes_safety_steps`` is the model property the executor reads to
+        # pick the step set (F-C8); the stand-in answers like a PENDING record.
+        workflow=SimpleNamespace(
+            fencing_token=7, step_executions=[], executes_safety_steps=False
+        ),
         incident=SimpleNamespace(fencing_token=7),
     )
 

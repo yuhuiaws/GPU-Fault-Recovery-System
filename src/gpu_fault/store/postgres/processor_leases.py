@@ -10,7 +10,9 @@ class PostgresProcessorLeaseMixin:
     get_processor_request: Callable[..., Any]
 
     _db: Any
+    _decode: Callable[..., Any]
     _persist_processor_state: Callable[..., Any]
+    _processor_queue_effective_payload: Callable[..., Any]
     _state_transaction: Callable[..., Any]
 
     def validate_processor_lane(
@@ -215,6 +217,11 @@ class PostgresProcessorLeaseMixin:
                 or current.lease_token != lease_token
             ):
                 return
+            # Same guard as ``release_active_processor_request``: completion
+            # keeps the fencing fields, so without it a COMPLETED row passes
+            # the token check and is reopened as PENDING (F-D9).
+            if current.status != ProcessorRequestStatus.LEASED:
+                return
             self._persist_processor_state(
                 current.model_copy(
                     update={
@@ -231,6 +238,72 @@ class PostgresProcessorLeaseMixin:
                     }
                 )
             )
+
+    def reclaim_expired_processor_leases(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+    ) -> int:
+        """Hand LEASED rows whose lease lapsed back to PENDING (F-D5).
+
+        A lease that expired without a release means its owner is gone.
+        The claim window does reclaim such rows, but only when they fall
+        inside it; behind the retry horizon, or on a priority nobody is
+        claiming, a row could stay LEASED indefinitely with nothing
+        counting it. Booked as a retry (``retry_count + 1``) so the second
+        execution is visible as one. Queue rows are locked here and the
+        lane row is left alone: the lane lease expired with the request
+        (renewal moves both in one transaction) and the next claim's
+        ``leased_lanes`` upsert takes it over, so this keeps the queue-row
+        -> lane lock order documented on ``_lock_processor_queue_row``.
+        ``gpu_fault_processor_queue_available`` leads with ``status``, so
+        the scan is bounded by the LEASED set, not the history.
+        """
+
+        from gpu_fault.processor import (
+            ProcessorRequestStatus,
+        )
+
+        with self._state_transaction("processor_request/reclaim-expired"):
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT {
+                        self._processor_queue_effective_payload(
+                            "gpu_fault_processor_queue"
+                        )
+                    }
+                    FROM gpu_fault_processor_queue
+                    WHERE status='LEASED'
+                      AND lease_expires_at <= %s
+                    ORDER BY lease_expires_at, request_id
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    (now, limit),
+                )
+                rows = cursor.fetchall()
+            reclaimed = 0
+            for row in rows:
+                current = self._decode("processor_request", row[0])
+                self._persist_processor_state(
+                    current.model_copy(
+                        update={
+                            "status": ProcessorRequestStatus.PENDING,
+                            "lease_owner": None,
+                            "leader_epoch": None,
+                            "lease_token": None,
+                            "lease_expires_at": None,
+                            "not_before": None,
+                            "retry_count": current.retry_count + 1,
+                            # The state upsert is guarded on ``updated_at``.
+                            "updated_at": max(now, current.updated_at),
+                        }
+                    )
+                )
+                reclaimed += 1
+            return reclaimed
 
     def cleanup_processor_lanes(
         self,

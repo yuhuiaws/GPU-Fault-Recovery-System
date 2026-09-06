@@ -6,7 +6,7 @@ from threading import RLock, local
 from typing import Any
 
 from gpu_fault.store.shared.errors import (
-    is_retryable_store_unavailable,
+    connection_is_lost,
 )
 
 
@@ -59,7 +59,7 @@ class PooledPostgresDatabase:
             try:
                 yield connection
             except Exception as exc:
-                if is_retryable_store_unavailable(exc):
+                if connection_is_lost(exc):
                     connection.close()
                 raise
 
@@ -70,6 +70,12 @@ class PooledPostgresDatabase:
                 "checkout_sum_seconds": self._checkout_sum_seconds,
                 "checkout_max_seconds": self._checkout_max_seconds,
             }
+
+    @property
+    def in_transaction(self) -> bool:
+        """Whether this thread is inside ``transaction()`` (F-J4)."""
+
+        return getattr(self._local, "connection", None) is not None
 
     @contextmanager
     def cursor(self):

@@ -7,6 +7,7 @@ import inspect
 from pathlib import Path
 from typing import Protocol
 
+from gpu_fault.store.postgres.ddl import _create_priority_counter_function
 from gpu_fault.store.postgres.ddl_processor_retry import (
     upgrade_processor_retry_schedule,
 )
@@ -53,6 +54,41 @@ def _apply_processor_retry_schedule_v7(
     cursor: MigrationCursor,
 ) -> None:
     upgrade_processor_retry_schedule(cursor)
+
+
+def _apply_claim_order_index_v10(cursor: MigrationCursor) -> None:
+    # gpu_fault_processor_queue_claim_order (F-D2) follows the same three-step
+    # method as v9: declared IF NOT EXISTS by the idempotent DDL, built
+    # CONCURRENTLY by an operator on a live database, validated at startup.
+    cursor.execute("SELECT 1")
+
+
+def _drop_duplicate_claim_window_index_v11(cursor: MigrationCursor) -> None:
+    # F-D2 declared ``gpu_fault_processor_queue_claim_order`` without noticing
+    # that ``gpu_fault_processor_queue_priority_claim`` already had the same
+    # columns and the same partial predicate. Two identical indexes cost a
+    # second write amplification and let the planner pick either, so the
+    # twin goes and the original stays the only declaration. Any database that
+    # built the twin (staging release gates, developer databases) loses it
+    # here; production never had it.
+    cursor.execute("DROP INDEX IF EXISTS gpu_fault_processor_queue_claim_order")
+
+
+def _apply_dispatcher_indexes_v9(cursor: MigrationCursor) -> None:
+    # The three dispatcher partial indexes (F-A9) are declared IF NOT EXISTS
+    # by the idempotent DDL that ``--ensure-schema`` runs before recording this
+    # version; on a live database they are built CONCURRENTLY by an operator
+    # first (F-J3) and the schema check refuses to start without them.
+    cursor.execute("SELECT 1")
+
+
+def _apply_device_event_tier_v8(cursor: MigrationCursor) -> None:
+    # Device events moved from tier 0 to tier 10 (F-D1). The priority
+    # counter buckets are computed inside the trigger function, so the
+    # function has to be replaced on an existing schema for a tier-10 row to
+    # be counted against the fault reserve; rows admitted before this
+    # migration keep their tier and their bucket.
+    _create_priority_counter_function(cursor)
 
 
 def _apply_registry_v3(cursor: MigrationCursor) -> None:
@@ -143,6 +179,30 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="processor-retry-schedule-and-lane-policy",
         ddl_checksum="4efa9f9838dff7df19006e02b371522accff8574a1e13c24531835636a971e08",
         apply=_apply_processor_retry_schedule_v7,
+    ),
+    SchemaMigration(
+        version=8,
+        name="device-event-tier-counts-in-the-fault-bucket",
+        ddl_checksum="d917e42c2da8e43f75db172da9755d3512ad9c61012dc298474fc8c0e7cb6c9d",
+        apply=_apply_device_event_tier_v8,
+    ),
+    SchemaMigration(
+        version=9,
+        name="dispatcher-hot-query-indexes",
+        ddl_checksum="3d3485c8fcce1763a05cc951f093708084fa6e54fbbd1eb468f284114b739231",
+        apply=_apply_dispatcher_indexes_v9,
+    ),
+    SchemaMigration(
+        version=10,
+        name="processor-claim-window-index",
+        ddl_checksum="3cd52c8412322ecf5a41f74cfa845ee3071d7a686f98afac8fa367e5c3238237",
+        apply=_apply_claim_order_index_v10,
+    ),
+    SchemaMigration(
+        version=11,
+        name="drop-duplicate-claim-window-index",
+        ddl_checksum="0038a7136838d584e28786a82d82b6f6d6fb3cfa88978f6ea6e5ac224b5c9cdf",
+        apply=_drop_duplicate_claim_window_index_v11,
     ),
 )
 

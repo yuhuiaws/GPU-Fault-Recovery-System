@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from gpu_fault.models import (
+    BlockedKind,
     FaultIncident,
     IncidentState,
     RecoveryAction,
@@ -13,6 +14,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.operation_registry import (
     HARDWARE_ESCALATION_RELEVANT_OPERATIONS,
+    NODE_ACTION_SCOPE_OPERATIONS,
 )
 from gpu_fault.store.shared.errors import NotFoundError
 
@@ -24,6 +26,68 @@ RESTART_SAFETY_PARAMETERS = (
     "source_gpu_count",
     "restart_budget",
 )
+
+
+_RESET_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.RESET_GPU,
+        WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+    }
+)
+_VALIDATION_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.VALIDATE_HOST,
+        WorkflowOperation.VALIDATE_FABRIC,
+    }
+)
+# Containment and release steps. Their failure is not a hardware rung but it
+# is not nothing either: a node whose RESTORE_SCHEDULING failed stays
+# cordoned until someone acts, so the failure goes to an operator (F-H1).
+_CONTAINMENT_RELEASE_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.RESTORE_SCHEDULING,
+        WorkflowOperation.QUIESCE_GPU_SERVICES,
+        WorkflowOperation.RESTORE_GPU_SERVICES,
+        WorkflowOperation.QUARANTINE,
+    }
+)
+_CLASSIFIABLE_OPERATIONS = (
+    HARDWARE_ESCALATION_RELEVANT_OPERATIONS
+    | _CONTAINMENT_RELEASE_OPERATIONS
+    | _VALIDATION_OPERATIONS
+)
+
+
+def next_rung(
+    failed_operation: WorkflowOperation,
+    recovery_context: set[WorkflowOperation] | frozenset[WorkflowOperation],
+) -> WorkflowOperation | None:
+    """The next hardware-recovery rung after ``failed_operation`` failed.
+
+    Mirrors the ladder ``HardwareEscalationService._classify`` applies to a
+    whole workflow, for one node branch (F-N1): reset -> reboot -> warm-spare
+    replacement. ``None`` means the ladder is exhausted for this branch and
+    the outcome belongs to an operator (support escalation / drain), which
+    the whole-workflow path produces once the workflow fails.
+    ``recovery_context`` is the set of recovery operations that already ran
+    on the branch; it decides what a failed *validation* escalates from.
+    """
+
+    if failed_operation in _RESET_OPERATIONS:
+        return WorkflowOperation.RESTART_NODE
+    if failed_operation is WorkflowOperation.RESTART_NODE:
+        return WorkflowOperation.REPLACE_NODE
+    if failed_operation in _VALIDATION_OPERATIONS:
+        if WorkflowOperation.REPLACE_NODE in recovery_context:
+            return None
+        if WorkflowOperation.RESTART_NODE in recovery_context:
+            return WorkflowOperation.REPLACE_NODE
+        if recovery_context & _RESET_OPERATIONS:
+            return WorkflowOperation.RESTART_NODE
+        return None
+    return None
 
 
 class HardwareEscalationService:
@@ -78,6 +142,21 @@ class HardwareEscalationService:
 
     @staticmethod
     def _classify(workflow: WorkflowRequest):
+        lifetime_failures = [
+            execution
+            for execution in workflow.step_executions
+            if execution.status is WorkflowStepStatus.FAILED
+            and execution.details.get("workflow_lifetime_exceeded") is True
+        ]
+        if lifetime_failures:
+            # The remediation ran out of lifetime (F-N1): no further hardware
+            # rung, the node belongs to an operator now.
+            return (
+                "lifetime_exceeded",
+                RecoveryAction.ESCALATE_OPERATOR,
+                WorkflowOperation.ESCALATE_SUPPORT,
+                lifetime_failures,
+            )
         failed_operation_set = {
             execution.operation
             for execution in workflow.step_executions
@@ -88,16 +167,30 @@ class HardwareEscalationService:
             for execution in workflow.step_executions
             if execution.status is WorkflowStepStatus.SUCCEEDED
         }
-        prior_operation_set = {
-            step.operation
-            for execution in workflow.step_executions
-            if (
-                execution.status is WorkflowStepStatus.FAILED
-                and 0 <= execution.step_index < len(workflow.official_steps)
-            )
-            for step in workflow.official_steps[: execution.step_index]
+        # What actually ran before the failure, by execution record -- not the
+        # steps that merely sit earlier in the list. In a DAG a sibling branch's
+        # RESTART_NODE may precede the failed step positionally without ever
+        # having run on this node (F-C6).
+        executed_operation_set = {
+            execution.operation for execution in workflow.step_executions
         }
-        recovery_context_operations = successful_operation_set | prior_operation_set
+        recovery_context_operations = successful_operation_set | executed_operation_set
+        if (
+            not (recovery_context_operations - failed_operation_set)
+            & HARDWARE_ESCALATION_RELEVANT_OPERATIONS
+        ):
+            # A record with no execution history for its recovery steps (rows
+            # written before completions were recorded): fall back to the
+            # steps planned ahead of the failure.
+            recovery_context_operations |= {
+                step.operation
+                for execution in workflow.step_executions
+                if (
+                    execution.status is WorkflowStepStatus.FAILED
+                    and 0 <= execution.step_index < len(workflow.official_steps)
+                )
+                for step in workflow.official_steps[: execution.step_index]
+            }
         requested_escalations = {
             str(
                 workflow.official_steps[execution.step_index].parameters.get(
@@ -159,12 +252,7 @@ class HardwareEscalationService:
             failed_stage = "reset"
             next_action = RecoveryAction.REBOOT_NODE
             next_operation = WorkflowOperation.RESTART_NODE
-        elif failed_operation_set.intersection(
-            {
-                WorkflowOperation.VALIDATE_GPU,
-                WorkflowOperation.VALIDATE_FABRIC,
-            }
-        ):
+        elif failed_operation_set.intersection(_VALIDATION_OPERATIONS):
             if WorkflowOperation.REPLACE_NODE in recovery_context_operations:
                 failed_stage = "replacement_validation"
                 next_action = RecoveryAction.ESCALATE_OPERATOR
@@ -199,6 +287,10 @@ class HardwareEscalationService:
                 next_operation = None
             else:
                 return None
+        elif failed_operation_set.intersection(_CONTAINMENT_RELEASE_OPERATIONS):
+            failed_stage = "containment_or_release"
+            next_action = RecoveryAction.ESCALATE_OPERATOR
+            next_operation = WorkflowOperation.ESCALATE_SUPPORT
         else:
             return None
 
@@ -207,7 +299,7 @@ class HardwareEscalationService:
             for execution in workflow.step_executions
             if (
                 execution.status is WorkflowStepStatus.FAILED
-                and execution.operation in HARDWARE_ESCALATION_RELEVANT_OPERATIONS
+                and execution.operation in _CLASSIFIABLE_OPERATIONS
             )
         ]
         if not failed_executions:
@@ -356,6 +448,14 @@ class HardwareEscalationService:
             "ordered_failed_nodes": ordered_failed_nodes,
             "workload_ids": workload_ids,
             "gpu_uuids": gpu_uuids,
+            # Per-node GPU scope of the failed nodes: node-action steps of
+            # the replacement plan carry it so a multi-node step is not
+            # refused by the agent barrier (F-H1).
+            "gpu_uuids_by_node": {
+                node_id: list(dict.fromkeys(gpu_uuids_by_node[node_id]))
+                for node_id in ordered_failed_nodes
+                if gpu_uuids_by_node.get(node_id)
+            },
             "failed_operations": failed_operations,
             "failed": failed,
             "node_reason": node_reason,
@@ -371,6 +471,7 @@ class HardwareEscalationService:
         ordered_failed_nodes: list[str],
         gpu_uuids: list[str],
         workload_ids: list[str],
+        gpu_uuids_by_node: dict[str, list[str]] | None = None,
     ) -> tuple[list, list[str]]:
         profile = None
         errors = []
@@ -465,6 +566,14 @@ class HardwareEscalationService:
             inventory_parameters = inventory_parameters_by_operation.get(step.operation)
             if inventory_parameters:
                 parameters.update(inventory_parameters)
+            if step.operation in NODE_ACTION_SCOPE_OPERATIONS and gpu_uuids_by_node:
+                scoped = {
+                    node_id: list(gpu_uuids_by_node[node_id])
+                    for node_id in step.node_ids
+                    if gpu_uuids_by_node.get(node_id)
+                }
+                if scoped:
+                    parameters["gpu_uuids_by_node"] = scoped
             normalized_steps.append(step.model_copy(update={"parameters": parameters}))
         replacement_steps = normalized_steps
         return replacement_steps, errors
@@ -492,12 +601,21 @@ class HardwareEscalationService:
         incident = FaultIncident(
             incident_id=f"inc-{event_id}",
             event_id=event_id,
-            event_type="NODE_HEALTH_BATCH",
+            # The escalation is a continuation of the source incident: it
+            # reports the policy, workload and drill that produced it (F-H1).
+            event_type=source.event_type,
+            event_source=source.event_source,
+            source_boot_id=source.source_boot_id,
             cluster_id=source.cluster_id,
             node_ids=ordered_failed_nodes,
             gpu_uuids=gpu_uuids,
-            policy_version="site-node-health-policy/v1",
-            policy_source="SITE_NODE_HEALTH",
+            job_id=source.job_id,
+            attempt_id=source.attempt_id,
+            workload_identity_source=source.workload_identity_source,
+            policy_version=source.policy_version,
+            policy_source=source.policy_source,
+            policy_reference=source.policy_reference,
+            drill_id=source.drill_id,
             effective_action=next_action,
             state=IncidentState.DETECTED,
             reasons=[
@@ -567,6 +685,7 @@ class HardwareEscalationService:
             ordered_failed_nodes,
             gpu_uuids,
             workload_ids,
+            scope.get("gpu_uuids_by_node") or None,
         )
         replacement = WorkflowRequest(
             request_id=(f"workflow-{escalation_name}-after-{workflow.request_id}"),
@@ -577,6 +696,9 @@ class HardwareEscalationService:
             fencing_token=incident.fencing_token,
             official_steps=replacement_steps,
             blocked_reasons=errors,
+            blocked_kind=(BlockedKind.NEEDS_OPERATOR if errors else None),
+            # The chain shares one lifetime (F-N1).
+            lifetime_deadline_at=workflow.lifetime_deadline_at,
             created_at=now,
             updated_at=now,
         )
@@ -590,9 +712,15 @@ class HardwareEscalationService:
                 "workflow_request_id": replacement.request_id,
             }
         )
-        self.store.save_workflow(replacement)
-        self.store.save_incident(incident)
-        return incident, replacement
+        # One transaction, keyed by the deterministic event id: two workers
+        # escalating the same failed workflow get the same pair, and a
+        # workflow never exists ahead of its incident (F-H1 / F-B1).
+        created_incident, created_workflow, _ = (
+            self.store.create_incident_workflow_if_absent(
+                event_id, lambda: (incident, replacement)
+            )
+        )
+        return created_incident, created_workflow
 
     def escalate(
         self, workflow: WorkflowRequest

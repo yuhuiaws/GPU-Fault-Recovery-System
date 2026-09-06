@@ -12,6 +12,8 @@ from gpu_fault.store.shared.time import (
 from gpu_fault.store.postgres.processor_completion_runtime import (
     complete_cluster_groups,
 )
+from gpu_fault.store.shared.errors import StaleFencingTokenError
+from gpu_fault.store.shared.group_commit import submit_group_commit
 
 
 class _CompletionEntry(TypedDict):
@@ -33,6 +35,9 @@ class PostgresProcessorCompletionMixin:
     _processor_completion_condition: Any
     _processor_completion_executor: ThreadPoolExecutor | None
     _processor_completion_queue: list[_CompletionEntry]
+    # Whether a leader is draining the queue right now (F-D6); class default
+    # so a stand-in host without the attribute starts leaderless.
+    _processor_completion_leader_active: bool = False
     _processor_queue_effective_payload: Callable[..., Any]
     _state_transaction: Callable[..., Any]
     get_processor_leadership: Callable[..., Any]
@@ -83,31 +88,35 @@ class PostgresProcessorCompletionMixin:
             "result": None,
             "error": None,
         }
-        with self._processor_completion_condition:
-            leader = not self._processor_completion_queue
-            self._processor_completion_queue.append(entry)
-            if not leader:
-                self._processor_completion_condition.notify()
-        if leader:
-            with self._processor_completion_condition:
-                self._processor_completion_condition.wait(timeout=0.01)
-                batch = self._processor_completion_queue[:64]
-                del self._processor_completion_queue[: len(batch)]
+
+        def flush(batch: list[Any]) -> None:
             try:
                 completed = self._complete_active_processor_requests_batch(batch)
                 for item in batch:
-                    request_id = item["args"][0]
-                    if request_id in completed:
-                        item["result"] = completed[request_id]
+                    batch_request_id = item["args"][0]
+                    if batch_request_id in completed:
+                        item["result"] = completed[batch_request_id]
                     else:
-                        item["error"] = ValueError("stale processor lane fencing token")
+                        item["error"] = StaleFencingTokenError(
+                            "stale processor lane fencing token"
+                        )
             except Exception as exc:
                 for item in batch:
                     item["error"] = exc
             for item in batch:
                 item["event"].set()
-        if not entry["event"].wait(timeout=30):
-            raise TimeoutError("processor completion batch did not flush")
+
+        try:
+            submit_group_commit(
+                entry,  # type: ignore[arg-type]
+                condition=self._processor_completion_condition,
+                queue=self._processor_completion_queue,  # type: ignore[arg-type]
+                host=self,
+                active_attr="_processor_completion_leader_active",
+                flush=flush,
+            )
+        except TimeoutError as exc:
+            raise TimeoutError("processor completion batch did not flush") from exc
         if entry["error"] is not None:
             raise entry["error"]
         return entry["result"]
@@ -374,7 +383,7 @@ class PostgresProcessorCompletionMixin:
                 or current.leader_epoch != lane_epoch
                 or current.lease_token != lease_token
             ):
-                raise ValueError("stale processor lane fencing token")
+                raise StaleFencingTokenError("stale processor lane fencing token")
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """
@@ -398,7 +407,7 @@ class PostgresProcessorCompletionMixin:
                 )
                 completed_lane = cursor.rowcount == 1
             if not completed_lane:
-                raise ValueError("stale processor lane fencing token")
+                raise StaleFencingTokenError("stale processor lane fencing token")
             completed = current.model_copy(
                 update={
                     "status": ProcessorRequestStatus.COMPLETED,
@@ -442,7 +451,7 @@ class PostgresProcessorCompletionMixin:
                 or current.lease_expires_at is None
                 or current.lease_expires_at <= now
             ):
-                raise ValueError("stale processor fencing token")
+                raise StaleFencingTokenError("stale processor fencing token")
             completed = current.model_copy(
                 update={
                     "status": ProcessorRequestStatus.COMPLETED,

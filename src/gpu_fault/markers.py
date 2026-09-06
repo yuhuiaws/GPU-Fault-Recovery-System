@@ -15,14 +15,23 @@ grows with every observation on every node in the fleet, so that cost is
 proportional to fleet history rather than to the question being asked. The
 lookups here push node scope and the blocking-action set into the store, which
 answers them with an indexed, bounded read.
+
+The one writer here, :func:`retire_markers_for_incident`, is the counterpart of
+the reads: a marker's ``active`` flag had no writer on any success path, so a
+repaired incident's markers stayed live until their TTL and kept matching
+terminal events and disqualifying spares (F-G6).
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
 from gpu_fault.models import NodeMarker, RecoveryAction, WorkflowStatus
+from gpu_fault.recovery_actions import RECOVERY_ACTION_PROFILES
+
+LOGGER = logging.getLogger(__name__)
 
 #: Recommended actions that mean "this node must not take on work".
 #: A marker whose action is outside this set is observational (for
@@ -30,16 +39,12 @@ from gpu_fault.models import NodeMarker, RecoveryAction, WorkflowStatus
 #: not disqualify an otherwise healthy warm spare -- warm-spare
 #: failover is the only supported node replacement path, so treating
 #: advisory noise as disqualifying makes real replacements fail.
-SPARE_BLOCKING_ACTIONS = frozenset(
-    {
-        RecoveryAction.QUARANTINE,
-        RecoveryAction.REPLACE_NODE,
-        RecoveryAction.REBOOT_NODE,
-        RecoveryAction.RESET_GPU,
-        RecoveryAction.DRAIN,
-        RecoveryAction.MARK_UNSCHEDULABLE,
-        RecoveryAction.ESCALATE_OPERATOR,
-    }
+#: Derived from the same table the passive compiler uses, so an action
+#: cannot be plannable here and invisible there (F-G5).
+SPARE_BLOCKING_ACTIONS: frozenset[RecoveryAction] = frozenset(
+    action
+    for action, profile in RECOVERY_ACTION_PROFILES.items()
+    if profile.blocks_spare
 )
 
 
@@ -60,6 +65,39 @@ class MarkerLookupStore(Protocol):
     def get_incident(self, incident_id: str) -> Any: ...
 
     def get_workflow(self, request_id: str) -> Any: ...
+
+
+@runtime_checkable
+class MarkerRetirementStore(Protocol):
+    """The two store methods retiring an incident's markers needs."""
+
+    def list_markers_for_incident(self, incident_id: str) -> list[NodeMarker]: ...
+
+    def add_marker(self, marker: NodeMarker) -> None: ...
+
+
+def retire_markers_for_incident(
+    store: MarkerRetirementStore, incident_id: str, *, reason: str
+) -> int:
+    """Set ``active=False`` on every live marker of a recovered incident.
+
+    ``add_marker`` upserts by ``marker_id`` in every store, so this rewrites
+    the marker in place. Returns how many markers were retired. Safe to call
+    repeatedly: an already-retired marker is skipped.
+    """
+    if not incident_id:
+        return 0
+    retired = 0
+    for marker in store.list_markers_for_incident(incident_id):
+        if not marker.active:
+            continue
+        store.add_marker(marker.model_copy(update={"active": False}))
+        retired += 1
+    if retired:
+        LOGGER.info(
+            "retired %s marker(s) of incident %s: %s", retired, incident_id, reason
+        )
+    return retired
 
 
 def marker_disqualifies_spare(marker: NodeMarker, now: datetime) -> bool:

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, cast
 
 from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
+    CompletionDecision,
+    DecisionStatus,
     NodeMarker,
     RecoveryAction,
     TerminalEvent,
@@ -248,6 +251,20 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
             rows = cursor.fetchall()
         return [self._decode("marker", row[0]) for row in rows]
 
+    def has_workflow_successor(self, predecessor_workflow_id: str) -> bool:
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM gpu_fault_objects
+                    WHERE kind='workflow'
+                      AND payload->>'predecessor_workflow_id'=%s
+                )
+                """,
+                (predecessor_workflow_id,),
+            )
+            return bool(cursor.fetchone()[0])
+
     def get_preempting_successor(
         self, predecessor_workflow_id: str
     ) -> WorkflowRequest | None:
@@ -375,7 +392,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                     """,
                     (_utc_text(observed), limit),
                 )
-                return cursor.rowcount
+                return int(cursor.rowcount)
 
     def backfill_hot_state_tables(self) -> dict[str, int]:
         counts = {}
@@ -598,8 +615,10 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
         limit: int = 1000,
     ) -> dict[str, int]:
         observed = now or datetime.now(timezone.utc)
-        with self._state_transaction("attempt_observation/terminal-reconcile"):
-            terminalized = reconcile_terminal_attempt_observations(self, limit)
+        # No global lock around the sweep: it takes each observation row's own
+        # ``attempt_observation/<key>`` advisory lock, the one every other
+        # writer of that row holds (F-G7 / P1-44L).
+        terminalized = reconcile_terminal_attempt_observations(self, limit)
         deleted = {"attempt_observation_terminalized": terminalized}
         with self._state_transaction("hot_state/cleanup"):
             with self._db.cursor() as cursor:
@@ -624,6 +643,21 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                     ),
                 )
                 deleted["gpu_finding_history"] = cursor.rowcount
+        if self.hot_state_mode != "dedicated":
+            # The ``attempt_observation`` kind in gpu_fault_objects had no
+            # retention at all, so in legacy and dual mode a terminal row
+            # lived forever (F-G7 / P3-50J). Same two rules as the dedicated
+            # table below: terminal rows by ``terminal_retention``, any row by
+            # ``attempt_observation_max_age``.
+            deleted["attempt_observation_legacy"] = self._cleanup_legacy_observations(
+                terminal_cutoff=observed - terminal_retention,
+                stale_cutoff=(
+                    observed - attempt_observation_max_age
+                    if attempt_observation_max_age is not None
+                    else None
+                ),
+                limit=limit,
+            )
         if self.hot_state_mode == "legacy":
             return deleted
         cutoffs = {
@@ -694,6 +728,127 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                     )
                     deleted[name] = cursor.rowcount
         return deleted
+
+    def _cleanup_legacy_observations(
+        self,
+        *,
+        terminal_cutoff: datetime,
+        stale_cutoff: datetime | None,
+        limit: int,
+    ) -> int:
+        condition = """
+            (
+                payload->'observation'->>'workload_phase'
+                    IN ('SUCCEEDED', 'FAILED', 'STOPPED')
+                AND payload->'observation'->>'observed_at' <= %s
+            )
+        """
+        parameters: list[object] = [_utc_text(terminal_cutoff)]
+        if stale_cutoff is not None:
+            condition += " OR payload->'observation'->>'observed_at' <= %s"
+            parameters.append(_utc_text(stale_cutoff))
+        parameters.append(limit)
+        with self._state_transaction("hot_state/cleanup"):
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    WITH expired AS (
+                        SELECT key
+                        FROM gpu_fault_objects
+                        WHERE kind='attempt_observation'
+                          AND ({condition})
+                        ORDER BY payload->'observation'->>'observed_at', key
+                        LIMIT %s
+                    )
+                    DELETE FROM gpu_fault_objects AS target
+                    USING expired
+                    WHERE target.kind='attempt_observation'
+                      AND target.key=expired.key
+                    """,
+                    parameters,
+                )
+                return int(cursor.rowcount)
+
+    def completion_transaction(self, event_key: str) -> AbstractContextManager[None]:
+        # One transaction, one advisory lock per event: the writes the
+        # completion service nests inside (event row, incident + workflow,
+        # plan, decision) become savepoints of it and commit or roll back as
+        # one, and a second replica deciding the same event waits here.
+        return cast(
+            AbstractContextManager[None],
+            self._state_transaction(f"completion/{event_key}"),
+        )
+
+    def list_decisions_by_status(
+        self,
+        status: DecisionStatus,
+        *,
+        older_than: datetime | None = None,
+        limit: int = 100,
+    ) -> list[CompletionDecision]:
+        if limit < 1:
+            return []
+        clauses = ["decision.kind='decision'", "decision.payload->>'status'=%s"]
+        parameters: list[object] = [status.value]
+        if older_than is not None:
+            clauses.append(
+                "(diagnostic.key IS NULL OR diagnostic.payload->>'created_at' <= %s)"
+            )
+            parameters.append(_utc_text(older_than))
+        parameters.append(limit)
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT decision.payload
+                FROM gpu_fault_objects AS decision
+                LEFT JOIN gpu_fault_objects AS diagnostic
+                  ON diagnostic.kind='diagnostic'
+                 AND diagnostic.key=decision.payload->>'diagnostic_request_id'
+                WHERE """
+                + " AND ".join(clauses)
+                + """
+                ORDER BY diagnostic.payload->>'created_at' NULLS FIRST,
+                         decision.key
+                LIMIT %s
+                """,
+                parameters,
+            )
+            rows = cursor.fetchall()
+        return [
+            cast(CompletionDecision, self._decode("decision", row[0])) for row in rows
+        ]
+
+    def decision_status_counts(self) -> dict[DecisionStatus, int]:
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload->>'status' AS status, count(*)
+                FROM gpu_fault_objects
+                WHERE kind='decision'
+                GROUP BY status
+                """
+            )
+            rows = cursor.fetchall()
+        counts = {status: 0 for status in DecisionStatus}
+        for status, count in rows:
+            counts[DecisionStatus(status)] = int(count)
+        return counts
+
+    def count_completion_events_without_decision(self) -> int:
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT count(*)
+                FROM gpu_fault_objects AS event
+                WHERE event.kind='event'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM gpu_fault_objects AS decision
+                      WHERE decision.kind='decision'
+                        AND decision.key=event.key
+                  )
+                """
+            )
+            return int(cursor.fetchone()[0])
 
     def save_event_if_absent(self, event: TerminalEvent) -> bool:
         storage_key = self._state_key((event.cluster_id, event.attempt_id))

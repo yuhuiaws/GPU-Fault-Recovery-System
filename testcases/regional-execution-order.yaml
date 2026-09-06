@@ -46,7 +46,7 @@ phases:
     name: Workflow 抢占与 DAG
     maintenance_window: 分级
     entries:
-      - range: {prefix: PREEMPT, start: 1, end: 31}
+      - range: {prefix: PREEMPT, start: 1, end: 34}
   - sequence: 7
     name: 单集群闭环
     maintenance_window: 是

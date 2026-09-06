@@ -6,12 +6,15 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from gpu_fault.models import (
+    bounded_reasons,
+    BlockedKind,
     FaultIncident,
     IncidentState,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
     WorkloadState,
+    resolved_step_indexes,
 )
 from gpu_fault.orchestration.arbitration import RecoveryArbiter
 from gpu_fault.orchestration.dag_branching import DagBrancher
@@ -22,6 +25,7 @@ from gpu_fault.policy import (
     SxidEvent,
 )
 from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.orchestration.disposition import MERGING_DISPOSITIONS
 
 
 @dataclass(frozen=True)
@@ -101,9 +105,14 @@ def merge_sxid_step_scope(
         WorkflowOperation.RESET_GPU,
         WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
     }
+    # Finished, superseded and in-flight steps keep the scope they ran with;
+    # only pending steps take the new node's GPUs and SXIDs (F-B6).
+    untouchable = set(resolved_step_indexes(workflow)) | {
+        execution.step_index for execution in workflow.step_executions
+    }
     steps = []
-    for step in workflow.official_steps:
-        if step.operation not in scoped_operations:
+    for index, step in enumerate(workflow.official_steps):
+        if step.operation not in scoped_operations or index in untouchable:
             steps.append(step)
             continue
         parameters = dict(step.parameters)
@@ -260,13 +269,11 @@ class SxidIngestionService:
             return (
                 existing_incident.model_copy(
                     update={
-                        "reasons": list(
-                            dict.fromkeys(
-                                [
-                                    *existing_incident.reasons,
-                                    generation_ignore_reason,
-                                ]
-                            )
+                        "reasons": bounded_reasons(
+                            [
+                                *existing_incident.reasons,
+                                generation_ignore_reason,
+                            ]
                         ),
                         "updated_at": now,
                     }
@@ -279,11 +286,7 @@ class SxidIngestionService:
             existing_incident,
             existing_workflow,
         )
-        if state.disposition in {
-            "ABSORB",
-            "WIDEN_BRANCH",
-            "WIDEN_IN_PLACE",
-        }:
+        if state.disposition in MERGING_DISPOSITIONS:
             return self._merge_existing(context, state)
         scope = self._scope(context, state)
         compiled = self._compile(context, state, scope)
@@ -428,16 +431,14 @@ class SxidIngestionService:
                     if candidate_wins
                     else existing_incident.policy_version
                 ),
-                "reasons": list(
-                    dict.fromkeys(
-                        [
-                            *existing_incident.reasons,
-                            *(
-                                f"{event.node_id}: SXID {event.sxid}: {reason}"
-                                for reason in decision.reasons
-                            ),
-                        ]
-                    )
+                "reasons": bounded_reasons(
+                    [
+                        *existing_incident.reasons,
+                        *(
+                            f"{event.node_id}: SXID {event.sxid}: {reason}"
+                            for reason in decision.reasons
+                        ),
+                    ]
                 ),
                 "updated_at": state.now,
             }
@@ -780,8 +781,19 @@ class SxidIngestionService:
             safety_steps=compiled.safety_steps,
             official_steps=compiled.official_steps,
             blocked_reasons=compiled.errors,
+            safety_only=compiled.status is WorkflowStatus.SAFETY_PENDING,
+            blocked_kind=(
+                BlockedKind.NEEDS_OPERATOR
+                if compiled.status is WorkflowStatus.BLOCKED
+                else None
+            ),
             not_before=scope.not_before,
             aggregation_max_deadline=(scope.aggregation_max_deadline),
+            lifetime_deadline_at=(
+                existing_workflow.lifetime_deadline_at
+                if existing_workflow is not None
+                else None
+            ),
             created_at=scope.opened_at,
             updated_at=state.now,
         )

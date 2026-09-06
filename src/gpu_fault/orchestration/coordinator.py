@@ -7,9 +7,11 @@ import os
 from datetime import datetime, timedelta, timezone
 from functools import cached_property
 from threading import RLock
-from typing import Any
+from typing import Any, Sequence
 
 from gpu_fault.models import (
+    bounded_reasons,
+    BlockedKind,
     Environment,
     FaultIncident,
     IncidentState,
@@ -20,6 +22,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepSpec,
     WorkloadState,
+    resolved_step_indexes,
 )
 from gpu_fault.operation_registry import (
     MERGE_INTENT_OPERATIONS,
@@ -335,6 +338,7 @@ class IncidentOrchestrator:
             merge_disposition=self._merge_disposition,
             node_group_key=self._node_group_key,
             prepare_preempting_successor=(self._prepare_preempting_successor),
+            preempt_parallel_job_branch=(self._preempt_parallel_job_branch),
             reopen_if_terminal=self._reopen_if_terminal,
             runtime_effective_action=self._runtime_effective_action,
             widen_node_action_scope=self._widen_node_action_scope,
@@ -346,6 +350,7 @@ class IncidentOrchestrator:
             callbacks,
             aggregation_window_seconds=(self.multi_node_aggregation_window_seconds),
             merge_actions=self._NODE_MERGE_ACTIONS,
+            workflow_preemption_enabled=(self.workflow_preemption_enabled),
         )
 
     @cached_property
@@ -392,6 +397,7 @@ class IncidentOrchestrator:
             is_attempt_grouped_health_finding=(self._is_attempt_grouped_health_finding),
             merge_disposition=self._merge_disposition,
             prepare_preempting_successor=(self._prepare_preempting_successor),
+            preempt_parallel_job_branch=(self._preempt_parallel_job_branch),
             quiesce_parameters=self._quiesce_parameters,
             reopen_if_terminal=self._reopen_if_terminal,
             utc=self._utc,
@@ -403,6 +409,7 @@ class IncidentOrchestrator:
             self._brancher,
             callbacks,
             aggregation_window_seconds=(self.multi_node_aggregation_window_seconds),
+            workflow_preemption_enabled=(self.workflow_preemption_enabled),
         )
 
     @cached_property
@@ -492,6 +499,42 @@ class IncidentOrchestrator:
                 else RecoveryAction.QUARANTINE
             )
         return default
+
+    def compile_branch_steps(
+        self,
+        workflow: WorkflowRequest,
+        operations: Sequence[WorkflowOperation],
+        node_id: str,
+        gpu_uuids: Sequence[str],
+    ) -> list[WorkflowStepSpec]:
+        """Steps for one node's escalated branch (F-N1), or ``[]``.
+
+        Compiled against the workflow's runtime profile exactly like the
+        whole-workflow replacement path; an empty result tells the executor
+        the branch cannot be escalated in place.
+        """
+
+        if not workflow.runtime_profile_version:
+            return []
+        try:
+            profile = self.store.get_profile(workflow.runtime_profile_version)
+        except NotFoundError:
+            return []
+        compiled: tuple[list[WorkflowStepSpec], list[str]] = (
+            self._builder.compile_steps(
+                list(operations), profile, [node_id], list(gpu_uuids), []
+            )
+        )
+        steps, errors = compiled
+        if errors:
+            LOGGER.warning(
+                "branch escalation for %s on %s could not be compiled: %s",
+                workflow.request_id,
+                node_id,
+                "; ".join(errors),
+            )
+            return []
+        return steps
 
     def escalate_failed_hardware_remediation(
         self, workflow: WorkflowRequest
@@ -670,13 +713,11 @@ class IncidentOrchestrator:
                     if generation_ignore_reason is not None:
                         correlated = correlated.model_copy(
                             update={
-                                "reasons": list(
-                                    dict.fromkeys(
-                                        [
-                                            *correlated.reasons,
-                                            generation_ignore_reason,
-                                        ]
-                                    )
+                                "reasons": bounded_reasons(
+                                    [
+                                        *correlated.reasons,
+                                        generation_ignore_reason,
+                                    ]
                                 ),
                                 "updated_at": datetime.now(timezone.utc),
                             }
@@ -693,6 +734,10 @@ class IncidentOrchestrator:
                         correlated.incident_id,
                     )
                     return correlated, workflow
+
+            stale = self._fence_stale_generation_without_baseline(event, decision)
+            if stale is not None:
+                return stale, None
 
             if isinstance(event, XidEvent):
                 grouped = self._ingest_grouped_fault(event, decision)
@@ -711,32 +756,7 @@ class IncidentOrchestrator:
             if grouped is not None:
                 return grouped
 
-            effective_action, runtime_reason = self._runtime_effective_action(
-                event, decision
-            )
-            incident = FaultIncident(
-                incident_id=decision.marker.incident_id,
-                event_id=event.event_id,
-                event_type=decision.event_type.value,
-                event_source=event.event_source,
-                source_boot_id=event.source_boot_id,
-                cluster_id=event.cluster_id,
-                node_ids=[event.node_id],
-                gpu_uuids=decision.marker.scope.gpu_uuids,
-                job_id=event.job_id,
-                attempt_id=event.attempt_id,
-                workload_identity_source=(event.workload_identity_source),
-                policy_version=decision.policy_version,
-                policy_source=decision.source.value,
-                official_action=decision.official_action,
-                effective_action=effective_action,
-                safety_action=decision.safety_action,
-                drill_id=event.drill_id,
-                reasons=[
-                    *decision.reasons,
-                    *([runtime_reason] if runtime_reason else []),
-                ],
-            )
+            incident = self._independent_incident(event, decision)
 
             if (
                 decision.action is RecoveryAction.NO_ACTION
@@ -766,6 +786,99 @@ class IncidentOrchestrator:
             self.store.save_workflow(workflow)
             self.store.save_incident(incident)
             return incident, workflow
+
+    def _independent_incident(
+        self,
+        event: XidEvent | SxidEvent,
+        decision: FaultPolicyDecision,
+        *,
+        extra_reasons: list[str] | None = None,
+    ) -> FaultIncident:
+        effective_action, runtime_reason = self._runtime_effective_action(
+            event, decision
+        )
+        return FaultIncident(
+            incident_id=decision.marker.incident_id,
+            event_id=event.event_id,
+            event_type=decision.event_type.value,
+            event_source=event.event_source,
+            source_boot_id=event.source_boot_id,
+            cluster_id=event.cluster_id,
+            node_ids=[event.node_id],
+            gpu_uuids=decision.marker.scope.gpu_uuids,
+            job_id=event.job_id,
+            attempt_id=event.attempt_id,
+            workload_identity_source=(event.workload_identity_source),
+            policy_version=decision.policy_version,
+            policy_source=decision.source.value,
+            official_action=decision.official_action,
+            effective_action=effective_action,
+            safety_action=decision.safety_action,
+            drill_id=event.drill_id,
+            reasons=bounded_reasons(
+                [
+                    *decision.reasons,
+                    *([runtime_reason] if runtime_reason else []),
+                    *(extra_reasons or []),
+                ]
+            ),
+        )
+
+    def _fence_stale_generation_without_baseline(
+        self,
+        event: XidEvent | SxidEvent,
+        decision: FaultPolicyDecision,
+    ) -> FaultIncident | None:
+        """F-B8: fence a stale event even when no recovery workflow exists.
+
+        ``_generation_fence`` compares a stale candidate against the ranked
+        recovery workflow of the running attempt and admits only escalations.
+        When there is no such workflow the attempt restart itself is the
+        recovery that already answered the fault, so the comparison baseline
+        is RESTART_WORKLOAD's rank. A candidate that does not out-rank it is
+        recorded as an ignored incident with no workflow; the families never
+        see it, so nothing acts on a fault the restart has already left behind.
+        """
+
+        observation = self._evidence_operations.attempt_observation(
+            event, record_ambiguity=False
+        )
+        if observation is None or observation.started_at is None:
+            return None
+        event_time = self._utc(self._event_time(event))
+        attempt_started_at = self._utc(observation.started_at)
+        if attempt_started_at <= event_time:
+            return None
+        if self._job_recovery_workflow(observation) is not None:
+            # A ranked baseline exists: the family fence compares against it.
+            return None
+        candidate_workflow = self._candidate_recovery_workflow(event, decision)
+        candidate_rank = self._arbiter.workflow_recovery_rank(candidate_workflow)
+        restart_rank = self._arbiter.RECOVERY_OPERATION_RANK[
+            WorkflowOperation.RESTART_WORKLOAD
+        ]
+        if candidate_rank > restart_rank:
+            return None
+        event_name = (
+            f"XID {event.xid}" if isinstance(event, XidEvent) else f"SXID {event.sxid}"
+        )
+        reason = (
+            f"Ignored stale {event_name} action for previous attempt "
+            f"generation: event_time={event_time.isoformat()}, "
+            f"current_attempt={observation.attempt_id}, "
+            "current_attempt_started_at="
+            f"{attempt_started_at.isoformat()}, "
+            f"candidate_rank={candidate_rank}, "
+            f"current_recovery_rank={restart_rank} (the attempt restart is the "
+            "baseline; no recovery workflow to compare); "
+            "action is not an escalation"
+        )
+        incident = self._independent_incident(
+            event, decision, extra_reasons=[reason]
+        ).model_copy(update={"state": IncidentState.RECOVERED})
+        self.store.save_incident(incident)
+        self.store.link_event_to_incident(event.event_id, incident.incident_id)
+        return incident
 
     @staticmethod
     def _sample_hung_triage_nodes(
@@ -868,6 +981,7 @@ class IncidentOrchestrator:
         gpu_uuids: set[str],
         *,
         allow_job_branch_merge: bool = True,
+        now: datetime | None = None,
     ) -> str:
         return self._workflow_merger.disposition(
             existing_workflow,
@@ -875,6 +989,7 @@ class IncidentOrchestrator:
             node_id,
             gpu_uuids,
             allow_job_branch_merge=allow_job_branch_merge,
+            now=now,
         )
 
     def _recovery_action_has_started(
@@ -1266,23 +1381,55 @@ class IncidentOrchestrator:
         cordon one node and readmit it while the other was still being
         reset, and would validate only half the faulted fleet.
         """
+        if not gpu_uuids_by_node:
+            # Nothing to widen to. Rewriting every node step's ``gpu_uuids``
+            # to ``[]`` made the node-action adapter refuse the step
+            # outright (P0-57C).
+            return workflow
         node_ids = sorted(gpu_uuids_by_node)
-        all_gpu_uuids = sorted(
-            {gpu_uuid for values in gpu_uuids_by_node.values() for gpu_uuid in values}
-        )
+        # Nodes that carry no GPU identity join host-level steps only; the
+        # node-action adapter refuses a GPU action on a node whose explicit
+        # GPU list is empty (P0-57C), so GPU actions take GPU nodes alone.
+        gpu_nodes = sorted(node for node, values in gpu_uuids_by_node.items() if values)
+        all_gpu_uuids = {
+            gpu_uuid for values in gpu_uuids_by_node.values() for gpu_uuid in values
+        }
+        # Finished, superseded and in-flight steps are history or a command
+        # the agent already holds; widening them would make the ledger
+        # disagree with what ran (F-B6). Only pending steps take the union.
+        untouchable = set(resolved_step_indexes(workflow)) | {
+            execution.step_index for execution in workflow.step_executions
+        }
         steps = []
-        for step in workflow.official_steps:
-            if step.operation in self._WORKLOAD_SCOPED_OPERATIONS:
+        for index, step in enumerate(workflow.official_steps):
+            if (
+                index in untouchable
+                or step.operation in self._WORKLOAD_SCOPED_OPERATIONS
+            ):
                 steps.append(step)
                 continue
-            widened = {
+            widened: dict[str, object] = {
                 "node_ids": sorted(set(step.node_ids) | set(node_ids)),
-                "gpu_uuids": all_gpu_uuids,
+                "gpu_uuids": sorted(set(step.gpu_uuids) | all_gpu_uuids),
             }
             if step.operation in self._NODE_ACTION_OPERATIONS:
+                widened["node_ids"] = sorted(set(step.node_ids) | set(gpu_nodes))
+                merged: dict[str, set[str]] = {}
+                raw = step.parameters.get("gpu_uuids_by_node")
+                if isinstance(raw, dict):
+                    for node, values in raw.items():
+                        if isinstance(values, list):
+                            merged.setdefault(str(node), set()).update(
+                                str(value) for value in values
+                            )
+                for node, values in gpu_uuids_by_node.items():
+                    if values:
+                        merged.setdefault(node, set()).update(values)
                 widened["parameters"] = {
                     **step.parameters,
-                    "gpu_uuids_by_node": gpu_uuids_by_node,
+                    "gpu_uuids_by_node": {
+                        node: sorted(values) for node, values in sorted(merged.items())
+                    },
                 }
             steps.append(step.model_copy(update=widened))
         return workflow.model_copy(update={"official_steps": steps})
@@ -1680,4 +1827,8 @@ class IncidentOrchestrator:
             safety_steps=safety_steps,
             official_steps=official_steps,
             blocked_reasons=list(dict.fromkeys(blocked_reasons)),
+            safety_only=status is WorkflowStatus.SAFETY_PENDING,
+            blocked_kind=(
+                BlockedKind.NEEDS_OPERATOR if status is WorkflowStatus.BLOCKED else None
+            ),
         )

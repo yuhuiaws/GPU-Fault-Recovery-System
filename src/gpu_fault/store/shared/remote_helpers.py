@@ -61,6 +61,7 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
         RemoteCommandStatus.LEASED,
     }
     by_status: dict[str, int] = {status.value: 0 for status in RemoteCommandStatus}
+    by_cluster_status: dict[str, dict[str, int]] = {}
     unclaimed_age_by_cluster: dict[str, float] = {}
     open_by_cluster: dict[str, int] = {}
     internal_errors = 0
@@ -68,6 +69,10 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
     unclaimed_expired = 0
     for command in commands:
         by_status[command.status.value] = by_status.get(command.status.value, 0) + 1
+        cluster_counts = by_cluster_status.setdefault(command.cluster_id, {})
+        cluster_counts[command.status.value] = (
+            cluster_counts.get(command.status.value, 0) + 1
+        )
         if (
             command.status_source == "executor-internal-error"
             and command.error not in LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS
@@ -100,6 +105,9 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
     return {
         "total": len(commands),
         "by_status": by_status,
+        # The (cluster, status) cells behind ``by_status`` (F-D12): the
+        # per-cluster gauge reads them, the fleet total stays ``by_status``.
+        "by_cluster_status": by_cluster_status,
         "open_by_cluster": open_by_cluster,
         "oldest_unclaimed_age_seconds_by_cluster": (unclaimed_age_by_cluster),
         "oldest_unclaimed_age_seconds": max(

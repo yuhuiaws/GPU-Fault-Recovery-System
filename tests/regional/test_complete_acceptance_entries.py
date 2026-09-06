@@ -72,7 +72,7 @@ def test_reusable_entries_follow_the_formal_predecessor_chain() -> None:
     assert formal_predecessor("GF-REGIONAL-WORKLOAD-001") == "GF-REGIONAL-AUTH-016"
     assert formal_predecessor("GF-REGIONAL-ISO-001") == ("GF-REGIONAL-WORKLOAD-002")
     assert formal_predecessor("GF-REGIONAL-PREEMPT-012") == ("GF-REGIONAL-PREEMPT-011")
-    assert formal_predecessor("GF-REGIONAL-E2E-001") == ("GF-REGIONAL-PREEMPT-031")
+    assert formal_predecessor("GF-REGIONAL-E2E-001") == ("GF-REGIONAL-PREEMPT-034")
     assert formal_predecessor("GF-REGIONAL-NET-001") == "GF-REGIONAL-CAP-005"
     assert all(
         case_metadata(case_id).predecessor == formal_predecessor(case_id)

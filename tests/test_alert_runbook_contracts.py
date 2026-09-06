@@ -507,3 +507,113 @@ def test_anchor_matches_github_heading_slug_rules() -> None:
     assert MODULE.markdown_anchor("REG-14.1 CPU API Pod") == "reg-141-cpu-api-pod", (
         "spaces become dashes and the dot is dropped"
     )
+
+
+# BATCH3: the periodic-job and closed-loop gauges added on 2026-09-06. Each one
+# describes a condition every component alert is blind to -- a processor that
+# died mid-lease, a shard counter that no longer matches the table, a completion
+# event nobody triaged, an escalation nobody picked up, a workflow nobody
+# dispatched -- so each needs its own rule and its own card.
+BATCH3_ALERTS = {
+    "GpuFaultProcessorExpiredLeasesReclaimed": (
+        "increase(gpu_fault_processor_expired_leases_reclaimed_total[10m])"
+    ),
+    "GpuFaultProcessorCounterDrift": "gpu_fault_processor_counter_drift_abs",
+    "GpuFaultCompletionPendingTriageBacklog": (
+        'gpu_fault_completion_decisions{status="PENDING_TRIAGE"}'
+    ),
+    "GpuFaultCompletionEventsWithoutDecision": (
+        "gpu_fault_completion_events_without_decision"
+    ),
+    "GpuFaultIncidentsAwaitingOperator": (
+        'gpu_fault_incidents_by_state{state="ESCALATED"}'
+    ),
+    "GpuFaultWorkflowPendingAge": "gpu_fault_workflow_pending_age_seconds_max",
+}
+
+
+def _rule(alert: str) -> dict[str, object]:
+    return next(rule for rule in amp_rules() if rule["alert"] == alert)
+
+
+def _expression(alert: str) -> str:
+    return " ".join(str(_rule(alert)["expr"]).split())
+
+
+def test_the_periodic_job_gauges_each_have_an_alert() -> None:
+    alerts = {str(rule["alert"]) for rule in amp_rules()}
+
+    for alert, metric in BATCH3_ALERTS.items():
+        assert alert in alerts, f"periodic-job alert is missing: {alert}"
+        assert metric in _expression(alert), (alert, _expression(alert))
+
+
+def test_the_pending_triage_backlog_waits_twice_the_deadline() -> None:
+    """900s is the default GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS.
+
+    The reconcile job gets one full deadline plus a scan interval to act; only a
+    decision still PENDING_TRIAGE after twice that is a stall rather than a lag.
+    """
+    assert _rule("GpuFaultCompletionPendingTriageBacklog")["for"] == "30m"
+    assert _rule("GpuFaultCompletionEventsWithoutDecision")["for"] == "30m"
+
+
+def test_the_escalated_incident_reminder_is_slow_and_soft() -> None:
+    """ESCALATED is a designed parking state, so this is a reminder, not a fault."""
+    rule = _rule("GpuFaultIncidentsAwaitingOperator")
+
+    assert rule["for"] == "24h"
+    assert rule["labels"]["severity"] != "critical"  # type: ignore[index]
+
+
+def test_the_pending_age_alert_fires_at_thirty_minutes() -> None:
+    rule = _rule("GpuFaultWorkflowPendingAge")
+
+    assert "> 1800" in _expression("GpuFaultWorkflowPendingAge")
+    assert rule["for"] == "10m"
+
+
+def test_the_counter_drift_alert_reads_both_drift_gauges_over_a_window() -> None:
+    """A single scrape can straddle a batch commit; five minutes of drift cannot."""
+    expression = _expression("GpuFaultProcessorCounterDrift")
+
+    assert "min_over_time(gpu_fault_processor_counter_drift_abs[5m])" in expression
+    assert (
+        "min_over_time(gpu_fault_processor_counter_mismatched_clusters[5m])"
+        in expression
+    )
+
+
+def test_the_batch3_alerts_are_not_a_severity_of_their_own() -> None:
+    severities = {
+        str(_rule(alert)["labels"]["severity"])  # type: ignore[index]
+        for alert in BATCH3_ALERTS
+    }
+
+    assert severities <= {"warning", "critical"}, severities
+
+
+def test_the_keep_list_admits_the_completion_incident_and_finding_families() -> None:
+    """`gpu_fault_incident_.+` does not match `gpu_fault_incidents_by_state`.
+
+    The `s` is enough to drop the whole family before AMP, so a rule on it would
+    validate and never fire. The findings counter has no rule yet but is the
+    only evidence that a CRITICAL finding was suppressed rather than lost.
+    """
+    scrapes = adot_collector_config()["receivers"]["prometheus"]["config"][
+        "scrape_configs"
+    ]
+    probe = [
+        {
+            "alert": "Probe",
+            "expr": (
+                'gpu_fault_completion_decisions{status="PENDING_TRIAGE"} + '
+                "gpu_fault_completion_events_without_decision + "
+                'gpu_fault_incidents_by_state{state="ESCALATED"} + '
+                "gpu_fault_gpu_findings_without_incident_total + "
+                "gpu_fault_completion_pending_triage_reconciled_total"
+            ),
+        }
+    ]
+
+    assert MODULE.keep_filter_defects(scrapes, probe) == []

@@ -118,6 +118,8 @@ def main() -> None:
     source.add_argument("--sqlite-path")
     source.add_argument("--source-postgres-url")
     source.add_argument("--ensure-schema", action="store_true")
+    source.add_argument("--build-indexes-concurrently", action="store_true")
+    source.add_argument("--schema-preflight", action="store_true")
     source.add_argument("--backfill-hot-state", action="store_true")
     source.add_argument("--hot-state-status", action="store_true")
     source.add_argument(
@@ -157,6 +159,28 @@ def main() -> None:
         store.close()
         print("schema initialization complete")
         return
+    if arguments.build_indexes_concurrently or arguments.schema_preflight:
+        # Deliberately not a PostgresStore: opening one validates the schema
+        # and fails closed on the very indexes this is about to build.
+        import psycopg
+
+        from gpu_fault.store.postgres.index_builder import (
+            build_missing_indexes_concurrently,
+            schema_preflight,
+        )
+
+        with psycopg.connect(arguments.postgres_url, autocommit=True) as connection:
+            if arguments.build_indexes_concurrently:
+                report = build_missing_indexes_concurrently(connection)
+                print(json.dumps(report, indent=2, sort_keys=True))
+                if report["missing_after"] or report["invalid_after"]:
+                    raise SystemExit(1)
+                return
+            report = schema_preflight(connection)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            if not report["ok"]:
+                raise SystemExit(1)
+            return
     if arguments.backfill_hot_state:
         store = PostgresStore(arguments.postgres_url, hot_state_mode="dual")
         try:

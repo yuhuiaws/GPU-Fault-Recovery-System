@@ -315,6 +315,7 @@ class NodeActionExecutionService:
                 item
                 for item in reversed(context.workflow.step_executions)
                 if item.step_index == context.step_index
+                and item.operation is context.step.operation
             ),
             None,
         )

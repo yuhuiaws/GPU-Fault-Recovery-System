@@ -78,6 +78,7 @@ from gpu_fault.admin.site import (
 )
 from gpu_fault.admin.source_deploy import run_source_deploy
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
+from gpu_fault.models import BlockedKind
 from gpu_fault.admin.workflow_reconcile import (
     apply_retired_generation_reconcile,
     apply_workflow_reconcile,
@@ -315,6 +316,16 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
         default="restore",
     )
     reconcile.add_argument("--workflow-id", action="append", default=[])
+    # Batch selectors for ``--mode restore --plan`` discovery: review one
+    # incident's BLOCKED records, or one kind of BLOCKED, and cap the batch.
+    reconcile.add_argument("--incident-id", action="append", default=[])
+    reconcile.add_argument(
+        "--blocked-kind",
+        action="append",
+        default=[],
+        choices=[kind.value for kind in BlockedKind],
+    )
+    reconcile.add_argument("--max-items", type=int, default=None)
     reconcile.add_argument("--plan-sha256")
     reconcile.add_argument("--reference")
 
@@ -764,19 +775,34 @@ def _run_workflow_reconcile(arguments: argparse.Namespace) -> int:
     site_file = _managed_site_file(arguments, command="workflow-reconcile")
     assert site_file is not None
     retired = getattr(arguments, "mode", "restore") == "retired-generation"
+    incident_ids = tuple(getattr(arguments, "incident_id", ()) or ())
+    blocked_kinds = tuple(getattr(arguments, "blocked_kind", ()) or ())
+    max_items = getattr(arguments, "max_items", None)
+    if retired and (incident_ids or blocked_kinds or max_items is not None):
+        raise SiteConfigError(
+            "--incident-id, --blocked-kind and --max-items select BLOCKED records "
+            "for --mode restore --plan only"
+        )
+    if max_items is not None and max_items < 1:
+        raise SiteConfigError("--max-items must be at least 1")
     with administrator_operation_lock(state_dir):
         site = load_site(site_file, repository_root=arguments.repo_root)
         if arguments.plan:
-            planner = (
-                plan_retired_generation_reconcile
-                if retired
-                else plan_workflow_reconcile
-            )
-            result = planner(
-                site,
-                state_dir,
-                workflow_ids=tuple(arguments.workflow_id),
-            )
+            if retired:
+                result = plan_retired_generation_reconcile(
+                    site,
+                    state_dir,
+                    workflow_ids=tuple(arguments.workflow_id),
+                )
+            else:
+                result = plan_workflow_reconcile(
+                    site,
+                    state_dir,
+                    workflow_ids=tuple(arguments.workflow_id),
+                    incident_ids=incident_ids,
+                    blocked_kinds=blocked_kinds,
+                    max_items=max_items,
+                )
         else:
             if not arguments.plan_sha256 or not arguments.reference:
                 raise SiteConfigError(
@@ -794,7 +820,10 @@ def _run_workflow_reconcile(arguments: argparse.Namespace) -> int:
                 reference=arguments.reference,
             )
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
+    # A partial apply is reported in full and exits non-zero: the rows that
+    # were written are named under ``applied_workflow_ids``, the rest under
+    # ``failures``, and the operator reruns the same command for the rest.
+    return 1 if result.get("failed_workflow_ids") else 0
 
 
 def _run_readonly_managed_command(

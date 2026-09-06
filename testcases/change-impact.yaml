@@ -135,7 +135,7 @@ rules:
       - GF-REGIONAL-HA-003
       - GF-REGIONAL-HA-008..009
       - GF-REGIONAL-CMD-001..016
-      - GF-REGIONAL-PREEMPT-001..031
+      - GF-REGIONAL-PREEMPT-001..034
     checks:
       - config-check
     full: true
@@ -326,7 +326,7 @@ rules:
       - tests/orchestration
       - tests/execution
     regional_cases:
-      - GF-REGIONAL-PREEMPT-001..031
+      - GF-REGIONAL-PREEMPT-001..034
     checks:
       - architecture-check
 
@@ -652,7 +652,7 @@ rules:
       - tests/execution
       - tests/orchestration
     regional_cases:
-      - GF-REGIONAL-PREEMPT-001..031
+      - GF-REGIONAL-PREEMPT-001..034
       - GF-REGIONAL-E2E-001
     fallback: true
 

@@ -8,6 +8,9 @@ from fastapi.responses import Response
 from gpu_fault.app.authorization import authorization_bucket
 from gpu_fault.app.builtin_metric_contributors import (
     closed_loop_metric_lines,
+    completion_state_metric_lines,
+    control_loop_metric_lines,
+    postgres_pool_metric_lines,
     fleet_rollout_metric_lines,
     orchestration_metric_lines,
     policy_metric_lines,
@@ -132,6 +135,11 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
             "notification_reconnects_total": 0,
             "notification_shard": -1,
             "notification_shard_count": 0,
+            "notification_listener_connected": 0,
+            "notification_shardless_episodes_total": 0,
+            "fault_rows_skipped_by_observation_total": 0,
+            "fault_rows_blocked_by_observation": 0,
+            "interlock_probes_total": 0,
             "stale_superseded_total": 0,
             "stale_superseded_by_path": {},
             "lane_wait": {
@@ -283,6 +291,9 @@ METRIC_CONTRIBUTORS.register(
     orchestration_metric_lines,
 )
 METRIC_CONTRIBUTORS.register("closed-loop", closed_loop_metric_lines)
+METRIC_CONTRIBUTORS.register("control-loop", control_loop_metric_lines)
+METRIC_CONTRIBUTORS.register("completion-state", completion_state_metric_lines)
+METRIC_CONTRIBUTORS.register("postgres-pool", postgres_pool_metric_lines)
 METRIC_CONTRIBUTORS.register(
     "collector-silence",
     collector_silence_lines,

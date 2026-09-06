@@ -15,24 +15,40 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     recovery_action_sort_key,
 )
+from gpu_fault.recovery_actions import RECOVERY_ACTION_PROFILES
 from gpu_fault.store import NotFoundError
 
 
-ACTION_OPERATION = {
-    RecoveryAction.MARK_UNSCHEDULABLE: (WorkflowOperation.MARK_UNSCHEDULABLE),
-    RecoveryAction.DRAIN: WorkflowOperation.MARK_UNSCHEDULABLE,
-    RecoveryAction.STOP_WORKLOAD: WorkflowOperation.STOP_WORKLOADS,
-    RecoveryAction.COLLECT_EVIDENCE: (WorkflowOperation.FREEZE_EVIDENCE),
-    RecoveryAction.RESTART_WORKLOAD: (WorkflowOperation.RESTART_WORKLOAD),
-    RecoveryAction.RESET_GPU: WorkflowOperation.RESET_GPU,
-    RecoveryAction.REBOOT_NODE: WorkflowOperation.RESTART_NODE,
-    RecoveryAction.REPLACE_NODE: WorkflowOperation.REPLACE_NODE,
-    RecoveryAction.RUN_DIAGNOSTICS: WorkflowOperation.VALIDATE_GPU,
-    RecoveryAction.VALIDATE_NODE: WorkflowOperation.VALIDATE_GPU,
-    RecoveryAction.RESTORE_SCHEDULING: (WorkflowOperation.RESTORE_SCHEDULING),
-    RecoveryAction.QUARANTINE: WorkflowOperation.QUARANTINE,
-    RecoveryAction.ESCALATE_OPERATOR: (WorkflowOperation.ESCALATE_SUPPORT),
+#: Derived from the one recovery-action table shared with the spare-blocking
+#: set in :mod:`gpu_fault.markers`; see :mod:`gpu_fault.recovery_actions`.
+ACTION_OPERATION: dict[RecoveryAction, WorkflowOperation] = {
+    action: profile.operation
+    for action, profile in RECOVERY_ACTION_PROFILES.items()
+    if profile.operation is not None
 }
+
+
+class PassiveCompileError(ValueError):
+    """A recovery plan names an action the passive compiler cannot execute."""
+
+
+def operation_for_action(action: RecoveryAction) -> WorkflowOperation:
+    """The workflow operation for a plan action, or a named error.
+
+    ``ACTION_OPERATION[action]`` raised ``KeyError`` for the four actions the
+    planner can emit that were missing from the table, and it raised it inside
+    the window between the event row and the decision row being written -- the
+    permanent poisoning of P0-62A / P0-62B. The table is now complete for
+    every actionable ``RecoveryAction`` (pinned by a test), and an unmapped
+    action is reported by name instead of as a bare ``KeyError``.
+    """
+
+    try:
+        return ACTION_OPERATION[action]
+    except KeyError:
+        raise PassiveCompileError(
+            f"recovery action {action.value} has no workflow operation"
+        ) from None
 
 
 class PassiveWorkflowCompiler:
@@ -159,7 +175,7 @@ class PassiveWorkflowCompiler:
                         )
                     )
                 continue
-            operation = ACTION_OPERATION[item.action]
+            operation = operation_for_action(item.action)
             owner = (
                 self.evidence_owner
                 if operation is WorkflowOperation.FREEZE_EVIDENCE
@@ -198,6 +214,10 @@ class PassiveWorkflowCompiler:
                         "restart_budget": event.restart_budget,
                     }
                 )
+                if plan.avoid_node_ids:
+                    # The plan's only isolation lever for a node it does not
+                    # trust; the Kubernetes restart adapter reads it (F-G5).
+                    parameters["avoid_node_ids"] = sorted(set(plan.avoid_node_ids))
             steps.append(
                 WorkflowStepSpec(
                     operation=operation,

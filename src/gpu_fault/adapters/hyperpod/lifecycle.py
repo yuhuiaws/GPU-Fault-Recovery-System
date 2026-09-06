@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from gpu_fault.adapters.hyperpod.confirmation import HyperPodConfirmationMixin
+from gpu_fault.adapters.hyperpod.notifications import HyperPodNotificationMixin
+from gpu_fault.adapters.kubernetes.adapter import KubernetesWorkflowAdapter
+from gpu_fault.adapters.node_action.adapter import NodeActionWorkflowAdapter
 from gpu_fault.aws_errors import aws_configuration_error
 from gpu_fault.execution import (
     WorkflowStepContext,
@@ -25,20 +29,14 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
-from gpu_fault.operation_registry import (
-    OperationAdapter,
-    operations_for_adapter,
-)
 from gpu_fault.notifications import (
     RestartGuardEmailBuilder,
     WarmSpareReplacementEmailBuilder,
 )
-
-
-from gpu_fault.adapters.kubernetes.adapter import KubernetesWorkflowAdapter
-from gpu_fault.adapters.node_action.adapter import NodeActionWorkflowAdapter
-from gpu_fault.adapters.hyperpod.confirmation import HyperPodConfirmationMixin
-from gpu_fault.adapters.hyperpod.notifications import HyperPodNotificationMixin
+from gpu_fault.operation_registry import (
+    OperationAdapter,
+    operations_for_adapter,
+)
 
 
 class HyperPodLifecycleStepAdapter(
@@ -190,6 +188,7 @@ class HyperPodLifecycleStepAdapter(
                 item
                 for item in context.workflow.step_executions
                 if item.step_index == context.step_index
+                and item.operation is context.step.operation
                 and item.status is WorkflowStepStatus.WAITING
             ),
             None,

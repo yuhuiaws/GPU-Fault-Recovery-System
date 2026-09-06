@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, cast
 
 from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     CompletionDecision,
+    DecisionStatus,
     DiagnosticRequest,
     EffectiveRuntimeProfile,
     NodeMarker,
@@ -284,12 +286,90 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
             raise NotFoundError(f"{cluster_id}/{attempt_id}")
         return self._get("event", key)
 
+    def completion_transaction(self, event_key: str) -> AbstractContextManager[None]:
+        # One transaction under the process lock (F-G2 (3)): the writes the
+        # completion service nests inside (event row, incident + workflow, plan,
+        # decision) become savepoints of it and commit or roll back as one.
+        return cast(
+            AbstractContextManager[None],
+            self._state_transaction(f"completion/{event_key}"),
+        )
+
     def save_decision(self, decision: CompletionDecision) -> None:
         with self._lock:
             self._put("decision", decision.event_key, decision)
 
     def get_decision_by_event(self, event_key: str) -> CompletionDecision | None:
         return self._get_optional("decision", event_key)
+
+    def list_decisions_by_status(
+        self,
+        status: DecisionStatus,
+        *,
+        older_than: datetime | None = None,
+        limit: int = 100,
+    ) -> list[CompletionDecision]:
+        if limit < 1:
+            return []
+        rows = self._db.execute(
+            """
+            SELECT decision.payload, diagnostic.payload
+            FROM objects AS decision
+            LEFT JOIN objects AS diagnostic
+              ON diagnostic.kind='diagnostic'
+             AND diagnostic.key=json_extract(
+                 decision.payload, '$.diagnostic_request_id'
+             )
+            WHERE decision.kind='decision'
+              AND json_extract(decision.payload, '$.status')=?
+            """,
+            (status.value,),
+        ).fetchall()
+        floor = datetime.min.replace(tzinfo=timezone.utc)
+        candidates: list[tuple[datetime | None, CompletionDecision]] = []
+        for decision_payload, diagnostic_payload in rows:
+            created_at = (
+                DiagnosticRequest.model_validate_json(diagnostic_payload).created_at
+                if diagnostic_payload is not None
+                else None
+            )
+            if older_than is not None and created_at is not None:
+                if created_at > older_than:
+                    continue
+            candidates.append(
+                (created_at, CompletionDecision.model_validate_json(decision_payload))
+            )
+        candidates.sort(key=lambda item: (item[0] or floor, item[1].event_key))
+        return [decision for _created_at, decision in candidates[:limit]]
+
+    def decision_status_counts(self) -> dict[DecisionStatus, int]:
+        rows = self._db.execute(
+            """
+            SELECT json_extract(payload, '$.status'), count(*)
+            FROM objects
+            WHERE kind='decision'
+            GROUP BY 1
+            """
+        ).fetchall()
+        counts = {status: 0 for status in DecisionStatus}
+        for status, count in rows:
+            counts[DecisionStatus(status)] = int(count)
+        return counts
+
+    def count_completion_events_without_decision(self) -> int:
+        row = self._db.execute(
+            """
+            SELECT count(*)
+            FROM objects AS event
+            WHERE event.kind='event'
+              AND NOT EXISTS (
+                  SELECT 1 FROM objects AS decision
+                  WHERE decision.kind='decision'
+                    AND decision.key=event.key
+              )
+            """
+        ).fetchone()
+        return int(row[0])
 
     def add_marker(self, marker: NodeMarker) -> None:
         with self._lock:
@@ -462,6 +542,12 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
         return sorted(
             (item for item in resources if site_id is None or item.site_id == site_id),
             key=lambda item: (item.site_id, item.resource_key),
+        )
+
+    def has_workflow_successor(self, predecessor_workflow_id: str) -> bool:
+        return any(
+            workflow.predecessor_workflow_id == predecessor_workflow_id
+            for workflow in self._list("workflow")
         )
 
     def get_preempting_successor(

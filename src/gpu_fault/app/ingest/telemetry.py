@@ -26,6 +26,7 @@ from gpu_fault.host_health import (
     NodeHealthIngestionResult,
 )
 from gpu_fault.models import RecoveryAction, Severity
+from gpu_fault.store.shared.health_signals import finding_health_signal_key
 from gpu_fault.telemetry import CollectorKind, EvidenceKind
 
 
@@ -86,8 +87,21 @@ class TelemetryIngestionService:
         """The half of gpu-metrics ingestion that must be one commit.
 
         Split out so a claim batch can persist every item in a single
-        transaction; everything after the commit lives in
+        transaction; only the dispatcher wake lives after the commit, in
         ``_finish_gpu_metrics``.
+
+        The incidents are created *here*, inside the caller's ingestion
+        transaction, and not after it (F-M1 / P0-31A / P0-37A). When they
+        were created after the commit, a failure or a crash between the two
+        halves left a CRITICAL finding state that no incident named: the next
+        batch for the node saw the same severity, ``update_gpu_findings``
+        reported nothing new, and the finding stayed orphaned for as long as
+        the fault persisted. On Postgres the orchestrator's own state
+        transactions nest as savepoints inside ``collector_ingestion_transaction``,
+        so finding, batch record, marker, incident and workflow now commit
+        together or not at all; a same-batch replay after a rollback recomputes
+        them once, and a same-batch replay after a commit is the duplicate
+        fast path plus idempotent incident lookups.
         """
 
         batch = self.telemetry_context._enrich_workload_context(
@@ -121,13 +135,36 @@ class TelemetryIngestionService:
                 payload=batch.model_dump(mode="json"),
                 observations=observations,
             )
-        return batch, result
+        return batch, self._ingest_gpu_findings(batch, result)
 
     def _finish_gpu_metrics(
         self,
         batch: GpuMetricBatch,
         result: GpuMetricsIngestionResult,
     ) -> GpuMetricsIngestionResult:
+        """What runs after the ingestion transaction has committed.
+
+        Only the dispatcher wake: waking before the commit would let the
+        dispatcher poll a workflow row that is not visible yet.
+        """
+
+        del batch
+        self.context.dispatcher.wake()
+        return result
+
+    def _ingest_gpu_findings(
+        self,
+        batch: GpuMetricBatch,
+        result: GpuMetricsIngestionResult,
+    ) -> GpuMetricsIngestionResult:
+        """Turn one batch's new findings and XID events into incidents.
+
+        Runs inside the ingestion transaction (see ``_persist_gpu_metrics``).
+        Every path in here is idempotent by event id, so a replayed batch --
+        whose result is the stored one with ``duplicate=True`` -- reaches the
+        incidents it already created rather than nothing.
+        """
+
         decisions = [
             self.fault_ingestion.ingest_xid(event) for event in result.xid_events
         ]
@@ -202,17 +239,19 @@ class TelemetryIngestionService:
             )
         if node_findings:
             self.node_health.ingest(batch.batch_id, node_findings)
-        self.context.dispatcher.wake()
         return result.model_copy(update={"decisions": decisions})
 
     def _persist_host_telemetry(
         self, batch: HostTelemetryBatch, observations=None
-    ) -> tuple[HostTelemetryBatch, list]:
+    ) -> tuple[HostTelemetryBatch, NodeHealthIngestionResult]:
         """The half of host-telemetry ingestion that must be one commit.
 
-        See ``_persist_gpu_metrics``: the findings are turned into
-        incidents and workflows after the commit, in
-        ``_finish_host_telemetry``.
+        See ``_persist_gpu_metrics``: the findings become incidents and
+        workflows here, in the same transaction as the health-signal claim
+        that produced them. The claim does not latch ``notified``; the finish
+        half does, after this transaction committed, so a failed incident write
+        -- on any backend, transactional or not -- leaves the signal free to
+        emit again on its next sample (P0-38B).
         """
 
         batch = self.telemetry_context._enrich_workload_context(
@@ -220,6 +259,9 @@ class TelemetryIngestionService:
             batch.observed_at,
             observations=observations,
         )
+        if batch.received_at is None:
+            # Sustained-signal windows run on this clock, not the node's (F-M2).
+            batch = batch.model_copy(update={"received_at": datetime.now(timezone.utc)})
         findings = self.context.node_health.evaluate_metrics(batch)
         self.telemetry_context._record_collector_status(
             CollectorKind.HOST_TELEMETRY,
@@ -244,12 +286,20 @@ class TelemetryIngestionService:
                 payload=batch.model_dump(mode="json"),
                 observations=observations,
             )
-        return batch, findings
+        return batch, self.node_health.ingest(batch.batch_id, findings)
 
     def _finish_host_telemetry(
-        self, batch: HostTelemetryBatch, findings: list
+        self, batch: HostTelemetryBatch, result: NodeHealthIngestionResult
     ) -> NodeHealthIngestionResult:
-        result = self.node_health.ingest(batch.batch_id, findings)
+        # The commit that carried the incident and its advisory notification
+        # is the delivery: latch the signals that emitted only now (P0-38B).
+        # Before the wake, which is not part of delivering anything -- a
+        # failed wake must not re-emit a fault that already has its incident.
+        notified_at = batch.received_at or batch.observed_at
+        for finding in result.findings:
+            self.context.store.mark_health_signal_notified(
+                finding_health_signal_key(finding), notified_at=notified_at
+            )
         self.context.dispatcher.wake()
         return result
 
@@ -257,7 +307,7 @@ class TelemetryIngestionService:
         self,
         batch: NodeLogBatch,
         observations=None,
-    ) -> tuple[NodeLogBatch, list]:
+    ) -> tuple[NodeLogBatch, NodeHealthIngestionResult]:
         batch = self.telemetry_context._enrich_workload_context(
             batch,
             batch.collected_at,
@@ -289,14 +339,16 @@ class TelemetryIngestionService:
                 payload=batch.model_dump(mode="json"),
                 observations=observations,
             )
-        return batch, findings
+        # Incidents in the same transaction as the evidence, as for the other
+        # two channels (F-M1).
+        return batch, self.node_health.ingest(batch.batch_id, findings)
 
     def _finish_node_logs(
         self,
         batch: NodeLogBatch,
-        findings: list,
+        result: NodeHealthIngestionResult,
     ) -> NodeHealthIngestionResult:
-        result = self.node_health.ingest(batch.batch_id, findings)
+        del batch
         self.context.dispatcher.wake()
         return result
 
@@ -372,9 +424,12 @@ class TelemetryIngestionService:
         ``raw_evidence/<cluster>/<node>``, so two groups with overlapping
         node sets would deadlock if each walked its nodes in claim order.
 
-        The follow-up work -- incidents, workflows, notifications, the
-        dispatcher wake -- runs after the commit, exactly as it does for
-        a single request.
+        Incidents, workflows, markers and notifications are written inside
+        each item's savepoint, so a failed incident write takes that item's
+        findings back with it and its siblings keep theirs (F-M1: the
+        two-phase window does not widen to the whole claim batch). Only the
+        dispatcher wake runs after the commit, exactly as it does for a
+        single request.
         """
 
         ordered = sorted(

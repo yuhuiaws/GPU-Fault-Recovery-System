@@ -16,6 +16,7 @@ from gpu_fault.app.admission import (
 from gpu_fault.app.runtime import ProcessorDispatchState
 from gpu_fault.async_store import (
     AsyncStoreExecutor,
+    RequestDeadlineExceeded,
     StoreIoCapacityExceeded,
 )
 from gpu_fault.channel_registry import CHANNEL_REGISTRY
@@ -107,6 +108,29 @@ def inflate_bounded(body: bytes, max_bytes: int) -> bytes:
     return decoded
 
 
+@dataclass(frozen=True)
+class PostgresPoolCapacity:
+    """What this role can ask of its connection pool at full load (F-E5).
+
+    ``demand_by_consumer`` is every thread family that checks a connection out
+    of the pool; ``unpooled_connections`` are the LISTEN connections opened
+    beside it, which count against Aurora's ``max_connections`` but never
+    against the pool, so they are reported and kept out of the ratio.
+    """
+
+    pool_max: int
+    demand_by_consumer: dict[str, int]
+    unpooled_connections: int
+
+    @property
+    def demand(self) -> int:
+        return sum(self.demand_by_consumer.values())
+
+    @property
+    def oversubscription_ratio(self) -> float:
+        return self.demand / self.pool_max if self.pool_max > 0 else float("inf")
+
+
 @dataclass
 class AdmissionRuntime:
     max_queue_depth: int
@@ -151,6 +175,10 @@ class AdmissionRuntimeFactory:
     def build(self) -> AdmissionRuntime:
         limits = self._limits()
         executors = self._executors(limits)
+        # Published on the context the way the periodic runner is (F-L1), so
+        # /metrics can export the ratio; a startup WARNING is invisible during a
+        # rolling release.
+        self.context.postgres_pool_capacity = self.pool_capacity(limits)
         batchers = self._batchers(limits, executors)
         return AdmissionRuntime(
             **limits,
@@ -340,31 +368,86 @@ class AdmissionRuntimeFactory:
                 prefix="gpu-fault-store-io-spool-admission",
             ),
         }
-        self._warn_pool_capacity(limits)
         return executors
 
     @staticmethod
-    def _warn_pool_capacity(limits: dict) -> None:
+    def pool_capacity(limits: dict) -> PostgresPoolCapacity | None:
+        """Estimate the role's connection demand against its pool (F-E5).
+
+        The guard used to count only the Store I/O threads: 8 in the worker
+        role against a pool of 8, so it never warned in the one role where the
+        processor threads, the workflow dispatcher and the periodic runner are
+        the consumers that actually queue on checkout.
+        """
+
         if not os.getenv("GPU_FAULT_STORE_URL", "").startswith("postgres"):
-            return
-        pool_max = int(os.getenv("GPU_FAULT_POSTGRES_POOL_MAX_SIZE", "8"))
-        service_role = os.getenv("GPU_FAULT_SERVICE_ROLE", "all").strip().lower()
-        general = int(os.getenv("GPU_FAULT_STORE_IO_WORKERS", "8"))
-        fault = int(os.getenv("GPU_FAULT_FAULT_STORE_IO_WORKERS", "8"))
-        evidence = int(os.getenv("GPU_FAULT_EVIDENCE_STORE_IO_WORKERS", "4"))
-        spool = int(os.getenv("GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_WORKERS", "16"))
-        active = general if service_role in {"all", "ingress", "worker"} else 0
+            return None
+        env = os.getenv
+        pool_max = int(env("GPU_FAULT_POSTGRES_POOL_MAX_SIZE", "8"))
+        service_role = env("GPU_FAULT_SERVICE_ROLE", "all").strip().lower()
+        spool_enabled = bool(limits["spool_enabled"])
+        queued_processor = (
+            env("GPU_FAULT_PROCESSOR_MODE", "direct").strip().lower() == "active-active"
+        )
+        background_services = service_role in {"all", "worker"}
+        processor_workers = int(env("GPU_FAULT_PROCESSOR_WORKERS", "4"))
+        demand: dict[str, int] = {}
+        if service_role in {"all", "ingress", "worker"}:
+            demand["store_io_general"] = int(env("GPU_FAULT_STORE_IO_WORKERS", "8"))
         if service_role in {"all", "ingress"}:
-            active += fault + evidence
-            if limits["spool_enabled"]:
-                active += spool
-        if pool_max < active:
-            LOGGER.warning(
-                "postgres pool max %s is smaller than %s active "
-                "Store I/O workers; callers will queue on checkout",
-                pool_max,
-                active,
+            demand["store_io_fault"] = int(env("GPU_FAULT_FAULT_STORE_IO_WORKERS", "8"))
+            demand["store_io_evidence"] = int(
+                env("GPU_FAULT_EVIDENCE_STORE_IO_WORKERS", "4")
             )
+            if spool_enabled:
+                demand["store_io_spool"] = int(
+                    env("GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_WORKERS", "16")
+                )
+        if background_services and queued_processor:
+            demand["processor_workers"] = processor_workers
+        if background_services and _enabled_default_true(
+            "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER"
+        ):
+            demand["workflow_dispatcher"] = int(
+                env("GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS", "8")
+            )
+        if background_services:
+            demand["periodic_services"] = 1
+        if (
+            spool_enabled
+            and queued_processor
+            and service_role in {"all", "spool-worker"}
+        ):
+            demand["telemetry_spool_replay"] = int(
+                env(
+                    "GPU_FAULT_TELEMETRY_SPOOL_WORKERS",
+                    str(max(1, processor_workers // 4) * 2),
+                )
+            )
+        unpooled = 0
+        if queued_processor and background_services:
+            unpooled += 1  # LISTEN gpu_fault_processor_queue
+        if (
+            queued_processor
+            and spool_enabled
+            and service_role in {"all", "spool-worker"}
+        ):
+            unpooled += 1  # LISTEN gpu_fault_telemetry_spool
+        estimate = PostgresPoolCapacity(
+            pool_max=pool_max,
+            demand_by_consumer=demand,
+            unpooled_connections=unpooled,
+        )
+        if estimate.demand > pool_max:
+            LOGGER.warning(
+                "postgres pool max %s is smaller than the %s connections the %s "
+                "role can hold at once (%s); callers will queue on checkout",
+                pool_max,
+                estimate.demand,
+                service_role,
+                ", ".join(f"{name}={count}" for name, count in demand.items()),
+            )
+        return estimate
 
     def _batchers(self, limits: dict, executors: dict) -> dict:
         common = {
@@ -517,7 +600,11 @@ class AdmissionRuntimeFactory:
                 except StoreIoCapacityExceeded as exc:
                     raise HTTPException(
                         status_code=503,
-                        detail="store I/O capacity exceeded",
+                        detail=(
+                            "request deadline exceeded"
+                            if isinstance(exc, RequestDeadlineExceeded)
+                            else "store I/O capacity exceeded"
+                        ),
                         headers={"Retry-After": "2"},
                     ) from exc
 
@@ -532,6 +619,12 @@ def _enabled(name: str) -> bool:
         "true",
         "yes",
     }
+
+
+def _enabled_default_true(name: str) -> bool:
+    # Mirrors ``WorkflowDispatcherConfig.from_environment``: only the literal
+    # "true" (default) enables the dispatcher.
+    return os.getenv(name, "true").strip().lower() == "true"
 
 
 def _executor(

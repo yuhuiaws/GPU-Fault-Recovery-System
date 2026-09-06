@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, cast
 
+from pydantic import ValidationError
+
 from gpu_fault.attempt_observation_state import terminal_attempt_observation
 from gpu_fault.models import Environment, TerminalEvent
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
@@ -46,24 +48,61 @@ def attempt_spec_from_observation(observation: AttemptObservation) -> AttemptSpe
 
 
 def restore_persisted_attempt_observations(controller: Any) -> None:
+    """Rebuild in-memory attempt state from the sink's persisted records.
+
+    A record that cannot be parsed, or that belongs to another cluster,
+    environment or is no longer active, is skipped and counted in
+    ``controller.restore_skipped_total`` rather than raised: the persisted
+    state is shared by every Watcher generation, and one foreign record used
+    to keep the whole process from starting (F-G4 / P1-24B).
+    """
+    controller.restore_skipped_total = 0
     load = getattr(controller.sink, "load_attempt_observations", None)
     if load is None:
         return
     for payload in load():
-        observation = AttemptObservation.model_validate(payload)
+        try:
+            observation = AttemptObservation.model_validate(payload)
+        except ValidationError as exc:
+            controller.restore_skipped_total += 1
+            LOGGER.warning(
+                "skipping unparsable persisted attempt observation %r: %s",
+                (payload or {}).get("attempt_id")
+                if isinstance(payload, dict)
+                else None,
+                exc,
+            )
+            continue
         if (
             observation.cluster_id != controller.cluster_id
             or observation.environment is not controller.environment
             or observation.workload_phase not in ACTIVE_PHASES
         ):
-            raise ValueError(
-                "persisted attempt observation does not belong to this watcher"
+            controller.restore_skipped_total += 1
+            LOGGER.warning(
+                "skipping persisted attempt observation that does not belong to "
+                "this watcher: attempt=%s cluster=%s environment=%s phase=%s",
+                observation.attempt_id,
+                observation.cluster_id,
+                observation.environment.value,
+                observation.workload_phase.value,
             )
+            continue
+        try:
+            controller.watcher.observe(observation)
+        except ValueError as exc:
+            controller.restore_skipped_total += 1
+            LOGGER.warning(
+                "skipping persisted attempt observation rejected by the watcher "
+                "core: attempt=%s: %s",
+                observation.attempt_id,
+                exc,
+            )
+            continue
         controller._attempt_specs[observation.attempt_id] = (
             attempt_spec_from_observation(observation)
         )
         controller._last_observations[observation.attempt_id] = observation
-        controller.watcher.observe(observation)
 
 
 def cache_terminal_attempt_observation(

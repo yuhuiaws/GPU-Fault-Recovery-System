@@ -34,7 +34,6 @@ from gpu_fault.operation_registry import (
     MAINTENANCE_GENERATION_OPERATIONS,
     NODE_MUTATING_OPERATIONS,
     OPERATION_REGISTRY,
-    PREEMPTION_NON_CANCELABLE_OPERATIONS,
     OperationResourceClaim,
     OperationScope,
 )
@@ -66,15 +65,6 @@ EXPECTED_MAINTENANCE_GENERATION = {
     WorkflowOperation.RESET_GPU,
     WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
     WorkflowOperation.RESTORE_GPU_SERVICES,
-}
-EXPECTED_PREEMPTION_NON_CANCELABLE = {
-    WorkflowOperation.RESET_GPU,
-    WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
-    WorkflowOperation.REMEDIATE_DRIVER,
-    WorkflowOperation.REMEDIATE_EFA_DRIVER,
-    WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
-    WorkflowOperation.RESTART_NODE,
-    WorkflowOperation.REPLACE_NODE,
 }
 # A set literal this large is unreadable at a call site and drifts the
 # moment an operation is added, so re-listing one is what the duplication
@@ -163,7 +153,6 @@ def test_containment_and_node_mutating_sets_are_disjoint_and_complete() -> None:
 def test_registry_semantic_sets_match_declared_membership() -> None:
     assert HOST_PROC_ROOT_OPERATIONS == EXPECTED_HOST_PROC_ROOT
     assert MAINTENANCE_GENERATION_OPERATIONS == EXPECTED_MAINTENANCE_GENERATION
-    assert PREEMPTION_NON_CANCELABLE_OPERATIONS == EXPECTED_PREEMPTION_NON_CANCELABLE
     # Escalating to hardware support is only defensible for operations the
     # fleet has actually attempted on the device.
     assert HARDWARE_ESCALATION_RELEVANT_OPERATIONS
@@ -176,7 +165,6 @@ def test_large_registry_sets_are_not_relisted_as_literals() -> None:
         "NODE_MUTATING_OPERATIONS": NODE_MUTATING_OPERATIONS,
         "HOST_PROC_ROOT_OPERATIONS": HOST_PROC_ROOT_OPERATIONS,
         "MAINTENANCE_GENERATION_OPERATIONS": (MAINTENANCE_GENERATION_OPERATIONS),
-        "PREEMPTION_NON_CANCELABLE_OPERATIONS": (PREEMPTION_NON_CANCELABLE_OPERATIONS),
         "HARDWARE_ESCALATION_RELEVANT_OPERATIONS": (
             HARDWARE_ESCALATION_RELEVANT_OPERATIONS
         ),

@@ -12,6 +12,11 @@ from gpu_fault.policy import (
     XidCorrelationStatus,
     XidEvent,
 )
+from gpu_fault.store.shared.health_signals import (
+    latched_health_signal_state,
+    sample_disposition,
+    signal_clock,
+)
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -29,6 +34,7 @@ class SqliteXidMixin:
     _list: Callable[[str], list[Any]]
     _lock: Any
     _next_health_signal_state: Callable[..., tuple[HealthSignalState, bool]]
+    _note_health_signal_clock_regression: Callable[..., None]
     _put: Callable[..., None]
     _state_key: Callable[..., str]
     _state_transaction: Callable[[str], ContextManager[None]]
@@ -247,64 +253,60 @@ class SqliteXidMixin:
             xid=xid,
             observed_at=observed_at,
         )
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                previous = cast(
-                    "XidMetricBaseline | None",
-                    self._get_optional("xid_metric_baseline", key),
-                )
-                if previous is not None and observed_at <= previous.observed_at:
-                    self._db.execute("COMMIT")
-                    return False
-                self._put("xid_metric_baseline", key, baseline)
-                self._db.execute("COMMIT")
-                return previous is not None and xid > 0 and xid != previous.xid
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
+        with self._state_transaction(f"xid_metric_baseline/{key}"):
+            previous = cast(
+                "XidMetricBaseline | None",
+                self._get_optional("xid_metric_baseline", key),
+            )
+            if previous is not None and observed_at <= previous.observed_at:
+                return False
+            self._put("xid_metric_baseline", key, baseline)
+            return previous is not None and xid > 0 and xid != previous.xid
 
     def claim_health_signal_transitions(
-        self, items: Sequence[tuple[str, bool, datetime, float]]
+        self,
+        items: Sequence[tuple[str, bool, datetime, float]],
+        *,
+        received_at: datetime | None = None,
     ) -> list[bool]:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                results: list[bool] = []
-                for (
+        with self._state_transaction("health_signal_state/claims"):
+            results: list[bool] = []
+            for (
+                signal_key,
+                active,
+                observed_at,
+                minimum_active_seconds,
+            ) in items:
+                previous = cast(
+                    "HealthSignalState | None",
+                    self._get_optional("health_signal_state", signal_key),
+                )
+                accept, regressed = sample_disposition(
+                    previous, observed_at, received_at
+                )
+                if regressed:
+                    self._note_health_signal_clock_regression(signal_key, observed_at)
+                if not accept:
+                    results.append(False)
+                    continue
+                if previous is None and not active:
+                    results.append(False)
+                    continue
+                state, emit = self._next_health_signal_state(
                     signal_key,
                     active,
                     observed_at,
+                    previous,
                     minimum_active_seconds,
-                ) in items:
-                    previous = cast(
-                        "HealthSignalState | None",
-                        self._get_optional("health_signal_state", signal_key),
-                    )
-                    if previous is not None and observed_at <= previous.observed_at:
-                        results.append(False)
-                        continue
-                    if previous is None and not active:
-                        results.append(False)
-                        continue
-                    state, emit = self._next_health_signal_state(
-                        signal_key,
-                        active,
-                        observed_at,
-                        previous,
-                        minimum_active_seconds,
-                    )
-                    self._put(
-                        "health_signal_state",
-                        signal_key,
-                        state,
-                    )
-                    results.append(emit)
-                self._db.execute("COMMIT")
-                return results
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
+                    clock=signal_clock(observed_at, received_at),
+                )
+                self._put(
+                    "health_signal_state",
+                    signal_key,
+                    state,
+                )
+                results.append(emit)
+            return results
 
     def claim_health_signal_transition(
         self,
@@ -313,6 +315,9 @@ class SqliteXidMixin:
         observed_at: datetime,
         minimum_active_seconds: float = 0,
     ) -> bool:
+        # The single form is the training-progress path. Like the plural form
+        # it only decides to emit; ``TrainingHealthService.mark_notified``
+        # latches once the finding's incident has been written (P0-38B).
         return self.claim_health_signal_transitions(
             [
                 (
@@ -323,3 +328,23 @@ class SqliteXidMixin:
                 )
             ]
         )[0]
+
+    def get_health_signal_state(self, signal_key: str) -> HealthSignalState | None:
+        return cast(
+            "HealthSignalState | None",
+            self._get_optional("health_signal_state", signal_key),
+        )
+
+    def mark_health_signal_notified(
+        self, signal_key: str, *, notified_at: datetime
+    ) -> None:
+        with self._state_transaction(f"health_signal_state/{signal_key}"):
+            latched = latched_health_signal_state(
+                cast(
+                    "HealthSignalState | None",
+                    self._get_optional("health_signal_state", signal_key),
+                ),
+                notified_at,
+            )
+            if latched is not None:
+                self._put("health_signal_state", signal_key, latched)

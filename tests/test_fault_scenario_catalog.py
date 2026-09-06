@@ -445,6 +445,9 @@ def test_parallel_command_cases_declare_resource_locks() -> None:
         "GF-REGIONAL-PREEMPT-028",
         "GF-REGIONAL-PREEMPT-029",
         "GF-REGIONAL-PREEMPT-031",
+        "GF-REGIONAL-PREEMPT-032",
+        "GF-REGIONAL-PREEMPT-033",
+        "GF-REGIONAL-PREEMPT-034",
     }
 
     for case_id in local_cases:
@@ -801,7 +804,7 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
         case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
     ]
 
-    assert len(regional) == 154
+    assert len(regional) == 157
     assert all((case.get("evidence") or {}).get("verdict") for case in regional)
     # Membership, not equality. The equality form froze the catalog at "no
     # regional case has ever passed", so the first recorded PASS failed this

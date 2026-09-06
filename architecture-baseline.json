@@ -1,41 +1,45 @@
 {
   "classes": {
-    "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 937,
-    "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1535,
-    "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 1270,
-    "src/gpu_fault/host_health.py:NodeHealthPolicy": 984,
-    "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1565,
+    "src/gpu_fault/adapters/kubernetes/restart_operations.py:KubernetesRestartOperationsMixin": 847,
+    "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 1007,
+    "src/gpu_fault/execution/dispatcher.py:WorkflowDispatcher": 1272,
+    "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 1891,
+    "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 1278,
+    "src/gpu_fault/host_health.py:NodeHealthPolicy": 1009,
+    "src/gpu_fault/notification_service.py:AdvisoryNotificationService": 847,
+    "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1713,
     "src/gpu_fault/policy/engine.py:GpuFaultPolicyEngine": 1375,
-    "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator": 1581
+    "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator": 1722,
+    "src/gpu_fault/store/postgres/control_records.py:PostgresControlRecordMixin": 856
   },
   "cycles": [],
   "files": {
     "src/gpu_fault/admin/aws_cleanup.py": 1540,
     "src/gpu_fault/admin/bootstrap.py": 2076,
-    "src/gpu_fault/admin/cli.py": 1522,
-    "src/gpu_fault/completion_controller.py": 1515,
-    "src/gpu_fault/execution/executor.py": 1589,
-    "src/gpu_fault/gpu_metrics.py": 1546,
-    "src/gpu_fault/orchestration/coordinator.py": 1683,
-    "src/gpu_fault/processor/coordinator.py": 1639,
-    "src/gpu_fault/store/postgres/ddl.py": 1523
+    "src/gpu_fault/admin/cli.py": 1551,
+    "src/gpu_fault/completion_controller.py": 1634,
+    "src/gpu_fault/execution/executor.py": 1956,
+    "src/gpu_fault/gpu_metrics.py": 1555,
+    "src/gpu_fault/orchestration/coordinator.py": 1834,
+    "src/gpu_fault/processor/coordinator.py": 1780,
+    "src/gpu_fault/store/postgres/ddl.py": 1596
   },
   "functions": {
     "deploy/control-plane/tools/render_control_plane_role_split.py:main": 648,
     "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 252,
-    "src/gpu_fault/adapters/hyperpod/lifecycle.py:HyperPodLifecycleStepAdapter.execute": 212,
+    "src/gpu_fault/adapters/hyperpod/lifecycle.py:HyperPodLifecycleStepAdapter.execute": 213,
+    "src/gpu_fault/adapters/kubernetes/restart_operations.py:KubernetesRestartOperationsMixin._restart_guard": 218,
     "src/gpu_fault/admin/bootstrap.py:_ensure_aurora": 290,
     "src/gpu_fault/admin/legacy_site.py:discover_legacy_site": 291,
+    "src/gpu_fault/app/builtin_metric_contributors.py:closed_loop_metric_lines": 213,
     "src/gpu_fault/app/factory.py:create_app": 285,
-    "src/gpu_fault/app/metrics.py:render_prometheus_metrics": 218,
-    "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor.execute": 212,
+    "src/gpu_fault/app/metrics.py:render_prometheus_metrics": 223,
+    "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor._execute_dag": 214,
     "src/gpu_fault/node_agent/app.py:create_node_agent_app": 216,
     "src/gpu_fault/node_agent/operations/diagnostics.py:DiagnosticOperationsMixin._collect_diagnostic_bundle": 221,
     "src/gpu_fault/node_agent/operations/hung_triage.py:HungTriageOperationsMixin._collect_hung_triage": 218,
-    "src/gpu_fault/planner.py:PlanBuilder.from_marker": 247,
-    "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator.__init__": 252,
-    "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator._claim_active_by_pool": 215,
-    "src/gpu_fault/service.py:CompletionService.handle_terminal": 203,
-    "src/gpu_fault/store/postgres/store.py:PostgresStore.__init__": 234
+    "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator.__init__": 262,
+    "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator._claim_active_by_pool": 217,
+    "src/gpu_fault/store/postgres/store.py:PostgresStore.__init__": 235
   }
 }

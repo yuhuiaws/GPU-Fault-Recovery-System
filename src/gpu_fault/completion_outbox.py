@@ -4,10 +4,16 @@ import hashlib
 import json
 import logging
 import os
+import time
 from collections.abc import Callable
 from typing import Any
 
-from gpu_fault.collectors.sinks import EventSink, HttpEventSink
+from gpu_fault.collectors.sinks import (
+    CollectorError,
+    EventSink,
+    HttpEventSink,
+    is_retryable_delivery_status,
+)
 
 CRITICAL_COMPLETION_PATHS = frozenset(
     {
@@ -16,10 +22,33 @@ CRITICAL_COMPLETION_PATHS = frozenset(
     }
 )
 WORKLOAD_OBSERVATION_PATH = "/v1/workload-observations"
+LOGGER = logging.getLogger(__name__)
 
 
 class CompletionOutboxFull(RuntimeError):
     pass
+
+
+def completion_delivery_disposition(exc: BaseException) -> str:
+    """``"retry"`` or ``"quarantine"`` for a failed critical delivery.
+
+    Uses the same status-code rule as the collector sink
+    (``is_retryable_delivery_status``) so that the two layers cannot disagree
+    about a 409 or a 422 again (P0-64B). An exception that carries no status
+    -- a socket error, an unexpected bug -- is retried; the attempt counter
+    bounds it.
+    """
+
+    if isinstance(exc, CollectorError):
+        if exc.replayable:
+            return "retry"
+        return (
+            "retry" if is_retryable_delivery_status(exc.status_code) else "quarantine"
+        )
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return "retry" if is_retryable_delivery_status(code) else "quarantine"
+    return "retry"
 
 
 class KubernetesCompletionOutbox:
@@ -38,9 +67,15 @@ class KubernetesCompletionOutbox:
         max_records: int = 256,
         max_bytes: int = 900_000,
         replay_batch_size: int = 32,
+        replay_budget_seconds: float = 10.0,
+        max_replay_attempts: int = 20,
+        monotonic: Callable[[], float] = time.monotonic,
+        now: Callable[[], float] = time.time,
     ) -> None:
         if max_records < 1 or max_bytes < 1024 or replay_batch_size < 1:
             raise ValueError("completion outbox bounds must be positive")
+        if replay_budget_seconds <= 0 or max_replay_attempts < 1:
+            raise ValueError("completion outbox replay bounds must be positive")
         self.core_api = core_api
         self.sink = sink
         self.namespace = namespace
@@ -48,6 +83,15 @@ class KubernetesCompletionOutbox:
         self.max_records = max_records
         self.max_bytes = max_bytes
         self.replay_batch_size = replay_batch_size
+        self.replay_budget_seconds = replay_budget_seconds
+        self.max_replay_attempts = max_replay_attempts
+        self.monotonic = monotonic
+        self.now = now
+        self.last_replay: dict[str, int] = {
+            "replayed": 0,
+            "deferred": 0,
+            "quarantined": 0,
+        }
         self._attempt_digests: dict[str, str] = {}
 
     @staticmethod
@@ -171,17 +215,27 @@ class KubernetesCompletionOutbox:
         def append(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if any(item.get("key") == key for item in records):
                 return records
-            return [*records, {"key": key, "path": path, "payload": payload}]
+            return [*records, self._record(key, path, payload)]
 
         self._mutate(append)
         return key
+
+    def _record(self, key: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "key": key,
+            "path": path,
+            "payload": payload,
+            "buffered_at": self.now(),
+            "attempts": 0,
+            "quarantined": False,
+        }
 
     def _upsert_latest(self, path: str, payload: dict[str, Any]) -> str:
         key = self._record_key(path, payload)
 
         def upsert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             retained = [item for item in records if item.get("key") != key]
-            return [*retained, {"key": key, "path": path, "payload": payload}]
+            return [*retained, self._record(key, path, payload)]
 
         self._mutate(upsert)
         return key
@@ -190,6 +244,15 @@ class KubernetesCompletionOutbox:
         self._mutate(
             lambda records: [item for item in records if item.get("key") != key]
         )
+
+    def _update(self, key: str, **fields: Any) -> None:
+        def update(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {**item, **fields} if item.get("key") == key else item
+                for item in records
+            ]
+
+        self._mutate(update)
 
     @staticmethod
     def _attempt_key(payload: dict[str, Any]) -> str:
@@ -276,24 +339,109 @@ class KubernetesCompletionOutbox:
         self._remove(key)
         return result
 
-    def replay(self) -> int:
+    def replay(self, *, include_quarantined: bool = False) -> int:
+        """Deliver buffered records, isolating each one (F-G1).
+
+        A record whose delivery fails is kept and counted, never allowed to
+        stop the records behind it: a permanent rejection (or too many
+        attempts) quarantines it, a transient failure defers it to the next
+        cycle. Quarantined records are skipped unless ``include_quarantined``
+        is set, which is how an operator retries them after fixing the cause
+        (for example registering the runtime profile the control plane did
+        not know). The whole pass is bounded by ``replay_budget_seconds``.
+        """
+
         records, _resource_version = self._read()
-        replayed = 0
-        for record in records[: self.replay_batch_size]:
+        candidates = [
+            record
+            for record in records
+            if include_quarantined or not record.get("quarantined", False)
+        ]
+        batch = candidates[: self.replay_batch_size]
+        deferred = len(candidates) - len(batch)
+        replayed = quarantined = 0
+        deadline = self.monotonic() + self.replay_budget_seconds
+        for index, record in enumerate(batch):
+            if index > 0 and self.monotonic() >= deadline:
+                deferred += len(batch) - index
+                LOGGER.warning(
+                    "completion outbox replay budget exhausted: "
+                    "%d records deferred to the next cycle",
+                    len(batch) - index,
+                )
+                break
+            key = str(record["key"])
             path = str(record["path"])
             payload = dict(record["payload"])
-            self.sink.post(path, payload)
+            try:
+                self.sink.post(path, payload)
+            except Exception as exc:
+                attempts = int(record.get("attempts", 0)) + 1
+                disposition = completion_delivery_disposition(exc)
+                status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+                if disposition == "quarantine" or attempts >= self.max_replay_attempts:
+                    quarantined += 1
+                    LOGGER.warning(
+                        "completion outbox record quarantined after %d attempts: "
+                        "key=%s status=%s error=%s",
+                        attempts,
+                        key,
+                        status,
+                        exc,
+                    )
+                    self._update(
+                        key,
+                        attempts=attempts,
+                        quarantined=True,
+                        quarantined_at=self.now(),
+                        last_status=status,
+                        last_error=str(exc)[:500],
+                    )
+                else:
+                    deferred += 1
+                    self._update(
+                        key,
+                        attempts=attempts,
+                        last_status=status,
+                        last_error=str(exc)[:500],
+                    )
+                continue
             if path == WORKLOAD_OBSERVATION_PATH and str(
                 payload.get("workload_phase") or ""
             ) not in {"PENDING", "RUNNING"}:
                 self.remove_attempt_observation(payload)
-            self._remove(str(record["key"]))
+            self._remove(key)
             replayed += 1
+        self.last_replay = {
+            "replayed": replayed,
+            "deferred": deferred,
+            "quarantined": quarantined,
+        }
         return replayed
 
     def depth(self) -> int:
         records, _resource_version = self._read()
         return len(records)
+
+    def quarantined_depth(self) -> int:
+        records, _resource_version = self._read()
+        return sum(1 for record in records if record.get("quarantined", False))
+
+    def stats(self) -> dict[str, float]:
+        """Depth, quarantined depth and the age of the oldest buffered record."""
+
+        records, _resource_version = self._read()
+        now = self.now()
+        ages = [
+            max(0.0, now - float(record["buffered_at"]))
+            for record in records
+            if isinstance(record.get("buffered_at"), (int, float))
+        ]
+        return {
+            "depth": len(records),
+            "quarantined": sum(1 for r in records if r.get("quarantined", False)),
+            "oldest_age_seconds": max(ages, default=0.0),
+        }
 
 
 def completion_sink_from_environment(core_api: Any) -> KubernetesCompletionOutbox:

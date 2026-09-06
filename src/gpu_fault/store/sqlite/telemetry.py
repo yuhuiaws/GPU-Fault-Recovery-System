@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Callable, ContextManager, Literal, Sequence, cast
 
@@ -41,6 +43,19 @@ class SqliteTelemetryMixin:
     _put: Callable[..., Any]
     _state_key: Callable[..., str]
     _state_transaction: Callable[[str], ContextManager[None]]
+
+    @contextmanager
+    def collector_ingestion_transaction(
+        self, cluster_id: str, node_id: str, batch_id: str
+    ) -> Iterator[None]:
+        # One transaction for the whole ingestion of a batch (F-M1): the
+        # finding state, the health-signal claim, the incident and the workflow
+        # the store writes inside become savepoints of it and commit or roll
+        # back together, as they do on PostgreSQL.
+        with self._state_transaction(
+            f"collector_ingestion/{cluster_id}/{node_id}/{batch_id}"
+        ):
+            yield
 
     def get_gpu_metrics_batch(
         self, key: GpuMetricsBatchKey

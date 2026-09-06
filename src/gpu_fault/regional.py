@@ -699,7 +699,7 @@ class RegionalRemoteWorkflowAdapter:
         identity_step = context.step.model_dump(mode="json")
         identity_step["branch_id"] = None
         identity_step["depends_on_step_indexes"] = []
-        if context.workflow.blocked_reasons:
+        if context.workflow.executes_safety_steps:
             identity_step["command_step_space"] = "safety"
         digest = hashlib.sha256(
             "\x1f".join(

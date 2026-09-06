@@ -198,6 +198,8 @@ async def ingest_training_progress(
             dependencies.ingest_node_health_findings(
                 heartbeat.heartbeat_id, result.findings
             )
+            # The incident write is the delivery; latch only after it (P0-38B).
+            ctx.training_health.mark_notified(result.findings)
         ctx.evidence.capture(
             record_id=(f"training-progress/{heartbeat.heartbeat_id}"),
             cluster_id=heartbeat.cluster_id,
@@ -222,11 +224,13 @@ async def scan_training_health(
     dependencies: TelemetryRouterDependencies = Depends(get_telemetry_dependencies),
 ) -> TrainingHealthResult:
     def scan() -> TrainingHealthResult:
-        result = dependencies.context.training_health.scan(cluster_id)
+        training_health = dependencies.context.training_health
+        result = training_health.scan(cluster_id)
         if result.findings:
             dependencies.ingest_node_health_findings(
                 "training-health-scan", result.findings
             )
+            training_health.mark_notified(result.findings)
         return result
 
     return await _store_call(dependencies, scan)

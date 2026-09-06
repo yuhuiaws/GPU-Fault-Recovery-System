@@ -1748,6 +1748,26 @@ build_artifacts() {
     fi
 }
 
+run_postgres_job() {
+    # Apply a one-shot migrate Job, wait for it, print its log, fail the deploy
+    # if it failed. The Job is deleted first because a completed Job's pod
+    # template is immutable and a new release must run the new wheel.
+    local name="$1" manifest="$2" timeout="$3"
+    kubectl -n "${NAMESPACE}" delete job "${name}" --ignore-not-found >/dev/null
+    sed \
+        -e "s/REPLACE_WITH_WHEEL_CONFIGMAP/${WHEEL_CONFIGMAP_NAME}/g" \
+        -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
+        "${manifest}" |
+        kubectl apply -f -
+    if ! kubectl -n "${NAMESPACE}" wait --for=condition=complete \
+        "job/${name}" --timeout="${timeout}"; then
+        echo "postgres job ${name} did not complete; its log follows" >&2
+        kubectl -n "${NAMESPACE}" logs "job/${name}" --all-containers=true >&2 || true
+        return 1
+    fi
+    kubectl -n "${NAMESPACE}" logs "job/${name}" --all-containers=true || true
+}
+
 deploy_control_plane() {
     local enable_hyperpod_adapter allow_hyperpod_mutation
     local allow_hyperpod_reboot allow_hyperpod_replace
@@ -1868,16 +1888,22 @@ EOF
     # below come up with AUTO_SCHEMA_INIT=false and will not create
     # anything themselves.
     if [[ "${POSTGRES_AUTO_SCHEMA_INIT}" == "false" ]]; then
-        kubectl -n "${NAMESPACE}" delete job \
-            gpu-fault-postgres-schema-ensure \
-            --ignore-not-found >/dev/null
-        sed \
-            -e "s/REPLACE_WITH_WHEEL_CONFIGMAP/${WHEEL_CONFIGMAP_NAME}/g" \
-            -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
-            "${REPO_DIR}/deploy/migrations/postgres-schema-ensure-job.yaml" |
-            kubectl apply -f -
-        kubectl -n "${NAMESPACE}" wait --for=condition=complete \
-            job/gpu-fault-postgres-schema-ensure --timeout=12m
+        # Three-step index method (F-J3): every index the DDL declares is
+        # built CONCURRENTLY here, online, before the ensure Job -- whose
+        # transactional DDL would otherwise build a missing index with a
+        # write lock on the hot tables. The ensure Job then finds them
+        # present, and the schema preflight below refuses to roll if any
+        # is still missing or invalid.
+        run_postgres_job gpu-fault-postgres-index-build \
+            "${REPO_DIR}/deploy/migrations/postgres-index-build-job.yaml" 60m
+        run_postgres_job gpu-fault-postgres-schema-ensure \
+            "${REPO_DIR}/deploy/migrations/postgres-schema-ensure-job.yaml" 12m
+        # Read-only gate: schema version, index presence/validity and
+        # in-flight safety workflows the new safety_only field cannot yet
+        # describe. Its JSON report is the last thing in the deploy log
+        # before the Deployments roll.
+        run_postgres_job gpu-fault-postgres-schema-preflight \
+            "${REPO_DIR}/deploy/migrations/postgres-schema-preflight-job.yaml" 5m
     fi
     sed \
         -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CONFIGMAP_NAME}/g" \

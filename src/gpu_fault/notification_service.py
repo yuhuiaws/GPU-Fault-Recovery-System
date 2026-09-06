@@ -9,6 +9,7 @@ from typing import Any
 
 from gpu_fault.models import (
     AdvisoryNotification,
+    NotificationDelivery,
     NotificationDispatchReport,
     NotificationResult,
     NotificationStatus,
@@ -672,6 +673,34 @@ class AdvisoryNotificationService:
                 expired += 1
                 oldest_expired = max(oldest_expired, age)
                 continue
+            recorded = self.store.get_notification_result(notification.notification_id)
+            if recorded is not None and recorded.status is NotificationStatus.SENT:
+                # The notification id is the idempotency key and the
+                # recorded result is the shared truth: an inline ``send``
+                # on a sibling, or a dispatcher whose lease lapsed after
+                # its mail went out, may have delivered this since the
+                # claim. The claim query skips SENT rows, but only as of
+                # the claim (P0-38B). Retire the delivery without calling
+                # the provider again.
+                result = recorded.model_copy(
+                    update={
+                        "reason": (
+                            recorded.reason
+                            or "already delivered by another path; not sent again"
+                        )
+                    }
+                )
+                self._record_delivery_outcome(
+                    notification,
+                    delivery,
+                    owner_id=owner_id,
+                    result=result,
+                    now=datetime.now(timezone.utc),
+                    retry_at=None,
+                    terminal=False,
+                )
+                results.append(result)
+                continue
             try:
                 result = self.notifier.send(notification)
             except Exception as exc:
@@ -729,34 +758,15 @@ class AdvisoryNotificationService:
                 retry_max_seconds,
                 retry_base_seconds * (2 ** max(0, attempts - 1)),
             )
-            try:
-                self.store.complete_notification_delivery(
-                    notification.notification_id,
-                    owner_id=owner_id,
-                    lease_epoch=delivery.lease_epoch,
-                    result=result,
-                    now=completed_at,
-                    retry_at=completed_at + timedelta(seconds=delay),
-                    terminal=terminal,
-                )
-            except WorkflowLeaseError:
-                # The mail is already out. Losing the record of that
-                # because the lease ran out while the provider was slow is
-                # what turns one notification into an unbounded stream of
-                # identical mail: the row stays claimable, the next
-                # replica sends it again, and its bookkeeping fails the
-                # same way. Persist the outcome even though the lease is
-                # gone -- the claim query skips anything already SENT.
-                self.store.save_notification_result(result)
-                LOGGER.warning(
-                    "notification %s was %s but its delivery lease had "
-                    "already expired; recorded the outcome anyway to stop "
-                    "it being sent again (raise "
-                    "GPU_FAULT_NOTIFICATION_LEASE_SECONDS above the time "
-                    "a full batch takes)",
-                    notification.notification_id,
-                    result.status.value,
-                )
+            self._record_delivery_outcome(
+                notification,
+                delivery,
+                owner_id=owner_id,
+                result=result,
+                now=completed_at,
+                retry_at=completed_at + timedelta(seconds=delay),
+                terminal=terminal,
+            )
             results.append(result)
         if expired:
             # One line per cycle, not per notification: a flood of drops
@@ -783,6 +793,46 @@ class AdvisoryNotificationService:
             throttled=throttled,
             suppressed_drills=suppressed_drills,
         )
+
+    def _record_delivery_outcome(
+        self,
+        notification: AdvisoryNotification,
+        delivery: NotificationDelivery,
+        *,
+        owner_id: str,
+        result: NotificationResult,
+        now: datetime,
+        retry_at: datetime | None,
+        terminal: bool,
+    ) -> None:
+        try:
+            self.store.complete_notification_delivery(
+                notification.notification_id,
+                owner_id=owner_id,
+                lease_epoch=delivery.lease_epoch,
+                result=result,
+                now=now,
+                retry_at=retry_at,
+                terminal=terminal,
+            )
+        except WorkflowLeaseError:
+            # The mail is already out. Losing the record of that
+            # because the lease ran out while the provider was slow is
+            # what turns one notification into an unbounded stream of
+            # identical mail: the row stays claimable, the next
+            # replica sends it again, and its bookkeeping fails the
+            # same way. Persist the outcome even though the lease is
+            # gone -- the claim query skips anything already SENT.
+            self.store.save_notification_result(result)
+            LOGGER.warning(
+                "notification %s was %s but its delivery lease had "
+                "already expired; recorded the outcome anyway to stop "
+                "it being sent again (raise "
+                "GPU_FAULT_NOTIFICATION_LEASE_SECONDS above the time "
+                "a full batch takes)",
+                notification.notification_id,
+                result.status.value,
+            )
 
     def _release_throttled(
         self,

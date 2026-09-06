@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from threading import RLock
-from uuid import uuid4
 
 from gpu_fault.models import (
     FaultIncident,
@@ -13,11 +13,15 @@ from gpu_fault.models import (
     WorkflowStatus,
 )
 from gpu_fault.operation_registry import WORKLOAD_SCOPED_OPERATIONS
+from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.policy import (
     ActionDisposition,
     DistributedXidBatch,
     FaultPolicyDecision,
 )
+from gpu_fault.store import NotFoundError
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ResetOperationService:
@@ -34,9 +38,19 @@ class ResetOperationService:
         with self.lock:
             existing = self.store.get_incident_by_event(batch.batch_id)
             if existing is not None:
-                return (
-                    existing,
-                    self.store.get_workflow(existing.workflow_request_id),
+                workflow = self._workflow_if_present(existing.workflow_request_id)
+                if workflow is not None:
+                    return existing, workflow
+                # A re-posted batch whose workflow row is gone used to fail
+                # here on every retry (P2-51H). The ids below are derived from
+                # the batch id, so building again rewrites the same incident
+                # and re-creates its workflow rather than adding a second pair.
+                LOGGER.warning(
+                    "incident %s for re-posted XID batch %s points at workflow %s "
+                    "which is missing; rebuilding the workflow",
+                    existing.incident_id,
+                    batch.batch_id,
+                    existing.workflow_request_id,
                 )
             if len(decisions) != len(batch.events):
                 raise ValueError("every distributed XID event needs a decision")
@@ -89,7 +103,9 @@ class ResetOperationService:
                 gpu_uuids,
                 workload_ids,
             )
-            incident_id = f"incident-{uuid4()}"
+            incident_id = derived_record_id(
+                "incident", "distributed-xid", batch.batch_id
+            )
             now = datetime.now(timezone.utc)
             incident = FaultIncident(
                 incident_id=incident_id,
@@ -163,6 +179,9 @@ class ResetOperationService:
             )
             errors.extend(safety_errors)
             workflow = WorkflowRequest(
+                request_id=derived_record_id(
+                    "workflow", "distributed-xid", batch.batch_id
+                ),
                 incident_id=incident_id,
                 runtime_profile_version=profile_version,
                 status=(
@@ -194,3 +213,12 @@ class ResetOperationService:
             for event in batch.events:
                 self.store.link_event_to_incident(event.event_id, incident.incident_id)
             return incident, workflow
+
+    def _workflow_if_present(self, request_id: str | None) -> WorkflowRequest | None:
+        if not request_id:
+            return None
+        try:
+            workflow: WorkflowRequest = self.store.get_workflow(request_id)
+        except NotFoundError:
+            return None
+        return workflow

@@ -511,9 +511,9 @@ def test_destr001_reset_contract_takes_the_workload_step_sequence() -> None:
     from scripts.e2e.regional import run_collect016_training_recovery as collect016
 
     steps = collect016.WORKLOAD_RESET_STEPS
-    assert [s for s in steps if s not in {"STOP_WORKLOADS", "RESTART_WORKLOAD"}] == list(
-        destr001.EXPECTED_STEPS
-    )
+    assert [
+        s for s in steps if s not in {"STOP_WORKLOADS", "RESTART_WORKLOAD"}
+    ] == list(destr001.EXPECTED_STEPS)
     assert steps.index("STOP_WORKLOADS") < steps.index("QUIESCE_GPU_SERVICES")
     assert steps[-1] == "RESTART_WORKLOAD"
 

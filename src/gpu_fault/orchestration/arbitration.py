@@ -1,19 +1,89 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from gpu_fault.models import (
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStepSpec,
+    resolved_step_indexes,
 )
 from gpu_fault.operation_registry import (
     MERGE_INTENT_OPERATIONS,
     NODE_ACTION_SCOPE_OPERATIONS,
+    NODE_MUTATING_OPERATIONS,
     NODE_WIDE_RECOVERY_OPERATIONS,
     RECOVERY_OPERATION_DOMINANCE,
     RECOVERY_OPERATION_RANK,
     WORKLOAD_SCOPED_OPERATIONS,
     ZERO_RANK_ACTION_OPERATIONS,
 )
+
+# GPU-scoped recovery actions. A fault that names no GPU yet asks for one of
+# these has an unresolved GPU identity; it is not a node-level fault.
+GPU_SCOPED_RECOVERY_OPERATIONS = (
+    NODE_ACTION_SCOPE_OPERATIONS & NODE_MUTATING_OPERATIONS
+) - NODE_WIDE_RECOVERY_OPERATIONS
+
+
+def gpu_identity_unresolved(
+    candidate: WorkflowRequest | None,
+    node_id: str,
+    gpu_uuids: set[str],
+) -> bool:
+    if gpu_uuids or candidate is None:
+        return False
+    return any(
+        step.operation in GPU_SCOPED_RECOVERY_OPERATIONS and node_id in step.node_ids
+        for step in candidate.official_steps
+    )
+
+
+def fault_scope_covered(
+    workflow: WorkflowRequest,
+    node_id: str,
+    gpu_uuids: set[str],
+    *,
+    indexes: Iterable[int] | None = None,
+    candidate: WorkflowRequest | None = None,
+) -> bool:
+    """Whether the steps that will still run already act on this fault.
+
+    Only live steps count -- completed and superseded ones are history
+    (F-C2), and only steps that name ``node_id``. A node-wide recovery on
+    that node covers every GPU on it. A fault with no GPU identity is
+    covered when a live step names the node, unless the candidate asks for
+    a GPU-scoped action: then the identity is unresolved, not node-level,
+    and absorbing it would leave that GPU untouched. GPU coverage is read
+    from node-mutating steps only; an evidence step that froze a GPU's
+    state has not repaired it (F-B6).
+    """
+    resolved = resolved_step_indexes(workflow)
+    selected = None if indexes is None else set(indexes)
+    live = [
+        step
+        for index, step in enumerate(workflow.official_steps)
+        if (selected is None or index in selected)
+        and index not in resolved
+        and node_id in step.node_ids
+        and step.operation not in WORKLOAD_SCOPED_OPERATIONS
+    ]
+    if not live:
+        return False
+    if any(step.operation in NODE_WIDE_RECOVERY_OPERATIONS for step in live):
+        return True
+    if not gpu_uuids:
+        return not gpu_identity_unresolved(candidate, node_id, gpu_uuids)
+    covered: set[str] = set()
+    for step in live:
+        if step.operation not in NODE_MUTATING_OPERATIONS:
+            continue
+        raw = step.parameters.get("gpu_uuids_by_node")
+        if isinstance(raw, dict):
+            covered.update(str(value) for value in raw.get(node_id, []))
+        else:
+            covered.update(step.gpu_uuids)
+    return gpu_uuids <= covered
 
 
 class RecoveryArbiter:
@@ -108,30 +178,10 @@ class RecoveryArbiter:
         workflow: WorkflowRequest,
         node_id: str,
         gpu_uuids: set[str],
+        *,
+        candidate: WorkflowRequest | None = None,
     ) -> bool:
-        node_ids = {
-            node
-            for step in workflow.official_steps
-            if step.operation not in self.WORKLOAD_SCOPED_OPERATIONS
-            for node in step.node_ids
-        }
-        if node_id not in node_ids:
-            return False
-        intent = self.merge_intent(workflow)
-        if intent.intersection(self.NODE_WIDE_RECOVERY_OPERATIONS):
-            return True
-        if not gpu_uuids:
-            return True
-        covered: set[str] = set()
-        for step in workflow.official_steps:
-            if node_id not in step.node_ids:
-                continue
-            raw = step.parameters.get("gpu_uuids_by_node")
-            if isinstance(raw, dict):
-                covered.update(str(value) for value in raw.get(node_id, []))
-            else:
-                covered.update(step.gpu_uuids)
-        return gpu_uuids <= covered
+        return fault_scope_covered(workflow, node_id, gpu_uuids, candidate=candidate)
 
     @staticmethod
     def step_scope_covers(
@@ -181,6 +231,8 @@ class RecoveryArbiter:
                     continue
                 for existing_node in step.node_ids:
                     mapping.setdefault(existing_node, set()).update(step.gpu_uuids)
-        if gpu_uuids:
-            mapping.setdefault(node_id, set()).update(gpu_uuids)
-        return {key: sorted(values) for key, values in mapping.items() if values}
+        # A node with no GPU identity stays in scope with an empty list so
+        # host-level steps still widen onto it (F-B6); GPU actions skip
+        # such nodes because the agent refuses a node without GPUs.
+        mapping.setdefault(node_id, set()).update(gpu_uuids)
+        return {key: sorted(values) for key, values in mapping.items()}

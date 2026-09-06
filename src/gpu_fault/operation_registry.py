@@ -59,7 +59,6 @@ class OperationSemantics:
     safe_remote_waiting_preempt: bool = False
     multi_node_barrier: bool = False
     transient_gpu_inventory_recovery: bool = False
-    preemption_non_cancelable: bool | None = None
     hardware_escalation_relevant: bool | None = None
     host_proc_root_dependent: bool = False
     maintenance_generation_scoped: bool = False
@@ -93,7 +92,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         OperationAdapter.NODE_ACTION,
         zero_rank_action=True,
         safe_remote_waiting_preempt=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
     ),
     WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE: _semantics(
@@ -103,7 +101,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         zero_rank_action=True,
         node_action_scope=True,
         safe_remote_waiting_preempt=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
     ),
     WorkflowOperation.RUN_DCGM_DIAGNOSTIC: _semantics(
@@ -114,7 +111,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         merge_intent=True,
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
         safe_remote_waiting_preempt=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=True,
     ),
     WorkflowOperation.MARK_UNSCHEDULABLE: _semantics(
@@ -124,7 +120,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         destructive=True,
         merge_intent=True,
         node_exclusive=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
         resource_claims=frozenset({OperationResourceClaim.SCHEDULER_MUTATION}),
     ),
@@ -144,7 +139,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         merge_intent=True,
         workload_scoped=True,
         shared_dag=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
     ),
     WorkflowOperation.QUIESCE_GPU_SERVICES: _semantics(
@@ -154,7 +148,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         destructive=True,
         node_action_scope=True,
         node_exclusive=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
         host_proc_root_dependent=True,
@@ -168,7 +161,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         safe_remote_waiting_preempt=True,
         host_proc_root_dependent=True,
         maintenance_generation_scoped=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
     ),
     WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT: _semantics(
@@ -176,7 +168,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         OperationScope.NODE,
         OperationAdapter.NODE_ACTION,
         zero_rank_action=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
     ),
     WorkflowOperation.RESET_GPU: _semantics(
@@ -190,7 +181,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         node_exclusive=True,
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
         multi_node_barrier=True,
-        preemption_non_cancelable=True,
         hardware_escalation_relevant=True,
         host_proc_root_dependent=True,
         maintenance_generation_scoped=True,
@@ -202,7 +192,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         destructive=True,
         node_action_scope=True,
         node_exclusive=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
         maintenance_generation_scoped=True,
@@ -229,7 +218,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
                 WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
             }
         ),
-        preemption_non_cancelable=True,
         hardware_escalation_relevant=True,
     ),
     WorkflowOperation.REPLACE_NODE: _semantics(
@@ -238,7 +226,7 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         OperationAdapter.HYPERPOD,
         OperationAdapter.MANAGED_RECOVERY,
         destructive=True,
-        recovery_rank=70,
+        recovery_rank=75,  # strictly above the rank-70 remediations it dominates
         merge_intent=True,
         node_wide=True,
         node_exclusive=True,
@@ -257,7 +245,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
                 WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
             }
         ),
-        preemption_non_cancelable=True,
         hardware_escalation_relevant=True,
     ),
     WorkflowOperation.RESTART_VM: _semantics(
@@ -265,7 +252,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         OperationScope.NODE,
         destructive=True,
         planning_only=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
     ),
     WorkflowOperation.RESTART_FABRIC_MANAGER: _semantics(
@@ -276,7 +262,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         recovery_rank=10,
         merge_intent=True,
         node_exclusive=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
     ),
@@ -292,7 +277,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         node_exclusive=True,
         resource_claims=frozenset({OperationResourceClaim.EFA_RUNTIME_MUTATION}),
         dominates=frozenset({WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN}),
-        preemption_non_cancelable=True,
         hardware_escalation_relevant=True,
     ),
     WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN: _semantics(
@@ -305,7 +289,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         node_wide=True,
         node_exclusive=True,
         resource_claims=frozenset({OperationResourceClaim.EFA_DEVICE_PLUGIN_MUTATION}),
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=True,
     ),
     WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN: _semantics(
@@ -318,7 +301,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         node_wide=True,
         node_exclusive=True,
         resource_claims=frozenset({OperationResourceClaim.GPU_DEVICE_PLUGIN_MUTATION}),
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=True,
     ),
     WorkflowOperation.RUN_FIELD_DIAGNOSTIC: _semantics(
@@ -328,7 +310,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         recovery_rank=10,
         merge_intent=True,
         safe_remote_waiting_preempt=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=True,
     ),
     WorkflowOperation.RUN_NVLINK74_WORKFLOW: _semantics(
@@ -336,7 +317,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         OperationScope.FABRIC,
         OperationAdapter.NODE_ACTION,
         safe_remote_waiting_preempt=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=True,
     ),
     WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES: _semantics(
@@ -357,7 +337,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
                 WorkflowOperation.RESTART_FABRIC_MANAGER,
             }
         ),
-        preemption_non_cancelable=True,
         hardware_escalation_relevant=True,
         host_proc_root_dependent=True,
         maintenance_generation_scoped=True,
@@ -382,7 +361,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         node_action_scope=True,
         node_exclusive=True,
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
-        preemption_non_cancelable=True,
         hardware_escalation_relevant=True,
         host_proc_root_dependent=True,
     ),
@@ -397,7 +375,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         node_action_scope=True,
         node_exclusive=True,
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
-        preemption_non_cancelable=True,
         hardware_escalation_relevant=True,
         host_proc_root_dependent=True,
     ),
@@ -438,7 +415,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         OperationAdapter.KUBERNETES,
         destructive=True,
         node_exclusive=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
         resource_claims=frozenset({OperationResourceClaim.SCHEDULER_MUTATION}),
     ),
@@ -452,7 +428,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         merge_intent=True,
         workload_scoped=True,
         shared_dag=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
     ),
     WorkflowOperation.QUARANTINE: _semantics(
@@ -464,7 +439,6 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         merge_intent=True,
         node_wide=True,
         node_exclusive=True,
-        preemption_non_cancelable=False,
         hardware_escalation_relevant=False,
         resource_claims=frozenset({OperationResourceClaim.SCHEDULER_MUTATION}),
     ),
@@ -490,10 +464,7 @@ def validate_operation_registry() -> None:
         if semantics.destructive or OperationAdapter.NODE_ACTION in semantics.adapters:
             missing_risk_fields = [
                 name
-                for name in (
-                    "preemption_non_cancelable",
-                    "hardware_escalation_relevant",
-                )
+                for name in ("hardware_escalation_relevant",)
                 if getattr(semantics, name) is None
             ]
             if missing_risk_fields:
@@ -507,6 +478,45 @@ def validate_operation_registry() -> None:
                 f"{operation.value} dominates unknown operations: "
                 f"{sorted(item.value for item in unknown)}"
             )
+    _validate_dominance(operations)
+
+
+def _validate_dominance(operations: set[WorkflowOperation]) -> None:
+    """Dominance must agree with rank, be transitively closed and acyclic.
+
+    The arbiter compares ranks first and dominance second; a tie between the
+    two ends of a declared dominance let either side win, so the incident's
+    declared action and the executed action could disagree (P0-67A). Checked
+    at import so a registry edit cannot reintroduce it (F-C5).
+    """
+
+    dominance = {
+        operation: OPERATION_REGISTRY[operation].dominates for operation in operations
+    }
+    for operation, dominated_set in dominance.items():
+        rank = OPERATION_REGISTRY[operation].recovery_rank
+        for dominated in dominated_set:
+            if not rank > OPERATION_REGISTRY[dominated].recovery_rank:
+                raise RuntimeError(
+                    f"{operation.value} dominates {dominated.value} without a "
+                    "strictly higher recovery rank"
+                )
+            for grandchild in dominance[dominated]:
+                if grandchild not in dominated_set:
+                    raise RuntimeError(
+                        f"{operation.value} dominates {dominated.value} but not "
+                        f"{grandchild.value}: dominance is not transitively closed"
+                    )
+        frontier = set(dominated_set)
+        seen: set[WorkflowOperation] = set()
+        while frontier:
+            current = frontier.pop()
+            if current is operation:
+                raise RuntimeError(f"{operation.value} dominates itself transitively")
+            if current in seen:
+                continue
+            seen.add(current)
+            frontier |= dominance[current]
 
 
 def operations_for_adapter(
@@ -570,7 +580,6 @@ SAFE_WAITING_PREEMPT_OPERATIONS = operations_with("safe_waiting_preempt")
 SAFE_REMOTE_WAITING_PREEMPT_OPERATIONS = operations_with("safe_remote_waiting_preempt")
 MULTI_NODE_BARRIER_OPERATIONS = operations_with("multi_node_barrier")
 TRANSIENT_GPU_INVENTORY_OPERATIONS = operations_with("transient_gpu_inventory_recovery")
-PREEMPTION_NON_CANCELABLE_OPERATIONS = operations_with("preemption_non_cancelable")
 HARDWARE_ESCALATION_RELEVANT_OPERATIONS = operations_with(
     "hardware_escalation_relevant"
 )

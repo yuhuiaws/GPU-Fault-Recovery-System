@@ -24,15 +24,21 @@ def finalize_replay_response(
 
     outcome = "error"
     if retry_partition == "lane-lease-changed":
-        coordinator._release(item)
+        # Somebody else holds the lane now. Booked as a retry (F-D4): a bare
+        # release made this row the oldest PENDING of its priority and the
+        # lane's next claim re-ran it immediately.
+        coordinator._release(item, failure="lane lease changed")
         coordinator._observe_processing(outcome, time.monotonic() - started)
         return
     response_age_seconds = max(
         0.0,
         (datetime.now(timezone.utc) - item.created_at).total_seconds(),
     )
+    # An observation's horizon is its own stale limit, not the generic
+    # retry age (F-D3): while it retries it holds correlated faults back.
+    retry_horizon_seconds = coordinator._retry_horizon_seconds(item)
     if (status in {408, 425, 429} or status >= 500) and (
-        response_age_seconds <= coordinator._retry_max_age
+        response_age_seconds <= retry_horizon_seconds
     ):
         retry_count = item.retry_count + 1
         delay_seconds = min(
@@ -51,7 +57,7 @@ def finalize_replay_response(
             response_age_seconds,
             retry_count,
             not_before.isoformat(),
-            coordinator._retry_max_age,
+            retry_horizon_seconds,
         )
         coordinator._release(
             item,
@@ -61,6 +67,22 @@ def finalize_replay_response(
         coordinator._observe_retry_schedule(item.path, delay_seconds)
         coordinator._observe_processing(outcome, time.monotonic() - started)
         return
+    if status in {408, 425, 429} or status >= 500:
+        # Retryable, but past the horizon: the response below is committed
+        # as the row's final answer. Booked like the release path's
+        # horizon failures so the two exits of the same bound share a count.
+        with coordinator._state_lock:
+            coordinator._retry_horizon_failures_total += 1
+        LOGGER.error(
+            "processor replay returned a retryable response past the retry "
+            "horizon; completing as failed request_id=%s path=%s status=%s "
+            "age_seconds=%.3f horizon_seconds=%.3f",
+            item.request_id,
+            item.path,
+            status,
+            response_age_seconds,
+            retry_horizon_seconds,
+        )
 
     coordinator._set_request_phase(item.request_id, "completion")
     try:
@@ -114,7 +136,10 @@ def finalize_replay_response(
                 )
         if completion_error is not None:
             try:
-                coordinator._release(item)
+                coordinator._release(
+                    item,
+                    failure=f"completion failed: {type(completion_error).__name__}",
+                )
             except Exception:
                 LOGGER.exception(
                     "processor request release after completion "

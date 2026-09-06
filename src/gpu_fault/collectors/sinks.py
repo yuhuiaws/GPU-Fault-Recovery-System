@@ -25,6 +25,19 @@ from gpu_fault.transport.http_client import urlopen
 LOGGER = logging.getLogger(__name__)
 
 
+def is_retryable_delivery_status(status_code: int | None) -> bool:
+    """Whether a control-plane response means "try the same event again later".
+
+    The one rule both delivery layers use (F-G1): no status (network failure),
+    any 5xx, and the three 4xx codes that mean "not now" rather than "never"
+    (408 request timeout, 425 too early, 429 too many requests). Every other
+    4xx is a verdict on the event itself; replaying it forever only blocks the
+    records behind it.
+    """
+
+    return status_code is None or status_code >= 500 or status_code in {408, 425, 429}
+
+
 class CollectorError(RuntimeError):
     def __init__(
         self,
@@ -313,7 +326,7 @@ class HttpEventSink:
                     return parsed
             except HTTPError as exc:
                 last_error = exc
-                if exc.code < 500 and exc.code != 429:
+                if not is_retryable_delivery_status(exc.code):
                     detail = exc.read().decode(errors="replace")
                     buffered = False
                     if buffer_failure:

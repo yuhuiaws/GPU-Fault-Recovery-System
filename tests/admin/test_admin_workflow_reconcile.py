@@ -185,3 +185,112 @@ def test_apply_fails_closed_when_node_state_drifts(
             expected_plan_sha256=plan["plan_sha256"],
             reference="CHG-12345",
         )
+
+
+def test_a_restamped_updated_at_does_not_invalidate_the_reviewed_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The admin digest re-hashes the runtime items, so it needs the same rule.
+
+    A merge into the BLOCKED record restamps ``workflow_updated_at`` and changes
+    nothing the verdict reads. Hashing it here left the apply unwinnable for the
+    records the tool exists to close (P0-72A), whatever the runtime digest did.
+    """
+
+    runtime_plans = iter(
+        [
+            _runtime_plan(),
+            dict(
+                _runtime_plan(),
+                items=[
+                    dict(
+                        _runtime_plan()["items"][0],
+                        workflow_updated_at="2026-09-03T06:59:00+00:00",
+                    )
+                ],
+            ),
+        ]
+    )
+
+    def run(_site_value, payload):
+        if payload["mode"] == "plan":
+            return next(runtime_plans)
+        return {"mode": "workflow-reconcile-apply", "applied_workflow_ids": []}
+
+    monkeypatch.setattr(reconcile, "_run_reconcile", run)
+    monkeypatch.setattr(
+        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+    )
+    site = _site(tmp_path)
+    plan = reconcile.plan_workflow_reconcile(
+        site, tmp_path, workflow_ids=("workflow-blocked",)
+    )
+
+    result = reconcile.apply_workflow_reconcile(
+        site, tmp_path, expected_plan_sha256=plan["plan_sha256"], reference="CHG-1"
+    )
+
+    assert result["admin_plan_sha256"] == plan["plan_sha256"]
+
+
+def test_a_changed_plan_names_the_field_that_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_plans = iter(
+        [
+            _runtime_plan(),
+            dict(
+                _runtime_plan(),
+                items=[dict(_runtime_plan()["items"][0], fencing_token=8)],
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        reconcile, "_run_reconcile", lambda *_args, **_kwargs: next(runtime_plans)
+    )
+    monkeypatch.setattr(
+        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+    )
+    site = _site(tmp_path)
+    plan = reconcile.plan_workflow_reconcile(
+        site, tmp_path, workflow_ids=("workflow-blocked",)
+    )
+
+    with pytest.raises(BootstrapError, match=r"workflow-blocked.*fencing_token.*7.*8"):
+        reconcile.apply_workflow_reconcile(
+            site, tmp_path, expected_plan_sha256=plan["plan_sha256"], reference="CHG-1"
+        )
+
+
+def test_plan_forwards_incident_and_blocked_kind_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payloads: list[dict] = []
+
+    def run(_site_value, payload):
+        payloads.append(payload)
+        return _runtime_plan()
+
+    monkeypatch.setattr(reconcile, "_run_reconcile", run)
+    monkeypatch.setattr(
+        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+    )
+
+    reconcile.plan_workflow_reconcile(
+        _site(tmp_path),
+        tmp_path,
+        workflow_ids=(),
+        incident_ids=("incident-a",),
+        blocked_kinds=("INTERNAL_ERROR",),
+        max_items=50,
+    )
+
+    assert payloads == [
+        {
+            "mode": "plan",
+            "workflow_ids": [],
+            "incident_ids": ["incident-a"],
+            "blocked_kinds": ["INTERNAL_ERROR"],
+            "max_items": 50,
+        }
+    ]

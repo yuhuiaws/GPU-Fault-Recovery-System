@@ -16,9 +16,35 @@ from gpu_fault.channel_registry import (
     WORKLOAD_OBSERVATIONS_PATH,
     ChannelLane,
     channel_for_path,
+    is_control_plane_action_path,
     is_fault_path,
 )
 from gpu_fault.models import StrictModel
+
+# Queue tiers. The integer is stored on the queue row at admission and is
+# compared in three unrelated places: the claim window orders by it, admission
+# keeps reserved depth for it, and the telemetry spool accepts only ROUTINE.
+# Never compare the integer directly -- use the predicates below, so that the
+# three policies cannot drift apart again (F-D1).
+CONTROL_PLANE_ACTION_PRIORITY = 0
+DEVICE_EVENT_PRIORITY = 10
+EVIDENCE_PRIORITY = 50
+ROUTINE_PRIORITY = 100
+# A routine row that has waited past the starvation threshold is claimed just
+# ahead of evidence (50) but still behind every fault tier.
+STARVED_ROUTINE_PRIORITY = 49
+RESERVED_TIER_MAX_PRIORITY = DEVICE_EVENT_PRIORITY
+
+
+def is_reserved_tier(priority: int) -> bool:
+    """Whether ``priority`` is a fault tier: reserved queue depth, fault pool.
+
+    Both the control-plane actions (0) and the device events (10) are faults.
+    Admission, the fault pool and the fault backlog gauge all ask this instead
+    of ``priority == 0``, which is what let a tier split turn into a 429 storm.
+    """
+
+    return priority <= RESERVED_TIER_MAX_PRIORITY
 
 
 LOGGER = logging.getLogger(__name__)
@@ -124,7 +150,11 @@ class ProcessorRequest(StrictModel):
         channel = channel_for_path(path)
         if (
             channel is not None
-            and (channel.lane is ChannelLane.ATTEMPT or channel.correlated_fault)
+            and (
+                channel.lane is ChannelLane.ATTEMPT
+                or channel.correlated_fault
+                or channel.incident_scoped
+            )
         ) or path in {
             "/v1/attempts/failure-detected",
             "/v1/attempts/terminal",
@@ -249,9 +279,16 @@ class ProcessorRequest(StrictModel):
         ``observed_at`` under a row lock and keeps the newer value; the
         lane the queue gives these paths only serialises writes that
         already exclude each other.
+
+        The channel path is part of the key (F-E6). The queue lane is
+        shared by every edge-filtered channel whose reasons are routine
+        but not ``health-summary`` - ``filter-disabled``, ``baseline:*``,
+        the nvidia-smi fallback - and a shared lane is fine for the queue
+        (it only orders) but not for a primary key that coalesces: a host
+        sample would overwrite the gpu-metrics sample for the same node.
         """
 
-        key = self.ordering_key()
+        key = f"{self.path}|{self.ordering_key()}"
         if self.coalescable():
             return key
         return f"{key}:{self.request_id}"
@@ -391,9 +428,14 @@ class ProcessorRequest(StrictModel):
     def queue_priority(self) -> int:
         """Which of three service tiers this request belongs to.
 
-        ``0`` - a confirmed fault or a control-plane action on one. Never
-        dropped, never coalesced, claimed first, and the only tier with
-        reserved queue depth and its own ingress threads.
+        ``0`` - a control-plane action on a confirmed fault, and the attempt
+        lifecycle events that finalize a workflow. Never dropped, never
+        coalesced, claimed before everything else.
+
+        ``10`` - a confirmed fault reported by a node or a provider. Still a
+        fault: same reserved queue depth and ingress threads as tier 0
+        (``is_reserved_tier``), but ordered after the actions that end a
+        storm so that a storm cannot starve its own cure (F-D1).
 
         ``50`` - evidence and decisions read from it: edge-filtered
         batches that report something wrong, workload observations,
@@ -419,12 +461,17 @@ class ProcessorRequest(StrictModel):
         return priority
 
     def _compute_queue_priority(self) -> int:
+        if is_control_plane_action_path(self.path):
+            return CONTROL_PLANE_ACTION_PRIORITY
         if is_fault_path(self.path):
-            return 0
+            return DEVICE_EVENT_PRIORITY
         channel = channel_for_path(self.path)
         if channel is not None:
             return channel.priority(self._json_payload())
-        return 50
+        return EVIDENCE_PRIORITY
+
+    def is_reserved_tier(self) -> bool:
+        return is_reserved_tier(self.queue_priority())
 
     def is_correlated_fault(self) -> bool:
         return bool(self.correlation_scope_keys) and (
@@ -456,7 +503,7 @@ class ProcessorRequest(StrictModel):
             and routine_starvation_before is not None
             and self.created_at <= routine_starvation_before
         ):
-            return 49
+            return STARVED_ROUTINE_PRIORITY
         return priority
 
     def waits_for_observation(self, pending_observation_scope_keys: set[str]) -> bool:

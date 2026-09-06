@@ -17,25 +17,22 @@ class NodeHealthIngestionService:
         notifications = []
         host_resource_notification_groups = {}
         for finding in findings:
-            marker = finding.marker()
+            # The marker is built before ingestion picks an incident, so it
+            # cannot know the pointer: grouping and merging route a finding
+            # into an incident that already owns the attempt or the node, and
+            # that incident keeps its own id. It used to guess `inc-<event_id>`
+            # and be re-pointed afterwards, which left a marker pointing at a
+            # record nobody ever persisted whenever ingestion raised between
+            # the two writes (F-G6 / P0-50B). It is now written first as an
+            # *observational* marker with no incident pointer -- nothing may
+            # observe the node without a marker while ingestion is deciding,
+            # and `marker_blocks_spare` fails closed on a missing pointer --
+            # and re-pointed once the incident is known.
+            marker = finding.marker().model_copy(update={"incident_id": ""})
             self.context.completion.add_marker(marker)
             incident, workflow = self.context.orchestrator.ingest_node_health(finding)
-            if marker.incident_id != incident.incident_id:
-                # The marker is built before ingestion picks an incident, so it
-                # can only guess `inc-<event_id>`; grouping and merging route a
-                # finding into an incident that already owns the attempt or the
-                # node, and that incident keeps its own id. Leaving the guess in
-                # place points the marker at a record nobody persisted, which
-                # defeats both guards that read it: the completion handler
-                # cannot see that recovery is already owned by the incident's
-                # workflow, so a terminal attempt inside the marker window opens
-                # a second recovery for the same fault, and `marker_blocks_spare`
-                # fails closed forever because it can never reach the SUCCEEDED
-                # workflow. Re-point it, the way the SXID and distributed-XID
-                # paths already do. The first write stays: nothing may observe
-                # the node without a marker while ingestion is deciding.
-                marker = marker.model_copy(update={"incident_id": incident.incident_id})
-                self.context.completion.add_marker(marker)
+            marker = marker.model_copy(update={"incident_id": incident.incident_id})
+            self.context.completion.add_marker(marker)
             markers.append(marker.marker_id)
             incidents.append(incident.incident_id)
             if workflow is not None:

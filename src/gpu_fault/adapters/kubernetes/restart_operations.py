@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import hashlib
 from copy import deepcopy
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
 from gpu_fault.models import (
+    IncidentState,
     WorkflowOperation,
     WorkflowStepStatus,
 )
@@ -25,6 +26,19 @@ from gpu_fault.adapters.common import (
 )
 
 
+class IncidentOwnershipReport(Protocol):
+    """The slice of the control plane's ownership answer the premise reads."""
+
+    known: bool
+    incident_state: str | None
+
+
+class IncidentOwnershipProvider(Protocol):
+    """How a storeless (regional) executor asks about an incident's state."""
+
+    def incident_ownership(self, incident_id: str) -> IncidentOwnershipReport: ...
+
+
 class KubernetesRestartOperationsMixin:
     # Attributes supplied by the composed concrete implementation.
     _annotations: Callable[..., Any]
@@ -34,8 +48,14 @@ class KubernetesRestartOperationsMixin:
     batch: Any
     custom: Any
     notification_sink: Any
+    ownership_provider: IncidentOwnershipProvider | None
     restart_email_builder: Any
     store: Any
+
+    #: Incident states from which ``RECOVERED`` is no longer reachable.
+    _UNRECOVERABLE_INCIDENT_STATES = frozenset(
+        {IncidentState.QUARANTINED.value, IncidentState.ESCALATED.value}
+    )
 
     def _restart_guard(
         self,
@@ -58,6 +78,32 @@ class KubernetesRestartOperationsMixin:
                 ),
                 None,
             )
+        premise = self._incident_premise(context)
+        if premise is not None:
+            return premise, None
+        avoided = self._avoid_node_ids(context)
+        if avoided:
+            rebindings = self._node_rebindings(context)
+            pinned = sorted(
+                {
+                    node
+                    for _, kind, _, _, workload in workloads
+                    for node in self._pinned_nodes(kind, workload, rebindings)
+                    if node in avoided
+                }
+            )
+            if pinned:
+                return (
+                    WorkflowStepOutcome.failed(
+                        "restart target is pinned to an avoided node: "
+                        + ", ".join(pinned),
+                        details={
+                            "reason": "RESTART_TARGET_AVOIDED",
+                            "avoided_node_ids": pinned,
+                        },
+                    ),
+                    None,
+                )
         declared_job_ids = {
             value
             for *_, workload in workloads
@@ -230,6 +276,148 @@ class KubernetesRestartOperationsMixin:
             )
         return None, state.restart_count
 
+    def _incident_premise(
+        self, context: WorkflowStepContext
+    ) -> WorkflowStepOutcome | None:
+        """Honour ``requires_incident_state`` at execution time.
+
+        The planner's ``after_incident`` restart depends on the incident that
+        owns the nodes being ``RECOVERED``. Only the simulated executor read
+        that premise, so a production restart went ahead mid-repair (F-G5).
+        Not yet recovered: wait (the executor re-runs the step). Can never
+        recover (quarantined, escalated): fail. Cannot be verified: fail
+        closed rather than restart on an assumption.
+        """
+        parameters = context.step.parameters
+        required = parameters.get("requires_incident_state")
+        if not required:
+            return None
+        required_state = str(required)
+        incident_id = str(parameters.get("incident_id") or context.incident.incident_id)
+        state = self._incident_state(incident_id)
+        details: dict[str, Any] = {
+            "incident_id": incident_id,
+            "required_incident_state": required_state,
+            "incident_state": state,
+        }
+        if state is None:
+            return WorkflowStepOutcome.failed(
+                f"cannot verify that incident {incident_id} is {required_state}: "
+                "no store or ownership provider can answer",
+                details={**details, "reason": "INCIDENT_STATE_UNVERIFIABLE"},
+            )
+        if state == required_state:
+            return None
+        if state in self._UNRECOVERABLE_INCIDENT_STATES:
+            return WorkflowStepOutcome.failed(
+                f"incident {incident_id} is {state}; it will never be "
+                f"{required_state}, so the workload cannot be restarted on its nodes",
+                details={**details, "reason": "INCIDENT_NOT_RECOVERABLE"},
+            )
+        return WorkflowStepOutcome.waiting(
+            operation_id=context.idempotency_key,
+            details={**details, "reason": "INCIDENT_NOT_RECOVERED"},
+        )
+
+    def _incident_state(self, incident_id: str) -> str | None:
+        if self.store is not None:
+            try:
+                incident = self.store.get_incident(incident_id)
+            except Exception:  # noqa: BLE001 - unknown incident is "unverifiable"
+                return None
+            state = incident.state
+            return str(getattr(state, "value", state))
+        provider = getattr(self, "ownership_provider", None)
+        if provider is None or not hasattr(provider, "incident_ownership"):
+            # Older providers answer only incident_workflow_is_terminal.
+            return None
+        try:
+            report = provider.incident_ownership(incident_id)
+        except Exception:  # noqa: BLE001 - a failed lookup is "unverifiable"
+            return None
+        if not report.known:
+            return None
+        return str(report.incident_state) if report.incident_state else None
+
+    @staticmethod
+    def _avoid_node_ids(context: WorkflowStepContext) -> list[str]:
+        values = context.step.parameters.get("avoid_node_ids")
+        if not isinstance(values, list):
+            return []
+        return sorted({str(value) for value in values if value})
+
+    @classmethod
+    def _pod_specs(cls, kind: str, workload: Any) -> list[dict[str, Any]]:
+        spec = cls._serialize_workload(workload).get("spec") or {}
+        if kind == "job":
+            pod_spec = (spec.get("template") or {}).get("spec")
+            return [pod_spec] if isinstance(pod_spec, dict) else []
+        if kind == "pytorchjob":
+            return [
+                pod_spec
+                for replica in (spec.get("pytorchReplicaSpecs") or {}).values()
+                if isinstance(replica, dict)
+                and isinstance(
+                    pod_spec := (replica.get("template") or {}).get("spec"), dict
+                )
+            ]
+        if kind == "jobset":
+            specs: list[dict[str, Any]] = []
+            for replicated in spec.get("replicatedJobs") or []:
+                if not isinstance(replicated, dict):
+                    continue
+                job_spec = (replicated.get("template") or {}).get("spec") or {}
+                pod_spec = (job_spec.get("template") or {}).get("spec")
+                if isinstance(pod_spec, dict):
+                    specs.append(pod_spec)
+            return specs
+        return []
+
+    @classmethod
+    def _pinned_nodes(
+        cls, kind: str, workload: Any, rebindings: dict[str, str]
+    ) -> set[str]:
+        """Nodes a workload's Pod templates are pinned to, after rebinding."""
+        pinned: set[str] = set()
+        for pod_spec in cls._pod_specs(kind, workload):
+            node_name = pod_spec.get("nodeName")
+            if isinstance(node_name, str) and node_name:
+                pinned.add(rebindings.get(node_name, node_name))
+            node_selector = pod_spec.get("nodeSelector")
+            if isinstance(node_selector, dict):
+                hostname = node_selector.get("kubernetes.io/hostname")
+                if isinstance(hostname, str) and hostname:
+                    pinned.add(rebindings.get(hostname, hostname))
+        return pinned
+
+    @staticmethod
+    def _apply_node_avoidance(pod_spec: dict[str, Any], avoided: list[str]) -> None:
+        """Keep the restarted Pods off ``avoided`` with a required anti-affinity.
+
+        The expression is added to every existing node-selector term (terms
+        are OR-ed, expressions within a term AND-ed), or as the only term.
+        """
+        if not avoided:
+            return
+        expression = {
+            "key": "kubernetes.io/hostname",
+            "operator": "NotIn",
+            "values": list(avoided),
+        }
+        affinity = pod_spec.setdefault("affinity", {})
+        node_affinity = affinity.setdefault("nodeAffinity", {})
+        required = node_affinity.setdefault(
+            "requiredDuringSchedulingIgnoredDuringExecution", {}
+        )
+        terms = required.setdefault("nodeSelectorTerms", [])
+        if not terms:
+            terms.append({"matchExpressions": [expression]})
+            return
+        for term in terms:
+            expressions = term.setdefault("matchExpressions", [])
+            if expression not in expressions:
+                expressions.append(expression)
+
     def _observed_source_gpu_count(
         self, cluster_id: str, job_id: str, attempt_id: str
     ) -> int:
@@ -343,6 +531,7 @@ class KubernetesRestartOperationsMixin:
             hostname = node_selector.get("kubernetes.io/hostname")
             if hostname in rebindings:
                 node_selector["kubernetes.io/hostname"] = rebindings[hostname]
+        self._apply_node_avoidance(template_spec, self._avoid_node_ids(context))
         template_metadata = spec.setdefault("template", {}).setdefault("metadata", {})
         labels = template_metadata.setdefault("labels", {})
         for key in {
@@ -429,6 +618,7 @@ class KubernetesRestartOperationsMixin:
             restart_count,
             self._node_rebindings(context),
             workload_ids=[retry_workload_id],
+            avoid_node_ids=self._avoid_node_ids(context),
         )
         spec = body.setdefault("spec", {})
         if kind == "pytorchjob":
@@ -461,6 +651,7 @@ class KubernetesRestartOperationsMixin:
         restart_count: int | None,
         node_rebindings: dict[str, str] | None = None,
         workload_ids: list[str] | None = None,
+        avoid_node_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         annotations = {
             ANNOTATION_RESTART_BUDGET: str(restart_budget),
@@ -487,6 +678,7 @@ class KubernetesRestartOperationsMixin:
                 hostname = node_selector.get("kubernetes.io/hostname")
                 if hostname in (node_rebindings or {}):
                     node_selector["kubernetes.io/hostname"] = node_rebindings[hostname]
+            cls._apply_node_avoidance(pod_spec, list(avoid_node_ids or []))
 
         serialized = cls._serialize_workload(workload)
         spec = serialized.get("spec") or {}

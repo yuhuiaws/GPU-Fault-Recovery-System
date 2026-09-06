@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from gpu_fault.store.contracts import ProcessorQueueStats
 from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.processor.models import RESERVED_TIER_MAX_PRIORITY
 
 
 class PostgresProcessorStorageMixin:
@@ -182,46 +183,6 @@ class PostgresProcessorStorageMixin:
             update_payload=(self.processor_queue_state_mode != "dedicated"),
         )
 
-    def _reconcile_legacy_processor_requests(self, *, limit: int = 1000) -> int:
-        with self._db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT legacy.payload
-                FROM gpu_fault_objects AS legacy
-                LEFT JOIN gpu_fault_processor_queue AS queue
-                  ON queue.request_id=legacy.key
-                WHERE legacy.kind='processor_request'
-                  AND (
-                      legacy.payload->>'status'
-                          IN ('PENDING', 'LEASED')
-                      OR (legacy.payload->>'updated_at')::timestamptz
-                          > now() - interval '10 minutes'
-                  )
-                  AND (
-                      queue.request_id IS NULL
-                      OR (legacy.payload->>'updated_at')::timestamptz
-                          > queue.updated_at
-                  )
-                ORDER BY
-                    (legacy.payload->>'updated_at')::timestamptz,
-                    legacy.key
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cursor.fetchall()
-        for row in rows:
-            self._put_processor_queue(self._decode("processor_request", row[0]))
-        return len(rows)
-
-    def _maybe_reconcile_legacy_processor_requests(
-        self,
-        *,
-        interval_seconds: float = 60,
-        limit: int = 1000,
-    ) -> int:
-        return 0
-
     def enqueue_processor_request(self, request):
         with self._state_transaction(f"processor_request/{request.request_id}"):
             try:
@@ -339,8 +300,9 @@ class PostgresProcessorStorageMixin:
                 SELECT count(*)
                 FROM gpu_fault_processor_queue
                 WHERE status IN ('PENDING', 'LEASED')
-                  AND priority=0
-                """
+                  AND priority <= %s
+                """,
+                (RESERVED_TIER_MAX_PRIORITY,),
             )
             return cursor.fetchone()[0]
 
@@ -362,7 +324,6 @@ class PostgresProcessorStorageMixin:
         raise NotFoundError(request_id)
 
     def has_incomplete_processor_requests(self, cluster_id: str) -> bool:
-        self._maybe_reconcile_legacy_processor_requests()
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -382,7 +343,6 @@ class PostgresProcessorStorageMixin:
     ) -> bool:
         if not scope_keys:
             return self.has_incomplete_processor_requests(cluster_id)
-        self._maybe_reconcile_legacy_processor_requests()
         with self._db.cursor() as cursor:
             cursor.execute(
                 """

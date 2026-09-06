@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 import logging
 from threading import RLock
 from typing import Callable
-from uuid import uuid4
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
+    BlockedKind,
     FaultIncident,
     IncidentState,
     RecoveryAction,
@@ -17,6 +17,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkloadState,
 )
+from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.store import NotFoundError
 
 
@@ -88,7 +89,11 @@ class NodeHealthPlanBuilder:
         )
         workflow_status = WorkflowStatus.BLOCKED if errors else WorkflowStatus.PENDING
         workflow = WorkflowRequest(
-            request_id=workflow_request_id or f"workflow-{uuid4()}",
+            # Derived from the event, like the incident's ``inc-<event_id>``:
+            # a rebuild after a dangling link re-creates the same record
+            # instead of a second one (F-B7).
+            request_id=workflow_request_id
+            or derived_record_id("workflow", "node-health", finding.event_id),
             incident_id=incident.incident_id,
             runtime_profile_version=finding.runtime_profile_version,
             status=workflow_status,
@@ -101,6 +106,7 @@ class NodeHealthPlanBuilder:
             dag_revision=1 if context.hung_triage_requested else 0,
             predecessor_workflow_id=None,
             blocked_reasons=errors,
+            blocked_kind=(BlockedKind.NEEDS_OPERATOR if errors else None),
             created_at=now,
             updated_at=now,
         )
@@ -434,6 +440,7 @@ class NodeHealthPlanBuilder:
                 context.diagnostic_parameters,
                 restart,
                 inventory,
+                incident.incident_id,
             )
             for step in steps
         ]
@@ -471,10 +478,19 @@ class NodeHealthPlanBuilder:
         diagnostic: dict,
         restart: dict,
         inventory: dict,
+        incident_id: str,
     ):
         parameters = step.parameters
         if step.operation is WorkflowOperation.RESTART_WORKLOAD:
             parameters = restart
+        elif step.operation is WorkflowOperation.STOP_WORKLOADS:
+            # The completion watcher tells a controller-initiated stop from a
+            # user stop by this marker; without it the job the system stopped
+            # to repair the node came back as a failed job (F-C9).
+            parameters = {
+                **parameters,
+                "termination_initiator_incident_id": incident_id,
+            }
         elif step.operation is WorkflowOperation.RUN_FIELD_DIAGNOSTIC:
             parameters = {
                 "procedure": "NVIDIA_FIELD_DIAGNOSTIC",
@@ -691,12 +707,23 @@ class NodeHealthIngestionService:
     ) -> tuple[FaultIncident, WorkflowRequest | None] | None:
         existing = self.store.get_incident_by_event(finding.event_id)
         if existing is not None:
-            workflow = (
-                self.store.get_workflow(existing.workflow_request_id)
-                if existing.workflow_request_id
-                else None
+            if not existing.workflow_request_id:
+                return existing, None
+            workflow = self._workflow_if_present(existing.workflow_request_id)
+            if workflow is not None:
+                return existing, workflow
+            # The link says "already handled" but the workflow it was handled
+            # by is gone. Raising here made every re-post of the event fail
+            # the same way (P2-51H); building again is the repair -- the
+            # incident id is derived from the event, so the same record is
+            # rewritten with a workflow pointer that resolves.
+            LOGGER.warning(
+                "incident %s for re-posted event %s points at workflow %s which "
+                "is missing; rebuilding the workflow",
+                existing.incident_id,
+                finding.event_id,
+                existing.workflow_request_id,
             )
-            return existing, workflow
         covered = self.callbacks.active_workflow_covers_inventory_finding(finding)
         if covered is not None:
             incident, workflow = covered
@@ -735,6 +762,13 @@ class NodeHealthIngestionService:
             if grouped is not None:
                 return grouped
         return None
+
+    def _workflow_if_present(self, request_id: str) -> WorkflowRequest | None:
+        try:
+            workflow: WorkflowRequest = self.store.get_workflow(request_id)
+        except NotFoundError:
+            return None
+        return workflow
 
     def _finalize(
         self,

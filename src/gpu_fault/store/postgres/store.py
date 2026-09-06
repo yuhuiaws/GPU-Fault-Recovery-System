@@ -291,9 +291,10 @@ class PostgresStore(
         configure_processor_completion_runtime(self, pool_max_size)
         self._processor_completion_condition = Condition()
         self._processor_completion_queue = []
+        self._processor_completion_leader_active = False
         self._attempt_observation_condition = Condition()
         self._attempt_observation_queue = []
-        self._legacy_reconciled_at = 0.0
+        self._attempt_observation_leader_active = False
         self._processor_counter_mode_cache = "dual"
         self._processor_counter_mode_checked_at = 0.0
         try:

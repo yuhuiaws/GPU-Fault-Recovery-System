@@ -117,6 +117,15 @@ class ProcessorFactory:
                     "30",
                 )
             ),
+            "deadline_exceeded_process_threshold": int(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_DEADLINE_EXCEEDED_PROCESS_THRESHOLD",
+                    "3",
+                )
+            ),
+            "unhealthy_ttl_seconds": float(
+                os.getenv("GPU_FAULT_PROCESSOR_UNHEALTHY_TTL_SECONDS", "300")
+            ),
             "retryable_response_max_age_seconds": float(
                 os.getenv(
                     "GPU_FAULT_PROCESSOR_RETRYABLE_RESPONSE_MAX_AGE_SECONDS",
@@ -162,8 +171,8 @@ class ProcessorFactory:
                     "5",
                 )
             ),
-            "processor_notification_shard_count": int(
-                os.getenv("GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS", "8")
+            "processor_notification_shard_count": (
+                ProcessorFactory._notification_shard_count()
             ),
             "routine_starvation_seconds": float(
                 os.getenv(
@@ -172,6 +181,39 @@ class ProcessorFactory:
                 )
             ),
         }
+
+    @staticmethod
+    def _notification_shard_count() -> int:
+        """Shards must cover the consumer processes, or the losers are pollers.
+
+        The deployment computes ``GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS`` as
+        replicas x uvicorn workers; the code default of 8 knew nothing of
+        that and left 16 of 24 processes without a shard (F-D11). With
+        ``GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES`` set the shard count is
+        derived from it, and an explicit shard count below it is refused at
+        startup rather than discovered as a warning per process at run time.
+        """
+
+        shards_raw = os.getenv("GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS")
+        processes_raw = os.getenv("GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES")
+        if processes_raw is None:
+            return int(shards_raw if shards_raw is not None else "8")
+        processes = int(processes_raw)
+        if processes <= 0:
+            raise RuntimeError(
+                "GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES must be a positive integer"
+            )
+        if shards_raw is None:
+            return processes
+        shards = int(shards_raw)
+        if shards < processes:
+            raise RuntimeError(
+                "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS "
+                f"({shards}) is below GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES "
+                f"({processes}); every consumer process needs a shard or it "
+                "never receives a notification"
+            )
+        return shards
 
     @staticmethod
     def _pool_settings(

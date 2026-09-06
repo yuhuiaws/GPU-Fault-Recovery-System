@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from gpu_fault.models import (
+    bounded_reasons,
     FaultIncident,
     IncidentState,
     WorkflowRequest,
@@ -17,6 +18,7 @@ from gpu_fault.policy import (
     SxidEvent,
     XidEvent,
 )
+from gpu_fault.orchestration.disposition import DispositionApplier
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,9 @@ class NodeScopedFaultCallbacks:
     merge_disposition: Callable
     node_group_key: Callable
     prepare_preempting_successor: Callable
+    preempt_parallel_job_branch: Callable[
+        [WorkflowRequest, WorkflowRequest, str], WorkflowRequest
+    ]
     reopen_if_terminal: Callable
     runtime_effective_action: Callable
     widen_node_action_scope: Callable
@@ -44,11 +49,20 @@ class NodeScopedFaultService:
         *,
         aggregation_window_seconds: int,
         merge_actions: set,
+        workflow_preemption_enabled: bool,
     ) -> None:
         self.store = store
         self.arbiter = arbiter
         self.brancher = brancher
         self.callbacks = callbacks
+        self.dispositions = DispositionApplier(
+            arbiter=arbiter,
+            brancher=brancher,
+            aggregation_deadlines=callbacks.aggregation_deadlines,
+            prepare_preempting_successor=callbacks.prepare_preempting_successor,
+            preempt_parallel_job_branch=callbacks.preempt_parallel_job_branch,
+            workflow_preemption_enabled=workflow_preemption_enabled,
+        )
         self.aggregation_window_seconds = aggregation_window_seconds
         self.merge_actions = merge_actions
 
@@ -290,121 +304,17 @@ class NodeScopedFaultService:
         mutable: bool,
         now: datetime,
     ) -> tuple[WorkflowRequest, FaultIncident]:
-        if disposition == "PARALLEL_BRANCH":
-            workflow = self.brancher.append_parallel_job_branch(
-                existing_workflow,
-                candidate_workflow,
-            )
-            return workflow, self._winner(
-                candidate,
-                candidate_workflow,
-                existing_incident,
-                existing_workflow,
-            )
-        if disposition == "WIDEN_BRANCH":
-            return (
-                self.brancher.widen_parallel_job_branch(
-                    existing_workflow,
-                    candidate_workflow,
-                    node_id,
-                    event_gpus,
-                ),
-                existing_incident,
-            )
-        if disposition == "WIDEN_IN_PLACE":
-            return (
-                existing_workflow.model_copy(update={"updated_at": now}),
-                existing_incident,
-            )
-        if disposition == "REPLACE_BRANCH":
-            workflow = self.brancher.replace_parallel_job_branch(
-                existing_workflow,
-                candidate_workflow,
-                node_id,
-            )
-            return workflow, self._winner(
-                candidate,
-                candidate_workflow,
-                existing_incident,
-                existing_workflow,
-            )
-        if disposition == "QUEUE_BRANCH_SUCCESSOR":
-            workflow = self.brancher.append_parallel_job_branch_successor(
-                existing_workflow,
-                candidate_workflow,
-                node_id,
-            )
-            return workflow, self._winner(
-                candidate,
-                candidate_workflow,
-                existing_incident,
-                existing_workflow,
-            )
-        if disposition == "ABSORB":
-            updates = {"updated_at": now}
-            if mutable:
-                not_before, maximum = self.callbacks.aggregation_deadlines(
-                    now,
-                    existing_workflow,
-                )
-                updates.update(
-                    {
-                        "not_before": not_before,
-                        "aggregation_max_deadline": maximum,
-                    }
-                )
-            return (
-                existing_workflow.model_copy(update=updates),
-                existing_incident,
-            )
-        if disposition == "REPLACE_IN_PLACE":
-            not_before, maximum = self.callbacks.aggregation_deadlines(
-                now,
-                existing_workflow,
-            )
-            return (
-                candidate_workflow.model_copy(
-                    update={
-                        "request_id": existing_workflow.request_id,
-                        "incident_id": existing_incident.incident_id,
-                        "fencing_token": (existing_workflow.fencing_token + 1),
-                        "not_before": not_before,
-                        "aggregation_max_deadline": maximum,
-                        "created_at": existing_workflow.created_at,
-                        "updated_at": now,
-                    }
-                ),
-                candidate,
-            )
-        workflow = candidate_workflow.model_copy(
-            update={
-                "incident_id": existing_incident.incident_id,
-                "predecessor_workflow_id": (existing_workflow.request_id),
-                "fencing_token": existing_workflow.fencing_token,
-                "not_before": None,
-                "updated_at": now,
-            }
+        return self.dispositions.apply(
+            disposition,
+            node_id=node_id,
+            candidate=candidate,
+            candidate_workflow=candidate_workflow,
+            existing_incident=existing_incident,
+            existing_workflow=existing_workflow,
+            gpu_uuids=event_gpus,
+            mutable=mutable,
+            now=now,
         )
-        return (
-            self.callbacks.prepare_preempting_successor(
-                existing_workflow,
-                workflow,
-            ),
-            candidate,
-        )
-
-    def _winner(
-        self,
-        candidate: FaultIncident,
-        candidate_workflow: WorkflowRequest,
-        existing_incident: FaultIncident,
-        existing_workflow: WorkflowRequest,
-    ) -> FaultIncident:
-        if self.arbiter.workflow_recovery_rank(
-            candidate_workflow
-        ) > self.arbiter.workflow_recovery_rank(existing_workflow):
-            return candidate
-        return existing_incident
 
     def _merged_incident(
         self,
@@ -432,16 +342,14 @@ class NodeScopedFaultService:
                 "policy_source": winner.policy_source,
                 "policy_version": winner.policy_version,
                 "fencing_token": workflow.fencing_token,
-                "reasons": list(
-                    dict.fromkeys(
-                        [
-                            *existing.reasons,
-                            *(
-                                f"{event.node_id}: {event_label}: {reason}"
-                                for reason in decision.reasons
-                            ),
-                        ]
-                    )
+                "reasons": bounded_reasons(
+                    [
+                        *existing.reasons,
+                        *(
+                            f"{event.node_id}: {event_label}: {reason}"
+                            for reason in decision.reasons
+                        ),
+                    ]
                 ),
                 "workflow_request_id": workflow.request_id,
                 "state": self.callbacks.incident_state_for_workflow(workflow),

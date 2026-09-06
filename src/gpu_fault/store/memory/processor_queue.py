@@ -17,6 +17,8 @@ from gpu_fault.store.contracts import (
 )
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.processor_helpers import (
+    PartialEnqueueError,
+    fault_rows_blocked_by_observation as _fault_rows_blocked_by_observation,
     incomplete_observation_scope_keys as _incomplete_observation_scope_keys,
     pending_fault_scope_keys as _pending_fault_scope_keys,
 )
@@ -52,12 +54,12 @@ class MemoryProcessorQueueMixin:
             existing = self._processor_requests.get(request.request_id)
             if existing is not None:
                 return existing, None
-            # ``coalescable()``, not the tier: a lane is shared by every
-            # channel that resolves to the same node, so overwriting on
-            # tier alone replaces whatever happens to be pending on it -
-            # a node log batch, or an earlier breach whose confirmation
-            # the detector is still counting. The batch admission path has
-            # always asked this question this way.
+            # A lane is shared by every channel that resolves to the same
+            # node, so "the pending row on this lane" may be a fault, a node
+            # log batch, or an earlier breach whose confirmation the
+            # detector is still counting. What a latest-wins sample may
+            # supersede is the previous routine sample of its *own* path,
+            # nothing else (F-D8).
             if request.coalescable():
                 pending_match = next(
                     (
@@ -65,6 +67,8 @@ class MemoryProcessorQueueMixin:
                         for item in self._processor_requests.values()
                         if item.status is ProcessorRequestStatus.PENDING
                         and item.ordering_key() == request.ordering_key()
+                        and item.path == request.path
+                        and item.coalescable()
                     ),
                     None,
                 )
@@ -89,7 +93,7 @@ class MemoryProcessorQueueMixin:
             if len(incomplete) >= max_depth:
                 return None, "global"
             if (
-                request.queue_priority() != 0
+                not request.is_reserved_tier()
                 and len(incomplete) >= max_depth - reserved_fault_depth
             ):
                 return None, "global_reserved"
@@ -99,7 +103,7 @@ class MemoryProcessorQueueMixin:
             if cluster_depth >= max_cluster_depth:
                 return None, "cluster"
             if (
-                request.queue_priority() != 0
+                not request.is_reserved_tier()
                 and cluster_depth >= max_cluster_depth - reserved_cluster_fault_depth
             ):
                 return None, "cluster_reserved"
@@ -116,17 +120,26 @@ class MemoryProcessorQueueMixin:
         reserved_cluster_fault_depth: int = 0,
         global_admission_guard: int = 0,
     ):
-        return [
-            self.try_enqueue_processor_request(
-                request,
-                max_depth=max_depth,
-                max_cluster_depth=max_cluster_depth,
-                reserved_fault_depth=reserved_fault_depth,
-                reserved_cluster_fault_depth=(reserved_cluster_fault_depth),
-                global_admission_guard=global_admission_guard,
-            )
-            for request in requests
-        ]
+        results: list[tuple[Any, str | None]] = []
+        committed: list[str] = []
+        for request in requests:
+            try:
+                result = self.try_enqueue_processor_request(
+                    request,
+                    max_depth=max_depth,
+                    max_cluster_depth=max_cluster_depth,
+                    reserved_fault_depth=reserved_fault_depth,
+                    reserved_cluster_fault_depth=(reserved_cluster_fault_depth),
+                    global_admission_guard=global_admission_guard,
+                )
+            except Exception as exc:
+                # Rows admitted before the failure stay admitted; tell the
+                # caller which ones (F-D9), as the Postgres batch does.
+                raise PartialEnqueueError(committed=committed, cause=exc) from exc
+            results.append(result)
+            if result[0] is not None:
+                committed.append(result[0].request_id)
+        return results
 
     def processor_queue_stats(
         self, *, now: datetime | None = None
@@ -181,7 +194,7 @@ class MemoryProcessorQueueMixin:
                     ProcessorRequestStatus.PENDING,
                     ProcessorRequestStatus.LEASED,
                 }
-                and item.queue_priority() == 0
+                and item.is_reserved_tier()
                 for item in self._processor_requests.values()
             )
 
@@ -257,7 +270,7 @@ class MemoryProcessorQueueMixin:
                     deferred_strict_lanes=deferred_strict_lanes,
                 )
             ]
-            observation_scope_keys = _incomplete_observation_scope_keys(items)
+            observation_scope_keys = _incomplete_observation_scope_keys(items, now)
             eligible_items = [
                 item
                 for item in eligible_items
@@ -298,6 +311,11 @@ class MemoryProcessorQueueMixin:
                 claimed.append(value)
             return claimed
 
+    def count_fault_rows_blocked_by_observation(self, *, now: datetime) -> int:
+        with self._lock:
+            items = list(self._processor_requests.values())
+        return _fault_rows_blocked_by_observation(items, now)
+
     def claim_active_processor_requests(
         self,
         owner_id: str,
@@ -321,7 +339,7 @@ class MemoryProcessorQueueMixin:
                     deferred_strict_lanes=deferred_strict_lanes,
                 )
             ]
-            observation_scope_keys = _incomplete_observation_scope_keys(items)
+            observation_scope_keys = _incomplete_observation_scope_keys(items, now)
             eligible_items = [
                 item
                 for item in eligible_items

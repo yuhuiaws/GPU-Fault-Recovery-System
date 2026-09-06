@@ -10,6 +10,7 @@ from gpu_fault.processor import (
     ProcessorLeadership,
     ProcessorRequestStatus,
 )
+from gpu_fault.store.shared.errors import StaleFencingTokenError
 
 
 class MemoryProcessorLeaseMixin:
@@ -238,7 +239,7 @@ class MemoryProcessorLeaseMixin:
                 or current.leader_epoch != lane_epoch
                 or current.lease_token != lease_token
             ):
-                raise ValueError("stale processor lane fencing token")
+                raise StaleFencingTokenError("stale processor lane fencing token")
             completed = current.model_copy(
                 update={
                     "status": ProcessorRequestStatus.COMPLETED,
@@ -275,6 +276,9 @@ class MemoryProcessorLeaseMixin:
                 or current.leader_epoch != leader_epoch
                 or current.lease_token != lease_token
             ):
+                return
+            # A COMPLETED row keeps its fencing fields; only LEASED goes back.
+            if current.status != ProcessorRequestStatus.LEASED:
                 return
             self._processor_requests[request_id] = current.model_copy(
                 update={
@@ -317,7 +321,7 @@ class MemoryProcessorLeaseMixin:
                 or current.lease_expires_at is None
                 or current.lease_expires_at <= now
             ):
-                raise ValueError("stale processor fencing token")
+                raise StaleFencingTokenError("stale processor fencing token")
             completed = current.model_copy(
                 update={
                     "status": ProcessorRequestStatus.COMPLETED,
@@ -330,6 +334,44 @@ class MemoryProcessorLeaseMixin:
             )
             self._processor_requests[request_id] = completed
             return completed
+
+    def reclaim_expired_processor_leases(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+    ) -> int:
+        """Hand LEASED rows whose lease lapsed back to PENDING (F-D5).
+
+        Booked as a retry (``retry_count + 1``); the lane row is left to
+        the next claim, which takes over an expired lane on its own.
+        """
+
+        with self._lock:
+            expired = sorted(
+                (
+                    item
+                    for item in self._processor_requests.values()
+                    if item.status is ProcessorRequestStatus.LEASED
+                    and item.lease_expires_at is not None
+                    and item.lease_expires_at <= now
+                ),
+                key=lambda item: (item.lease_expires_at, item.request_id),
+            )[:limit]
+            for item in expired:
+                self._processor_requests[item.request_id] = item.model_copy(
+                    update={
+                        "status": ProcessorRequestStatus.PENDING,
+                        "lease_owner": None,
+                        "leader_epoch": None,
+                        "lease_token": None,
+                        "lease_expires_at": None,
+                        "not_before": None,
+                        "retry_count": item.retry_count + 1,
+                        "updated_at": max(now, item.updated_at),
+                    }
+                )
+            return len(expired)
 
     def cleanup_processor_lanes(
         self,

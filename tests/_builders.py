@@ -10,7 +10,7 @@ import httpx
 
 from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.execution import ProductionExecutorConfig, ProductionWorkflowExecutor
-from gpu_fault.execution.config import managed_recovery_step_overrides
+from gpu_fault.execution.config import default_step_waiting_overrides
 from gpu_fault.gpu_metrics import GpuMetricBatch
 from gpu_fault.host_health import HostTelemetryBatch, NodeHealthFinding
 from gpu_fault.models import (
@@ -274,7 +274,7 @@ def active_workflow_executor(
             step_waiting_timeout_seconds=step_waiting_timeout_seconds,
             step_waiting_warning_seconds=step_waiting_warning_seconds,
             step_waiting_timeout_overrides=(
-                managed_recovery_step_overrides({})
+                default_step_waiting_overrides({})
                 if step_waiting_timeout_overrides is None
                 else dict(step_waiting_timeout_overrides)
             ),

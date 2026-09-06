@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
+
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
 from gpu_fault.models import (
+    workflow_is_open,
     FaultIncident,
     IncidentState,
     RecoveryPlan,
@@ -11,22 +14,34 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
+from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
 from gpu_fault.store.shared.errors import (
+    WorkflowMergedError,
+    StaleFencingTokenError,
     NotFoundError,
     RemediationBudgetError,
     WorkflowLeaseError,
 )
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
+    extend_remediation_budget,
     blocked_by_remediation_budget,
 )
 from gpu_fault.workflow_resolution import (
     reconciled_restore_records,
     retired_generation_records,
 )
+from gpu_fault.store.shared.preemption import preemption_pending_update
 
 if TYPE_CHECKING:
     from gpu_fault.regional import RemoteActionCommand
+
+
+# The two statuses in which an aggregated-but-unnamed workflow waits forever
+# (F-B3): not RUNNING, which the executor owns, and not terminal.
+ORPHAN_WORKFLOW_STATUSES = frozenset(
+    {WorkflowStatus.PENDING, WorkflowStatus.SAFETY_PENDING}
+)
 
 
 class MemoryWorkflowMixin:
@@ -38,6 +53,7 @@ class MemoryWorkflowMixin:
     _workflows: Any
 
     get_plan: Callable[[str], RecoveryPlan]
+    list_remote_commands: Callable[..., list[RemoteActionCommand]]
     _lock: Any
     _replacement_fault_groups: Any
     _sxid_fault_groups: Any
@@ -57,8 +73,14 @@ class MemoryWorkflowMixin:
         if workflow.incident_id != incident.incident_id:
             raise ValueError("workflow incident pointer does not match incident")
         with self._lock:
+            existing = self._workflows.get(workflow.request_id)
+            if existing is not None:
+                workflow = workflow.model_copy(
+                    update={"merge_revision": existing.merge_revision + 1}
+                )
             self._incidents[incident.incident_id] = incident
             self._workflows[workflow.request_id] = workflow
+            self._stamp_preemption_pending(workflow)
             self._incident_by_event[incident.event_id] = incident.incident_id
 
     def reconcile_restored_workflow(
@@ -67,7 +89,8 @@ class MemoryWorkflowMixin:
         successor_workflow_id: str,
         *,
         expected_fencing_token: int,
-        expected_workflow_updated_at: datetime,
+        expected_execution_epoch: int,
+        expected_workflow_updated_at: datetime | None = None,
         reference: str,
         reconciled_at: datetime,
     ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
@@ -84,8 +107,11 @@ class MemoryWorkflowMixin:
                     incident,
                     successor,
                     source_plan,
-                    list(self._remote_commands.values()),
+                    self.list_remote_commands(
+                        workflow_request_ids=[workflow_request_id]
+                    ),
                     expected_fencing_token=expected_fencing_token,
+                    expected_execution_epoch=expected_execution_epoch,
                     expected_workflow_updated_at=expected_workflow_updated_at,
                     reference=reference,
                     reconciled_at=reconciled_at,
@@ -120,7 +146,7 @@ class MemoryWorkflowMixin:
                 workflow,
                 incident,
                 successor,
-                list(self._remote_commands.values()),
+                self.list_remote_commands(workflow_request_ids=[workflow_request_id]),
                 expected_fencing_token=expected_fencing_token,
                 reference=reference,
                 reconciled_at=reconciled_at,
@@ -168,9 +194,19 @@ class MemoryWorkflowMixin:
             incident, workflow = builder()
             self._incidents[incident.incident_id] = incident
             self._workflows[workflow.request_id] = workflow
+            self._stamp_preemption_pending(workflow)
             self._incident_by_event[event_id] = incident.incident_id
             self._incident_by_event[incident.event_id] = incident.incident_id
             return incident, workflow, True
+
+    def _stamp_preemption_pending(self, successor: WorkflowRequest) -> None:
+        if not (successor.preempt_predecessor and successor.predecessor_workflow_id):
+            return
+        stamped = preemption_pending_update(
+            successor, self._workflows.get(successor.predecessor_workflow_id)
+        )
+        if stamped is not None:
+            self._workflows[stamped.request_id] = stamped
 
     def merge_replacement_workflow(
         self,
@@ -200,8 +236,16 @@ class MemoryWorkflowMixin:
                 else None
             )
             incident, workflow = builder(existing_incident, existing_workflow)
+            if (
+                existing_workflow is not None
+                and existing_workflow.request_id == workflow.request_id
+            ):
+                workflow = workflow.model_copy(
+                    update={"merge_revision": existing_workflow.merge_revision + 1}
+                )
             self._incidents[incident.incident_id] = incident
             self._workflows[workflow.request_id] = workflow
+            self._stamp_preemption_pending(workflow)
             self._incident_by_event[incident.event_id] = incident.incident_id
             self._incident_by_event[event_id] = incident.incident_id
             self._replacement_fault_groups[group_key] = incident.incident_id
@@ -235,8 +279,16 @@ class MemoryWorkflowMixin:
                 else None
             )
             incident, workflow = builder(existing_incident, existing_workflow)
+            if (
+                existing_workflow is not None
+                and existing_workflow.request_id == workflow.request_id
+            ):
+                workflow = workflow.model_copy(
+                    update={"merge_revision": existing_workflow.merge_revision + 1}
+                )
             self._incidents[incident.incident_id] = incident
             self._workflows[workflow.request_id] = workflow
+            self._stamp_preemption_pending(workflow)
             self._incident_by_event[incident.event_id] = incident.incident_id
             self._incident_by_event[event_id] = incident.incident_id
             self._sxid_fault_groups[group_key] = incident.incident_id
@@ -253,9 +305,64 @@ class MemoryWorkflowMixin:
     ) -> tuple[FaultIncident, WorkflowRequest]:
         return self.merge_attempt_fault_workflow(group_key, event_id, builder)
 
+    def has_workflow_successor(self, predecessor_workflow_id: str) -> bool:
+        with self._lock:
+            return any(
+                workflow.predecessor_workflow_id == predecessor_workflow_id
+                for workflow in self._workflows.values()
+            )
+
+    def list_orphan_workflows(
+        self, *, created_before: datetime, limit: int = 1000
+    ) -> list[WorkflowRequest]:
+        """See ``ControlPlaneStore.list_orphan_workflows``.
+
+        ``tests/store/test_orphan_workflow_inspection.py`` pins the three
+        backends to the same answer, so a change here has to move the SQLite
+        and Postgres predicates too.
+        """
+
+        with self._lock:
+            named_as_predecessor = {
+                workflow.predecessor_workflow_id
+                for workflow in self._workflows.values()
+                if workflow.predecessor_workflow_id is not None
+            }
+            orphans = [
+                workflow
+                for workflow in self._workflows.values()
+                if workflow.status in ORPHAN_WORKFLOW_STATUSES
+                and workflow.created_at < created_before
+                and workflow.request_id not in named_as_predecessor
+                and self._incident_names_someone_else(workflow)
+            ]
+        orphans.sort(key=lambda item: (item.created_at, item.request_id))
+        return orphans[:limit]
+
+    def _incident_names_someone_else(self, workflow: WorkflowRequest) -> bool:
+        incident = self._incidents.get(workflow.incident_id)
+        return (
+            incident is None
+            or (incident.workflow_request_id or "") != workflow.request_id
+        )
+
+    def list_incidents_with_missing_workflow(
+        self, *, limit: int = 1000
+    ) -> list[FaultIncident]:
+        with self._lock:
+            dangling = [
+                incident
+                for incident in self._incidents.values()
+                if incident.workflow_request_id
+                and incident.workflow_request_id not in self._workflows
+            ]
+        dangling.sort(key=lambda item: (item.created_at, item.incident_id))
+        return dangling[:limit]
+
     def save_workflow(self, workflow: WorkflowRequest) -> None:
         with self._lock:
             self._workflows[workflow.request_id] = workflow
+            self._stamp_preemption_pending(workflow)
 
     def get_workflow(self, request_id: str) -> WorkflowRequest:
         with self._lock:
@@ -270,19 +377,93 @@ class MemoryWorkflowMixin:
         *,
         limit: int = 100,
         newest_first: bool = False,
+        dispatchable_at: datetime | None = None,
+        exclude_request_ids: Collection[str] = (),
+        after: WorkflowRequest | None = None,
     ) -> list[WorkflowRequest]:
-        with self._lock:
-            workflows = sorted(
-                self._workflows.values(),
-                key=lambda item: (
-                    item.updated_at,
-                    item.request_id,
-                ),
-                reverse=newest_first,
+        if after is not None and dispatchable_at is None:
+            raise ValueError(
+                "the scan cursor (after) is only defined with dispatchable_at"
             )
+        with self._lock:
+            if dispatchable_at is not None:
+                # Dispatch mode orders by when the row became eligible, not by
+                # its last merge (F-A2a); the cursor pages that order (F-A2c).
+                workflows = sorted(
+                    self._workflows.values(),
+                    key=dispatch_order_key,
+                    reverse=newest_first,
+                )
+                if after is not None:
+                    anchor = dispatch_order_key(after)
+                    workflows = [
+                        item for item in workflows if dispatch_order_key(item) > anchor
+                    ]
+            else:
+                workflows = sorted(
+                    self._workflows.values(),
+                    key=lambda item: (
+                        item.updated_at,
+                        item.request_id,
+                    ),
+                    reverse=newest_first,
+                )
             if statuses is not None:
                 workflows = [item for item in workflows if item.status in statuses]
+            if dispatchable_at is not None or exclude_request_ids:
+                workflows = [
+                    item
+                    for item in workflows
+                    if held_reason(
+                        item,
+                        dispatchable_at=dispatchable_at or item.updated_at,
+                        exclude_request_ids=exclude_request_ids,
+                        lookup=self._workflows.get,
+                    )
+                    is None
+                ]
             return workflows[:limit]
+
+    def amend_workflow(
+        self,
+        request_id: str,
+        updates: Mapping[str, object],
+    ) -> WorkflowRequest:
+        with self._lock:
+            current = self._workflows.get(request_id)
+            if current is None:
+                raise NotFoundError(request_id)
+            amended: WorkflowRequest = current.model_copy(
+                update={
+                    **dict(updates),
+                    "merge_revision": current.merge_revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            self._workflows[request_id] = amended
+            return amended
+
+    def count_held_workflows(
+        self,
+        statuses: set[WorkflowStatus] | None,
+        *,
+        dispatchable_at: datetime,
+        exclude_request_ids: Collection[str] = (),
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        with self._lock:
+            for item in self._workflows.values():
+                if statuses is not None and item.status not in statuses:
+                    continue
+                reason = held_reason(
+                    item,
+                    dispatchable_at=dispatchable_at,
+                    exclude_request_ids=exclude_request_ids,
+                    lookup=self._workflows.get,
+                )
+                if reason is not None:
+                    counts[reason] = counts.get(reason, 0) + 1
+        return counts
 
     def workflow_status_counts(self) -> dict[WorkflowStatus, int]:
         """Count every persisted workflow by status without decoding any.
@@ -296,6 +477,16 @@ class MemoryWorkflowMixin:
             counts = {status: 0 for status in WorkflowStatus}
             for workflow in self._workflows.values():
                 counts[workflow.status] += 1
+            return counts
+
+    def incident_state_counts(self) -> dict[IncidentState, int]:
+        """Count every persisted incident by state (server-side aggregate
+        for the /metrics incident gauge; ESCALATED is the operator queue)."""
+
+        with self._lock:
+            counts = {state: 0 for state in IncidentState}
+            for incident in self._incidents.values():
+                counts[incident.state] += 1
             return counts
 
     def blocked_workflows_without_verified_restore(self) -> int:
@@ -360,16 +551,14 @@ class MemoryWorkflowMixin:
         *,
         node_ids: set[str] | None = None,
         job_id: str | None = None,
+        limit: int = ACTIVE_WORKFLOW_INCIDENTS_LIMIT,
     ) -> list[tuple[FaultIncident, WorkflowRequest]]:
-        active_statuses = {
-            WorkflowStatus.PENDING,
-            WorkflowStatus.RUNNING,
-            WorkflowStatus.SAFETY_PENDING,
-        }
         with self._lock:
             matches = []
             for workflow in self._workflows.values():
-                if workflow.status not in active_statuses:
+                # Executable rows plus BLOCKED rows that still occupy their
+                # node (F-A4); mirrors the SQL backends.
+                if not workflow_is_open(workflow.status, workflow.blocked_kind):
                     continue
                 incident = self._incidents.get(workflow.incident_id)
                 if incident is None or incident.cluster_id != cluster_id:
@@ -388,7 +577,7 @@ class MemoryWorkflowMixin:
                     item[1].request_id,
                 ),
                 reverse=True,
-            )
+            )[:limit]
 
     def list_job_recovery_workflow_incidents(
         self,
@@ -455,7 +644,7 @@ class MemoryWorkflowMixin:
         with self._lock:
             workflow = self.get_workflow(request_id)
             if workflow.fencing_token != fencing_token:
-                raise ValueError("stale workflow fencing token")
+                raise StaleFencingTokenError("stale workflow fencing token")
             claimed_at = now or datetime.now(timezone.utc)
             lease_active = (
                 workflow.execution_lease_expires_at is not None
@@ -498,6 +687,29 @@ class MemoryWorkflowMixin:
                         else {}
                     ),
                 }
+            )
+            self._workflows[request_id] = workflow
+            return workflow
+
+    def extend_remediation_budget(
+        self,
+        request_id: str,
+        executor_id: str,
+        claims: dict[str, int],
+        *,
+        now: datetime | None = None,
+    ) -> WorkflowRequest:
+        with self._lock:
+            workflow = self.get_workflow(request_id)
+            at = now or datetime.now(timezone.utc)
+            if (
+                workflow.execution_owner_id != executor_id
+                or workflow.execution_lease_expires_at is None
+                or workflow.execution_lease_expires_at <= at
+            ):
+                raise WorkflowLeaseError("workflow execution lease is stale")
+            workflow = extend_remediation_budget(
+                workflow, list(self._workflows.values()), claims, now=at
             )
             self._workflows[request_id] = workflow
             return workflow
@@ -545,7 +757,10 @@ class MemoryWorkflowMixin:
                 or current.execution_lease_expires_at <= checked_at
             ):
                 raise WorkflowLeaseError("workflow execution lease is stale")
+            if current.merge_revision != workflow.merge_revision:
+                raise WorkflowMergedError("workflow was merged since it was read")
             self._workflows[workflow.request_id] = workflow
+            self._stamp_preemption_pending(workflow)
 
     def save_workflow_and_incident_if_leased(
         self,
@@ -566,6 +781,9 @@ class MemoryWorkflowMixin:
                 or current.execution_lease_expires_at <= checked_at
             ):
                 raise WorkflowLeaseError("workflow execution lease is stale")
+            if current.merge_revision != workflow.merge_revision:
+                raise WorkflowMergedError("workflow was merged since it was read")
             self._workflows[workflow.request_id] = workflow
+            self._stamp_preemption_pending(workflow)
             self._incidents[incident.incident_id] = incident
             self._incident_by_event[incident.event_id] = incident.incident_id

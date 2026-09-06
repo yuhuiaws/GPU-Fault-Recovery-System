@@ -73,6 +73,10 @@ class ProcessorCoordinator(
     _TELEMETRY_BATCH_MAX = 64
     _TELEMETRY_BATCH_ENVELOPE_BYTES = 8192
     _TELEMETRY_SPOOL_PATH_SCHEDULE = TELEMETRY_SPOOL_PATH_SCHEDULE
+    # F-D3: how often an under-filled fault claim may ask the store how many
+    # fault rows the observation interlock is holding back. A liveness
+    # probe, not a scheduling input, so it does not need the claim rate.
+    _INTERLOCK_PROBE_SECONDS = 5.0
 
     def __init__(
         self,
@@ -87,6 +91,8 @@ class ProcessorCoordinator(
         request_lease_seconds: int = 120,
         request_renew_seconds: float = 5,
         request_max_execution_seconds: float = 30,
+        deadline_exceeded_process_threshold: int = 3,
+        unhealthy_ttl_seconds: float = 300,
         retryable_response_max_age_seconds: float = 300,
         retry_backoff_seconds: float = 1,
         retry_backoff_max_seconds: float = 30,
@@ -108,7 +114,7 @@ class ProcessorCoordinator(
         health_summary_stale_seconds: float = 420,
         observation_stale_seconds: float = 120,
         training_progress_stale_seconds: float = 120,
-        active_consumers: bool = False,
+        active_consumers: bool,
         telemetry_spool_enabled: bool = False,
         telemetry_spool_workers: int = 4,
         telemetry_spool_lease_seconds: float = 60,
@@ -161,6 +167,14 @@ class ProcessorCoordinator(
         self.request_lease_seconds = request_lease_seconds
         self.request_renew_seconds = request_renew_seconds
         self.request_max_execution_seconds = request_max_execution_seconds
+        # F-D7: a deadline is charged to the request first; the process gives
+        # up only after this many *distinct* requests timed out, and the
+        # unhealthy latch expires instead of gating every background service
+        # for the life of the process.
+        self.deadline_exceeded_process_threshold = max(
+            1, int(deadline_exceeded_process_threshold)
+        )
+        self.unhealthy_ttl_seconds = float(unhealthy_ttl_seconds)
         self._retry_max_age = retryable_response_max_age_seconds
         self._configure_retry_backoff(
             retry_backoff_seconds,
@@ -382,11 +396,17 @@ class ProcessorCoordinator(
         self._stop = Event()
         self._work_available = Event()
         self._notifications_enabled = False
+        self._notification_listener_connected = False
+        self._notification_shardless_episodes_total = 0
         self._notification_shard: int | None = None
         self._notification_pending_streams: set[str] = set()
         self._notifications_received_total = 0
         self._notifications_filtered_total = 0
         self._notification_reconnects_total = 0
+        self._fault_rows_skipped_by_observation_total = 0
+        self._fault_rows_blocked_by_observation = 0
+        self._interlock_probes_total = 0
+        self._next_interlock_probe_at = 0.0
         self._processed = {"success": 0, "error": 0}
         self._duration_buckets = (
             0.1,
@@ -413,6 +433,10 @@ class ProcessorCoordinator(
         self._deadline_exceeded_total = 0
         self._completion_retries_total = 0
         self._completion_failures_total = 0
+        self._completion_failure_releases_total = 0
+        self._retry_horizon_failures_total = 0
+        self._renewal_errors_total = 0
+        self._renewal_fenced_total = 0
         self._stale_superseded_total = 0
         self._stale_superseded_by_path: dict[str, int] = {}
         self._unhealthy_reason: str | None = None
@@ -431,8 +455,28 @@ class ProcessorCoordinator(
             and leadership.lease_expires_at > datetime.now(timezone.utc)
         )
 
+    def _expire_unhealthy_latch(self) -> None:
+        """Clear the latch once its TTL has passed (caller holds the lock)."""
+
+        if (
+            self._unhealthy_reason is not None
+            and self._unhealthy_since is not None
+            and self.unhealthy_ttl_seconds > 0
+            and (datetime.now(timezone.utc) - self._unhealthy_since).total_seconds()
+            >= self.unhealthy_ttl_seconds
+        ):
+            LOGGER.warning(
+                "processor unhealthy latch expired after %.0fs: %s",
+                self.unhealthy_ttl_seconds,
+                self._unhealthy_reason,
+            )
+            self._unhealthy_reason = None
+            self._unhealthy_since = None
+            self._deadline_exceeded_requests.clear()
+
     def is_healthy(self) -> bool:
         with self._state_lock:
+            self._expire_unhealthy_latch()
             return self._unhealthy_reason is None
 
     @property
@@ -443,6 +487,7 @@ class ProcessorCoordinator(
     @property
     def unhealthy_reason(self) -> str | None:
         with self._state_lock:
+            self._expire_unhealthy_latch()
             return self._unhealthy_reason
 
     def stop(self) -> None:
@@ -451,13 +496,74 @@ class ProcessorCoordinator(
         self._spool_work_available.set()
 
     def _set_notification_state(self, enabled: bool, shard: int | None) -> None:
+        # A listener that is connected but owns no shard relays nothing: the
+        # store forwards only the payloads of the shard it advisory-locked
+        # (F-D11). With fewer shards than consumer processes the losers must
+        # stay pollers - the fault stream keeps its idle ceiling instead of
+        # stretching to the notification fallback - and must not report
+        # notifications enabled.
+        owns_shard = enabled and shard is not None
+        shardless_started = False
         with self._state_lock:
-            if self._notifications_enabled and not enabled:
+            if self._notification_listener_connected and not enabled:
                 self._notification_reconnects_total += 1
-            self._notifications_enabled = enabled
-            self._notification_shard = shard
-        if enabled:
+            was_shardless = (
+                self._notification_listener_connected
+                and not self._notifications_enabled
+            )
+            if enabled and not owns_shard and not was_shardless:
+                self._notification_shardless_episodes_total += 1
+                shardless_started = True
+            self._notification_listener_connected = enabled
+            self._notifications_enabled = owns_shard
+            self._notification_shard = shard if owns_shard else None
+        if shardless_started:
+            LOGGER.warning(
+                "processor notification listener owns no shard; polling only "
+                "owner=%s shard_count=%s (set GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS "
+                "to at least the number of consumer processes)",
+                self.owner_id,
+                self.processor_notification_shard_count,
+            )
+        if owns_shard:
             self._work_available.set()
+
+    def _probe_observation_interlock(self, now: datetime) -> None:
+        """Count the fault rows the observation interlock is holding back.
+
+        A fault claim that came back short says nothing about *why*; the
+        interlock is one silent reason (F-D3). A store that can count the
+        held-back rows is asked at most once per ``_INTERLOCK_PROBE_SECONDS``;
+        one that predates the probe leaves the counters at zero.
+        """
+
+        probe = getattr(
+            self.store,
+            "count_fault_rows_blocked_by_observation",
+            None,
+        )
+        if probe is None:
+            return
+        monotonic = time.monotonic()
+        if monotonic < self._next_interlock_probe_at:
+            return
+        self._next_interlock_probe_at = monotonic + self._INTERLOCK_PROBE_SECONDS
+        try:
+            blocked = int(probe(now=now))
+        except Exception:
+            LOGGER.exception("processor observation interlock probe failed")
+            return
+        with self._state_lock:
+            self._interlock_probes_total += 1
+            self._fault_rows_blocked_by_observation = blocked
+            self._fault_rows_skipped_by_observation_total += blocked
+        if blocked:
+            LOGGER.warning(
+                "processor fault rows held back by the observation interlock "
+                "owner=%s blocked=%s",
+                self.owner_id,
+                blocked,
+            )
 
     def _set_processor_fault_pressure(self, active: bool) -> None:
         with self._state_lock:
@@ -517,6 +623,10 @@ class ProcessorCoordinator(
                 self.processor_notification_shard_count,
                 self.notify_work_available,
                 self._set_notification_state,
+                # Shard ownership follows consumption (F-D11): the listener
+                # gives the shard up when payloads it forwarded did not
+                # move this counter.
+                on_progress=lambda: self.claim_rounds_total,
             )
         except Exception:
             self._set_notification_state(False, None)
@@ -840,6 +950,8 @@ class ProcessorCoordinator(
                 routine_starvation_seconds=(self.routine_starvation_seconds),
             )
             claim_elapsed = time.monotonic() - claim_started
+            if stream == "fault" and len(rows) < limit:
+                self._probe_observation_interlock(now)
             self.claim_rounds_total += 1
             self.claim_rows_total += len(rows)
             self.claim_rounds_by_stream[stream] = (
@@ -1002,7 +1114,7 @@ class ProcessorCoordinator(
         return claimed
 
     def _pool_for_request(self, item: ProcessorRequest) -> str:
-        if item.queue_priority() == 0:
+        if item.is_reserved_tier():
             return "fault"
         channel = channel_for_path(item.path)
         selected = channel.pool.value if channel is not None else "fault"
@@ -1092,7 +1204,7 @@ class ProcessorCoordinator(
         except Exception:
             for item, _ in parsed:
                 try:
-                    self._release(item)
+                    self._release(item, failure="batch execution raised")
                 except Exception:
                     LOGGER.exception(
                         "observation batch release failed request_id=%s",
@@ -1175,7 +1287,7 @@ class ProcessorCoordinator(
         except Exception:
             for item in items:
                 try:
-                    self._release(item)
+                    self._release(item, failure="batch execution raised")
                 except Exception:
                     LOGGER.exception(
                         "telemetry batch release failed request_id=%s",
@@ -1381,7 +1493,7 @@ class ProcessorCoordinator(
             return True
         except Exception:
             try:
-                self._release(item)
+                self._release(item, failure="stale disposition raised")
             except Exception:
                 LOGGER.exception(
                     "stale processor request release failed request_id=%s",
@@ -1417,8 +1529,13 @@ class ProcessorCoordinator(
                     ),
                 )
             except Exception:
+                # A transient store error must not abandon the lease while the
+                # handler keeps running (F-D5): count it and try again on the
+                # next tick; only a fence ends the renewal.
+                with self._state_lock:
+                    self._renewal_errors_total += 1
                 LOGGER.exception(
-                    "processor request renewal failed "
+                    "processor request renewal failed; retrying "
                     "request_id=%s path=%s lane=%s owner=%s epoch=%s",
                     item.request_id,
                     item.path,
@@ -1426,8 +1543,10 @@ class ProcessorCoordinator(
                     self.owner_id,
                     item.leader_epoch,
                 )
-                return
+                continue
             if not renewed:
+                with self._state_lock:
+                    self._renewal_fenced_total += 1
                 LOGGER.warning(
                     "processor request renewal fenced "
                     "request_id=%s path=%s lane=%s owner=%s epoch=%s",
@@ -1461,7 +1580,7 @@ class ProcessorCoordinator(
             ).decode("ascii")
         if item.execution_authorized:
             if not self.execution_token:
-                self._release(item)
+                self._release(item, failure="execution token missing")
                 self._observe_processing(outcome, time.monotonic() - started)
                 raise RuntimeError("processor request requires an execution token")
             headers["X-GPU-Fault-Execution-Token"] = self.execution_token
@@ -1509,7 +1628,7 @@ class ProcessorCoordinator(
                     self._mark_execution_deadline_exceeded(item)
                     self._observe_processing(outcome, time.monotonic() - started)
                     return
-                self._release(item)
+                self._release(item, failure="replay attempts exhausted")
                 self._observe_processing(outcome, time.monotonic() - started)
                 raise
         if time.monotonic() >= deadline:
@@ -1616,21 +1735,43 @@ class ProcessorCoordinator(
                 return
             self._deadline_exceeded_requests.add(item.request_id)
             self._deadline_exceeded_total += 1
-            if self._unhealthy_reason is None:
+            distinct = len(self._deadline_exceeded_requests)
+            if (
+                self._unhealthy_reason is None
+                and distinct >= self.deadline_exceeded_process_threshold
+            ):
                 self._unhealthy_reason = "processor request execution deadline exceeded"
                 self._unhealthy_since = datetime.now(timezone.utc)
                 notify_unhealthy = True
+        # The request is charged first (F-D7): it goes back with a backoff
+        # and a retry count, so a poisoned row is isolated instead of
+        # re-executing at the head of its lane while the process restarts.
+        # The handler thread may still be running; its later completion is
+        # fenced by the release.
+        try:
+            self._release(item, failure="execution deadline exceeded")
+        except Exception:
+            LOGGER.exception(
+                "could not release request after its execution deadline "
+                "request_id=%s path=%s lane=%s",
+                item.request_id,
+                item.path,
+                item.ordering_key(),
+            )
         LOGGER.error(
-            "processor request execution deadline exceeded; "
-            "stopping claims and requiring pod restart "
+            "processor request execution deadline exceeded "
             "request_id=%s path=%s lane=%s owner=%s epoch=%s "
-            "max_execution_seconds=%s",
+            "max_execution_seconds=%s distinct_requests=%s threshold=%s "
+            "process_unhealthy=%s",
             item.request_id,
             item.path,
             item.ordering_key(),
             self.owner_id,
             item.leader_epoch,
             self.request_max_execution_seconds,
+            distinct,
+            self.deadline_exceeded_process_threshold,
+            notify_unhealthy,
         )
         if notify_unhealthy and self.on_unhealthy is not None:
             try:

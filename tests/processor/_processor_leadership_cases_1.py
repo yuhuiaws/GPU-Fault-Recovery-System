@@ -173,7 +173,8 @@ def test_real_fault_collectors_use_attempt_priority_and_node_lane(path: str) -> 
         '["cluster-a","training-job","training-job-a001"]',
         '["cluster-a","node","node-a"]',
     ]
-    assert request.queue_priority() == 0
+    assert request.queue_priority() == 10
+    assert request.is_reserved_tier()
     assert request.ordering_key() == "cluster-a:node:node-a"
     assert peer.ordering_key() != request.ordering_key()
 
@@ -181,26 +182,47 @@ def test_real_fault_collectors_use_attempt_priority_and_node_lane(path: str) -> 
 @pytest.mark.parametrize(
     "path",
     [
-        "/v1/gpu-events/nvidia-kernel",
-        "/v1/provider-events/hyperpod-hma/health",
         "/v1/incidents/inc-1/acknowledge",
         "/v1/workflows/wf-1/steps/s1/complete",
         "/v1/attempts/attempt-1/hang-check",
         "/v1/recovery-plans/plan-1/approve",
-        "/v1/collector-events/nvidia-kernel",
-        "/v1/collector-events/fabric-manager",
     ],
 )
-def test_faults_and_control_plane_actions_are_the_first_tier(path) -> None:
-    """Tier 0: a decided fault, and the actions that recover from it.
+def test_control_plane_actions_are_the_first_tier(path) -> None:
+    """Tier 0: the actions that recover from a decided fault.
 
-    These are what the reserved queue depth and the dedicated worker pool
-    are for, both of which test ``priority == 0`` exactly.
+    They are claimed before the device events of the storm they end; the
+    reserved queue depth and the dedicated worker pool cover both tiers via
+    ``is_reserved_tier``.
     """
 
     request = processor_request(path, body=b'{"node_id":"node-a"}')
 
     assert request.queue_priority() == 0, path
+    assert request.is_reserved_tier(), path
+    assert request.spoolable() is False, path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/gpu-events/nvidia-kernel",
+        "/v1/provider-events/hyperpod-hma/health",
+        "/v1/collector-events/nvidia-kernel",
+        "/v1/collector-events/fabric-manager",
+    ],
+)
+def test_device_events_are_the_second_fault_tier(path) -> None:
+    """Tier 10: a decided fault reported by a node or a provider.
+
+    Still a fault -- reserved depth, fault pool, never spooled -- but ordered
+    after the control-plane actions so a storm cannot starve its own cure.
+    """
+
+    request = processor_request(path, body=b'{"node_id":"node-a"}')
+
+    assert request.queue_priority() == 10, path
+    assert request.is_reserved_tier(), path
     assert request.spoolable() is False, path
 
 

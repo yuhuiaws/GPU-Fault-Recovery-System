@@ -466,7 +466,9 @@ def test_restore_of_a_node_nobody_isolated_is_an_idempotent_success() -> None:
         for item in store.get_workflow(workflow.request_id).step_executions
         if item.operation is WorkflowOperation.RESTORE_SCHEDULING
     )
-    assert restore.details["already_restored_nodes"] == restore.details["restored_nodes"]
+    assert (
+        restore.details["already_restored_nodes"] == restore.details["restored_nodes"]
+    )
 
 
 def test_restore_still_refuses_a_node_another_incident_isolated() -> None:

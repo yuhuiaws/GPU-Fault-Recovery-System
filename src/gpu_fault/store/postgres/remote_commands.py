@@ -28,6 +28,7 @@ class PostgresRemoteCommandMixin:
     # Attributes supplied by the composed concrete implementation.
     _db: Any
     _decode: Callable[..., Any]
+    _get_for_update: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _put: Callable[..., Any]
     _state_transaction: Callable[..., Any]
@@ -120,6 +121,7 @@ class PostgresRemoteCommandMixin:
         unclaimed_expired = 0
         total = 0
         open_by_cluster: dict[str, int] = {}
+        by_cluster_status: dict[str, dict[str, int]] = {}
         oldest_pending_by_cluster = {}
         open_statuses = {
             RemoteCommandStatus.PENDING.value,
@@ -135,7 +137,11 @@ class PostgresRemoteCommandMixin:
             oldest_pending,
             expired_count,
         ) in rows:
-            by_status[status_value] = count
+            # Rows are grouped by (cluster, status): add them up, do not
+            # let the last cluster's count stand for the fleet (F-D12).
+            by_status[status_value] += count
+            cluster_counts = by_cluster_status.setdefault(cluster_id, {})
+            cluster_counts[status_value] = cluster_counts.get(status_value, 0) + count
             total += count
             internal_errors += error_count
             if latest_internal_error is not None:
@@ -160,6 +166,7 @@ class PostgresRemoteCommandMixin:
         return {
             "total": total,
             "by_status": by_status,
+            "by_cluster_status": by_cluster_status,
             "open_by_cluster": open_by_cluster,
             "oldest_unclaimed_age_seconds_by_cluster": (unclaimed_age_by_cluster),
             "oldest_unclaimed_age_seconds": max(
@@ -247,6 +254,7 @@ class PostgresRemoteCommandMixin:
                   OR (cmd.payload->>'lease_expires_at')::timestamptz
                      <= %s
               )
+              AND cmd.payload->>'cancellation_requested_at' IS NULL
         """
         params: list = [cluster_id, now]
         if owners is not None:
@@ -311,6 +319,10 @@ class PostgresRemoteCommandMixin:
                 )
                 if (
                     command.cluster_id != cluster_id
+                    # A command told to stop is never handed to another
+                    # executor, even after its lease lapses (F-D12); the
+                    # memory and sqlite claims already filtered this.
+                    or command.cancellation_requested_at is not None
                     or (
                         execution_owners is not None
                         and command.step.execution_owner not in execution_owners
@@ -471,6 +483,12 @@ class PostgresRemoteCommandMixin:
         ones. This runs on the periodic services thread next to the
         retention delete, so it has to stay proportional to the stuck
         backlog instead of the history.
+
+        The candidate scan holds no lock, so each candidate is re-read
+        under the per-command advisory lock the claim path takes (in
+        ``command_id`` order, like the claim) and its row lock, and is
+        only expired if it is still PENDING (F-D12). Before that, a lease
+        issued between the scan and the write was overwritten by FAILED.
         """
 
         now = datetime.now(timezone.utc)
@@ -479,7 +497,7 @@ class PostgresRemoteCommandMixin:
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT payload FROM gpu_fault_objects
+                    SELECT key FROM gpu_fault_objects
                     WHERE kind='remote_command'
                       AND payload->>'status'='PENDING'
                       AND payload->>'created_at' <= %s
@@ -488,9 +506,33 @@ class PostgresRemoteCommandMixin:
                     """,
                     (_utc_text(older_than), limit),
                 )
-                rows = cursor.fetchall()
-            for row in rows:
-                command = self._decode("remote_command", row[0])
+                keys = sorted(row[0] for row in cursor.fetchall())
+                if not keys:
+                    return 0
+                cursor.execute(
+                    """
+                    SELECT pg_advisory_xact_lock(
+                        hashtextextended(
+                            'remote_command/' || command_id, 0
+                        )
+                    )
+                    FROM (
+                        SELECT unnest(%s::text[]) AS command_id
+                        ORDER BY command_id
+                    ) AS ordered
+                    """,
+                    (keys,),
+                )
+            for key in keys:
+                try:
+                    command = self._get_for_update("remote_command", key)
+                except NotFoundError:
+                    continue
+                if (
+                    command.status is not RemoteCommandStatus.PENDING
+                    or command.created_at > older_than
+                ):
+                    continue
                 self._put(
                     "remote_command",
                     command.command_id,

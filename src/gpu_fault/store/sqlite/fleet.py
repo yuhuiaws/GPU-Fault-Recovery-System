@@ -176,19 +176,12 @@ class SqliteFleetMixin:
             replacement.cluster_id,
             replacement.node_id,
         )
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                current = self._get_optional("agent", key)
-                if current != expected:
-                    self._db.execute("ROLLBACK")
-                    return False
-                self._put("agent", key, replacement)
-                self._db.execute("COMMIT")
-                return True
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
+        with self._state_transaction(f"agent/{key}"):
+            current = self._get_optional("agent", key)
+            if current != expected:
+                return False
+            self._put("agent", key, replacement)
+            return True
 
     def get_agent(self, cluster_id: str, node_id: str):
         return self._get("agent", self._agent_key(cluster_id, node_id))
@@ -218,26 +211,19 @@ class SqliteFleetMixin:
         replacement: FleetDeployment,
         expected: FleetDeployment | None,
     ) -> bool:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                current = self._get_optional(
-                    "fleet_deployment",
-                    replacement.deployment_id,
-                )
-                if current != expected:
-                    self._db.execute("ROLLBACK")
-                    return False
-                self._put(
-                    "fleet_deployment",
-                    replacement.deployment_id,
-                    replacement,
-                )
-                self._db.execute("COMMIT")
-                return True
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
+        with self._state_transaction(f"fleet_deployment/{replacement.deployment_id}"):
+            current = self._get_optional(
+                "fleet_deployment",
+                replacement.deployment_id,
+            )
+            if current != expected:
+                return False
+            self._put(
+                "fleet_deployment",
+                replacement.deployment_id,
+                replacement,
+            )
+            return True
 
     def get_fleet_deployment(self, deployment_id: str):
         return self._get("fleet_deployment", deployment_id)

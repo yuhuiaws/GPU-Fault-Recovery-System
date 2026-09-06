@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import random
 import secrets
@@ -17,6 +18,7 @@ from gpu_fault.app.admission_runtime import max_compressed_request_bytes
 from gpu_fault.app.runtime import ProcessorDispatchState
 from gpu_fault.async_store import (
     REQUEST_DEADLINE,
+    RequestDeadlineExceeded,
     StoreIoCapacityExceeded,
 )
 from gpu_fault.processor import (
@@ -28,6 +30,7 @@ from gpu_fault.processor_diagnostics import (
     report_processor_replay_phase,
     reset_processor_replay,
 )
+from gpu_fault.processor.models import is_reserved_tier
 
 # A synchronous caller waits for the processor to complete its request by
 # polling the store. A fixed 100ms interval cost every waiter ~1150 store reads
@@ -45,6 +48,37 @@ RESPONSE_POLL_INITIAL_SECONDS = 0.01
 RESPONSE_POLL_MAX_SECONDS = 0.25
 RESPONSE_POLL_GROWTH = 1.6
 RESPONSE_POLL_JITTER = 0.25
+
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+def idempotent_request_id(
+    *,
+    cluster_id: str | None,
+    path: str,
+    key: str,
+    body: bytes,
+) -> str:
+    """The queue row a request with this ``Idempotency-Key`` belongs to (F-E4).
+
+    ``request_id`` used to be a fresh ``uuid4()`` on every POST. The data plane
+    already sends ``Idempotency-Key`` (event id, batch id, ``attempt_id/time``)
+    and retries the same body when the 202 is lost to a timeout, but nothing
+    on this side read it, so every retry became a second, independently
+    executed processor request. Every store returns the existing row for a
+    known ``request_id``, so deriving the id here is the whole dedup.
+
+    The derivation is scoped to the cluster and path, and to the body itself:
+    a key reused by mistake for a different payload gets its own row instead of
+    another request's receipt, and no cluster can address another's rows.
+    """
+
+    digest = hashlib.sha256()
+    for part in (cluster_id or "", path, key):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\x1f")
+    digest.update(hashlib.sha256(body).digest())
+    return f"processor-idem-{digest.hexdigest()[:40]}"
 
 
 @dataclass(frozen=True)
@@ -250,6 +284,18 @@ async def _prepare_request(
             headers={"Retry-After": "2"},
             content={"detail": "request decode capacity exceeded"},
         )
+    idempotency_key = request.headers.get(IDEMPOTENCY_KEY_HEADER, "").strip()
+    if idempotency_key:
+        item = item.model_copy(
+            update={
+                "request_id": idempotent_request_id(
+                    cluster_id=item.cluster_id,
+                    path=item.path,
+                    key=idempotency_key,
+                    body=body,
+                )
+            }
+        )
     server_timing["request_build"] = (time.monotonic() - request_build_started) * 1000
     return PreparedProcessorRequest(
         item=item,
@@ -317,17 +363,30 @@ async def _try_spool(
         and item.spoolable()
     ):
         return None
-    token = REQUEST_DEADLINE.set(
-        time.monotonic() + dependencies.telemetry_request_budget_seconds
-    )
+    # Tighten the request's deadline, never extend it: ``set`` replaced a 15 s
+    # budget with the 30 s spool budget (F-E1).
+    spool_deadline = time.monotonic() + dependencies.telemetry_request_budget_seconds
+    existing_deadline = REQUEST_DEADLINE.get()
+    if existing_deadline is not None:
+        spool_deadline = min(spool_deadline, existing_deadline)
+    token = REQUEST_DEADLINE.set(spool_deadline)
     try:
         try:
             spooled, result = await dependencies.telemetry_spool_batcher.submit(item)
-        except StoreIoCapacityExceeded:
+        except StoreIoCapacityExceeded as exc:
             return JSONResponse(
                 status_code=503,
-                headers={"Retry-After": "2"},
-                content={"detail": "store I/O capacity exceeded"},
+                headers={
+                    "Retry-After": str(dependencies.processor_retry_after_seconds)
+                },
+                content={
+                    "detail": (
+                        "request deadline exceeded"
+                        if isinstance(exc, RequestDeadlineExceeded)
+                        else "store I/O capacity exceeded"
+                    ),
+                    "processor_request_id": item.request_id,
+                },
             )
     finally:
         REQUEST_DEADLINE.reset(token)
@@ -368,7 +427,7 @@ async def _enqueue(
         priority = item.queue_priority()
         if priority == 100:
             queued, result = await dependencies.processor_admission_batcher.submit(item)
-        elif priority == 0:
+        elif is_reserved_tier(priority):
             queued, result = await dependencies.fault_admission_batcher.submit(item)
         elif priority == 50:
             queued, result = await dependencies.evidence_admission_batcher.submit(item)
@@ -425,21 +484,35 @@ async def _enqueue(
 async def _wait_for_response(
     item: ProcessorRequest,
     dependencies: ProcessorDispatchDependencies,
+    store_io: Any | None = None,
 ) -> Response:
     signals = getattr(dependencies.processor, "completion_signals", None)
     registration = (
         nullcontext(None) if signals is None else signals.waiting(item.request_id)
     )
     with registration as wake:
-        return await _poll_for_response(item, dependencies, wake)
+        return await _poll_for_response(item, dependencies, wake, store_io=store_io)
 
 
 async def _poll_for_response(
     item: ProcessorRequest,
     dependencies: ProcessorDispatchDependencies,
     wake: asyncio.Event | None,
+    *,
+    store_io: Any | None = None,
 ) -> Response:
+    # The pool the request was admitted on: a fault-ingress request waited on
+    # the general pool, so the fault path's isolation ended at admission and a
+    # telemetry burst could starve the wait for a fault decision (F-E5).
+    pool = dependencies.store_io if store_io is None else store_io
     deadline = time.monotonic() + dependencies.processor_response_timeout_seconds
+    # The request's own budget (REQUEST_DEADLINE, 15/30 s) is the fourth and
+    # tightest clamp; without it the configured response timeout could never
+    # take effect and the client saw a capacity 503 instead (F-E1).
+    request_deadline = REQUEST_DEADLINE.get()
+    if request_deadline is not None:
+        deadline = min(deadline, request_deadline)
+    retry_after = {"Retry-After": str(dependencies.processor_retry_after_seconds)}
     interval = RESPONSE_POLL_INITIAL_SECONDS
     while time.monotonic() < deadline:
         if wake is not None:
@@ -449,15 +522,20 @@ async def _poll_for_response(
             # signal raised while the read was in flight.
             wake.clear()
         try:
-            current = await dependencies.store_io.run(
+            current = await pool.run(
                 dependencies.context.store.get_processor_request,
                 item.request_id,
             )
-        except StoreIoCapacityExceeded:
+        except StoreIoCapacityExceeded as exc:
+            if isinstance(exc, RequestDeadlineExceeded) or time.monotonic() >= deadline:
+                break
             return JSONResponse(
                 status_code=503,
-                headers={"Retry-After": "2"},
-                content={"detail": "store I/O capacity exceeded"},
+                headers=retry_after,
+                content={
+                    "detail": "store I/O capacity exceeded",
+                    "processor_request_id": item.request_id,
+                },
             )
         if current.status is ProcessorRequestStatus.COMPLETED:
             headers = {}
@@ -479,7 +557,7 @@ async def _poll_for_response(
         interval = min(interval * RESPONSE_POLL_GROWTH, RESPONSE_POLL_MAX_SECONDS)
     return JSONResponse(
         status_code=503,
-        headers={"Retry-After": "2"},
+        headers=retry_after,
         content={
             "detail": "processor response timed out",
             "processor_request_id": item.request_id,
@@ -539,7 +617,7 @@ async def dispatch_processor_request(
                 "coalesced": result == "coalesced",
             },
         )
-    return await _wait_for_response(item, dependencies)
+    return await _wait_for_response(item, dependencies, prepared.store_pool)
 
 
 def install_processor_dispatch(

@@ -9,6 +9,7 @@ from gpu_fault.app.identity import pod_process_owner
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.control_record_archive import ControlRecordArchiver
 from gpu_fault.diagnostics import KubernetesDcgmDiagnosticAdapter
+from gpu_fault.execution.branch_escalation import BranchEscalator
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.execution import (
     ProductionExecutorConfig,
@@ -94,6 +95,17 @@ LOGGER = logging.getLogger(__name__)
 _pod_process_owner = pod_process_owner
 
 
+def _pending_triage_deadline() -> timedelta:
+    """How long a decision may sit in PENDING_TRIAGE before the watchdog closes
+    it (F-G2 (4)). The service refuses a non-positive deadline; refusing it
+    here names the variable the operator has to fix."""
+
+    seconds = float(os.getenv("GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS", "900"))
+    if seconds <= 0:
+        raise ValueError("GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS must be positive")
+    return timedelta(seconds=seconds)
+
+
 class ApplicationContext:
     def __init__(
         self,
@@ -111,12 +123,14 @@ class ApplicationContext:
         self.store: ControlPlaneStore = store if store is not None else InMemoryStore()
         self.diagnostics = SimulatedDiagnosticAdapter(self.store)
         self.evidence = EvidenceService.from_environment(self.store)
+        self.policy = GpuFaultPolicyEngine()
         self.completion = CompletionService(
             self.store,
             self.diagnostics,
             evidence_service=self.evidence,
+            marker_ttl_seconds=self.policy.policy.marker_ttl_seconds,
+            pending_triage_deadline=_pending_triage_deadline(),
         )
-        self.policy = GpuFaultPolicyEngine()
         self.xid_correlation = XidCorrelationCoordinator(
             self.store,
             self.policy,
@@ -216,6 +230,7 @@ class ApplicationContext:
             self.production_executor_config,
         )
         self.workflow_executor.fleet_registry = fleet_registry
+        self.workflow_executor.branch_escalator = _branch_escalator(self.orchestrator)
         self.execution_token = execution_token
         self.processor_replay_secret = processor_replay_secret
         self.fleet_registry = fleet_registry
@@ -295,6 +310,9 @@ class ApplicationContext:
             notification_sender=context.advisory_notifications.send,
         )
         context.workflow_executor.fleet_registry = context.fleet_registry
+        context.workflow_executor.branch_escalator = _branch_escalator(
+            context.orchestrator
+        )
         context.dispatcher = WorkflowDispatcher(
             context.store,
             context.workflow_executor,
@@ -411,6 +429,8 @@ class ApplicationContext:
                 context.store,
                 evidence_owner=settings.evidence_owner,
             ),
+            marker_ttl_seconds=context.policy.policy.marker_ttl_seconds,
+            pending_triage_deadline=_pending_triage_deadline(),
         )
         return context
 
@@ -801,3 +821,16 @@ def default_simulated_profile() -> EffectiveRuntimeProfile:
         ],
     )
     return compile_runtime_profile(profile)
+
+
+def _branch_escalator(orchestrator: IncidentOrchestrator) -> BranchEscalator:
+    """F-N1: a failed node branch of a job workflow escalates in place."""
+
+    rungs = int(os.getenv("GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS", "2"))
+    if rungs < 1:
+        raise ValueError("GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS must be at least 1")
+    return BranchEscalator(
+        orchestrator._brancher,
+        orchestrator.compile_branch_steps,
+        max_rungs=rungs,
+    )

@@ -14,6 +14,7 @@ from gpu_fault.hyperpod_spares import (
     HyperPodSpareCoordinator,
     SparePoolState,
 )
+from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.models import (
     AdvisoryNotification,
     RecoveryAction,
@@ -203,6 +204,7 @@ class HyperPodSpareHealthController:
                     unavailable_at=None,
                     last_alert_at=None,
                 )
+                self._retire_incident_markers(node_name, incident_id)
                 return self._result(node_name, SpareHealthState.HEALTHY, [])
             failures = self._failure_count(annotations, node_name=node_name) + 1
             if failures < self.failure_threshold:
@@ -308,6 +310,25 @@ class HyperPodSpareHealthController:
             reasons,
             incident.incident_id,
         )
+
+    def _retire_incident_markers(self, node_name: str, incident_id: str | None) -> None:
+        """The spare is healthy after its own remediation succeeded: the
+        markers that asked for that remediation no longer describe the node.
+        Best effort -- the health verdict was already recorded on the node."""
+        if not incident_id:
+            return
+        try:
+            retire_markers_for_incident(
+                self.store,
+                incident_id,
+                reason=f"spare {node_name} rechecked healthy after remediation",
+            )
+        except Exception:  # noqa: BLE001 - never undo a HEALTHY verdict for this
+            LOGGER.exception(
+                "cannot retire markers of incident %s for spare %s",
+                incident_id,
+                node_name,
+            )
 
     @staticmethod
     def _reason_class(

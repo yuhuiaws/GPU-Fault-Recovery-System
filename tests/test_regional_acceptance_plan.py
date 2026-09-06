@@ -59,8 +59,8 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
     assert plan.collect_all is False
     assert plan.read_only is False
     assert plan.repair_allowed is False
-    assert len(plan.execution_order) == 152
-    assert len(plan.cases) == 154
+    assert len(plan.execution_order) == 155
+    assert len(plan.cases) == 157
     assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-011", "GF-REGIONAL-BOOT-012")
     assert plan.execution_order[-1] == "GF-REGIONAL-COLLECT-015"
     assert plan.do_not_run_case_ids == ("GF-REGIONAL-DESTR-004", "GF-REGIONAL-AUTH-012")
@@ -235,7 +235,7 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
     ]
     # 78 pytest + 22 command of the 154 cases. The number only moves when a case
     # gains or loses a local answer, so it is stated rather than derived.
-    assert len(automated) == 100
+    assert len(automated) == 103
     assert all(
         case.risk == "non-destructive" or case.local_proxy for case in automated
     ), [case.id for case in automated]

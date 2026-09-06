@@ -70,6 +70,10 @@ spec:
       app: gpu-fault-completion-watcher
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9109"
       labels:
         app: gpu-fault-completion-watcher
     spec:
@@ -128,6 +132,12 @@ spec:
               value: "true"
             - name: GPU_FAULT_DISCOVER_POD_GPU_UUIDS
               value: "true"
+            - name: GPU_FAULT_COMPLETION_WATCHER_METRICS_PORT
+              value: "9109"
+          ports:
+            - name: metrics
+              containerPort: 9109
+              protocol: TCP
           resources:
             requests:
               cpu: 50m

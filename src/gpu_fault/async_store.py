@@ -39,6 +39,15 @@ class StoreIoCapacityExceeded(RuntimeError):
     pass
 
 
+class RequestDeadlineExceeded(StoreIoCapacityExceeded):
+    """The caller's own deadline passed before store I/O admission (F-E1).
+
+    A subclass so every existing ``except StoreIoCapacityExceeded`` keeps
+    working while the HTTP layer can tell "you ran out of time" from "the
+    store is out of capacity" -- they call for different client behaviour.
+    """
+
+
 class AsyncStoreExecutor:
     """Runs synchronous store transactions outside the API event loop."""
 
@@ -64,6 +73,11 @@ class AsyncStoreExecutor:
         self._slots = asyncio.Semaphore(max_in_flight)
         self.in_flight = 0
         self.rejected_total = 0
+        self.rejected_by_reason: dict[str, int] = {
+            "deadline": 0,
+            "capacity": 0,
+            "writer_unavailable": 0,
+        }
         self.admission_wait_count = 0
         self.admission_wait_sum_seconds = 0.0
         self.admission_wait_max_seconds = 0.0
@@ -75,7 +89,8 @@ class AsyncStoreExecutor:
             # The caller's deadline already passed, so the work would be
             # thrown away on return. Reject without taking a slot.
             self.rejected_total += 1
-            raise StoreIoCapacityExceeded(
+            self.rejected_by_reason["deadline"] += 1
+            raise RequestDeadlineExceeded(
                 "request deadline exceeded before store I/O admission"
             )
         try:
@@ -85,6 +100,7 @@ class AsyncStoreExecutor:
             )
         except TimeoutError as exc:
             self.rejected_total += 1
+            self.rejected_by_reason["capacity"] += 1
             raise StoreIoCapacityExceeded(
                 "store I/O executor capacity exceeded"
             ) from exc
@@ -120,6 +136,7 @@ class AsyncStoreExecutor:
                 if not is_retryable_store_unavailable(exc):
                     raise
                 self.rejected_total += 1
+                self.rejected_by_reason["writer_unavailable"] += 1
                 raise StoreIoCapacityExceeded(
                     "PostgreSQL writer is temporarily unavailable"
                 ) from exc

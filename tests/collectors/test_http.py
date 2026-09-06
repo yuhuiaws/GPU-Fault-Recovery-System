@@ -454,6 +454,63 @@ def test_http_event_sink_propagates_processor_receipt_rejection(monkeypatch) -> 
     assert "containment pending" in str(captured.value)
 
 
+def test_a_receipt_path_retry_after_a_lost_202_still_polls_the_receipt(
+    monkeypatch,
+) -> None:
+    """The client half of F-E4: the retry after a transport timeout carries the
+    same ``Idempotency-Key`` and polls whatever receipt the retry returns. With
+    the control plane deriving ``request_id`` from that key, the receipt is the
+    original request's, not a second one's."""
+
+    calls: list[tuple[str, str, str | None]] = []
+
+    class Response:
+        def __init__(self, status: int, body: bytes) -> None:
+            self.status = status
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return self.body
+
+    responses = iter(
+        [
+            Response(
+                202,
+                b'{"accepted":true,"processor_request_id":"p-same",'
+                b'"status_url":"/v1/processor/requests/p-same"}',
+            ),
+            Response(200, b'{"status":"CONTAINED"}'),
+        ]
+    )
+
+    def urlopen_probe(request, **_kwargs):
+        calls.append(
+            (request.method, request.full_url, request.get_header("Idempotency-key"))
+        )
+        if len(calls) == 1:
+            raise TimeoutError("read timed out before the 202 arrived")
+        return next(responses)
+
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", urlopen_probe)
+    sink = HttpEventSink("https://control", sleep=lambda _delay: None)
+
+    result = sink.post(
+        "/v1/attempts/failure-detected",
+        {"cluster_id": "cluster-a", "event_id": "evt-1"},
+    )
+
+    assert result == {"status": "CONTAINED"}
+    assert [call[0] for call in calls] == ["POST", "POST", "GET"]
+    assert calls[0][2] == calls[1][2] == "evt-1"
+    assert calls[2][1] == "https://control/v1/processor/requests/p-same"
+
+
 def test_sqs_sink_and_consumer_private_delivery() -> None:
     class FakeSqs:
         def __init__(self) -> None:

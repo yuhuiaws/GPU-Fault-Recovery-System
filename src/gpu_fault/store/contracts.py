@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
 from typing import (
+    Collection,
+    Mapping,
     TYPE_CHECKING,
     Any,
     Callable,
@@ -22,10 +25,13 @@ if TYPE_CHECKING:
     from gpu_fault.models import (
         AdvisoryNotification,
         CompletionDecision,
+        DecisionStatus,
         DiagnosticRequest,
         EfaTrafficState,
         EffectiveRuntimeProfile,
         FaultIncident,
+        HealthSignalState,
+        IncidentState,
         NodeMarker,
         NotificationDelivery,
         NotificationResult,
@@ -51,6 +57,13 @@ if TYPE_CHECKING:
     from gpu_fault.telemetry_models import (
         WorkloadObservationState,
     )
+
+
+# Upper bound for one cluster's active (PENDING/RUNNING/SAFETY_PENDING)
+# workflow listing. The ingest path runs this jsonb self-join inside the
+# aggregation lock, so the read must not grow with the cluster's history
+# (F-J5). Any real active set is orders of magnitude smaller.
+ACTIVE_WORKFLOW_INCIDENTS_LIMIT = 500
 
 
 class ProcessorQueueStats(TypedDict):
@@ -102,6 +115,8 @@ class ProcessorStore(Protocol):
         routine_starvation_seconds: float = 30,
     ) -> list[ProcessorRequest]: ...
 
+    def count_fault_rows_blocked_by_observation(self, *, now: datetime) -> int: ...
+
     def complete_active_processor_request(
         self,
         request_id: str,
@@ -125,6 +140,13 @@ class ProcessorStore(Protocol):
         not_before: datetime | None = None,
         retry_count: int | None = None,
     ) -> None: ...
+
+    def reclaim_expired_processor_leases(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+    ) -> int: ...
 
     def processor_queue_stats(
         self, *, now: datetime | None = None
@@ -249,7 +271,8 @@ class WorkflowStore(Protocol):
         successor_workflow_id: str,
         *,
         expected_fencing_token: int,
-        expected_workflow_updated_at: datetime,
+        expected_execution_epoch: int,
+        expected_workflow_updated_at: datetime | None = None,
         reference: str,
         reconciled_at: datetime,
     ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]: ...
@@ -278,9 +301,59 @@ class WorkflowStore(Protocol):
         *,
         limit: int = 100,
         newest_first: bool = False,
-    ) -> list[WorkflowRequest]: ...
+        dispatchable_at: datetime | None = None,
+        exclude_request_ids: Collection[str] = (),
+        after: WorkflowRequest | None = None,
+    ) -> list[WorkflowRequest]:
+        """Workflows in ``statuses``, oldest ``updated_at`` first.
+
+        ``dispatchable_at`` pushes the dispatcher's permanent filters below
+        the LIMIT (F-A2b): rows whose ``not_before`` is still in the future
+        and rows whose predecessor is still open are excluded in the store,
+        as are ``exclude_request_ids`` (retired generations). Without it the
+        oldest held rows occupied the front of every scan window.
+
+        In that dispatch mode the order is ``dispatch_eligible_at`` --
+        max(``created_at``, ``not_before``), then ``request_id`` -- which no
+        merge rewrites (F-A2a), and ``after`` is the last row of the previous
+        page: the result starts strictly after it in that order (F-A2c).
+        ``after`` without ``dispatchable_at`` is a ``ValueError``; the cursor
+        is only defined over the dispatch order.
+        """
+        ...
+
+    def amend_workflow(
+        self,
+        request_id: str,
+        updates: Mapping[str, object],
+    ) -> WorkflowRequest:
+        """Apply ``updates`` to a live workflow row from outside its lease.
+
+        Bumps ``merge_revision`` like a merge does, so an executor holding a
+        stale copy fails its next leased write and re-reads (F-B1). Used for
+        out-of-band verdicts: the job was withdrawn (F-N1 §7), the plan was
+        rewritten after a node-busy timeout (F-N1 §8). Raises NotFoundError.
+        """
+        ...
+
+    def count_held_workflows(
+        self,
+        statuses: set[WorkflowStatus] | None,
+        *,
+        dispatchable_at: datetime,
+        exclude_request_ids: Collection[str] = (),
+    ) -> dict[str, int]:
+        """How many rows the pushdown of ``list_workflows`` held back, by
+        reason (``not_before``, ``predecessor``, ``retired``); zero counts are
+        omitted. Counts are independent, so one row may count under two."""
+        ...
 
     def workflow_status_counts(self) -> dict[WorkflowStatus, int]: ...
+
+    def incident_state_counts(self) -> dict[IncidentState, int]:
+        """Count every persisted incident by state without decoding any;
+        every state is present, absent ones as 0."""
+        ...
 
     def blocked_workflows_without_verified_restore(self) -> int: ...
 
@@ -290,6 +363,7 @@ class WorkflowStore(Protocol):
         *,
         node_ids: set[str] | None = None,
         job_id: str | None = None,
+        limit: int = ACTIVE_WORKFLOW_INCIDENTS_LIMIT,
     ) -> list[tuple[FaultIncident, WorkflowRequest]]: ...
 
     def list_job_recovery_workflow_incidents(
@@ -309,6 +383,33 @@ class WorkflowStore(Protocol):
         self, predecessor_workflow_id: str
     ) -> WorkflowRequest | None: ...
 
+    def has_workflow_successor(self, predecessor_workflow_id: str) -> bool: ...
+
+    def list_orphan_workflows(
+        self, *, created_before: datetime, limit: int = 1000
+    ) -> list[WorkflowRequest]:
+        """PENDING / SAFETY_PENDING workflows nothing will ever act on (F-B3).
+
+        A workflow is an orphan when its incident is gone or names a different
+        workflow *and* no other workflow names it as predecessor: the
+        dispatcher hands out one workflow per incident, the fences and both
+        sweepers require a strictly higher generation, so the record sits
+        forever. ``created_before`` excludes rows still inside the aggregation
+        window, where the twin shape is normal churn. Oldest ``created_at``
+        first. Read-only.
+        """
+        ...
+
+    def list_incidents_with_missing_workflow(
+        self, *, limit: int = 1000
+    ) -> list[FaultIncident]:
+        """Incidents whose ``workflow_request_id`` names no workflow row (F-B3).
+
+        The mirror image of ``list_orphan_workflows``: a pointer to a record that
+        was never persisted or has been cleaned up. Read-only.
+        """
+        ...
+
     def claim_workflow(
         self,
         request_id: str,
@@ -318,6 +419,15 @@ class WorkflowStore(Protocol):
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
         remediation_budget_claims: dict[str, int] | None = None,
+    ) -> WorkflowRequest: ...
+
+    def extend_remediation_budget(
+        self,
+        request_id: str,
+        executor_id: str,
+        claims: dict[str, int],
+        *,
+        now: datetime | None = None,
     ) -> WorkflowRequest: ...
 
     def renew_workflow_lease(
@@ -443,6 +553,19 @@ class CompletionStore(Protocol):
         limit: int = 1000,
     ) -> list[NodeMarker]: ...
 
+    def completion_transaction(self, event_key: str) -> AbstractContextManager[None]:
+        """Serialize and (where the backend can) atomize one attempt's decision.
+
+        The completion service decides a terminal event -- event row, plan with
+        its incident and workflow, decision -- inside this context, keyed by the
+        event (F-G2). PostgreSQL takes the ``completion/<event_key>`` advisory
+        lock in one transaction, so two replicas cannot both decide the same
+        event and a crash mid-way leaves no event row without a decision. The
+        in-memory and SQLite stores serialize on their process lock. Nested
+        store writes (each with their own transaction) must be allowed inside.
+        """
+        ...
+
     def save_event_if_absent(self, event: TerminalEvent) -> bool: ...
 
     def get_event_by_attempt(
@@ -456,6 +579,33 @@ class CompletionStore(Protocol):
     def get_decision_by_attempt(
         self, cluster_id: str, attempt_id: str
     ) -> CompletionDecision: ...
+
+    def list_decisions_by_status(
+        self,
+        status: DecisionStatus,
+        *,
+        older_than: datetime | None = None,
+        limit: int = 100,
+    ) -> list[CompletionDecision]:
+        """Decisions in ``status``, oldest first.
+
+        A decision carries no timestamp of its own, so its age is that of the
+        diagnostic request it points at (``diagnostic_request_id`` ->
+        ``DiagnosticRequest.created_at``). With ``older_than`` only decisions
+        whose request was created at or before it are returned; a decision
+        whose request cannot be found is returned too -- nothing can ever
+        report on it, so it is stale by definition (F-G2 (4)).
+        """
+        ...
+
+    def decision_status_counts(self) -> dict[DecisionStatus, int]: ...
+
+    def count_completion_events_without_decision(self) -> int:
+        """Terminal event rows with no decision row: the poisoned shape of
+        P0-48B, exported as a gauge (F-G2 (6))."""
+        ...
+
+    def save_diagnostic(self, request: DiagnosticRequest) -> None: ...
 
     def save_plan(self, plan: RecoveryPlan) -> None: ...
 
@@ -495,6 +645,20 @@ class TelemetryStore(Protocol):
         cluster_id: str,
         node_id: str | None = None,
     ) -> list[CollectorStatus]: ...
+
+    def get_health_signal_state(self, signal_key: str) -> HealthSignalState | None: ...
+
+    def mark_health_signal_notified(
+        self, signal_key: str, *, notified_at: datetime
+    ) -> None:
+        """Set a signal's ``notified`` latch once its notification was delivered.
+
+        ``claim_health_signal_transitions`` decides to emit but does not latch
+        (P0-38B); the deliverer calls this after the commit that carried the
+        incident. A missing or inactive signal, or one whose activation began
+        after ``notified_at``, is left alone.
+        """
+        ...
 
 
 @runtime_checkable

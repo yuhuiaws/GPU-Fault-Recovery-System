@@ -96,7 +96,32 @@ def _documents(text: str) -> list[dict[str, Any]]:
     ]
 
 
+# In execution order; deploy/hyperpod/deploy.sh and the regional schema tool
+# run the same three (F-J3 three-step index method).
+SCHEMA_JOB_MANIFESTS = (
+    "deploy/migrations/postgres-index-build-job.yaml",
+    "deploy/migrations/postgres-schema-ensure-job.yaml",
+    "deploy/migrations/postgres-schema-preflight-job.yaml",
+)
+
+
+def render_release_payload(release: Any) -> dict[str, Any]:
+    """The manifests and digests a release delivers, as one JSON-able payload."""
+
+    return _render_release_payload(release)
+
+
 def rendered_release_manifest_sha256(release: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            render_release_payload(release),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _render_release_payload(release: Any) -> dict[str, Any]:
     config = release.config
     generated = ROOT / "deploy/control-plane/regional/generated"
     manifest_names = [
@@ -144,15 +169,19 @@ def rendered_release_manifest_sha256(release: Any) -> str:
         }
         for target in config.clusters
     }
-    schema_text = (
-        ROOT / "deploy/migrations/postgres-schema-ensure-job.yaml"
-    ).read_text(encoding="utf-8")
-    for source, destination in {
-        "namespace: gpu-fault-system": f"namespace: {config.namespace}",
-        "REPLACE_WITH_WHEEL_CONFIGMAP": release.wheel_cm,
-        DEFAULT_RUNTIME_IMAGE: release.runtime_image,
-    }.items():
-        schema_text = schema_text.replace(source, destination)
+    # The schema stage is three Jobs (index-build, ensure, preflight; F-J3),
+    # run in that order by deploy/control-plane/tools/ensure-postgres-schema.sh;
+    # the release digest covers all three manifests.
+    schema_documents: list[dict[str, Any]] = []
+    for manifest in SCHEMA_JOB_MANIFESTS:
+        schema_text = (ROOT / manifest).read_text(encoding="utf-8")
+        for source, destination in {
+            "namespace: gpu-fault-system": f"namespace: {config.namespace}",
+            "REPLACE_WITH_WHEEL_CONFIGMAP": release.wheel_cm,
+            DEFAULT_RUNTIME_IMAGE: release.runtime_image,
+        }.items():
+            schema_text = schema_text.replace(source, destination)
+        schema_documents.extend(_documents(schema_text))
     refresh_text = (
         ROOT / "deploy/control-plane/regional/aurora-credential-refresh.yaml"
     ).read_text(encoding="utf-8")
@@ -201,7 +230,7 @@ def rendered_release_manifest_sha256(release: Any) -> str:
         "cpu": cpu_documents,
         "admin_config": config.admin_config.as_dict(),
         "gpu": gpu_documents,
-        "schema": _documents(schema_text),
+        "schema": schema_documents,
         "aurora_refresh": _documents(refresh_text),
         "nlb": nlb_documents,
         "dcgm": _documents(dcgm_text),
@@ -221,13 +250,7 @@ def rendered_release_manifest_sha256(release: Any) -> str:
             for target in config.clusters
         },
     }
-    return hashlib.sha256(
-        json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    return payload
 
 
 def stamp_gpu_deployments(

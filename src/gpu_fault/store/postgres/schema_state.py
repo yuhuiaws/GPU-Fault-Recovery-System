@@ -4,17 +4,103 @@ from typing import Any, Callable
 
 import json
 import os
+import re
+from pathlib import Path
 
 from gpu_fault.schema_migrations import (
     LATEST_POSTGRES_SCHEMA_VERSION,
     POSTGRES_SCHEMA_MIGRATIONS,
 )
 from gpu_fault.store.postgres.ddl import (
+    declared_index_names,
     create_postgres_schema,
 )
 
 
 POSTGRES_SCHEMA_VERSION = LATEST_POSTGRES_SCHEMA_VERSION
+
+# ``pg_trigger.tgtype`` bits (utils/reltrigger.h). A statement-level AFTER
+# trigger sets only its event bit; ROW / BEFORE / INSTEAD stay clear.
+_TGTYPE_AFTER_STATEMENT_INSERT = 1 << 2
+_TGTYPE_AFTER_STATEMENT_DELETE = 1 << 3
+_TGTYPE_AFTER_STATEMENT_UPDATE = 1 << 4
+
+_COUNTER_TRIGGER_TABLE = "gpu_fault_processor_queue"
+
+# What the DDL declares for the six queue counter triggers (F-D10):
+# name -> (function, tgtype, OLD transition table, NEW transition table).
+# A counter trigger recreated ``FOR EACH ROW``, without its transition table,
+# or bound to the other counter function is enabled and present -- and drifts
+# the admission counters on every write. The DDL creates these ``IF NOT
+# EXISTS`` so ``--ensure-schema`` cannot repair a present-but-wrong one.
+_COUNTER_TRIGGERS: dict[str, tuple[str, int, str | None, str | None]] = {
+    "gpu_fault_processor_queue_count_insert": (
+        "gpu_fault_processor_queue_count_sync",
+        _TGTYPE_AFTER_STATEMENT_INSERT,
+        None,
+        "added",
+    ),
+    "gpu_fault_processor_queue_count_update": (
+        "gpu_fault_processor_queue_count_sync",
+        _TGTYPE_AFTER_STATEMENT_UPDATE,
+        "removed",
+        "added",
+    ),
+    "gpu_fault_processor_queue_count_delete": (
+        "gpu_fault_processor_queue_count_sync",
+        _TGTYPE_AFTER_STATEMENT_DELETE,
+        "removed",
+        None,
+    ),
+    "gpu_fault_processor_priority_count_insert": (
+        "gpu_fault_processor_priority_count_sync",
+        _TGTYPE_AFTER_STATEMENT_INSERT,
+        None,
+        "added",
+    ),
+    "gpu_fault_processor_priority_count_update": (
+        "gpu_fault_processor_priority_count_sync",
+        _TGTYPE_AFTER_STATEMENT_UPDATE,
+        "removed",
+        "added",
+    ),
+    "gpu_fault_processor_priority_count_delete": (
+        "gpu_fault_processor_priority_count_sync",
+        _TGTYPE_AFTER_STATEMENT_DELETE,
+        "removed",
+        None,
+    ),
+}
+
+_COUNTER_FUNCTIONS = (
+    "gpu_fault_processor_queue_count_sync",
+    "gpu_fault_processor_priority_count_sync",
+)
+
+_TRIGGER_FUNCTION_BODY = re.compile(
+    r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+(\w+)\(\)\s+RETURNS\s+trigger\s+"
+    r"LANGUAGE\s+plpgsql\s+AS\s+\$\$(.*?)\$\$",
+    re.DOTALL,
+)
+
+
+def declared_trigger_function_bodies() -> dict[str, str]:
+    """The plpgsql body of every trigger function the DDL declares, verbatim.
+
+    Read from the DDL source like ``declared_index_names`` so the schema check
+    cannot drift from the DDL: Postgres stores the body between the dollar
+    quotes character for character in ``pg_proc.prosrc``, and ``CREATE OR
+    REPLACE`` on every ``--ensure-schema`` keeps a live database on exactly
+    this text -- so anything else is a body somebody replaced by hand.
+    """
+
+    bodies: dict[str, str] = {}
+    for path in sorted(Path(__file__).parent.glob("ddl*.py")):
+        for name, body in _TRIGGER_FUNCTION_BODY.findall(
+            path.read_text(encoding="utf-8")
+        ):
+            bodies[name] = body
+    return bodies
 
 
 class PostgresSchemaMixin:
@@ -127,6 +213,8 @@ class PostgresSchemaMixin:
                 "PostgreSQL schema is not initialized; run "
                 "gpu-fault-store-migrate --ensure-schema first"
             )
+        self._validate_declared_indexes()
+        self._validate_triggers_enabled()
         trigger_names = (
             "gpu_fault_processor_queue_notify_pending_trigger",
             "gpu_fault_telemetry_spool_notify_available_trigger",
@@ -168,6 +256,8 @@ class PostgresSchemaMixin:
                 "PostgreSQL fault counter shard triggers are missing; "
                 "run gpu-fault-store-migrate --ensure-schema"
             )
+        # Present -- now check they are the triggers the DDL declares (F-D10).
+        self._validate_counter_trigger_definitions()
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -184,6 +274,114 @@ class PostgresSchemaMixin:
                 "PostgreSQL schema version mismatch: expected "
                 f"{POSTGRES_SCHEMA_VERSION}, got {actual_schema_version}; "
                 "run gpu-fault-store-migrate --ensure-schema"
+            )
+
+    def _validate_declared_indexes(self) -> None:
+        """Every index the DDL declares must exist (F-J3, three-step method).
+
+        The DDL runs in one transaction and therefore cannot ``CREATE INDEX
+        CONCURRENTLY``; large indexes are built by an operator first and the
+        DDL only declares them ``IF NOT EXISTS``. Without this check a skipped
+        build degraded silently into a sequential scan per dispatcher tick.
+        """
+
+        expected = declared_index_names()
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                "SELECT indexname FROM pg_indexes WHERE indexname = ANY(%s)",
+                (sorted(expected),),
+            )
+            present = {row[0] for row in cursor.fetchall()}
+        missing = sorted(expected - present)
+        if missing:
+            raise RuntimeError(
+                "PostgreSQL indexes are missing: "
+                + ", ".join(missing)
+                + "; build them (CREATE INDEX CONCURRENTLY on a live database) "
+                "and run gpu-fault-store-migrate --ensure-schema"
+            )
+
+    def _validate_triggers_enabled(self) -> None:
+        """A disabled gpu-fault trigger silently drifts the queue counters
+        (F-D10); the schema check treats it like a missing one."""
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT tgname
+                FROM pg_trigger
+                WHERE tgname LIKE 'gpu\\_fault\\_%'
+                  AND NOT tgisinternal
+                  AND tgenabled = 'D'
+                ORDER BY tgname
+                """
+            )
+            disabled = [row[0] for row in cursor.fetchall()]
+        if disabled:
+            raise RuntimeError(
+                "PostgreSQL triggers are disabled: "
+                + ", ".join(disabled)
+                + "; re-enable them before starting the control plane"
+            )
+
+    def _validate_counter_trigger_definitions(self) -> None:
+        """Every queue counter trigger must be the one the DDL declares, and
+        must drive the function body the DDL declares (F-D10).
+
+        ``tgenabled`` alone passes a trigger that was recreated per row, lost
+        its transition table, or was pointed at the other counter function;
+        each drifts the counters silently and the ingress then 429s fault
+        events by the depth of the drift.
+        """
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT t.tgname, c.relname, p.proname, t.tgtype,
+                       t.tgoldtable, t.tgnewtable
+                FROM pg_trigger t
+                JOIN pg_class c ON c.oid = t.tgrelid
+                JOIN pg_proc p ON p.oid = t.tgfoid
+                WHERE t.tgname = ANY(%s) AND NOT t.tgisinternal
+                """,
+                (sorted(_COUNTER_TRIGGERS),),
+            )
+            actual = {
+                row[0]: (row[1], row[2], int(row[3]), row[4], row[5])
+                for row in cursor.fetchall()
+            }
+            cursor.execute(
+                "SELECT proname, prosrc FROM pg_proc WHERE proname = ANY(%s)",
+                (list(_COUNTER_FUNCTIONS),),
+            )
+            bodies = {row[0]: row[1] for row in cursor.fetchall()}
+        problems: list[str] = []
+        for name, (function, tgtype, old_table, new_table) in sorted(
+            _COUNTER_TRIGGERS.items()
+        ):
+            expected = (_COUNTER_TRIGGER_TABLE, function, tgtype, old_table, new_table)
+            found = actual.get(name)
+            if found is None:
+                problems.append(f"{name} is missing")
+            elif found != expected:
+                problems.append(
+                    f"{name} is defined as (table, function, tgtype, old, new)="
+                    f"{found!r}, expected {expected!r}"
+                )
+        declared = declared_trigger_function_bodies()
+        for function in _COUNTER_FUNCTIONS:
+            if function not in declared:
+                problems.append(f"{function} is not declared by the DDL source")
+            elif function not in bodies:
+                problems.append(f"{function} is missing")
+            elif bodies[function] != declared[function]:
+                problems.append(f"{function} body differs from the DDL")
+        if problems:
+            raise RuntimeError(
+                "PostgreSQL queue counter triggers drifted from the DDL: "
+                + "; ".join(problems)
+                + "; drop the drifted trigger and run "
+                "gpu-fault-store-migrate --ensure-schema"
             )
 
     def _validate_dedicated_hot_state(self) -> None:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Callable
 
 from gpu_fault.models import (
+    EXECUTABLE_WORKFLOW_STATUSES,
     FaultIncident,
     WorkflowOperation,
     WorkflowRequest,
@@ -11,11 +13,16 @@ from gpu_fault.models import (
     WorkflowStepExecution,
     WorkflowStepSpec,
     WorkflowStepStatus,
+    lifetime_exceeded,
 )
 from gpu_fault.operation_registry import (
     NODE_MUTATING_OPERATIONS,
-    PREEMPTION_NON_CANCELABLE_OPERATIONS,
+    NODE_WIDE_RECOVERY_OPERATIONS,
 )
+from gpu_fault.orchestration.disposition import Disposition
+from gpu_fault.orchestration.preemption_boundary import preemption_boundary
+
+LOGGER = logging.getLogger(__name__)
 
 
 class WorkflowMergeService:
@@ -35,6 +42,10 @@ class WorkflowMergeService:
         self.workload_scoped_operations = workload_scoped_operations
         self.node_exclusive_operations = node_exclusive_operations
         self.workflow_resource_claims_by_node = workflow_resource_claims_by_node
+        # F-N1: read-only events recorded on the incident with no new steps.
+        self.absorbed_record_only_total = 0
+        self.lifetime_record_only_total = 0
+        self.withdrawn_record_only_total = 0
 
     def disposition(
         self,
@@ -44,11 +55,43 @@ class WorkflowMergeService:
         gpu_uuids: set[str],
         *,
         allow_job_branch_merge: bool = True,
-    ) -> str:
+        now: datetime | None = None,
+    ) -> Disposition:
+        if lifetime_exceeded(existing):
+            # The remediation ran out of lifetime and is with an operator
+            # (F-N1): the event is recorded on its incident, nothing is
+            # planned or queued until the incident is closed.
+            self.lifetime_record_only_total += 1
+            return Disposition.ABSORB_RECORD_ONLY
+        if existing.workload_withdrawn_at is not None:
+            # The job this workflow repaired was stopped by someone else; it
+            # is winding down (F-N1 §7). The event is recorded, not planned.
+            self.withdrawn_record_only_total += 1
+            return Disposition.ABSORB_RECORD_ONLY
+        if existing.status not in EXECUTABLE_WORKFLOW_STATUSES:
+            # Nothing merges into a record that will never execute again --
+            # BLOCKED included. ABSORB / WIDEN into one silently dropped the
+            # new fault and left the node's group link pinned to it (F-B4).
+            # The candidate gets its own record; a terminal predecessor does
+            # not hold it back.
+            LOGGER.warning(
+                "merge target %s is %s; queueing %s as its own record",
+                existing.request_id,
+                existing.status.value,
+                candidate.request_id,
+            )
+            return Disposition.QUEUE_SUCCESSOR
         if allow_job_branch_merge and self._read_only_branch_window_closed(
-            existing, candidate
+            existing, candidate, now
         ):
-            return "QUEUE_SUCCESSOR"
+            if self._mutating_scope_covers(existing, node_id, gpu_uuids):
+                # A node-mutating action is already under way for exactly
+                # this scope. Evidence collected after it finishes describes
+                # a rebooted node, not the fault; the event lands on the
+                # incident and schedules nothing (F-N1).
+                self.absorbed_record_only_total += 1
+                return Disposition.ABSORB_RECORD_ONLY
+            return Disposition.QUEUE_SUCCESSOR
         mutable = (
             existing.status is WorkflowStatus.PENDING
             and existing.execution_owner_id is None
@@ -60,7 +103,7 @@ class WorkflowMergeService:
             existing,
             candidate,
         ):
-            return "PARALLEL_BRANCH"
+            return Disposition.PARALLEL_BRANCH
         if existing.dag_enabled and allow_job_branch_merge:
             result = self._dag_disposition(
                 existing,
@@ -83,9 +126,10 @@ class WorkflowMergeService:
             existing,
             node_id,
             gpu_uuids,
+            candidate=candidate,
         )
         if compatible and (scope_covered or mutable):
-            return "ABSORB"
+            return Disposition.ABSORB
         if (
             candidate_rank == existing_rank
             and candidate_primary == existing_primary
@@ -94,7 +138,7 @@ class WorkflowMergeService:
                 list(range(len(existing.official_steps))),
             )
         ):
-            return "WIDEN_IN_PLACE"
+            return Disposition.WIDEN_IN_PLACE
         if (
             mutable
             and candidate_rank > existing_rank
@@ -103,20 +147,50 @@ class WorkflowMergeService:
                 existing_primary,
             )
         ):
-            return "REPLACE_IN_PLACE"
+            return Disposition.REPLACE_IN_PLACE
         if (
             allow_job_branch_merge
             and WorkflowOperation.RESTART_WORKLOAD
             in {step.operation for step in existing.official_steps}
             and self.brancher.dag_join_accepts_new_branch(existing)
         ):
-            return "QUEUE_BRANCH_SUCCESSOR"
-        return "REPLACE_IN_PLACE" if mutable else "QUEUE_SUCCESSOR"
+            return Disposition.QUEUE_BRANCH_SUCCESSOR
+        return Disposition.REPLACE_IN_PLACE if mutable else Disposition.QUEUE_SUCCESSOR
+
+    @staticmethod
+    def _mutating_scope_covers(
+        existing: WorkflowRequest,
+        node_id: str,
+        gpu_uuids: set[str],
+    ) -> bool:
+        """Does a live node-mutating step of ``existing`` cover this fault?
+
+        Node-wide actions (reboot, replace, drain) cover every GPU of the
+        node; a GPU-scoped action covers only the GPUs it names. Superseded
+        steps never run again and do not count.
+        """
+
+        superseded = set(existing.superseded_step_indexes)
+        for index, step in enumerate(existing.official_steps):
+            if (
+                index in superseded
+                or step.operation not in NODE_MUTATING_OPERATIONS
+                or node_id not in step.node_ids
+            ):
+                continue
+            if (
+                step.operation in NODE_WIDE_RECOVERY_OPERATIONS
+                or not gpu_uuids
+                or gpu_uuids <= set(step.gpu_uuids)
+            ):
+                return True
+        return False
 
     @staticmethod
     def _read_only_branch_window_closed(
         existing: WorkflowRequest,
         candidate: WorkflowRequest,
+        now: datetime | None = None,
     ) -> bool:
         if any(
             step.operation in NODE_MUTATING_OPERATIONS
@@ -124,7 +198,7 @@ class WorkflowMergeService:
         ):
             return False
         deadline = existing.aggregation_max_deadline
-        if deadline is not None and datetime.now(timezone.utc) >= deadline:
+        if deadline is not None and (now or datetime.now(timezone.utc)) >= deadline:
             return True
         stop_indexes = {
             index
@@ -146,7 +220,7 @@ class WorkflowMergeService:
         candidate: WorkflowRequest,
         node_id: str,
         gpu_uuids: set[str],
-    ) -> str | None:
+    ) -> Disposition | None:
         existing_primary = self.arbiter.workflow_primary_recovery_operations(existing)
         candidate_primary = self.arbiter.workflow_primary_recovery_operations(candidate)
         if (
@@ -160,11 +234,12 @@ class WorkflowMergeService:
                 existing,
                 node_id,
                 gpu_uuids,
+                candidate=candidate,
             )
         ):
-            return "ABSORB"
+            return Disposition.ABSORB
         if not self.brancher.dag_join_accepts_new_branch(existing):
-            return "QUEUE_SUCCESSOR"
+            return Disposition.QUEUE_SUCCESSOR
         indexes = self.brancher.node_branch_step_indexes(
             existing,
             node_id,
@@ -192,8 +267,9 @@ class WorkflowMergeService:
             indexes,
             node_id,
             gpu_uuids,
+            candidate=candidate,
         ):
-            return "ABSORB"
+            return Disposition.ABSORB
         branch_started = self.brancher.branch_has_started(
             existing,
             indexes,
@@ -203,7 +279,7 @@ class WorkflowMergeService:
             and candidate_primary == existing_primary
             and not self.recovery_action_has_started(existing, indexes)
         ):
-            return "WIDEN_BRANCH"
+            return Disposition.WIDEN_BRANCH
         if (
             not branch_started
             and candidate_rank > existing_rank
@@ -212,8 +288,8 @@ class WorkflowMergeService:
                 existing_primary,
             )
         ):
-            return "REPLACE_BRANCH"
-        return "QUEUE_BRANCH_SUCCESSOR"
+            return Disposition.REPLACE_BRANCH
+        return Disposition.QUEUE_BRANCH_SUCCESSOR
 
     def can_append_parallel_branch(
         self,
@@ -282,9 +358,14 @@ class WorkflowMergeService:
                 candidate,
                 node_id,
             )
-        predecessor, replaced = self._preemption_boundary(
+        # The same judgement the executor makes at a step boundary (F-C1),
+        # restricted to this node's branch. Planning has no store to cancel a
+        # remote command through, so a cancellable wait is a boundary here
+        # rather than a step to mark superseded under a running command.
+        boundary = preemption_boundary(
             existing,
-            indexes,
+            indexes=indexes,
+            remote_cancellation_available=False,
         )
         candidate = self._handoff_quiesce(
             existing,
@@ -294,34 +375,8 @@ class WorkflowMergeService:
         return self.brancher.append_parallel_job_branch(
             existing,
             candidate,
-            predecessor_step_index=predecessor,
-            replaced_step_indexes=replaced,
-        )
-
-    @staticmethod
-    def _preemption_boundary(
-        workflow: WorkflowRequest,
-        indexes: list[int],
-    ) -> tuple[int | None, frozenset[int]]:
-        completed = set(workflow.completed_step_indexes)
-        blocking = [
-            execution.step_index
-            for execution in workflow.step_executions
-            if execution.step_index in indexes
-            and execution.status is WorkflowStepStatus.WAITING
-            and execution.operation in PREEMPTION_NON_CANCELABLE_OPERATIONS
-        ]
-        safe_completed = [index for index in indexes if index in completed]
-        predecessor = (
-            max(blocking)
-            if blocking
-            else max(safe_completed)
-            if safe_completed
-            else None
-        )
-        protected = set(blocking) | completed
-        return predecessor, frozenset(
-            index for index in indexes if index not in protected
+            predecessor_step_index=boundary.predecessor,
+            replaced_step_indexes=boundary.replaceable,
         )
 
     @staticmethod
@@ -394,6 +449,11 @@ class WorkflowMergeService:
         existing: WorkflowRequest,
         candidate: WorkflowRequest,
     ) -> WorkflowRequest:
+        if candidate.lifetime_deadline_at is None and existing.lifetime_deadline_at:
+            # A successor shares its predecessor's lifetime (F-N1).
+            candidate = candidate.model_copy(
+                update={"lifetime_deadline_at": existing.lifetime_deadline_at}
+            )
         existing_rank = self.arbiter.workflow_recovery_rank(existing)
         candidate_rank = self.arbiter.workflow_recovery_rank(candidate)
         existing_nodes = self._exclusive_nodes(existing)
@@ -403,11 +463,13 @@ class WorkflowMergeService:
             or candidate.status is not WorkflowStatus.PENDING
             or existing.status not in {WorkflowStatus.PENDING, WorkflowStatus.RUNNING}
             or candidate_rank <= existing_rank
-            or (
-                existing_nodes
-                and candidate_nodes
-                and not existing_nodes & candidate_nodes
-            )
+            # Fail closed on the node gate (F-C1): a candidate that holds no
+            # node-exclusive step is not a stronger node action whatever its
+            # rank says, and a predecessor that does hold nodes is only
+            # preempted by a successor on those same nodes. An empty set no
+            # longer makes the gate pass vacuously.
+            or not candidate_nodes
+            or (existing_nodes and not existing_nodes & candidate_nodes)
         ):
             return candidate
         inherited = self._inherited_containment(existing, candidate)
@@ -446,12 +508,19 @@ class WorkflowMergeService:
             WorkflowOperation.MARK_UNSCHEDULABLE,
             WorkflowOperation.STOP_WORKLOADS,
         }
+        # A containment step is only a fact until its undo has started: a
+        # RESTART_WORKLOAD or RESTORE_SCHEDULING with any execution record --
+        # WAITING included -- means the job or the node is already on its way
+        # back, so the successor must redo the containment (F-C1).
+        undone = set(existing.completed_operations) | {
+            execution.operation for execution in existing.step_executions
+        }
         invalidated = {
             WorkflowOperation.MARK_UNSCHEDULABLE: (
-                WorkflowOperation.RESTORE_SCHEDULING in existing.completed_operations
+                WorkflowOperation.RESTORE_SCHEDULING in undone
             ),
             WorkflowOperation.STOP_WORKLOADS: (
-                WorkflowOperation.RESTART_WORKLOAD in existing.completed_operations
+                WorkflowOperation.RESTART_WORKLOAD in undone
             ),
         }
         completed = set(existing.completed_step_indexes)
@@ -479,12 +548,13 @@ class WorkflowMergeService:
             )
             if match is None:
                 continue
-            existing_index, _ = match
+            existing_index, existing_step = match
             previous = next(
                 (
                     item
                     for item in existing.step_executions
                     if item.step_index == existing_index
+                    and item.operation is existing_step.operation
                     and item.status is WorkflowStepStatus.SUCCEEDED
                 ),
                 None,
@@ -513,6 +583,7 @@ class WorkflowMergeService:
             step_index=index,
             operation=operation,
             status=WorkflowStepStatus.SUCCEEDED,
+            phase="official",
             adapter_operation_id=(
                 previous.adapter_operation_id if previous is not None else None
             ),

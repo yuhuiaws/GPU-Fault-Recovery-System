@@ -184,10 +184,22 @@ class CompletionWatcher:
         self.terminal_retention_seconds = terminal_retention_seconds
         self.max_attempts = max_attempts
         self.pruned_attempts_total = 0
+        # Attempt ids pruned since the owner last asked. The controller keeps
+        # its own per-attempt state (specs, cached terminal observations, sent
+        # keys) and has to let go of the same attempts, or it re-feeds the
+        # cached terminal every pass and this core re-creates what it pruned.
+        self._pruned_attempt_ids: set[str] = set()
 
     def reset_attempt(self, attempt_id: str) -> None:
         with self._lock:
             self._attempts.pop(attempt_id, None)
+
+    def take_pruned_attempt_ids(self) -> set[str]:
+        """Attempt ids pruned since the previous call; the set is then cleared."""
+        with self._lock:
+            pruned = set(self._pruned_attempt_ids)
+            self._pruned_attempt_ids.clear()
+            return pruned
 
     def observe(self, observation: AttemptObservation) -> WatcherResult:
         with self._lock:
@@ -215,6 +227,17 @@ class CompletionWatcher:
 
             state.last_observation = observation
             for container in observation.containers:
+                # A Pod replaced by the job controller (evicted, preempted,
+                # recreated after a non-zero exit) takes over its rank. The
+                # predecessor is not a separate rank of the attempt; keeping
+                # it made a still-"running" ghost block the terminal forever
+                # and a failed ghost put a stale exit into the terminal event.
+                for key, previous in list(state.containers.items()):
+                    if (
+                        previous.rank == container.rank
+                        and key != container.observation_key
+                    ):
+                        del state.containers[key]
                 state.containers[container.observation_key] = container
 
             critical = [item for item in state.containers.values() if item.critical]
@@ -351,34 +374,38 @@ class CompletionWatcher:
         keep_attempt_id: str,
     ) -> None:
         cutoff = observed_at - timedelta(seconds=self.terminal_retention_seconds)
-        removable = sorted(
-            (
-                (attempt_id, state)
-                for attempt_id, state in self._attempts.items()
-                if attempt_id != keep_attempt_id and state.terminal is not None
-            ),
-            key=lambda item: (
-                item[1].terminal.ended_at,
-                item[0],
-            ),
-        )
+        removable = [
+            (attempt_id, state)
+            for attempt_id, state in self._attempts.items()
+            if attempt_id != keep_attempt_id and state.terminal is not None
+        ]
         expired = {
             attempt_id
             for attempt_id, state in removable
-            if state.terminal.ended_at <= cutoff
+            if state.terminal is not None and state.terminal.ended_at <= cutoff
         }
         remaining_count = len(self._attempts) - len(expired)
         overflow = max(0, remaining_count - self.max_attempts)
-        for attempt_id, _state in removable:
-            if attempt_id in expired:
-                continue
-            if overflow <= 0:
-                break
-            expired.add(attempt_id)
-            overflow -= 1
+        if overflow > 0:
+            # Only the overflow path needs the oldest-first order; sorting on
+            # every observation made each pass O(N log N) for nothing.
+            removable.sort(
+                key=lambda item: (
+                    item[1].terminal.ended_at if item[1].terminal else observed_at,
+                    item[0],
+                )
+            )
+            for attempt_id, _state in removable:
+                if attempt_id in expired:
+                    continue
+                if overflow <= 0:
+                    break
+                expired.add(attempt_id)
+                overflow -= 1
         for attempt_id in expired:
             self._attempts.pop(attempt_id, None)
         self.pruned_attempts_total += len(expired)
+        self._pruned_attempt_ids.update(expired)
 
     def _terminal_event(
         self,

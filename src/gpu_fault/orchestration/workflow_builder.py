@@ -256,6 +256,8 @@ class WorkflowBuilder:
                 return item.owner
         return None
 
+    _RESTART_OBSERVATION_SCAN_LIMIT = 256
+
     def restart_step_parameters(
         self,
         cluster_id: str,
@@ -268,7 +270,17 @@ class WorkflowBuilder:
         fallback_gpu_uuids: list[str] | None = None,
     ) -> dict[str, object]:
         workload_set = set(workload_ids)
-        observations = self.store.list_attempt_observations(cluster_id)
+        # Newest attempts only: this runs inside the merge lock and the
+        # window below is two minutes wide, so a cluster's whole observation
+        # history has nothing to add (F-B8).
+        observations = [
+            state.observation
+            for state in self.store.list_attempt_observation_states(
+                cluster_id,
+                limit=self._RESTART_OBSERVATION_SCAN_LIMIT,
+                newest_first=True,
+            )
+        ]
         if observed_at is not None:
             observations = [
                 observation
@@ -435,7 +447,9 @@ class WorkflowBuilder:
                 event.affected_workload_ids,
                 job_id=event.job_id,
                 fallback_attempt_id=(event.attempt_id or event.event_id),
-                observed_at=event.observed_at,
+                # Compared against the watcher's observation times, which are
+                # control-plane clocks; the node's observed_at is not (F-B8).
+                observed_at=event.ingested_at or event.observed_at,
                 node_id=event.node_id,
             )
         return {}

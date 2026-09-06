@@ -167,7 +167,17 @@ class EvidenceOperationService:
     def attempt_observation(
         self,
         event: XidEvent | SxidEvent | NodeHealthFinding,
+        *,
+        record_ambiguity: bool = True,
     ):
+        """Resolve the attempt an event belongs to.
+
+        ``record_ambiguity=False`` is for a pre-check that runs before the
+        family lookup of the same event: the ambiguity metric and warning
+        must count each event once, and the family lookup is the one that
+        counts it.
+        """
+
         workload_ids = set(event.affected_workload_ids)
         job_id = getattr(event, "job_id", None)
         attempt_id = getattr(event, "attempt_id", None)
@@ -278,6 +288,8 @@ class EvidenceOperationService:
             candidates.append(observation)
         identities = {(item.job_id, item.attempt_id) for item in candidates}
         if len(identities) != 1:
+            if len(identities) > 1 and not record_ambiguity:
+                return None
             if len(identities) > 1:
                 with self._metrics_lock:
                     self._ambiguous_attempt_ownership_total += 1

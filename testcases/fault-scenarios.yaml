@@ -4934,6 +4934,109 @@ test_cases:
   - tests/execution/test_kubernetes.py::test_terminal_quarantine_hold_rejects_automatic_reset_takeover
   - tests/regional/test_regional_control_plane.py::test_incident_ownership_route_answers_takeover_question
   - tests/regional/test_regional_control_plane.py::test_regional_ownership_provider_reads_the_route
+- id: GF-REGIONAL-PREEMPT-032
+  title: 工作流生命周期硬截止：到点失败、取消在飞命令、只升级到人工、后续事件只记录
+  category: regional-preemption
+  level: integration
+  risk: non-destructive
+  problem: >-
+    单节点 reset→reboot 链没有整条工作流的时间上限，一个卡住的远程命令能让 incident 永远不闭合；到点后新事件又会开出下一代 reboot/replace 工作流。
+  injection: >-
+    经公共摄取 API 为空闲节点开出 RESET_GPU 工作流，把生命周期压到 1 秒，让 RESET_GPU 的远程命令停在 WAITING；到点后再次派发，然后对同节点上报更强的 XID 79。
+  expected:
+  - 首次领取盖 lifetime_deadline_at，execution_deadline 不晚于它
+  - 到点后不再启动任何新步骤（无 RESTART_NODE、无 VALIDATE）
+  - 在飞远程命令被取消：status FAILED、status_source workflow-timeout
+  - 失败执行记录带 details.workflow_lifetime_exceeded=true，工作流 FAILED，incident ESCALATED 或 QUARANTINED（节点仍隔离）
+  - 硬件升级分类为 lifetime_exceeded → ESCALATE_SUPPORT，不再 reboot/replace
+  - 到点后的同节点事件落在同一 incident 与同一 workflow 上，不产生新的 PENDING/RUNNING 工作流
+  evidence:
+    verdict: NOT_RUN
+  automation: command
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-032工作流生命周期硬截止
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
+  command:
+  - python3
+  - -m
+  - pytest
+  - -q
+  - tests/execution/test_workflow_lifecycle_scenarios.py::test_preempt032_a_node_workflow_past_its_lifetime_ends_with_the_operator
+  - tests/orchestration/test_job_workflow_lifetime.py
+  related_pytest: tests/orchestration/test_job_workflow_lifetime.py::test_a_single_node_workflow_past_its_lifetime_escalates_only_to_support
+- id: GF-REGIONAL-PREEMPT-033
+  title: 作业被外部停止后工作流收口：在飞动作跑完、已 cordon 节点恢复调度、不再重启作业
+  category: regional-preemption
+  level: integration
+  risk: non-destructive
+  problem: >-
+    完成服务判定「用户或控制器停止」后只记录不重启，但作业工作流继续修复每个分支，最后把用户刚停掉的作业重新拉起，或对无故障硬件升级。
+  injection: >-
+    两分支作业 DAG 执行中（node-b 的 RESET_GPU 在飞、node-c 未开始），经完成服务注入同作业同 attempt 的 STOPPED 终态事件，再派发执行。
+  expected:
+  - 工作流被打上 workload_withdrawn_at
+  - 在飞的 node-b RESET_GPU 跑完，node-b 的 RESTORE_SCHEDULING 执行
+  - node-c 从未 cordon，其 cordon/reset/restore 全部作废，不多跑一次 RESTORE_SCHEDULING
+  - RESTART_WORKLOAD 作废，工作流 SUPERSEDED，preemption_reason 含 stop
+  - incident RECOVERED
+  evidence:
+    verdict: NOT_RUN
+  automation: command
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-033作业被外部停止后工作流收口
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
+  command:
+  - python3
+  - -m
+  - pytest
+  - -q
+  - tests/execution/test_workflow_lifecycle_scenarios.py::test_preempt033_a_stopped_job_winds_its_workflow_down_without_restarting_it
+  - tests/execution/test_workload_withdrawal.py
+  related_pytest: tests/execution/test_workload_withdrawal.py::test_a_withdrawn_dag_finishes_in_flight_work_releases_nodes_and_stops
+- id: GF-REGIONAL-PREEMPT-034
+  title: 新作业工作流等待节点修复：最多等待 300 秒，超时只执行 STOP_WORKLOADS 并 FAILED/ESCALATED
+  category: regional-preemption
+  level: integration
+  risk: non-destructive
+  problem: >-
+    新作业落在正被另一 incident 修复的节点上时，作业工作流在派发器里无界串行等待（曾出现 5 小时饥饿），且数据面收不到任何通知。
+  injection: >-
+    node-a 上有他人持有的 RUNNING reboot 工作流；为含 node-a 的作业开出 STOP→RESET→RESTART 工作流，先立即派发一次，再把 created_at 回拨 6 分钟后派发两次。
+  expected:
+  - 等待期内 filtered.node_busy=1，作业工作流保持 PENDING，不执行任何步骤
+  - 超时后计划被改写为只剩 STOP_WORKLOADS，参数含 termination_initiator_incident_id=作业 incident
+  - STOP 执行后工作流 FAILED，terminal_failure_reason 点名忙节点，incident ESCALATED
+  - 节点自己的工作流保持 RUNNING、持有者不变
+  - node_busy_timeouts_total 计 1
+  evidence:
+    verdict: NOT_RUN
+  automation: command
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-034新作业工作流等待节点修复
+  execution:
+    parallel_safe: true
+    environment: isolated
+    failure_scope: case
+    locks:
+    - resource: local-test
+      mode: shared
+  command:
+  - python3
+  - -m
+  - pytest
+  - -q
+  - tests/execution/test_workflow_lifecycle_scenarios.py::test_preempt034_a_job_on_a_node_under_repair_waits_then_stops_the_job
+  - tests/execution/test_node_busy_wait.py
+  related_pytest: tests/execution/test_node_busy_wait.py::test_past_the_wait_the_job_workflow_stops_the_job_and_fails
 - id: GF-REGIONAL-WORKLOAD-001
   title: 用 gpu-training-submit 提交三节点 managed PyTorchJob
   category: regional-workload

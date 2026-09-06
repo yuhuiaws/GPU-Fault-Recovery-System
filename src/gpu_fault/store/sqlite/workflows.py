@@ -1,17 +1,28 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
+
+from typing import Any, Callable, Collection, ContextManager
 
 from datetime import datetime, timedelta, timezone
 
 from gpu_fault.models import (
     FaultIncident,
+    IncidentState,
     WorkflowRequest,
     WorkflowStatus,
 )
-from gpu_fault.store.shared.errors import RemediationBudgetError, WorkflowLeaseError
+from gpu_fault.store.shared.time import utc_text as _utc_text
+from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
+from gpu_fault.store.shared.errors import (
+    WorkflowMergedError,
+    RemediationBudgetError,
+    WorkflowLeaseError,
+    StaleFencingTokenError,
+)
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
+    extend_remediation_budget,
     blocked_by_remediation_budget,
 )
 
@@ -26,6 +37,7 @@ class SqliteWorkflowMixin:
     _list: Callable[..., Any]
     _lock: Any
     _put: Callable[..., Any]
+    _state_transaction: Callable[[str], ContextManager[None]]
 
     def save_incident(self, incident: FaultIncident) -> None:
         with self._lock:
@@ -61,18 +73,72 @@ class SqliteWorkflowMixin:
         *,
         limit: int = 100,
         newest_first: bool = False,
+        dispatchable_at: datetime | None = None,
+        exclude_request_ids: Collection[str] = (),
+        after: WorkflowRequest | None = None,
     ) -> list[WorkflowRequest]:
-        workflows = sorted(
-            self._list("workflow"),
-            key=lambda item: (
-                item.updated_at,
-                item.request_id,
-            ),
-            reverse=newest_first,
-        )
+        if after is not None and dispatchable_at is None:
+            raise ValueError(
+                "the scan cursor (after) is only defined with dispatchable_at"
+            )
+        if dispatchable_at is not None:
+            # Dispatch mode orders by when the row became eligible, not by its
+            # last merge (F-A2a); the cursor pages that order (F-A2c).
+            workflows = sorted(
+                self._list("workflow"),
+                key=dispatch_order_key,
+                reverse=newest_first,
+            )
+            if after is not None:
+                anchor = dispatch_order_key(after)
+                workflows = [
+                    item for item in workflows if dispatch_order_key(item) > anchor
+                ]
+        else:
+            workflows = sorted(
+                self._list("workflow"),
+                key=lambda item: (
+                    item.updated_at,
+                    item.request_id,
+                ),
+                reverse=newest_first,
+            )
         if statuses is not None:
             workflows = [item for item in workflows if item.status in statuses]
+        if dispatchable_at is not None or exclude_request_ids:
+            workflows = [
+                item
+                for item in workflows
+                if held_reason(
+                    item,
+                    dispatchable_at=dispatchable_at or item.updated_at,
+                    exclude_request_ids=exclude_request_ids,
+                    lookup=lambda key: self._get_optional("workflow", key),
+                )
+                is None
+            ]
         return workflows[:limit]
+
+    def count_held_workflows(
+        self,
+        statuses: set[WorkflowStatus] | None,
+        *,
+        dispatchable_at: datetime,
+        exclude_request_ids: Collection[str] = (),
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in self._list("workflow"):
+            if statuses is not None and item.status not in statuses:
+                continue
+            reason = held_reason(
+                item,
+                dispatchable_at=dispatchable_at,
+                exclude_request_ids=exclude_request_ids,
+                lookup=lambda key: self._get_optional("workflow", key),
+            )
+            if reason is not None:
+                counts[reason] = counts.get(reason, 0) + 1
+        return counts
 
     def workflow_status_counts(self) -> dict[WorkflowStatus, int]:
         """Count every persisted workflow by status without decoding any.
@@ -93,6 +159,21 @@ class SqliteWorkflowMixin:
             counts[WorkflowStatus(status)] = int(count)
         return counts
 
+    def incident_state_counts(self) -> dict[IncidentState, int]:
+        """Count every persisted incident by state (server-side aggregate
+        for the /metrics incident gauge; ESCALATED is the operator queue)."""
+
+        rows = self._db.execute(
+            """
+            SELECT json_extract(payload, '$.state') AS state, COUNT(*)
+            FROM objects WHERE kind='incident' GROUP BY state
+            """
+        ).fetchall()
+        counts = {state: 0 for state in IncidentState}
+        for state, count in rows:
+            counts[IncidentState(state)] = int(count)
+        return counts
+
     def blocked_workflows_without_verified_restore(self) -> int:
         """Count the BLOCKED workflows whose GPU node is still held.
 
@@ -105,8 +186,9 @@ class SqliteWorkflowMixin:
 
         This is the same predicate as
         ``workflow_resolution.verified_restore_successor``, negated -- the
-        condition ``workflow_blocks_release`` and the release preflight already
-        use to decide whether a BLOCKED record still means a node is out of the
+        condition the release preflight
+        (``deploy/control-plane/regional/probes/workflow_safety.py``) already
+        uses to decide whether a BLOCKED record still means a node is out of the
         training pool. It recovers on its own the moment the successor
         workflow restores scheduling, without waiting for
         ``gpu-fault-admin workflow-reconcile``.
@@ -153,6 +235,67 @@ class SqliteWorkflowMixin:
         ).fetchone()
         return int(row[0])
 
+    def list_orphan_workflows(
+        self, *, created_before: datetime, limit: int = 1000
+    ) -> list[WorkflowRequest]:
+        """See ``ControlPlaneStore.list_orphan_workflows``.
+
+        One server-side predicate rather than a decode of the workflow table:
+        the gauge that reads it runs on every scrape. ``created_at`` is
+        compared as the ISO-8601 text the models serialize, whose order is
+        time order.
+        """
+
+        rows = self._db.execute(
+            """
+            SELECT w.payload
+            FROM objects w
+            LEFT JOIN objects i
+              ON i.kind='incident'
+             AND i.key=json_extract(w.payload, '$.incident_id')
+            WHERE w.kind='workflow'
+              AND json_extract(w.payload, '$.status')
+                  IN ('PENDING', 'SAFETY_PENDING')
+              AND json_extract(w.payload, '$.created_at') < ?
+              AND (
+                  i.key IS NULL
+                  OR COALESCE(
+                      json_extract(i.payload, '$.workflow_request_id'), ''
+                  ) <> w.key
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM objects s
+                  WHERE s.kind='workflow'
+                    AND json_extract(s.payload, '$.predecessor_workflow_id')=w.key
+              )
+            ORDER BY json_extract(w.payload, '$.created_at'), w.key
+            LIMIT ?
+            """,
+            (_utc_text(created_before), limit),
+        ).fetchall()
+        return [WorkflowRequest.model_validate_json(row[0]) for row in rows]
+
+    def list_incidents_with_missing_workflow(
+        self, *, limit: int = 1000
+    ) -> list[FaultIncident]:
+        rows = self._db.execute(
+            """
+            SELECT i.payload
+            FROM objects i
+            WHERE i.kind='incident'
+              AND COALESCE(json_extract(i.payload, '$.workflow_request_id'), '') <> ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM objects w
+                  WHERE w.kind='workflow'
+                    AND w.key=json_extract(i.payload, '$.workflow_request_id')
+              )
+            ORDER BY json_extract(i.payload, '$.created_at'), i.key
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [FaultIncident.model_validate_json(row[0]) for row in rows]
+
     def list_unhandled_failed_workflows(
         self, *, limit: int = 1000
     ) -> list[WorkflowRequest]:
@@ -175,12 +318,16 @@ class SqliteWorkflowMixin:
         *,
         node_ids: set[str] | None = None,
         job_id: str | None = None,
+        limit: int = ACTIVE_WORKFLOW_INCIDENTS_LIMIT,
     ) -> list[tuple[FaultIncident, WorkflowRequest]]:
         clauses = [
             "w.kind='workflow'",
             "i.kind='incident'",
-            "json_extract(w.payload, '$.status') "
-            "IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')",
+            "(json_extract(w.payload, '$.status') "
+            "IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')"
+            " OR (json_extract(w.payload, '$.status') = 'BLOCKED'"
+            " AND json_extract(w.payload, '$.blocked_kind')"
+            " IN ('NEEDS_OPERATOR', 'INTERNAL_ERROR')))",
             "json_extract(i.payload, '$.cluster_id')=?",
         ]
         parameters: list[object] = [cluster_id]
@@ -208,8 +355,8 @@ class SqliteWorkflowMixin:
             """
             + " AND ".join(clauses)
             + " ORDER BY json_extract(w.payload, '$.updated_at') DESC, "
-            "w.key DESC",
-            parameters,
+            "w.key DESC LIMIT ?",
+            [*parameters, limit],
         ).fetchall()
         return [
             (
@@ -288,12 +435,14 @@ class SqliteWorkflowMixin:
         remediation_budget_claims: dict[str, int] | None = None,
     ) -> WorkflowRequest:
         with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
+            # A budget refusal is a committed write (the workflow goes BLOCKED)
+            # followed by a raise, so it leaves the transaction block normally
+            # and raises after it.
             budget_error: RemediationBudgetError | None = None
-            try:
+            with self._state_transaction(f"workflow/{request_id}"):
                 workflow = self._get("workflow", request_id)
                 if workflow.fencing_token != fencing_token:
-                    raise ValueError("stale workflow fencing token")
+                    raise StaleFencingTokenError("stale workflow fencing token")
                 claimed_at = now or datetime.now(timezone.utc)
                 lease_active = (
                     workflow.execution_lease_expires_at is not None
@@ -320,36 +469,54 @@ class SqliteWorkflowMixin:
                             now=claimed_at,
                         )
                         self._put("workflow", request_id, workflow)
-                        self._db.execute("COMMIT")
                         budget_error = exc
-                if budget_error is not None:
-                    raise budget_error
-                new_epoch = (
-                    workflow.execution_owner_id != executor_id or not lease_active
-                )
-                workflow = workflow.model_copy(
-                    update={
-                        "execution_owner_id": executor_id,
-                        "execution_epoch": (
-                            workflow.execution_epoch + 1
-                            if new_epoch
-                            else max(workflow.execution_epoch, 1)
-                        ),
-                        "execution_lease_expires_at": (claimed_at + lease_duration),
-                        **(
-                            {"status": WorkflowStatus.RUNNING}
-                            if remediation_budget_claims is not None
-                            else {}
-                        ),
-                    }
-                )
-                self._put("workflow", request_id, workflow)
-                self._db.execute("COMMIT")
-                return workflow
-            except Exception:
                 if budget_error is None:
-                    self._db.execute("ROLLBACK")
-                raise
+                    new_epoch = (
+                        workflow.execution_owner_id != executor_id or not lease_active
+                    )
+                    workflow = workflow.model_copy(
+                        update={
+                            "execution_owner_id": executor_id,
+                            "execution_epoch": (
+                                workflow.execution_epoch + 1
+                                if new_epoch
+                                else max(workflow.execution_epoch, 1)
+                            ),
+                            "execution_lease_expires_at": (claimed_at + lease_duration),
+                            **(
+                                {"status": WorkflowStatus.RUNNING}
+                                if remediation_budget_claims is not None
+                                else {}
+                            ),
+                        }
+                    )
+                    self._put("workflow", request_id, workflow)
+            if budget_error is not None:
+                raise budget_error
+            return workflow
+
+    def extend_remediation_budget(
+        self,
+        request_id: str,
+        executor_id: str,
+        claims: dict[str, int],
+        *,
+        now: datetime | None = None,
+    ) -> WorkflowRequest:
+        with self._state_transaction(f"workflow/{request_id}"):
+            workflow = self._get("workflow", request_id)
+            at = now or datetime.now(timezone.utc)
+            if (
+                workflow.execution_owner_id != executor_id
+                or workflow.execution_lease_expires_at is None
+                or workflow.execution_lease_expires_at <= at
+            ):
+                raise WorkflowLeaseError("workflow execution lease is stale")
+            workflow = extend_remediation_budget(
+                workflow, self._list("workflow"), claims, now=at
+            )
+            self._put("workflow", request_id, workflow)
+            return workflow
 
     def renew_workflow_lease(
         self,
@@ -360,27 +527,21 @@ class SqliteWorkflowMixin:
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
     ) -> WorkflowRequest:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                workflow = self._get("workflow", request_id)
-                renewed_at = now or datetime.now(timezone.utc)
-                if (
-                    workflow.execution_owner_id != executor_id
-                    or workflow.execution_epoch != execution_epoch
-                    or workflow.execution_lease_expires_at is None
-                    or workflow.execution_lease_expires_at <= renewed_at
-                ):
-                    raise WorkflowLeaseError("workflow execution lease is stale")
-                workflow = workflow.model_copy(
-                    update={"execution_lease_expires_at": (renewed_at + lease_duration)}
-                )
-                self._put("workflow", request_id, workflow)
-                self._db.execute("COMMIT")
-                return workflow
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
+        with self._state_transaction(f"workflow/{request_id}"):
+            workflow = self._get("workflow", request_id)
+            renewed_at = now or datetime.now(timezone.utc)
+            if (
+                workflow.execution_owner_id != executor_id
+                or workflow.execution_epoch != execution_epoch
+                or workflow.execution_lease_expires_at is None
+                or workflow.execution_lease_expires_at <= renewed_at
+            ):
+                raise WorkflowLeaseError("workflow execution lease is stale")
+            workflow = workflow.model_copy(
+                update={"execution_lease_expires_at": (renewed_at + lease_duration)}
+            )
+            self._put("workflow", request_id, workflow)
+            return workflow
 
     def save_workflow_if_leased(
         self,
@@ -390,27 +551,23 @@ class SqliteWorkflowMixin:
         *,
         now: datetime | None = None,
     ) -> None:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                current = self._get("workflow", workflow.request_id)
-                checked_at = now or datetime.now(timezone.utc)
-                if (
-                    current.execution_owner_id != executor_id
-                    or current.execution_epoch != execution_epoch
-                    or current.execution_lease_expires_at is None
-                    or current.execution_lease_expires_at <= checked_at
-                ):
-                    raise WorkflowLeaseError("workflow execution lease is stale")
-                self._put(
-                    "workflow",
-                    workflow.request_id,
-                    workflow,
-                )
-                self._db.execute("COMMIT")
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
+        with self._state_transaction(f"workflow/{workflow.request_id}"):
+            current = self._get("workflow", workflow.request_id)
+            checked_at = now or datetime.now(timezone.utc)
+            if (
+                current.execution_owner_id != executor_id
+                or current.execution_epoch != execution_epoch
+                or current.execution_lease_expires_at is None
+                or current.execution_lease_expires_at <= checked_at
+            ):
+                raise WorkflowLeaseError("workflow execution lease is stale")
+            if current.merge_revision != workflow.merge_revision:
+                raise WorkflowMergedError("workflow was merged since it was read")
+            self._put(
+                "workflow",
+                workflow.request_id,
+                workflow,
+            )
 
     def save_workflow_and_incident_if_leased(
         self,
@@ -421,34 +578,30 @@ class SqliteWorkflowMixin:
         *,
         now: datetime | None = None,
     ) -> None:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                current = self._get("workflow", workflow.request_id)
-                checked_at = now or datetime.now(timezone.utc)
-                if (
-                    current.execution_owner_id != executor_id
-                    or current.execution_epoch != execution_epoch
-                    or current.execution_lease_expires_at is None
-                    or current.execution_lease_expires_at <= checked_at
-                ):
-                    raise WorkflowLeaseError("workflow execution lease is stale")
-                self._put(
-                    "workflow",
-                    workflow.request_id,
-                    workflow,
-                )
-                self._put(
-                    "incident",
-                    incident.incident_id,
-                    incident,
-                )
-                self._link(
-                    "incident_by_event",
-                    incident.event_id,
-                    incident.incident_id,
-                )
-                self._db.execute("COMMIT")
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
+        with self._state_transaction(f"workflow/{workflow.request_id}"):
+            current = self._get("workflow", workflow.request_id)
+            checked_at = now or datetime.now(timezone.utc)
+            if (
+                current.execution_owner_id != executor_id
+                or current.execution_epoch != execution_epoch
+                or current.execution_lease_expires_at is None
+                or current.execution_lease_expires_at <= checked_at
+            ):
+                raise WorkflowLeaseError("workflow execution lease is stale")
+            if current.merge_revision != workflow.merge_revision:
+                raise WorkflowMergedError("workflow was merged since it was read")
+            self._put(
+                "workflow",
+                workflow.request_id,
+                workflow,
+            )
+            self._put(
+                "incident",
+                incident.incident_id,
+                incident,
+            )
+            self._link(
+                "incident_by_event",
+                incident.event_id,
+                incident.incident_id,
+            )

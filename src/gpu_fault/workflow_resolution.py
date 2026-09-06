@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from gpu_fault.models import (
+    bounded_reasons,
     FaultIncident,
     IncidentState,
     PlanStatus,
@@ -12,6 +13,10 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepStatus,
+)
+from gpu_fault.operation_registry import (
+    CONTAINMENT_ONLY_OPERATIONS,
+    NODE_MUTATING_OPERATIONS,
 )
 from gpu_fault.retired_generation import (
     OPEN_REMOTE_STATUSES,
@@ -23,6 +28,7 @@ from gpu_fault.retired_generation import (
 )
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import WorkflowStore
+from gpu_fault.store.shared.errors import StaleWriteError
 
 if TYPE_CHECKING:
     from gpu_fault.regional import RemoteActionCommand
@@ -34,7 +40,9 @@ if TYPE_CHECKING:
 __all__ = [
     "OPEN_REMOTE_STATUSES",
     "RETIRED_GENERATION_STATUSES",
+    "SETTLED_INCIDENT_STATES",
     "abandoned_generation_successor",
+    "completed_containment_operations",
     "reconciled_restore_records",
     "restore_reconciliation_reasons",
     "retired_generation_audit",
@@ -43,8 +51,14 @@ __all__ = [
     "retired_generation_successor",
     "retirement_fences_out_dispatch",
     "verified_restore_successor",
-    "workflow_blocks_release",
+    "workflow_never_changed_a_node",
 ]
+
+# Incident states in which nobody is waiting on the incident's workflow to act:
+# it recovered, or it was handed to an operator. A BLOCKED workflow puts its
+# incident in ESCALATED (``coordinator._incident_state_for_workflow``), which is
+# the state the operator running ``workflow-reconcile`` is answering.
+SETTLED_INCIDENT_STATES = frozenset({IncidentState.RECOVERED, IncidentState.ESCALATED})
 
 
 def verified_restore_successor(
@@ -137,7 +151,54 @@ def abandoned_generation_successor(
         )
     ):
         return None
-    return retired_generation_successor(store, workflow)
+    successor = retired_generation_successor(store, workflow)
+    if successor is not None:
+        return successor
+    return _same_generation_twin_successor(store, workflow)
+
+
+def _same_generation_twin_successor(
+    store: WorkflowStore,
+    workflow: WorkflowRequest,
+) -> WorkflowRequest | None:
+    """The fourth shape (P1-80A): a twin at the *same* generation.
+
+    ``retired_generation_successor`` requires a strictly later generation
+    because a legitimate preemption or queued successor shares the token -- and
+    links back to its predecessor. A twin created by two families racing the
+    same incident shares the token too, but nothing links it: the incident
+    names the other record, nobody names this one as a predecessor. Nothing
+    dispatches, fences or sweeps it, so it is closed here. The predecessor link
+    check is what keeps a queued successor's pending predecessor safe.
+    """
+
+    if workflow.predecessor_workflow_id is not None:
+        # A queued successor is waiting on its own predecessor; it is that
+        # predecessor's business, not a twin.
+        return None
+    try:
+        incident = store.get_incident(workflow.incident_id)
+    except (KeyError, NotFoundError):
+        return None
+    successor_id = incident.workflow_request_id
+    if (
+        not successor_id
+        or successor_id == workflow.request_id
+        or workflow.fencing_token != incident.fencing_token
+    ):
+        return None
+    try:
+        successor: WorkflowRequest = store.get_workflow(successor_id)
+    except (KeyError, NotFoundError):
+        return None
+    if (
+        successor.incident_id != workflow.incident_id
+        or successor.fencing_token != incident.fencing_token
+        or successor.predecessor_workflow_id == workflow.request_id
+        or store.has_workflow_successor(workflow.request_id)
+    ):
+        return None
+    return successor
 
 
 def retirement_fences_out_dispatch(
@@ -176,11 +237,25 @@ def retirement_fences_out_dispatch(
     return retired_generation_successor(store, workflow) is not None
 
 
-def workflow_blocks_release(
-    store: WorkflowStore,
-    workflow: WorkflowRequest,
-) -> bool:
-    return verified_restore_successor(store, workflow) is None
+def workflow_never_changed_a_node(workflow: WorkflowRequest) -> bool:
+    """Whether the workflow completed no node-mutating operation (F-B4 (4)).
+
+    Containment-only operations -- a cordon, a quarantine taint -- do not count:
+    they change what the scheduler may place on the node, not the node, and the
+    incident that owns the isolation is what lifts it. A record that only ever
+    isolated, or did nothing at all before it blocked, has left nothing on the
+    node that a restore successor would have to undo.
+    """
+
+    return not (set(workflow.completed_operations) & NODE_MUTATING_OPERATIONS)
+
+
+def completed_containment_operations(workflow: WorkflowRequest) -> list[str]:
+    return sorted(
+        operation.value
+        for operation in set(workflow.completed_operations)
+        & CONTAINMENT_ONLY_OPERATIONS
+    )
 
 
 def restore_reconciliation_reasons(
@@ -216,10 +291,23 @@ def restore_reconciliation_reasons(
         reasons.append("workflow has an unknown provider action")
     if incident is None:
         reasons.append("incident is missing")
-    elif incident.state is not IncidentState.RECOVERED:
+    # The second eligible path (F-B4 (4)): a record that never changed a node
+    # needs no restore successor, because there is nothing to restore. It still
+    # needs its incident settled -- recovered elsewhere, or escalated to the
+    # operator now closing it -- and every gate below this block still applies,
+    # including the source-plan gate: a workflow that was never plan-driven has
+    # no plan to carry the reconciliation audit, and stays ineligible by design.
+    never_changed = successor is None and workflow_never_changed_a_node(workflow)
+    if incident is not None and never_changed:
+        if incident.state not in SETTLED_INCIDENT_STATES:
+            reasons.append(
+                f"incident is {incident.state.value}, still waiting on a workflow"
+            )
+    elif incident is not None and incident.state is not IncidentState.RECOVERED:
         reasons.append("incident is not RECOVERED")
     if successor is None:
-        reasons.append("workflow has no verified restore successor")
+        if not never_changed:
+            reasons.append("workflow has no verified restore successor")
     elif (
         incident is None
         or incident.workflow_request_id != successor.request_id
@@ -248,15 +336,30 @@ def restore_reconciliation_reasons(
 def reconciled_restore_records(
     workflow: WorkflowRequest,
     incident: FaultIncident,
-    successor: WorkflowRequest,
+    successor: WorkflowRequest | None,
     source_plan: RecoveryPlan,
     remote_commands: list[RemoteActionCommand],
     *,
     expected_fencing_token: int,
-    expected_workflow_updated_at: datetime,
+    expected_workflow_updated_at: datetime | None,
+    expected_execution_epoch: int | None = None,
     reference: str,
     reconciled_at: datetime,
 ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
+    """Terminalize a BLOCKED record, re-verifying every condition first.
+
+    The compare-and-set names the field that moved and both values, so a
+    refusal reads as "the generation changed" or "somebody claimed it" rather
+    than a generic "plan changed". ``fencing_token`` and ``execution_epoch`` are
+    the keys a re-plan or a claim moves and a merge does not; ``updated_at`` is
+    what the Store contract still hands in today and is honoured when given.
+
+    ``blocked_reasons`` is deliberately not appended to (P1-61D): it records why
+    the workflow blocked, the audit lives in ``preemption_reason`` and on the
+    incident, and the retired-generation sibling refuses to touch it for the
+    same reason.
+    """
+
     reasons = restore_reconciliation_reasons(
         workflow,
         incident,
@@ -265,35 +368,70 @@ def reconciled_restore_records(
         remote_commands,
         evaluated_at=reconciled_at,
     )
+    stale: list[str] = []
     if workflow.fencing_token != expected_fencing_token:
-        reasons.append("workflow fencing token changed")
-    if workflow.updated_at != expected_workflow_updated_at:
-        reasons.append("workflow changed after reconcile validation")
+        stale.append(
+            "workflow fencing token changed: expected "
+            f"{expected_fencing_token}, found {workflow.fencing_token}"
+        )
+    if (
+        expected_execution_epoch is not None
+        and workflow.execution_epoch != expected_execution_epoch
+    ):
+        stale.append(
+            "workflow execution epoch changed: expected "
+            f"{expected_execution_epoch}, found {workflow.execution_epoch}"
+        )
+    if (
+        expected_workflow_updated_at is not None
+        and workflow.updated_at != expected_workflow_updated_at
+    ):
+        stale.append(
+            "workflow updated_at changed after reconcile validation: expected "
+            f"{expected_workflow_updated_at.isoformat()}, found "
+            f"{workflow.updated_at.isoformat()}"
+        )
+    if stale:
+        # The record moved under the caller: a ``StaleWriteError`` (still a
+        # ``ValueError``) so a retry can tell it from an ineligible record.
+        raise StaleWriteError(
+            "workflow reconcile rejected: " + "; ".join([*reasons, *stale])
+        )
     if reasons:
         raise ValueError("workflow reconcile rejected: " + "; ".join(reasons))
-    audit = (
-        f"operator reconciliation {reference}: superseded {workflow.request_id} "
-        f"after verified restore {successor.request_id}"
-    )
+    if successor is not None:
+        audit = (
+            f"operator reconciliation {reference}: superseded {workflow.request_id} "
+            f"after verified restore {successor.request_id}"
+        )
+    else:
+        audit = (
+            f"operator reconciliation {reference}: closed {workflow.request_id}, "
+            "which completed no node-mutating operation, with its incident "
+            f"{incident.state.value}"
+        )
     updated_workflow = workflow.model_copy(
         update={
             "status": WorkflowStatus.SUPERSEDED,
-            "preempted_by_workflow_id": successor.request_id,
+            "preempted_by_workflow_id": (
+                successor.request_id if successor is not None else None
+            ),
             "preemption_reason": audit,
             "superseded_at": reconciled_at,
             "updated_at": reconciled_at,
-            "blocked_reasons": list(dict.fromkeys([*workflow.blocked_reasons, audit])),
         }
     )
     updated_incident = incident.model_copy(
         update={
-            "reasons": list(dict.fromkeys([*incident.reasons, audit])),
+            "reasons": bounded_reasons([*incident.reasons, audit]),
             "updated_at": reconciled_at,
         }
     )
     updated_plan = source_plan.model_copy(
         update={
-            "resolved_by_restore_workflow_id": successor.request_id,
+            "resolved_by_restore_workflow_id": (
+                successor.request_id if successor is not None else None
+            ),
             "reconciliation_reference": reference,
             "reconciled_at": reconciled_at,
         }

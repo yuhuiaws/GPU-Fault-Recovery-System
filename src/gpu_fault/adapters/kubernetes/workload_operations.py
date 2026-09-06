@@ -7,24 +7,6 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib import parse as urllib_parse
 
-from gpu_fault.execution import (
-    WorkflowStepContext,
-    WorkflowStepOutcome,
-)
-from gpu_fault.regional import RemoteEvidenceCaptureRequest
-from gpu_fault.telemetry import (
-    EvidenceKind,
-)
-from gpu_fault.hyperpod import (
-    HYPERPOD_JOB_AUTO_RESUME_ANNOTATION,
-    HyperPodRecoveryState,
-    HyperPodWorkloadRecoveryEvidence,
-)
-from gpu_fault.models import (
-    WorkflowStepStatus,
-)
-
-
 from gpu_fault.adapters.common import (
     ANNOTATION_EXECUTION_EPOCH,
     ANNOTATION_FENCING,
@@ -44,6 +26,22 @@ from gpu_fault.adapters.kubernetes.restart_source_guard import (
     restart_source_failure,
     workload_lifecycle_identity,
 )
+from gpu_fault.execution import (
+    WorkflowStepContext,
+    WorkflowStepOutcome,
+)
+from gpu_fault.hyperpod import (
+    HYPERPOD_JOB_AUTO_RESUME_ANNOTATION,
+    HyperPodRecoveryState,
+    HyperPodWorkloadRecoveryEvidence,
+)
+from gpu_fault.models import (
+    WorkflowStepStatus,
+)
+from gpu_fault.regional import RemoteEvidenceCaptureRequest
+from gpu_fault.telemetry import (
+    EvidenceKind,
+)
 
 
 class KubernetesWorkloadOperationsMixin:
@@ -53,6 +51,7 @@ class KubernetesWorkloadOperationsMixin:
     _read_workload: Callable[..., Any]
 
     _annotations: Callable[..., Any]
+    _avoid_node_ids: Callable[[WorkflowStepContext], list[str]]
     _declared_gpu_count: Callable[..., Any]
     _labels: Callable[..., Any]
     _metadata: Callable[..., Any]
@@ -363,6 +362,7 @@ class KubernetesWorkloadOperationsMixin:
                     int(context.step.parameters["restart_budget"]),
                     state.restart_count,
                     self._node_rebindings(context),
+                    avoid_node_ids=self._avoid_node_ids(context),
                 )
             if kind == "job":
                 if not suspend:
@@ -449,6 +449,7 @@ class KubernetesWorkloadOperationsMixin:
     ) -> WorkflowStepOutcome | None:
         previous_waiting = any(
             item.step_index == context.step_index
+            and item.operation is context.step.operation
             and item.status is WorkflowStepStatus.WAITING
             for item in context.workflow.step_executions
         )

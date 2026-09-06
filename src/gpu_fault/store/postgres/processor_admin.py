@@ -30,18 +30,33 @@ class PostgresProcessorAdminMixin:
         on_state: Callable[[bool, int | None], None],
         *,
         timeout_seconds: float = 1.0,
+        on_progress: Callable[[], int] | None = None,
+        stall_seconds: float = 5.0,
     ) -> None:
         """Wake a consumer when a queue row becomes pending.
 
         Notifications are hints, not state. The processor retains a
         polling fallback, so reconnects and PostgreSQL's best-effort
         delivery cannot strand work.
+
+        Shard ownership is tied to consumption (F-D11). The shard lock is
+        session-level on this LISTEN connection, so a process whose
+        consumer loop is wedged but whose listener is healthy would keep
+        the shard and swallow every wakeup for it. ``on_progress`` is a
+        counter the consumer advances; when payloads have been forwarded
+        for ``stall_seconds`` without it moving, the shard is unlocked and
+        reported as lost so a healthy process claims it within its next
+        attempt. No forwarded payloads means nothing was ignored, so an
+        idle owner keeps its shard. After giving a shard up this process
+        waits ``stall_seconds`` before competing for one again.
         """
 
         import psycopg
 
         if shard_count <= 0:
             raise ValueError("processor notification shard count must be positive")
+        if stall_seconds <= 0:
+            raise ValueError("processor notification stall window must be positive")
         shard_order = sorted(
             range(shard_count),
             key=lambda shard: hashlib.blake2b(
@@ -58,12 +73,16 @@ class PostgresProcessorAdminMixin:
                     connect_timeout=5,
                 ) as connection:
                     connection.execute("LISTEN gpu_fault_processor_queue")
-                    owned_shard = None
+                    owned_shard: int | None = None
                     last_claim_attempt = 0.0
+                    claim_not_before = 0.0
+                    progress_seen: int | None = None
+                    first_forward_at: float | None = None
                     while not stop_event.is_set():
                         monotonic = time.monotonic()
                         if (
                             owned_shard is None
+                            and monotonic >= claim_not_before
                             and monotonic - last_claim_attempt >= 2.0
                         ):
                             last_claim_attempt = monotonic
@@ -79,6 +98,10 @@ class PostgresProcessorAdminMixin:
                                 if row[0]:
                                     owned_shard = shard
                                     break
+                            progress_seen = (
+                                on_progress() if on_progress is not None else None
+                            )
+                            first_forward_at = None
                             on_state(True, owned_shard)
                         payloads = set()
                         for notification in connection.notifies(
@@ -91,8 +114,37 @@ class PostgresProcessorAdminMixin:
                             ):
                                 on_notification(notification.payload)
                                 payloads.add(notification.payload)
+                                if first_forward_at is None:
+                                    first_forward_at = time.monotonic()
                             if stop_event.is_set():
                                 break
+                        if owned_shard is None or on_progress is None:
+                            continue
+                        progress = on_progress()
+                        if progress != progress_seen:
+                            progress_seen = progress
+                            first_forward_at = None
+                            continue
+                        if (
+                            first_forward_at is None
+                            or time.monotonic() - first_forward_at < stall_seconds
+                        ):
+                            continue
+                        # Payloads were forwarded ``stall_seconds`` ago and
+                        # the consumer has not moved since: give the shard
+                        # to a process that will act on it.
+                        connection.execute(
+                            """
+                            SELECT pg_advisory_unlock(
+                                hashtextextended(%s, 0)
+                            )
+                            """,
+                            (f"gpu_fault_processor_notify/{owned_shard}",),
+                        )
+                        owned_shard = None
+                        first_forward_at = None
+                        claim_not_before = time.monotonic() + stall_seconds
+                        on_state(True, None)
             except Exception:
                 on_state(False, None)
                 if stop_event.wait(1.0):
@@ -356,6 +408,12 @@ class PostgresProcessorAdminMixin:
                     """,
                     (mode,),
                 )
+                # Replayed in both directions. A process whose 0.25 s mode
+                # cache still says ``dual`` after the switch to partitioned
+                # reads this table; left empty it answered depth 0 and that
+                # process admitted without limit for the cache window
+                # (F-D10). Filled, it holds the depth that was true at the
+                # switch -- stale, never zero.
                 cursor.execute("TRUNCATE gpu_fault_processor_queue_counts")
                 cursor.execute(
                     """
@@ -368,12 +426,10 @@ class PostgresProcessorAdminMixin:
                         now()
                     FROM gpu_fault_processor_queue
                     WHERE status IN ('PENDING', 'LEASED')
-                      AND %s='dual'
                     GROUP BY coalesce(
                         cluster_id, '__unscoped__'
                     )
-                    """,
-                    (mode,),
+                    """
                 )
                 cursor.execute("TRUNCATE gpu_fault_processor_priority_count_shards")
                 cursor.execute(
@@ -390,7 +446,7 @@ class PostgresProcessorAdminMixin:
                         coalesce(cluster_id, '__unscoped__'),
                         (
                             CASE
-                                WHEN priority=0 THEN 0
+                                WHEN priority <= 10 THEN 0
                                 WHEN priority <= 50 THEN 50
                                 ELSE 100
                             END

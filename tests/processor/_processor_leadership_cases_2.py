@@ -277,7 +277,7 @@ def test_processor_http_faults_use_cluster_microbatch(monkeypatch) -> None:
     batch_sizes = []
 
     def record_batch(requests, **kwargs):
-        if requests[0].queue_priority() == 0:
+        if requests[0].is_reserved_tier():
             batch_sizes.append(len(requests))
         return original(requests, **kwargs)
 

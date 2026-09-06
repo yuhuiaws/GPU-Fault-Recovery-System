@@ -22,6 +22,9 @@ def test_unhealthy_processor_fails_health_check_and_exports_metrics(
     token = "processor-deadline-token-" + "x" * 32
     app = create_app(ApplicationContext(execution_token=token))
     request = processor_request("/v1/workload-observations")
+    # One strike suffices here: the test is about the health surface, not
+    # the F-D7 threshold (covered in test_deadline_responsibility.py).
+    app.state.processor.deadline_exceeded_process_threshold = 1
     app.state.processor._mark_execution_deadline_exceeded(request)
 
     async def scenario():

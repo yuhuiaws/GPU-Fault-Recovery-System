@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     CompletionDecision,
+    DecisionStatus,
     DiagnosticRequest,
     EffectiveRuntimeProfile,
     NodeMarker,
@@ -252,6 +255,16 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
                 raise NotFoundError(f"{cluster_id}/{attempt_id}")
             return self._events[key]
 
+    @contextmanager
+    def _completion_transaction(self, event_key: str) -> Iterator[None]:
+        with self._lock:
+            yield
+
+    def completion_transaction(self, event_key: str) -> AbstractContextManager[None]:
+        # One process, one RLock: re-entrant, so the nested store writes the
+        # completion service makes inside it take the same lock again.
+        return self._completion_transaction(event_key)
+
     def save_decision(self, decision: CompletionDecision) -> None:
         with self._lock:
             self._decisions[decision.event_key] = decision
@@ -259,6 +272,50 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     def get_decision_by_event(self, event_key: str) -> CompletionDecision | None:
         with self._lock:
             return self._decisions.get(event_key)
+
+    def _decision_age_key(self, decision: CompletionDecision) -> datetime | None:
+        if not decision.diagnostic_request_id:
+            return None
+        request = self._diagnostics.get(decision.diagnostic_request_id)
+        return request.created_at if request is not None else None
+
+    def list_decisions_by_status(
+        self,
+        status: DecisionStatus,
+        *,
+        older_than: datetime | None = None,
+        limit: int = 100,
+    ) -> list[CompletionDecision]:
+        if limit < 1:
+            return []
+        with self._lock:
+            candidates = [
+                (self._decision_age_key(decision), decision)
+                for decision in self._decisions.values()
+                if decision.status is status
+            ]
+        if older_than is not None:
+            candidates = [
+                (created_at, decision)
+                for created_at, decision in candidates
+                if created_at is None or created_at <= older_than
+            ]
+        floor = datetime.min.replace(tzinfo=timezone.utc)
+        candidates.sort(
+            key=lambda item: (item[0] or floor, item[1].event_key),
+        )
+        return [decision for _created_at, decision in candidates[:limit]]
+
+    def decision_status_counts(self) -> dict[DecisionStatus, int]:
+        with self._lock:
+            counts = {status: 0 for status in DecisionStatus}
+            for decision in self._decisions.values():
+                counts[decision.status] += 1
+            return counts
+
+    def count_completion_events_without_decision(self) -> int:
+        with self._lock:
+            return sum(1 for key in self._events if key not in self._decisions)
 
     def get_decision_by_attempt(
         self, cluster_id: str, attempt_id: str

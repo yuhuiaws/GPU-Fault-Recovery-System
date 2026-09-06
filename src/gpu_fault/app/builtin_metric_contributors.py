@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Container, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app.metric_scan_cache import metric_scan_cache
 from gpu_fault.app.runtime import AppRuntime
@@ -10,6 +10,8 @@ from gpu_fault.collector_requirements import agent_is_current
 from gpu_fault.execution import ProductionExecutorConfig
 from gpu_fault.fleet_deployment import DeploymentStatus
 from gpu_fault.models import (
+    DecisionStatus,
+    IncidentState,
     NotificationStatus,
     WorkflowOperation,
     WorkflowRequest,
@@ -17,6 +19,11 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from gpu_fault.store.contracts import ControlPlaneStore
+
+
+# Upper bound on the rows either orphan inspection decodes per scrape; the
+# gauges saturate there rather than let a pathological table grow the render.
+ORPHAN_INSPECTION_LIMIT = 10_000
 
 
 def _escape_label(value: str) -> str:
@@ -38,6 +45,23 @@ def remote_command_metric_lines(
         lines.append(
             f'gpu_fault_remote_command_total{{status="{status_value}"}} {count}'
         )
+    # F-D12: the same counts per cluster, so one stuck cluster is not averaged
+    # into the fleet total the alerts read.
+    lines.extend(
+        [
+            "# HELP gpu_fault_remote_command_by_cluster_total Remote cluster "
+            "commands by cluster and status.",
+            "# TYPE gpu_fault_remote_command_by_cluster_total gauge",
+        ]
+    )
+    by_cluster_status: dict[str, dict[str, int]] = remote.get("by_cluster_status", {})
+    for cluster_id, statuses in sorted(by_cluster_status.items()):
+        for status_value, count in sorted(statuses.items()):
+            lines.append(
+                "gpu_fault_remote_command_by_cluster_total"
+                f'{{cluster_id="{_escape_label(cluster_id)}",'
+                f'status="{status_value}"}} {count}'
+            )
     lines.extend(
         [
             "# HELP gpu_fault_remote_command_oldest_unclaimed_seconds "
@@ -153,6 +177,293 @@ def policy_metric_lines(runtime: AppRuntime) -> list[str]:
             "gpu_fault_policy_unknown_product_total"
             f'{{product="{_escape_label(product)}"}} {count}'
         )
+    return lines
+
+
+def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
+    """Counters the dispatcher, executor, merge service and periodic runner
+    keep in memory (F-L1). Each is an alertable statement about the control
+    loop: a job stopped because its nodes stayed busy, a remediation that ran
+    out of lifetime, an event recorded instead of planned."""
+
+    ctx = runtime.context
+    dispatcher = getattr(ctx, "dispatcher", None)
+    executor = getattr(ctx, "workflow_executor", None)
+    orchestrator = getattr(ctx, "orchestrator", None)
+    merger = getattr(orchestrator, "_workflow_merger", None) if orchestrator else None
+    periodic = getattr(ctx, "periodic_runner", None)
+    lines: list[str] = []
+    dispatch_counters = (
+        (
+            "node_busy_timeouts_total",
+            "Job workflows failed by stopping the job because their nodes stayed under another remediation past the wait (F-N1).",
+        ),
+        (
+            "failure_handling_abandoned_total",
+            "Failed workflows whose failure handler kept raising and was given up on (F-A6).",
+        ),
+        (
+            "plan_sync_misses_total",
+            "Workflow status changes whose recovery plan row no longer existed (P2-80D).",
+        ),
+        (
+            "internal_errors_total",
+            "Dispatch attempts that raised an unrecognised error; the workflow stayed executable with a backoff (F-B4).",
+        ),
+    )
+    for name, help_text in dispatch_counters:
+        lines.extend(
+            [
+                f"# HELP gpu_fault_workflow_dispatch_{name} {help_text}",
+                f"# TYPE gpu_fault_workflow_dispatch_{name} counter",
+                f"gpu_fault_workflow_dispatch_{name} {getattr(dispatcher, name, 0) if dispatcher else 0}",
+            ]
+        )
+    lines.extend(
+        [
+            "# HELP gpu_fault_workflow_lifetime_exceeded_total Workflows failed because their hard lifetime passed (F-N1).",
+            "# TYPE gpu_fault_workflow_lifetime_exceeded_total counter",
+            f"gpu_fault_workflow_lifetime_exceeded_total {getattr(executor, 'lifetime_exceeded_total', 0) if executor else 0}",
+            "# HELP gpu_fault_workflow_merge_record_only_total Events recorded on an incident with no new steps, by reason (F-N1).",
+            "# TYPE gpu_fault_workflow_merge_record_only_total counter",
+        ]
+    )
+    for reason, attribute in (
+        ("covered_read_only", "absorbed_record_only_total"),
+        ("lifetime_exceeded", "lifetime_record_only_total"),
+        ("workload_withdrawn", "withdrawn_record_only_total"),
+    ):
+        value = getattr(merger, attribute, 0) if merger is not None else 0
+        lines.append(
+            f'gpu_fault_workflow_merge_record_only_total{{reason="{reason}"}} {value}'
+        )
+    store = getattr(ctx, "store", None)
+    archiver = getattr(ctx, "control_record_archiver", None)
+    lines.extend(
+        [
+            "# HELP gpu_fault_workflow_dispatch_deferred_total Rows a dispatch cycle scanned but never started because its deadline passed; they stayed PENDING (F-C7).",
+            "# TYPE gpu_fault_workflow_dispatch_deferred_total counter",
+            f"gpu_fault_workflow_dispatch_deferred_total {getattr(dispatcher, 'deferred_total', 0) if dispatcher else 0}",
+            "# HELP gpu_fault_workflow_branch_escalation_budget_refusals_total Node branches retired to an operator because the cluster remediation budget could not take the next rung (F-N1).",
+            "# TYPE gpu_fault_workflow_branch_escalation_budget_refusals_total counter",
+            f"gpu_fault_workflow_branch_escalation_budget_refusals_total {getattr(executor, 'branch_escalation_budget_refusals_total', 0) if executor else 0}",
+            "# HELP gpu_fault_health_signal_clock_regressions_total Host-health samples whose node timestamp went backwards while the control plane's clock moved on; judged on control-plane time (F-M2).",
+            "# TYPE gpu_fault_health_signal_clock_regressions_total counter",
+            f"gpu_fault_health_signal_clock_regressions_total {getattr(store, 'health_signal_clock_regressions_total', 0) if store is not None else 0}",
+            "# HELP gpu_fault_ingest_stale_event_link_repairs_total Duplicate-event fast paths that found a dangling incident or workflow pointer and rebuilt the chain instead of failing the event (F-B7).",
+            "# TYPE gpu_fault_ingest_stale_event_link_repairs_total counter",
+            f"gpu_fault_ingest_stale_event_link_repairs_total {getattr(store, 'stale_event_link_repairs', 0) if store is not None else 0}",
+            "# HELP gpu_fault_control_record_archive_withheld_total Incidents the archiver refused to archive, by safety reason (F-I1).",
+            "# TYPE gpu_fault_control_record_archive_withheld_total counter",
+        ]
+    )
+    withheld = (
+        getattr(archiver, "withheld_total", None) if archiver is not None else None
+    )
+    for reason, count in sorted((withheld or {}).items()):
+        lines.append(
+            "gpu_fault_control_record_archive_withheld_total"
+            f'{{reason="{_escape_label(reason)}"}} {count}'
+        )
+    lines.extend(_dispatch_pending_state_lines(ctx, dispatcher))
+    snapshot = periodic.metrics_snapshot() if periodic is not None else {}
+    lines.extend(_periodic_reconciliation_lines(snapshot))
+    lines.extend(
+        [
+            "# HELP gpu_fault_periodic_lease_errors_total Periodic-service task leases that could not be taken because of a store error (F-F1).",
+            "# TYPE gpu_fault_periodic_lease_errors_total counter",
+            f"gpu_fault_periodic_lease_errors_total {snapshot.get('periodic_lease_errors_total', 0)}",
+            "# HELP gpu_fault_periodic_job_errors_total Periodic jobs that raised and were skipped for the tick, by job (F-F1).",
+            "# TYPE gpu_fault_periodic_job_errors_total counter",
+        ]
+    )
+    for job, count in sorted(snapshot.get("periodic_job_errors_total", {}).items()):
+        lines.append(f'gpu_fault_periodic_job_errors_total{{job="{job}"}} {count}')
+    for name, help_text in (
+        (
+            "cleanup_rows_total",
+            "Rows removed or expired by the periodic cleanup, by job (F-F2).",
+        ),
+        (
+            "cleanup_budget_exhausted_total",
+            "Cleanup rounds a job ended still saturated because its share of the budget ran out (F-F2).",
+        ),
+        (
+            "cleanup_job_errors_total",
+            "Cleanup rounds a job ended early on a store error (F-F2).",
+        ),
+    ):
+        lines.extend(
+            [
+                f"# HELP gpu_fault_periodic_{name} {help_text}",
+                f"# TYPE gpu_fault_periodic_{name} counter",
+            ]
+        )
+        for job, count in sorted(snapshot.get(name, {}).items()):
+            lines.append(
+                f'gpu_fault_periodic_{name}{{job="{_escape_label(job)}"}} {count}'
+            )
+    return lines
+
+
+# Filter reasons a dispatch cycle always has a name for; exported at zero so
+# an alert can rate() them before the first row is ever set aside (F-L1).
+DISPATCH_FILTER_REASONS = ("batch_limit", "preemption_pending")
+
+
+def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
+    """What the dispatcher knows about rows it did not start (F-L1)."""
+
+    def read(name: str, default: float) -> float | int:
+        if dispatcher is None:
+            return default
+        value = getattr(dispatcher, name, default)
+        return value if isinstance(value, (int, float)) else default
+
+    lines = [
+        "# HELP gpu_fault_workflow_dispatch_preemption_pending_seen_total Dispatch cycles that saw a PENDING row set aside because a pre-emption on the same nodes was still open (F-A2).",
+        "# TYPE gpu_fault_workflow_dispatch_preemption_pending_seen_total counter",
+        f"gpu_fault_workflow_dispatch_preemption_pending_seen_total {read('preemption_pending_seen_total', 0)}",
+        "# HELP gpu_fault_workflow_pending_age_seconds_max Age of the oldest PENDING workflow the last dispatch cycle scanned (F-A5).",
+        "# TYPE gpu_fault_workflow_pending_age_seconds_max gauge",
+        f"gpu_fault_workflow_pending_age_seconds_max {read('pending_age_seconds_max', 0.0):g}",
+        "# HELP gpu_fault_workflow_pending_age_warnings_total Dispatch cycles whose oldest PENDING workflow was older than the warning threshold (F-A5).",
+        "# TYPE gpu_fault_workflow_pending_age_warnings_total counter",
+        f"gpu_fault_workflow_pending_age_warnings_total {read('pending_age_warnings_total', 0)}",
+        "# HELP gpu_fault_workflow_retired_generation_awaiting_operator Retired workflow generations the last dispatch cycle left for an operator instead of superseding (F-A5).",
+        "# TYPE gpu_fault_workflow_retired_generation_awaiting_operator gauge",
+        f"gpu_fault_workflow_retired_generation_awaiting_operator {read('retired_generation_awaiting_operator', 0)}",
+        "# HELP gpu_fault_workflow_dispatch_filtered_total Rows a dispatch cycle scanned and set aside, by reason, summed over the process (F-L1).",
+        "# TYPE gpu_fault_workflow_dispatch_filtered_total counter",
+    ]
+    filtered = getattr(dispatcher, "filtered_total", None)
+    totals: dict[str, int] = dict.fromkeys(DISPATCH_FILTER_REASONS, 0)
+    if isinstance(filtered, dict):
+        for reason, count in filtered.items():
+            totals[str(reason)] = int(count)
+    for reason, count in sorted(totals.items()):
+        lines.append(
+            "gpu_fault_workflow_dispatch_filtered_total"
+            f'{{reason="{_escape_label(reason)}"}} {count}'
+        )
+    return lines
+
+
+def _periodic_reconciliation_lines(snapshot: dict[str, object]) -> list[str]:
+    """The reconciliation jobs the periodic runner grew in batch 3: lease
+    reclaim (F-D5), the PENDING_TRIAGE watchdog (F-G2 (4)) and processor
+    counter drift (F-D10). The drift gauges are refreshed by the job, so a
+    scrape never counts the queue table."""
+
+    def read(name: str) -> int:
+        value = snapshot.get(name, 0)
+        return value if isinstance(value, int) else 0
+
+    return [
+        "# HELP gpu_fault_processor_expired_leases_reclaimed_total LEASED processor requests whose lease had lapsed and were handed back to PENDING by the periodic reclaim (F-D5).",
+        "# TYPE gpu_fault_processor_expired_leases_reclaimed_total counter",
+        f"gpu_fault_processor_expired_leases_reclaimed_total {read('processor_expired_leases_reclaimed_total')}",
+        "# HELP gpu_fault_completion_pending_triage_reconciled_total Decisions stuck in PENDING_TRIAGE past the deadline that the watchdog closed (F-G2).",
+        "# TYPE gpu_fault_completion_pending_triage_reconciled_total counter",
+        f"gpu_fault_completion_pending_triage_reconciled_total {read('completion_pending_triage_reconciled_total')}",
+        "# HELP gpu_fault_processor_counter_drift_abs Absolute gap between incomplete processor queue rows and the per-cluster counter table, as of the last drift scan (F-D10).",
+        "# TYPE gpu_fault_processor_counter_drift_abs gauge",
+        f"gpu_fault_processor_counter_drift_abs {read('processor_counter_drift_abs')}",
+        "# HELP gpu_fault_processor_counter_mismatched_clusters Clusters whose processor counter disagrees with their queue rows, as of the last drift scan (F-D10).",
+        "# TYPE gpu_fault_processor_counter_mismatched_clusters gauge",
+        f"gpu_fault_processor_counter_mismatched_clusters {read('processor_counter_mismatched_clusters')}",
+    ]
+
+
+def completion_state_metric_lines(runtime: AppRuntime) -> list[str]:
+    """Where the completion path and the incidents stand, as gauges (F-L1).
+
+    A decision that stays PENDING_TRIAGE is a triage that never reported; a
+    terminal event without a decision is the poisoned shape of P0-48B; the
+    ESCALATED incident bucket is the operator queue; a CRITICAL GPU finding
+    closed without an incident is the one deliberate exception of F-M1.
+    Each is a server-side count, never a decode of the rows.
+    """
+
+    store = runtime.context.store
+    lines = [
+        "# HELP gpu_fault_completion_decisions Completion decisions by status (F-G2).",
+        "# TYPE gpu_fault_completion_decisions gauge",
+    ]
+    decisions = store.decision_status_counts()
+    for status in DecisionStatus:
+        lines.append(
+            f'gpu_fault_completion_decisions{{status="{status.value}"}} '
+            f"{decisions.get(status, 0)}"
+        )
+    lines.extend(
+        [
+            "# HELP gpu_fault_completion_events_without_decision Terminal events with no completion decision row (P0-48B).",
+            "# TYPE gpu_fault_completion_events_without_decision gauge",
+            "gpu_fault_completion_events_without_decision "
+            f"{store.count_completion_events_without_decision()}",
+            "# HELP gpu_fault_incidents_by_state Fault incidents by state; ESCALATED is the operator queue.",
+            "# TYPE gpu_fault_incidents_by_state gauge",
+        ]
+    )
+    incidents = store.incident_state_counts()
+    for state in IncidentState:
+        lines.append(
+            f'gpu_fault_incidents_by_state{{state="{state.value}"}} '
+            f"{incidents.get(state, 0)}"
+        )
+    lines.extend(
+        [
+            "# HELP gpu_fault_gpu_findings_without_incident_total New CRITICAL GPU findings deliberately closed without an incident of their own, by reason (F-M1).",
+            "# TYPE gpu_fault_gpu_findings_without_incident_total counter",
+        ]
+    )
+    gpu_metrics = getattr(runtime.context, "gpu_metrics", None)
+    findings = getattr(gpu_metrics, "findings_without_incident", None)
+    reasons: dict[str, int] = {"suppressed_by_composite": 0}
+    if isinstance(findings, dict):
+        for reason, count in findings.items():
+            reasons[str(reason)] = int(count)
+    for reason, count in sorted(reasons.items()):
+        lines.append(
+            "gpu_fault_gpu_findings_without_incident_total"
+            f'{{reason="{_escape_label(reason)}"}} {count}'
+        )
+    return lines
+
+
+def postgres_pool_metric_lines(runtime: AppRuntime) -> list[str]:
+    """The role's connection demand against its pool, as a gauge (F-E5).
+
+    The guard used to be one startup WARNING that nobody sees during a rolling
+    release, and it undercounted the worker role so badly it never fired there.
+    """
+
+    estimate = getattr(runtime.context, "postgres_pool_capacity", None)
+    if estimate is None:
+        return []
+    lines = [
+        "# HELP gpu_fault_postgres_pool_max_size Configured per-process PostgreSQL pool ceiling.",
+        "# TYPE gpu_fault_postgres_pool_max_size gauge",
+        f"gpu_fault_postgres_pool_max_size {estimate.pool_max}",
+        "# HELP gpu_fault_postgres_pool_demand_connections Threads of this role that can hold a pooled connection at once, by consumer (F-E5).",
+        "# TYPE gpu_fault_postgres_pool_demand_connections gauge",
+    ]
+    for consumer, count in sorted(estimate.demand_by_consumer.items()):
+        lines.append(
+            "gpu_fault_postgres_pool_demand_connections"
+            f'{{consumer="{_escape_label(consumer)}"}} {count}'
+        )
+    lines.extend(
+        [
+            "# HELP gpu_fault_postgres_pool_oversubscription_ratio Pooled connection demand divided by the pool ceiling; above 1 callers queue on checkout (F-E5).",
+            "# TYPE gpu_fault_postgres_pool_oversubscription_ratio gauge",
+            f"gpu_fault_postgres_pool_oversubscription_ratio {estimate.oversubscription_ratio:g}",
+            "# HELP gpu_fault_postgres_unpooled_connections LISTEN connections opened beside the pool; they count against the server's max_connections, not the pool.",
+            "# TYPE gpu_fault_postgres_unpooled_connections gauge",
+            f"gpu_fault_postgres_unpooled_connections {estimate.unpooled_connections}",
+        ]
+    )
     return lines
 
 
@@ -312,6 +623,23 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     # the status gauge counts every workflow ever persisted, so its BLOCKED
     # bucket never falls just because the node came back.
     blocked_unreconciled = store.blocked_workflows_without_verified_restore()
+    # The orphan inspection (F-B3 (4)): bounded server-side reads. A PENDING
+    # record younger than the aggregation window plus the processor drain wait
+    # is still normal churn, so those are excluded before counting.
+    orchestrator = runtime.context.orchestrator
+    orphan_grace = timedelta(
+        seconds=orchestrator.multi_node_aggregation_window_max_seconds
+        + orchestrator.processor_drain_max_wait_seconds
+    )
+    orphan_workflows = len(
+        store.list_orphan_workflows(
+            created_before=datetime.now(timezone.utc) - orphan_grace,
+            limit=ORPHAN_INSPECTION_LIMIT,
+        )
+    )
+    dangling_incident_pointers = len(
+        store.list_incidents_with_missing_workflow(limit=ORPHAN_INSPECTION_LIMIT)
+    )
     step_statuses: Counter[tuple[str, str]] = Counter()
     terminal_durations: dict[str, list[float]] = defaultdict(list)
     milestone_durations: dict[str, list[float]] = defaultdict(list)
@@ -393,6 +721,17 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
             "still out of the training pool.",
             "# TYPE gpu_fault_workflow_blocked_unreconciled gauge",
             f"gpu_fault_workflow_blocked_unreconciled {blocked_unreconciled}",
+            "# HELP gpu_fault_orphan_workflows PENDING or SAFETY_PENDING "
+            "workflows past the aggregation window whose incident is gone or "
+            "names another workflow and which no successor names as "
+            "predecessor: nothing will dispatch, fence or sweep them (F-B3).",
+            "# TYPE gpu_fault_orphan_workflows gauge",
+            f"gpu_fault_orphan_workflows {orphan_workflows}",
+            "# HELP gpu_fault_incident_dangling_workflow_pointers Incidents "
+            "whose workflow_request_id names a workflow row that does not "
+            "exist (F-B3).",
+            "# TYPE gpu_fault_incident_dangling_workflow_pointers gauge",
+            f"gpu_fault_incident_dangling_workflow_pointers {dangling_incident_pointers}",
             "# HELP gpu_fault_workflow_scan_limit Workflows the step, duration "
             "and milestone families are allowed to read per scrape.",
             "# TYPE gpu_fault_workflow_scan_limit gauge",

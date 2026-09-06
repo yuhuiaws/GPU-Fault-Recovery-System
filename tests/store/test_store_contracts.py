@@ -58,7 +58,6 @@ SQLITE_INHERITED_PUBLIC = frozenset(
     {
         "abandon_telemetry_spool_claims",
         "claim_telemetry_spool",
-        "collector_ingestion_transaction",
         "complete_active_processor_requests_batch",
         "complete_telemetry_spool",
         "efa_traffic_state_key",
@@ -149,6 +148,7 @@ POSTGRES_INHERITED_PUBLIC = frozenset(
         "save_gpu_inventory_snapshot",
         "save_hyperpod_node_identity",
         "save_hyperpod_submission",
+        "amend_workflow",
         "save_incident_and_workflow",
         "save_notification_result",
         "save_plan",
@@ -167,6 +167,7 @@ SQLITE_PROCESSOR_QUEUE_PUBLIC = frozenset(
         "claim_active_processor_requests",
         "claim_processor_requests",
         "cleanup_completed_processor_requests",
+        "count_fault_rows_blocked_by_observation",
         "enqueue_processor_request",
         "get_processor_request",
         "has_incomplete_processor_requests",
@@ -189,6 +190,7 @@ SQLITE_PROCESSOR_LEASE_PUBLIC = frozenset(
         "release_processor_request",
         "renew_active_processor_request",
         "validate_processor_lane",
+        "reclaim_expired_processor_leases",
     }
 )
 
@@ -211,8 +213,10 @@ POSTGRES_PROCESSOR_PUBLIC = {
     PostgresProcessorClaimsMixin: frozenset(
         {
             "active_backlog_is_lane_blocked",
+            "claim_active_processor_query",
             "claim_active_processor_requests",
             "claim_processor_requests",
+            "count_fault_rows_blocked_by_observation",
         }
     ),
     PostgresProcessorCompletionMixin: frozenset(
@@ -229,6 +233,7 @@ POSTGRES_PROCESSOR_PUBLIC = {
             "release_processor_request",
             "renew_active_processor_request",
             "validate_processor_lane",
+            "reclaim_expired_processor_leases",
         }
     ),
     PostgresProcessorStorageMixin: frozenset(
@@ -251,6 +256,7 @@ TRANSACTIONAL_WORKFLOW_PUBLIC = frozenset(
         "merge_sxid_workflow",
         "reconcile_restored_workflow",
         "reconcile_retired_generation_workflow",
+        "amend_workflow",
         "save_incident_and_workflow",
     }
 )
@@ -289,6 +295,7 @@ MEMORY_PROCESSOR_QUEUE_PUBLIC = frozenset(
         "claim_active_processor_requests",
         "claim_processor_requests",
         "cleanup_completed_processor_requests",
+        "count_fault_rows_blocked_by_observation",
         "enqueue_processor_request",
         "get_processor_request",
         "has_incomplete_processor_requests",
@@ -315,6 +322,7 @@ MEMORY_PROCESSOR_LEASE_PUBLIC = frozenset(
         "release_processor_request",
         "renew_active_processor_request",
         "validate_processor_lane",
+        "reclaim_expired_processor_leases",
     }
 )
 
@@ -449,7 +457,7 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
         4: "9ce8369e79e881c566bc429c72a157a0e7fe6a2557bcf2b4d050f2565db2b947",
         5: "884820da9fdf5521dad40dffd8a40b1a3acf415de1871f563202eafd083ebb97",
     }
-    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 7
+    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 11
 
 
 def test_completion_cluster_groups_use_bounded_parallelism() -> None:
@@ -516,8 +524,12 @@ def test_postgres_schema_state_and_ddl_are_distinct_modules() -> None:
     from gpu_fault.store.postgres.ddl import create_postgres_schema
     from gpu_fault.store.postgres.schema_state import PostgresSchemaMixin
 
-    assert create_postgres_schema.__module__.endswith(".ddl")
-    assert PostgresSchemaMixin.__module__.endswith(".schema_state")
+    assert create_postgres_schema.__module__.endswith(".ddl"), (
+        'expected create_postgres_schema.__module__.endswith(".ddl") to be true'
+    )
+    assert PostgresSchemaMixin.__module__.endswith(".schema_state"), (
+        'expected PostgresSchemaMixin.__module__.endswith(".schema_state") to be true'
+    )
 
 
 @pytest.fixture(params=["memory", "sqlite", "postgres"])

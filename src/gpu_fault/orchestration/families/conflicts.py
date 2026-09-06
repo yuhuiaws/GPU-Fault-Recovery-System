@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
+    IncidentState,
+    lifetime_exceeded,
+    resolved_step_indexes,
     FaultIncident,
     WorkflowOperation,
     WorkflowRequest,
@@ -13,9 +16,17 @@ from gpu_fault.operation_registry import (
     OPERATION_RESOURCE_CLAIMS,
     TRANSIENT_GPU_INVENTORY_OPERATIONS,
 )
+from gpu_fault.store import NotFoundError
 
 
 class NodeConflictService:
+    EXECUTABLE_STATUSES = frozenset(
+        {
+            WorkflowStatus.PENDING,
+            WorkflowStatus.RUNNING,
+            WorkflowStatus.SAFETY_PENDING,
+        }
+    )
     TERMINAL_STATUSES = frozenset(
         {
             WorkflowStatus.SUCCEEDED,
@@ -62,7 +73,19 @@ class NodeConflictService:
         incident: FaultIncident | None,
         workflow: WorkflowRequest | None,
     ) -> tuple[FaultIncident | None, WorkflowRequest | None]:
-        if workflow is not None and workflow.status in cls.TERMINAL_STATUSES:
+        # Anything that is not PENDING / RUNNING / SAFETY_PENDING will never
+        # execute again on its own -- BLOCKED included. Merging a new fault into
+        # it absorbed the fault into a record nobody dispatches (P0-56A).
+        if workflow is not None and workflow.status not in cls.EXECUTABLE_STATUSES:
+            if (
+                lifetime_exceeded(workflow)
+                and incident is not None
+                and incident.state is not IncidentState.RECOVERED
+            ):
+                # Out of lifetime and with an operator (F-N1): the pair stays
+                # the merge target so the event is recorded on this incident
+                # instead of opening a new remediation.
+                return incident, workflow
             return None, None
         return incident, workflow
 
@@ -127,6 +150,14 @@ class NodeConflictService:
             for index, step in enumerate(workflow.official_steps)
             if step.operation is WorkflowOperation.VALIDATE_GPU
         }
-        if not validation - set(workflow.completed_step_indexes):
+        # A superseded validation will never run either (F-C2).
+        if not validation - set(resolved_step_indexes(workflow)):
             return None
-        return self.store.get_incident(workflow.incident_id), workflow
+        try:
+            incident = self.store.get_incident(workflow.incident_id)
+        except NotFoundError:
+            # Listed a moment ago, gone now. "No incumbent" is the safe answer:
+            # the finding takes the normal path and at worst repeats one
+            # exclusivity check, instead of failing the whole batch (P2-51H).
+            return None
+        return incident, workflow

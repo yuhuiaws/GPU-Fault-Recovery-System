@@ -74,19 +74,67 @@ def remediation_budget_claims(
     pending = [
         step
         for index, step in enumerate(steps)
-        if index not in completed
-        and step.operation in NODE_MUTATING_OPERATIONS
-        and step.operation is not WorkflowOperation.RESTORE_GPU_SERVICES
+        if index not in completed and _budgeted(step.operation)
     ]
     if not pending or workflow.pending_failure_step_index is not None:
         return {}
     if any(
-        index in completed and step.operation in NODE_MUTATING_OPERATIONS
+        index in completed and _budgeted(step.operation)
         for index, step in enumerate(steps)
     ):
         return {}
 
-    cluster_id = incident.cluster_id
+    return _scopes_for_steps(policy, incident.cluster_id, pending)
+
+
+def escalation_budget_claims(
+    policy: RemediationBudgetPolicy,
+    workflow: WorkflowRequest,
+    incident: FaultIncident,
+    steps: Sequence[WorkflowStepSpec],
+) -> dict[str, int]:
+    """Scopes an in-place branch escalation adds to a workflow's held budget.
+
+    The workflow claimed its concurrency budget for the plan it was born
+    with. A rung appended later (RESET_GPU -> RESTART_NODE -> REPLACE_NODE)
+    may start a resource class or touch a failure domain that budget never
+    counted; those scopes -- and only those -- have to be taken before the
+    rung runs (F-N1 per-branch settlement).
+    """
+
+    mutating = [step for step in steps if _budgeted(step.operation)]
+    if not mutating:
+        return {}
+    held = set(workflow.remediation_budget_claims)
+    return {
+        scope: limit
+        for scope, limit in _scopes_for_steps(
+            policy, incident.cluster_id, mutating
+        ).items()
+        if scope not in held
+    }
+
+
+# Isolation is budgeted like a mutation: it is containment-only for the
+# scheduler, but a false-positive cascade must not quarantine nodes without
+# limit (F-C5). Cordon and release alone stay free.
+_ISOLATION_RESOURCE_CLASS = "NODE_ISOLATION"
+
+
+def _budgeted(operation: WorkflowOperation) -> bool:
+    if operation is WorkflowOperation.QUARANTINE:
+        return True
+    return (
+        operation in NODE_MUTATING_OPERATIONS
+        and operation is not WorkflowOperation.RESTORE_GPU_SERVICES
+    )
+
+
+def _scopes_for_steps(
+    policy: RemediationBudgetPolicy,
+    cluster_id: str,
+    pending: Sequence[WorkflowStepSpec],
+) -> dict[str, int]:
     claims = {
         "region": policy.region_limit,
         f"cluster:{cluster_id}": policy.cluster_limit,
@@ -103,6 +151,9 @@ def remediation_budget_claims(
             raw = step.parameters.get(key)
             values = raw if isinstance(raw, list) else [raw]
             failure_domains.update(str(value) for value in values if value)
+        if step.operation is WorkflowOperation.QUARANTINE:
+            resource_classes.add(_ISOLATION_RESOURCE_CLASS)
+            continue
         resource_classes.update(OPERATION_RESOURCE_CLAIMS[step.operation])
         if not OPERATION_RESOURCE_CLAIMS[step.operation]:
             scope = OPERATION_REGISTRY[step.operation].scope

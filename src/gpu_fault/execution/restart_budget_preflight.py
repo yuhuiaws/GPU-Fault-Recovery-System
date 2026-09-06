@@ -3,19 +3,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from gpu_fault.models import (
+    resolved_step_indexes,
     FaultIncident,
     IncidentState,
     WorkflowOperation,
     WorkflowExecutionRequest,
     WorkflowRequest,
     WorkflowStatus,
+    WorkflowStepExecution,
     WorkflowStepSpec,
+    WorkflowStepStatus,
 )
 from gpu_fault.store import NotFoundError
 from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.execution.config import OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
 from gpu_fault.execution.remediation_budget import remediation_budget_claims
 import gpu_fault.execution.step_bounds as step_bounds
 
@@ -46,13 +50,85 @@ class ClaimedWorkflowPreparation:
     result: Any | None = None
 
 
-def _reservation_id(
+# Which step list a reservation belongs to. Safety and official steps share
+# indexes (P0-62D), so a restart at index N in each phase is two different
+# steps and must hold two different reservations (F-C9).
+ReservationPhase = Literal["official", "safety"]
+
+
+def reservation_phase(workflow: WorkflowRequest) -> ReservationPhase:
+    """The phase whose steps this record executes, as the release sees it."""
+
+    return "safety" if workflow.executes_safety_steps else "official"
+
+
+def reservation_id(
     workflow: WorkflowRequest,
     step_index: int,
+    *,
+    phase: ReservationPhase = "official",
 ) -> str:
-    return (
-        f"{workflow.request_id}/{step_index}/{WorkflowOperation.RESTART_WORKLOAD.value}"
+    """The reservation a RESTART_WORKLOAD step holds on its job's budget.
+
+    Also the adapter's idempotency key for that step: the restart adapter
+    reserves under its key, and the two have to agree or a step would take a
+    second reservation. The official form is the historical
+    ``<workflow>/<index>/RESTART_WORKLOAD`` so rows reserved before the phase
+    existed still match; only the safety phase carries a discriminator.
+    """
+
+    operation = WorkflowOperation.RESTART_WORKLOAD.value
+    if phase == "safety":
+        return f"{workflow.request_id}/safety/{step_index}/{operation}"
+    return f"{workflow.request_id}/{step_index}/{operation}"
+
+
+_reservation_id = reservation_id
+
+
+def claim_deadlines(
+    workflow: WorkflowRequest,
+    now: datetime,
+    *,
+    timeout_seconds: float,
+    job_lifetime_seconds: float,
+    node_lifetime_seconds: float,
+    operator_acknowledgement_seconds: float | None = None,
+) -> tuple[datetime, datetime]:
+    """``(execution_deadline, lifetime_deadline_at)`` for a claim (F-N1).
+
+    The lifetime is stamped once, at the first claim, from the workflow's kind
+    (job vs single node) and inherited afterwards. The execution deadline is
+    the usual per-claim budget capped by the lifetime. A workflow that contains
+    an operator-acknowledgement step (CHECK_MECHANICALS) waits on a human, so
+    both deadlines are floored at ``now + operator_acknowledgement_seconds``:
+    a one-hour lifetime would otherwise fail the very step whose meaning is
+    "wait for the inspection".
+    """
+
+    lifetime = workflow.lifetime_deadline_at
+    if lifetime is None:
+        is_job = workflow.dag_enabled or any(
+            step.operation is WorkflowOperation.RESTART_WORKLOAD
+            for step in workflow.official_steps
+        )
+        lifetime = now + timedelta(
+            seconds=job_lifetime_seconds if is_job else node_lifetime_seconds
+        )
+    budget = timedelta(seconds=timeout_seconds)
+    execution = (
+        now + budget
+        if (workflow.dag_enabled or workflow.execution_deadline is None)
+        else workflow.execution_deadline
     )
+    if operator_acknowledgement_seconds is not None and any(
+        step.operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
+        for step in workflow.official_steps
+    ):
+        floor = now + timedelta(seconds=operator_acknowledgement_seconds)
+        lifetime = max(lifetime, floor)
+        execution = max(execution, floor)
+    return min(execution, lifetime), lifetime
 
 
 def reserve_restart_budgets(
@@ -60,10 +136,19 @@ def reserve_restart_budgets(
     workflow: WorkflowRequest,
     incident: FaultIncident,
     steps: Sequence[WorkflowStepSpec],
+    *,
+    phase: ReservationPhase | None = None,
 ) -> RestartBudgetPreflightFailure | None:
-    """Reserve every pending restart before any workflow adapter runs."""
+    """Reserve every pending restart before any workflow adapter runs.
 
-    completed = set(workflow.completed_step_indexes)
+    ``phase`` names the list ``steps`` came from; it defaults to the one the
+    record executes.
+    """
+
+    if phase is None:
+        phase = reservation_phase(workflow)
+    # A superseded restart will never run, so it needs no reservation (F-C2).
+    completed = set(resolved_step_indexes(workflow))
     for step_index, step in enumerate(steps):
         if (
             step.operation is not WorkflowOperation.RESTART_WORKLOAD
@@ -106,7 +191,7 @@ def reserve_restart_budgets(
                 cluster_id,
                 job_id,
                 budget,
-                _reservation_id(workflow, step_index),
+                reservation_id(workflow, step_index, phase=phase),
             )
         except (TypeError, ValueError) as exc:
             return RestartBudgetPreflightFailure(
@@ -161,14 +246,22 @@ def prepare_claimed_workflow(
             incident,
             steps,
         ),
-    ).model_copy(
+    )
+    deadlines = claim_deadlines(
+        workflow,
+        datetime.now(timezone.utc),
+        timeout_seconds=executor.config.workflow_execution_timeout_seconds,
+        job_lifetime_seconds=executor.config.job_workflow_lifetime_seconds,
+        node_lifetime_seconds=executor.config.node_workflow_lifetime_seconds,
+        operator_acknowledgement_seconds=(
+            executor.config.operator_acknowledgement_timeout_seconds
+        ),
+    )
+    workflow = workflow.model_copy(
         update={
             "status": WorkflowStatus.RUNNING,
-            "execution_deadline": (
-                workflow.execution_deadline
-                or datetime.now(timezone.utc)
-                + timedelta(seconds=executor.config.workflow_execution_timeout_seconds)
-            ),
+            "execution_deadline": deadlines[0],
+            "lifetime_deadline_at": deadlines[1],
             "updated_at": datetime.now(timezone.utc),
         }
     )
@@ -193,6 +286,7 @@ def prepare_claimed_workflow(
         workflow,
         incident,
         steps,
+        phase="safety" if is_safety else "official",
     )
     return ClaimedWorkflowPreparation(
         workflow=workflow,
@@ -226,22 +320,14 @@ def fail_restart_preflight(
         failure.step_index,
         failure.outcome,
     )
-    now = datetime.now(timezone.utc)
-    workflow = workflow.model_copy(
-        update={
-            "status": WorkflowStatus.FAILED,
-            "execution_owner_id": None,
-            "execution_lease_expires_at": None,
-            "updated_at": now,
-        }
+    result = executor._terminalize(
+        workflow,
+        incident,
+        WorkflowStatus.FAILED,
+        execution_epoch,
+        reason=failure.outcome.error,
+        incident_state=IncidentState.ESCALATED,
     )
-    incident = incident.model_copy(
-        update={
-            "state": IncidentState.ESCALATED,
-            "updated_at": now,
-        }
-    )
-    executor._save_terminal(workflow, incident, execution_epoch)
     LOGGER.warning(
         "workflow failed restart budget preflight before adapter "
         "execution: workflow=%s step=%s error=%s",
@@ -249,11 +335,37 @@ def fail_restart_preflight(
         failure.step_index,
         failure.outcome.error,
     )
-    return executor._result(
-        workflow,
-        incident,
-        error=failure.outcome.error,
-    )
+    return result
+
+
+# The bounds in ``step_bounds`` stamp these when they, not the adapter, end a
+# step; a RESTART_WORKLOAD record carrying one never reached a submission.
+_WAITING_CAP_DETAIL = "step_waiting_timeout_seconds"
+
+
+def _restart_never_left_the_gate(
+    record: WorkflowStepExecution,
+    *,
+    now: datetime,
+    waiting_ttl: timedelta | None,
+) -> bool:
+    """Does this RESTART_WORKLOAD record show a restart that never happened?
+
+    The restart adapter answers WAITING only before it submits anything -- an
+    approval is pending, or the incident it depends on is not recovered -- so a
+    wait that outlived the step's cap, or that the cap already turned into a
+    failure, holds budget for a restart nobody made (F-C9). A remote command
+    that a cluster executor is running is the one shape that says nothing
+    about submission, and keeps its reservation.
+    """
+
+    if str(record.details.get("remote_status") or "") == "RUNNING":
+        return False
+    if record.status is WorkflowStepStatus.WAITING:
+        return waiting_ttl is not None and now - record.started_at >= waiting_ttl
+    if record.status is WorkflowStepStatus.FAILED:
+        return _WAITING_CAP_DETAIL in record.details
+    return False
 
 
 def release_unattempted_restart_reservations(
@@ -262,26 +374,50 @@ def release_unattempted_restart_reservations(
     steps: Sequence[WorkflowStepSpec] | None = None,
     *,
     release_step_indexes: set[int] | None = None,
+    waiting_ttl: timedelta | None = None,
+    now: datetime | None = None,
 ) -> None:
-    """Release reservations for restart steps no adapter ever attempted."""
+    """Release reservations for restart steps no adapter ever attempted.
+
+    A step whose only record is a wait older than ``waiting_ttl`` -- or one the
+    waiting cap already failed -- counts as unattempted too: the adapter never
+    submitted its restart (see ``_restart_never_left_the_gate``). Without a
+    ``waiting_ttl`` a WAITING record keeps its reservation.
+    """
 
     selected = (
         list(steps)
         if steps is not None
         else (
             workflow.safety_steps
-            if workflow.blocked_reasons
+            if workflow.executes_safety_steps
             else workflow.official_steps
         )
     )
-    attempted = {item.step_index for item in workflow.step_executions}
+    phase = reservation_phase(workflow)
+    moment = now if now is not None else datetime.now(timezone.utc)
+    # Only a RESTART_WORKLOAD record counts as "attempted": a safety-phase
+    # step at the same index is a different step (P0-62D). The last record at
+    # an index is the live one (see ``step_bounds.previous_execution``).
+    latest: dict[int, WorkflowStepExecution] = {}
+    for item in workflow.step_executions:
+        if item.operation is WorkflowOperation.RESTART_WORKLOAD:
+            latest[item.step_index] = item
     completed = set(workflow.completed_step_indexes)
     forced = release_step_indexes or set()
     for step_index, step in enumerate(selected):
         if (
             step.operation is not WorkflowOperation.RESTART_WORKLOAD
-            or (step_index in attempted and step_index not in forced)
             or step_index in completed
+        ):
+            continue
+        record = latest.get(step_index)
+        if (
+            record is not None
+            and step_index not in forced
+            and not _restart_never_left_the_gate(
+                record, now=moment, waiting_ttl=waiting_ttl
+            )
         ):
             continue
         parameters = step.parameters
@@ -291,7 +427,7 @@ def release_unattempted_restart_reservations(
             store.release_job_restart(
                 str(parameters["cluster_id"]),
                 str(parameters["job_id"]),
-                _reservation_id(workflow, step_index),
+                reservation_id(workflow, step_index, phase=phase),
             )
         except NotFoundError:
             continue

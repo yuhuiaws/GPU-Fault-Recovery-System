@@ -263,7 +263,7 @@ def test_postgres_enqueue_notifies_waiting_consumers(store) -> None:
     assert states[0] == (True, 0)
     notification = json.loads(payloads[0])
     assert "partition" not in notification
-    assert notification["priority"] == 0
+    assert notification["priority"] == 10
     assert notification["path"] == "/v1/gpu-events/xid"
     assert notification["request_id"]
 

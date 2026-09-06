@@ -162,7 +162,10 @@ def test_the_abandoned_generation_is_terminalized_with_its_successor_named() -> 
     assert resolved.preempted_by_workflow_id == CURRENT
     assert resolved.superseded_at is not None
     assert "advanced to generation 4" in (resolved.preemption_reason or "")
-    assert any("generation 4" in reason for reason in resolved.blocked_reasons), (
+    # The audit trail lives in ``preemption_reason``; ``blocked_reasons`` is the
+    # executor's safety-step switch and must not carry prose (P0-61A).
+    assert resolved.blocked_reasons == []
+    assert "generation 4" in (resolved.preemption_reason or ""), (
         "the audit trail has to survive on the record, not only in a log line"
     )
 
@@ -278,8 +281,14 @@ STARTED_SHAPES = [
             },
         ),
         # The generation comparison is strict, and the successor has to really
-        # be the incident's current workflow for this incident.
-        ("its generation is not behind", {"abandoned_token": 4}),
+        # be the incident's current workflow for this incident. An equal
+        # generation is left alone only while something links the pair: an
+        # *unlinked* same-generation twin is closed too (P1-80A, pinned in
+        # tests/store/test_merge_executor_isolation.py).
+        (
+            "its generation is not behind and the successor links back to it",
+            {"abandoned_token": 4, "successor_predecessor": ABANDONED},
+        ),
         ("its generation is ahead", {"abandoned_token": 5}),
         ("the incident still names it", {"incident_points_at": ABANDONED}),
         (

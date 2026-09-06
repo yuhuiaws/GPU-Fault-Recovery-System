@@ -6,6 +6,7 @@ from typing import Callable
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
+    bounded_reasons,
     FaultIncident,
     IncidentState,
     RecoveryAction,
@@ -114,7 +115,7 @@ class DrainOperationService:
                 finding.node_id,
                 set(finding.gpu_uuids),
             )
-            if disposition == "ABSORB":
+            if disposition in {"ABSORB", "ABSORB_RECORD_ONLY"}:
                 merged = target_workflow.model_copy(update={"updated_at": now})
             else:
                 merged = self.brancher.append_parallel_job_branch_successor(
@@ -144,16 +145,11 @@ class DrainOperationService:
                     "state": IncidentState.ACTION_PENDING,
                     "workflow_request_id": merged.request_id,
                     "fencing_token": merged.fencing_token,
-                    "reasons": list(
-                        dict.fromkeys(
-                            [
-                                *target_incident.reasons,
-                                (
-                                    f"{finding.node_id}: "
-                                    f"{finding_name}: {finding.reason}"
-                                ),
-                            ]
-                        )
+                    "reasons": bounded_reasons(
+                        [
+                            *target_incident.reasons,
+                            (f"{finding.node_id}: {finding_name}: {finding.reason}"),
+                        ]
                     ),
                     "updated_at": now,
                 }
@@ -217,7 +213,7 @@ class DrainOperationService:
                 allow_job_branch_merge=False,
             )
             winner_is_candidate = False
-            if disposition in {"ABSORB", "WIDEN_IN_PLACE"}:
+            if disposition in {"ABSORB", "ABSORB_RECORD_ONLY", "WIDEN_IN_PLACE"}:
                 merged = target_workflow.model_copy(update={"updated_at": now})
             elif disposition == "REPLACE_IN_PLACE":
                 winner_is_candidate = True
@@ -279,16 +275,11 @@ class DrainOperationService:
                         if winner_is_candidate
                         else target_incident.effective_action
                     ),
-                    "reasons": list(
-                        dict.fromkeys(
-                            [
-                                *target_incident.reasons,
-                                (
-                                    f"{finding.node_id}: "
-                                    f"{finding_name}: {finding.reason}"
-                                ),
-                            ]
-                        )
+                    "reasons": bounded_reasons(
+                        [
+                            *target_incident.reasons,
+                            (f"{finding.node_id}: {finding_name}: {finding.reason}"),
+                        ]
                     ),
                     "updated_at": now,
                 }

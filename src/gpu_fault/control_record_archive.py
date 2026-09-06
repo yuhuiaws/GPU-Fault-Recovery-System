@@ -3,12 +3,42 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
+
+from gpu_fault.models import WorkflowStatus
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ArchiveSafetyError(RuntimeError):
     pass
+
+
+# Archivable is a whitelist of statuses that will never execute or be acted
+# on again. BLOCKED is deliberately absent: a blocked workflow is held for
+# reconciliation or an operator, and archiving its incident would delete the
+# record before anyone reconciled it (F-I1, F-B4).
+ARCHIVABLE_WORKFLOW_STATUSES = frozenset(
+    {
+        WorkflowStatus.SUCCEEDED,
+        WorkflowStatus.SUPERSEDED,
+    }
+)
+_ARCHIVABLE_STATUS_VALUES = sorted(
+    status.value for status in ARCHIVABLE_WORKFLOW_STATUSES
+)
+# A FAILED workflow is archivable only once its failure handler ran
+# (``failure_handled_at``); before that an escalation may still be owed
+# (F-B4 (5)). Statuses in the whitelist plus this predicate are "inactive".
+_INACTIVE_WORKFLOW_SQL = """(
+    payload->>'status' = ANY(%s)
+    OR (
+        payload->>'status' = 'FAILED'
+        AND payload->>'failure_handled_at' IS NOT NULL
+    )
+)"""
 
 
 RELATED_RECORDS_SQL = """
@@ -96,6 +126,9 @@ class ControlRecordArchiver:
 
             s3_client = boto3.client("s3")
         self.s3 = s3_client
+        # Refusals by reason. A retention that is permanently withheld used
+        # to be invisible; this is what the metrics contributor exports.
+        self.withheld_total: dict[str, int] = {}
 
     @staticmethod
     def _bundle(cursor, incident_id: str) -> tuple[bytes, list[tuple]]:
@@ -103,12 +136,14 @@ class ControlRecordArchiver:
             """
             SELECT count(*) FROM gpu_fault_objects
             WHERE kind='workflow' AND payload->>'incident_id'=%s
-              AND payload->>'status' IN ('PENDING','RUNNING','SAFETY_PENDING')
+              AND NOT """
+            + _INACTIVE_WORKFLOW_SQL
+            + """
             """,
-            (incident_id,),
+            (incident_id, _ARCHIVABLE_STATUS_VALUES),
         )
         if cursor.fetchone()[0]:
-            raise ArchiveSafetyError("incident has active workflow")
+            raise ArchiveSafetyError("incident has non-terminal workflow")
         cursor.execute(
             """
             SELECT count(*) FROM gpu_fault_objects
@@ -240,28 +275,31 @@ class ControlRecordArchiver:
                     FROM gpu_fault_objects i
                     WHERE i.kind='incident'
                       AND (i.payload->>'updated_at')::timestamptz < %s
-                      AND EXISTS (
-                        SELECT 1 FROM gpu_fault_objects w
-                        WHERE w.kind='workflow'
-                          AND w.payload->>'incident_id'=i.key
-                      )
                       AND NOT EXISTS (
                         SELECT 1 FROM gpu_fault_objects w
                         WHERE w.kind='workflow'
                           AND w.payload->>'incident_id'=i.key
-                          AND w.payload->>'status' IN
-                              ('PENDING','RUNNING','SAFETY_PENDING')
+                          AND NOT """
+                    + _INACTIVE_WORKFLOW_SQL.replace("payload", "w.payload")
+                    + """
                       )
                     ORDER BY (i.payload->>'updated_at')::timestamptz,i.key
                     LIMIT %s
                     """,
-                    (cutoff, limit),
+                    (cutoff, _ARCHIVABLE_STATUS_VALUES, limit),
                 )
                 candidates = [row[0] for row in cursor.fetchall()]
         archived = []
         for incident_id in candidates:
             try:
                 archived.append(self.archive_one(incident_id))
-            except ArchiveSafetyError:
+            except ArchiveSafetyError as exc:
+                reason = str(exc)
+                self.withheld_total[reason] = self.withheld_total.get(reason, 0) + 1
+                LOGGER.warning(
+                    "control record archive withheld incident %s: %s",
+                    incident_id,
+                    reason,
+                )
                 continue
         return archived

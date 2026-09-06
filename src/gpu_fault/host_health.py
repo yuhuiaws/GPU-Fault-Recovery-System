@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import logging
@@ -47,6 +49,9 @@ class HostTelemetryBatch(StrictModel):
     cluster_id: str = Field(min_length=1)
     node_id: str = Field(min_length=1)
     observed_at: datetime
+    # When the control plane accepted this batch (F-M2). Sustained-signal
+    # windows are measured on it; ``observed_at`` is the node's clock.
+    received_at: datetime | None = None
     samples: list[HostMetricSample]
     collection_errors: list[str] = Field(default_factory=list)
     runtime_profile_version: str | None = None
@@ -757,7 +762,9 @@ class NodeHealthPolicy:
                 )
             )
         self.store.observe_telemetry_metrics(latest_metrics)
-        emitted = self.store.claim_health_signal_transitions(transitions)
+        emitted = self.store.claim_health_signal_transitions(
+            transitions, received_at=batch.received_at
+        )
         findings.extend(
             finding
             for finding, emit in zip(transition_findings, emitted, strict=True)
@@ -1221,7 +1228,7 @@ class NodeHealthPolicy:
                     -item[4],
                 ),
             )
-            event_id = f"log-{self._safe(entry.entry_id)}"
+            event_id = self._log_event_id(batch, entry)
             findings.append(
                 NodeHealthFinding(
                     finding_id=f"finding-{event_id}",
@@ -1241,6 +1248,29 @@ class NodeHealthPolicy:
                 )
             )
         return findings
+
+    @classmethod
+    def _log_event_id(cls, batch: NodeLogBatch, entry: NodeLogEntry) -> str:
+        """The identity of one node-log finding, decided here and not on the node.
+
+        ``log-<entry_id>`` trusted the collector's id for the whole identity. A
+        training-log entry was ``sha256(path:offset)`` and every rank of a
+        distributed job writes the same path on its own node, so two nodes'
+        faults at the same offset were one event: the second node hit the first
+        node's incident in the duplicate fast path and never got a workflow
+        (P0-38A). The cluster and node are part of the digest, and the readable
+        prefix is for operators only -- ``_safe`` folds separators, so the
+        prefix alone could spell ``a-b``/``c`` and ``a``/``b-c`` the same way.
+        """
+
+        digest = hashlib.sha256(
+            json.dumps(
+                [batch.cluster_id, batch.node_id, entry.entry_id],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        return f"log-{cls._safe(batch.cluster_id)}-{cls._safe(batch.node_id)}-{digest}"
 
     @staticmethod
     def _safe(value: str) -> str:

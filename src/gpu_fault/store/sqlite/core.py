@@ -86,9 +86,38 @@ class SqliteCoreMixin:
             default=str,
         )
 
+    # How many ``_state_transaction`` entries are nested inside the open
+    # transaction; names the savepoint each nested entry opens.
+    _savepoint_depth: int = 0
+
     @contextmanager
     def _state_transaction(self, _lock_key: str) -> Iterator[None]:
+        """One write transaction, re-entrant within the process lock.
+
+        The outermost entry is a ``BEGIN IMMEDIATE`` transaction. An entry made
+        while one is open (``collector_ingestion_transaction`` or
+        ``completion_transaction`` around the store's own writes) is a savepoint
+        of it: it commits or rolls back with the outer transaction, and its own
+        failure undoes only its writes so the caller can catch and go on. The
+        lock is an ``RLock`` and every transaction is opened under it, so the
+        shared connection never sees two threads' transactions interleave.
+        """
+
         with self._lock:
+            if self._db.in_transaction:
+                name = f"gpu_fault_sp_{self._savepoint_depth}"
+                self._savepoint_depth += 1
+                self._db.execute(f"SAVEPOINT {name}")
+                try:
+                    yield
+                    self._db.execute(f"RELEASE SAVEPOINT {name}")
+                except Exception:
+                    self._db.execute(f"ROLLBACK TO SAVEPOINT {name}")
+                    self._db.execute(f"RELEASE SAVEPOINT {name}")
+                    raise
+                finally:
+                    self._savepoint_depth -= 1
+                return
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 yield

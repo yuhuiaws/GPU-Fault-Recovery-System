@@ -13,6 +13,7 @@ from gpu_fault.processor import (
 )
 from gpu_fault.store.contracts import ProcessorQueueStats
 from gpu_fault.store.shared.processor_helpers import (
+    fault_rows_blocked_by_observation as _fault_rows_blocked_by_observation,
     incomplete_observation_scope_keys as _incomplete_observation_scope_keys,
     pending_fault_scope_keys as _pending_fault_scope_keys,
 )
@@ -26,6 +27,7 @@ class SqliteProcessorQueueMixin:
     _get: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _list: Callable[..., Any]
+    _lock: Any
     _put: Callable[..., Any]
     _state_transaction: Callable[..., Any]
 
@@ -65,6 +67,8 @@ class SqliteProcessorQueueMixin:
                         for item in self._list("processor_request")
                         if item.status is ProcessorRequestStatus.PENDING
                         and item.ordering_key() == request.ordering_key()
+                        and item.path == request.path
+                        and item.coalescable()
                     ),
                     None,
                 )
@@ -93,7 +97,7 @@ class SqliteProcessorQueueMixin:
             if len(incomplete) >= max_depth:
                 return None, "global"
             if (
-                request.queue_priority() != 0
+                not request.is_reserved_tier()
                 and len(incomplete) >= max_depth - reserved_fault_depth
             ):
                 return None, "global_reserved"
@@ -103,7 +107,7 @@ class SqliteProcessorQueueMixin:
             if cluster_depth >= max_cluster_depth:
                 return None, "cluster"
             if (
-                request.queue_priority() != 0
+                not request.is_reserved_tier()
                 and cluster_depth >= max_cluster_depth - reserved_cluster_fault_depth
             ):
                 return None, "cluster_reserved"
@@ -154,7 +158,7 @@ class SqliteProcessorQueueMixin:
                 ProcessorRequestStatus.PENDING,
                 ProcessorRequestStatus.LEASED,
             }
-            and item.queue_priority() == 0
+            and item.is_reserved_tier()
             for item in self._list("processor_request")
         )
 
@@ -224,7 +228,7 @@ class SqliteProcessorQueueMixin:
                     deferred_strict_lanes=deferred_strict_lanes,
                 )
             ]
-            observation_scope_keys = _incomplete_observation_scope_keys(items)
+            observation_scope_keys = _incomplete_observation_scope_keys(items, now)
             eligible_items = [
                 item
                 for item in eligible_items
@@ -269,6 +273,11 @@ class SqliteProcessorQueueMixin:
                 claimed.append(value)
             return claimed
 
+    def count_fault_rows_blocked_by_observation(self, *, now: datetime) -> int:
+        with self._lock:
+            items = self._list("processor_request")
+        return _fault_rows_blocked_by_observation(items, now)
+
     def claim_active_processor_requests(
         self,
         owner_id: str,
@@ -293,7 +302,7 @@ class SqliteProcessorQueueMixin:
                     deferred_strict_lanes=deferred_strict_lanes,
                 )
             ]
-            observation_scope_keys = _incomplete_observation_scope_keys(items)
+            observation_scope_keys = _incomplete_observation_scope_keys(items, now)
             eligible_items = [
                 item
                 for item in eligible_items

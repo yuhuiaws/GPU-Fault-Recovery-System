@@ -23,15 +23,23 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import (
+    WorkflowOperation,
     WorkflowRequest,
     WorkflowStepExecution,
     WorkflowStepSpec,
     WorkflowStepStatus,
+    execution_matches_step,
+    execution_phase,
 )
-from gpu_fault.execution.models import WorkflowStepOutcome
 
 LOGGER = logging.getLogger(__name__)
+
+
+# Compensation that restores what the workflow itself stopped. It never
+# escalates and it is the only thing allowed to start after the deadline.
+DEADLINE_EXEMPT_COMPENSATION = frozenset({WorkflowOperation.RESTORE_GPU_SERVICES})
 
 
 def workflow_deadline_failure(
@@ -49,16 +57,32 @@ def workflow_deadline_failure(
     terminalizing from a watchdog -- skips all three.
     """
 
-    deadline = workflow.execution_deadline
-    if deadline is None:
+    if step.operation in DEADLINE_EXEMPT_COMPENSATION:
+        # The undo of a quiesce that already ran is owed even past the
+        # deadline; failing it here would leave GPU services stopped on a
+        # node handed to an operator, and count the same workflow twice.
         return None
     now = datetime.now(timezone.utc)
-    if now < deadline:
+    lifetime = workflow.lifetime_deadline_at
+    lifetime_hit = lifetime is not None and now >= lifetime
+    deadline = workflow.execution_deadline
+    if lifetime_hit:
+        # The remediation's hard lifetime (F-N1) is the stronger verdict: it is
+        # reported as such so neither the branch escalator nor the hardware
+        # escalation plans another rung -- this record goes to an operator.
+        deadline = lifetime
+    if deadline is None or now < deadline:
         return None
     overdue = int((now - deadline).total_seconds())
+    what = "workflow lifetime" if lifetime_hit else "workflow execution deadline"
+    if lifetime_hit:
+        counter = getattr(executor, "lifetime_exceeded_total", None)
+        if counter is not None:
+            executor.lifetime_exceeded_total = counter + 1
     LOGGER.error(
-        "workflow execution deadline exceeded, failing step: workflow=%s "
-        "step=%s/%s deadline=%s overdue_seconds=%s",
+        "%s exceeded, failing step: workflow=%s step=%s/%s deadline=%s "
+        "overdue_seconds=%s",
+        what,
         workflow.request_id,
         index,
         step.operation.value,
@@ -72,7 +96,7 @@ def workflow_deadline_failure(
     try:
         cancellation = executor.store.cancel_remote_commands_for_workflow(
             workflow.request_id,
-            reason="workflow execution deadline exceeded",
+            reason=f"{what} exceeded",
         )
     except Exception as exc:  # noqa: BLE001 - the deadline still has to land
         LOGGER.exception(
@@ -81,13 +105,14 @@ def workflow_deadline_failure(
         )
         cancellation = f"{type(exc).__name__}: {exc}"
     return WorkflowStepOutcome.failed(
-        "workflow execution deadline exceeded at "
+        f"{what} exceeded at "
         f"{deadline.isoformat()} ({overdue}s overdue) before step "
         f"{index}/{step.operation.value}",
         details={
             "workflow_execution_deadline": deadline.isoformat(),
             "workflow_deadline_overdue_seconds": overdue,
             "workflow_deadline_remote_command_cancellation": cancellation,
+            "workflow_lifetime_exceeded": lifetime_hit,
         },
     )
 
@@ -177,11 +202,13 @@ def record_attempt(
     function because that is the only way the preserved value reaches the store.
     """
 
+    phase = execution_phase(workflow)
     previous = previous_execution(workflow, step, index)
     execution = WorkflowStepExecution(
         step_index=index,
         operation=step.operation,
         status=outcome.status,
+        phase=phase,
         adapter_operation_id=outcome.adapter_operation_id,
         error=outcome.error,
         details=outcome.details or {},
@@ -189,7 +216,26 @@ def record_attempt(
             previous.started_at if previous is not None else datetime.now(timezone.utc)
         ),
     )
-    executions = [item for item in workflow.step_executions if item.step_index != index]
+    # A step's identity is (phase, index, operation) (F-C2 / P0-62D). What gets
+    # replaced is exactly this step's own record -- a legacy record without a
+    # phase counts as this step's. Records at this index for another phase or
+    # another legitimate operation are different steps and stay. A record whose
+    # operation matches neither phase at this index is a stale rebound (the
+    # index now hosts another operation) and is dropped.
+    legitimate = {
+        steps[index].operation
+        for steps in (workflow.official_steps, workflow.safety_steps)
+        if index < len(steps)
+    }
+    executions = [
+        item
+        for item in workflow.step_executions
+        if item.step_index != index
+        or (
+            not execution_matches_step(item, index, step.operation, phase)
+            and item.operation in legitimate
+        )
+    ]
     executions.append(execution)
     return workflow.model_copy(
         update={
@@ -213,11 +259,12 @@ def previous_execution(
     for entirely different operations.
     """
 
+    phase = execution_phase(workflow)
     return next(
         (
             item
             for item in reversed(workflow.step_executions)
-            if item.step_index == index and item.operation is step.operation
+            if execution_matches_step(item, index, step.operation, phase)
         ),
         None,
     )

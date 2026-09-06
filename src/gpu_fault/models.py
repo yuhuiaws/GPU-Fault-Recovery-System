@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -106,6 +107,11 @@ class PlanStatus(StrEnum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    # A plan whose workflow was replaced by a later generation, or is held for
+    # an operator, did not fail; recording it as FAILED alarmed on cleanup
+    # and contradicted the dispatcher's own reporting rule (P1-71D).
+    SUPERSEDED = "SUPERSEDED"
+    BLOCKED = "BLOCKED"
 
 
 class WorkloadState(StrEnum):
@@ -128,6 +134,9 @@ class HealthSignalState(StrictModel):
     observed_at: datetime
     active_since: datetime | None = None
     notified: bool | None = None
+    # Control-plane time of the last accepted sample (F-M2). Durations and
+    # ordering run on it when present; ``observed_at`` is the node's clock.
+    clock_at: datetime | None = None
 
 
 class EfaTrafficSignal(StrEnum):
@@ -213,6 +222,51 @@ class WorkflowStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     SUPERSEDED = "SUPERSEDED"
+
+
+# The statuses the dispatcher scans and the executor accepts. Everything else
+# (SUCCEEDED, FAILED, SUPERSEDED and BLOCKED) will never execute again on its
+# own, so nothing may be merged into such a record (F-B4).
+EXECUTABLE_WORKFLOW_STATUSES = frozenset(
+    {
+        WorkflowStatus.PENDING,
+        WorkflowStatus.SAFETY_PENDING,
+        WorkflowStatus.RUNNING,
+    }
+)
+
+
+class BlockedKind(StrEnum):
+    """Why a workflow is BLOCKED; set wherever the status is written (F-B4).
+
+    ``SAFETY_SETTLED``: the safety steps ran to completion, the plan ended the
+    way it was meant to. ``NEEDS_OPERATOR``: compilation left something an
+    operator has to decide (policy block, no executable owner, ...).
+    ``INTERNAL_ERROR``: the dispatcher hit an error that proves the record
+    itself cannot be executed.
+    """
+
+    SAFETY_SETTLED = "SAFETY_SETTLED"
+    NEEDS_OPERATOR = "NEEDS_OPERATOR"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+
+# BLOCKED rows that still hold their node and their successors: an operator
+# has to act before anything else may touch what they touched (F-A4). A
+# settled safety plan releases both; a legacy row without a kind keeps the
+# pre-F-B4 semantics (released) so nothing written before the field existed
+# can pin a successor forever.
+OCCUPYING_BLOCKED_KINDS = frozenset(
+    {BlockedKind.NEEDS_OPERATOR, BlockedKind.INTERNAL_ERROR}
+)
+
+
+def workflow_is_open(status: WorkflowStatus, blocked_kind: BlockedKind | None) -> bool:
+    """Whether a workflow in ``status`` still gates successors and node use."""
+
+    if status in EXECUTABLE_WORKFLOW_STATUSES:
+        return True
+    return status is WorkflowStatus.BLOCKED and blocked_kind in OCCUPYING_BLOCKED_KINDS
 
 
 class WorkflowStepStatus(StrEnum):
@@ -568,12 +622,26 @@ class WorkflowStepSpec(StrictModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     depends_on_step_indexes: list[int] = Field(default_factory=list)
     branch_id: str | None = None
+    # The nodes a job-workflow branch was created for. Branch identity reads
+    # this, not ``node_ids``: widening a host-level step onto another node
+    # must not make that node's lookups collapse onto this branch (F-B6 (2)).
+    # Empty on rows written before the field existed; callers fall back to
+    # ``node_ids`` then.
+    branch_node_ids: list[str] = Field(default_factory=list)
+
+
+# Which step list a record belongs to. Safety and official steps share
+# indexes, so a step's identity is (phase, step_index, operation) (F-C2).
+StepPhase = Literal["official", "safety"]
 
 
 class WorkflowStepExecution(StrictModel):
     step_index: int = Field(ge=0)
     operation: WorkflowOperation
     status: WorkflowStepStatus
+    # None on records written before the phase existed; such a record answers
+    # for either phase (dual read) until it is replaced by a stamped one.
+    phase: StepPhase | None = None
     adapter_operation_id: str | None = None
     error: str | None = None
     details: dict[str, Any] = Field(default_factory=dict)
@@ -621,6 +689,11 @@ class WorkflowRequest(StrictModel):
     preempt_predecessor: bool = False
     preempted_by_workflow_id: str | None = None
     preemption_reason: str | None = None
+    # Set by the merge transaction that created a stronger successor with
+    # ``preempt_predecessor`` (F-C1): this row is about to be superseded, so
+    # the dispatcher must not start it while the executor works out the safe
+    # boundary. Cleared when the row reaches a terminal status.
+    preemption_pending_by_workflow_id: str | None = None
     inherited_step_indexes: list[int] = Field(default_factory=list)
     quiesce_handoff_from_workflow_id: str | None = None
     superseded_at: datetime | None = None
@@ -630,15 +703,44 @@ class WorkflowRequest(StrictModel):
     status: WorkflowStatus
     official_action: str | None = None
     fencing_token: int = Field(ge=1)
+    # Bumped by every merge into an existing workflow row; the leased writers
+    # compare it so an executor copy taken before a merge cannot erase the
+    # merged targets (F-B1).
+    merge_revision: int = Field(default=0, ge=0)
     safety_steps: list[WorkflowStepSpec] = Field(default_factory=list)
     official_steps: list[WorkflowStepSpec] = Field(default_factory=list)
     blocked_reasons: list[str] = Field(default_factory=list)
+    blocked_kind: BlockedKind | None = None
+    # F-N1: per-node escalation bookkeeping for a multi-branch job workflow.
+    # Keyed by node id; counts the in-place rungs already taken.
+    branch_escalation_counts: dict[str, int] = Field(default_factory=dict)
+    # Branch ids whose escalation ladder is exhausted. The job-restart join
+    # must not run while this is non-empty; the workflow ends FAILED.
+    exhausted_branch_ids: list[str] = Field(default_factory=list)
+    # Hard lifetime of this remediation (F-N1). Stamped at the first claim
+    # from the workflow's kind, inherited along the escalation chain. At the
+    # deadline the workflow fails and escalates to an operator; later events
+    # for the same scope are recorded on the incident, not re-planned.
+    lifetime_deadline_at: datetime | None = None
+    # F-N1 §7: the training job this workflow was repairing was stopped by
+    # someone else. In-flight work finishes, touched nodes are released,
+    # nothing new starts, the job is not restarted.
+    workload_withdrawn_at: datetime | None = None
+    workload_withdrawn_reason: str | None = None
+    # F-N1 §8: when set, the workflow ends FAILED with this reason once its
+    # (rewritten) steps complete, instead of SUCCEEDED.
+    terminal_failure_reason: str | None = None
+    # True when this record was compiled to run its ``safety_steps`` (it was
+    # created SAFETY_PENDING). Explicit so that a warning appended to
+    # ``blocked_reasons`` can never switch the executor's step set (F-C8).
+    safety_only: bool = False
     completed_operations: list[WorkflowOperation] = Field(default_factory=list)
     completed_step_indexes: list[int] = Field(default_factory=list)
     superseded_step_indexes: list[int] = Field(default_factory=list)
     pending_failure_step_index: int | None = Field(default=None, ge=0)
     pending_failure_error: str | None = None
     failure_handled_at: datetime | None = None
+    failure_handling_attempts: int = Field(default=0, ge=0)
     step_executions: list[WorkflowStepExecution] = Field(default_factory=list)
     execution_owner_id: str | None = None
     execution_epoch: int = Field(default=0, ge=0)
@@ -652,6 +754,14 @@ class WorkflowRequest(StrictModel):
     aggregation_max_deadline: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def executes_safety_steps(self) -> bool:
+        """Whether the executor runs ``safety_steps`` rather than
+        ``official_steps``. SAFETY_PENDING implies it for records written
+        before ``safety_only`` existed."""
+
+        return self.safety_only or self.status is WorkflowStatus.SAFETY_PENDING
 
 
 class RestartAuthorization(StrictModel):
@@ -683,6 +793,73 @@ class WorkflowExecutionResult(StrictModel):
     error: str | None = None
 
 
+def lifetime_exceeded(workflow: "WorkflowRequest", now: datetime | None = None) -> bool:
+    """Whether the workflow's hard lifetime has passed (F-N1).
+
+    An unstamped workflow (never claimed) has no lifetime yet and is never
+    exceeded.
+    """
+
+    if workflow.lifetime_deadline_at is None:
+        return False
+    return (now or datetime.now(timezone.utc)) >= workflow.lifetime_deadline_at
+
+
+# Upper bound on ``FaultIncident.reasons``. Every merged event appends its
+# reasons; a long-lived incident (an hour of correlated faults, a node that
+# keeps re-reporting) grew the list without bound and squeezed the row (F-J6).
+INCIDENT_REASONS_LIMIT = 200
+
+
+def bounded_reasons(
+    values: Iterable[str], *, limit: int = INCIDENT_REASONS_LIMIT
+) -> list[str]:
+    """Deduplicated reasons within ``limit``: the first half of the budget
+    keeps the reasons the incident opened with, the rest the most recent."""
+
+    unique = list(dict.fromkeys(values))
+    if len(unique) <= limit:
+        return unique
+    head = limit // 2
+    return [*unique[:head], *unique[-(limit - head) :]]
+
+
+def resolved_step_indexes(workflow: "WorkflowRequest") -> frozenset[int]:
+    """Steps that will never run again: completed or superseded (F-C2).
+
+    A superseded step is skipped by the executor exactly like a completed one,
+    so every "is this step still pending?" question must use this set. It is
+    *not* the set of steps whose effects took place -- for that (coverage,
+    inherited containment, unrestored quiesce) read ``completed_step_indexes``.
+    """
+
+    return frozenset(workflow.completed_step_indexes) | frozenset(
+        workflow.superseded_step_indexes
+    )
+
+
+def execution_phase(workflow: "WorkflowRequest") -> StepPhase:
+    """The phase whose steps this record executes right now (F-C2)."""
+
+    return "safety" if workflow.executes_safety_steps else "official"
+
+
+def execution_matches_step(
+    execution: WorkflowStepExecution,
+    index: int,
+    operation: WorkflowOperation,
+    phase: StepPhase | None = None,
+) -> bool:
+    """Is this record *this* step's record? Identity is (phase, index,
+    operation); a record or a caller without a phase matches either phase."""
+
+    return (
+        execution.step_index == index
+        and execution.operation is operation
+        and (phase is None or execution.phase is None or execution.phase == phase)
+    )
+
+
 class WorkflowDispatchFailure(StrictModel):
     workflow_request_id: str
     error: str
@@ -695,6 +872,18 @@ class WorkflowDispatchReport(StrictModel):
     completed: int = Field(ge=0)
     failed: int = Field(ge=0)
     failures: list[WorkflowDispatchFailure] = Field(default_factory=list)
+    # Rows the eligibility filters held back this tick, by reason (F-A2).
+    filtered: dict[str, int] = Field(default_factory=dict)
+    # True when the scan hit its ceiling before finding a full batch.
+    horizon_exhausted: bool = False
+    # True when another process holds the fleet-wide dispatch lease (F-A1).
+    lease_held_by_other: bool = False
+    # Dispatch attempts that raised something other than a lease/fencing or
+    # transient store error; the workflow stayed executable (F-B4 (3)).
+    internal_errors: int = Field(default=0, ge=0)
+    # Rows scanned but never started because the cycle deadline passed; they
+    # stay PENDING for the next cycle (F-C7).
+    deferred: int = Field(default=0, ge=0)
 
 
 class NotificationStatus(StrEnum):
