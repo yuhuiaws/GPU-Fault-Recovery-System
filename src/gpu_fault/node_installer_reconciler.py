@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import re
+import socket
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +25,13 @@ INSTALLER_BUNDLE_ANNOTATION = "gpu-fault.io/installer-bundle-sha256"
 INSTALLER_TEMPLATE_ANNOTATION = "gpu-fault.io/installer-template-sha256"
 INSTALLER_NODE_UID_ANNOTATION = "gpu-fault.io/installer-node-uid"
 INSTALLER_STATE_ANNOTATION = "gpu-fault.io/installer-state"
+# The boot the installation was recorded on. HyperPod UpdateClusterSoftware
+# re-images a node in place: same Node object, same UID, every annotation kept,
+# and an empty root where the Agent used to be. The UID check cannot see that;
+# a boot-id change followed by an Agent that does not answer can.
+INSTALLER_BOOT_ID_ANNOTATION = "gpu-fault.io/installer-boot-id"
+DEFAULT_AGENT_PORT = 9099
+DEFAULT_REBOOT_GRACE_SECONDS = 600
 INSTALLER_JOB_LABEL = "gpu-fault.io/node-installer"
 
 _INVENTORY = {
@@ -56,6 +64,48 @@ def _is_ready(node: Any) -> bool:
         and str(_value(condition, "status")).lower() == "true"
         for condition in _conditions(node)
     )
+
+
+def _boot_id(node: Any) -> str | None:
+    info = _value(_value(node, "status"), "node_info")
+    if info is None:
+        info = _value(_value(node, "status"), "nodeInfo")
+    value = _value(info, "boot_id") if info is not None else None
+    if value is None and info is not None:
+        value = _value(info, "bootID")
+    return str(value) if value else None
+
+
+def _ready_since(node: Any) -> datetime | None:
+    for condition in _conditions(node):
+        if _value(condition, "type") == "Ready":
+            value = _value(condition, "last_transition_time")
+            if value is None:
+                value = _value(condition, "lastTransitionTime")
+            if isinstance(value, datetime):
+                return value if value.tzinfo else value.replace(tzinfo=UTC)
+            if isinstance(value, str) and value:
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None
+
+
+def agent_answers(address: str, port: int, *, timeout_seconds: float = 2.0) -> bool:
+    """Whether something listens on the Agent port.
+
+    A TCP connect is enough: the Agent serves HTTPS with client certificates,
+    so a plain HTTP health call would be refused even by a healthy Agent, and
+    the question here is only whether the installed software is running at all.
+    """
+
+    try:
+        with socket.create_connection((address, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
 
 
 def _job_condition(job: Any, condition_type: str) -> bool:
@@ -117,6 +167,9 @@ class NodeInstallerReconciler:
         allowed_node_names: frozenset[str] | None = None,
         wave_config_map: str | None = None,
         now: Callable[[], datetime] | None = None,
+        agent_port: int = DEFAULT_AGENT_PORT,
+        reboot_grace_seconds: int = DEFAULT_REBOOT_GRACE_SECONDS,
+        agent_alive: Callable[[str, int], bool] = agent_answers,
     ) -> None:
         self.core = core_api
         self.batch = batch_api
@@ -154,6 +207,9 @@ class NodeInstallerReconciler:
         self.allowed_node_names = allowed_node_names
         self.wave_config_map = wave_config_map
         self.now = now or (lambda: datetime.now(UTC))
+        self.agent_port = agent_port
+        self.reboot_grace_seconds = reboot_grace_seconds
+        self.agent_alive = agent_alive
 
     @property
     def node_selector(self) -> str:
@@ -169,6 +225,8 @@ class NodeInstallerReconciler:
             "deferred": 0,
             "not_ready": 0,
             "unsupported": 0,
+            "rebooted": 0,
+            "recovering": 0,
         }
         allowed_node_names, max_unavailable = self._wave_settings()
         response = self.core.list_node(label_selector=self.node_selector)
@@ -232,8 +290,40 @@ class NodeInstallerReconciler:
             and annotations.get(INSTALLER_NODE_UID_ANNOTATION) == node_uid
         )
         installer_state = annotations.get(INSTALLER_STATE_ANNOTATION)
+        boot_id = _boot_id(node)
         if identity_matches and installer_state == "Succeeded":
-            return "current"
+            recorded_boot = annotations.get(INSTALLER_BOOT_ID_ANNOTATION)
+            if boot_id is None or recorded_boot == boot_id:
+                return "current"
+            if recorded_boot is None:
+                # Installed before boot ids were recorded: adopt this boot.
+                self._mark_node(node_name, node_uid, "Succeeded", boot_id)
+                return "current"
+            # The node booted since the installation was recorded. A plain
+            # reboot keeps the software and the Agent comes back on its own; a
+            # re-image (HyperPod UpdateClusterSoftware) keeps the Node object
+            # and its annotations but not /opt/gpu-fault. Only the Agent can
+            # tell the two apart.
+            if self.agent_alive(_internal_ip(node), self.agent_port):
+                self._mark_node(node_name, node_uid, "Succeeded", boot_id)
+                return "rebooted"
+            ready_since = _ready_since(node)
+            if (
+                ready_since is not None
+                and (self.now() - ready_since).total_seconds()
+                < self.reboot_grace_seconds
+            ):
+                return "recovering"
+            LOGGER.warning(
+                "node %s rebooted (boot %s -> %s) and its Agent does not answer on "
+                "port %s; reinstalling",
+                node_name,
+                recorded_boot,
+                boot_id,
+                self.agent_port,
+            )
+            self._mark_node(node_name, node_uid, "Retrying", boot_id)
+            installer_state = "Retrying"
 
         name = _job_name(
             node_name,
@@ -260,7 +350,7 @@ class NodeInstallerReconciler:
             except Exception as create_error:
                 if _api_status(create_error) != 409:
                     raise
-            self._mark_node(node_name, node_uid, "Installing")
+            self._mark_node(node_name, node_uid, "Installing", boot_id)
             LOGGER.info("created installer Job %s for node %s", name, node_name)
             return "created"
 
@@ -271,13 +361,13 @@ class NodeInstallerReconciler:
                     self.namespace,
                     propagation_policy="Background",
                 )
-                self._mark_node(node_name, node_uid, "Retrying")
+                self._mark_node(node_name, node_uid, "Retrying", boot_id)
                 LOGGER.warning(
                     "deleted stale completed installer Job %s for replay",
                     name,
                 )
                 return "running"
-            self._mark_node(node_name, node_uid, "Succeeded")
+            self._mark_node(node_name, node_uid, "Succeeded", boot_id)
             return "succeeded"
         if _job_condition(job, "Failed"):
             if self._retry_due(job):
@@ -286,10 +376,10 @@ class NodeInstallerReconciler:
                     self.namespace,
                     propagation_policy="Background",
                 )
-                self._mark_node(node_name, node_uid, "Retrying")
+                self._mark_node(node_name, node_uid, "Retrying", boot_id)
                 LOGGER.warning("deleted failed installer Job %s for retry", name)
             else:
-                self._mark_node(node_name, node_uid, "Failed")
+                self._mark_node(node_name, node_uid, "Failed", boot_id)
             return "failed"
         return "running"
 
@@ -301,7 +391,13 @@ class NodeInstallerReconciler:
             created = created.replace(tzinfo=UTC)
         return (self.now() - created).total_seconds() >= self.retry_seconds
 
-    def _mark_node(self, node_name: str, node_uid: str, state: str) -> None:
+    def _mark_node(
+        self,
+        node_name: str,
+        node_uid: str,
+        state: str,
+        boot_id: str | None = None,
+    ) -> None:
         annotations = {
             INSTALLER_VERSION_ANNOTATION: self.version,
             INSTALLER_DIGEST_ANNOTATION: self.config_digest,
@@ -311,6 +407,8 @@ class NodeInstallerReconciler:
             INSTALLER_NODE_UID_ANNOTATION: node_uid,
             INSTALLER_STATE_ANNOTATION: state,
         }
+        if boot_id is not None:
+            annotations[INSTALLER_BOOT_ID_ANNOTATION] = boot_id
         self.core.patch_node(
             node_name,
             {"metadata": {"annotations": annotations}},
@@ -458,6 +556,10 @@ def main() -> None:
         job_active_deadline_seconds=active_deadline_seconds,
         allowed_node_names=allowed_nodes,
         wave_config_map=(os.environ.get("GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP") or None),
+        agent_port=int(os.environ.get("GPU_FAULT_NODE_AGENT_PORT", "9099")),
+        reboot_grace_seconds=int(
+            os.environ.get("GPU_FAULT_INSTALLER_REBOOT_GRACE_SECONDS", "600")
+        ),
     )
     while True:
         try:

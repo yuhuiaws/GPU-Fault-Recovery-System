@@ -7,6 +7,7 @@ import pytest
 
 from gpu_fault.node_installer_reconciler import (
     INSTALLER_ARTIFACT_ANNOTATION,
+    INSTALLER_BOOT_ID_ANNOTATION,
     INSTALLER_BUNDLE_ANNOTATION,
     INSTALLER_DIGEST_ANNOTATION,
     INSTALLER_NODE_UID_ANNOTATION,
@@ -398,3 +399,155 @@ def test_unsupported_instance_does_not_create_privileged_job():
     assert reconciler(core, batch).reconcile_once()["unsupported"] == 1
     assert not batch.created
     assert not core.patches
+
+
+# ------------------------------------------------- re-imaged nodes (boot id)
+
+
+def _installed_annotations(**extra: str) -> dict[str, str]:
+    annotations = {
+        INSTALLER_VERSION_ANNOTATION: "0.10.0",
+        INSTALLER_DIGEST_ANNOTATION: "config-sha",
+        INSTALLER_ARTIFACT_ANNOTATION: ARTIFACT,
+        INSTALLER_BUNDLE_ANNOTATION: BUNDLE,
+        INSTALLER_TEMPLATE_ANNOTATION: TEMPLATE,
+        INSTALLER_NODE_UID_ANNOTATION: "node-uid",
+        INSTALLER_STATE_ANNOTATION: "Succeeded",
+    }
+    annotations.update(extra)
+    return annotations
+
+
+def _booted_node(annotations, *, boot_id: str, ready_since: datetime):
+    item = node(annotations=annotations)
+    item.status.node_info = SimpleNamespace(boot_id=boot_id)
+    item.status.conditions = [
+        SimpleNamespace(type="Ready", status="True", last_transition_time=ready_since)
+    ]
+    return item
+
+
+def _reconciler_with_probe(core, batch, *, alive: bool):
+    probes: list[tuple[str, int]] = []
+
+    def probe(address: str, port: int) -> bool:
+        probes.append((address, port))
+        return alive
+
+    value = NodeInstallerReconciler(
+        core,
+        batch,
+        namespace="gpu-fault-system",
+        cluster_name="hp-cluster-a",
+        version="0.10.0",
+        config_digest="config-sha",
+        artifact_sha256=ARTIFACT,
+        bundle_sha256=BUNDLE,
+        template_sha256=TEMPLATE,
+        job_template=template(),
+        dcgm_metrics_url_template="http://{node_ip}:9400/metrics",
+        retry_seconds=300,
+        now=lambda: NOW,
+        agent_alive=probe,
+        reboot_grace_seconds=600,
+    )
+    return value, probes
+
+
+def test_a_reimaged_node_whose_agent_is_gone_is_reinstalled():
+    """HyperPod UpdateClusterSoftware keeps the Node object and its annotations
+    but wipes /opt/gpu-fault. The UID check cannot see it; a new boot id plus
+    an Agent port nobody answers on can (live 2026-09-06 12:0xZ, four nodes)."""
+
+    core = CoreApi(
+        [
+            _booted_node(
+                _installed_annotations(**{INSTALLER_BOOT_ID_ANNOTATION: "boot-old"}),
+                boot_id="boot-new",
+                ready_since=NOW - timedelta(hours=1),
+            )
+        ]
+    )
+    batch = BatchApi()
+    value, probes = _reconciler_with_probe(core, batch, alive=False)
+
+    first = value.reconcile_once()
+
+    assert probes == [("10.0.1.25", 9099)], probes
+    assert first["created"] == 1, first
+    assert batch.created, "no installer Job was created for the re-imaged node"
+    states = [
+        body["metadata"]["annotations"][INSTALLER_STATE_ANNOTATION]
+        for _name, body in core.patches
+    ]
+    assert states == ["Retrying", "Installing"], states
+    assert all(
+        body["metadata"]["annotations"][INSTALLER_BOOT_ID_ANNOTATION] == "boot-new"
+        for _name, body in core.patches
+    ), "the new boot id must be recorded with the reinstall"
+
+
+def test_a_plain_reboot_with_a_live_agent_only_restamps_the_boot_id():
+    core = CoreApi(
+        [
+            _booted_node(
+                _installed_annotations(**{INSTALLER_BOOT_ID_ANNOTATION: "boot-old"}),
+                boot_id="boot-new",
+                ready_since=NOW - timedelta(hours=1),
+            )
+        ]
+    )
+    batch = BatchApi()
+    value, probes = _reconciler_with_probe(core, batch, alive=True)
+
+    result = value.reconcile_once()
+
+    assert result["rebooted"] == 1, result
+    assert not batch.created, "a node whose Agent answers must not be reinstalled"
+    assert batch.reads == 0, "no installer Job lookup for a healthy rebooted node"
+    ((name, body),) = core.patches
+    assert body["metadata"]["annotations"][INSTALLER_STATE_ANNOTATION] == "Succeeded"
+    assert body["metadata"]["annotations"][INSTALLER_BOOT_ID_ANNOTATION] == "boot-new"
+
+
+def test_a_freshly_booted_node_gets_a_grace_period_before_reinstall():
+    core = CoreApi(
+        [
+            _booted_node(
+                _installed_annotations(**{INSTALLER_BOOT_ID_ANNOTATION: "boot-old"}),
+                boot_id="boot-new",
+                ready_since=NOW - timedelta(seconds=30),
+            )
+        ]
+    )
+    batch = BatchApi()
+    value, _probes = _reconciler_with_probe(core, batch, alive=False)
+
+    result = value.reconcile_once()
+
+    assert result["recovering"] == 1, result
+    assert not batch.created and not core.patches, (
+        "an Agent that is still starting after a reboot must not be reinstalled"
+    )
+
+
+def test_a_node_installed_before_boot_ids_adopts_its_current_boot():
+    core = CoreApi(
+        [
+            _booted_node(
+                _installed_annotations(),
+                boot_id="boot-now",
+                ready_since=NOW - timedelta(hours=1),
+            )
+        ]
+    )
+    batch = BatchApi()
+    value, probes = _reconciler_with_probe(core, batch, alive=False)
+
+    result = value.reconcile_once()
+
+    assert result["current"] == 1, result
+    assert probes == [], "adopting a boot id must not probe or reinstall"
+    ((name, body),) = core.patches
+    assert body["metadata"]["annotations"][INSTALLER_BOOT_ID_ANNOTATION] == "boot-now"
+    assert body["metadata"]["annotations"][INSTALLER_STATE_ANNOTATION] == "Succeeded"
