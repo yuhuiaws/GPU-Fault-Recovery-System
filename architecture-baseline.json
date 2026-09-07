@@ -17,7 +17,7 @@
   "files": {
     "deploy/control-plane/regional/regional_release_orchestration.py": 1782,
     "src/gpu_fault/admin/aws_cleanup.py": 1540,
-    "src/gpu_fault/admin/bootstrap.py": 2078,
+    "src/gpu_fault/admin/bootstrap.py": 2109,
     "src/gpu_fault/admin/cli.py": 1580,
     "src/gpu_fault/completion_controller.py": 1634,
     "src/gpu_fault/execution/dispatcher.py": 1504,
@@ -34,7 +34,7 @@
     "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 252,
     "src/gpu_fault/adapters/hyperpod/lifecycle.py:HyperPodLifecycleStepAdapter.execute": 213,
     "src/gpu_fault/adapters/kubernetes/restart_operations.py:KubernetesRestartOperationsMixin._restart_guard": 218,
-    "src/gpu_fault/admin/bootstrap.py:_ensure_aurora": 290,
+    "src/gpu_fault/admin/bootstrap.py:_ensure_aurora": 319,
     "src/gpu_fault/admin/legacy_site.py:discover_legacy_site": 291,
     "src/gpu_fault/app/builtin_metric_contributors.py:closed_loop_metric_lines": 213,
     "src/gpu_fault/app/factory.py:create_app": 285,

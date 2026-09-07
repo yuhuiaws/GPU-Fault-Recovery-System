@@ -284,3 +284,184 @@ def test_a_missing_availability_zone_is_refused_rather_than_defaulted(
             availability_zones=["us-east-1a"],
             safe_name=lambda value, maximum: value[:maximum],
         )
+
+
+class DiagnosticsRunner(Runner):
+    """Plays the parameter-group side of RDS: the group's current values and
+    the engine family, plus a quiet cluster for the settle wait."""
+
+    def __init__(self, parameters: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self.parameters = dict(parameters or {})
+
+    def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> dict:
+        self.calls.append(("aws", *arguments))
+        if arguments[1] == "describe-db-engine-versions":
+            return {
+                "DBEngineVersions": [{"DBParameterGroupFamily": "aurora-postgresql16"}]
+            }
+        if arguments[1] == "describe-db-cluster-parameters":
+            return {
+                "Parameters": [
+                    {"ParameterName": name, "ParameterValue": value}
+                    for name, value in self.parameters.items()
+                ]
+            }
+        if arguments[1] == "describe-db-clusters":
+            return {"DBClusters": [{"Status": "available"}]}
+        return {"DBInstances": [{"DBInstanceStatus": "available"}]}
+
+
+def _settled(parameters: dict[str, str]) -> dict[str, str]:
+    return {
+        **{name: value for name, value, _method in aurora.DIAGNOSTIC_PARAMETERS},
+        **parameters,
+    }
+
+
+def test_a_missing_parameter_group_is_created_for_the_engine_family_and_filled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default group cannot be modified, so a fresh cluster gets its own
+    group, in the family of its engine version, with the four diagnostic
+    parameters set in one call."""
+
+    monkeypatch.setattr(
+        aurora.subprocess,
+        "run",
+        lambda *_args, **_keywords: subprocess.CompletedProcess([], 254),
+    )
+    runner = DiagnosticsRunner()
+
+    group = aurora.ensure_cluster_parameter_group(
+        runner,
+        aws_region="us-west-2",
+        cluster_id="aurora-a",
+        engine_version="16.8",
+        safe_name=lambda value, maximum: value[:maximum],
+    )
+
+    assert group == "aurora-a-pg"
+    assert _operations(runner) == [
+        "describe-db-engine-versions",
+        "create-db-cluster-parameter-group",
+        "modify-db-cluster-parameter-group",
+    ]
+    create = runner.calls[1]
+    assert (
+        create[create.index("--db-parameter-group-family") + 1] == "aurora-postgresql16"
+    )
+    modify = runner.calls[2]
+    parameters = modify[modify.index("--parameters") + 1 :]
+    assert (
+        "ParameterName=log_lock_waits,ParameterValue=1,ApplyMethod=immediate"
+        in parameters
+    )
+    assert (
+        "ParameterName=shared_preload_libraries,ParameterValue=pg_stat_statements,"
+        "ApplyMethod=pending-reboot"
+    ) in parameters
+
+
+def test_a_settled_parameter_group_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routine deploy must not modify a group whose values already match:
+    the modify is a live mutation even when nothing changes."""
+
+    monkeypatch.setattr(
+        aurora.subprocess,
+        "run",
+        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
+    )
+    runner = DiagnosticsRunner(_settled({"work_mem": "65536"}))
+
+    aurora.ensure_cluster_parameter_group(
+        runner,
+        aws_region="us-west-2",
+        cluster_id="aurora-a",
+        engine_version="16.8",
+        safe_name=lambda value, maximum: value[:maximum],
+    )
+
+    assert _operations(runner) == ["describe-db-cluster-parameters"]
+
+
+def test_only_the_drifted_parameters_are_rewritten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator's other parameters and the already-correct ones stay out of
+    the modify call."""
+
+    monkeypatch.setattr(
+        aurora.subprocess,
+        "run",
+        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
+    )
+    runner = DiagnosticsRunner(_settled({"log_lock_waits": "0"}))
+
+    aurora.ensure_cluster_parameter_group(
+        runner,
+        aws_region="us-west-2",
+        cluster_id="aurora-a",
+        engine_version="16.8",
+        safe_name=lambda value, maximum: value[:maximum],
+    )
+
+    modify = runner.calls[-1]
+    assert modify[2] == "modify-db-cluster-parameter-group"
+    assert modify[modify.index("--parameters") + 1 :] == (
+        "ParameterName=log_lock_waits,ParameterValue=1,ApplyMethod=immediate",
+    )
+
+
+def test_an_aligned_cluster_needs_no_modify() -> None:
+    runner = DiagnosticsRunner()
+
+    changed = aurora.reconcile_cluster_diagnostics(
+        runner,
+        aws_region="us-west-2",
+        cluster_id="aurora-a",
+        cluster={
+            "DBClusterParameterGroup": "aurora-a-pg",
+            "EnabledCloudwatchLogsExports": ["postgresql"],
+        },
+        parameter_group="aurora-a-pg",
+    )
+
+    assert changed is False
+    assert runner.calls == []
+
+
+def test_a_cluster_on_the_default_group_gets_the_group_and_the_log_export_in_one_online_modify() -> (
+    None
+):
+    """One ``modify-db-cluster --apply-immediately`` carries both changes; no
+    instance is rebooted (the preload library stays pending-reboot), and the
+    settle wait follows because the modify answers before the cluster flips."""
+
+    runner = DiagnosticsRunner()
+
+    changed = aurora.reconcile_cluster_diagnostics(
+        runner,
+        aws_region="us-west-2",
+        cluster_id="aurora-a",
+        cluster={"DBClusterParameterGroup": "default.aurora-postgresql16"},
+        parameter_group="aurora-a-pg",
+    )
+
+    assert changed is True
+    modify = runner.calls[0]
+    assert modify[2] == "modify-db-cluster"
+    assert (
+        modify[modify.index("--db-cluster-parameter-group-name") + 1] == "aurora-a-pg"
+    )
+    assert (
+        modify[modify.index("--cloudwatch-logs-export-configuration") + 1]
+        == '{"EnableLogTypes":["postgresql"]}'
+    )
+    assert "--apply-immediately" in modify
+    assert not any("reboot" in item for call in runner.calls for item in call), (
+        "diagnostics must never reboot an instance; the preload library waits for the operator"
+    )
+    assert "describe-db-clusters" in _operations(runner), "the settle wait ran"

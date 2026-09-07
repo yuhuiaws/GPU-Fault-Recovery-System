@@ -16,7 +16,9 @@ from urllib.parse import quote
 
 from gpu_fault.admin.bootstrap_aurora import (
     bootstrap_aurora_capacity,
+    ensure_cluster_parameter_group,
     ensure_serverless_instances,
+    reconcile_cluster_diagnostics,
     reconcile_existing_capacity,
     scaling_configuration,
 )
@@ -1684,7 +1686,32 @@ def _ensure_aurora(
             cluster=existing_cluster,
             capacity=capacity,
         )
+        # Diagnostics (lock-wait and slow-statement logging, pg_stat_statements,
+        # CloudWatch log export) are reconciled on every deploy like capacity
+        # is, so a cluster created before they existed gets them on its next
+        # deploy without an operator step.
+        parameter_group = ensure_cluster_parameter_group(
+            runner,
+            aws_region=cpu.region,
+            cluster_id=cluster_id,
+            engine_version=str(existing_cluster.get("EngineVersion") or "16.8"),
+            safe_name=_safe_name,
+        )
+        reconcile_cluster_diagnostics(
+            runner,
+            aws_region=cpu.region,
+            cluster_id=cluster_id,
+            cluster=existing_cluster,
+            parameter_group=parameter_group,
+        )
     if not cluster_exists:
+        parameter_group = ensure_cluster_parameter_group(
+            runner,
+            aws_region=cpu.region,
+            cluster_id=cluster_id,
+            engine_version="16.8",
+            safe_name=_safe_name,
+        )
         runner.run(
             [
                 "aws",
@@ -1717,6 +1744,10 @@ def _ensure_aurora(
                 "--deletion-protection",
                 "--copy-tags-to-snapshot",
                 "--enable-iam-database-authentication",
+                "--db-cluster-parameter-group-name",
+                parameter_group,
+                "--enable-cloudwatch-logs-exports",
+                "postgresql",
                 "--tags",
                 f"Key=gpu-fault:site-id,Value={site_id}",
             ],
