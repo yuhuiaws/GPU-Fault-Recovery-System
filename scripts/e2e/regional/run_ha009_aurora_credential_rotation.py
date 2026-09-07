@@ -520,6 +520,13 @@ def wait_deployments(before: dict, timeout_seconds: int = 900) -> dict:
                 complete = False
             if int(current["ready"]) != int(current["replicas"]):
                 complete = False
+            # A rollout is not finished while a superseded Pod is still
+            # draining: control-worker keeps a Terminating Pod (and its
+            # Ready condition) for up to terminationGracePeriodSeconds, and
+            # _rotation_result must see the Pod set with every old uid gone.
+            before_uids = {value["uid"] for _pod, value in previous["pods"]}
+            if any(value["uid"] in before_uids for _pod, value in current["pods"]):
+                complete = False
         if complete:
             return last
         time.sleep(3)

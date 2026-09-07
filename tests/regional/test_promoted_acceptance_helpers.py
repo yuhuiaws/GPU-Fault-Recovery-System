@@ -600,3 +600,45 @@ def test_host_probe_create_deletes_a_leftover_pod_before_applying(
     assert verbs == ["delete", "apply", "apply", "wait"], verbs
     assert calls[0][1:3] == ("pod", fixture.pod), calls[0]
     assert "--ignore-not-found" in calls[0], calls[0]
+
+
+def _ha009_snapshot(generation: int, pods: list[tuple[str, str]]) -> dict:
+    return {
+        name: {
+            "generation": generation,
+            "observed_generation": generation,
+            "replicas": len(pods),
+            "ready": len(pods),
+            "refresh_annotation": None,
+            "pods": [
+                (pod, {"uid": uid, "ready": True, "restarts": 0}) for pod, uid in pods
+            ],
+        }
+        for name in ha009.DEPLOYMENTS
+    }
+
+
+def test_ha009_rollout_wait_outlives_draining_old_pods(monkeypatch) -> None:
+    """A Terminating control-worker Pod stays Ready for up to its 240 s grace.
+
+    The wait must not return while any pre-rotation Pod uid is still listed,
+    or _rotation_result reports "did not replace every old Pod" for a
+    rollout that merely had not finished draining.
+    """
+    before = _ha009_snapshot(1, [("old-a", "uid-a"), ("old-b", "uid-b")])
+    snapshots = iter(
+        [
+            _ha009_snapshot(2, [("old-a", "uid-a"), ("new-b", "uid-nb")]),
+            _ha009_snapshot(2, [("new-a", "uid-na"), ("new-b", "uid-nb")]),
+        ]
+    )
+    seen = []
+    monkeypatch.setattr(ha009, "deployment_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(ha009.time, "sleep", lambda _seconds: seen.append("slept"))
+
+    after = ha009.wait_deployments(before, timeout_seconds=30)
+
+    assert seen == ["slept"], "wait must poll past the still-draining old Pod"
+    for name in ha009.DEPLOYMENTS:
+        uids = {value["uid"] for _pod, value in after[name]["pods"]}
+        assert uids == {"uid-na", "uid-nb"}, name
