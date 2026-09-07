@@ -72,6 +72,9 @@ from gpu_fault_release.regional_release_rollout_cleanup import (
 from gpu_fault_release.regional_release_rollout_cleanup import (
     terminalize_stranded_rollouts as terminalize_stranded_rollouts,
 )
+from gpu_fault_release.regional_release_rollout_cleanup import (
+    terminalize_stranded_cluster_rollouts,
+)
 from gpu_fault_release.regional_release_state import state_transaction
 from gpu_fault_release.regional_release_timing import (
     complete_timed_entry,
@@ -1009,6 +1012,16 @@ def upgrade_release(
         plan=plan,
     )
     if not resume:
+        # This transaction now holds the release lock, so any rollout record a
+        # dead or superseded transaction left non-terminal is stranded -- and
+        # while it stands, the destructive-workflow fence holds the cluster.
+        terminalize_stranded_cluster_rollouts(
+            self,
+            reason=(
+                f"superseded by a new release {self.release_id} transaction "
+                "before reaching a terminal state"
+            ),
+        )
         # A new transaction must not inherit rollback checkpoints or failure
         # fields from the currently deployed release.
         self.state = {}

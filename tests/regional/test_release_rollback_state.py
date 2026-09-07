@@ -1330,3 +1330,47 @@ def test_fleet_deployment_id_without_nonce_keeps_the_historical_shape() -> None:
     legacy = _fleet_id({})
     assert legacy == _fleet_id({"fleet_rollout_transaction": ""}), legacy
     assert legacy != _fleet_id({"fleet_rollout_transaction": "1111aaaa2222"}), legacy
+
+
+def test_fresh_upgrade_terminalizes_every_active_cluster_rollout() -> None:
+    """A fresh transaction holds the release lock: whatever is still non-terminal
+    for the site's clusters was abandoned, and while it stands the destructive
+    workflow fence holds the cluster. The sweep is by cluster, not release id,
+    because the stranded record may belong to an earlier abandoned release."""
+    calls = []
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            clusters=(
+                SimpleNamespace(cluster_id="gpu-a"),
+                SimpleNamespace(cluster_id="gpu-b"),
+            )
+        ),
+        release_id="candidate",
+        _fleet_command=lambda operation, payload: calls.append((operation, payload))
+        or {
+            "terminalized": (
+                ["release-upgrade-older-aaaa", "release-upgrade-candidate-bbbb"]
+                if payload["cluster_id"] == "gpu-a"
+                else []
+            )
+        },
+    )
+
+    terminalized = ORCHESTRATION.terminalize_stranded_cluster_rollouts(
+        release, reason="superseded by a new transaction"
+    )
+
+    assert terminalized == (
+        "release-upgrade-older-aaaa",
+        "release-upgrade-candidate-bbbb",
+    )
+    assert calls == [
+        (
+            "terminalize-cluster-rollouts",
+            {"cluster_id": "gpu-a", "reason": "superseded by a new transaction"},
+        ),
+        (
+            "terminalize-cluster-rollouts",
+            {"cluster_id": "gpu-b", "reason": "superseded by a new transaction"},
+        ),
+    ]

@@ -47,6 +47,25 @@ def stranded_release_rollouts(store: Any, release_id: str) -> list[str]:
     return sorted(stranded)
 
 
+def active_cluster_rollouts(store: Any, cluster_id: str) -> list[str]:
+    """Ids of every non-terminal rollout of ``cluster_id``, whatever its release.
+
+    Called when a *fresh* upgrade transaction starts. The transaction holds the
+    release lock, so no rollout of any release can legitimately still be in
+    flight for the site's clusters: whatever is non-terminal was abandoned by a
+    transaction that died or was superseded without a rollback. The by-release
+    sweep above cannot see those -- on 2026-09-07 two ``IN_PROGRESS`` records
+    from two abandoned transactions (one of a different release id) fenced every
+    destructive remediation for the cluster for four hours after the successor
+    had rolled out cleanly, until they were cancelled by hand.
+    """
+
+    return sorted(
+        str(deployment.deployment_id)
+        for deployment in store.list_active_fleet_deployments(cluster_id)
+    )
+
+
 def main() -> int:
     payload = json.load(sys.stdin)
     context = ApplicationContext.from_environment()
@@ -87,6 +106,12 @@ def main() -> int:
             return 0
     elif operation == "terminalize-release-rollouts":
         stranded = stranded_release_rollouts(context.store, payload["release_id"])
+        for deployment_id in stranded:
+            registry.cancel_deployment(deployment_id, reason=payload["reason"])
+        print(json.dumps({"terminalized": stranded}, sort_keys=True))
+        return 0
+    elif operation == "terminalize-cluster-rollouts":
+        stranded = active_cluster_rollouts(context.store, payload["cluster_id"])
         for deployment_id in stranded:
             registry.cancel_deployment(deployment_id, reason=payload["reason"])
         print(json.dumps({"terminalized": stranded}, sort_keys=True))

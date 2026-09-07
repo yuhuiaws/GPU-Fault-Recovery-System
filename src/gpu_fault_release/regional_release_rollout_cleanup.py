@@ -101,3 +101,35 @@ def terminalize_stranded_rollouts(self: Any) -> tuple[str, ...]:
             file=sys.stderr,
         )
     return terminalized
+
+
+def terminalize_stranded_cluster_rollouts(self: Any, *, reason: str) -> tuple[str, ...]:
+    """Drive every non-terminal rollout of the site's clusters to a terminal state.
+
+    Runs when a *fresh* upgrade transaction starts. The by-release sweep in
+    ``terminalize_stranded_rollouts`` only runs during a rollback and only sees
+    the release being rolled back, so a transaction that was abandoned without
+    a rollback -- it died in a guard, or its resume was refused and a new
+    transaction was started instead -- leaves its fleet deployment record
+    ``IN_PROGRESS`` forever, and ``execution/fleet_preflight.py`` fences every
+    destructive remediation for the cluster behind it. On 2026-09-07 two such
+    records did exactly that for four hours after the successor had converged.
+
+    A fresh transaction holds the release lock, so nothing else can legitimately
+    be rolling out; every non-terminal record is stranded by definition.
+    """
+
+    terminalized: list[str] = []
+    for target in self.config.clusters:
+        result = self._fleet_command(
+            "terminalize-cluster-rollouts",
+            {"cluster_id": target.cluster_id, "reason": reason},
+        )
+        terminalized.extend(str(item) for item in result.get("terminalized") or ())
+    if terminalized:
+        print(
+            "release-upgrade terminalized stranded fleet deployments: "
+            + ", ".join(terminalized),
+            file=sys.stderr,
+        )
+    return tuple(terminalized)
