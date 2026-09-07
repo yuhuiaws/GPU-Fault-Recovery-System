@@ -14,6 +14,7 @@ from gpu_fault.models import IncidentState, WorkflowOperation
 from gpu_fault.processor import ProcessorRequest
 from gpu_fault.regional import RemoteActionCommand
 from gpu_fault.store import PostgresStore
+from gpu_fault.store.shared.errors import NotFoundError
 from tests._builders import (
     fault_incident,
     processor_request,
@@ -123,7 +124,14 @@ def _workflow_state(store, *, request_id: str, fencing_token: int = 3):
     )
     incident = incident.model_copy(update={"workflow_request_id": workflow.request_id})
     store.save_incident(incident)
-    store.save_workflow(workflow)
+    # A second call with another fencing_token is the deliberate "stale
+    # workflow" setup; ``expected=`` is how an out-of-band generation change
+    # gets past the version guard of save_workflow (store review 2026-09-07, B).
+    try:
+        existing = store.get_workflow(request_id)
+    except NotFoundError:
+        existing = None
+    store.save_workflow(workflow, expected=existing)
     return incident, workflow
 
 

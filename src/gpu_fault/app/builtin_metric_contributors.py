@@ -277,6 +277,7 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     lines.extend(_dispatch_pending_state_lines(ctx, dispatcher))
     snapshot = periodic.metrics_snapshot() if periodic is not None else {}
     lines.extend(_periodic_reconciliation_lines(snapshot))
+    lines.extend(_processor_counter_mode_lines(store))
     lines.extend(
         [
             "# HELP gpu_fault_periodic_lease_errors_total Periodic-service task leases that could not be taken because of a store error (F-F1).",
@@ -382,6 +383,39 @@ def _periodic_reconciliation_lines(snapshot: dict[str, object]) -> list[str]:
         "# TYPE gpu_fault_processor_counter_mismatched_clusters gauge",
         f"gpu_fault_processor_counter_mismatched_clusters {read('processor_counter_mismatched_clusters')}",
     ]
+
+
+# Every value the processor counter mode can take; one series per value so a
+# panel can select on the label without knowing which one is active.
+PROCESSOR_COUNTER_MODES = ("dual", "partitioned")
+
+
+def _processor_counter_mode_lines(store: object) -> list[str]:
+    """Which processor counter table admission reads (store review 2026-09-07,
+    item I). ``dual`` still locks the single per-cluster counter row on every
+    enqueue, so the shards relieve nothing until ``partitioned``; production
+    sat in ``dual`` with nothing exporting it. Only the Postgres store has the
+    accessor; SQLite and memory stores emit no series."""
+
+    read = getattr(store, "processor_counter_mode", None)
+    if read is None:
+        return []
+    active = str(read())
+    lines = [
+        "# HELP gpu_fault_processor_counter_mode Processor admission counter mode; the 16 priority shards relieve counter-row contention only in partitioned mode; finalize requires an empty queue (gpu-fault-store-migrate --finalize-processor-counter-shards)",
+        "# TYPE gpu_fault_processor_counter_mode gauge",
+    ]
+    modes = list(PROCESSOR_COUNTER_MODES)
+    if active not in modes:
+        # An unexpected value is worth a series of its own rather than a row
+        # of zeros that reads as "no mode".
+        modes.append(active)
+    for mode in modes:
+        lines.append(
+            "gpu_fault_processor_counter_mode"
+            f'{{mode="{_escape_label(mode)}"}} {int(mode == active)}'
+        )
+    return lines
 
 
 def completion_state_metric_lines(runtime: AppRuntime) -> list[str]:

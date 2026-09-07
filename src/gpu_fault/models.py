@@ -6,11 +6,79 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    GetCoreSchemaHandler,
+    model_validator,
+)
+from pydantic_core import CoreSchema, core_schema
+
+
+def datetime_json_text(value: datetime) -> str:
+    """The one JSON text every ``StrictModel`` datetime field serializes to.
+
+    Fixed six-digit microseconds, always. Pydantic's default drops the fraction
+    when it is zero (``...:00Z`` next to ``...:00.500000Z``), and the stores
+    compare and order these strings as TEXT on purpose so expression indexes
+    can serve them; ``'Z'`` sorts after ``'.'``, so a whole second sorted
+    after every fractional instant of the same second and ``not_before <= now``
+    or a page cursor could be off by up to one second (store review
+    2026-09-07, item E). Aware values are rendered in UTC with ``Z``; a naive
+    value stays offset-less, as before, so a reader never has to compare naive
+    against aware. ``store.shared.time.utc_text`` renders the bound SQL
+    parameter through this same function.
+    """
+
+    if value.tzinfo is None:
+        return value.isoformat(timespec="microseconds")
+    # The UTC offset is always the six characters "+00:00"; swap it for "Z".
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")[:-6] + "Z"
+
+
+_DATETIME_JSON_SERIALIZATION = core_schema.plain_serializer_function_ser_schema(
+    datetime_json_text, when_used="json-unless-none"
+)
+
+
+def _attach_datetime_serialization(node: object) -> None:
+    """Walk a core schema and give every bare ``datetime`` node the fixed
+    renderer for JSON mode (store review 2026-09-07, item E).
+
+    Recurses through every dict and list so Optional, unions, list/dict/tuple
+    items, ``definitions`` and nested models are all reached. A node that
+    already carries a ``serialization`` (an explicit field serializer, or a
+    nested ``StrictModel`` that patched itself) is left alone. Python-mode
+    dumps are untouched: ``when_used="json-unless-none"``.
+    """
+
+    if isinstance(node, dict):
+        if node.get("type") == "datetime":
+            node.setdefault("serialization", _DATETIME_JSON_SERIALIZATION)
+            return
+        for child in node.values():
+            _attach_datetime_serialization(child)
+    elif isinstance(node, (list, tuple)):
+        for child in node:
+            _attach_datetime_serialization(child)
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", use_enum_values=False)
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: type[Any], handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        # Every persisted control-plane object derives from here, so patching
+        # the generated schema once per class is the single place that makes
+        # all datetime JSON text sort as time (store review 2026-09-07, item E).
+        schema = handler(source)
+        # A recursive model comes back as a reference; patch what it points at.
+        _attach_datetime_serialization(handler.resolve_ref_schema(schema))
+        _attach_datetime_serialization(schema)
+        return schema
 
 
 class Environment(StrEnum):

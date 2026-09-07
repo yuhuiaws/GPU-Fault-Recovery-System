@@ -24,6 +24,44 @@ from gpu_fault.store.shared.time import (
 )
 
 
+# Hot-state kind -> (dedicated table, dedicated timestamp column, legacy
+# timestamp expression). Shared by the counting status (CLI) and the EXISTS
+# gap check (startup) so the two cannot disagree on what a twin is.
+_HOT_STATE_MAPPINGS: dict[str, tuple[str, str | None, str | None]] = {
+    "gpu_metric_latest": (
+        "gpu_fault_gpu_metric_latest",
+        "observed_at",
+        "legacy.payload->>'observed_at'",
+    ),
+    "gpu_metrics_batch": (
+        "gpu_fault_gpu_metrics_batches",
+        None,
+        None,
+    ),
+    "attempt_observation": (
+        "gpu_fault_attempt_observations",
+        "observed_at",
+        "legacy.payload->'observation'->>'observed_at'",
+    ),
+    "training_progress": (
+        "gpu_fault_training_progress",
+        "observed_at",
+        "legacy.payload->'heartbeat'->>'observed_at'",
+    ),
+}
+
+
+def _hot_state_mismatch(
+    dedicated_timestamp: str | None, legacy_timestamp: str | None
+) -> str:
+    """SQL predicate: the dedicated twin is older than (or differs from) the
+    legacy row. Kinds without a timestamp compare the whole payload."""
+
+    if dedicated_timestamp is None:
+        return "dedicated.payload IS DISTINCT FROM legacy.payload"
+    return f"dedicated.{dedicated_timestamp} < ({legacy_timestamp})::timestamptz"
+
+
 class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
     # Attributes supplied by the composed concrete implementation.
     _db: Any
@@ -34,6 +72,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
     _state_transaction: Callable[..., Any]
     hot_state_mode: Any
     _get_optional: Callable[..., Any]
+    _count_by_field: Callable[..., dict[str, int]]
 
     def list_markers(self) -> list[NodeMarker]:
         with self._db.cursor() as cursor:
@@ -504,42 +543,15 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
     def hot_state_migration_status(
         self,
     ) -> dict[str, dict[str, int]]:
-        mappings = {
-            "gpu_metric_latest": (
-                "gpu_fault_gpu_metric_latest",
-                "observed_at",
-                "legacy.payload->>'observed_at'",
-            ),
-            "gpu_metrics_batch": (
-                "gpu_fault_gpu_metrics_batches",
-                None,
-                None,
-            ),
-            "attempt_observation": (
-                "gpu_fault_attempt_observations",
-                "observed_at",
-                ("legacy.payload->'observation'->>'observed_at'"),
-            ),
-            "training_progress": (
-                "gpu_fault_training_progress",
-                "observed_at",
-                "legacy.payload->'heartbeat'->>'observed_at'",
-            ),
-        }
         status = {}
         with self._db.cursor() as cursor:
             for kind, (
                 table,
                 dedicated_timestamp,
                 legacy_timestamp,
-            ) in mappings.items():
-                mismatch_condition = (
-                    "dedicated.payload IS DISTINCT FROM legacy.payload"
-                    if dedicated_timestamp is None
-                    else (
-                        f"dedicated.{dedicated_timestamp} < "
-                        f"({legacy_timestamp})::timestamptz"
-                    )
+            ) in _HOT_STATE_MAPPINGS.items():
+                mismatch_condition = _hot_state_mismatch(
+                    dedicated_timestamp, legacy_timestamp
                 )
                 cursor.execute(
                     f"""
@@ -571,6 +583,44 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                     "missing_or_mismatched": mismatched,
                 }
         return status
+
+    def hot_state_backfill_gaps(self) -> dict[str, bool]:
+        """Per hot-state kind: does any legacy row lack an up-to-date twin?
+
+        The dedicated-mode startup check used to call
+        ``hot_state_migration_status`` -- a full LEFT JOIN with three
+        aggregates per kind plus ``count(*)`` of each dedicated table -- and
+        uvicorn ``--limit-max-requests`` makes process start routine (store
+        review 2026-09-07, item J). Startup only needs a yes/no per kind, so
+        this stops at the first gap and never counts the dedicated tables;
+        the CLI keeps the counting form.
+        """
+
+        gaps: dict[str, bool] = {}
+        with self._db.cursor() as cursor:
+            for kind, (
+                table,
+                dedicated_timestamp,
+                legacy_timestamp,
+            ) in _HOT_STATE_MAPPINGS.items():
+                cursor.execute(
+                    f"""
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM gpu_fault_objects AS legacy
+                        LEFT JOIN {table} AS dedicated
+                          ON dedicated.key=legacy.key
+                        WHERE legacy.kind=%s
+                          AND (
+                              dedicated.key IS NULL
+                              OR {_hot_state_mismatch(dedicated_timestamp, legacy_timestamp)}
+                          )
+                    )
+                    """,
+                    (kind,),
+                )
+                gaps[kind] = bool(cursor.fetchone()[0])
+        return gaps
 
     def purge_legacy_hot_state(self) -> dict[str, int]:
         status = self.hot_state_migration_status()
@@ -819,20 +869,14 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
         ]
 
     def decision_status_counts(self) -> dict[DecisionStatus, int]:
-        with self._db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT payload->>'status' AS status, count(*)
-                FROM gpu_fault_objects
-                WHERE kind='decision'
-                GROUP BY status
-                """
-            )
-            rows = cursor.fetchall()
-        counts = {status: 0 for status in DecisionStatus}
-        for status, count in rows:
-            counts[DecisionStatus(status)] = int(count)
-        return counts
+        # Per-value counts on ``gpu_fault_decision_status_count`` rather than a
+        # GROUP BY over every decision payload; see
+        # ``PostgresWorkflowMixin.workflow_status_counts`` (store review
+        # 2026-09-07, item G).
+        counts = self._count_by_field(
+            "decision", "status", [status.value for status in DecisionStatus]
+        )
+        return {DecisionStatus(value): count for value, count in counts.items()}
 
     def count_completion_events_without_decision(self) -> int:
         with self._db.cursor() as cursor:

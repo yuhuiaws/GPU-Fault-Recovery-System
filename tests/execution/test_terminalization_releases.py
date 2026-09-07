@@ -80,7 +80,7 @@ def test_the_deadline_reap_releases_the_unattempted_restart_reservation():
         execution_lease_expires_at=now - timedelta(minutes=5),
         execution_deadline=now - timedelta(minutes=1),
     )
-    store.save_workflow(overdue)
+    store.save_workflow(overdue, expected=workflow)
     store.reserve_job_restart(CLUSTER, JOB, 1, _reservation(overdue, 1))
     assert _budget_is_free(store) is False
 

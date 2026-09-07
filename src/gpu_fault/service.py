@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from typing import NoReturn
 
 import logging
@@ -606,21 +608,34 @@ class CompletionService:
     def _expire_pending_triage(
         self, decision: CompletionDecision, now: datetime
     ) -> CompletionDecision | None:
+        # The diagnostics adapter is read *before* the transaction: the body of
+        # a store transaction must be pure computation, and an HTTP adapter
+        # here held the ``completion/<key>`` advisory lock and a pooled
+        # connection for its full latency (store review 2026-09-07, item D).
+        # The decision is read once outside for the request id, then re-read
+        # under the lock, which decides whether the pre-fetched report is used.
+        current = self.store.get_decision_by_event(decision.event_key)
+        if current is None or current.status is not DecisionStatus.PENDING_TRIAGE:
+            return None
+        report: TriageReport | None = None
+        result: Callable[[str], TriageReport | None] | None = getattr(
+            self.diagnostics, "result", None
+        )
+        if result is not None and current.diagnostic_request_id:
+            report = result(current.diagnostic_request_id)
         with self.store.completion_transaction(decision.event_key):
             current = self.store.get_decision_by_event(decision.event_key)
             if current is None or current.status is not DecisionStatus.PENDING_TRIAGE:
                 return None
-            result = getattr(self.diagnostics, "result", None)
-            if result is not None and current.diagnostic_request_id:
-                report = result(current.diagnostic_request_id)
-                if report is not None:
-                    try:
-                        return self.handle_triage(report)
-                    except ValueError:
-                        LOGGER.exception(
-                            "late triage result for %s is unusable; expiring",
-                            decision.event_key,
-                        )
+            if report is not None:
+                # ``handle_triage`` writes, so it stays inside the transaction.
+                try:
+                    return self.handle_triage(report)
+                except ValueError:
+                    LOGGER.exception(
+                        "late triage result for %s is unusable; expiring",
+                        decision.event_key,
+                    )
             event = self.store.get_event_by_attempt(
                 current.cluster_id, current.attempt_id
             )

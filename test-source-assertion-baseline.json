@@ -4,6 +4,10 @@
       "reason": "a probe is shipped to a Pod as source text, so the text is the artifact: this audits that each one parses, imports only what exists inside the Pod, and that no program went back to being an inline literal in the engine",
       "sites": 4
     },
+    "tests/store/test_remote_command_lock_key_convention.py": {
+      "reason": "audits the advisory-lock key literals of every remote_command writer; the key text is the contract (a writer on a private key is a lost update the behaviour tests cannot reach until the race happens), and only the source can show a new writer's key",
+      "sites": 3
+    },
     "tests/test_deploy_layout.py": {
       "reason": "audits that the architecture gate still declares every source root; the declaration is data, not behaviour",
       "sites": 1

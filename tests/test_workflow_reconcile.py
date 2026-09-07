@@ -176,7 +176,10 @@ def test_reconcile_apply_fails_when_fencing_identity_drifts() -> None:
     store.save_workflow(
         workflow.model_copy(
             update={"fencing_token": workflow.fencing_token + 1, "updated_at": NOW}
-        )
+        ),
+        # A deliberate out-of-band generation change; ``expected=`` is how a
+        # writer says so to the version guard (store review 2026-09-07, B).
+        expected=workflow,
     )
 
     with pytest.raises(ValueError, match="plan changed"):

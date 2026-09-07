@@ -15,10 +15,16 @@ from gpu_fault.models import (
 from gpu_fault.store.shared.time import utc_text as _utc_text
 from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
 from gpu_fault.store.shared.errors import (
+    StaleWriteError,
     WorkflowMergedError,
     RemediationBudgetError,
     WorkflowLeaseError,
     StaleFencingTokenError,
+)
+from gpu_fault.store.shared.transactional_workflows import (
+    lease_extension_due,
+    stale_workflow_versions,
+    workflow_matches_expected,
 )
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
@@ -60,8 +66,29 @@ class SqliteWorkflowMixin:
         with self._lock:
             self._link("incident_by_event", event_id, incident_id)
 
-    def save_workflow(self, workflow: WorkflowRequest) -> None:
-        with self._lock:
+    def save_workflow(
+        self,
+        workflow: WorkflowRequest,
+        *,
+        expected: WorkflowRequest | None = None,
+    ) -> None:
+        """See ``WorkflowStore.save_workflow`` (store review 2026-09-07, item B).
+
+        Read-compare-write inside one write transaction; the process lock
+        serializes every writer of this connection, so that is the CAS here.
+        """
+
+        with self._state_transaction(f"workflow/{workflow.request_id}"):
+            current = self._get_optional("workflow", workflow.request_id)
+            if expected is not None:
+                if not workflow_matches_expected(current, expected):
+                    raise StaleWriteError(
+                        f"workflow/{workflow.request_id} changed since it was read"
+                    )
+            elif current is not None:
+                stale = stale_workflow_versions(current, workflow)
+                if stale is not None:
+                    raise stale
             self._put("workflow", workflow.request_id, workflow)
 
     def get_workflow(self, request_id: str) -> WorkflowRequest:
@@ -528,7 +555,7 @@ class SqliteWorkflowMixin:
         lease_duration: timedelta = timedelta(minutes=3),
     ) -> WorkflowRequest:
         with self._state_transaction(f"workflow/{request_id}"):
-            workflow = self._get("workflow", request_id)
+            workflow: WorkflowRequest = self._get("workflow", request_id)
             renewed_at = now or datetime.now(timezone.utc)
             if (
                 workflow.execution_owner_id != executor_id
@@ -537,6 +564,10 @@ class SqliteWorkflowMixin:
                 or workflow.execution_lease_expires_at <= renewed_at
             ):
                 raise WorkflowLeaseError("workflow execution lease is stale")
+            if not lease_extension_due(
+                workflow, renewed_at=renewed_at, lease_duration=lease_duration
+            ):
+                return workflow  # store review 2026-09-07, item F1
             workflow = workflow.model_copy(
                 update={"execution_lease_expires_at": (renewed_at + lease_duration)}
             )

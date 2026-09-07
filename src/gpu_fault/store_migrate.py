@@ -110,6 +110,50 @@ def migrate_postgres_to_postgres(
         destination.close()
 
 
+def ensure_diagnostics(postgres_url: str) -> int:
+    """Install pg_stat_statements and print the diagnostics report (item K2).
+
+    ``CREATE EXTENSION`` needs the library preloaded and a role allowed to
+    create it; on Aurora that is the parameter group and the master user, so
+    an insufficient-privilege failure (sqlstate 42501) is reported as such
+    instead of a stack trace. Runs on an autocommit connection: the deploy
+    Job runs this once and the extension is not transactional state.
+    """
+
+    import psycopg
+
+    from gpu_fault.store.postgres.index_builder import (
+        database_diagnostics,
+        diagnostics_warnings,
+    )
+
+    with psycopg.connect(postgres_url, autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            try:
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+            except psycopg.Error as exc:
+                if exc.sqlstate != "42501":
+                    raise
+                print(
+                    "cannot install pg_stat_statements: insufficient privilege "
+                    f"({str(exc).strip()}); run --ensure-diagnostics as "
+                    "the database master user or create the extension by hand"
+                )
+                return 1
+            diagnostics = database_diagnostics(cursor)
+    print(
+        json.dumps(
+            {
+                "diagnostics": diagnostics,
+                "warnings": diagnostics_warnings(diagnostics),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Migrate a stopped SQLite store to PostgreSQL."
@@ -120,6 +164,7 @@ def main() -> None:
     source.add_argument("--ensure-schema", action="store_true")
     source.add_argument("--build-indexes-concurrently", action="store_true")
     source.add_argument("--schema-preflight", action="store_true")
+    source.add_argument("--ensure-diagnostics", action="store_true")
     source.add_argument("--backfill-hot-state", action="store_true")
     source.add_argument("--hot-state-status", action="store_true")
     source.add_argument(
@@ -181,6 +226,8 @@ def main() -> None:
             if not report["ok"]:
                 raise SystemExit(1)
             return
+    if arguments.ensure_diagnostics:
+        raise SystemExit(ensure_diagnostics(arguments.postgres_url))
     if arguments.backfill_hot_state:
         store = PostgresStore(arguments.postgres_url, hot_state_mode="dual")
         try:
@@ -255,7 +302,7 @@ def main() -> None:
         store = PostgresStore(arguments.postgres_url)
         try:
             status = {
-                "mode": store._processor_counter_mode(),
+                "mode": store.processor_counter_mode(),
                 **store.processor_queue_count_status(),
             }
         finally:

@@ -255,7 +255,47 @@ class InstallationResourceStore(Protocol):
 
 @runtime_checkable
 class WorkflowStore(Protocol):
-    def save_workflow(self, workflow: WorkflowRequest) -> None: ...
+    """Incident, workflow and plan records and the transactions over them.
+
+    Every method that takes a ``builder`` (``create_incident_workflow_if_absent``
+    and the three ``merge_*`` methods) runs it inside the store transaction, with
+    the group's advisory lock held and one pooled connection pinned to the
+    calling thread. The builder must therefore be pure computation over the
+    records it is handed: no network, no adapter or HTTP call, no sleep, no
+    independent store round-trip beyond the nested writes the store itself
+    makes. A remote call there holds the lock and the connection for its full
+    latency, so one slow adapter becomes a stall of every ingest for that group
+    and, once the pool is exhausted, of the whole control plane (store review
+    2026-09-07, item D).
+    """
+
+    def save_workflow(
+        self,
+        workflow: WorkflowRequest,
+        *,
+        expected: WorkflowRequest | None = None,
+    ) -> None:
+        """Write one workflow row without overwriting a row that has moved.
+
+        Without ``expected`` the write is version-guarded: a missing row is
+        inserted; an existing row is replaced only while its
+        ``merge_revision``, ``execution_epoch`` and ``fencing_token`` still
+        equal the caller's copy. Any of the three moving means a merge widened
+        the record, an executor re-leased it (epoch bump) or the incident moved
+        to a new generation since the caller read it, and writing the copy back
+        would erase that; the store raises :class:`StaleWriteError` naming the
+        field so the caller re-reads and reapplies. With ``expected`` the write
+        is a full compare-and-set on the whole payload the caller read.
+
+        Callers that hold a read copy should pass it as ``expected``. Paths that
+        create a row should prefer ``create_incident_workflow_if_absent`` or
+        ``save_incident_and_workflow``, which link the incident in the same
+        transaction. Before this guard PostgreSQL inherited the SQLite blind
+        upsert under a process lock that ``PostgresStore`` neutralizes, so a
+        concurrent merge or lease was silently overwritten (store review
+        2026-09-07, item B).
+        """
+        ...
 
     def get_workflow(self, request_id: str) -> WorkflowRequest: ...
 
@@ -438,7 +478,20 @@ class WorkflowStore(Protocol):
         *,
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
-    ) -> WorkflowRequest: ...
+    ) -> WorkflowRequest:
+        """Confirm the caller's lease and return the current row.
+
+        Owner, epoch and expiry are validated exactly as for a leased save; a
+        mismatch is a ``WorkflowLeaseError``. The lease is only extended when
+        less than half of ``lease_duration`` remains; otherwise the row is
+        returned unchanged and nothing is written. The executor renews before
+        and after every step, seconds into a 3-minute lease, and every renewal
+        re-serialized the whole record (step executions, events, steps) into a
+        new heap tuple, its TOAST chunks and every partial index entry. The
+        read stays because the executor picks merges up through the row this
+        returns (store review 2026-09-07, item F1).
+        """
+        ...
 
     def save_workflow_if_leased(
         self,
@@ -465,7 +518,70 @@ class WorkflowStore(Protocol):
         builder: Callable[[], tuple[FaultIncident, WorkflowRequest]],
         *,
         serialization_key: str | None = None,
-    ) -> tuple[FaultIncident, WorkflowRequest, bool]: ...
+    ) -> tuple[FaultIncident, WorkflowRequest, bool]:
+        """Create an event's incident and workflow once, or return the pair
+        the event already resolves to.
+
+        ``builder`` runs inside the store transaction with the
+        ``incident_workflow/<key>`` advisory lock and a pinned connection held:
+        it must be pure computation on the caller's own inputs -- no network,
+        no adapter or HTTP call, no sleep, no store reads of its own (store
+        review 2026-09-07, item D; see the class docstring for why).
+        """
+        ...
+
+    def merge_replacement_workflow(
+        self,
+        group_key: str,
+        event_id: str,
+        builder: Callable[
+            [FaultIncident | None, WorkflowRequest | None],
+            tuple[FaultIncident, WorkflowRequest],
+        ],
+    ) -> tuple[FaultIncident, WorkflowRequest]:
+        """Merge one node fault into the replacement group ``group_key``.
+
+        ``builder`` receives the group's current incident and workflow (both
+        row-locked, or ``None`` for a new group) and returns the merged pair.
+        It runs inside the store transaction with the
+        ``replacement_fault_group/<key>`` advisory lock and a pinned connection
+        held, so it must be pure computation over those two records: no
+        network, no adapter or HTTP call, no sleep, no independent store
+        round-trip (store review 2026-09-07, item D).
+        """
+        ...
+
+    def merge_attempt_fault_workflow(
+        self,
+        group_key: str,
+        event_id: str,
+        builder: Callable[
+            [FaultIncident | None, WorkflowRequest | None],
+            tuple[FaultIncident, WorkflowRequest],
+        ],
+    ) -> tuple[FaultIncident, WorkflowRequest]:
+        """Merge one fault into the attempt-scoped group ``group_key``.
+
+        Same contract as ``merge_replacement_workflow`` under the
+        ``sxid_fault_group/<key>`` advisory lock: ``builder`` is pure
+        computation over the locked records it is handed, nothing external
+        (store review 2026-09-07, item D).
+        """
+        ...
+
+    def merge_sxid_workflow(
+        self,
+        group_key: str,
+        event_id: str,
+        builder: Callable[
+            [FaultIncident | None, WorkflowRequest | None],
+            tuple[FaultIncident, WorkflowRequest],
+        ],
+    ) -> tuple[FaultIncident, WorkflowRequest]:
+        """Alias of ``merge_attempt_fault_workflow`` kept for the SXID ingest
+        path; the same builder purity rule applies (store review 2026-09-07,
+        item D)."""
+        ...
 
     def cancel_remote_commands_for_workflow(
         self,
@@ -563,6 +679,14 @@ class CompletionStore(Protocol):
         event and a crash mid-way leaves no event row without a decision. The
         in-memory and SQLite stores serialize on their process lock. Nested
         store writes (each with their own transaction) must be allowed inside.
+
+        The body runs with that advisory lock and one pooled connection held,
+        so it must be pure computation over records already in hand plus the
+        nested store writes: no network, no adapter or HTTP call, no sleep, no
+        independent store round-trip. A remote call inside holds the lock and
+        the connection for its latency, and one slow adapter becomes a stall of
+        every completion for that event key and, with the pool drained, of the
+        control plane (store review 2026-09-07, item D).
         """
         ...
 

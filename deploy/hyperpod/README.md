@@ -36,7 +36,12 @@ HyperPod EKS cluster and verifies the complete passive recovery path.
 
 ## Deploy
 
+The script refuses to run unless `GPU_FAULT_ALLOW_LEGACY_DEPLOY=1` is set
+(exit code 64 with a pointer to `gpu-fault-admin deploy`), so it cannot be
+started by habit next to a regional site.
+
 ```bash
+export GPU_FAULT_ALLOW_LEGACY_DEPLOY=1
 export AWS_REGION=us-west-2
 export EKS_CLUSTER_NAME='<gpu-eks-cluster>'
 export HYPERPOD_CLUSTER_NAME='<gpu-hyperpod-cluster>'

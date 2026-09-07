@@ -207,9 +207,11 @@ class ResetOperationService:
                     "workflow_request_id": workflow.request_id,
                 }
             )
-            self.store.save_workflow(workflow)
-            self.store.save_incident(incident)
-            self.store.link_event_to_incident(batch.batch_id, incident.incident_id)
+            # Incident + workflow in one transaction; the store links
+            # ``incident.event_id`` (the batch id) itself, the member events are
+            # linked below. Two blind autocommit writes let a crash between them
+            # leave an orphan workflow (store review 2026-09-07, item B).
+            self.store.save_incident_and_workflow(incident, workflow)
             for event in batch.events:
                 self.store.link_event_to_incident(event.event_id, incident.incident_id)
             return incident, workflow

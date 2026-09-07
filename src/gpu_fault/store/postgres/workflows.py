@@ -15,10 +15,16 @@ from gpu_fault.models import (
 from gpu_fault.store.shared.time import utc_text as _utc_text
 from gpu_fault.store.shared.workflow_scan import dispatch_order_key
 from gpu_fault.store.shared.errors import (
+    NotFoundError,
+    StaleWriteError,
     WorkflowMergedError,
     RemediationBudgetError,
     WorkflowLeaseError,
     StaleFencingTokenError,
+)
+from gpu_fault.store.shared.transactional_workflows import (
+    lease_extension_due,
+    stale_workflow_versions,
 )
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
@@ -207,37 +213,54 @@ class PostgresWorkflowMixin:
         The /metrics workflow gauge must stay exact while the detail scan that
         feeds the duration and step families is bounded, so the count is a
         server-side aggregate rather than a by-product of that scan.
+
+        One ``count(*)`` per enum value rather than ``GROUP BY``: Postgres never
+        plans an Index Only Scan over an expression index, so the grouped form
+        read and detoasted every workflow payload on every scrape, and the
+        cost grew with lifetime because control-record retention is off. The
+        per-value form is an index range scan on
+        ``gpu_fault_workflow_status_count`` with no payload evaluated (store
+        review 2026-09-07, item G).
+        """
+
+        counts = self._count_by_field(
+            "workflow", "status", [status.value for status in WorkflowStatus]
+        )
+        return {WorkflowStatus(value): count for value, count in counts.items()}
+
+    def incident_state_counts(self) -> dict[IncidentState, int]:
+        """Count every persisted incident by state (server-side aggregate
+        for the /metrics incident gauge; ESCALATED is the operator queue).
+        Per-value counts on ``gpu_fault_incident_state_count`` (item G)."""
+
+        counts = self._count_by_field(
+            "incident", "state", [state.value for state in IncidentState]
+        )
+        return {IncidentState(value): count for value, count in counts.items()}
+
+    def _count_by_field(
+        self, kind: str, field: str, values: list[str]
+    ) -> dict[str, int]:
+        """``{value: count}`` for one kind, one index range scan per value.
+
+        ``kind`` and ``field`` are literals from the callers, never input; the
+        values are the enum members. Missing values count as zero; a stored
+        value outside the enum is not counted (the gauge is per enum member).
         """
 
         with self._db.cursor() as cursor:
             cursor.execute(
-                """
-                SELECT payload->>'status' AS status, COUNT(*)
-                FROM gpu_fault_objects WHERE kind='workflow' GROUP BY status
-                """
+                f"""
+                SELECT s.value, (
+                    SELECT count(*) FROM gpu_fault_objects
+                    WHERE kind='{kind}' AND payload->>'{field}' = s.value
+                )
+                FROM unnest(%s::text[]) AS s(value)
+                """,
+                (values,),
             )
             rows = cursor.fetchall()
-        counts = {status: 0 for status in WorkflowStatus}
-        for status, count in rows:
-            counts[WorkflowStatus(status)] = int(count)
-        return counts
-
-    def incident_state_counts(self) -> dict[IncidentState, int]:
-        """Count every persisted incident by state (server-side aggregate
-        for the /metrics incident gauge; ESCALATED is the operator queue)."""
-
-        with self._db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT payload->>'state' AS state, COUNT(*)
-                FROM gpu_fault_objects WHERE kind='incident' GROUP BY state
-                """
-            )
-            rows = cursor.fetchall()
-        counts = {state: 0 for state in IncidentState}
-        for state, count in rows:
-            counts[IncidentState(state)] = int(count)
-        return counts
+        return {value: int(count) for value, count in rows}
 
     def blocked_workflows_without_verified_restore(self) -> int:
         """Count the BLOCKED workflows whose GPU node is still held.
@@ -433,6 +456,12 @@ class PostgresWorkflowMixin:
         *,
         limit: int = 100,
     ) -> list[tuple[FaultIncident, WorkflowRequest]]:
+        # Text order on ``updated_at`` (store review 2026-09-07, item H2): the
+        # ``::timestamptz`` cast forced a per-row detoast and sort. Text order
+        # is time order for rows written after item E (fixed-width
+        # ``YYYY-MM-DDTHH:MM:SS.ffffffZ``); legacy rows with a shorter
+        # fraction may misorder within one second, which this reader
+        # tolerates because it filters by rank afterwards.
         with self._db.cursor() as cursor:
             cursor.execute(
                 """
@@ -465,7 +494,7 @@ class PostgresWorkflowMixin:
                                   ->>'restart_attempt_id'=%s
                         )
                   )
-                ORDER BY (w.payload->>'updated_at')::timestamptz DESC,
+                ORDER BY w.payload->>'updated_at' DESC,
                          w.key DESC
                 LIMIT %s
                 """,
@@ -655,7 +684,7 @@ class PostgresWorkflowMixin:
         lease_duration: timedelta = timedelta(minutes=3),
     ) -> WorkflowRequest:
         with self._db.transaction():
-            workflow = self._get_for_update("workflow", request_id)
+            workflow: WorkflowRequest = self._get_for_update("workflow", request_id)
             renewed_at = now or datetime.now(timezone.utc)
             if (
                 workflow.execution_owner_id != executor_id
@@ -664,11 +693,111 @@ class PostgresWorkflowMixin:
                 or workflow.execution_lease_expires_at <= renewed_at
             ):
                 raise WorkflowLeaseError("workflow execution lease is stale")
+            if not lease_extension_due(
+                workflow, renewed_at=renewed_at, lease_duration=lease_duration
+            ):
+                # More than half the lease left: the read is the point (the
+                # executor picks merges up through it); the write is not
+                # (store review 2026-09-07, item F1).
+                return workflow
             workflow = workflow.model_copy(
                 update={"execution_lease_expires_at": (renewed_at + lease_duration)}
             )
             self._put("workflow", request_id, workflow)
             return workflow
+
+    def save_workflow(
+        self,
+        workflow: WorkflowRequest,
+        *,
+        expected: WorkflowRequest | None = None,
+    ) -> None:
+        """See ``WorkflowStore.save_workflow`` (store review 2026-09-07, item B).
+
+        The inherited SQLite version was a blind whole-row upsert under the
+        process lock that ``PostgresStore`` neutralizes, so a copy read before
+        a merge, a re-lease or a generation change overwrote it. With
+        ``expected`` this is the full-payload compare-and-set of ``_put``.
+        Without it, two statements and no transaction:
+
+        1. a guarded UPDATE that matches only while the three version fields
+           still equal the caller's copy;
+        2. if that touched nothing, ``INSERT ... ON CONFLICT DO NOTHING``.
+
+        Race analysis: the UPDATE is atomic on its own; a concurrent writer
+        either commits first and moves a version (we match nothing) or waits
+        behind our row lock and then sees our row. If it matched nothing the
+        row was absent or moved. The INSERT then creates it only if it is still
+        absent -- two creators race on the unique key and exactly one wins, the
+        other gets no row back and is told the row moved, which is true. A row
+        that was present with other versions at step 1 stays untouched and
+        step 2 finds it, so nothing is ever overwritten. The one interleaving
+        that lands is "present at step 1, deleted before step 2", which
+        recreates a row the archive just removed; workflow rows are only
+        deleted by control-record retention, which is off, so that is accepted
+        rather than paid for with a transaction on every save.
+        """
+
+        if expected is not None:
+            self._put("workflow", workflow.request_id, workflow, expected=expected)
+            return
+        payload = workflow.model_dump_json()
+        with self._db.cursor() as cursor:
+            # COALESCE to the model defaults: rows written before a field
+            # existed decode with the default, and must compare as such.
+            cursor.execute(
+                """
+                UPDATE gpu_fault_objects
+                SET payload=%s::jsonb
+                WHERE kind='workflow' AND key=%s
+                  AND coalesce(payload->>'merge_revision', '0')=%s
+                  AND coalesce(payload->>'execution_epoch', '0')=%s
+                  AND payload->>'fencing_token'=%s
+                """,
+                (
+                    payload,
+                    workflow.request_id,
+                    str(workflow.merge_revision),
+                    str(workflow.execution_epoch),
+                    str(workflow.fencing_token),
+                ),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                """
+                INSERT INTO gpu_fault_objects(kind, key, payload)
+                VALUES ('workflow', %s, %s::jsonb)
+                ON CONFLICT(kind, key) DO NOTHING
+                RETURNING key
+                """,
+                (workflow.request_id, payload),
+            )
+            if cursor.fetchone() is not None:
+                return
+            # Neither statement landed: re-read only to name what moved.
+            cursor.execute(
+                """
+                SELECT payload FROM gpu_fault_objects
+                WHERE kind='workflow' AND key=%s
+                """,
+                (workflow.request_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            raise StaleWriteError(
+                f"workflow/{workflow.request_id} changed since it was read"
+            )
+        stored: WorkflowRequest = self._decode("workflow", row[0])
+        stale = stale_workflow_versions(stored, workflow)
+        if stale is None:
+            # The guard missed but the versions match now: the row moved and
+            # moved back, or another writer landed the same versions in
+            # between. Either way the caller's copy predates a write.
+            stale = StaleWriteError(
+                f"workflow/{workflow.request_id} changed since it was read"
+            )
+        raise stale
 
     def save_incident(self, incident: FaultIncident) -> None:
         """Write the incident and its event link atomically.
@@ -720,6 +849,15 @@ class PostgresWorkflowMixin:
         now: datetime | None = None,
     ) -> None:
         with self._db.transaction():
+            # Lock order rule (TransactionalWorkflowMixin): the incident row
+            # first, then the workflow. Workflow-first made this the W->I half
+            # of a deadlock pair with every merge on the same incident (store
+            # review 2026-09-07, item C). A missing incident is tolerated: the
+            # write below creates it.
+            try:
+                self._get_for_update("incident", incident.incident_id)
+            except NotFoundError:
+                pass
             current = self._get_for_update("workflow", workflow.request_id)
             checked_at = now or datetime.now(timezone.utc)
             if (

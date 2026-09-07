@@ -135,7 +135,11 @@ def test_the_execution_epoch_is_part_of_what_the_approval_binds() -> None:
     assert plan["items"][0]["execution_epoch"] == 0
 
     workflow = store.get_workflow(blocked_id)
-    store.save_workflow(workflow.model_copy(update={"execution_epoch": 1}))
+    # Deliberate out-of-band claim; ``expected`` names the row as read (store
+    # review 2026-09-07, item B).
+    store.save_workflow(
+        workflow.model_copy(update={"execution_epoch": 1}), expected=workflow
+    )
 
     assert (
         build_workflow_reconcile_plan(store, [blocked_id], now=NOW)["plan_sha256"]

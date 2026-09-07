@@ -705,7 +705,10 @@ def _revoke_planned_item(
             reference=reference,
             reconciled_at=applied_at,
         )
-        store.save_workflow(revoked)
+        # Compare-and-set on the copy read above: the lease renewal named
+        # there now surfaces as ``StaleWriteError`` (reported per item by the
+        # caller) instead of being overwritten (store review 2026-09-07, item B).
+        store.save_workflow(revoked, expected=workflow)
         store.save_incident(updated_incident)
     return revoked.request_id, _release_restart_reservations(
         store, revoked, waiting_ttl=waiting_ttl

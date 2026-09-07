@@ -5,7 +5,9 @@ before the rolling upgrade, the transactional DDL then finds it already
 present, and the schema check fails a replica closed if it is missing. This
 module is the operator side of that method plus the gate a FULL release runs
 before it rolls anything: schema version, index presence and validity, and
-in-flight safety workflows written before ``safety_only`` existed.
+in-flight safety workflows written before ``safety_only`` existed. The report
+also carries the server's diagnostic settings (item K2) as non-blocking
+warnings.
 """
 
 from __future__ import annotations
@@ -185,6 +187,7 @@ def _schema_preflight_report(
             f"{unflagged} in-flight safety workflow(s) predate safety_only; "
             "wait for them to finish before rolling"
         )
+    diagnostics = database_diagnostics(cursor)
     return {
         "ok": not reasons,
         "schema_version": {
@@ -195,4 +198,53 @@ def _schema_preflight_report(
         "indexes": {"missing": missing, "invalid": invalid, "declared": len(health)},
         "in_flight_safety_workflows_without_flag": unflagged,
         "blocking_reasons": reasons,
+        "diagnostics": diagnostics,
+        "warnings": diagnostics_warnings(diagnostics),
     }
+
+
+# The Aurora cluster is not visible to the deploy host's AWS role, so the
+# database itself is the only place to see whether lock waits are logged and
+# whether pg_stat_statements is loaded (store review 2026-09-07, item K2).
+_DIAGNOSTIC_SETTINGS = (
+    "log_lock_waits",
+    "deadlock_timeout",
+    "log_min_duration_statement",
+    "shared_preload_libraries",
+)
+
+
+def database_diagnostics(cursor: Any) -> dict[str, Any]:
+    """Server settings that decide what the database can tell us afterwards.
+
+    ``current_setting(name, true)`` returns NULL rather than raising for a
+    name this server does not know, so the report never blocks on one.
+    """
+
+    report: dict[str, Any] = {}
+    for name in _DIAGNOSTIC_SETTINGS:
+        cursor.execute("SELECT current_setting(%s, true)", (name,))
+        report[name] = cursor.fetchone()[0]
+    cursor.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements')"
+    )
+    report["pg_stat_statements_installed"] = bool(cursor.fetchone()[0])
+    return report
+
+
+def diagnostics_warnings(diagnostics: dict[str, Any]) -> list[str]:
+    """Non-blocking: each entry names what the missing diagnostic costs."""
+
+    warnings: list[str] = []
+    if str(diagnostics.get("log_lock_waits") or "off").lower() != "on":
+        warnings.append(
+            "log_lock_waits is off: lock waits longer than deadlock_timeout and "
+            "the deadlocks the store retries stay invisible in the database log"
+        )
+    if not diagnostics.get("pg_stat_statements_installed"):
+        warnings.append(
+            "pg_stat_statements is not installed: there is no per-statement "
+            "profile of the ACU spend; run --ensure-diagnostics (needs "
+            "shared_preload_libraries=pg_stat_statements in the parameter group)"
+        )
+    return warnings

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 
+import pytest
+
 from gpu_fault import store_migrate
+
+POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
 
 
 def test_store_migrate_can_initialize_schema(monkeypatch, capsys) -> None:
@@ -171,3 +176,106 @@ def test_store_migrate_refuses_unsafe_legacy_purge(monkeypatch) -> None:
         assert "incomplete" in str(exc)
     else:
         raise AssertionError("unsafe hot-state purge was accepted")
+
+
+@pytest.fixture
+def without_pg_stat_statements():
+    """Leave the extension state as the other tests found it."""
+
+    psycopg = pytest.importorskip("psycopg")
+    assert POSTGRES_URL is not None
+
+    def drop() -> None:
+        with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DROP EXTENSION IF EXISTS pg_stat_statements")
+
+    drop()
+    yield
+    drop()
+
+
+@pytest.mark.skipif(
+    not POSTGRES_URL, reason="GPU_FAULT_TEST_POSTGRES_URL is not configured"
+)
+def test_store_migrate_ensure_diagnostics_installs_pg_stat_statements(
+    monkeypatch, capsys, without_pg_stat_statements
+) -> None:
+    """Store review 2026-09-07, item K2. The postgres:16 image ships contrib
+    and the test role is a superuser, so the extension installs; the report
+    then shows it and drops the matching warning."""
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gpu-fault-store-migrate",
+            "--ensure-diagnostics",
+            "--postgres-url",
+            POSTGRES_URL,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        store_migrate.main()
+
+    assert exit_info.value.code == 0
+    body = json.loads(capsys.readouterr().out)
+    assert body["diagnostics"]["pg_stat_statements_installed"] is True
+    assert all("pg_stat_statements" not in item for item in body["warnings"]), body[
+        "warnings"
+    ]
+    assert set(body["diagnostics"]) >= {
+        "log_lock_waits",
+        "deadlock_timeout",
+        "log_min_duration_statement",
+        "shared_preload_libraries",
+    }
+
+
+def test_store_migrate_ensure_diagnostics_reports_insufficient_privilege(
+    monkeypatch, capsys
+) -> None:
+    psycopg = pytest.importorskip("psycopg")
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            return None
+
+        def execute(self, query, _params=None):
+            if query.startswith("CREATE EXTENSION"):
+                raise psycopg.errors.InsufficientPrivilege(
+                    "permission denied to create extension"
+                )
+            raise AssertionError(f"unexpected statement after the failure: {query}")
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            return None
+
+        def cursor(self):
+            return FakeCursor()
+
+    monkeypatch.setattr(psycopg, "connect", lambda *_args, **_kwargs: FakeConnection())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gpu-fault-store-migrate",
+            "--ensure-diagnostics",
+            "--postgres-url",
+            "postgresql://db/gpu_fault",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        store_migrate.main()
+
+    assert exit_info.value.code == 1
+    assert "insufficient privilege" in capsys.readouterr().out

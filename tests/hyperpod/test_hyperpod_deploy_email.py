@@ -38,7 +38,11 @@ def test_cloudwatch_hma_deployment_is_disabled_by_default() -> None:
 def test_hyperpod_deploy_script_expands_passive_fallback() -> None:
     result = subprocess.run(
         [str(SCRIPT), "invalid"],
-        env={**os.environ, "GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS": "30"},
+        env={
+            **os.environ,
+            "GPU_FAULT_ALLOW_LEGACY_DEPLOY": "1",
+            "GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS": "30",
+        },
         text=True,
         capture_output=True,
     )
@@ -46,6 +50,25 @@ def test_hyperpod_deploy_script_expands_passive_fallback() -> None:
     assert result.returncode == 2
     assert "bad substitution" not in result.stderr
     assert "Usage:" in result.stderr
+
+
+def test_hyperpod_deploy_refuses_to_run_without_the_legacy_opt_in() -> None:
+    """The script has no regional caller; a stray invocation must stop before
+    any step runs, with a pointer to the real entry point."""
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "GPU_FAULT_ALLOW_LEGACY_DEPLOY"
+    }
+    result = subprocess.run(
+        [str(SCRIPT), "validate"], env=env, text=True, capture_output=True
+    )
+
+    assert result.returncode == 64
+    assert "gpu-fault-admin deploy" in result.stderr
+    assert "GPU_FAULT_ALLOW_LEGACY_DEPLOY=1" in result.stderr
+    assert "Validate platform" not in result.stdout
 
 
 def test_agent_consistency_ignores_revoked_and_expired_records() -> None:
@@ -148,7 +171,11 @@ def test_hyperpod_deploy_can_enable_xid_firmware_workflow() -> None:
 def test_hyperpod_deploy_rejects_invalid_dcgm_exporter_mode() -> None:
     result = subprocess.run(
         [str(SCRIPT), "validate"],
-        env={**os.environ, "GPU_FAULT_DCGM_EXPORTER_MODE": "unexpected"},
+        env={
+            **os.environ,
+            "GPU_FAULT_ALLOW_LEGACY_DEPLOY": "1",
+            "GPU_FAULT_DCGM_EXPORTER_MODE": "unexpected",
+        },
         text=True,
         capture_output=True,
     )

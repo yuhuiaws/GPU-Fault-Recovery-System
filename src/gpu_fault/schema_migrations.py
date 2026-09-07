@@ -74,6 +74,19 @@ def _drop_duplicate_claim_window_index_v11(cursor: MigrationCursor) -> None:
     cursor.execute("DROP INDEX IF EXISTS gpu_fault_processor_queue_claim_order")
 
 
+def _apply_store_review_indexes_v12(cursor: MigrationCursor) -> None:
+    # Store review 2026-09-07, items G, H1, H2, H3: seven new partial indexes
+    # on gpu_fault_objects (three /metrics count covers, the all-status
+    # remote-command workflow index, the workflow incident_id index, and the
+    # dispatch-order index the code had assumed since F-A2a). Same three-step
+    # method as v9-v11: declared IF NOT EXISTS by the idempotent DDL, built
+    # CONCURRENTLY by the operator/deploy Job first, validated at startup.
+    # ``gpu_fault_remote_command_workflow_all`` covers every read the open-only
+    # partial ``gpu_fault_remote_command_workflow`` served, so that one goes
+    # here the way v11 dropped the twin claim-window index.
+    cursor.execute("DROP INDEX IF EXISTS gpu_fault_remote_command_workflow")
+
+
 def _apply_dispatcher_indexes_v9(cursor: MigrationCursor) -> None:
     # The three dispatcher partial indexes (F-A9) are declared IF NOT EXISTS
     # by the idempotent DDL that ``--ensure-schema`` runs before recording this
@@ -203,6 +216,12 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="drop-duplicate-claim-window-index",
         ddl_checksum="0038a7136838d584e28786a82d82b6f6d6fb3cfa88978f6ea6e5ac224b5c9cdf",
         apply=_drop_duplicate_claim_window_index_v11,
+    ),
+    SchemaMigration(
+        version=12,
+        name="store-review-hot-query-indexes",
+        ddl_checksum="37e84d0dbacd405f6eb05223c65f997e44b0be2524d7b7ed577f3ced0a222c99",
+        apply=_apply_store_review_indexes_v12,
     ),
 )
 

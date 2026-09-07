@@ -1412,8 +1412,16 @@ class WorkflowDispatcher:
             abandoned = attempts >= self.config.failure_handling_max_attempts
             if abandoned:
                 update["failure_handled_at"] = datetime.now(timezone.utc)
+            # Compare-and-set on ``current``: a row another process moved since
+            # the read raises ``StaleWriteError`` up to the per-workflow guard
+            # in ``_reconcile_failed_workflows``; the next tick re-reads. The
+            # counter moves after the write so a refused write is not counted
+            # as an abandonment (store review 2026-09-07, item B).
+            self.store.save_workflow(
+                current.model_copy(update=update), expected=current
+            )
+            if abandoned:
                 self.failure_handling_abandoned_total += 1
-            self.store.save_workflow(current.model_copy(update=update))
             LOGGER.exception(
                 "failed workflow handler raised (attempt %d/%d%s): %s",
                 attempts,
@@ -1433,7 +1441,8 @@ class WorkflowDispatcher:
                         "failure_handled_at": datetime.now(timezone.utc),
                         "updated_at": datetime.now(timezone.utc),
                     }
-                )
+                ),
+                expected=current,
             )
 
     def _sync_plan(

@@ -83,7 +83,6 @@ POSTGRES_INHERITED_PUBLIC = frozenset(
         "acquire_processor_leadership",
         "add_marker",
         "apply_efa_traffic_admin_action",
-        "cancel_remote_command",
         "complete_notification_delivery",
         "complete_remote_command",
         "complete_xid_correlation",
@@ -156,7 +155,6 @@ POSTGRES_INHERITED_PUBLIC = frozenset(
         "save_regional_cluster",
         "save_regional_registry_member",
         "save_triage_report",
-        "save_workflow",
         "save_xid_policy_decision",
     }
 )
@@ -202,6 +200,7 @@ POSTGRES_PROCESSOR_PUBLIC = {
             "finalize_processor_counter_shards",
             "listen_processor_queue_notifications",
             "processor_batch_transaction",
+            "processor_counter_mode",
             "processor_queue_count_status",
             "processor_queue_state_status",
             "restore_legacy_processor_counters",
@@ -457,7 +456,7 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
         4: "9ce8369e79e881c566bc429c72a157a0e7fe6a2557bcf2b4d050f2565db2b947",
         5: "884820da9fdf5521dad40dffd8a40b1a3acf415de1871f563202eafd083ebb97",
     }
-    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 11
+    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 12
 
 
 def test_completion_cluster_groups_use_bounded_parallelism() -> None:

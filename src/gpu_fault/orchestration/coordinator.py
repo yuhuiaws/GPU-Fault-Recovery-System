@@ -790,9 +790,23 @@ class IncidentOrchestrator:
                     "updated_at": datetime.now(timezone.utc),
                 }
             )
-            self.store.save_workflow(workflow)
-            self.store.save_incident(incident)
-            return incident, workflow
+            # One transaction for incident + workflow + event link. The blind
+            # ``save_workflow`` then ``save_incident`` pair was two autocommit
+            # statements on Postgres: two replicas ingesting the same event made
+            # two incidents, and a crash in between left an orphan workflow
+            # (store review 2026-09-07, item B). The pair is built above, not in
+            # the builder: ``_build_workflow`` reads the profile from the store,
+            # and the builder runs under the advisory lock, where it must be pure
+            # (item D). ``incident.event_id`` is this event's id, so the store's
+            # link of both is one link.
+            created_incident, created_workflow, _created = (
+                self.store.create_incident_workflow_if_absent(
+                    event.event_id, lambda: (incident, workflow)
+                )
+            )
+            # ``created`` False means a duplicate raced another replica past the
+            # ``get_incident_by_event`` check at the top; the stored pair wins.
+            return created_incident, created_workflow
 
     def _independent_incident(
         self,
@@ -1621,6 +1635,7 @@ class IncidentOrchestrator:
                 )
 
             now = datetime.now(timezone.utc)
+            read_workflow = workflow
             workflow = workflow.model_copy(
                 update={
                     "status": final_workflow_status,
@@ -1634,7 +1649,15 @@ class IncidentOrchestrator:
                     "updated_at": now,
                 }
             )
-            self.store.save_workflow(workflow)
+            # Compare-and-set on the copy read above: a merge or lease change
+            # by another replica between the read and this write surfaces as
+            # ``StaleWriteError`` instead of being overwritten. It propagates,
+            # like ``WorkflowFencingError`` from the same method: the caller
+            # re-reads and retries, this method holds no state to retry with.
+            # ``save_incident_and_workflow`` is not used because it has no
+            # ``expected`` and stamps a merge revision on an existing row
+            # (store review 2026-09-07, item B).
+            self.store.save_workflow(workflow, expected=read_workflow)
             self.store.save_incident(incident)
             return WorkflowExecutionResult(
                 workflow_request_id=workflow.request_id,

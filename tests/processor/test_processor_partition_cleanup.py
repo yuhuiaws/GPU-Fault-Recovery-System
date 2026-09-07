@@ -21,9 +21,14 @@ class RecordingCursor:
         self.statements.append(" ".join(sql.split()))
         self.parameters.append(parameters)
 
-    def fetchone(self) -> tuple[object, ...]:
-        # The counter seeding asks whether it already ran; say yes so the
-        # schema pass stays a pure DDL recording.
+    def fetchone(self) -> tuple[object, ...] | None:
+        # Play a legacy database so every removal is issued and recorded: the
+        # counter seed says it already ran, the catalog reads say the column /
+        # index / disabled trigger are present, the recorded schema version
+        # is 1 (``True``), and the trigger definition read says "absent" so
+        # the CREATE TRIGGER is recorded (item J made the DDL ask first).
+        if self.statements and "pg_get_triggerdef" in self.statements[-1]:
+            return None
         return (True,)
 
     def __enter__(self) -> RecordingCursor:

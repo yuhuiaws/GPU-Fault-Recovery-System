@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.store.postgres.ddl_helpers import _declare_index, _ensure_trigger
+
 
 def _create_telemetry_spool(cursor) -> None:
     # Telemetry's own spool, deliberately not the processor queue.
@@ -52,34 +54,37 @@ def _create_telemetry_spool(cursor) -> None:
     # claim window. This index is the claim: one range scan from the
     # front, and the ``spool_key`` tiebreak keeps two consumers taking
     # the same rows in the same order rather than crossing.
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_telemetry_spool_available
         ON gpu_fault_telemetry_spool (available_at, spool_key)
-        """
+        """,
     )
     # Dedicated consumers claim one telemetry path at a time to give
     # inventory, GPU metrics and host summaries bounded service even
     # when one stream dominates. Keep that claim as one ordered index
     # range scan rather than filtering the global availability index.
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_telemetry_spool_path_available
         ON gpu_fault_telemetry_spool (
             path, available_at, spool_key
         )
-        """
+        """,
     )
     # Depth is reported and capped per cluster, and the cap is the
     # only thing on the admission path that has to read the table.
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_telemetry_spool_cluster
         ON gpu_fault_telemetry_spool (cluster_id)
-        """
+        """,
     )
     cursor.execute(
         """
@@ -102,14 +107,10 @@ def _create_telemetry_spool(cursor) -> None:
         $$
         """
     )
-    cursor.execute(
-        """
-        DROP TRIGGER IF EXISTS
-        gpu_fault_telemetry_spool_notify_available_trigger
-        ON gpu_fault_telemetry_spool
-        """
-    )
-    cursor.execute(
+    _ensure_trigger(
+        cursor,
+        "gpu_fault_telemetry_spool_notify_available_trigger",
+        "gpu_fault_telemetry_spool",
         """
         CREATE TRIGGER
         gpu_fault_telemetry_spool_notify_available_trigger
@@ -118,5 +119,5 @@ def _create_telemetry_spool(cursor) -> None:
         FOR EACH ROW
         EXECUTE FUNCTION
             gpu_fault_telemetry_spool_notify_available()
-        """
+        """,
     )

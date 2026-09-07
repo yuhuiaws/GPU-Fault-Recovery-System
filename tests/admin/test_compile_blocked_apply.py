@@ -208,8 +208,11 @@ def test_apply_refuses_a_plan_that_changed_under_it() -> None:
     _compile_blocked_pair(store)
     plan = build_compile_blocked_plan(store, [WORKFLOW])
     # A re-plan bumps the fencing token: the approval no longer describes it.
+    # ``expected`` names the row as read: this is a deliberate out-of-band
+    # write past the version guard (store review 2026-09-07, item B).
+    current = store.get_workflow(WORKFLOW)
     store.save_workflow(
-        store.get_workflow(WORKFLOW).model_copy(update={"fencing_token": 2})
+        current.model_copy(update={"fencing_token": 2}), expected=current
     )
 
     with pytest.raises(ValueError, match="changed before apply"):

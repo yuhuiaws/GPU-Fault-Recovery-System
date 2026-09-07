@@ -44,7 +44,7 @@ def _malformed(store, **values):
 
     _, workflow = workflow_state(store, [FREEZE])
     malformed = copy_model(workflow, completed_step_indexes=[7], **values)
-    store.save_workflow(malformed)
+    store.save_workflow(malformed, expected=workflow)
     return malformed
 
 

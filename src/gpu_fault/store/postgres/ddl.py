@@ -1,8 +1,18 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
+from typing import Any
 
+from gpu_fault.store.postgres.ddl_helpers import (
+    _CREATE_INDEX,
+    _add_column_if_missing,
+    _declare_index,
+    _drop_column_if_present,
+    _drop_index_if_present,
+    _enable_trigger_if_disabled,
+    _ensure_trigger,
+    _recorded_schema_version,
+)
 from gpu_fault.store.postgres.ddl_processor_retry import (
     upgrade_processor_retry_schedule,
 )
@@ -10,9 +20,30 @@ from gpu_fault.store.postgres.ddl_spool import _create_telemetry_spool
 
 
 def create_postgres_schema(cursor) -> None:
-    """Idempotent DDL, serialized by the caller advisory lock."""
+    """Idempotent DDL, serialized by the caller advisory lock.
+
+    Idempotent means lock-free when nothing changes (store review 2026-09-07,
+    item J). Every statement here runs in one transaction with a 60 s
+    ``lock_timeout``, and ``--ensure-schema`` runs on every deploy against a
+    live database. Postgres takes the lock before it checks whether the
+    statement is a no-op: ``CREATE INDEX ... IF NOT EXISTS`` opens the table in
+    ShareLock (blocks every writer) and only then finds the index present;
+    ``ALTER TABLE ... ADD/DROP COLUMN IF [NOT] EXISTS`` and ``DROP TRIGGER`` +
+    ``CREATE TRIGGER`` take AccessExclusiveLock; ``ALTER TABLE ... ENABLE
+    TRIGGER`` takes ShareRowExclusiveLock. Each lock is held until commit, so
+    ~50 such statements against a busy ``gpu_fault_objects`` stall the whole
+    control plane for the DDL duration, or fail on ``lock_timeout``. The
+    helpers below (``_declare_index``, ``_add_column_if_missing``,
+    ``_ensure_trigger``, ...) read the catalog first and issue the DDL only
+    when the object is actually missing or different; the two legacy
+    partition sweeps are gated on the recorded schema version. A routine
+    deploy therefore holds only AccessShareLock on the catalogs and the
+    schema-version table.
+    """
     _create_base_tables(cursor)
+    _create_base_indexes(cursor)
     _create_domain_indexes_one(cursor)
+    _create_dispatcher_indexes(cursor)
     _create_domain_indexes_two(cursor)
     _create_domain_tables_and_indexes(cursor)
     _create_processor_tables(cursor)
@@ -80,16 +111,23 @@ def _create_base_tables(cursor) -> None:
         )
         """
     )
-    cursor.execute(
+
+
+def _create_base_indexes(cursor: Any) -> None:
+    # Split from ``_create_base_tables`` so each stage stays readable; the
+    # order (tables first, then their indexes) is unchanged.
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_gpu_metric_latest_node
         ON gpu_fault_gpu_metric_latest (
             cluster_id, node_id, key
         )
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_marker_incident
@@ -99,14 +137,15 @@ def _create_base_tables(cursor) -> None:
             key
         )
         WHERE kind='marker'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_gpu_metric_latest_observed
         ON gpu_fault_gpu_metric_latest (observed_at)
-        """
+        """,
     )
     cursor.execute(
         """
@@ -120,12 +159,13 @@ def _create_base_tables(cursor) -> None:
         )
         """
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_gpu_metrics_batches_created
         ON gpu_fault_gpu_metrics_batches (created_at, key)
-        """
+        """,
     )
     cursor.execute(
         """
@@ -139,21 +179,23 @@ def _create_base_tables(cursor) -> None:
         )
         """
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_attempt_observations_cluster
         ON gpu_fault_attempt_observations (
             cluster_id, observed_at, key
         )
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_attempt_observations_observed
         ON gpu_fault_attempt_observations (observed_at, key)
-        """
+        """,
     )
     cursor.execute(
         """
@@ -168,23 +210,26 @@ def _create_base_tables(cursor) -> None:
         )
         """
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_training_progress_attempt
         ON gpu_fault_training_progress (
             cluster_id, attempt_id, rank, key
         )
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_training_progress_observed
         ON gpu_fault_training_progress (observed_at, key)
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_raw_evidence_lookup
@@ -194,9 +239,10 @@ def _create_base_tables(cursor) -> None:
             (payload->>'observed_at') DESC
         )
         WHERE kind='raw_evidence'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_raw_evidence_expiry
@@ -205,9 +251,10 @@ def _create_base_tables(cursor) -> None:
             key
         )
         WHERE kind='raw_evidence'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_xid_correlation_lookup
@@ -217,7 +264,7 @@ def _create_base_tables(cursor) -> None:
             (payload->>'observed_at')
         )
         WHERE kind='xid_correlation_event'
-        """
+        """,
     )
 
 
@@ -227,7 +274,8 @@ def _create_domain_indexes_one(cursor) -> None:
     # partial index the claim scans all remote commands ever
     # written, including terminal ones, and the cost grows with
     # cluster lifetime rather than with the open backlog.
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_remote_command_claim
@@ -241,24 +289,33 @@ def _create_domain_indexes_one(cursor) -> None:
           AND payload->>'status' IN (
               'PENDING', 'WAITING', 'LEASED'
           )
-        """
+        """,
     )
-    # A workflow timeout cancels that workflow's open commands. Only
-    # the non-terminal rows can be cancelled, so this stays small
-    # even when the terminal history is large.
-    cursor.execute(
+    # Every workflow reconcile lists that workflow's commands in every
+    # status (``list_remote_commands(workflow_request_ids=...)``), inside
+    # the transaction that holds the workflow's advisory and row locks;
+    # the only workflow_request_id index used to be partial on the open
+    # statuses, so that read was a full remote_command scan under lock
+    # (store review 2026-09-07, item H1). This all-status index carries
+    # the query's ORDER BY, and the timeout cancel path (open rows of one
+    # workflow) walks the same prefix with a status filter, so the old
+    # open-only partial ``gpu_fault_remote_command_workflow`` is dropped
+    # by the v12 migration.
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
-        gpu_fault_remote_command_workflow
+        gpu_fault_remote_command_workflow_all
         ON gpu_fault_objects (
             (payload->>'workflow_request_id'),
+            (payload->>'created_at'),
             key
         )
         WHERE kind='remote_command'
-          AND payload->>'status' NOT IN ('SUCCEEDED', 'FAILED')
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_remote_command_terminal
@@ -267,9 +324,10 @@ def _create_domain_indexes_one(cursor) -> None:
         )
         WHERE kind='remote_command'
           AND payload->>'status' IN ('SUCCEEDED', 'FAILED')
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_active_workflow_scope
@@ -282,9 +340,10 @@ def _create_domain_indexes_one(cursor) -> None:
           AND payload->>'status' IN (
               'PENDING', 'RUNNING', 'SAFETY_PENDING'
           )
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_failed_workflow_updated
@@ -294,14 +353,20 @@ def _create_domain_indexes_one(cursor) -> None:
         )
         WHERE kind='workflow'
           AND payload->>'status'='FAILED'
-        """
+        """,
     )
+
+
+def _create_dispatcher_indexes(cursor: Any) -> None:
+    # Second half of ``_create_domain_indexes_one``: the dispatcher, join-key
+    # and /metrics count indexes of ``gpu_fault_objects``.
     # Dispatcher hot queries (F-A9). Each partial index carries exactly the
     # predicate its query uses, and the queries spell the status list as
     # literals so the planner can prove the predicate (P0-73C). Text order on
     # ``payload->>'updated_at'`` is deliberate: the stored value is
     # ``isoformat()`` and a ``::timestamptz`` cast would bypass the index.
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_executable_workflow_order
@@ -313,9 +378,10 @@ def _create_domain_indexes_one(cursor) -> None:
           AND payload->>'status' IN (
               'PENDING', 'RUNNING', 'SAFETY_PENDING'
           )
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_unhandled_failed_workflow_updated
@@ -329,9 +395,10 @@ def _create_domain_indexes_one(cursor) -> None:
               payload->>'failure_handled_at' IS NULL
               OR payload->>'failure_handled_at'=''
           )
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_blocked_workflow_updated
@@ -341,9 +408,10 @@ def _create_domain_indexes_one(cursor) -> None:
         )
         WHERE kind='workflow'
           AND payload->>'status'='BLOCKED'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_preempting_successor
@@ -357,9 +425,10 @@ def _create_domain_indexes_one(cursor) -> None:
           AND payload->>'status' IN (
               'PENDING', 'SAFETY_PENDING'
           )
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_incident_scope
@@ -369,21 +438,99 @@ def _create_domain_indexes_one(cursor) -> None:
             key
         )
         WHERE kind='incident'
+        """,
+    )
+    # incident -> workflow join key in every status. The job-recovery
+    # reader (``list_job_recovery_workflow_incidents``, once per attempt
+    # observation) joins ``w.payload->>'incident_id' = i.key`` and the
+    # only incident_id index was the active-status partial above, so the
+    # terminal history was scanned per observation (store review
+    # 2026-09-07, item H2).
+    _declare_index(
+        cursor,
         """
+        CREATE INDEX IF NOT EXISTS
+        gpu_fault_workflow_incident
+        ON gpu_fault_objects (
+            (payload->>'incident_id'),
+            key
+        )
+        WHERE kind='workflow'
+        """,
+    )
+    # The paged dispatch scan (F-A2a/c) orders by the eligibility key
+    # ``GREATEST(created_at, not_before)`` with a row-value cursor; the code
+    # and its tests assumed this index while the DDL never declared it, so
+    # production sorted the executable set on every tick (store review
+    # 2026-09-07, item H3).
+    _declare_index(
+        cursor,
+        """
+        CREATE INDEX IF NOT EXISTS
+        gpu_fault_executable_workflow_dispatch_order
+        ON gpu_fault_objects (
+            (GREATEST(payload->>'created_at', payload->>'not_before')),
+            key
+        )
+        WHERE kind='workflow'
+          AND payload->>'status' IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')
+        """,
+    )
+    # /metrics aggregates ``count(*) GROUP BY payload->>'status'`` over every
+    # workflow, incident and decision on every scrape, and control-record
+    # retention is off, so each scrape read and detoasted the whole kind
+    # (store review 2026-09-07, item G). One extra small index entry per
+    # write buys one index range scan per status value (``count(*) WHERE
+    # payload->>'status' = $1``: an Index Cond on the expression, no payload
+    # evaluated, no TOAST fetch). Not an index-only scan: Postgres ignores
+    # expression columns when deciding whether an index can return a tuple
+    # (indxpath.c check_index_only), so the aggregate must ask per status
+    # rather than GROUP BY the expression. A trigger-maintained counter
+    # table was rejected: it would put every workflow write on one hot
+    # counter row, the contention shape the processor counters had to shard
+    # their way out of.
+    _declare_index(
+        cursor,
+        """
+        CREATE INDEX IF NOT EXISTS
+        gpu_fault_workflow_status_count
+        ON gpu_fault_objects ((payload->>'status'))
+        WHERE kind='workflow'
+        """,
+    )
+    _declare_index(
+        cursor,
+        """
+        CREATE INDEX IF NOT EXISTS
+        gpu_fault_incident_state_count
+        ON gpu_fault_objects ((payload->>'state'))
+        WHERE kind='incident'
+        """,
+    )
+    _declare_index(
+        cursor,
+        """
+        CREATE INDEX IF NOT EXISTS
+        gpu_fault_decision_status_count
+        ON gpu_fault_objects ((payload->>'status'))
+        WHERE kind='decision'
+        """,
     )
 
 
 def _create_domain_indexes_two(cursor) -> None:
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_incident_nodes
         ON gpu_fault_objects
         USING GIN ((payload->'node_ids'))
         WHERE kind='incident'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_attempt_observation_cluster
@@ -393,9 +540,10 @@ def _create_domain_indexes_two(cursor) -> None:
             key
         )
         WHERE kind='attempt_observation'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_gpu_metric_latest_scope
@@ -405,9 +553,10 @@ def _create_domain_indexes_two(cursor) -> None:
             key
         )
         WHERE kind='gpu_metric_latest'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_gpu_finding_state_scope
@@ -418,9 +567,10 @@ def _create_domain_indexes_two(cursor) -> None:
         )
         WHERE kind='gpu_finding_state'
           AND payload->'finding' IS NOT NULL
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_gpu_finding_history_scope
@@ -430,9 +580,10 @@ def _create_domain_indexes_two(cursor) -> None:
             key
         )
         WHERE kind='gpu_finding_history'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_gpu_finding_history_observed
@@ -441,9 +592,10 @@ def _create_domain_indexes_two(cursor) -> None:
             key
         )
         WHERE kind='gpu_finding_history'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_xid_correlation_due
@@ -454,9 +606,10 @@ def _create_domain_indexes_two(cursor) -> None:
         )
         WHERE kind='xid_correlation'
           AND payload->>'status'='PENDING'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_agent_cluster
@@ -466,9 +619,10 @@ def _create_domain_indexes_two(cursor) -> None:
             key
         )
         WHERE kind='agent'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_fleet_deployment_created
@@ -477,7 +631,7 @@ def _create_domain_indexes_two(cursor) -> None:
             key
         )
         WHERE kind='fleet_deployment'
-        """
+        """,
     )
 
 
@@ -487,7 +641,8 @@ def _create_domain_tables_and_indexes(cursor) -> None:
     # and all statuses, so that lookup had to walk every deployment
     # ever recorded and filter; this one matches the query exactly
     # and only carries the open rows.
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_fleet_deployment_active_scope
@@ -498,9 +653,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
         )
         WHERE kind='fleet_deployment'
           AND payload->>'status' NOT IN ('SUCCEEDED', 'FAILED')
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_collector_status_scope
@@ -511,9 +667,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
             key
         )
         WHERE kind='collector_status'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_telemetry_metric_scope
@@ -525,9 +682,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
             key
         )
         WHERE kind='telemetry_metric_latest'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_training_progress_scope
@@ -538,9 +696,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
             key
         )
         WHERE kind='training_progress'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_remote_command_status_scope
@@ -551,9 +710,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
             key
         )
         WHERE kind='remote_command'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_notification_delivery_due
@@ -567,9 +727,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
           AND payload->>'status' IN (
               'PENDING', 'RETRY', 'LEASED'
           )
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_notification_created
@@ -579,9 +740,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
             key
         )
         WHERE kind='notification'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_notification_result_status
@@ -590,9 +752,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
             key
         )
         WHERE kind='notification_result'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_hyperpod_identity_cluster
@@ -602,9 +765,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
             key
         )
         WHERE kind='hyperpod_node_identity'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_barrier_created
@@ -613,9 +777,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
             key
         )
         WHERE kind='barrier'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_active_marker_action
@@ -627,9 +792,10 @@ def _create_domain_tables_and_indexes(cursor) -> None:
         WHERE kind='marker'
           AND payload->>'active'='true'
           AND payload->>'trusted'='true'
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_active_marker_nodes
@@ -638,7 +804,7 @@ def _create_domain_tables_and_indexes(cursor) -> None:
         WHERE kind='marker'
           AND payload->>'active'='true'
           AND payload->>'trusted'='true'
-        """
+        """,
     )
 
 
@@ -670,23 +836,14 @@ def _create_processor_tables(cursor) -> None:
         )
         """
     )
-    cursor.execute(
-        """
-        ALTER TABLE gpu_fault_processor_queue
-        ADD COLUMN IF NOT EXISTS response_status INTEGER
-        """
+    _add_column_if_missing(
+        cursor, "gpu_fault_processor_queue", "response_status", "INTEGER"
     )
-    cursor.execute(
-        """
-        ALTER TABLE gpu_fault_processor_queue
-        ADD COLUMN IF NOT EXISTS response_content_type TEXT
-        """
+    _add_column_if_missing(
+        cursor, "gpu_fault_processor_queue", "response_content_type", "TEXT"
     )
-    cursor.execute(
-        """
-        ALTER TABLE gpu_fault_processor_queue
-        ADD COLUMN IF NOT EXISTS response_body_base64 TEXT
-        """
+    _add_column_if_missing(
+        cursor, "gpu_fault_processor_queue", "response_body_base64", "TEXT"
     )
     upgrade_processor_retry_schedule(cursor)
     cursor.execute(
@@ -712,14 +869,10 @@ def _create_processor_tables(cursor) -> None:
         $$
         """
     )
-    cursor.execute(
-        """
-        DROP TRIGGER IF EXISTS
-        gpu_fault_processor_queue_notify_pending_trigger
-        ON gpu_fault_processor_queue
-        """
-    )
-    cursor.execute(
+    _ensure_trigger(
+        cursor,
+        "gpu_fault_processor_queue_notify_pending_trigger",
+        "gpu_fault_processor_queue",
         """
         CREATE TRIGGER
         gpu_fault_processor_queue_notify_pending_trigger
@@ -728,7 +881,7 @@ def _create_processor_tables(cursor) -> None:
         FOR EACH ROW
         EXECUTE FUNCTION
         gpu_fault_processor_queue_notify_pending()
-        """
+        """,
     )
     cursor.execute(
         """
@@ -765,14 +918,18 @@ def _create_processor_tables(cursor) -> None:
         )
         """
     )
-    cursor.execute(
-        """
-        INSERT INTO gpu_fault_processor_counter_mode(
-            singleton, mode, updated_at
-        ) VALUES (TRUE, 'dual', now())
-        ON CONFLICT(singleton) DO NOTHING
-        """
-    )
+    # Read before write: the no-op upsert still took RowExclusiveLock on the
+    # mode table and a row lock on the singleton every bootstrap (item J).
+    cursor.execute("SELECT 1 FROM gpu_fault_processor_counter_mode WHERE singleton")
+    if cursor.fetchone() is None:
+        cursor.execute(
+            """
+            INSERT INTO gpu_fault_processor_counter_mode(
+                singleton, mode, updated_at
+            ) VALUES (TRUE, 'dual', now())
+            ON CONFLICT(singleton) DO NOTHING
+            """
+        )
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS
@@ -1327,12 +1484,7 @@ def _create_priority_counter_triggers(cursor) -> None:
             $$
             """
         )
-        cursor.execute(
-            f"""
-            ALTER TABLE gpu_fault_processor_queue
-            ENABLE TRIGGER {name}
-            """
-        )
+        _enable_trigger_if_disabled(cursor, "gpu_fault_processor_queue", name)
 
 
 def _seed_processor_counters(cursor) -> None:
@@ -1346,6 +1498,20 @@ def _seed_processor_counters(cursor) -> None:
     # keeps the lock off the steady state path - the row trigger
     # maintains the counters from there, and
     # ``processor_queue_count_status`` reports any drift.
+    #
+    # An empty queue has nothing to count either: seeding an empty counter
+    # table from it is a TRUNCATE plus a LOCK TABLE that both end where they
+    # started, so that case skips the locks as well (store review
+    # 2026-09-07, item J).
+    cursor.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM gpu_fault_processor_queue
+            WHERE status IN ('PENDING', 'LEASED')
+        )
+        """
+    )
+    queue_has_incomplete = bool(cursor.fetchone()[0])
     cursor.execute(
         """
         SELECT EXISTS (
@@ -1354,7 +1520,7 @@ def _seed_processor_counters(cursor) -> None:
         """
     )
     counts_seeded = bool(cursor.fetchone()[0])
-    if not counts_seeded:
+    if not counts_seeded and queue_has_incomplete:
         cursor.execute(
             """
             LOCK TABLE gpu_fault_processor_queue
@@ -1393,7 +1559,7 @@ def _seed_processor_counters(cursor) -> None:
         """
     )
     priority_counts_seeded = bool(cursor.fetchone()[0])
-    if not priority_counts_seeded:
+    if not priority_counts_seeded and queue_has_incomplete:
         cursor.execute(
             """
             LOCK TABLE gpu_fault_processor_queue
@@ -1433,71 +1599,63 @@ def _seed_processor_counters(cursor) -> None:
             GROUP BY 1, 2, 3
             """
         )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_processor_lanes_expiry
         ON gpu_fault_processor_lanes (lease_expires_at)
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_processor_queue_incomplete_cluster
         ON gpu_fault_processor_queue (cluster_id, priority)
         WHERE status IN ('PENDING', 'LEASED')
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_processor_queue_correlation_scopes
         ON gpu_fault_processor_queue
         USING GIN ((payload->'correlation_scope_keys'))
         WHERE status IN ('PENDING', 'LEASED')
-        """
+        """,
     )
-    cursor.execute(
-        """
-        ALTER TABLE gpu_fault_processor_queue
-        ADD COLUMN IF NOT EXISTS correlation_key TEXT
-        """
+    _add_column_if_missing(
+        cursor, "gpu_fault_processor_queue", "correlation_key", "TEXT"
     )
     # Virtual processor partitions no longer participate in claiming.
     # Strip the legacy JSON field before the strict ProcessorRequest model
     # reads an existing queue row, then remove both obsolete indexes and
-    # the constant-valued column.
-    cursor.execute(
-        """
-        UPDATE gpu_fault_processor_queue
-        SET payload=payload - 'partition_id'
-        WHERE payload ? 'partition_id'
-        """
-    )
-    cursor.execute(
-        """
-        UPDATE gpu_fault_objects
-        SET payload=payload - 'partition_id'
-        WHERE kind='processor_request'
-          AND payload ? 'partition_id'
-        """
-    )
-    cursor.execute(
-        """
-        DROP INDEX IF EXISTS gpu_fault_processor_queue_claim
-        """
-    )
-    cursor.execute(
-        """
-        DROP INDEX IF EXISTS gpu_fault_processor_queue_partition_claim
-        """
-    )
-    cursor.execute(
-        """
-        ALTER TABLE gpu_fault_processor_queue
-        DROP COLUMN IF EXISTS partition_id
-        """
-    )
+    # the constant-valued column. The v5 migration removed partition state,
+    # so a database recorded at v5 or later has already been swept; the two
+    # sweeps have no index and read every row, so they only run on a fresh
+    # database or one still below v5 (item J).
+    recorded_version = _recorded_schema_version(cursor)
+    if recorded_version is None or recorded_version < 5:
+        cursor.execute(
+            """
+            UPDATE gpu_fault_processor_queue
+            SET payload=payload - 'partition_id'
+            WHERE payload ? 'partition_id'
+            """
+        )
+        cursor.execute(
+            """
+            UPDATE gpu_fault_objects
+            SET payload=payload - 'partition_id'
+            WHERE kind='processor_request'
+              AND payload ? 'partition_id'
+            """
+        )
+    _drop_index_if_present(cursor, "gpu_fault_processor_queue_claim")
+    _drop_index_if_present(cursor, "gpu_fault_processor_queue_partition_claim")
+    _drop_column_if_present(cursor, "gpu_fault_processor_queue", "partition_id")
 
 
 def _create_processor_indexes(cursor) -> None:
@@ -1507,7 +1665,8 @@ def _create_processor_indexes(cursor) -> None:
     # statuses so COMPLETED history never enters it. F-D2 briefly declared an
     # identical twin (``..._claim_order``); the planner picked either at
     # random, so v11 drops the twin and this one stays the only declaration.
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_processor_queue_priority_claim
@@ -1517,9 +1676,10 @@ def _create_processor_indexes(cursor) -> None:
             request_id
         )
         WHERE status IN ('PENDING', 'LEASED')
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_processor_queue_cluster
@@ -1529,20 +1689,16 @@ def _create_processor_indexes(cursor) -> None:
             created_at
         )
         WHERE status IN ('PENDING', 'LEASED')
-        """
+        """,
     )
     # Per-pool claims filter on one path and then take the oldest
     # window in (priority, created_at) order. ordering_key sat
     # between the two in the previous shape, which forced a sort over
     # the whole path backlog; lane lookups use
     # gpu_fault_processor_queue_lane instead.
-    cursor.execute(
-        """
-        DROP INDEX IF EXISTS
-        gpu_fault_processor_queue_path_claim
-        """
-    )
-    cursor.execute(
+    _drop_index_if_present(cursor, "gpu_fault_processor_queue_path_claim")
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_processor_queue_path_priority_claim
@@ -1553,9 +1709,10 @@ def _create_processor_indexes(cursor) -> None:
             request_id
         )
         WHERE status IN ('PENDING', 'LEASED')
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_processor_queue_lane
@@ -1565,19 +1722,17 @@ def _create_processor_indexes(cursor) -> None:
             lease_expires_at
         )
         WHERE status IN ('PENDING', 'LEASED')
-        """
+        """,
     )
-    cursor.execute(
+    _declare_index(
+        cursor,
         """
         CREATE INDEX IF NOT EXISTS
         gpu_fault_processor_queue_completed
         ON gpu_fault_processor_queue (updated_at)
         WHERE status='COMPLETED'
-        """
+        """,
     )
-
-
-_CREATE_INDEX = re.compile(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)")
 
 
 def declared_index_names() -> frozenset[str]:

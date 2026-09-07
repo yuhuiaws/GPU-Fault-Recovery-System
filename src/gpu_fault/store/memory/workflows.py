@@ -18,9 +18,15 @@ from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
 from gpu_fault.store.shared.errors import (
     WorkflowMergedError,
     StaleFencingTokenError,
+    StaleWriteError,
     NotFoundError,
     RemediationBudgetError,
     WorkflowLeaseError,
+)
+from gpu_fault.store.shared.transactional_workflows import (
+    lease_extension_due,
+    stale_workflow_versions,
+    workflow_matches_expected,
 )
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
@@ -359,8 +365,25 @@ class MemoryWorkflowMixin:
         dangling.sort(key=lambda item: (item.created_at, item.incident_id))
         return dangling[:limit]
 
-    def save_workflow(self, workflow: WorkflowRequest) -> None:
+    def save_workflow(
+        self,
+        workflow: WorkflowRequest,
+        *,
+        expected: WorkflowRequest | None = None,
+    ) -> None:
+        """See ``WorkflowStore.save_workflow`` (store review 2026-09-07, item B)."""
+
         with self._lock:
+            current = self._workflows.get(workflow.request_id)
+            if expected is not None:
+                if not workflow_matches_expected(current, expected):
+                    raise StaleWriteError(
+                        f"workflow/{workflow.request_id} changed since it was read"
+                    )
+            elif current is not None:
+                stale = stale_workflow_versions(current, workflow)
+                if stale is not None:
+                    raise stale
             self._workflows[workflow.request_id] = workflow
             self._stamp_preemption_pending(workflow)
 
@@ -733,6 +756,10 @@ class MemoryWorkflowMixin:
                 or workflow.execution_lease_expires_at <= renewed_at
             ):
                 raise WorkflowLeaseError("workflow execution lease is stale")
+            if not lease_extension_due(
+                workflow, renewed_at=renewed_at, lease_duration=lease_duration
+            ):
+                return workflow  # store review 2026-09-07, item F1
             workflow = workflow.model_copy(
                 update={"execution_lease_expires_at": (renewed_at + lease_duration)}
             )

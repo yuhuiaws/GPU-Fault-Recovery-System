@@ -512,17 +512,17 @@ def test_lease_holder_enforces_deadline_the_watchdog_cannot_claim(
 
     store = build_store()
     operation = WorkflowOperation.FREEZE_EVIDENCE
-    _, workflow = workflow_state(store, [operation])
+    _, created = workflow_state(store, [operation])
     now = datetime.now(timezone.utc)
     workflow = copy_model(
-        workflow,
+        created,
         status=WorkflowStatus.RUNNING,
         execution_owner_id="executor-a",
         execution_epoch=1,
         execution_lease_expires_at=now + timedelta(seconds=180),
         execution_deadline=now - timedelta(seconds=600),
     )
-    store.save_workflow(workflow)
+    store.save_workflow(workflow, expected=created)
     incident = store.get_incident(workflow.incident_id)
     store.ensure_remote_command(
         RemoteActionCommand(

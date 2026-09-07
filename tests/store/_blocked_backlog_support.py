@@ -11,6 +11,7 @@ parallel invocation clears the variable.
 from __future__ import annotations
 
 from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
+from gpu_fault.store import NotFoundError
 from tests._builders import fault_incident, workflow_request
 
 FLAWS = (
@@ -47,14 +48,23 @@ def blocked(store, name: str, *, fencing_token: int = 3) -> None:
 
 def restore(store, name: str) -> None:
     """Close ``name`` the way a successor workflow does when it restores it."""
+    request_id = f"restore-{name}"
+    # A re-restore after ``break_one_clause`` rewrites a row whose token the
+    # flaw deliberately moved; ``expected`` names that row as read instead of
+    # asking the version guard to look away (store review 2026-09-07, item B).
+    try:
+        existing = store.get_workflow(request_id)
+    except NotFoundError:
+        existing = None
     store.save_workflow(
         workflow_request(
-            f"restore-{name}",
+            request_id,
             f"incident-{name}",
             status=WorkflowStatus.SUCCEEDED,
             fencing_token=3,
             completed_operations=[WorkflowOperation.RESTORE_SCHEDULING],
-        )
+        ),
+        expected=existing,
     )
     incident = store.get_incident(f"incident-{name}")
     store.save_incident(
@@ -84,7 +94,11 @@ def break_one_clause(store, flaw: str, name: str) -> None:
     elif flaw == "successor_operation":
         store.save_workflow(successor.model_copy(update={"completed_operations": []}))
     elif flaw == "successor_fencing_token":
-        store.save_workflow(successor.model_copy(update={"fencing_token": 4}))
+        # A deliberate out-of-band corruption of the token: ``expected`` is
+        # the honest way past the version guard (store review 2026-09-07, B).
+        store.save_workflow(
+            successor.model_copy(update={"fencing_token": 4}), expected=successor
+        )
     elif flaw == "incident_state":
         store.save_incident(
             incident.model_copy(update={"state": IncidentState.ESCALATED})

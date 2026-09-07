@@ -57,10 +57,10 @@ def _overdue_workflow(
     the execution bound alone would still consider unexpired.
     """
 
-    _, workflow = workflow_state(store, [operation])
+    _, created = workflow_state(store, [operation])
     now = datetime.now(timezone.utc)
     workflow = copy_model(
-        workflow,
+        created,
         status=WorkflowStatus.RUNNING,
         execution_owner_id="executor-a",
         execution_epoch=1,
@@ -76,7 +76,9 @@ def _overdue_workflow(
             else now - timedelta(seconds=lifetime_overdue_seconds)
         ),
     )
-    store.save_workflow(workflow)
+    # Deliberate out-of-band lease: ``expected`` names the row as read
+    # (store review 2026-09-07, item B).
+    store.save_workflow(workflow, expected=created)
     return workflow
 
 
@@ -211,10 +213,10 @@ def test_the_restore_the_workflow_owes_is_exempt_from_the_deadline() -> None:
 
 def test_a_workflow_past_its_deadline_starts_only_the_restore_it_owes() -> None:
     store = build_store()
-    _, workflow = workflow_state(store, [QUIESCE, REBOOT, RESTORE])
+    _, created = workflow_state(store, [QUIESCE, REBOOT, RESTORE])
     now = datetime.now(timezone.utc)
     workflow = copy_model(
-        workflow,
+        created,
         status=WorkflowStatus.RUNNING,
         execution_owner_id="executor-a",
         execution_epoch=1,
@@ -224,7 +226,7 @@ def test_a_workflow_past_its_deadline_starts_only_the_restore_it_owes() -> None:
         completed_operations=[QUIESCE],
         step_executions=[workflow_step_execution(0, QUIESCE)],
     )
-    store.save_workflow(workflow)
+    store.save_workflow(workflow, expected=created)
     adapter = FakeAdapter(
         {
             QUIESCE: WorkflowStepOutcome.succeeded(),

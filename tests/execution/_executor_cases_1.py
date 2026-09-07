@@ -791,10 +791,10 @@ def test_dispatcher_waits_for_predecessor_terminal_state() -> None:
 def test_dispatcher_expires_stuck_predecessor_and_runs_successor() -> None:
     store = build_store()
     operation = WorkflowOperation.FREEZE_EVIDENCE
-    _, predecessor = workflow_state(store, [operation])
+    _, created = workflow_state(store, [operation])
     now = datetime.now(timezone.utc)
     predecessor = copy_model(
-        predecessor,
+        created,
         status=WorkflowStatus.RUNNING,
         execution_owner_id="dead-executor",
         execution_epoch=1,
@@ -813,7 +813,7 @@ def test_dispatcher_expires_stuck_predecessor_and_runs_successor() -> None:
         created_at=now,
         updated_at=now,
     )
-    store.save_workflow(predecessor)
+    store.save_workflow(predecessor, expected=created)
     store.save_workflow(successor)
     incident = store.get_incident(predecessor.incident_id)
     for suffix in ("leased", "pending"):

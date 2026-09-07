@@ -409,10 +409,10 @@ def test_predecessor_terminal_save_preserves_successor_incident_pointer(
 def test_queued_successor_does_not_fence_running_predecessor() -> None:
     store = build_store()
     operation = WorkflowOperation.FREEZE_EVIDENCE
-    incident, predecessor = workflow_state(store, [operation])
+    incident, created = workflow_state(store, [operation])
     now = datetime.now(timezone.utc)
     predecessor = copy_model(
-        predecessor,
+        created,
         status=WorkflowStatus.RUNNING,
         execution_owner_id="expired-executor",
         execution_epoch=1,
@@ -436,7 +436,7 @@ def test_queued_successor_does_not_fence_running_predecessor() -> None:
         fencing_token=successor.fencing_token,
     )
     store.save_incident(incident)
-    store.save_workflow(predecessor)
+    store.save_workflow(predecessor, expected=created)
     store.save_workflow(successor)
     adapter = FakeAdapter({operation: WorkflowStepOutcome.succeeded()})
     dispatcher = WorkflowDispatcher(

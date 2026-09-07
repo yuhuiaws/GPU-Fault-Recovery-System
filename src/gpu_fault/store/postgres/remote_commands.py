@@ -25,6 +25,22 @@ if TYPE_CHECKING:
 
 
 class PostgresRemoteCommandMixin:
+    """Row writers of kind ``remote_command`` and the one lock they share.
+
+    Every writer of a command row serialises on the advisory key
+    ``remote_command/<command_id>`` (store review 2026-09-07, item A): the
+    single-row paths through ``_state_transaction`` and the bulk paths
+    (claim, unclaimed expiry) through ``pg_advisory_xact_lock`` taken in
+    ``command_id`` order. Each path reads the row and writes it back whole,
+    so two writers on different keys are a lost update: the cancel paths
+    used ``.../timeout`` and ``.../cancel`` suffixes, and a cancel that
+    overlapped a completion could put a SUCCEEDED command back to LEASED.
+    The only writer outside the key is the terminal-row cleanup, which
+    deletes SUCCEEDED/FAILED rows nothing else writes.
+    ``tests/store/test_remote_command_lock_key_convention.py`` enforces
+    this from the source.
+    """
+
     # Attributes supplied by the composed concrete implementation.
     _db: Any
     _decode: Callable[..., Any]
@@ -364,9 +380,10 @@ class PostgresRemoteCommandMixin:
         The inherited implementation listed and decoded every remote
         command ever written to find the handful belonging to one
         workflow, which is the dominant cost of a workflow timeout once
-        the terminal history is large. ``gpu_fault_remote_command_workflow``
-        indexes exactly the rows this needs; the per-command transaction
-        and state machine below are unchanged.
+        the terminal history is large. ``gpu_fault_remote_command_workflow_all``
+        (every status, store review 2026-09-07 item H1) serves this lookup
+        and the reconcile-time ``list_remote_commands`` read alike; the
+        per-command transaction and state machine below are unchanged.
         """
         with self._db.cursor() as cursor:
             cursor.execute(
@@ -387,12 +404,12 @@ class PostgresRemoteCommandMixin:
             "cancellation_requested": 0,
         }
         for command_id in command_ids:
-            with self._state_transaction(f"remote_command/{command_id}/timeout"):
-                command = self._get_optional("remote_command", command_id)
-                if (
-                    command is None
-                    or command.workflow_request_id != workflow_request_id
-                ):
+            with self._state_transaction(f"remote_command/{command_id}"):
+                try:
+                    command = self._get_for_update("remote_command", command_id)
+                except NotFoundError:
+                    continue
+                if command.workflow_request_id != workflow_request_id:
                     continue
                 now = datetime.now(timezone.utc)
                 if command.status in {
@@ -428,6 +445,44 @@ class PostgresRemoteCommandMixin:
                 self._put("remote_command", command_id, command)
         return result
 
+    def cancel_remote_command(self, command_id: str, *, reason: str) -> bool:
+        """Cancel one PENDING/WAITING command; same lock discipline as above.
+
+        Store review 2026-09-07, item A: the inherited SQLite version takes
+        the shared advisory key but reads with ``_get_optional`` and no row
+        lock. Here the row is read ``FOR UPDATE`` like
+        ``cancel_remote_commands_for_workflow`` does, so a writer that ever
+        bypasses the advisory convention still queues on the row instead of
+        overwriting this cancel or being overwritten by it.
+        """
+        with self._state_transaction(f"remote_command/{command_id}"):
+            try:
+                command = self._get_for_update("remote_command", command_id)
+            except NotFoundError:
+                return False
+            if command.status not in {
+                RemoteCommandStatus.PENDING,
+                RemoteCommandStatus.WAITING,
+            }:
+                return False
+            now = datetime.now(timezone.utc)
+            self._put(
+                "remote_command",
+                command_id,
+                command.model_copy(
+                    update={
+                        "status": RemoteCommandStatus.FAILED,
+                        "error": reason,
+                        "status_source": "workflow-preempted",
+                        "lease_owner": None,
+                        "lease_token": None,
+                        "lease_expires_at": None,
+                        "updated_at": now,
+                    }
+                ),
+            )
+            return True
+
     def cleanup_terminal_remote_commands(
         self,
         *,
@@ -441,6 +496,11 @@ class PostgresRemoteCommandMixin:
         backlog. Here the ordering and the limit stay in SQL.
         """
 
+        # The one writer that does not take ``remote_command/<id>`` (store
+        # review 2026-09-07, item A): it only deletes SUCCEEDED/FAILED rows,
+        # which no other path writes once terminal, and ``FOR UPDATE SKIP
+        # LOCKED`` steps around any row a reader still holds. The bulk key
+        # serialises concurrent sweepers against each other, nothing more.
         with self._state_transaction("remote_command/cleanup"):
             with self._db.cursor() as cursor:
                 cursor.execute(

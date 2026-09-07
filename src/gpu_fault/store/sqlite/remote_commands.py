@@ -28,6 +28,19 @@ if TYPE_CHECKING:
 
 
 class SqliteRemoteCommandMixin:
+    """Command-row writers; every per-command key is ``remote_command/<id>``.
+
+    On SQLite ``_state_transaction`` is one ``BEGIN IMMEDIATE`` under a
+    process lock, so the key text does not matter here. It matters because
+    ``PostgresStore`` inherits ``ensure_remote_command``,
+    ``complete_remote_command`` and ``renew_remote_command_lease`` from this
+    class and turns the key into an advisory lock; a writer on a different
+    key was a lost update there (store review 2026-09-07, item A). The
+    bulk sweeps (``unclaimed-expiry``, ``cleanup``) rely on the
+    whole-connection transaction and are overridden on Postgres, which
+    ``tests/store/test_remote_command_lock_key_convention.py`` checks.
+    """
+
     # Attributes supplied by the composed concrete implementation.
     _db: sqlite3.Connection
     _models: dict[str, Any]
@@ -352,9 +365,7 @@ class SqliteRemoteCommandMixin:
                 }
             ):
                 continue
-            with self._state_transaction(
-                f"remote_command/{candidate.command_id}/timeout"
-            ):
+            with self._state_transaction(f"remote_command/{candidate.command_id}"):
                 command = self._get_optional("remote_command", candidate.command_id)
                 if (
                     command is None
@@ -400,7 +411,7 @@ class SqliteRemoteCommandMixin:
         return result
 
     def cancel_remote_command(self, command_id: str, *, reason: str) -> bool:
-        with self._state_transaction(f"remote_command/{command_id}/cancel"):
+        with self._state_transaction(f"remote_command/{command_id}"):
             command = self._get_optional("remote_command", command_id)
             if command is None or command.status not in {
                 RemoteCommandStatus.PENDING,

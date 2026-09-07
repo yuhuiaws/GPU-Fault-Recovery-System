@@ -119,9 +119,10 @@ def test_postgres_pushed_down_dispatch_scan_still_walks_the_executable_index():
     residual filters on the open-workflow partial index.
 
     Since F-A2(a) the dispatch scan orders by eligibility rather than
-    ``updated_at``, so until ``gpu_fault_executable_workflow_dispatch_order``
-    is built (next test) the rows come off this index through a bitmap scan
-    and one bounded in-memory sort -- never a sequential scan.
+    ``updated_at``; the first page has no cursor, so the planner may take the
+    rows off either executable-status partial index -- never a sequential
+    scan. The paged form below must walk
+    ``gpu_fault_executable_workflow_dispatch_order`` without a sort.
     """
 
     store = _store()
@@ -140,7 +141,7 @@ def test_postgres_pushed_down_dispatch_scan_still_walks_the_executable_index():
         )
         plan = _plan(store, sql, params)
 
-        assert "gpu_fault_executable_workflow_order" in plan, plan
+        assert "gpu_fault_executable_workflow_" in plan, plan
         assert "Seq Scan on gpu_fault_objects" not in plan, plan
         assert "::timestamptz" not in sql
     finally:
@@ -180,9 +181,11 @@ def test_declared_indexes_include_the_dispatcher_indexes():
 
     assert {
         "gpu_fault_executable_workflow_order",
+        "gpu_fault_executable_workflow_dispatch_order",
         "gpu_fault_unhandled_failed_workflow_updated",
         "gpu_fault_blocked_workflow_updated",
         "gpu_fault_active_workflow_scope",
+        "gpu_fault_workflow_incident",
     } <= names
 
 
@@ -233,49 +236,18 @@ def test_postgres_schema_validation_fails_closed_when_a_counter_trigger_is_disab
         _store(initialize_schema=True).close()
 
 
-def _create_dispatch_order_index() -> None:
-    """The index F-A2(a) needs, built by the test because the DDL cannot
-    declare it before an operator has built it CONCURRENTLY (F-J3). The exact
-    production statement is recorded in the review log."""
-
-    import psycopg
-
-    assert POSTGRES_URL is not None
-    with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE INDEX IF NOT EXISTS gpu_fault_executable_workflow_dispatch_order
-                ON gpu_fault_objects (
-                    (GREATEST(payload->>'created_at', payload->>'not_before')),
-                    key
-                )
-                WHERE kind='workflow'
-                  AND payload->>'status' IN ('PENDING', 'RUNNING', 'SAFETY_PENDING')
-                """
-            )
-            cursor.execute("ANALYZE gpu_fault_objects")
-
-
-def _drop_dispatch_order_index() -> None:
-    import psycopg
-
-    assert POSTGRES_URL is not None
-    with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "DROP INDEX IF EXISTS gpu_fault_executable_workflow_dispatch_order"
-            )
-
-
 def test_postgres_paged_dispatch_scan_walks_the_dispatch_order_index_without_a_sort():
     """F-A2(a)(c): ordered by dispatch_eligible_at with a row-value cursor, the
-    page is one index range scan -- no Sort node, no sequential scan."""
+    page is one index range scan -- no Sort node, no sequential scan.
+
+    ``gpu_fault_executable_workflow_dispatch_order`` is declared by the DDL
+    since v12 (store review 2026-09-07, item H3); until then this test built it
+    itself and production sorted every tick.
+    """
 
     store = _store()
     try:
         _seed(store, count=400)
-        _create_dispatch_order_index()
         anchor = store.list_workflows(
             {
                 WorkflowStatus.PENDING,
@@ -306,5 +278,4 @@ def test_postgres_paged_dispatch_scan_walks_the_dispatch_order_index_without_a_s
         assert "Seq Scan on gpu_fault_objects" not in plan, plan
         assert "::timestamptz" not in sql
     finally:
-        _drop_dispatch_order_index()
         store.close()

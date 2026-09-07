@@ -263,3 +263,54 @@ def test_pending_triage_deadline_is_a_constructor_setting(
         CompletionService(
             context.store, context.diagnostics, pending_triage_deadline=timedelta(0)
         )
+
+
+class PollingDiagnostics:
+    """A quick-triage adapter whose ``result`` poll records the store's open
+    completion transactions at the moment it is called."""
+
+    def __init__(self, store: RecordingStore) -> None:
+        self.store = store
+        self.polled: list[str] = []
+        self.open_keys_at_result: list[list[str]] = []
+
+    def submit(self, request: DiagnosticRequest) -> str:
+        return request.request_id
+
+    def result(self, request_id: str) -> TriageReport | None:
+        self.polled.append(request_id)
+        self.open_keys_at_result.append(list(self.store.open_keys))
+        return None
+
+
+def test_the_watchdog_polls_the_adapter_outside_the_completion_transaction(
+    recording_store: RecordingStore, failed_event: TerminalEvent
+) -> None:
+    """Store review 2026-09-07, item D: the adapter's ``result`` is a remote
+    call, so it must not run under the ``completion/<key>`` advisory lock and
+    the pooled connection the transaction pins."""
+
+    diagnostics = PollingDiagnostics(recording_store)
+    build_context(store=recording_store)  # seeds the simulated profile
+    service = CompletionService(recording_store, diagnostics)
+    pending = service.handle_terminal(failed_event)
+    assert pending.status is DecisionStatus.PENDING_TRIAGE
+    # The submit path probes a synchronous adapter once, after its commit.
+    assert diagnostics.polled == [pending.diagnostic_request_id]
+
+    expired = service.reconcile_pending_triage(
+        now=datetime.now(timezone.utc)
+        + service.pending_triage_deadline
+        + timedelta(minutes=1)
+    )
+
+    assert [item.event_key for item in expired] == [failed_event.event_key]
+    assert diagnostics.polled == [pending.diagnostic_request_id] * 2, (
+        "the watchdog must poll the adapter exactly once per stale decision"
+    )
+    assert diagnostics.open_keys_at_result == [[], []], (
+        "the diagnostics adapter was polled while a completion transaction was open"
+    )
+    assert ("decision", failed_event.event_key) in recording_store.writes, (
+        "the expiry decision was written outside the completion transaction"
+    )

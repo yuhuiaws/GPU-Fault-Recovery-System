@@ -308,7 +308,10 @@ def apply_compile_blocked_plan(
                 reference=reference,
                 reconciled_at=applied_at,
             )
-            store.save_workflow(closed)
+            # Compare-and-set on the row just read; a record that moved since
+            # is reported as a per-item failure, not overwritten (store review
+            # 2026-09-07, item B).
+            store.save_workflow(closed, expected=workflow)
         except Exception as exc:  # noqa: BLE001 -- per-item isolation, reported
             failures[request_id] = f"{type(exc).__name__}: {exc}"
             continue

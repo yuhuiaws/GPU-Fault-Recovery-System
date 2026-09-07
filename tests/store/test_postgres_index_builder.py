@@ -106,3 +106,57 @@ def test_the_preflight_passes_on_a_ready_database_and_names_what_blocks(connecti
     assert any("safety" in reason for reason in blocked["blocking_reasons"]), (
         'expected any("safety" in reason for reason in blocked["blocking_reasons"]) to be true'
     )
+
+
+def test_the_preflight_reports_the_diagnostic_settings_without_blocking(connection):
+    """Store review 2026-09-07, item K2: the Aurora cluster is not visible to
+    the deploy host's AWS role, so the database is the only place to see
+    whether lock waits are logged and pg_stat_statements is loaded. Both are
+    warnings, never blocking reasons."""
+
+    report = schema_preflight(connection)
+
+    assert report["ok"] is True
+    diagnostics = report["diagnostics"]
+    assert set(diagnostics) == {
+        "log_lock_waits",
+        "deadlock_timeout",
+        "log_min_duration_statement",
+        "shared_preload_libraries",
+        "pg_stat_statements_installed",
+    }
+    assert diagnostics["log_lock_waits"] in {"on", "off"}
+    assert diagnostics["deadlock_timeout"] is not None
+    assert isinstance(diagnostics["pg_stat_statements_installed"], bool), diagnostics
+    warnings = report["warnings"]
+    lock_wait_warnings = [item for item in warnings if "log_lock_waits" in item]
+    statement_warnings = [item for item in warnings if "pg_stat_statements" in item]
+    assert len(lock_wait_warnings) == (
+        0 if diagnostics["log_lock_waits"] == "on" else 1
+    )
+    assert len(statement_warnings) == (
+        0 if diagnostics["pg_stat_statements_installed"] else 1
+    )
+    for item in lock_wait_warnings:
+        assert "deadlocks" in item, item
+    for item in statement_warnings:
+        assert "ACU" in item, item
+    assert report["blocking_reasons"] == []
+
+
+def test_the_diagnostic_warnings_say_what_each_gap_costs():
+    from gpu_fault.store.postgres.index_builder import diagnostics_warnings
+
+    warnings = diagnostics_warnings(
+        {"log_lock_waits": "off", "pg_stat_statements_installed": False}
+    )
+
+    assert len(warnings) == 2
+    assert "deadlocks" in warnings[0]
+    assert "ACU" in warnings[1]
+    assert (
+        diagnostics_warnings(
+            {"log_lock_waits": "on", "pg_stat_statements_installed": True}
+        )
+        == []
+    )

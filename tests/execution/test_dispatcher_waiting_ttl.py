@@ -98,7 +98,7 @@ def test_the_watchdog_reap_applies_the_waiting_ttl(
         execution_lease_expires_at=now - timedelta(minutes=5),
         execution_deadline=now - timedelta(minutes=1),
     )
-    store.save_workflow(overdue)
+    store.save_workflow(overdue, expected=workflow)
     store.reserve_job_restart(CLUSTER, JOB, 1, _reservation(overdue, 2))
 
     _dispatcher(store).run_once()

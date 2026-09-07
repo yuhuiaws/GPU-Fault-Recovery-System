@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-import json
 import os
 import re
 from pathlib import Path
@@ -106,7 +105,7 @@ def declared_trigger_function_bodies() -> dict[str, str]:
 class PostgresSchemaMixin:
     # Attributes supplied by the composed concrete implementation.
     _db: Any
-    hot_state_migration_status: Callable[..., Any]
+    hot_state_backfill_gaps: Callable[..., Any]
     hot_state_mode: Any
 
     def _initialize_schema_state(self, initialize_schema: bool) -> None:
@@ -402,15 +401,17 @@ class PostgresSchemaMixin:
                 "gpu-fault-store-migrate --ensure-schema and "
                 "--backfill-hot-state first"
             )
-        unsafe = {
-            kind: item["missing_or_mismatched"]
-            for kind, item in self.hot_state_migration_status().items()
-            if item["missing_or_mismatched"]
-        }
+        # EXISTS per kind, not the counting status: this runs on every worker
+        # process start (store review 2026-09-07, item J).
+        unsafe = sorted(
+            kind for kind, gap in self.hot_state_backfill_gaps().items() if gap
+        )
         if unsafe:
             raise RuntimeError(
-                "dedicated hot-state backfill is incomplete: "
-                + json.dumps(unsafe, sort_keys=True)
+                "dedicated hot-state backfill is incomplete for: "
+                + ", ".join(unsafe)
+                + "; run gpu-fault-store-migrate --hot-state-status "
+                "and --backfill-hot-state"
             )
 
     @staticmethod

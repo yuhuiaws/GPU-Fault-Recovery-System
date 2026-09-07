@@ -71,7 +71,9 @@ def _overdue(store, operations, **values):
         execution_deadline=now - timedelta(minutes=1),
         **values,
     )
-    store.save_workflow(overdue)
+    # Deliberate out-of-band lease: ``expected`` names the row as read
+    # (store review 2026-09-07, item B).
+    store.save_workflow(overdue, expected=workflow)
     return overdue
 
 
@@ -231,7 +233,7 @@ def test_terminalize_claimed_refuses_a_record_another_executor_holds() -> None:
         execution_epoch=4,
         execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
     )
-    store.save_workflow(held)
+    store.save_workflow(held, expected=workflow)
     executor = active_workflow_executor(store, [], [FREEZE])
 
     with pytest.raises(WorkflowLeaseError):

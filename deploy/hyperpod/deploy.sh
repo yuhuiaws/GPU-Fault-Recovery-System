@@ -5,6 +5,21 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 MODE="${1:-deploy}"
+
+# Legacy single-cluster path, kept only as a migration record and a canary
+# recipe. Nothing in src/, scripts/, the Makefile or deploy/control-plane/
+# executes it; the production path is `gpu-fault-admin deploy`. Refuse to run
+# unless the operator says so explicitly, so a stray invocation cannot deploy
+# a stale layout next to a regional site (confirmed 2026-09-07).
+if [[ "${GPU_FAULT_ALLOW_LEGACY_DEPLOY:-}" != "1" ]]; then
+    cat >&2 <<'EOF'
+deploy/hyperpod/deploy.sh is the legacy single-cluster deployment and is not
+used by the regional architecture. Use `gpu-fault-admin deploy` instead
+(docs/部署和运维手册.md). To run this script anyway, for a single-cluster
+migration or canary, set GPU_FAULT_ALLOW_LEGACY_DEPLOY=1.
+EOF
+    exit 64
+fi
 RUN_E2E="${RUN_E2E:-true}"
 AWS_REGION="${AWS_REGION:-us-west-2}"
 EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-}"
@@ -1170,6 +1185,7 @@ print(json.dumps({"Version": "2012-10-17", "Statement": statements}))
 ensure_aurora() {
     local cluster_json vpc_id node_ip node_sg subnet_json
     local subnet_group security_group endpoint secret_arn secret_json url
+    local parameter_group parameter_group_family current_parameter_group
     local writer_id="${AURORA_CLUSTER_ID}-writer"
     local reader_id="${AURORA_CLUSTER_ID}-reader"
 
@@ -1291,6 +1307,51 @@ for item in json.loads(os.environ["SUBNET_JSON"]):
         }
     fi
 
+    # Store review 2026-09-07, item K1. On the engine-default parameter group
+    # log_lock_waits is off, so the deadlocks the store silently retries after
+    # 40P01 never reach the log, and pg_stat_statements is not loaded, so
+    # there is no per-statement view of what the ACUs are spent on. The
+    # group is created once, its parameters re-applied on every run (a no-op
+    # when unchanged), and attached to the cluster on create or, for an
+    # existing cluster, by a guarded modify. shared_preload_libraries is
+    # pending-reboot: the writer takes it at its next reboot or maintenance
+    # window; the immediate ones are live as soon as the group is attached.
+    # CREATE EXTENSION pg_stat_statements is a database-level statement and
+    # is done by `gpu-fault-store-migrate --ensure-diagnostics`, not here.
+    parameter_group="${AURORA_CLUSTER_ID}-pg"
+    if ! aws rds describe-db-cluster-parameter-groups \
+        --db-cluster-parameter-group-name "${parameter_group}" \
+        --region "${AWS_REGION}" >/dev/null 2>&1; then
+        parameter_group_family="$(
+            aws rds describe-db-engine-versions \
+                --engine aurora-postgresql \
+                --engine-version "${AURORA_ENGINE_VERSION}" \
+                --region "${AWS_REGION}" \
+                --query 'DBEngineVersions[0].DBParameterGroupFamily' \
+                --output text
+        )"
+        [[ -n "${parameter_group_family}" && "${parameter_group_family}" != "None" ]] || {
+            printf 'ERROR: no parameter group family for aurora-postgresql %s\n' \
+                "${AURORA_ENGINE_VERSION}" >&2
+            exit 1
+        }
+        aws rds create-db-cluster-parameter-group \
+            --db-cluster-parameter-group-name "${parameter_group}" \
+            --db-parameter-group-family "${parameter_group_family}" \
+            --description \
+                "GPU fault control plane Aurora lock and statement diagnostics" \
+            --tags Key=Application,Value=gpu-fault-control-plane \
+            --region "${AWS_REGION}" >/dev/null
+    fi
+    aws rds modify-db-cluster-parameter-group \
+        --db-cluster-parameter-group-name "${parameter_group}" \
+        --parameters \
+            "ParameterName=log_lock_waits,ParameterValue=1,ApplyMethod=immediate" \
+            "ParameterName=shared_preload_libraries,ParameterValue=pg_stat_statements,ApplyMethod=pending-reboot" \
+            "ParameterName=pg_stat_statements.track,ParameterValue=all,ApplyMethod=immediate" \
+            "ParameterName=log_min_duration_statement,ParameterValue=1000,ApplyMethod=immediate" \
+        --region "${AWS_REGION}" >/dev/null
+
     if ! aws rds describe-db-clusters \
         --db-cluster-identifier "${AURORA_CLUSTER_ID}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
@@ -1305,14 +1366,49 @@ for item in json.loads(os.environ["SUBNET_JSON"]):
             --serverless-v2-scaling-configuration \
                 "MinCapacity=${AURORA_MIN_ACU},MaxCapacity=${AURORA_MAX_ACU}" \
             --db-subnet-group-name "${subnet_group}" \
+            --db-cluster-parameter-group-name "${parameter_group}" \
             --vpc-security-group-ids "${security_group}" \
             --storage-encrypted \
             --backup-retention-period 7 \
             --deletion-protection \
             --copy-tags-to-snapshot \
             --enable-iam-database-authentication \
+            --enable-cloudwatch-logs-exports postgresql \
             --tags Key=Application,Value=gpu-fault-control-plane \
             --region "${AWS_REGION}" >/dev/null
+    else
+        # The parameters above only write to the instance-local postgresql.log,
+        # which RDS rotates away after rds.log_retention_period (3 days by
+        # default). Exporting it puts every lock wait, deadlock and slow
+        # statement into the CloudWatch log group
+        # /aws/rds/cluster/<cluster>/postgresql, where Logs Insights and
+        # metric filters can read it. Online, no restart, idempotent.
+        if ! aws rds describe-db-clusters \
+            --db-cluster-identifier "${AURORA_CLUSTER_ID}" \
+            --region "${AWS_REGION}" \
+            --query 'DBClusters[0].EnabledCloudwatchLogsExports' \
+            --output text | grep -qw postgresql; then
+            aws rds modify-db-cluster \
+                --db-cluster-identifier "${AURORA_CLUSTER_ID}" \
+                --cloudwatch-logs-export-configuration \
+                    '{"EnableLogTypes":["postgresql"]}' \
+                --apply-immediately \
+                --region "${AWS_REGION}" >/dev/null
+        fi
+        current_parameter_group="$(
+            aws rds describe-db-clusters \
+                --db-cluster-identifier "${AURORA_CLUSTER_ID}" \
+                --region "${AWS_REGION}" \
+                --query 'DBClusters[0].DBClusterParameterGroup' \
+                --output text
+        )"
+        if [[ "${current_parameter_group}" != "${parameter_group}" ]]; then
+            aws rds modify-db-cluster \
+                --db-cluster-identifier "${AURORA_CLUSTER_ID}" \
+                --db-cluster-parameter-group-name "${parameter_group}" \
+                --apply-immediately \
+                --region "${AWS_REGION}" >/dev/null
+        fi
     fi
     if ! aws rds describe-db-instances \
         --db-instance-identifier "${writer_id}" \

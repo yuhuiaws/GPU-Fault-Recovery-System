@@ -398,19 +398,21 @@ def test_correlated_action_chain_preempts_and_escalates_fabric_reset() -> None:
     }
     inherited_indexes = [
         index
-        for index, step in enumerate(weak.official_steps)
+        for index, step in enumerate(aggregate.official_steps)
         if step.operation in inherited_operations
     ]
     running = copy_model(
-        weak,
+        # The merge above bumped merge_revision; copy the merged row so the
+        # version guard of save_workflow accepts the write (item B).
+        aggregate,
         status=WorkflowStatus.RUNNING,
         execution_owner_id="scenario-executor",
         completed_step_indexes=inherited_indexes,
         completed_operations=[
-            weak.official_steps[index].operation for index in inherited_indexes
+            aggregate.official_steps[index].operation for index in inherited_indexes
         ],
         step_executions=[
-            workflow_step_execution(index, weak.official_steps[index].operation)
+            workflow_step_execution(index, aggregate.official_steps[index].operation)
             for index in inherited_indexes
         ],
     )

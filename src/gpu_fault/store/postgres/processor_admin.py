@@ -301,6 +301,20 @@ class PostgresProcessorAdminMixin:
         result["ready"] = all(result[name] == 0 for name in names[1:])
         return result
 
+    def processor_counter_mode(self) -> str:
+        """Which table admission reads the per-cluster depth from.
+
+        ``dual`` (the shipped default) keeps the single-row
+        ``gpu_fault_processor_queue_counts`` authoritative and writes the 16
+        priority shards alongside, so every enqueue still locks one row per
+        cluster and the shards buy no contention relief. Only
+        ``partitioned`` reads the shards. The mode is invisible from
+        outside otherwise -- production sat in ``dual`` unnoticed (store
+        review 2026-09-07, item I) -- so /metrics exports this. Served from
+        the 0.25 s cache the admission path uses.
+        """
+        return str(self._processor_counter_mode())
+
     def processor_queue_count_status(
         self,
     ) -> ProcessorQueueCountStatus:

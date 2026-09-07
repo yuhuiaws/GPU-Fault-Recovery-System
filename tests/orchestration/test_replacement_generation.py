@@ -57,7 +57,9 @@ def test_replacement_keeps_the_incidents_generation(context: ApplicationContext)
     incident, workflow = context.orchestrator.ingest_node_health(_finding("first"))
     # The incident advances three generations (re-plans by other families).
     context.store.save_incident(copy_model(incident, fencing_token=4))
-    context.store.save_workflow(copy_model(workflow, fencing_token=4))
+    context.store.save_workflow(
+        copy_model(workflow, fencing_token=4), expected=workflow
+    )
 
     merged_incident, merged_workflow = context.orchestrator.ingest_node_health(
         _finding("second")
