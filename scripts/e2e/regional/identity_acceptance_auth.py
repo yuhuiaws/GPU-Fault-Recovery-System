@@ -367,6 +367,120 @@ def direct_claim(
         return type(exc).__name__
 
 
+REGISTRY_HEAD_PROBE = r"""
+import json
+from gpu_fault.app import ApplicationContext
+from gpu_fault.store import NotFoundError
+store = ApplicationContext.from_environment().store
+try:
+    head = store.get_regional_registry_head()
+except NotFoundError:
+    print(json.dumps({"durable": False}))
+else:
+    revision = store.get_regional_registry_revision(head.generation)
+    print(json.dumps({
+        "durable": True,
+        "generation": head.generation,
+        "registrations": [item.model_dump(mode="json") for item in revision.registrations],
+    }, sort_keys=True, default=str))
+"""
+
+# Publishes a registry revision through the control plane's own API from
+# inside an api Pod (execution token from the Pod environment). Only digests
+# travel on argv; the plaintext tokens never leave the driver.
+REGISTRY_PUBLISH_PROBE = r"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from gpu_fault.app import ApplicationContext
+
+cluster_id, token_sha256, retiring_sha256, expires_at, reason = sys.argv[1:6]
+store = ApplicationContext.from_environment().store
+head = store.get_regional_registry_head()
+revision = store.get_regional_registry_revision(head.generation)
+registrations = []
+for item in revision.registrations:
+    value = item.model_dump(mode="json")
+    if value["cluster_id"] == cluster_id:
+        value["token_sha256"] = token_sha256
+        value["retiring_token_sha256"] = retiring_sha256 or None
+        value["token_rotation_expires_at"] = expires_at or None
+    registrations.append(value)
+payload = {
+    "expected_generation": head.generation,
+    "registrations": registrations,
+    "reason": reason,
+}
+headers = {
+    "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"],
+    "Content-Type": "application/json",
+}
+request = urllib.request.Request(
+    "http://127.0.0.1:8080/v1/regional/registry/revisions",
+    data=json.dumps(payload, default=str).encode(),
+    headers=headers,
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        status = json.load(response)
+except urllib.error.HTTPError as exc:
+    print(json.dumps({"published": False, "status": exc.code, "body": exc.read().decode()[:400]}))
+    raise SystemExit(1)
+deadline = time.monotonic() + 120
+while status.get("missing_member_ids") and time.monotonic() < deadline:
+    time.sleep(2)
+    poll = urllib.request.Request(
+        "http://127.0.0.1:8080/v1/regional/registry/status", headers=headers
+    )
+    with urllib.request.urlopen(poll, timeout=10) as response:
+        status = json.load(response)
+print(json.dumps({
+    "published": True,
+    "generation": status.get("generation"),
+    "converged": status.get("converged"),
+    "missing_member_ids": status.get("missing_member_ids"),
+}, sort_keys=True))
+"""
+
+
+def durable_registry(primary: Any) -> dict[str, Any]:
+    """The durable registry head, or ``{"durable": False}`` on a clusters.json site."""
+
+    return primary.cpu_python(REGISTRY_HEAD_PROBE)
+
+
+def publish_registry_token(
+    primary: Any,
+    cluster_id: str,
+    token: str,
+    *,
+    retiring_token: str | None = None,
+    rotation_expires_at: str | None = None,
+    reason: str,
+) -> dict[str, Any]:
+    """Rotate one cluster's token through a durable registry revision.
+
+    Production sites carry a durable registry revision in the store; the
+    control plane then treats ``clusters.json`` as a bootstrap copy and ignores
+    edits to it (manual REG-9). Patching the Secret and rolling the control
+    plane -- what this runner did before -- left the new token unknown to the
+    API and the rolled executor at 403 for ten minutes, live on 2026-09-07.
+    """
+
+    return primary.cpu_python(
+        REGISTRY_PUBLISH_PROBE,
+        cluster_id,
+        secret_digest(token),
+        secret_digest(retiring_token) if retiring_token else "",
+        rotation_expires_at or "",
+        reason,
+    )
+
+
 def update_registry_token(
     entries: list[dict[str, Any]],
     cluster_id: str,
@@ -395,6 +509,89 @@ def update_registry_token(
             item["token_rotation_expires_at"] = rotation_expires_at
         return result
     raise IdentityAcceptanceError("target cluster is absent from registry")
+
+
+def apply_registry_token(
+    site: IdentitySite,
+    primary: Any,
+    target: ClusterTarget,
+    original_registry: list[dict[str, Any]],
+    *,
+    durable: dict[str, Any],
+    publications: list[dict[str, Any]],
+    token: str,
+    retiring_token: str | None,
+    rotation_expires_at: str | None,
+    reason: str,
+) -> float | None:
+    """Make the control plane accept ``token`` the way this site is run.
+
+    The bootstrap Secret is kept in step either way; on a durable site the
+    revision is what authenticates, so no control-plane rollout is needed and
+    ``None`` is returned instead of a rollout duration.
+    """
+
+    site.write_registry(
+        update_registry_token(
+            original_registry,
+            target.cluster_id,
+            token,
+            retiring_token=retiring_token,
+            rotation_expires_at=rotation_expires_at,
+        )
+    )
+    if durable.get("durable"):
+        publications.append(
+            publish_registry_token(
+                primary,
+                target.cluster_id,
+                token,
+                retiring_token=retiring_token,
+                rotation_expires_at=rotation_expires_at,
+                reason=reason,
+            )
+        )
+        return None
+    return site.rollout_control()
+
+
+def restore_registry_token(
+    site: IdentitySite,
+    primary: Any,
+    target: ClusterTarget,
+    original_registry: list[dict[str, Any]],
+    *,
+    durable: dict[str, Any],
+    publications: list[dict[str, Any]],
+    old_token: str,
+) -> bool:
+    """Put the original token back everywhere and say whether it took."""
+
+    site.write_registry(original_registry)
+    if durable.get("durable"):
+        publications.append(
+            publish_registry_token(
+                primary,
+                target.cluster_id,
+                old_token,
+                reason="GF-REGIONAL-AUTH-016 restore: original token republished",
+            )
+        )
+    else:
+        site.rollout_control()
+    write_cluster_token(site, target, old_token)
+    rollout_executor(site, target)
+    restored = site.registry() == original_registry and secret_digest(
+        read_cluster_token(site, target)
+    ) == secret_digest(old_token)
+    if durable.get("durable"):
+        restored = restored and any(
+            item.get("token_sha256") == secret_digest(old_token)
+            and not item.get("retiring_token_sha256")
+            for item in durable_registry(primary).get("registrations") or []
+            if item.get("cluster_id") == target.cluster_id
+        )
+    return restored
 
 
 def run_auth016(
@@ -448,20 +645,39 @@ def run_auth016(
     executor_rollout = None
     new_token_during_overlap: int | str | None = None
     old_token_after_completion: int | str | None = None
+    durable = durable_registry(primary)
+    registry_publications: list[dict[str, Any]] = []
+
+    def apply_registry(
+        token: str,
+        *,
+        retiring_token: str | None,
+        rotation_expires_at: str | None,
+        reason: str,
+    ) -> float | None:
+        return apply_registry_token(
+            site,
+            primary,
+            target,
+            original_registry,
+            durable=durable,
+            publications=registry_publications,
+            token=token,
+            retiring_token=retiring_token,
+            rotation_expires_at=rotation_expires_at,
+            reason=reason,
+        )
+
     try:
         thread.start()
         time.sleep(60)
         # Control plane first: both slots live, data plane untouched.
-        site.write_registry(
-            update_registry_token(
-                original_registry,
-                target.cluster_id,
-                new_token,
-                retiring_token=old_token,
-                rotation_expires_at=deadline.isoformat().replace("+00:00", "Z"),
-            )
+        control_rollout = apply_registry(
+            new_token,
+            retiring_token=old_token,
+            rotation_expires_at=deadline.isoformat().replace("+00:00", "Z"),
+            reason="GF-REGIONAL-AUTH-016 overlap: new token live, old token retiring",
         )
-        control_rollout = site.rollout_control()
         enter("overlap")
         time.sleep(30)
         new_token_during_overlap = direct_claim(
@@ -475,14 +691,12 @@ def run_auth016(
         time.sleep(30)
         # Finishing the rotation must withdraw the old credential at once
         # instead of leaving it live until the deadline lapses.
-        site.write_registry(
-            update_registry_token(
-                original_registry,
-                target.cluster_id,
-                new_token,
-            )
+        apply_registry(
+            new_token,
+            retiring_token=None,
+            rotation_expires_at=None,
+            reason="GF-REGIONAL-AUTH-016 completed: retiring slot withdrawn",
         )
-        site.rollout_control()
         enter("completed")
         old_token_after_completion = direct_claim(
             target,
@@ -493,13 +707,15 @@ def run_auth016(
     finally:
         stop.set()
         thread.join(timeout=15)
-        site.write_registry(original_registry)
-        site.rollout_control()
-        write_cluster_token(site, target, old_token)
-        rollout_executor(site, target)
-        restored = site.registry() == original_registry and secret_digest(
-            read_cluster_token(site, target)
-        ) == secret_digest(old_token)
+        restored = restore_registry_token(
+            site,
+            primary,
+            target,
+            original_registry,
+            durable=durable,
+            publications=registry_publications,
+            old_token=old_token,
+        )
     by_phase: dict[str, list[int | str]] = {}
     for item in samples:
         by_phase.setdefault(str(item["phase"]), []).append(item["status"])
@@ -536,6 +752,10 @@ def run_auth016(
             for phase, statuses in sorted(by_phase.items())
         },
         "rotation_window_seconds": 1800,
+        "registry_mode": "durable-revision"
+        if durable.get("durable")
+        else "clusters.json",
+        "registry_publications": registry_publications,
         "control_rollout_seconds": control_rollout,
         "executor_rollout_seconds": executor_rollout,
         "samples": [
@@ -770,8 +990,10 @@ def run_auth014(
         and isinstance(item.get("status"), int)
         and 200 <= int(item["status"]) < 300
     ]
+    # Keyed by "METHOD path": the evidence file is JSON and a tuple key made
+    # write_json_atomic raise TypeError after every probe had passed (live).
     high_risk = {
-        (item["path"], item["method"]): item.get("status")
+        f"{item['method']} {item['path']}": item.get("status")
         for item in results
         if item["path"]
         in {
@@ -815,7 +1037,9 @@ for node in nodes:
     result[node] = {
         "generation": agent.generation,
         "lifecycle_state": agent.lifecycle_state.value,
-        "last_heartbeat_at": agent.last_heartbeat_at.isoformat(),
+        # AgentRecord renamed the heartbeat field to last_seen_at; the evidence
+        # key stays for readers of earlier reports.
+        "last_heartbeat_at": agent.last_seen_at.isoformat(),
         "node_action_key_version": agent.node_action_key_version,
     }
 print(json.dumps({"agents": result}, sort_keys=True))
