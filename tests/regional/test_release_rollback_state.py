@@ -16,6 +16,7 @@ from gpu_fault_release import (
 )
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_release_rollback_context as ROLLBACK_CONTEXT
+from gpu_fault_release import regional_release_rollout_cleanup as ROLLOUT_CLEANUP
 from gpu_fault_release import regional_release_state as STATE
 from gpu_fault_release import regional_release_validation as VALIDATION
 from gpu_fault_release import rollout as MODULE
@@ -836,6 +837,7 @@ def test_legacy_partial_rollback_omits_new_fleet_identity_fields(
     commands = iter(
         [
             {"normalized": 0},
+            {"terminalized": []},
             {
                 "status": "PENDING",
                 "waves": [["node-a"]],
@@ -1332,45 +1334,41 @@ def test_fleet_deployment_id_without_nonce_keeps_the_historical_shape() -> None:
     assert legacy != _fleet_id({"fleet_rollout_transaction": "1111aaaa2222"}), legacy
 
 
-def test_fresh_upgrade_terminalizes_every_active_cluster_rollout() -> None:
-    """A fresh transaction holds the release lock: whatever is still non-terminal
-    for the site's clusters was abandoned, and while it stands the destructive
-    workflow fence holds the cluster. The sweep is by cluster, not release id,
-    because the stranded record may belong to an earlier abandoned release."""
+def test_fleet_create_terminalizes_the_cluster_s_other_active_rollouts() -> None:
+    """The release holding the lock is the cluster's only legitimate rollout, so
+    right before it creates (or resumes) its own record every *other*
+    non-terminal record is stranded -- whatever release id minted it -- and
+    while it stands the destructive workflow fence holds the cluster. Fakes
+    answering with nothing mean nothing terminalized, not an error."""
     calls = []
     release = SimpleNamespace(
-        config=SimpleNamespace(
-            clusters=(
-                SimpleNamespace(cluster_id="gpu-a"),
-                SimpleNamespace(cluster_id="gpu-b"),
-            )
-        ),
         release_id="candidate",
         _fleet_command=lambda operation, payload: calls.append((operation, payload))
-        or {
-            "terminalized": (
-                ["release-upgrade-older-aaaa", "release-upgrade-candidate-bbbb"]
-                if payload["cluster_id"] == "gpu-a"
-                else []
-            )
-        },
+        or {"terminalized": ["release-upgrade-older-aaaa"]},
     )
 
-    terminalized = ORCHESTRATION.terminalize_stranded_cluster_rollouts(
-        release, reason="superseded by a new transaction"
+    terminalized = ROLLOUT_CLEANUP.terminalize_stranded_cluster_rollouts(
+        release,
+        cluster_id="gpu-a",
+        keep_deployment_id="release-upgrade-candidate-bbbb",
+        reason="superseded",
     )
 
-    assert terminalized == (
-        "release-upgrade-older-aaaa",
-        "release-upgrade-candidate-bbbb",
-    )
+    assert terminalized == ("release-upgrade-older-aaaa",)
     assert calls == [
         (
             "terminalize-cluster-rollouts",
-            {"cluster_id": "gpu-a", "reason": "superseded by a new transaction"},
-        ),
-        (
-            "terminalize-cluster-rollouts",
-            {"cluster_id": "gpu-b", "reason": "superseded by a new transaction"},
-        ),
+            {
+                "cluster_id": "gpu-a",
+                "keep_deployment_id": "release-upgrade-candidate-bbbb",
+                "reason": "superseded",
+            },
+        )
     ]
+    quiet = SimpleNamespace(release_id="c", _fleet_command=lambda *_a, **_k: None)
+    assert (
+        ROLLOUT_CLEANUP.terminalize_stranded_cluster_rollouts(
+            quiet, cluster_id="gpu-a", keep_deployment_id="x", reason="r"
+        )
+        == ()
+    )

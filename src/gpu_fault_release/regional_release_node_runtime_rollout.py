@@ -4,6 +4,9 @@ from collections.abc import Callable
 from typing import Any
 
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from gpu_fault_release.regional_release_rollout_cleanup import (
+    terminalize_stranded_cluster_rollouts,
+)
 from gpu_fault_release.regional_release_fleet_rollout import (
     FleetWaveContext,
     NodeRolloutPolicy,
@@ -77,6 +80,18 @@ def _create_fleet_rollout(
         "node_failure_domains": failure_domains,
     }
     apply_fleet_request_identity(request, agent_identity)
+    # This release holds the lock: any other non-terminal rollout record for
+    # the cluster was abandoned by a dead or superseded transaction, and while
+    # it stands the destructive-workflow fence holds the whole cluster.
+    terminalize_stranded_cluster_rollouts(
+        release,
+        cluster_id=target.cluster_id,
+        keep_deployment_id=deployment_id,
+        reason=(
+            f"superseded by release {release.release_id} fleet deployment "
+            f"{deployment_id} before reaching a terminal state"
+        ),
+    )
     deployment = release._fleet_command("create", {"request": request})
     if deployment.get("status") in {"FAILED", "CANCELLED"} and (
         deployment.get("status") == "CANCELLED"

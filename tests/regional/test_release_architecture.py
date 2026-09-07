@@ -107,6 +107,8 @@ def test_node_runtime_rollout_uses_fleet_waves(tmp_path: Path, monkeypatch) -> N
         fleet_calls.append((operation, payload))
         if operation == "normalize-records":
             return {"normalized": 0}
+        if operation == "terminalize-cluster-rollouts":
+            return {"terminalized": []}
         if operation == "create":
             return {"status": "PLANNED"}
         if operation == "next-wave":

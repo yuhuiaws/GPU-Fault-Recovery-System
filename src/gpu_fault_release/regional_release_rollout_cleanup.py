@@ -103,33 +103,49 @@ def terminalize_stranded_rollouts(self: Any) -> tuple[str, ...]:
     return terminalized
 
 
-def terminalize_stranded_cluster_rollouts(self: Any, *, reason: str) -> tuple[str, ...]:
-    """Drive every non-terminal rollout of the site's clusters to a terminal state.
+def terminalize_stranded_cluster_rollouts(
+    self: Any,
+    *,
+    cluster_id: str,
+    keep_deployment_id: str,
+    reason: str,
+) -> tuple[str, ...]:
+    """Drive every other non-terminal rollout of ``cluster_id`` to a terminal state.
 
-    Runs when a *fresh* upgrade transaction starts. The by-release sweep in
+    Called by the node-runtime rollout right before it creates (or resumes)
+    ``keep_deployment_id``. The by-release sweep in
     ``terminalize_stranded_rollouts`` only runs during a rollback and only sees
-    the release being rolled back, so a transaction that was abandoned without
-    a rollback -- it died in a guard, or its resume was refused and a new
+    the release being rolled back, so a transaction abandoned without a
+    rollback -- it died in a guard, or its resume was refused and a fresh
     transaction was started instead -- leaves its fleet deployment record
     ``IN_PROGRESS`` forever, and ``execution/fleet_preflight.py`` fences every
     destructive remediation for the cluster behind it. On 2026-09-07 two such
-    records did exactly that for four hours after the successor had converged.
+    records (one of a different release id) did exactly that for four hours
+    after the successor had converged.
 
-    A fresh transaction holds the release lock, so nothing else can legitimately
-    be rolling out; every non-terminal record is stranded by definition.
+    The release holding the lock is the only legitimate rollout for the
+    cluster, so anything non-terminal other than its own record is stranded.
+    Fakes and older control planes may answer with nothing; that is "nothing
+    terminalized", never an error on the rollout path.
     """
 
-    terminalized: list[str] = []
-    for target in self.config.clusters:
-        result = self._fleet_command(
-            "terminalize-cluster-rollouts",
-            {"cluster_id": target.cluster_id, "reason": reason},
-        )
-        terminalized.extend(str(item) for item in result.get("terminalized") or ())
+    result = self._fleet_command(
+        "terminalize-cluster-rollouts",
+        {
+            "cluster_id": cluster_id,
+            "keep_deployment_id": keep_deployment_id,
+            "reason": reason,
+        },
+    )
+    terminalized = (
+        tuple(str(item) for item in result.get("terminalized") or ())
+        if isinstance(result, dict)
+        else ()
+    )
     if terminalized:
         print(
             "release-upgrade terminalized stranded fleet deployments: "
             + ", ".join(terminalized),
             file=sys.stderr,
         )
-    return tuple(terminalized)
+    return terminalized
