@@ -15,6 +15,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
 from scripts.e2e.regional.identity_acceptance_auth import (  # noqa: E402
+    auth015_focused_tests,
     run_auth007,
     run_auth010,
     run_auth013,
@@ -25,6 +26,7 @@ from scripts.e2e.regional.identity_acceptance_auth import (  # noqa: E402
 from scripts.e2e.regional.identity_acceptance_common import (  # noqa: E402
     ClusterTarget,
     IdentityAcceptanceError,
+    IdentityCaseFailure,
     IdentitySite,
     utc_now,
 )
@@ -38,6 +40,8 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     authorize_execution,
     build_plan,
     install_site_profile,
+    record_focused_tests,
+    reusable_focused_tests,
 )
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
@@ -67,6 +71,7 @@ def case_plan(
     secondary: ClusterTarget | None,
     nodes: tuple[str, ...],
     predecessor: dict[str, Any],
+    evidence_identity: dict[str, str],
 ) -> dict[str, Any]:
     mutations = {
         "GF-REGIONAL-AUTH-007": (
@@ -92,6 +97,7 @@ def case_plan(
     return {
         "risk": "case-defined",
         "predecessor": predecessor,
+        "evidence_identity": evidence_identity,
         "primary": {
             "cluster_id": primary.cluster_id,
             "context": primary.context,
@@ -177,6 +183,18 @@ def validate_case_arguments(
             raise IdentityAcceptanceError(
                 "AUTH-015 host probe image must use an immutable digest"
             )
+    if arguments.case == "GF-REGIONAL-AUTH-013":
+        # Optional: one node plus a host probe image lets the case read the
+        # per-node certificate-expiry timer; without them that check is
+        # recorded as not evaluated and the case cannot PASS.
+        if len(nodes) > 1 or bool(nodes) != bool(arguments.host_probe_image):
+            raise IdentityAcceptanceError(
+                "AUTH-013 takes at most one --node, together with --host-probe-image"
+            )
+        if nodes and "@sha256:" not in arguments.host_probe_image:
+            raise IdentityAcceptanceError(
+                "AUTH-013 host probe image must use an immutable digest"
+            )
     return primary, secondary, nodes
 
 
@@ -186,13 +204,17 @@ def main() -> int:
     os.umask(0o077)
     site = IdentitySite(arguments.site)
     primary, secondary, nodes = validate_case_arguments(arguments, site)
+    # The release and cluster this run's evidence is bound to; the predecessor
+    # must have been earned against the same pair, and the successor will ask
+    # the same of this case's evidence.
+    identity = site.regional(primary).evidence_identity()
     predecessor_id, path = predecessor_path(
         arguments.run_dir,
         arguments.case,
         arguments.predecessor_evidence,
     )
     predecessor = (
-        predecessor_evidence(path, predecessor_id)
+        predecessor_evidence(path, predecessor_id, **identity)
         if predecessor_id is not None and path is not None
         else {"valid": True, "case_id": None, "verdict": "NOT_REQUIRED"}
     )
@@ -208,23 +230,32 @@ def main() -> int:
         ),
         "GPU_FAULT_TARGET_NODES": ",".join(nodes),
     }
+    case_dir = arguments.run_dir / "cases" / arguments.case
+    case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not arguments.execute:
+        details = case_plan(
+            arguments.case,
+            primary=primary,
+            secondary=secondary,
+            nodes=nodes,
+            predecessor=predecessor,
+            evidence_identity=identity,
+        )
+        if arguments.case == "GF-REGIONAL-AUTH-015":
+            # Run the focused pytest here so --execute can reuse the result
+            # against an unchanged tree instead of paying for it twice.
+            record_focused_tests(details, auth015_focused_tests())
         plan = build_plan(
             run_dir=arguments.run_dir,
             case_id=arguments.case,
             attempt=arguments.attempt,
             confirmation=confirmation,
             environment=environment,
-            details=case_plan(
-                arguments.case,
-                primary=primary,
-                secondary=secondary,
-                nodes=nodes,
-                predecessor=predecessor,
-            ),
+            details=details,
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if predecessor.get("valid", False) else 1
+        focused_ok = details.get("focused_tests", {"passed": True}).get("passed")
+        return 0 if predecessor.get("valid", False) and focused_ok is True else 1
     if arguments.confirm != confirmation:
         raise IdentityAcceptanceError(f"confirmation must be exactly {confirmation}")
     authorize_execution(
@@ -235,16 +266,20 @@ def main() -> int:
     )
     if not predecessor.get("valid", False):
         raise IdentityAcceptanceError("formal predecessor evidence is not PASS")
-    case_dir = arguments.run_dir / "cases" / arguments.case
-    case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     started_at = utc_now()
     try:
         handlers: dict[str, Callable[[], dict[str, Any]]] = {
             "GF-REGIONAL-AUTH-007": lambda: run_auth007(
-                site, primary, cast(ClusterTarget, secondary)
+                site, primary, cast(ClusterTarget, secondary), case_dir=case_dir
             ),
             "GF-REGIONAL-AUTH-010": lambda: run_auth010(site, primary),
-            "GF-REGIONAL-AUTH-013": lambda: run_auth013(site, primary),
+            "GF-REGIONAL-AUTH-013": lambda: run_auth013(
+                site,
+                primary,
+                node=nodes[0] if nodes else "",
+                host_probe_image=arguments.host_probe_image,
+                case_dir=case_dir,
+            ),
             "GF-REGIONAL-AUTH-014": lambda: run_auth014(
                 site,
                 primary,
@@ -257,8 +292,11 @@ def main() -> int:
                 fleet_master_file=arguments.fleet_master_file,
                 host_probe_image=arguments.host_probe_image,
                 case_dir=case_dir,
+                focused_tests=reusable_focused_tests(case_dir / "plan.json"),
             ),
-            "GF-REGIONAL-AUTH-016": lambda: run_auth016(site, primary),
+            "GF-REGIONAL-AUTH-016": lambda: run_auth016(
+                site, primary, case_dir=case_dir
+            ),
             "GF-REGIONAL-ISO-003": lambda: run_iso003(
                 site, primary, cast(ClusterTarget, secondary)
             ),
@@ -272,6 +310,19 @@ def main() -> int:
             ),
         }
         outcome = handlers[arguments.case]()
+    except IdentityCaseFailure as exc:
+        # The handler restored what it could and kept its partial checks;
+        # they are evidence of how far the case got, not a PASS.
+        outcome = {
+            "verdict": "FAIL",
+            "error": f"{type(exc.__cause__ or exc).__name__}: {exc}",
+            "partial": exc.details,
+            "cleanup_errors": list(exc.details.get("cleanup_errors") or []),
+            "limitations": [
+                "The case stopped at the first failed step; the checks under "
+                "'partial' were gathered before it and the restore state after."
+            ],
+        }
     except Exception as exc:
         outcome = {
             "verdict": "FAIL",
@@ -289,7 +340,12 @@ def main() -> int:
         "started_at": started_at,
         "executed_at": utc_now(),
         "predecessor": predecessor,
-        **{key: value for key, value in outcome.items() if key != "verdict"},
+        **identity,
+        **{
+            key: value
+            for key, value in outcome.items()
+            if key not in {"verdict", *identity}
+        },
     }
     write_json_atomic(case_evidence_path(arguments.run_dir, arguments.case), result)
     print(json.dumps(result, sort_keys=True))

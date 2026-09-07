@@ -11,6 +11,10 @@ PYTHON="${PYTHON:-${ROOT}/.venv/bin/python}"
 : "${CPU_HYPERPOD_CLUSTER:?}"
 : "${AWS_REGION:?}"
 : "${BOOT_GUARD_START_CASE:=1}"
+# Optional: the IAM role name the control-plane Pods run as. When set, the
+# BOOT-005 CloudTrail read is filtered to that principal; when unset, every
+# HyperPod mutation in the window is reported.
+: "${CONTROL_PLANE_ROLE_NAME:=}"
 
 if [[ "${BOOT_GUARD_START_CASE}" != "1" &&
       "${BOOT_GUARD_START_CASE}" != "7" &&
@@ -27,12 +31,61 @@ CASE_DIR="${RUN_DIR}/cases"
 install -d -m 0700 "${CASE_DIR}"
 export CPU_KUBECONFIG NAMESPACE PROBE
 
+# ---------------------------------------------------------------------------
+# Verdict contract. Every case file ends in exactly one line
+#   VERDICT PASS | VERDICT FAIL
+# written by pass_case / fail_case / the ERR trap. Anything else in the file
+# (assert.sh's own "PASS", tee'd kubectl output) is evidence, not a verdict:
+# the old resume gate grepped a bare "PASS" line that assert.sh writes *before*
+# the later checks of the same case run, so a case could resume as passed after
+# a later check had failed.
+# ---------------------------------------------------------------------------
+CURRENT_EVIDENCE=""
+
+begin_case() {
+  printf -v case_id 'GF-REGIONAL-BOOT-%03d' "$1"
+  CURRENT_EVIDENCE="${CASE_DIR}/${case_id}.txt"
+  : >"${CURRENT_EVIDENCE}"
+  echo "== ${case_id}"
+}
+
+pass_case() {
+  echo "VERDICT PASS" | tee -a "${CURRENT_EVIDENCE}"
+  CURRENT_EVIDENCE=""
+}
+
+fail_case() {
+  echo "FAIL: $*" >&2
+  if [[ -n "${CURRENT_EVIDENCE}" ]]; then
+    printf 'FAIL: %s\nVERDICT FAIL\n' "$*" >>"${CURRENT_EVIDENCE}"
+  fi
+  exit 1
+}
+
+on_error() {
+  local status=$?
+  if [[ -n "${CURRENT_EVIDENCE}" ]]; then
+    printf 'FAIL: command exited %s\nVERDICT FAIL\n' "${status}" \
+      >>"${CURRENT_EVIDENCE}"
+  fi
+}
+trap on_error ERR
+
+case_passed() {
+  # The gate reads the last line only: a "VERDICT PASS" followed by anything
+  # is not a finished case.
+  if [[ -f "$1" && "$(tail -n 1 "$1")" == "VERDICT PASS" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 if (( BOOT_GUARD_START_CASE > 1 )); then
   for case_number in $(seq 1 $((BOOT_GUARD_START_CASE - 1))); do
     printf -v case_id 'GF-REGIONAL-BOOT-%03d' "${case_number}"
     evidence="${CASE_DIR}/${case_id}.txt"
-    if [[ ! -f "${evidence}" ]] || ! grep -qx "PASS" "${evidence}"; then
-      echo "BOOT-007 resume requires prior PASS evidence: ${evidence}" >&2
+    if ! case_passed "${evidence}"; then
+      echo "BOOT-007 resume requires prior VERDICT PASS evidence: ${evidence}" >&2
       exit 2
     fi
   done
@@ -67,6 +120,24 @@ assert_probe() {
 apply_mutation() {
   "${PYTHON}" "${FIXTURE_DIR}/mutate.py" "$@" |
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" apply -f -
+}
+
+# The Pod name of the single probe replica, read only after the Deployment is
+# Available. `.items[0]` straight after `kubectl apply` races the ReplicaSet:
+# the list is empty, or still holds the previous round's terminating Pod.
+probe_pod_name() {
+  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+    wait deployment "${PROBE}" --for=condition=Available --timeout=600s >/dev/null
+  local pods
+  pods="$(
+    kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+      get pod -l "app=${PROBE}" -o json |
+      jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | .[]'
+  )"
+  if [[ "$(wc -l <<<"${pods}")" != "1" || -z "${pods}" ]]; then
+    fail_case "expected exactly one probe Pod, got: ${pods//$'\n'/ }"
+  fi
+  printf '%s\n' "${pods}"
 }
 
 probe_registry() {
@@ -174,28 +245,52 @@ unset secret_manifest
 
 "${FIXTURE_DIR}/derive.sh" "${BASE}"
 export GUARD_PROBE_BASE="${BASE}"
+# One readiness period of the probe: after the guard text is seen, Ready is
+# re-read this much later so a Pod that flips Ready on the next probe tick is
+# not recorded as refused.
+readiness_period="$(
+  jq -r '.spec.template.spec.containers[0].readinessProbe.periodSeconds // 10' \
+    "${BASE}"
+)"
 
 if (( BOOT_GUARD_START_CASE <= 1 )); then
+  begin_case 1
   reset_probe
   apply_mutation del GPU_FAULT_REGIONAL_CLUSTERS_JSON
   assert_probe \
     "regional mode requires GPU_FAULT_REGIONAL_CLUSTERS_JSON" |
-    tee "${CASE_DIR}/GF-REGIONAL-BOOT-001.txt"
+    tee -a "${CURRENT_EVIDENCE}"
   endpoints="$(
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
       get endpoints gpu-fault-api \
       -o jsonpath='{range .subsets[*].addresses[*]}{.targetRef.name}{"\n"}{end}'
   )"
-  printf '%s\n' "${endpoints}" \
-    >>"${CASE_DIR}/GF-REGIONAL-BOOT-001.txt"
+  printf '%s\n' "${endpoints}" >>"${CURRENT_EVIDENCE}"
   if grep -q "gpu-fault-api-guard-probe" <<<"${endpoints}"; then
-    echo "guard probe entered the production Service endpoints" >&2
-    exit 1
+    fail_case "guard probe entered the production Service endpoints"
   fi
+  # assert.sh saw "not Ready" at the moment the text matched; one readiness
+  # period later it must still not be Ready, or the guard only delayed startup.
+  sleep "${readiness_period}"
+  probe_pod="$(
+    kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+      get pod -l "app=${PROBE}" -o jsonpath='{.items[0].metadata.name}'
+  )"
+  ready_again="$(
+    kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+      get pod "${probe_pod}" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+  )"
+  printf 'ready_after_%ss=%s\n' "${readiness_period}" "${ready_again}" |
+    tee -a "${CURRENT_EVIDENCE}"
+  if [[ "${ready_again}" == "True" ]]; then
+    fail_case "probe became Ready one readiness period after the guard fired"
+  fi
+  pass_case
 fi
 
 if (( BOOT_GUARD_START_CASE <= 2 )); then
-  : >"${CASE_DIR}/GF-REGIONAL-BOOT-002.txt"
+  begin_case 2
   for payload in '{"cluster_id":' '{}' '[1]'; do
     reset_probe
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -214,9 +309,9 @@ if (( BOOT_GUARD_START_CASE <= 2 )); then
       expected="regional cluster registry entries must be objects"
     fi
     printf 'payload=%s\n' "${payload}" |
-      tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-002.txt"
+      tee -a "${CURRENT_EVIDENCE}"
     assert_probe "${expected}" |
-      tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-002.txt"
+      tee -a "${CURRENT_EVIDENCE}"
   done
 
   reset_probe
@@ -228,12 +323,7 @@ if (( BOOT_GUARD_START_CASE <= 2 )); then
   apply_mutation \
     sref GPU_FAULT_REGIONAL_CLUSTERS_JSON \
     gpu-fault-regional-clusters-bad clusters.json
-  probe_pod="$(
-    kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-      get pod -l "app=${PROBE}" -o jsonpath='{.items[0].metadata.name}'
-  )"
-  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    wait --for=condition=ready "pod/${probe_pod}" --timeout=600s
+  probe_pod="$(probe_pod_name)"
   empty_registry_output="$(
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
       exec -i "${probe_pod}" -- python - <<'PY'
@@ -252,37 +342,47 @@ request = urllib.request.Request(
 with urllib.request.urlopen(request, timeout=10) as response:
     payload = json.load(response)
     print("status", response.status, "clusters", payload)
-    assert response.status == 200
-    assert payload == []
+    if response.status != 200 or payload != []:
+        raise SystemExit("empty registry did not answer 200 []")
 PY
   )"
   printf 'payload=[]\n%s\n' "${empty_registry_output}" |
-    tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-002.txt"
+    tee -a "${CURRENT_EVIDENCE}"
+  pass_case
 fi
 
 if (( BOOT_GUARD_START_CASE <= 3 )); then
+  begin_case 3
   reset_probe
   apply_mutation \
     set GPU_FAULT_HYPERPOD_CLUSTER "${CPU_HYPERPOD_CLUSTER}"
   assert_probe \
     "regional mode uses the cluster registry; GPU_FAULT_HYPERPOD_CLUSTER must be unset" |
-    tee "${CASE_DIR}/GF-REGIONAL-BOOT-003.txt"
+    tee -a "${CURRENT_EVIDENCE}"
+  pass_case
 fi
 
 if (( BOOT_GUARD_START_CASE <= 4 )); then
+  begin_case 4
   reset_probe
   apply_mutation set GPU_FAULT_ENABLE_KUBERNETES_ADAPTER true
   assert_probe \
     "regional control plane must not enable the in-cluster KubernetesWorkflowAdapter" |
-    tee "${CASE_DIR}/GF-REGIONAL-BOOT-004.txt"
+    tee -a "${CURRENT_EVIDENCE}"
+  pass_case
 fi
 
 if (( BOOT_GUARD_START_CASE <= 5 )); then
+  begin_case 5
   reset_probe
   apply_mutation set GPU_FAULT_ENABLE_HYPERPOD_ADAPTER true
   assert_probe \
     "regional control plane must delegate HyperPod mutations to the target cluster executor" |
-    tee "${CASE_DIR}/GF-REGIONAL-BOOT-005.txt"
+    tee -a "${CURRENT_EVIDENCE}"
+  # CloudTrail is eventually consistent (delivery within 15 minutes), so a
+  # lookup seconds after the action cannot prove absence. The positive
+  # evidence for this case is the guard exit above; the CloudTrail read is
+  # recorded as provisional, filtered to the control-plane role when known.
   # shellcheck disable=SC2016 # The expression is AWS CLI JMESPath.
   mutations="$(
     aws cloudtrail lookup-events \
@@ -294,53 +394,78 @@ if (( BOOT_GUARD_START_CASE <= 5 )); then
       'Events[?EventName==`RebootClusterNodes` || EventName==`BatchDeleteClusterNodes` || EventName==`BatchReplaceClusterNodes` || EventName==`UpdateClusterSoftware`].[EventTime,EventName,Username]' \
     --output json
   )"
+  if [[ -n "${CONTROL_PLANE_ROLE_NAME}" ]]; then
+    mutations="$(
+      jq --arg role "${CONTROL_PLANE_ROLE_NAME}" \
+        '[.[] | select((.[2] // "") | contains($role))]' <<<"${mutations}"
+    )"
+    printf 'cloudtrail_filter=role:%s\n' "${CONTROL_PLANE_ROLE_NAME}" |
+      tee -a "${CURRENT_EVIDENCE}"
+  else
+    printf 'cloudtrail_filter=none\n' | tee -a "${CURRENT_EVIDENCE}"
+  fi
+  printf 'cloudtrail_provisional=true (lookup at %s, CloudTrail delivers within 15 min)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" |
+    tee -a "${CURRENT_EVIDENCE}"
   printf '%s\n' "${mutations}" |
-    tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-005.txt"
-  jq -e 'length == 0' <<<"${mutations}" >/dev/null
+    tee -a "${CURRENT_EVIDENCE}"
+  if ! jq -e 'length == 0' <<<"${mutations}" >/dev/null; then
+    fail_case "CloudTrail shows a HyperPod mutation during the guard window"
+  fi
+  pass_case
 fi
 
 if (( BOOT_GUARD_START_CASE <= 6 )); then
+  begin_case 6
   reset_probe
   apply_mutation set GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS true
   assert_probe \
     "regional control plane cannot run in-cluster quick diagnostics against its own EKS" |
-    tee "${CASE_DIR}/GF-REGIONAL-BOOT-006.txt"
+    tee -a "${CURRENT_EVIDENCE}"
+  pass_case
 fi
 
 if (( BOOT_GUARD_START_CASE <= 7 )); then
+  begin_case 7
   probe_registry 31
   assert_probe "cluster token must contain at least 32 characters" |
-    tee "${CASE_DIR}/GF-REGIONAL-BOOT-007.txt"
+    tee -a "${CURRENT_EVIDENCE}"
 
   probe_registry 32
-  probe_pod="$(
-    kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-      get pod -l "app=${PROBE}" -o jsonpath='{.items[0].metadata.name}'
-  )"
-  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    wait --for=condition=ready "pod/${probe_pod}" --timeout=600s
+  probe_pod="$(probe_pod_name)"
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
     get pod "${probe_pod}" \
     -o custom-columns=READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount \
     --no-headers |
-    tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-007.txt"
+    tee -a "${CURRENT_EVIDENCE}"
+  # Ready alone is the kubelet's view; the positive branch also has to answer
+  # its own health endpoint from inside the Pod.
+  healthz_output="$(
+    kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+      exec -i "${probe_pod}" -- python - <<'PY'
+import urllib.request
+
+with urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=10) as response:
+    print("healthz", response.status)
+    if response.status != 200:
+        raise SystemExit("healthz did not answer 200")
+PY
+  )"
+  printf '%s\n' "${healthz_output}" | tee -a "${CURRENT_EVIDENCE}"
+  pass_case
 fi
 
+begin_case 8
 probe_registry 64 "" eks_cluster_arn
 assert_probe "validation error for RegionalClusterRegistration" |
-  tee "${CASE_DIR}/GF-REGIONAL-BOOT-008.txt"
+  tee -a "${CURRENT_EVIDENCE}"
 
 probe_registry 64 "" "" alowed_namespaces
 assert_probe "Extra inputs are not permitted" |
-  tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-008.txt"
+  tee -a "${CURRENT_EVIDENCE}"
 
 probe_registry 64 disabled
-probe_pod="$(
-  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    get pod -l "app=${PROBE}" -o jsonpath='{.items[0].metadata.name}'
-)"
-kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-  wait --for=condition=ready "pod/${probe_pod}" --timeout=600s
+probe_pod="$(probe_pod_name)"
 disabled_output="$(
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
     exec -i "${probe_pod}" -- python - <<'PY'
@@ -371,21 +496,24 @@ try:
 except urllib.error.HTTPError as exc:
     body = exc.read().decode()
     print("status", exc.code, body)
-    assert exc.code == 403
-    assert "regional cluster authentication failed" in body
+    if exc.code != 403 or "regional cluster authentication failed" not in body:
+        raise SystemExit("disabled cluster was not refused with 403")
 else:
     raise SystemExit("disabled cluster authenticated")
 PY
 )"
 printf '%s\n' "${disabled_output}" |
-  tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-008.txt"
+  tee -a "${CURRENT_EVIDENCE}"
 unset disabled_output
+pass_case
 
+begin_case 9
 reset_probe
 apply_mutation set GPU_FAULT_ENABLE_AGENT_REGISTRY false
 assert_probe \
   "HyperPod managed recovery observer requires GPU_FAULT_ENABLE_AGENT_REGISTRY=true" |
-  tee "${CASE_DIR}/GF-REGIONAL-BOOT-009.txt"
+  tee -a "${CURRENT_EVIDENCE}"
+pass_case
 
 reset_probe
 "${FIXTURE_DIR}/cleanup.sh" --drop-database |
@@ -393,16 +521,22 @@ reset_probe
 trap - EXIT
 shred -u "${BASE}" 2>/dev/null || true
 
+# BOOT-010 is the positive gate: production is back at its baseline and the
+# three replicas run in regional mode with the dangerous switches off. Every
+# comparison names what it found; a silent `[[ ]]` under set -e exits with no
+# line in the evidence saying which one failed.
+begin_case 10
 current="$(
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
     get deployment gpu-fault-api-ha \
     -o jsonpath='{.metadata.generation} {.status.readyReplicas}'
 )"
 printf 'current=%s\n' "${current}" |
-  tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-001-010-baseline.txt"
-[[ "${current}" == "${baseline}" ]]
+  tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-001-010-baseline.txt" "${CURRENT_EVIDENCE}"
+if [[ "${current}" != "${baseline}" ]]; then
+  fail_case "production deployment left its baseline: ${baseline} -> ${current}"
+fi
 
-: >"${CASE_DIR}/GF-REGIONAL-BOOT-010.txt"
 baseline_env=""
 for pod in $(
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -417,36 +551,86 @@ for pod in $(
       sort
   )"
   printf '== %s\n%s\n' "${pod}" "${output}" |
-    tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-010.txt"
+    tee -a "${CURRENT_EVIDENCE}"
   if [[ -z "${baseline_env}" ]]; then
     baseline_env="${output}"
-  else
-    [[ "${output}" == "${baseline_env}" ]]
+  elif [[ "${output}" != "${baseline_env}" ]]; then
+    fail_case "replica ${pod} environment differs from the first replica"
   fi
 done
-grep -q '^GPU_FAULT_DEPLOYMENT_MODE=regional$' <<<"${baseline_env}"
-grep -q '^GPU_FAULT_ENABLE_KUBERNETES_ADAPTER=false$' <<<"${baseline_env}"
-grep -q '^GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER=false$' <<<"${baseline_env}"
-grep -q '^GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=false$' <<<"${baseline_env}"
-grep -q '^GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false$' <<<"${baseline_env}"
-grep -q '^GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER=true$' <<<"${baseline_env}"
-grep -q '^GPU_FAULT_ENABLE_AGENT_REGISTRY=true$' <<<"${baseline_env}"
-grep -q '^GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS=false$' <<<"${baseline_env}"
-grep -q '^GPU_FAULT_PROCESSOR_MODE=active-active$' <<<"${baseline_env}"
+
+expect_env() {
+  if ! grep -q "^$1\$" <<<"${baseline_env}"; then
+    fail_case "expected '$1' in every replica environment"
+  fi
+}
+expect_env 'GPU_FAULT_DEPLOYMENT_MODE=regional'
+expect_env 'GPU_FAULT_ENABLE_KUBERNETES_ADAPTER=false'
+expect_env 'GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER=false'
+expect_env 'GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=false'
+expect_env 'GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false'
+expect_env 'GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER=true'
+expect_env 'GPU_FAULT_ENABLE_AGENT_REGISTRY=true'
+expect_env 'GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS=false'
+expect_env 'GPU_FAULT_PROCESSOR_MODE=active-active'
 if grep -q '^GPU_FAULT_HYPERPOD_CLUSTER=' <<<"${baseline_env}"; then
-  echo "GPU_FAULT_HYPERPOD_CLUSTER must be absent in regional mode" >&2
-  exit 1
+  fail_case "GPU_FAULT_HYPERPOD_CLUSTER must be absent in regional mode"
 fi
+
+# The registry is loaded: every registered cluster answers the read-only
+# collector-status side channel with 200 (not 404/500). Read from inside one
+# replica so the execution token never leaves the Pod.
+cluster_ids="$(
+  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+    get secret gpu-fault-regional-clusters -o jsonpath='{.data.clusters\.json}' |
+    base64 -d | jq -r '.[].cluster_id'
+)"
+if [[ -z "${cluster_ids}" ]]; then
+  fail_case "production registry names no clusters"
+fi
+api_pod="$(latest_ready_api_pod)"
+collector_status_output="$(
+  CLUSTER_IDS="${cluster_ids}" kubectl --kubeconfig "${CPU_KUBECONFIG}" \
+    -n "${NAMESPACE}" exec -i "${api_pod}" -- \
+    env "PROBE_CLUSTER_IDS=${cluster_ids}" python - <<'PY'
+import os
+import urllib.error
+import urllib.request
+
+failures = []
+for cluster_id in os.environ["PROBE_CLUSTER_IDS"].split():
+    request = urllib.request.Request(
+        f"http://127.0.0.1:8080/v1/collector-status/{cluster_id}",
+        headers={
+            "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"]
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    print(f"collector-status {cluster_id} {status}")
+    if status != 200:
+        failures.append(cluster_id)
+if failures:
+    raise SystemExit("collector-status not 200 for: " + ", ".join(failures))
+PY
+)"
+printf '%s\n' "${collector_status_output}" | tee -a "${CURRENT_EVIDENCE}"
 
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   get pod -l app=gpu-fault-api-ha \
   -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName |
-  tee -a "${CASE_DIR}/GF-REGIONAL-BOOT-010.txt"
+  tee -a "${CURRENT_EVIDENCE}"
 node_count="$(
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
     get pod -l app=gpu-fault-api-ha -o json |
     jq '[.items[].spec.nodeName] | unique | length'
 )"
-[[ "${node_count}" == "3" ]]
+if [[ "${node_count}" != "3" ]]; then
+  fail_case "api replicas span ${node_count} nodes, expected 3"
+fi
+pass_case
 
 echo "GF-REGIONAL-BOOT-001..010 PASS"

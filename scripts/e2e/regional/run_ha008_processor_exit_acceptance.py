@@ -14,21 +14,39 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 if __package__:
-    from .acceptance_scope import scoped_case_evidence
+    from .acceptance_runner_common import write_json_atomic
 else:
-    from acceptance_scope import scoped_case_evidence
+    from acceptance_runner_common import write_json_atomic
 
 
 ROOT = Path(__file__).resolve().parents[3]
 PROBE = ROOT / "scripts/e2e/regional/run_ha008_processor_exit_probe.py"
 CASE_ID = "GF-REGIONAL-HA-008"
+# What the processor itself emits (gpu_fault.processor.coordinator), at ERROR:
+# LOGGER.exception(...) when the post-deadline release raises, and the
+# deadline-exceeded record in every case. The probe's injected exception text is
+# not evidence -- it would appear in the traceback whether or not the processor
+# logged anything of its own.
+PROCESSOR_LOGGER = "gpu_fault.processor.coordinator"
+RELEASE_FAILURE_MESSAGE = "could not release request after its execution deadline"
+DEADLINE_EXCEEDED_MESSAGE = "processor request execution deadline exceeded"
 
 
-def _write_json(path: Path, value: object) -> None:
-    path.write_text(
-        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
+def _processor_error_logged(output: str, message: str) -> bool:
+    return any(
+        line.startswith(f"ERROR {PROCESSOR_LOGGER} ") and message in line
+        for line in output.splitlines()
     )
-    path.chmod(0o600)
+
+
+def release_failure_logged(output: str) -> bool:
+    """True if the processor logged its own release-failure ERROR line."""
+
+    return _processor_error_logged(output, RELEASE_FAILURE_MESSAGE)
+
+
+def deadline_exceeded_logged(output: str) -> bool:
+    return _processor_error_logged(output, DEADLINE_EXCEEDED_MESSAGE)
 
 
 def _write_text(path: Path, value: str) -> None:
@@ -149,9 +167,11 @@ def _run_branch(evidence_dir: Path, name: str, *, fail_release: bool) -> dict:
             "stale_result_rejected": stale_rejected,
             "final_status": final.status.value,
             "final_response_status": final.response_status,
-            "release_failure_logged": (
-                "HA008 injected release failure"
-                in f"{completed.stdout}\n{completed.stderr}"
+            "release_failure_logged": release_failure_logged(
+                f"{completed.stdout}\n{completed.stderr}"
+            ),
+            "deadline_exceeded_logged": deadline_exceeded_logged(
+                f"{completed.stdout}\n{completed.stderr}"
             ),
         }
 
@@ -172,12 +192,21 @@ def run_acceptance(evidence_dir: Path) -> dict:
             errors.append(f"{branch['branch']} final response is not 200")
         if branch["second_owner"] == branch["first_owner"]:
             errors.append(f"{branch['branch']} did not change owner")
+        if not branch["deadline_exceeded_logged"]:
+            errors.append(
+                f"{branch['branch']} processor did not log the deadline-exceeded error"
+            )
     if normal["status_after_exit"] != "PENDING":
         errors.append("normal branch did not release the request before exit")
+    if normal["release_failure_logged"]:
+        errors.append("normal branch logged a release failure it should not have")
     if failed["status_after_exit"] != "LEASED":
         errors.append("release-failure branch did not preserve the leased request")
     if not failed["release_failure_logged"]:
-        errors.append("release-failure branch did not log the injected error")
+        errors.append(
+            "release-failure branch: processor did not log its own "
+            f"'{RELEASE_FAILURE_MESSAGE}' ERROR line"
+        )
     result = {
         "case_id": CASE_ID,
         "verdict": "PASS" if not errors else "FAIL",
@@ -185,7 +214,7 @@ def run_acceptance(evidence_dir: Path) -> dict:
         "branches": [normal, failed],
         "sensitive_temp_files_removed": True,
     }
-    _write_json(evidence_dir / f"{CASE_ID}.json", result)
+    write_json_atomic(evidence_dir / f"{CASE_ID}.json", result)
     return result
 
 

@@ -23,6 +23,8 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
@@ -74,6 +76,30 @@ CLEANUP_TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED"}
 CLEANUP_QUIET_SECONDS = 15
 CLEANUP_TIMEOUT_SECONDS = 300
 CLEANUP_POLL_SECONDS = 5
+CONTROL_PLANE_LOG_APPS = (
+    "gpu-fault-api-ha",
+    "gpu-fault-control-worker",
+    "gpu-fault-processor",
+)
+# A Kubernetes write against the workload, in the plain-text form the control
+# plane logs (`LOG_FORMAT` in gpu_fault.logging_setup is `%(asctime)s
+# %(levelname)s %(name)s %(message)s`, not JSON) and in the structured form a
+# client library or a future JSON handler would emit.
+WORKLOAD_WRITE_LOG_TOKENS = (
+    " patch ",
+    " delete ",
+    " create ",
+    " suspend",
+    "kubernetes write",
+    '"verb":"patch"',
+    '"verb": "patch"',
+    '"verb":"delete"',
+    '"verb": "delete"',
+    '"verb":"create"',
+    '"verb": "create"',
+    '"verb":"update"',
+    '"verb": "update"',
+)
 
 
 @dataclass(frozen=True)
@@ -135,7 +161,18 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
 
 
-def focused_tests(case_dir: Path) -> dict[str, Any]:
+def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
+    """Run the focused pytest, or reuse the plan's result in ``--execute``.
+
+    ``reuse`` consults ``reusable_focused_tests`` on the plan this case wrote:
+    a passing result taken against the same source digest speaks for the tree
+    now, and the ~minute the suite costs is not paid twice per run.
+    """
+
+    if reuse:
+        recorded = reusable_focused_tests(case_dir / "plan.json")
+        if recorded is not None:
+            return {**recorded, "focused_tests_reused": True}
     command = [
         sys.executable,
         "-m",
@@ -193,12 +230,15 @@ def managed_owner_errors(profile: dict[str, Any] | None) -> list[str]:
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
+    *,
+    reuse_focused_tests: bool = False,
 ) -> dict[str, Any]:
     if not settings.site_file.is_file():
         raise RegionalFixtureError("regional site file does not exist")
     if not settings.manifest.is_file():
         raise RegionalFixtureError("training manifest does not exist")
     fixture = RegionalLiveFixture(settings.regional)
+    identity = fixture.evidence_identity()
     gpu_nodes = fixture.gpu_nodes()
     candidates = [
         item
@@ -209,10 +249,11 @@ def read_only_preflight(
         fixture.store_snapshot(node=str(candidates[0]["name"])) if candidates else {}
     )
     runtime_identity = fixture.runtime_identity()
-    tests = focused_tests(case_dir)
+    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
+        **identity,
     )
     errors = []
     errors.extend(runtime_identity_errors(runtime_identity))
@@ -237,6 +278,7 @@ def read_only_preflight(
         errors.append("training manifest image digest differs from the contract")
     result = {
         "release_id": state.get("release_id"),
+        "evidence_identity": identity,
         "gpu_nodes": gpu_nodes,
         "candidate_nodes": candidates,
         "gpu_workloads": gpu_workloads,
@@ -282,6 +324,7 @@ def wait_observation(
             node=node,
             job_id=settings.job_id,
             attempt_id=settings.attempt_id,
+            queue_attempts=1,
         )
         last = state.get("observations") or []
         if len(last) == 1:
@@ -337,21 +380,41 @@ def xid11_payload(
     }
 
 
-def control_plane_log_snapshot(
+def workload_write_lines(output: str, workload_name: str) -> list[str]:
+    """Log lines that name ``workload_name`` next to a Kubernetes write verb."""
+
+    needle = workload_name.lower()
+    return [
+        line[:500]
+        for line in output.splitlines()
+        if needle in line.lower()
+        and any(token in line.lower() for token in WORKLOAD_WRITE_LOG_TOKENS)
+    ]
+
+
+def log_write_snapshot(
     regional: RegionalLiveFixture,
+    *,
+    plane: str,
+    apps: tuple[str, ...],
     since: datetime,
     workload_name: str,
 ) -> dict[str, Any]:
-    entries = []
-    suspicious = []
-    for app in (
-        "gpu-fault-api-ha",
-        "gpu-fault-control-worker",
-        "gpu-fault-processor",
-    ):
-        for pod in regional.ready_pods("cpu", app):
+    """Grep the Pods of ``apps`` for a write against the workload.
+
+    A Pod that returned no log lines for the window has not been checked --
+    the window may predate its log retention, or the read may have failed --
+    so it is listed under ``inconclusive`` and the verdict is INCONCLUSIVE,
+    not CLEAN. The old shape counted an empty read as "no suspicious lines".
+    """
+
+    entries: list[dict[str, Any]] = []
+    suspicious: list[dict[str, Any]] = []
+    inconclusive: list[str] = []
+    for app in apps:
+        for pod in regional.ready_pods(plane, app):
             output = regional.kubectl(
-                "cpu",
+                plane,
                 "logs",
                 str(pod["name"]),
                 "--since-time",
@@ -360,27 +423,75 @@ def control_plane_log_snapshot(
                 timeout=120,
             )
             path_key = f"{app}/{pod['name']}"
+            line_count = len(output.splitlines())
             entries.append(
                 {
                     "pod": path_key,
-                    "line_count": len(output.splitlines()),
+                    "line_count": line_count,
                     "sha256": hashlib.sha256(output.encode()).hexdigest(),
                 }
             )
-            for line in output.splitlines():
-                lowered = line.lower()
-                if workload_name.lower() in lowered and any(
-                    token in lowered
-                    for token in (
-                        " patch ",
-                        " delete ",
-                        " create ",
-                        " suspend",
-                        "kubernetes write",
-                    )
-                ):
-                    suspicious.append({"pod": path_key, "line": line[:500]})
-    return {"entries": entries, "suspicious": suspicious}
+            if line_count == 0:
+                inconclusive.append(path_key)
+            suspicious.extend(
+                {"pod": path_key, "line": line}
+                for line in workload_write_lines(output, workload_name)
+            )
+    if suspicious:
+        verdict = "SUSPICIOUS"
+    elif inconclusive or not entries:
+        verdict = "INCONCLUSIVE"
+    else:
+        verdict = "CLEAN"
+    return {
+        "entries": entries,
+        "suspicious": suspicious,
+        "inconclusive": inconclusive,
+        "verdict": verdict,
+    }
+
+
+def log_write_errors(logs: dict[str, Any], label: str) -> list[str]:
+    errors = []
+    if logs.get("suspicious"):
+        errors.append(f"{label} logs show a Kubernetes workload write")
+    if logs.get("verdict") == "INCONCLUSIVE":
+        errors.append(
+            f"{label} logs are INCONCLUSIVE: no lines from "
+            + (", ".join(logs.get("inconclusive") or []) or "any Pod")
+        )
+    return errors
+
+
+def control_plane_log_snapshot(
+    regional: RegionalLiveFixture,
+    since: datetime,
+    workload_name: str,
+) -> dict[str, Any]:
+    return log_write_snapshot(
+        regional,
+        plane="cpu",
+        apps=CONTROL_PLANE_LOG_APPS,
+        since=since,
+        workload_name=workload_name,
+    )
+
+
+def workflow_official_steps(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """The compiled steps with their owners, as the case evidence records them.
+
+    DESTR-012 group A reads this from the DESTR-009 evidence instead of
+    restarting a second 24-GPU job to look at the same two owner fields.
+    """
+
+    return [
+        {
+            "operation": item.get("operation"),
+            "execution_owner": item.get("execution_owner"),
+        }
+        for item in (state.get("workflow") or {}).get("official_steps") or []
+        if isinstance(item, dict)
+    ]
 
 
 def remote_waiting_evidence(state: dict[str, Any], operation: str) -> bool:
@@ -489,7 +600,7 @@ def workflow_errors(
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     state = preflight["store"]
-    return {
+    details = {
         "risk": "live-workload-restart",
         "predecessor": preflight["predecessor"],
         "job_id": settings.job_id,
@@ -537,6 +648,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight["focused_tests"])
+    return details
 
 
 def cleanup_quiescence_summary(state: dict[str, Any]) -> dict[str, Any]:
@@ -584,19 +697,27 @@ def wait_for_cleanup_quiescence(
     timeout_seconds: int = CLEANUP_TIMEOUT_SECONDS,
     quiet_seconds: int = CLEANUP_QUIET_SECONDS,
     poll_seconds: int = CLEANUP_POLL_SECONDS,
+    workflow_request_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     stable_since: float | None = None
     stable_signature = ""
     entries: list[dict[str, Any]] = []
     last_summary: dict[str, Any] = {}
+    snapshot_arguments: dict[str, Any] = {}
+    if workflow_request_ids:
+        snapshot_arguments["workflow_request_ids"] = list(workflow_request_ids)
     while time.monotonic() < deadline:
+        # A wait loop wants the cheap queue read; the drained-backlog gate is
+        # for preflights (see store_snapshot).
         state = regional.store_snapshot(
             node=node,
             marker=marker,
             observed_after=observed_after,
             job_id=job_id,
             attempt_id=attempt_id,
+            queue_attempts=1,
+            **snapshot_arguments,
         )
         summary = cleanup_quiescence_summary(state)
         last_summary = summary
@@ -662,6 +783,7 @@ def cleanup_case(
     observed_after: datetime | None,
     job_id: str,
     attempt_id: str,
+    workflow_request_ids: list[str] | None = None,
 ) -> None:
     cleanup_deferred = False
     if node and marker and observed_after is not None:
@@ -674,6 +796,7 @@ def cleanup_case(
                 job_id=job_id,
                 attempt_id=attempt_id,
                 case_dir=case_dir,
+                workflow_request_ids=workflow_request_ids,
             )
         except Exception as exc:
             cleanup_deferred = True
@@ -734,7 +857,7 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -777,18 +900,26 @@ def execute_case(
         "case_id": CASE_ID,
         "attempt": attempt,
         "verdict": "FAIL",
+        **preflight["evidence_identity"],
         "job_id": settings.job_id,
         "attempt_id": settings.attempt_id,
         "maintenance_window_end": maintenance_window_end.isoformat(),
+        "focused_tests_reused": bool(
+            preflight["focused_tests"].get("focused_tests_reused")
+        ),
     }
     injection_started: datetime | None = None
     marker: str | None = None
     target_node: str | None = None
+    workflow_request_ids: list[str] = []
     try:
         candidate_names = [str(item["name"]) for item in preflight["candidate_nodes"]]
-        prewarm.create(candidate_names)
+        prewarmed = prewarm.create(candidate_names)
         cached = prewarm.cached_nodes()
-        write_json_atomic(case_dir / "image-cache.json", {"cached_nodes": cached})
+        write_json_atomic(
+            case_dir / "image-cache.json",
+            {"cached_nodes": cached, **prewarmed},
+        )
         if not set(candidate_names) <= set(cached):
             raise RegionalFixtureError(
                 "training image is not cached on every candidate"
@@ -837,6 +968,9 @@ def execute_case(
             attempt_id=settings.attempt_id,
         )
         write_json_atomic(case_dir / "workflow-state.json", state)
+        workflow_request_id = (state.get("workflow") or {}).get("request_id")
+        if workflow_request_id:
+            workflow_request_ids.append(str(workflow_request_id))
         errors = workflow_errors(state)
         target = workload.wait_restarted(source_uids, timeout_seconds=900)
         write_json_atomic(case_dir / "workload-target.json", target)
@@ -853,11 +987,17 @@ def execute_case(
         budget = state.get("restart_budget") or {}
         if budget.get("restart_count") != 1 or budget.get("budget") != 1:
             errors.append("restart budget did not advance exactly once")
-        provider = regional.provider_events(
-            injection_started,
-            datetime.now(timezone.utc),
+        provider_window_end = datetime.now(timezone.utc)
+        provider = regional.provider_events(injection_started, provider_window_end)
+        # "No provider mutation" cannot be proven inside CloudTrail's delivery
+        # window; an empty read is recorded as provisional, not as proof.
+        provider_provisional = not provider and regional.provider_events_provisional(
+            provider_window_end
         )
-        write_json_atomic(case_dir / "provider-events.json", {"events": provider})
+        write_json_atomic(
+            case_dir / "provider-events.json",
+            {"events": provider, "provider_events_provisional": provider_provisional},
+        )
         if provider:
             errors.append("provider mutation appeared during workload restart")
         node_states = [
@@ -880,8 +1020,7 @@ def execute_case(
             workload.name,
         )
         write_json_atomic(case_dir / "control-plane-logs.json", logs)
-        if logs["suspicious"]:
-            errors.append("control-plane logs show a Kubernetes workload write")
+        errors.extend(log_write_errors(logs, "control-plane"))
         cpu_after = regional.cpu_blast_snapshot()
         write_json_atomic(case_dir / "cpu-blast-after.json", cpu_after)
         if cpu_after != preflight["cpu_blast"]:
@@ -892,13 +1031,13 @@ def execute_case(
                 "errors": errors,
                 "marker": marker,
                 "target_node": target_node,
-                "workflow_request_id": (
-                    (state.get("workflow") or {}).get("request_id")
-                ),
+                "workflow_request_id": workflow_request_id,
+                "workflow_official_steps": workflow_official_steps(state),
                 "source_pod_uids": sorted(source_uids),
                 "target_pod_uids": sorted(target_uids),
                 "restart_budget": budget,
                 "provider_events": provider,
+                "provider_events_provisional": provider_provisional,
             }
         )
     except Exception as exc:
@@ -916,6 +1055,7 @@ def execute_case(
             observed_after=injection_started,
             job_id=settings.job_id,
             attempt_id=settings.attempt_id,
+            workflow_request_ids=workflow_request_ids or None,
         )
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))

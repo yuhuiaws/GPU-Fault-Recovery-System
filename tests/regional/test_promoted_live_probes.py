@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import sys
 import time
 from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.e2e.regional.probes import (
+    destructive_node_probe,
     ha001_probe,
     ha005_probe,
     ha006_executor,
@@ -226,3 +231,81 @@ def test_node_host_probe_counts_systemd_unit_transition_once(monkeypatch) -> Non
 
     assert summary["started_count"] == 1
     assert summary["stopped_count"] == 1
+
+
+def test_destructive_sampler_records_a_timed_out_reading_instead_of_dying(
+    monkeypatch,
+) -> None:
+    """During the reset the sampler exists to observe, `nvidia-smi` blocks and
+    the 10s bound trips; the sampler used to die on that exact sample."""
+
+    def hang(command, **_kwargs):
+        raise subprocess.TimeoutExpired(command, 10)
+
+    monkeypatch.setattr(destructive_node_probe, "run", hang)
+
+    sample = destructive_node_probe.gpu_sample()
+
+    assert sample["timed_out"] is True
+    assert sample["gpu_count"] is None
+    assert sample["returncode"] is None
+
+
+def test_destructive_sampler_start_stops_the_unit_when_no_samples_arrive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    commands: list[list[str]] = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(stdout="", returncode=0)
+
+    clock = {"now": 0.0}
+
+    def monotonic() -> float:
+        clock["now"] += 31.0
+        return clock["now"]
+
+    monkeypatch.setattr(destructive_node_probe, "run", run)
+    monkeypatch.setattr(destructive_node_probe, "SAMPLER_DIR", tmp_path)
+    monkeypatch.setattr(
+        destructive_node_probe,
+        "sampler_summary",
+        lambda _run_id: {"sample_count": 0, "active": True},
+    )
+    monkeypatch.setattr(destructive_node_probe.time, "monotonic", monotonic)
+    monkeypatch.setattr(destructive_node_probe.time, "sleep", lambda _s: None)
+    arguments = SimpleNamespace(
+        run_id="run-a",
+        probe_script=destructive_node_probe.__file__,
+        duration_seconds=600,
+        interval_seconds=0.25,
+    )
+
+    with pytest.raises(destructive_node_probe.ProbeError, match="unit stopped"):
+        destructive_node_probe.start_sampler(arguments)
+
+    unit, _path = destructive_node_probe.sampler_paths("run-a")
+    systemd_run = next(command for command in commands if command[0] == "systemd-run")
+    assert systemd_run[systemd_run.index("--property=KillMode=control-group") + 1] == (
+        sys.executable
+    ), systemd_run
+    assert "/opt/gpu-fault/venv/bin/python" not in systemd_run
+    after_start = commands[commands.index(systemd_run) + 1 :]
+    assert ["systemctl", "stop", unit + ".service"] in after_start, after_start
+    assert ["systemctl", "reset-failed", unit + ".service"] in after_start
+
+
+def test_node_host_probe_commands_are_time_bounded(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(node_host_probe.subprocess, "run", fake_run)
+
+    node_host_probe.run(["systemctl", "show", "x"])
+    assert seen["timeout"] == 120, seen
+    node_host_probe.run(["systemctl", "show", "x"], timeout=30)
+    assert seen["timeout"] == 30, seen

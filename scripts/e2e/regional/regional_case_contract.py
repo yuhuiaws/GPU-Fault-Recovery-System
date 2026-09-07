@@ -11,6 +11,9 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 ROOT = Path(__file__).resolve().parents[3]
 ORDER_PATH = ROOT / "testcases" / "regional-execution-order.yaml"
 CATALOG_PATH = ROOT / "testcases" / "fault-scenarios.yaml"
+# The interpreters a catalog ``command`` may name when it is really just a
+# pytest invocation in disguise (``python3 -m pytest ...``).
+_PYTHON_INTERPRETERS = frozenset({"python", "python3"})
 
 
 class RegionalCaseContractError(RuntimeError):
@@ -42,17 +45,40 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 @lru_cache(maxsize=1)
-def ordered_case_ids() -> tuple[str, ...]:
+def expanded_order() -> tuple[tuple[str, ...], dict[str, str], frozenset[str]]:
+    """Expand the order file once: ordered ids, explicit predecessors, DO_NOT_RUN.
+
+    A ``case:`` entry may carry ``predecessor: GF-REGIONAL-XXX-NNN`` when the
+    evidence it needs is not the case that happens to sit in front of it (the
+    warm-spare and destructive chains fan out from a few anchor cases, and the
+    order notes have always said so in prose). ``range`` entries cannot carry
+    one: a range is by definition a serial run.
+    """
     order = _load_yaml(ORDER_PATH)
     result: list[str] = []
+    explicit: dict[str, str] = {}
     phases = order.get("phases")
     if not isinstance(phases, list):
         raise RegionalCaseContractError("regional execution order has no phases")
     for phase in sorted(phases, key=lambda item: int(item["sequence"])):
         for entry in phase["entries"]:
             if "case" in entry:
-                result.append(str(entry["case"]))
+                case_id = str(entry["case"])
+                result.append(case_id)
+                predecessor = entry.get("predecessor")
+                if predecessor is not None:
+                    if not isinstance(predecessor, str) or not predecessor.startswith(
+                        "GF-REGIONAL-"
+                    ):
+                        raise RegionalCaseContractError(
+                            f"{case_id} predecessor must be a GF-REGIONAL case id"
+                        )
+                    explicit[case_id] = predecessor
                 continue
+            if "predecessor" in entry:
+                raise RegionalCaseContractError(
+                    "regional execution order range entries cannot carry a predecessor"
+                )
             item = entry["range"]
             result.extend(
                 f"GF-REGIONAL-{item['prefix']}-{number:03d}"
@@ -60,7 +86,37 @@ def ordered_case_ids() -> tuple[str, ...]:
             )
     if len(result) != len(set(result)):
         raise RegionalCaseContractError("regional execution order has duplicate cases")
-    return tuple(result)
+    retired = frozenset(str(entry["case"]) for entry in (order.get("do_not_run") or []))
+    overlap = retired & set(result)
+    if overlap:
+        raise RegionalCaseContractError(
+            f"regional execution order lists DO_NOT_RUN cases in a phase: {sorted(overlap)}"
+        )
+    position = {case_id: index for index, case_id in enumerate(result)}
+    for case_id, predecessor in explicit.items():
+        if predecessor not in position:
+            raise RegionalCaseContractError(
+                f"{case_id} predecessor {predecessor} is not in the formal "
+                "regional execution order"
+            )
+        if position[predecessor] >= position[case_id]:
+            raise RegionalCaseContractError(
+                f"{case_id} predecessor {predecessor} does not run before it"
+            )
+    return tuple(result), explicit, retired
+
+
+def ordered_case_ids() -> tuple[str, ...]:
+    return expanded_order()[0]
+
+
+def explicit_predecessors() -> dict[str, str]:
+    """The ``predecessor:`` overrides the order file declares, by case id."""
+    return dict(expanded_order()[1])
+
+
+def do_not_run_case_ids() -> frozenset[str]:
+    return expanded_order()[2]
 
 
 @lru_cache(maxsize=1)
@@ -77,15 +133,64 @@ def _catalog_cases() -> dict[str, dict[str, Any]]:
     return result
 
 
+def is_pytest_wrapper(case: dict[str, Any]) -> bool:
+    """True when running the case only runs pytest, so it leaves no case evidence.
+
+    ``automation: pytest`` cases and ``automation: command`` cases whose command
+    is a bare ``python3 -m pytest ...`` are both executed by
+    ``tools/run_fault_test_cases.py`` and report into ``artifacts/fault``; neither
+    ever writes ``cases/<id>/<id>.json`` under an acceptance run directory. A
+    live case placed behind one of them in the order could therefore never
+    satisfy its formal predecessor, so the positional fallback skips them.
+    """
+    automation = case.get("automation")
+    if automation == "pytest":
+        return True
+    if automation != "command":
+        return False
+    command = case.get("command")
+    if not isinstance(command, list) or len(command) < 3:
+        return False
+    return (
+        Path(str(command[0])).name in _PYTHON_INTERPRETERS
+        and command[1] == "-m"
+        and command[2] == "pytest"
+    )
+
+
+def pytest_wrapper_case_ids() -> tuple[str, ...]:
+    return tuple(
+        case_id for case_id, case in _catalog_cases().items() if is_pytest_wrapper(case)
+    )
+
+
 def formal_predecessor(case_id: str) -> str | None:
-    ordered = ordered_case_ids()
+    """The case whose PASS evidence ``case_id`` must read before it may run.
+
+    An explicit ``predecessor:`` in the order file wins. Otherwise the answer is
+    positional: the nearest earlier case in the formal order that can actually
+    produce ``cases/<id>/<id>.json`` evidence, i.e. not a pytest wrapper.
+    """
+    ordered, explicit, retired = expanded_order()
+    if case_id in retired:
+        raise RegionalCaseContractError(
+            f"{case_id} is DO_NOT_RUN in the formal regional execution order"
+        )
     try:
         position = ordered.index(case_id)
     except ValueError as exc:
         raise RegionalCaseContractError(
             f"{case_id} is not in the formal regional execution order"
         ) from exc
-    return ordered[position - 1] if position else None
+    if case_id in explicit:
+        return explicit[case_id]
+    catalog = _catalog_cases()
+    for candidate in reversed(ordered[:position]):
+        case = catalog.get(candidate)
+        if case is not None and is_pytest_wrapper(case):
+            continue
+        return candidate
+    return None
 
 
 def case_metadata(case_id: str) -> RegionalCaseMetadata:

@@ -25,6 +25,8 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     authorize_execution,
     build_plan,
     install_site_profile,
+    record_focused_tests,
+    reusable_focused_tests,
 )
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
@@ -42,6 +44,27 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 CASE_ID = "GF-REGIONAL-PREEMPT-012"
 CONFIRMATION = "PREEMPT012_REAL_QUIESCE_BOUNDARIES"
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "preempt012_node_probe.py"
+# How long the runner waits for the host cycle to report QUIESCED before the
+# control audit starts, and for it to finish afterwards. The cycle is armed
+# with a 5s delay and a 45s hold; the fail-safe restore is at 180s.
+QUIESCE_WAIT_SECONDS = 120
+CYCLE_WAIT_SECONDS = 600
+CYCLE_TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "INTERRUPTED"})
+TIMER_LIVE_STATES = frozenset({"active", "activating", "waiting", "reloading"})
+LIMITATIONS = [
+    "The node performs a real quiesce/restore. Reset, reboot and replace "
+    "remain deliberately unsubmitted because PREEMPT-012 targets the "
+    "boundaries before or immediately after quiesce.",
+    "Clean group: the predecessor is superseded at a step boundary before "
+    "QUIESCE (PREEMPT-002 shape) and the successor then executes with the "
+    "predecessor's containment inherited, so only RESTART_NODE reaches an "
+    "adapter.",
+    "Dirty group: the boundary exercised is 'QUIESCE done, reset not "
+    "submitted' (PREEMPT-008 shape): the quiesce is handed to the successor "
+    "and no RESET_GPU is issued. The LEASED-reset boundary -- a reset already "
+    "leased by an executor when the preemption lands -- is covered by "
+    "DESTR-016, not here.",
+]
 
 
 class PreemptAcceptanceError(RuntimeError):
@@ -78,6 +101,22 @@ owner = f"preempt012-{stamp}"
 now = datetime.now(timezone.utc)
 later = now + timedelta(hours=1)
 created = []
+# Every synthetic id this audit will write. The script is sent with a single
+# exec attempt, but a leftover from an earlier run with the same stamp would
+# otherwise be silently overwritten and its state mixed into this verdict.
+planned_ids = []
+for label in ("clean", "dirty"):
+    planned_ids.append(("incident", f"incident-{label}-{stamp}"))
+    planned_ids.append(("workflow", f"workflow-{label}-pred-{stamp}"))
+    planned_ids.append(("workflow", f"workflow-{label}-succ-{stamp}"))
+existing = [
+    {"kind": kind, "key": key}
+    for kind, key in planned_ids
+    if store._get_optional(kind, key) is not None
+]
+if existing:
+    print(json.dumps({"error": "audit ids already exist", "existing": existing}))
+    raise SystemExit(1)
 
 
 class AuditAdapter:
@@ -126,8 +165,52 @@ executor = ProductionWorkflowExecutor(
     ),
 )
 
+OPERATIONS = [
+    WorkflowOperation.MARK_UNSCHEDULABLE,
+    WorkflowOperation.STOP_WORKLOADS,
+    WorkflowOperation.QUIESCE_GPU_SERVICES,
+    WorkflowOperation.RESET_GPU,
+    WorkflowOperation.RESTORE_GPU_SERVICES,
+    WorkflowOperation.VALIDATE_GPU,
+]
 
-def save_pair(label, completed):
+
+def step_for(operation):
+    return WorkflowStepSpec(
+        operation=operation,
+        execution_owner="preempt012-audit",
+        node_ids=[node_id],
+        workload_ids=(
+            [f"training/pytorchjob/preempt012-{stamp}"]
+            if operation is WorkflowOperation.STOP_WORKLOADS
+            else []
+        ),
+        gpu_uuids=(
+            ["GPU-PREEMPT012"] if operation is WorkflowOperation.RESET_GPU else []
+        ),
+    )
+
+
+def execution_for(index, operation, *, extra=None):
+    details = {}
+    if operation is WorkflowOperation.QUIESCE_GPU_SERVICES:
+        details = {
+            "agent_generations": {node_id: 1},
+            "maintenance_window_expires_at": (
+                now + timedelta(minutes=10)
+            ).isoformat(),
+        }
+    details.update(extra or {})
+    return WorkflowStepExecution(
+        step_index=index,
+        operation=operation,
+        status=WorkflowStepStatus.SUCCEEDED,
+        adapter_operation_id=f"audit/{operation.value}",
+        details=details,
+    )
+
+
+def save_pair(label, completed, *, inherit_containment):
     incident = FaultIncident(
         incident_id=f"incident-{label}-{stamp}",
         event_id=f"event-{label}-{stamp}",
@@ -141,14 +224,6 @@ def save_pair(label, completed):
         created_at=now,
         updated_at=now,
     )
-    operations = [
-        WorkflowOperation.MARK_UNSCHEDULABLE,
-        WorkflowOperation.STOP_WORKLOADS,
-        WorkflowOperation.QUIESCE_GPU_SERVICES,
-        WorkflowOperation.RESET_GPU,
-        WorkflowOperation.RESTORE_GPU_SERVICES,
-        WorkflowOperation.VALIDATE_GPU,
-    ]
     predecessor = WorkflowRequest(
         request_id=f"workflow-{label}-pred-{stamp}",
         incident_id=incident.incident_id,
@@ -156,48 +231,40 @@ def save_pair(label, completed):
         status=WorkflowStatus.RUNNING,
         fencing_token=1,
         not_before=later,
-        official_steps=[
-            WorkflowStepSpec(
-                operation=operation,
-                execution_owner="preempt012-audit",
-                node_ids=[node_id],
-                workload_ids=(
-                    [f"training/pytorchjob/preempt012-{stamp}"]
-                    if operation is WorkflowOperation.STOP_WORKLOADS
-                    else []
-                ),
-                gpu_uuids=(
-                    ["GPU-PREEMPT012"]
-                    if operation is WorkflowOperation.RESET_GPU
-                    else []
-                ),
-            )
-            for operation in operations
-        ],
+        official_steps=[step_for(operation) for operation in OPERATIONS],
         completed_step_indexes=list(range(completed)),
-        completed_operations=operations[:completed],
+        completed_operations=OPERATIONS[:completed],
         step_executions=[
-            WorkflowStepExecution(
-                step_index=index,
-                operation=operations[index],
-                status=WorkflowStepStatus.SUCCEEDED,
-                adapter_operation_id=f"audit/{operations[index].value}",
-                details=(
-                    {
-                        "agent_generations": {node_id: 1},
-                        "maintenance_window_expires_at": (
-                            now + timedelta(minutes=10)
-                        ).isoformat(),
-                    }
-                    if operations[index] is WorkflowOperation.QUIESCE_GPU_SERVICES
-                    else {}
-                ),
-            )
-            for index in range(completed)
+            execution_for(index, OPERATIONS[index]) for index in range(completed)
         ],
         created_at=now,
         updated_at=now,
     )
+    if inherit_containment:
+        # The merge's PREEMPT-002 shape: the stronger successor carries the
+        # predecessor's completed containment as its own completed steps.
+        successor_operations = [
+            WorkflowOperation.MARK_UNSCHEDULABLE,
+            WorkflowOperation.STOP_WORKLOADS,
+            WorkflowOperation.RESTART_NODE,
+        ]
+        inherited = list(range(completed))
+        successor_extra = {
+            "completed_step_indexes": inherited,
+            "completed_operations": successor_operations[:completed],
+            "inherited_step_indexes": inherited,
+            "step_executions": [
+                execution_for(
+                    index,
+                    successor_operations[index],
+                    extra={"inherited_from_workflow_id": predecessor.request_id},
+                )
+                for index in inherited
+            ],
+        }
+    else:
+        successor_operations = [WorkflowOperation.RESTART_NODE]
+        successor_extra = {}
     successor = WorkflowRequest(
         request_id=f"workflow-{label}-succ-{stamp}",
         incident_id=incident.incident_id,
@@ -208,15 +275,10 @@ def save_pair(label, completed):
         status=WorkflowStatus.PENDING,
         fencing_token=1,
         not_before=later,
-        official_steps=[
-            WorkflowStepSpec(
-                operation=WorkflowOperation.RESTART_NODE,
-                execution_owner="preempt012-audit",
-                node_ids=[node_id],
-            )
-        ],
+        official_steps=[step_for(operation) for operation in successor_operations],
         created_at=now,
         updated_at=now,
+        **successor_extra,
     )
     incident = incident.model_copy(
         update={"workflow_request_id": successor.request_id}
@@ -234,37 +296,55 @@ def save_pair(label, completed):
     return incident, predecessor, successor
 
 
-baseline_remote = len(store.list_remote_commands())
-result = {"executed_at": datetime.now(timezone.utc).isoformat()}
+def request():
+    return WorkflowExecutionRequest(expected_fencing_token=1)
+
+
+result = {"stamp": stamp, "executed_at": datetime.now(timezone.utc).isoformat()}
 try:
-    _incident, clean, clean_successor = save_pair("clean", 2)
-    before_calls = list(adapter.calls)
-    clean_result = executor.execute(
-        clean.request_id,
-        WorkflowExecutionRequest(expected_fencing_token=1),
+    _incident, clean, clean_successor = save_pair(
+        "clean", 2, inherit_containment=True
     )
+    before_calls = list(adapter.calls)
+    clean_result = executor.execute(clean.request_id, request())
     clean_saved = store.get_workflow(clean.request_id)
+    predecessor_calls = adapter.calls[len(before_calls):]
+    before_calls = list(adapter.calls)
+    clean_successor_result = executor.execute(clean_successor.request_id, request())
+    clean_successor_saved = store.get_workflow(clean_successor.request_id)
     result["clean"] = {
         "status": clean_result.status.value,
+        "predecessor_id": clean.request_id,
         "preempted_by": clean_saved.preempted_by_workflow_id,
         "successor_id": clean_successor.request_id,
-        "new_adapter_calls": adapter.calls[len(before_calls):],
+        "new_adapter_calls": predecessor_calls,
         "completed_operations": [
             item.value for item in clean_saved.completed_operations
         ],
+        "successor_status": clean_successor_result.status.value,
+        "successor_adapter_calls": adapter.calls[len(before_calls):],
+        "successor_inherited_step_indexes": list(
+            clean_successor_saved.inherited_step_indexes
+        ),
+        "successor_completed_operations": [
+            item.value for item in clean_successor_saved.completed_operations
+        ],
+        "successor_inherited_from": sorted(
+            {
+                str(item.details.get("inherited_from_workflow_id"))
+                for item in clean_successor_saved.step_executions
+                if item.step_index in clean_successor_saved.inherited_step_indexes
+            }
+        ),
     }
 
-    _incident, dirty, dirty_successor = save_pair("dirty", 3)
+    _incident, dirty, dirty_successor = save_pair(
+        "dirty", 3, inherit_containment=False
+    )
     before_calls = list(adapter.calls)
-    dirty_result = executor.execute(
-        dirty.request_id,
-        WorkflowExecutionRequest(expected_fencing_token=1),
-    )
+    dirty_result = executor.execute(dirty.request_id, request())
     before_claim = store.get_workflow(dirty_successor.request_id)
-    handoff_result = executor.execute(
-        dirty_successor.request_id,
-        WorkflowExecutionRequest(expected_fencing_token=1),
-    )
+    handoff_result = executor.execute(dirty_successor.request_id, request())
     after_claim = store.get_workflow(dirty_successor.request_id)
     result["dirty"] = {
         "status": dirty_result.status.value,
@@ -283,7 +363,9 @@ try:
         "successor_dependencies": [
             item.depends_on_step_indexes for item in after_claim.official_steps
         ],
+        "boundary": "QUIESCE done, reset not submitted (PREEMPT-008 shape)",
     }
+    result["completed_at"] = datetime.now(timezone.utc).isoformat()
     result["physical_operations_called"] = [
         item
         for item in adapter.calls
@@ -294,8 +376,9 @@ try:
             "REPLACE_NODE",
         }
     ]
-    result["remote_command_delta"] = (
-        len(store.list_remote_commands()) - baseline_remote
+    audit_workflow_ids = [key for kind, key in created if kind == "workflow"]
+    result["remote_commands_for_audit_workflows"] = len(
+        store.list_remote_commands(workflow_request_ids=audit_workflow_ids)
     )
 finally:
     for kind, key in reversed(created):
@@ -313,7 +396,18 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def focused_tests(case_dir: Path) -> dict[str, Any]:
+def focused_tests(case_dir: Path, *, reuse_from: Path | None = None) -> dict[str, Any]:
+    """The focused regression tests, or the plan's result when it still holds.
+
+    ``--plan`` runs them and records the result with a source digest;
+    ``--execute`` passes the plan path so a passing result taken against the
+    same tree is reused instead of paid for twice.
+    """
+
+    if reuse_from is not None:
+        reused = reusable_focused_tests(reuse_from)
+        if reused is not None:
+            return {**reused, "reused_from_plan": True}
     command = [
         sys.executable,
         "-m",
@@ -349,10 +443,11 @@ def read_only_preflight(
     node: str,
     predecessor_path_value: Path,
     case_dir: Path,
+    plan_path: Path | None = None,
 ) -> dict[str, Any]:
     node_state = regional.node_snapshot(node)
     store = regional.store_snapshot(node=node)
-    tests = focused_tests(case_dir)
+    tests = focused_tests(case_dir, reuse_from=plan_path)
     predecessor = predecessor_evidence(
         predecessor_path_value,
         "GF-REGIONAL-PREEMPT-011",
@@ -401,6 +496,124 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def _parse_time(value: object) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def wait_for_cycle(
+    host: HostProbeFixture,
+    run_id: str,
+    *,
+    until: frozenset[str],
+    timeout: float,
+    poll_seconds: float = 2.0,
+) -> dict[str, Any]:
+    """Poll the host cycle's evidence until its status is one of ``until``.
+
+    A terminal status (COMPLETED, FAILED, INTERRUPTED) always ends the wait,
+    whether or not it was asked for: the caller decides what an early end
+    means. A fixed sleep used to stand here, and it raced the QUIESCED write
+    the control audit needs to overlap.
+    """
+
+    deadline = time.monotonic() + timeout
+    cycle: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        try:
+            cycle = host.execute("read", "--run-id", run_id)
+        except Exception:
+            time.sleep(poll_seconds)
+            continue
+        status = str(cycle.get("status") or "")
+        if status in until or status in CYCLE_TERMINAL_STATUSES:
+            return cycle
+        time.sleep(poll_seconds)
+    return cycle
+
+
+def evaluate_checks(
+    *,
+    control: dict[str, Any],
+    cycle: dict[str, Any],
+    baseline: dict[str, Any],
+    final_host: dict[str, Any],
+    final_nodes: list[dict[str, Any]],
+    provider: list[dict[str, Any]],
+    cpu_blast_unchanged: bool,
+) -> dict[str, bool]:
+    """The verdict's checks, from the control audit and the host cycle."""
+
+    audit_started_at = _parse_time(control["executed_at"])
+    audit_completed_at = _parse_time(control["completed_at"])
+    quiesced_at = _parse_time(cycle["quiesced_at"])
+    restored_at = _parse_time(cycle["restored_at"])
+    clean = control["clean"]
+    dirty = control["dirty"]
+    return {
+        "clean_boundary_superseded": (
+            clean["status"] == "SUPERSEDED" and not clean["new_adapter_calls"]
+        ),
+        "clean_successor_reused_containment": (
+            clean["preempted_by"] == clean["successor_id"]
+            and clean["successor_adapter_calls"] == ["RESTART_NODE"]
+            and clean["successor_inherited_step_indexes"] == [0, 1]
+            and clean["successor_completed_operations"][:2]
+            == ["MARK_UNSCHEDULABLE", "STOP_WORKLOADS"]
+            and clean["successor_inherited_from"] == [clean["predecessor_id"]]
+        ),
+        "dirty_boundary_superseded": dirty["status"] == "SUPERSEDED",
+        "dirty_handoff_recorded": (
+            dirty["handoff_after_claim"] == dirty["predecessor_id"]
+        ),
+        "no_physical_operation_called": not control["physical_operations_called"],
+        "no_remote_command_created": (
+            control["remote_commands_for_audit_workflows"] == 0
+        ),
+        "control_audit_overlapped_real_quiesce": (
+            quiesced_at <= audit_started_at and audit_completed_at <= restored_at
+        ),
+        "host_services_restored": all(
+            value == "active"
+            for service, value in final_host["services"].items()
+            if baseline["services"].get(service) == "active"
+        ),
+        "quiesce_state_removed": not final_host["quiesce_state_files"],
+        "gpu_count_unchanged": final_host["gpu_count"] == baseline["gpu_count"],
+        "all_gpu_nodes_ready_and_schedulable": all(
+            item["ready"] == "True"
+            and not item["unschedulable"]
+            and not any(
+                str(taint.get("key", "")).startswith("gpu-fault.io/")
+                for taint in item["taints"]
+            )
+            for item in final_nodes
+        ),
+        "audit_objects_removed": not control["residual_objects"],
+        "no_provider_mutation": not provider,
+        "control_plane_eks_identical": cpu_blast_unchanged,
+    }
+
+
+def cleanup_checks(
+    *,
+    host_cleanup: dict[str, Any] | None,
+    node_state: dict[str, Any] | None,
+) -> dict[str, bool]:
+    """What must be true of the node once the probe has been torn down."""
+
+    return {
+        "ownership_annotations_removed": (
+            node_state is not None and not node_state.get("ownership_annotations")
+        ),
+        "cycle_timer_inactive": (
+            host_cleanup is not None
+            and str(host_cleanup.get("timer_active_state") or "unknown")
+            not in TIMER_LIVE_STATES
+            and "restore_error" not in host_cleanup
+        ),
+    }
+
+
 def execute_case(
     arguments: argparse.Namespace,
     regional: RegionalLiveFixture,
@@ -423,6 +636,7 @@ def execute_case(
         node=node,
         predecessor_path_value=predecessor_path_value,
         case_dir=case_dir,
+        plan_path=case_dir / "plan.json",
     )
     if preflight["errors"]:
         raise PreemptAcceptanceError(
@@ -432,7 +646,10 @@ def execute_case(
         raise PreemptAcceptanceError(
             "maintenance window must have at least 10 minutes remaining"
         )
-    run_id = f"preempt012-{arguments.attempt}-{int(time.time())}"
+    # The attempt number is part of every synthetic id (host unit, evidence
+    # file, control-audit workflows), so a re-run never collides with the
+    # objects an earlier attempt may have left behind.
+    run_id = f"preempt012-a{arguments.attempt}-{int(time.time())}"
     host = HostProbeFixture(
         HostProbeSettings(
             kubeconfig=regional.settings.gpu_kubeconfig,
@@ -454,7 +671,9 @@ def execute_case(
         "verdict": "FAIL",
         "started_at": started_at,
         "predecessor": preflight["predecessor"],
+        **regional.evidence_identity(),
     }
+    checks: dict[str, bool] = {}
     try:
         host.create()
         baseline = host.execute("snapshot")
@@ -475,81 +694,56 @@ def execute_case(
         )
         if not armed["timer_active"]:
             raise PreemptAcceptanceError("host cycle timer is not active")
-        time.sleep(25)
+        # The control audit has to run *inside* the real quiesce window: wait
+        # for the host to report QUIESCED rather than guessing with a sleep.
+        cycle = wait_for_cycle(
+            host,
+            run_id,
+            until=frozenset({"QUIESCED"}),
+            timeout=QUIESCE_WAIT_SECONDS,
+        )
+        if cycle.get("status") != "QUIESCED":
+            raise PreemptAcceptanceError(
+                f"host cycle did not reach QUIESCED before the audit: {cycle}"
+            )
+        # One attempt only: the script writes and executes synthetic workflows,
+        # and a retry after a partial run would execute them twice.
         control = regional.cpu_python(
             CONTROL_AUDIT,
             regional.settings.cluster_id,
             node,
             run_id,
+            attempts=1,
         )
-        cycle: dict[str, Any] = {}
-        deadline_wait = time.monotonic() + 600
-        while time.monotonic() < deadline_wait:
-            try:
-                cycle = host.execute("read", "--run-id", run_id)
-            except Exception:
-                time.sleep(5)
-                continue
-            if cycle.get("status") in {"COMPLETED", "FAILED"}:
-                break
-            time.sleep(5)
+        if "error" in control:
+            raise PreemptAcceptanceError(f"control audit refused: {control}")
+        cycle = wait_for_cycle(
+            host,
+            run_id,
+            until=CYCLE_TERMINAL_STATUSES,
+            timeout=CYCLE_WAIT_SECONDS,
+        )
         if cycle.get("status") != "COMPLETED":
             raise PreemptAcceptanceError(f"host quiesce cycle failed: {cycle}")
-        audit_at = datetime.fromisoformat(
-            str(control["executed_at"]).replace("Z", "+00:00")
-        )
-        quiesced_at = datetime.fromisoformat(
-            str(cycle["quiesced_at"]).replace("Z", "+00:00")
-        )
-        restored_at = datetime.fromisoformat(
-            str(cycle["restored_at"]).replace("Z", "+00:00")
-        )
         final_host = host.execute("snapshot")
         final_nodes = regional.gpu_nodes()
         provider = regional.provider_events(
             datetime.fromisoformat(started_at),
             datetime.now(timezone.utc),
         )
-        checks = {
-            "clean_boundary_superseded": (
-                control["clean"]["status"] == "SUPERSEDED"
-                and not control["clean"]["new_adapter_calls"]
-            ),
-            "dirty_boundary_superseded": (control["dirty"]["status"] == "SUPERSEDED"),
-            "dirty_handoff_recorded": (
-                control["dirty"]["handoff_after_claim"]
-                == control["dirty"]["predecessor_id"]
-            ),
-            "no_physical_operation_called": not control["physical_operations_called"],
-            "no_remote_command_created": control["remote_command_delta"] == 0,
-            "control_audit_overlapped_real_quiesce": (
-                quiesced_at <= audit_at <= restored_at
-            ),
-            "host_services_restored": all(
-                value == "active"
-                for service, value in final_host["services"].items()
-                if baseline["services"].get(service) == "active"
-            ),
-            "quiesce_state_removed": not final_host["quiesce_state_files"],
-            "gpu_count_unchanged": final_host["gpu_count"] == baseline["gpu_count"],
-            "all_gpu_nodes_ready_and_schedulable": all(
-                item["ready"] == "True"
-                and not item["unschedulable"]
-                and not any(
-                    str(taint.get("key", "")).startswith("gpu-fault.io/")
-                    for taint in item["taints"]
-                )
-                for item in final_nodes
-            ),
-            "audit_objects_removed": not control["residual_objects"],
-            "no_provider_mutation": not provider,
-            "control_plane_eks_identical": (
+        checks = evaluate_checks(
+            control=control,
+            cycle=cycle,
+            baseline=baseline,
+            final_host=final_host,
+            final_nodes=final_nodes,
+            provider=provider,
+            cpu_blast_unchanged=(
                 regional.cpu_blast_snapshot() == preflight["cpu_blast"]
             ),
-        }
+        )
         result.update(
             {
-                "verdict": "PASS" if all(checks.values()) else "FAIL",
                 "checks": checks,
                 "control_audit": control,
                 "host_cycle": cycle,
@@ -559,30 +753,42 @@ def execute_case(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        host_cleanup: dict[str, Any] | None = None
         try:
-            result["host_cleanup"] = host.execute(
+            host_cleanup = host.execute(
                 "cleanup",
                 "--run-id",
                 run_id,
                 timeout=300,
             )
+            result["host_cleanup"] = host_cleanup
         except Exception as exc:
             result["host_cleanup_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
         try:
             residuals = host.cleanup()
         except Exception as exc:
             residuals = {"cleanup_error": True}
             result["probe_cleanup_error"] = f"{type(exc).__name__}: {exc}"
         result["probe_residuals"] = residuals
-        if any(residuals.values()):
-            result["verdict"] = "FAIL"
+        node_state: dict[str, Any] | None = None
+        try:
+            node_state = regional.node_snapshot(node)
+        except Exception as exc:
+            result["node_snapshot_error"] = f"{type(exc).__name__}: {exc}"
+        result["node_after_cleanup"] = node_state
+        checks.update(cleanup_checks(host_cleanup=host_cleanup, node_state=node_state))
+        result["checks"] = checks
+        result["verdict"] = (
+            "PASS"
+            if checks
+            and all(checks.values())
+            and "error" not in result
+            and "host_cleanup_error" not in result
+            and not any(residuals.values())
+            else "FAIL"
+        )
     result["executed_at"] = utc_now()
-    result["limitations"] = [
-        "The node performs a real quiesce/restore. Reset, reboot and replace "
-        "remain deliberately unsubmitted because PREEMPT-012 targets the "
-        "boundaries before or immediately after quiesce."
-    ]
+    result["limitations"] = list(LIMITATIONS)
     write_json_atomic(case_evidence_path(arguments.run_dir, CASE_ID), result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
@@ -627,35 +833,39 @@ def main() -> int:
             predecessor_path_value=predecessor_path_value,
             case_dir=case_dir,
         )
+        details: dict[str, Any] = {
+            "risk": "destructive",
+            "predecessor": preflight["predecessor"],
+            "target_node": node,
+            "mutation": (
+                "run one real host GPU-service quiesce/restore cycle while "
+                "the deployed executor state machine evaluates clean and dirty "
+                "preemption boundaries against the live PostgreSQL store"
+            ),
+            "stop_conditions": [
+                "PREEMPT-011 evidence is not PASS",
+                "target node is not Ready/schedulable/idle",
+                "quiesce fail-safe timer is not armed",
+                "host cycle does not report QUIESCED before the control audit",
+                "any reset, reboot or replacement reaches an adapter",
+                "quiesce state, timer, workflow object or probe resource remains",
+            ],
+            "rollback": {
+                "node_quiesce_has_independent_failsafe_seconds": 180,
+                "cycle_restores_services_after_45_seconds": True,
+                "cycle_restores_on_sigterm": True,
+                "runner_finally_stops_timer_then_restores_and_deletes_probe": True,
+            },
+            "preflight": preflight,
+        }
+        record_focused_tests(details, preflight["focused_tests"])
         plan = build_plan(
             run_dir=arguments.run_dir,
             case_id=CASE_ID,
             attempt=arguments.attempt,
             confirmation=CONFIRMATION,
             environment=environment,
-            details={
-                "risk": "destructive",
-                "predecessor": preflight["predecessor"],
-                "target_node": node,
-                "mutation": (
-                    "run one real host GPU-service quiesce/restore cycle while "
-                    "the deployed executor state machine evaluates clean and dirty "
-                    "preemption boundaries against the live PostgreSQL store"
-                ),
-                "stop_conditions": [
-                    "PREEMPT-011 evidence is not PASS",
-                    "target node is not Ready/schedulable/idle",
-                    "quiesce fail-safe timer is not armed",
-                    "any reset, reboot or replacement reaches an adapter",
-                    "quiesce state, timer, workflow object or probe resource remains",
-                ],
-                "rollback": {
-                    "node_quiesce_has_independent_failsafe_seconds": 180,
-                    "cycle_restores_services_after_45_seconds": True,
-                    "runner_finally_calls_restore_and_deletes_probe": True,
-                },
-                "preflight": preflight,
-            },
+            details=details,
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0 if not preflight["errors"] else 1

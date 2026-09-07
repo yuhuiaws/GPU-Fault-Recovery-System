@@ -21,6 +21,7 @@ from scripts.e2e.regional import run_destr018_lifetime_deadline as destr018
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
 from scripts.e2e.regional.regional_live_fixture import (
     RUNTIME_IDENTITY_DEPLOYMENTS,
+    RegionalLiveFixture,
     RegionalLiveSettings,
 )
 
@@ -602,6 +603,34 @@ def test_the_node_must_end_unschedulable_and_tainted() -> None:
     assert "still schedulable" in _text(errors)
 
 
+def test_the_quarantine_is_judged_only_once_the_taint_or_the_support_settles() -> None:
+    """QUARANTINE runs asynchronously in the support workflow; a node read the
+    instant the reset workflow went FAILED is not tainted *yet* and must be
+    polled, not failed."""
+
+    bare = {"unschedulable": True, "taints": []}
+    tainted = {"unschedulable": True, "taints": [{"key": verdicts.QUARANTINE_TAINT}]}
+    running = {"status": "RUNNING"}
+    assert verdicts.quarantine_settled(bare, running) is False
+    assert verdicts.quarantine_settled(bare, None) is False
+    assert verdicts.quarantine_settled(bare, {}) is False
+    assert verdicts.quarantine_settled(tainted, running) is True
+    for status in ("SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"):
+        assert verdicts.quarantine_settled(bare, {"status": status}) is True, status
+
+
+def test_the_absorb_is_settled_only_when_the_event_has_been_merged() -> None:
+    assert verdicts.absorb_settled({}) is False
+    assert verdicts.absorb_settled({"event": {"xid": 79}}) is False
+    assert verdicts.absorb_settled({"event": {"xid": 79}, "incident": None}) is False
+    assert (
+        verdicts.absorb_settled(
+            {"event": {"xid": 79}, "incident": {"incident_id": "i"}}
+        )
+        is True
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Record-only absorb of the second XID
 # --------------------------------------------------------------------------- #
@@ -673,6 +702,53 @@ def test_no_executable_workflow_may_outlive_the_known_pair() -> None:
         [{"request_id": "workflow-third", "status": "PENDING"}], known_request_ids=known
     )
     assert "left executable workflows behind" in _text(errors)
+
+
+def test_only_workflows_the_drill_could_have_caused_count_as_left_behind() -> None:
+    """The store lists workflows cluster-wide: another node's incident, or a
+    workflow older than the case, is not this drill's residue."""
+
+    known = {WORKFLOW_ID, SUPPORT_WORKFLOW_ID}
+    older = {
+        "request_id": "workflow-before",
+        "status": "RUNNING",
+        "node_ids": [NODE],
+        "created_at": (T0 - timedelta(hours=2)).isoformat(),
+    }
+    elsewhere = {
+        "request_id": "workflow-other-node",
+        "status": "PENDING",
+        "node_ids": ["node-z"],
+        "created_at": (T0 + timedelta(seconds=30)).isoformat(),
+    }
+    ours = {
+        "request_id": "workflow-third",
+        "status": "PENDING",
+        "node_ids": [NODE],
+        "created_at": (T0 + timedelta(seconds=30)).isoformat(),
+    }
+    undated = {
+        "request_id": "workflow-undated",
+        "status": "PENDING",
+        "node_ids": [NODE],
+    }
+    assert (
+        verdicts.new_executable_workflow_errors(
+            [older, elsewhere], known_request_ids=known, started_after=T0, node=NODE
+        )
+        == []
+    )
+    errors = verdicts.new_executable_workflow_errors(
+        [older, elsewhere, ours], known_request_ids=known, started_after=T0, node=NODE
+    )
+    assert "workflow-third" in _text(errors)
+    assert "workflow-before" not in _text(errors)
+    assert "workflow-other-node" not in _text(errors)
+    # Unknown is not "before": a workflow without a readable created_at stays.
+    errors = verdicts.new_executable_workflow_errors(
+        [undated], known_request_ids=known, started_after=T0, node=NODE
+    )
+    assert "workflow-undated" in _text(errors)
 
 
 # --------------------------------------------------------------------------- #
@@ -793,6 +869,7 @@ def _leased_reset_command(
     status: str = "FAILED",
     status_source: str = verdicts.COMPLETED_AFTER_CANCELLATION,
     post_status: str | None = "FAILED",
+    command_id: str = f"{WORKFLOW_ID}/4/RESET_GPU/commit",
 ) -> dict[str, Any]:
     return _command(
         verdicts.RESET_STEP,
@@ -803,7 +880,7 @@ def _leased_reset_command(
         result_details=(
             {"post_cancellation_status": post_status} if post_status else {}
         ),
-        command_id=f"{WORKFLOW_ID}/4/RESET_GPU/commit",
+        command_id=command_id,
     )
 
 
@@ -908,6 +985,33 @@ def test_a_straddling_row_with_no_matching_command_fails_the_case() -> None:
         commands=[happy_commands()[0]],
     )
     assert "no remote command matches the straddling ledger row" in _text(errors)
+
+
+def test_the_straddling_row_is_matched_to_its_command_by_id_not_by_operation() -> None:
+    """A same-operation command of another attempt, in the state the verdict
+    wants, must not stand in for the straddling row's own command."""
+
+    rows = [*happy_ledger(), _straddling_reset()]
+    lookalike = _leased_reset_command(command_id=f"{WORKFLOW_ID}/4/RESET_GPU/other")
+    errors = verdicts.straddling_row_errors(
+        rows,
+        t_cancel=T_CANCEL,
+        baseline_command_ids=BASELINE_IDS,
+        kernel_journal=EMPTY_JOURNAL,
+        commands=[*happy_commands(), lookalike],
+    )
+    assert "no remote command matches the straddling ledger row" in _text(errors)
+    # Without a command id on the row the match falls back to the operation,
+    # and says so as a failure: it cannot prove it is the same dispatch.
+    anonymous = {**_straddling_reset(), "command_id": None}
+    errors = verdicts.straddling_row_errors(
+        [*happy_ledger(), anonymous],
+        t_cancel=T_CANCEL,
+        baseline_command_ids=BASELINE_IDS,
+        kernel_journal=EMPTY_JOURNAL,
+        commands=[*happy_commands(), _leased_reset_command()],
+    )
+    assert "matched by operation only" in _text(errors)
 
 
 def test_the_one_compensation_after_the_cancellation_must_have_succeeded() -> None:
@@ -1324,3 +1428,184 @@ def test_the_expected_step_sequence_is_the_reset_contract() -> None:
     assert destr018.EXPECTED_STEPS.index(verdicts.RESET_STEP) == 4
     assert destr018.EXPECTED_STEPS.index(verdicts.COMPENSATION_STEP) == 5
     assert isinstance(destr018.parser(), argparse.ArgumentParser) is True
+
+
+# --------------------------------------------------------------------------- #
+# Cleanup order
+# --------------------------------------------------------------------------- #
+class _Recorder:
+    """Every fixture the cleanup talks to, replaced by one call log."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+
+class _FakeWarm:
+    recorder: _Recorder
+
+    def __init__(self, regional: Any, hyperpod_cluster: str) -> None:
+        self.regional = regional
+
+    def wait_incident_idle(self, incident_id: str, **_: Any) -> dict[str, Any]:
+        self.recorder.calls.append(f"idle:{incident_id}")
+        return {"incident_id": incident_id}
+
+    def create_restore_workflow(self, **kwargs: Any) -> dict[str, Any]:
+        self.recorder.calls.append(f"restore:{kwargs['incident_id']}")
+        return {"workflow_request_id": f"restore-{kwargs['incident_id']}"}
+
+    def wait_workflow_id(self, request_id: str) -> dict[str, Any]:
+        return {"request_id": request_id, "status": "SUCCEEDED"}
+
+
+class _FakeProbe:
+    def __init__(self, recorder: _Recorder, label: str) -> None:
+        self.recorder = recorder
+        self.label = label
+        self.settings = type("S", (), {"run_id": f"{label}-run"})()
+
+    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+        self.recorder.calls.append(f"{self.label}:{arguments[0]}")
+        return {"ok": True}
+
+    def cleanup(self) -> dict[str, bool]:
+        self.recorder.calls.append(f"{self.label}:cleanup")
+        return {}
+
+
+class _FakeRegional:
+    def __init__(self, recorder: _Recorder, identity: dict[str, Any]) -> None:
+        self.recorder = recorder
+        self.identity = identity
+
+    def node_snapshot(self, node: str) -> dict[str, Any]:
+        self.recorder.calls.append("node_snapshot")
+        return {
+            "name": node,
+            "ready": "True",
+            "unschedulable": True,
+            "ownership_annotations": {},
+            "taints": [{"key": verdicts.QUARANTINE_TAINT}],
+        }
+
+    def runtime_identity(self) -> dict[str, Any]:
+        return self.identity
+
+
+def test_cleanup_closes_the_window_before_it_creates_the_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restore created inside the window inherits the 180s lifetime and can
+    FAIL on it; the order has to be disarm, quiesce, close, restore -- and the
+    restore names the support incident first, then the reset incident."""
+
+    recorder = _Recorder()
+    _FakeWarm.recorder = recorder
+    monkeypatch.setattr(destr018, "WarmSpareLiveFixture", _FakeWarm)
+    monkeypatch.setattr(env_window, "survey", lambda regional: {"survey": True})
+
+    def close_window(window: Any, regional: Any, report: Any) -> dict[str, Any]:
+        recorder.calls.append("close_window")
+        return {"closed_at": "now", "close_survey": report}
+
+    monkeypatch.setattr(env_window, "close_window", close_window)
+    monkeypatch.setattr(destr018, "identity_errors", lambda *a, **k: [])
+    identity = _identity(generation=3)
+    run = destr018.LiveRun(
+        settings=_settings(tmp_path),
+        regional=_FakeRegional(recorder, identity),  # type: ignore[arg-type]
+        case_dir=tmp_path,
+        preflight={"runtime_identity": identity},
+        run_id="destr018-x-a1",
+        holder=_FakeProbe(recorder, "holder"),  # type: ignore[arg-type]
+        injector=_FakeProbe(recorder, "injector"),  # type: ignore[arg-type]
+        window=env_window.Settings(
+            baseline=tmp_path / "b.json", rollout_timeout_seconds=1
+        ),
+        incident_id="inc-reset",
+        support_incident_id=SUPPORT_INCIDENT_ID,
+        holder_armed=True,
+        window_opened=True,
+    )
+    # The final node read must see a released node; the fake above reports the
+    # taint for the restore decision, so the last read is replaced here.
+    monkeypatch.setattr(destr018, "_final_node", lambda run: {"released": True})
+
+    result = destr018.cleanup(run)
+
+    assert result["errors"] == [], result
+    assert destr018.known_incidents(run) == [SUPPORT_INCIDENT_ID, "inc-reset"]
+    ordered = [
+        item
+        for item in recorder.calls
+        if item.startswith(("holder:disarm", "idle:", "close_window", "restore:"))
+    ]
+    assert ordered == [
+        "holder:disarm-holder",
+        f"idle:{SUPPORT_INCIDENT_ID}",
+        "idle:inc-reset",
+        "close_window",
+        f"idle:{SUPPORT_INCIDENT_ID}",
+        f"restore:{SUPPORT_INCIDENT_ID}",
+        "idle:inc-reset",
+        "restore:inc-reset",
+    ], ordered
+    assert result["restore_isolated_node"] == {
+        "isolated": True,
+        SUPPORT_INCIDENT_ID: "SUCCEEDED",
+        "inc-reset": "SUCCEEDED",
+    }
+    assert run.window_closed is True
+
+
+def test_an_isolated_node_with_no_known_incident_fails_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _Recorder()
+    _FakeWarm.recorder = recorder
+    monkeypatch.setattr(destr018, "WarmSpareLiveFixture", _FakeWarm)
+    run = destr018.LiveRun(
+        settings=_settings(tmp_path),
+        regional=_FakeRegional(recorder, {}),  # type: ignore[arg-type]
+        case_dir=tmp_path,
+        preflight={},
+        run_id="destr018-x-a1",
+        holder=_FakeProbe(recorder, "holder"),  # type: ignore[arg-type]
+        injector=_FakeProbe(recorder, "injector"),  # type: ignore[arg-type]
+        window=env_window.Settings(
+            baseline=tmp_path / "b.json", rollout_timeout_seconds=1
+        ),
+    )
+    with pytest.raises(Exception, match="no incident is known"):
+        destr018.restore_isolated_node(run)
+    assert not any(item.startswith("restore:") for item in recorder.calls), (
+        "no restore is attempted when the incident is unknown"
+    )
+
+
+def test_execute_reuses_the_plans_focused_tests_only_for_the_same_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--plan records the focused pytest with a source digest; --execute reuses
+    it instead of paying for the same run twice, and only for this exact tree."""
+
+    from scripts.e2e.regional import live_driver_guard
+
+    def refuse(*arguments: Any, **keywords: Any) -> Any:
+        raise AssertionError("pytest must not run when the plan's result is reusable")
+
+    monkeypatch.setattr(RegionalLiveFixture, "run", staticmethod(refuse))
+    recorded = {"passed": True, "returncode": 0, "command": ["pytest"]}
+    details: dict[str, Any] = {}
+    live_driver_guard.record_focused_tests(details, recorded)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
+    reused = destr018.focused_tests(tmp_path, reuse=True)
+    assert reused == {**recorded, "focused_tests_reused": True}
+    # A --plan never reuses, and a result taken against another tree is rerun.
+    with pytest.raises(AssertionError, match="must not run"):
+        destr018.focused_tests(tmp_path, reuse=False)
+    details["focused_tests_source_digest"] = "0" * 64
+    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
+    with pytest.raises(AssertionError, match="must not run"):
+        destr018.focused_tests(tmp_path, reuse=True)

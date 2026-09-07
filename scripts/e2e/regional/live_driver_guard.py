@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generic, Protocol, TypeVar
+
+ROOT = Path(__file__).resolve().parents[3]
+# The trees whose content decides whether a recorded focused-test result still
+# speaks for the code about to run: the drivers, their unit tests, the package.
+SOURCE_DIGEST_PATHS = ("scripts/e2e/regional", "tests/regional", "src")
 
 if __package__:
     from .acceptance_runner_common import write_json_atomic
@@ -42,9 +49,13 @@ __all__ = [
     "environment_snapshot",
     "install_site_profile",
     "PlainCaseRunner",
+    "details_sha256",
+    "record_focused_tests",
+    "reusable_focused_tests",
     "run_plain_case",
     "run_selected_case",
     "run_standard_case",
+    "source_digest",
 ]
 
 
@@ -114,6 +125,24 @@ def _deadline(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def details_sha256(details: dict[str, Any]) -> str:
+    """The digest ``build_plan`` records over the plan's ``details``.
+
+    Canonical JSON (sorted keys, no whitespace, ``default=str`` for the odd
+    datetime a preflight leaves in) so the same details always hash the same
+    whatever order a runner built them in.
+    """
+
+    canonical = json.dumps(
+        details,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def build_plan(
     *,
     run_dir: Path,
@@ -133,6 +162,7 @@ def build_plan(
         "site_profile": applied_site_profile(),
         **scope.plan_fields(),
         "details": details,
+        "details_sha256": details_sha256(details),
         "mutation_performed": False,
     }
     write_json_atomic(run_dir / "cases" / case_id / "plan.json", plan)
@@ -145,7 +175,19 @@ def authorize_execution(
     case_id: str,
     confirmation: str,
     environment: dict[str, str] | None = None,
+    details: dict[str, Any] | None = None,
 ) -> datetime:
+    """Admit an ``--execute`` only against the plan the operator approved.
+
+    Beyond the identity fields, the plan's ``details`` must still hash to the
+    ``details_sha256`` written next to them -- the target node, the drill
+    marker and the preflight verdict live in ``details``, and a plan edited
+    after approval is not the plan that was approved. A runner that knows its
+    current ``details`` at execute time passes them too, and they must hash to
+    the same value; one that only learns them from the plan file leaves the
+    parameter ``None`` and gets the on-disk integrity check alone.
+    """
+
     if not arguments.execute:
         raise RuntimeError("execute authorization requested outside --execute mode")
     if arguments.confirm != confirmation:
@@ -173,7 +215,81 @@ def authorize_execution(
     for key, value in expected.items():
         if plan.get(key) != value:
             raise RuntimeError(f"live-driver plan drifted at {key}")
+    recorded_details = plan.get("details")
+    if not isinstance(recorded_details, dict):
+        raise RuntimeError("live-driver plan drifted at details")
+    recorded_digest = plan.get("details_sha256")
+    if recorded_digest != details_sha256(recorded_details):
+        raise RuntimeError("live-driver plan drifted at details_sha256")
+    if details is not None and details_sha256(details) != recorded_digest:
+        raise RuntimeError("live-driver plan drifted at details")
     return deadline
+
+
+def _git_output(*arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", *arguments],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=120,
+    )
+    if completed.returncode:
+        raise RuntimeError(
+            f"git {' '.join(arguments)} failed ({completed.returncode}): "
+            f"{completed.stderr.strip()}"
+        )
+    return completed.stdout
+
+
+def source_digest() -> str:
+    """A digest of the source a focused-test result was computed against.
+
+    ``git rev-parse HEAD`` plus the working-tree diff of the driver, test and
+    package trees, so an uncommitted edit to any of them changes the digest
+    while an unrelated edit (docs, deploy manifests) does not. Read-only.
+    """
+
+    head = _git_output("rev-parse", "HEAD").strip()
+    diff = _git_output("diff", "HEAD", "--", *SOURCE_DIGEST_PATHS)
+    return hashlib.sha256(f"{head}\n{diff}".encode()).hexdigest()
+
+
+def record_focused_tests(details: dict[str, Any], result: dict[str, Any]) -> None:
+    """Store a focused pytest result in plan ``details`` with its source digest."""
+
+    details["focused_tests"] = result
+    details["focused_tests_source_digest"] = source_digest()
+
+
+def reusable_focused_tests(plan_path: Path) -> dict[str, Any] | None:
+    """The plan's recorded focused-test result, if it still speaks for this tree.
+
+    Returns the result only when it recorded ``passed: True`` and the source
+    digest it was taken against equals ``source_digest()`` now; otherwise
+    ``None``, and the runner re-runs pytest. A ``--plan`` that ran the tests
+    minutes ago on the same tree is thereby not paid for twice in ``--execute``,
+    while any edit in between forces a fresh run.
+    """
+
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(plan, dict):
+        return None
+    details = plan.get("details")
+    if not isinstance(details, dict):
+        return None
+    recorded = details.get("focused_tests")
+    digest = details.get("focused_tests_source_digest")
+    if not isinstance(recorded, dict) or recorded.get("passed") is not True:
+        return None
+    if not isinstance(digest, str) or digest != source_digest():
+        return None
+    return dict(recorded)
 
 
 class CaseSettings(Protocol):

@@ -16,6 +16,14 @@ environment's own defaults. `applied_site_profile` reports the path and digest
 so `build_plan` can record which profile a run used, and `authorize_execution`
 can refuse an execute whose profile differs from the one the plan was built
 from.
+
+The profile describes the target, never the per-case approval. ``--execute``,
+``--confirm``, ``--plan`` and ``--attempt`` are what an operator types for one
+run of one case after reading its plan; a profile that carried them would turn
+every ``--plan`` into an execute against a real node, with the confirmation
+string supplied by a file nobody re-reads. Those keys are refused outright
+(`RESERVED_ARGUMENTS`), both when the file is loaded and again when its
+arguments are expanded.
 """
 
 from __future__ import annotations
@@ -32,10 +40,30 @@ from typing import Any
 
 SITE_PROFILE_ENV = "GPU_FAULT_ACCEPTANCE_SITE_PROFILE"
 SITE_PROFILE_SECTIONS = ("arguments", "environment")
+# Per-case approval flags a profile must never supply; see the module docstring.
+RESERVED_ARGUMENTS = frozenset({"attempt", "confirm", "execute", "plan"})
 
 
 class SiteProfileError(RuntimeError):
     """The site profile cannot be trusted to name a target."""
+
+
+def _argument_dest(key: object) -> str:
+    return str(key).lstrip("-").replace("-", "_")
+
+
+def refuse_reserved_arguments(arguments: dict[str, Any]) -> None:
+    """Raise when the profile's ``arguments`` carry a per-case approval flag."""
+
+    reserved = sorted(
+        str(key) for key in arguments if _argument_dest(key) in RESERVED_ARGUMENTS
+    )
+    if reserved:
+        raise SiteProfileError(
+            "site profile arguments must not carry per-case approval flags: "
+            + ", ".join(reserved)
+            + "; --execute/--confirm/--plan/--attempt are typed per run"
+        )
 
 
 def site_profile_path(
@@ -89,6 +117,7 @@ def load_site_profile(path: Path) -> dict[str, Any]:
     for section in SITE_PROFILE_SECTIONS:
         if not isinstance(document.get(section, {}), dict):
             raise SiteProfileError(f"site profile {section} must be a mapping")
+    refuse_reserved_arguments(document.get("arguments", {}))
     return document
 
 
@@ -113,9 +142,11 @@ def profile_argv(
     2 on an unrecognised argument.
     """
 
+    arguments = profile.get("arguments", {})
+    refuse_reserved_arguments(arguments)
     supplied = {item.split("=", 1)[0] for item in argv if item.startswith("--")}
     extra: list[str] = []
-    for dest, value in sorted(profile.get("arguments", {}).items()):
+    for dest, value in sorted(arguments.items()):
         flag = "--" + str(dest).replace("_", "-")
         if flag in supplied:
             continue

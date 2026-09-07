@@ -26,6 +26,8 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
@@ -36,18 +38,24 @@ from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
 from scripts.e2e.regional.multi_cluster_fixture import (  # noqa: E402
     ClusterTarget,
     MultiClusterSettings,
+    container_status_errors,
+    control_plane_container_statuses,
     registration_snapshot,
     registrations_are_distinct_physical_clusters,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
+    RegionalLiveFixture,
     predecessor_evidence,
     required,
     run_case_main,
 )
 
 CASE_ID = "GF-REGIONAL-E2E-002"
-PREDECESSOR_CASE_ID = "GF-REGIONAL-ISO-006"
+# ISO-001 is the same-identity, single-injection isolation case; E2E-002 is
+# its two-injection successor. ISO-006 (whole-cluster offline) proves nothing
+# this case builds on. The execution order lists ISO-001 before E2E-002.
+PREDECESSOR_CASE_ID = "GF-REGIONAL-ISO-001"
 CONFIRMATION = "E2E002_RESTART_SAME_JOB_IN_TWO_CLUSTERS"
 MANIFEST = (
     Path(__file__).with_name("manifests")
@@ -148,19 +156,13 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
 
 
-def read_only_preflight(
-    settings: Settings,
-    case_dir: Path,
-) -> dict[str, Any]:
-    a = settings.multi.regional(settings.multi.cluster_a)
-    b = settings.multi.regional(settings.multi.cluster_b)
-    registrations = registration_snapshot(a, settings.multi)
-    predecessor = predecessor_evidence(
-        settings.predecessor_path,
-        PREDECESSOR_CASE_ID,
-    )
-    nodes_a = a.gpu_nodes()
-    nodes_b = b.gpu_nodes()
+def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
+    """Run the focused pytest, or reuse the plan's result in ``--execute``."""
+
+    if reuse:
+        recorded = reusable_focused_tests(case_dir / "plan.json")
+        if recorded is not None:
+            return {**recorded, "focused_tests_reused": True}
     command = [
         sys.executable,
         "-m",
@@ -171,14 +173,61 @@ def read_only_preflight(
         "tests/regional/test_regional_control_plane.py::"
         "test_failed_remote_restart_releases_restart_budget",
     ]
-    completed = a.run(command, cwd=ROOT, check=False, timeout=300)
-    (case_dir / "focused-tests.log").write_text(
-        completed.stdout + completed.stderr,
-        encoding="utf-8",
+    completed = RegionalLiveFixture.run(command, cwd=ROOT, check=False, timeout=300)
+    path = case_dir / "focused-tests.log"
+    path.write_text(completed.stdout + completed.stderr, encoding="utf-8")
+    path.chmod(0o600)
+    return {
+        "passed": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "command": command,
+    }
+
+
+def executor_identities(fixture: RegionalLiveFixture) -> list[str]:
+    """The identities a cluster's executor may lease commands under.
+
+    The lease owner is the executor's ``GPU_FAULT_EXECUTOR_ID``; the
+    Deployment either sets it literally or from the Pod name, so both the
+    literal values and the executor Pod names are accepted.
+    """
+
+    document = json.loads(
+        fixture.kubectl(
+            "gpu", "get", "pod", "-l", "app=gpu-fault-cluster-executor", "-o", "json"
+        )
     )
+    identities: set[str] = set()
+    for item in document.get("items", []):
+        identities.add(str(item.get("metadata", {}).get("name") or ""))
+        for container in item.get("spec", {}).get("containers", []):
+            for entry in container.get("env", []):
+                if entry.get("name") == "GPU_FAULT_EXECUTOR_ID" and entry.get("value"):
+                    identities.add(str(entry["value"]))
+    return sorted(identity for identity in identities if identity)
+
+
+def read_only_preflight(
+    settings: Settings,
+    case_dir: Path,
+    *,
+    reuse_focused_tests: bool = False,
+) -> dict[str, Any]:
+    a = settings.multi.regional(settings.multi.cluster_a)
+    b = settings.multi.regional(settings.multi.cluster_b)
+    registrations = registration_snapshot(a, settings.multi)
+    identity = a.evidence_identity()
+    predecessor = predecessor_evidence(
+        settings.predecessor_path,
+        PREDECESSOR_CASE_ID,
+        release_id=identity["release_id"],
+    )
+    nodes_a = a.gpu_nodes()
+    nodes_b = b.gpu_nodes()
+    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
     errors = []
     if not predecessor["valid"]:
-        errors.append("ISO-006 predecessor evidence is not PASS")
+        errors.append("ISO-001 predecessor evidence is not PASS")
     if len(registrations) != 2 or any(
         not item.get("enabled") or item.get("synthetic") for item in registrations
     ):
@@ -191,15 +240,21 @@ def read_only_preflight(
         errors.append("a target cluster already has GPU workloads")
     if not settings.site_file.is_file() or not MANIFEST.is_file():
         errors.append("site or training manifest is missing")
-    if completed.returncode:
+    if not tests["passed"]:
         errors.append("focused regression tests failed")
     result = {
-        "release_id": a.release_id(),
+        **identity,
         "registrations": registrations,
         "nodes_a": nodes_a,
         "nodes_b": nodes_b,
         "predecessor": predecessor,
         "cpu_pods": a.ready_pods("cpu", "gpu-fault-api-ha"),
+        "cpu_containers": control_plane_container_statuses(a),
+        "executor_identities": {
+            settings.multi.cluster_a.cluster_id: executor_identities(a),
+            settings.multi.cluster_b.cluster_id: executor_identities(b),
+        },
+        "focused_tests": tests,
         "errors": errors,
     }
     write_json_atomic(case_dir / "preflight.json", result)
@@ -240,8 +295,80 @@ def managed_workload(
     )
 
 
+def notification_errors(
+    states: list[dict[str, Any]],
+    cluster_ids: list[str],
+    registrations: list[dict[str, Any]],
+) -> list[str]:
+    """The two emails belong to their own cluster's incident, and only to it."""
+
+    errors = []
+    names_by_cluster = {
+        str(item.get("cluster_id")): {
+            str(item.get("cluster_id")),
+            str(item.get("hyperpod_cluster_name") or ""),
+        }
+        for item in registrations
+    }
+    seen: dict[str, str] = {}
+    for state, cluster_id in zip(states, cluster_ids, strict=True):
+        incident = state.get("incident") or {}
+        if incident.get("cluster_id") != cluster_id:
+            errors.append(f"{cluster_id}: incident is not scoped to the cluster")
+        notifications = state.get("notifications") or []
+        if not notifications:
+            errors.append(f"{cluster_id}: no notification was recorded")
+        for entry in notifications:
+            notification = entry.get("notification") or {}
+            notification_id = str(notification.get("notification_id") or "")
+            if notification.get("incident_id") != incident.get("incident_id"):
+                errors.append(f"{cluster_id}: notification names another incident")
+            if str(notification.get("cluster_name") or "") not in names_by_cluster.get(
+                cluster_id, {cluster_id}
+            ):
+                errors.append(f"{cluster_id}: notification cluster_name is foreign")
+            if notification_id in seen and seen[notification_id] != cluster_id:
+                errors.append("a notification appears under both clusters")
+            seen[notification_id] = cluster_id
+    return errors
+
+
+def command_scope_errors(
+    states: list[dict[str, Any]],
+    cluster_ids: list[str],
+    identities: dict[str, list[str]],
+) -> list[str]:
+    """Each remote command was leased by its own cluster's executor."""
+
+    errors = []
+    owners_by_cluster: dict[str, set[str]] = {}
+    for state, cluster_id in zip(states, cluster_ids, strict=True):
+        commands = state.get("commands") or []
+        if not commands:
+            errors.append(f"{cluster_id}: no remote command was recorded")
+        for item in commands:
+            if item.get("cluster_id") != cluster_id:
+                errors.append("remote command crossed cluster scope")
+            owner = str(item.get("last_lease_owner") or item.get("lease_owner") or "")
+            if not owner:
+                errors.append(
+                    f"{cluster_id}: command {item.get('command_id')} was never leased"
+                )
+                continue
+            owners_by_cluster.setdefault(cluster_id, set()).add(owner)
+            known = identities.get(cluster_id) or []
+            if known and owner not in known:
+                errors.append(
+                    f"{cluster_id}: command leased by unknown executor {owner!r}"
+                )
+    for first, second in zip(cluster_ids, cluster_ids[1:], strict=False):
+        if owners_by_cluster.get(first, set()) & owners_by_cluster.get(second, set()):
+            errors.append("one executor identity leased commands in both clusters")
+    return errors
+
+
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
-    return {
+    details = {
         "risk": "live-workload-restart",
         "predecessor": preflight["predecessor"],
         "cluster_ids": [
@@ -264,11 +391,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             ),
         },
         "stop_conditions": [
-            "ISO-006 predecessor evidence is not PASS",
+            "ISO-001 predecessor evidence is not PASS",
             "fewer than two enabled physical clusters",
             "either workload or 24-GPU observation fails",
             "injections are more than 60 seconds apart",
             "incident, command, budget or notification crosses cluster scope",
+            "a control-plane container restarts",
             "cleanup leaves either workload behind",
         ],
         "rollback": {
@@ -278,6 +406,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight["focused_tests"])
+    return details
 
 
 def execute_case(
@@ -288,7 +418,7 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -296,6 +426,7 @@ def execute_case(
     if datetime.now(timezone.utc) >= maintenance_window_end:
         raise RegionalFixtureError("approved maintenance window has ended")
     targets = (settings.multi.cluster_a, settings.multi.cluster_b)
+    cluster_ids = [target.cluster_id for target in targets]
     fixtures = [settings.multi.regional(target) for target in targets]
     workloads = [managed_workload(settings, target) for target in targets]
     prewarms = [
@@ -309,37 +440,63 @@ def execute_case(
     result: dict[str, Any] = {
         "case_id": CASE_ID,
         "attempt": attempt,
+        **fixtures[0].evidence_identity(),
+        "cluster_ids": cluster_ids,
         "verdict": "FAIL",
         "errors": [],
     }
+
+    def prepare(index: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Prewarm, submit, wait Running and wait for the 24-GPU observation
+        in one cluster. The two clusters are independent, so they run side by
+        side: serially this phase cost twice the slowest cluster."""
+
+        fixture, workload, prewarm, target = (
+            fixtures[index],
+            workloads[index],
+            prewarms[index],
+            targets[index],
+        )
+        nodes = [
+            str(item["name"])
+            for item in fixture.gpu_nodes()
+            if item["ready"] == "True" and not item["unschedulable"]
+        ]
+        prewarm.create(nodes)
+        workload.submit()
+        source = workload.wait_running(timeout_seconds=900)
+        observation = workload_case.wait_observation(
+            fixture,
+            workload_settings(settings, target),
+            node=str(source["pods"][0]["node"]),
+            expected_gpu_count=24,
+        )
+        return source, observation
+
+    def settle(index: int, injected_at: datetime, payload: dict[str, Any]) -> Any:
+        fixture, workload, source = fixtures[index], workloads[index], sources[index]
+        state = fixture.wait_for_workflow(
+            node=str(source["pods"][0]["node"]),
+            marker=str(payload["record_id"]),
+            observed_after=injected_at,
+            case_dir=case_dir / str(fixture.settings.cluster_id),
+            timeout_seconds=1200,
+            job_id=settings.job_id,
+            attempt_id=settings.attempt_id,
+        )
+        restarted = workload.wait_restarted(
+            {str(item["uid"]) for item in source["pods"]},
+            timeout_seconds=900,
+        )
+        return state, restarted
+
+    sources: list[dict[str, Any]] = []
     try:
-        sources = []
-        observations = []
-        for fixture, workload, prewarm, target in zip(
-            fixtures,
-            workloads,
-            prewarms,
-            targets,
-            strict=True,
-        ):
-            nodes = [
-                str(item["name"])
-                for item in fixture.gpu_nodes()
-                if item["ready"] == "True" and not item["unschedulable"]
-            ]
-            prewarm.create(nodes)
-            workload.submit()
-            source = workload.wait_running(timeout_seconds=900)
-            sources.append(source)
-            node = str(source["pods"][0]["node"])
-            observations.append(
-                workload_case.wait_observation(
-                    fixture,
-                    workload_settings(settings, target),
-                    node=node,
-                    expected_gpu_count=24,
-                )
-            )
+        containers_before = preflight["cpu_containers"]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            prepared = list(pool.map(prepare, range(len(targets))))
+        sources = [item[0] for item in prepared]
+        observations = [item[1] for item in prepared]
         injected_at = datetime.now(timezone.utc)
         payloads = [
             workload_case.xid11_payload(
@@ -367,33 +524,21 @@ def execute_case(
         completed_at = datetime.now(timezone.utc)
         if (completed_at - injected_at).total_seconds() > 60:
             result["errors"].append("concurrent injections exceeded 60 seconds")
-        states = []
-        targets_after = []
-        for fixture, workload, payload, source in zip(
-            fixtures,
-            workloads,
-            payloads,
-            sources,
-            strict=True,
-        ):
-            state = fixture.wait_for_workflow(
-                node=str(source["pods"][0]["node"]),
-                marker=str(payload["record_id"]),
-                observed_after=injected_at,
-                case_dir=case_dir / str(fixture.settings.cluster_id),
-                timeout_seconds=1200,
-                job_id=settings.job_id,
-                attempt_id=settings.attempt_id,
+        # Both workflows run at once; waiting for them one after the other
+        # would have serialised two 20-minute bounds and, worse, watched the
+        # second cluster only after the first had already settled.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            settled = list(
+                pool.map(
+                    lambda index: settle(index, injected_at, payloads[index]),
+                    range(len(targets)),
+                )
             )
-            states.append(state)
+        states = [item[0] for item in settled]
+        targets_after = [item[1] for item in settled]
+        for state in states:
             result["errors"].extend(
                 workload_case.workflow_errors(state, expected_gpu_count=24)
-            )
-            targets_after.append(
-                workload.wait_restarted(
-                    {str(item["uid"]) for item in source["pods"]},
-                    timeout_seconds=900,
-                )
             )
         workflow_ids = {
             (state.get("workflow") or {}).get("request_id") for state in states
@@ -409,18 +554,25 @@ def execute_case(
                 result["errors"].append(
                     f"{fixture.settings.cluster_id} restart budget is not one"
                 )
-            commands = state.get("commands") or []
-            if any(
-                item.get("cluster_id") != fixture.settings.cluster_id
-                for item in commands
-            ):
-                result["errors"].append("remote command crossed cluster scope")
+        result["errors"].extend(
+            command_scope_errors(
+                states, cluster_ids, preflight.get("executor_identities") or {}
+            )
+        )
+        result["errors"].extend(
+            notification_errors(states, cluster_ids, preflight["registrations"])
+        )
+        containers_after = control_plane_container_statuses(fixtures[0])
+        result["errors"].extend(
+            container_status_errors(containers_before, containers_after)
+        )
         result.update(
             {
                 "verdict": "PASS" if not result["errors"] else "FAIL",
                 "injections": injections,
                 "states": states,
                 "target_workloads": targets_after,
+                "cpu_containers_after": containers_after,
             }
         )
     except Exception as exc:

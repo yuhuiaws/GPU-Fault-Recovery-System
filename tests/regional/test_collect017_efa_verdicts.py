@@ -10,6 +10,7 @@ ever having run on a real node.
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -286,3 +287,137 @@ def test_plugin_workflow_wait_outlives_two_collector_samples() -> None:
     assert collect017.PLUGIN_WORKFLOW_PLAN_TIMEOUT_SECONDS >= 120, (
         "the DaemonSet must stay excluded long enough for the collector to report"
     )
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def time(self) -> float:
+        return 1_700_000_000 + self.now
+
+
+def _settings() -> collect017.Settings:
+    return collect017.Settings(
+        regional=object(),  # type: ignore[arg-type]
+        node=NODE,
+        site_file=Path("/tmp/site.yaml"),
+        host_probe_image="img",
+        predecessor_path=Path("/tmp/p.json"),
+    )
+
+
+def test_efa_inventory_wait_short_circuits_instead_of_falling_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unbind that never shows up used to flow into a 600s workflow wait."""
+
+    clock = _Clock()
+    monkeypatch.setattr(collect017, "time", clock)
+    reads = {"count": 0}
+
+    class Collector:
+        def efa_inventory(self) -> dict[str, Any]:
+            reads["count"] += 1
+            return _inventory(BDF, OTHER)
+
+        def snapshot(self) -> dict[str, Any]:
+            raise AssertionError("the wait must use the light efa-inventory read")
+
+    with pytest.raises(collect017.RegionalFixtureError, match="did not reach 1"):
+        collect017.wait_efa_inventory(
+            Collector(),  # type: ignore[arg-type]
+            discovered_count=1,
+            timeout_seconds=30,
+        )
+    assert reads["count"] > 1 and set(clock.sleeps) == {3}
+
+    last = collect017.wait_efa_inventory(
+        Collector(),  # type: ignore[arg-type]
+        discovered_count=1,
+        timeout_seconds=6,
+        required=False,
+    )
+    assert last["discovered_count"] == 2, "the recovery read reports what it saw"
+
+
+def test_restore_efa_failure_never_masks_the_case_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(collect017, "time", _Clock())
+    calls: list[str] = []
+
+    class Collector:
+        def snapshot(self) -> dict[str, Any]:
+            return {"efa_inventory": _inventory(BDF, OTHER)}
+
+        def efa_inventory(self) -> dict[str, Any]:
+            return _inventory(BDF, OTHER)  # the unbind never takes
+
+        def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+            calls.append(arguments[0])
+            if arguments[0] == "restore-efa":
+                raise RuntimeError("kubectl exec lost the pod")
+            return {}
+
+    with pytest.raises(collect017.RegionalFixtureError, match="did not reach"):
+        collect017.run_efa_unbind(
+            _settings(),
+            object(),  # type: ignore[arg-type]
+            Collector(),  # type: ignore[arg-type]
+            1,
+        )
+    assert calls == ["unbind-efa", "restore-efa"], "the fail-safe is still disarmed"
+
+
+def test_gpu_plugin_daemonset_is_restored_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    restores = {"count": 0}
+
+    class Plugin:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            pass
+
+        def discover(self) -> dict[str, Any]:
+            return {"name": "nvidia-device-plugin"}
+
+        def exclude_node(self) -> None:
+            pass
+
+        def wait_allocatable(self, expected: int) -> dict[str, Any]:
+            return {"allocatable": expected}
+
+        def restore(self) -> None:
+            restores["count"] += 1
+
+    class Regional:
+        def node_snapshot(self, _node: str) -> dict[str, Any]:
+            return {"gpu_allocatable": 8}
+
+    good = _plugin_bundle(collect017.GPU_PLUGIN_STEPS)
+    monkeypatch.setattr(collect017.base, "DevicePluginFixture", Plugin)
+    monkeypatch.setattr(
+        collect017, "_wait_planned_workflow", lambda *_, **__: {"request_id": "wf"}
+    )
+    monkeypatch.setattr(collect017.base, "latest_node_workflow", lambda *_, **__: good)
+
+    result = collect017.run_gpu_plugin(_settings(), Regional())  # type: ignore[arg-type]
+    assert result["errors"] == []
+    assert restores["count"] == 1, "no second rollout wait on the success path"
+
+    def never_planned(*_: Any, **__: Any) -> dict[str, Any]:
+        raise collect017.RegionalFixtureError("no workflow planned")
+
+    monkeypatch.setattr(collect017, "_wait_planned_workflow", never_planned)
+    with pytest.raises(collect017.RegionalFixtureError):
+        collect017.run_gpu_plugin(_settings(), Regional())  # type: ignore[arg-type]
+    assert restores["count"] == 2, "the finally restores when the success path did not"

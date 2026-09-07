@@ -78,6 +78,8 @@ def normalized_bdf_or_raw(value: str) -> str:
 
 
 ACCEPTANCE_STATE = Path("/var/lib/gpu-fault/acceptance")
+SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
+HOST_COLLECTOR_UNIT = "gpu-fault-host-collector.service"
 
 
 class ProbeError(RuntimeError):
@@ -458,12 +460,73 @@ def file_snapshot(path: Path) -> dict[str, Any] | None:
     }
 
 
+def fabric_manager_cursor() -> dict[str, Any] | None:
+    """The Fabric Manager file collector's persisted cursor, decoded.
+
+    COLLECT-005 compared the log's size to itself and called that "the cursor
+    advanced". The cursor is the ``files[<path>]`` entry of the collector's
+    state file -- device, inode and byte offset -- and only that entry can say
+    whether the collector caught up to the line the case appended and kept
+    that position across a restart.
+    """
+
+    for path in FM_STATE_CANDIDATES:
+        if not path.is_file():
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"path": str(path), "error": "state file is not JSON"}
+        files = value.get("files") if isinstance(value, dict) else None
+        return {
+            "path": str(path),
+            "files": files if isinstance(files, dict) else {},
+            "journal_cursor": (
+                value.get("journal_cursor") if isinstance(value, dict) else None
+            ),
+        }
+    return None
+
+
+def fm_cursor(_arguments: argparse.Namespace) -> None:
+    """The light read COLLECT-005 polls after restarting the FM collector."""
+
+    emit(
+        {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "service": service_snapshot().get(
+                "gpu-fault-fabric-manager-collector.service"
+            ),
+            "fabric_manager_log": file_snapshot(FM_LOG),
+            "fabric_manager_cursor": fabric_manager_cursor(),
+        }
+    )
+
+
+def efa_inventory_command(_arguments: argparse.Namespace) -> None:
+    """Only the EFA inventory: COLLECT-017 polls it every few seconds.
+
+    A full ``snapshot`` runs nvidia-smi three times and stats every unit; the
+    unbind wait needs the sysfs walk alone.
+    """
+
+    emit(
+        {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "efa_inventory": efa_inventory(),
+        }
+    )
+
+
 def snapshot(_arguments: argparse.Namespace) -> None:
     emit(
         {
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
             "collector_env": parse_env(),
+            # The file's identity, not only the keys parsed out of it: a
+            # restore is "the original bytes" only when the digest matches.
+            "collector_env_file": file_snapshot(COLLECTOR_ENV),
             "services": service_snapshot(),
             "gpu_inventory": gpu_inventory(),
             "gpu_power": gpu_power_state(),
@@ -476,6 +539,7 @@ def snapshot(_arguments: argparse.Namespace) -> None:
                 for path in FM_STATE_CANDIDATES
                 if (value := file_snapshot(path)) is not None
             ],
+            "fabric_manager_cursor": fabric_manager_cursor(),
         }
     )
 
@@ -570,6 +634,18 @@ def collector_restore_paths(run_id: str) -> tuple[Path, str]:
     )
 
 
+def collector_override_record(backup: Path) -> Path:
+    """Where the override remembers what it changed, independent of the backup.
+
+    The deadman timer's service only copies the backup back; it does not
+    delete it. The one way to lose the backup before ``restore-collector-env``
+    runs is a probe that never wrote it, and then the env must still be
+    inspected rather than declared restored. This record survives either way.
+    """
+
+    return backup.with_suffix(".override.json")
+
+
 def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
     backup, unit = collector_restore_paths(arguments.run_id)
     values = parse_env()
@@ -580,8 +656,22 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
     ACCEPTANCE_STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     backup.write_bytes(COLLECTOR_ENV.read_bytes())
     backup.chmod(0o600)
-    service = Path("/etc/systemd/system") / f"{unit}.service"
-    timer = Path("/etc/systemd/system") / f"{unit}.timer"
+    record = collector_override_record(backup)
+    record.write_text(
+        json.dumps(
+            {
+                "key": "GPU_FAULT_EXPECTED_GPU_COUNT",
+                "baseline": current,
+                "override": target,
+                "backup_sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    record.chmod(0o600)
+    service = SYSTEMD_UNIT_DIR / f"{unit}.service"
+    timer = SYSTEMD_UNIT_DIR / f"{unit}.timer"
     service.write_text(
         "\n".join(
             [
@@ -590,7 +680,7 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
                 "[Service]",
                 "Type=oneshot",
                 f"ExecStart=/bin/cp {backup} {COLLECTOR_ENV}",
-                "ExecStart=/bin/systemctl restart gpu-fault-host-collector.service",
+                f"ExecStart=/bin/systemctl restart {HOST_COLLECTOR_UNIT}",
             ]
         )
         + "\n",
@@ -603,6 +693,12 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
                 "Description=Timed gpu-fault collector env restore",
                 "[Timer]",
                 f"OnActiveSec={arguments.restore_seconds}s",
+                # `Persistent=` only replays *calendar* timers; on a monotonic
+                # OnActiveSec timer it is inert, and the RESTART_NODE this case
+                # provokes would otherwise boot a node whose env still carried
+                # the override. OnBootSec=1 makes the enabled timer fire right
+                # after the reboot instead.
+                "OnBootSec=1",
                 "Persistent=true",
                 f"Unit={unit}.service",
                 "[Install]",
@@ -625,7 +721,7 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
     os.replace(temporary, COLLECTOR_ENV)
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "--now", f"{unit}.timer"])
-    run(["systemctl", "restart", "gpu-fault-host-collector.service"])
+    run(["systemctl", "restart", HOST_COLLECTOR_UNIT])
     emit(
         {
             "run_id": arguments.run_id,
@@ -638,20 +734,62 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
 
 
 def restore_collector_env(arguments: argparse.Namespace) -> None:
+    """Put the original ``collector.env`` back and say whether that is true.
+
+    ``restored`` used to be an unconditional ``True``: with the backup gone
+    (never written, or a probe that died between the two writes) the env kept
+    the override and the runner recorded a successful restore. Now the answer
+    is read back from the file: the backup's digest when it exists, otherwise
+    the override record's baseline value against the live key.
+    """
+
     backup, unit = collector_restore_paths(arguments.run_id)
-    if backup.is_file():
+    record_path = collector_override_record(backup)
+    record: dict[str, Any] = {}
+    if record_path.is_file():
+        try:
+            loaded = json.loads(record_path.read_text(encoding="utf-8"))
+            record = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            record = {}
+    backup_present = backup.is_file()
+    if backup_present:
         COLLECTOR_ENV.write_bytes(backup.read_bytes())
-        run(["systemctl", "restart", "gpu-fault-host-collector.service"])
+        run(["systemctl", "restart", HOST_COLLECTOR_UNIT])
     run(["systemctl", "disable", "--now", f"{unit}.timer"], check=False)
     for suffix in (".timer", ".service"):
-        Path("/etc/systemd/system", unit + suffix).unlink(missing_ok=True)
-    backup.unlink(missing_ok=True)
+        (SYSTEMD_UNIT_DIR / (unit + suffix)).unlink(missing_ok=True)
     run(["systemctl", "daemon-reload"])
+    env_after = parse_env()
+    file_after = file_snapshot(COLLECTOR_ENV)
+    key = str(record.get("key") or "GPU_FAULT_EXPECTED_GPU_COUNT")
+    reason: str | None = None
+    if backup_present:
+        expected_digest = record.get("backup_sha256")
+        restored = not expected_digest or (
+            file_after is not None and file_after.get("sha256") == expected_digest
+        )
+        if not restored:
+            reason = "collector.env digest differs from the backup"
+    elif record:
+        restored = env_after.get(key) == str(record.get("baseline"))
+        if not restored:
+            reason = f"backup missing and {key} still carries the override"
+    else:
+        restored = False
+        reason = "no backup and no override record for this run ID"
+    if restored:
+        backup.unlink(missing_ok=True)
+        record_path.unlink(missing_ok=True)
     emit(
         {
             "run_id": arguments.run_id,
-            "restored": True,
-            "collector_env": parse_env(),
+            "restored": restored,
+            "backup_present": backup_present,
+            "reason": reason,
+            "override_record": record or None,
+            "collector_env": env_after,
+            "collector_env_file": file_after,
         }
     )
 
@@ -733,6 +871,12 @@ def parser() -> argparse.ArgumentParser:
 
     show = commands.add_parser("snapshot")
     show.set_defaults(handler=snapshot)
+
+    cursor = commands.add_parser("fm-cursor")
+    cursor.set_defaults(handler=fm_cursor)
+
+    efa = commands.add_parser("efa-inventory")
+    efa.set_defaults(handler=efa_inventory_command)
 
     xid = commands.add_parser("write-xid")
     xid.add_argument("--xid", type=int, choices=sorted(ALLOWED_XIDS), required=True)

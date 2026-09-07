@@ -592,6 +592,7 @@ def _expand_order(
 
     parsed_phases: list[tuple[int, str, str, tuple[str, ...]]] = []
     seen_sequences: set[int] = set()
+    explicit_predecessors: dict[str, str] = {}
     for phase_index, raw_phase in enumerate(
         _list(root.get("phases"), "regional order phases")
     ):
@@ -626,8 +627,17 @@ def _expand_order(
         ):
             entry_context = f"{context}.entries[{entry_index}]"
             entry = _mapping(raw_entry, entry_context)
-            if set(entry) == {"case"}:
+            if "case" in entry:
+                # A case entry may name the case whose evidence it formally
+                # depends on when that is not its positional neighbour; the
+                # evidence chain is read by scripts/e2e/regional/
+                # regional_case_contract.py, the serial order stays positional.
+                _known_fields(entry, {"case", "predecessor"}, entry_context)
                 case_ids.append(_case_id(entry["case"], f"{entry_context}.case"))
+                if "predecessor" in entry:
+                    explicit_predecessors[case_ids[-1]] = _case_id(
+                        entry["predecessor"], f"{entry_context}.predecessor"
+                    )
                 continue
             if set(entry) != {"range"}:
                 raise ValueError(f"{entry_context} must contain exactly case or range")
@@ -677,6 +687,18 @@ def _expand_order(
             )
             for case_id in phase_case_ids
         )
+    position = {case.id: index for index, case in enumerate(ordered)}
+    for case_id, predecessor in explicit_predecessors.items():
+        if predecessor not in position:
+            raise ValueError(
+                f"regional order {case_id} predecessor {predecessor} is not an "
+                "ordered case"
+            )
+        if position[predecessor] >= position[case_id]:
+            raise ValueError(
+                f"regional order {case_id} predecessor {predecessor} does not run "
+                "before it"
+            )
 
     retired: list[_OrderedCase] = []
     for index, raw_entry in enumerate(

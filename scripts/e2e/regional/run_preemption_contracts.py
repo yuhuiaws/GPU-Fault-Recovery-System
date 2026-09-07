@@ -1,13 +1,28 @@
+"""Run one deterministic PREEMPT-001..009 contract fixture.
+
+Each case is a fixed set of pytest node ids; the verdict is the pytest exit
+code. Given ``--run-dir`` the case also writes ``cases/<id>/<id>.json`` so the
+PREEMPT chain (PREEMPT-012's predecessor resolution in particular) can find a
+PASS where the formal order expects one. Stdout is unchanged: the pytest output
+followed by one JSON line.
+"""
+
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-from pathlib import Path
 import subprocess
 import sys
-
+from collections.abc import Callable
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 CASE_NODEIDS = {
     "GF-REGIONAL-PREEMPT-001": (
         "tests/execution/test_executor.py::"
@@ -58,21 +73,11 @@ CASE_NODEIDS = {
     ),
 }
 
+PytestRunner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Run one deterministic PREEMPT-001..009 contract fixture."
-    )
-    parser.add_argument("--case", choices=tuple(CASE_NODEIDS), required=True)
-    arguments = parser.parse_args()
-    command = [
-        sys.executable,
-        "-m",
-        "pytest",
-        "-q",
-        *CASE_NODEIDS[arguments.case],
-    ]
-    completed = subprocess.run(
+
+def _run_pytest(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         command,
         cwd=ROOT,
         text=True,
@@ -80,18 +85,89 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         check=False,
     )
+
+
+def case_evidence(
+    case_id: str,
+    completed: subprocess.CompletedProcess[str],
+    *,
+    release_id: str = "",
+) -> dict[str, Any]:
+    """The evidence document for one PREEMPT contract case."""
+
+    document: dict[str, Any] = {
+        "schema_version": 1,
+        "report_type": "fault-acceptance",
+        "case_id": case_id,
+        "verdict": "PASS" if completed.returncode == 0 else "FAIL",
+        "executed_at": datetime.now(timezone.utc).isoformat(),
+        "fixture": "deterministic pytest contract; no cluster touched",
+        "pytest_nodeids": list(CASE_NODEIDS[case_id]),
+        "pytest_returncode": completed.returncode,
+        "pytest_output_sha256": hashlib.sha256(
+            (completed.stdout or "").encode("utf-8")
+        ).hexdigest(),
+    }
+    if release_id:
+        document["release_id"] = release_id
+    return document
+
+
+def run_case(
+    case_id: str,
+    *,
+    run_dir: Path | None = None,
+    release_id: str = "",
+    runner: PytestRunner = _run_pytest,
+) -> int:
+    command = [sys.executable, "-m", "pytest", "-q", *CASE_NODEIDS[case_id]]
+    completed = runner(command)
     print(completed.stdout, end="")
+    if run_dir is not None:
+        from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
+        from scripts.e2e.regional.regional_case_contract import case_evidence_path
+
+        write_json_atomic(
+            case_evidence_path(run_dir, case_id),
+            case_evidence(case_id, completed, release_id=release_id),
+        )
     print(
         json.dumps(
             {
-                "case_id": arguments.case,
+                "case_id": case_id,
                 "verdict": "PASS" if completed.returncode == 0 else "FAIL",
-                "pytest_nodeids": list(CASE_NODEIDS[arguments.case]),
+                "pytest_nodeids": list(CASE_NODEIDS[case_id]),
             },
             sort_keys=True,
         )
     )
     return completed.returncode
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--case", choices=tuple(CASE_NODEIDS), required=True)
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="write cases/<id>/<id>.json for the case under this directory",
+    )
+    parser.add_argument(
+        "--release-id",
+        default="",
+        help="release the evidence is bound to (from the release state ConfigMap)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = build_parser().parse_args(argv)
+    return run_case(
+        arguments.case,
+        run_dir=arguments.run_dir,
+        release_id=arguments.release_id,
+    )
 
 
 if __name__ == "__main__":

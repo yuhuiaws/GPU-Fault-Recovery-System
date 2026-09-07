@@ -7,10 +7,11 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -22,6 +23,8 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
@@ -297,44 +300,85 @@ def preflight_errors(
     return errors
 
 
+PREFLIGHT_WORKERS = 6
+
+
+def gather(reads: dict[str, Callable[[], Any]], *, workers: int) -> dict[str, Any]:
+    """Run independent read-only calls concurrently and return them by name.
+
+    Every read is a separate ``kubectl``/``aws``/``pytest`` subprocess with
+    no shared state in the fixture, so the ~15 of them the preflight makes
+    are bounded by the slowest, not by their sum. An exception in any one of
+    them propagates once all have finished, so the operator reads the real
+    failure and not a half-built result.
+    """
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {name: pool.submit(read) for name, read in reads.items()}
+        return {name: future.result() for name, future in futures.items()}
+
+
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
+    *,
+    reusable_tests: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not settings.site_file.is_file() or not settings.manifest.is_file():
         raise RegionalFixtureError("site file or training manifest does not exist")
     regional = RegionalLiveFixture(settings.regional)
     warm = WarmSpareLiveFixture(regional, settings.hyperpod_cluster)
-    fault = warm.node_snapshot(settings.fault_node)
-    spare = warm.node_snapshot(settings.spare_node)
-    state = warm.store_snapshot()
-    fault_state = regional.store_snapshot(node=settings.fault_node)
-    state["profile"] = fault_state.get("profile")
-    state["release_id"] = fault_state.get("release_id")
-    spare_nodes = warm.spare_nodes()
-    cluster = warm.cluster_recovery()
-    executor_env = warm.executor_environment()
-    synthetic_gates = warm.synthetic_replacement_gates()
-    gpu_workloads = regional.gpu_workloads()
+    reads: dict[str, Callable[[], Any]] = {
+        "fault": lambda: warm.node_snapshot(settings.fault_node),
+        "spare": lambda: warm.node_snapshot(settings.spare_node),
+        "state": warm.store_snapshot,
+        "fault_state": lambda: regional.store_snapshot(node=settings.fault_node),
+        "spare_nodes": warm.spare_nodes,
+        "cluster": warm.cluster_recovery,
+        "executor_env": warm.executor_environment,
+        "synthetic_gates": warm.synthetic_replacement_gates,
+        "gpu_workloads": regional.gpu_workloads,
+        "provider_inventory": warm.provider_inventory,
+        "cpu_blast": regional.cpu_blast_snapshot,
+        "identity": regional.evidence_identity,
+    }
+    if reusable_tests is None:
+        reads["tests"] = lambda: focused_tests(case_dir)
+    read = gather(reads, workers=PREFLIGHT_WORKERS)
+    fault = read["fault"]
+    spare = read["spare"]
+    state = read["state"]
+    state["profile"] = read["fault_state"].get("profile")
+    state["release_id"] = read["fault_state"].get("release_id")
+    spare_nodes = read["spare_nodes"]
+    cluster = read["cluster"]
+    executor_env = read["executor_env"]
+    synthetic_gates = read["synthetic_gates"]
+    gpu_workloads = read["gpu_workloads"]
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
+        **read["identity"],
     )
-    tests = focused_tests(case_dir)
+    tests = (
+        {**reusable_tests, "reused": True}
+        if reusable_tests is not None
+        else read["tests"]
+    )
     result = {
         "release_id": state.get("release_id"),
         "fault_node": fault,
         "spare_node": spare,
         "declared_spares": spare_nodes,
         "cluster": cluster,
-        "provider_inventory": warm.provider_inventory(),
+        "provider_inventory": read["provider_inventory"],
         "store": state,
         "executor_environment": executor_env,
         "synthetic_replacement_gates": synthetic_gates,
         "gpu_workloads": gpu_workloads,
         "predecessor": predecessor,
         "focused_tests": tests,
-        "cpu_blast": regional.cpu_blast_snapshot(),
+        "cpu_blast": read["cpu_blast"],
     }
     result["errors"] = preflight_errors(
         settings,
@@ -493,7 +537,7 @@ def workflow_errors(
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     state = preflight["store"]
-    return {
+    details: dict[str, Any] = {
         "risk": "destructive-warm-spare",
         "predecessor": preflight["predecessor"],
         "fault_node": settings.fault_node,
@@ -535,6 +579,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight.get("focused_tests") or {})
+    return details
 
 
 def verify_plan_identity(
@@ -554,6 +600,74 @@ def verify_plan_identity(
     }
     if current != planned:
         raise RegionalFixtureError(f"DESTR-003 plan drifted: {planned} != {current}")
+
+
+def node_isolated(snapshot: dict[str, Any]) -> bool:
+    return bool(snapshot.get("unschedulable")) or any(
+        item.get("key") == QUARANTINE_TAINT for item in snapshot.get("taints") or []
+    )
+
+
+def restore_fault_node(
+    warm: WarmSpareLiveFixture,
+    *,
+    settings: Settings,
+    incident_id: str,
+    profile_version: str,
+) -> dict[str, Any]:
+    """Un-quarantine the fault node through whichever incident owns it now.
+
+    A failover the product escalates -- a spare that stopped answering, a
+    validation that failed -- ends with a successor support incident owning
+    the node's quarantine, not ours. Cleanup that restored only when the
+    annotation still named our incident skipped that node silently, and the
+    case then failed in postflight for a condition its cleanup had already
+    seen. Now the owner is read off the node, and a node that is still
+    isolated with no owner to restore through is itself an error.
+    """
+
+    result: dict[str, Any] = {"errors": []}
+    try:
+        fault = warm.node_snapshot(settings.fault_node)
+        owner = str(fault["annotations"].get("gpu-fault.io/incident-id") or "")
+        result["quarantine_owner"] = owner or None
+        if owner and owner != incident_id:
+            result["successor_incident"] = owner
+        if owner:
+            warm.wait_incident_idle(owner)
+            created = warm.create_restore_workflow(
+                incident_id=owner,
+                node=settings.fault_node,
+                profile_version=profile_version,
+                reason="DESTR-003 validated cleanup",
+            )
+            restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
+            result["restore_workflow"] = restored
+            if restored.get("status") != "SUCCEEDED":
+                result["errors"].append("fault-node restore workflow failed")
+        elif node_isolated(fault):
+            result["errors"].append(
+                "fault node is still isolated but names no incident owner; "
+                "nothing could be restored"
+            )
+    except Exception as exc:
+        result["errors"].append(f"fault-node restore: {type(exc).__name__}: {exc}")
+    return result
+
+
+def recover_incident_id(warm: WarmSpareLiveFixture, event_id: str) -> str:
+    """The incident the injected event opened, when the run lost track of it.
+
+    ``incident_id`` is only learned from the terminal store snapshot; a
+    ``wait_for_workflow`` that timed out never produced one, and a cleanup
+    keyed on an empty id released no spare, reactivated no agent and restored
+    nothing -- on a node the run had just quarantined.
+    """
+
+    if not event_id:
+        return ""
+    state = warm.store_snapshot(event_id=event_id)
+    return str((state.get("incident") or {}).get("incident_id") or "")
 
 
 def cleanup_case(
@@ -584,22 +698,14 @@ def cleanup_case(
             warm.wait_agent_active(settings.fault_node)
         except Exception as exc:
             result["errors"].append(f"agent reactivation: {type(exc).__name__}: {exc}")
-        try:
-            fault = warm.node_snapshot(settings.fault_node)
-            if fault["annotations"].get("gpu-fault.io/incident-id") == incident_id:
-                created = warm.create_restore_workflow(
-                    incident_id=incident_id,
-                    node=settings.fault_node,
-                    profile_version=profile_version,
-                    reason="DESTR-003 validated cleanup",
-                )
-                result["restore_workflow"] = warm.wait_workflow_id(
-                    str(created["workflow_request_id"])
-                )
-                if result["restore_workflow"].get("status") != "SUCCEEDED":
-                    result["errors"].append("fault-node restore workflow failed")
-        except Exception as exc:
-            result["errors"].append(f"fault-node restore: {type(exc).__name__}: {exc}")
+        restore = restore_fault_node(
+            warm,
+            settings=settings,
+            incident_id=incident_id,
+            profile_version=profile_version,
+        )
+        result["fault_restore"] = restore
+        result["errors"].extend(restore["errors"])
     try:
         residuals = prewarm.cleanup()
         result["prewarm_residuals"] = residuals
@@ -645,7 +751,11 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(
+        settings,
+        case_dir,
+        reusable_tests=reusable_focused_tests(case_dir / "plan.json"),
+    )
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -678,8 +788,13 @@ def execute_case(
         "verdict": "FAIL",
         "synthetic_trigger": True,
         "maintenance_window_end": maintenance_window_end.isoformat(),
+        **regional.evidence_identity(),
+        "focused_tests_reused": bool(
+            (preflight.get("focused_tests") or {}).get("reused")
+        ),
     }
     incident_id = ""
+    event_id = ""
     try:
         prewarm.create([settings.fault_node, settings.spare_node])
         submission = workload.submit()
@@ -753,13 +868,19 @@ def execute_case(
         write_json_atomic(case_dir / "provider-after.json", provider_after)
         if provider_after != preflight["provider_inventory"]:
             errors.append("HyperPod provider inventory changed")
-        provider_events = regional.provider_events(
-            started_at,
-            datetime.now(timezone.utc),
-        )
+        ended_at = datetime.now(timezone.utc)
+        provider_events = regional.provider_events(started_at, ended_at)
+        # A negative claim cannot be proven inside CloudTrail's delivery lag;
+        # it is recorded as provisional and DESTR-013 re-reads the window.
+        provider_provisional = regional.provider_events_provisional(ended_at)
         write_json_atomic(
             case_dir / "provider-events.json",
-            {"events": provider_events},
+            {
+                "events": provider_events,
+                "window_start": started_at.isoformat(),
+                "window_end": ended_at.isoformat(),
+                "provisional": provider_provisional,
+            },
         )
         if any(
             item["event_name"] in PROVIDER_REPLACE_EVENTS for item in provider_events
@@ -780,11 +901,18 @@ def execute_case(
                 "source_pod_uids": sorted(source_uids),
                 "target_pod_uids": sorted(str(item["uid"]) for item in target["pods"]),
                 "provider_events": provider_events,
+                "provider_events_provisional": provider_provisional,
             }
         )
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        if not incident_id:
+            try:
+                incident_id = recover_incident_id(warm, event_id)
+                result["incident_id_recovered_from_event"] = bool(incident_id)
+            except Exception as exc:
+                result["incident_lookup_error"] = f"{type(exc).__name__}: {exc}"
         cleanup = cleanup_case(
             warm=warm,
             regional=regional,

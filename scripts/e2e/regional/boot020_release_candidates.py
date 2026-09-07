@@ -28,6 +28,10 @@ on 2026-09-07 was actually done against the production site:
     live state, printing the kind and changed keys -- run this before
     ``--execute``.
 
+``clean``
+    Remove the ``dist/<release_id>`` symlinks ``configs`` left in the
+    repository so the work tree is back to what it was before the run.
+
 Nothing site-specific is hard-coded: ECR repositories, paths and the site
 file all come from the command line.
 """
@@ -36,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -83,6 +88,53 @@ def candidate_edits(
     }
 
 
+def edits_digest(edits: list[tuple[str, str]]) -> str:
+    """The sha256 of a candidate's module edits, path and text included.
+
+    Recorded beside each candidate so a later ``build`` can tell whether the
+    build sitting in ``wt-<name>`` came from the same edits; a different
+    ``--executor-module`` or edit text with the same base release must not be
+    mistaken for a reusable build.
+    """
+
+    digest = hashlib.sha256()
+    for relative, text in edits:
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(text.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def reusable_candidate(
+    manifest_path: Path,
+    *,
+    base_release_id: str,
+    recorded: dict[str, Any] | None,
+    expected_edits_digest: str,
+) -> bool:
+    """Whether an existing candidate build can stand in for a fresh one.
+
+    It can only when its manifest exists and names a release other than the
+    base (so it is a real rebuild), and ``candidates.json`` recorded the same
+    edits digest for it -- otherwise the checkout is rebuilt.
+    """
+
+    if not manifest_path.exists():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if manifest.get("release_id") in (None, base_release_id):
+        return False
+    if not isinstance(recorded, dict):
+        return False
+    return recorded.get("edits_sha256") == expected_edits_digest and recorded.get(
+        "release_id"
+    ) == manifest.get("release_id")
+
+
 def component_summary(manifest: dict[str, Any]) -> dict[str, str]:
     components = manifest.get("components") or {}
     return {
@@ -114,13 +166,28 @@ def build_candidates(arguments: argparse.Namespace) -> dict[str, Any]:
         "base_components": component_summary(base),
         "candidates": {},
     }
+    summary_path = work / "candidates.json"
+    previous: dict[str, Any] = {}
+    if summary_path.exists():
+        try:
+            previous = dict(json.loads(summary_path.read_text("utf-8")))
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+    recorded_candidates = (
+        previous.get("candidates")
+        if previous.get("base_release_id") == base["release_id"]
+        else {}
+    ) or {}
     edits = candidate_edits(arguments.executor_module, arguments.node_module)
     for name in CANDIDATES:
         checkout = work / f"wt-{name}"
         manifest_path = checkout / "dist/current-release.json"
-        if manifest_path.exists() and (
-            json.loads(manifest_path.read_text("utf-8"))["release_id"]
-            != base["release_id"]
+        digest = edits_digest(edits[name])
+        if reusable_candidate(
+            manifest_path,
+            base_release_id=base["release_id"],
+            recorded=recorded_candidates.get(name),
+            expected_edits_digest=digest,
         ):
             print(f"[{name}] reusing existing build in {checkout}", flush=True)
         else:
@@ -164,8 +231,9 @@ def build_candidates(arguments: argparse.Namespace) -> dict[str, Any]:
             "release_id": manifest["release_id"],
             "components": component_summary(manifest),
             "manifest": str(manifest_path),
+            "edits_sha256": digest,
         }
-        (work / "candidates.json").write_text(json.dumps(summary, indent=1), "utf-8")
+        summary_path.write_text(json.dumps(summary, indent=1), "utf-8")
     return summary
 
 
@@ -250,6 +318,48 @@ def link_release_dist(repository_root: Path, manifest_path: Path) -> Path:
             raise SystemExit(f"{link} exists and is not a symlink; refusing")
     link.symlink_to(source.resolve())
     return link
+
+
+def unlink_release_dist(repository_root: Path, manifest_path: Path) -> Path | None:
+    """Remove the ``dist/<release_id>`` link ``link_release_dist`` created.
+
+    Only a symlink is removed, and only when it points at the manifest's own
+    artifact directory; a real directory or a link to somewhere else is left
+    alone and reported, since neither was made by this tool.
+    """
+
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    release_id = str(manifest["release_id"])
+    source = manifest_path.parent / release_id
+    link = repository_root / "dist" / release_id
+    if not link.is_symlink():
+        if link.exists():
+            print(f"{link} is not a symlink; left in place", flush=True)
+        return None
+    if link.resolve() != source.resolve():
+        print(f"{link} points elsewhere; left in place", flush=True)
+        return None
+    link.unlink()
+    return link
+
+
+def clean_release_dist(arguments: argparse.Namespace) -> int:
+    """``clean``: drop every symlink ``configs`` planted under ``<repo>/dist``."""
+
+    candidates = json.loads(
+        (arguments.work_dir.resolve() / "candidates.json").read_text("utf-8")
+    )["candidates"]
+    manifests = [
+        arguments.snapshot_repo.resolve() / "dist/current-release.json",
+        *(Path(c["manifest"]) for c in candidates.values()),
+    ]
+    removed = [
+        link
+        for link in (unlink_release_dist(ROOT, manifest) for manifest in manifests)
+        if link is not None
+    ]
+    print("removed:", ", ".join(str(link) for link in removed) or "nothing", flush=True)
+    return 0
 
 
 def write_configs(arguments: argparse.Namespace) -> None:
@@ -342,6 +452,10 @@ def parser() -> argparse.ArgumentParser:
     check = commands.add_parser("check", help="classify every config against live")
     check.add_argument("--out-dir", type=Path, required=True)
     check.add_argument("--gpu-kubeconfig", type=Path, required=True)
+
+    clean = commands.add_parser("clean", help="remove the dist/<release_id> links")
+    clean.add_argument("--snapshot-repo", type=Path, required=True)
+    clean.add_argument("--work-dir", type=Path, required=True)
     return value
 
 
@@ -353,6 +467,8 @@ def main() -> int:
     if arguments.command == "configs":
         write_configs(arguments)
         return 0
+    if arguments.command == "clean":
+        return clean_release_dist(arguments)
     return check_configs(arguments)
 
 

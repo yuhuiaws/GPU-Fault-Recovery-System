@@ -125,9 +125,11 @@ def read_only_preflight(
         for item in regional.gpu_nodes()
         if item["ready"] == "True" and not item["unschedulable"] and not item["taints"]
     ]
+    identity = regional.evidence_identity()
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
+        **identity,
     )
     command = [
         sys.executable,
@@ -161,7 +163,7 @@ def read_only_preflight(
     if completed.returncode:
         errors.append("focused regression tests failed")
     result = {
-        "release_id": regional.release_id(),
+        **identity,
         "candidate_nodes": candidates,
         "predecessor": predecessor,
         "focused_tests_passed": completed.returncode == 0,
@@ -210,12 +212,84 @@ def managed_fixture(
     )
 
 
+def restart_workload_job_id(workflow: dict[str, Any]) -> str | None:
+    """The job the RESTART_WORKLOAD step was compiled for, from its parameters."""
+
+    for step in workflow.get("official_steps") or []:
+        if step.get("operation") != "RESTART_WORKLOAD":
+            continue
+        parameters = step.get("parameters") or {}
+        value = parameters.get("job_id")
+        return str(value) if value else None
+    return None
+
+
+def restart_budget_section_errors(
+    state_a: dict[str, Any],
+    state_b: dict[str, Any],
+    *,
+    job_id: str,
+) -> list[str]:
+    """What is unique to COLLECT-016 A/B beyond the DESTR-009 restart contract.
+
+    A: the incident identified the workload (``workload_identity_source``), the
+    workflow was never BLOCKED, and RESTART_WORKLOAD was compiled for *this*
+    job. B: the second RESTART_APP failed for ``RESTART_BUDGET_EXHAUSTED`` and
+    the budget still shows the one restart A spent -- not two, not zero.
+    """
+
+    errors: list[str] = []
+    incident_a = state_a.get("incident") or {}
+    workflow_a = state_a.get("workflow") or {}
+    if not incident_a.get("workload_identity_source"):
+        errors.append("A: incident carries no workload_identity_source")
+    if list(workflow_a.get("blocked_reasons") or []):
+        errors.append(
+            f"A: RESTART_APP workflow was blocked: {workflow_a.get('blocked_reasons')}"
+        )
+    compiled_job = restart_workload_job_id(workflow_a)
+    if compiled_job != job_id:
+        errors.append(
+            f"A: RESTART_WORKLOAD was compiled for job {compiled_job!r}, not {job_id!r}"
+        )
+    workflow_b = state_b.get("workflow") or {}
+    if workflow_b.get("status") != "FAILED":
+        errors.append("B: second RESTART_APP was not budget rejected")
+    if state_b.get("commands"):
+        errors.append("B: budget rejection created a remote command")
+    reasons = {
+        str((item.get("details") or {}).get("reason") or "")
+        for item in workflow_b.get("step_executions") or []
+    }
+    if "RESTART_BUDGET_EXHAUSTED" not in reasons:
+        errors.append(
+            f"B: no step execution failed for RESTART_BUDGET_EXHAUSTED: {sorted(reasons)}"
+        )
+    budget = state_b.get("restart_budget") or {}
+    if budget.get("restart_count") != 1:
+        errors.append(
+            f"B: restart budget shows restart_count={budget.get('restart_count')!r}, "
+            "expected the single restart A spent"
+        )
+    return errors
+
+
 def run_restart_budget_sections(
     settings: Settings,
     regional: RegionalLiveFixture,
     case_dir: Path,
     suffix: str,
-) -> tuple[dict[str, Any], ManagedWorkloadFixture, CollectorAcceptanceFixture]:
+    *,
+    workloads: list[ManagedWorkloadFixture],
+    fixtures: list[CollectorAcceptanceFixture | HostProbeFixture],
+) -> dict[str, Any]:
+    """A and B. Resources land in ``workloads``/``fixtures`` the moment they exist.
+
+    They used to be returned and appended by the caller, so a timeout inside
+    this helper (a 900s wait_running, a workflow wait) leaked a 24-GPU
+    PyTorchJob and a privileged probe Pod that no finally block knew about.
+    """
+
     job_id = f"c016-a-{suffix}"
     attempt_id = f"{job_id}-a001"
     manifest = base.render_named_training_manifest(
@@ -228,6 +302,7 @@ def run_restart_budget_sections(
         job_id=job_id,
         attempt_id=attempt_id,
     )
+    workloads.append(workload)
     workload.submit()
     source = workload.wait_running(timeout_seconds=900)
     source_uids = {str(item["uid"]) for item in source["pods"]}
@@ -251,6 +326,7 @@ def run_restart_budget_sections(
         case_id=CASE_ID,
         run_id=f"c016-a-{suffix}",
     )
+    fixtures.append(collector)
     collector.create()
     bdf = str(collector.snapshot()["gpu_inventory"][0]["pci_bdf"])
     marker_a = f"c016-a-{int(time.time())}"
@@ -300,24 +376,23 @@ def run_restart_budget_sections(
         attempt_id=attempt_id,
     )
     workflow_b = state_b.get("workflow") or {}
-    if workflow_b.get("status") != "FAILED":
-        errors.append("second RESTART_APP was not budget rejected")
-    if state_b.get("commands"):
-        errors.append("budget rejection created a remote command")
-    return (
-        {
-            "errors": errors,
-            "a": {
-                "marker": marker_a,
-                "source_pod_uids": sorted(source_uids),
-                "target_pod_uids": sorted(str(item["uid"]) for item in target["pods"]),
-                "workflow": state_a.get("workflow"),
-            },
-            "b": {"marker": marker_b, "workflow": workflow_b},
+    errors.extend(restart_budget_section_errors(state_a, state_b, job_id=job_id))
+    return {
+        "errors": errors,
+        "a": {
+            "marker": marker_a,
+            "job_id": job_id,
+            "source_pod_uids": sorted(source_uids),
+            "target_pod_uids": sorted(str(item["uid"]) for item in target["pods"]),
+            "workflow": state_a.get("workflow"),
+            "incident": state_a.get("incident"),
         },
-        workload,
-        collector,
-    )
+        "b": {
+            "marker": marker_b,
+            "workflow": workflow_b,
+            "restart_budget": state_b.get("restart_budget"),
+        },
+    }
 
 
 def run_reset_section(
@@ -325,7 +400,12 @@ def run_reset_section(
     regional: RegionalLiveFixture,
     case_dir: Path,
     suffix: str,
-) -> tuple[dict[str, Any], ManagedWorkloadFixture, HostProbeFixture]:
+    *,
+    workloads: list[ManagedWorkloadFixture],
+    fixtures: list[CollectorAcceptanceFixture | HostProbeFixture],
+) -> dict[str, Any]:
+    """D. Like A/B, the workload and probe are registered as soon as they exist."""
+
     job_id = f"c016-d-{suffix}"
     attempt_id = f"{job_id}-a001"
     manifest = base.render_named_training_manifest(
@@ -338,6 +418,7 @@ def run_reset_section(
         job_id=job_id,
         attempt_id=attempt_id,
     )
+    workloads.append(workload)
     workload.submit()
     source = workload.wait_running(timeout_seconds=900)
     source_uids = {str(item["uid"]) for item in source["pods"]}
@@ -367,6 +448,7 @@ def run_reset_section(
             active_deadline_seconds=3600,
         )
     )
+    fixtures.append(reset_host)
     reset_host.create()
     marker = f"c016-d-{int(time.time())}"
     shim = base.Settings(
@@ -392,19 +474,15 @@ def run_reset_section(
         expected_steps=WORKLOAD_RESET_STEPS,
     )
     target = workload.wait_restarted(source_uids, timeout_seconds=900)
-    return (
-        {
-            "errors": errors,
-            "d": {
-                "marker": marker,
-                "workflow": state.get("workflow"),
-                "source_pod_uids": sorted(source_uids),
-                "target_pod_uids": sorted(str(item["uid"]) for item in target["pods"]),
-            },
+    return {
+        "errors": errors,
+        "d": {
+            "marker": marker,
+            "workflow": state.get("workflow"),
+            "source_pod_uids": sorted(source_uids),
+            "target_pod_uids": sorted(str(item["uid"]) for item in target["pods"]),
         },
-        workload,
-        reset_host,
-    )
+    }
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
@@ -466,29 +544,30 @@ def execute_case(
         "attempt": attempt,
         "verdict": "FAIL",
         "errors": [],
+        **regional.evidence_identity(),
     }
     try:
         prewarm.create(candidates)
         suffix = f"{int(time.time())}-{attempt}"
-        ab, workload_a, collector = run_restart_budget_sections(
+        ab = run_restart_budget_sections(
             settings,
             regional,
             case_dir,
             suffix,
+            workloads=workloads,
+            fixtures=fixtures,
         )
-        workloads.append(workload_a)
-        fixtures.append(collector)
         result["errors"].extend(ab["errors"])
         result.update({"a": ab["a"], "b": ab["b"]})
-        workload_a.delete()
-        d, workload_d, reset_host = run_reset_section(
+        workloads[0].delete()
+        d = run_reset_section(
             settings,
             regional,
             case_dir,
             suffix,
+            workloads=workloads,
+            fixtures=fixtures,
         )
-        workloads.append(workload_d)
-        fixtures.append(reset_host)
         result["errors"].extend(d["errors"])
         result["d"] = d["d"]
         result["verdict"] = "PASS" if not result["errors"] else "FAIL"

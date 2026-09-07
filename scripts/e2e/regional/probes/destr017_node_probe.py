@@ -206,6 +206,40 @@ def checked_max_hold(value: int) -> int:
     return int(value)
 
 
+def checked_probe_script(value: str) -> str:
+    """The path the watcher unit will run must be *this* file, on the host.
+
+    Compared as a resolved full path, not a basename: the runner once passed
+    the Pod-side ``/host/run/...`` path, whose basename matched while the
+    systemd unit -- which runs on the host -- could not find it.
+    """
+
+    if Path(value).resolve() != Path(__file__).resolve():
+        raise ProbeError("probe script identity mismatch")
+    return value
+
+
+def clear_state_file(path: Path, *, current_boot_id: str) -> dict[str, Any]:
+    """Remove this run's state file, unless a reboot timer is still live.
+
+    A reboot that was armed, not cancelled and has not fired (the boot id is
+    still the one recorded before arming) may still go off; its record is the
+    only thing that lets ``cancel-reboot`` prove what it stopped, so it stays.
+    """
+
+    state = read_state(path)
+    if not state:
+        return {"removed": False, "present": False}
+    armed = bool(state.get("reboot_armed_at"))
+    cancelled = bool(state.get("reboot_cancelled_at"))
+    before = str(state.get("boot_id_before_reboot") or "")
+    fired = bool(before) and before != current_boot_id
+    if armed and not cancelled and not fired:
+        raise ProbeError("reboot timer is still armed; cancel it before clearing")
+    path.unlink()
+    return {"removed": True, "present": True}
+
+
 def checked_reboot_delay(value: int) -> int:
     if not MIN_REBOOT_DELAY_SECONDS <= int(value) <= MAX_REBOOT_DELAY_SECONDS:
         raise ProbeError(
@@ -445,8 +479,7 @@ def arm_holder(arguments: argparse.Namespace) -> None:
     max_hold = checked_max_hold(arguments.max_hold_seconds)
     if arguments.after_ledger_op not in ARM_LEDGER_OPERATIONS:
         raise ProbeError("after-ledger-op is not permitted for arming")
-    if Path(arguments.probe_script).name != Path(__file__).name:
-        raise ProbeError("probe script identity mismatch")
+    checked_probe_script(arguments.probe_script)
     baseline_ids = [
         row["command_id"]
         for row in ledger_rows()
@@ -454,18 +487,17 @@ def arm_holder(arguments: argparse.Namespace) -> None:
     ]
     path = state_path(run_id)
     armed_at = datetime.now(timezone.utc).isoformat()
-    state = update_state(
-        path,
-        {
-            "run_id": run_id,
-            "drill_id": arguments.drill_id,
-            "device": device,
-            "max_hold_seconds": max_hold,
-            "after_ledger_op": arguments.after_ledger_op,
-            "baseline_command_ids": baseline_ids,
-            "armed_at": armed_at,
-        },
-    )
+    # Arming starts this run's record from scratch: a merge would carry a
+    # previous run's matched_row, hold_started_at or boot history into it.
+    state = {
+        "run_id": run_id,
+        "drill_id": arguments.drill_id,
+        "device": device,
+        "max_hold_seconds": max_hold,
+        "after_ledger_op": arguments.after_ledger_op,
+        "baseline_command_ids": baseline_ids,
+        "armed_at": armed_at,
+    }
     write_state(path, record_boot_observation(state, boot_id(), observed_at=armed_at))
     unit = arm_unit(run_id)
     _clear_unit(unit + ".service", run_id)
@@ -639,6 +671,14 @@ def cancel_reboot(arguments: argparse.Namespace) -> None:
     )
 
 
+def clear_state(arguments: argparse.Namespace) -> None:
+    """Remove this run's state file once nothing armed depends on it."""
+
+    run_id = safe_id(arguments.run_id, "run ID")
+    result = clear_state_file(state_path(run_id), current_boot_id=boot_id())
+    emit({"run_id": run_id, **result})
+
+
 def snapshot(arguments: argparse.Namespace) -> None:
     run_id = arguments.run_id
     payload: dict[str, Any] = {
@@ -703,6 +743,10 @@ def parser() -> argparse.ArgumentParser:
     cancel = commands.add_parser("cancel-reboot")
     cancel.add_argument("--run-id", required=True)
     cancel.set_defaults(handler=cancel_reboot)
+
+    clear = commands.add_parser("clear-state")
+    clear.add_argument("--run-id", required=True)
+    clear.set_defaults(handler=clear_state)
 
     show = commands.add_parser("snapshot")
     show.add_argument("--run-id", default="")

@@ -40,6 +40,17 @@ CONFIRMATION = "NET001_COLLECTOR_OUTBOX_REPLAY"
 # restarts; `backoffLimit` is a batch/v1 Job field and is rejected on a Pod.
 POD_DEADLINE_SECONDS = 7200
 HOST_TOOL = Path(__file__).with_name("probes") / "net001_node_probe.py"
+RELEASE_STATE_CONFIGMAP = "gpu-fault-regional-release-state"
+# Ten minutes of outage, five of replay wait, a reconnect drill with its own
+# replay wait, and the firewall/Pod cleanup: fifteen minutes was never enough
+# for the case to finish inside the window it had just checked.
+MAINTENANCE_WINDOW_MINIMUM_SECONDS = 25 * 60
+# kubectl deadlines. An exec that hangs (a node that stopped answering, a
+# host tool stuck on a firewall call) used to hang the runner with the
+# firewall rules still in place; the host rollback timer was the only exit.
+EXEC_TIMEOUT_SECONDS = 120
+DELETE_TIMEOUT_SECONDS = 300
+WAIT_TIMEOUT_SECONDS = 240
 SERVICES = (
     "gpu-fault-kernel-collector.service",
     "gpu-fault-metrics-collector.service",
@@ -103,6 +114,17 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def kubectl_timeout(args: tuple[str, ...] | list[str]) -> float:
+    """The deadline one kubectl invocation gets, from the verb it carries."""
+
+    verbs = set(args)
+    if "delete" in verbs:
+        return DELETE_TIMEOUT_SECONDS
+    if "wait" in verbs:
+        return WAIT_TIMEOUT_SECONDS
+    return EXEC_TIMEOUT_SECONDS
+
+
 def command(
     argv: list[str],
     *,
@@ -110,14 +132,21 @@ def command(
     check: bool = True,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        argv,
-        input=input_text,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=timeout,
-    )
+    if timeout is None:
+        timeout = kubectl_timeout(argv)
+    try:
+        completed = subprocess.run(
+            argv,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CaseError(
+            f"command timed out after {timeout:.0f}s: {' '.join(argv)}"
+        ) from exc
     if check and completed.returncode:
         raise CaseError(
             f"command failed ({completed.returncode}): {' '.join(argv)}: "
@@ -163,11 +192,24 @@ class Runner:
         self.wake_drill_id = f"net001-wake-{self.suffix}"
         self.ips: list[str] = []
         self.baseline: dict[str, Any] | None = None
-        self.blocked = False
-        self.reconnect_blocked = False
+        # Tags whose host rollback timer has been armed. A tag is added the
+        # moment `arm` returns -- before the block, before any connectivity
+        # assertion -- so a failure anywhere after arming still reaches
+        # `cleanup_tag` in `finally` instead of leaving the rules to the timer.
+        self.active_tags: list[str] = []
         self.created = False
         self.worker_pod = ""
+        self.release_id = ""
         self.timeline: list[dict[str, Any]] = []
+        self.soft_checks: dict[str, bool] = {}
+
+    @property
+    def blocked(self) -> bool:
+        return self.tag in self.active_tags
+
+    @property
+    def reconnect_blocked(self) -> bool:
+        return self.reconnect_tag in self.active_tags
 
     def gpu(self, *args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         return command(
@@ -556,6 +598,8 @@ finally:
         for ip in self.ips:
             args.extend(["--ip", ip])
         armed = self.host_tool(*args)
+        if tag not in self.active_tags:
+            self.active_tags.append(tag)
         write_json(self.case_dir / f"{tag}-armed.json", armed)
         args = ["block", "--tag", tag]
         for ip in self.ips:
@@ -577,7 +621,29 @@ finally:
             raise CaseError(f"firewall cleanup left tagged rules: {result['rules']}")
         if not all(result["connectivity"].values()):
             raise CaseError("NLB TCP/443 was not restored by cleanup")
+        if tag in self.active_tags:
+            self.active_tags.remove(tag)
         return result
+
+    def read_release_id(self) -> str:
+        """The release the CPU control plane runs, for binding this evidence."""
+
+        value = json.loads(
+            self.cpu(
+                "-n",
+                self.settings.namespace,
+                "get",
+                "configmap",
+                RELEASE_STATE_CONFIGMAP,
+                "-o",
+                "json",
+            ).stdout
+        )
+        state = json.loads(value["data"]["state.json"])
+        release = str(state.get("release_id") or "")
+        if not release:
+            raise CaseError("release state carries no release_id")
+        return release
 
     def snapshot(self, tag: str | None = None) -> dict[str, Any]:
         args = ["snapshot"]
@@ -603,7 +669,6 @@ finally:
 
     def outage(self) -> None:
         self.arm_and_block(self.tag, 720)
-        self.blocked = True
         started = time.monotonic()
         for index, test_id in enumerate(self.test_ids):
             target = index * 30
@@ -640,8 +705,22 @@ finally:
         if delay > 0:
             time.sleep(delay)
         self.cleanup_tag(self.tag)
-        self.blocked = False
         self.write_event(self.wake_test_id, drill_id=self.wake_drill_id)
+
+    @staticmethod
+    def replay_converged(snapshot: dict[str, Any], store: dict[str, Any]) -> bool:
+        """The replay is done when the three records are in and nothing waits.
+
+        Only the outbox and the evidence decide convergence. Incident state
+        and notification suppression are the processor's and the notifier's
+        business; they are judged in ``validate_final`` as separate checks
+        and must not keep the runner polling for five minutes when the
+        replay itself finished in the first fifteen seconds.
+        """
+
+        return len(store["evidence"]) == 3 and all(
+            value["replayable_count"] == 0 for value in snapshot["outboxes"].values()
+        )
 
     def wait_for_replay(self) -> tuple[dict[str, Any], dict[str, Any]]:
         deadline = time.monotonic() + 300
@@ -652,34 +731,24 @@ finally:
             self.validate_services(last_snapshot)
             last_store = self.store_probe()
             self.record_timeline("recovery", last_snapshot, last_store)
-            if (
-                not self.matching_ids(last_snapshot)
-                and len(last_store["evidence"]) == 3
-                and len(last_store["incidents"]) == 3
-                and len(last_store["notifications"]) == 3
-                and all(
-                    value["replayable_count"] == 0
-                    for value in last_snapshot["outboxes"].values()
-                )
-                and all(
-                    item["result_status"] == "SKIPPED"
-                    for item in last_store["notifications"]
-                )
-            ):
+            if self.replay_converged(last_snapshot, last_store):
                 return last_snapshot, last_store
             time.sleep(15)
-        raise CaseError(
-            "collector replay or drill notification suppression did not converge"
-        )
+        raise CaseError("collector replay did not converge")
 
-    def reconnect_once(self) -> None:
+    def reconnect_once(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Block and unblock once more; the replay must not duplicate anything.
+
+        Returns the snapshot and store read by the replay wait so the caller
+        judges the same documents that satisfied convergence instead of
+        reading both again.
+        """
+
         before = self.store_probe()
         self.arm_and_block(self.reconnect_tag, 60)
-        self.reconnect_blocked = True
         time.sleep(5)
         self.cleanup_tag(self.reconnect_tag)
-        self.reconnect_blocked = False
-        _snapshot, after = self.wait_for_replay()
+        snapshot, after = self.wait_for_replay()
         write_json(
             self.case_dir / "reconnect-dedup.json",
             {"before": before, "after": after},
@@ -688,12 +757,48 @@ finally:
         after_ids = sorted(item["record_id"] for item in after["evidence"])
         if len(after_ids) != 3 or after_ids != before_ids:
             raise CaseError("second reconnect created duplicate evidence")
+        return snapshot, after
+
+    @staticmethod
+    def incident_checks(store: dict[str, Any]) -> dict[str, bool]:
+        """Non-blocking checks on what the processor made of the replayed records.
+
+        Recorded next to the verdict, not folded into it: the case proves the
+        Collector outbox replays and that a monitor-only event never opens a
+        mutation workflow. Whether the incident has already reached RECOVERED
+        or whether the drill notification was suppressed depends on the
+        processor's and the notifier's cadence, which other cases own.
+        """
+
+        incidents = store.get("incidents") or []
+        notifications = store.get("notifications") or []
+        return {
+            "one_incident_per_record": bool(store)
+            and len(incidents) == len(store.get("evidence") or []),
+            "incidents_recovered": bool(incidents)
+            and all(item.get("state") == "RECOVERED" for item in incidents),
+            "incidents_monitor_only": bool(incidents)
+            and all(
+                item.get("decision_disposition") == "MONITOR_ONLY"
+                and item.get("decision_action") == "NO_ACTION"
+                and item.get("official_action") == "IGNORE"
+                for item in incidents
+            ),
+            "one_notification_per_incident": bool(incidents)
+            and len(notifications) == len(incidents),
+            "drill_notifications_suppressed": bool(store)
+            and all(
+                item.get("result_status") == "SKIPPED"
+                and not item.get("provider_message_id_present")
+                for item in notifications
+            ),
+        }
 
     def validate_final(
         self,
         snapshot: dict[str, Any],
         store: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, bool]:
         self.validate_services(snapshot)
         if self.matching_ids(snapshot):
             raise CaseError("test events remain in the kernel outbox")
@@ -701,26 +806,8 @@ finally:
         if len(evidence_ids) != 3 or len(set(evidence_ids)) != 3:
             raise CaseError(f"evidence records are not exactly three: {evidence_ids}")
         for incident in store["incidents"]:
-            if incident["state"] != "RECOVERED":
-                raise CaseError(f"incident is not recovered: {incident}")
             if incident["workflow_request_id"] is not None:
                 raise CaseError(f"NET-001 created a workflow: {incident}")
-            if incident["decision_disposition"] != "MONITOR_ONLY":
-                raise CaseError(f"unexpected decision disposition: {incident}")
-            if incident["decision_action"] != "NO_ACTION":
-                raise CaseError(f"unexpected decision action: {incident}")
-            if incident["official_action"] != "IGNORE":
-                raise CaseError(f"unexpected official action: {incident}")
-        for notification in store["notifications"]:
-            if notification["result_status"] != "SKIPPED":
-                raise CaseError(
-                    f"drill notification was not suppressed: {notification}"
-                )
-            if notification["provider_message_id_present"]:
-                raise CaseError(
-                    f"drill notification reached a provider: {notification}"
-                )
-
         if self.baseline is None:
             raise CaseError("host baseline is missing")
         for name in ("dcgm", "host", "fabric-manager"):
@@ -729,6 +816,9 @@ finally:
                 raise CaseError(
                     f"{name} outbox still has {current_replayable} replayable records"
                 )
+        self.soft_checks = self.incident_checks(store)
+        write_json(self.case_dir / "incident-checks.json", self.soft_checks)
+        return self.soft_checks
 
     def cleanup_resources(self) -> dict[str, bool]:
         if self.created:
@@ -792,6 +882,55 @@ finally:
             ),
         }
 
+    def result_checks(
+        self,
+        final_snapshot: dict[str, Any],
+        final_store: dict[str, Any],
+    ) -> dict[str, bool]:
+        outage = [
+            item for item in self.timeline if item["phase"].startswith("outage-minute-")
+        ]
+        return {
+            "collector_services_active_without_restart": bool(final_snapshot)
+            and all(
+                final_snapshot["services"][service].get("ActiveState") == "active"
+                and final_snapshot["services"][service].get("NRestarts")
+                == (
+                    self.baseline["services"][service].get("NRestarts")
+                    if self.baseline is not None
+                    else None
+                )
+                for service in SERVICES
+            ),
+            "outbox_contains_exact_test_ids_during_outage": bool(outage)
+            and all(
+                item["matching_outbox_ids"] == sorted(self.test_ids) for item in outage
+            ),
+            "control_plane_receives_nothing_during_outage": bool(outage)
+            and all(
+                item["evidence_count"] == 0
+                and item["incident_count"] == 0
+                and item["notification_count"] == 0
+                for item in outage
+            ),
+            "three_unique_records_after_recovery": (
+                len(final_store.get("evidence", [])) == 3
+            ),
+            # `all(...)` over an empty store is vacuously true; a run that
+            # never read the store must not report these as satisfied.
+            "no_mutation_workflow": bool(final_store)
+            and all(
+                item.get("workflow_request_id") is None
+                for item in final_store.get("incidents", [])
+            ),
+            "drill_notifications_suppressed": bool(final_store)
+            and all(
+                item.get("result_status") == "SKIPPED"
+                and not item.get("provider_message_id_present")
+                for item in final_store.get("notifications", [])
+            ),
+        }
+
     def run(self) -> int:
         started_at = utc_now()
         verdict = "FAIL"
@@ -802,12 +941,16 @@ finally:
         try:
             if not self.settings.predecessor.get("valid", False):
                 raise CaseError("formal predecessor evidence is not PASS")
-            if datetime.now(timezone.utc).timestamp() + 900 >= (
-                self.maintenance_window_end.timestamp()
+            if (
+                datetime.now(timezone.utc).timestamp()
+                + MAINTENANCE_WINDOW_MINIMUM_SECONDS
+                >= self.maintenance_window_end.timestamp()
             ):
                 raise CaseError(
-                    "maintenance window must have at least 15 minutes remaining"
+                    "maintenance window must have at least "
+                    f"{MAINTENANCE_WINDOW_MINIMUM_SECONDS // 60} minutes remaining"
                 )
+            self.release_id = self.read_release_id()
             self.create_resources()
             self.validate_preflight()
             print("NET-001 preflight: PASS", flush=True)
@@ -815,30 +958,33 @@ finally:
             print("NET-001 10-minute outage: PASS", flush=True)
             final_snapshot, final_store = self.wait_for_replay()
             print("NET-001 replay: PASS", flush=True)
-            self.reconnect_once()
-            final_snapshot = self.snapshot()
-            final_store = self.store_probe()
+            final_snapshot, final_store = self.reconnect_once()
             self.validate_final(final_snapshot, final_store)
             verdict = "PASS"
         except Exception as exc:
             error = str(exc)
             print(f"NET-001 STOP: {error}", file=sys.stderr, flush=True)
         finally:
+            for tag in list(self.active_tags):
+                try:
+                    self.cleanup_tag(tag)
+                except Exception as cleanup_error:
+                    error = (
+                        f"{error}; cleanup failed: {cleanup_error}"
+                        if error
+                        else f"cleanup failed: {cleanup_error}"
+                    )
+                    verdict = "FAIL"
             try:
-                if self.blocked:
-                    self.cleanup_tag(self.tag)
-                    self.blocked = False
-                if self.reconnect_blocked:
-                    self.cleanup_tag(self.reconnect_tag)
-                    self.reconnect_blocked = False
+                residuals = self.cleanup_resources()
             except Exception as cleanup_error:
+                residuals = {"pod": True, "configmap": True}
                 error = (
-                    f"{error}; cleanup failed: {cleanup_error}"
+                    f"{error}; resource cleanup failed: {cleanup_error}"
                     if error
-                    else f"cleanup failed: {cleanup_error}"
+                    else f"resource cleanup failed: {cleanup_error}"
                 )
                 verdict = "FAIL"
-            residuals = self.cleanup_resources()
             if any(residuals.values()):
                 error = (
                     f"{error}; probe resources remain after cleanup"
@@ -854,6 +1000,7 @@ finally:
             "verdict": verdict,
             "started_at": started_at,
             "ended_at": utc_now(),
+            "release_id": self.release_id or None,
             "cluster_id": self.settings.cluster_id,
             "target_node": self.settings.target_node,
             "region": self.settings.region,
@@ -866,45 +1013,9 @@ finally:
             "wake_drill_id": self.wake_drill_id,
             "endpoint_ipv4": self.ips,
             "error": error,
-            "checks": {
-                "collector_services_active_without_restart": bool(final_snapshot)
-                and all(
-                    final_snapshot["services"][service].get("ActiveState") == "active"
-                    and final_snapshot["services"][service].get("NRestarts")
-                    == (
-                        self.baseline["services"][service].get("NRestarts")
-                        if self.baseline is not None
-                        else None
-                    )
-                    for service in SERVICES
-                ),
-                "outbox_contains_exact_test_ids_during_outage": bool(self.timeline)
-                and all(
-                    item["matching_outbox_ids"] == sorted(self.test_ids)
-                    for item in self.timeline
-                    if item["phase"].startswith("outage-minute-")
-                ),
-                "control_plane_receives_nothing_during_outage": bool(self.timeline)
-                and all(
-                    item["evidence_count"] == 0
-                    and item["incident_count"] == 0
-                    and item["notification_count"] == 0
-                    for item in self.timeline
-                    if item["phase"].startswith("outage-minute-")
-                ),
-                "three_unique_records_after_recovery": (
-                    len(final_store.get("evidence", [])) == 3
-                ),
-                "no_mutation_workflow": all(
-                    item.get("workflow_request_id") is None
-                    for item in final_store.get("incidents", [])
-                ),
-                "drill_notifications_suppressed": all(
-                    item.get("result_status") == "SKIPPED"
-                    and not item.get("provider_message_id_present")
-                    for item in final_store.get("notifications", [])
-                ),
-            },
+            "checks": self.result_checks(final_snapshot, final_store),
+            # Judged in validate_final but not part of the verdict.
+            "non_blocking_checks": self.soft_checks,
             "probe_residuals": residuals,
             "limitations": [
                 "Collector disk outboxes are bounded to 1000 records per channel.",
@@ -1003,8 +1114,12 @@ def main() -> int:
                     "to the resolved control-plane addresses, and write three "
                     "monitor-only XID 63 records to /dev/kmsg"
                 ),
+                "maintenance_window_minimum_minutes": (
+                    MAINTENANCE_WINDOW_MINIMUM_SECONDS // 60
+                ),
                 "stop_conditions": [
                     "formal predecessor evidence is not PASS",
+                    "the maintenance window has under 25 minutes remaining",
                     "the node has a business workload or is not healthy",
                     "the rollback timer is not active before network rejection",
                     "any Collector service restarts",

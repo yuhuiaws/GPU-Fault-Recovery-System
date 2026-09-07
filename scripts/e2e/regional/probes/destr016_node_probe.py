@@ -398,6 +398,19 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
     )
 
 
+def checked_probe_script(value: str) -> str:
+    """The path the watcher unit will run must be *this* file, on the host.
+
+    Compared as a resolved full path, not a basename: a Pod-side
+    ``/host/run/...`` path has the right basename while the systemd unit,
+    which runs on the host, cannot find it.
+    """
+
+    if Path(value).resolve() != Path(__file__).resolve():
+        raise ProbeError("probe script identity mismatch")
+    return value
+
+
 def arm_holder(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id, "run ID")
     safe_id(arguments.drill_id, "drill ID")
@@ -405,8 +418,7 @@ def arm_holder(arguments: argparse.Namespace) -> None:
     max_hold = checked_max_hold(arguments.max_hold_seconds)
     if arguments.after_ledger_op not in ARM_LEDGER_OPERATIONS:
         raise ProbeError("after-ledger-op is not permitted for arming")
-    if Path(arguments.probe_script).name != Path(__file__).name:
-        raise ProbeError("probe script identity mismatch")
+    checked_probe_script(arguments.probe_script)
     rows = ledger_rows()
     baseline_ids = [
         row["command_id"]

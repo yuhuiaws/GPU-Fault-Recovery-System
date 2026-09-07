@@ -158,6 +158,26 @@ def test_release_is_refused_for_a_reserved_or_quarantined_node() -> None:
     assert helper.release_refusals(_node("node-spare")) == []
 
 
+def test_release_is_refused_while_the_pool_still_records_an_allocation() -> None:
+    # The pool state outlives the reservation annotation on some paths, and an
+    # ALLOCATED node is carrying the failed-over job: dropping its spare label
+    # takes it out of the pool while the control plane still holds it.
+    allocated = _node(
+        "node-spare", annotations={SPARE_POOL_STATE_ANNOTATION: "ALLOCATED"}
+    )
+
+    assert helper.release_refusals(allocated) == [
+        "node is ALLOCATED by the spare pool; release it through the case"
+    ]
+    for state in (None, "AVAILABLE"):
+        assert (
+            helper.release_refusals(
+                _node("node-spare", annotations={SPARE_POOL_STATE_ANNOTATION: state})
+            )
+            == []
+        )
+
+
 def test_release_restores_the_recorded_baseline_not_the_current_state(
     tmp_path: Path,
 ) -> None:

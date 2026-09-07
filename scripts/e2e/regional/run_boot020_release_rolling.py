@@ -61,6 +61,26 @@ class InjectedAcceptanceFailure(RuntimeError):
     pass
 
 
+class AcceptanceCheckError(RuntimeError):
+    """A live observation contradicted the BOOT-020 contract.
+
+    Raised explicitly rather than through ``assert``: ``python -O`` strips
+    ``assert`` statements, and a runner whose checks vanish under an
+    optimisation flag would report a constant PASS.
+    """
+
+
+def _require(condition: bool, message: str, context: Any = None) -> None:
+    if not condition:
+        detail = f"{message}: {context!r}" if context is not None else message
+        raise AcceptanceCheckError(detail)
+
+
+EXECUTOR_DEPLOYMENT = regional_deployment_inventory.GPU_EXECUTOR_DEPLOYMENT
+REQUIRED_EXECUTOR_PIN = "required-regional-executor-artifact-sha256"
+COMPATIBLE_EXECUTOR_PINS = "compatible-regional-executor-artifact-sha256s"
+
+
 class ReleaseRollingBackend(Protocol):
     def classify(self, scenario: str) -> dict[str, Any]: ...
 
@@ -78,51 +98,122 @@ class ReleaseRollingBackend(Protocol):
 
 
 def _assert_kind(scenario: str, diff: dict[str, Any]) -> None:
-    assert diff["kind"] == EXPECTED_KINDS[scenario], (scenario, diff)
+    _require(
+        diff["kind"] == EXPECTED_KINDS[scenario], "classification", (scenario, diff)
+    )
 
 
 def _assert_noop(before: dict[str, Any], after: dict[str, Any]) -> None:
-    assert before["live"] == after["live"], (before, after)
-    assert before["cpu_generations"] == after["cpu_generations"], (before, after)
-    assert before["gpu_generations"] == after["gpu_generations"], (before, after)
+    _require(
+        before["live"] == after["live"], "NOOP changed live state", (before, after)
+    )
+    _require(
+        before["cpu_generations"] == after["cpu_generations"],
+        "NOOP rolled a CPU Deployment",
+        (before, after),
+    )
+    _require(
+        before["gpu_generations"] == after["gpu_generations"],
+        "NOOP rolled a GPU Deployment",
+        (before, after),
+    )
 
 
 def _assert_control_plane_only(
     before: dict[str, Any],
     after: dict[str, Any],
 ) -> None:
-    assert before["live"]["clusters"] == after["live"]["clusters"], (before, after)
-    assert before["gpu_generations"] == after["gpu_generations"], (before, after)
-    assert before["cpu_generations"] != after["cpu_generations"], (before, after)
+    _require(
+        before["live"]["clusters"] == after["live"]["clusters"],
+        "CONTROL_PLANE_ONLY changed a GPU cluster",
+        (before, after),
+    )
+    _require(
+        before["gpu_generations"] == after["gpu_generations"],
+        "CONTROL_PLANE_ONLY rolled a GPU Deployment",
+        (before, after),
+    )
+    _require(
+        before["cpu_generations"] != after["cpu_generations"],
+        "CONTROL_PLANE_ONLY rolled no CPU Deployment",
+        (before, after),
+    )
+
+
+def _generation_changes(
+    before: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
+) -> dict[str, set[str]]:
+    """Per cluster, the GPU Deployments whose generation moved."""
+
+    changes: dict[str, set[str]] = {}
+    for cluster_id in set(before) | set(after):
+        old = before.get(cluster_id) or {}
+        new = after.get(cluster_id) or {}
+        moved = {name for name in set(old) | set(new) if old.get(name) != new.get(name)}
+        if moved:
+            changes[cluster_id] = moved
+    return changes
 
 
 def _assert_data_plane_changed(
     before: dict[str, Any],
     after: dict[str, Any],
+    *,
+    scenario: str,
 ) -> None:
     before_clusters = before["live"]["clusters"]
     after_clusters = after["live"]["clusters"]
-    assert set(before_clusters) == set(after_clusters), (before, after)
-    changed = []
-    for cluster_id in before_clusters:
-        if before_clusters[cluster_id] != after_clusters[cluster_id]:
-            changed.append(cluster_id)
-    assert changed, "DATA_PLANE_COMPATIBLE did not change any GPU data plane"
+    _require(
+        set(before_clusters) == set(after_clusters),
+        "DATA_PLANE_COMPATIBLE changed the cluster set",
+        (before, after),
+    )
+    changed = [
+        cluster_id
+        for cluster_id in before_clusters
+        if before_clusters[cluster_id] != after_clusters[cluster_id]
+    ]
+    _require(bool(changed), "DATA_PLANE_COMPATIBLE did not change any GPU data plane")
+    generations = _generation_changes(
+        before["gpu_generations"], after["gpu_generations"]
+    )
+    if scenario == "executor":
+        # An executor-only release rolls the executor Deployment and nothing
+        # else on the data plane; a collector or watcher generation moving
+        # means the release touched more than its classification claims.
+        _require(
+            bool(generations),
+            "executor-only release rolled no GPU Deployment",
+            (before, after),
+        )
+        for cluster_id, moved in generations.items():
+            _require(
+                moved == {EXECUTOR_DEPLOYMENT},
+                f"executor-only release rolled non-executor Deployments in {cluster_id}",
+                sorted(moved),
+            )
 
 
 def _assert_rollback_rto(scenario: str, result: dict[str, Any]) -> None:
     timing = result.get("rollback_timing")
-    assert isinstance(timing, dict), (scenario, result)
+    _require(isinstance(timing, dict), "rollback timing missing", (scenario, result))
+    timing = dict(timing or {})
     safe = float(timing["t_safe_seconds"])
     full = float(timing["t_full_seconds"])
-    assert 0 <= safe <= full, (scenario, timing)
-    assert safe <= RTO_LIMITS[scenario]["safe"], (scenario, timing)
-    assert full <= RTO_LIMITS[scenario]["full"], (scenario, timing)
+    _require(0 <= safe <= full, "rollback timing order", (scenario, timing))
+    _require(
+        safe <= RTO_LIMITS[scenario]["safe"], "T_safe over limit", (scenario, timing)
+    )
+    _require(
+        full <= RTO_LIMITS[scenario]["full"], "T_full over limit", (scenario, timing)
+    )
 
 
 def _assert_rollback_scope(scenario: str, result: dict[str, Any]) -> None:
     plan = result.get("rollback_plan")
-    assert isinstance(plan, dict), (scenario, result)
+    _require(isinstance(plan, dict), "rollback plan missing", (scenario, result))
+    plan = dict(plan or {})
     clusters = plan.get("clusters") or {}
     # The rollback plan names data-plane components in lower case
     # ("collector", "executor", "reconciler", "watcher", "agent"); live
@@ -131,26 +222,88 @@ def _assert_rollback_scope(scenario: str, result: dict[str, Any]) -> None:
     components = {
         str(component).lower() for values in clusters.values() for component in values
     }
+    global_components = {
+        str(component).lower() for component in plan.get("global_components") or []
+    }
+    # An empty plan means the rollback had nothing to restore, which for an
+    # injected failure after a real change is not a rollback at all.
+    _require(
+        bool(components) or bool(global_components),
+        "rollback plan names no components",
+        plan,
+    )
     if scenario == "control_plane":
-        assert plan.get("restores_data_plane") is False, plan
+        _require(plan.get("restores_data_plane") is False, "CPU rollback scope", plan)
+        _require(bool(global_components), "CPU rollback has no global components", plan)
     elif scenario == "executor":
-        assert "executor" in components, plan
-        assert "agent" not in components, plan
+        _require("executor" in components, "executor rollback scope", plan)
+        _require("agent" not in components, "executor rollback touched agents", plan)
     elif scenario == "agent":
-        assert "agent" in components, plan
-        assert plan.get("needs_controller") is True, plan
+        _require("agent" in components, "agent rollback scope", plan)
+        _require(
+            plan.get("needs_controller") is True, "agent rollback controller", plan
+        )
+    elif scenario == "full":
+        _require(bool(components), "FULL rollback restored no data plane", plan)
 
 
 def _assert_resume_rto(scenario: str, result: dict[str, Any]) -> None:
     duration = float(result["operation_duration_seconds"])
-    assert duration <= RTO_LIMITS[scenario]["resume"], (scenario, result)
+    _require(
+        duration <= RTO_LIMITS[scenario]["resume"],
+        "resume over limit",
+        (scenario, result),
+    )
 
 
 def _assert_rollback_snapshot(
     before: dict[str, Any],
     rolled_back: dict[str, Any],
 ) -> None:
-    assert rolled_back["live"] == before["live"], (before, rolled_back)
+    _require(
+        rolled_back["live"] == before["live"],
+        "rollback did not restore live state",
+        (before, rolled_back),
+    )
+
+
+def _pins(result: dict[str, Any]) -> dict[str, Any]:
+    pins = result.get("pins")
+    _require(isinstance(pins, dict), "deploy result carries no pins", result)
+    pins = dict(pins or {})
+    for key in ("required", "compatible", "candidate", "previous_required"):
+        _require(key in pins, f"pins lack {key}", pins)
+    return pins
+
+
+def _assert_executor_pins(result: dict[str, Any], *, phase: str) -> None:
+    """The two-phase executor pin window at each executor-stage checkpoint.
+
+    Staging (``cpu-staged``) keeps the previous artifact required and adds the
+    candidate to the compatible set, so old and new executors both pass
+    readiness while the data plane rolls; finalize promotes the candidate to
+    required and empties the window; a rollback restores the previous required
+    pin and drops the candidate. Reading the state's phase alone does not show
+    which of these the metadata ConfigMap actually holds.
+    """
+
+    pins = _pins(result)
+    required = str(pins["required"] or "")
+    compatible = {str(item) for item in pins["compatible"] or []}
+    candidate = str(pins["candidate"] or "")
+    previous = str(pins["previous_required"] or "")
+    _require(len(candidate) == 64, "candidate executor pin missing", pins)
+    if phase == "rolled-back":
+        _require(bool(previous) and required == previous, "rollback restored pin", pins)
+        _require(candidate not in compatible, "rollback kept the candidate", pins)
+    elif phase == "staged":
+        _require(bool(previous) and required == previous, "staged required pin", pins)
+        _require(candidate in compatible, "staged window lacks candidate", pins)
+    elif phase == "finalized":
+        _require(required == candidate, "finalized required pin", pins)
+        _require(not compatible, "finalized window not empty", pins)
+    else:
+        raise ValueError(f"unknown pin phase: {phase}")
 
 
 STAGES = ("noop", "control_plane", "executor", "agent", "full")
@@ -209,7 +362,7 @@ def _assert_next_noop(
         f"{scenario}_next_classification",
         lambda: backend.classify(scenario),
     )
-    assert following["kind"] == "NOOP", following
+    _require(following["kind"] == "NOOP", "next classification", following)
 
 
 class _SnapshotChain:
@@ -289,7 +442,7 @@ def _stage_noop(
         "noop_apply",
         lambda: backend.deploy("noop", diff=noop_diff),
     )
-    assert noop_apply["phase"] == "complete", noop_apply
+    _require(noop_apply["phase"] == "complete", "noop phase", noop_apply)
     noop_after = chain.after(backend, recorder, "noop")
     _assert_noop(noop_before, noop_after)
 
@@ -314,7 +467,9 @@ def _stage_control_plane(
             auto_rollback=True,
         ),
     )
-    assert control_failed["phase"] == "rolled-back", control_failed
+    _require(
+        control_failed["phase"] == "rolled-back", "CPU rollback phase", control_failed
+    )
     _assert_rollback_scope("control_plane", control_failed)
     _assert_rollback_rto("control_plane", control_failed)
     control_rolled_back = recorder.stage(
@@ -326,7 +481,7 @@ def _stage_control_plane(
         "control_plane_apply",
         lambda: backend.deploy("control_plane", diff=control_diff),
     )
-    assert control_apply["phase"] == "complete", control_apply
+    _require(control_apply["phase"] == "complete", "CPU apply phase", control_apply)
     control_after = chain.after(backend, recorder, "control_plane")
     _assert_control_plane_only(control_before, control_after)
     _assert_next_noop(backend, recorder, "control_plane")
@@ -352,9 +507,14 @@ def _stage_executor(
             auto_rollback=True,
         ),
     )
-    assert executor_rolled_back["phase"] == "rolled-back", executor_rolled_back
+    _require(
+        executor_rolled_back["phase"] == "rolled-back",
+        "executor rollback phase",
+        executor_rolled_back,
+    )
     _assert_rollback_scope("executor", executor_rolled_back)
     _assert_rollback_rto("executor", executor_rolled_back)
+    _assert_executor_pins(executor_rolled_back, phase="rolled-back")
     executor_rollback_snapshot = recorder.stage(
         "executor_rollback_snapshot",
         lambda: backend.snapshot("executor"),
@@ -369,8 +529,17 @@ def _stage_executor(
             auto_rollback=False,
         ),
     )
-    assert executor_failed["phase"] == "failed", executor_failed
-    assert executor_failed["injected_failure"] == "cpu-staged", executor_failed
+    _require(executor_failed["phase"] == "failed", "interrupted phase", executor_failed)
+    _require(
+        executor_failed["injected_failure"] == "cpu-staged",
+        "interrupted at the wrong phase",
+        executor_failed,
+    )
+    _assert_executor_pins(executor_failed, phase="staged")
+    executor_interrupted = recorder.stage(
+        "executor_interrupted_snapshot",
+        lambda: backend.snapshot("executor"),
+    )
     executor_resumed = recorder.stage(
         "executor_resumed",
         lambda: backend.deploy(
@@ -380,10 +549,18 @@ def _stage_executor(
             auto_rollback=False,
         ),
     )
-    assert executor_resumed["phase"] == "complete", executor_resumed
+    _require(executor_resumed["phase"] == "complete", "resume phase", executor_resumed)
     _assert_resume_rto("executor", executor_resumed)
+    _assert_executor_pins(executor_resumed, phase="finalized")
     executor_after = chain.after(backend, recorder, "executor")
-    _assert_data_plane_changed(executor_before, executor_after)
+    # The interrupted attempt already staged the CPU side; the resume finishes
+    # the data plane and finalizes pins without rolling the CPU again.
+    _require(
+        executor_interrupted["cpu_generations"] == executor_after["cpu_generations"],
+        "resume rolled the CPU Deployments a second time",
+        (executor_interrupted["cpu_generations"], executor_after["cpu_generations"]),
+    )
+    _assert_data_plane_changed(executor_before, executor_after, scenario="executor")
     _assert_next_noop(backend, recorder, "executor")
 
 
@@ -407,7 +584,9 @@ def _stage_agent(
             auto_rollback=True,
         ),
     )
-    assert agent_failed["phase"] == "rolled-back", agent_failed
+    _require(
+        agent_failed["phase"] == "rolled-back", "agent rollback phase", agent_failed
+    )
     _assert_rollback_scope("agent", agent_failed)
     _assert_rollback_rto("agent", agent_failed)
     agent_rolled_back = recorder.stage(
@@ -419,9 +598,9 @@ def _stage_agent(
         "agent_apply_after_rollback",
         lambda: backend.deploy("agent", diff=agent_diff),
     )
-    assert agent_apply["phase"] == "complete", agent_apply
+    _require(agent_apply["phase"] == "complete", "agent apply phase", agent_apply)
     agent_after = chain.after(backend, recorder, "agent")
-    _assert_data_plane_changed(agent_before, agent_after)
+    _assert_data_plane_changed(agent_before, agent_after, scenario="agent")
     _assert_next_noop(backend, recorder, "agent")
 
 
@@ -445,8 +624,13 @@ def _stage_full(
             auto_rollback=True,
         ),
     )
-    assert full_failed["phase"] == "rolled-back", full_failed
-    assert full_failed["injected_failure"] == "data-converged", full_failed
+    _require(full_failed["phase"] == "rolled-back", "FULL rollback phase", full_failed)
+    _require(
+        full_failed["injected_failure"] == "data-converged",
+        "FULL interrupted at the wrong phase",
+        full_failed,
+    )
+    _assert_rollback_scope("full", full_failed)
     _assert_rollback_rto("full", full_failed)
     full_rolled_back = recorder.stage(
         "full_rollback_snapshot",
@@ -457,9 +641,13 @@ def _stage_full(
         "full_apply_after_rollback",
         lambda: backend.deploy("full", diff=full_diff),
     )
-    assert full_apply["phase"] == "complete", full_apply
+    _require(full_apply["phase"] == "complete", "FULL apply phase", full_apply)
     full_after = chain.after(backend, recorder, "full")
-    assert full_after["live"] != full_before["live"], (full_before, full_after)
+    _require(
+        full_after["live"] != full_before["live"],
+        "FULL changed nothing",
+        (full_before, full_after),
+    )
     _assert_next_noop(backend, recorder, "full")
 
 
@@ -674,7 +862,7 @@ class LiveReleaseRollingBackend:
         scenario: str,
         *,
         auto_rollback: bool | None = None,
-    ):
+    ) -> Any:
         config = self.config_module.ReleaseConfig.load(self.configs[scenario])
         if auto_rollback is not None:
             config = replace(config, auto_rollback=auto_rollback)
@@ -683,7 +871,7 @@ class LiveReleaseRollingBackend:
     def classify(self, scenario: str) -> dict[str, Any]:
         release = self._release(scenario)
         state = release._load_state()
-        return self.diff_module.classify_release(release, state).as_dict()
+        return dict(self.diff_module.classify_release(release, state).as_dict())
 
     def _next_deploy(self, release: Any, state: dict[str, Any]) -> Any:
         """What ``build_release_summary(release)["next_deploy"]`` would hold.
@@ -741,7 +929,31 @@ class LiveReleaseRollingBackend:
             "next_deploy": next_deploy,
         }
 
-    def _diff(self, value: dict[str, Any]):
+    def _pin_window(self, release: Any, state: dict[str, Any]) -> dict[str, Any]:
+        """The executor pin window as the metadata ConfigMap holds it now.
+
+        ``previous_required`` comes from the release state's ``previous``
+        snapshot (what the transaction captured before mutating anything) and
+        ``candidate`` from the config being rolled out, so a stage can say
+        which of staged / finalized / rolled-back the live window is in.
+        """
+
+        metadata = release._config_map_data("gpu-fault-release-metadata")
+        previous = state.get("previous") or {}
+        previous_metadata = previous.get("metadata") or {}
+        compatible = [
+            item.strip()
+            for item in str(metadata.get(COMPATIBLE_EXECUTOR_PINS) or "").split(",")
+            if item.strip()
+        ]
+        return {
+            "required": metadata.get(REQUIRED_EXECUTOR_PIN),
+            "compatible": compatible,
+            "candidate": release.executor_wheel_sha,
+            "previous_required": previous_metadata.get(REQUIRED_EXECUTOR_PIN),
+        }
+
+    def _diff(self, value: dict[str, Any]) -> Any:
         return self.diff_module.ReleaseDiff(
             kind=self.diff_module.ReleaseChangeKind(value["kind"]),
             changed=frozenset(value.get("changed") or []),
@@ -787,6 +999,7 @@ class LiveReleaseRollingBackend:
                 "release_diff": diff,
                 "rollback_plan": state.get("rollback_plan"),
                 "rollback_timing": state.get("rollback_timing"),
+                "pins": self._pin_window(release, state),
                 "operation_duration_seconds": time.monotonic() - started,
             }
         state = release._load_state()
@@ -797,6 +1010,7 @@ class LiveReleaseRollingBackend:
             "release_diff": diff,
             "rollback_plan": state.get("rollback_plan"),
             "rollback_timing": state.get("rollback_timing"),
+            "pins": self._pin_window(release, state),
             "operation_duration_seconds": time.monotonic() - started,
         }
 

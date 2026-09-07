@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -77,6 +77,8 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -224,7 +226,9 @@ def plan_identity(preflight: dict[str, Any], *, node: str) -> dict[str, Any]:
         "node_uid": snapshot.get("uid"),
         "node_boot_id": snapshot.get("boot_id"),
         "agent_generation": (store.get("agent") or {}).get("generation"),
-        "agent_incarnation_id": (store.get("agent") or {}).get("incarnation_id"),
+        # ``AgentRecord.agent_incarnation_id`` -- the field the registry retires
+        # on re-registration; there is no ``incarnation_id``.
+        "agent_incarnation_id": (store.get("agent") or {}).get("agent_incarnation_id"),
         "runtime_profile_version": (store.get("profile") or {}).get("profile_version"),
         "runtime_identity": preflight.get("runtime_identity"),
         "node": node,
@@ -324,6 +328,10 @@ class Settings:
     reboot_delay_seconds: int
     max_hold_seconds: int
     predecessor_path: Path
+    # The attempt the plan and the execution share; the preflight derives the
+    # probe identity from it, so a second attempt never reads the first one's
+    # on-node state.
+    attempt: int = 1
 
     def environment(self) -> dict[str, str]:
         return {
@@ -363,12 +371,13 @@ def configure(arguments: argparse.Namespace) -> Settings:
         reboot_delay_seconds=int(arguments.reboot_delay_seconds),
         max_hold_seconds=int(arguments.max_hold_seconds),
         predecessor_path=predecessor,
+        attempt=int(arguments.attempt),
     )
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     identity = plan_identity(preflight, node=settings.node)
-    return {
+    details: dict[str, Any] = {
         "risk": "destructive",
         "predecessor": preflight.get("predecessor"),
         "node": settings.node,
@@ -417,12 +426,31 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "no_provider_reboot_or_replacement_is_authorized": True,
         },
     }
+    # The --plan's focused-test result is recorded with a source digest so
+    # --execute can reuse it instead of paying for the same run twice.
+    record_focused_tests(
+        details,
+        dict(preflight.get("focused_tests") or {"passed": False}),
+    )
+    return details
 
 
 # --------------------------------------------------------------------------- #
 # Live preflight (not unit-tested; delegates every assertion to the pure funcs)
 # --------------------------------------------------------------------------- #
-def focused_tests(case_dir: Path) -> dict[str, Any]:
+def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
+    """Run the focused pytest, or reuse the --plan's result in --execute.
+
+    ``reuse`` is set by the execution path only: the result recorded in
+    ``plan.json`` is taken when it passed against exactly this source tree
+    (``reusable_focused_tests`` compares the digest), so the same tests are
+    not paid for twice minutes apart; any edit in between forces a rerun.
+    """
+
+    if reuse:
+        recorded = reusable_focused_tests(case_dir / "plan.json")
+        if recorded is not None:
+            return {**recorded, "focused_tests_reused": True}
     command = [
         sys.executable,
         "-m",
@@ -467,7 +495,12 @@ def control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
     }
 
 
-def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
+def read_only_preflight(
+    settings: Settings,
+    case_dir: Path,
+    *,
+    reuse_focused_tests: bool = False,
+) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
     node_snapshot = regional.node_snapshot(settings.node)
     state = regional.store_snapshot(
@@ -475,10 +508,14 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         observed_after=datetime.now(timezone.utc) - timedelta(hours=1),
     )
     runtime_identity = regional.runtime_identity()
-    tests = focused_tests(case_dir)
-    predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
+    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
+    predecessor = predecessor_evidence(
+        settings.predecessor_path,
+        PREDECESSOR_CASE_ID,
+        **regional.evidence_identity(),
+    )
     env = control_env(regional)
-    run_id = derived_identity(case_dir.parents[1], 1)
+    run_id = derived_identity(case_dir.parents[1], settings.attempt)
     host = _host_probe(settings, run_id)
     fence = _fence_probe(settings, run_id)
     try:
@@ -531,7 +568,9 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
             lifetime_seconds=env["node_lifetime_seconds"],
         )
     )
-    if not predecessor.get("pass"):
+    # ``predecessor_evidence`` reports ``valid`` (PASS, or an operator-selected
+    # scope that lets the run go); there is no ``pass`` key.
+    if not predecessor.get("valid"):
         errors.append(f"{PREDECESSOR_CASE_ID} evidence is not PASS")
     if not tests["passed"]:
         errors.append("focused tests did not pass")
@@ -678,7 +717,7 @@ def _prepare_live_run(
 ) -> _LiveRun:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -739,8 +778,10 @@ def _start_probes(run: _LiveRun) -> None:
         str(settings.max_hold_seconds),
         "--run-id",
         run.run_id,
+        # The path the probe has *on the host*: the watch-ledger unit runs it
+        # under systemd, outside the Pod's /host mount.
         "--probe-script",
-        f"/host/run/gpu-fault-host-probe-{run.fence.pod.rsplit('-', 1)[-1]}.py",
+        run.fence.host_script,
         timeout=180,
     )
     run.holder_armed = True
@@ -787,12 +828,20 @@ def _inject(run: _LiveRun) -> dict[str, Any]:
 
 
 def _store_state(run: _LiveRun, *, queue_attempts: int = 1) -> dict[str, Any]:
-    return run.regional.store_snapshot(
+    state = run.regional.store_snapshot(
         node=run.settings.node,
         marker=run.marker,
         observed_after=run.started_at,
         queue_attempts=queue_attempts,
+        workflow_request_ids=(
+            [run.workflow_request_id] if run.workflow_request_id else None
+        ),
     )
+    # Pin the workflow as soon as it exists so every later read names it.
+    request_id = str((state.get("workflow") or {}).get("request_id") or "")
+    if request_id and not run.workflow_request_id:
+        run.workflow_request_id = request_id
+    return state
 
 
 def _wait_for_maintenance_pin(run: _LiveRun) -> dict[str, Any]:
@@ -848,17 +897,62 @@ def _wait_for_waiting_verify(run: _LiveRun) -> dict[str, Any]:
     )
 
 
-def _arm_out_of_band_reboot(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
+def waiting_elapsed_seconds(
+    workflow: dict[str, Any],
+    *,
+    operation: str,
+    now: datetime,
+) -> float:
+    """How long ``operation`` has already been WAITING, from its own record.
+
+    The per-step waiting cap counts from the moment the step parked, not from
+    the moment the runner looks; a reboot placed against the whole cap would
+    land after the cap when the runner arrives late.
+    """
+
+    # Read the raw records: the shared ``waiting_step_executions`` projection
+    # drops ``started_at``.
+    waiting = [
+        item
+        for item in workflow.get("step_executions") or []
+        if isinstance(item, dict)
+        and item.get("status") == "WAITING"
+        and item.get("operation") == operation
+    ]
+    starts = []
+    for item in waiting:
+        raw = item.get("started_at")
+        if not raw:
+            continue
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        starts.append(parsed)
+    if not starts:
+        return 0.0
+    return max(0.0, (now - min(starts)).total_seconds())
+
+
+def _arm_out_of_band_reboot(
+    run: _LiveRun,
+    waiting_state: dict[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
     """Arm the reboot, refusing a placement that would prove another fence."""
 
     now = datetime.now(timezone.utc)
     remaining = window_remaining_seconds(run.pin, now=now)
+    elapsed = waiting_elapsed_seconds(
+        waiting_state.get("workflow") or {},
+        operation=FENCE_STEP_OPERATION,
+        now=now,
+    )
     errors = reboot_window_errors(
         delay_seconds=run.settings.reboot_delay_seconds,
         window_remaining_seconds=remaining,
         step_waiting_limit_seconds=int(
             run.preflight["control_env"]["verify_waiting_limit_seconds"]
         ),
+        step_waiting_elapsed_seconds=elapsed,
     )
     if errors:
         raise RegionalFixtureError("; ".join(errors))
@@ -874,6 +968,7 @@ def _arm_out_of_band_reboot(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
     record = {
         "armed": armed,
         "window_remaining_seconds": remaining,
+        "step_waiting_elapsed_seconds": elapsed,
         "expected_fence": expected_fence_text(run.pin, node=run.settings.node),
     }
     write_json_atomic(run.case_dir / "reboot-armed.json", record)
@@ -988,14 +1083,22 @@ def _data_plane_errors(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
             reboot_status=reboot_state,
         )
     )
-    provider = run.regional.provider_events(run.started_at, datetime.now(timezone.utc))
-    write_json_atomic(run.case_dir / "provider-events.json", {"events": provider})
+    ended_at = datetime.now(timezone.utc)
+    provider = run.regional.provider_events(run.started_at, ended_at)
+    # A negative CloudTrail claim cannot be proven inside the delivery window;
+    # it is recorded as provisional and re-checked by DESTR-013.
+    provisional = run.regional.provider_events_provisional(ended_at)
+    write_json_atomic(
+        run.case_dir / "provider-events.json",
+        {"events": provider, "provisional": provisional},
+    )
     errors.extend(cloudtrail_errors(provider))
     return errors, {
         "host_after": after,
         "reboot_status": reboot_state,
         "holder_status": holder,
         "node_after": node_after,
+        "provider_events": {"count": len(provider), "provisional": provisional},
     }
 
 
@@ -1021,18 +1124,21 @@ def execute_case(
         _start_probes(run)
         _inject(run)
         _wait_for_maintenance_pin(run)
-        _wait_for_waiting_verify(run)
-        _, reboot_record = _arm_out_of_band_reboot(run)
+        waiting_state = _wait_for_waiting_verify(run)
+        _, reboot_record = _arm_out_of_band_reboot(run, waiting_state)
         agent_after = _wait_for_new_generation(run)
         state = _observe_until_terminal(run)
         workflow = state.get("workflow") or {}
         incident = state.get("incident") or {}
+        commands = list(state.get("commands") or [])
         run.incident_id = str(incident.get("incident_id") or "")
         run.workflow_request_id = str(workflow.get("request_id") or "")
-        evidence = fence_evidence(workflow)
+        evidence = fence_evidence(workflow, commands)
         write_json_atomic(run.case_dir / "fence-evidence.json", evidence)
-        errors = workflow_errors(workflow, incident, node=settings.node)
-        errors.extend(command_errors(state.get("commands") or [], node=settings.node))
+        errors = workflow_errors(
+            workflow, incident, node=settings.node, commands=commands
+        )
+        errors.extend(command_errors(commands, node=settings.node))
         errors.extend(agent_errors(run.baseline_agent, agent_after, node=settings.node))
         escalations = _escalations(run, run.workflow_request_id)
         support = escalations.get("support") or {}
@@ -1076,6 +1182,7 @@ def execute_case(
         components = evidence_components(details)
         result.update(
             {
+                **run.regional.evidence_identity(),
                 "verdict": "PASS" if not errors else "FAIL",
                 "errors": errors,
                 "marker": run.marker,
@@ -1085,6 +1192,7 @@ def execute_case(
                 "maintenance_pin": run.pin,
                 "reboot": reboot_record,
                 "fence_evidence": evidence,
+                "provider_events": hosts.get("provider_events"),
                 "reconcile_plan_sha256": reconcile.get("plan_sha256"),
                 "case_digest": case_digest(components),
                 "components": components,
@@ -1123,15 +1231,15 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     if run.reboot_armed and not run.reboot_fired:
         guard(
             "cancel_reboot",
-            lambda: run.fence.execute(
-                "cancel-reboot", "--run-id", run.run_id, timeout=120
+            lambda: execute_or_recreate(
+                run.fence, "cancel-reboot", "--run-id", run.run_id, timeout=120
             ),
         )
     if run.holder_armed:
         guard(
             "disarm_holder",
-            lambda: run.fence.execute(
-                "disarm-holder", "--run-id", run.run_id, timeout=120
+            lambda: execute_or_recreate(
+                run.fence, "disarm-holder", "--run-id", run.run_id, timeout=120
             ),
         )
     guard(
@@ -1149,13 +1257,22 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     guard("restore_isolation", lambda: _restore_isolation(run))
     guard(
         "quiesce_residue",
-        lambda: run.host.execute(
-            "restore-quiesce", "--incident-id", run.incident_id, timeout=180
+        lambda: execute_or_recreate(
+            run.host, "restore-quiesce", "--incident-id", run.incident_id, timeout=180
         )
         if run.incident_id
         else {"skipped": "no incident"},
     )
     guard("host_final", lambda: _host_final(run))
+    # The on-node state file is this run's alone; leaving it would let a later
+    # --plan of the same attempt read a stale holder match or reboot marker.
+    if run.holder_armed or run.reboot_armed:
+        guard(
+            "clear_state",
+            lambda: execute_or_recreate(
+                run.fence, "clear-state", "--run-id", run.run_id, timeout=120
+            ),
+        )
     guard("probe_cleanup_host", lambda: _refuse_residual_map(run.host.cleanup()))
     guard("probe_cleanup_fence", lambda: _refuse_residual_map(run.fence.cleanup()))
     guard(
@@ -1169,10 +1286,37 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     return result
 
 
+class _ProbeLike(Protocol):
+    def create(self) -> None: ...
+
+    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]: ...
+
+
+def execute_or_recreate(
+    probe: _ProbeLike,
+    *arguments: str,
+    timeout: int = 180,
+) -> dict[str, Any]:
+    """Run a probe command; if the Pod is gone, bring it back once and retry.
+
+    The probe Pods die with the node (``restartPolicy: Never``), and a failure
+    between the reboot and the post-reboot re-create leaves cleanup talking to
+    a Pod that no longer exists. Every command cleanup issues is idempotent,
+    so one re-create and retry is safe; a second failure is the real error.
+    """
+
+    try:
+        return probe.execute(*arguments, timeout=timeout)
+    except Exception:  # noqa: BLE001 - the retry decides
+        probe.create()
+        return probe.execute(*arguments, timeout=timeout)
+
+
 def _host_final(run: _LiveRun) -> dict[str, Any]:
     """The last read of the node, after everything has been undone."""
 
-    final = run.host.execute(
+    final = execute_or_recreate(
+        run.host,
         "snapshot",
         "--since-epoch",
         str(run.started_at.timestamp()),

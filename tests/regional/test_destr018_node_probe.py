@@ -455,3 +455,18 @@ def test_parser_accepts_every_documented_subcommand() -> None:
         )
     with pytest.raises(SystemExit):
         parser.parse_args([])
+
+
+def test_the_probe_script_identity_is_the_resolved_host_path(tmp_path: Path) -> None:
+    """The holder unit runs the path on the host. A basename match would let a
+    runner hand over the Pod-side ``/host/run/...`` path, which the unit could
+    not find (DESTR-017 once shipped exactly that)."""
+
+    assert probe.checked_probe_script(probe.__file__) == probe.__file__
+    same_name = tmp_path / "host" / Path(probe.__file__).name
+    same_name.parent.mkdir()
+    same_name.write_text("# not the probe\n", encoding="utf-8")
+    with pytest.raises(probe.ProbeError, match="identity mismatch"):
+        probe.checked_probe_script(str(same_name))
+    with pytest.raises(probe.ProbeError, match="identity mismatch"):
+        probe.checked_probe_script("/host" + probe.__file__)

@@ -9,9 +9,9 @@ HyperPod reboot that succeeds and the branch ends normally. node-c's branch
 resolves RESTART_NODE, but its Node Agent is disabled (without --now) before the
 reboot so no new boot id is reported: RESTART_NODE waits to its managed-recovery
 timeout, escalates to REPLACE_NODE, and -- with no warm spare declared -- FAILs
-``insufficient healthy HyperPod spares``, exhausting the branch. The join never
-runs; the workflow ends FAILED, the incident QUARANTINED, and the job is not
-restarted.
+``warm-spare replacement is required; provider node replacement API fallback is
+disabled``, exhausting the branch. The join never runs; the workflow ends
+FAILED, the incident QUARANTINED, and the job is not restarted.
 
 The runner defaults to ``--plan``; ``--execute`` needs ``--confirm
 DESTR014_EXECUTE``. The verdict functions are pure and unit-tested; the runner
@@ -47,6 +47,8 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
@@ -63,14 +65,45 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     settings_from_arguments,
 )
+from scripts.e2e.regional.run_destr002_hyperpod_reboot import (  # noqa: E402
+    PREFLIGHT_PROBE as REBOOT_PREFLIGHT_PROBE,
+)
+from scripts.e2e.regional.run_destr002_hyperpod_reboot import (  # noqa: E402
+    preflight_probe_errors as reboot_preflight_errors,
+)
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     INSTANCE_GROUP_LABEL,
     SPARE_LABEL,
     WarmSpareLiveFixture,
+    agent_by_node,
     instance_type,
 )
 
 yaml = importlib.import_module("yaml")
+
+# One exec per executor replica reads everything the preflight grades there:
+# the safety switches, the escalation ceiling, the poll interval and the
+# remediation budget limits. Two passes over the same Pods read the same env
+# twice and doubled the slowest part of the preflight.
+EXECUTOR_ENV_KEYS = {
+    "spare_failover": "GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER",
+    "remote_state": "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE",
+    "allow_replace": "GPU_FAULT_ALLOW_HYPERPOD_REPLACE",
+    "allow_reboot": "GPU_FAULT_ALLOW_HYPERPOD_REBOOT",
+    "max_rungs": "GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS",
+    "poll": "GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS",
+    "budget_region": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
+    "budget_cluster": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
+    "budget_node": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
+    "budget_resource_class": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS",
+}
+EXECUTOR_ENV_SCRIPT = (
+    "import json,os;print(json.dumps({"
+    + ",".join(
+        f"{key!r}:os.getenv({name!r})" for key, name in EXECUTOR_ENV_KEYS.items()
+    )
+    + "}))"
+)
 
 DESTRUCTIVE_PROBE = Path(__file__).with_name("probes") / "destructive_node_probe.py"
 DESTR014_PROBE = Path(__file__).with_name("probes") / "destr014_node_probe.py"
@@ -85,8 +118,10 @@ CONFIRMATION = "DESTR014_EXECUTE"
 VARIANTS = ("sibling-exhausted",)
 
 from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
+    BUDGETED_OPERATIONS,
     CONTAINMENT_ALLOWANCE_SECONDS,
     EXHAUSTION_PREFIX,
+    EXPECTED_REPLACE_FAILURE,
     FORBIDDEN_EVENTS,
     REBOOT_ALLOWANCE_SECONDS,
     REBOOT_EVENTS,
@@ -94,19 +129,68 @@ from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
     _branch_executions,
     _first,
     _step_node,
+    budget_headroom,
     budget_headroom_errors,
+    budget_limits,
     cloudtrail_errors,
     estimated_duration_seconds,
     follow_up_errors,
     host_errors,
     injection_errors,
     lifetime_errors,
+    planned_budget_scopes,
     quarantine_taint_value,
     schedulability_errors,
     step_transitions,
     workflow_errors,
     workload_errors,
 )
+
+
+def registry_resource_classes() -> dict[str, list[str]]:
+    """The resource classes the product's registry declares per budgeted op."""
+
+    registry = importlib.import_module("gpu_fault.operation_registry")
+    models = importlib.import_module("gpu_fault.models")
+    claims = registry.OPERATION_RESOURCE_CLAIMS
+    return {
+        name: sorted(claims[models.WorkflowOperation(name)])
+        for name in BUDGETED_OPERATIONS
+    }
+
+
+def focused_tests(case_dir: Path) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "tests/execution/test_branch_escalation.py::"
+        "test_an_exhausted_branch_fails_the_workflow_without_restarting_the_job",
+        "tests/execution/test_branch_escalation.py::"
+        "test_a_sibling_finishing_normally_does_not_restart_a_job_whose_other_"
+        "branch_exhausted",
+        "tests/execution/test_branch_settlement.py::"
+        "test_an_escalated_rung_is_counted_against_the_cluster_budget",
+        "tests/hyperpod/test_hyperpod_spares.py::"
+        "test_no_declared_spare_pool_keeps_existing_replace_behavior",
+        "tests/regional/test_destr014_branch_exhaustion.py::"
+        "test_the_sibling_replacement_must_fail_for_want_of_a_spare",
+    ]
+    completed = RegionalLiveFixture.run(
+        command,
+        cwd=ROOT,
+        check=False,
+        timeout=300,
+    )
+    path = case_dir / "focused-tests.log"
+    path.write_text(completed.stdout + completed.stderr, encoding="utf-8")
+    path.chmod(0o600)
+    return {
+        "passed": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "command": command,
+    }
 
 
 def preflight_errors(
@@ -364,7 +448,7 @@ def configure(arguments: argparse.Namespace) -> Settings:
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     identity = plan_identity(preflight)
-    return {
+    details: dict[str, Any] = {
         "risk": "destructive-provider-reboot",
         "variant": settings.variant,
         "predecessor": preflight.get("predecessor"),
@@ -406,13 +490,25 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "never_call_provider_replace_or_delete": True,
         },
     }
+    record_focused_tests(details, preflight.get("focused_tests") or {})
+    return details
 
 
 # --------------------------------------------------------------------------- #
-# Live preflight (not unit-tested; delegates every assertion to the pure funcs)
+# Live preflight (delegates every assertion to the pure funcs)
 # --------------------------------------------------------------------------- #
-def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
-    values: dict[str, Any] = {"poll_interval_seconds": 5.0}
+def executor_survey(regional: RegionalLiveFixture) -> dict[str, Any]:
+    """Everything the preflight reads from the executor tier, one exec per Pod.
+
+    Returns ``executor_env`` (one row per ready replica, the safety switches),
+    ``control_env`` (escalation ceiling, poll interval, and the workflow
+    lifetime and aggregation window from the release state) and ``budget_env``
+    (the remediation limit variables as the first replica has them).
+    """
+
+    executor_env: list[dict[str, Any]] = []
+    budget_env: dict[str, Any] = {}
+    control_env: dict[str, Any] = {"poll_interval_seconds": 5.0}
     for pod in regional.ready_pods("gpu", env_window.DEPLOYMENT):
         output = regional.kubectl(
             "gpu",
@@ -421,59 +517,88 @@ def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
             "--",
             "python3",
             "-c",
-            (
-                "import json,os;"
-                "print(json.dumps({"
-                "'max_rungs':os.getenv('GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS'),"
-                "'poll':os.getenv('GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS')}))"
-            ),
+            EXECUTOR_ENV_SCRIPT,
             timeout=60,
         )
         parsed = json.loads(output.splitlines()[-1])
-        values["max_rungs"] = int(parsed.get("max_rungs") or 2)
-        if parsed.get("poll"):
-            values["poll_interval_seconds"] = float(parsed["poll"])
-        break
+        executor_env.append(
+            {
+                "pod": str(pod["name"]),
+                **{
+                    key: parsed.get(key)
+                    for key in (
+                        "spare_failover",
+                        "remote_state",
+                        "allow_replace",
+                        "allow_reboot",
+                    )
+                },
+            }
+        )
+        if "max_rungs" not in control_env:
+            control_env["max_rungs"] = int(parsed.get("max_rungs") or 2)
+            if parsed.get("poll"):
+                control_env["poll_interval_seconds"] = float(parsed["poll"])
+            budget_env = {
+                EXECUTOR_ENV_KEYS[key]: parsed.get(key)
+                for key in EXECUTOR_ENV_KEYS
+                if key.startswith("budget_")
+            }
     connection = json.loads(
         regional.kubectl(
             "cpu", "get", "configmap", "gpu-fault-regional-release-state", "-o", "json"
         )
     )
     state = json.loads(connection["data"]["state.json"])
-    values["job_lifetime_seconds"] = int(
+    control_env["job_lifetime_seconds"] = int(
         state.get("job_workflow_lifetime_seconds") or 3600
     )
-    values["aggregation_window_seconds"] = int(
+    control_env["aggregation_window_seconds"] = int(
         state.get("multi_node_aggregation_window_seconds") or 5
     )
-    return values
+    return {
+        "executor_env": executor_env,
+        "control_env": control_env,
+        "budget_env": budget_env,
+    }
 
 
-def executor_env_snapshot(regional: RegionalLiveFixture) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for pod in regional.ready_pods("gpu", env_window.DEPLOYMENT):
-        output = regional.kubectl(
-            "gpu",
-            "exec",
-            str(pod["name"]),
-            "--",
-            "python3",
-            "-c",
-            (
-                "import json,os;"
-                "print(json.dumps({"
-                "'spare_failover':os.getenv('GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER'),"
-                "'remote_state':os.getenv('GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE'),"
-                "'allow_replace':os.getenv('GPU_FAULT_ALLOW_HYPERPOD_REPLACE'),"
-                "'allow_reboot':os.getenv('GPU_FAULT_ALLOW_HYPERPOD_REBOOT')}))"
-            ),
-            timeout=60,
+def remediation_budget(
+    warm: WarmSpareLiveFixture,
+    *,
+    cluster_id: str,
+    nodes: list[str],
+    budget_env: dict[str, Any],
+) -> dict[str, Any]:
+    """The live remediation budget headroom for the scopes this drill claims.
+
+    Any failure to read it -- a limit that does not parse, a probe that does
+    not answer -- is reported as unreadable, which ``budget_headroom_errors``
+    turns into a refusal rather than into a run on an unknown budget.
+    """
+
+    try:
+        scopes = planned_budget_scopes(
+            cluster_id=cluster_id,
+            nodes=nodes,
+            limits=budget_limits(budget_env),
+            resource_classes=registry_resource_classes(),
         )
-        result.append({"pod": str(pod["name"]), **json.loads(output.splitlines()[-1])})
-    return result
+        return budget_headroom(scopes, warm.active_budget_claims())
+    except Exception as exc:  # noqa: BLE001 - recorded; the verdict fails closed
+        return {
+            "readable": False,
+            "scopes": {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
-def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
+def read_only_preflight(
+    settings: Settings,
+    case_dir: Path,
+    *,
+    reusable_tests: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not settings.site_file.is_file() or not settings.manifest.is_file():
         raise RegionalFixtureError("site file or training manifest does not exist")
     regional = RegionalLiveFixture(settings.regional)
@@ -484,9 +609,21 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     fault_state = regional.store_snapshot(node=settings.fault_node)
     state["profile"] = fault_state.get("profile")
     state["release_id"] = fault_state.get("release_id")
-    control_env = _control_env(regional)
-    from scripts.e2e.regional.warm_spare_fixture import agent_by_node
-
+    survey = executor_survey(regional)
+    control_env = survey["control_env"]
+    nodes = [settings.fault_node, settings.sibling_node]
+    budget = remediation_budget(
+        warm,
+        cluster_id=settings.regional.cluster_id,
+        nodes=nodes,
+        budget_env=survey["budget_env"],
+    )
+    open_workflows = warm.open_workflows(job_id=settings.job_id, nodes=nodes)
+    reboot_probe = regional.executor_python(REBOOT_PREFLIGHT_PROBE, settings.fault_node)
+    if reusable_tests is not None:
+        tests = {**reusable_tests, "reused": True}
+    else:
+        tests = focused_tests(case_dir)
     result: dict[str, Any] = {
         "release_id": state.get("release_id"),
         "fault_node": regional.node_snapshot(settings.fault_node),
@@ -495,9 +632,16 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         "provider_inventory": warm.provider_inventory(),
         "cpu_blast": regional.cpu_blast_snapshot(),
         "predecessor": predecessor_evidence(
-            settings.predecessor_path, PREDECESSOR_CASE_ID
+            settings.predecessor_path,
+            PREDECESSOR_CASE_ID,
+            **regional.evidence_identity(),
         ),
         "control_env": control_env,
+        "executor_env": survey["executor_env"],
+        "reboot_preflight": reboot_probe,
+        "remediation_budget": budget,
+        "open_workflows": open_workflows,
+        "focused_tests": tests,
     }
     result["errors"] = preflight_errors(
         fault_node=settings.fault_node,
@@ -508,16 +652,18 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         sibling_agent=agent_by_node(state, settings.sibling_node) or {},
         spare_nodes=warm.spare_nodes(),
         cluster=warm.cluster_recovery(),
-        executor_env=executor_env_snapshot(regional),
-        reboot_probe_errors=[],
+        executor_env=survey["executor_env"],
+        reboot_probe_errors=reboot_preflight_errors(
+            reboot_probe, settings.hyperpod_cluster
+        ),
         control_env=control_env,
-        budget={"readable": False, "scopes": {}},
+        budget=budget,
         fault_workloads=regional.business_workloads(settings.fault_node),
         sibling_workloads=regional.business_workloads(settings.sibling_node),
-        open_workflows=[],
+        open_workflows=open_workflows,
         gpu_workloads=regional.gpu_workloads(),
         predecessor=result["predecessor"],
-        tests={"passed": True},
+        tests=tests,
         verify_max_attempts=settings.verify_max_attempts,
         managed_recovery_timeout_seconds=settings.managed_recovery_timeout_seconds,
     )
@@ -627,7 +773,11 @@ def _prepare_live_run(
 ) -> _LiveRun:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(
+        settings,
+        case_dir,
+        reusable_tests=reusable_focused_tests(case_dir / "plan.json"),
+    )
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -809,7 +959,7 @@ def _observe_until_terminal(run: _LiveRun, initial: dict[str, Any]) -> dict[str,
     return state
 
 
-def _control_plane_errors(
+def control_plane_errors(
     run: _LiveRun, state: dict[str, Any]
 ) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
     settings = run.settings
@@ -824,7 +974,10 @@ def _control_plane_errors(
         failure_reason=workflow.get("terminal_failure_reason")
         or state.get("workflow_failure_reason"),
     )
-    follow_up = run.regional.store_snapshot(
+    # The successor support incident is keyed by a synthetic event id, which
+    # only the warm-spare store probe resolves; the regional probe reads by
+    # node and marker and has no ``event_id`` at all.
+    follow_up = run.warm.store_snapshot(
         event_id=f"support-after-{workflow.get('request_id')}"
     )
     errors.extend(
@@ -842,7 +995,7 @@ def _control_plane_errors(
 
 def _data_plane_errors(
     run: _LiveRun, state: dict[str, Any]
-) -> tuple[list[str], list[dict[str, Any]]]:
+) -> tuple[list[str], dict[str, Any]]:
     """Node, scheduler, provider and workload verdicts after the workflow
     ended. Restores the sibling's agent on the way (its own verdict reads
     the before/after snapshots)."""
@@ -889,8 +1042,9 @@ def _data_plane_errors(
             incident_id=run.incident_id,
         )
     )
-    provider = run.regional.provider_events(run.started_at, datetime.now(timezone.utc))
-    write_json_atomic(run.case_dir / "provider-events.json", {"events": provider})
+    evidence = provider_evidence(run.regional, run.started_at)
+    provider = evidence["events"]
+    write_json_atomic(run.case_dir / "provider-events.json", evidence)
     errors.extend(
         cloudtrail_errors(provider, settings.fault_node, settings.sibling_node)
     )
@@ -906,7 +1060,36 @@ def _data_plane_errors(
             source_uids=run.source_uids,
         )
     )
-    return errors, provider
+    return errors, evidence
+
+
+def provider_evidence(
+    regional: RegionalLiveFixture,
+    started_at: datetime,
+) -> dict[str, Any]:
+    """The run's CloudTrail evidence, read once CloudTrail has caught up.
+
+    The positive claim -- two reboots, one per node -- is polled for, since a
+    lookup taken right after the second reboot finished routinely reads one.
+    The negative claim (no replace/delete) is then read over the same window
+    and labelled provisional while the window's end is inside CloudTrail's
+    delivery lag; DESTR-013 re-reads the whole run later.
+    """
+
+    reboots = regional.wait_provider_events(
+        started_at,
+        event_names=set(REBOOT_EVENTS),
+        expected_count=2,
+    )
+    ended_at = datetime.now(timezone.utc)
+    events = regional.provider_events(started_at, ended_at)
+    return {
+        "events": events,
+        "reboots_seen_by_poll": len(reboots),
+        "window_start": started_at.isoformat(),
+        "window_end": ended_at.isoformat(),
+        "provisional": regional.provider_events_provisional(ended_at),
+    }
 
 
 def execute_case(
@@ -925,20 +1108,24 @@ def execute_case(
         "verdict": "FAIL",
         "variant": settings.variant,
         "maintenance_window_end": maintenance_window_end.isoformat(),
+        **run.regional.evidence_identity(),
+        "focused_tests_reused": bool(
+            (run.preflight.get("focused_tests") or {}).get("reused")
+        ),
     }
     try:
         fault_state, sibling_state = _arm_and_inject(run)
         errors = injection_errors(fault_state, sibling_state)
         state = _observe_until_terminal(run, fault_state)
-        control_errors, workflow, incident = _control_plane_errors(run, state)
+        control_errors, workflow, incident = control_plane_errors(run, state)
         errors.extend(control_errors)
-        data_errors, provider = _data_plane_errors(run, state)
+        data_errors, evidence = _data_plane_errors(run, state)
         errors.extend(data_errors)
         details = {
             "preflight_identity": plan_identity(run.preflight),
             "workflow": workflow,
             "incident": incident,
-            "provider_events": provider,
+            "provider_events": evidence["events"],
         }
         components = evidence_components(details)
         result.update(
@@ -948,6 +1135,7 @@ def execute_case(
                 "incident_id": run.incident_id,
                 "case_digest": case_digest(components),
                 "components": components,
+                "provider_events_provisional": bool(evidence["provisional"]),
             }
         )
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
@@ -1034,7 +1222,7 @@ def _cleanup(
         )
         guard(
             "sibling_restore",
-            lambda: _restore_sibling(warm, settings, incident_id, profile_version),
+            lambda: restore_sibling(warm, settings, incident_id, profile_version),
         )
     if env_opened:
         guard(
@@ -1056,23 +1244,49 @@ def _cleanup(
     return result
 
 
-def _restore_sibling(
+def restore_sibling(
     warm: WarmSpareLiveFixture,
     settings: Settings,
     incident_id: str,
     profile_version: str,
 ) -> dict[str, Any]:
-    warm.wait_incident_idle(incident_id)
-    created = warm.create_restore_workflow(
-        incident_id=incident_id,
-        node=settings.sibling_node,
-        profile_version=profile_version,
-        reason="DESTR-014 validated cleanup",
-    )
-    restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
-    if restored.get("status") != "SUCCEEDED":
-        raise RegionalFixtureError("sibling restore workflow did not succeed")
-    return restored
+    """Un-quarantine the sibling through whoever owns it now.
+
+    An exhausted branch is escalated by the product itself: the escalation
+    engine opens a successor support incident over the sibling, re-quarantines
+    it and files a ticket, so the node's ``gpu-fault.io/incident-id`` names
+    that incident, not the DAG's. A restore filed against the original incident
+    would then be refused or, worse, would race the successor's ownership. The
+    owner is restored first; the original incident is restored afterwards so
+    it does not stay QUARANTINED over a node that is already back.
+    """
+
+    sibling = warm.node_snapshot(settings.sibling_node)
+    owner = str(sibling["annotations"].get("gpu-fault.io/incident-id") or "")
+    result: dict[str, Any] = {
+        "quarantine_owner": owner or None,
+        "successor_incident": owner if owner and owner != incident_id else None,
+    }
+    restored_through: list[str] = []
+    for restore_incident in (owner, incident_id):
+        if not restore_incident or restore_incident in restored_through:
+            continue
+        warm.wait_incident_idle(restore_incident)
+        created = warm.create_restore_workflow(
+            incident_id=restore_incident,
+            node=settings.sibling_node,
+            profile_version=profile_version,
+            reason="DESTR-014 validated cleanup",
+        )
+        restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
+        result[f"restore_workflow:{restore_incident}"] = restored
+        if restored.get("status") != "SUCCEEDED":
+            raise RegionalFixtureError(
+                f"sibling restore workflow for {restore_incident} did not succeed"
+            )
+        restored_through.append(restore_incident)
+    result["restored_through"] = restored_through
+    return result
 
 
 CASE = CaseRunner(

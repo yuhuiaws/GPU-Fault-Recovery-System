@@ -354,6 +354,100 @@ def test_state_file_roundtrip_is_scoped_to_the_run(tmp_path: Path) -> None:
         probe.state_path("bad id!", state_dir=tmp_path)
 
 
+def test_the_probe_script_identity_is_the_resolved_host_path(tmp_path: Path) -> None:
+    """The watcher unit runs the path on the host. A basename match let the
+    runner hand over the Pod-side ``/host/run/...`` path, which the unit could
+    not find."""
+
+    assert probe.checked_probe_script(probe.__file__) == probe.__file__
+    same_name = tmp_path / "host" / Path(probe.__file__).name
+    same_name.parent.mkdir()
+    same_name.write_text("# not the probe\n", encoding="utf-8")
+    with pytest.raises(probe.ProbeError, match="identity mismatch"):
+        probe.checked_probe_script(str(same_name))
+    with pytest.raises(probe.ProbeError, match="identity mismatch"):
+        probe.checked_probe_script("/host" + probe.__file__)
+
+
+def test_arming_starts_this_runs_state_from_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rerun of the same attempt reuses the run id, so a merged state file
+    would carry the previous run's matched row and boot history into it."""
+
+    path = probe.state_path(RUN_ID, state_dir=tmp_path)
+    probe.write_state(
+        path,
+        {
+            "run_id": RUN_ID,
+            "matched_row": {"command_id": "old"},
+            "hold_started_at": "2026-09-05T10:00:00+00:00",
+            "observed_boot_ids": [BOOT_A, BOOT_B],
+            "boot_changes": 1,
+        },
+    )
+    monkeypatch.setattr(probe, "state_path", lambda run_id: path)
+    monkeypatch.setattr(probe, "ledger_rows", lambda: [])
+    monkeypatch.setattr(probe, "boot_id", lambda: BOOT_B)
+    monkeypatch.setattr(probe, "run", lambda *a, **k: None)
+    monkeypatch.setattr(probe, "emit", lambda payload: None)
+    arguments = probe.parser().parse_args(
+        [
+            "arm-holder",
+            "--device",
+            "/dev/nvidia0",
+            "--drill-id",
+            RUN_ID,
+            "--run-id",
+            RUN_ID,
+            "--probe-script",
+            probe.__file__,
+        ]
+    )
+    probe.arm_holder(arguments)
+    state = probe.read_state(path)
+    assert "matched_row" not in state
+    assert "hold_started_at" not in state
+    assert state["observed_boot_ids"] == [BOOT_B]
+    assert state["boot_changes"] == 0
+    assert state["run_id"] == RUN_ID
+
+
+def test_clear_state_removes_the_run_file_unless_a_reboot_is_still_armed(
+    tmp_path: Path,
+) -> None:
+    path = probe.state_path(RUN_ID, state_dir=tmp_path)
+    assert probe.clear_state_file(path, current_boot_id=BOOT_A) == {
+        "removed": False,
+        "present": False,
+    }
+    probe.write_state(path, {"run_id": RUN_ID, "matched_row": {"command_id": "c"}})
+    assert probe.clear_state_file(path, current_boot_id=BOOT_A)["removed"] is True
+    assert not path.exists(), "a spent state file is removed"
+    # Armed, not cancelled, same boot id: the timer may still go off.
+    probe.write_state(
+        path,
+        {
+            "reboot_armed_at": "2026-09-06T10:00:00+00:00",
+            "boot_id_before_reboot": BOOT_A,
+        },
+    )
+    with pytest.raises(probe.ProbeError, match="still armed"):
+        probe.clear_state_file(path, current_boot_id=BOOT_A)
+    assert path.exists(), "an armed state file is kept"
+    # The same record after the reboot fired is spent and may go.
+    assert probe.clear_state_file(path, current_boot_id=BOOT_B)["removed"] is True
+    probe.write_state(
+        path,
+        {
+            "reboot_armed_at": "2026-09-06T10:00:00+00:00",
+            "reboot_cancelled_at": "2026-09-06T10:01:00+00:00",
+            "boot_id_before_reboot": BOOT_A,
+        },
+    )
+    assert probe.clear_state_file(path, current_boot_id=BOOT_A)["removed"] is True
+
+
 def test_the_state_file_lives_outside_the_node_agents_own_directory() -> None:
     """Acceptance artifacts never share a directory with the Agent's state, so a
     forgotten marker file can never be read as product state."""
@@ -432,6 +526,7 @@ def test_parser_accepts_every_documented_subcommand() -> None:
         ["holder-status", "--run-id", RUN_ID],
         ["reboot-status", "--run-id", RUN_ID],
         ["cancel-reboot", "--run-id", RUN_ID],
+        ["clear-state", "--run-id", RUN_ID],
         ["watch-ledger", "--run-id", RUN_ID],
         ["snapshot"],
         ["snapshot", "--run-id", RUN_ID],

@@ -10,7 +10,10 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.e2e.regional.capacity_acceptance_base import CapError  # noqa: E402
+from scripts.e2e.regional.capacity_acceptance_base import (  # noqa: E402
+    DEFAULT_B_LATENCY_FACTOR,
+    CapError,
+)
 from scripts.e2e.regional.capacity_acceptance_cases import (  # noqa: E402
     CapacityAcceptanceCases,
 )
@@ -39,6 +42,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case", choices=CASE_IDS, required=True)
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument("--predecessor-evidence", default="")
+    parser.add_argument(
+        "--b-latency-factor",
+        type=float,
+        default=DEFAULT_B_LATENCY_FACTOR,
+        help=(
+            "CAP-001: storm-phase cluster B p95 latency may be at most this "
+            "multiple of the B-only baseline p95 measured before the storm"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -71,6 +83,7 @@ def main() -> int:
             details={
                 "risk": "live-non-destructive",
                 "predecessor": predecessor,
+                "b_latency_factor": args.b_latency_factor,
                 "mutation": (
                     "create disposable capacity probe Deployments, Services, "
                     "Secrets and one isolated PostgreSQL database"
@@ -103,6 +116,7 @@ def main() -> int:
         run_dir=args.run_dir,
         case_id=args.case,
         predecessor=predecessor,
+        b_latency_factor=args.b_latency_factor,
     )
     return harness.run()
 

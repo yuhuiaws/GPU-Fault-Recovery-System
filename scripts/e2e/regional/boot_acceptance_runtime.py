@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import boto3
 import yaml  # type: ignore[import-untyped,unused-ignore]
@@ -32,15 +34,95 @@ READINESS_PROBE = (ROOT / "scripts/e2e/regional/audit_executor_readiness.py").re
     encoding="utf-8"
 )
 REMOTE_OWNER = "gpu-fault-boot015-nonexistent-adapter"
+EXECUTOR_DEPLOYMENT = "gpu-fault-cluster-executor"
+CA_FILE_ENV = "GPU_FAULT_CONTROL_PLANE_CA_FILE"
+# Either of these would replace boto3's public trust roots with the private CA
+# bundle and break STS/HyperPod calls; the manifest deliberately leaves them out.
+FORBIDDEN_TRUST_ENV = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
+EXECUTOR_READY_LIMIT_SECONDS = 180
 
 
-def secret_key_contract() -> dict[str, Any]:
+def manifest_deployment() -> dict[str, Any]:
     documents = [
         item
         for item in yaml.safe_load_all(EXECUTOR_MANIFEST.read_text(encoding="utf-8"))
         if item
     ]
-    deployment = next(item for item in documents if item.get("kind") == "Deployment")
+    return cast(
+        dict[str, Any],
+        next(item for item in documents if item.get("kind") == "Deployment"),
+    )
+
+
+def _container_env(deployment: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item["name"]): item
+        for container in deployment["spec"]["template"]["spec"]["containers"]
+        for item in container.get("env", [])
+    }
+
+
+def _ca_mount(deployment: dict[str, Any], ca_path: str) -> dict[str, Any] | None:
+    """The volumeMount + volume that serve ``ca_path``, or ``None``."""
+
+    spec = deployment["spec"]["template"]["spec"]
+    volumes = {str(item["name"]): item for item in spec.get("volumes", [])}
+    for container in spec["containers"]:
+        for mount in container.get("volumeMounts", []):
+            mount_path = str(mount.get("mountPath") or "").rstrip("/")
+            if mount_path and ca_path.startswith(mount_path + "/"):
+                volume = volumes.get(str(mount.get("name"))) or {}
+                secret = volume.get("secret") or {}
+                keys = sorted(str(item.get("key")) for item in secret.get("items", []))
+                return {
+                    "mount_path": mount_path,
+                    "read_only": bool(mount.get("readOnly")),
+                    "secret_name": secret.get("secretName"),
+                    "secret_keys": keys,
+                }
+    return None
+
+
+def ca_file_contract(
+    manifest: dict[str, Any],
+    live: dict[str, Any],
+) -> dict[str, Any]:
+    """The CA contract: the manifest's scoped CA file is what the live Pod runs.
+
+    The secretKeyRef contract says nothing about the CA; this one does. The
+    manifest declares ``GPU_FAULT_CONTROL_PLANE_CA_FILE`` and the read-only
+    Secret mount that serves it, and the live Deployment must carry the same
+    value and mount, with neither ``SSL_CERT_FILE`` nor ``REQUESTS_CA_BUNDLE``
+    anywhere in either environment.
+    """
+
+    manifest_env = _container_env(manifest)
+    live_env = _container_env(live)
+    ca_path = str((manifest_env.get(CA_FILE_ENV) or {}).get("value") or "")
+    live_path = str((live_env.get(CA_FILE_ENV) or {}).get("value") or "")
+    manifest_mount = _ca_mount(manifest, ca_path) if ca_path else None
+    live_mount = _ca_mount(live, live_path) if live_path else None
+    forbidden = sorted(
+        name for name in FORBIDDEN_TRUST_ENV if name in manifest_env or name in live_env
+    )
+    return {
+        "ca_file": ca_path,
+        "live_ca_file": live_path,
+        "manifest_mount": manifest_mount,
+        "live_mount": live_mount,
+        "forbidden_trust_env_present": forbidden,
+        "passed": bool(ca_path)
+        and ca_path == live_path
+        and manifest_mount is not None
+        and manifest_mount == live_mount
+        and bool(manifest_mount["read_only"])
+        and bool(manifest_mount["secret_name"])
+        and not forbidden,
+    }
+
+
+def secret_key_contract() -> dict[str, Any]:
+    deployment = manifest_deployment()
     required: list[tuple[str, str, str]] = []
     optional: list[tuple[str, str, str]] = []
     for container in deployment["spec"]["template"]["spec"]["containers"]:
@@ -79,6 +161,87 @@ def secret_key_contract() -> dict[str, Any]:
     }
 
 
+def _timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def ready_within(
+    pod_state: dict[str, Any],
+    *,
+    replicas: int,
+    limit_seconds: int = EXECUTOR_READY_LIMIT_SECONDS,
+) -> dict[str, Any]:
+    """Whether every desired executor replica became Ready within the limit.
+
+    ``len(ready_pods) == replicas`` alone is true for a Deployment scaled to
+    zero, and says nothing about *when* the Pods became Ready. This requires at
+    least one replica, exactly that many Ready Pods, and for each of them a
+    Ready transition no later than ``limit_seconds`` after creation.
+    """
+
+    durations: dict[str, float | None] = {}
+    for item in pod_state.get("items", []):
+        name = str(item["metadata"]["name"])
+        created = _timestamp(item["metadata"].get("creationTimestamp"))
+        ready_at = None
+        for condition in item.get("status", {}).get("conditions", []):
+            if condition.get("type") == "Ready" and condition.get("status") == "True":
+                ready_at = _timestamp(condition.get("lastTransitionTime"))
+        durations[name] = (
+            (ready_at - created).total_seconds()
+            if created is not None and ready_at is not None
+            else None
+        )
+    ready = {name: value for name, value in durations.items() if value is not None}
+    return {
+        "replicas": replicas,
+        "ready_seconds": durations,
+        "passed": replicas >= 1
+        and len(ready) == replicas
+        and all(value <= limit_seconds for value in ready.values()),
+    }
+
+
+def foreign_lease_owners(
+    owners: list[str],
+    *,
+    isolated_cluster_id: str,
+    isolated_pods: list[str],
+) -> list[str]:
+    """Lease owners in the production store that belong to the isolated executor.
+
+    The executor identifies itself as ``<cluster_id>/<hostname>`` unless
+    ``GPU_FAULT_CLUSTER_EXECUTOR_ID`` overrides it, and the hostname is the Pod
+    name; either form appearing as a production lease owner means the isolated
+    executor claimed production commands, which turns the case from a
+    deployability check into a production mutation.
+    """
+
+    prefix = f"{isolated_cluster_id}/"
+    pods = set(isolated_pods)
+    return sorted(
+        owner
+        for owner in owners
+        if owner.startswith(prefix)
+        or owner in pods
+        or any(owner.endswith(f"/{pod}") for pod in pods)
+    )
+
+
+LEASE_OWNER_PROBE = r"""
+import json
+from gpu_fault.app import ApplicationContext
+owners = set()
+for item in ApplicationContext.from_environment().store.list_remote_commands():
+    for value in (item.lease_owner, item.last_lease_owner):
+        if value:
+            owners.add(value)
+print(json.dumps({"owners": sorted(owners)}, sort_keys=True))
+"""
+
+
 def run_boot011(
     fixture: SiteFixture,
     *,
@@ -90,6 +253,12 @@ def run_boot011(
     production_ids = {
         str(item["cluster_id"]) for item in production.release_config["clusters"]
     }
+    if not production_ids:
+        raise BootAcceptanceError("production site names no GPU clusters")
+    production_fixture = SiteFixture(
+        production_site.resolve(),
+        sorted(production_ids)[0],
+    )
     deployment = json.loads(
         fixture.regional.kubectl(
             "gpu",
@@ -170,6 +339,16 @@ def run_boot011(
     )
     trust = json.loads(role.stdout)["Role"]["AssumeRolePolicyDocument"]
     trust_text = json.dumps(trust, sort_keys=True)
+    replicas = int(deployment["spec"].get("replicas") or 0)
+    readiness = ready_within(pod_state, replicas=replicas)
+    # Read-only: the production store's lease owners, to prove the isolated
+    # executor never claimed a production command.
+    production_owners = production_fixture.regional.cpu_python(LEASE_OWNER_PROBE)
+    foreign = foreign_lease_owners(
+        [str(item) for item in production_owners.get("owners") or []],
+        isolated_cluster_id=fixture.cluster_id,
+        isolated_pods=pods,
+    )
     checks = {
         "secret_contract": contract["passed"],
         "required_secret_keys_present": all(
@@ -184,8 +363,8 @@ def run_boot011(
             name != "GPU_FAULT_STORE_URL" and not name.startswith("POSTGRES_POOL_")
             for name in environment
         ),
-        "executor_ready_within_180s": len(pods)
-        == int(deployment["spec"].get("replicas") or 0),
+        "executor_ready_within_180s": readiness["passed"],
+        "isolated_executor_never_owned_production_lease": not foreign,
         "no_config_or_tls_errors": not any(
             marker in encoded + logs
             for marker in (
@@ -208,12 +387,16 @@ def run_boot011(
             "secret_key_names": actual_keys,
             "secret_contract": contract,
             "executor_pods": len(pods),
+            "executor_readiness": readiness,
+            "foreign_production_lease_owners": foreign,
             "isolated_cluster_count": len(isolated_ids),
             "production_cluster_count": len(production_ids),
         },
+        **fixture.regional.evidence_identity(),
         "limitations": [
             "The fixture verifies an explicitly supplied isolated greenfield "
-            "site; it never copies production Secret values."
+            "site; it never copies production Secret values, and reads the "
+            "production store only for lease owners."
         ],
     }
 
@@ -240,9 +423,71 @@ print(json.dumps({"caller_identity_available": bool(identity.get("Arn"))}))
 """
 
 
-def run_boot012(fixture: SiteFixture) -> dict[str, Any]:
+def _tail(completed: subprocess.CompletedProcess[str], limit: int = 600) -> str:
+    return (completed.stdout + completed.stderr)[-limit:]
+
+
+MATRIX_STATUS = {
+    "valid": 200,
+    "wrong_token": 403,
+    "wrong_pin": 503,
+    "no_owner": 503,
+    "stale_claim": 503,
+}
+
+
+def readiness_matrix_verdict(replicas: list[dict[str, Any]]) -> dict[str, Any]:
+    """The BOOT-021 conclusion from the per-Pod readiness matrices BOOT-012 ran.
+
+    BOOT-012 already executes ``audit_executor_readiness.py`` in every executor
+    Pod, which is the whole BOOT-021 case; recording it once here spares a
+    second live run whose only difference would be the case id on the file.
+    """
+
+    matrices: list[dict[str, Any]] = []
+    complete = bool(replicas)
+    for item in replicas:
+        matrix = item.get("readiness_matrix")
+        if not isinstance(matrix, dict) or any(
+            key not in matrix for key in MATRIX_STATUS
+        ):
+            complete = False
+            continue
+        matrices.append(matrix)
+    checks: dict[str, bool] = {"matrix_recorded_per_replica": complete}
+    for key, status in MATRIX_STATUS.items():
+        checks[f"{key}_{status}"] = complete and all(
+            (matrix[key] or {}).get("status") == status for matrix in matrices
+        )
+    return {
+        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "checks": checks,
+        "replicas": [
+            {"pod": item["pod"], "readiness_matrix": item.get("readiness_matrix")}
+            for item in replicas
+        ],
+    }
+
+
+def run_boot012(
+    fixture: SiteFixture,
+    *,
+    boot021_evidence_path: Path | None = None,
+) -> dict[str, Any]:
+    started_at = utc_now()
     contract = secret_key_contract()
-    pods = fixture.pods("gpu", "gpu-fault-cluster-executor")
+    live_deployment = json.loads(
+        fixture.regional.kubectl(
+            "gpu",
+            "get",
+            "deployment",
+            EXECUTOR_DEPLOYMENT,
+            "-o",
+            "json",
+        )
+    )
+    ca_contract = ca_file_contract(manifest_deployment(), live_deployment)
+    pods = fixture.pods("gpu", EXECUTOR_DEPLOYMENT)
     results = []
     for pod in pods:
         environment = fixture.pod_json("gpu", pod, BOOT012_ENV_PROBE)
@@ -259,7 +504,7 @@ def run_boot012(fixture: SiteFixture) -> dict[str, Any]:
             "-c",
             (
                 ": > /tmp/boot012-empty-ca.pem; "
-                "GPU_FAULT_CONTROL_PLANE_CA_FILE=/tmp/boot012-empty-ca.pem "
+                f"{CA_FILE_ENV}=/tmp/boot012-empty-ca.pem "
                 "gpu-fault-cluster-executor-readiness"
             ),
             check=False,
@@ -296,27 +541,48 @@ def run_boot012(fixture: SiteFixture) -> dict[str, Any]:
                 "Traceback",
             )
         )
+        empty_ca_output = empty_ca.stdout + empty_ca.stderr
         results.append(
             {
                 "pod": pod,
                 "environment": environment,
+                "ca_file_matches_contract": (
+                    environment["ca_file"] == ca_contract["ca_file"]
+                    and environment["ca_exists"]
+                    and not environment["ssl_cert_file_set"]
+                    and not environment["requests_ca_bundle_set"]
+                ),
                 "authenticated_readiness": readiness.returncode == 0,
-                "empty_ca_rejected": empty_ca.returncode != 0,
+                # A non-zero exit alone could be any failure; the negative probe
+                # has to fail *because* the empty CA cannot verify the server.
+                "empty_ca_rejected": empty_ca.returncode != 0
+                and "CERTIFICATE_VERIFY_FAILED" in empty_ca_output,
                 "sts_public_trust": sts["caller_identity_available"],
                 "stale_claim_503": (
                     (stale_payload.get("stale_claim") or {}).get("status") == 503
                 ),
+                "readiness_matrix": stale_payload or None,
                 "recent_error_count": error_count,
+                # stderr tails are kept only for probes that did not do what the
+                # case expects, so a live failure is diagnosable without a rerun.
+                "readiness_stderr_tail": (
+                    _tail(readiness) if readiness.returncode != 0 else None
+                ),
+                "empty_ca_stderr_tail": (
+                    _tail(empty_ca)
+                    if "CERTIFICATE_VERIFY_FAILED" not in empty_ca_output
+                    else None
+                ),
+                "stale_probe_stderr_tail": (
+                    _tail(stale) if stale.returncode != 0 else None
+                ),
             }
         )
     checks = {
         "scoped_ca": contract["passed"]
-        and all(
-            item["environment"]["ca_exists"]
-            and not item["environment"]["ssl_cert_file_set"]
-            and not item["environment"]["requests_ca_bundle_set"]
-            for item in results
-        ),
+        and ca_contract["passed"]
+        and bool(results)
+        and all(item["ca_file_matches_contract"] for item in results),
         "authenticated_readiness": bool(results)
         and all(item["authenticated_readiness"] for item in results),
         "empty_ca_rejected": bool(results)
@@ -329,15 +595,41 @@ def run_boot012(fixture: SiteFixture) -> dict[str, Any]:
             item["recent_error_count"] == 0 for item in results
         ),
     }
-    return {
+    identity = fixture.regional.evidence_identity()
+    result = {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
+        "ca_contract": ca_contract,
         "replicas": results,
+        **identity,
         "limitations": [
             "The empty-CA branch is a TLS negative probe; it does not modify "
             "the running executor process environment."
         ],
     }
+    if boot021_evidence_path is not None:
+        boot021 = readiness_matrix_verdict(results)
+        write_json_atomic(
+            boot021_evidence_path,
+            {
+                "schema_version": 2,
+                "report_type": "fault-acceptance",
+                "case_id": "GF-REGIONAL-BOOT-021",
+                "verdict": boot021["verdict"],
+                "started_at": started_at,
+                "executed_at": utc_now(),
+                "recorded_by": "GF-REGIONAL-BOOT-012",
+                "checks": boot021["checks"],
+                "replicas": boot021["replicas"],
+                **identity,
+                "limitations": [
+                    "Recorded from the readiness matrix BOOT-012 ran in every "
+                    "executor Pod; the matrix is the BOOT-021 procedure."
+                ],
+            },
+        )
+        result["boot021_evidence"] = str(boot021_evidence_path)
+    return result
 
 
 BOOT013_PROBE = r"""
@@ -684,11 +976,20 @@ def wait_amp_alert(
     *,
     expect_firing: bool,
     timeout_seconds: int,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
+    """Poll AMP until the alert reaches the expected state or the deadline.
+
+    ``deadline`` is a ``time.monotonic()`` value; BOOT-015 sets it right after
+    the injection so the readiness, metric and log reads it does in between
+    count against the same window instead of extending it.
+    """
+
     workspace_id = str(fixture.config["health"]["amp_workspace_id"])
-    deadline = time.monotonic() + timeout_seconds
+    if deadline is None:
+        deadline = time.monotonic() + timeout_seconds
     timeline = []
-    while time.monotonic() < deadline:
+    while True:
         query = amp_request(
             region=fixture.region,
             workspace_id=workspace_id,
@@ -723,8 +1024,123 @@ def wait_amp_alert(
             return {"matched": True, "timeline": timeline}
         if not expect_firing and not vector and not states:
             return {"matched": True, "timeline": timeline}
-        time.sleep(15)
-    return {"matched": False, "timeline": timeline}
+        if time.monotonic() >= deadline:
+            return {"matched": False, "timeline": timeline}
+        time.sleep(min(15.0, max(0.0, deadline - time.monotonic())))
+
+
+REMOTE_STATE_PROBE = r"""
+import json
+import sys
+from gpu_fault.app import ApplicationContext
+from gpu_fault.store import NotFoundError
+store = ApplicationContext.from_environment().store
+try:
+    command = store.get_remote_command(sys.argv[1])
+except NotFoundError:
+    print(json.dumps({"exists": False, "status": None, "lease_owner": None}))
+else:
+    print(json.dumps({
+        "exists": True,
+        "status": command.status.value,
+        "lease_owner": command.lease_owner,
+    }, sort_keys=True))
+"""
+
+AMP_FIRING_WINDOW_SECONDS = 300
+AMP_RESOLVE_WINDOW_SECONDS = 180
+# Two samples of an age metric are monotonic whatever the gap; 5 s is enough
+# to see it move and does not stretch the alert window.
+METRIC_SAMPLE_GAP_SECONDS = 5
+
+
+def _cleanup_step(
+    cleanup: dict[str, Any],
+    name: str,
+    operation: Callable[[], Any],
+) -> Any:
+    """Run one cleanup step and record its result or its error under ``name``.
+
+    The steps are independent, so one failing (the delete exec dropping, AMP
+    unreachable) must not skip the ones after it; the first version's
+    ``finally`` ran them in sequence and an exception in the first left the
+    injected command in place, which keeps every executor readiness probe
+    failing until someone deletes it by hand.
+    """
+
+    try:
+        value = operation()
+    except Exception as exc:  # noqa: BLE001 - recorded, later steps still run
+        cleanup[name] = {"error": f"{type(exc).__name__}: {exc}"}
+        return None
+    cleanup[name] = value
+    return value
+
+
+def boot015_cleanup(
+    fixture: SiteFixture,
+    *,
+    command_id: str,
+    pods: list[str],
+    baseline_ids: set[str],
+) -> dict[str, Any]:
+    """Delete the injected command and record every observation about it."""
+
+    cleanup: dict[str, Any] = {}
+    _cleanup_step(
+        cleanup,
+        "delete",
+        lambda: fixture.regional.cpu_python(REMOTE_DELETE_PROBE, command_id),
+    )
+    final = _cleanup_step(
+        cleanup,
+        "final_baseline",
+        lambda: fixture.regional.cpu_python(REMOTE_BASELINE_PROBE),
+    )
+    final_ids = set((final or {}).get("ids") or [])
+    cleanup["synthetic_command_removed"] = final is not None and (
+        command_id not in final_ids
+    )
+    # The retention sweep deletes old terminal commands on its own schedule,
+    # so the total count drifts during the case; what the case owns is that
+    # its command is gone and it introduced no other.
+    cleanup["commands_introduced"] = sorted(final_ids - baseline_ids)
+    cleanup["remote_count_after"] = (final or {}).get("count")
+    if cleanup["synthetic_command_removed"]:
+        # Staleness of the AMP series is not a cleanup defect: the gauge may
+        # keep its last value for a scrape interval after the command is gone.
+        # The wait is recorded, never a verdict.
+        _cleanup_step(
+            cleanup,
+            "resolve_observed",
+            lambda: wait_amp_alert(
+                fixture,
+                expect_firing=False,
+                timeout_seconds=AMP_RESOLVE_WINDOW_SECONDS,
+            ),
+        )
+
+    def readiness() -> dict[str, bool]:
+        recovered = {}
+        for pod in pods:
+            completed = fixture.exec(
+                "gpu",
+                pod,
+                "gpu-fault-cluster-executor-readiness",
+                check=False,
+            )
+            recovered[pod] = completed.returncode == 0
+        return recovered
+
+    recovered = _cleanup_step(cleanup, "readiness_recovered", readiness)
+    cleanup["passed"] = bool(
+        cleanup["synthetic_command_removed"]
+        and not cleanup["commands_introduced"]
+        and isinstance(recovered, dict)
+        and recovered
+        and all(recovered.values())
+    )
+    return cleanup
 
 
 def run_boot015(
@@ -760,7 +1176,12 @@ def run_boot015(
         check=False,
     )
     baseline = fixture.regional.cpu_python(REMOTE_BASELINE_PROBE)
-    result: dict[str, Any] = {"verdict": "FAIL"}
+    baseline_ids = set(baseline.get("ids") or [])
+    result: dict[str, Any] = {
+        "verdict": "FAIL",
+        "remote_count_before": baseline["count"],
+    }
+    injected = False
     try:
         fixture.regional.cpu_python(
             REMOTE_INJECT_PROBE,
@@ -768,6 +1189,9 @@ def run_boot015(
             command_id,
             REMOTE_OWNER,
         )
+        injected = True
+        # The alert window starts at injection; the reads below happen inside it.
+        alert_deadline = time.monotonic() + AMP_FIRING_WINDOW_SECONDS
         readiness = []
         for pod in pods:
             completed = fixture.exec(
@@ -787,7 +1211,7 @@ def run_boot015(
                 }
             )
         first = fixture.regional.cpu_python(METRIC_PROBE, fixture.cluster_id)
-        time.sleep(30)
+        time.sleep(METRIC_SAMPLE_GAP_SECONDS)
         second = fixture.regional.cpu_python(METRIC_PROBE, fixture.cluster_id)
         logs = [
             fixture.regional.kubectl(
@@ -802,8 +1226,12 @@ def run_boot015(
         firing = wait_amp_alert(
             fixture,
             expect_firing=True,
-            timeout_seconds=300,
+            timeout_seconds=AMP_FIRING_WINDOW_SECONDS,
+            deadline=alert_deadline,
         )
+        # Before deletion the command must still be exactly what was injected:
+        # pending in the catalog and never leased, or an executor did claim it.
+        state = fixture.regional.cpu_python(REMOTE_STATE_PROBE, command_id)
         checks = {
             "profile_remote_owners_subset": all(
                 not item["orphan_owners"] for item in profile["profiles"]
@@ -818,70 +1246,54 @@ def run_boot015(
             "metrics_under_five_seconds": (
                 first["duration_seconds"] < 5 and second["duration_seconds"] < 5
             ),
+            "pending_counted": second["pending"] >= 1,
             "oldest_metric_increases": (
                 first["oldest_unclaimed_seconds"] is not None
                 and second["oldest_unclaimed_seconds"]
                 > first["oldest_unclaimed_seconds"]
             ),
+            "never_leased": state["exists"]
+            and state["status"] == "PENDING"
+            and state["lease_owner"] is None,
             "executor_logs_exclude_command": all(
                 command_id not in text for text in logs
             ),
             "alert_reachability": static_alert.returncode == 0,
             "amp_firing": firing["matched"],
         }
-        result = {
-            "verdict": "PASS" if all(checks.values()) else "FAIL",
-            "checks": checks,
-            "owner_sets": owner_sets,
-            "profile": profile,
-            "readiness": readiness,
-            "metric_samples": [first, second],
-            "amp_firing": firing,
-        }
-    finally:
-        cleanup = fixture.regional.cpu_python(REMOTE_DELETE_PROBE, command_id)
-        resolved = wait_amp_alert(
-            fixture,
-            expect_firing=False,
-            timeout_seconds=180,
+        result.update(
+            {
+                "verdict": "PASS" if all(checks.values()) else "FAIL",
+                "checks": checks,
+                "owner_sets": owner_sets,
+                "profile": profile,
+                "readiness": readiness,
+                "metric_samples": [first, second],
+                "pre_delete_state": state,
+                "amp_firing": firing,
+            }
         )
-        recovered = []
-        for pod in pods:
-            completed = fixture.exec(
-                "gpu",
-                pod,
-                "gpu-fault-cluster-executor-readiness",
-                check=False,
+    finally:
+        # Runs for a PASS, a failed check and any exception alike; the details
+        # file is written here so an interrupted run still leaves evidence, and
+        # the original exception (if any) propagates after it.
+        if injected:
+            cleanup = boot015_cleanup(
+                fixture,
+                command_id=command_id,
+                pods=pods,
+                baseline_ids=baseline_ids,
             )
-            recovered.append(completed.returncode == 0)
-        final = fixture.regional.cpu_python(REMOTE_BASELINE_PROBE)
-        # The control plane's retention sweep deletes old terminal commands on
-        # its own schedule, so the total count drifts during the case (live:
-        # 81 -> 80 while the case ran and the equality check failed a clean
-        # run). What the case owns is: its synthetic command is gone and it
-        # left no other command behind.
-        baseline_ids = set(baseline.get("ids") or [])
-        final_ids = set(final.get("ids") or [])
-        introduced = sorted(final_ids - baseline_ids)
-        result["cleanup"] = {
-            "delete": cleanup,
-            "amp_resolved": resolved,
-            "readiness_recovered": recovered,
-            "synthetic_command_removed": command_id not in final_ids,
-            "commands_introduced": introduced,
-            "remote_count_before": baseline["count"],
-            "remote_count_after": final["count"],
-        }
-        if (
-            not resolved["matched"]
-            or not all(recovered)
-            or command_id in final_ids
-            or introduced
-        ):
-            result["verdict"] = "FAIL"
-    write_json_atomic(case_dir / "boot015-details.json", result)
-    result["limitations"] = [
-        "The current implementation validates owner compatibility at runtime "
-        "readiness; registration-time owner validation remains a known gap."
-    ]
+            result["cleanup"] = cleanup
+            if not cleanup["passed"]:
+                result["verdict"] = "FAIL"
+        else:
+            result["cleanup"] = {"injected": False}
+        result["limitations"] = [
+            "The current implementation validates owner compatibility at runtime "
+            "readiness; registration-time owner validation remains a known gap.",
+            "AMP alert resolution after cleanup is observed, not required: the "
+            "gauge may hold its last value for one scrape interval.",
+        ]
+        write_json_atomic(case_dir / "boot015-details.json", result)
     return result

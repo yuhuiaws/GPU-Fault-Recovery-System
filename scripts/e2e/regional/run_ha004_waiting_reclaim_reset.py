@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
+import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -17,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.e2e.regional import executor_env_window as env_window  # noqa: E402
 from scripts.e2e.regional import run_destr001_gpu_reset as reset_case  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
@@ -28,6 +32,8 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -47,12 +53,35 @@ from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
 CASE_ID = "GF-REGIONAL-HA-004"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-HA-003"
 CONFIRMATION = "HA004_FORCE_WAITING_COMMAND_RECLAIM"
-DEPLOYMENT = "gpu-fault-cluster-executor"
+DEPLOYMENT = env_window.DEPLOYMENT
 LEASE_ENV = "GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS"
 POLL_ENV = "GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS"
 TEST_LEASE_SECONDS = 10
 TEST_POLL_SECONDS = 2
-WATCHDOG_SECONDS = 900
+TEST_REPLICAS = 2
+# The detached rollback must not fire while the case is still measuring: it is
+# armed before the executor rollout and has to outlast every wait that follows.
+# The sum below plus the margin equals the host probe's active deadline, so
+# both fail-safes give up at the same moment.
+PHASE_BUDGETS = {
+    "executor_rollout": 600,
+    "command_timeline": 900,
+    "workflow_wait": 1200,
+    "host_snapshot_and_evaluate": 180,
+}
+WATCHDOG_MARGIN_SECONDS = 720
+WATCHDOG_SECONDS = sum(PHASE_BUDGETS.values()) + WATCHDOG_MARGIN_SECONDS
+HOST_PROBE_ACTIVE_DEADLINE_SECONDS = 3600
+# The timeline asks for a store read every 0.25s, but each read is a kubectl
+# exec plus a fresh PostgreSQL pool and takes ~6s, so that is the effective
+# owner/token sampling period unless the sampler moves to direct SQL.
+REQUESTED_SAMPLE_INTERVAL_SECONDS = 0.25
+SAMPLING_LIMITATION = (
+    "owner/token changes are sampled through STORE_PROBE (kubectl exec + new "
+    "PostgreSQL pool per read), whose effective period is ~6s, not the 100ms "
+    "the catalog describes; a LEASED phase shorter than one period is invisible "
+    "and the case relies on WAITING/last_lease_owner instead"
+)
 
 
 @dataclass(frozen=True)
@@ -161,22 +190,58 @@ def deployment_snapshot(regional: RegionalLiveFixture) -> dict[str, Any]:
     }
 
 
+def stop_process_group(process: subprocess.Popen[str] | None) -> dict[str, Any]:
+    """Kill a ``start_new_session`` watchdog's whole group; never raise.
+
+    ``Popen.terminate`` signals only ``bash``; the ``sleep`` and the kubectl
+    it would exec are in the same session, so the group is what has to go.
+    """
+
+    if process is None:
+        return {"armed": False}
+    if process.poll() is not None:
+        return {"armed": True, "fired": True, "returncode": process.returncode}
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+    except Exception as exc:  # pragma: no cover - platform dependent
+        return {
+            "armed": True,
+            "fired": False,
+            "stop_error": f"{type(exc).__name__}: {exc}",
+        }
+    return {"armed": True, "fired": False, "disarmed": True}
+
+
 class ExecutorTimingFixture:
+    """Open the lease/poll env window on the executor and put it back.
+
+    The env change itself goes through ``executor_env_window`` -- the same
+    baseline-record, converge-every-replica, restore-absent-as-delete helper
+    DESTR-014 uses -- so HA-004 no longer carries its own copy of that logic.
+    What stays here is the replica scale and the detached rollback watchdog.
+    """
+
     def __init__(
         self,
         regional: RegionalLiveFixture,
         case_dir: Path,
+        *,
+        watchdog_seconds: int = WATCHDOG_SECONDS,
     ) -> None:
         self.regional = regional
         self.case_dir = case_dir
         self.baseline = deployment_snapshot(regional)
         self.watchdog: subprocess.Popen[str] | None = None
-
-    def _env_arguments(self, values: dict[str, str | None]) -> list[str]:
-        return [
-            f"{name}={value}" if value is not None else f"{name}-"
-            for name, value in values.items()
-        ]
+        self.watchdog_seconds = watchdog_seconds
+        self.window = env_window.Settings(
+            baseline=case_dir / "executor-env-window.json",
+            rollout_timeout_seconds=PHASE_BUDGETS["executor_rollout"],
+        )
 
     def _kubectl_base(self) -> list[str]:
         settings = self.regional.settings
@@ -190,6 +255,15 @@ class ExecutorTimingFixture:
             settings.namespace,
         ]
 
+    def _restore_env_arguments(self) -> list[str]:
+        baseline = {
+            "variables": {
+                name: {"present": value is not None, "value": value}
+                for name, value in self.baseline["env"].items()
+            }
+        }
+        return env_window.restore_arguments(baseline)
+
     def start_watchdog(self) -> None:
         log_path = self.case_dir / "executor-rollback-watchdog.log"
         command = [
@@ -197,7 +271,8 @@ class ExecutorTimingFixture:
             "set",
             "env",
             f"deployment/{DEPLOYMENT}",
-            *self._env_arguments(self.baseline["env"]),
+            f"--containers={env_window.CONTAINER}",
+            *self._restore_env_arguments(),
         ]
         scale = [
             *self._kubectl_base(),
@@ -206,76 +281,88 @@ class ExecutorTimingFixture:
             f"--replicas={self.baseline['replicas']}",
         ]
         script = (
-            f"sleep {WATCHDOG_SECONDS}; "
+            f"sleep {self.watchdog_seconds}; "
             + shlex.join(command)
             + "; "
             + shlex.join(scale)
         )
-        stream = log_path.open("w", encoding="utf-8")
-        self.watchdog = subprocess.Popen(
-            ["bash", "-ceu", script],
-            stdout=stream,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-        (self.case_dir / "executor-rollback-watchdog.pid").write_text(
-            str(self.watchdog.pid),
-            encoding="utf-8",
+        with log_path.open("w", encoding="utf-8") as stream:
+            self.watchdog = subprocess.Popen(
+                ["bash", "-ceu", script],
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+        write_json_atomic(
+            self.case_dir / "executor-rollback-watchdog.json",
+            {"pid": self.watchdog.pid, "delay_seconds": self.watchdog_seconds},
         )
 
     def apply(self) -> dict[str, Any]:
         self.start_watchdog()
-        self.regional.kubectl(
-            "gpu",
-            "set",
-            "env",
-            f"deployment/{DEPLOYMENT}",
-            f"{LEASE_ENV}={TEST_LEASE_SECONDS}",
-            f"{POLL_ENV}={TEST_POLL_SECONDS}",
+        env_window.open_window(
+            self.window,
+            self.regional,
+            env_window.survey(self.regional),
+            {LEASE_ENV: str(TEST_LEASE_SECONDS), POLL_ENV: str(TEST_POLL_SECONDS)},
         )
         self.regional.kubectl(
             "gpu",
             "scale",
             f"deployment/{DEPLOYMENT}",
-            "--replicas=2",
+            f"--replicas={TEST_REPLICAS}",
         )
         self.regional.kubectl(
             "gpu",
             "rollout",
             "status",
             f"deployment/{DEPLOYMENT}",
-            "--timeout=600s",
-            timeout=630,
+            f"--timeout={PHASE_BUDGETS['executor_rollout']}s",
+            timeout=PHASE_BUDGETS["executor_rollout"] + 30,
         )
         return deployment_snapshot(self.regional)
 
     def restore(self) -> dict[str, Any]:
-        self.regional.kubectl(
-            "gpu",
-            "set",
-            "env",
-            f"deployment/{DEPLOYMENT}",
-            *self._env_arguments(self.baseline["env"]),
+        errors: list[str] = []
+        try:
+            if self.window.baseline.is_file():
+                env_window.close_window(
+                    self.window, self.regional, env_window.survey(self.regional)
+                )
+        except Exception as exc:
+            errors.append(f"env window close: {type(exc).__name__}: {exc}")
+        try:
+            self.regional.kubectl(
+                "gpu",
+                "scale",
+                f"deployment/{DEPLOYMENT}",
+                f"--replicas={self.baseline['replicas']}",
+            )
+            self.regional.kubectl(
+                "gpu",
+                "rollout",
+                "status",
+                f"deployment/{DEPLOYMENT}",
+                f"--timeout={PHASE_BUDGETS['executor_rollout']}s",
+                timeout=PHASE_BUDGETS["executor_rollout"] + 30,
+            )
+        except Exception as exc:
+            errors.append(f"scale restore: {type(exc).__name__}: {exc}")
+        # The watchdog is disarmed last and only once the live restore ran;
+        # if the restore above failed, the watchdog is the remaining rollback
+        # and stays armed.
+        watchdog = (
+            stop_process_group(self.watchdog)
+            if not errors
+            else {"armed": self.watchdog is not None, "left_armed": True}
         )
-        self.regional.kubectl(
-            "gpu",
-            "scale",
-            f"deployment/{DEPLOYMENT}",
-            f"--replicas={self.baseline['replicas']}",
-        )
-        self.regional.kubectl(
-            "gpu",
-            "rollout",
-            "status",
-            f"deployment/{DEPLOYMENT}",
-            "--timeout=600s",
-            timeout=630,
-        )
-        if self.watchdog is not None and self.watchdog.poll() is None:
-            self.watchdog.terminate()
-            self.watchdog.wait(timeout=10)
-        return deployment_snapshot(self.regional)
+        restored = deployment_snapshot(self.regional)
+        restored["watchdog"] = watchdog
+        restored["restore_errors"] = errors
+        if errors:
+            raise RegionalFixtureError("; ".join(errors))
+        return restored
 
 
 def read_only_preflight(
@@ -289,9 +376,15 @@ def read_only_preflight(
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
+        **regional.evidence_identity(),
     )
     deployment = deployment_snapshot(regional)
-    tests = focused_tests(case_dir)
+    reused = reusable_focused_tests(case_dir / "plan.json")
+    tests = (
+        {**reused, "reused_from_plan": True}
+        if reused is not None
+        else focused_tests(case_dir)
+    )
     errors = []
     if not predecessor["valid"]:
         errors.append("HA-003 predecessor evidence is not PASS")
@@ -333,6 +426,43 @@ def read_only_preflight(
     return result
 
 
+def lease_token_digest(command: dict[str, Any]) -> str | None:
+    """The lease token's SHA-256 as STORE_PROBE now reports it.
+
+    The probe stopped emitting ``lease_token`` and emits ``lease_token_sha256``;
+    an older probe (or a unit fixture) still carrying the raw token is digested
+    here so the timeline never records the credential itself.
+    """
+
+    digest = command.get("lease_token_sha256")
+    if digest:
+        return str(digest)
+    raw = command.get("lease_token")
+    if raw in (None, ""):
+        return None
+    return hashlib.sha256(str(raw).encode()).hexdigest()
+
+
+def effective_sampling_period_seconds(
+    timeline: list[dict[str, Any]],
+) -> float | None:
+    """Median gap between consecutive timeline samples, in seconds."""
+
+    stamps = []
+    for item in timeline:
+        raw = item.get("observed_at")
+        if not raw:
+            continue
+        stamps.append(datetime.fromisoformat(str(raw).replace("Z", "+00:00")))
+    if len(stamps) < 2:
+        return None
+    gaps = [
+        (later - earlier).total_seconds()
+        for earlier, later in zip(stamps, stamps[1:], strict=False)
+    ]
+    return round(statistics.median(gaps), 3)
+
+
 def command_timeline(
     regional: RegionalLiveFixture,
     settings: Settings,
@@ -369,7 +499,7 @@ def command_timeline(
             "status": command.get("status"),
             "lease_owner": command.get("lease_owner"),
             "last_lease_owner": command.get("last_lease_owner"),
-            "lease_token": command.get("lease_token"),
+            "lease_token_sha256": lease_token_digest(command),
             "lease_expires_at": command.get("lease_expires_at"),
         }
         timeline.append(sample)
@@ -393,7 +523,7 @@ def command_timeline(
         if killed and command.get("status") in {"SUCCEEDED", "FAILED"}:
             last = state
             break
-        time.sleep(0.25)
+        time.sleep(REQUESTED_SAMPLE_INTERVAL_SECONDS)
     else:
         raise RegionalFixtureError("RESET_GPU command did not reach a terminal state")
     owners = {
@@ -422,7 +552,7 @@ def owner_pod(
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     state = preflight["store"]
-    return {
+    details: dict[str, Any] = {
         "risk": "destructive",
         "predecessor": preflight["predecessor"],
         "target_node": settings.node,
@@ -450,14 +580,22 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "Node Agent ledger/journal show more than one physical reset",
             "Deployment, node ownership or services cannot be restored",
         ],
+        "phase_budgets_seconds": PHASE_BUDGETS,
+        "sampling": {
+            "requested_interval_seconds": REQUESTED_SAMPLE_INTERVAL_SECONDS,
+            "limitation": SAMPLING_LIMITATION,
+        },
         "rollback": {
             "detached_executor_config_watchdog_seconds": WATCHDOG_SECONDS,
+            "host_probe_active_deadline_seconds": HOST_PROBE_ACTIVE_DEADLINE_SECONDS,
             "restore_original_lease_poll_and_replica_values": True,
             "restore_GPU_services_and_node_ownership": True,
             "delete_host_probe_resources": True,
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight["focused_tests"])
+    return details
 
 
 def verify_plan_identity(
@@ -497,7 +635,9 @@ def lease_reissue_observed(
     """
 
     tokens = {
-        str(item.get("lease_token")) for item in timeline if item.get("lease_token")
+        str(item.get("lease_token_sha256"))
+        for item in timeline
+        if item.get("lease_token_sha256")
     }
     if len(tokens) >= 2:
         return True
@@ -541,7 +681,9 @@ def evaluate_reclaim(
         if item.get("lease_owner") or item.get("last_lease_owner")
     }
     tokens = {
-        str(item.get("lease_token")) for item in timeline if item.get("lease_token")
+        str(item.get("lease_token_sha256"))
+        for item in timeline
+        if item.get("lease_token_sha256")
     }
     if len(command_ids) != 1:
         errors.append("remote command ID changed across reclaim")
@@ -695,7 +837,7 @@ def execute_case(
             case_id=CASE_ID,
             run_id=run_id,
             probe_script=reset_case.PROBE_SCRIPT,
-            active_deadline_seconds=3600,
+            active_deadline_seconds=HOST_PROBE_ACTIVE_DEADLINE_SECONDS,
         )
     )
     result: dict[str, Any] = {
@@ -703,6 +845,7 @@ def execute_case(
         "attempt": attempt,
         "verdict": "FAIL",
         "maintenance_window_end": maintenance_window_end.isoformat(),
+        "limitations": [SAMPLING_LIMITATION],
     }
     incident_id = ""
     sampler_started = False
@@ -762,7 +905,7 @@ def execute_case(
             settings,
             marker=marker,
             observed_after=injected_at,
-            timeout_seconds=900,
+            timeout_seconds=PHASE_BUDGETS["command_timeline"],
             kill_owner=kill,
             evidence=waiting_evidence,
         )
@@ -773,7 +916,7 @@ def execute_case(
                 marker=marker,
                 observed_after=injected_at,
                 case_dir=case_dir,
-                timeout_seconds=1200,
+                timeout_seconds=PHASE_BUDGETS["workflow_wait"],
             )
         )
         # The workflow wait re-reads the store, so the facts only the command
@@ -808,6 +951,15 @@ def execute_case(
                 "lease_token_count": evidence["token_count"],
                 "node_command_id": evidence["expected_node_command"],
                 "killed_owner_pod": killed_pod,
+                "sampling": {
+                    "requested_interval_seconds": REQUESTED_SAMPLE_INTERVAL_SECONDS,
+                    "effective_period_seconds": effective_sampling_period_seconds(
+                        timeline
+                    ),
+                    "samples": len(timeline),
+                },
+                "phase_budgets_seconds": PHASE_BUDGETS,
+                "watchdog_seconds": WATCHDOG_SECONDS,
             }
         )
     except Exception as exc:
@@ -826,6 +978,7 @@ def execute_case(
         result["cleanup"] = cleanup
         if cleanup["errors"]:
             result["verdict"] = "FAIL"
+    result.update(regional.evidence_identity())
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1

@@ -9,37 +9,74 @@ import secrets
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
+from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
 from scripts.e2e.regional.host_probe_fixture import (
     HostProbeFixture,
     HostProbeSettings,
 )
 from scripts.e2e.regional.identity_acceptance_common import (
+    ACCEPTANCE_PROBE_OWNER,
     EXECUTOR_APP,
     ROOT,
     WRITE_METHODS,
     ClusterTarget,
     IdentityAcceptanceError,
+    IdentityCaseFailure,
     IdentitySite,
     claim,
     read_cluster_token,
     rollout_executor,
     run,
+    run_cleanup_steps,
     secret_digest,
     utc_now,
     write_cluster_token,
 )
 
 AUTH015_PROBE = Path(__file__).with_name("probes") / "auth015_node_probe.py"
+AUTH013_PROBE = Path(__file__).with_name("probes") / "auth013_certificate_probe.py"
+NODE_ACTION_KEYS_SECRET = "gpu-fault-node-action-keys"
+INSTALLER_SECRET = "gpu-fault-control-plane-active"
+# How long AUTH-016 waits for its sampler thread after asking it to stop. A
+# sample is one ``direct_claim``: the executor Pod lookup (``kubectl get``,
+# default 300 s bound) plus one exec bounded at 60 s. The old 15 s join let a
+# sampler mid-claim outlive the restore and read the restored token as a
+# "completed"-phase 200.
+DIRECT_CLAIM_EXEC_TIMEOUT_SECONDS = 60
+DIRECT_CLAIM_JOIN_SECONDS = 300 + DIRECT_CLAIM_EXEC_TIMEOUT_SECONDS + 15
+
+
+def verdict(checks: dict[str, Any]) -> str:
+    """PASS only when every check is literally ``True``.
+
+    ``all(checks.values())`` accepted any truthy value, so a check recorded as
+    the string ``"NOT_EVALUATED"`` passed. Checks that could not be evaluated
+    belong in a separate ``not_evaluated`` mapping, not here.
+    """
+
+    return "PASS" if all(value is True for value in checks.values()) else "FAIL"
+
+
+def failure_details(
+    *,
+    checks: dict[str, Any],
+    cleanup_errors: list[str],
+    **extra: Any,
+) -> dict[str, Any]:
+    return {"checks": checks, "cleanup_errors": cleanup_errors, **extra}
 
 
 def run_auth007(
     site: IdentitySite,
     primary: ClusterTarget,
     secondary: ClusterTarget,
+    *,
+    case_dir: Path,
 ) -> dict[str, Any]:
     original = site.registry()
     updated = [dict(item) for item in original]
@@ -50,35 +87,75 @@ def run_auth007(
             found = True
     if not found:
         raise IdentityAcceptanceError("secondary cluster is absent from registry")
-    disabled_latency = None
-    restored_latency = None
+    disabled_latency: float | None = None
+    restored_latency: float | None = None
     secondary_disabled: dict[str, Any] = {}
     primary_healthy: dict[str, Any] = {}
-    secondary_recovered: dict[str, Any] = {}
+    cleanup: dict[str, Any] = {}
+    cleanup_errors: list[str] = []
+    checks: dict[str, Any] = {}
     try:
         site.write_registry(updated)
-        disabled_latency = site.rollout_control()
+        # The revision is applied once every member acked it; that wait is the
+        # isolation delay, and write_registry measured it from the POST.
+        disabled_latency = site.last_registry_ready_seconds or site.rollout_control()
         secondary_disabled = claim(site, secondary)
         primary_healthy = claim(site, primary)
+    except Exception as exc:
+        checks["error"] = f"{type(exc).__name__}: {exc}"
+        raise IdentityCaseFailure(
+            str(exc),
+            details=failure_details(
+                checks=checks,
+                cleanup_errors=cleanup_errors,
+                secondary_disabled=secondary_disabled,
+                primary_healthy=primary_healthy,
+            ),
+        ) from exc
     finally:
-        site.write_registry(original)
-        restored_latency = site.rollout_control()
-        secondary_recovered = claim(site, secondary)
+        # Update in place: an IdentityCaseFailure raised above already holds
+        # these two containers, and a rebinding here would leave it the empty
+        # ones.
+        step_outcomes, step_errors = run_cleanup_steps(
+            [
+                ("restore_registry", lambda: site.write_registry(original)),
+                ("rollout_control", site.rollout_control),
+                ("secondary_claim", lambda: claim(site, secondary)),
+            ]
+        )
+        cleanup.update(step_outcomes)
+        cleanup_errors.extend(step_errors)
+        restored_latency = site.last_registry_ready_seconds or cleanup.get(
+            "rollout_control"
+        )
+        write_json_atomic(
+            case_dir / "auth007-details.json",
+            {
+                "cleanup": cleanup,
+                "cleanup_errors": cleanup_errors,
+                "secondary_disabled": secondary_disabled,
+                "primary_healthy": primary_healthy,
+            },
+        )
+    secondary_recovered = cleanup.get("secondary_claim") or {}
     checks = {
         "secondary_disabled_403": secondary_disabled.get("status") == 403,
         "primary_remains_200": primary_healthy.get("status") == 200,
         "secondary_recovers_200": secondary_recovered.get("status") == 200,
         "registry_restored": site.registry() == original,
+        "cleanup_completed": not cleanup_errors,
     }
     return {
-        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "verdict": verdict(checks),
         "checks": checks,
         "isolation_latency_seconds": disabled_latency,
         "restore_latency_seconds": restored_latency,
+        "cleanup_errors": cleanup_errors,
         "limitations": [
-            "The case rolls ingress and control-worker for the explicitly "
-            "selected secondary test cluster; it does not disable a production "
-            "training cluster."
+            "The case disables the explicitly selected secondary test cluster's "
+            "registration; it does not disable a production training cluster. "
+            "Latencies are measured from the revision POST to the last member "
+            "ack, not from a control-plane rollout."
         ],
     }
 
@@ -86,7 +163,11 @@ def run_auth007(
 ROUTE_INVENTORY_PROBE = r"""
 import json
 from gpu_fault.app import create_app
-from gpu_fault.app.authorization import ExplicitAuthorizationRegistry, iter_api_routes
+from gpu_fault.app.authorization import (
+    UNDOCUMENTED_PUBLIC_PATHS,
+    ExplicitAuthorizationRegistry,
+    iter_api_routes,
+)
 
 app = create_app()
 registry = ExplicitAuthorizationRegistry()
@@ -103,7 +184,22 @@ for route in iter_api_routes(app.routes):
         "methods": sorted(route.methods or []),
         "bucket": registry.inventory[route.path],
     })
+# The OpenAPI surface has no bucket: it is public read-only information that
+# AUTH-014 records (anonymous status) rather than judges against a bucket.
+for path in sorted(UNDOCUMENTED_PUBLIC_PATHS):
+    routes.append({"path": path, "methods": ["GET"], "bucket": "public-undocumented"})
 print(json.dumps({"routes": routes}, sort_keys=True))
+"""
+
+EXECUTION_TOKEN_DIGEST_PROBE = r"""
+import hashlib
+import json
+import os
+token = os.environ["GPU_FAULT_EXECUTION_TOKEN"]
+print(json.dumps({
+    "sha256": hashlib.sha256(token.encode()).hexdigest(),
+    "stripped_sha256": hashlib.sha256(token.strip().encode()).hexdigest(),
+}))
 """
 
 ANONYMOUS_ROUTE_PROBE = r"""
@@ -193,39 +289,89 @@ def anonymous_routes(
     return cast(list[dict[str, Any]], value["results"])
 
 
-def data_plane_execution_token_names(
-    site: IdentitySite,
-    target: ClusterTarget,
+def execution_token_hits(
+    secrets_document: dict[str, Any],
+    pods_document: dict[str, Any],
+    *,
+    digests: set[str],
 ) -> list[dict[str, str]]:
-    secret = json.loads(site.gpu(target, "get", "secret", "-o", "json"))
-    pods = json.loads(site.gpu(target, "get", "pod", "-o", "json"))
+    """Where the data plane holds the execution token, by name or by value.
+
+    ``digests`` are the SHA-256 of the token as the API Pod holds it (raw and
+    stripped); every Secret value and every literal Pod env value is digested
+    and compared, so a token stored under an innocent key is found too. Only
+    names and keys are returned, never values.
+    """
+
     matches = []
     pattern = re.compile(r"execution[_.-]?token", re.IGNORECASE)
-    for item in secret.get("items", []):
-        for key in item.get("data") or {}:
-            if pattern.search(str(key)):
+
+    def value_digests(raw: bytes) -> set[str]:
+        return {
+            hashlib.sha256(raw).hexdigest(),
+            hashlib.sha256(raw.strip()).hexdigest(),
+        }
+
+    for item in secrets_document.get("items", []):
+        name = str(item.get("metadata", {}).get("name", ""))
+        for key, encoded in (item.get("data") or {}).items():
+            try:
+                raw = base64.b64decode(str(encoded))
+            except (ValueError, TypeError):
+                raw = b""
+            by_value = bool(value_digests(raw) & digests) if raw else False
+            by_name = pattern.search(str(key)) is not None
+            if by_value or by_name:
                 matches.append(
                     {
                         "kind": "Secret",
-                        "name": str(item["metadata"]["name"]),
+                        "name": name,
                         "key": str(key),
+                        "match": "value" if by_value else "name",
                     }
                 )
-    for item in pods.get("items", []):
-        for container in item.get("spec", {}).get("containers", []):
+    for item in pods_document.get("items", []):
+        name = str(item.get("metadata", {}).get("name", ""))
+        spec = item.get("spec", {})
+        containers = [*spec.get("initContainers", []), *spec.get("containers", [])]
+        for container in containers:
             for entry in container.get("env", []):
-                if pattern.search(str(entry.get("name", ""))):
+                literal = entry.get("value")
+                by_value = isinstance(literal, str) and bool(
+                    value_digests(literal.encode()) & digests
+                )
+                by_name = pattern.search(str(entry.get("name", ""))) is not None
+                if by_value or by_name:
                     matches.append(
                         {
                             "kind": "Pod",
-                            "name": str(item["metadata"]["name"]),
+                            "name": name,
                             "key": str(entry.get("name")),
+                            "match": "value" if by_value else "name",
                         }
                     )
     return matches
 
 
+def data_plane_execution_token_hits(
+    site: IdentitySite,
+    target: ClusterTarget,
+) -> list[dict[str, str]]:
+    """Data-plane Secret values and Pod env compared to the real token digest.
+
+    The digest is computed inside the API Pod (the only place the token is
+    allowed to exist) and only the digest crosses to the runner.
+    """
+
+    reference = site.api_pod_json(EXECUTION_TOKEN_DIGEST_PROBE)
+    digests = {str(reference["sha256"]), str(reference["stripped_sha256"])}
+    secrets_document = json.loads(site.gpu(target, "get", "secret", "-o", "json"))
+    pods_document = json.loads(site.gpu(target, "get", "pod", "-o", "json"))
+    return execution_token_hits(secrets_document, pods_document, digests=digests)
+
+
 def run_auth010(site: IdentitySite, target: ClusterTarget) -> dict[str, Any]:
+    """AUTH-010, kept runnable; its content is a subset of AUTH-014's audit."""
     routes = route_inventory(site, target)
     cluster_routes = [
         {
@@ -250,32 +396,40 @@ def run_auth010(site: IdentitySite, target: ClusterTarget) -> dict[str, Any]:
         if set(item["methods"]) & WRITE_METHODS
         and item["bucket"] in {"public", "metrics", None}
     ]
-    token_names = data_plane_execution_token_names(site, target)
+    token_hits = data_plane_execution_token_hits(site, target)
     checks = {
         "cluster_token_routes_present": bool(results),
         "cluster_token_routes_anonymous_401": all(
             item.get("status") == 401 for item in results
         ),
         "write_routes_explicitly_protected": not unsafe_writes,
-        "execution_token_absent_from_data_plane": not token_names,
+        "execution_token_absent_from_data_plane": not token_hits,
     }
     return {
-        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "verdict": verdict(checks),
         "checks": checks,
+        "status": "superseded",
+        "superseded_by": "GF-REGIONAL-AUTH-014",
         "route_count": len(routes),
         "cluster_token_results": results,
         "unsafe_write_routes": unsafe_writes,
-        "execution_token_name_hits": token_names,
+        "execution_token_hits": token_hits,
         "limitations": [
             "Anonymous requests validate the deployed route registry and "
-            "middleware; they do not exercise every authorized success payload."
+            "middleware; they do not exercise every authorized success payload.",
+            "AUTH-010 is superseded by GF-REGIONAL-AUTH-014, which audits every "
+            "bucket and the outside-VPC denial; this run is kept for the chain.",
         ],
     }
 
 
 REMOTE_STATUS_PROBE = r"""
 import json
+import sys
 from gpu_fault.app import ApplicationContext
+# argv: command IDs whose status must be reported even once terminal, so the
+# "after" reading can tell SUCCEEDED (not interrupted) from a vanished row.
+tracked = set(sys.argv[1:])
 commands = ApplicationContext.from_environment().store.list_remote_commands()
 print(json.dumps({
     "commands": [
@@ -286,6 +440,7 @@ print(json.dumps({
         }
         for item in commands
         if item.status.value in {"PENDING", "WAITING", "LEASED"}
+        or item.command_id in tracked
     ]
 }, sort_keys=True))
 """
@@ -374,12 +529,15 @@ def direct_claim(
     stdin -- never on argv.
     """
 
+    # The probe owner never has commands, so the claim authenticates exactly
+    # like the executor's own and leases nothing (identity["owners"] leased the
+    # real executor's work for 60 s per sample, every 2 s, for eight minutes).
     payload = {
         "executor_id": "token-rotation-probe",
         "executor_protocol_version": 2,
         "executor_artifact_sha256": identity["artifact"],
         "executor_compatibility_digest": identity["compatibility"],
-        "execution_owners": identity["owners"],
+        "execution_owners": [ACCEPTANCE_PROBE_OWNER],
         "max_commands": 1,
         "lease_seconds": 60,
     }
@@ -389,7 +547,11 @@ def direct_claim(
         .replace("__CLUSTER_ID__", json.dumps(target.cluster_id))
     )
     try:
-        value = primary.executor_python(script, timeout=60)
+        # One attempt: a retried claim is a second authenticated request and
+        # would be read as the sample's answer for the phase it lands in.
+        value = primary.executor_python(
+            script, timeout=DIRECT_CLAIM_EXEC_TIMEOUT_SECONDS, attempts=1
+        )
     except Exception as exc:
         # No Ready executor to run the probe from (mid-rollout): an
         # infrastructure gap, not an authentication outcome.
@@ -456,6 +618,27 @@ def update_registry_token(
     raise IdentityAcceptanceError("target cluster is absent from registry")
 
 
+def commands_not_misterminated(
+    before_status: dict[str, str],
+    after_status: dict[str, str | None],
+) -> bool:
+    """Whether every command open before the rotation survived it.
+
+    An empty baseline used to pass vacuously (``all`` over nothing), so the
+    check said "no command was misterminated" on a site that had no command to
+    misterminate. It now needs at least one open command before the rotation.
+    A command that ran to SUCCEEDED during the window was not interrupted; one
+    that vanished (the status probe lists open commands only) or FAILED was.
+    """
+
+    if not before_status:
+        return False
+    return all(
+        after_status.get(command_id) in {"PENDING", "WAITING", "LEASED", "SUCCEEDED"}
+        for command_id in before_status
+    )
+
+
 def auth016_result(
     site: IdentitySite,
     primary: Any,
@@ -488,29 +671,34 @@ def auth016_result(
         for phase in ("baseline", "overlap", "cutover")
         if http_by_phase.get(phase) and set(http_by_phase[phase]) == {200}
     ]
-    after_commands = primary.cpu_python(REMOTE_STATUS_PROBE)
+    before_ids = [str(item["command_id"]) for item in before_commands["commands"]]
+    after_commands = primary.cpu_python(REMOTE_STATUS_PROBE, *before_ids)
     before_status = {
         item["command_id"]: item["status"] for item in before_commands["commands"]
     }
     after_status = {
         item["command_id"]: item["status"] for item in after_commands["commands"]
     }
-    commands_stable = all(
-        after_status.get(command_id) in {"PENDING", "WAITING", "LEASED"}
-        for command_id in before_status
-    )
     checks = {
         "baseline_only_200": "baseline" in uninterrupted,
         "overlap_only_200": "overlap" in uninterrupted,
         "cutover_only_200": "cutover" in uninterrupted,
         "new_token_accepted_during_overlap": new_token_during_overlap == 200,
         "old_token_rejected_after_completion": old_token_after_completion == 403,
-        "remote_commands_not_misterminated": commands_stable,
+        "remote_commands_not_misterminated": commands_not_misterminated(
+            before_status, after_status
+        ),
         "original_credentials_restored": restored,
     }
     return {
-        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "verdict": verdict(checks),
         "checks": checks,
+        "remote_command_baseline": {
+            "open_before": sorted(before_status),
+            "status_after": {
+                command_id: after_status.get(command_id) for command_id in before_status
+            },
+        },
         "statuses_by_phase": {
             phase: sorted({str(value) for value in statuses})
             for phase, statuses in sorted(by_phase.items())
@@ -536,7 +724,10 @@ def auth016_result(
         "limitations": [
             "The retiring token stays valid for the whole overlap window, so this "
             "case proves there is no interruption, not that the old credential is "
-            "revoked instantly; both original Secrets are restored."
+            "revoked instantly; both original Secrets are restored.",
+            "remote_commands_not_misterminated needs at least one command open "
+            "before the rotation; on an idle site the check fails rather than "
+            "passing over an empty baseline.",
         ],
     }
 
@@ -544,6 +735,8 @@ def auth016_result(
 def run_auth016(
     site: IdentitySite,
     target: ClusterTarget,
+    *,
+    case_dir: Path,
 ) -> dict[str, Any]:
     """Prove the overlap window rotates a cluster token without any 403.
 
@@ -571,6 +764,11 @@ def run_auth016(
             with token_lock:
                 token = token_box[0]
                 phase = phase_box[0]
+            # Re-check after the wait: a stop that arrived during the pause
+            # must not be answered with one more claim, which would run while
+            # the restore is republishing the original token.
+            if stop.is_set():
+                return
             samples.append(
                 {
                     "observed_at": utc_now(),
@@ -590,11 +788,23 @@ def run_auth016(
 
     thread = threading.Thread(target=sampler, daemon=True)
     restored = False
-    control_rollout = None
+    control_rollout: float | None = None
     executor_rollout = None
     new_token_during_overlap: int | str | None = None
     old_token_after_completion: int | str | None = None
     registry_generation = site.registry_generation()
+    cleanup_errors: list[str] = []
+    cleanup: dict[str, Any] = {}
+
+    def partial() -> dict[str, Any]:
+        return {
+            "samples": samples,
+            "new_token_during_overlap": new_token_during_overlap,
+            "old_token_after_completion": old_token_after_completion,
+            "cleanup": cleanup,
+            "cleanup_errors": cleanup_errors,
+            "restored": restored,
+        }
 
     try:
         thread.start()
@@ -610,7 +820,9 @@ def run_auth016(
             ),
             reason="GF-REGIONAL-AUTH-016 overlap: new token live, old token retiring",
         )
-        control_rollout = site.rollout_control()
+        # POST-to-last-ack propagation time; rollout_control is a no-op on a
+        # durable-revision site and would have measured ~1 s.
+        control_rollout = site.last_registry_ready_seconds or site.rollout_control()
         enter("overlap")
         time.sleep(30)
         new_token_during_overlap = direct_claim(
@@ -638,22 +850,54 @@ def run_auth016(
             identity=identity,
         )
         time.sleep(10)
+    except Exception as exc:
+        raise IdentityCaseFailure(str(exc), details=partial()) from exc
     finally:
         stop.set()
-        thread.join(timeout=15)
-        site.write_registry(
-            original_registry,
-            reason="GF-REGIONAL-AUTH-016 restore: original token republished",
+        # The sampler's worst case is one whole direct_claim; a shorter join
+        # let a claim in flight land after the restore below.
+        thread.join(timeout=DIRECT_CLAIM_JOIN_SECONDS)
+        if thread.is_alive():
+            cleanup_errors.append("sampler thread did not stop before restore")
+
+        def verify_restored() -> bool:
+            return registry_token_digests(
+                site.registry(), target.cluster_id
+            ) == registry_token_digests(
+                original_registry, target.cluster_id
+            ) and secret_digest(read_cluster_token(site, target)) == secret_digest(
+                old_token
+            )
+
+        # In place: the IdentityCaseFailure raised above holds these containers.
+        step_outcomes, step_errors = run_cleanup_steps(
+            [
+                (
+                    "restore_registry",
+                    lambda: site.write_registry(
+                        original_registry,
+                        reason=(
+                            "GF-REGIONAL-AUTH-016 restore: original token republished"
+                        ),
+                    ),
+                ),
+                ("rollout_control", site.rollout_control),
+                (
+                    "restore_cluster_token",
+                    lambda: write_cluster_token(site, target, old_token),
+                ),
+                ("rollout_executor", lambda: rollout_executor(site, target)),
+                ("verify_restored", verify_restored),
+            ]
         )
-        site.rollout_control()
-        write_cluster_token(site, target, old_token)
-        rollout_executor(site, target)
-        restored = registry_token_digests(
-            site.registry(), target.cluster_id
-        ) == registry_token_digests(
-            original_registry, target.cluster_id
-        ) and secret_digest(read_cluster_token(site, target)) == secret_digest(
-            old_token
+        cleanup.update(step_outcomes)
+        cleanup_errors.extend(step_errors)
+        restored = cleanup.get("verify_restored") is True and not cleanup_errors
+        write_json_atomic(case_dir / "auth016-details.json", partial())
+    if thread.is_alive():
+        raise IdentityCaseFailure(
+            "sampler thread outlived the restore; samples cannot be attributed",
+            details=partial(),
         )
     return auth016_result(
         site,
@@ -684,9 +928,16 @@ url = urlsplit(os.environ["GPU_FAULT_CONTROL_PLANE_URL"])
 host = url.hostname
 ca_file = os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
 context = ssl.create_default_context(cafile=ca_file)
-with socket.create_connection((host, url.port or 443), timeout=15) as raw:
-    with context.wrap_socket(raw, server_hostname=host) as tls:
-        certificate = tls.getpeercert()
+certificate = {}
+default_handshake_ok = False
+default_handshake_error = None
+try:
+    with socket.create_connection((host, url.port or 443), timeout=15) as raw:
+        with context.wrap_socket(raw, server_hostname=host) as tls:
+            certificate = tls.getpeercert() or {}
+            default_handshake_ok = True
+except (ssl.SSLError, OSError) as exc:
+    default_handshake_error = type(exc).__name__
 
 empty_ca_rejected = False
 Path("/tmp/auth013-empty-ca.pem").write_text("", encoding="ascii")
@@ -695,18 +946,24 @@ try:
 except ssl.SSLError:
     empty_ca_rejected = True
 
+# Any TLS or socket failure is a rejection of the wrong name; the server may
+# close the connection (OSError) instead of completing a handshake that then
+# fails hostname verification (SSLCertVerificationError). What must not
+# happen is a completed handshake.
 wrong_hostname_rejected = False
+wrong_hostname_error = None
 try:
     with socket.create_connection((host, url.port or 443), timeout=15) as raw:
         with context.wrap_socket(raw, server_hostname="wrong.invalid"):
             pass
-except ssl.SSLCertVerificationError:
+except (ssl.SSLError, OSError) as exc:
     wrong_hostname_rejected = True
+    wrong_hostname_error = type(exc).__name__
 
 not_after = certificate.get("notAfter")
-expires = datetime.fromtimestamp(
-    ssl.cert_time_to_seconds(not_after),
-    tz=timezone.utc,
+expires = (
+    datetime.fromtimestamp(ssl.cert_time_to_seconds(not_after), tz=timezone.utc)
+    if not_after else None
 )
 sans = [
     value
@@ -721,45 +978,208 @@ print(json.dumps({
     "requests_ca_bundle_set": bool(os.getenv("REQUESTS_CA_BUNDLE")),
     "sans": sans,
     "hostname_in_san": host in sans,
+    "default_handshake_ok": default_handshake_ok,
+    "default_handshake_error": default_handshake_error,
     "empty_ca_rejected": empty_ca_rejected,
     "wrong_hostname_rejected": wrong_hostname_rejected,
-    "not_after": expires.isoformat(),
-    "remaining_days": (expires - datetime.now(timezone.utc)).total_seconds() / 86400,
+    "wrong_hostname_error": wrong_hostname_error,
+    "not_after": expires.isoformat() if expires else None,
+    "remaining_days": (
+        (expires - datetime.now(timezone.utc)).total_seconds() / 86400
+        if expires else None
+    ),
 }, sort_keys=True))
 """
 
+CERTIFICATE_CHECK_TIMER = "gpu-fault-certificate-check.timer"
 
-def run_auth013(site: IdentitySite, target: ClusterTarget) -> dict[str, Any]:
+
+def certificate_alert_checks(
+    alert: dict[str, Any] | None,
+    *,
+    threshold_days: int,
+) -> dict[str, Any]:
+    """Whether the expiry alert the deploy ships is armed on a GPU node.
+
+    The only certificate-expiry alerting in ``deploy/`` is the per-node
+    ``gpu-fault-certificate-check.timer`` running
+    ``check-control-plane-certificate`` with
+    ``GPU_FAULT_CERTIFICATE_MIN_VALIDITY_SECONDS`` from ``collector.env``; there
+    is no PrometheusRule for it. ``threshold >= 30`` read the site file, not the
+    node, so it passed with the timer disabled. ``alert`` is the host probe's
+    reading; ``None`` means no node was given and the check is not evaluated.
+    """
+
+    if alert is None:
+        return {"expiry_threshold_configured": "NOT_EVALUATED"}
+    seconds = alert.get("min_validity_seconds")
+    configured = (
+        isinstance(seconds, int)
+        and seconds >= threshold_days * 86400
+        and alert.get("timer_enabled") is True
+        and alert.get("timer_active") is True
+    )
+    return {"expiry_threshold_configured": configured}
+
+
+def run_auth013(
+    site: IdentitySite,
+    target: ClusterTarget,
+    *,
+    node: str = "",
+    host_probe_image: str = "",
+    case_dir: Path | None = None,
+) -> dict[str, Any]:
     pod = site.any_executor_pod(target)
     result = site.pod_json("gpu", target, pod, TLS_BOUNDARY_PROBE)
     threshold = int(site.config["health"]["certificate_min_validity_days"])
-    checks = {
+    alert: dict[str, Any] | None = None
+    alert_residuals: dict[str, Any] = {}
+    if node and host_probe_image:
+        probe = HostProbeFixture(
+            HostProbeSettings(
+                kubeconfig=site.gpu_kubeconfig,
+                context=target.context,
+                namespace=site.namespace,
+                node=node,
+                image=host_probe_image,
+                case_id="GF-REGIONAL-AUTH-013",
+                run_id=f"auth013-{int(time.time())}",
+                probe_script=AUTH013_PROBE,
+                active_deadline_seconds=900,
+            )
+        )
+        try:
+            probe.create()
+            alert = probe.execute("--timer", CERTIFICATE_CHECK_TIMER)
+        finally:
+            try:
+                alert_residuals = probe.cleanup()
+            except Exception as exc:  # noqa: BLE001 - recorded, not raised
+                alert_residuals = {"cleanup_error": f"{type(exc).__name__}: {exc}"}
+    alert_checks = certificate_alert_checks(alert, threshold_days=threshold)
+    remaining = result.get("remaining_days")
+    checks: dict[str, Any] = {
         "scoped_private_ca": (
             result["ca_exists"]
             and not result["ssl_cert_file_set"]
             and not result["requests_ca_bundle_set"]
         ),
+        "default_sni_handshake_succeeds": result["default_handshake_ok"] is True,
         "certificate_san_matches_nlb": result["hostname_in_san"],
         "empty_ca_rejected": result["empty_ca_rejected"],
         "wrong_hostname_rejected": result["wrong_hostname_rejected"],
-        "remaining_validity_exceeds_threshold": result["remaining_days"] > threshold,
-        "expiry_threshold_configured": threshold >= 30,
+        "remaining_validity_exceeds_threshold": (
+            isinstance(remaining, (int, float)) and remaining > threshold
+        ),
     }
-    return {
-        "verdict": "PASS" if all(checks.values()) else "FAIL",
+    not_evaluated: dict[str, str] = {}
+    for name, value in alert_checks.items():
+        if value == "NOT_EVALUATED":
+            not_evaluated[name] = (
+                "no --node/--host-probe-image given: the per-node expiry timer "
+                "was not read, so the alert cannot be claimed as configured"
+            )
+            checks[name] = False
+        else:
+            checks[name] = value
+    if alert_residuals and any(
+        value for key, value in alert_residuals.items() if key != "cleanup_error"
+    ):
+        checks["alert_probe_removed"] = False
+    outcome = {
+        "verdict": verdict(checks),
         "checks": checks,
+        "not_evaluated": not_evaluated,
         "certificate": {
             "host": result["host"],
             "sans": result["sans"],
             "not_after": result["not_after"],
-            "remaining_days": result["remaining_days"],
+            "remaining_days": remaining,
             "configured_minimum_days": threshold,
+            "default_handshake_error": result.get("default_handshake_error"),
+            "wrong_hostname_error": result.get("wrong_hostname_error"),
         },
+        "expiry_alert": alert,
+        "alert_probe_residuals": alert_residuals,
         "limitations": [
             "The negative probes perform TLS handshakes only and never disable "
-            "verification in the running executor."
+            "verification in the running executor.",
+            "The expiry alert is the per-node gpu-fault-certificate-check timer; "
+            "it is read on the one node named by --node.",
         ],
     }
+    if case_dir is not None:
+        write_json_atomic(case_dir / "auth013-details.json", outcome)
+    return outcome
+
+
+def describe_all_load_balancers(region: str) -> list[dict[str, Any]]:
+    """Every ELBv2 load balancer in ``region``, following ``NextMarker``.
+
+    ``describe-load-balancers`` pages at 400; an account whose NLB is past the
+    first page made the single call select nothing.
+    """
+
+    result: list[dict[str, Any]] = []
+    marker: str | None = None
+    while True:
+        command = [
+            "aws",
+            "elbv2",
+            "describe-load-balancers",
+            "--region",
+            region,
+            "--output",
+            "json",
+        ]
+        if marker:
+            command.extend(["--marker", marker])
+        page = json.loads(run(command, timeout=120).stdout)
+        result.extend(page.get("LoadBalancers") or [])
+        marker = page.get("NextMarker")
+        if not marker:
+            return result
+
+
+def select_load_balancer(
+    load_balancers: list[dict[str, Any]],
+    hostname: str,
+) -> dict[str, Any]:
+    for item in load_balancers:
+        if str(item.get("DNSName") or "").lower() == hostname.lower():
+            return item
+    raise IdentityAcceptanceError(
+        f"no ELBv2 load balancer has DNS name {hostname!r} "
+        f"({len(load_balancers)} load balancers listed)"
+    )
+
+
+def world_open_rules(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ingress permissions open to every IPv4 or IPv6 source."""
+
+    broad = []
+    for group in groups:
+        for permission in group.get("IpPermissions") or []:
+            sources = [
+                item.get("CidrIp")
+                for item in permission.get("IpRanges") or []
+                if item.get("CidrIp") == "0.0.0.0/0"
+            ] + [
+                item.get("CidrIpv6")
+                for item in permission.get("Ipv6Ranges") or []
+                if item.get("CidrIpv6") == "::/0"
+            ]
+            if sources:
+                broad.append(
+                    {
+                        "group_id": group["GroupId"],
+                        "from_port": permission.get("FromPort"),
+                        "to_port": permission.get("ToPort"),
+                        "sources": sources,
+                    }
+                )
+    return broad
 
 
 def nlb_security_groups(site: IdentitySite) -> dict[str, Any]:
@@ -780,21 +1200,7 @@ def nlb_security_groups(site: IdentitySite) -> dict[str, Any]:
     )
     if not hostname:
         raise IdentityAcceptanceError("control-plane NLB has no hostname")
-    load_balancers = json.loads(
-        run(
-            [
-                "aws",
-                "elbv2",
-                "describe-load-balancers",
-                "--region",
-                site.region,
-                "--output",
-                "json",
-            ],
-            timeout=120,
-        ).stdout
-    )["LoadBalancers"]
-    selected = next(item for item in load_balancers if item.get("DNSName") == hostname)
+    selected = select_load_balancer(describe_all_load_balancers(site.region), hostname)
     group_ids = list(selected.get("SecurityGroups") or [])
     groups = (
         json.loads(
@@ -816,44 +1222,100 @@ def nlb_security_groups(site: IdentitySite) -> dict[str, Any]:
         if group_ids
         else []
     )
-    broad = []
-    for group in groups:
-        for permission in group.get("IpPermissions") or []:
-            if any(
-                item.get("CidrIp") == "0.0.0.0/0"
-                for item in permission.get("IpRanges") or []
-            ):
-                broad.append(
-                    {
-                        "group_id": group["GroupId"],
-                        "from_port": permission.get("FromPort"),
-                        "to_port": permission.get("ToPort"),
-                    }
-                )
+    broad = world_open_rules(groups)
     return {
+        "hostname": hostname,
         "scheme": selected.get("Scheme"),
         "security_group_count": len(group_ids),
-        "broad_ipv4_rules": broad,
+        "broad_ipv4_rules": [item for item in broad if "0.0.0.0/0" in item["sources"]],
+        "broad_ipv6_rules": [item for item in broad if "::/0" in item["sources"]],
+        "world_open_rules": broad,
     }
 
 
-def outside_probe(path: Path | None) -> dict[str, Any]:
+OUTSIDE_PROBE_MAX_AGE = timedelta(hours=24)
+
+
+def outside_probe(
+    path: Path | None,
+    *,
+    nlb_hostname: str = "",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Validate the outside-VPC connection-denial evidence.
+
+    The file is produced by a separately executed probe; before it can stand
+    for "the NLB is unreachable from outside", it has to name this site's NLB
+    (``target_host``), be recent (``observed_at`` within 24 h) and be
+    fingerprinted (``sha256``) so the auditor can tell which file was judged.
+    """
+
     if path is None:
         return {
             "valid": False,
             "error": "outside-VPC probe evidence is required",
         }
-    value = json.loads(path.read_text(encoding="utf-8"))
+    raw = path.read_bytes()
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {"valid": False, "error": f"outside probe is not JSON: {exc}"}
     if not isinstance(value, dict):
         return {"valid": False, "error": "outside probe is not an object"}
-    connection_blocked = bool(value.get("connection_blocked"))
+    errors: list[str] = []
+    connection_blocked = value.get("connection_blocked") is True
+    if not connection_blocked:
+        errors.append("connection_blocked is not true")
+    target_host = str(value.get("target_host") or "")
+    if not nlb_hostname:
+        errors.append("NLB hostname unknown; target_host not verified")
+    elif target_host.lower() != nlb_hostname.lower():
+        errors.append("target_host does not name this site's NLB")
     observed_at = str(value.get("observed_at") or "")
+    observed: datetime | None = None
+    try:
+        observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    except ValueError:
+        errors.append("observed_at is not ISO-8601")
+    if observed is not None:
+        if observed.tzinfo is None:
+            errors.append("observed_at has no timezone")
+        else:
+            current = now or datetime.now(timezone.utc)
+            age = current - observed
+            if age > OUTSIDE_PROBE_MAX_AGE or age < -timedelta(minutes=5):
+                errors.append("observed_at is not within the last 24 hours")
     return {
-        "valid": connection_blocked and bool(observed_at),
+        "valid": not errors,
+        "errors": errors,
         "connection_blocked": connection_blocked,
+        "target_host": target_host,
         "observed_at": observed_at,
         "probe_location": str(value.get("probe_location") or "external"),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "path": str(path),
     }
+
+
+HIGH_RISK_ROUTE_BUCKETS = {
+    "/v1/runtime-profiles": "execution-token",
+    "/v1/advisory-notifications/{notification_id}/send": "execution-token",
+    "/v1/fleet/agents": "cluster-token",
+}
+
+
+def high_risk_route_errors(routes: list[dict[str, Any]]) -> list[str]:
+    """The three routes whose bucket the catalog names, checked, not counted."""
+
+    buckets = {str(item["path"]): item.get("bucket") for item in routes}
+    errors = []
+    for path, expected in HIGH_RISK_ROUTE_BUCKETS.items():
+        actual = buckets.get(path)
+        if actual is None:
+            errors.append(f"{path} is not in the route inventory")
+        elif actual != expected:
+            errors.append(f"{path} is {actual}, expected {expected}")
+    return errors
 
 
 def run_auth014(
@@ -865,7 +1327,8 @@ def run_auth014(
     routes = route_inventory(site, target)
     results = anonymous_routes(site, target, routes)
     nlb = nlb_security_groups(site)
-    external = outside_probe(outside_probe_path)
+    external = outside_probe(outside_probe_path, nlb_hostname=str(nlb["hostname"]))
+    token_hits = data_plane_execution_token_hits(site, target)
     expected = {
         "cluster-token": {401},
         "dual-credential": {403},
@@ -873,9 +1336,16 @@ def run_auth014(
         "metrics": {403},
         "public": {200},
     }
+    # The OpenAPI surface is recorded, not judged: it has no bucket.
+    documented = [item for item in results if item["bucket"] != "public-undocumented"]
+    openapi_surface = {
+        f"{item['method']} {item['path']}": item.get("status", item.get("error"))
+        for item in results
+        if item["bucket"] == "public-undocumented"
+    }
     mismatches = [
         item
-        for item in results
+        for item in documented
         if item.get("status") not in expected.get(item["bucket"], set())
     ]
     anonymous_write_success = [
@@ -890,22 +1360,21 @@ def run_auth014(
     high_risk = {
         f"{item['method']} {item['path']}": item.get("status")
         for item in results
-        if item["path"]
-        in {
-            "/v1/fleet/agents",
-            "/v1/runtime-profiles",
-            "/v1/advisory-notifications/{notification_id}/send",
-        }
+        if item["path"] in HIGH_RISK_ROUTE_BUCKETS
     }
+    bucket_errors = high_risk_route_errors(routes)
     checks = {
         "route_matrix_matches_buckets": not mismatches,
         "anonymous_write_routes_never_succeed": not anonymous_write_success,
         "nlb_has_no_world_open_ipv4_rule": not nlb["broad_ipv4_rules"],
+        "nlb_has_no_world_open_ipv6_rule": not nlb["broad_ipv6_rules"],
         "outside_vpc_connection_blocked": external["valid"],
-        "high_risk_routes_present": len(high_risk) >= 3,
+        "high_risk_routes_in_declared_buckets": not bucket_errors,
+        "openapi_surface_recorded": len(openapi_surface) >= 3,
+        "execution_token_absent_from_data_plane": not token_hits,
     }
     return {
-        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "verdict": verdict(checks),
         "checks": checks,
         "nlb": nlb,
         "outside_probe": external,
@@ -913,9 +1382,16 @@ def run_auth014(
         "mismatches": mismatches,
         "anonymous_write_success": anonymous_write_success,
         "high_risk_routes": high_risk,
+        "high_risk_bucket_errors": bucket_errors,
+        "openapi_surface": openapi_surface,
+        "execution_token_hits": token_hits,
         "limitations": [
             "The network denial is supplied by a separately executed probe "
-            "outside the NLB allowlist; this runner validates its structured evidence."
+            "outside the NLB allowlist; this runner validates its structured "
+            "evidence (target host, age, digest).",
+            "The execution-token sweep compares SHA-256 digests of every "
+            "data-plane Secret value and literal Pod env value against the "
+            "token as the API Pod holds it (AUTH-010 folded in here).",
         ],
     }
 
@@ -992,26 +1468,31 @@ def node_key_digests(secret: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def gpu_master_reference_hits(
-    site: IdentitySite,
-    target: ClusterTarget,
-) -> list[dict[str, str]]:
-    resources = json.loads(
-        site.gpu(
-            target,
-            "get",
-            "job,pod,deployment",
-            "-o",
-            "json",
-        )
-    )
-    hits = []
+def master_reference_scan(resources: dict[str, Any]) -> dict[str, Any]:
+    """Which GPU-plane resources reference the fleet-master Secret.
+
+    The check is only meaningful if an installer resource was in the scan:
+    the installer Job is transient, and a scan of an idle namespace finds no
+    reference because it finds no installer. ``installer_resources`` names the
+    Jobs/Pods that looked like an installer so the caller can tell "clean" from
+    "nothing to look at".
+    """
+
+    hits: list[dict[str, str]] = []
+    installer_resources: list[str] = []
+    for item in resources.get("items", []):
+        metadata = item.get("metadata") or {}
+        name = str(metadata.get("name") or "")
+        kind = str(item.get("kind") or "")
+        labels = metadata.get("labels") or {}
+        if "installer" in name or any("installer" in str(v) for v in labels.values()):
+            installer_resources.append(f"{kind}/{name}")
 
     def visit(value: Any, path: str) -> None:
         if isinstance(value, dict):
             reference = value.get("secretKeyRef")
             if isinstance(reference, dict) and (
-                reference.get("name") == "gpu-fault-control-plane-active"
+                reference.get("name") == INSTALLER_SECRET
             ):
                 hits.append(
                     {
@@ -1022,7 +1503,7 @@ def gpu_master_reference_hits(
                 )
             secret_volume = value.get("secret")
             if isinstance(secret_volume, dict) and (
-                secret_volume.get("secretName") == "gpu-fault-control-plane-active"
+                secret_volume.get("secretName") == INSTALLER_SECRET
             ):
                 hits.append(
                     {
@@ -1038,7 +1519,52 @@ def gpu_master_reference_hits(
                 visit(child, f"{path}/{index}")
 
     visit(resources, "")
-    return hits
+    return {"hits": hits, "installer_resources": sorted(installer_resources)}
+
+
+def gpu_master_reference_scan(
+    site: IdentitySite,
+    target: ClusterTarget,
+) -> dict[str, Any]:
+    resources = json.loads(
+        site.gpu(
+            target,
+            "get",
+            "job,pod,deployment",
+            "-o",
+            "json",
+        )
+    )
+    return master_reference_scan(resources)
+
+
+def auth015_focused_tests() -> dict[str, Any]:
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "tests/fleet/test_fleet.py::test_derived_node_key_cannot_sign_for_another_node",
+        "tests/fleet/test_fleet.py::"
+        "test_node_specific_key_can_rotate_without_changing_peer",
+    ]
+    completed = run(command, check=False, timeout=600)
+    return {
+        "passed": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "command": command,
+    }
+
+
+def heartbeat_advanced(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Node B kept heartbeating: its last_heartbeat_at moved forward."""
+
+    try:
+        earlier = datetime.fromisoformat(str(before["last_heartbeat_at"]))
+        later = datetime.fromisoformat(str(after["last_heartbeat_at"]))
+    except (KeyError, ValueError, TypeError):
+        return False
+    return later > earlier
 
 
 def run_auth015(
@@ -1049,6 +1575,7 @@ def run_auth015(
     fleet_master_file: Path,
     host_probe_image: str,
     case_dir: Path,
+    focused_tests: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if fleet_master_file.stat().st_mode & 0o077:
         raise IdentityAcceptanceError("fleet master file must be mode 0600")
@@ -1056,24 +1583,24 @@ def run_auth015(
     if len(master) < 32:
         raise IdentityAcceptanceError("staging fleet master is too short")
     master_sha256 = secret_digest(master)
-    original_gpu = secret_document(
-        site,
-        "gpu",
-        target,
-        "gpu-fault-node-action-keys",
-    )
-    original_cpu = secret_document(
-        site,
-        "cpu",
-        target,
-        "gpu-fault-node-action-keys",
-    )
+    regional = site.regional(target)
+    original_gpu = secret_document(site, "gpu", target, NODE_ACTION_KEYS_SECRET)
+    original_cpu = secret_document(site, "cpu", target, NODE_ACTION_KEYS_SECRET)
     before_keys = node_key_digests(original_gpu)
-    before_agents = site.regional(target).cpu_python(
-        AGENT_SNAPSHOT_PROBE,
-        target.cluster_id,
-        *nodes,
-    )
+    before_cpu_keys = node_key_digests(original_cpu)
+    # provision-node-action-keys.sh derives a key for every GPU node missing
+    # from the Secret. If the Secret does not already cover the node set, the
+    # run adds keys for nodes the case never named and the "only node A
+    # changed" reading is wrong before it starts.
+    gpu_node_names = sorted(str(item["name"]) for item in regional.gpu_nodes())
+    if sorted(before_keys) != gpu_node_names:
+        raise IdentityAcceptanceError(
+            "node-action-keys Secret does not cover exactly the GPU node set: "
+            f"secret={sorted(before_keys)} nodes={gpu_node_names}"
+        )
+    if any(node not in before_keys for node in nodes):
+        raise IdentityAcceptanceError("a target node has no key in the Secret")
+    before_agents = regional.cpu_python(AGENT_SNAPSHOT_PROBE, target.cluster_id, *nodes)
     probes = [
         HostProbeFixture(
             HostProbeSettings(
@@ -1094,27 +1621,20 @@ def run_auth015(
     scans_after: dict[str, Any] = {}
     rotation = None
     residuals: dict[str, Any] = {}
-    tests = run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "tests/fleet/test_fleet.py::"
-            "test_derived_node_key_cannot_sign_for_another_node",
-            "tests/fleet/test_fleet.py::"
-            "test_node_specific_key_can_rotate_without_changing_peer",
-        ],
-        check=False,
-        timeout=600,
-    )
+    cleanup_errors: list[str] = []
+    checks: dict[str, Any] = {}
+    not_evaluated: dict[str, str] = {}
+    tests = focused_tests if focused_tests is not None else auth015_focused_tests()
+
+    def create_and_scan(probe: HostProbeFixture) -> tuple[str, dict[str, Any]]:
+        probe.create()
+        return probe.settings.node, probe.execute("--master-sha256", master_sha256)
+
     try:
-        for probe in probes:
-            probe.create()
-            scans_before[probe.settings.node] = probe.execute(
-                "--master-sha256",
-                master_sha256,
-            )
+        # Two privileged Pods on two nodes: creating them one after the other
+        # doubled the slowest step for nothing they share.
+        with ThreadPoolExecutor(max_workers=len(probes)) as pool:
+            scans_before = dict(pool.map(create_and_scan, probes))
         environment = {
             **os.environ,
             "PYTHONPATH": str(ROOT / "src"),
@@ -1134,78 +1654,134 @@ def run_auth015(
             timeout=600,
             env=environment,
         )
-        after_gpu = secret_document(
-            site,
-            "gpu",
-            target,
-            "gpu-fault-node-action-keys",
-        )
+        # Scan while the rotation's resources are freshest; the installer Job
+        # is transient, and the scan says so when it saw none.
+        reference_scan = gpu_master_reference_scan(site, target)
+        after_gpu = secret_document(site, "gpu", target, NODE_ACTION_KEYS_SECRET)
         after_keys = node_key_digests(after_gpu)
         time.sleep(30)
-        after_agents = site.regional(target).cpu_python(
+        after_agents = regional.cpu_python(
             AGENT_SNAPSHOT_PROBE,
             target.cluster_id,
             *nodes,
         )
-        for probe in probes:
-            scans_after[probe.settings.node] = probe.execute(
-                "--master-sha256",
-                master_sha256,
+        with ThreadPoolExecutor(max_workers=len(probes)) as pool:
+            scans_after = dict(
+                pool.map(
+                    lambda probe: (
+                        probe.settings.node,
+                        probe.execute("--master-sha256", master_sha256),
+                    ),
+                    probes,
+                )
             )
         checks = {
-            "installer_references_no_fleet_master": not gpu_master_reference_hits(
-                site, target
-            ),
             "host_scan_before_zero_matches": all(
                 not item["master_matches"] for item in scans_before.values()
             ),
             "host_scan_after_zero_matches": all(
                 not item["master_matches"] for item in scans_after.values()
             ),
-            "cross_node_signature_tests": tests.returncode == 0,
+            "cross_node_signature_tests": tests.get("passed") is True,
             "rotation_command_succeeded": rotation.returncode == 0,
             "node_a_key_changed": before_keys.get(nodes[0]) != after_keys.get(nodes[0]),
             "node_b_key_unchanged": before_keys.get(nodes[1])
             == after_keys.get(nodes[1]),
+            "no_other_node_key_changed": all(
+                before_keys.get(node) == after_keys.get(node)
+                for node in before_keys
+                if node != nodes[0]
+            ),
             "node_b_agent_continues": (
                 before_agents["agents"][nodes[1]]["generation"]
                 == after_agents["agents"][nodes[1]]["generation"]
                 and after_agents["agents"][nodes[1]]["lifecycle_state"] == "ACTIVE"
             ),
+            "node_b_heartbeat_advanced": heartbeat_advanced(
+                before_agents["agents"][nodes[1]], after_agents["agents"][nodes[1]]
+            ),
         }
-    finally:
-        restore_secret(site, "gpu", target, original_gpu)
-        restore_secret(site, "cpu", target, original_cpu)
-        for probe in probes:
-            try:
-                residuals[probe.settings.node] = probe.cleanup()
-            except Exception as exc:
-                residuals[probe.settings.node] = {
-                    "cleanup_error": f"{type(exc).__name__}: {exc}"
-                }
-    checks["secrets_restored"] = (
-        node_key_digests(
-            secret_document(
-                site,
-                "gpu",
-                target,
-                "gpu-fault-node-action-keys",
+        if reference_scan["installer_resources"]:
+            checks["installer_references_no_fleet_master"] = not reference_scan["hits"]
+        else:
+            not_evaluated["installer_references_no_fleet_master"] = (
+                "no installer Job/Pod was present during the scan; the "
+                "reference check had nothing to inspect"
             )
+    except Exception as exc:
+        raise IdentityCaseFailure(
+            str(exc),
+            details=failure_details(
+                checks=checks,
+                cleanup_errors=cleanup_errors,
+                scan_before=scans_before,
+                scan_after=scans_after,
+                rotation_returncode=(
+                    rotation.returncode if rotation is not None else None
+                ),
+            ),
+        ) from exc
+    finally:
+        steps: list[tuple[str, Any]] = [
+            (
+                "restore_gpu_secret",
+                lambda: restore_secret(site, "gpu", target, original_gpu),
+            ),
+            (
+                "restore_cpu_secret",
+                lambda: restore_secret(site, "cpu", target, original_cpu),
+            ),
+        ]
+        for probe in probes:
+            steps.append((f"cleanup_probe:{probe.settings.node}", probe.cleanup))
+        # In place: the IdentityCaseFailure raised above holds cleanup_errors.
+        cleanup, step_errors = run_cleanup_steps(steps)
+        cleanup_errors.extend(step_errors)
+        for probe in probes:
+            key = f"cleanup_probe:{probe.settings.node}"
+            residuals[probe.settings.node] = cleanup.get(key) or {"cleanup_error": True}
+        write_json_atomic(
+            case_dir / "auth015-details.json",
+            {
+                "checks": checks,
+                "cleanup_errors": cleanup_errors,
+                "scan_before": scans_before,
+                "scan_after": scans_after,
+                "probe_residuals": residuals,
+            },
         )
+    checks["gpu_secret_restored"] = (
+        node_key_digests(secret_document(site, "gpu", target, NODE_ACTION_KEYS_SECRET))
         == before_keys
+    )
+    checks["cpu_secret_restored"] = (
+        node_key_digests(secret_document(site, "cpu", target, NODE_ACTION_KEYS_SECRET))
+        == before_cpu_keys
     )
     checks["probe_resources_removed"] = all(
         not any(value.values()) for value in residuals.values()
     )
+    checks["cleanup_completed"] = not cleanup_errors
     return {
-        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "verdict": verdict(checks),
         "checks": checks,
+        "not_evaluated": not_evaluated,
         "master_sha256": master_sha256,
+        "gpu_node_set": gpu_node_names,
+        "installer_scan": {
+            "installer_resources": reference_scan["installer_resources"],
+            "hits": reference_scan["hits"],
+        },
+        "focused_tests": tests,
         "scan_before": scans_before,
         "scan_after": scans_after,
         "probe_residuals": residuals,
+        "cleanup_errors": cleanup_errors,
         "limitations": [
             "The master is supplied from a trusted-host mode-0600 file. Only "
-            "its SHA-256 enters evidence; the runner restores both key Secrets."
+            "its SHA-256 enters evidence; the runner restores both key Secrets.",
+            "The installer-reference scan is only evaluated when an installer "
+            "Job or Pod exists during the case; otherwise it is recorded under "
+            "not_evaluated.",
         ],
     }

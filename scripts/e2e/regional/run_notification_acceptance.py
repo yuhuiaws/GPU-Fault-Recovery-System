@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+from collections.abc import Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -28,6 +31,8 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     authorize_execution,
     build_plan,
     install_site_profile,
+    record_focused_tests,
+    reusable_focused_tests,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     TRAINING_IMAGE,
@@ -49,6 +54,27 @@ CASE_IDS = tuple(f"GF-REGIONAL-NOTIFY-{number:03d}" for number in range(1, 6))
 DRILL_PROBE = (Path(__file__).with_name("probes") / "notification_drill.py").read_text(
     encoding="utf-8"
 )
+# NOTIFY-002's duplicate-result proof is carried by NOTIFY-001 (the drill sends
+# the same notification four times and requires one provider message ID), so
+# the catalog marks NOTIFY-002 superseded. The runner stays callable so an old
+# evidence chain can still be reproduced, but says so in its result.
+NOTIFY002_SUPERSEDED_BY = "GF-REGIONAL-NOTIFY-001"
+# The two completion kinds NOTIFY-001 judges, keyed by the drill's `--kind` and
+# mapped to the substring the builders put in `deduplication_key`
+# (`.../gpu-reset/<operation>` and `.../workload-restarted/<operation>`).
+NOTIFICATION_KINDS: dict[str, str] = {
+    "gpu-reset": "/gpu-reset/",
+    "workload-restart": "/workload-restarted/",
+}
+YAML_ALIAS_PATTERN = re.compile(r"(?:^|\s)[&*]id\d+\b")
+NOTIFY003_FOCUSED_TESTS = (
+    "tests/notifications/test_notifications.py::"
+    "test_first_dispatch_suppresses_the_pre_enable_backlog",
+    "tests/notifications/test_notifications.py::"
+    "test_suppressed_backlog_can_be_requeued_on_demand",
+    "tests/notifications/test_notifications.py::"
+    "test_notification_worker_reclaims_expired_lease_and_stops",
+)
 
 
 class NotificationAcceptanceError(RuntimeError):
@@ -57,6 +83,18 @@ class NotificationAcceptanceError(RuntimeError):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def run(
@@ -85,20 +123,31 @@ def run(
     return completed
 
 
+def control_worker_pod(site: IdentitySite, target: ClusterTarget) -> str:
+    """One Ready control-worker Pod, resolved once per case.
+
+    Every drill used to list the Pods again; the answer does not change between
+    two drills seconds apart, and each list is a kubectl round trip.
+    """
+
+    pods = site.ready_pods("cpu", "gpu-fault-control-worker", target)
+    if not pods:
+        raise NotificationAcceptanceError("no Ready control-worker Pod")
+    return pods[0]
+
+
 def drill(
     site: IdentitySite,
     target: ClusterTarget,
     *,
     kind: str,
     drill_id: str,
+    pod: str | None = None,
 ) -> dict[str, Any]:
-    pods = site.ready_pods("cpu", "gpu-fault-control-worker", target)
-    if not pods:
-        raise NotificationAcceptanceError("no Ready control-worker Pod")
-    return site.pod_json(
+    result = site.pod_json(
         "cpu",
         target,
-        pods[0],
+        pod or control_worker_pod(site, target),
         DRILL_PROBE,
         "--kind",
         kind,
@@ -108,35 +157,254 @@ def drill(
         target.cluster_id,
         timeout=180,
     )
+    # `executed_at` is written by the probe; a probe from before it existed
+    # gets the runner's clock so the operator's SES window can still be
+    # cross-checked against something.
+    result.setdefault("executed_at", utc_now())
+    result.setdefault("drill_id", drill_id)
+    return result
 
 
-def validate_external_evidence(path: Path | None, kind: str) -> dict[str, Any]:
+def validate_external_evidence(
+    path: Path | None,
+    kind: str,
+    *,
+    record_times: Sequence[datetime] = (),
+) -> dict[str, Any]:
+    """Judge the operator's out-of-solution evidence for ``kind``.
+
+    Both kinds must say how the fact was established (``method``), what to look
+    at to re-establish it (``reference``) and the SES-side window it was read
+    over (``window_start``/``window_end``); the window must cover every drill or
+    record time the runner is claiming for. Without the window a `received:
+    true` or a `send_count_delta: 0` cannot be tied to *this* run's messages,
+    and the account has no SES configuration set, so the SES-side answer is
+    necessarily a windowed CloudWatch count that only means something with its
+    window attached. ``receipt`` additionally needs ``received``; ``dedup``
+    needs both counters at zero.
+    """
+
     if path is None:
-        return {"valid": False, "error": f"{kind} evidence is required"}
-    value = json.loads(path.read_text(encoding="utf-8"))
+        return {"valid": False, "errors": [f"{kind} evidence is required"]}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"valid": False, "errors": [f"cannot read {kind} evidence: {exc}"]}
     if not isinstance(value, dict):
-        return {"valid": False, "error": "external evidence is not an object"}
-    if kind == "receipt":
-        # `method` is required so the evidence says how delivery was established.
-        # Both a human inbox check and an SES-side delivery record answer the
-        # case's question ("the mail left the solution and arrived"), but they are
-        # not interchangeable when someone later audits the report -- and without
-        # a named method a bare `received: true` is indistinguishable from a
-        # guess. The account has no SES configuration set, so there is no
-        # per-MessageId event destination and the SES-side answer is necessarily
-        # a windowed CloudWatch `Delivery` count; the reference has to pin that
-        # window down.
-        valid = (
-            bool(value.get("received"))
-            and bool(value.get("reference"))
-            and bool(value.get("method"))
-        )
+        return {"valid": False, "errors": ["external evidence is not an object"]}
+    errors = []
+    for field in ("method", "reference"):
+        if not str(value.get(field) or "").strip():
+            errors.append(f"{field} is required")
+    window_start = parse_time(value.get("window_start"))
+    window_end = parse_time(value.get("window_end"))
+    if window_start is None or window_end is None:
+        errors.append("window_start and window_end must be ISO-8601 timestamps")
+    elif window_start > window_end:
+        errors.append("window_start is after window_end")
     else:
-        valid = (
-            int(value.get("send_count_delta", -1)) == 0
-            and int(value.get("duplicate_inbox_count", -1)) == 0
-        )
-    return {"valid": valid, **value}
+        uncovered = [
+            item.isoformat()
+            for item in record_times
+            if not (window_start <= item <= window_end)
+        ]
+        if uncovered:
+            errors.append(f"window does not cover record times: {uncovered}")
+    if kind == "receipt":
+        if not bool(value.get("received")):
+            errors.append("received is not true")
+    elif kind == "dedup":
+        try:
+            if int(value.get("send_count_delta", -1)) != 0:
+                errors.append("send_count_delta is not 0")
+            if int(value.get("duplicate_inbox_count", -1)) != 0:
+                errors.append("duplicate_inbox_count is not 0")
+        except (TypeError, ValueError):
+            errors.append("send_count_delta/duplicate_inbox_count are not integers")
+    else:
+        errors.append(f"unknown evidence kind {kind}")
+    return {"valid": not errors, "errors": errors, **value}
+
+
+def notification_kind(deduplication_key: str) -> str | None:
+    for kind, marker in NOTIFICATION_KINDS.items():
+        if marker in deduplication_key:
+            return kind
+    return None
+
+
+def _notification_entries(value: Any) -> Iterator[dict[str, Any]]:
+    """Every ``{"notification": {...}, "result": ...}`` pair inside ``value``.
+
+    That is the shape the store probe writes into a case result
+    (``state.notifications[]``), wherever the runner nested the state.
+    """
+
+    if isinstance(value, dict):
+        notification = value.get("notification")
+        if isinstance(notification, dict) and "result" in value:
+            yield value
+            return
+        for item in value.values():
+            yield from _notification_entries(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _notification_entries(item)
+
+
+def action_completed_records_from_evidence(
+    run_dir: Path,
+    *,
+    cluster_id: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """This run's real ACTION_COMPLETED notifications, from the case evidence.
+
+    DESTR-001, DESTR-009 and E2E-001 record the notifications their workflows
+    produced; the catalog says NOTIFY-001 reuses those and drills only when the
+    run has none. Only records for ``cluster_id`` count -- a notification for
+    another cluster proves nothing about this target's mail path.
+    """
+
+    records: dict[str, list[dict[str, Any]]] = {kind: [] for kind in NOTIFICATION_KINDS}
+    cases_dir = run_dir / "cases"
+    if not cases_dir.is_dir():
+        return records
+    for path in sorted(cases_dir.glob("GF-REGIONAL-*/GF-REGIONAL-*.json")):
+        if path.stem != path.parent.name or path.stem in CASE_IDS:
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for entry in _notification_entries(document):
+            notification = entry["notification"]
+            if notification.get("category") != "ACTION_COMPLETED":
+                continue
+            if str(notification.get("cluster_name") or "") != cluster_id:
+                continue
+            kind = notification_kind(str(notification.get("deduplication_key") or ""))
+            if kind is None or not notification.get("notification_id"):
+                continue
+            records[kind].append(
+                {
+                    "case_id": document.get("case_id"),
+                    "evidence_path": str(path),
+                    "notification_id": str(notification["notification_id"]),
+                    "incident_id": notification.get("incident_id"),
+                    "deduplication_key": notification.get("deduplication_key"),
+                    "created_at": notification.get("created_at"),
+                    "recorded_result": entry.get("result"),
+                }
+            )
+    return records
+
+
+LIVE_NOTIFICATION_PROBE = r"""
+import json
+import sys
+from gpu_fault.app import ApplicationContext
+
+# The current store state of notifications another case recorded. Evidence
+# files say what a run saw at the time; the verdict must rest on what the
+# store holds now, and the per-incident count is the deduplication proof for a
+# real record (a drill proves it by re-sending, a live record by there being
+# exactly one for its incident and kind).
+kind_markers = json.loads(sys.argv[1])
+notification_ids = sys.argv[2:]
+store = ApplicationContext.from_environment().store
+by_incident = {}
+for item in store.list_notifications():
+    if item.category != "ACTION_COMPLETED":
+        continue
+    by_incident.setdefault(item.incident_id, []).append(item)
+records = []
+for notification_id in notification_ids:
+    try:
+        notification = store.get_notification(notification_id)
+    except Exception as exc:
+        records.append({"notification_id": notification_id, "missing": True,
+                        "error": type(exc).__name__})
+        continue
+    result = store.get_notification_result(notification_id)
+    kind = next(
+        (name for name, marker in kind_markers.items()
+         if marker in notification.deduplication_key),
+        None,
+    )
+    same_kind = [
+        item for item in by_incident.get(notification.incident_id, [])
+        if kind is not None and kind_markers[kind] in item.deduplication_key
+    ]
+    records.append({
+        "notification_id": notification_id,
+        "missing": False,
+        "kind": kind,
+        "incident_id": notification.incident_id,
+        "cluster_name": notification.cluster_name,
+        "category": notification.category,
+        "deduplication_key": notification.deduplication_key,
+        "created_at": notification.created_at.isoformat(),
+        "drill_id": notification.drill_id,
+        "status": result.status.value if result else None,
+        "provider_message_id_present": bool(
+            result is not None and result.provider_message_id
+        ),
+        "same_incident_kind_count": len(same_kind),
+    })
+print(json.dumps({"records": records}, sort_keys=True))
+"""
+
+
+def live_action_completed_records(
+    site: IdentitySite,
+    target: ClusterTarget,
+    *,
+    run_dir: Path,
+    pod: str,
+) -> dict[str, Any]:
+    """Resolve the run's recorded ACTION_COMPLETED notifications against the store."""
+
+    candidates = action_completed_records_from_evidence(
+        run_dir, cluster_id=target.cluster_id
+    )
+    notification_ids = sorted(
+        {item["notification_id"] for items in candidates.values() for item in items}
+    )
+    if not notification_ids:
+        return {"candidates": candidates, "records": []}
+    live = site.pod_json(
+        "cpu",
+        target,
+        pod,
+        LIVE_NOTIFICATION_PROBE,
+        json.dumps(NOTIFICATION_KINDS, sort_keys=True),
+        *notification_ids,
+        timeout=180,
+    )
+    return {"candidates": candidates, "records": live.get("records") or []}
+
+
+def select_live_record(
+    records: Sequence[dict[str, Any]],
+    *,
+    kind: str,
+    cluster_id: str,
+) -> dict[str, Any] | None:
+    """The newest real ``kind`` record for ``cluster_id`` that is SENT with an ID."""
+
+    matching = [
+        item
+        for item in records
+        if not item.get("missing")
+        and item.get("kind") == kind
+        and item.get("cluster_name") == cluster_id
+        and not item.get("drill_id")
+        and item.get("status") == "SENT"
+        and item.get("provider_message_id_present")
+    ]
+    if not matching:
+        return None
+    return max(matching, key=lambda item: str(item.get("created_at") or ""))
 
 
 def run_notify001(
@@ -144,45 +412,131 @@ def run_notify001(
     target: ClusterTarget,
     *,
     attempt: int,
+    run_dir: Path,
     receipt_evidence: Path | None,
+    ses_window_evidence: Path | None,
 ) -> dict[str, Any]:
-    reset = drill(
-        site,
-        target,
-        kind="gpu-reset",
-        drill_id=f"notify001-reset-{attempt}-{int(time.time())}",
+    pod = control_worker_pod(site, target)
+    live = live_action_completed_records(site, target, run_dir=run_dir, pod=pod)
+    evidence: dict[str, dict[str, Any]] = {}
+    drills: list[dict[str, Any]] = []
+    record_times: list[datetime] = []
+    for kind in NOTIFICATION_KINDS:
+        record = select_live_record(
+            live["records"], kind=kind, cluster_id=target.cluster_id
+        )
+        if record is not None:
+            evidence[kind] = {
+                "source": "live",
+                "sent": True,
+                "deduplicated": record["same_incident_kind_count"] == 1,
+                "record": record,
+            }
+            created_at = parse_time(record.get("created_at"))
+            if created_at is not None:
+                record_times.append(created_at)
+            continue
+        # Drill fallback, as the catalog allows: the run produced no real
+        # completion of this kind, so the mail path is proven with a labeled
+        # drill rather than by re-executing the action.
+        result = drill(
+            site,
+            target,
+            kind=kind,
+            drill_id=f"notify001-{kind}-{attempt}-{int(time.time())}",
+            pod=pod,
+        )
+        drills.append(result)
+        executed_at = parse_time(result.get("executed_at"))
+        if executed_at is not None:
+            record_times.append(executed_at)
+        evidence[kind] = {
+            "source": "drill",
+            "sent": result["statuses"][0] == "SENT"
+            and result["provider_message_id_present"],
+            "deduplicated": bool(result["provider_message_id_stable"]),
+            "drill": result,
+        }
+    # NOTIFY-002's proof lives here now: four submissions of one notification
+    # must return one provider message ID. A gpu-reset drill that already ran
+    # as fallback is that proof; when both kinds came from live records, one
+    # dedicated drill supplies it so the check is never inferred.
+    dedup_drill = next(
+        (item for item in drills if item.get("kind") == "gpu-reset"),
+        None,
     )
-    restart = drill(
-        site,
-        target,
-        kind="workload-restart",
-        drill_id=f"notify001-restart-{attempt}-{int(time.time())}",
+    if dedup_drill is None:
+        dedup_drill = drill(
+            site,
+            target,
+            kind="gpu-reset",
+            drill_id=f"notify001-dedup-{attempt}-{int(time.time())}",
+            pod=pod,
+        )
+        drills.append(dedup_drill)
+        executed_at = parse_time(dedup_drill.get("executed_at"))
+        if executed_at is not None:
+            record_times.append(executed_at)
+    receipt = validate_external_evidence(
+        receipt_evidence, "receipt", record_times=record_times
     )
-    receipt = validate_external_evidence(receipt_evidence, "receipt")
+    dedup_executed_at = parse_time(dedup_drill.get("executed_at"))
+    ses_window = validate_external_evidence(
+        ses_window_evidence,
+        "dedup",
+        record_times=[dedup_executed_at] if dedup_executed_at else [],
+    )
     checks = {
-        "gpu_reset_sent": reset["statuses"][0] == "SENT"
-        and reset["provider_message_id_present"],
-        "workload_restart_sent": restart["statuses"][0] == "SENT"
-        and restart["provider_message_id_present"],
-        "gpu_reset_deduplicated": reset["provider_message_id_stable"],
-        "workload_restart_deduplicated": restart["provider_message_id_stable"],
-        # Renamed from `human_receipt_confirmed`: the gate is "delivery was
-        # confirmed by something outside this solution", and an SES-side delivery
-        # record satisfies that as well as a human inbox check does. The old name
-        # claimed the evidence was a human attestation regardless of what the file
-        # actually contained.
+        "gpu_reset_sent": evidence["gpu-reset"]["sent"],
+        "workload_restart_sent": evidence["workload-restart"]["sent"],
+        "gpu_reset_deduplicated": evidence["gpu-reset"]["deduplicated"],
+        "workload_restart_deduplicated": evidence["workload-restart"]["deduplicated"],
+        "four_submissions_return_one_provider_id": (
+            len(dedup_drill["statuses"]) == 4
+            and bool(dedup_drill["provider_message_id_present"])
+            and bool(dedup_drill["provider_message_id_stable"])
+        ),
+        # The gate is "delivery was confirmed by something outside this
+        # solution", and an SES-side delivery record satisfies that as well as
+        # a human inbox check does -- provided its window covers the records.
         "receipt_confirmed_outside_the_solution": receipt["valid"],
+        "ses_send_count_did_not_increase_for_duplicates": ses_window["valid"],
     }
+    sources = {kind: value["source"] for kind, value in evidence.items()}
+    limitations = [
+        "Drill emails are explicitly labeled and are built without executing "
+        "RESET_GPU or RESTART_WORKLOAD; the deduplication drill always sends "
+        "one labeled mail and repeats the same notification three more times.",
+        "GF-REGIONAL-NOTIFY-002 is superseded by this case: "
+        "four_submissions_return_one_provider_id and the SES window evidence "
+        "carry its duplicate-result proof.",
+    ]
+    if any(source == "live" for source in sources.values()):
+        limitations.append(
+            "Live records are this run's real ACTION_COMPLETED notifications; "
+            "their deduplication proof is one notification per incident and kind."
+        )
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
-        "gpu_reset_drill": reset,
-        "workload_restart_drill": restart,
-        "receipt_evidence": receipt,
-        "limitations": [
-            "Both emails are explicitly labeled drills and are built without "
-            "executing RESET_GPU or RESTART_WORKLOAD."
+        "sources": sources,
+        "evidence": evidence,
+        "live_candidates": live["candidates"],
+        "live_records": live["records"],
+        "drills": [
+            {
+                "kind": item.get("kind"),
+                "drill_id": item.get("drill_id"),
+                "executed_at": item.get("executed_at"),
+                "notification_id": item.get("notification_id"),
+            }
+            for item in drills
         ],
+        "dedup_drill": dedup_drill,
+        "record_times": [item.isoformat() for item in record_times],
+        "receipt_evidence": receipt,
+        "ses_window_evidence": ses_window,
+        "limitations": limitations,
     }
 
 
@@ -193,13 +547,24 @@ def run_notify002(
     attempt: int,
     ses_window_evidence: Path | None,
 ) -> dict[str, Any]:
+    print(
+        f"GF-REGIONAL-NOTIFY-002 is superseded by {NOTIFY002_SUPERSEDED_BY}; "
+        "running it only reproduces the drill that NOTIFY-001 already records.",
+        file=sys.stderr,
+        flush=True,
+    )
     result = drill(
         site,
         target,
         kind="gpu-reset",
         drill_id=f"notify002-{attempt}-{int(time.time())}",
     )
-    external = validate_external_evidence(ses_window_evidence, "dedup")
+    executed_at = parse_time(result.get("executed_at"))
+    external = validate_external_evidence(
+        ses_window_evidence,
+        "dedup",
+        record_times=[executed_at] if executed_at else [],
+    )
     checks = {
         "four_submissions_return_one_provider_id": (
             len(result["statuses"]) == 4
@@ -210,12 +575,16 @@ def run_notify002(
     }
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "superseded_by": NOTIFY002_SUPERSEDED_BY,
         "checks": checks,
         "drill": result,
         "ses_window_evidence": external,
         "limitations": [
+            f"This case is superseded by {NOTIFY002_SUPERSEDED_BY}, which records "
+            "the same four-submission deduplication result; it remains runnable "
+            "for reproduction only.",
             "The first call sends one labeled drill email; the next three calls "
-            "reuse the same notification ID and provider message ID."
+            "reuse the same notification ID and provider message ID.",
         ],
     }
 
@@ -320,30 +689,47 @@ def deployment_notification_config(
     return values
 
 
+def notify003_focused_tests(
+    case_dir: Path | None = None,
+    *,
+    reuse: bool = False,
+) -> dict[str, Any]:
+    """Run NOTIFY-003's focused pytest, or reuse the plan's result in --execute.
+
+    ``reuse`` consults ``reusable_focused_tests`` on the plan this case wrote:
+    a passing result taken against the same source digest speaks for the tree
+    now, so the suite is not paid for twice per run.
+    """
+
+    if reuse and case_dir is not None:
+        recorded = reusable_focused_tests(case_dir / "plan.json")
+        if recorded is not None:
+            return {**recorded, "focused_tests_reused": True}
+    command = [sys.executable, "-m", "pytest", "-q", *NOTIFY003_FOCUSED_TESTS]
+    completed = run(command, check=False, timeout=600)
+    if case_dir is not None:
+        log = case_dir / "focused-tests.log"
+        log.write_text(completed.stdout + completed.stderr, encoding="utf-8")
+        log.chmod(0o600)
+    return {
+        "passed": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "command": command,
+        "focused_tests_reused": False,
+    }
+
+
 def run_notify003(
     site: IdentitySite,
     target: ClusterTarget,
+    *,
+    case_dir: Path | None = None,
 ) -> dict[str, Any]:
-    tests = run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "tests/notifications/test_notifications.py::"
-            "test_first_dispatch_suppresses_the_pre_enable_backlog",
-            "tests/notifications/test_notifications.py::"
-            "test_suppressed_backlog_can_be_requeued_on_demand",
-            "tests/notifications/test_notifications.py::"
-            "test_notification_worker_reclaims_expired_lease_and_stops",
-        ],
-        check=False,
-        timeout=600,
-    )
+    tests = notify003_focused_tests(case_dir, reuse=True)
     config = deployment_notification_config(site, target)
     roles = {name: value["service_role"] for name, value in config.items()}
     checks = {
-        "backlog_and_requeue_contract_tests": tests.returncode == 0,
+        "backlog_and_requeue_contract_tests": bool(tests["passed"]),
         "only_worker_has_worker_role": (
             roles["gpu-fault-control-worker"] == "worker"
             and roles["gpu-fault-api-ha"] == "ingress"
@@ -371,7 +757,8 @@ def run_notify003(
         "verdict": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
         "deployment_config": config,
-        "focused_test_returncode": tests.returncode,
+        "focused_tests": tests,
+        "focused_test_returncode": tests["returncode"],
         "limitations": [
             "The backlog is exercised in an isolated in-process store while live "
             "Deployments prove the production service-role assembly."
@@ -659,6 +1046,10 @@ def low_utilization_manifest(
             "containers": [container],
         },
     }
+    # One template object per role. Sharing the dict made yaml.safe_dump emit
+    # an alias, and gpu-training-submit then injected role/rank-offset into the
+    # same object twice: Master ended up `role=worker, rank-offset=1` and the
+    # Completion Watcher counted ranks that did not exist.
     return {
         "apiVersion": "kubeflow.org/v1",
         "kind": "PyTorchJob",
@@ -669,16 +1060,77 @@ def low_utilization_manifest(
                 "Master": {
                     "replicas": 1,
                     "restartPolicy": "Never",
-                    "template": template,
+                    "template": copy.deepcopy(template),
                 },
                 "Worker": {
                     "replicas": 2,
                     "restartPolicy": "Never",
-                    "template": template,
+                    "template": copy.deepcopy(template),
                 },
             },
         },
     }
+
+
+def manifest_alias_errors(document: dict[str, Any]) -> list[str]:
+    """Why ``document`` would not survive a per-role metadata injection.
+
+    A PyTorchJob whose Master and Worker share one template object serializes
+    with a YAML alias and is mutated twice by the submit tool; the dump is
+    checked as well as the object identity because the alias is what the
+    submit tool actually reads back.
+    """
+
+    errors = []
+    rendered = yaml.safe_dump(document, sort_keys=False)
+    if YAML_ALIAS_PATTERN.search(rendered):
+        errors.append("manifest serializes with a YAML alias")
+    replicas = (document.get("spec") or {}).get("pytorchReplicaSpecs") or {}
+    templates = [
+        replica.get("template")
+        for replica in replicas.values()
+        if isinstance(replica, dict)
+    ]
+    if len({id(item) for item in templates}) != len(templates):
+        errors.append("replica specs share one template object")
+    return errors
+
+
+def low_utilization_metadata_errors(
+    workload: dict[str, Any],
+    *,
+    expected_pods: int,
+) -> list[str]:
+    """Role and rank-offset the submit tool injected, one per replica spec.
+
+    The alias defect surfaced here: Master carried Worker's role and offset.
+    """
+
+    if str(workload.get("kind") or "") != "PyTorchJob":
+        return []
+    errors = []
+    replicas = (workload.get("spec") or {}).get("pytorchReplicaSpecs") or {}
+    expected = {"Master": ("master", "0"), "Worker": ("worker", "1")}
+    seen_offsets = []
+    for role, (label, offset) in expected.items():
+        metadata = ((replicas.get(role) or {}).get("template") or {}).get(
+            "metadata"
+        ) or {}
+        labels = metadata.get("labels") or {}
+        annotations = metadata.get("annotations") or {}
+        if labels.get("gpu-fault.io/role") != label:
+            errors.append(f"{role} role label is {labels.get('gpu-fault.io/role')!r}")
+        actual_offset = annotations.get("gpu-fault.io/rank-offset")
+        if actual_offset != offset:
+            errors.append(f"{role} rank offset is {actual_offset!r}")
+        seen_offsets.append(actual_offset)
+        if annotations.get("gpu-fault.io/expected-critical-ranks") != str(
+            expected_pods
+        ):
+            errors.append(f"{role} expected critical ranks differs")
+    if len(set(seen_offsets)) != len(seen_offsets):
+        errors.append("replica specs share one rank offset")
+    return errors
 
 
 def wait_running_pods(
@@ -908,15 +1360,19 @@ def run_notify005(
             phase_started_at = datetime.now(timezone.utc)
             name = f"notify005-{count}n-{attempt}-{int(time.time())}"
             source = case_dir / f"{name}.source.yaml"
+            document = low_utilization_manifest(
+                name=name,
+                nodes=selected,
+                image=training_image,
+            )
+            alias_errors = manifest_alias_errors(document)
+            if alias_errors:
+                raise NotificationAcceptanceError(
+                    "low-utilization manifest is not injectable per role: "
+                    + "; ".join(alias_errors)
+                )
             source.write_text(
-                yaml.safe_dump(
-                    low_utilization_manifest(
-                        name=name,
-                        nodes=selected,
-                        image=training_image,
-                    ),
-                    sort_keys=False,
-                ),
+                yaml.safe_dump(document, sort_keys=False),
                 encoding="utf-8",
             )
             source.chmod(0o600)
@@ -934,6 +1390,9 @@ def run_notify005(
             )
             fixtures.append(fixture)
             fixture.submit()
+            metadata_errors = low_utilization_metadata_errors(
+                fixture.workload(), expected_pods=count
+            )
             running = wait_running_pods(fixture, count)
             records, polls = wait_low_utilization_notifications(
                 regional,
@@ -946,6 +1405,7 @@ def run_notify005(
                 "node_count": count,
                 "nodes": list(selected),
                 "pods": running["pods"],
+                "metadata_errors": metadata_errors,
                 "quiesce_polls": quiesce_polls,
                 "polls": polls,
                 "notifications": records,
@@ -969,6 +1429,12 @@ def run_notify005(
         three_count = len(observations[1]["notifications"])
         observed = [item for value in observations for item in value["notifications"]]
         checks = {
+            # Master and Worker must each carry their own role and rank offset;
+            # a shared template object once gave Master `role=worker,
+            # rank-offset=1`, and the three-node phase then counted wrong.
+            "replica_metadata_injected_per_role": all(
+                not value["metadata_errors"] for value in observations
+            ),
             # The 判定 is an upper bound -- "通知条数按节点数或任务数增长（≤3 条），
             # 不是按 GPU 数（不应是 24 条）" -- so these three are stated as bounds
             # rather than as an exact count.
@@ -1041,10 +1507,14 @@ def case_plan(
 ) -> dict[str, Any]:
     mutations = {
         "GF-REGIONAL-NOTIFY-001": (
-            "send one GPU-reset drill and one workload-restart drill through SES"
+            "reuse this run's real ACTION_COMPLETED notifications where the store "
+            "still holds them SENT; otherwise send one GPU-reset drill and one "
+            "workload-restart drill through SES; always repeat one GPU-reset "
+            "notification four times for the deduplication proof"
         ),
         "GF-REGIONAL-NOTIFY-002": (
-            "send one GPU-reset drill and repeat the same notification ID three times"
+            f"superseded by {NOTIFY002_SUPERSEDED_BY}: send one GPU-reset drill "
+            "and repeat the same notification ID three times"
         ),
         "GF-REGIONAL-NOTIFY-003": (
             "run isolated backlog/watermark contracts and read live role configuration"
@@ -1112,13 +1582,17 @@ def main() -> int:
             raise NotificationAcceptanceError(
                 "NOTIFY-005 training image must use an immutable digest"
             )
+    # The release and cluster this evidence is bound to: the predecessor must
+    # have earned its PASS against the same pair, and the result carries it so
+    # the next case can demand the same.
+    identity = site.regional(target).evidence_identity()
     predecessor_id, path = predecessor_path(
         arguments.run_dir,
         arguments.case,
         arguments.predecessor_evidence,
     )
     predecessor = (
-        predecessor_evidence(path, predecessor_id)
+        predecessor_evidence(path, predecessor_id, **identity)
         if predecessor_id is not None and path is not None
         else {"valid": True, "case_id": None, "verdict": "NOT_REQUIRED"}
     )
@@ -1131,19 +1605,26 @@ def main() -> int:
         "GPU_FAULT_CLUSTER_ID": target.cluster_id,
         "GPU_FAULT_TARGET_NODES": ",".join(nodes),
     }
+    case_dir = arguments.run_dir / "cases" / arguments.case
     if not arguments.execute:
+        details = case_plan(
+            arguments.case,
+            target=target,
+            nodes=nodes,
+            predecessor=predecessor,
+        )
+        if arguments.case == "GF-REGIONAL-NOTIFY-003":
+            # Run the focused suite once here; --execute reuses the result
+            # while the source digest still matches.
+            case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            record_focused_tests(details, notify003_focused_tests(case_dir))
         plan = build_plan(
             run_dir=arguments.run_dir,
             case_id=arguments.case,
             attempt=arguments.attempt,
             confirmation=confirmation,
             environment=environment,
-            details=case_plan(
-                arguments.case,
-                target=target,
-                nodes=nodes,
-                predecessor=predecessor,
-            ),
+            details=details,
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0 if predecessor.get("valid", False) else 1
@@ -1159,7 +1640,6 @@ def main() -> int:
     )
     if not predecessor.get("valid", False):
         raise NotificationAcceptanceError("formal predecessor evidence is not PASS")
-    case_dir = arguments.run_dir / "cases" / arguments.case
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     started_at = utc_now()
     try:
@@ -1168,7 +1648,9 @@ def main() -> int:
                 site,
                 target,
                 attempt=arguments.attempt,
+                run_dir=arguments.run_dir,
                 receipt_evidence=arguments.receipt_evidence,
+                ses_window_evidence=arguments.ses_window_evidence,
             ),
             "GF-REGIONAL-NOTIFY-002": lambda: run_notify002(
                 site,
@@ -1176,7 +1658,9 @@ def main() -> int:
                 attempt=arguments.attempt,
                 ses_window_evidence=arguments.ses_window_evidence,
             ),
-            "GF-REGIONAL-NOTIFY-003": lambda: run_notify003(site, target),
+            "GF-REGIONAL-NOTIFY-003": lambda: run_notify003(
+                site, target, case_dir=case_dir
+            ),
             "GF-REGIONAL-NOTIFY-004": lambda: run_notify004(site, target),
             "GF-REGIONAL-NOTIFY-005": lambda: run_notify005(
                 site,
@@ -1205,6 +1689,7 @@ def main() -> int:
         "started_at": started_at,
         "executed_at": utc_now(),
         "predecessor": predecessor,
+        **identity,
         **{key: value for key, value in outcome.items() if key != "verdict"},
     }
     write_json_atomic(case_evidence_path(arguments.run_dir, arguments.case), result)

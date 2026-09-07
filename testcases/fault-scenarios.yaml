@@ -2592,20 +2592,20 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-009
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth009_every_cluster_token_write_route_rejects_a_foreign_payload
 - id: GF-REGIONAL-AUTH-010
-  title: 受保护路径矩阵完整性
+  title: 已并入：受保护路径矩阵完整性
   category: regional-authentication
   level: live
   risk: read-only-signal-replay
-  problem: 每条应用 route 都必须显式声明 authorization bucket，任何写路由不得落入 public/metrics 或未声明状态。
-  injection: 机械导出全部 cluster-token route 并逐条发无凭证请求，同时审计全部写 route 的 bucket。
+  problem: 每条应用 route 都必须显式声明 authorization bucket；该矩阵是 GF-REGIONAL-AUTH-014 全量清单的前半段，单独保留只会重复计数。
+  injection: 不单独执行。AUTH-014 机械枚举全部 route/method/bucket 并从数据面逐条无凭证访问，同时核对数据面 Secret 中没有 execution token。
   expected:
-  - 全部 cluster-token route 的无凭证请求返回 401
-  - 每个 POST/PUT/PATCH/DELETE route 都显式属于 cluster-token、dual-credential 或 execution-token
-  - 管理员 execution token 未出现在任何数据面 Secret 中
+  - 不再单独执行该用例
+  - 使用 superseded_by 指向的 AUTH-014 全量清单
   evidence:
-    verdict: NOT_RUN
+    verdict: SUPERSEDED
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-010
+  superseded_by: GF-REGIONAL-AUTH-014
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_auth010_every_route_answers_the_denial_its_bucket_declares
 - id: GF-REGIONAL-AUTH-011
   title: 健康与指标端点不需要集群凭证但也不泄露集群清单
@@ -2688,6 +2688,7 @@ test_cases:
   - fleet/agents 的 cluster token 读取严格限定认证 cluster
   - runtime-profiles 与 advisory notification send 只接受 execution token
   - OpenAPI/docs/redoc 的公开只读信息面被记录
+  - 管理员 execution token 未出现在任何数据面 Secret 中（原 GF-REGIONAL-AUTH-010 的判定）
   evidence:
     verdict: NOT_RUN
   automation: manual
@@ -2971,17 +2972,20 @@ test_cases:
   title: executor 本地校验 fencing token 三方一致
   category: regional-remote-command
   level: live
-  risk: live-non-destructive
+  risk: non-destructive
   problem: command、workflow 和 incident 的 fencing token 必须三方一致，数据面要独立校验。
-  injection: 在 executor Pod 内用 model_copy 篡改 command.incident.fencing_token 后调 _execute。
+  injection: 本地 Executor 夹具（无集群客户端、不连接控制面）构造 command/workflow token 为 1、incident token 为 2 的 command 后直接调 _execute。
   expected:
   - 返回 FAILED 且 error 含 command fencing token does not match workflow/incident
   - 全过程没有任何 Kubernetes 变更
   - 报告记录数据面校验失败会终结 step 而不是让它重试
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-011
+  command:
+  - python3
+  - scripts/e2e/regional/audit_executor_local_guards.py
   related_pytest: tests/regional/test_regional_acceptance_fixtures.py::test_local_executor_guard_fixture_covers_iso002_and_cmd011
 - id: GF-REGIONAL-CMD-012
   title: command 身份幂等与冲突拒绝
@@ -3037,13 +3041,13 @@ test_cases:
   title: restart 预算在委托前被预留且耗尽时不下发 command
   category: regional-remote-command
   level: live
-  risk: live-workload-restart
+  risk: read-only-signal-replay
   problem: 预算检查若发生在委托之后，数据面会先停 workload 再发现不允许重启，导致任务被无谓杀死。
-  injection: 用 restart-budget 1 的任务连续注入两次 XID 11，并另外构造缺 source_gpu_count 的 RESTART_WORKLOAD step。
+  injection: 不触碰任何 workload：在控制面 store 上为合成 job 预留 restart-budget 1 后，用 RegionalRemoteWorkflowAdapter 对指向不存在 workload 的 RESTART_WORKLOAD step 直接执行，再构造缺 source_gpu_count 的同类 step；结束后删除合成预算行。
   expected:
-  - 第二次注入的 step FAILED 且 reason 为 RESTART_BUDGET_EXHAUSTED
+  - 预算已耗尽时 step FAILED 且 reason 为 RESTART_BUDGET_EXHAUSTED
   - error 含 restart budget exhausted 与 1/1
-  - 没有新的 remote command 被创建且训练 Pod 未被再次停止
+  - 没有新的 remote command 被创建，全程没有任何 workload 被停止
   - "缺参数时 step FAILED 且 error 含 restart safety context is missing: source_gpu_count"
   - 缺参数时同样没有 command 下发
   evidence:
@@ -3180,14 +3184,9 @@ test_cases:
   - 结果提交重试只表现为 409 或 200 幂等而不产生第二次物理动作
   - Aurora连接类OperationalError不把workflow写成BLOCKED
   - processor内部重放的新鲜5xx响应释放lane并重试而不是标记COMPLETED
+  - 若 failover 落在 reset command 已终态之后，结果记为 INCONCLUSIVE 而不是 PASS
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 010a9ba4e45b69c9add73e50429b645aeddfdf88122ce11d4cab0b36778df771
-      components:
-        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
-        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
-        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-003
   related_pytest: tests/regional/test_ha_reset_window_fixtures.py::test_ha003_waits_for_reset_claim_before_failover
@@ -3197,7 +3196,7 @@ test_cases:
   level: staging
   risk: destructive
   problem: WAITING command重新可claim不等于物理动作已停止，防重复必须同时依赖稳定command_id、持久ledger和显式进程内in-flight锁。
-  injection: 把executor lease设为10秒、poll设为2秒、副本数2，触发返回WAITING的RESET_GPU并以100ms采样owner/token变化。
+  injection: 经 executor_env_window 把executor lease设为10秒、poll设为2秒、副本数2，触发返回WAITING的RESET_GPU；owner/token 变化经 STORE_PROBE 采样，有效周期约 6 秒（不是 100ms），可观测量是同一 command_id 上 owner 的变化。
   expected:
   - 允许两个副本在WAITING或lease过期后都领到同一command_id
   - 目标节点上物理 reset 只发生一次
@@ -3205,34 +3204,25 @@ test_cases:
   - 显式in-flight锁测试必须在并发执行模型下通过，不能依赖ASGI handler恰好同步
   - lease续租保持有效；强制续租失败时仍由command_id幂等防止重复物理动作
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 0232e1f4b4d49c142da3502e898789d1575e6ccbe87788e541aa717d9dfb589a
-      components:
-        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
-        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
-        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-004
   related_pytest: tests/regional/test_ha_reset_window_fixtures.py::test_ha004_reclaim_timeline_keeps_one_command_id
 - id: GF-REGIONAL-HA-005
-  title: 控制面滚动升级期间数据面只观察到可重试错误
+  title: 已并入：控制面滚动升级期间数据面只观察到可重试错误
   category: regional-high-availability
   level: live
   risk: live-service-action
-  problem: 滚动升级期间出现401、403或500说明Secret未同步或存在未处理异常；控制面短暂不可达时Collector必须进入有界磁盘outbox而不是在重试耗尽后直接丢失。
-  injection: 在持续 claim 与事件上报负载下执行 rollout restart。
+  problem: 滚动升级期间出现401、403或500说明Secret未同步或存在未处理异常；GF-REGIONAL-HA-009 在 Aurora 凭据轮换触发的同一类滚动上导入并重新断言本条全部判定，单独保留只会重复计数。
+  injection: 不单独执行。HA-009 的 runner 导入 run_ha005_rollout_continuity.py 作为基座，在持续 claim 与事件上报负载下做凭据轮换驱动的滚动。
   expected:
-  - 数据面只看到连接重置、超时和带 Retry-After 的 503
-  - 不出现 401、403 或 500
-  - 尝试数减202数等于数据面记录的失败次数
-  - 每个202返回的processor_request_id最终COMPLETED且内部response_status为200
-  - 重试耗尽的可重放事件进入每通道磁盘outbox，恢复后先发送实时事件再有界补交历史
-  - validation_limitations记录outbox容量溢出、磁盘不可写和CompletionWatcher未配置持久outbox的残余风险
+  - 不再单独执行该用例
+  - 使用 superseded_by 指向的 HA-009 滚动连续性判定
   evidence:
-    verdict: NOT_RUN
+    verdict: SUPERSEDED
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-005
+  superseded_by: GF-REGIONAL-HA-009
 - id: GF-REGIONAL-HA-006
   title: executor Pod 被强杀后动作被接管而不是丢失
   category: regional-high-availability
@@ -3246,6 +3236,7 @@ test_cases:
   - WAITING分支由另一副本短轮询接管而不等待完整lease
   - Node Agent ledger按同一command_id只记录一次物理动作
   - 报告记录默认 lease_seconds=120 意味着最多约 2 分钟停滞并与业务可接受延迟对比
+  - 强杀未落在 LEASED 上（lease_expires_at 为空）时 LEASED 分支无法度量，结果记为 INCONCLUSIVE
   evidence:
     verdict: NOT_RUN
   automation: manual
@@ -3279,6 +3270,7 @@ test_cases:
   - executor 记录该错误并在下一轮重新 claim
   - command 最终到达终态且只执行一次
   - run 循环在 ClusterExecutorError 后不退出进程
+  - 局限记入证据：驱动把 executor HTTP 超时设为 180 s 以让被封禁的提交撑过 lease 过期而到达 409 路径，生产默认为 15 s；生产超时下同一中断会先以传输错误重试
   evidence:
     verdict: NOT_RUN
   automation: manual
@@ -3289,11 +3281,12 @@ test_cases:
   level: live
   risk: live-non-destructive
   problem: 结果提交的重试不得产生第二次物理副作用或第二封通知。
-  injection: 在 executor 调用 result 端点的瞬间注入网络中断再解除让其重试。
+  injection: loopback 代理把 executor 的首个 /result 提交转发到控制面、丢弃响应并向 executor 重置连接（forward-then-reset），executor 随后对同一终态结果重放一次。
   expected:
   - command 最终为单一终态
   - 物理副作用只发生一次
   - 不产生第二封通知
+  - 只重放一次；更宽的终态重放协议矩阵由 GF-REGIONAL-CMD-007 承担
   evidence:
     verdict: NOT_RUN
   automation: manual
@@ -3533,7 +3526,7 @@ test_cases:
   expected:
   - secrets、configmaps 和 clusterroles 的所有 verb 都是 no
   - nodes 只有 get、list、watch 和 patch 而没有 delete
-  - pods 有 delete 但没有 create
+  - ClusterRole 对 pods 只有 get、list、watch，没有 create 也没有 delete；pods delete/patch 只经每个 allowed namespace 的 Role 授予
   - IAM 中无 SES 权限
   - 报告记录 nodes patch 无法按 label selector 收窄这一事实
   evidence:
@@ -3567,7 +3560,8 @@ test_cases:
   - step 序列完整走过 FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、QUIESCE、VERIFY、RESET、RESTORE_GPU_SERVICES、VALIDATE_GPU、RESTORE_SCHEDULING
   - 远端 step 的 WAITING 委托详情含 mutation_submitted_by_control_plane=false；终态 details 以真实 adapter 结果为准
   - QUIESCE_GPU_SERVICES 先创建 systemd fail-safe timer
-  - Node Agent ledger 中 RESET_GPU 恰一条且 attempt=1，kernel journal 有且仅有一条目标 PCI reset；高频宿主采样若捕获到单 GPU 瞬时不可枚举则记录为补充证据，未捕获不单独判失败
+  - Node Agent ledger 中 RESET_GPU 恰一条且 attempt=1；kernel journal 中目标 PCI reset 至多一条（0 条允许，>1 条 FAIL——journal 里含 BDF 与 reset 的行此前只有注入文本本身，内核来源行只记录不据以计数）
+  - 高频宿主采样必须捕获到目标 GPU 瞬时不可枚举（样本序列先低于期望 GPU 数再回到期望数），未捕获判 FAIL；这是物理 reset 的直接证据
   - RESTORE_GPU_SERVICES 恢复原本 active 的服务并取消 timer
   - Node Agent ledger 以确定性 command_id 为主键且只记录一条结果
   - CloudTrail 中没有 BatchRebootClusterNodes、BatchReplaceClusterNodes 或 BatchDeleteClusterNodes；周期性只读 ListClusterNodes 允许存在但频率不得因本 workflow 改变
@@ -3830,31 +3824,21 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-010
 
 - id: GF-REGIONAL-DESTR-011
-  title: provider replace应用不变量与IAM拒绝
+  title: 已并入：provider replace应用不变量与IAM拒绝
   category: regional-destructive-acceptance
   level: staging
   risk: non-destructive
   problem: >-
-    当前生产始终启用warm-spare coordinator，但provider replace仍必须有独立应用层不变量：ALLOW_HYPERPOD_REPLACE=true直接拒绝配置，replace preflight在AWS调用前失败，IAM同时implicitDeny。该负向只在隔离进程运行，不再通过滚动生产Executor或cordon节点构造历史“模式C”。
-  injection: 在隔离进程验证replace preflight与ALLOW_HYPERPOD_REPLACE=true启动拒绝；线上只读核对所有Executor副本开关、IAM implicitDeny和CloudTrail，不修改生产Executor或节点。
+    provider replace 的应用层不变量（ALLOW_HYPERPOD_REPLACE=true 直接拒绝配置、replace preflight 在 AWS 调用前失败、IAM implicitDeny、CloudTrail 为空）与 GF-REGIONAL-DESTR-013 在阶段末做的否证是同一组只读核对；单独保留只会重复计数。
+  injection: 不单独执行。DESTR-013 在覆盖全部破坏性阶段的时间窗上做同一组只读核对，并承担"reboot 仍可独立启用"与逐副本开关报告。
   expected:
-  - provider replace preflight在AWS调用前返回HyperPod REPLACE mutation is disabled by configuration
-  - 显式ALLOW_HYPERPOD_REPLACE=true使配置构造直接失败
-  - reboot仍可独立启用
-  - CloudTrail 中 BatchReplaceClusterNodes 为空（枚举动词，不用 contains）
-  - 节点数量与实例ID均未变化
-  - 报告记录所有副本ALLOW_HYPERPOD_REPLACE=false
-  - Executor IAM中不存在BatchReplaceClusterNodes，区域发布编排器的最小权限审计保持通过
+  - 不再单独执行该用例
+  - 使用 superseded_by 指向的 DESTR-013 否证
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: f29067102487c5f8e511e3e56b9a9c23c4e088e4887f7d5c92133a7f69b91c84
-      components:
-        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
-        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
-        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
+    verdict: SUPERSEDED
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-011
+  superseded_by: GF-REGIONAL-DESTR-013
   related_pytest: tests/hyperpod/test_hyperpod.py::test_replace_env_is_rejected_by_the_design_invariant
 - id: GF-REGIONAL-DESTR-012
   title: 任务自动恢复由本方案独占且 HyperPod auto-resume 必须处于禁用状态
@@ -3863,13 +3847,13 @@ test_cases:
   risk: live-workload-restart
   problem: >-
     方案硬约束（2026-08-05，概要设计 §2.1 约束 3）要求禁用 HyperPod 的任务自动恢复， 训练任务的自动恢复完全由本方案接管：受管任务不得带 sagemaker.amazonaws.com/enable-job-auto-resume=true，Slurm 不得带 --auto-resume=1， runtime profile 的 workloadStop/workloadRestart 恒为 OWN。 该约束有两道落实：纳管前置检查（部署期，人工，会漏）与运行期 fail-closed 守卫 KubernetesWorkflowAdapter._managed_job_recovery_conflict()—— _set_workloads() 取回 workload 对象后立即用 from_eks_annotations() 复判 annotation， 任一 workload 为 ENABLED 即返回 FAILED，且守卫排在 _mark_terminating_pods() 与所有 patch 之前，STOP_WORKLOADS 与 RESTART_WORKLOAD 共用该入口。 生产 profile 由 deploy.sh:1527-1530 与 :1579-1586 静态填 OWN，正好是唯一合规形态。 故意不提供 per-workload 豁免注解：能违规开启 auto-resume 的一方同样能加豁免注解。 原 B 组（故意复现双写者）已作废：其前提是 auto-resume 为合法配置， 且守卫接通后双写在合规部署里已不可复现。
-  injection: 分四组——B 组纯只读遍历受管命名空间核对 annotation 与 profile；A 组任务不带 annotation 且 profile 默认 OWN，注入 XID 11；D 组在一次性单节点 Job 上打违规 annotation（profile 不改）后注入 XID 11 验运行期守卫；C 组（可选）把 profile 误改为 DELEGATE 后注入 XID 11 验 fail-closed，任务配置全程保持合规。组内次序 B → A → D → C。
+  injection: 分四组——B 组纯只读遍历受管命名空间核对 annotation 与 profile；A 组复用 DESTR-009 PASS 证据并核对 step execution_owner=gpu-fault-kubernetes-adapter，不重复提交训练任务；D 组在一次性单节点 Job 上打违规 annotation（profile 不改）后注入 XID 11 验运行期守卫；C 组（可选）把 profile 误改为 DELEGATE 后注入 XID 11 验 fail-closed，任务配置全程保持合规。组内次序 B → A → D → C。
   expected:
   - B 组遍历全部受管命名空间后 enable-job-auto-resume 开启的任务集合为空（Slurm 脚本核对当前不执行，Slurm 编排暂不支持）
   - B 组所有副本的 profile 中 workloadStop 与 workloadRestart 均为 OWN 且 owner 为自建 adapter，副本间不一致即 FAIL
   - B 组报告必须给出遍历的命名空间清单与逐任务取值，只写未发现不构成证据
   - B 组失败的后果不是双写而是该任务失去本方案的全部自动恢复能力（每次故障停在 FAILED），仍阻断上线
-  - A 组断言与 DESTR-009 一致，且 step execution_owner 为 gpu-fault-kubernetes-adapter 而非 hyperpod-managed-job-recovery
+  - A 组复用 DESTR-009 PASS 证据并核对 step execution_owner=gpu-fault-kubernetes-adapter（而非 hyperpod-managed-job-recovery），不重复提交训练任务；DESTR-009 证据缺失或非 PASS 时 A 组 FAIL
   - A 组只证明合规配置被放行，违规配置被拒绝由 D 组承担；单靠 A 组无法区分读了并判为合规与根本没读
   - D 组 STOP_WORKLOADS step FAILED 且 error 含 enable-job-auto-resume is enabled
   - D 组 step details 含 managed_job_recovery_workloads 且只列违规 workload，另含 required_annotation 与 required_annotation_value 为 absent or false 以及可直接执行的 remediation_commands
@@ -3881,13 +3865,7 @@ test_cases:
   - C 组 owner 必须在 GPU_FAULT_MANAGED_RECOVERY_OWNERS 内且不在 GPU_FAULT_REMOTE_EXECUTION_OWNERS 内，否则 step 会被 RegionalRemoteWorkflowAdapter 抢走真去动 K8s
   - C组结束后删除隔离测试数据库；当前site profile内容与指纹必须始终未变
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 313e54c783bcf8057db7a66f12039b2d96f35e32866a0b756be300c8395808c9
-      components:
-        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
-        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
-        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-012
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr012_group_d_requires_prewrite_failure_details
@@ -4184,14 +4162,10 @@ test_cases:
   - cluster-action-executor.yaml 仍为 false 且部署 patch 链中无覆盖
   - executor role 不具备 sagemaker:BatchReplaceClusterNodes；权限存在直接判FAIL
   - 报告须说明 CloudTrail 的空结论只覆盖所查时间窗，需配置类证据支撑“将来也不会调用”
+  - reboot 仍可独立启用 (ALLOW_HYPERPOD_REBOOT=true)（原 GF-REGIONAL-DESTR-011 的判定）
+  - 报告记录所有 executor 副本数与 ALLOW_HYPERPOD_REPLACE=false（原 GF-REGIONAL-DESTR-011 的判定）
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 693f1e9794ff77973c7e28a05f04d2d416ffb4fd46774e74d3a7f77c61f41fe3
-      components:
-        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
-        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
-        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-013
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr013_manifest_audit_keeps_provider_replace_disabled
@@ -4219,7 +4193,7 @@ test_cases:
   - node-b 分支 RESET_GPU FAILED，error 含 clients are still active 与 gpu_reset_commit_attempt；原分支剩余步骤进入 superseded_step_indexes
   - node-b 就地升级出的 RESTART_NODE 为真实 HyperPod reboot 且 SUCCEEDED；持有者随重启消失；Node Agent 以新 boot_id 重新注册；VALIDATE_GPU、VALIDATE_HOST、VALIDATE_FABRIC、RESTORE_SCHEDULING 全部 SUCCEEDED，node-b 恢复可调度
   - node-c 分支 RESTART_NODE 为真实 HyperPod reboot，节点回到 Ready 但始终没有新的 boot_id 上报；该步在 GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS 到期后 FAILED，details 含 step_waiting_timeout_seconds
-  - node-c 分支升级出的 REPLACE_NODE 参数 replacement_strategy=HEALTHY_WARM_SPARE_ONLY，FAILED 且 error 含 insufficient healthy HyperPod spares；exhausted_branch_ids 恰含 node-c 的 branch
+  - node-c 分支升级出的 REPLACE_NODE 参数 replacement_strategy=HEALTHY_WARM_SPARE_ONLY，FAILED 且 error 含 warm-spare replacement is required; provider node replacement API fallback is disabled（集群无任何 gpu-fault.io/spare 标签时 hyperpod_spares 返回 applicable=False，不会走到 insufficient healthy HyperPod spares）；exhausted_branch_ids 恰含 node-c 的 branch
   - branch_escalation_counts 为 node-b=1、node-c=1；全部非 join 步骤到终态后 workflow FAILED，error 含 node branch escalation exhausted 与 node-c 的 branch id；未触发生命周期上限
   - RESTART_WORKLOAD 从未执行，作业未重启，旧 Pod 未被新 attempt 取代，restart budget 不变
   - incident QUARANTINED；node-c 保持 cordon 且带 gpu-fault.io/quarantined taint，值为 sha256(incident_id) 前 24 位；node-b 无 quarantine taint 且 schedulable
@@ -4245,39 +4219,27 @@ test_cases:
   - 每条通知 status 为 SENT 且 provider_message_id 非空
   - MessageId 可在 SES 侧核对到
   - 人工确认收件箱真的收到邮件
+  - 对同一 RESET_GPU completion 四次重复提交 provider_message_id 不变、通知条数不变，SES 发送计数不增加（原 GF-REGIONAL-NOTIFY-002 的去重判定）
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: bc16ea5ade7bc0de05912fbb44db82c9198bf7ee28594e5fd16cfaf4f2f536e5
-      components:
-        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
-        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
-        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-001
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_api_sends_executor_workload_restart_notification
 - id: GF-REGIONAL-NOTIFY-002
-  title: 重复 remote result 不产生第二封邮件
+  title: 已并入：重复 remote result 不产生第二封邮件
   category: regional-notification
   level: live
   risk: live-non-destructive
-  problem: 一次故障产生多封重复邮件会让运维对告警脱敏。
-  injection: 在隔离控制面构造已终态remote command，对同一/result端点重复提交三次相同SUCCEEDED payload；不重新执行真实RESET_GPU。
+  problem: 一次故障产生多封重复邮件会让运维对告警脱敏；该去重判定与 GF-REGIONAL-NOTIFY-001 的通知 drill 是同一条提交路径，单独保留只会重复计数。
+  injection: 不单独执行。NOTIFY-001 的 drill 对同一 RESET_GPU completion 重复提交四次并断言 provider_message_id 不变。
   expected:
-  - 通知条数不变
-  - provider_message_id 不变
-  - SES 发送计数不增加
-  - 收件箱不出现第二封
+  - 不再单独执行该用例
+  - 使用 superseded_by 指向的 NOTIFY-001 去重判定
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 3683bc005f85dbb6e86645a88d0eb06bc714b01163c526b7060d6b02f2375357
-      components:
-        control_plane: 9f7a4f08fbb0bd93baa4f68533d05f4371f5c0e56ffa2108dcf9a0c243ae5d9c
-        executor: 81beb03d5ac2b31753f9852897b43b30c69737e5292a83c54fedd11e41614a55
-        node_runtime: 0c3e1fbc263e927d85887159ef059fa5c1dded787b748cb52fff561c00cdaa27
+    verdict: SUPERSEDED
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-002
+  superseded_by: GF-REGIONAL-NOTIFY-001
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_api_sends_gpu_reset_completion_once
 - id: GF-REGIONAL-NOTIFY-003
   title: 首次启用 dispatcher 不倒灌历史积压
@@ -4546,20 +4508,25 @@ test_cases:
   title: control-worker 带合法长请求滚动退出
   category: regional-high-availability
   level: staging
-  risk: live-non-destructive
+  risk: non-destructive
   problem: >-
     YAML 时间预算正确不能证明 processor 线程排空；合法长请求可能超过 lifespan 对 processor thread 的固定等待时间。
   injection: >-
-    用隔离构建中的 test-only 阻塞 handler 让非破坏性 processor request 持有 lease 30、70、110 秒，并在执行中滚动删除承载它的 worker Pod。
+    本地 subprocess 演练，不触碰任何集群：runner 拉起模拟 processor 线程的子进程，让请求持有 30、70、110 秒并对子进程发 SIGTERM，用生产同一个 ShutdownCoordinator（预算 130 s）排空；不删除任何 Pod。
   expected:
   - 不出现 SIGKILL 或 did not stop cleanly
-  - request 由旧 Pod 完成或在退出前明确释放后由新 Pod 接管
-  - request 最终恰好一次完成且无孤儿 LEASED 记录
-  - Pod 退出总时长不超过 terminationGracePeriodSeconds
+  - 每个子进程的请求在 SIGTERM 后由同一进程排空完成，不存在孤儿 LEASED 记录
+  - 每个请求恰好一次完成
+  - 每个子进程 shutdown 用时不超过 terminationGracePeriodSeconds（worker 当前 240 s）
   evidence:
     verdict: NOT_RUN
-  automation: manual
+  automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-007
+  command:
+  - python3
+  - scripts/e2e/regional/run_ha007_control_worker_shutdown.py
+  - --run-dir
+  - artifacts/regional-acceptance/ha007
   related_pytest: tests/regional/test_production_safety_config.py::test_control_plane_shutdown_budget_has_real_margin
 - id: GF-REGIONAL-HA-008
   title: processor deadline fatal-exit 与 lease 释放
@@ -4839,8 +4806,7 @@ test_cases:
   - 已提交的低级 reset 只允许执行一次
   - reset 终态后只执行必要 RESTORE，跳过低级 validation 等剩余步骤
   - 前驱 SUPERSEDED，reboot successor 执行一次
-  - Node Agent ledger 中低级 reset=1
-  - 高级 reboot 由 HyperPodSubmissionRecord 与 CloudTrail 证明只提交一次
+  - 低级 reset 的物理 ledger 只有一条与高级 reboot 只提交一次这两条真机判定不在本条的确定性契约里（由 DESTR-016 真机覆盖）
   evidence:
     verdict: NOT_RUN
   automation: command
@@ -4970,7 +4936,7 @@ test_cases:
     真机执行两组：clean boundary 在 MARK/STOP 后、QUIESCE 前抢占； dirty boundary 在真实 QUIESCE 后抢占；可安全handoff的REBOOT successor在 高级动作后cleanup RESTORE，否则由前驱先RESTORE再SUPERSEDE。
   expected:
   - clean 组低级物理动作 ledger=0
-  - dirty 组已 LEASED 的低级物理命令允许单次结束，但低级 workflow 后续步骤被截断
+  - dirty 组边界为 QUIESCE 已完成、reset 尚未提交（PREEMPT-008 形态）：quiesce 交接给 successor，不下发 RESET_GPU；已 LEASED 的 reset 边界由 GF-REGIONAL-DESTR-016 覆盖
   - 每组结束时本用例 active mutation workflow=0，remote PENDING/LEASED/WAITING=0
   - 四节点 Ready、unschedulable=false、无 gpu-fault taint 与 ownership annotation
   - GPU count=8，quiesce state 与 timer 无残留
@@ -4993,11 +4959,13 @@ test_cases:
   - incident 始终指向 C
   - A 与 B 的物理 action ledger 均为 0，或已提交动作各最多一次
   - predecessor 链不被压平也不成环
+  - 不再单独执行该用例：三级链是 GF-REGIONAL-PREEMPT-014 五级链的严格子集
   evidence:
-    verdict: NOT_RUN
-  automation: pytest
+    verdict: SUPERSEDED
+  automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-013三级连环抢占
-  pytest_nodeid: tests/execution/test_executor.py::test_dispatcher_resolves_chained_preemptions_to_highest_action[3]
+  superseded_by: GF-REGIONAL-PREEMPT-014
+  related_pytest: tests/execution/test_executor.py::test_dispatcher_resolves_chained_preemptions_to_highest_action[3]
 - id: GF-REGIONAL-PREEMPT-014
   title: 五级连环抢占与两种到达时序等价
   category: regional-preemption
@@ -5087,7 +5055,6 @@ test_cases:
   - -m
   - pytest
   - -q
-  - tests/orchestration/test_cross_fault_arbitration.py::test_disjoint_node_scope_uses_independent_workflows_or_shared_dag
   - tests/execution/test_executor.py::test_dag_fans_out_node_branches_and_joins_once
 - id: GF-REGIONAL-PREEMPT-018
   title: 3 节点与 5 节点动态追加 branch
@@ -5209,11 +5176,13 @@ test_cases:
   - 不同节点继续并行
   - driver 与 firmware 只与 GPU runtime mutation 及 node lifecycle mutation 互斥
   - rank 更高但无显式 dominance 的 action 不覆盖另一个故障域
+  - 不再单独执行该用例：其唯一 nodeid 已包含在 GF-REGIONAL-PREEMPT-024 的命令里
   evidence:
-    verdict: NOT_RUN
-  automation: pytest
+    verdict: SUPERSEDED
+  automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-023跨故障域action-dominance
-  pytest_nodeid: tests/orchestration/test_merge.py::test_same_node_cross_domain_actions_require_explicit_dominance
+  superseded_by: GF-REGIONAL-PREEMPT-024
+  related_pytest: tests/orchestration/test_merge.py::test_same_node_cross_domain_actions_require_explicit_dominance
 - id: GF-REGIONAL-PREEMPT-024
   title: 持续采集与按需诊断的边界
   category: regional-preemption
@@ -5553,24 +5522,12 @@ test_cases:
   - STOP 执行后工作流 FAILED，terminal_failure_reason 点名忙节点，incident ESCALATED
   - 节点自己的工作流保持 RUNNING、持有者不变
   - node_busy_timeouts_total 计 1
+  - 不再单独执行该用例：node-busy 等待、超时 STOP 与 node_busy_timeouts_total 由 GF-REGIONAL-PREEMPT-035 的 placement-hold 套件覆盖
   evidence:
-    verdict: NOT_RUN
-  automation: command
+    verdict: SUPERSEDED
+  automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-034新作业工作流等待节点修复
-  execution:
-    parallel_safe: true
-    environment: isolated
-    failure_scope: case
-    locks:
-    - resource: local-test
-      mode: shared
-  command:
-  - python3
-  - -m
-  - pytest
-  - -q
-  - tests/execution/test_workflow_lifecycle_scenarios.py::test_preempt034_a_job_on_a_node_under_repair_waits_then_stops_the_job
-  - tests/execution/test_node_busy_wait.py
+  superseded_by: GF-REGIONAL-PREEMPT-035
   related_pytest: tests/execution/test_node_busy_wait.py::test_past_the_wait_the_job_workflow_stops_the_job_and_fails
 - id: GF-REGIONAL-PREEMPT-035
   title: 新作业被观察到落在修复中节点：开出安置保留，窗口内节点释放即消散，超时只执行 STOP_WORKLOADS 并 FAILED/ESCALATED
@@ -5828,16 +5785,12 @@ test_cases:
     维护窗口内把单节点expected GPU count从live基线临时改为baseline+1并重启host collector，观察同一进程的前两个真实采样周期；该finding会触发REBOOT_NODE，必须按破坏性用例执行。
   expected:
   - 1 个周期不报事件
-  - 2个周期报事件且延迟约为2乘live采集周期
+  - 2个周期报事件且延迟约为2乘live采集周期；去抖延迟按 collector status/evidence 时间戳测量，不按 runner 本地时钟
+  - RESTART_NODE 工作流 SUCCEEDED 且注入后该节点恰一条工作流
+  - collector.env 的 sha256 在还原后与基线一致
   - 配置原字节恢复、节点reboot后完成DCGM与正式restore
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 70af99d86b337df8b07a9afb1c89da510bce59a6205afcbfe443741329e1904d
-      components:
-        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
-        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
-        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-004
   related_pytest: tests/collectors/test_gpu.py::test_host_collector_reports_persistent_gpu_and_efa_card_loss
@@ -6039,22 +5992,17 @@ test_cases:
   category: regional-collector
   level: staging
   risk: destructive
-  problem: RESET_GPU 这 14 条此前只有 API 重放，单卡 reset 的真机链路从未跑通。
+  problem: RESET_GPU 这 14 条此前只有 API 重放，单卡 reset 的真机链路从未跑通；真机只需证明一条 RESET_GPU 类 XID 能驱动出真实单卡 reset，逐码语义由目录回放承担。
   injection: >-
-    通过真实 /dev/kmsg 注入 RESET_GPU 类 XID，让 QUIESCE_GPU_SERVICES 真的停 kubelet 并执行单卡 reset；注入前先用 nohup setsid 起宿主机侧采样器写日志到 /var/log。
+    通过真实 /dev/kmsg 注入一条 RESET_GPU 类 XID（XID 109），让 QUIESCE_GPU_SERVICES 真的停 kubelet 并执行单卡 reset；注入前先用 nohup setsid 起宿主机侧采样器写日志到 /var/log。其余 RESET_GPU 码由 GF-LIVE-KMSG-* 家族与 COLLECT-007 的 XID 目录回放覆盖，不逐码做真实 reset。
   expected:
-  - 真 kmsg 驱动出真实单卡 reset
+  - 一条真 kmsg RESET_GPU 类 XID 驱动出恰一次真实单卡 reset
   - reset 后自动恢复调度
   - boot_id 不变，证明没有重启节点
   - quiesce 期间的证据由宿主机侧采样器完整留存
+  - 其余 RESET_GPU 码由 GF-LIVE-KMSG-* 家族与 COLLECT-007 的 XID 目录回放覆盖，本用例不重复做第二次 reset
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: ca35b3af488bae700fe6697334b9092d18b3ce5db8befe0d374fdb7e1e3ee76b
-      components:
-        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
-        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
-        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-013
   related_pytest: tests/node_agent/test_remediation.py::test_gpu_reset_is_idempotent_and_rechecks_clients

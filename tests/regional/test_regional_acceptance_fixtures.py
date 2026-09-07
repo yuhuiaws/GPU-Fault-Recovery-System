@@ -21,10 +21,13 @@ from scripts.e2e.regional.audit_regional_command_protocol_live import (
     AUDITED_CASE_IDS,
     LiveProtocolAudit,
 )
+from scripts.e2e.regional import seeded_command_fixture
+from scripts.e2e.regional.regional_case_contract import formal_predecessor
 from scripts.e2e.regional.run_boot019_admin_lifecycle import run_admin_lifecycle
 from scripts.e2e.regional.run_boot020_release_rolling import (
     STAGES,
     LiveReleaseRollingBackend,
+    EXECUTOR_DEPLOYMENT,
     configure_gpu_kubeconfig,
     deployment_generations,
     resume_release_rolling,
@@ -32,7 +35,10 @@ from scripts.e2e.regional.run_boot020_release_rolling import (
     run_release_rolling,
 )
 from scripts.e2e.regional.run_ha007_control_worker_shutdown import (
+    DEFAULT_DURATIONS,
+    WORKER_THREAD_NAME,
     _child_environment,
+    control_worker_budgets,
     run_probe,
 )
 from scripts.e2e.regional.run_ha008_processor_exit_acceptance import (
@@ -103,6 +109,9 @@ PLAN_ONLY_SMOKE_CASES = {
     "GF-REGIONAL-CMD-017": "CMD017_LIVE_BARRIER_HOLD",
     "GF-REGIONAL-CMD-018": "CMD018_EXECUTE",
 }
+# Plan-only drivers whose ``--plan`` path already gates on the formal
+# predecessor's PASS evidence (exit 1 when it is missing).
+PREDECESSOR_GATED_PLAN_CASES = {"GF-REGIONAL-NET-002", "GF-REGIONAL-NET-003"}
 
 
 def test_regional_fixture_layout_has_no_legacy_scattered_directories() -> None:
@@ -125,6 +134,34 @@ def test_regional_fixture_layout_has_no_legacy_scattered_directories() -> None:
     assert (
         regional / "manifests/training/xid11-three-node-pytorchjob.yaml"
     ).is_file(), "regional training manifests are missing"
+    # Orphans the 2026-09-07 review removed: nothing under scripts/, tests/,
+    # src/, deploy/, docs/ or testcases/ named them, and one of them
+    # (spare_health_p156_probe.py) cordoned a real node with no guard.
+    removed = (
+        "q118_requeue_containment.py",
+        "spare_health_p156_probe.py",
+        "audit_collector_runtime_probe.py",
+        "audit_kernel_collector_p110.py",
+        "audit_workload_log_evidence.py",
+        "manifests/audit-collector-host-probe.yaml",
+        "manifests/fault-injection/cross-fault-outside-window-sxid.yaml",
+        "manifests/fault-injection/cross-fault-outside-window-xid79.yaml",
+        "manifests/fault-injection/cross-fault-within-window.yaml",
+        "manifests/fault-injection/dual-node-sxid10003-kmsg.yaml",
+        "manifests/fault-injection/dual-node-training-reset-quiesce.yaml",
+        "manifests/fault-injection/dual-node-xid95-kmsg.yaml",
+        "manifests/fault-injection/dual-node-xid95-quiesced-kmsg.yaml",
+        "manifests/fault-injection/kmsg-xid74-live.yaml",
+        "manifests/fault-injection/kmsg-xid78.yaml",
+        "manifests/fault-injection/kmsg-xid79-reboot-resume.yaml",
+        "manifests/training/three-node-nccl-hung-triage-pytorchjob.yaml",
+        "manifests/training/two-node-hung-e2e-pytorchjob.yaml",
+    )
+    present = [name for name in removed if (regional / name).exists()]
+    assert present == [], "unreferenced regional fixtures must stay removed"
+    assert sorted(
+        path.name for path in (regional / "manifests/fault-injection").glob("*.yaml")
+    ) == ["kmsg-xid45-xid14.yaml", "kmsg-xid54.yaml", "kmsg-xid63-xid48.yaml"]
     assert (regional / "run_boot019_admin_lifecycle.py").is_file(), (
         "BOOT-019 lifecycle runner is missing"
     )
@@ -370,6 +407,18 @@ def test_synthetic_registry_live_driver_plan_is_non_mutating(
         "GPU_FAULT_PERF_CONTROL_NAMESPACE": "gpu-fault-system",
         "GPU_FAULT_PERF_DATAPLANE_NAMESPACE": "gpu-fault-system",
     }
+    # The gated drivers' plan path refuses without the formal predecessor's
+    # PASS evidence, so seed it under the run directory; the plan-only gate
+    # binds no release_id/cluster_id, so case_id and verdict are enough.
+    predecessor = None
+    if case_id in PREDECESSOR_GATED_PLAN_CASES:
+        predecessor = formal_predecessor(case_id)
+        assert predecessor is not None, case_id
+        evidence = tmp_path / "cases" / predecessor / f"{predecessor}.json"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text(
+            json.dumps({"case_id": predecessor, "verdict": "PASS"}), encoding="utf-8"
+        )
     completed = subprocess.run(
         [
             sys.executable,
@@ -393,6 +442,58 @@ def test_synthetic_registry_live_driver_plan_is_non_mutating(
     assert plan["attempt"] == 7
     assert plan["confirmation"] == confirmation
     assert plan["mutation_performed"] is False
+    if predecessor is not None:
+        gate = plan["details"]["predecessor"]
+        assert gate["case_id"] == predecessor
+        assert gate["verdict"] == "PASS"
+        assert gate["valid"] is True
+        assert gate["execution_allowed"] is True
+        # The seeded evidence is the only file under cases/<predecessor>/.
+        assert sorted(path.name for path in evidence.parent.iterdir()) == [
+            evidence.name
+        ]
+
+
+@pytest.mark.parametrize("case_id", sorted(PREDECESSOR_GATED_PLAN_CASES))
+def test_predecessor_gated_plan_refuses_without_pass_evidence(
+    tmp_path: Path, case_id: str
+) -> None:
+    """The plan is still written but exits 1 when the predecessor has no PASS."""
+
+    script_name = PROMOTED_MANUAL_DRIVERS[case_id]
+    env = {
+        **os.environ,
+        "GPU_FAULT_CONTROL_KUBECONFIG": "/tmp/cpu.kubeconfig",
+        "KUBECONFIG": "/tmp/gpu.kubeconfig",
+        "GPU_FAULT_DATAPLANE_CONTEXT": "test-gpu-context",
+        "GPU_FAULT_PERF_AWS_REGION": "us-west-2",
+        "GPU_FAULT_PERF_CONTROL_NAMESPACE": "gpu-fault-system",
+        "GPU_FAULT_PERF_DATAPLANE_NAMESPACE": "gpu-fault-system",
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/e2e/regional" / script_name),
+            "--run-dir",
+            str(tmp_path),
+            "--attempt",
+            "1",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    plan = json.loads(
+        (tmp_path / "cases" / case_id / "plan.json").read_text(encoding="utf-8")
+    )
+
+    assert completed.returncode == 1, completed.stderr
+    assert plan["mutation_performed"] is False
+    assert plan["details"]["predecessor"]["verdict"] == "MISSING"
+    assert plan["details"]["predecessor"]["valid"] is False
+    assert plan["details"]["predecessor"]["case_id"] == formal_predecessor(case_id)
 
 
 def _readiness_matrix() -> dict:
@@ -498,9 +599,11 @@ class FakeAdminLifecycleBackend:
 
     def capture_joined_token(self, cluster_id: str) -> dict:
         self.calls.append(("capture", cluster_id))
+        # Like the live backend: the token stays in memory, the record carries
+        # only its digest.
         return {
             "cluster_id": cluster_id,
-            "token_path": "/secure/revoked-token",
+            "token_storage": "memory",
             "token_sha256": "a" * 64,
         }
 
@@ -519,10 +622,18 @@ class FakeAdminLifecycleBackend:
 
     def uninstall(self) -> dict:
         self.calls.append(("uninstall", None))
+        # The runner asserts what varies with the live run: at least the CPU
+        # cluster and the GPU cluster record preserved, and no resource still
+        # waiting to be deleted in the final registry snapshot.
         return {
             "cpu_cluster": "keep",
             "gpu_clusters": "preserved",
             "delete_policy_residuals": 0,
+            "registry_entries_preserved": 2,
+            "final_registry_statuses": {
+                "cluster/cluster-a/eks": "PRESERVED",
+                "cpu/eks": "PRESERVED",
+            },
         }
 
     def cleanup_sensitive_files(self) -> None:
@@ -564,7 +675,37 @@ def test_boot019_runner_executes_and_records_the_full_lifecycle(tmp_path: Path) 
         ("uninstall", None),
         ("cleanup", None),
     ]
+    assert result["stages"]["joined_token_captured"]["token_storage"] == "memory"
+    assert "token_path" not in result["stages"]["joined_token_captured"]
+    assert result["stages"]["uninstall_keep_cpu"]["registry_entries_preserved"] == 2
     assert evidence.stat().st_mode & 0o777 == 0o600
+
+
+def test_boot019_runner_rejects_an_uninstall_that_left_delete_pending(
+    tmp_path: Path,
+) -> None:
+    class Backend(FakeAdminLifecycleBackend):
+        def uninstall(self) -> dict:
+            result = super().uninstall()
+            result["final_registry_statuses"]["aurora/cluster"] = "DELETE_PENDING"
+            return result
+
+    backend = Backend()
+    recorder = EvidenceRecorder(
+        tmp_path / "GF-REGIONAL-BOOT-019.json",
+        case_id="GF-REGIONAL-BOOT-019",
+        inputs={"site": "test"},
+    )
+
+    with pytest.raises(RuntimeError, match="DELETE_PENDING"):
+        run_admin_lifecycle(backend, recorder)
+
+    # The captured token is cleared on the failure path as well.
+    assert backend.calls[-1] == ("cleanup", None)
+
+
+PREVIOUS_EXECUTOR_PIN = "a" * 64
+CANDIDATE_EXECUTOR_PIN = "b" * 64
 
 
 class FakeReleaseRollingBackend:
@@ -581,8 +722,12 @@ class FakeReleaseRollingBackend:
                 }
             },
         }
-        self.cpu_generations = {"ingress": 1, "worker": 1}
-        self.gpu_generations = {"cluster-a": {"executor": 1, "reconciler": 1}}
+        self.cpu_generations = {"gpu-fault-api-ha": 1, "gpu-fault-worker": 1}
+        # Keyed by the real Deployment names: the executor stage asserts the
+        # generation changes are exactly {GPU_EXECUTOR_DEPLOYMENT} per cluster.
+        self.gpu_generations = {
+            "cluster-a": {EXECUTOR_DEPLOYMENT: 1, "gpu-fault-completion-watcher": 1}
+        }
         self.calls = []
         # Every live snapshot costs 20-30 s of kubectl reads, so the runner is
         # held to the number it takes, not only to the deploys it issues.
@@ -613,6 +758,22 @@ class FakeReleaseRollingBackend:
             "next_deploy": self.classify(scenario),
         }
 
+    @staticmethod
+    def _pins(phase: str) -> dict:
+        """The two-phase executor pin window the runner asserts at each checkpoint."""
+
+        return {
+            "rolled-back": {"required": PREVIOUS_EXECUTOR_PIN, "compatible": []},
+            "staged": {
+                "required": PREVIOUS_EXECUTOR_PIN,
+                "compatible": [CANDIDATE_EXECUTOR_PIN],
+            },
+            "finalized": {"required": CANDIDATE_EXECUTOR_PIN, "compatible": []},
+        }[phase] | {
+            "candidate": CANDIDATE_EXECUTOR_PIN,
+            "previous_required": PREVIOUS_EXECUTOR_PIN,
+        }
+
     def deploy(
         self,
         scenario: str,
@@ -626,6 +787,7 @@ class FakeReleaseRollingBackend:
         plans = {
             "control_plane": {
                 "clusters": {},
+                "global_components": ["cpu_stage", "cpu_finalize"],
                 "restores_data_plane": False,
                 "needs_controller": False,
             },
@@ -633,16 +795,19 @@ class FakeReleaseRollingBackend:
                 "clusters": {
                     "cluster-a": ["collector", "executor", "reconciler", "watcher"]
                 },
+                "global_components": [],
                 "restores_data_plane": True,
                 "needs_controller": False,
             },
             "agent": {
                 "clusters": {"cluster-a": ["reconciler", "agent"]},
+                "global_components": [],
                 "restores_data_plane": True,
                 "needs_controller": True,
             },
             "full": {
                 "clusters": {"cluster-a": ["executor", "reconciler", "agent"]},
+                "global_components": ["cpu_stage"],
                 "restores_data_plane": True,
                 "needs_controller": True,
             },
@@ -654,23 +819,27 @@ class FakeReleaseRollingBackend:
                     "injected_failure": fault_phase,
                     "rollback_plan": plans[scenario],
                     "rollback_timing": {"t_safe_seconds": 30.0, "t_full_seconds": 45.0},
+                    "pins": self._pins("rolled-back"),
                     "operation_duration_seconds": 45.0,
                 }
             return {
                 "phase": "failed",
                 "injected_failure": fault_phase,
+                "pins": self._pins("staged"),
                 "operation_duration_seconds": 1.0,
             }
         if scenario == "control_plane":
             self.live["cpu_wheel"] = "cpu-v2"
-            self.cpu_generations = {"ingress": 2, "worker": 2}
+            self.cpu_generations = {"gpu-fault-api-ha": 2, "gpu-fault-worker": 2}
         elif scenario == "executor":
+            # The interrupted attempt already staged the CPU side; the resume
+            # rolls only the executor Deployment.
             self.live["clusters"]["cluster-a"]["wheel"] = "executor-v2"
-            self.gpu_generations["cluster-a"]["executor"] = 2
+            self.gpu_generations["cluster-a"][EXECUTOR_DEPLOYMENT] = 2
         elif scenario == "agent":
             self.live["clusters"]["cluster-a"]["reconciler_wheel"] = "node-v2"
             self.live["clusters"]["cluster-a"]["bundle"] = "bundle-v2"
-            self.gpu_generations["cluster-a"]["reconciler"] = 2
+            self.gpu_generations["cluster-a"]["gpu-fault-completion-watcher"] = 2
         elif scenario == "full":
             self.live = {
                 "cpu_wheel": "cpu-v3",
@@ -683,12 +852,15 @@ class FakeReleaseRollingBackend:
                     }
                 },
             }
-            self.cpu_generations = {"ingress": 3, "worker": 3}
-            self.gpu_generations = {"cluster-a": {"executor": 3, "reconciler": 2}}
+            self.cpu_generations = {"gpu-fault-api-ha": 3, "gpu-fault-worker": 3}
+            self.gpu_generations = {
+                "cluster-a": {EXECUTOR_DEPLOYMENT: 3, "gpu-fault-completion-watcher": 3}
+            }
         self.completed.add(scenario)
         return {
             "phase": "complete",
             "injected_failure": None,
+            "pins": self._pins("finalized"),
             "operation_duration_seconds": 10.0 if resume else 20.0,
         }
 
@@ -719,16 +891,48 @@ def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
         result["stages"]["full_rollback_snapshot"]["live"]
         == (result["stages"]["full_before"]["live"])
     )
+    stages = result["stages"]
+    # Executor stage: the two-phase pin window at each checkpoint, only the
+    # executor Deployment rolled, and the CPU generation held across the resume.
+    assert stages["executor_injected_failure_and_rollback"]["pins"]["required"] == (
+        PREVIOUS_EXECUTOR_PIN
+    )
+    assert stages["executor_interrupted_failure"]["pins"]["compatible"] == [
+        CANDIDATE_EXECUTOR_PIN
+    ]
+    assert stages["executor_resumed"]["pins"] == {
+        "required": CANDIDATE_EXECUTOR_PIN,
+        "compatible": [],
+        "candidate": CANDIDATE_EXECUTOR_PIN,
+        "previous_required": PREVIOUS_EXECUTOR_PIN,
+    }
+    assert (
+        stages["executor_interrupted_snapshot"]["cpu_generations"]
+        == stages["executor_after"]["cpu_generations"]
+    )
+    before = stages["executor_before"]["gpu_generations"]["cluster-a"]
+    after = stages["executor_after"]["gpu_generations"]["cluster-a"]
+    assert {name for name in after if after[name] != before[name]} == {
+        EXECUTOR_DEPLOYMENT
+    }
+    assert stages["control_plane_injected_failure_and_rollback"]["rollback_plan"][
+        "global_components"
+    ] == ["cpu_stage", "cpu_finalize"]
     assert evidence.stat().st_mode & 0o777 == 0o600
     # A stage's ``*_after`` and the next stage's ``*_before`` observe the same
     # live state -- only read-only classifications run between them -- so the
     # runner takes the ``*_after`` once and reuses it, marked, as the next
     # ``*_before``. ``noop_before`` has no predecessor and stays fresh.
+    # The executor stage takes one extra mid-stage snapshot
+    # (``executor_interrupted_snapshot``) so the CPU generations can be held
+    # across the resume; like the ``*_rollback_snapshot`` reads it is never a
+    # stage boundary and is not reused.
     assert backend.snapshots == [
         "noop",
         "noop",
         "control_plane",
         "control_plane",
+        "executor",
         "executor",
         "executor",
         "agent",
@@ -1006,11 +1210,57 @@ def test_boot020_configures_explicit_gpu_kubeconfig(
 
 
 def test_ha007_runner_waits_for_in_flight_requests(tmp_path: Path) -> None:
-    report = run_probe(tmp_path, [0.01, 0.02])
+    """Two in-budget requests complete; one over-budget request is the
+    coordinator's documented failure. The budgets are injected so the
+    over-budget path costs well under a second instead of the live 130s."""
 
-    assert report["status"] == "PASS"
-    assert [item["completed"] for item in report["runs"]] == [1, 1]
-    assert all(not item["shutdown_failures"] for item in report["runs"]), report
+    budgets = {"lifespan_budget_seconds": 0.5, "kubernetes_grace_seconds": 10.0}
+
+    report = run_probe(tmp_path, [0.01, 0.02, 3.0], budgets=budgets)
+
+    assert report["verdict"] == "PASS", report["errors"]
+    assert report["errors"] == []
+    assert report["lifespan_budget_seconds"] == 0.5
+    assert report["kubernetes_grace_seconds"] == 10.0
+    assert [item["expected_outcome"] for item in report["runs"]] == [
+        "completed",
+        "completed",
+        "deadline-exceeded",
+    ]
+    assert [item["completed"] for item in report["runs"]] == [1, 1, 0]
+    assert [item["returncode"] for item in report["runs"]] == [0, 0, 1]
+    assert [item["shutdown_failures"] for item in report["runs"]] == [
+        [],
+        [],
+        [WORKER_THREAD_NAME],
+    ]
+    assert report["runs"][2]["shutdown_seconds"] >= 0.5
+    assert all(item["errors"] == [] for item in report["runs"]), report
+    written = json.loads((tmp_path / "GF-REGIONAL-HA-007.json").read_text())
+    assert written["verdict"] == "PASS"
+
+
+def test_ha007_budgets_come_from_the_generated_control_worker_manifest() -> None:
+    budgets = control_worker_budgets()
+
+    assert budgets["sources"] == {
+        "lifespan_budget_seconds": (
+            "deploy/control-plane/regional/generated/"
+            "gpu-fault-control-worker-config-core.yaml"
+        ),
+        "kubernetes_grace_seconds": (
+            "deploy/control-plane/regional/generated/gpu-fault-control-worker.yaml"
+        ),
+    }
+    assert budgets["lifespan_budget_seconds"] < budgets["kubernetes_grace_seconds"]
+    # Three defaults sit inside the lifespan budget so a completing request is
+    # exercised; the last is over budget so the give-up path is exercised too.
+    inside = [d for d in DEFAULT_DURATIONS if d <= budgets["lifespan_budget_seconds"]]
+    beyond = [d for d in DEFAULT_DURATIONS if d > budgets["lifespan_budget_seconds"]]
+    assert len(inside) == 3, DEFAULT_DURATIONS
+    assert len(beyond) == 1, DEFAULT_DURATIONS
+    # An over-budget run still has to exit inside the Pod grace period.
+    assert budgets["lifespan_budget_seconds"] + 5 < budgets["kubernetes_grace_seconds"]
 
 
 def test_ha007_child_uses_the_repository_source_tree(monkeypatch) -> None:
@@ -1130,6 +1380,20 @@ def test_probe_pod_commands_run_the_script_the_configmap_publishes() -> None:
         assert module.SCRIPT.is_file(), (
             f"{module_name} probe is missing: {module.SCRIPT}"
         )
+        if "/scripts/" not in source:
+            # NET-002/003 build their Pod through seeded_command_fixture, which
+            # execs the name of the very ``script`` the runner hands it -- the
+            # same file the ConfigMap publishes -- so the check moves there.
+            fixture_source = Path(seeded_command_fixture.__file__).read_text(
+                encoding="utf-8"
+            )
+            assert "script=SCRIPT" in source, (
+                f"{module_name} must hand SCRIPT to the seeded probe"
+            )
+            assert "/scripts/{probe.script.name}" in fixture_source, (
+                "seeded_command_fixture must exec the script name it publishes"
+            )
+            continue
         assert "/scripts/{SCRIPT.name}" in source, (
             f"{module_name} must exec SCRIPT.name"
         )

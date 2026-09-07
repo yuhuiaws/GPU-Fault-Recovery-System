@@ -3,11 +3,15 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+from pathlib import Path
 from typing import Any, Mapping
+
+import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from scripts.e2e.regional.blast_acceptance_base import (
     EXECUTION_TOKEN_NAME,
     FORBIDDEN_EXECUTOR_ACTIONS,
+    ROOT,
     CheckError,
     ClusterTarget,
     action_pattern_matches,
@@ -18,6 +22,30 @@ from scripts.e2e.regional.blast_acceptance_base import (
     write_json,
 )
 from scripts.e2e.regional.blast_acceptance_cases_1 import BlastCasesOne
+
+EXECUTOR_MANIFEST = ROOT / "deploy" / "dataplane" / "cluster-action-executor.yaml"
+EXECUTOR_CLUSTER_ROLE = "gpu-fault-cluster-executor"
+
+
+def expected_executor_role(
+    manifest: Path = EXECUTOR_MANIFEST,
+) -> dict[str, list[str]]:
+    """The executor ClusterRole as the shipped manifest declares it.
+
+    BLAST-003 compares the live role against the manifest; a hard-coded copy
+    of the rules drifted silently whenever the manifest changed, and then the
+    case judged the deployment against a role nobody ships.
+    """
+
+    documents = yaml.safe_load_all(manifest.read_text(encoding="utf-8"))
+    for document in documents:
+        if (
+            isinstance(document, dict)
+            and document.get("kind") == "ClusterRole"
+            and (document.get("metadata") or {}).get("name") == EXECUTOR_CLUSTER_ROLE
+        ):
+            return BlastCasesTwo.normalized_role_rules(document)
+    raise CheckError(f"{manifest} declares no ClusterRole {EXECUTOR_CLUSTER_ROLE}")
 
 
 class BlastCasesTwo(BlastCasesOne):
@@ -38,25 +66,16 @@ class BlastCasesTwo(BlastCasesOne):
         case_id = "GF-REGIONAL-BLAST-003"
         target_results = []
         passed = True
-        expected_role = {
-            "core:nodes": ["get", "list", "patch", "watch"],
-            "core:pods": ["delete", "get", "list", "patch", "watch"],
-            "batch:jobs": ["create", "get", "list", "patch", "watch"],
-            "kubeflow.org:pytorchjobs": [
-                "create",
-                "get",
-                "list",
-                "patch",
-                "watch",
-            ],
-            "jobset.x-k8s.io:jobsets": [
-                "create",
-                "get",
-                "list",
-                "patch",
-                "watch",
-            ],
-        }
+        expected_role = expected_executor_role()
+        expected_node_verbs = set(expected_role.get("core:nodes", []))
+        expected_pod_verbs = set(expected_role.get("core:pods", []))
+        # The spec's two named facts about the manifest, checked against the
+        # manifest itself rather than assumed: nodes carry no delete, pods no
+        # create.
+        if "delete" in expected_node_verbs or "create" in expected_pod_verbs:
+            raise CheckError(
+                "shipped executor ClusterRole grants nodes/delete or pods/create"
+            )
         for target in self.targets:
             service_account = (
                 f"system:serviceaccount:{self.namespace}:gpu-fault-cluster-executor"
@@ -97,13 +116,10 @@ class BlastCasesTwo(BlastCasesOne):
                 )
             )
             node_expected = all(
-                matrix[verb]["nodes"] == (verb in {"get", "list", "watch", "patch"})
-                for verb in verbs
+                matrix[verb]["nodes"] == (verb in expected_node_verbs) for verb in verbs
             )
             pod_expected = all(
-                matrix[verb]["pods"]
-                == (verb in {"get", "list", "watch", "patch", "delete"})
-                for verb in verbs
+                matrix[verb]["pods"] == (verb in expected_pod_verbs) for verb in verbs
             )
 
             role = self.gpu_json(
@@ -121,6 +137,7 @@ class BlastCasesTwo(BlastCasesOne):
                 {
                     "actual": normalized_role,
                     "expected": expected_role,
+                    "expected_source": str(EXECUTOR_MANIFEST.relative_to(ROOT)),
                     "matches": role_matches_manifest,
                 },
             )

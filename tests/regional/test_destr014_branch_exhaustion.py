@@ -139,7 +139,7 @@ def happy_workflow() -> dict[str, Any]:
         _execution(19, "VALIDATE_FABRIC", "SUCCEEDED"),
         _execution(20, "RESTORE_SCHEDULING", "SUCCEEDED"),
         _execution(
-            21, "REPLACE_NODE", "FAILED", error="insufficient healthy HyperPod spares"
+            21, "REPLACE_NODE", "FAILED", error=destr014.EXPECTED_REPLACE_FAILURE
         ),
     ]
     return {
@@ -259,12 +259,22 @@ def test_the_sibling_reboot_must_fail_by_bounded_waiting() -> None:
 
 
 def test_the_sibling_replacement_must_fail_for_want_of_a_spare() -> None:
+    # With no spare pool declared at all the shipped adapter refuses because
+    # the provider fallback is disabled; "insufficient healthy HyperPod spares"
+    # is what a *declared but short* pool says (DESTR-008's topology mismatch),
+    # and a verdict pinned to it failed every correct live run.
+    assert destr014.EXPECTED_REPLACE_FAILURE == (
+        "warm-spare replacement is required; provider node replacement API "
+        "fallback is disabled"
+    )
     workflow = happy_workflow()
     workflow["step_executions"][-1]["error"] = "HyperPod preflight failed"
     errors = _errors(workflow, happy_incident())
-    assert any("insufficient healthy HyperPod spares" in item for item in errors), (
-        errors
-    )
+    assert any(destr014.EXPECTED_REPLACE_FAILURE in item for item in errors), errors
+    workflow = happy_workflow()
+    workflow["step_executions"][-1]["error"] = "insufficient healthy HyperPod spares"
+    errors = _errors(workflow, happy_incident())
+    assert any(destr014.EXPECTED_REPLACE_FAILURE in item for item in errors), errors
     workflow = happy_workflow()
     workflow["official_steps"][21]["parameters"] = {}
     errors = _errors(workflow, happy_incident())
@@ -571,6 +581,21 @@ def test_workload_must_be_gone_and_not_recreated() -> None:
     assert any("restart" in item for item in errors), errors
 
 
+def test_a_missing_restart_budget_is_reported_as_unreadable_not_advanced() -> None:
+    # Fail-safe either way, but a budget row the store never returned proves
+    # nothing; calling it "advanced" sent the reader after a restart that may
+    # never have happened.
+    missing_budgets: list[dict[str, Any] | None] = [{}, None]
+    for missing in missing_budgets:
+        errors = destr014.workload_errors(
+            pods=[], restart_budget=missing or {}, source_uids={"a"}
+        )
+        assert errors == [
+            "restart budget unreadable; cannot prove the job was not restarted"
+        ], errors
+        assert not any("advanced" in item for item in errors), errors
+
+
 def test_step_transitions_record_only_changes() -> None:
     previous: dict[str, str] = {}
     current, changes = destr014.step_transitions(
@@ -650,6 +675,74 @@ def test_budget_headroom_fails_closed() -> None:
     assert destr014.budget_headroom_errors({"readable": True, "scopes": {}}), (
         "no scopes at all means the probe did not compute the claims"
     )
+
+
+def test_budget_limits_follow_the_executor_env_and_its_defaults() -> None:
+    limits = destr014.budget_limits(
+        {
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "7",
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": None,
+            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "",
+        }
+    )
+    assert limits == {"region": 7, "cluster": 5, "node": 1, "resource_class": 2}
+    with pytest.raises(ValueError, match="not an integer"):
+        destr014.budget_limits({"GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "many"})
+    with pytest.raises(ValueError, match="positive"):
+        destr014.budget_limits({"GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "0"})
+
+
+def test_planned_budget_scopes_follow_the_registry_classes() -> None:
+    scopes = destr014.planned_budget_scopes(
+        cluster_id="cluster-a",
+        nodes=[SIBLING, FAULT, FAULT],
+        limits={"region": 20, "cluster": 5, "node": 1, "resource_class": 2},
+        resource_classes={
+            "RESET_GPU": ["GPU_RESET"],
+            "RESTART_NODE": ["NODE_REBOOT"],
+            "REPLACE_NODE": ["NODE_REPLACE"],
+        },
+    )
+    assert scopes == {
+        "region": 20,
+        "cluster:cluster-a": 5,
+        f"node:cluster-a:{FAULT}": 1,
+        f"node:cluster-a:{SIBLING}": 1,
+        "class:cluster-a:GPU_RESET": 2,
+        "class:cluster-a:NODE_REBOOT": 2,
+        "class:cluster-a:NODE_REPLACE": 2,
+    }
+    with pytest.raises(ValueError, match="REPLACE_NODE"):
+        destr014.planned_budget_scopes(
+            cluster_id="cluster-a",
+            nodes=[FAULT],
+            limits={"region": 20, "cluster": 5, "node": 1, "resource_class": 2},
+            resource_classes={"RESET_GPU": [], "RESTART_NODE": []},
+        )
+    # The live registry answers for every budgeted operation.
+    live = destr014.registry_resource_classes()
+    assert set(live) == set(destr014.BUDGETED_OPERATIONS), live
+
+
+def test_budget_headroom_counts_only_leased_running_claims_per_scope() -> None:
+    scopes = {"region": 20, "class:c:NODE_REBOOT": 2, "node:c:node-b": 1}
+    active = [
+        {"request_id": "wf-1", "claims": ["region", "class:c:NODE_REBOOT"]},
+        {"request_id": "wf-2", "claims": ["region", "class:c:NODE_REBOOT"]},
+        {"request_id": "wf-3", "claims": ["region"]},
+    ]
+    budget = destr014.budget_headroom(scopes, active)
+    assert budget == {
+        "readable": True,
+        "scopes": {
+            "region": {"limit": 20, "active": 3},
+            "class:c:NODE_REBOOT": {"limit": 2, "active": 2},
+            "node:c:node-b": {"limit": 1, "active": 0},
+        },
+    }
+    errors = destr014.budget_headroom_errors(budget)
+    assert errors == ["remediation budget scope is full: class:c:NODE_REBOOT"], errors
+    assert destr014.budget_headroom_errors(destr014.budget_headroom(scopes, [])) == []
 
 
 def _node_snapshot(name: str) -> dict[str, Any]:

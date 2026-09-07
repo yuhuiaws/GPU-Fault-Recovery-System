@@ -4,9 +4,11 @@ import argparse
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import live_driver_guard
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
 from scripts.e2e.regional.acceptance_scope import (
     EXECUTION_SCOPE_ENV,
@@ -16,6 +18,10 @@ from scripts.e2e.regional.live_driver_guard import (
     add_live_arguments,
     authorize_execution,
     build_plan,
+    details_sha256,
+    record_focused_tests,
+    reusable_focused_tests,
+    source_digest,
 )
 
 CASE_ID = "GF-REGIONAL-TEST-001"
@@ -189,3 +195,138 @@ def test_live_driver_rejects_expired_window(tmp_path: Path) -> None:
             confirmation=CONFIRMATION,
             environment=ENVIRONMENT,
         )
+
+
+def test_plan_records_a_details_digest_and_refuses_edited_details(
+    tmp_path: Path,
+) -> None:
+    """The target node and the drill marker live in ``details``; a plan whose
+    details were edited after approval is not the approved plan."""
+
+    plan = build_plan(
+        run_dir=tmp_path,
+        case_id=CASE_ID,
+        attempt=1,
+        confirmation=CONFIRMATION,
+        environment=ENVIRONMENT,
+        details={"node": "node-a", "marker": "m-1"},
+    )
+
+    assert plan["details_sha256"] == details_sha256(plan["details"])
+    path = tmp_path / "cases" / CASE_ID / "plan.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["details"]["node"] = "node-b"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="drifted at details_sha256"):
+        authorize_execution(
+            _arguments(tmp_path),
+            case_id=CASE_ID,
+            confirmation=CONFIRMATION,
+            environment=ENVIRONMENT,
+        )
+
+
+def test_authorize_compares_the_callers_current_details_when_given(
+    tmp_path: Path,
+) -> None:
+    build_plan(
+        run_dir=tmp_path,
+        case_id=CASE_ID,
+        attempt=1,
+        confirmation=CONFIRMATION,
+        environment=ENVIRONMENT,
+        details={"node": "node-a", "marker": "m-1"},
+    )
+
+    # Same content in another key order is the same plan.
+    authorize_execution(
+        _arguments(tmp_path),
+        case_id=CASE_ID,
+        confirmation=CONFIRMATION,
+        environment=ENVIRONMENT,
+        details={"marker": "m-1", "node": "node-a"},
+    )
+    with pytest.raises(RuntimeError, match="drifted at details"):
+        authorize_execution(
+            _arguments(tmp_path),
+            case_id=CASE_ID,
+            confirmation=CONFIRMATION,
+            environment=ENVIRONMENT,
+            details={"node": "node-b", "marker": "m-1"},
+        )
+
+
+def test_a_plan_without_a_details_digest_is_refused(tmp_path: Path) -> None:
+    build_plan(
+        run_dir=tmp_path,
+        case_id=CASE_ID,
+        attempt=1,
+        confirmation=CONFIRMATION,
+        environment=ENVIRONMENT,
+        details={},
+    )
+    path = tmp_path / "cases" / CASE_ID / "plan.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    del document["details_sha256"]
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="drifted at details_sha256"):
+        authorize_execution(
+            _arguments(tmp_path),
+            case_id=CASE_ID,
+            confirmation=CONFIRMATION,
+            environment=ENVIRONMENT,
+        )
+
+
+def test_source_digest_is_a_stable_sha256_over_the_checked_trees() -> None:
+    first = source_digest()
+
+    assert len(first) == 64 and int(first, 16) >= 0
+    assert source_digest() == first, "two reads of an unchanged tree must agree"
+
+
+def test_focused_tests_are_reused_only_for_the_same_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(live_driver_guard, "source_digest", lambda: "digest-a")
+    details: dict[str, Any] = {"node": "node-a"}
+    record_focused_tests(details, {"passed": True, "returncode": 0})
+    assert details["focused_tests_source_digest"] == "digest-a", details
+    build_plan(
+        run_dir=tmp_path,
+        case_id=CASE_ID,
+        attempt=1,
+        confirmation=CONFIRMATION,
+        environment=ENVIRONMENT,
+        details=details,
+    )
+    plan_path = tmp_path / "cases" / CASE_ID / "plan.json"
+
+    assert reusable_focused_tests(plan_path) == {"passed": True, "returncode": 0}
+
+    # Any edit to the drivers, their tests or the package changes the digest,
+    # and the recorded pass no longer speaks for the code about to run.
+    monkeypatch.setattr(live_driver_guard, "source_digest", lambda: "digest-b")
+    assert reusable_focused_tests(plan_path) is None
+
+
+def test_a_failed_or_absent_focused_result_is_never_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(live_driver_guard, "source_digest", lambda: "digest-a")
+    details: dict[str, Any] = {}
+    record_focused_tests(details, {"passed": False, "returncode": 1})
+    build_plan(
+        run_dir=tmp_path,
+        case_id=CASE_ID,
+        attempt=1,
+        confirmation=CONFIRMATION,
+        environment=ENVIRONMENT,
+        details=details,
+    )
+    plan_path = tmp_path / "cases" / CASE_ID / "plan.json"
+
+    assert reusable_focused_tests(plan_path) is None
+    assert reusable_focused_tests(tmp_path / "absent.json") is None

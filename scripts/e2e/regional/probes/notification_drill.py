@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 
 from gpu_fault.models import AdvisoryNotification
 from gpu_fault.notification_service import AdvisoryNotificationService
@@ -84,6 +85,9 @@ def main() -> int:
         async_delivery=False,
         deliver_drills=True,
     )
+    # Recorded before the first send so an operator's SES window that starts at
+    # this instant still covers the mail.
+    executed_at = datetime.now(timezone.utc).isoformat()
     results = [service.send(notification.notification_id) for _ in range(4)]
     provider_ids = [item.provider_message_id for item in results]
     print(
@@ -91,6 +95,7 @@ def main() -> int:
             {
                 "kind": arguments.kind,
                 "drill_id": arguments.drill_id,
+                "executed_at": executed_at,
                 "notification_id": notification.notification_id,
                 "statuses": [item.status.value for item in results],
                 "provider_message_id_present": bool(provider_ids[0]),

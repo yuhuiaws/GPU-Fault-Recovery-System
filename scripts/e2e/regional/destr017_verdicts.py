@@ -126,6 +126,27 @@ def _error_text(item: dict[str, Any]) -> str:
     return str(item.get("error") or "")
 
 
+def _command_error_text(command: dict[str, Any]) -> str:
+    """The refusal a *remote* command carries.
+
+    A remote step keeps only pointers in ``step.details``
+    (``remote_command_id``/``remote_status``); the executor writes the real
+    error onto the command row (``cluster_executor``: ``error = outcome.error``)
+    and sometimes into ``result_details``. Both are read, the command field
+    first.
+    """
+
+    details = command.get("result_details") or {}
+    return str(command.get("error") or details.get("error") or "")
+
+
+def _capability(profile: dict[str, Any], name: str) -> dict[str, Any] | None:
+    for item in profile.get("capabilities") or []:
+        if isinstance(item, dict) and item.get("capability") == name:
+            return item
+    return None
+
+
 def _added_ledger_rows(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -167,16 +188,22 @@ def fence_variant(error: str) -> str:
     return FENCE_UNKNOWN
 
 
-def fence_evidence(workflow: dict[str, Any]) -> dict[str, Any]:
+def fence_evidence(
+    workflow: dict[str, Any],
+    commands: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """The variant of every terminal error the case reads, digest-free.
 
     Recorded whatever the verdict, so a run that fails on an unexpected variant
-    still says which one it saw.
+    still says which one it saw. ``commands`` are the workflow's remote command
+    rows: a remote step's execution record only points at its command, so the
+    fence text of a refused dispatch lives there and nowhere else.
     """
 
     executions = workflow.get("step_executions") or []
     verify = _executions_of(executions, FENCE_STEP_OPERATION)
     compensation = _executions_of(executions, COMPENSATION_OPERATION)
+    remote = commands or []
     return {
         "workflow_status": workflow.get("status"),
         "workflow_error_variant": fence_variant(str(workflow.get("error") or "")),
@@ -186,6 +213,14 @@ def fence_evidence(workflow: dict[str, Any]) -> dict[str, Any]:
         "compensation_statuses": [item.get("status") for item in compensation],
         "compensation_variants": [
             fence_variant(_error_text(item)) for item in compensation
+        ],
+        "command_statuses": [
+            {
+                "operation": (item.get("step") or {}).get("operation"),
+                "status": item.get("status"),
+                "variant": fence_variant(_command_error_text(item)),
+            }
+            for item in remote
         ],
         "executed_operations": sorted(
             {str(item.get("operation")) for item in executions}
@@ -202,12 +237,17 @@ def workflow_errors(
     incident: dict[str, Any],
     *,
     node: str,
+    commands: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """The terminal contract of the fenced RESET_GPU workflow.
 
     Not "it failed": it must fail *closed*, at the waiting maintenance step, with
     the generation fence recorded somewhere in the terminal record, having never
     executed a reset and never marked an old-generation command SUCCEEDED.
+
+    ``commands`` are the workflow's remote command rows. The fence is raised
+    while a remote command is dispatched, so its text lands on the command's
+    ``error``; the step execution of a remote step carries pointers only.
     """
 
     errors: list[str] = []
@@ -265,10 +305,18 @@ def workflow_errors(
             )
         variant = fence_variant(_error_text(last_verify))
         if variant not in ACCEPTED_FENCES:
-            errors.append(
-                f"{FENCE_STEP_OPERATION} did not fail closed on a known fence: "
-                f"{_error_text(last_verify)!r}"
-            )
+            # The step record of a remote step points at its command; the
+            # refusal itself may only be on that command row.
+            command_variants = {
+                fence_variant(_command_error_text(item))
+                for item in commands or []
+                if (item.get("step") or {}).get("operation") == FENCE_STEP_OPERATION
+            }
+            if not command_variants & set(ACCEPTED_FENCES):
+                errors.append(
+                    f"{FENCE_STEP_OPERATION} did not fail closed on a known fence: "
+                    f"{_error_text(last_verify)!r}"
+                )
 
     compensation = _executions_of(executions, COMPENSATION_OPERATION)
     if not compensation:
@@ -280,25 +328,27 @@ def workflow_errors(
     # The proof of the case: the generation fence has to be in the record. The
     # waiting step may have failed on any of the accepted variants, but the
     # window-exempt compensation that follows it is still generation-checked.
-    fenced = [
-        item
+    fenced_texts = [
+        _error_text(item)
         for item in executions
         if fence_variant(_error_text(item)) == FENCE_AGENT_GENERATION
+    ] + [
+        _command_error_text(item)
+        for item in commands or []
+        if fence_variant(_command_error_text(item)) == FENCE_AGENT_GENERATION
     ]
     workflow_fenced = (
         fence_variant(str(workflow.get("error") or "")) == FENCE_AGENT_GENERATION
     )
-    if not fenced and not workflow_fenced:
+    if not fenced_texts and not workflow_fenced:
         errors.append(
-            "no step and not the terminal error carries "
+            "no step, no remote command and not the terminal error carries "
             f"{GENERATION_FENCE_LITERAL!r}: the new boot's Agent was never "
             "fenced out, so this run does not prove the generation fence"
         )
-    for item in fenced:
-        if node not in _error_text(item):
-            errors.append(
-                f"a generation fence names another node: {_error_text(item)!r}"
-            )
+    for text in fenced_texts:
+        if node not in text:
+            errors.append(f"a generation fence names another node: {text!r}")
 
     if workflow.get("superseded_step_indexes"):
         errors.append(
@@ -440,8 +490,16 @@ def agent_errors(
         errors.append(
             f"the reboot did not retire exactly one incarnation: {len(added)}"
         )
-    elif before.get("incarnation_id") and added[0] != before.get("incarnation_id"):
-        errors.append("the retired incarnation is not the pre-reboot one")
+    else:
+        # ``AgentRecord.agent_incarnation_id``: the field the registry retires.
+        previous = before.get("agent_incarnation_id")
+        if not previous:
+            errors.append(
+                "the pre-reboot agent record has no agent_incarnation_id; the "
+                "retired generation cannot be tied to it"
+            )
+        elif added[0] != previous:
+            errors.append("the retired incarnation is not the pre-reboot one")
     return errors
 
 
@@ -752,27 +810,32 @@ def preflight_errors(
         )
     if agent.get("lifecycle_state") != "ACTIVE":
         errors.append(f"{node} agent is not ACTIVE: {agent.get('lifecycle_state')}")
-    if agent.get("capability_mode") != "OWN":
+    # OWN is a property of the runtime profile's capability, not of the agent
+    # record (``AgentRecord`` has no mode field).
+    reset = _capability(profile, "gpuReset")
+    if reset is None:
+        errors.append(f"{node} runtime profile has no gpuReset capability")
+    elif reset.get("mode") != "OWN" or reset.get("owner") != "gpu-fault-node-agent":
         errors.append(
-            f"{node} agent capability mode is not OWN: {agent.get('capability_mode')}"
+            f"{node} gpuReset is not OWN by the Node Agent: "
+            f"{reset.get('mode')}/{reset.get('owner')}"
         )
     if not isinstance(agent.get("generation"), int):
         errors.append(f"{node} agent has no generation to fence on: {agent!r}")
     missing = [
         operation
         for operation in AGENT_OPERATIONS
-        if operation not in (agent.get("supported_operations") or [])
+        if operation not in (agent.get("allowed_operations") or [])
     ]
     if missing:
-        errors.append(f"{node} agent does not advertise {missing}")
+        errors.append(f"{node} agent does not allow {missing}")
     if profile.get("warnings"):
         errors.append(f"{node} runtime profile carries warnings: {profile['warnings']}")
     if int(queue.get("depth") or 0):
         errors.append(f"processor queue is not empty: {queue}")
-    for key in ("pending", "leased", "in_progress"):
-        if int(remote_commands.get(key) or 0):
-            errors.append(f"remote commands are not idle: {remote_commands}")
-            break
+    # ``Store.remote_command_stats()`` reports open rows per cluster.
+    if remote_commands.get("open_by_cluster"):
+        errors.append(f"remote commands are not idle: {remote_commands}")
     if recent_events:
         errors.append(
             f"{node} already has a recent XID event: "
@@ -795,7 +858,13 @@ def preflight_errors(
             f"{node} already has GPU compute clients: "
             f"{host_snapshot.get('compute_clients')}"
         )
-    if reboot_status.get("armed") and not reboot_status.get("reboot_cancelled_at"):
+    # A timer that already fired is spent -- its boot id changed -- and a
+    # cancelled one is gone. Only an armed, unfired, uncancelled timer is live.
+    if (
+        reboot_status.get("armed")
+        and not reboot_status.get("reboot_cancelled_at")
+        and not reboot_status.get("fired")
+    ):
         errors.append(
             f"{node} already has an armed reboot timer from an earlier run: "
             f"{reboot_status.get('reboot_unit')}"
@@ -810,14 +879,24 @@ def step_transitions(
     previous: dict[str, str],
     executions: list[dict[str, Any]],
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Fold step executions into ``{index/operation: status}``; return the new
-    state and only the entries whose status changed since ``previous``."""
+    """Fold step executions into ``{index/operation#occurrence: status}``;
+    return the new state and only the entries whose status changed.
+
+    The occurrence ordinal is part of the key on purpose: the waiting step
+    keeps its WAITING row *and* gains a FAILED row when the fence ends it, and a
+    key of index/operation alone would see the pair flip status on every poll
+    and append the same two "changes" for ever.
+    """
 
     state = dict(previous)
     changes: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc).isoformat()
+    seen: dict[str, int] = {}
     for item in executions:
-        key = f"{item.get('step_index')}/{item.get('operation')}"
+        step = f"{item.get('step_index')}/{item.get('operation')}"
+        occurrence = seen.get(step, 0)
+        seen[step] = occurrence + 1
+        key = f"{step}#{occurrence}"
         status = str(item.get("status") or "")
         if state.get(key) == status:
             continue
@@ -825,7 +904,8 @@ def step_transitions(
         changes.append(
             {
                 "observed_at": now,
-                "step": key,
+                "step": step,
+                "occurrence": occurrence,
                 "status": status,
                 "fence_variant": fence_variant(_error_text(item)),
                 "started_at": item.get("started_at"),
@@ -868,12 +948,15 @@ def reboot_window_errors(
     delay_seconds: int,
     window_remaining_seconds: float | None,
     step_waiting_limit_seconds: int | None,
+    step_waiting_elapsed_seconds: float = 0.0,
 ) -> list[str]:
     """The reboot has to land while the step is still waiting.
 
     A reboot armed after the pinned maintenance window has already expired, or
     after the per-step waiting cap would have failed the step anyway, proves the
-    window fence rather than the generation fence.
+    window fence rather than the generation fence. The cap is measured from
+    when the step started WAITING, so the time it has already spent waiting
+    (``step_waiting_elapsed_seconds``) is what is left to subtract from it.
     """
 
     errors: list[str] = []
@@ -884,12 +967,14 @@ def reboot_window_errors(
             f"a reboot armed {delay_seconds}s out fires after the maintenance "
             f"window ends in {window_remaining_seconds:.0f}s"
         )
-    if (
-        step_waiting_limit_seconds is not None
-        and delay_seconds >= step_waiting_limit_seconds
-    ):
-        errors.append(
-            f"a reboot armed {delay_seconds}s out fires after the "
-            f"{step_waiting_limit_seconds}s per-step waiting cap"
+    if step_waiting_limit_seconds is not None:
+        cap_remaining = step_waiting_limit_seconds - max(
+            0.0, step_waiting_elapsed_seconds
         )
+        if delay_seconds >= cap_remaining:
+            errors.append(
+                f"a reboot armed {delay_seconds}s out fires after the "
+                f"{step_waiting_limit_seconds}s per-step waiting cap, of which "
+                f"{cap_remaining:.0f}s remain"
+            )
     return errors

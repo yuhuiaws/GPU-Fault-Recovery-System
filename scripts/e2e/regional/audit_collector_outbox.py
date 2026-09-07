@@ -4,10 +4,24 @@ import io
 import json
 import tempfile
 from email.message import Message
+from typing import Any
 from urllib.error import HTTPError
 
 import gpu_fault.collectors.sinks as collector_sinks
 from gpu_fault.collectors import CollectorError, HttpEventSink
+
+
+class OutboxAuditFailure(RuntimeError):
+    """One delivery-contract expectation the Collector sink did not meet."""
+
+
+def expect(condition: bool, message: str, observed: Any = None) -> None:
+    """A bare ``assert`` vanishes under ``python -O``; this does not."""
+
+    if condition:
+        return
+    detail = message if observed is None else f"{message}: observed {observed!r}"
+    raise OutboxAuditFailure(detail)
 
 
 def main() -> None:
@@ -46,8 +60,13 @@ def main() -> None:
                 pass
             available[0] = True
             sink.post("/events", {"sequence": 2})
-            assert [item["sequence"] for item in calls] == [1, 2, 1]
-            assert open(outbox).read() == ""
+            replay_order = [item["sequence"] for item in calls]
+            expect(
+                replay_order == [1, 2, 1],
+                "live post did not replay the buffered event after itself",
+                replay_order,
+            )
+            expect(open(outbox).read() == "", "outbox was not drained after replay")
 
             available[0] = False
             background_path = f"{directory}/background.ndjson"
@@ -66,10 +85,20 @@ def main() -> None:
             calls.clear()
             available[0] = True
             background.post("/events", {"sequence": 99})
-            assert background.wait_for_outbox_replay(2)
+            expect(
+                background.wait_for_outbox_replay(2),
+                "background replay did not finish within two seconds",
+            )
             background_replay_order = [item["sequence"] for item in calls]
-            assert background_replay_order == [99, *range(30, 37)]
-            assert open(background_path).read() == ""
+            expect(
+                background_replay_order == [99, *range(30, 37)],
+                "background replay order is wrong",
+                background_replay_order,
+            )
+            expect(
+                open(background_path).read() == "",
+                "background outbox was not drained",
+            )
 
             def permanent(*_args, **_kwargs):
                 raise HTTPError(
@@ -86,7 +115,11 @@ def main() -> None:
             except CollectorError:
                 pass
             dead = json.loads(open(outbox).read())
-            assert dead["replayable"] is False
+            expect(
+                dead["replayable"] is False,
+                "a 400 was buffered as replayable",
+                dead,
+            )
 
             def unavailable(*_args, **_kwargs):
                 raise OSError("network unavailable")
@@ -109,11 +142,14 @@ def main() -> None:
                 for line in open(bounded_path).read().splitlines()
                 if line
             ]
-            assert [item["payload"]["sequence"] for item in bounded_records] == [
-                12,
-                13,
-                14,
+            bounded_sequences = [
+                item["payload"]["sequence"] for item in bounded_records
             ]
+            expect(
+                bounded_sequences == [12, 13, 14],
+                "bounded outbox did not keep the newest three records",
+                bounded_sequences,
+            )
 
             blocked_parent = f"{directory}/not-a-directory"
             with open(blocked_parent, "w") as handle:
@@ -126,17 +162,23 @@ def main() -> None:
             try:
                 unwritable.post("/events", {"sequence": 20})
             except CollectorError as exc:
-                assert exc.buffered is False
+                expect(
+                    exc.buffered is False,
+                    "unwritable outbox claimed to have buffered the event",
+                    exc.buffered,
+                )
             else:
-                raise AssertionError("unwritable outbox unexpectedly buffered an event")
+                raise OutboxAuditFailure(
+                    "unwritable outbox unexpectedly buffered an event"
+                )
 
             print(
                 "PASS",
                 {
-                    "replay_order": [1, 2, 1],
+                    "replay_order": replay_order,
                     "background_replay_order": background_replay_order,
                     "background_drained_without_new_live_event": True,
-                    "bounded_sequences": [12, 13, 14],
+                    "bounded_sequences": bounded_sequences,
                     "unwritable_buffered": False,
                     "dead_letter_replayable": dead["replayable"],
                     "dead_letter_error": dead["error"],

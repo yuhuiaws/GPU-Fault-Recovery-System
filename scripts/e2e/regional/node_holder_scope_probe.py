@@ -5,8 +5,8 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
+from typing import Any
 
 from gpu_fault.node_agent import GpuServiceQuiesceManager
 
@@ -63,6 +63,22 @@ def alive(process: subprocess.Popen[str]) -> bool:
     return process.poll() is None
 
 
+def settled(process: subprocess.Popen[str], timeout: float = 5.0) -> bool:
+    """Whether ``process`` exited within ``timeout`` seconds.
+
+    A fixed ``sleep`` before ``alive()`` raced the SIGTERM the sweep just sent:
+    a holder still tearing down 200ms later read as "survived" and failed the
+    probe, while a holder that took 200ms to *start* dying read as swept. The
+    process's own exit is the fact being tested, so wait for it, bounded.
+    """
+
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 def stop(process: subprocess.Popen[str]) -> None:
     if not alive(process):
         return
@@ -96,17 +112,21 @@ def main() -> None:
             target_device_paths={target},
             workload_cgroup_paths=set(),
         )
-        time.sleep(0.2)
-        first = {
-            "swept_pids": sorted(item["pid"] for item in swept),
-            "skipped_pids": sorted(item["pid"] for item in skipped),
-            "whitelist_alive": alive(whitelist),
+        # The swept holder must actually exit; the untouched ones must still be
+        # running once it has.
+        whitelist_exited = settled(whitelist)
+        first_swept = sorted(str(item["pid"]) for item in swept)
+        first_skipped = sorted(str(item["pid"]) for item in skipped)
+        first: dict[str, Any] = {
+            "swept_pids": first_swept,
+            "skipped_pids": first_skipped,
+            "whitelist_alive": not whitelist_exited,
             "same_gpu_alive": alive(same_gpu),
             "other_gpu_alive": alive(other_gpu),
         }
-        if str(whitelist.pid) not in first["swept_pids"]:
+        if str(whitelist.pid) not in first_swept:
             raise AssertionError(first)
-        if str(same_gpu.pid) not in first["skipped_pids"]:
+        if str(same_gpu.pid) not in first_skipped:
             raise AssertionError(first)
         if (
             first["whitelist_alive"]
@@ -120,15 +140,16 @@ def main() -> None:
             target_device_paths={target},
             workload_cgroup_paths=workload_paths,
         )
-        time.sleep(0.2)
-        second = {
-            "swept_pids": sorted(item["pid"] for item in swept),
-            "skipped_pids": sorted(item["pid"] for item in skipped),
-            "same_gpu_alive": alive(same_gpu),
+        same_gpu_exited = settled(same_gpu)
+        second_swept = sorted(str(item["pid"]) for item in swept)
+        second: dict[str, Any] = {
+            "swept_pids": second_swept,
+            "skipped_pids": sorted(str(item["pid"]) for item in skipped),
+            "same_gpu_alive": not same_gpu_exited,
             "other_gpu_alive": alive(other_gpu),
             "workload_cgroup_paths": sorted(workload_paths),
         }
-        if str(same_gpu.pid) not in second["swept_pids"]:
+        if str(same_gpu.pid) not in second_swept:
             raise AssertionError(second)
         if second["same_gpu_alive"] or not second["other_gpu_alive"]:
             raise AssertionError(second)

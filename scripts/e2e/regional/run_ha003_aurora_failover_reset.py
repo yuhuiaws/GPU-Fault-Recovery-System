@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -27,9 +28,12 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    PROVIDER_MUTATIONS,
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
@@ -46,6 +50,12 @@ from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
 CASE_ID = "GF-REGIONAL-HA-003"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-008"
 CONFIRMATION = "HA003_FAILOVER_AURORA_DURING_GPU_RESET"
+NON_TERMINAL_COMMAND_STATUSES = {"PENDING", "LEASED", "WAITING"}
+# The executor logs a rejected result as "could not report result" followed by
+# the control plane's "rejected request (NNN)"; an accepted result logs nothing.
+RESULT_REJECTED_LINE = "could not report result"
+REJECTED_STATUS_PATTERN = re.compile(r"rejected request \((\d{3})\)")
+ALLOWED_RESULT_SUBMISSION_CODES = {200, 409}
 
 
 @dataclass(frozen=True)
@@ -147,30 +157,146 @@ def rds_snapshot(settings: Settings) -> dict[str, Any]:
     }
 
 
+def reset_command_status(state: dict[str, Any]) -> str | None:
+    commands = [
+        item
+        for item in state.get("commands") or []
+        if item.get("step", {}).get("operation") == "RESET_GPU"
+    ]
+    if len(commands) != 1:
+        return None
+    return cast(str | None, commands[0].get("status"))
+
+
 def wait_rds_failover(
     settings: Settings,
     *,
     previous_writer: str,
     timeout_seconds: int = 900,
-    observe: Callable[[], None] | None = None,
-) -> dict[str, Any]:
+    observe: Callable[[], dict[str, Any] | None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Poll Aurora until the writer moved, pairing each poll with a store sample.
+
+    ``observe`` returns the store snapshot taken alongside the RDS read (or
+    None); each pairing is kept as a sample so ``failover_overlap_observed``
+    can decide afterwards whether the writer change happened while the reset
+    command was still open. The workflow keeps moving during the failover, so
+    the WAITING records of the steps finishing in this window are read here too.
+    """
+
     deadline = time.monotonic() + timeout_seconds
     last: dict[str, Any] = {}
+    samples: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
         last = rds_snapshot(settings)
+        state = observe() if observe is not None else None
+        samples.append(
+            {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "rds_status": last.get("status"),
+                "writer": last.get("writer"),
+                "reset_command_status": (
+                    reset_command_status(state) if state is not None else None
+                ),
+            }
+        )
         if (
             last.get("status") == "available"
             and last.get("writer")
             and last.get("writer") != previous_writer
         ):
-            return last
-        # The workflow keeps moving while Aurora fails over; whoever wants the
-        # WAITING records of the steps that finish in this window has to read
-        # them now.
-        if observe is not None:
-            observe()
-        time.sleep(5)
+            return last, samples
+        sleep(5)
     raise RegionalFixtureError(f"Aurora failover did not converge: {last}")
+
+
+def failover_overlap_observed(
+    samples: list[dict[str, Any]],
+    *,
+    previous_writer: str,
+) -> bool:
+    """Whether Aurora was seen failing over while RESET_GPU was still open.
+
+    Requesting the failover when the command is LEASED/WAITING proves nothing
+    about the window itself: the writer may only switch after the command has
+    already reached SUCCEEDED, in which case the case observed a reset and a
+    failover, not a reset *during* a failover. At least one sample must show
+    the cluster mid-failover (writer changed or status not ``available``) with
+    the command still non-terminal.
+    """
+
+    for sample in samples:
+        mid_failover = sample.get("rds_status") != "available" or (
+            sample.get("writer") and sample.get("writer") != previous_writer
+        )
+        if mid_failover and sample.get("reset_command_status") in (
+            NON_TERMINAL_COMMAND_STATUSES
+        ):
+            return True
+    return False
+
+
+def result_submission_codes(logs: str) -> list[int]:
+    """HTTP codes of rejected result submissions in executor logs.
+
+    A rejected ``complete`` logs "could not report result" followed by the
+    traceback whose last line carries "rejected request (NNN)"; an accepted
+    result is silent. So the codes returned here are the non-200 submissions,
+    and the catalog allows only 409 among them.
+    """
+
+    codes: list[int] = []
+    pending = False
+    for line in logs.splitlines():
+        if RESULT_REJECTED_LINE in line:
+            pending = True
+            continue
+        if pending:
+            match = REJECTED_STATUS_PATTERN.search(line)
+            if match:
+                codes.append(int(match.group(1)))
+                pending = False
+    return codes
+
+
+def executor_logs(
+    regional: RegionalLiveFixture,
+    started_at: datetime,
+) -> dict[str, Any]:
+    entries = []
+    codes: list[int] = []
+    for pod in regional.ready_pods("gpu", "gpu-fault-cluster-executor"):
+        output = regional.kubectl(
+            "gpu",
+            "logs",
+            str(pod["name"]),
+            "--since-time",
+            started_at.isoformat(),
+            check=False,
+            timeout=120,
+        )
+        pod_codes = result_submission_codes(output)
+        codes.extend(pod_codes)
+        entries.append(
+            {
+                "pod": pod["name"],
+                "sha256": hashlib.sha256(output.encode()).hexdigest(),
+                "rejected_result_codes": pod_codes,
+                "relevant_lines": [
+                    line[:500]
+                    for line in output.splitlines()
+                    if RESULT_REJECTED_LINE in line or "rejected request" in line
+                ][-50:],
+            }
+        )
+    return {
+        "entries": entries,
+        "rejected_result_codes": codes,
+        "forbidden_result_codes": sorted(
+            {code for code in codes if code not in ALLOWED_RESULT_SUBMISSION_CODES}
+        ),
+    }
 
 
 def focused_tests(case_dir: Path) -> dict[str, Any]:
@@ -215,9 +341,17 @@ def read_only_preflight(
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
+        **regional.evidence_identity(),
     )
     rds = rds_snapshot(settings)
-    tests = focused_tests(case_dir)
+    # The plan phase already paid for the focused pytest run; --execute reuses
+    # its recorded result when the source digest still matches.
+    reused = reusable_focused_tests(case_dir / "plan.json")
+    tests = (
+        {**reused, "reused_from_plan": True}
+        if reused is not None
+        else focused_tests(case_dir)
+    )
     errors = []
     if not predecessor["valid"]:
         errors.append("DESTR-008 predecessor evidence is not PASS")
@@ -359,7 +493,7 @@ def control_logs(
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     state = preflight["store"]
-    return {
+    details: dict[str, Any] = {
         "risk": "destructive",
         "predecessor": preflight["predecessor"],
         "target_node": settings.node,
@@ -388,6 +522,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "workflow becomes BLOCKED or reset ledger/journal count differs from one",
             "cleanup cannot restore quiesce state or node ownership",
         ],
+        "inconclusive_conditions": [
+            "no store sample shows the writer changing (or the cluster leaving "
+            "'available') while RESET_GPU is still LEASED/WAITING/PENDING",
+        ],
         "rollback": {
             "Aurora failover is allowed to complete forward": True,
             "quiesce_fail_safe_timer_is_independent": True,
@@ -396,6 +534,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight["focused_tests"])
+    return details
 
 
 def verify_plan_identity(
@@ -473,6 +613,13 @@ def evaluate_reset(
     )
     logs = control_logs(regional, failover_requested_at)
     write_json_atomic(case_dir / "control-logs.json", logs)
+    executor = executor_logs(regional, failover_requested_at)
+    write_json_atomic(case_dir / "executor-logs.json", executor)
+    if executor["forbidden_result_codes"]:
+        errors.append(
+            "executor result submissions were not only 409/200: "
+            f"{executor['forbidden_result_codes']}"
+        )
     if workflow.get("status") == "BLOCKED" or workflow.get("blocked_reasons"):
         errors.append("Aurora failover left the workflow BLOCKED")
     final_node = regional.node_snapshot(settings.node)
@@ -482,9 +629,15 @@ def evaluate_reset(
         errors.append("target node retained workflow ownership")
     if final_node["unschedulable"] != preflight["node"]["unschedulable"]:
         errors.append("target node cordon state differs from baseline")
-    provider = regional.provider_events(
+    # A negative CloudTrail claim cannot be proven inside the 15-minute
+    # delivery window; poll for what is visible and label the rest provisional.
+    window_end = datetime.now(timezone.utc)
+    provider = regional.wait_provider_events(
         injected_at,
-        datetime.now(timezone.utc),
+        event_names=set(PROVIDER_MUTATIONS),
+        expected_count=0,
+        ended_at=window_end,
+        timeout_seconds=0,
     )
     if provider:
         errors.append("provider node mutation appeared during HA-003")
@@ -493,10 +646,25 @@ def evaluate_reset(
     return errors, {
         "workflow": workflow,
         "provider_events": provider,
+        "provider_events_provisional": regional.provider_events_provisional(window_end),
         "control_logs": logs,
+        "executor_logs": executor,
         "host_after": after,
         "final_node": final_node,
     }
+
+
+def verdict_for(errors: list[str], *, overlap_observed: bool) -> str:
+    """FAIL on any error; PASS only if the failover provably overlapped the reset.
+
+    A clean run whose failover landed after the command was already terminal
+    is INCONCLUSIVE: nothing went wrong, but the property the case exists to
+    test was not exercised.
+    """
+
+    if errors:
+        return "FAIL"
+    return "PASS" if overlap_observed else "INCONCLUSIVE"
 
 
 def cleanup_case(
@@ -649,19 +817,31 @@ def execute_case(
             settings.rds_cluster_id,
         )
         write_json_atomic(case_dir / "failover-request.json", failover)
-        rds_after = wait_rds_failover(
+
+        def observe() -> dict[str, Any]:
+            sample = regional.store_snapshot(
+                node=settings.node,
+                marker=marker,
+                observed_after=injected_at,
+                queue_attempts=1,
+            )
+            waiting_evidence.observe(sample)
+            return sample
+
+        previous_writer = str(preflight["rds"]["writer"])
+        rds_after, failover_samples = wait_rds_failover(
             settings,
-            previous_writer=str(preflight["rds"]["writer"]),
-            observe=lambda: waiting_evidence.observe(
-                regional.store_snapshot(
-                    node=settings.node,
-                    marker=marker,
-                    observed_after=injected_at,
-                    queue_attempts=1,
-                )
-            ),
+            previous_writer=previous_writer,
+            observe=observe,
         )
         write_json_atomic(case_dir / "rds-after.json", rds_after)
+        overlap = failover_overlap_observed(
+            failover_samples, previous_writer=previous_writer
+        )
+        write_json_atomic(
+            case_dir / "failover-window.json",
+            {"samples": failover_samples, "overlap_observed": overlap},
+        )
         state = waiting_evidence.merged_into(
             regional.wait_for_workflow(
                 node=settings.node,
@@ -689,8 +869,10 @@ def execute_case(
         )
         result.update(
             {
-                "verdict": "PASS" if not errors else "FAIL",
+                "verdict": verdict_for(errors, overlap_observed=overlap),
                 "errors": errors,
+                "failover_overlap_observed": overlap,
+                "failover_samples": failover_samples,
                 "marker": marker,
                 "incident_id": incident_id,
                 "workflow_request_id": evidence["workflow"].get("request_id"),
@@ -698,8 +880,17 @@ def execute_case(
                 "rds_before": preflight["rds"],
                 "rds_after": rds_after,
                 "provider_events": evidence["provider_events"],
+                "provider_events_provisional": evidence["provider_events_provisional"],
+                "executor_result_codes": evidence["executor_logs"][
+                    "rejected_result_codes"
+                ],
             }
         )
+        if not overlap:
+            result["inconclusive_reason"] = (
+                "no store sample showed Aurora mid-failover while RESET_GPU was "
+                "still open; the reset and the failover did not provably overlap"
+            )
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
@@ -715,6 +906,7 @@ def execute_case(
         result["cleanup"] = cleanup
         if cleanup["errors"]:
             result["verdict"] = "FAIL"
+    result.update(regional.evidence_identity())
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1

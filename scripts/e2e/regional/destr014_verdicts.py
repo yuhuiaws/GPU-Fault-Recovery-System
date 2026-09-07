@@ -36,6 +36,31 @@ CONTAINMENT_ALLOWANCE_SECONDS = 120
 
 EXHAUSTION_PREFIX = "node branch escalation exhausted"
 
+# What the shipped adapter says when the strategy is HEALTHY_WARM_SPARE_ONLY and
+# no spare pool is declared at all. ``hyperpod_spares`` reports the allocation as
+# not *applicable* (there is no pool to be short of), and the lifecycle adapter
+# then refuses because the provider fallback is disabled -- a different sentence
+# from the "insufficient healthy HyperPod spares" a declared-but-short pool
+# produces, which is DESTR-008's topology-mismatch scenario, not this one.
+EXPECTED_REPLACE_FAILURE = (
+    "warm-spare replacement is required; provider node replacement API "
+    "fallback is disabled"
+)
+
+# The remediation budget scopes this drill claims: the region, the cluster, one
+# node scope per faulted node, and one resource class per budgeted operation.
+# Failure-domain scopes come from an operator-declared map the runner cannot
+# read from outside the executor, so they are not modelled here; the preflight
+# reads the region/cluster/node/class tiers, which is where the drill's own
+# concurrency lands.
+BUDGET_LIMIT_ENV = {
+    "region": ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION", 20),
+    "cluster": ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER", 5),
+    "node": ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE", 1),
+    "resource_class": ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS", 2),
+}
+BUDGETED_OPERATIONS = ("RESET_GPU", "RESTART_NODE", "REPLACE_NODE")
+
 
 # --------------------------------------------------------------------------- #
 # Pure verdict functions (unit-tested)
@@ -205,12 +230,10 @@ def workflow_errors(
     )
     if replace_exec is None:
         errors.append(f"{sibling_node} has no FAILED REPLACE_NODE execution")
-    elif "insufficient healthy HyperPod spares" not in str(
-        replace_exec.get("error") or ""
-    ):
+    elif EXPECTED_REPLACE_FAILURE not in str(replace_exec.get("error") or ""):
         errors.append(
             f"{sibling_node} REPLACE_NODE did not fail with "
-            "'insufficient healthy HyperPod spares'"
+            f"{EXPECTED_REPLACE_FAILURE!r}: {replace_exec.get('error')!r}"
         )
     return errors
 
@@ -363,7 +386,14 @@ def workload_errors(
     live = [item for item in pods if item.get("phase") not in {"Succeeded", "Failed"}]
     if live:
         errors.append(f"the job still has {len(live)} Pod(s) after the failed workflow")
-    if (restart_budget or {}).get("restart_count") != 0:
+    if not restart_budget:
+        # Fail-safe, but for the right reason: a budget row the store never
+        # returned proves nothing either way, and calling it "advanced" sent the
+        # reader looking for a restart that may never have happened.
+        errors.append(
+            "restart budget unreadable; cannot prove the job was not restarted"
+        )
+    elif restart_budget.get("restart_count") != 0:
         errors.append("restart budget advanced; the job was restarted")
     return errors
 
@@ -419,6 +449,78 @@ def lifetime_errors(
             f"workflow lifetime {lifetime_seconds}s"
         ]
     return []
+
+
+def budget_limits(environment: dict[str, Any]) -> dict[str, int]:
+    """The executor's remediation concurrency limits, from its environment.
+
+    Unset variables take the product's own defaults; a value that is not a
+    positive integer is refused rather than defaulted, because the executor
+    would refuse it too and a preflight that read past it would be grading a
+    configuration the executor does not run.
+    """
+
+    limits: dict[str, int] = {}
+    for tier, (name, default) in BUDGET_LIMIT_ENV.items():
+        raw = environment.get(name)
+        try:
+            value = int(str(raw)) if raw not in (None, "") else default
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} is not an integer: {raw!r}") from exc
+        if value < 1:
+            raise ValueError(f"{name} must be positive: {value}")
+        limits[tier] = value
+    return limits
+
+
+def planned_budget_scopes(
+    *,
+    cluster_id: str,
+    nodes: list[str],
+    limits: dict[str, int],
+    resource_classes: dict[str, list[str]],
+) -> dict[str, int]:
+    """Scope name -> limit for the claims this drill's workflow will make.
+
+    ``resource_classes`` maps each budgeted operation to the resource classes
+    the operation registry declares for it, so the class tier follows the
+    product's registry rather than a list kept here.
+    """
+
+    scopes = {
+        "region": limits["region"],
+        f"cluster:{cluster_id}": limits["cluster"],
+    }
+    for node in sorted(set(nodes)):
+        scopes[f"node:{cluster_id}:{node}"] = limits["node"]
+    classes: set[str] = set()
+    for operation in BUDGETED_OPERATIONS:
+        declared = resource_classes.get(operation)
+        if declared is None:
+            raise ValueError(f"{operation} has no resource classes in the registry")
+        classes.update(declared)
+    for resource_class in sorted(classes):
+        scopes[f"class:{cluster_id}:{resource_class}"] = limits["resource_class"]
+    return scopes
+
+
+def budget_headroom(
+    scopes: dict[str, int],
+    active_workflows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The ``budget`` ``budget_headroom_errors`` grades, from live store rows.
+
+    ``active_workflows`` are the RUNNING, lease-holding workflows and the
+    scopes each holds; a scope is as busy as the number of such rows naming it.
+    """
+
+    counted: dict[str, dict[str, int]] = {}
+    for name, limit in scopes.items():
+        active = sum(
+            1 for item in active_workflows if name in (item.get("claims") or [])
+        )
+        counted[name] = {"limit": int(limit), "active": active}
+    return {"readable": True, "scopes": counted}
 
 
 def budget_headroom_errors(budget: dict[str, Any]) -> list[str]:

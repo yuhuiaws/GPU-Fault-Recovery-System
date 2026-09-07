@@ -11,6 +11,10 @@ import pytest
 from scripts.e2e.regional import destr015_verdicts as verdicts
 from scripts.e2e.regional import run_destr015_parallel_branch_join as destr015
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from scripts.e2e.regional.regional_live_fixture import (
+    RegionalFixtureError,
+    RegionalLiveFixture,
+)
 
 yaml = importlib.import_module("yaml")
 
@@ -644,11 +648,92 @@ def test_step_transitions_record_only_changes() -> None:
     first = [_execution(5, "RESET_GPU", "WAITING", started_at=T0, updated_at=T0)]
     state, changes = verdicts.step_transitions({}, first)
     assert len(changes) == 1
+    assert state == {"5/RESET_GPU#0": "WAITING"}
     state, changes = verdicts.step_transitions(state, first)
     assert changes == []
     second = [_execution(5, "RESET_GPU", "SUCCEEDED", started_at=T0, updated_at=T0)]
     state, changes = verdicts.step_transitions(state, second)
     assert [item["status"] for item in changes] == ["SUCCEEDED"]
+
+
+def test_step_transitions_do_not_flip_between_a_kept_waiting_row_and_its_end() -> None:
+    """A barrier step keeps its WAITING row when the SUCCEEDED one is added; a
+    key of index/operation alone would flip between the two on every poll."""
+
+    waiting = _execution(
+        4, "VERIFY_NO_GPU_CLIENTS", "WAITING", started_at=T0, updated_at=T0
+    )
+    done = _execution(
+        4, "VERIFY_NO_GPU_CLIENTS", "SUCCEEDED", started_at=T0, updated_at=_at(1)
+    )
+    state, first = verdicts.step_transitions({}, [waiting, done])
+    assert [(item["occurrence"], item["status"]) for item in first] == [
+        (0, "WAITING"),
+        (1, "SUCCEEDED"),
+    ]
+    state, second = verdicts.step_transitions(state, [waiting, done])
+    assert second == []
+    _, third = verdicts.step_transitions(state, [waiting, done])
+    assert third == []
+
+
+def test_the_injection_spread_is_read_from_the_events_own_clocks() -> None:
+    """The exec return stamps are one kubectl round trip late each; the events'
+    ``observed_at`` is what the aggregation window is measured against."""
+
+    first = _state(NODE_A)
+    second = _state(NODE_B)
+    first["event"]["observed_at"] = T0
+    second["event"]["observed_at"] = _at(0, 1)
+    observed = verdicts.event_observed_at({NODE_A: first, NODE_B: second})
+    assert observed == {NODE_A: T0, NODE_B: _at(0, 1)}
+    assert verdicts.spread_errors(observed, aggregation_window_seconds=5) == []
+    second["event"].pop("observed_at")
+    partial = verdicts.event_observed_at({NODE_A: first, NODE_B: second})
+    assert partial == {NODE_A: T0}
+    assert verdicts.spread_errors(partial, aggregation_window_seconds=5) == [
+        "injection timestamps are incomplete"
+    ]
+
+
+def test_control_env_is_read_from_the_worker_replicas_not_the_release_state() -> None:
+    """Nothing writes these bounds into the release-state ConfigMap; the
+    control worker reads them from its environment, so the case must too."""
+
+    assert destr015.CONTROL_VARIABLES == (
+        "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS",
+        "GPU_FAULT_JOB_WORKFLOW_MAX_LIFETIME_SECONDS",
+    )
+    agreed = destr015.control_env_record(
+        {
+            destr015.AGGREGATION_WINDOW_VARIABLE: "8",
+            destr015.JOB_LIFETIME_VARIABLE: "5400",
+        }
+    )
+    assert agreed["aggregation_window_seconds"] == 8
+    assert agreed["job_lifetime_seconds"] == 5400
+    unset = destr015.control_env_record(
+        {
+            destr015.AGGREGATION_WINDOW_VARIABLE: None,
+            destr015.JOB_LIFETIME_VARIABLE: "x",
+        }
+    )
+    assert unset["aggregation_window_seconds"] == (
+        destr015.DEFAULT_AGGREGATION_WINDOW_SECONDS
+    )
+    assert unset["job_lifetime_seconds"] == destr015.DEFAULT_JOB_LIFETIME_SECONDS
+    assert unset["observed"] == {
+        destr015.AGGREGATION_WINDOW_VARIABLE: None,
+        destr015.JOB_LIFETIME_VARIABLE: "x",
+    }
+
+
+def test_a_failed_injection_stops_the_case_before_observation() -> None:
+    destr015.stop_before_observation([])
+    with pytest.raises(RegionalFixtureError, match="stopping before observation"):
+        destr015.stop_before_observation(
+            ["the two events did not land in one workflow"]
+        )
 
 
 def test_lifetime_arithmetic_refuses_an_estimate_over_the_lifetime() -> None:
@@ -944,3 +1029,31 @@ def test_preflight_rejects_nodes_hosting_arbiters_or_all_dns_endpoints() -> None
         )
         == []
     )
+
+
+def test_execute_reuses_the_plans_focused_tests_only_for_the_same_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--plan records the focused pytest with a source digest; --execute reuses
+    it instead of paying for the same run twice, and only for this exact tree."""
+
+    from scripts.e2e.regional import live_driver_guard
+
+    def refuse(*arguments: Any, **keywords: Any) -> Any:
+        raise AssertionError("pytest must not run when the plan's result is reusable")
+
+    monkeypatch.setattr(RegionalLiveFixture, "run", staticmethod(refuse))
+    recorded = {"passed": True, "returncode": 0, "command": ["pytest"]}
+    details: dict[str, Any] = {}
+    live_driver_guard.record_focused_tests(details, recorded)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
+    reused = destr015.focused_tests(tmp_path, reuse=True)
+    assert reused == {**recorded, "focused_tests_reused": True}
+    # A --plan never reuses, and a result taken against another tree is rerun.
+    with pytest.raises(AssertionError, match="must not run"):
+        destr015.focused_tests(tmp_path, reuse=False)
+    details["focused_tests_source_digest"] = "0" * 64
+    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
+    with pytest.raises(AssertionError, match="must not run"):
+        destr015.focused_tests(tmp_path, reuse=True)

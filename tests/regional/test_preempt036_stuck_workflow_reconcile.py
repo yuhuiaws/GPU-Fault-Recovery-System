@@ -30,6 +30,7 @@ from gpu_fault.store import SqliteStore
 from scripts.e2e.regional.preempt036_verdicts import (
     CANCELLED_STATUS_SOURCE,
     CASE_ID,
+    CLUSTER_ID,
     COMPILE_BLOCKED_MODE,
     DRIFT_REFUSALS,
     INELIGIBLE_REFUSALS,
@@ -55,6 +56,7 @@ from scripts.e2e.regional.preempt036_verdicts import (
     rerun_event_errors,
     safety_errors,
     seed_mode,
+    shipped_source_errors,
     workflow_snapshot,
 )
 
@@ -351,6 +353,79 @@ def test_apply_errors_reports_a_wider_change_than_the_plan(tmp_path: Any) -> Non
     )
 
 
+@pytest.mark.parametrize("mode", [ORPHANED_COMMANDS_MODE, RETIRED_GENERATION_MODE])
+def test_apply_errors_reports_a_cancelling_mode_that_omits_its_cancel_counters(
+    tmp_path: Any, mode: str
+) -> None:
+    seed = _seed(tmp_path, mode)
+    digest = "e" * 64
+    result = {
+        "mode": seed.apply_mode,
+        "reference": REFERENCE,
+        "applied_workflow_ids": list(seed.actionable_ids),
+        "records_deleted": 0,
+        seed.approved_digest_field: digest,
+        "settled_plan_sha256": digest if not seed.settled_digest_differs else "f" * 64,
+    }
+
+    errors = apply_errors(result, seed, approved_plan_sha256=digest)
+
+    assert any("no cancelled_remote_commands" in error for error in errors), (
+        f"{mode}: an apply that reports no cancel counters used to pass unjudged"
+    )
+    counted = {
+        **result,
+        "cancelled_remote_commands": {
+            request_id: {"cancelled": 1} for request_id in seed.actionable_ids
+        },
+    }
+    assert not any(
+        "cancelled_remote_commands" in error
+        for error in apply_errors(counted, seed, approved_plan_sha256=digest)
+    ), f"{mode}: an apply that reports its cancel counters must not be faulted"
+
+
+def test_compile_blocked_apply_needs_no_cancel_counters(tmp_path: Any) -> None:
+    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
+    digest = "e" * 64
+    result = {
+        "mode": seed.apply_mode,
+        "reference": REFERENCE,
+        "applied_workflow_ids": list(seed.actionable_ids),
+        "records_deleted": 0,
+        seed.approved_digest_field: digest,
+        "settled_plan_sha256": digest,
+    }
+
+    assert apply_errors(result, seed, approved_plan_sha256=digest) == []
+
+
+def test_shipped_source_is_judged_not_merely_recorded() -> None:
+    good = {
+        "starts_with_module_source": True,
+        "script_sha256": "a" * 64,
+        "module_sha256": "b" * 64,
+        "driver_sha256": "c" * 64,
+    }
+    assert shipped_source_errors(good) == []
+
+    drifted = {**good, "starts_with_module_source": False}
+    assert shipped_source_errors(drifted) == [
+        "the executed script does not start with the shipped module source"
+    ]
+    assert any(
+        "driver_sha256" in error
+        for error in shipped_source_errors({**good, "driver_sha256": ""})
+    ), "a missing driver digest must be reported"
+    assert case_verdict({"shipped_source": shipped_source_errors(drifted)}) == "FAIL"
+
+
+def test_seed_identifiers_carry_the_case_number() -> None:
+    assert "p036" in CLUSTER_ID and "p035" not in CLUSTER_ID, (
+        "the seeds still carried the pre-renumbering p035 identifiers"
+    )
+
+
 def test_apply_errors_reports_a_second_pass_digest_that_did_not_move(
     tmp_path: Any,
 ) -> None:
@@ -410,7 +485,7 @@ def test_record_errors_reports_a_revoked_record_that_kept_its_owner(
             "status": seed.statuses_after[request_id],
             "preemption_reason": " ".join(seed.reason_substrings.get(request_id) or ()),
             "preempted_by_workflow_id": seed.preempted_by.get(request_id),
-            "execution_owner_id": "p035-executor-a",
+            "execution_owner_id": "p036-executor-a",
         }
         for request_id in seed.statuses_after
     }
@@ -460,7 +535,7 @@ def test_command_errors_reports_a_cancelled_command_that_kept_its_lease(
             "status": "FAILED",
             "status_source": CANCELLED_STATUS_SOURCE,
             "error": f"operator reconciliation {REFERENCE}: cancelled",
-            "lease_owner": "p035-node-agent",
+            "lease_owner": "p036-node-agent",
         }
     }
 

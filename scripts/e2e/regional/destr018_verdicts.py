@@ -583,6 +583,44 @@ def escalation_errors(
     return errors
 
 
+SUPPORT_TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"})
+
+
+def quarantine_settled(
+    node_snapshot: dict[str, Any],
+    support_workflow: dict[str, Any] | None,
+) -> bool:
+    """Whether the quarantine verdict can be judged yet.
+
+    The support workflow's QUARANTINE step runs asynchronously after the
+    lifetime failure, so a node read the instant the reset workflow went FAILED
+    has not been tainted *yet*. The verdict is ready once the taint is there, or
+    once the support workflow is terminal (then whatever the node shows is what
+    it will keep showing).
+    """
+
+    taints = [
+        str(item.get("key"))
+        for item in (node_snapshot.get("taints") or [])
+        if isinstance(item, dict)
+    ]
+    if QUARANTINE_TAINT in taints:
+        return True
+    status = (support_workflow or {}).get("status")
+    return status in SUPPORT_TERMINAL_STATUSES
+
+
+def absorb_settled(snapshot: dict[str, Any]) -> bool:
+    """Whether the absorbed event has been merged, not merely ingested.
+
+    The event row appears first; the merge onto an incident is what
+    :func:`absorb_errors` judges, so a snapshot with the event but no incident
+    is still in flight.
+    """
+
+    return bool(snapshot.get("event")) and bool(snapshot.get("incident"))
+
+
 def quarantine_errors(node_snapshot: dict[str, Any]) -> list[str]:
     """The node must end isolated: unschedulable and carrying the taint."""
 
@@ -668,14 +706,34 @@ def new_executable_workflow_errors(
     workflows: list[dict[str, Any]],
     *,
     known_request_ids: set[str],
+    started_after: datetime | None = None,
+    node: str | None = None,
 ) -> list[str]:
-    """No PENDING or RUNNING workflow may exist beyond the known pair."""
+    """No PENDING or RUNNING workflow the drill could have caused may exist
+    beyond the known pair.
+
+    The store lists workflows cluster-wide. A workflow another node's incident
+    opened, or one that predates this case, is not evidence about this drill,
+    so the read is narrowed to workflows created at or after ``started_after``
+    and, when ``node`` is given, to those that name the node. A workflow whose
+    ``created_at`` cannot be read is kept: unknown is not "before".
+    """
+
+    def relevant(item: dict[str, Any]) -> bool:
+        if started_after is not None:
+            created = parse_time(item.get("created_at"))
+            if created is not None and created < started_after:
+                return False
+        if node is not None and node not in (item.get("node_ids") or []):
+            return False
+        return True
 
     executable = [
         item
         for item in workflows
         if item.get("status") in {"PENDING", "RUNNING"}
         and item.get("request_id") not in known_request_ids
+        and relevant(item)
     ]
     if not executable:
         return []
@@ -818,15 +876,29 @@ def straddling_row_errors(
             f"the straddling {operation} row is {state}; the device holder was "
             "meant to make every attempt fail"
         )
-    command = next(
-        (
-            item
-            for item in commands
-            if item.get("command_id") == row.get("command_id")
-            or (item.get("step") or {}).get("operation") == operation
-        ),
-        None,
-    )
+    # The ledger row and the remote command share the command id; that is the
+    # only match that says "the same dispatch". Matching on the operation would
+    # pick any VERIFY attempt of the workflow and judge the wrong command.
+    row_id = row.get("command_id")
+    if row_id:
+        command = next(
+            (item for item in commands if item.get("command_id") == row_id), None
+        )
+    else:
+        command = next(
+            (
+                item
+                for item in commands
+                if (item.get("step") or {}).get("operation") == operation
+            ),
+            None,
+        )
+        if command is not None:
+            errors.append(
+                f"the straddling {operation} ledger row has no command_id; the "
+                f"remote command {command.get('command_id')} was matched by "
+                "operation only, which cannot prove it is the same dispatch"
+            )
     if command is None:
         errors.append(
             f"no remote command matches the straddling ledger row "

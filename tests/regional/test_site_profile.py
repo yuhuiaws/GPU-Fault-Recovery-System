@@ -257,6 +257,11 @@ def test_every_live_runner_installs_the_profile_before_parsing() -> None:
             for spine in ("run_standard_case", "run_selected_case", "run_plain_case")
         ):
             continue
+        # NET-002/003 delegate to net_command_fixture.run_main, which installs
+        # the profile before it builds the parser; pinned in
+        # tests/regional/test_net002_command_recovery.py.
+        if "fixture.run_main(" in source:
+            continue
         missing.append(path.name)
     assert not missing, missing
 
@@ -274,3 +279,22 @@ def test_runner_help_still_works_without_a_profile() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert "--site-profile" in completed.stdout, completed.stdout
+
+
+def test_a_profile_may_not_carry_the_per_case_approval_flags(tmp_path: Path) -> None:
+    """The profile names the target; ``--execute``/``--confirm``/``--plan``/
+    ``--attempt`` are what the operator types for one run after reading its
+    plan. A profile carrying them turns every ``--plan`` into an execute."""
+
+    for key in ("confirm", "execute", "plan", "attempt", "--confirm"):
+        path = _profile(tmp_path, {"arguments": {"node": "node-a", key: "x"}})
+        with pytest.raises(SiteProfileError, match=key.lstrip("-")):
+            load_site_profile(path)
+
+    with pytest.raises(SiteProfileError, match="confirm"):
+        profile_argv({"arguments": {"confirm": "DESTR001_EXECUTE"}}, [])
+    # A key that merely contains a reserved word is not reserved.
+    assert profile_argv({"arguments": {"confirm_node": "node-a"}}, []) == [
+        "--confirm-node",
+        "node-a",
+    ]

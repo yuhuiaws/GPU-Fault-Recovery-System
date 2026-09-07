@@ -46,6 +46,10 @@ environment while the parser is being built.
 The profile is refused if it is group- or world-writable, or if it has a section
 other than `arguments`/`environment`: it decides which node a destructive case
 reboots, and a typo in a section name would silently drop every value in it.
+It may not carry `attempt`, `confirm`, `execute` or `plan` either
+(`site_profile.RESERVED_ARGUMENTS`, checked when the file is loaded and again
+when its values are bound): those are typed per run, and a profile that carried
+them would turn every `--plan` into an execute against a real node.
 
 ## Live and staging drivers
 
@@ -118,11 +122,125 @@ interrupted-resume RTO evidence.
 
 The grouped BOOT-011..018, AUTH/ISO, WORKLOAD/E2E, PREEMPT-012, NOTIFY,
 CAP-001..004 and NET-001 drivers use the same plan/execute guard. They derive
-their formal predecessor from `testcases/regional-execution-order.yaml` and
-default to the preceding evidence file under the same run directory.
+their formal predecessor from `testcases/regional-execution-order.yaml` through
+`regional_case_contract.formal_predecessor()` and default to that case's
+evidence file under the same run directory. The contract answers in two steps:
+an explicit `predecessor:` on the order entry wins (the destructive and
+warm-spare chains fan out from a few anchor cases -- DESTR-016/017 read
+DESTR-002, DESTR-018/019 read DESTR-010, and so on); otherwise the predecessor
+is the nearest earlier case that can actually produce `cases/<id>/<id>.json`,
+which skips `automation: pytest` cases and `command` cases that only wrap
+`python3 -m pytest` (they report into `artifacts/fault`, never into a run
+directory). Runners that hard-code `PREDECESSOR_CASE_ID` are held to the same
+answer by `tests/regional/test_regional_case_contract.py`.
+
+Predecessor evidence is bound to the deployment it was earned against:
+`regional_live_fixture.read_predecessor_evidence` compares the evidence file's
+top-level `release_id` and `cluster_id` with the successor's
+`RegionalLiveFixture.evidence_identity`, so a PASS from before a redeploy, or
+from another cluster, is `evidence_valid=false` and does not let the successor
+execute. The plan/execute guard also remembers the focused pytest a `--plan`
+ran: `live_driver_guard.record_focused_tests` stores the result together with a
+digest of `scripts/e2e/regional`, `tests/regional` and `src`
+(`focused_tests_source_digest`), and `--execute` reuses that result instead of
+running the tests again only while the digest still equals the working tree's.
+
 `run_preemption_contracts.py` is the deterministic non-live command entry for
-PREEMPT-001..009. `run_blast_acceptance.py` executes one explicit read-only
-BLAST case.
+PREEMPT-001..009; with `--run-dir` (and `--release-id`) it writes
+`cases/<id>/<id>.json` so the case can serve as a predecessor.
+`run_blast_acceptance.py` executes one explicit read-only BLAST case;
+`--e2e-dir` defaults to `<run-dir>/cases/GF-REGIONAL-E2E-001` (or
+`GPU_FAULT_E2E001_EVIDENCE_DIR`) and `--trusted-cpu-baseline` to that
+directory's `cpu-nodes-before.json` (or `GPU_FAULT_TRUSTED_CPU_BASELINE`).
+
+### Flags and defaults that changed with the 2026-09 runner review
+
+- `run_workload_acceptance.py --skip-admin-status`: `gpu-fault-admin status`
+  runs once for the WORKLOAD group, by default only under
+  `GF-REGIONAL-WORKLOAD-002` (`ADMIN_STATUS_CASE`), which therefore needs
+  `--state-dir` unless the flag is given.
+- `run_collector_destructive.py --xid {109,62}` (COLLECT-013, default `109`):
+  one kmsg injection, one real single-GPU reset per run. `--debounce-tolerance`
+  (COLLECT-004, default `0.5`) is the allowed fraction above
+  `samples x interval` for the debounced finding.
+- `audit_destr013_replacement_invariant.py` now needs a CPU kubeconfig
+  (`--cpu-kubeconfig/--cpu-context`, or `GPU_FAULT_CONTROL_KUBECONFIG` /
+  `CPU_KUBECONFIG`): it reads every running API replica and fails if any still
+  carries `GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS` (a DESTR-003/008 route
+  window nobody closed). `--run-dir` is cross-checked: every run timestamp
+  recorded under `cases/GF-REGIONAL-DESTR-*` must fall inside
+  `--window-start/--window-end`. `--accept-recent-window` lets the window end
+  inside CloudTrail's 15-minute delivery lag and records the negative as
+  `cloudtrail_provisional: true`; `--expect-no-reboots` declares that the run
+  drove no reboot case, otherwise zero `BatchRebootClusterNodes` events are
+  read as a wrong region or wrong hours, not as a clean cluster.
+- `run_boot_acceptance.py --also-record-boot021` (BOOT-012 only): the executor
+  readiness matrix BOOT-012 ran is also written as `GF-REGIONAL-BOOT-021`
+  evidence under `--run-dir`.
+- `run_capacity_acceptance.py --b-latency-factor` (CAP-001, default `2.0`):
+  the storm-phase cluster B p95 may be at most this multiple of the B-only
+  baseline p95.
+- `audit_regional_command_protocol_live.py` refuses to start unless the operator
+  passes `--isolated-cluster` or `--executor-ready-replicas 0` (read from the
+  executor Deployment outside the Pod); `--run-dir`/`--release-id` write
+  `cases/<id>/<id>.json` per CMD case, and `--write-evidence SUMMARY_JSON`
+  writes that evidence operator-side from a printed run summary without
+  touching any cluster.
+- `audit_executor_local_guards.py --run-dir/--release-id` writes ISO-002 and
+  CMD-011 evidence.
+- `audit_auth_boundary.py matrix ... --run-dir --cpu-kubeconfig --namespace`:
+  the former `probe-clusters` mode is gone (that is
+  `run_identity_acceptance.py --case GF-REGIONAL-AUTH-007`, with a restore).
+  With `--run-dir` AUTH-001..006/008/009/011 each get their own evidence
+  document; with `--cpu-kubeconfig` the store is read before and after so the
+  denials are proven to have written nothing.
+- `run_identity_acceptance.py --case GF-REGIONAL-AUTH-013 --node <node>
+  --host-probe-image <image@sha256:...>` (at most one `--node`): the host probe
+  (`probes/auth013_certificate_probe.py`) reads the node's
+  `gpu-fault-certificate-check.timer`. Without them the expiry-alert checks are
+  recorded `NOT_EVALUATED` and counted as false, so the case is `FAIL`.
+- `run_iso006_cluster_offline.py --duration-seconds` defaults to `900`
+  (30 A-claim samples at 30 s); the catalog's 30-minute window is reachable by
+  passing `1800`. The block is on both the `OUTPUT` and `FORWARD` chains of
+  every B node, TCP 443 to the explicit control-plane CIDRs only, and the run
+  refuses to observe until a `cut_proof` claim from B fails at the transport
+  (no HTTP status at all).
+- `run_destr016_preempting_reboot.py --max-hold-seconds` defaults to `2400`;
+  the preflight refuses anything below `required_hold_seconds()` (barrier,
+  absorb, preemption and supersession budgets plus margin).
+- `run_destr012_managed_recovery_guard.py --rerun-group-a-workload`: group A
+  now reads the STOP/RESTART owners from the DESTR-009 evidence
+  (`workflow_official_steps`) it already validated; the flag restores the old
+  second 24-GPU PyTorchJob.
+- `run_notification_acceptance.py --receipt-evidence` / `--ses-window-evidence`
+  take an operator-written JSON object with `method`, `reference`,
+  `window_start` and `window_end` (ISO-8601; the window must cover every drill
+  or record time the run claims). Receipt evidence additionally needs
+  `received: true`; dedup evidence needs `send_count_delta: 0` and
+  `duplicate_inbox_count: 0`.
+- `boot020_release_candidates.py clean --snapshot-repo ... --work-dir ...`
+  removes the `dist/<release_id>` symlinks `configs` planted in the repository.
+- `executor_env_window.py` allow-list: `GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS`
+  and `GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS` (HA-004) next to
+  `GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS` and
+  `GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS` (DESTR-014).
+- `probes/destr017_node_probe.py clear-state --run-id <id>`: cleanup removes
+  the run's on-node state file so a later `--plan` of the same attempt cannot
+  read a stale holder match or reboot marker.
+
+Verdicts that are not PASS/FAIL: `run_ha003_aurora_failover_reset.py` records
+`INCONCLUSIVE` when nothing went wrong but the failover landed after the reset
+command was already terminal; `run_ha006_executor_takeover.py` records
+`INCONCLUSIVE` when the kill did not land on a LEASED command (no
+`lease_expires_at` to measure the LEASED-branch bound against);
+`run_boot_acceptance.py --case GF-REGIONAL-BOOT-017` records `PARTIAL` when the
+manual-order gate and its self-test pass but the BOOT-016 greenfield reuse is
+`NOT_EVALUATED`. CloudTrail negatives queried inside the 15-minute delivery lag
+are recorded `provisional` (the BOOT guard's BOOT-005 check always, DESTR-013
+only with `--accept-recent-window`) and DESTR-013's full-window query is what
+re-checks them. `run_ha001_control_plane_failover.py` and
+`run_ha002_pdb_topology.py` write plan `schema_version` 3; an older plan is
+refused with "re-plan".
 
 `run_ha008_processor_exit_probe.py` is the fatal child process used internally
 by the HA-008 acceptance wrapper. It is not the public case entry point.
@@ -134,6 +252,7 @@ procedure. Notable entry points:
 
 - `audit_regional_command_protocol_live.py`
 - `audit_executor_local_guards.py`
+- `audit_auth_boundary.py`
 - `audit_executor_readiness.py`
 - `audit_net004_dependency_boundary.py`
 - `audit_collector_outbox.py`
@@ -171,6 +290,15 @@ manual live case into executed acceptance evidence.
 Current classification:
 
 - `NET-004` and `NET-005` have reusable read-only/isolated audit commands.
+- BOOT-001..010 are `run_regional_boot_guard_cases.sh`. Every case file ends in
+  exactly one `VERDICT PASS` / `VERDICT FAIL` line and the
+  `BOOT_GUARD_START_CASE` resume gate reads only the last line, so a bare
+  `PASS` that `assert.sh` writes before later checks can no longer resume a
+  case as passed. BOOT-005's CloudTrail negative is filtered to the control
+  plane role when `CONTROL_PLANE_ROLE_NAME` is exported and is always recorded
+  `cloudtrail_provisional=true`; BOOT-010 also reads
+  `/v1/collector-status/<cluster_id>` from inside a Pod for every registered
+  cluster and requires 200.
 - BOOT-011..018 share `run_boot_acceptance.py`. Greenfield actions remain
   plan-only; runtime CA, SES, dispatcher and owner checks cover every selected
   live replica. BOOT-018 performs reproducible builds and removes the isolated
@@ -178,6 +306,10 @@ Current classification:
 - AUTH-007/010/012..015 and ISO-003..005 share
   `run_identity_acceptance.py`. Registry, token and key documents remain only
   in memory and are restored in `finally`; Secret values never enter evidence.
+  AUTH-013's per-node certificate-timer reading is
+  `probes/auth013_certificate_probe.py`, a node-pinned host probe run through
+  `host_probe_fixture.py`. AUTH-001..006/008/009/011 are the live matrix of
+  `audit_auth_boundary.py`.
 - WORKLOAD-001/002, ISO-001 and E2E-001 share
   `run_workload_acceptance.py`. It owns prewarm, managed submission,
   observation checks and workload cleanup. E2E-001 emits the execution card
@@ -209,10 +341,29 @@ Current classification:
   disposable-control-plane harness. NET-001 uses
   `run_net001_collector_replay.py` and arms a host rollback timer before any
   TCP/443 rule is added.
-- `HA-007` and `HA-008` have reusable isolated subprocess drivers.
+- `HA-007` and `HA-008` have reusable isolated subprocess drivers. HA-007
+  drains requests of 30, 70, 110 and 140 seconds (`DEFAULT_DURATIONS`): the
+  first three sit inside the control-worker lifespan budget, the last one is
+  longer than it so the coordinator's give-up path runs rather than being
+  asserted from YAML.
 - `NET-002/003` and `HA-001/002/005/006` have reusable manual live drivers.
   Their generalized source has not yet been rerun live, so existing private
   evidence is not yet declared equivalent to these final entry points.
+  NET-002 and NET-003 share `net_command_fixture.py`, the common skeleton on
+  top of `seeded_command_fixture.py` (synthetic `perf-cap-000` registration,
+  one seeded command, one probe executor Pod, purge). NET-002 blocks the probe
+  executor's path to the control plane for `BLOCK_SECONDS=70` against a
+  `LEASE_SECONDS=60` lease that is never renewed while blocked (host rollback
+  at 100 s), and raises the probe executor's HTTP timeout to 180 s (production
+  15 s) so the held `/result` post reaches the 409 path -- recorded as a
+  limitation. NET-003's loopback proxy (`probes/net003_executor.py`) forwards
+  the first `/result` post upstream, discards the response and resets the
+  client (`RESPONSE_LOSS_MODE=forward-then-reset`), after which the executor
+  replays the same terminal result exactly once (`TERMINAL_RESULT_REPLAYS=1`);
+  the wider terminal-replay protocol matrix stays with CMD-007. NET-001 refuses
+  a maintenance window shorter than 25 minutes
+  (`MAINTENANCE_WINDOW_MINIMUM_SECONDS`): ten minutes of outage, replay wait,
+  a reconnect drill and the firewall/Pod cleanup never fit in fifteen.
 - HA-009 credential rotation has a reusable manual live driver with the same
   plan/execute guard and roll-forward recovery contract.
 - DESTR-011 has a reusable read-only/isolated guard audit.
@@ -284,9 +435,12 @@ Current classification:
   end FAILED with `status_source=workflow-timeout`, exactly one successful
   `RESTORE_GPU_SERVICES`, an `ESCALATE_SUPPORT` handoff, and a later XID 79 to
   be absorbed record-only. It never lowers
-  `GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS`: the runner measures the real
-  redispatch cadence from the ledger and refuses to execute unless
-  `lifetime < attempts x cadence` holds with margin. Its verdicts live in
+  `GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS`: before executing, the runner reads
+  the configured redispatch cadence (`GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS`)
+  from the deployed control-worker and refuses unless
+  `lifetime < attempts x cadence` holds with margin; after the run it re-asserts
+  the same arithmetic against the cadence actually measured from the Node Agent
+  ledger. Its verdicts live in
   `destr018_verdicts.py`, including the three data-plane verdicts that read the
   Node Agent ledger against the cancellation moment. A node the deadline left
   isolated is restored only through the validation-first workflow.
@@ -415,15 +569,24 @@ Current classification:
   replacement signal to drive the real workflow and real Kubernetes
   mutations, and explicitly do not claim a real hardware fault.
 - HA-003/004 have reusable destructive live drivers. HA-003 triggers Aurora
-  failover only after the real RESET_GPU command is observed LEASED. HA-004
-  temporarily rolls the two-replica executor Deployment to 10s/2s
-  lease/poll settings, arms a detached rollback watchdog, force deletes the
-  first command owner and requires the same command ID to be reclaimed while
-  the Node Agent ledger records one physical reset.
+  failover only after the real RESET_GPU command is observed in flight (LEASED,
+  or WAITING while the Node Agent executes) and is `INCONCLUSIVE` rather than
+  PASS when the failover provably landed after the command was terminal. HA-004
+  opens the 10s/2s lease/poll window on the two-replica executor Deployment
+  through `executor_env_window.py`, arms a detached rollback watchdog, force
+  deletes the first command owner and requires the same command ID to be
+  reclaimed while the Node Agent ledger records one physical reset. Its
+  owner/token timeline is sampled through `STORE_PROBE` (a `kubectl exec` plus
+  a fresh PostgreSQL pool per read), whose effective period is ~6 s
+  (`SAMPLING_LIMITATION`, recorded in the evidence next to the requested
+  0.25 s) -- so the observable is the owner change on the same `command_id`,
+  never a sub-second lease-token trace.
 - DESTR-013 has a reusable read-only final invariant audit. It requires an
-  explicit start/end window plus HA-004 PASS evidence and enumerates exact
-  CloudTrail mutation verbs, running executor environments, NodeRecovery,
-  IAM simulation and deploy YAML invariants.
+  explicit start/end window that covers every timestamp the run's
+  `cases/GF-REGIONAL-DESTR-*` evidence recorded, HA-004 PASS evidence and a CPU
+  kubeconfig, and enumerates exact CloudTrail mutation verbs, running executor
+  environments, the closed synthetic replacement route on every API replica,
+  NodeRecovery, IAM simulation and deploy YAML invariants.
 - COLLECT manual cases use two shared entry points:
   `run_collector_acceptance.py` for 001/002/003/005/009/010/011/012 and
   `run_collector_destructive.py` for 004/008/013/014/015. COLLECT-016 and

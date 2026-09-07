@@ -345,7 +345,9 @@ def test_multi_cluster_runners_are_plan_only(tmp_path: Path) -> None:
     assert iso006.PREDECESSOR_CASE_ID == "GF-REGIONAL-DESTR-013", (
         iso006.PREDECESSOR_CASE_ID
     )
-    assert e2e002.PREDECESSOR_CASE_ID == "GF-REGIONAL-ISO-006", (
+    # The order file names ISO-001 as E2E-002's explicit `predecessor:`; the
+    # runner must read that record, not the ISO-006 verdict it used to chain to.
+    assert e2e002.PREDECESSOR_CASE_ID == "GF-REGIONAL-ISO-001", (
         e2e002.PREDECESSOR_CASE_ID
     )
 
@@ -438,21 +440,52 @@ def test_collector_store_probe_scopes_fabric_manager_workflows_by_injection_time
 def test_collect012_restores_the_quarantine_before_injecting_the_second_xid(
     tmp_path: Path,
 ) -> None:
-    """XID 31 must reach BLOCKED on a node XID 13 no longer owns."""
+    """XID 31 must reach BLOCKED on a node XID 13 no longer owns.
+
+    Samples 1 and 2 write the same XID 13 line under one marker, so the kernel
+    collector must give the second write its own kmsg sequence and evidence_ref
+    (``kmsg-<boot_id>-<seq>``) and the runner must wait for two records before
+    it judges sample 2."""
 
     calls: list[str] = []
+    minimum_evidence_seen: list[int] = []
 
     class Fixture:
+        boot_id = "boot-1"
+
+        def __init__(self) -> None:
+            self.sequence = 0
+            self.records: dict[str, list[dict]] = {}
+
         def snapshot(self) -> dict:
-            return {"gpu_inventory": [{"pci_bdf": "0000:59:00.0"}]}
+            return {
+                "gpu_inventory": [{"pci_bdf": "0000:59:00.0"}],
+                "boot_id": self.boot_id,
+            }
 
         def execute(self, *arguments: str, timeout: int = 180) -> dict:
             calls.append("inject:" + arguments[arguments.index("--xid") + 1])
             return {}
 
-        def wait_marker(self, marker: str, **_kwargs: object) -> dict:
+        def wait_marker(
+            self, marker: str, *, minimum_evidence: int = 1, **_kwargs: object
+        ) -> dict:
+            # Every wait follows one more write of the marker's line; the node
+            # gives it a fresh kmsg sequence even when the text is identical.
+            minimum_evidence_seen.append(minimum_evidence)
+            self.sequence += 1
+            self.records.setdefault(marker, []).append(
+                {
+                    "record_id": f"kmsg-{self.boot_id}-{self.sequence}",
+                    "evidence_ref": (
+                        f"kmsg://hyperpod-node/{self.boot_id}/{self.sequence}"
+                    ),
+                }
+            )
+            evidence = list(self.records[marker])
+            assert len(evidence) >= minimum_evidence, (marker, evidence)
             return {
-                "evidence": [{"record_id": f"kmsg-{marker}"}],
+                "evidence": evidence,
                 "workflows": [{"status": "BLOCKED"}],
                 "incidents": [{"incident_id": f"inc-{marker}"}],
             }
@@ -466,6 +499,11 @@ def test_collect012_restores_the_quarantine_before_injecting_the_second_xid(
     assert result["verdict"] == "PASS", result
     assert calls == ["inject:13", "inject:13", "restore", "inject:31", "restore"], calls
     assert len(result["restore_workflows"]) == 2, result["restore_workflows"]
+    # Sample 2 alone waits for the second record of the shared marker.
+    assert minimum_evidence_seen == [1, 2, 1], minimum_evidence_seen
+    assert result["boot_id"] == "boot-1", result
+    assert len(result["record_ids"]) == 3, result["record_ids"]
+    assert len(result["markers"]) == 3 and result["markers"][0] == result["markers"][1]
 
 
 def test_destructive_probe_does_not_count_its_own_injected_lines_as_resets() -> None:
@@ -498,13 +536,20 @@ def _collect014_harness(
     fail_reasons=None,
     ledger_after_fail: int = 0,
     positive_raises: bool = False,
+    inventory_age=None,
 ):
-    """Stub the four collaborators run_collect014 drives and record calls."""
+    """Stub the four collaborators run_collect014 drives and record calls.
 
-    from datetime import datetime, timezone
+    ``inventory_age`` is how old the store's newest GPU inventory snapshot is
+    at the moment the runner reads it; the default (five minutes) leaves the
+    back-dated fail-closed event a comfortable three-minute freshness margin.
+    """
+
+    from datetime import datetime, timedelta, timezone
 
     calls: list[str] = []
     seen: dict[str, object] = {}
+    inventory_age = inventory_age or timedelta(minutes=5)
 
     class Settings:
         class regional:  # noqa: N801 - stub attribute holder
@@ -513,9 +558,25 @@ def _collect014_harness(
         node = "hyperpod-node"
 
     class Regional:
-        def executor_python(self, _script: str, payload: str) -> dict:
+        def cpu_python(self, script: str, *arguments: str) -> dict:
+            assert script is collect_destructive.GPU_INVENTORY_SNAPSHOT
+            assert arguments == ("hp-cluster", "hyperpod-node"), arguments
+            calls.append("inventory-read")
+            observed_at = datetime.now(timezone.utc) - inventory_age
+            return {
+                "present": True,
+                "observed_at": observed_at.isoformat(),
+                "source_boot_id": "boot-1",
+                "device_count": 1,
+            }
+
+        def executor_python(
+            self, script: str, payload: str, *, attempts: int | None = None
+        ) -> dict:
             import json
 
+            assert script is collect_destructive.FABRIC_POST
+            seen["post_attempts"] = attempts
             seen["fail_observed_at"] = datetime.fromisoformat(
                 json.loads(payload)["observed_at"]
             )
@@ -568,10 +629,15 @@ def _collect014_harness(
         def wait_marker(self, marker: str, **kwargs: object) -> dict:
             if marker.startswith("c014-fail-"):
                 calls.append("wait-fail")
+                seen["fail_kwargs"] = kwargs
                 return {
                     "workflows": [
                         {
                             "status": fail_status,
+                            # The BLOCKED workflow is the one that *decided*
+                            # the full reset; the runner selects it by that
+                            # decision, not by list position.
+                            "official_action": "RESET_ALL_GPUS_AND_NVSWITCHES",
                             "blocked_reasons": (
                                 fail_reasons
                                 if fail_reasons is not None
@@ -592,6 +658,7 @@ def _collect014_harness(
                 "workflows": [
                     {
                         "status": "SUCCEEDED",
+                        "official_steps": [{"operation": "RESET_ALL_GPUS_NVSWITCHES"}],
                         "step_executions": [
                             {
                                 "operation": "RESET_ALL_GPUS_NVSWITCHES",
@@ -634,6 +701,12 @@ def test_collect014_restores_the_node_before_the_positive_injection(
     assert (
         calls.index("wait-fail") < calls.index("restore") < calls.index("append-sxid")
     ), calls
+    # The store's inventory freshness is read before the post is made, the
+    # post is a one-shot mutation, and both waits are scoped to their moment.
+    assert calls.index("inventory-read") < calls.index("fabric-post"), calls
+    assert seen["post_attempts"] == 1, seen
+    assert seen["fail_kwargs"].get("observed_after") is not None, seen
+    assert calls[-1] == "restore" and calls[-2] == "sampler-stop", calls
     assert len(result["restore_workflows"]) == 2, result["restore_workflows"]
     assert seen["positive_kwargs"].get("observed_after") is not None, seen
     # The fail-closed event is back-dated far enough that a stored inventory
@@ -678,6 +751,31 @@ def test_collect014_never_injects_the_positive_sxid_after_a_bad_fail_closed(
     assert "sampler-start" not in calls, calls
     assert calls.count("restore") == 1, calls
     assert result["positive"] is None
+
+
+def test_collect014_refuses_the_fail_closed_post_when_inventory_is_stale(
+    tmp_path: Path,
+) -> None:
+    """The fail-closed premise is a bet that no stored inventory sample can
+    vouch for the back-dated event. On 2026-09-06 the sample lagged 2-3 min,
+    the bet lost, and the "no-op" SXID ran two real full-fabric resets. The
+    runner must read the store first and post nothing when the margin is
+    thinner than the ingest tolerance plus the safety margin."""
+
+    from datetime import timedelta
+
+    settings, regional, host, collector, calls, _ = _collect014_harness(
+        inventory_age=timedelta(minutes=7, seconds=30)
+    )
+    result = collect_destructive.run_collect014(
+        settings, regional, host, collector, tmp_path, 1, "hyperpod-v1"
+    )
+
+    assert result["verdict"] == "FAIL", result
+    assert any("not posted" in error for error in result["errors"]), result["errors"]
+    assert calls == ["inventory-read"], calls
+    assert result["fail_closed"] is None and result["positive"] is None, result
+    assert result["restore_workflows"] == [], result
 
 
 def test_collect014_stops_the_sampler_when_the_positive_path_raises(
@@ -749,6 +847,26 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
     carries the marker into the workflow; the wait must be time-scoped."""
 
     seen: dict[str, object] = {}
+    reboot_event = {
+        "event_name": "BatchRebootClusterNodes",
+        "user_identity": {"session_issuer_arn": "arn:aws:iam::1:role/executor"},
+    }
+    # The chain the node grows after the injection: the reboot's failed
+    # validation escalated into a replace-after workflow that sits newest, so
+    # picking "the latest workflow" would judge the wrong record.
+    workflows = [
+        {
+            "request_id": "wf-replace-after",
+            "status": "FAILED",
+            "official_steps": [{"operation": "REPLACE_NODE"}],
+        },
+        {
+            "request_id": "wf-reboot",
+            "status": "SUCCEEDED",
+            "official_steps": [{"operation": "RESTART_NODE"}],
+            "step_executions": [{"operation": "RESTART_NODE", "status": "SUCCEEDED"}],
+        },
+    ]
 
     class Settings:
         node = "hyperpod-node"
@@ -757,18 +875,29 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
 
     class Regional:
         def node_snapshot(self, _node: str) -> dict:
-            return {"boot_id": "boot-1"}
+            return {"boot_id": "boot-1", "unschedulable": False}
 
         def wait_node_ready(self, _node: str, **_kwargs: object) -> dict:
             return {"boot_id": "boot-2"}
 
+        def cpu_python(self, script: str, *arguments: str) -> dict:
+            assert script is collect_destructive.HYPERPOD_SUBMISSION
+            seen["submission_query"] = arguments
+            return {"submission": {"state": "SUBMITTED"}, "restart_commands": []}
+
+        def executor_python(self, script: str, *_arguments: str) -> dict:
+            assert script is collect_destructive.EXECUTOR_REPLACE_FLAG
+            return {"GPU_FAULT_ALLOW_HYPERPOD_REPLACE": "false"}
+
+        def wait_provider_events(self, _started_at: object, **kwargs: object) -> list:
+            seen["reboot_wait"] = kwargs
+            return [reboot_event]
+
         def provider_events(self, *_args: object) -> list:
-            return [
-                {
-                    "event_name": "BatchRebootClusterNodes",
-                    "user_identity": {"session_issuer_arn": Settings.executor_role_arn},
-                }
-            ]
+            return [reboot_event]
+
+        def provider_events_provisional(self, _ended_at: object) -> bool:
+            return True
 
     class Collector:
         def snapshot(self) -> dict:
@@ -779,7 +908,7 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
 
         def wait_marker(self, marker: str, **kwargs: object) -> dict:
             seen.update(kwargs)
-            return {"workflows": [{"status": "SUCCEEDED"}]}
+            return {"workflows": workflows}
 
     class Provider:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -787,6 +916,9 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
 
         def provider_inventory(self) -> dict:
             return {"nodes": ["a"]}
+
+        def cluster_recovery(self) -> dict:
+            return {"node_recovery": "None"}
 
     monkeypatch.setattr(collect_destructive, "WarmSpareLiveFixture", Provider)
     monkeypatch.setattr(
@@ -799,6 +931,16 @@ def test_collect015_matches_the_reboot_workflow_by_injection_time(
     assert result["verdict"] == "PASS", result
     assert seen.get("observed_after") is not None, seen
     assert seen.get("terminal_workflow") is True, seen
+    # The RESTART_NODE workflow is judged, not the newer replace-after one,
+    # and its own request_id is what the HyperPod submission is looked up by.
+    assert result["workflow"]["request_id"] == "wf-reboot", result["workflow"]
+    assert seen["submission_query"] == ("wf-reboot", "hp"), seen
+    assert result["submission"] == {"state": "SUBMITTED"}, result
+    assert seen["reboot_wait"] == {
+        "event_names": set(collect_destructive.REBOOT_EVENTS),
+        "expected_count": 1,
+    }, seen
+    assert result["provider_events_provisional"] is True, result
 
 
 def _daemonset(namespace: str, name: str, desired: int) -> dict:

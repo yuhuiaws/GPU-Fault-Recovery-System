@@ -5,14 +5,17 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
+import signal
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 if __package__:
     from . import run_ha005_rollout_continuity as BASE
-    from .acceptance_scope import scoped_case_evidence
+    from .acceptance_runner_common import write_json_atomic
     from .live_driver_guard import (
         add_live_arguments,
         authorize_execution,
@@ -22,7 +25,7 @@ if __package__:
     )
 else:
     import run_ha005_rollout_continuity as BASE
-    from acceptance_scope import scoped_case_evidence
+    from acceptance_runner_common import write_json_atomic
     from live_driver_guard import (
         add_live_arguments,
         authorize_execution,
@@ -42,10 +45,43 @@ DEPLOYMENTS = (
     "gpu-fault-control-worker",
     "gpu-fault-telemetry-spool-worker",
 )
+# Every wait the case can spend after the probe exists, in seconds. The
+# synthetic registration's TTL, the probe Pod's active deadline and the
+# detached refresh watchdog are all derived from these rather than guessed: a
+# 45-minute registration under a worst path of ~60 minutes expired mid-case.
+PHASE_BUDGETS = {
+    "managed_rotation": 600,
+    "first_refresh_job": 700,
+    "consumer_rollout": 900,
+    "outbox_convergence": 300,
+    "runtime_records": 180,
+    "processor_receipts": 180,
+    "second_refresh_job": 700,
+}
+BUDGET_MARGIN_SECONDS = 600
+# If the runner dies after rotate-secret and before the refresh Job ran, every
+# new Pod fails Aurora auth until someone refreshes the Secret. The watchdog
+# creates the Job itself once the runner's own rotation-plus-refresh budget has
+# passed unless the runner disarmed it first.
+REFRESH_WATCHDOG_SECONDS = (
+    PHASE_BUDGETS["managed_rotation"]
+    + PHASE_BUDGETS["first_refresh_job"]
+    + BUDGET_MARGIN_SECONDS
+)
+BASELINE_EVENT_SAMPLES = 4
+BASELINE_CLAIM_SAMPLES = 8
 
 
 class CaseError(RuntimeError):
     pass
+
+
+def total_budget_seconds(
+    budgets: dict[str, int] = PHASE_BUDGETS,
+    *,
+    margin_seconds: int = BUDGET_MARGIN_SECONDS,
+) -> int:
+    return sum(int(value) for value in budgets.values()) + int(margin_seconds)
 
 
 def configure(arguments: argparse.Namespace) -> None:
@@ -86,13 +122,6 @@ def environment_values() -> dict[str, str]:
 def log(message: str) -> None:
     stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{stamp}] {message}", flush=True)
-
-
-def write_json(path: Path, value: object) -> None:
-    path.write_text(
-        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
-    )
-    path.chmod(0o600)
 
 
 def write_text(path: Path, value: str) -> None:
@@ -185,11 +214,15 @@ def deployment_snapshot() -> dict:
                 "json",
             )
         )
+        status = item.get("status", {})
         result[name] = {
+            "name": name,
             "generation": item["metadata"].get("generation"),
-            "observed_generation": item.get("status", {}).get("observedGeneration"),
+            "observed_generation": status.get("observedGeneration"),
             "replicas": item["spec"].get("replicas", 0),
-            "ready": item.get("status", {}).get("readyReplicas", 0),
+            "ready": status.get("readyReplicas", 0),
+            "updated": status.get("updatedReplicas", 0),
+            "available": status.get("availableReplicas", 0),
             "refresh_annotation": item["spec"]["template"]
             .get("metadata", {})
             .get("annotations", {})
@@ -215,6 +248,101 @@ def deployment_snapshot() -> dict:
     return result
 
 
+def role_status(deployments: dict) -> dict[str, str]:
+    """``ROLLED`` for an enabled role, ``SKIPPED_NOT_ENABLED`` for replicas=0.
+
+    The catalog wants an unconfigured role recorded as skipped, not silently
+    passed or failed; the spool-worker ships with replicas=0 on sites without
+    telemetry spooling.
+    """
+
+    return {
+        name: (
+            "SKIPPED_NOT_ENABLED"
+            if int(deployments[name].get("replicas") or 0) == 0
+            else "ROLLED"
+        )
+        for name in DEPLOYMENTS
+    }
+
+
+def enabled_roles(deployments: dict) -> list[str]:
+    return [
+        name for name, status in role_status(deployments).items() if status == "ROLLED"
+    ]
+
+
+def refresh_job_command(name: str) -> list[str]:
+    return [
+        "kubectl",
+        "--kubeconfig",
+        str(BASE._registry.CONTROL_KUBECONFIG),
+        "-n",
+        str(BASE._registry.CONTROL_NAMESPACE),
+        "create",
+        "job",
+        name,
+        f"--from=cronjob/{CRONJOB}",
+    ]
+
+
+def start_refresh_watchdog(
+    case_dir: Path,
+    job_name: str,
+    *,
+    delay_seconds: int = REFRESH_WATCHDOG_SECONDS,
+) -> subprocess.Popen[str]:
+    """Arm a detached fallback that creates the refresh Job after ``delay_seconds``.
+
+    ``start_new_session`` puts it in its own process group so the runner's
+    death (SIGKILL, lost SSH) does not take it along; ``stop_refresh_watchdog``
+    disarms it by killing that group once the runner has run the Job itself.
+    """
+
+    log_path = case_dir / "refresh-watchdog.log"
+    handle = log_path.open("w", encoding="utf-8")
+    os.chmod(log_path, 0o600)
+    script = f"sleep {int(delay_seconds)}; exec " + shlex.join(
+        refresh_job_command(job_name)
+    )
+    process = subprocess.Popen(
+        ["/bin/bash", "-c", script],
+        stdout=handle,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    handle.close()
+    write_json_atomic(
+        case_dir / "refresh-watchdog.json",
+        {"pid": process.pid, "job": job_name, "delay_seconds": int(delay_seconds)},
+    )
+    return process
+
+
+def stop_refresh_watchdog(process: subprocess.Popen[str] | None) -> dict[str, Any]:
+    """Kill the watchdog's process group; never raise from cleanup."""
+
+    if process is None:
+        return {"armed": False}
+    if process.poll() is not None:
+        return {"armed": True, "fired": True, "returncode": process.returncode}
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+    except Exception as exc:  # pragma: no cover - platform dependent
+        return {
+            "armed": True,
+            "fired": False,
+            "stop_error": f"{type(exc).__name__}: {exc}",
+        }
+    return {"armed": True, "fired": False, "disarmed": True}
+
+
 def run_refresh_job(case_dir: Path, name: str) -> dict:
     BASE.control("delete", "job", name, "--ignore-not-found", check=False)
     BASE.control("create", "job", name, f"--from=cronjob/{CRONJOB}")
@@ -222,9 +350,9 @@ def run_refresh_job(case_dir: Path, name: str) -> dict:
         "wait",
         "--for=condition=complete",
         f"job/{name}",
-        "--timeout=600s",
+        f"--timeout={PHASE_BUDGETS['first_refresh_job'] - 100}s",
         check=False,
-        timeout=700,
+        timeout=PHASE_BUDGETS["first_refresh_job"],
     )
     job = json.loads(BASE.control("get", "job", name, "-o", "json"))
     succeeded = int(job.get("status", {}).get("succeeded", 0)) == 1
@@ -256,7 +384,7 @@ def managed_rotation_complete(
 
 
 def wait_rotated_secret(old_current: str, secret_arn: str) -> dict:
-    deadline = time.monotonic() + 600
+    deadline = time.monotonic() + PHASE_BUDGETS["managed_rotation"]
     last = {}
     while time.monotonic() < deadline:
         last = secret_versions(secret_arn)
@@ -405,8 +533,8 @@ print(json.dumps({
     )
 
 
-def wait_runtime_records(seed: dict, timeout_seconds: int = 180) -> dict:
-    deadline = time.monotonic() + timeout_seconds
+def wait_runtime_records(seed: dict, timeout_seconds: int | None = None) -> dict:
+    deadline = time.monotonic() + (timeout_seconds or PHASE_BUDGETS["runtime_records"])
     last = {}
     while time.monotonic() < deadline:
         last = runtime_snapshot(seed)
@@ -505,29 +633,31 @@ print(json.dumps({
     return result
 
 
-def wait_deployments(before: dict, timeout_seconds: int = 900) -> dict:
-    deadline = time.monotonic() + timeout_seconds
+def deployments_rolled(before: dict, current: dict) -> bool:
+    """Every enabled role rolled to a new generation with all old Pods replaced.
+
+    Uses HA-005's ``rollout_complete`` -- Ready, updated and available all equal
+    to replicas, generation observed, old UIDs gone -- rather than a bare
+    ``ready == replicas``, which is true half-way through a rollout while the
+    old Pods still hold the old credentials. A replicas=0 role is skipped.
+    """
+
+    for name in enabled_roles(before):
+        item = current[name]
+        if int(item["generation"]) <= int(before[name]["generation"]):
+            return False
+        old_uids = {value["uid"] for _pod, value in before[name]["pods"]}
+        if not BASE.rollout_complete(item, old_uids):
+            return False
+    return True
+
+
+def wait_deployments(before: dict, timeout_seconds: int | None = None) -> dict:
+    deadline = time.monotonic() + (timeout_seconds or PHASE_BUDGETS["consumer_rollout"])
     last = {}
     while time.monotonic() < deadline:
         last = deployment_snapshot()
-        complete = True
-        for name in DEPLOYMENTS:
-            current = last[name]
-            previous = before[name]
-            if int(current["generation"]) <= int(previous["generation"]):
-                complete = False
-            if current["observed_generation"] != current["generation"]:
-                complete = False
-            if int(current["ready"]) != int(current["replicas"]):
-                complete = False
-            # A rollout is not finished while a superseded Pod is still
-            # draining: control-worker keeps a Terminating Pod (and its
-            # Ready condition) for up to terminationGracePeriodSeconds, and
-            # _rotation_result must see the Pod set with every old uid gone.
-            before_uids = {value["uid"] for _pod, value in previous["pods"]}
-            if any(value["uid"] in before_uids for _pod, value in current["pods"]):
-                complete = False
-        if complete:
+        if deployments_rolled(before, last):
             return last
         time.sleep(3)
     raise CaseError(f"database consumers did not finish rollout: {last}")
@@ -540,7 +670,7 @@ def create_probe(image: str, identity: dict[str, object], run_id: str) -> None:
     )
     BASE.dataplane("delete", "pod", BASE.POD, "--ignore-not-found", check=False)
     manifest = BASE.pod_manifest(image, identity, run_id)
-    manifest["spec"]["activeDeadlineSeconds"] = 1800
+    manifest["spec"]["activeDeadlineSeconds"] = total_budget_seconds()
     BASE.dataplane(
         "apply",
         "-f",
@@ -566,9 +696,9 @@ def _run_rotation_case(
     database_preflight = BASE.database_residuals()
     registry_preflight = BASE.registry_residuals()
     kubernetes_preflight = BASE.kubernetes_residuals()
-    write_json(case_dir / "database-preflight.json", database_preflight)
-    write_json(case_dir / "registry-preflight.json", registry_preflight)
-    write_json(case_dir / "kubernetes-preflight.json", kubernetes_preflight)
+    write_json_atomic(case_dir / "database-preflight.json", database_preflight)
+    write_json_atomic(case_dir / "registry-preflight.json", registry_preflight)
+    write_json_atomic(case_dir / "kubernetes-preflight.json", kubernetes_preflight)
     if database_preflight["total"] != 0:
         raise CaseError(f"database preflight residuals: {database_preflight}")
     if registry_preflight["count"] != 0:
@@ -582,21 +712,14 @@ def _run_rotation_case(
     if not current_before:
         raise CaseError("managed secret has no AWSCURRENT version")
     digest_before = kubernetes_secret_digest()
-    deployments_before = deployment_snapshot()
-    write_json(case_dir / "secret-versions-before.json", versions_before)
-    write_json(
-        case_dir / "baseline.json",
-        {
-            "kubernetes_secret_digest": digest_before,
-            "deployments": deployments_before,
-        },
-    )
+    write_json_atomic(case_dir / "secret-versions-before.json", versions_before)
 
     BASE.register(
         1,
         case_dir,
         run_id=run_id,
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=45),
+        expires_at=datetime.now(timezone.utc)
+        + timedelta(seconds=total_budget_seconds()),
         allow_live_registry=True,
         live_registry_confirmation="ALLOW_PERF_CAPACITY_LIVE_REGISTRY",
     )
@@ -607,21 +730,36 @@ def _run_rotation_case(
     image = deployment["spec"]["template"]["spec"]["containers"][0]["image"]
     create_probe(image, identity, run_id)
     state["probe_created"] = True
-    time.sleep(20)
-    probe_baseline = BASE.read_probe()
-    write_json(case_dir / "probe-baseline.json", probe_baseline)
+    probe_baseline = BASE.wait_probe_samples(
+        minimum_events=BASELINE_EVENT_SAMPLES,
+        minimum_claims=BASELINE_CLAIM_SAMPLES,
+    )
+    write_json_atomic(case_dir / "probe-baseline.json", probe_baseline)
+    # One snapshot, taken right before the rotation, is the baseline every
+    # later comparison uses.
     deployments_before = deployment_snapshot()
-    write_json(case_dir / "deployments-before-rotation.json", deployments_before)
+    roles = role_status(deployments_before)
+    write_json_atomic(
+        case_dir / "baseline.json",
+        {
+            "kubernetes_secret_digest": digest_before,
+            "deployments": deployments_before,
+            "roles": roles,
+        },
+    )
     seed = seed_runtime_records(run_id)
     state["seed"] = seed
-    write_json(case_dir / "runtime-seed.json", seed)
+    write_json_atomic(case_dir / "runtime-seed.json", seed)
 
+    watchdog_job = f"gpu-fault-ha009-refresh-{attempt}-watchdog"
+    state["jobs"].append(watchdog_job)
+    state["watchdog"] = start_refresh_watchdog(case_dir, watchdog_job)
     log("triggering RDS-managed master secret rotation")
     rotation_response = aws(
         "secretsmanager", "rotate-secret", "--secret-id", secret_arn
     )
     state["rotation_started"] = True
-    write_json(
+    write_json_atomic(
         case_dir / "rotation-request.json",
         {
             "arn": rotation_response.get("ARN"),
@@ -630,16 +768,18 @@ def _run_rotation_case(
         },
     )
     versions_after = wait_rotated_secret(current_before, secret_arn)
-    write_json(case_dir / "secret-versions-after.json", versions_after)
+    write_json_atomic(case_dir / "secret-versions-after.json", versions_after)
 
     job_one = f"gpu-fault-ha009-refresh-{attempt}-1"
     state["jobs"].append(job_one)
     log(f"running credential refresh Job {job_one}")
     first_job = run_refresh_job(case_dir, job_one)
     state["refresh_succeeded"] = True
+    state["watchdog_result"] = stop_refresh_watchdog(state["watchdog"])
+    state["watchdog"] = None
     deployments_after = wait_deployments(deployments_before)
     digest_after = kubernetes_secret_digest()
-    write_json(
+    write_json_atomic(
         case_dir / "first-refresh.json",
         {
             "job": first_job,
@@ -649,7 +789,7 @@ def _run_rotation_case(
     )
 
     attempts_at_recovery = int(BASE.read_probe()["counters"].get("event_attempts", 0))
-    deadline = time.monotonic() + 300
+    deadline = time.monotonic() + PHASE_BUDGETS["outbox_convergence"]
     while time.monotonic() < deadline:
         probe = BASE.read_probe()
         if (
@@ -662,12 +802,14 @@ def _run_rotation_case(
     else:
         raise CaseError("probe outbox did not converge after credential refresh")
     final_probe = BASE.read_probe()
-    write_json(case_dir / "probe-final.json", final_probe)
+    write_json_atomic(case_dir / "probe-final.json", final_probe)
     runtime = wait_runtime_records(seed)
-    write_json(case_dir / "runtime-final.json", runtime)
+    write_json_atomic(case_dir / "runtime-final.json", runtime)
     accepted_ids = sorted(set(final_probe.get("accepted_request_ids", [])))
-    receipts = BASE.wait_receipts(accepted_ids)
-    write_json(case_dir / "processor-receipts.json", receipts)
+    receipts = BASE.wait_receipts(
+        accepted_ids, timeout_seconds=PHASE_BUDGETS["processor_receipts"]
+    )
+    write_json_atomic(case_dir / "processor-receipts.json", receipts)
 
     before_noop = deployment_snapshot()
     digest_before_noop = kubernetes_secret_digest()
@@ -677,7 +819,7 @@ def _run_rotation_case(
     second_job = run_refresh_job(case_dir, job_two)
     after_noop = deployment_snapshot()
     digest_after_noop = kubernetes_secret_digest()
-    write_json(
+    write_json_atomic(
         case_dir / "second-refresh.json",
         {
             "job": second_job,
@@ -687,7 +829,7 @@ def _run_rotation_case(
             "deployments_after": after_noop,
         },
     )
-    return _rotation_result(
+    result = _rotation_result(
         attempt,
         versions_before,
         versions_after,
@@ -706,6 +848,74 @@ def _run_rotation_case(
         before_noop,
         after_noop,
     )
+    result["refresh_watchdog"] = state.get("watchdog_result")
+    return result
+
+
+def rotation_errors(
+    *,
+    versions_after: dict,
+    current_before: str,
+    digest_before: str,
+    digest_after: str,
+    first_job: dict,
+    second_job: dict,
+    deployments_before: dict,
+    deployments_after: dict,
+    final_probe: dict,
+    receipts: dict,
+    runtime: dict,
+    digest_before_noop: str,
+    digest_after_noop: str,
+    before_noop: dict,
+    after_noop: dict,
+) -> list[str]:
+    errors = []
+    if versions_after["stages"].get("AWSCURRENT") == current_before:
+        errors.append("AWSCURRENT did not change")
+    if versions_after["stages"].get("AWSPREVIOUS") != current_before:
+        errors.append("old AWSCURRENT did not become AWSPREVIOUS")
+    if digest_after == digest_before:
+        errors.append("Kubernetes Aurora Secret digest did not change")
+    if "rotated=True restarted=True" not in "\n".join(first_job["logs"]):
+        errors.append("first refresh Job did not report rotation and restart")
+    roles = role_status(deployments_before)
+    for name in DEPLOYMENTS:
+        if roles[name] != "ROLLED":
+            continue
+        if int(deployments_after[name]["generation"]) <= int(
+            deployments_before[name]["generation"]
+        ):
+            errors.append(f"{name} generation did not advance")
+        old_uids = {value["uid"] for _pod, value in deployments_before[name]["pods"]}
+        if not BASE.rollout_complete(deployments_after[name], old_uids):
+            errors.append(
+                f"{name} did not complete its rollout (ready/updated/available/uids)"
+            )
+        if any(value["restarts"] for _pod, value in deployments_after[name]["pods"]):
+            errors.append(f"{name} replacement Pod restarted")
+    accepted_ids = sorted(set(final_probe.get("accepted_request_ids", [])))
+    errors.extend(
+        BASE.continuity_errors(final_probe, receipts, accepted_ids=accepted_ids)
+    )
+    if runtime["command"].get("status") != "SUCCEEDED":
+        errors.append("synthetic remote command did not succeed")
+    notification = runtime["notification"]
+    for kind in ("notification", "notification_delivery", "notification_result"):
+        if notification.get(kind, {}).get("count") != 1:
+            errors.append(f"{kind} count is not one")
+    if notification.get("notification_result", {}).get("status") != "SKIPPED":
+        errors.append("drill notification was not safely suppressed")
+    if "rotated=False restarted=False" not in "\n".join(second_job["logs"]):
+        errors.append("second refresh Job was not a NOOP")
+    if digest_after_noop != digest_before_noop:
+        errors.append("NOOP refresh changed the Kubernetes Secret")
+    for name in DEPLOYMENTS:
+        if after_noop[name]["generation"] != before_noop[name]["generation"]:
+            errors.append(f"NOOP refresh changed {name} generation")
+        if after_noop[name]["pods"] != before_noop[name]["pods"]:
+            errors.append(f"NOOP refresh rolled {name} Pods")
+    return errors
 
 
 def _rotation_result(
@@ -727,68 +937,36 @@ def _rotation_result(
     before_noop: dict,
     after_noop: dict,
 ) -> dict:
-    errors = []
-    if versions_after["stages"].get("AWSCURRENT") == current_before:
-        errors.append("AWSCURRENT did not change")
-    if versions_after["stages"].get("AWSPREVIOUS") != current_before:
-        errors.append("old AWSCURRENT did not become AWSPREVIOUS")
-    if digest_after == digest_before:
-        errors.append("Kubernetes Aurora Secret digest did not change")
-    if "rotated=True restarted=True" not in "\n".join(first_job["logs"]):
-        errors.append("first refresh Job did not report rotation and restart")
-    for name in DEPLOYMENTS:
-        if int(deployments_after[name]["generation"]) <= int(
-            deployments_before[name]["generation"]
-        ):
-            errors.append(f"{name} generation did not advance")
-        if deployments_after[name]["ready"] != deployments_after[name]["replicas"]:
-            errors.append(f"{name} did not return to declared Ready replicas")
-    for name in ("gpu-fault-api-ha", "gpu-fault-control-worker"):
-        before_uids = {value["uid"] for _pod, value in deployments_before[name]["pods"]}
-        after_uids = {value["uid"] for _pod, value in deployments_after[name]["pods"]}
-        if not before_uids.isdisjoint(after_uids):
-            errors.append(f"{name} did not replace every old Pod")
-        if any(value["restarts"] for _pod, value in deployments_after[name]["pods"]):
-            errors.append(f"{name} replacement Pod restarted")
-    counters = final_probe.get("counters", {})
-    if int(counters.get("event_attempts", 0)) - int(
-        counters.get("event_accepted", 0)
-    ) != int(counters.get("event_failures", 0)):
-        errors.append("event attempt accounting is inconsistent")
-    if final_probe.get("outbox") != {"records": 0, "replayable": 0}:
-        errors.append("probe outbox is not empty")
-    if any(
-        key in {"http-401", "http-403", "http-500"} and int(value) > 0
-        for key, value in final_probe.get("error_types", {}).items()
-    ):
-        errors.append("probe observed 401, 403 or 500")
-    if receipts.get("missing") or any(
-        item["status"] != "COMPLETED" or item["response_status"] != 200
-        for item in receipts.get("requests", [])
-    ):
-        errors.append("processor requests did not complete exactly once")
-    if runtime["command"].get("status") != "SUCCEEDED":
-        errors.append("synthetic remote command did not succeed")
-    notification = runtime["notification"]
-    for kind in ("notification", "notification_delivery", "notification_result"):
-        if notification.get(kind, {}).get("count") != 1:
-            errors.append(f"{kind} count is not one")
-    if notification.get("notification_result", {}).get("status") != "SKIPPED":
-        errors.append("drill notification was not safely suppressed")
-    if "rotated=False restarted=False" not in "\n".join(second_job["logs"]):
-        errors.append("second refresh Job was not a NOOP")
-    if digest_after_noop != digest_before_noop:
-        errors.append("NOOP refresh changed the Kubernetes Secret")
-    for name in DEPLOYMENTS:
-        if after_noop[name]["generation"] != before_noop[name]["generation"]:
-            errors.append(f"NOOP refresh changed {name} generation")
-        if after_noop[name]["pods"] != before_noop[name]["pods"]:
-            errors.append(f"NOOP refresh rolled {name} Pods")
+    errors = rotation_errors(
+        versions_after=versions_after,
+        current_before=current_before,
+        digest_before=digest_before,
+        digest_after=digest_after,
+        first_job=first_job,
+        second_job=second_job,
+        deployments_before=deployments_before,
+        deployments_after=deployments_after,
+        final_probe=final_probe,
+        receipts=receipts,
+        runtime=runtime,
+        digest_before_noop=digest_before_noop,
+        digest_after_noop=digest_after_noop,
+        before_noop=before_noop,
+        after_noop=after_noop,
+    )
+    exercised = BASE.outbox_exercised(final_probe)
+    limitations = list(BASE.KNOWN_LIMITATIONS)
+    if not exercised:
+        limitations.append(BASE.OUTBOX_NOT_EXERCISED_LIMITATION)
     return {
         "case_id": CASE_ID,
         "attempt": attempt,
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
+        "roles": role_status(deployments_before),
+        "phase_budgets_seconds": PHASE_BUDGETS,
+        "total_budget_seconds": total_budget_seconds(),
+        "refresh_watchdog_seconds": REFRESH_WATCHDOG_SECONDS,
         "secret_versions_before": versions_before,
         "secret_versions_after": versions_after,
         "kubernetes_secret_digest_before": digest_before,
@@ -800,6 +978,8 @@ def _rotation_result(
         "probe_final": final_probe,
         "processor_receipts": receipts,
         "runtime_records": runtime,
+        "outbox_exercised": exercised,
+        "validation_limitations": limitations,
     }
 
 
@@ -819,6 +999,19 @@ def _cleanup_rotation(
         except Exception as exc:
             result["emergency_refresh_error"] = f"{type(exc).__name__}: {exc}"
             result["verdict"] = "FAIL"
+    if state.get("watchdog") is not None:
+        # Only after the refresh succeeded (above or in the case body) may the
+        # fallback be disarmed; if the emergency Job failed too, the watchdog
+        # stays armed as the last line of defence and its Job is kept.
+        if state["refresh_succeeded"]:
+            result["refresh_watchdog"] = stop_refresh_watchdog(state["watchdog"])
+            state["watchdog"] = None
+        else:
+            result["refresh_watchdog"] = {
+                "armed": True,
+                "left_armed": True,
+                "reason": "credential refresh never succeeded",
+            }
     if state["probe_created"]:
         final_log = BASE.dataplane("logs", BASE.POD, check=False, timeout=120)
         write_text(case_dir / "probe.log", final_log)
@@ -831,7 +1024,7 @@ def _cleanup_rotation(
         try:
             cleanup = cleanup_runtime_records(state["seed"])
             result["runtime_cleanup"] = cleanup
-            write_json(case_dir / "runtime-cleanup.json", cleanup)
+            write_json_atomic(case_dir / "runtime-cleanup.json", cleanup)
         except Exception as exc:
             result["runtime_cleanup_error"] = f"{type(exc).__name__}: {exc}"
             result["verdict"] = "FAIL"
@@ -848,6 +1041,8 @@ def _cleanup_rotation(
         result["registry_cleanup_error"] = f"{type(exc).__name__}: {exc}"
         result["verdict"] = "FAIL"
     for job in state["jobs"]:
+        if state.get("watchdog") is not None and job.endswith("-watchdog"):
+            continue
         BASE.control("delete", "job", job, "--ignore-not-found", check=False)
     try:
         postflight = {
@@ -857,7 +1052,7 @@ def _cleanup_rotation(
             "deployments": deployment_snapshot(),
         }
         result["postflight"] = postflight
-        write_json(case_dir / "postflight.json", postflight)
+        write_json_atomic(case_dir / "postflight.json", postflight)
         if postflight["database"]["total"] != 0:
             raise CaseError(f"database residuals: {postflight}")
         if postflight["registry"]["count"] != 0:
@@ -884,12 +1079,13 @@ def run_case(
     case_dir.mkdir(parents=True, exist_ok=True)
     run_id = f"ha009-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     result: dict = {"case_id": CASE_ID, "attempt": attempt, "verdict": "FAIL"}
-    state = {
+    state: dict = {
         "seed": {},
         "probe_created": False,
         "rotation_started": False,
         "refresh_succeeded": False,
         "jobs": [],
+        "watchdog": None,
     }
     try:
         result = _run_rotation_case(case_dir, run_id, attempt, state)
@@ -897,7 +1093,7 @@ def run_case(
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         _cleanup_rotation(case_dir, run_id, attempt, state, result)
-    write_json(case_dir / f"{CASE_ID}.json", result)
+    write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
 
@@ -939,9 +1135,13 @@ def main() -> int:
                 "refresh_cronjob": CRONJOB,
                 "aurora_secret_name": SECRET_NAME,
                 "probe": "continuous claim, telemetry, command and notification",
+                "phase_budgets_seconds": PHASE_BUDGETS,
+                "total_budget_seconds": total_budget_seconds(),
                 "rollback": [
                     "candidate DSN is verified before Kubernetes Secret patch",
                     "emergency refresh Job rolls forward to AWSCURRENT",
+                    "detached refresh watchdog creates the Job after "
+                    f"{REFRESH_WATCHDOG_SECONDS}s if the runner dies",
                     "synthetic registry/database/Kubernetes teardown",
                 ],
             },

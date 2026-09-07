@@ -51,7 +51,12 @@ from scripts.e2e.regional.site_profile import (  # noqa: E402
 
 DEPLOYMENT = "gpu-fault-cluster-executor"
 CONTAINER = "executor"
+# DESTR-014 lowers the two verify/recovery bounds; HA-004 lowers the executor's
+# lease and poll so a WAITING command is re-claimed inside its window. All four
+# are positive second/attempt counts, so the same validation applies.
 ALLOWED_VARIABLES = (
+    "GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS",
+    "GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS",
     "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS",
     "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS",
 )

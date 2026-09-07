@@ -6,12 +6,18 @@ import time
 from typing import Any
 
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
+from scripts.e2e.regional.identity_acceptance_auth import verdict
 from scripts.e2e.regional.identity_acceptance_common import (
     FORBIDDEN_NAMESPACE,
     ClusterTarget,
     IdentityAcceptanceError,
+    IdentityCaseFailure,
     IdentitySite,
+    run_cleanup_steps,
 )
+
+TERMINAL_COMMAND_STATUSES = {"FAILED", "SUCCEEDED", "CANCELLED"}
+COMMAND_SETTLE_TIMEOUT_SECONDS = 180
 
 
 FLEET_CROSS_CLUSTER_PROBE = r"""
@@ -100,11 +106,21 @@ def run_iso003(
         "revoke_agent_rejected": result["revoke_agent"]["rejected"]
         and "cannot transition an agent in another cluster"
         in result["revoke_agent"]["error"],
-        "secondary_agent_state_unchanged": before == after,
     }
     return {
-        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "verdict": verdict(checks),
         "checks": checks,
+        # RegionalFleetRegistry raises locally, before any HTTP request, so the
+        # secondary's agents cannot have changed because of this probe; the
+        # before/after comparison proved nothing about the boundary and is
+        # recorded as data, not as a check.
+        "not_evaluated": {
+            "secondary_agent_state_unchanged": (
+                "n/a: the proxy rejects both calls locally before any request "
+                "reaches the control plane, so the comparison is vacuous"
+            )
+        },
+        "secondary_agents_before_after_equal": before == after,
         "results": result,
         "limitations": [
             "The probe invokes the deployed executor client but performs no "
@@ -121,35 +137,40 @@ import sys
 import urllib.error
 import urllib.request
 
-requested = sys.argv[1]
-payload = json.dumps({
-    "cluster_id": requested,
-    "node_aliases": ["iso-004-nonexistent-node"],
-}).encode()
-request = urllib.request.Request(
-    os.environ["GPU_FAULT_CONTROL_PLANE_URL"].rstrip("/")
-    + "/v1/regional/executors/spares/health",
-    data=payload,
-    method="POST",
-    headers={
-        "Authorization": "Bearer " + os.environ["GPU_FAULT_CONTROL_PLANE_TOKEN"],
-        "Content-Type": "application/json",
-        "X-GPU-Fault-Cluster-ID": os.environ["GPU_FAULT_CLUSTER_ID"],
-    },
-)
+# One process answers for every requested cluster_id: the two queries used to
+# cost two kubectl execs (two python start-ups, two TLS handshakes).
 context = ssl.create_default_context(
     cafile=os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
 )
-try:
-    with urllib.request.urlopen(request, context=context, timeout=20) as response:
-        body = json.load(response)
-        print(json.dumps({"status": response.status, "body": body}, sort_keys=True))
-except urllib.error.HTTPError as exc:
-    print(json.dumps({
-        "status": exc.code,
-        "body": json.loads(exc.read() or b"{}"),
-    }, sort_keys=True))
+results = {}
+for requested in sys.argv[1:]:
+    payload = json.dumps({
+        "cluster_id": requested,
+        "node_aliases": ["iso-004-nonexistent-node"],
+    }).encode()
+    request = urllib.request.Request(
+        os.environ["GPU_FAULT_CONTROL_PLANE_URL"].rstrip("/")
+        + "/v1/regional/executors/spares/health",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + os.environ["GPU_FAULT_CONTROL_PLANE_TOKEN"],
+            "Content-Type": "application/json",
+            "X-GPU-Fault-Cluster-ID": os.environ["GPU_FAULT_CLUSTER_ID"],
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=20) as response:
+            results[requested] = {"status": response.status, "body": json.load(response)}
+    except urllib.error.HTTPError as exc:
+        results[requested] = {
+            "status": exc.code,
+            "body": json.loads(exc.read() or b"{}"),
+        }
+print(json.dumps({"results": results}, sort_keys=True))
 """
+
+MISSING_AGENT_REASON = "expected one matching agent, found 0"
 
 
 def run_iso004(
@@ -158,21 +179,19 @@ def run_iso004(
     secondary: ClusterTarget,
 ) -> dict[str, Any]:
     pod = site.any_executor_pod(primary)
-    cross = site.pod_json(
+    results = site.pod_json(
         "gpu",
         primary,
         pod,
         SPARE_HEALTH_PROBE,
         secondary.cluster_id,
-    )
-    local = site.pod_json(
-        "gpu",
-        primary,
-        pod,
-        SPARE_HEALTH_PROBE,
         primary.cluster_id,
-    )
+    )["results"]
+    cross = results[secondary.cluster_id]
+    local = results[primary.cluster_id]
     detail = str((cross.get("body") or {}).get("detail") or "")
+    local_body = local.get("body") or {}
+    reasons = [str(item) for item in local_body.get("reasons") or []]
     checks = {
         "cross_cluster_rejected_403": cross["status"] == 403,
         "binding_error_is_precise": (
@@ -180,10 +199,15 @@ def run_iso004(
             in detail
         ),
         "local_query_accepted": local["status"] == 200,
-        "missing_node_is_not_ready": (local.get("body") or {}).get("ready") is False,
+        "missing_node_is_not_ready": local_body.get("ready") is False,
+        # The not-ready answer must be *because the node does not exist*, not
+        # because the spare pool is unhealthy for some unrelated reason.
+        "missing_node_reason_is_precise": any(
+            MISSING_AGENT_REASON in reason for reason in reasons
+        ),
     }
     return {
-        "verdict": "PASS" if all(checks.values()) else "FAIL",
+        "verdict": verdict(checks),
         "checks": checks,
         "cross_cluster": cross,
         "local": local,
@@ -287,16 +311,66 @@ commands = [
 print(json.dumps({"commands": commands}, sort_keys=True, default=str))
 """
 
-REMOTE_COMMAND_DELETE_PROBE = r"""
+# Settle, cancel, then delete. The probe commands belong to a workflow that
+# was never saved, so nothing else will ever retire them; but a LEASED command
+# is in the executor's hands and deleting the row under it makes its result
+# POST a 404 and leaves a ledger entry for a command that no longer exists.
+# Each command is therefore given a bounded wait for its terminal state, a
+# public ``cancel_remote_command`` if it is still open and unleased, and only
+# then the row removal (there is no public delete; ``_delete`` is the shared
+# store primitive, and it is the last step, never the first).
+REMOTE_COMMAND_RETIRE_PROBE = r"""
 import json
 import sys
+import time
 from gpu_fault.app import ApplicationContext
+settle_seconds = float(sys.argv[1])
+command_ids = sys.argv[2:]
 store = ApplicationContext.from_environment().store
+terminal = {"FAILED", "SUCCEEDED", "CANCELLED"}
+deadline = time.monotonic() + settle_seconds
+final = {}
+while True:
+    final = {}
+    for command_id in command_ids:
+        try:
+            item = store.get_remote_command(command_id)
+        except Exception as exc:  # absent already
+            final[command_id] = {"status": None, "error": type(exc).__name__}
+            continue
+        final[command_id] = {
+            "status": item.status.value,
+            "status_source": item.status_source,
+            "lease_owner_present": item.lease_owner is not None,
+        }
+    if all(
+        value["status"] is None or value["status"] in terminal
+        for value in final.values()
+    ) or time.monotonic() >= deadline:
+        break
+    time.sleep(2)
+cancelled = {}
+for command_id, value in final.items():
+    if value["status"] in {"PENDING", "WAITING"}:
+        cancelled[command_id] = store.cancel_remote_command(
+            command_id, reason="GF-REGIONAL-ISO-005 cleanup"
+        )
 deleted = []
-for command_id in sys.argv[1:]:
+skipped = []
+for command_id, value in final.items():
+    if value["status"] == "LEASED":
+        # Still in an executor's hands after the settle window: leave the row
+        # for the lease to expire rather than delete it under the executor.
+        skipped.append(command_id)
+        continue
     store._delete("remote_command", command_id)
     deleted.append(command_id)
-print(json.dumps({"deleted": deleted}))
+print(json.dumps({
+    "final": final,
+    "cancelled": cancelled,
+    "deleted": deleted,
+    "skipped_leased": skipped,
+}, sort_keys=True, default=str))
 """
 
 
@@ -343,11 +417,16 @@ def run_iso005(
     case_dir: Path,
 ) -> dict[str, Any]:
     original_registry = site.registry()
-    registration = next(
+    matching = [
         item
         for item in original_registry
         if item.get("cluster_id") == target.cluster_id
-    )
+    ]
+    if len(matching) != 1:
+        raise IdentityAcceptanceError(
+            f"registry has {len(matching)} registrations for {target.cluster_id}"
+        )
+    registration = matching[0]
     original_allowlist = list(registration.get("allowed_namespaces") or [])
     if FORBIDDEN_NAMESPACE in original_allowlist:
         raise IdentityAcceptanceError(
@@ -382,10 +461,11 @@ def run_iso005(
     }
     regional = site.regional(target)
     command_ids: list[str] = []
-    result: dict[str, Any] = {"verdict": "FAIL"}
+    result: dict[str, Any] = {"verdict": "FAIL", "checks": {}}
+    failure: Exception | None = None
     try:
         site.gpu(target, "create", "namespace", FORBIDDEN_NAMESPACE)
-        site.regional(target).kubectl(
+        regional.kubectl(
             "gpu",
             "apply",
             "-f",
@@ -393,7 +473,7 @@ def run_iso005(
             input_text=json.dumps(manifest),
             namespace=FORBIDDEN_NAMESPACE,
         )
-        site.regional(target).kubectl(
+        regional.kubectl(
             "gpu",
             "rollout",
             "status",
@@ -403,11 +483,14 @@ def run_iso005(
         )
         baseline = workload_snapshot(site, target)
         suffix = f"iso005-control-{int(time.time())}"
+        # attempts=1: the probe creates a remote command; a retried exec after
+        # a lost receipt would create a second one the cleanup never learns of.
         control = regional.cpu_python(
             ALLOWLIST_WORKFLOW_PROBE,
             target.cluster_id,
             suffix,
             f"{FORBIDDEN_NAMESPACE}/deployment/regional-allowlist-probe",
+            attempts=1,
         )
         command_ids.extend(item["command_id"] for item in control.get("commands") or [])
         updated = [dict(item) for item in original_registry]
@@ -425,17 +508,18 @@ def run_iso005(
             target.cluster_id,
             suffix,
             f"{FORBIDDEN_NAMESPACE}/deployment/regional-allowlist-probe",
+            attempts=1,
         )
         command_ids.extend(
             item["command_id"] for item in executor.get("commands") or []
         )
         workflow_id = str(executor["workflow_id"])
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + COMMAND_SETTLE_TIMEOUT_SECONDS
         final: dict[str, Any] = {"commands": []}
         while time.monotonic() < deadline:
             final = regional.cpu_python(REMOTE_COMMAND_PROBE, workflow_id)
             if final["commands"] and all(
-                item["status"] in {"FAILED", "SUCCEEDED", "CANCELLED"}
+                item["status"] in TERMINAL_COMMAND_STATUSES
                 for item in final["commands"]
             ):
                 break
@@ -459,45 +543,97 @@ def run_iso005(
             "placeholder_workload_unchanged": after == baseline,
         }
         result = {
-            "verdict": "PASS" if all(checks.values()) else "FAIL",
+            "verdict": verdict(checks),
             "checks": checks,
             "control_plane": control,
             "executor": final,
+            # The probe's workflow was never saved, so the executor's result
+            # POST completes a command whose workflow does not exist. How the
+            # control plane closed it is evidence in its own right.
+            "executor_completion": [
+                {
+                    "command_id": item.get("command_id"),
+                    "status": item.get("status"),
+                    "status_source": item.get("status_source"),
+                    "error": item.get("error"),
+                    "workflow_saved": False,
+                }
+                for item in commands
+            ],
         }
+    except Exception as exc:
+        failure = exc
+        result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        if command_ids:
-            regional.cpu_python(REMOTE_COMMAND_DELETE_PROBE, *command_ids)
-        site.write_registry(original_registry)
-        site.rollout_control()
-        site.gpu(
-            target,
-            "delete",
-            "namespace",
-            FORBIDDEN_NAMESPACE,
-            "--ignore-not-found",
-            "--wait=true",
-            check=False,
-            timeout=300,
+
+        def retire_commands() -> dict[str, Any]:
+            if not command_ids:
+                return {}
+            return regional.cpu_python(
+                REMOTE_COMMAND_RETIRE_PROBE,
+                str(COMMAND_SETTLE_TIMEOUT_SECONDS),
+                *command_ids,
+                timeout=COMMAND_SETTLE_TIMEOUT_SECONDS + 120,
+                attempts=1,
+            )
+
+        def delete_namespace() -> str:
+            site.gpu(
+                target,
+                "delete",
+                "namespace",
+                FORBIDDEN_NAMESPACE,
+                "--ignore-not-found",
+                "--wait=true",
+                check=False,
+                timeout=300,
+            )
+            return site.gpu(
+                target,
+                "get",
+                "namespace",
+                FORBIDDEN_NAMESPACE,
+                "--ignore-not-found",
+                "-o",
+                "name",
+                check=False,
+            ).strip()
+
+        cleanup, cleanup_errors = run_cleanup_steps(
+            [
+                ("retire_commands", retire_commands),
+                ("restore_registry", lambda: site.write_registry(original_registry)),
+                ("rollout_control", site.rollout_control),
+                ("delete_namespace", delete_namespace),
+                ("read_registry", site.registry),
+            ]
         )
-        residual = site.gpu(
-            target,
-            "get",
-            "namespace",
-            FORBIDDEN_NAMESPACE,
-            "--ignore-not-found",
-            "-o",
-            "name",
-            check=False,
-        ).strip()
+        residual = str(cleanup.get("delete_namespace") or "")
+        registry_restored = cleanup.get("read_registry") == original_registry
+        retired = cleanup.get("retire_commands") or {}
         result["cleanup"] = {
-            "registry_restored": site.registry() == original_registry,
+            **cleanup,
+            "registry_restored": registry_restored,
             "namespace_residual": residual,
+            "commands_left_leased": list(retired.get("skipped_leased") or []),
         }
-        if residual or site.registry() != original_registry:
+        result["cleanup_errors"] = cleanup_errors
+        if (
+            residual
+            or not registry_restored
+            or cleanup_errors
+            or retired.get("skipped_leased")
+        ):
             result["verdict"] = "FAIL"
-    write_json_atomic(case_dir / "iso005-details.json", result)
-    result["limitations"] = [
-        "The target is a one-replica pause Deployment in a dedicated namespace; "
-        "the runner verifies that neither defense changes its UID or Pod set."
-    ]
+        result["limitations"] = [
+            "The target is a one-replica pause Deployment in a dedicated "
+            "namespace; the runner verifies that neither defense changes its "
+            "UID or Pod set.",
+            "The probe commands belong to a workflow that is never saved; the "
+            "executor-side completion of such a command is recorded under "
+            "executor_completion.",
+        ]
+        write_json_atomic(case_dir / "iso005-details.json", result)
+    if failure is not None:
+        raise IdentityCaseFailure(str(failure), details=result) from failure
     return result

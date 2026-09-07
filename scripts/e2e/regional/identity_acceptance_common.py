@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -29,6 +29,17 @@ CPU_APPS = ("gpu-fault-api-ha", "gpu-fault-control-worker")
 REGISTRY_SECRET = "gpu-fault-regional-clusters"
 REGISTRY_API_PREFIX = "/v1/regional/registry"
 REGISTRY_READY_TIMEOUT_SECONDS = 180
+# The execution owner every acceptance claim advertises. No command is ever
+# created for it, so a claim that carries it authenticates exactly like the
+# executor's own claim (same route, same token, same cluster binding) and
+# returns 200 with zero commands: ``claim_remote_commands`` filters candidates
+# by ``step.execution_owner`` in every store, and the route only substitutes
+# the adapter owner for an *empty* list. The previous probes advertised the
+# real ``gpu-fault-kubernetes-adapter`` owner with a 60 s lease, so an
+# AUTH-016 sampler firing every 2 s for eight minutes leased -- and starved --
+# the production executor's own work. Readiness is never probed with it: that
+# route reports 503 for an owner set that leaves backlog unclaimed.
+ACCEPTANCE_PROBE_OWNER = "gpu-fault-acceptance-probe"
 
 # Runs inside a control-plane API Pod: the registry API is execution-token
 # scoped and the token lives only in that Pod's environment. The body carries
@@ -119,6 +130,42 @@ class IdentityAcceptanceError(RuntimeError):
     pass
 
 
+class IdentityCaseFailure(IdentityAcceptanceError):
+    """A case handler failed after it had already gathered partial evidence.
+
+    ``details`` carries whatever checks, samples and restore state the handler
+    had when the exception surfaced, so ``run_identity_acceptance`` writes them
+    into the case evidence instead of only the exception text.
+    """
+
+    def __init__(self, message: str, *, details: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.details = details
+
+
+def run_cleanup_steps(
+    steps: list[tuple[str, Callable[[], Any]]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Run every restore step, whatever the earlier ones did.
+
+    A ``finally`` block that calls its restore steps back to back stops at the
+    first one that raises, leaves the later resources (a token Secret, a probe
+    Pod, a namespace) in place and replaces the exception that ended the case
+    with the cleanup's. Every step here runs; the ones that raised come back as
+    ``cleanup_errors`` for the caller to record and fail on, and the caller's
+    original exception, if any, is the one that propagates.
+    """
+
+    outcomes: dict[str, Any] = {}
+    errors: list[str] = []
+    for name, step in steps:
+        try:
+            outcomes[name] = step()
+        except Exception as exc:  # noqa: BLE001 - every step must run
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+    return outcomes, errors
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -194,6 +241,13 @@ class IdentitySite:
         }
         if not self.targets:
             raise IdentityAcceptanceError("site contains no GPU clusters")
+        self._api_pod_name: str | None = None
+        # Seconds from the last revision POST until every required member had
+        # acked it (``missing_member_ids`` empty): the isolation delay AUTH-007
+        # and AUTH-016 record. ``rollout_control`` after ``write_registry`` used
+        # to be measured instead, and it reads a head that is already applied:
+        # one status call, ~1 s, whatever the propagation actually took.
+        self.last_registry_ready_seconds: float | None = None
 
     def target(self, cluster_id: str) -> ClusterTarget:
         if not cluster_id:
@@ -309,22 +363,41 @@ class IdentitySite:
     # AUTH-016 lost its new token to a 403 that way (live, 2026-09-07).
 
     def _api_pod(self) -> str:
+        """A Ready control-plane API Pod, selected once and reused.
+
+        Every registry call used to list the API Pods first -- one extra
+        ``kubectl get`` per call, and AUTH-016 makes hundreds of them. The
+        name is cached; ``api_pod_json`` drops it when an exec against it fails
+        so the next call selects again (the Pod may have rolled).
+        """
+
+        cached: str | None = getattr(self, "_api_pod_name", None)
+        if cached is None:
+            target = next(iter(self.targets.values()))
+            pods = self.ready_pods("cpu", "gpu-fault-api-ha", target)
+            if not pods:
+                raise IdentityAcceptanceError("no Ready control-plane API Pod")
+            cached = str(pods[0])
+            self._api_pod_name = cached
+        return cached
+
+    def api_pod_json(self, script: str, *arguments: str) -> dict[str, Any]:
+        """``pod_json`` against the cached API Pod; re-selects once on failure."""
+
         target = next(iter(self.targets.values()))
-        pods = self.ready_pods("cpu", "gpu-fault-api-ha", target)
-        if not pods:
-            raise IdentityAcceptanceError("no Ready control-plane API Pod")
-        return pods[0]
+        try:
+            return self.pod_json("cpu", target, self._api_pod(), script, *arguments)
+        except Exception:
+            self._api_pod_name = None
+            return self.pod_json("cpu", target, self._api_pod(), script, *arguments)
 
     def registry_api(
         self, method: str, path: str, payload: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        target = next(iter(self.targets.values()))
         arguments = [method, path]
         if payload is not None:
             arguments.append(json.dumps(payload, separators=(",", ":")))
-        return self.pod_json(
-            "cpu", target, self._api_pod(), REGISTRY_API_PROBE, *arguments
-        )
+        return self.api_pod_json(REGISTRY_API_PROBE, *arguments)
 
     def registry_generation(self) -> int | None:
         """The durable registry head generation, or None while the site still
@@ -366,10 +439,7 @@ class IdentitySite:
 
     def registry(self) -> list[dict[str, Any]]:
         if self.registry_generation() is not None:
-            target = next(iter(self.targets.values()))
-            revision = self.pod_json(
-                "cpu", target, self._api_pod(), REGISTRY_REVISION_PROBE
-            )
+            revision = self.api_pod_json(REGISTRY_REVISION_PROBE)
             return cast(list[dict[str, Any]], revision["registrations"])
         value = json.loads(
             self.cpu(
@@ -393,6 +463,7 @@ class IdentitySite:
     ) -> None:
         generation = self.registry_generation()
         if generation is not None:
+            posted = time.monotonic()
             response = self.registry_api(
                 "POST",
                 f"{REGISTRY_API_PREFIX}/revisions",
@@ -408,7 +479,9 @@ class IdentitySite:
                     f"{response.get('body')}"
                 )
             self.wait_registry_ready(generation + 1)
+            self.last_registry_ready_seconds = time.monotonic() - posted
             return
+        self.last_registry_ready_seconds = None
         patch = {
             "stringData": {"clusters.json": json.dumps(entries, separators=(",", ":"))}
         }
@@ -422,14 +495,17 @@ class IdentitySite:
         )
 
     def rollout_control(self) -> float:
+        """Make a registry change effective on the control plane.
+
+        On a durable-revision site this is a no-op: ``write_registry`` already
+        waited for every member's ack, and the propagation time is in
+        ``last_registry_ready_seconds``. Only a bootstrap-Secret site still
+        needs the control-plane Deployments restarted.
+        """
+
         started = time.monotonic()
         generation = self.registry_generation()
         if generation is not None:
-            # A durable revision propagates through the registry runtime (1 s
-            # poll); the members ack it without a restart. Waiting for the ack
-            # is the "rollout" here, and its duration is the isolation delay the
-            # cases record.
-            self.wait_registry_ready(generation)
             return time.monotonic() - started
         for deployment in CPU_APPS:
             self.cpu("rollout", "restart", f"deployment/{deployment}")
@@ -448,6 +524,7 @@ CLAIM_PROBE = r"""
 import json
 import os
 import ssl
+import time
 import urllib.error
 import urllib.request
 
@@ -462,7 +539,7 @@ payload = {
     "executor_compatibility_digest": os.environ[
         "GPU_FAULT_EXECUTOR_COMPATIBILITY_DIGEST"
     ],
-    "execution_owners": ["gpu-fault-kubernetes-adapter"],
+    "execution_owners": ["__PROBE_OWNER__"],
     "max_commands": 1,
     "lease_seconds": 60,
 }
@@ -480,17 +557,46 @@ request = urllib.request.Request(
 context = ssl.create_default_context(
     cafile=os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
 )
+started = time.monotonic()
 try:
     with urllib.request.urlopen(request, context=context, timeout=20) as response:
-        print(json.dumps({"status": response.status}))
+        body = json.loads(response.read() or b"{}")
+        print(json.dumps({
+            "status": response.status,
+            "latency_seconds": time.monotonic() - started,
+            "command_count": len(body.get("commands") or []),
+        }))
 except urllib.error.HTTPError as exc:
-    print(json.dumps({"status": exc.code, "detail": exc.read().decode()}))
-"""
+    print(json.dumps({
+        "status": exc.code,
+        "latency_seconds": time.monotonic() - started,
+        "detail": exc.read().decode()[:500],
+    }))
+except Exception as exc:
+    # URLError, socket timeout, TLS failure: a transport-level outcome, which
+    # is exactly what ISO-006 has to observe from the blocked cluster.
+    print(json.dumps({
+        "status": None,
+        "transport_error": type(exc).__name__,
+        "latency_seconds": time.monotonic() - started,
+    }))
+""".replace("__PROBE_OWNER__", ACCEPTANCE_PROBE_OWNER)
 
 
 def claim(site: IdentitySite, target: ClusterTarget) -> dict[str, Any]:
     pod = site.any_executor_pod(target)
     return site.pod_json("gpu", target, pod, CLAIM_PROBE)
+
+
+def claim_sample(fixture: RegionalLiveFixture) -> dict[str, Any]:
+    """One probe-owner claim from a Ready executor Pod of ``fixture``'s cluster.
+
+    ``attempts=1``: the claim is authenticated traffic against the control
+    plane and its latency is the measurement; a kubectl retry would both
+    double the request and report the retry's latency as the sample's.
+    """
+
+    return fixture.executor_python(CLAIM_PROBE, timeout=60, attempts=1)
 
 
 def secret_digest(value: str) -> str:

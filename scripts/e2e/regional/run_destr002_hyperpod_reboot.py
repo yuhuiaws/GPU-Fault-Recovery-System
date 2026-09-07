@@ -26,6 +26,8 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -107,31 +109,33 @@ print(json.dumps({
 """
 
 
-DIRECT_DUPLICATE_REPLAY = r"""
+# Runs in the *replacement* executor Pod after the submitting one was deleted,
+# and reads the durable submission record through that Pod's own lifecycle
+# adapter store. It never calls `submit`: the adapter's dedupe rule for a
+# replay (HyperPodLifecycleAdapter._durable_duplicate) is "same idempotency
+# key, same request identity, state SUBMITTED, result present", and reading
+# that record from the new Pod proves the same thing a second live submit
+# would -- without asking the provider to consider a second reboot. The key
+# is taken from the command's result_details and never recomputed: a runner
+# that derives its own key can only confirm its own arithmetic.
+STORE_REPLAY_PROBE = r"""
 import json
 import sys
 
 from gpu_fault.cluster_executor import executor_from_environment
-from gpu_fault.hyperpod import (
-    HyperPodAction,
-    hyperpod_submission_idempotency_key,
-)
-from gpu_fault.regional import RemoteActionCommand
+from gpu_fault.hyperpod import HyperPodAction
 
-command = RemoteActionCommand.model_validate(json.loads(sys.argv[1]))
+command = json.loads(sys.argv[1])
+submission_key = str(command["result_details"]["submission_idempotency_key"])
+expected_identity = (
+    HyperPodAction.REBOOT,
+    tuple(sorted(str(item) for item in command["step"]["node_ids"])),
+)
 executor = executor_from_environment()
 step_adapter = next(
     item
     for item in executor.adapters
     if getattr(item, "owner", "") == "gpu-fault-hyperpod-adapter"
-)
-submission_key = (
-    command.result_details.get("submission_idempotency_key")
-    or hyperpod_submission_idempotency_key(
-        command.workflow.request_id,
-        command.step_index,
-        command.step.operation,
-    )
 )
 lifecycle = step_adapter.dispatcher.adapter
 if lifecycle.store is None:
@@ -140,29 +144,18 @@ record = lifecycle.store.get_hyperpod_submission(
     lifecycle.config.cluster_name,
     submission_key,
 )
-expected_identity = (
-    HyperPodAction.REBOOT,
-    tuple(sorted(command.step.node_ids)),
-)
-if (
-    record.idempotency_key != submission_key
-    or record.request_identity != expected_identity
-    or record.state != "SUBMITTED"
-    or record.result is None
-):
-    raise RuntimeError(
-        "exact HyperPod submission is not safely replayable"
-    )
-result = step_adapter.dispatcher.adapter.submit(
-    HyperPodAction.REBOOT,
-    command.step.node_ids,
-    isolation_verified_nodes=command.step.node_ids,
-    confirm_cluster_name=executor.confirm_cluster_name,
-    workflow_fencing_token=command.workflow.fencing_token,
-    expected_fencing_token=command.fencing_token,
-    idempotency_key=submission_key,
-)
-print(json.dumps(result.model_dump(mode="json"), sort_keys=True, default=str))
+checks = {
+    "idempotency_key_matches": record.idempotency_key == submission_key,
+    "request_identity_matches": record.request_identity == expected_identity,
+    "state_submitted": record.state == "SUBMITTED",
+    "result_present": record.result is not None,
+}
+print(json.dumps({
+    "replay_mode": "store-level",
+    "duplicate": all(checks.values()),
+    "checks": checks,
+    "record": record.model_dump(mode="json"),
+}, sort_keys=True, default=str))
 """
 
 
@@ -224,7 +217,17 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
 
 
-def focused_tests(case_dir: Path) -> dict[str, Any]:
+def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
+    """Run the focused pytest, or reuse the plan's result in ``--execute``.
+
+    ``reuse`` consults ``reusable_focused_tests`` on the plan this case wrote:
+    a passing result recorded against the same source digest is not re-run.
+    """
+
+    if reuse:
+        recorded = reusable_focused_tests(case_dir / "plan.json")
+        if recorded is not None:
+            return {**recorded, "focused_tests_reused": True}
     command = [
         sys.executable,
         "-m",
@@ -297,19 +300,23 @@ def preflight_probe_errors(
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
+    *,
+    reuse_focused_tests: bool = False,
 ) -> dict[str, Any]:
     fixture = RegionalLiveFixture(settings.regional)
+    identity = fixture.evidence_identity()
     state = fixture.store_snapshot(
         node=settings.node,
         observed_after=datetime.now(timezone.utc) - timedelta(minutes=10),
     )
     node = fixture.node_snapshot(settings.node)
     workloads = fixture.business_workloads(settings.node)
-    tests = focused_tests(case_dir)
+    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
     probe = fixture.executor_python(PREFLIGHT_PROBE, settings.node)
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
+        **identity,
     )
     errors = preflight_probe_errors(probe, settings.hyperpod_cluster)
     if not predecessor["valid"]:
@@ -345,6 +352,7 @@ def read_only_preflight(
         errors.append("focused regression tests failed")
     result = {
         "release_id": state.get("release_id"),
+        "evidence_identity": identity,
         "node": node,
         "business_workloads": workloads,
         "store": state,
@@ -371,11 +379,14 @@ def wait_for_submission(
     timeline = []
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
+        # A wait loop takes the cheap queue read; the drained-backlog gate is
+        # for preflights (see store_snapshot).
         last = regional.store_snapshot(
             node=settings.node,
             marker=marker,
             observed_after=observed_after,
             hyperpod_cluster=settings.hyperpod_cluster,
+            queue_attempts=1,
         )
         workflow = last.get("workflow") or {}
         submission = last.get("submission") or {}
@@ -408,7 +419,7 @@ def wait_for_submission(
 
 def redact_lease_tokens(value: Any) -> Any:
     if isinstance(value, dict):
-        result = {}
+        result: dict[str, Any] = {}
         for key, child in value.items():
             if key == "lease_token" and child not in (None, ""):
                 raw = str(child).encode()
@@ -422,6 +433,69 @@ def redact_lease_tokens(value: Any) -> Any:
     return value
 
 
+def duplicate_replay_gate(
+    command: dict[str, Any],
+    submission: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Why the durable replay must not run, as a NOT_APPLIED record, or None.
+
+    The replay reads the record under the key the executor wrote into the
+    command's ``result_details``; the runner never recomputes it. Without the
+    key, or without a SUBMITTED store record under that key, there is nothing
+    a replay could confirm, and the case records that rather than guessing.
+    """
+
+    details = command.get("result_details") or {}
+    key = details.get("submission_idempotency_key")
+    if not key:
+        reason = (
+            "remote command result_details lacks submission_idempotency_key; "
+            "the runner does not recompute it"
+        )
+    elif submission.get("state") != "SUBMITTED":
+        reason = (
+            f"HyperPod submission record is not SUBMITTED: {submission.get('state')!r}"
+        )
+    elif submission.get("idempotency_key") not in (None, key):
+        reason = "submission record key differs from the command's recorded key"
+    else:
+        return None
+    return {
+        "status": "NOT_APPLIED",
+        "replay_mode": "store-level",
+        "duplicate": None,
+        "reason": reason,
+    }
+
+
+def submission_target_errors(
+    submission: dict[str, Any],
+    *,
+    target_aliases: set[str],
+    node: str,
+) -> list[str]:
+    """The submission record must name exactly the target node, nothing else.
+
+    ``requested_node_identifiers`` may carry the node's logical ID, instance ID
+    or private DNS name rather than its Kubernetes name, hence the aliases from
+    the provider preflight; but one identifier, inside that alias set, is the
+    whole contract. An overlap test let a record naming extra nodes through.
+    """
+
+    requested = {
+        str(item) for item in submission.get("requested_node_identifiers") or []
+    }
+    if not requested:
+        return ["submission record names no node"]
+    if len(requested) != 1:
+        return [
+            f"submission record names {len(requested)} nodes, not exactly the target"
+        ]
+    if not requested <= (target_aliases | {node}):
+        return ["submission record does not identify the target node"]
+    return []
+
+
 def restart_executor(
     regional: RegionalLiveFixture,
     command: dict[str, Any],
@@ -430,16 +504,36 @@ def restart_executor(
     if len(pods_before) < 2:
         raise RegionalFixtureError("expected at least two Ready executor Pods")
     details = command.get("result_details") or {}
-    executor_id = str(
-        details.get("executor_id")
-        or command.get("last_lease_owner")
-        or command.get("lease_owner")
-        or ""
+    source, executor_id = next(
+        (
+            (field, str(value))
+            for field, value in (
+                ("result_details.executor_id", details.get("executor_id")),
+                ("last_lease_owner", command.get("last_lease_owner")),
+                ("lease_owner", command.get("lease_owner")),
+            )
+            if value
+        ),
+        ("", ""),
     )
-    target = next(
-        (item for item in pods_before if str(item["name"]) in executor_id),
-        pods_before[0],
-    )
+    # The case restarts *the submitting* executor; deleting an arbitrary Pod
+    # when the lease owner matched none of them would test a different thing
+    # and still report "executor restarted".
+    matches = [
+        item for item in pods_before if executor_id and str(item["name"]) in executor_id
+    ]
+    if len(matches) != 1:
+        raise RegionalFixtureError(
+            "cannot identify the submitting executor Pod from "
+            f"{source or 'the command'}={executor_id!r}; Ready Pods: "
+            f"{[str(item['name']) for item in pods_before]}"
+        )
+    target = matches[0]
+    match_basis = {
+        "field": source,
+        "executor_id": executor_id,
+        "rule": "the Pod name is a substring of the executor identity",
+    }
     regional.kubectl(
         "gpu",
         "delete",
@@ -457,6 +551,7 @@ def restart_executor(
         ):
             return {
                 "deleted": target,
+                "match_basis": match_basis,
                 "before": pods_before,
                 "after": pods_after,
             }
@@ -530,7 +625,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
     targets = (preflight["provider_preflight"].get("positive") or {}).get(
         "targets"
     ) or []
-    return {
+    details = {
         "risk": "destructive-provider-reboot",
         "predecessor": preflight["predecessor"],
         "target_node": settings.node,
@@ -539,7 +634,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "mutation": (
             "write one synthetic XID 79 to /dev/kmsg, allow the executor role "
             "to submit one HyperPod reboot, then restart the submitting "
-            "executor Pod and verify durable duplicate replay"
+            "executor Pod and verify the durable submission record from the "
+            "replacement Pod (store-level replay; no second submit)"
         ),
         "preflight_identity": {
             "release_id": preflight["release_id"],
@@ -567,10 +663,13 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "runner_waits_for_the_original_node_to_return": True,
             "failed_return_keeps_the_node_out_of_service_for_operator_action": True,
             "provider_replace_is_never_attempted": True,
+            "runner_never_submits_a_second_provider_reboot": True,
             "runner_finally_deletes_probe_resources": True,
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight["focused_tests"])
+    return details
 
 
 def verify_plan_identity(
@@ -619,7 +718,7 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -634,8 +733,12 @@ def execute_case(
         "case_id": CASE_ID,
         "attempt": attempt,
         "verdict": "FAIL",
+        **preflight["evidence_identity"],
         "node": settings.node,
         "maintenance_window_end": maintenance_window_end.isoformat(),
+        "focused_tests_reused": bool(
+            preflight["focused_tests"].get("focused_tests_reused")
+        ),
     }
     injection_started: datetime | None = None
     try:
@@ -685,14 +788,31 @@ def execute_case(
             raise RegionalFixtureError("reboot remote command is not unique")
         executor_restart = restart_executor(regional, reboot_commands[0])
         write_json_atomic(case_dir / "executor-restart.json", executor_restart)
-        duplicate = regional.executor_python(
-            DIRECT_DUPLICATE_REPLAY,
-            json.dumps(reboot_commands[0], sort_keys=True),
-            timeout=180,
+        replay_errors: list[str] = []
+        replay_gate = duplicate_replay_gate(
+            reboot_commands[0],
+            submitted.get("submission") or {},
         )
+        if replay_gate is not None:
+            duplicate = replay_gate
+            replay_errors.append(
+                f"durable HyperPod replay NOT_APPLIED: {replay_gate['reason']}"
+            )
+        else:
+            duplicate = regional.executor_python(
+                STORE_REPLAY_PROBE,
+                json.dumps(reboot_commands[0], sort_keys=True),
+                timeout=180,
+            )
+            if duplicate.get("duplicate") is not True:
+                replay_errors.append(
+                    "durable HyperPod submission record is not replayable from "
+                    f"the replacement executor: {duplicate.get('checks')}"
+                )
         write_json_atomic(case_dir / "duplicate-replay.json", duplicate)
-        if duplicate.get("duplicate") is not True:
-            raise RegionalFixtureError("durable HyperPod replay was not duplicate")
+        submitted_workflow_id = str(
+            (submitted.get("workflow") or {}).get("request_id") or ""
+        )
 
         node_after_boot = regional.wait_node_ready(
             settings.node,
@@ -707,6 +827,9 @@ def execute_case(
             case_dir=case_dir,
             timeout_seconds=1800,
             hyperpod_cluster=settings.hyperpod_cluster,
+            workflow_request_ids=(
+                [submitted_workflow_id] if submitted_workflow_id else None
+            ),
         )
         write_json_atomic(case_dir / "workflow-state.json", state)
         errors = workflow_errors(
@@ -716,17 +839,33 @@ def execute_case(
             ),
             expected_boot_id=(preflight["store"].get("agent") or {}).get("boot_id"),
         )
-        provider = regional.provider_events(
+        errors.extend(replay_errors)
+        # The positive claim -- exactly one reboot, by the executor role --
+        # polls CloudTrail until the event is visible or the delivery window
+        # closes; the negative claim -- no replace/delete -- cannot be proven
+        # inside that window and is recorded as provisional when empty.
+        reboot_events = regional.wait_provider_events(
             injection_started,
-            datetime.now(timezone.utc),
+            event_names=REBOOT_EVENTS,
+            expected_count=1,
         )
-        write_json_atomic(case_dir / "provider-events.json", {"events": provider})
-        reboot_events = [
-            item for item in provider if item["event_name"] in REBOOT_EVENTS
-        ]
+        provider_window_end = datetime.now(timezone.utc)
+        provider = regional.provider_events(injection_started, provider_window_end)
         forbidden = [
             item for item in provider if item["event_name"] in FORBIDDEN_EVENTS
         ]
+        provider_provisional = not forbidden and regional.provider_events_provisional(
+            provider_window_end
+        )
+        write_json_atomic(
+            case_dir / "provider-events.json",
+            {
+                "events": provider,
+                "reboot_events": reboot_events,
+                "forbidden_events": forbidden,
+                "provider_events_provisional": provider_provisional,
+            },
+        )
         if len(reboot_events) != 1:
             errors.append("CloudTrail does not contain exactly one reboot event")
         elif not provider_event_actor_matches_role(
@@ -737,7 +876,6 @@ def execute_case(
         if forbidden:
             errors.append("CloudTrail contains replace/delete mutation")
         submission = state.get("submission") or {}
-        requested = set(submission.get("requested_node_identifiers") or [])
         target_aliases = {
             str(item)
             for target in (preflight["provider_preflight"].get("positive") or {}).get(
@@ -750,8 +888,13 @@ def execute_case(
             )
             if item
         }
-        if not requested or requested.isdisjoint(target_aliases | {settings.node}):
-            errors.append("submission record does not identify the target node")
+        errors.extend(
+            submission_target_errors(
+                submission,
+                target_aliases=target_aliases,
+                node=settings.node,
+            )
+        )
         final_node = regional.node_snapshot(settings.node)
         write_json_atomic(case_dir / "node-final.json", final_node)
         errors.extend(
@@ -780,6 +923,7 @@ def execute_case(
                 "submission": submission,
                 "duplicate_replay": duplicate,
                 "provider_events": provider,
+                "provider_events_provisional": provider_provisional,
                 "executor_restart": executor_restart,
             }
         )

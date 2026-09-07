@@ -35,10 +35,29 @@ CASE_ID = "GF-REGIONAL-BOOT-019"
 CONFIRMATION = "RUN_BOOT019_ADMIN_LIFECYCLE"
 REMOVE_CONFIRMATION = "REMOVE_GPU_CLUSTER"
 UNINSTALL_CONFIRMATION = "UNINSTALL_GPU_FAULT"
+# Uninstall with ``--cpu-cluster keep`` preserves at least the CPU EKS cluster
+# and the GPU cluster records; fewer preserved entries means it deleted
+# something the request told it to keep.
+MIN_PRESERVED_REGISTRY_ENTRIES = 2
 
 
 class InjectedAcceptanceFailure(RuntimeError):
     pass
+
+
+class AcceptanceCheckError(RuntimeError):
+    """A live observation contradicted the BOOT-019 contract.
+
+    Raised explicitly rather than through ``assert``: ``python -O`` strips
+    ``assert`` statements, and a runner whose checks vanish under an
+    optimisation flag would report a constant PASS.
+    """
+
+
+def _require(condition: bool, message: str, context: Any = None) -> None:
+    if not condition:
+        detail = f"{message}: {context!r}" if context is not None else message
+        raise AcceptanceCheckError(detail)
 
 
 class AdminLifecycleBackend(Protocol):
@@ -67,8 +86,43 @@ def _assert_consistent_snapshot(
         "release_state_cluster_ids",
         "installation_registry_cluster_ids",
     ):
-        assert set(snapshot[field]) == expected, (field, snapshot)
-    assert snapshot["cpu_control_plane_ready"] is True, snapshot
+        _require(set(snapshot[field]) == expected, f"{field} differs", snapshot)
+    _require(
+        snapshot["cpu_control_plane_ready"] is True,
+        "CPU control plane is not ready",
+        snapshot,
+    )
+
+
+def assert_uninstall_result(result: dict[str, Any]) -> None:
+    """What a keep-CPU uninstall must have left behind.
+
+    ``cpu_cluster == "keep"`` and ``delete_policy_residuals == 0`` are
+    literals the uninstall code writes unconditionally, so asserting them
+    proved nothing. What varies with the live run is how many registry
+    entries were preserved and whether any resource is still waiting to be
+    deleted in the final registry snapshot.
+    """
+
+    preserved = result.get("registry_entries_preserved")
+    _require(
+        isinstance(preserved, int) and preserved >= MIN_PRESERVED_REGISTRY_ENTRIES,
+        f"uninstall preserved fewer than {MIN_PRESERVED_REGISTRY_ENTRIES} "
+        "registry entries",
+        result,
+    )
+    statuses = result.get("final_registry_statuses")
+    _require(
+        isinstance(statuses, dict) and bool(statuses),
+        "uninstall result carries no final registry statuses",
+        result,
+    )
+    pending = sorted(
+        key
+        for key, status in dict(statuses or {}).items()
+        if status == "DELETE_PENDING"
+    )
+    _require(not pending, "final registry still has DELETE_PENDING entries", pending)
 
 
 def run_admin_lifecycle(
@@ -78,8 +132,10 @@ def run_admin_lifecycle(
     try:
         baseline = recorder.stage("baseline", backend.snapshot)
         baseline_ids = set(baseline["site_cluster_ids"])
-        assert len(baseline_ids) == 1, (
-            "BOOT-019 requires an isolated site with exactly one managed GPU cluster"
+        _require(
+            len(baseline_ids) == 1,
+            "BOOT-019 requires an isolated site with exactly one managed GPU cluster",
+            sorted(baseline_ids),
         )
         _assert_consistent_snapshot(baseline, baseline_ids)
 
@@ -87,20 +143,24 @@ def run_admin_lifecycle(
             "join_failure_before_site_commit",
             lambda: backend.join("before-site-commit"),
         )
-        assert pre_commit["phase"] == "ROLLED_BACK", pre_commit
+        _require(pre_commit["phase"] == "ROLLED_BACK", "pre-commit phase", pre_commit)
         _assert_consistent_snapshot(backend.snapshot(), baseline_ids)
 
         post_commit = recorder.stage(
             "join_failure_after_site_commit",
             lambda: backend.join("after-site-commit"),
         )
-        assert post_commit["phase"] == "FAILED_AFTER_COMMIT", post_commit
+        _require(
+            post_commit["phase"] == "FAILED_AFTER_COMMIT",
+            "post-commit phase",
+            post_commit,
+        )
         joined_id = str(post_commit["cluster_id"])
-        assert joined_id not in baseline_ids
+        _require(joined_id not in baseline_ids, "joined cluster was already managed")
 
         joined = recorder.stage("join_resumed", backend.join)
-        assert joined["phase"] == "COMPLETED", joined
-        assert joined["cluster_id"] == joined_id, joined
+        _require(joined["phase"] == "COMPLETED", "resumed join phase", joined)
+        _require(joined["cluster_id"] == joined_id, "resumed join cluster", joined)
         joined_ids = baseline_ids | {joined_id}
         after_join = recorder.stage("joined_snapshot", backend.snapshot)
         _assert_consistent_snapshot(after_join, joined_ids)
@@ -113,14 +173,22 @@ def run_admin_lifecycle(
             "joined_cluster_removed",
             lambda: backend.remove(joined_id),
         )
-        assert removed["phase"] == "COMPLETED", removed
-        assert set(removed["remaining_cluster_ids"]) == baseline_ids, removed
+        _require(removed["phase"] == "COMPLETED", "remove phase", removed)
+        _require(
+            set(removed["remaining_cluster_ids"]) == baseline_ids,
+            "remaining clusters after remove",
+            removed,
+        )
         revoked = recorder.stage(
             "removed_token_rejected",
             lambda: backend.probe_revoked_token(token_capture),
         )
-        assert revoked["status"] == 403, revoked
-        assert revoked["detail"] == "regional cluster authentication failed", revoked
+        _require(revoked["status"] == 403, "revoked token status", revoked)
+        _require(
+            revoked["detail"] == "regional cluster authentication failed",
+            "revoked token detail",
+            revoked,
+        )
         after_remove = recorder.stage("post_remove_snapshot", backend.snapshot)
         _assert_consistent_snapshot(after_remove, baseline_ids)
 
@@ -129,20 +197,27 @@ def run_admin_lifecycle(
             "last_cluster_removed",
             lambda: backend.remove(last_cluster_id),
         )
-        assert last_removed["phase"] == "COMPLETED", last_removed
-        assert last_removed["remaining_cluster_ids"] == [], last_removed
+        _require(
+            last_removed["phase"] == "COMPLETED", "last remove phase", last_removed
+        )
+        _require(
+            last_removed["remaining_cluster_ids"] == [],
+            "clusters remain after the last remove",
+            last_removed,
+        )
         empty = recorder.stage("empty_registry_snapshot", backend.snapshot)
         _assert_consistent_snapshot(empty, set())
 
         uninstall_result = recorder.stage("uninstall_keep_cpu", backend.uninstall)
-        assert uninstall_result["cpu_cluster"] == "keep", uninstall_result
-        assert uninstall_result["gpu_clusters"] == "preserved", uninstall_result
-        assert uninstall_result["delete_policy_residuals"] == 0, uninstall_result
-        backend.cleanup_sensitive_files()
+        assert_uninstall_result(uninstall_result)
         return recorder.complete()
     except BaseException as exc:
         recorder.fail(exc)
         raise
+    finally:
+        # The captured cluster token is a live credential until the cluster is
+        # removed; whatever happened above, it must not outlive the run.
+        backend.cleanup_sensitive_files()
 
 
 class LiveAdminLifecycleBackend:
@@ -162,9 +237,12 @@ class LiveAdminLifecycleBackend:
         self.cluster_id = cluster_id
         self.allowed_namespaces = allowed_namespaces
         self.join_state_dir = join_state_dir
-        self.secure_dir = run_dir / "secure"
-        self.secure_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.run_dir = run_dir
         self.final_snapshot_policy = final_snapshot_policy
+        # Captured tokens stay in memory: a copy under run_dir would be a valid
+        # cluster credential on disk until the cluster is removed, and the old
+        # code only deleted it on success.
+        self._captured_tokens: dict[str, bytes] = {}
 
     def _site(self) -> RenderedSite:
         return load_site(self.site_path, repository_root=ROOT)
@@ -200,7 +278,7 @@ class LiveAdminLifecycleBackend:
         try:
             if fault == "before-site-commit":
 
-                def fail_before_commit(*_args, **_kwargs):
+                def fail_before_commit(*_args: Any, **_kwargs: Any) -> None:
                     raise InjectedAcceptanceFailure(
                         "BOOT-019 injected failure before site commit"
                     )
@@ -208,7 +286,7 @@ class LiveAdminLifecycleBackend:
                 admin_cluster_join._deploy_and_commit = fail_before_commit
             elif fault == "after-site-commit":
 
-                def commit_then_fail(*args, **kwargs):
+                def commit_then_fail(*args: Any, **kwargs: Any) -> None:
                     original_commit(*args, **kwargs)
                     raise InjectedAcceptanceFailure(
                         "BOOT-019 injected failure after site commit"
@@ -216,7 +294,7 @@ class LiveAdminLifecycleBackend:
 
                 admin_cluster_join._commit_site = commit_then_fail
             try:
-                return join_cluster(self._join_request())
+                return dict(join_cluster(self._join_request()))
             except InjectedAcceptanceFailure:
                 state = self._join_state()
                 return {
@@ -244,7 +322,10 @@ class LiveAdminLifecycleBackend:
             text=True,
             capture_output=True,
         ).stdout
-        return json.loads(output)
+        value = json.loads(output)
+        if not isinstance(value, dict):
+            raise AcceptanceCheckError("kubectl did not return a JSON object")
+        return value
 
     def snapshot(self) -> dict[str, Any]:
         site = self._site()
@@ -303,30 +384,36 @@ class LiveAdminLifecycleBackend:
             for item in site.release_config["clusters"]
             if item["cluster_id"] == cluster_id
         )
-        source = Path(record["token_file"])
-        token = source.read_bytes()
-        destination = self.secure_dir / f"{cluster_id}.revoked-token"
-        destination.write_bytes(token)
-        destination.chmod(0o600)
+        token = Path(record["token_file"]).read_bytes()
+        self._captured_tokens[cluster_id] = token
         return {
             "cluster_id": cluster_id,
-            "token_path": str(destination),
+            "token_storage": "memory",
             "token_sha256": hashlib.sha256(token).hexdigest(),
             "control_plane_url": record["control_plane_url"],
             "ca_file": record["ca_file"],
         }
 
     def remove(self, cluster_id: str) -> dict[str, Any]:
-        return remove_cluster(
-            RemoveClusterRequest(
-                site=self._site(),
-                cluster_id=cluster_id,
-                confirmation=REMOVE_CONFIRMATION,
+        return dict(
+            remove_cluster(
+                RemoveClusterRequest(
+                    site=self._site(),
+                    cluster_id=cluster_id,
+                    confirmation=REMOVE_CONFIRMATION,
+                )
             )
         )
 
     def probe_revoked_token(self, capture: dict[str, Any]) -> dict[str, Any]:
-        token = Path(capture["token_path"]).read_text(encoding="utf-8").strip()
+        cluster_id = str(capture["cluster_id"])
+        stored = self._captured_tokens.get(cluster_id)
+        if stored is None:
+            raise AcceptanceCheckError(
+                f"no captured token for {cluster_id}; capture and probe must run "
+                "in the same process"
+            )
+        token = stored.decode("utf-8").strip()
         request = urllib.request.Request(
             str(capture["control_plane_url"]).rstrip("/")
             + "/v1/regional/executors/readiness",
@@ -334,7 +421,7 @@ class LiveAdminLifecycleBackend:
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                "X-GPU-Fault-Cluster-ID": str(capture["cluster_id"]),
+                "X-GPU-Fault-Cluster-ID": cluster_id,
             },
             method="POST",
         )
@@ -351,7 +438,7 @@ class LiveAdminLifecycleBackend:
             return {"status": exc.code, "detail": payload.get("detail")}
 
     def uninstall(self) -> dict[str, Any]:
-        return uninstall(
+        result = uninstall(
             UninstallRequest(
                 site=self._site(),
                 cpu_disposition="keep",
@@ -359,10 +446,31 @@ class LiveAdminLifecycleBackend:
                 final_snapshot_policy=self.final_snapshot_policy,
             )
         )
+        return {**result, "final_registry_statuses": final_registry_statuses(result)}
 
     def cleanup_sensitive_files(self) -> None:
-        for path in self.secure_dir.glob("*.revoked-token"):
+        self._captured_tokens.clear()
+        # Earlier runs of this runner wrote the token under run_dir/secure; a
+        # file left by one of them is removed here as well.
+        for path in (self.run_dir / "secure").glob("*.revoked-token"):
             path.unlink(missing_ok=True)
+
+
+def final_registry_statuses(result: dict[str, Any]) -> dict[str, str]:
+    """``resource_key -> status`` of the final registry snapshot uninstall wrote."""
+
+    path = result.get("final_registry")
+    if not path:
+        raise AcceptanceCheckError("uninstall result names no final registry")
+    document = json.loads(Path(str(path)).read_text(encoding="utf-8"))
+    resources = document.get("resources")
+    if not isinstance(resources, list):
+        raise AcceptanceCheckError("final registry has no resources list")
+    return {
+        str(item["resource_key"]): str(item["status"])
+        for item in resources
+        if isinstance(item, dict)
+    }
 
 
 def parser() -> argparse.ArgumentParser:

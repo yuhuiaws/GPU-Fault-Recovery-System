@@ -9,6 +9,7 @@ takes over.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -122,6 +123,7 @@ class _ServiceRecorder:
         self.node = node
         self.created = False
         self.stops: list[dict[str, Any]] = []
+        self.failsafe_at: datetime | None = None
 
     def create(self) -> None:
         self.created = True
@@ -135,6 +137,9 @@ class _ServiceRecorder:
                 "restore_seconds": restore_seconds,
                 "delay_seconds": delay_seconds,
             }
+        )
+        self.failsafe_at = datetime.now(timezone.utc) + timedelta(
+            seconds=delay_seconds + restore_seconds
         )
         return {"service": service, "scheduled": bool(delay_seconds)}
 
@@ -221,6 +226,114 @@ def test_a_service_scenario_stops_the_unit_only_after_the_workload_is_running(
     else:
         assert late["stopped"]["scheduled"] is False, late
         assert warm.fleet_ready == [False], warm.fleet_ready
+    # The failsafe is the bound on this shortage; the scenario's wait and its
+    # verdict both read it.
+    assert fixture.bound_at == built[0].failsafe_at
+    assert fixture.bound_label == f"{service} failsafe"
+    assert late["failsafe_at"] == built[0].failsafe_at.isoformat()  # type: ignore[union-attr]
+
+
+class _HolderRecorder:
+    """The GPU holder Pod: named on construction, created on demand."""
+
+    def __init__(self, warm: Any, *, node: str, run_id: str) -> None:
+        self.node = node
+        self.name = f"holder-{run_id}"
+        self.created = False
+        self.deadline_at: datetime | None = None
+
+    def create(self) -> None:
+        self.created = True
+        self.deadline_at = datetime.now(timezone.utc) + timedelta(seconds=840)
+
+
+def test_the_gpu_holder_is_created_late_and_bounds_the_scenario(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The holder's sleep is what keeps the spare busy. Created in `apply()`, it
+    # spent its 14 minutes while the workload was still scheduling; a slow
+    # pre-REPLACE pipeline then met an idle spare and REPLACE_NODE succeeded --
+    # a real failover in a case that promises never to perform one.
+    built: list[_HolderRecorder] = []
+
+    def build(*args: Any, **kwargs: Any) -> _HolderRecorder:
+        recorder = _HolderRecorder(*args, **kwargs)
+        built.append(recorder)
+        return recorder
+
+    monkeypatch.setattr(destr008, "GpuHolderFixture", build)
+    fixture, warm, _services = _fixture(monkeypatch, tmp_path, "active-gpu-pod")
+
+    early = fixture.apply()
+
+    assert built[0].created is False, "the holder must not be created before the run"
+    assert early == {"holder_pod": built[0].name, "armed": "late"}, early
+    assert fixture.bound_at is None
+
+    late = fixture.apply_late()
+
+    assert built[0].created is True
+    assert fixture.bound_at == built[0].deadline_at
+    assert fixture.bound_label == "GPU holder Pod"
+    deadline = built[0].deadline_at
+    assert deadline is not None
+    assert late["holder_deadline_at"] == deadline.isoformat()
+
+
+def test_the_workflow_wait_never_outlives_the_shortage_bound() -> None:
+    now = datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)
+    # Unbounded scenarios keep the full wait.
+    assert destr008.wait_timeout_seconds(None, now) == destr008.WORKFLOW_WAIT_SECONDS
+    # The kubelet failsafe (15s delay + 420s restore) bounds S3 well under 900s.
+    failsafe = now + timedelta(seconds=15 + destr008.SERVICE_RESTORE_SECONDS)
+    assert destr008.wait_timeout_seconds(failsafe, now) == 435 - 60
+    # A bound already past waits one second and fails on the timeout, rather
+    # than waiting for the REPLACE_NODE that could now succeed.
+    assert destr008.wait_timeout_seconds(now - timedelta(seconds=5), now) == 1
+    # A far bound is still capped by the default.
+    assert (
+        destr008.wait_timeout_seconds(now + timedelta(hours=2), now)
+        == destr008.WORKFLOW_WAIT_SECONDS
+    )
+
+
+def test_a_replace_that_concluded_after_the_bound_fails_the_scenario() -> None:
+    bound = datetime(2026, 9, 7, 10, 7, tzinfo=timezone.utc)
+    before = {
+        "operation": "REPLACE_NODE",
+        "status": "FAILED",
+        "updated_at": "2026-09-07T10:05:00+00:00",
+    }
+    after = {**before, "updated_at": "2026-09-07T10:07:30Z"}
+
+    assert destr008.bound_errors(before, bound_at=bound, label="kubelet failsafe") == []
+    errors = destr008.bound_errors(after, bound_at=bound, label="kubelet failsafe")
+    assert len(errors) == 1 and "kubelet failsafe fired" in errors[0], errors
+    # Unbounded scenarios and a missing execution have nothing to compare.
+    assert destr008.bound_errors(after, bound_at=None, label="x") == []
+    assert destr008.bound_errors(None, bound_at=bound, label="x") == []
+    # A bounded verdict without a timestamp cannot be trusted either way.
+    assert destr008.bound_errors(
+        {"operation": "REPLACE_NODE", "status": "FAILED"},
+        bound_at=bound,
+        label="GPU holder Pod",
+    ) == ["REPLACE_NODE has no timestamp to compare with the GPU holder Pod"]
+
+
+def test_a_lost_incident_id_is_recovered_from_the_injected_event() -> None:
+    class _Warm:
+        def __init__(self) -> None:
+            self.event_ids: list[str] = []
+
+        def store_snapshot(self, *, event_id: str = "", **_: Any) -> dict[str, Any]:
+            self.event_ids.append(event_id)
+            return {"incident": {"incident_id": "inc-from-event"}}
+
+    warm = _Warm()
+    assert destr008.recover_incident_id(warm, "destr008-no-spare-1") == "inc-from-event"  # type: ignore[arg-type]
+    assert warm.event_ids == ["destr008-no-spare-1"]
+    assert destr008.recover_incident_id(warm, "") == ""  # type: ignore[arg-type]
+    assert warm.event_ids == ["destr008-no-spare-1"]
 
 
 def test_a_label_scenario_has_nothing_left_to_inject_late(

@@ -31,7 +31,7 @@ def test_release_change_selects_only_release_domain_and_cases() -> None:
     assert "tests/regional/test_release_diff.py" in plan.pytest_targets
     assert "GF-REGIONAL-BOOT-018" in plan.safe_cases
     assert "GF-REGIONAL-BOOT-020" in plan.approval_cases
-    assert "GF-REGIONAL-HA-005" in plan.approval_cases
+    assert "GF-REGIONAL-HA-009" in plan.approval_cases
     assert "PREEMPT" in plan.not_selected_families
 
 

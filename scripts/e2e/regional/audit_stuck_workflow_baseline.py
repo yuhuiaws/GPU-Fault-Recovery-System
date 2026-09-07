@@ -11,14 +11,20 @@ none of which writes anything:
 * **Q-ZOMBIE** -- processor queue rows still ``LEASED`` after their lease expired,
   i.e. work a crashed process never released.
 * **Q-STUCK-PENDING** -- ``PENDING`` workflows whose ``not_before`` has passed,
-  whose predecessor (if any) is terminal, and which nothing has touched for the
-  idle window. Every one of them should have been dispatched.
+  whose predecessor (if any) is terminal *the way the dispatcher reads terminal*
+  -- SUCCEEDED / FAILED / SUPERSEDED, a BLOCKED row whose safety plan settled
+  (``blocked_kind`` not NEEDS_OPERATOR / INTERNAL_ERROR), or a predecessor row
+  that is gone -- and which nothing has touched for the idle window. Every one
+  of them should have been dispatched.
 
 The script is meant to run either where ``GPU_FAULT_STORE_URL`` is available or
 piped into an API Pod (``kubectl exec -i <pod> -- python - --json``), which is why
-it depends on nothing but the standard library and psycopg. Every session sets
-``default_transaction_read_only`` and a statement timeout and ends with a
-rollback. Timestamps inside ``payload`` are compared as ISO-8601 text on purpose:
+it depends on nothing but the standard library and psycopg. Every session opens
+its one transaction with ``SET TRANSACTION READ ONLY`` -- a session-level
+``SET default_transaction_read_only`` issued *inside* an already-open
+transaction only takes effect for the *next* one, which is why the earlier
+version guarded nothing -- sets a statement timeout and ends with a rollback.
+Timestamps inside ``payload`` are compared as ISO-8601 text on purpose:
 the stored values come from ``isoformat()``, whose text order equals time order,
 and a ``::timestamptz`` cast would bypass the expression indexes.
 
@@ -70,14 +76,28 @@ WHERE w.kind = 'workflow'
   AND w.payload->>'updated_at' < %(idle_cutoff)s
   AND (
       w.payload->>'predecessor_workflow_id' IS NULL
+      OR NOT EXISTS (
+          SELECT 1 FROM gpu_fault_objects gone
+          WHERE gone.kind = 'workflow'
+            AND gone.key = w.payload->>'predecessor_workflow_id'
+      )
       OR EXISTS (
           SELECT 1 FROM gpu_fault_objects p
           WHERE p.kind = 'workflow'
             AND p.key = w.payload->>'predecessor_workflow_id'
-            AND p.payload->>'status' IN ('SUCCEEDED', 'FAILED', 'SUPERSEDED')
+            AND p.payload->>'status' NOT IN ('PENDING', 'SAFETY_PENDING', 'RUNNING')
+            AND NOT (
+                p.payload->>'status' = 'BLOCKED'
+                AND p.payload->>'blocked_kind' IN ('NEEDS_OPERATOR', 'INTERNAL_ERROR')
+            )
       )
   )
 """
+
+# The first statement of the audit's only transaction. ``SET TRANSACTION`` has
+# to come before any query in that transaction; psycopg opens the transaction
+# on the first ``execute``, so executing this first is what makes it apply.
+READ_ONLY_SQL = "SET TRANSACTION READ ONLY"
 
 DEFAULT_ORPHAN_CUTOFF_SECONDS = 600
 DEFAULT_STUCK_IDLE_SECONDS = 600
@@ -153,7 +173,8 @@ def run(
     moment = now or datetime.now(timezone.utc)
     with psycopg.connect(store_url) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SET default_transaction_read_only = on")
+            # Must be the transaction's first statement (see READ_ONLY_SQL).
+            cursor.execute(READ_ONLY_SQL)
             # SET takes no bind parameters; the value is an int we own.
             cursor.execute(
                 f"SET statement_timeout = '{int(statement_timeout_seconds)}s'"

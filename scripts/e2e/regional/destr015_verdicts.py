@@ -287,13 +287,37 @@ def injection_errors(
     return errors
 
 
+def event_observed_at(
+    states: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    """``{node: observed_at}`` of each node's stored event.
+
+    The runner stamps ``injected_at`` when the probe exec *returns*, which is
+    one kubectl round trip after the kmsg write and lands the two nodes' stamps
+    seconds apart when the writes were simultaneous. The event's ``observed_at``
+    is the node's own clock at collection time and is what the aggregation
+    window is measured against, so the spread verdict reads that instead. A
+    node whose event carries no ``observed_at`` is left out, and
+    :func:`spread_errors` then reports the stamps as incomplete.
+    """
+
+    result: dict[str, str] = {}
+    for node, state in states.items():
+        event = state.get("event") or {}
+        observed = event.get("observed_at")
+        if observed:
+            result[node] = str(observed)
+    return result
+
+
 def spread_errors(
     injected_at: dict[str, str],
     *,
     aggregation_window_seconds: int,
 ) -> list[str]:
-    """The two kmsg writes must land inside one aggregation window, or the
-    second fault was never a candidate for the in-window merge."""
+    """The two faults must land inside one aggregation window, or the second
+    was never a candidate for the in-window merge. ``injected_at`` is the
+    per-node stamp to compare, normally :func:`event_observed_at`."""
 
     stamps = [_parse(value) for value in injected_at.values()]
     if len(stamps) != 2 or any(item is None for item in stamps):
@@ -435,14 +459,24 @@ def step_transitions(
     previous: dict[str, str],
     executions: list[dict[str, Any]],
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Fold step executions into ``{index/operation: status}``; return the
-    new state and only the entries whose status changed since ``previous``."""
+    """Fold step executions into ``{index/operation#occurrence: status}``;
+    return the new state and only the entries whose status changed.
+
+    The occurrence ordinal is part of the key on purpose: a barrier step that
+    parks WAITING before it succeeds keeps both rows in ``step_executions``,
+    and a key of index/operation alone would see the pair flip status on every
+    poll and append the same two "changes" for ever.
+    """
 
     state = dict(previous)
     changes: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc).isoformat()
+    seen: dict[str, int] = {}
     for item in executions:
-        key = f"{item.get('step_index')}/{item.get('operation')}"
+        step = f"{item.get('step_index')}/{item.get('operation')}"
+        occurrence = seen.get(step, 0)
+        seen[step] = occurrence + 1
+        key = f"{step}#{occurrence}"
         status = str(item.get("status") or "")
         if state.get(key) == status:
             continue
@@ -450,7 +484,8 @@ def step_transitions(
         changes.append(
             {
                 "observed_at": now,
-                "step": key,
+                "step": step,
+                "occurrence": occurrence,
                 "status": status,
                 "error": item.get("error"),
                 "started_at": item.get("started_at"),

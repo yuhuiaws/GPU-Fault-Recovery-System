@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 import re
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from scripts.e2e.regional import run_preemption_contracts as preemption
 from scripts.e2e.regional import run_workload_acceptance as workload
 from scripts.e2e.regional.regional_case_contract import (
     case_metadata,
+    do_not_run_case_ids,
     formal_predecessor,
 )
 
@@ -71,12 +73,18 @@ def test_reusable_entries_follow_the_formal_predecessor_chain() -> None:
     assert formal_predecessor("GF-REGIONAL-AUTH-013") == "GF-REGIONAL-AUTH-011"
     assert formal_predecessor("GF-REGIONAL-WORKLOAD-001") == "GF-REGIONAL-AUTH-016"
     assert formal_predecessor("GF-REGIONAL-ISO-001") == ("GF-REGIONAL-WORKLOAD-002")
-    assert formal_predecessor("GF-REGIONAL-PREEMPT-012") == ("GF-REGIONAL-PREEMPT-011")
+    # PREEMPT-010/011 are pytest cases and never write case evidence, so the
+    # live PREEMPT-012 reads the last command entry, PREEMPT-009.
+    assert formal_predecessor("GF-REGIONAL-PREEMPT-012") == ("GF-REGIONAL-PREEMPT-009")
     assert formal_predecessor("GF-REGIONAL-E2E-001") == ("GF-REGIONAL-PREEMPT-038")
     assert formal_predecessor("GF-REGIONAL-NET-001") == "GF-REGIONAL-CAP-005"
+    # AUTH-010 and NOTIFY-002 are still driver entries but are DO_NOT_RUN
+    # (superseded by AUTH-014 / NOTIFY-001), so they have no formal predecessor.
+    retired = do_not_run_case_ids()
+    assert {"GF-REGIONAL-AUTH-010", "GF-REGIONAL-NOTIFY-002"} <= retired
     assert all(
         case_metadata(case_id).predecessor == formal_predecessor(case_id)
-        for case_id in REQUESTED_CASES
+        for case_id in REQUESTED_CASES - retired
     ), "case metadata predecessor drifted from the formal execution order"
 
 
@@ -231,13 +239,24 @@ def test_external_notification_evidence_is_structured(tmp_path: Path) -> None:
                 "received": True,
                 "reference": "mailbox-audit-1",
                 "method": "inbox-screenshot",
+                "window_start": "2026-09-07T10:00:00+00:00",
+                "window_end": "2026-09-07T11:00:00+00:00",
             }
         ),
         encoding="utf-8",
     )
     dedup = tmp_path / "dedup.json"
     dedup.write_text(
-        json.dumps({"send_count_delta": 0, "duplicate_inbox_count": 0}),
+        json.dumps(
+            {
+                "send_count_delta": 0,
+                "duplicate_inbox_count": 0,
+                "reference": "cloudwatch-ses-delivery",
+                "method": "windowed-ses-delivery-count",
+                "window_start": "2026-09-07T10:00:00+00:00",
+                "window_end": "2026-09-07T11:00:00+00:00",
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -254,8 +273,39 @@ def test_external_notification_evidence_is_structured(tmp_path: Path) -> None:
     # named method a bare `received: true` cannot be told apart from a guess.
     unmethodical = tmp_path / "unmethodical.json"
     unmethodical.write_text(
-        json.dumps({"received": True, "reference": "mailbox-audit-1"}), encoding="utf-8"
+        json.dumps(
+            {
+                "received": True,
+                "reference": "mailbox-audit-1",
+                "window_start": "2026-09-07T10:00:00+00:00",
+                "window_end": "2026-09-07T11:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
     )
     assert not notification.validate_external_evidence(unmethodical, "receipt")[
         "valid"
     ], "receipt evidence was accepted without saying how delivery was established"
+
+    # The SES-side answer is a windowed count, so a file without its window
+    # cannot be tied to this run's messages: both kinds need window_start/end,
+    # and the window must cover the drill or record times the runner claims.
+    unwindowed = tmp_path / "unwindowed.json"
+    unwindowed.write_text(
+        json.dumps(
+            {
+                "send_count_delta": 0,
+                "duplicate_inbox_count": 0,
+                "reference": "cloudwatch-ses-delivery",
+                "method": "windowed-ses-delivery-count",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not notification.validate_external_evidence(unwindowed, "dedup")["valid"], (
+        "dedup evidence was accepted without the SES window it was read over"
+    )
+    outside = notification.validate_external_evidence(
+        dedup, "dedup", record_times=[datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)]
+    )
+    assert not outside["valid"], "a window that misses the record time was accepted"

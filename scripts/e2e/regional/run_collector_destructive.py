@@ -23,6 +23,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     CollectorAcceptanceFixture,
     collector_setting,
+    select_workflow,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeError,
@@ -32,6 +33,8 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseSurface,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_selected_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -66,11 +69,29 @@ CONFIRMATIONS = {
     case_id: case_id.replace("GF-REGIONAL-", "").replace("-", "") + "_EXECUTE"
     for case_id in CASE_IDS
 }
+# COLLECT-013 proves one single-GPU reset from a real kmsg XID. XID 109 and 62
+# reach the identical RESET_GPU contract, so the case runs one of them (109 by
+# default, `--xid 62` for the other) instead of two full quiesce/reset cycles
+# with the same verdict.
+COLLECT013_XIDS = (109, 62)
+DEFAULT_COLLECT013_XID = 109
 # COLLECT-014 fail-closed direction: how far back the API SXID is dated so no
 # stored inventory sample can count as evidence for it (see run_collect014).
 # Must stay below GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS (900s).
 FAIL_CLOSED_EVENT_AGE = timedelta(minutes=8)
+# Ingest accepts an inventory sample as evidence while
+# event.observed_at - sample.observed_at >= -30s (src/gpu_fault/app/ingest/
+# faults.py, _fresh_gpu_inventory). The back-dated event is only safe when the
+# newest stored sample is newer than event + 30s by a margin ingestion lag
+# cannot eat; 60s is that margin.
+INGEST_FUTURE_TOLERANCE = timedelta(seconds=30)
+FAIL_CLOSED_SAFETY_MARGIN = timedelta(seconds=60)
 FAIL_CLOSED_REASON = "requires fabric_partition and complete node GPU inventory"
+FULL_FABRIC_RESET_ACTIONS = frozenset({"RESET_ALL_GPUS_AND_NVSWITCHES"})
+REBOOT_EVENTS = frozenset({"BatchRebootClusterNodes", "RebootClusterNodes"})
+REPLACE_EVENTS = frozenset({"BatchReplaceClusterNodes", "ReplaceClusterNodes"})
+# `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` unset or any of these spellings is "false".
+FALSE_ENV_VALUES = frozenset({"", "0", "false", "no", "off"})
 DESTRUCTIVE_PROBE = Path(__file__).with_name("probes") / "destructive_node_probe.py"
 TRAINING_MANIFEST = (
     Path(__file__).with_name("manifests")
@@ -127,6 +148,111 @@ print(json.dumps({"matches": matches}, sort_keys=True, default=str))
 """
 
 
+GPU_INVENTORY_SNAPSHOT = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+
+cluster_id, node_id = sys.argv[1:]
+store = ApplicationContext.from_environment().store
+snapshot = store.get_gpu_inventory_snapshot(cluster_id, node_id)
+print(json.dumps({
+    "present": snapshot is not None,
+    "observed_at": snapshot.observed_at.isoformat() if snapshot else None,
+    "source_boot_id": snapshot.source_boot_id if snapshot else None,
+    "device_count": len(snapshot.devices) if snapshot else 0,
+}, sort_keys=True, default=str))
+"""
+
+
+HOST_INVENTORY_EVIDENCE = r"""
+import json
+import sys
+from datetime import datetime
+
+from gpu_fault.app import ApplicationContext
+
+cluster_id, node_id, observed_after_text = sys.argv[1:]
+observed_after = datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
+store = ApplicationContext.from_environment().store
+records = []
+for item in store.list_raw_evidence(cluster_id, node_id=node_id, limit=500):
+    if item.observed_at < observed_after:
+        continue
+    if str(getattr(item.kind, "value", item.kind)) != "HOST_TELEMETRY":
+        continue
+    samples = [
+        sample
+        for sample in (item.payload.get("samples") or [])
+        if str(sample.get("name")) == "gpu_inventory_mismatch"
+    ]
+    if not samples:
+        continue
+    records.append({
+        "record_id": item.record_id,
+        "observed_at": item.observed_at.isoformat(),
+        "samples": samples,
+    })
+records.sort(key=lambda item: item["observed_at"])
+print(json.dumps({"records": records}, sort_keys=True, default=str))
+"""
+
+
+HYPERPOD_SUBMISSION = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.hyperpod import hyperpod_submission_idempotency_key
+
+request_id, hyperpod_cluster = sys.argv[1:]
+store = ApplicationContext.from_environment().store
+restart_commands = [
+    item
+    for item in store.list_remote_commands(workflow_request_ids=[request_id])
+    if item.step.operation.value == "RESTART_NODE"
+]
+submission = None
+if restart_commands:
+    command = restart_commands[-1]
+    key = command.result_details.get(
+        "submission_idempotency_key"
+    ) or hyperpod_submission_idempotency_key(
+        request_id, command.step_index, command.step.operation
+    )
+    try:
+        submission = store.get_hyperpod_submission(hyperpod_cluster, key).model_dump(
+            mode="json"
+        )
+    except Exception:
+        submission = None
+print(json.dumps({
+    "submission": submission,
+    "restart_commands": [
+        {
+            "command_id": item.command_id,
+            "status": str(getattr(item.status, "value", item.status)),
+            "step_index": item.step_index,
+        }
+        for item in restart_commands
+    ],
+}, sort_keys=True, default=str))
+"""
+
+
+EXECUTOR_REPLACE_FLAG = r"""
+import json
+import os
+
+print(json.dumps({
+    "GPU_FAULT_ALLOW_HYPERPOD_REPLACE": os.environ.get(
+        "GPU_FAULT_ALLOW_HYPERPOD_REPLACE", ""
+    ),
+}, sort_keys=True))
+"""
+
+
 @dataclass(frozen=True)
 class Settings:
     regional: RegionalLiveSettings
@@ -138,6 +264,11 @@ class Settings:
     executor_role_arn: str
     site_file: Path | None
     predecessor_path: Path
+    xid: int = DEFAULT_COLLECT013_XID
+    # COLLECT-004: the finding's latency may exceed samples x interval by this
+    # fraction (collector restart, ingestion) before it stops being "about
+    # two collection periods".
+    debounce_tolerance: float = 0.5
 
     @property
     def confirmation(self) -> str:
@@ -156,6 +287,8 @@ class Settings:
         }
         if self.site_file is not None:
             result["GPU_FAULT_SITE_FILE"] = str(self.site_file)
+        if self.case_id == "GF-REGIONAL-COLLECT-013":
+            result["GPU_FAULT_COLLECT013_XID"] = str(self.xid)
         return result
 
 
@@ -195,35 +328,49 @@ def configure(arguments: argparse.Namespace) -> Settings:
         ).strip(),
         site_file=site_file,
         predecessor_path=predecessor,
+        xid=int(getattr(arguments, "xid", DEFAULT_COLLECT013_XID)),
+        debounce_tolerance=float(getattr(arguments, "debounce_tolerance", 0.5)),
     )
 
 
-def focused_tests(case_id: str, case_dir: Path) -> dict[str, Any]:
-    definitions = {
-        "GF-REGIONAL-COLLECT-004": [
-            "tests/collectors/test_gpu.py::"
-            "test_host_collector_reports_persistent_gpu_and_efa_card_loss",
-        ],
-        "GF-REGIONAL-COLLECT-008": [
-            "tests/orchestration/test_xid.py::"
-            "test_xid_48_solo_and_companion_compile_the_same_containment",
-        ],
-        "GF-REGIONAL-COLLECT-013": [
-            "tests/node_agent/test_remediation.py::"
-            "test_gpu_reset_is_idempotent_and_rechecks_clients",
-        ],
-        "GF-REGIONAL-COLLECT-014": [
-            "tests/node_agent/test_remediation.py::"
-            "test_full_fabric_reset_rejects_inventory_mismatch",
-            "tests/node_agent/test_remediation.py::"
-            "test_full_fabric_reset_verifies_inventory_and_is_idempotent",
-        ],
-        "GF-REGIONAL-COLLECT-015": [
-            "tests/policy/test_policy.py::"
-            "test_always_fatal_sxid_uses_host_restart_branch",
-        ],
-    }
-    command = [sys.executable, "-m", "pytest", "-q", *definitions[case_id]]
+FOCUSED_TESTS = {
+    "GF-REGIONAL-COLLECT-004": [
+        "tests/collectors/test_gpu.py::"
+        "test_host_collector_reports_persistent_gpu_and_efa_card_loss",
+    ],
+    "GF-REGIONAL-COLLECT-008": [
+        "tests/orchestration/test_xid.py::"
+        "test_xid_48_solo_and_companion_compile_the_same_containment",
+    ],
+    "GF-REGIONAL-COLLECT-013": [
+        "tests/node_agent/test_remediation.py::"
+        "test_gpu_reset_is_idempotent_and_rechecks_clients",
+    ],
+    "GF-REGIONAL-COLLECT-014": [
+        "tests/node_agent/test_remediation.py::"
+        "test_full_fabric_reset_rejects_inventory_mismatch",
+        "tests/node_agent/test_remediation.py::"
+        "test_full_fabric_reset_verifies_inventory_and_is_idempotent",
+    ],
+    "GF-REGIONAL-COLLECT-015": [
+        "tests/policy/test_policy.py::test_always_fatal_sxid_uses_host_restart_branch",
+    ],
+}
+
+
+def focused_tests(
+    case_id: str,
+    case_dir: Path,
+    *,
+    reuse_plan: Path | None = None,
+) -> dict[str, Any]:
+    """Run the case's focused pytest, or reuse the plan's result on the same tree."""
+
+    if reuse_plan is not None:
+        recorded = reusable_focused_tests(reuse_plan)
+        if recorded is not None:
+            return {**recorded, "reused_from_plan": str(reuse_plan)}
+    command = [sys.executable, "-m", "pytest", "-q", *FOCUSED_TESTS[case_id]]
     completed = RegionalLiveFixture.run(
         command,
         cwd=ROOT,
@@ -243,13 +390,20 @@ def focused_tests(case_id: str, case_dir: Path) -> dict[str, Any]:
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
+    *,
+    reuse_plan: Path | None = None,
 ) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
     node = regional.node_snapshot(settings.node)
     state = regional.store_snapshot(node=settings.node)
     predecessor_id = PREDECESSORS[settings.case_id]
-    predecessor = predecessor_evidence(settings.predecessor_path, predecessor_id)
-    tests = focused_tests(settings.case_id, case_dir)
+    identity = regional.evidence_identity()
+    predecessor = predecessor_evidence(
+        settings.predecessor_path,
+        predecessor_id,
+        **identity,
+    )
+    tests = focused_tests(settings.case_id, case_dir, reuse_plan=reuse_plan)
     errors = []
     if not predecessor["valid"]:
         errors.append(f"{predecessor_id} predecessor evidence is not PASS")
@@ -269,7 +423,7 @@ def read_only_preflight(
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     result = {
-        "release_id": state.get("release_id"),
+        **identity,
         "node": node,
         "store": state,
         "predecessor": predecessor,
@@ -310,16 +464,36 @@ def wait_xid_workflow(
     case_dir: Path,
     node: str | None = None,
 ) -> dict[str, Any]:
-    return cast(
-        dict[str, Any],
-        regional.wait_for_workflow(
-            node=node or settings.node,
-            marker=marker,
-            observed_after=injected_at,
-            case_dir=case_dir,
-            timeout_seconds=1800,
-        ),
+    return regional.wait_for_workflow(
+        node=node or settings.node,
+        marker=marker,
+        observed_after=injected_at,
+        case_dir=case_dir,
+        timeout_seconds=1800,
     )
+
+
+def stop_sampler(host: HostProbeFixture, run_id: str, errors: list[str]) -> None:
+    """Stop the detached nvidia-smi sampler; a failure is recorded, never raised.
+
+    The sampler polls nvidia-smi four times a second for up to 30 minutes.
+    Left running by an exception it outlives the case and sits on the GPUs the
+    next reset has to take, so every path stops it -- and a stop that fails
+    must not replace the exception that brought us here.
+    """
+
+    try:
+        host.execute("stop-reset-sampler", "--run-id", run_id, timeout=60)
+    except Exception as exc:
+        errors.append(f"reset sampler stop failed: {type(exc).__name__}: {exc}")
+
+
+def boot_id_errors(baseline: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    """A single-GPU or full-fabric reset never reboots the node."""
+
+    if after.get("boot_id") != baseline.get("boot_id"):
+        return ["node boot ID changed: the reset became a reboot"]
+    return []
 
 
 def run_single_reset(
@@ -344,39 +518,45 @@ def run_single_reset(
         host.host_script,
         timeout=60,
     )
-    injected_at = datetime.now(timezone.utc)
-    host.execute(
-        "write-xid",
-        "--xid",
-        str(xid),
-        "--marker",
-        marker,
-        "--drill-id",
-        run_id,
-        "--pci-bdf",
-        target_bdf.rsplit(".", 1)[0],
-        "--case-id",
-        settings.case_id,
+    errors: list[str] = []
+    try:
+        injected_at = datetime.now(timezone.utc)
+        host.execute(
+            "write-xid",
+            "--xid",
+            str(xid),
+            "--marker",
+            marker,
+            "--drill-id",
+            run_id,
+            "--pci-bdf",
+            target_bdf.rsplit(".", 1)[0],
+            "--case-id",
+            settings.case_id,
+        )
+        state = wait_xid_workflow(
+            regional,
+            settings,
+            marker=marker,
+            injected_at=injected_at,
+            case_dir=case_dir,
+            node=node,
+        )
+        after = host.execute(
+            "snapshot",
+            "--since-epoch",
+            str(injected_at.timestamp()),
+            "--pci-bdf",
+            target_bdf.rsplit(".", 1)[0],
+            "--run-id",
+            run_id,
+            timeout=180,
+        )
+    finally:
+        stop_sampler(host, run_id, errors)
+    errors.extend(
+        reset_case.workflow_errors(state, xid=xid, expected_steps=expected_steps)
     )
-    state = wait_xid_workflow(
-        regional,
-        settings,
-        marker=marker,
-        injected_at=injected_at,
-        case_dir=case_dir,
-        node=node,
-    )
-    after = host.execute(
-        "snapshot",
-        "--since-epoch",
-        str(injected_at.timestamp()),
-        "--pci-bdf",
-        target_bdf.rsplit(".", 1)[0],
-        "--run-id",
-        run_id,
-        timeout=180,
-    )
-    errors = reset_case.workflow_errors(state, xid=xid, expected_steps=expected_steps)
     errors.extend(
         reset_case.host_errors(
             baseline,
@@ -385,8 +565,32 @@ def run_single_reset(
             target_bdf=target_bdf.rsplit(".", 1)[0],
         )
     )
-    host.execute("stop-reset-sampler", "--run-id", run_id, timeout=60)
+    errors.extend(boot_id_errors(baseline, after))
     return state, errors
+
+
+def companion_xid_errors(solo: dict[str, Any]) -> list[str]:
+    """COLLECT-008's first line: XID 63 alone is watched, never acted on.
+
+    ``solo`` is the store's reading for the XID 63 marker. Its event must be
+    kmsg-backed like every other kernel XID, its decision MONITOR_ONLY, and
+    no workflow may hang off it -- the reset belongs to the XID 48 companion.
+    """
+
+    errors = []
+    event = solo.get("event") or {}
+    decision = solo.get("decision") or {}
+    if event.get("xid") != 63:
+        errors.append("XID 63 marker did not resolve to an XID 63 event")
+    if not str(event.get("evidence_ref") or "").startswith("kmsg://"):
+        errors.append("XID 63 evidence is not backed by kmsg://")
+    if decision.get("disposition") != "MONITOR_ONLY":
+        errors.append(
+            f"XID 63 disposition is {decision.get('disposition')!r}, not MONITOR_ONLY"
+        )
+    if solo.get("workflow"):
+        errors.append("solo XID 63 opened a workflow of its own")
+    return errors
 
 
 def run_collect008(
@@ -409,53 +613,57 @@ def run_collect008(
         host.host_script,
         timeout=60,
     )
-    injected_at = datetime.now(timezone.utc)
-    host.execute(
-        "write-xid",
-        "--xid",
-        "63",
-        "--marker",
-        marker63,
-        "--drill-id",
-        run_id,
-        "--pci-bdf",
-        target_bdf,
-        "--case-id",
-        settings.case_id,
-    )
-    time.sleep(6)
-    host.execute(
-        "write-xid",
-        "--xid",
-        "48",
-        "--marker",
-        marker48,
-        "--drill-id",
-        run_id,
-        "--pci-bdf",
-        target_bdf,
-        "--case-id",
-        settings.case_id,
-    )
-    state = wait_xid_workflow(
-        regional,
-        settings,
-        marker=marker48,
-        injected_at=injected_at,
-        case_dir=case_dir,
-    )
-    errors = reset_case.workflow_errors(
-        state, xid=48, official_action="DRAIN_AND_RESET"
-    )
-    after = host.execute(
-        "snapshot",
-        "--since-epoch",
-        str(injected_at.timestamp()),
-        "--pci-bdf",
-        target_bdf,
-        "--run-id",
-        run_id,
-        timeout=180,
+    errors: list[str] = []
+    try:
+        injected_at = datetime.now(timezone.utc)
+        host.execute(
+            "write-xid",
+            "--xid",
+            "63",
+            "--marker",
+            marker63,
+            "--drill-id",
+            run_id,
+            "--pci-bdf",
+            target_bdf,
+            "--case-id",
+            settings.case_id,
+        )
+        time.sleep(6)
+        host.execute(
+            "write-xid",
+            "--xid",
+            "48",
+            "--marker",
+            marker48,
+            "--drill-id",
+            run_id,
+            "--pci-bdf",
+            target_bdf,
+            "--case-id",
+            settings.case_id,
+        )
+        state = wait_xid_workflow(
+            regional,
+            settings,
+            marker=marker48,
+            injected_at=injected_at,
+            case_dir=case_dir,
+        )
+        after = host.execute(
+            "snapshot",
+            "--since-epoch",
+            str(injected_at.timestamp()),
+            "--pci-bdf",
+            target_bdf,
+            "--run-id",
+            run_id,
+            timeout=180,
+        )
+    finally:
+        stop_sampler(host, run_id, errors)
+    errors.extend(
+        reset_case.workflow_errors(state, xid=48, official_action="DRAIN_AND_RESET")
     )
     errors.extend(
         reset_case.host_errors(
@@ -465,12 +673,23 @@ def run_collect008(
             target_bdf=target_bdf,
         )
     )
-    host.execute("stop-reset-sampler", "--run-id", run_id, timeout=60)
+    errors.extend(boot_id_errors(baseline, after))
+    solo = regional.store_snapshot(
+        node=settings.node,
+        marker=marker63,
+        observed_after=injected_at,
+        queue_attempts=1,
+    )
+    errors.extend(companion_xid_errors(solo))
     return {
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "markers": [marker63, marker48],
         "workflow_request_id": (state.get("workflow") or {}).get("request_id"),
+        "xid63": {
+            "event_id": (solo.get("event") or {}).get("event_id"),
+            "disposition": (solo.get("decision") or {}).get("disposition"),
+        },
     }
 
 
@@ -481,34 +700,30 @@ def run_collect013(
     case_dir: Path,
     attempt: int,
 ) -> dict[str, Any]:
-    results = []
-    errors = []
-    for xid in (109, 62):
-        marker = f"c013-{xid}-{int(time.time())}-a{attempt}"
-        state, current_errors = run_single_reset(
-            settings,
-            regional,
-            host,
-            case_dir / f"xid-{xid}",
-            xid=xid,
-            marker=marker,
-            run_id=f"c013-{xid}-{attempt}",
-        )
-        errors.extend(current_errors)
-        results.append(
-            {
-                "xid": xid,
-                "marker": marker,
-                "workflow_request_id": (
-                    (state.get("workflow") or {}).get("request_id")
-                ),
-            }
-        )
-        time.sleep(10)
+    xid = settings.xid
+    if xid not in COLLECT013_XIDS:
+        raise RegionalFixtureError(f"COLLECT-013 XID must be one of {COLLECT013_XIDS}")
+    marker = f"c013-{xid}-{int(time.time())}-a{attempt}"
+    state, errors = run_single_reset(
+        settings,
+        regional,
+        host,
+        case_dir / f"xid-{xid}",
+        xid=xid,
+        marker=marker,
+        run_id=f"c013-{xid}-{attempt}",
+    )
     return {
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
-        "runs": results,
+        "xid": xid,
+        "runs": [
+            {
+                "xid": xid,
+                "marker": marker,
+                "workflow_request_id": (state.get("workflow") or {}).get("request_id"),
+            }
+        ],
     }
 
 
@@ -516,12 +731,12 @@ def post_fabric_event(
     regional: RegionalLiveFixture,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    return cast(
-        dict[str, Any],
-        regional.executor_python(
-            FABRIC_POST,
-            json.dumps(payload, sort_keys=True),
-        ),
+    # One attempt: the post is a mutation. A retry after a failure that
+    # happened *after* the control plane accepted the event posts it twice.
+    return regional.executor_python(
+        FABRIC_POST,
+        json.dumps(payload, sort_keys=True),
+        attempts=1,
     )
 
 
@@ -552,6 +767,40 @@ def latest_node_workflow(
                 return cast(dict[str, Any], {**matches[0], "matches": matches})
         time.sleep(5)
     raise RegionalFixtureError(f"node workflow did not converge: {last}")
+
+
+def wait_planned_workflow(
+    regional: RegionalLiveFixture,
+    settings: Settings,
+    *,
+    operation: str,
+    observed_after: datetime,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """The workflow that planned ``operation`` for the node, in any status.
+
+    ``latest_node_workflow`` waits for a terminal workflow; COLLECT-004 needs
+    the moment the reboot is *planned*, because that is when the injected
+    override has done its work and must come off the node.
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = regional.cpu_python(
+            LATEST_NODE_WORKFLOW,
+            settings.regional.cluster_id,
+            settings.node,
+            observed_after.isoformat(),
+        )
+        planned = workflow_planning(last, operation)
+        if planned is not None:
+            return planned
+        time.sleep(5)
+    raise RegionalFixtureError(
+        f"no workflow planned {operation} for {settings.node} within "
+        f"{timeout_seconds}s: {last}"
+    )
 
 
 def workflow_planning(
@@ -630,10 +879,100 @@ def restore_incident(
         profile_version=profile_version,
         reason=reason,
     )
-    return cast(
-        dict[str, Any],
-        restore.wait_workflow_id(str(created["workflow_request_id"])),
-    )
+    return restore.wait_workflow_id(str(created["workflow_request_id"]))
+
+
+def mismatch_finding(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The first HOST_TELEMETRY record whose ``gpu_inventory_mismatch`` fired."""
+
+    for record in records:
+        for sample in record.get("samples") or []:
+            if str(sample.get("name")) != "gpu_inventory_mismatch":
+                continue
+            if float(sample.get("value") or 0) >= 1:
+                return {**record, "sample": sample}
+    return None
+
+
+def debounce_errors(
+    records: list[dict[str, Any]],
+    *,
+    interval: int,
+    required_samples: int,
+    started_at: datetime,
+    tolerance: float,
+) -> list[str]:
+    """COLLECT-004's actual claim: the finding fires on sample N, not sample 1.
+
+    The host collector labels every inventory sample with the consecutive
+    mismatch count it has seen and the count it requires; the persisted
+    finding (``gpu_inventory_mismatch`` = 1) therefore says on which sample
+    it fired. The latency from the override to that record must be about
+    ``required_samples`` collection intervals.
+    """
+
+    errors = []
+    finding = mismatch_finding(records)
+    if finding is None:
+        errors.append("no gpu_inventory_mismatch finding reached the control plane")
+        return errors
+    labels = finding["sample"].get("labels") or {}
+    consecutive = int(labels.get("consecutive_mismatch_samples") or 0)
+    required_label = int(labels.get("required_consecutive_samples") or 0)
+    if required_samples < 2:
+        errors.append(
+            "GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES is below 2; the "
+            "debounce this case exists to prove is switched off"
+        )
+    if consecutive != required_samples:
+        errors.append(
+            f"finding fired on consecutive sample {consecutive}, the node is "
+            f"configured for {required_samples}"
+        )
+    if consecutive < 2:
+        errors.append("finding fired on the first mismatching sample")
+    if required_label and required_label != required_samples:
+        errors.append(
+            f"collector reports required_consecutive_samples={required_label}, "
+            f"collector.env says {required_samples}"
+        )
+    latency = (
+        datetime.fromisoformat(str(finding["observed_at"]).replace("Z", "+00:00"))
+        - started_at
+    ).total_seconds()
+    expected = interval * required_samples
+    lower = interval * (required_samples - 1)
+    upper = expected * (1 + tolerance)
+    if not lower <= latency <= upper:
+        errors.append(
+            f"finding latency {latency:.1f}s is not about {expected}s "
+            f"({required_samples} x {interval}s; accepted {lower}..{upper:.0f}s)"
+        )
+    return errors
+
+
+def wait_mismatch_finding(
+    regional: RegionalLiveFixture,
+    settings: Settings,
+    *,
+    observed_after: datetime,
+    timeout_seconds: int,
+) -> list[dict[str, Any]]:
+    """Poll the node's HOST_TELEMETRY evidence until the mismatch finding lands."""
+
+    deadline = time.monotonic() + timeout_seconds
+    records: list[dict[str, Any]] = []
+    while True:
+        value = regional.cpu_python(
+            HOST_INVENTORY_EVIDENCE,
+            settings.regional.cluster_id,
+            settings.node,
+            observed_after.isoformat(),
+        )
+        records = list(value.get("records") or [])
+        if mismatch_finding(records) is not None or time.monotonic() >= deadline:
+            return records
+        time.sleep(5)
 
 
 def run_collect004(
@@ -647,9 +986,19 @@ def run_collect004(
     env = baseline["collector_env"]
     expected = collector_setting(env, "GPU_FAULT_EXPECTED_GPU_COUNT")
     interval = collector_setting(env, "GPU_FAULT_HOST_INTERVAL_SECONDS")
+    required_samples = collector_setting(
+        env, "GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES"
+    )
+    baseline_env_sha256 = (baseline.get("collector_env_file") or {}).get("sha256")
     run_id = f"c004-{attempt}"
     started_at = datetime.now(timezone.utc)
-    collector.execute(
+    result: dict[str, Any] = {
+        "errors": [],
+        "collector_env": env,
+        "interval_seconds": interval,
+        "required_consecutive_samples": required_samples,
+    }
+    result["override"] = collector.execute(
         "override-expected-gpu-count",
         "--run-id",
         run_id,
@@ -658,20 +1007,43 @@ def run_collect004(
         "--restore-seconds",
         "600",
     )
-    result: dict[str, Any] = {"errors": []}
+    restore: dict[str, Any] | None = None
     try:
-        time.sleep(interval * 3)
-        workflow_state = latest_node_workflow(
+        # (a) The debounce itself: which sample the finding fired on.
+        records = wait_mismatch_finding(
             regional,
             settings,
             observed_after=started_at,
+            timeout_seconds=interval * (required_samples + 4) + 60,
         )
-        result["workflow_state"] = workflow_state
-        restart_workflow = workflow_planning(workflow_state, "RESTART_NODE")
-        if restart_workflow is None:
-            result["errors"].append("inventory mismatch did not plan RESTART_NODE")
-        else:
-            result["restart_workflow_id"] = restart_workflow.get("request_id")
+        result["mismatch_records"] = records
+        result["errors"].extend(
+            debounce_errors(
+                records,
+                interval=interval,
+                required_samples=required_samples,
+                started_at=started_at,
+                tolerance=settings.debounce_tolerance,
+            )
+        )
+        planned = wait_planned_workflow(
+            regional,
+            settings,
+            operation="RESTART_NODE",
+            observed_after=started_at,
+            timeout_seconds=600,
+        )
+        result["restart_workflow_id"] = planned.get("request_id")
+        # (b) The finding is captured and the reboot is planned: the override
+        # comes off the node *now*. Kept through the reboot it makes the
+        # post-reboot VALIDATE_GPU see the wrong expected count, the workflow
+        # fails and escalates, and the runner used to tolerate that.
+        restore = restore_collector_env(collector, run_id)
+        result["collector_restore"] = restore
+        if restore.get("restored") is not True:
+            result["errors"].append(
+                f"collector env restore did not restore: {restore.get('reason')}"
+            )
         node_after = regional.wait_node_ready(
             settings.node,
             timeout_seconds=1800,
@@ -683,13 +1055,39 @@ def run_collect004(
         collector.recreate()
         if node_after["boot_id"] == baseline["boot_id"]:
             result["errors"].append("inventory mismatch did not reboot the node")
-        provider = regional.provider_events(started_at, datetime.now(timezone.utc))
-        result["provider_events"] = provider
-        reboot = [
-            item
-            for item in provider
-            if item["event_name"] in {"BatchRebootClusterNodes", "RebootClusterNodes"}
-        ]
+        # (c) The reboot workflow itself, not merely "RESTART_NODE planned".
+        workflow_state = latest_node_workflow(
+            regional,
+            settings,
+            observed_after=started_at,
+        )
+        result["workflow_state"] = workflow_state
+        matches = workflow_state.get("matches") or []
+        if len(matches) != 1:
+            result["errors"].append(
+                f"node grew {len(matches)} workflows after the injection, expected "
+                "exactly the inventory-mismatch reboot"
+            )
+        restart_workflow = workflow_planning(workflow_state, "RESTART_NODE")
+        if restart_workflow is None:
+            result["errors"].append("inventory mismatch did not plan RESTART_NODE")
+        elif restart_workflow.get("status") != "SUCCEEDED":
+            result["errors"].append(
+                f"reboot workflow is {restart_workflow.get('status')!r}, not SUCCEEDED"
+            )
+        after = collector.snapshot()
+        result["collector_env_after"] = after.get("collector_env_file")
+        after_sha256 = (after.get("collector_env_file") or {}).get("sha256")
+        if not baseline_env_sha256 or after_sha256 != baseline_env_sha256:
+            result["errors"].append(
+                "collector.env digest after restore differs from the baseline"
+            )
+        reboot = regional.wait_provider_events(
+            started_at,
+            event_names=set(REBOOT_EVENTS),
+            expected_count=1,
+        )
+        result["provider_events"] = reboot
         if len(reboot) != 1:
             result["errors"].append("CloudTrail does not contain exactly one reboot")
         elif not provider_event_actor_matches_role(
@@ -698,14 +1096,54 @@ def run_collect004(
         ):
             result["errors"].append("reboot actor is not the executor role")
     finally:
-        try:
-            result["collector_restore"] = restore_collector_env(collector, run_id)
-        except Exception as exc:
-            result["errors"].append(
-                f"collector env restore failed: {type(exc).__name__}: {exc}"
-            )
+        if restore is None or restore.get("restored") is not True:
+            try:
+                result["collector_restore"] = restore_collector_env(collector, run_id)
+                if result["collector_restore"].get("restored") is not True:
+                    result["errors"].append(
+                        "collector env restore did not restore: "
+                        f"{result['collector_restore'].get('reason')}"
+                    )
+            except Exception as exc:
+                result["errors"].append(
+                    f"collector env restore failed: {type(exc).__name__}: {exc}"
+                )
     result["verdict"] = "PASS" if not result["errors"] else "FAIL"
     return result
+
+
+def fail_closed_timing_errors(
+    inventory: dict[str, Any],
+    *,
+    event_time: datetime,
+) -> list[str]:
+    """Refuse the fail-closed post unless no stored inventory can vouch for it.
+
+    ``inventory`` is the node's newest ``GpuInventorySnapshot`` as the store
+    holds it. Ingest treats a sample as fresh for the event while
+    ``event.observed_at - sample.observed_at >= -30s``; the back-dated event is
+    safe only when the sample is newer than that by a margin. A node with no
+    snapshot at all cannot produce evidence, so it is safe by construction.
+    On 2026-09-06 the sample lagged 2-3 minutes, the two-minute back-date
+    looked fresh, and two real full-fabric resets ran under a "fail-closed"
+    label.
+    """
+
+    if not inventory.get("present"):
+        return []
+    observed_at = datetime.fromisoformat(
+        str(inventory.get("observed_at")).replace("Z", "+00:00")
+    )
+    margin = observed_at - event_time
+    needed = INGEST_FUTURE_TOLERANCE + FAIL_CLOSED_SAFETY_MARGIN
+    if margin < needed:
+        return [
+            f"stored GPU inventory ({observed_at.isoformat()}) is only "
+            f"{margin.total_seconds():.0f}s newer than the back-dated event; "
+            f"{needed.total_seconds():.0f}s are required for the fail-closed "
+            "premise to hold, so the SXID is not posted"
+        ]
+    return []
 
 
 def run_collect014(
@@ -725,15 +1163,30 @@ def run_collect014(
     # Ingest accepts an inventory sample as evidence only while
     # -30s <= event.observed_at - sample.observed_at <= 180s (snapshot) or
     # 600s (legacy metrics), so the event is back-dated far enough that the
-    # newest stored sample is still *newer* than event + 30s. Two minutes,
-    # the original offset, only holds while inventory delivery lags < 90s;
-    # on 2026-09-06 05:11Z and 05:17Z the newest sample was ~2-3 min old
-    # (gpu-inventory batch completions were failing and retrying), the gate
-    # saw complete inventory, and each "fail-closed" post executed a real
-    # RESET_ALL_GPUS_NVSWITCHES on the node. Eight minutes tolerates a
-    # 7.5 min delivery lag and stays under the 900s STALE_FAULT_GENERATION
-    # fence, which would block for the wrong reason.
-    old_time = datetime.now(timezone.utc) - FAIL_CLOSED_EVENT_AGE
+    # newest stored sample is still *newer* than event + 30s. Eight minutes
+    # tolerates a 7.5 min delivery lag and stays under the 900s
+    # STALE_FAULT_GENERATION fence, which would block for the wrong reason.
+    # And because the premise is a bet on inventory freshness, the store is
+    # read first and the post refused when the bet would not hold.
+    posted_at = datetime.now(timezone.utc)
+    old_time = posted_at - FAIL_CLOSED_EVENT_AGE
+    inventory = regional.cpu_python(
+        GPU_INVENTORY_SNAPSHOT,
+        settings.regional.cluster_id,
+        settings.node,
+    )
+    errors = fail_closed_timing_errors(inventory, event_time=old_time)
+    if errors:
+        return {
+            "verdict": "FAIL",
+            "errors": errors,
+            "fail_closed_marker": None,
+            "positive_marker": None,
+            "inventory_snapshot": inventory,
+            "fail_closed": None,
+            "positive": None,
+            "restore_workflows": [],
+        }
     fail_payload = {
         "cluster_id": settings.regional.cluster_id,
         "node_id": settings.node,
@@ -747,15 +1200,23 @@ def run_collect014(
         "runtime_profile_version": profile_version,
     }
     post_fabric_event(regional, fail_payload)
+    # The workflow is created now, not at the back-dated observed_at, so the
+    # store scan is scoped to the moment of the post.
     fail_state = collector.wait_marker(
         fail_marker,
         case_dir=case_dir / "fail-closed",
         timeout_seconds=300,
         terminal_workflow=True,
+        observed_after=posted_at,
     )
     after_fail = reset_host.execute("snapshot")
-    errors = []
-    fail_workflow = (fail_state.get("workflows") or [{}])[0]
+    fail_workflow = (
+        select_workflow(
+            fail_state.get("workflows") or [],
+            official_actions=FULL_FABRIC_RESET_ACTIONS,
+        )
+        or (fail_state.get("workflows") or [{}])[0]
+    )
     if fail_workflow.get("status") != "BLOCKED":
         errors.append("incomplete inventory SXID did not fail closed")
     else:
@@ -791,6 +1252,7 @@ def run_collect014(
             "errors": errors,
             "fail_closed_marker": fail_marker,
             "positive_marker": None,
+            "inventory_snapshot": inventory,
             "fail_closed": fail_state,
             "positive": None,
             "restore_workflows": restores,
@@ -832,7 +1294,13 @@ def run_collect014(
             terminal_workflow=True,
             observed_after=injected_at,
         )
-        workflow = (state.get("workflows") or [{}])[0]
+        workflow = select_workflow(
+            state.get("workflows") or [],
+            operation="RESET_ALL_GPUS_NVSWITCHES",
+        )
+        if workflow is None:
+            errors.append("no workflow planned RESET_ALL_GPUS_NVSWITCHES")
+            workflow = {}
         if workflow.get("status") != "SUCCEEDED":
             errors.append("full GPU/NVSwitch reset workflow is not SUCCEEDED")
         execution = next(
@@ -871,11 +1339,9 @@ def run_collect014(
             errors.append("full fabric reset ledger count is not one")
         if len(after["gpu_inventory"]) != len(baseline["gpu_inventory"]):
             errors.append("GPU inventory changed after full fabric reset")
+        errors.extend(boot_id_errors(baseline, after))
     finally:
-        # The sampler polls nvidia-smi four times a second for up to 30 min.
-        # Left running by an exception it outlives the case and sits on the
-        # GPUs the next reset has to take, so it is stopped on every path.
-        reset_host.execute("stop-reset-sampler", "--run-id", run_id, timeout=60)
+        stop_sampler(reset_host, run_id, errors)
     # A SUCCEEDED reset returns the node to service, but restore through the
     # validated path regardless so a partial run never leaves it quarantined.
     restores.append(
@@ -890,10 +1356,54 @@ def run_collect014(
         "errors": errors,
         "fail_closed_marker": fail_marker,
         "positive_marker": marker,
+        "inventory_snapshot": inventory,
         "fail_closed": fail_state,
         "positive": state,
         "restore_workflows": restores,
     }
+
+
+def collect015_workflow_errors(
+    workflow: dict[str, Any] | None,
+    *,
+    submission: dict[str, Any] | None,
+    node_after: dict[str, Any],
+    node_recovery: Any,
+    allow_replace: str | None,
+) -> list[str]:
+    """COLLECT-015's control-plane readings around the ALWAYS_FATAL reboot."""
+
+    errors = []
+    if workflow is None:
+        errors.append("no workflow planned RESTART_NODE for the ALWAYS_FATAL SXID")
+        return errors
+    if workflow.get("status") != "SUCCEEDED":
+        errors.append("ALWAYS_FATAL reboot workflow is not SUCCEEDED")
+    restart = [
+        item
+        for item in workflow.get("step_executions") or []
+        if item.get("operation") == "RESTART_NODE"
+    ]
+    if not restart or restart[-1].get("status") != "SUCCEEDED":
+        errors.append("RESTART_NODE step did not reach SUCCEEDED")
+    if not submission:
+        errors.append("no HyperPod submission record for the RESTART_NODE step")
+    elif submission.get("state") != "SUBMITTED":
+        errors.append(
+            f"HyperPod submission record is {submission.get('state')!r}, not SUBMITTED"
+        )
+    if node_recovery not in (None, "None"):
+        errors.append(
+            f"HyperPod cluster NodeRecovery is {node_recovery!r}; the reboot must "
+            "not compete with automatic recovery"
+        )
+    if str(allow_replace or "").strip().lower() not in FALSE_ENV_VALUES:
+        errors.append(
+            f"executor GPU_FAULT_ALLOW_HYPERPOD_REPLACE={allow_replace!r} is not false"
+        )
+    if node_after.get("unschedulable"):
+        errors.append("node is still unschedulable after the reboot workflow")
+    return errors
 
 
 def run_collect015(
@@ -904,10 +1414,8 @@ def run_collect015(
     attempt: int,
 ) -> dict[str, Any]:
     baseline_node = regional.node_snapshot(settings.node)
-    baseline_provider = WarmSpareLiveFixture(
-        regional,
-        settings.hyperpod_cluster,
-    ).provider_inventory()
+    provider = WarmSpareLiveFixture(regional, settings.hyperpod_cluster)
+    baseline_provider = provider.provider_inventory()
     snapshot = collector.snapshot()
     bdf = str(snapshot["gpu_inventory"][0]["pci_bdf"])
     marker = f"c015-{int(time.time())}-a{attempt}"
@@ -942,28 +1450,38 @@ def run_collect015(
         expected_boot_id=str(baseline_node["boot_id"]),
     )
     errors = []
-    workflow = (state.get("workflows") or [{}])[0]
-    if workflow.get("status") != "SUCCEEDED":
-        errors.append("ALWAYS_FATAL reboot workflow is not SUCCEEDED")
+    workflow = select_workflow(state.get("workflows") or [], operation="RESTART_NODE")
+    submission_state: dict[str, Any] = {}
+    if workflow is not None:
+        submission_state = regional.cpu_python(
+            HYPERPOD_SUBMISSION,
+            str(workflow.get("request_id") or ""),
+            settings.hyperpod_cluster,
+        )
+    recovery = provider.cluster_recovery()
+    executor_flags = regional.executor_python(EXECUTOR_REPLACE_FLAG)
+    errors.extend(
+        collect015_workflow_errors(
+            workflow,
+            submission=submission_state.get("submission"),
+            node_after=regional.node_snapshot(settings.node),
+            node_recovery=recovery.get("node_recovery"),
+            allow_replace=executor_flags.get("GPU_FAULT_ALLOW_HYPERPOD_REPLACE"),
+        )
+    )
     if node_after["boot_id"] == baseline_node["boot_id"]:
         errors.append("node boot ID did not change")
-    provider_after = WarmSpareLiveFixture(
-        regional,
-        settings.hyperpod_cluster,
-    ).provider_inventory()
+    provider_after = provider.provider_inventory()
     if provider_after != baseline_provider:
         errors.append("provider node identity changed during reboot")
-    events = regional.provider_events(started_at, datetime.now(timezone.utc))
-    reboot = [
-        item
-        for item in events
-        if item["event_name"] in {"BatchRebootClusterNodes", "RebootClusterNodes"}
-    ]
-    replace = [
-        item
-        for item in events
-        if item["event_name"] in {"BatchReplaceClusterNodes", "ReplaceClusterNodes"}
-    ]
+    reboot = regional.wait_provider_events(
+        started_at,
+        event_names=set(REBOOT_EVENTS),
+        expected_count=1,
+    )
+    ended_at = datetime.now(timezone.utc)
+    events = regional.provider_events(started_at, ended_at)
+    replace = [item for item in events if item["event_name"] in REPLACE_EVENTS]
     if len(reboot) != 1:
         errors.append("CloudTrail reboot count is not one")
     elif not provider_event_actor_matches_role(
@@ -978,7 +1496,14 @@ def run_collect015(
         "errors": errors,
         "marker": marker,
         "workflow": workflow,
+        "submission": submission_state.get("submission"),
+        "cluster_recovery": recovery,
+        "executor_flags": executor_flags,
         "provider_events": events,
+        "reboot_events": reboot,
+        # "no replacement" is a negative claim inside CloudTrail's delivery
+        # window; DESTR-013 re-checks the whole run once it has caught up.
+        "provider_events_provisional": regional.provider_events_provisional(ended_at),
     }
 
 
@@ -1177,7 +1702,7 @@ class DevicePluginFixture:
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
-    return {
+    details = {
         "risk": "destructive",
         "case_id": settings.case_id,
         "predecessor": preflight["predecessor"],
@@ -1185,7 +1710,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "mutation": {
             "GF-REGIONAL-COLLECT-004": "temporary expected-count mismatch and real reboot",
             "GF-REGIONAL-COLLECT-008": "real kmsg XID63+48 and one GPU reset",
-            "GF-REGIONAL-COLLECT-013": "real kmsg XID109 and XID62 single-GPU resets",
+            "GF-REGIONAL-COLLECT-013": (
+                f"real kmsg XID{settings.xid} single-GPU reset (one cycle)"
+            ),
             "GF-REGIONAL-COLLECT-014": "fail-closed API SXID then real FM full fabric reset",
             "GF-REGIONAL-COLLECT-015": "real FM ALWAYS_FATAL SXID and HyperPod reboot",
         }[settings.case_id],
@@ -1211,6 +1738,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight["focused_tests"])
+    return details
 
 
 def execute_case(
@@ -1221,7 +1750,11 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / settings.case_id
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(
+        settings,
+        case_dir,
+        reuse_plan=case_dir / "plan.json",
+    )
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -1237,6 +1770,7 @@ def execute_case(
         "case_id": settings.case_id,
         "attempt": attempt,
         "verdict": "FAIL",
+        **regional.evidence_identity(),
     }
     collector: CollectorAcceptanceFixture | None = None
     try:
@@ -1347,6 +1881,19 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--executor-role-arn", default="")
     value.add_argument("--site-file", default="")
     value.add_argument("--predecessor-evidence", default="")
+    value.add_argument(
+        "--xid",
+        type=int,
+        choices=COLLECT013_XIDS,
+        default=DEFAULT_COLLECT013_XID,
+        help="COLLECT-013: which single-GPU reset XID to inject (one cycle)",
+    )
+    value.add_argument(
+        "--debounce-tolerance",
+        type=float,
+        default=0.5,
+        help="COLLECT-004: allowed fraction above samples x interval for the finding",
+    )
     return value
 
 

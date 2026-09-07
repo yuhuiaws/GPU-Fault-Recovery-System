@@ -1,230 +1,196 @@
 #!/usr/bin/env python3
+"""GF-REGIONAL-NET-003: the control plane commits a result the client never sees.
+
+One seeded ``FREEZE_EVIDENCE`` command and one drill notification for the
+synthetic cluster, one probe executor Pod. The probe's loopback proxy forwards
+the first result post to the control plane, waits for the control plane's
+answer, discards it and resets the client connection. The control plane has
+committed the command as SUCCEEDED; the client has a transport error. The
+client retries the same terminal result once, and the control plane must
+answer idempotently: the command is not reclaimed, the ledger shows one
+physical execution, and the drill notification is not duplicated.
+
+Plan-only by default; ``--execute`` needs the exact confirmation and a PASS
+from the formal predecessor.
+"""
+
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
-import shlex
 import sys
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-
-if __package__:
-    from .acceptance_scope import scoped_case_evidence
-    from .live_driver_guard import (
-        add_live_arguments,
-        authorize_execution,
-        build_plan,
-        install_site_profile,
-    )
-else:
-    from acceptance_scope import scoped_case_evidence
-    from live_driver_guard import (
-        add_live_arguments,
-        authorize_execution,
-        build_plan,
-        install_site_profile,
-    )
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "scripts" / "perf"))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-_action_capacity = importlib.import_module("regional_action_capacity_suite")
-_registry = importlib.import_module("regional_capacity_registry")
-_capacity_suite = importlib.import_module("regional_capacity_suite")
-executor_identity = _action_capacity.executor_identity
-AWS_REGION = _registry.AWS_REGION
-CONTROL_NAMESPACE = _registry.CONTROL_NAMESPACE
-DATAPLANE_CONTEXT = _registry.DATAPLANE_CONTEXT
-NAMESPACE = _registry.NAMESPACE
-control = _registry.control
-dataplane = _registry.dataplane
-load_registry = _registry.load_registry
-register = _registry.register
-teardown = _capacity_suite.teardown
-upsert_configmap = _capacity_suite.upsert_configmap
+from scripts.e2e.regional import net_command_fixture as fixture  # noqa: E402
+from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
+    add_live_arguments,
+)
 
+CASE_ID = "GF-REGIONAL-NET-003"
+CONFIRMATION = "NET003_RESULT_CONNECTION_RESET"
+RUN_PREFIX = "net003-"
 SCRIPT = Path(__file__).with_name("probes") / "net003_executor.py"
 CONFIGMAP = "gpu-fault-net003-script"
 POD = "gpu-fault-net003-executor"
 OWNER = "gpu-fault-net-test"
-CONFIRMATION = "NET003_RESULT_CONNECTION_RESET"
+OPERATION = "FREEZE_EVIDENCE"
+NODE_IDS = ["net003-synthetic-node"]
 DROP_ROLLBACK_SECONDS = 10
 HTTP_TIMEOUT_SECONDS = 30
+LEASE_SECONDS = 60
+ACTION_SECONDS = 5
+RESPONSE_QUIET_SECONDS = 2.0
+REPLAY_DELAY_SECONDS = 5.0
+TERMINAL_RESULT_REPLAYS = 1
+RESPONSE_LOSS_MODE = "forward-then-reset"
 POD_DEADLINE_SECONDS = 600
+STALE_LEASE_409 = "rejected request (409)"
+LOST_RESPONSE_LOG = "net003 result submission lost its response"
+
+CaseError = fixture.NetCommandError
+write_json = fixture.write_json
 
 
-class CaseError(RuntimeError):
-    pass
-
-
-def write_json(path: Path, value) -> None:
-    path.write_text(
-        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
+def probe_definition() -> fixture.NetCommandProbe:
+    return fixture.NetCommandProbe(
+        case_id=CASE_ID,
+        run_prefix=RUN_PREFIX,
+        pod=POD,
+        configmap=CONFIGMAP,
+        owner=OWNER,
+        script=SCRIPT,
+        environment={
+            "DROP_ROLLBACK_SECONDS": str(DROP_ROLLBACK_SECONDS),
+            "HTTP_TIMEOUT_SECONDS": str(HTTP_TIMEOUT_SECONDS),
+            "LEASE_SECONDS": str(LEASE_SECONDS),
+            "RESPONSE_QUIET_SECONDS": str(RESPONSE_QUIET_SECONDS),
+            "REPLAY_DELAY_SECONDS": str(REPLAY_DELAY_SECONDS),
+        },
+        pod_deadline_seconds=POD_DEADLINE_SECONDS,
     )
-    path.chmod(0o600)
 
 
-def preflight_metadata(attempt: int, maintenance_window_end: datetime) -> dict:
+def renewal_interval_seconds(lease_seconds: int) -> float:
+    """``ClusterActionExecutor._renew_lease``'s cadence for one lease length."""
+
+    return min(30.0, lease_seconds / 3)
+
+
+def timing_errors(
+    *,
+    lease_seconds: int = LEASE_SECONDS,
+    quiet_seconds: float = RESPONSE_QUIET_SECONDS,
+    replay_delay_seconds: float = REPLAY_DELAY_SECONDS,
+    http_timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
+) -> list[str]:
+    """Refuse a parameter set that could muddle the verdict.
+
+    The whole result exchange -- the action, the withheld response, the
+    replay delay -- has to finish before the executor's first lease renewal,
+    because a renewal sent against the now-terminal command is refused with
+    409 and would count as a renewal failure the case has no business
+    producing. That is why the lease is not shortened to 20s here: a 20s
+    lease renews every 6.7s and cannot fit the exchange.
+    """
+
+    errors: list[str] = []
+    interval = renewal_interval_seconds(lease_seconds)
+    exchange = ACTION_SECONDS + quiet_seconds + replay_delay_seconds
+    if exchange + 5 >= interval:
+        errors.append(
+            f"result exchange takes {exchange:.1f}s (+5s margin), not inside the "
+            f"{interval:.1f}s renewal interval of a {lease_seconds}s lease; a "
+            "renewal against the terminal command would be refused"
+        )
+    if quiet_seconds + replay_delay_seconds >= http_timeout_seconds:
+        errors.append(
+            f"quiet {quiet_seconds}s plus replay delay {replay_delay_seconds}s "
+            f"is not below the HTTP timeout {http_timeout_seconds}s"
+        )
+    if replay_delay_seconds < 2:
+        errors.append(
+            f"replay delay {replay_delay_seconds}s is too short to attribute the "
+            "commit to the first post against clock skew"
+        )
+    return errors
+
+
+def stop_conditions() -> list[str]:
+    return [
+        "formal predecessor evidence is not PASS",
+        "any preflight or rollout failure",
+        "test pod readiness failure",
+        "the first result post is not forwarded and its response not withheld",
+        "the control plane did not commit the first result before the reset",
+        "the client retry of the terminal result is not answered idempotently",
+        "the command is reclaimed or a lease renewal is refused",
+        "simulated physical execution count differs from one",
+        "terminal result replay creates a second notification",
+        "executor run loop exits",
+        "any cleanup or postflight residual check fails",
+    ]
+
+
+def rollback_contract() -> dict[str, Any]:
+    return {
+        "drop_marker_auto_release_seconds": DROP_ROLLBACK_SECONDS,
+        "pod_active_deadline_seconds": POD_DEADLINE_SECONDS,
+        "synthetic_registry_expires_minutes": 30,
+        "runner_finally_deletes_test_resources": True,
+        "runner_finally_purges_synthetic_state": True,
+        "runner_finally_restores_registry": True,
+    }
+
+
+def preflight_metadata(
+    attempt: int, maintenance_window_end: datetime
+) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     if now >= maintenance_window_end:
         raise CaseError("approved maintenance window has ended")
-    if not CONTROL_NAMESPACE or not NAMESPACE or not DATAPLANE_CONTEXT:
-        raise CaseError("GPU_FAULT_DATAPLANE_CONTEXT is required")
+    fixture.require_environment()
+    timing = timing_errors()
+    if timing:
+        raise CaseError("; ".join(timing))
     return {
         "observed_at": now.isoformat(),
         "attempt": attempt,
         "maintenance_window_end": maintenance_window_end.isoformat(),
-        "region": AWS_REGION,
-        "control_namespace": CONTROL_NAMESPACE,
-        "dataplane_context": DATAPLANE_CONTEXT,
-        "dataplane_namespace": NAMESPACE,
-        "cluster_id": "perf-cap-000",
-        "node": None,
-        "operation": "FREEZE_EVIDENCE",
+        "region": fixture.AWS_REGION,
+        "control_namespace": fixture.CONTROL_NAMESPACE,
+        "dataplane_context": fixture.DATAPLANE_CONTEXT,
+        "dataplane_namespace": fixture.NAMESPACE,
+        "cluster_id": fixture.SYNTHETIC_CLUSTER_ID,
+        "node_ids": NODE_IDS,
+        "operation": OPERATION,
         "destructive": False,
-        "network_scope": "one test-pod result connection reset on loopback proxy",
-        "stop_conditions": [
-            "any preflight or rollout failure",
-            "test pod readiness failure",
-            "the first result connection is not reset",
-            "the command is not reclaimed after lease expiry",
-            "simulated physical execution count differs from one",
-            "terminal result replay creates a second notification",
-            "executor run loop exits",
-            "any cleanup or postflight residual check fails",
-        ],
-        "rollback": {
-            "drop_marker_auto_release_seconds": DROP_ROLLBACK_SECONDS,
-            "pod_active_deadline_seconds": POD_DEADLINE_SECONDS,
-            "runner_finally_deletes_test_resources": True,
-            "runner_finally_purges_synthetic_state": True,
-            "runner_finally_restores_registry": True,
+        "network_scope": (
+            "one test-pod result connection reset on loopback proxy, after the "
+            "control plane answered"
+        ),
+        "timing": {
+            "lease_seconds": LEASE_SECONDS,
+            "response_quiet_seconds": RESPONSE_QUIET_SECONDS,
+            "replay_delay_seconds": REPLAY_DELAY_SECONDS,
+            "renewal_interval_seconds": renewal_interval_seconds(LEASE_SECONDS),
+            "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
         },
+        "stop_conditions": stop_conditions(),
+        "rollback": rollback_contract(),
     }
 
 
-def cpu_python(script: str, *arguments: str) -> dict:
-    pod = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ).strip()
-    output = control(
-        "exec",
-        "-i",
-        pod,
-        "--",
-        "python3",
-        "-",
-        *arguments,
-        stdin=script.encode(),
-        timeout=120,
-    )
-    return json.loads(output.splitlines()[-1])
-
-
-def database_residuals() -> dict:
-    script = r"""
-import json
-import os
-import psycopg
-
-queries = {
-    "objects": (
-        "SELECT count(*) FROM gpu_fault_objects "
-        "WHERE key LIKE '%net003-%' "
-        "OR payload->>'cluster_id' LIKE 'perf-cap-%'"
-    ),
-    "links": (
-        "SELECT count(*) FROM gpu_fault_links "
-        "WHERE key LIKE '%net003-%' OR value LIKE '%net003-%'"
-    ),
-    "processor_queue": (
-        "SELECT count(*) FROM gpu_fault_processor_queue "
-        "WHERE cluster_id LIKE 'perf-cap-%'"
-    ),
-    "processor_lanes": (
-        "SELECT count(*) FROM gpu_fault_processor_lanes "
-        "WHERE ordering_key LIKE 'perf-cap-%'"
-    ),
-    "processor_queue_counts": (
-        "SELECT count(*) FROM gpu_fault_processor_queue_counts "
-        "WHERE cluster_id LIKE 'perf-cap-%'"
-    ),
-    "gpu_metric_latest": (
-        "SELECT count(*) FROM gpu_fault_gpu_metric_latest "
-        "WHERE cluster_id LIKE 'perf-cap-%'"
-    ),
-    "gpu_metric_batches": (
-        "SELECT count(*) FROM gpu_fault_gpu_metrics_batches "
-        "WHERE cluster_id LIKE 'perf-cap-%'"
-    ),
-    "attempt_observations": (
-        "SELECT count(*) FROM gpu_fault_attempt_observations "
-        "WHERE cluster_id LIKE 'perf-cap-%'"
-    ),
-    "training_progress": (
-        "SELECT count(*) FROM gpu_fault_training_progress "
-        "WHERE cluster_id LIKE 'perf-cap-%'"
-    ),
-}
-result = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
-    with connection.cursor() as cursor:
-        for name, query in queries.items():
-            cursor.execute(query)
-            result[name] = int(cursor.fetchone()[0])
-result["total"] = sum(result.values())
-print(json.dumps(result, sort_keys=True))
-"""
-    return cpu_python(script)
-
-
-def registry_residuals() -> dict:
-    synthetic = [
-        {
-            "cluster_id": str(entry.get("cluster_id") or ""),
-            "synthetic_run_id": entry.get("synthetic_run_id"),
-        }
-        for entry in load_registry()
-        if bool(entry.get("synthetic"))
-        or str(entry.get("cluster_id") or "").startswith("perf-cap-")
-    ]
-    return {"count": len(synthetic), "entries": synthetic}
-
-
-def kubernetes_residuals() -> dict:
-    resources = {}
-    for kind, name in (
-        ("pod", POD),
-        ("configmap", CONFIGMAP),
-        ("secret", "gpu-fault-perf-clusters"),
-    ):
-        output = dataplane(
-            "get",
-            kind,
-            name,
-            "--ignore-not-found",
-            "-o",
-            "name",
-            check=False,
-        ).strip()
-        resources[f"{kind}/{name}"] = bool(output)
-    return {
-        "count": sum(resources.values()),
-        "resources": resources,
-    }
-
-
-def seed_command(run_id: str) -> dict:
-    script = r"""
+# --------------------------------------------------------------------------- #
+# Store scripts specific to NET-003 (a notification rides along with the seed)
+# --------------------------------------------------------------------------- #
+_SEED_COMMAND = r"""
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -241,20 +207,24 @@ from gpu_fault.models import (
 )
 from gpu_fault.regional import RemoteActionCommand
 
-run_id, cluster_id, owner, notification_id, deduplication_key = sys.argv[1:]
+run_id, cluster_id, owner, notification_id, deduplication_key, raw_node_ids = (
+    sys.argv[1:]
+)
+node_ids = [item for item in raw_node_ids.split(",") if item]
 incident_id = f"incident-{run_id}"
 workflow_id = f"workflow-actionperf-{run_id}"
 command_id = f"remote-{run_id}"
 step = WorkflowStepSpec(
     operation=WorkflowOperation.FREEZE_EVIDENCE,
     execution_owner=owner,
+    node_ids=node_ids,
 )
 incident = FaultIncident(
     incident_id=incident_id,
     event_id=f"event-{run_id}",
     event_type="NET_ACCEPTANCE",
     cluster_id=cluster_id,
-    node_ids=[],
+    node_ids=node_ids,
     policy_version="net-acceptance/v1",
     policy_source="ACCEPTANCE",
     state=IncidentState.ACTION_PENDING,
@@ -299,6 +269,7 @@ store.save_incident(incident)
 store.save_workflow(workflow)
 store.save_notification_if_absent(notification)
 store.ensure_remote_command(command)
+agents = [item.node_id for item in store.list_agents(cluster_id)]
 print(json.dumps({
     "incident_id": incident_id,
     "event_id": incident.event_id,
@@ -307,45 +278,25 @@ print(json.dumps({
     "cluster_id": cluster_id,
     "notification_id": notification_id,
     "deduplication_key": deduplication_key,
-}))
+    "node_ids": node_ids,
+    "registered_agents": agents,
+}, sort_keys=True))
 """
-    notification_id = f"notification-{run_id}"
-    deduplication_key = f"{run_id}/result-retry"
-    return cpu_python(
-        script,
+
+
+def seed_command(run_id: str) -> dict[str, Any]:
+    return fixture.cpu_python(
+        _SEED_COMMAND,
         run_id,
-        "perf-cap-000",
+        fixture.SYNTHETIC_CLUSTER_ID,
         OWNER,
-        notification_id,
-        deduplication_key,
+        f"notification-{run_id}",
+        f"{run_id}/result-retry",
+        ",".join(NODE_IDS),
     )
 
 
-def command_snapshot(command_id: str) -> dict:
-    script = r"""
-import json
-import sys
-from gpu_fault.app import ApplicationContext
-command = ApplicationContext.from_environment().store.get_remote_command(sys.argv[1])
-print(json.dumps({
-    "command_id": command.command_id,
-    "status": command.status.value,
-    "last_lease_owner": command.last_lease_owner,
-    "lease_owner": command.lease_owner,
-    "lease_expires_at": (
-        command.lease_expires_at.isoformat()
-        if command.lease_expires_at is not None else None
-    ),
-    "status_source": command.status_source,
-    "error": command.error,
-    "result_details": command.result_details,
-}, sort_keys=True))
-"""
-    return cpu_python(script, command_id)
-
-
-def notification_snapshot(notification_id: str, deduplication_key: str) -> dict:
-    script = r"""
+_NOTIFICATION_SNAPSHOT = r"""
 import json
 import os
 import sys
@@ -387,113 +338,86 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
         link_count = int(cursor.fetchone()[0])
 print(json.dumps({"objects": objects, "dedup_link_count": link_count}, sort_keys=True))
 """
-    return cpu_python(script, notification_id, deduplication_key)
 
 
-def purge_seed(seed: dict) -> dict:
-    script = r"""
+def notification_snapshot(
+    notification_id: str, deduplication_key: str
+) -> dict[str, Any]:
+    return fixture.cpu_python(
+        _NOTIFICATION_SNAPSHOT, notification_id, deduplication_key
+    )
+
+
+_PURGE_SEED = r"""
 import json
 import os
 import sys
 import psycopg
 
+command_id, workflow_id, incident_id, notification_id, dedup_key, event_id = (
+    sys.argv[1:]
+)
 deleted = {}
-remaining = []
 with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], autocommit=True) as connection:
     cursor = connection.cursor()
     cursor.execute(
-        '''
-        DELETE FROM gpu_fault_links
-        WHERE kind='incident_by_event'
-          AND key=%s
-          AND value=%s
-        ''',
-        (sys.argv[6], sys.argv[3]),
+        "DELETE FROM gpu_fault_links WHERE kind='incident_by_event' "
+        "AND key=%s AND value=%s",
+        (event_id, incident_id),
     )
-    deleted[f"incident_by_event/{sys.argv[6]}"] = cursor.rowcount
+    deleted[f"incident_by_event/{event_id}"] = cursor.rowcount
     cursor.execute(
-        '''
-        DELETE FROM gpu_fault_links
-        WHERE kind='notification_dedup'
-          AND key=%s
-          AND value=%s
-        ''',
-        (sys.argv[5], sys.argv[4]),
+        "DELETE FROM gpu_fault_links WHERE kind='notification_dedup' "
+        "AND key=%s AND value=%s",
+        (dedup_key, notification_id),
     )
-    deleted[f"notification_dedup/{sys.argv[5]}"] = cursor.rowcount
+    deleted[f"notification_dedup/{dedup_key}"] = cursor.rowcount
     items = (
-        ("remote_command", sys.argv[1]),
-        ("workflow", sys.argv[2]),
-        ("incident", sys.argv[3]),
-        ("notification_result", sys.argv[4]),
-        ("notification_delivery", sys.argv[4]),
-        ("notification", sys.argv[4]),
+        ("remote_command", command_id),
+        ("workflow", workflow_id),
+        ("incident", incident_id),
+        ("notification_result", notification_id),
+        ("notification_delivery", notification_id),
+        ("notification", notification_id),
     )
     for kind, key in items:
         cursor.execute(
-            "DELETE FROM gpu_fault_objects WHERE kind=%s AND key=%s",
-            (kind, key),
+            "DELETE FROM gpu_fault_objects WHERE kind=%s AND key=%s", (kind, key)
         )
         deleted[f"{kind}/{key}"] = cursor.rowcount
     cursor.execute(
-        '''
-        SELECT kind, key
-        FROM gpu_fault_objects
-        WHERE (kind, key) IN (
-            ('remote_command', %s),
-            ('workflow', %s),
-            ('incident', %s),
-            ('notification_result', %s),
-            ('notification_delivery', %s),
-            ('notification', %s)
-        )
-        ORDER BY kind, key
-        ''',
+        "SELECT kind, key FROM gpu_fault_objects WHERE (kind, key) IN ("
+        "('remote_command', %s), ('workflow', %s), ('incident', %s), "
+        "('notification_result', %s), ('notification_delivery', %s), "
+        "('notification', %s)) ORDER BY kind, key",
         (
-            sys.argv[1],
-            sys.argv[2],
-            sys.argv[3],
-            sys.argv[4],
-            sys.argv[4],
-            sys.argv[4],
+            command_id,
+            workflow_id,
+            incident_id,
+            notification_id,
+            notification_id,
+            notification_id,
         ),
     )
-    remaining = [
-        {"kind": kind, "key": key}
-        for kind, key in cursor.fetchall()
-    ]
+    remaining = [{"kind": kind, "key": key} for kind, key in cursor.fetchall()]
     cursor.execute(
-        '''
-        SELECT count(*)
-        FROM gpu_fault_links
-        WHERE kind='notification_dedup'
-          AND key=%s
-          AND value=%s
-        ''',
-        (sys.argv[5], sys.argv[4]),
+        "SELECT count(*) FROM gpu_fault_links WHERE "
+        "(kind='notification_dedup' AND key=%s AND value=%s) "
+        "OR (kind='incident_by_event' AND key=%s AND value=%s)",
+        (dedup_key, notification_id, event_id, incident_id),
     )
-    remaining_notification_links = int(cursor.fetchone()[0])
-    cursor.execute(
-        '''
-        SELECT count(*)
-        FROM gpu_fault_links
-        WHERE kind='incident_by_event'
-          AND key=%s
-          AND value=%s
-        ''',
-        (sys.argv[6], sys.argv[3]),
-    )
-    remaining_incident_links = int(cursor.fetchone()[0])
+    remaining_links = int(cursor.fetchone()[0])
 print(json.dumps({
     "deleted": deleted,
     "remaining": remaining,
-    "remaining_links": (
-        remaining_notification_links + remaining_incident_links
-    ),
+    "remaining_links": remaining_links,
 }, sort_keys=True))
 """
-    result = cpu_python(
-        script,
+
+
+def purge_seed(seed: dict[str, Any]) -> dict[str, Any]:
+    result = fixture.cpu_python(
+        _PURGE_SEED,
         str(seed["command_id"]),
         str(seed["workflow_id"]),
         str(seed["incident_id"]),
@@ -506,194 +430,34 @@ print(json.dumps({
     return result
 
 
-def pod_manifest(
-    image: str,
-    identity: dict[str, object],
-    notification_id: str,
-) -> dict:
-    return {
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": POD,
-            "namespace": NAMESPACE,
-            "labels": {"app": "gpu-fault-net003-executor"},
-        },
-        "spec": {
-            "restartPolicy": "Never",
-            "activeDeadlineSeconds": POD_DEADLINE_SECONDS,
-            "terminationGracePeriodSeconds": 5,
-            "serviceAccountName": "gpu-fault-completion-watcher",
-            "tolerations": [{"operator": "Exists"}],
-            "containers": [
-                {
-                    "name": "executor",
-                    "image": image,
-                    "command": [
-                        "/opt/gpu-fault/executor/bin/python",
-                        f"/scripts/{SCRIPT.name}",
-                    ],
-                    "env": [
-                        {
-                            "name": "CONTROL_PLANE_URL",
-                            "valueFrom": {
-                                "secretKeyRef": {
-                                    "name": "gpu-fault-regional-connection",
-                                    "key": "control-plane-url",
-                                }
-                            },
-                        },
-                        {
-                            "name": "EXECUTOR_ARTIFACT_SHA256",
-                            "value": str(identity["executor_artifact_sha256"]),
-                        },
-                        {
-                            "name": "EXECUTOR_COMPATIBILITY_DIGEST",
-                            "value": str(identity["executor_compatibility_digest"]),
-                        },
-                        {
-                            "name": "DROP_ROLLBACK_SECONDS",
-                            "value": str(DROP_ROLLBACK_SECONDS),
-                        },
-                        {
-                            "name": "HTTP_TIMEOUT_SECONDS",
-                            "value": str(HTTP_TIMEOUT_SECONDS),
-                        },
-                        {
-                            "name": "NOTIFICATION_ID",
-                            "value": notification_id,
-                        },
-                    ],
-                    "volumeMounts": [
-                        {"name": "script", "mountPath": "/scripts", "readOnly": True},
-                        {"name": "tokens", "mountPath": "/tokens", "readOnly": True},
-                        {"name": "tls", "mountPath": "/tls", "readOnly": True},
-                        {"name": "state", "mountPath": "/state"},
-                    ],
-                }
-            ],
-            "volumes": [
-                {"name": "script", "configMap": {"name": CONFIGMAP}},
-                {"name": "tokens", "secret": {"secretName": "gpu-fault-perf-clusters"}},
-                {
-                    "name": "tls",
-                    "secret": {
-                        "secretName": "gpu-fault-regional-connection",
-                        "items": [{"key": "ca.crt", "path": "ca.crt"}],
-                    },
-                },
-                {"name": "state", "emptyDir": {}},
-            ],
-        },
-    }
-
-
-def wait_file(path: str, timeout_seconds: int) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        result = dataplane(
-            "exec",
-            POD,
-            "--",
-            "sh",
-            "-c",
-            f"if [ -f {shlex.quote(path)} ]; then printf present; fi",
-            check=False,
-        )
-        if result.strip() == "present":
-            return
-        time.sleep(1)
-    raise CaseError(f"timed out waiting for {path}")
-
-
-def read_state(path: str) -> dict:
-    output = dataplane("exec", POD, "--", "cat", path)
-    return json.loads(output)
-
-
-def file_present(path: str) -> bool:
-    output = dataplane(
-        "exec",
-        POD,
-        "--",
-        "sh",
-        "-c",
-        f"if [ -f {shlex.quote(path)} ]; then printf present; fi",
-        check=False,
-    )
-    return output.strip() == "present"
-
-
-def wait_command(command_id: str, status: str, timeout_seconds: int) -> dict:
-    deadline = time.monotonic() + timeout_seconds
-    last = {}
-    while time.monotonic() < deadline:
-        last = command_snapshot(command_id)
-        if last.get("status") == status:
-            return last
-        time.sleep(2)
-    raise CaseError(f"command did not reach {status}: {last}")
-
-
-def wait_executor_state(timeout_seconds: int) -> dict:
-    deadline = time.monotonic() + timeout_seconds
-    last = {}
-    while time.monotonic() < deadline:
-        last = read_state("/state/executor-state.json")
-        if int(last.get("claimed_total", 0)) >= 2:
-            return last
-        time.sleep(1)
-    return last
-
-
+# --------------------------------------------------------------------------- #
+# The case
+# --------------------------------------------------------------------------- #
 def _run_net003_case(
+    probe: fixture.NetCommandProbe,
     case_dir: Path,
     run_id: str,
     attempt: int,
     maintenance_window_end: datetime,
-    state: dict,
-) -> dict:
+    state: dict[str, Any],
+) -> dict[str, Any]:
     notification_id = f"notification-{run_id}"
     deduplication_key = f"{run_id}/result-retry"
     preflight = preflight_metadata(attempt, maintenance_window_end)
     write_json(case_dir / "preflight.json", preflight)
-    database_preflight = database_residuals()
-    write_json(case_dir / "database-preflight.json", database_preflight)
-    if database_preflight.get("total") != 0:
-        raise CaseError(f"database preflight found residuals: {database_preflight}")
-    registry_preflight = registry_residuals()
-    write_json(case_dir / "registry-verification-preflight.json", registry_preflight)
-    if registry_preflight.get("count") != 0:
-        raise CaseError(f"registry preflight found residuals: {registry_preflight}")
-    kubernetes_preflight = kubernetes_residuals()
-    write_json(case_dir / "kubernetes-preflight.json", kubernetes_preflight)
-    if kubernetes_preflight.get("count") != 0:
-        raise CaseError(f"Kubernetes preflight found residuals: {kubernetes_preflight}")
-    register(
-        1,
-        case_dir,
-        run_id=run_id,
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
-        allow_live_registry=True,
-        live_registry_confirmation="ALLOW_PERF_CAPACITY_LIVE_REGISTRY",
+    fixture.preflight_residuals(probe, case_dir)
+    fixture.register_synthetic_cluster(case_dir, run_id)
+    probe_with_notification = fixture.NetCommandProbe(
+        case_id=probe.case_id,
+        run_prefix=probe.run_prefix,
+        pod=probe.pod,
+        configmap=probe.configmap,
+        owner=probe.owner,
+        script=probe.script,
+        environment={**probe.environment, "NOTIFICATION_ID": notification_id},
+        pod_deadline_seconds=probe.pod_deadline_seconds,
     )
-    identity = executor_identity(require_dataplane_deployment=True)
-    deployment = json.loads(
-        dataplane("get", "deployment", "gpu-fault-cluster-executor", "-o", "json")
-    )
-    image = deployment["spec"]["template"]["spec"]["containers"][0]["image"]
-    upsert_configmap(CONFIGMAP, text={SCRIPT.name: SCRIPT.read_text()})
-    dataplane("delete", "pod", POD, "--ignore-not-found", check=False)
-    dataplane(
-        "apply",
-        "-f",
-        "-",
-        stdin=json.dumps(pod_manifest(image, identity, notification_id)).encode(),
-    )
-    dataplane("wait", "--for=condition=Ready", f"pod/{POD}", "--timeout=180s")
-    wait_file("/state/ready.json", 60)
-    ready = read_state("/state/ready.json")
-    write_json(case_dir / "probe-ready.json", ready)
+    ready = fixture.create_probe_pod(probe_with_notification, case_dir)
     seed = seed_command(run_id)
     state["seed"] = seed
     write_json(case_dir / "seed.json", seed)
@@ -702,270 +466,329 @@ def _run_net003_case(
         or seed.get("deduplication_key") != deduplication_key
     ):
         raise CaseError("seed notification identity is inconsistent")
+    if seed.get("registered_agents"):
+        raise CaseError(
+            "the synthetic cluster has registered Node Agents; the hard stop "
+            f"does not hold: {seed['registered_agents']}"
+        )
     notification_baseline = notification_snapshot(notification_id, deduplication_key)
     write_json(case_dir / "notification-baseline.json", notification_baseline)
-    wait_file("/state/action-started", 120)
-    leased = command_snapshot(str(seed["command_id"]))
+    fixture.wait_file(probe, "/state/action-started", 120)
+    leased = fixture.command_snapshot(str(seed["command_id"]))
     write_json(case_dir / "leased-command.json", leased)
     if leased.get("status") != "LEASED" or not leased.get("lease_expires_at"):
         raise CaseError(f"command was not actively leased before injection: {leased}")
-    wait_file("/state/result-submit-started.json", 30)
-    result_submit_started = read_state("/state/result-submit-started.json")
+    fixture.wait_file(probe, "/state/result-submit-started.json", 30)
+    result_submit_started = fixture.read_state(
+        probe, "/state/result-submit-started.json"
+    )
     write_json(case_dir / "result-submit-started.json", result_submit_started)
-    wait_file("/state/drop-observed.json", 30)
-    drop_observed = read_state("/state/drop-observed.json")
+    fixture.wait_file(probe, "/state/drop-observed.json", 60)
+    drop_observed = fixture.read_state(probe, "/state/drop-observed.json")
     write_json(case_dir / "drop-observed.json", drop_observed)
-    interrupted = command_snapshot(str(seed["command_id"]))
-    write_json(case_dir / "interrupted-command.json", interrupted)
-    final = wait_command(str(seed["command_id"]), "SUCCEEDED", 180)
-    write_json(case_dir / "final-command.json", final)
-    wait_file("/state/result-replays.json", 30)
-    result_replays = read_state("/state/result-replays.json")
+    # The proxy wrote drop-observed only after the control plane answered, so
+    # this snapshot shows what the control plane committed before the client
+    # saw anything -- whether it lands before or after the client's replay.
+    committed = fixture.command_snapshot(str(seed["command_id"]))
+    write_json(case_dir / "committed-command.json", committed)
+    fixture.wait_file(probe, "/state/result-interrupted.json", 30)
+    result_interrupted = fixture.read_state(probe, "/state/result-interrupted.json")
+    write_json(case_dir / "result-interrupted.json", result_interrupted)
+    fixture.wait_file(
+        probe, "/state/result-replays.json", int(REPLAY_DELAY_SECONDS) + 60
+    )
+    result_replays = fixture.read_state(probe, "/state/result-replays.json")
     write_json(case_dir / "result-replays.json", result_replays)
+    final = fixture.wait_command(str(seed["command_id"]), "SUCCEEDED", 60)
+    write_json(case_dir / "final-command.json", final)
     notification_final = notification_snapshot(notification_id, deduplication_key)
     write_json(case_dir / "notification-final.json", notification_final)
-    executor_state = wait_executor_state(30)
-    write_json(case_dir / "executor-state.json", executor_state)
-    ledger = read_state("/state/ledger.json")
-    write_json(case_dir / "ledger.json", ledger)
-    logs = dataplane("logs", POD, check=False, timeout=120)
-    (case_dir / "executor.log").write_text(logs)
-    (case_dir / "executor.log").chmod(0o600)
-    rollback_triggered = file_present("/state/rollback.json")
-    errors = _net003_errors(
-        ready,
-        leased,
-        interrupted,
-        final,
-        result_replays,
-        executor_state,
-        ledger,
-        logs,
-        rollback_triggered,
-        drop_observed,
-        notification_id,
-        notification_baseline,
-        notification_final,
+    executor_state = fixture.wait_executor_state(
+        probe, lambda item: bool(item.get("last_successful_claim_at")), 30
     )
-    pod_phase = dataplane("get", "pod", POD, "-o", "jsonpath={.status.phase}").strip()
-    if pod_phase != "Running":
+    write_json(case_dir / "executor-state.json", executor_state)
+    ledger = fixture.read_state(probe, "/state/ledger.json")
+    write_json(case_dir / "ledger.json", ledger)
+    logs = fixture.pod_logs(probe)
+    (case_dir / "executor.log").write_text(logs, encoding="utf-8")
+    (case_dir / "executor.log").chmod(0o600)
+    rollback_triggered = fixture.file_present(probe, "/state/rollback.json")
+    errors = net003_errors(
+        ready=ready,
+        leased=leased,
+        committed=committed,
+        final=final,
+        result_interrupted=result_interrupted,
+        result_replays=result_replays,
+        executor_state=executor_state,
+        ledger=ledger,
+        logs=logs,
+        rollback_triggered=rollback_triggered,
+        drop_observed=drop_observed,
+        notification_id=notification_id,
+        notification_baseline=notification_baseline,
+        notification_final=notification_final,
+    )
+    phase = fixture.pod_phase(probe)
+    if phase != "Running":
         errors.append("executor run loop did not remain running")
     return {
-        "case_id": "GF-REGIONAL-NET-003",
+        "case_id": CASE_ID,
         "attempt": attempt,
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "preflight": preflight,
+        "http_timeout_seconds": ready.get("http_timeout_seconds"),
         "network_interruption": {
-            "type": "single-result-connection-reset",
+            "type": "single-result-connection-reset-after-response",
             "result_submit_started": result_submit_started,
             "drop_observed": drop_observed,
+            "result_interrupted": result_interrupted,
             "watchdog_rollback_triggered": rollback_triggered,
         },
         "leased_command": leased,
-        "interrupted_command": interrupted,
+        "committed_command": committed,
         "command": final,
         "result_replays": result_replays,
         "executor_state": executor_state,
         "ledger": ledger,
         "notification_baseline": notification_baseline,
         "notification_final": notification_final,
-        "pod_phase": pod_phase,
+        "pod_phase": phase,
     }
 
 
-def _net003_errors(
-    ready: dict,
-    leased: dict,
-    interrupted: dict,
-    final: dict,
-    result_replays: dict,
-    executor_state: dict,
-    ledger: dict,
+def parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def net003_errors(
+    *,
+    ready: dict[str, Any],
+    leased: dict[str, Any],
+    committed: dict[str, Any],
+    final: dict[str, Any],
+    result_interrupted: dict[str, Any],
+    result_replays: dict[str, Any],
+    executor_state: dict[str, Any],
+    ledger: dict[str, Any],
     logs: str,
     rollback_triggered: bool,
-    drop_observed: dict,
+    drop_observed: dict[str, Any],
     notification_id: str,
-    notification_baseline: dict,
-    notification_final: dict,
+    notification_baseline: dict[str, Any],
+    notification_final: dict[str, Any],
 ) -> list[str]:
-    errors = []
+    errors: list[str] = []
     if ledger.get("physical_count") != 1:
         errors.append("physical action count is not one")
-    if len(ledger.get("keys", [])) != 1:
+    if len(ledger.get("keys") or []) != 1:
         errors.append("idempotency ledger does not contain exactly one key")
-    if int(executor_state.get("claimed_total", 0)) != 2:
-        errors.append("command was not reclaimed exactly once after lease expiry")
-    if int(executor_state.get("reported_failures", 0)) != 0:
-        errors.append("connection reset was misclassified as a reported result")
-    if int(executor_state.get("unexpected_failures", 0)):
+    if int(executor_state.get("claimed_total") or 0) != 1:
+        errors.append(
+            "the committed command was claimed again; the control plane did not "
+            "hold the first result"
+        )
+    if int(executor_state.get("reported_failures") or 0) != 0:
+        errors.append("a result post was rejected; the replay was not idempotent")
+    if int(executor_state.get("unexpected_failures") or 0):
         errors.append("executor recorded an unexpected failure")
-    if int(executor_state.get("lease_renewal_failures", 0)) != 0:
-        errors.append("lease renewal ran despite immediate result interruption")
+    if int(executor_state.get("lease_renewal_failures") or 0) != 0:
+        errors.append("a lease renewal was refused during the result exchange")
     if ready.get("drop_rollback_seconds") != DROP_ROLLBACK_SECONDS:
         errors.append("connection-drop rollback timer is not configured")
-    if ready.get("http_timeout_seconds") != HTTP_TIMEOUT_SECONDS:
-        errors.append("executor HTTP timeout is not the approved value")
+    if ready.get("lease_seconds") != LEASE_SECONDS:
+        errors.append("probe executor lease length is not the approved value")
     if ready.get("result_connection_reset") is not True:
         errors.append("result connection reset is not configured")
-    if ready.get("terminal_result_replays") != 2:
+    if ready.get("response_loss_mode") != RESPONSE_LOSS_MODE:
+        errors.append("probe proxy does not forward the request before the reset")
+    if ready.get("terminal_result_replays") != TERMINAL_RESULT_REPLAYS:
         errors.append("terminal result replay count is not configured")
+    errors.extend(
+        timing_errors(
+            lease_seconds=int(ready.get("lease_seconds") or 0),
+            quiet_seconds=float(ready.get("response_quiet_seconds") or 0),
+            replay_delay_seconds=float(ready.get("replay_delay_seconds") or 0),
+            http_timeout_seconds=float(ready.get("http_timeout_seconds") or 0),
+        )
+    )
     if drop_observed.get("connection_reset") is not True:
         errors.append("proxy did not record a connection reset")
+    if drop_observed.get("request_forwarded") is not True:
+        errors.append("proxy reset the client before forwarding the result post")
+    if int(drop_observed.get("upstream_response_bytes") or 0) <= 0:
+        errors.append("proxy reset the client before the control plane answered")
+    if result_interrupted.get("first_post_succeeded") is not False or not (
+        result_interrupted.get("exception")
+    ):
+        errors.append("the client did not see a transport error on the first post")
     if rollback_triggered:
         errors.append("connection-drop marker required watchdog rollback")
-    if interrupted.get("status") != "LEASED":
-        errors.append("interrupted command did not remain leased")
-    if interrupted.get("lease_expires_at") != leased.get("lease_expires_at"):
-        errors.append("command lease changed before reclaim")
-    if result_replays.get("count") != 2 or any(
-        item.get("status") != "SUCCEEDED"
-        for item in result_replays.get("responses", [])
+    if committed.get("status") != "SUCCEEDED":
+        errors.append(
+            "the control plane did not commit the first result before the reset: "
+            f"{committed.get('status')}"
+        )
+    if committed.get("lease_expires_at") is not None:
+        errors.append("the committed command still carries a lease")
+    if leased.get("status") != "LEASED":
+        errors.append(f"command was not leased before the result post: {leased}")
+    replay_sent_at = result_replays.get("replay_sent_at_epoch")
+    updated_at = parse_time(final.get("updated_at"))
+    if not isinstance(replay_sent_at, (int, float)) or updated_at is None:
+        errors.append("replay time or command update time is missing")
+    else:
+        lead = float(replay_sent_at) - updated_at.timestamp()
+        if lead < REPLAY_DELAY_SECONDS / 2:
+            errors.append(
+                f"the command was updated {lead:.1f}s before the replay was sent; "
+                "the commit is not attributable to the first post"
+            )
+    responses = result_replays.get("responses") or []
+    if result_replays.get("count") != TERMINAL_RESULT_REPLAYS or len(responses) != (
+        TERMINAL_RESULT_REPLAYS
     ):
-        errors.append("terminal result was not replayed twice idempotently")
-    transport_markers = (
-        "Connection reset by peer",
-        "ConnectionResetError",
-        "Remote end closed connection",
-        "RemoteDisconnected",
-        "URLError",
-    )
-    if "regional cluster executor claim failed; retrying" not in logs or not any(
-        marker in logs for marker in transport_markers
-    ):
-        errors.append("executor log has no result-submit transport interruption")
-    if "rejected request (409)" in logs:
+        errors.append("terminal result was not replayed exactly once")
+    for response in responses:
+        if response.get("status") != "SUCCEEDED":
+            errors.append(f"replay was not answered SUCCEEDED: {response}")
+        replay_updated = parse_time(response.get("updated_at"))
+        if updated_at is not None and replay_updated != updated_at:
+            errors.append("the replay rewrote the committed command")
+    if LOST_RESPONSE_LOG not in logs:
+        errors.append("executor log has no lost-response transport interruption")
+    if STALE_LEASE_409 in logs:
         errors.append("NET-003 unexpectedly followed the stale-result 409 path")
-    if final.get("result_details", {}).get("cached") is not True:
-        errors.append("reclaimed command did not use the idempotency ledger")
-    if final.get("result_details", {}).get("notification_id") != notification_id:
+    details = final.get("result_details") or {}
+    if details.get("cached") is not False:
+        errors.append("the committed result is not the first physical execution")
+    if details.get("notification_id") != notification_id:
         errors.append("final result lost the notification identity")
-    baseline_objects = notification_baseline.get("objects", {})
-    final_objects = notification_final.get("objects", {})
-    if baseline_objects.get("notification", {}).get("count") != 1:
+    baseline_objects = notification_baseline.get("objects") or {}
+    final_objects = notification_final.get("objects") or {}
+    if (baseline_objects.get("notification") or {}).get("count") != 1:
         errors.append("notification baseline does not contain exactly one object")
-    if baseline_objects.get("notification_delivery", {}).get("count") != 1:
+    if (baseline_objects.get("notification_delivery") or {}).get("count") != 1:
         errors.append("notification baseline has no single delivery row")
-    if baseline_objects.get("notification_result", {}).get("count", 0) != 0:
+    if (baseline_objects.get("notification_result") or {}).get("count", 0) != 0:
         errors.append("notification was sent before result completion")
     if notification_baseline.get("dedup_link_count") != 1:
         errors.append("notification baseline dedup link count is not one")
     for kind in ("notification", "notification_delivery", "notification_result"):
-        if final_objects.get(kind, {}).get("count") != 1:
+        if (final_objects.get(kind) or {}).get("count") != 1:
             errors.append(f"final {kind} count is not one")
-    if final_objects.get("notification_result", {}).get("status") != "SKIPPED":
+    if (final_objects.get("notification_result") or {}).get("status") != "SKIPPED":
         errors.append("drill notification was not safely suppressed")
     if notification_final.get("dedup_link_count") != 1:
-        errors.append("terminal replays created a second dedup link")
+        errors.append("terminal replay created a second dedup link")
     return errors
-
-
-def _cleanup_net003(case_dir: Path, run_id: str, result: dict, seed: dict) -> None:
-    if seed:
-        try:
-            seed_cleanup = purge_seed(seed)
-            result["seed_cleanup"] = seed_cleanup
-            write_json(case_dir / "seed-cleanup.json", seed_cleanup)
-        except Exception as exc:
-            result["cleanup_error"] = f"seed cleanup: {exc}"
-            result["verdict"] = "FAIL"
-    dataplane("delete", "pod", POD, "--ignore-not-found", check=False)
-    dataplane("delete", "configmap", CONFIGMAP, "--ignore-not-found", check=False)
-    try:
-        teardown(
-            purge=True,
-            deregister_clusters=True,
-            allow_live_registry=True,
-            live_registry_confirmation="ALLOW_PERF_CAPACITY_LIVE_REGISTRY",
-            artifacts=case_dir,
-            run_id=run_id,
-        )
-    except Exception as exc:
-        result["cleanup_error"] = f"registry cleanup: {exc}"
-        result["verdict"] = "FAIL"
-    try:
-        postflight = {
-            "database": database_residuals(),
-            "registry": registry_residuals(),
-            "kubernetes": kubernetes_residuals(),
-        }
-        file_names = {
-            "database": "database-postflight.json",
-            "registry": "registry-verification-postflight.json",
-            "kubernetes": "kubernetes-postflight.json",
-        }
-        for name, value in postflight.items():
-            result[f"{name}_postflight"] = value
-            write_json(case_dir / file_names[name], value)
-            key = "total" if name == "database" else "count"
-            if value.get(key) != 0:
-                raise CaseError(f"{name} postflight found residuals: {value}")
-    except Exception as exc:
-        result["postflight_error"] = f"{type(exc).__name__}: {exc}"
-        result["verdict"] = "FAIL"
 
 
 def run_case(
     run_dir: Path,
     attempt: int,
     maintenance_window_end: datetime,
+    *,
+    predecessor: dict[str, Any],
+    cluster_id: str | None,
 ) -> int:
-    case_dir = run_dir / "cases" / "GF-REGIONAL-NET-003"
+    case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    run_id = f"net003-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
-    result = {"case_id": "GF-REGIONAL-NET-003", "verdict": "FAIL"}
-    state: dict = {"seed": {}}
+    run_id = fixture.run_identity(run_dir, attempt, "net003")
+    probe = probe_definition()
+    result: dict[str, Any] = {"case_id": CASE_ID, "verdict": "FAIL"}
+    state: dict[str, Any] = {"seed": {}}
     try:
+        fixture.require_predecessor(predecessor)
         result = _run_net003_case(
-            case_dir,
-            run_id,
-            attempt,
-            maintenance_window_end,
-            state,
+            probe, case_dir, run_id, attempt, maintenance_window_end, state
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        _cleanup_net003(case_dir, run_id, result, state["seed"])
-    write_json(case_dir / "GF-REGIONAL-NET-003.json", result)
+        fixture.cleanup(
+            probe, case_dir, run_id, result, state["seed"], purge=purge_seed
+        )
+    result["predecessor"] = predecessor
+    try:
+        result.update(fixture.evidence_identity(cluster_id))
+    except Exception as exc:  # noqa: BLE001 - unbound evidence is not a PASS
+        result["identity_error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
+    write_json(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
 
 
-def main() -> int:
-    install_site_profile()
-    parser = argparse.ArgumentParser()
-    add_live_arguments(parser, confirmation=CONFIRMATION)
-    args = parser.parse_args()
-    os.umask(0o077)
-    if not args.execute:
-        plan = build_plan(
-            run_dir=args.run_dir,
-            case_id="GF-REGIONAL-NET-003",
-            attempt=args.attempt,
-            confirmation=CONFIRMATION,
-            details={
-                "risk": "live-non-destructive",
-                "synthetic_cluster_id": "perf-cap-000",
-                "network_scope": "one test-Pod result connection reset",
-                "drop_marker_rollback_seconds": DROP_ROLLBACK_SECONDS,
-                "pod_active_deadline_seconds": POD_DEADLINE_SECONDS,
-                "terminal_result_replays": 2,
-                "mutations": [
-                    "temporary synthetic registry entry",
-                    "controlled CPU registry rollouts",
-                    "temporary GPU probe Pod and ConfigMap",
-                ],
-            },
+def plan_details(predecessor: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "risk": "live-non-destructive",
+        "predecessor": predecessor,
+        "synthetic_cluster_id": fixture.SYNTHETIC_CLUSTER_ID,
+        "seeded_operation": OPERATION,
+        "seeded_node_ids": NODE_IDS,
+        "network_scope": (
+            "one test-Pod result connection reset, after the control plane answered"
+        ),
+        "response_loss_mode": RESPONSE_LOSS_MODE,
+        "drop_marker_rollback_seconds": DROP_ROLLBACK_SECONDS,
+        "pod_active_deadline_seconds": POD_DEADLINE_SECONDS,
+        "terminal_result_replays": TERMINAL_RESULT_REPLAYS,
+        "timing": {
+            "lease_seconds": LEASE_SECONDS,
+            "response_quiet_seconds": RESPONSE_QUIET_SECONDS,
+            "replay_delay_seconds": REPLAY_DELAY_SECONDS,
+            "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
+        },
+        "mutations": [
+            "temporary synthetic registry entry",
+            "controlled CPU registry rollouts",
+            "temporary GPU probe Pod and ConfigMap",
+        ],
+        "hard_stop": (
+            "the seeded command belongs to a synthetic cluster with no Node "
+            "Agents and names a node id no cluster carries"
+        ),
+        "stop_conditions": stop_conditions(),
+        "rollback": rollback_contract(),
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(
+        description=(
+            "Run the guarded NET-003 acceptance: the control plane commits a "
+            "result whose response the client lost, and the client's retry is "
+            "answered idempotently."
         )
-        print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0
-    deadline = authorize_execution(
-        args,
-        case_id="GF-REGIONAL-NET-003",
-        confirmation=CONFIRMATION,
     )
-    return run_case(args.run_dir, args.attempt, deadline)
+    add_live_arguments(value, confirmation=CONFIRMATION)
+    value.add_argument("--predecessor-evidence", default="")
+    value.add_argument(
+        "--cluster-id",
+        default=os.getenv("GPU_FAULT_CLUSTER_ID", ""),
+        help="the site's GPU cluster id recorded in the evidence for binding",
+    )
+    return value
+
+
+def main() -> int:
+    return fixture.run_main(
+        case_id=CASE_ID,
+        confirmation=CONFIRMATION,
+        parser=parser,
+        plan_details=plan_details,
+        run_case=run_case,
+    )
 
 
 if __name__ == "__main__":

@@ -7,9 +7,9 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -45,6 +45,10 @@ RUNTIME_IDENTITY_DEPLOYMENTS = {
         "gpu-fault-kubernetes-node-resource-collector",
     ),
 }
+# CloudTrail delivers management events eventually, typically within 5 minutes
+# and documented at up to 15. A lookup that returns nothing inside that window
+# has not shown that nothing happened.
+PROVIDER_EVENT_VISIBILITY_SECONDS = 900
 RELEASE_STATE_IDENTITY_FIELDS = (
     "release_id",
     "phase",
@@ -116,6 +120,21 @@ class RegionalFixtureError(RuntimeError):
     pass
 
 
+class RegionalCommandTimeout(RegionalFixtureError):
+    """A subprocess hit its wall-clock bound.
+
+    A ``subprocess.TimeoutExpired`` says nothing about whether the command ran:
+    a ``kubectl exec`` that posts an XID and then hangs on the receipt poll has
+    already posted it. Raising this instead of the raw exception lets
+    ``pod_python`` refuse to retry a script whose first attempt may have acted.
+    """
+
+    def __init__(self, command: Sequence[str], timeout: float | None) -> None:
+        super().__init__(f"command timed out after {timeout}s: {' '.join(command)}")
+        self.command = list(command)
+        self.timeout = timeout
+
+
 class RegionalFixtureAbort(BaseException):
     """An operator abort delivered by SIGINT/SIGTERM.
 
@@ -165,10 +184,47 @@ def required(value: str, label: str) -> str:
     return result
 
 
+def predecessor_identity_errors(
+    value: dict[str, Any],
+    *,
+    release_id: str | None,
+    cluster_id: str | None,
+) -> list[str]:
+    """Why ``value`` is not evidence from this release and cluster.
+
+    A PASS is only a predecessor if it was earned against the deployment the
+    successor is about to mutate. A run directory reused across a redeploy, or
+    an evidence file copied from another site, otherwise satisfies the chain
+    while proving nothing about the code that is live now.
+    """
+
+    errors = []
+    for field, expected in (("release_id", release_id), ("cluster_id", cluster_id)):
+        if expected is None:
+            continue
+        actual = value.get(field)
+        if actual in (None, ""):
+            errors.append(f"{field} missing from predecessor evidence")
+        elif str(actual) != expected:
+            errors.append(f"{field} mismatch")
+    return errors
+
+
 def predecessor_evidence(
     path: Path,
     expected_case_id: str,
+    *,
+    release_id: str | None = None,
+    cluster_id: str | None = None,
 ) -> dict[str, Any]:
+    """Read a predecessor case's evidence and decide whether it lets this run go.
+
+    ``release_id``/``cluster_id``, when given, must equal the evidence file's
+    top-level fields of the same name; the successor obtains both from
+    ``RegionalLiveFixture.evidence_identity``. Left as ``None`` the identity is
+    not checked, which is the pre-binding behaviour.
+    """
+
     scope = current_acceptance_scope()
     if scope.selective:
         return {
@@ -230,12 +286,21 @@ def predecessor_evidence(
             evidence_scope == FORMAL_SCOPE,
         )
     )
-    evidence_valid = actual_case_id == expected_case_id and verdict == "PASS"
+    identity_errors = predecessor_identity_errors(
+        value,
+        release_id=release_id,
+        cluster_id=cluster_id,
+    )
+    evidence_valid = (
+        actual_case_id == expected_case_id and verdict == "PASS" and not identity_errors
+    )
     valid = (
         evidence_valid and evidence_scope == FORMAL_SCOPE and formal_sequence_satisfied
     )
-    if not evidence_valid:
+    if actual_case_id != expected_case_id or verdict != "PASS":
         error = "predecessor case must have verdict PASS"
+    elif identity_errors:
+        error = "; ".join(identity_errors)
     elif evidence_scope != FORMAL_SCOPE or not formal_sequence_satisfied:
         error = "selective evidence cannot satisfy a formal predecessor"
     else:
@@ -249,6 +314,10 @@ def predecessor_evidence(
         "execution_allowed": valid,
         "evidence_valid": evidence_valid,
         "evidence_execution_scope": evidence_scope,
+        "evidence_release_id": value.get("release_id"),
+        "evidence_cluster_id": value.get("cluster_id"),
+        "expected_release_id": release_id,
+        "expected_cluster_id": cluster_id,
         **scope.plan_fields(),
         "formal_sequence_satisfied": valid,
         "error": error,
@@ -256,23 +325,33 @@ def predecessor_evidence(
 
 
 def waiting_step_executions(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    """The WAITING step execution records, projected to what evidence keeps.
+
+    ``started_at``/``updated_at`` ride along when the record has them -- the
+    per-step waiting cap counts from when the step parked, and DESTR-017 reads
+    that off this projection -- and are omitted when it does not, so a record
+    without timestamps is projected exactly as before.
+    """
+
     result = []
     for item in workflow.get("step_executions") or []:
         if not isinstance(item, dict) or item.get("status") != "WAITING":
             continue
-        result.append(
-            {
-                key: item.get(key)
-                for key in (
-                    "step_index",
-                    "operation",
-                    "status",
-                    "adapter_operation_id",
-                    "details",
-                    "error",
-                )
-            }
-        )
+        projected = {
+            key: item.get(key)
+            for key in (
+                "step_index",
+                "operation",
+                "status",
+                "adapter_operation_id",
+                "details",
+                "error",
+            )
+        }
+        for key in ("started_at", "updated_at"):
+            if item.get(key) is not None:
+                projected[key] = item[key]
+        result.append(projected)
     return result
 
 
@@ -411,6 +490,7 @@ def settings_from_arguments(arguments: Any) -> RegionalLiveSettings:
 
 
 STORE_PROBE = r"""
+import hashlib
 import json
 import os
 import sys
@@ -420,6 +500,21 @@ from datetime import datetime, timezone
 from gpu_fault.app import ApplicationContext
 from gpu_fault.hyperpod import hyperpod_submission_idempotency_key
 from gpu_fault.store import NotFoundError
+
+
+# The lease token is the credential an executor presents to report a result
+# for the command it holds; a case's evidence directory is not where it
+# belongs. Digest and length still let a verdict say "the same lease" or "a
+# lease was present" without carrying the secret.
+def redacted_command(item):
+    value = item.model_dump(mode="json")
+    token = value.pop("lease_token", None)
+    raw = str(token).encode() if token not in (None, "") else None
+    value["lease_token_sha256"] = (
+        hashlib.sha256(raw).hexdigest() if raw is not None else None
+    )
+    value["lease_token_length"] = len(raw) if raw is not None else None
+    return value
 
 
 # Report the processor queue as a backlog check, not an instant sample.
@@ -454,6 +549,11 @@ def drained_queue_stats(store, attempts=20, pause=0.5):
     )
     return result
 
+probe_argv = list(sys.argv[1:])
+# The ninth argument arrived after the eighth; a caller that still passes eight
+# gets today's unfiltered command read.
+if len(probe_argv) == 8:
+    probe_argv.append("")
 (
     cluster_id,
     node_id,
@@ -463,11 +563,15 @@ def drained_queue_stats(store, attempts=20, pause=0.5):
     attempt_id,
     hyperpod_cluster,
     queue_attempts_text,
-) = sys.argv[1:]
+    workflow_request_ids_text,
+) = probe_argv
 # A preflight wants the drained backlog reading above; a wait loop wants the
 # cheapest read that still reports the queue, because the drain sampling alone
 # is ~10s per call and a step's WAITING record can come and go inside that.
 queue_attempts = int(queue_attempts_text or 20)
+explicit_workflow_request_ids = [
+    item for item in workflow_request_ids_text.split(",") if item
+]
 store = ApplicationContext.from_environment().store
 observed_after = (
     datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
@@ -505,11 +609,25 @@ workflow = (
     if incident is not None and incident.workflow_request_id
     else None
 )
-commands = [
-    item
-    for item in store.list_remote_commands()
-    if workflow is not None and item.workflow_request_id == workflow.request_id
-]
+# Every backend filters remote commands by workflow in the store, so the probe
+# never has to page the whole table through the API Pod. Without an explicit
+# filter this is exactly the old read -- the workflow's own commands, or none
+# when no workflow exists yet -- only cheaper; with one, the caller names the
+# workflows it wants regardless of what the marker resolved to.
+if explicit_workflow_request_ids:
+    commands = store.list_remote_commands(
+        workflow_request_ids=explicit_workflow_request_ids
+    )
+elif workflow is not None:
+    commands = [
+        item
+        for item in store.list_remote_commands(
+            workflow_request_ids=[workflow.request_id]
+        )
+        if item.workflow_request_id == workflow.request_id
+    ]
+else:
+    commands = []
 notifications = []
 if incident is not None:
     for item in store.list_notifications():
@@ -585,7 +703,7 @@ print(json.dumps({
     "workflow": (
         workflow.model_dump(mode="json") if workflow is not None else None
     ),
-    "commands": [item.model_dump(mode="json") for item in commands],
+    "commands": [redacted_command(item) for item in commands],
     "notifications": notifications,
     "observations": observations,
     "restart_budget": restart_budget,
@@ -673,17 +791,20 @@ class RegionalLiveFixture:
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        completed = subprocess.run(
-            command,
-            input=input_text,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-            cwd=cwd,
-            env=env,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                input=input_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+                cwd=cwd,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RegionalCommandTimeout(command, exc.timeout) from exc
         if check and completed.returncode:
             raise RegionalFixtureError(
                 f"command failed ({completed.returncode}): "
@@ -772,9 +893,22 @@ class RegionalLiveFixture:
         script: str,
         *arguments: str,
         timeout: int = 180,
+        attempts: int = 3,
     ) -> dict[str, Any]:
+        """Run ``script`` under python3 in a Ready Pod and parse its last line.
+
+        ``attempts`` is the retry budget for transient exec failures. The
+        default suits read-only probes; a script that mutates -- posts an event,
+        releases a spare -- must pass ``attempts=1``, because a retry after a
+        failure that happened *after* the mutation performs it again. A timeout
+        is never retried whatever the budget: the first attempt may have run to
+        completion and only the receipt was lost.
+        """
+
+        if attempts < 1:
+            raise ValueError("attempts must be at least 1")
         last_error: Exception | None = None
-        for _attempt in range(3):
+        for _attempt in range(attempts):
             try:
                 output = self.kubectl(
                     plane,
@@ -792,17 +926,31 @@ class RegionalLiveFixture:
                 if not isinstance(value, dict):
                     raise RegionalFixtureError("Pod probe did not return a JSON object")
                 return cast(dict[str, Any], value)
+            except RegionalCommandTimeout as exc:
+                raise RegionalFixtureError(
+                    f"{plane} Pod probe timed out; not retried because the script "
+                    f"may already have run: {exc}"
+                ) from exc
             except Exception as exc:
                 last_error = exc
-                time.sleep(1)
+                if _attempt + 1 < attempts:
+                    time.sleep(1)
         raise RegionalFixtureError(f"{plane} Pod probe failed: {last_error}")
 
-    def cpu_python(self, script: str, *arguments: str) -> dict[str, Any]:
+    def cpu_python(
+        self,
+        script: str,
+        *arguments: str,
+        timeout: int = 180,
+        attempts: int = 3,
+    ) -> dict[str, Any]:
         return self.pod_python(
             "cpu",
             "gpu-fault-api-ha",
             script,
             *arguments,
+            timeout=timeout,
+            attempts=attempts,
         )
 
     def executor_python(
@@ -810,6 +958,7 @@ class RegionalLiveFixture:
         script: str,
         *arguments: str,
         timeout: int = 180,
+        attempts: int = 3,
     ) -> dict[str, Any]:
         return self.pod_python(
             "gpu",
@@ -817,6 +966,7 @@ class RegionalLiveFixture:
             script,
             *arguments,
             timeout=timeout,
+            attempts=attempts,
         )
 
     def store_snapshot(
@@ -829,6 +979,7 @@ class RegionalLiveFixture:
         attempt_id: str = "",
         hyperpod_cluster: str = "",
         queue_attempts: int = 20,
+        workflow_request_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """One store read; `queue_attempts=1` for wait loops, the default for gates.
 
@@ -837,10 +988,13 @@ class RegionalLiveFixture:
         the workflow does not need that reading and cannot afford it: with it,
         samples land 15s apart and a ten-second step's WAITING record is never
         seen.
+
+        ``workflow_request_ids`` narrows the ``commands`` read to those
+        workflows in the store itself. Without it the probe returns the
+        marker's own workflow's commands, as it always has.
         """
 
-        result = self.cpu_python(
-            STORE_PROBE,
+        arguments = [
             self.settings.cluster_id,
             node,
             marker,
@@ -849,10 +1003,29 @@ class RegionalLiveFixture:
             attempt_id,
             hyperpod_cluster,
             str(queue_attempts),
-        )
+        ]
+        if workflow_request_ids:
+            for request_id in workflow_request_ids:
+                if "," in request_id or not request_id:
+                    raise ValueError("workflow request IDs must be non-empty, no comma")
+            arguments.append(",".join(workflow_request_ids))
+        result = self.cpu_python(STORE_PROBE, *arguments)
         if not result.get("release_id"):
             result["release_id"] = self.release_id()
         return result
+
+    def evidence_identity(self) -> dict[str, str]:
+        """The release and cluster a case's evidence must be bound to.
+
+        Written into every case result (``result.update(...)``) so the next case
+        in the chain can pass the same values to ``predecessor_evidence`` and
+        refuse a PASS that was earned against another deployment.
+        """
+
+        return {
+            "release_id": self.release_id(),
+            "cluster_id": self.settings.cluster_id,
+        }
 
     def release_id(self) -> str:
         value = json.loads(
@@ -973,10 +1146,15 @@ class RegionalLiveFixture:
     def post_xid_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("cluster_id") != self.settings.cluster_id:
             raise RegionalFixtureError("XID payload cluster ID does not match settings")
+        # One attempt: the sink itself is max_attempts=1, and a kubectl retry
+        # after a lost receipt would post the same XID twice -- a second
+        # collector event, a second incident, and a workflow the case did not
+        # plan for.
         return self.executor_python(
             EXECUTOR_XID_POST,
             json.dumps(payload, sort_keys=True),
             timeout=240,
+            attempts=1,
         )
 
     def wait_for_workflow(
@@ -991,11 +1169,15 @@ class RegionalLiveFixture:
         attempt_id: str = "",
         hyperpod_cluster: str = "",
         terminal: bool = True,
+        workflow_request_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_seconds
         timeline: list[dict[str, Any]] = []
-        observed_waiting: dict[tuple[int, str], dict[str, Any]] = {}
+        observed_waiting = WaitingEvidence()
         last: dict[str, Any] = {}
+        snapshot_arguments: dict[str, Any] = {}
+        if workflow_request_ids:
+            snapshot_arguments["workflow_request_ids"] = list(workflow_request_ids)
         while time.monotonic() < deadline:
             last = self.store_snapshot(
                 node=node,
@@ -1005,20 +1187,12 @@ class RegionalLiveFixture:
                 attempt_id=attempt_id,
                 hyperpod_cluster=hyperpod_cluster,
                 queue_attempts=1,
+                **snapshot_arguments,
             )
             workflow = last.get("workflow") or {}
             current_waiting = waiting_step_executions(workflow)
-            for execution in current_waiting:
-                step_index = execution.get("step_index")
-                observed_waiting[
-                    (
-                        step_index if isinstance(step_index, int) else -1,
-                        str(execution.get("operation") or ""),
-                    )
-                ] = execution
-            waiting_evidence = [
-                observed_waiting[key] for key in sorted(observed_waiting)
-            ]
+            observed_waiting.observe(last)
+            waiting_evidence = observed_waiting.evidence()
             timeline.append(
                 {
                     "observed_at": datetime.now(timezone.utc).isoformat(),
@@ -1129,6 +1303,26 @@ class RegionalLiveFixture:
             ),
         }
 
+    @staticmethod
+    def pod_gpu_count(item: dict[str, Any]) -> int:
+        """The largest ``nvidia.com/gpu`` request or limit across containers."""
+
+        gpu_count = 0
+        for container in item.get("spec", {}).get("containers", []):
+            resources = container.get("resources", {})
+            for values in (
+                resources.get("requests", {}),
+                resources.get("limits", {}),
+            ):
+                try:
+                    gpu_count = max(
+                        gpu_count,
+                        int(values.get("nvidia.com/gpu", 0)),
+                    )
+                except (TypeError, ValueError):
+                    pass
+        return gpu_count
+
     def gpu_workloads(self) -> list[dict[str, Any]]:
         value = json.loads(
             self.kubectl(
@@ -1145,20 +1339,7 @@ class RegionalLiveFixture:
             phase = item.get("status", {}).get("phase")
             if phase in {"Succeeded", "Failed"}:
                 continue
-            gpu_count = 0
-            for container in item.get("spec", {}).get("containers", []):
-                resources = container.get("resources", {})
-                for values in (
-                    resources.get("requests", {}),
-                    resources.get("limits", {}),
-                ):
-                    try:
-                        gpu_count = max(
-                            gpu_count,
-                            int(values.get("nvidia.com/gpu", 0)),
-                        )
-                    except (TypeError, ValueError):
-                        pass
+            gpu_count = self.pod_gpu_count(item)
             if gpu_count <= 0:
                 continue
             result.append(
@@ -1201,20 +1382,7 @@ class RegionalLiveFixture:
         result = []
         for item in value.get("items", []):
             namespace = str(item["metadata"].get("namespace", ""))
-            gpu_count = 0
-            for container in item.get("spec", {}).get("containers", []):
-                resources = container.get("resources", {})
-                for values in (
-                    resources.get("requests", {}),
-                    resources.get("limits", {}),
-                ):
-                    try:
-                        gpu_count = max(
-                            gpu_count,
-                            int(values.get("nvidia.com/gpu", 0)),
-                        )
-                    except (TypeError, ValueError):
-                        pass
+            gpu_count = self.pod_gpu_count(item)
             if namespace in system_namespaces:
                 continue
             if namespace == self.settings.namespace and gpu_count <= 0:
@@ -1356,6 +1524,70 @@ class RegionalLiveFixture:
             )
         return result
 
+    def wait_provider_events(
+        self,
+        started_at: datetime,
+        *,
+        event_names: set[str],
+        expected_count: int,
+        ended_at: datetime | None = None,
+        timeout_seconds: int = PROVIDER_EVENT_VISIBILITY_SECONDS,
+        poll_seconds: int = 60,
+    ) -> list[dict[str, str]]:
+        """Poll CloudTrail until ``expected_count`` of ``event_names`` are visible.
+
+        CloudTrail is eventually consistent -- a mutation typically appears
+        within 5 minutes and is only guaranteed within 15 -- so a single lookup
+        taken right after a reboot finished reads "no RebootClusterNodes" and
+        fails a case that did exactly what it should. The intended pattern:
+
+        * a *positive* claim ("the executor issued exactly one reboot") polls
+          here and then asserts on the returned list; the poll stops as soon as
+          enough events are visible, or at ``timeout_seconds``;
+        * a *negative* claim ("no provider mutation happened") cannot be proven
+          inside the window -- see ``provider_events_provisional`` -- and the
+          case labels it ``provisional``; DESTR-013 re-checks the whole run's
+          window once CloudTrail has caught up.
+
+        ``ended_at`` defaults to *now at each poll*, so late-delivered events
+        are seen. Returns whatever was visible when it stopped; the caller
+        decides what the count means.
+        """
+
+        if expected_count < 0:
+            raise ValueError("expected_count must not be negative")
+        deadline = time.monotonic() + timeout_seconds
+        events: list[dict[str, str]] = []
+        while True:
+            window_end = ended_at or datetime.now(timezone.utc)
+            events = [
+                item
+                for item in self.provider_events(started_at, window_end)
+                if item.get("event_name") in event_names
+            ]
+            if len(events) >= expected_count or time.monotonic() >= deadline:
+                return events
+            time.sleep(max(1, min(poll_seconds, int(deadline - time.monotonic()))))
+
+    @staticmethod
+    def provider_events_provisional(
+        ended_at: datetime,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """True while CloudTrail may still be delivering events up to ``ended_at``.
+
+        A runner that saw no provider mutation and whose window ended inside
+        the last 15 minutes has a provisional negative, not a PASS. Record it
+        as ``provider_events_provisional: True`` so the auditor knows the claim
+        rests on DESTR-013's later full-window lookup.
+        """
+
+        current = now or datetime.now(timezone.utc)
+        if ended_at.tzinfo is None:
+            ended_at = ended_at.replace(tzinfo=timezone.utc)
+        return current - ended_at < timedelta(seconds=PROVIDER_EVENT_VISIBILITY_SECONDS)
+
     def wait_node_ready(
         self,
         node: str,
@@ -1371,9 +1603,15 @@ class RegionalLiveFixture:
             except Exception:
                 time.sleep(10)
                 continue
-            if last.get("ready") == "True" and (
-                expected_boot_id is None or last.get("boot_id") != expected_boot_id
-            ):
+            # A node whose status has not repopulated bootID yet reports it as
+            # None, which is "different from the old boot ID" only in the
+            # trivial sense; requiring a real value keeps "rebooted" meaning a
+            # new boot was observed rather than an empty field.
+            observed_boot_id = str(last.get("boot_id") or "")
+            rebooted = expected_boot_id is None or (
+                bool(observed_boot_id) and observed_boot_id != expected_boot_id
+            )
+            if last.get("ready") == "True" and rebooted:
                 return last
             time.sleep(10)
         raise RegionalFixtureError(f"node did not return Ready: {last}")

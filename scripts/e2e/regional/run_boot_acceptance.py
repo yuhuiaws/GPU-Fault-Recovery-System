@@ -47,11 +47,76 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 )
 
 CASE_IDS = tuple(f"GF-REGIONAL-BOOT-{number:03d}" for number in range(11, 19))
+BOOT021_CASE_ID = "GF-REGIONAL-BOOT-021"
+SITE_CASES = frozenset(
+    {
+        "GF-REGIONAL-BOOT-011",
+        "GF-REGIONAL-BOOT-012",
+        "GF-REGIONAL-BOOT-013",
+        "GF-REGIONAL-BOOT-014",
+        "GF-REGIONAL-BOOT-015",
+    }
+)
+
+
+def failure_outcome(exc: BaseException) -> dict[str, Any]:
+    """The FAIL outcome recorded when the case body raised.
+
+    ``KeyboardInterrupt`` and ``SystemExit`` are recorded too (as
+    ``interrupted``) so an operator's Ctrl-C still leaves an evidence file
+    saying the case did not finish, instead of no file at all; the runner
+    re-raises them after writing it.
+    """
+
+    interrupted = not isinstance(exc, Exception)
+    return {
+        "verdict": "FAIL",
+        "error": f"{type(exc).__name__}: {exc}",
+        "interrupted": interrupted,
+        # A JSONDecodeError alone does not say which probe returned nothing;
+        # keep the frames so a live failure can be traced without a rerun.
+        "traceback": traceback.format_exception(exc)[-12:],
+        "limitations": [
+            "The case was interrupted; no check after the interruption ran."
+            if interrupted
+            else "The case stopped at the first failed assertion; later checks "
+            "were not treated as executed."
+        ],
+    }
+
+
+def evidence_identity_for(arguments: argparse.Namespace) -> dict[str, str] | None:
+    """The release/cluster identity the predecessor check is bound to.
+
+    Site cases read it from ``--site``; the lifecycle cases from the managed
+    site under ``--bootstrap-state-dir`` when BOOT-016 has already created it.
+    A site that cannot be reached yields ``None``: the predecessor check then
+    runs unbound, as it did before identity binding, rather than failing the
+    plan on a kubectl error.
+    """
+
+    site_file: Path | None = None
+    if arguments.case in SITE_CASES and arguments.site is not None:
+        site_file = arguments.site
+    elif arguments.bootstrap_state_dir is not None:
+        candidate = arguments.bootstrap_state_dir / "site.yaml"
+        site_file = candidate if candidate.is_file() else None
+    if site_file is None:
+        return None
+    try:
+        return dict(
+            SiteFixture(site_file, arguments.cluster_id).regional.evidence_identity()
+        )
+    except Exception:  # noqa: BLE001 - identity is best effort, never a verdict
+        return None
 
 
 def case_plan(case_id: str, arguments: argparse.Namespace) -> dict[str, Any]:
     mutations = {
-        "GF-REGIONAL-BOOT-011": "read isolated greenfield Kubernetes and IAM state",
+        "GF-REGIONAL-BOOT-011": (
+            "read isolated greenfield Kubernetes and IAM state and the "
+            "production store's lease owners"
+        ),
         "GF-REGIONAL-BOOT-012": "run read-only TLS/readiness/STS negative probes",
         "GF-REGIONAL-BOOT-013": "run local SES client validation with zero delivery",
         "GF-REGIONAL-BOOT-014": "read dispatcher configuration and outbox state",
@@ -112,22 +177,25 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--gpu-cluster-arn", action="append", default=[])
     value.add_argument("--admin-email", default="")
     value.add_argument("--retain-bootstrap-site", action="store_true")
+    value.add_argument(
+        "--also-record-boot021",
+        action="store_true",
+        help=(
+            "BOOT-012 only: also write the executor readiness matrix it ran as "
+            "GF-REGIONAL-BOOT-021 evidence under --run-dir"
+        ),
+    )
     return value
 
 
 def validate_arguments(arguments: argparse.Namespace) -> None:
-    site_cases = {
-        "GF-REGIONAL-BOOT-011",
-        "GF-REGIONAL-BOOT-012",
-        "GF-REGIONAL-BOOT-013",
-        "GF-REGIONAL-BOOT-014",
-        "GF-REGIONAL-BOOT-015",
-    }
-    if arguments.case in site_cases and arguments.site is None:
+    if arguments.case in SITE_CASES and arguments.site is None:
         raise BootAcceptanceError(f"{arguments.case} requires --site")
     if arguments.case == "GF-REGIONAL-BOOT-011":
         if arguments.production_site is None:
             raise BootAcceptanceError("BOOT-011 requires --production-site")
+    if arguments.also_record_boot021 and arguments.case != "GF-REGIONAL-BOOT-012":
+        raise BootAcceptanceError("--also-record-boot021 applies to BOOT-012 only")
     if (
         arguments.case
         in {
@@ -161,8 +229,9 @@ def main() -> int:
         arguments.case,
         arguments.predecessor_evidence,
     )
+    identity = evidence_identity_for(arguments)
     predecessor = (
-        predecessor_evidence(path, predecessor_id)
+        predecessor_evidence(path, predecessor_id, **(identity or {}))
         if predecessor_id is not None and path is not None
         else {"valid": True, "case_id": None, "verdict": "NOT_REQUIRED"}
     )
@@ -203,6 +272,7 @@ def main() -> int:
     case_dir = arguments.run_dir / "cases" / arguments.case
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     started_at = utc_now()
+    interrupted: BaseException | None = None
     try:
         if arguments.case == "GF-REGIONAL-BOOT-016":
             outcome = run_boot016(arguments, case_dir)
@@ -212,12 +282,22 @@ def main() -> int:
             outcome = run_boot018(arguments, case_dir)
         else:
             fixture = SiteFixture(arguments.site, arguments.cluster_id)
+            boot021_path = (
+                case_evidence_path(arguments.run_dir, BOOT021_CASE_ID)
+                if arguments.also_record_boot021
+                else None
+            )
+            if boot021_path is not None:
+                boot021_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             handlers: dict[str, Callable[[], dict[str, Any]]] = {
                 "GF-REGIONAL-BOOT-011": lambda: run_boot011(
                     fixture,
                     production_site=arguments.production_site,
                 ),
-                "GF-REGIONAL-BOOT-012": lambda: run_boot012(fixture),
+                "GF-REGIONAL-BOOT-012": lambda: run_boot012(
+                    fixture,
+                    boot021_evidence_path=boot021_path,
+                ),
                 "GF-REGIONAL-BOOT-013": lambda: run_boot013(fixture),
                 "GF-REGIONAL-BOOT-014": lambda: run_boot014(fixture),
                 "GF-REGIONAL-BOOT-015": lambda: run_boot015(
@@ -227,18 +307,13 @@ def main() -> int:
                 ),
             }
             outcome = handlers[arguments.case]()
-    except Exception as exc:
-        outcome = {
-            "verdict": "FAIL",
-            "error": f"{type(exc).__name__}: {exc}",
-            # A JSONDecodeError alone does not say which probe returned nothing;
-            # keep the frames so a live failure can be traced without a rerun.
-            "traceback": traceback.format_exc().splitlines()[-12:],
-            "limitations": [
-                "The case stopped at the first failed assertion; later checks "
-                "were not treated as executed."
-            ],
-        }
+    except BaseException as exc:
+        # Every failure -- an assertion, a kubectl error, an operator's Ctrl-C --
+        # leaves an evidence document; the interrupt itself is re-raised after
+        # the document is on disk.
+        outcome = failure_outcome(exc)
+        if not isinstance(exc, Exception):
+            interrupted = exc
     result = {
         "schema_version": 2,
         "report_type": "fault-acceptance",
@@ -247,10 +322,13 @@ def main() -> int:
         "started_at": started_at,
         "executed_at": utc_now(),
         "predecessor": predecessor,
+        **(identity or {}),
         **{key: value for key, value in outcome.items() if key != "verdict"},
     }
     write_json_atomic(case_evidence_path(arguments.run_dir, arguments.case), result)
     print(json.dumps(result, sort_keys=True))
+    if interrupted is not None:
+        raise interrupted
     return 0 if result["verdict"] == "PASS" else 1
 
 

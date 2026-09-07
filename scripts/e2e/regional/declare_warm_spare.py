@@ -168,6 +168,15 @@ def release_refusals(spare: dict[str, Any]) -> list[str]:
         # hand a reserved spare back to the scheduler while a workflow is still
         # counting on it.
         refusals.append("node is reserved by an incident; release it through the case")
+    if spare["annotations"].get(SPARE_POOL_STATE_ANNOTATION) == "ALLOCATED":
+        # The pool state is the coordinator's own record of the allocation and
+        # outlives the reservation annotation on some paths (a failover whose
+        # restart is still running). Removing the spare label from an ALLOCATED
+        # node takes a node that is carrying the failed-over job out of the
+        # pool while the control plane still believes it holds it.
+        refusals.append(
+            "node is ALLOCATED by the spare pool; release it through the case"
+        )
     if any(item.get("key") == QUARANTINE_TAINT for item in spare["taints"]):
         refusals.append(
             "node is quarantined; use restore_validated_quarantine.py instead"

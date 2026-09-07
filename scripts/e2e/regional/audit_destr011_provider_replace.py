@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""GF-REGIONAL-DESTR-011: the provider-replace safety invariant, read-only.
+
+Superseded by ``GF-REGIONAL-DESTR-013`` (``audit_destr013_replacement_invariant``),
+which runs the same executor-environment, IAM and CloudTrail checks over the
+whole run's window and additionally requires ``GPU_FAULT_ALLOW_HYPERPOD_REBOOT``
+on every replica, records the replica count, asserts the synthetic replacement
+route is closed on every API Pod and treats an empty CloudTrail window as a
+wrong-window signal rather than as proof. This runner is kept as-is for sites
+whose catalog still schedules it; new evidence should come from DESTR-013.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,11 +20,12 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 if __package__:
-    from .acceptance_scope import scoped_case_evidence
+    from .acceptance_runner_common import write_json_atomic
 else:
-    from acceptance_scope import scoped_case_evidence
+    from acceptance_runner_common import write_json_atomic
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -84,14 +96,13 @@ def command(argv: list[str], *, timeout: int = 180) -> str:
     return result.stdout
 
 
-def write_json(path: Path, value: object) -> None:
-    path.write_text(
-        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
-    )
-    path.chmod(0o600)
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    # All-or-nothing: a verdict file that is half-written when the auditor
+    # host dies parses as no verdict at best and as a wrong one at worst.
+    write_json_atomic(path, value)
 
 
-def node_inventory() -> dict:
+def node_inventory() -> dict[str, Any]:
     value = json.loads(
         command(
             [
@@ -129,6 +140,7 @@ def run_case(run_dir: Path, attempt: int) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     errors = []
+    result: dict[str, Any]
     try:
         inventory_before = node_inventory()
         tests = command(
@@ -296,6 +308,7 @@ def run_case(run_dir: Path, attempt: int) -> int:
             "case_id": CASE_ID,
             "attempt": attempt,
             "verdict": "PASS" if not errors else "FAIL",
+            "superseded_by": "GF-REGIONAL-DESTR-013",
             "errors": errors,
             "executor_env": executor_env,
             "iam_decisions": decisions,

@@ -538,7 +538,7 @@ def test_destr001_reset_contract_takes_the_workload_step_sequence() -> None:
     state["workflow"]["completed_operations"] = list(steps)
     assert any(
         "reset contract" in error for error in destr001.workflow_errors(state, xid=109)
-    )
+    ), "an XID 109 workflow with reset steps must name the reset contract"
     assert destr001.workflow_errors(state, xid=109, expected_steps=steps) == [], state
 
 
@@ -661,15 +661,22 @@ def test_destr002_wait_stops_on_terminal_workflow_without_submission(
 
 
 def test_destr002_duplicate_replay_requires_exact_submitted_record() -> None:
-    source = destr002.DIRECT_DUPLICATE_REPLAY
+    """The replay is a store read from the replacement executor: the record
+    under the command's recorded key must be SUBMITTED with a result and the
+    same request identity. It never submits and never recomputes the key."""
 
-    read_index = source.index("get_hyperpod_submission")
-    submit_index = source.index("result = step_adapter.dispatcher.adapter.submit")
+    source = destr002.STORE_REPLAY_PROBE
 
-    assert "hyperpod_submission_idempotency_key" in source
-    assert 'record.state != "SUBMITTED"' in source
-    assert "record.result is None" in source
-    assert read_index < submit_index
+    assert "get_hyperpod_submission" in source
+    assert 'record.state == "SUBMITTED"' in source
+    assert "record.result is not None" in source
+    assert "record.request_identity == expected_identity" in source
+    assert 'command["result_details"]["submission_idempotency_key"]' in source
+    assert ".submit(" not in source
+    assert "hyperpod_submission_idempotency_key" not in source
+    assert not hasattr(destr002, "DIRECT_DUPLICATE_REPLAY"), (
+        "DESTR-002 no longer ships the direct duplicate-replay probe"
+    )
     assert "hyperpod_submission_idempotency_key" in live_fixture_module.STORE_PROBE
 
 
@@ -903,7 +910,7 @@ def test_destr009_workflow_contract_scales_to_expected_gpu_count() -> None:
     assert any(
         "not XID 11" in error
         for error in destr009.workflow_errors(state, expected_gpu_count=24)
-    )
+    ), "an XID 31 event fails the XID 11 contract by name"
     assert destr009.workflow_errors(state, expected_gpu_count=24, xid=31) == [], state
     state["event"]["xid"] = 11
     errors = destr009.workflow_errors(state, expected_gpu_count=1)
@@ -1167,7 +1174,14 @@ def test_destr012_group_d_requires_prewrite_failure_details() -> None:
     ), state
 
 
-def test_destr012_keeps_group_c_optional_and_isolated(tmp_path: Path) -> None:
+def test_destr012_keeps_group_c_optional_and_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        destr012,
+        "record_focused_tests",
+        lambda details, result: details.__setitem__("focused_tests", result),
+    )
     settings = destr012.Settings(
         regional=_regional(tmp_path).settings,
         site_file=tmp_path / "site.yaml",
@@ -1186,6 +1200,7 @@ def test_destr012_keeps_group_c_optional_and_isolated(tmp_path: Path) -> None:
         "store": {"profile": {"profile_version": "profile-a"}},
         "group_b": {"profile": {"profile_sha256s": ["a" * 64]}},
         "runtime_identity": {"release_state": {}, "deployments": {}},
+        "focused_tests": {"passed": True},
     }
 
     details = destr012.plan_details(settings, preflight)
@@ -1194,6 +1209,15 @@ def test_destr012_keeps_group_c_optional_and_isolated(tmp_path: Path) -> None:
     assert details["group_c"]["optional"] is True, details
     assert details["group_c"]["planned_status"] == "NOT_RUN", details
     assert details["rollback"]["production_Runtime_Profile_is_never_modified"] is True
+    # Group workloads are deleted only once DESTR-009's quiescence gate passes,
+    # and the plan says so; group A defaults to the DESTR-009 evidence.
+    assert (
+        details["rollback"]["runner_finally_deletes_both_test_workloads"]
+        == "only_after_quiescence"
+    )
+    assert details["rollback"]["group_workloads_are_deleted_only_after_quiescence"]
+    assert details["group_a"]["source"] == destr012.GROUP_A_EVIDENCE_SOURCE
+    assert details["focused_tests"] == {"passed": True}
     assert (
         details["preflight_identity"]["runtime_identity"]
         == preflight["runtime_identity"]

@@ -83,6 +83,61 @@ class BlastCasesOne(BlastRunnerBase):
             )
         )
 
+    @staticmethod
+    def managed_field_key(node: str, entry: Mapping[str, Any]) -> str:
+        return json.dumps(
+            {
+                "node": node,
+                "manager": entry.get("manager"),
+                "operation": entry.get("operation"),
+                "time": entry.get("time"),
+                "fieldsV1": entry.get("fieldsV1") or {},
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def managed_field_writes(
+        cls,
+        current_nodes: Mapping[str, Any],
+        *,
+        baseline_nodes: Mapping[str, Any],
+        since: datetime,
+    ) -> list[dict[str, Any]]:
+        """Taint/cordon/gpu-fault managedFields entries new since the baseline.
+
+        An entry is a hit when it is relevant, stamped at or after ``since``
+        and absent from the baseline snapshot taken immediately before the
+        fault window. The time filter alone is not enough: a manager that
+        rewrites its entry keeps the *newest* time, so a pre-window write by
+        the same manager showed up as in-window noise and a baseline entry
+        with a clock skewed forward did the same.
+        """
+
+        known = {
+            cls.managed_field_key(str(node.get("metadata", {}).get("name", "")), entry)
+            for node in baseline_nodes.get("items", [])
+            for entry in node.get("metadata", {}).get("managedFields") or []
+        }
+        hits = []
+        for node in current_nodes.get("items", []):
+            metadata = node.get("metadata", {})
+            name = str(metadata.get("name", ""))
+            for entry in metadata.get("managedFields") or []:
+                if not cls.managed_field_relevant(entry, since=since):
+                    continue
+                if cls.managed_field_key(name, entry) in known:
+                    continue
+                hits.append(
+                    {
+                        "node": name,
+                        "manager": entry.get("manager"),
+                        "operation": entry.get("operation"),
+                        "time": entry.get("time"),
+                    }
+                )
+        return hits
+
     def blast_001(self) -> None:
         case_id = "GF-REGIONAL-BLAST-001"
         execution_card = json.loads(
@@ -105,19 +160,11 @@ class BlastCasesOne(BlastRunnerBase):
         baseline_snapshot = self.node_security_snapshot(baseline_nodes)
         baseline_identical = baseline_snapshot == current_snapshot
 
-        managed_field_hits = []
-        for node in current_nodes.get("items", []):
-            metadata = node.get("metadata", {})
-            for entry in metadata.get("managedFields") or []:
-                if self.managed_field_relevant(entry, since=start):
-                    managed_field_hits.append(
-                        {
-                            "node": metadata.get("name"),
-                            "manager": entry.get("manager"),
-                            "operation": entry.get("operation"),
-                            "time": entry.get("time"),
-                        }
-                    )
+        managed_field_hits = self.managed_field_writes(
+            current_nodes,
+            baseline_nodes=baseline_nodes,
+            since=start,
+        )
 
         jobs = self.cpu_json("get", "jobs", "-A", "-o", "json")
         gpu_fault_jobs = []
@@ -221,10 +268,13 @@ class BlastCasesOne(BlastRunnerBase):
         )
         status = "PASS" if passed else "FAIL"
         limitations = [
-            "The current E2E-001 run did not preserve an immediate CPU node "
-            "before snapshot. The verdict combines the latest trusted full "
-            "CPU node baseline with managedFields and event/job checks for "
-            "the exact E2E window."
+            "The CPU node baseline is the snapshot E2E-001 wrote immediately "
+            "before its injection (cpu-nodes-before.json) unless the operator "
+            "supplied another --trusted-cpu-baseline; managedFields writes are "
+            "counted only when they are new relative to that baseline and "
+            "inside the E2E window.",
+            "This case reuses E2E-001's fault window and does not trigger a "
+            "reset or workload restart of its own.",
         ]
         self.record_case(
             case_id,
@@ -396,6 +446,25 @@ class BlastCasesOne(BlastRunnerBase):
             }
         )
 
+    @staticmethod
+    def sagemaker_patterns(patterns: Iterable[str]) -> list[str]:
+        return [item for item in patterns if item.lower().startswith("sagemaker:")]
+
+    @staticmethod
+    def sagemaker_read_only(sagemaker_patterns: Iterable[str]) -> bool:
+        """ "SageMaker 权限只有 Describe 和 List", zero patterns included.
+
+        A role with no SageMaker permission at all satisfies the requirement;
+        requiring at least one pattern failed the stricter role. The pattern
+        count is recorded next to this so the evidence still says which of the
+        two shapes was seen.
+        """
+
+        return all(
+            item.lower().startswith(("sagemaker:describe", "sagemaker:list"))
+            for item in sagemaker_patterns
+        )
+
     def blast_002(self) -> None:
         case_id = "GF-REGIONAL-BLAST-002"
         pod = self.ready_cpu_pod()
@@ -449,13 +518,8 @@ class BlastCasesOne(BlastRunnerBase):
             and statement_not_actions(item)
             for item in statements
         )
-        sagemaker_patterns = [
-            item for item in patterns if item.lower().startswith("sagemaker:")
-        ]
-        sagemaker_read_only = bool(sagemaker_patterns) and all(
-            item.lower().startswith(("sagemaker:describe", "sagemaker:list"))
-            for item in sagemaker_patterns
-        )
+        sagemaker_patterns = self.sagemaker_patterns(patterns)
+        sagemaker_read_only = self.sagemaker_read_only(sagemaker_patterns)
         ses_send_statements = [
             item
             for item in statements
@@ -480,6 +544,8 @@ class BlastCasesOne(BlastRunnerBase):
                 "forbidden_hyperpod_mutations_present": forbidden,
                 "broad_allow_not_action_present": broad_not_action,
                 "sagemaker_read_only_describe_list_only": sagemaker_read_only,
+                "sagemaker_action_pattern_count": len(sagemaker_patterns),
+                "sagemaker_action_patterns": sagemaker_patterns,
                 "ses_send_statement_count": len(ses_send_statements),
                 "ses_send_scoped_to_identity_with_condition": ses_scoped,
             }
@@ -506,6 +572,7 @@ class BlastCasesOne(BlastRunnerBase):
                 "kubeconfig_env_unset": "kubeconfig_env=unset" in filesystem_probe,
                 "forbidden_hyperpod_mutations_present": forbidden,
                 "sagemaker_describe_list_only": sagemaker_read_only,
+                "sagemaker_action_pattern_count": len(sagemaker_patterns),
                 "ses_send_scoped": ses_scoped,
             },
         )

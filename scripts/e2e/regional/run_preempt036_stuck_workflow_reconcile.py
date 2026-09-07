@@ -90,6 +90,7 @@ from scripts.e2e.regional.preempt036_verdicts import (  # noqa: E402
     rerun_event_errors,
     safety_errors,
     seed_mode,
+    shipped_source_errors,
     workflow_snapshot,
 )
 
@@ -190,7 +191,7 @@ class PostgresProvisioner(StoreProvisioner):
         import psycopg
         from psycopg import sql
 
-        database = f"gpu_fault_p035_{name.replace('-', '_')}_{uuid4().hex[:8]}"
+        database = f"gpu_fault_p036_{name.replace('-', '_')}_{uuid4().hex[:8]}"
         if _DATABASE_NAME.fullmatch(database) is None:
             raise RunnerError(f"refusing an unexpected database name: {database}")
         with psycopg.connect(self.base_url, autocommit=True) as connection:
@@ -432,6 +433,10 @@ def run_mode(
     seed: ModeSeed = seed_mode(mode, store)
     script = SCRIPT_BUILDERS[mode]()
     stages: dict[str, list[str]] = {}
+    # Judged, not merely recorded: everything below executes ``script``, so a
+    # script that is not the shipped text fails the case before it runs.
+    shipped = _shipped_evidence(mode, script)
+    stages["shipped_source"] = shipped_source_errors(shipped)
 
     safety_before = _safety(provisioner, url, safety_probe)
     stats_before = _run_json(provisioner, url, stats_probe, None)
@@ -563,7 +568,7 @@ def run_mode(
         "errors": all_errors(stages),
         "stages": {name: list(errors) for name, errors in stages.items()},
         "store_identity_sha256": _sha256(url),
-        "shipped_source": _shipped_evidence(mode, script),
+        "shipped_source": shipped,
         "seeded_workflow_ids": list(seed.workflow_ids),
         "applied_workflow_ids": list(seed.actionable_ids),
         "refused_workflow_ids": list(seed.refused_ids),

@@ -9,7 +9,11 @@ from gpu_fault.admin.config import AdminConfig
 from scripts.e2e.regional.boot020_release_candidates import (
     candidate_edits,
     chain_configs,
+    edits_digest,
     link_release_dist,
+    parser,
+    reusable_candidate,
+    unlink_release_dist,
 )
 
 
@@ -100,3 +104,86 @@ def test_link_release_dist_points_repo_dist_at_the_candidate(tmp_path: Path) -> 
     assert link == repo / "dist" / "rid123"
     assert link.resolve() == (candidate / "rid123").resolve()
     assert link_release_dist(repo, manifest) == link
+
+
+def test_edits_digest_distinguishes_candidates_and_modules() -> None:
+    edits = candidate_edits("src/gpu_fault/x.py", "src/gpu_fault/node_agent/y.py")
+    other = candidate_edits("src/gpu_fault/z.py", "src/gpu_fault/node_agent/y.py")
+
+    assert edits_digest(edits["B"]) == edits_digest(edits["B"])
+    assert len({edits_digest(edits[name]) for name in ("B", "C", "D")}) == 3
+    assert edits_digest(edits["B"]) != edits_digest(other["B"])
+
+
+def test_reusable_candidate_requires_the_recorded_edits_digest(tmp_path: Path) -> None:
+    manifest = tmp_path / "wt-B" / "dist" / "current-release.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"release_id": "rid-b"}), "utf-8")
+    recorded = {"release_id": "rid-b", "edits_sha256": "d" * 64}
+
+    assert reusable_candidate(
+        manifest,
+        base_release_id="rid-base",
+        recorded=recorded,
+        expected_edits_digest="d" * 64,
+    ), "a manifest built from the recorded edits is the candidate asked for"
+    # The same checkout built from different edits is not the candidate asked for.
+    assert not reusable_candidate(
+        manifest,
+        base_release_id="rid-base",
+        recorded=recorded,
+        expected_edits_digest="e" * 64,
+    ), "different edits digest means a different candidate"
+    # A build that never diverged from the base, or one nobody recorded, is rebuilt.
+    assert not reusable_candidate(
+        manifest,
+        base_release_id="rid-b",
+        recorded=recorded,
+        expected_edits_digest="d" * 64,
+    ), "a build that never diverged from the base is not a candidate"
+    assert not reusable_candidate(
+        manifest,
+        base_release_id="rid-base",
+        recorded=None,
+        expected_edits_digest="d" * 64,
+    ), "an unrecorded build is rebuilt"
+    assert not reusable_candidate(
+        tmp_path / "missing.json",
+        base_release_id="rid-base",
+        recorded=recorded,
+        expected_edits_digest="d" * 64,
+    ), "a missing manifest is rebuilt"
+
+
+def test_unlink_release_dist_removes_only_the_link_it_made(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "dist").mkdir(parents=True)
+    candidate = tmp_path / "wt-B" / "dist"
+    (candidate / "rid123").mkdir(parents=True)
+    manifest = candidate / "current-release.json"
+    manifest.write_text(json.dumps({"release_id": "rid123"}), "utf-8")
+    link = link_release_dist(repo, manifest)
+
+    assert unlink_release_dist(repo, manifest) == link
+    assert not link.exists() and not link.is_symlink()
+    assert unlink_release_dist(repo, manifest) is None, "idempotent"
+
+    # A real directory of the same name was not made by this tool.
+    link.mkdir()
+    assert unlink_release_dist(repo, manifest) is None
+    assert link.is_dir(), "a real directory of the same name is left in place"
+
+    # A link to a different target is left alone as well.
+    link.rmdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    link.symlink_to(elsewhere)
+    assert unlink_release_dist(repo, manifest) is None
+    assert link.is_symlink(), "a link to another target is left in place"
+
+
+def test_clean_is_a_subcommand() -> None:
+    arguments = parser().parse_args(
+        ["clean", "--snapshot-repo", "/tmp/snap", "--work-dir", "/tmp/work"]
+    )
+    assert arguments.command == "clean"

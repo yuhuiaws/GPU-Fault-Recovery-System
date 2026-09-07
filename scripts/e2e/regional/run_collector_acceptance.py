@@ -6,8 +6,8 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,10 +21,13 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     CollectorAcceptanceFixture,
     collector_setting,
+    select_workflow,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseSurface,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_selected_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -65,6 +68,22 @@ NODE_COUNTS = {
     **{case_id: 1 for case_id in CASE_IDS},
     "GF-REGIONAL-COLLECT-011": 2,
 }
+# COLLECT-011 injects a fatal SXID whose reset scope the control plane cannot
+# trust; the BLOCKED workflow is the one that decided one of these, not "the
+# latest for the node" (a restore or an unrelated finding may be newer).
+SCOPE_DEPENDENT_ACTIONS = frozenset(
+    {"RESET_PARTICIPATING_GPUS", "RESET_ALL_GPUS_AND_NVSWITCHES"}
+)
+# COLLECT-009: the wrong acknowledgement must be *observed* to be refused. The
+# dispatcher re-reads the annotation every ~5s, so three cycles is the least
+# that proves the step looked and did not complete.
+WRONG_ACKNOWLEDGEMENT_OBSERVATION_SECONDS = 15
+# COLLECT-005: how the replay claim is sampled after the collector restart.
+# One read right after the restart only proves the collector had not yet
+# re-read the file; the count has to stay put over more than one cycle.
+REPLAY_OBSERVATION_SAMPLES = 3
+REPLAY_OBSERVATION_SECONDS = 10
+FM_CURSOR_TIMEOUT_SECONDS = 60
 
 
 RECENT_EVIDENCE = r"""
@@ -116,6 +135,19 @@ print(json.dumps({"records": [
 COLLECT001_PRODUCERS = {
     "GPU_METRICS": "dcgm-",
     "HOST_TELEMETRY": "host-",
+}
+# Each chain runs on its own interval and summary period; judging both against
+# the max() of the two let the faster chain deliver a whole extra summary and
+# still pass, and made the slower chain's "gap" threshold too lax.
+COLLECT001_SETTINGS = {
+    "GPU_METRICS": (
+        "GPU_FAULT_METRICS_INTERVAL_SECONDS",
+        "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS",
+    ),
+    "HOST_TELEMETRY": (
+        "GPU_FAULT_HOST_INTERVAL_SECONDS",
+        "GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS",
+    ),
 }
 
 
@@ -169,48 +201,66 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
 
 
-def focused_tests(case_id: str, case_dir: Path) -> dict[str, Any]:
-    definitions = {
-        "GF-REGIONAL-COLLECT-001": [
-            "tests/collectors/test_gpu.py::"
-            "test_dcgm_edge_filter_suppresses_unchanged_healthy_samples",
-            "tests/collectors/test_host.py::"
-            "test_host_edge_filter_suppresses_health_and_delivers_edges",
-        ],
-        "GF-REGIONAL-COLLECT-002": [
-            "tests/collectors/test_gpu.py::"
-            "test_dcgm_edge_filter_emits_counter_delta_and_candidate_recovery",
-        ],
-        "GF-REGIONAL-COLLECT-003": [
-            "tests/collectors/test_host.py::"
-            "test_efa_inventory_ignores_non_efa_rdma_devices",
-            "tests/collectors/test_gpu.py::"
-            "test_host_collector_reports_persistent_gpu_and_efa_card_loss",
-        ],
-        "GF-REGIONAL-COLLECT-005": [
-            "tests/collectors/test_logs.py::"
-            "test_fabric_manager_file_collector_persists_offsets",
-            "tests/collectors/test_logs.py::"
-            "test_fabric_manager_file_cursor_rolls_back_on_delivery_failure",
-        ],
-        "GF-REGIONAL-COLLECT-009": [
-            "tests/execution/test_misc.py::"
-            "test_mechanical_inspection_waits_for_incident_fenced_annotation",
-        ],
-        "GF-REGIONAL-COLLECT-010": [
-            "tests/orchestration/test_misc.py::"
-            "test_failed_firmware_remediation_escalates_directly_to_support",
-        ],
-        "GF-REGIONAL-COLLECT-011": [
-            "tests/orchestration/test_sxid_topology.py::"
-            "test_conflicting_or_untrusted_topology_fails_closed",
-        ],
-        "GF-REGIONAL-COLLECT-012": [
-            "tests/orchestration/test_misc.py::"
-            "test_restart_app_requires_workload_identity",
-        ],
-    }
-    command = [sys.executable, "-m", "pytest", "-q", *definitions[case_id]]
+FOCUSED_TESTS = {
+    "GF-REGIONAL-COLLECT-001": [
+        "tests/collectors/test_gpu.py::"
+        "test_dcgm_edge_filter_suppresses_unchanged_healthy_samples",
+        "tests/collectors/test_host.py::"
+        "test_host_edge_filter_suppresses_health_and_delivers_edges",
+    ],
+    "GF-REGIONAL-COLLECT-002": [
+        "tests/collectors/test_gpu.py::"
+        "test_dcgm_edge_filter_emits_counter_delta_and_candidate_recovery",
+    ],
+    "GF-REGIONAL-COLLECT-003": [
+        "tests/collectors/test_host.py::"
+        "test_efa_inventory_ignores_non_efa_rdma_devices",
+        "tests/collectors/test_gpu.py::"
+        "test_host_collector_reports_persistent_gpu_and_efa_card_loss",
+    ],
+    "GF-REGIONAL-COLLECT-005": [
+        "tests/collectors/test_logs.py::"
+        "test_fabric_manager_file_collector_persists_offsets",
+        "tests/collectors/test_logs.py::"
+        "test_fabric_manager_file_cursor_rolls_back_on_delivery_failure",
+    ],
+    "GF-REGIONAL-COLLECT-009": [
+        "tests/execution/test_misc.py::"
+        "test_mechanical_inspection_waits_for_incident_fenced_annotation",
+    ],
+    "GF-REGIONAL-COLLECT-010": [
+        "tests/orchestration/test_misc.py::"
+        "test_failed_firmware_remediation_escalates_directly_to_support",
+    ],
+    "GF-REGIONAL-COLLECT-011": [
+        "tests/orchestration/test_sxid_topology.py::"
+        "test_conflicting_or_untrusted_topology_fails_closed",
+    ],
+    "GF-REGIONAL-COLLECT-012": [
+        "tests/orchestration/test_misc.py::test_restart_app_requires_workload_identity",
+    ],
+}
+
+
+def focused_tests(
+    case_id: str,
+    case_dir: Path,
+    *,
+    reuse_plan: Path | None = None,
+) -> dict[str, Any]:
+    """Run the case's focused pytest, or reuse the plan's run on the same tree.
+
+    ``--plan`` and ``--execute`` are minutes apart on the same checkout; the
+    plan recorded its result with a source digest, and when that digest still
+    matches, the ``--execute`` preflight takes the recorded result instead of
+    paying for pytest a second time.
+    """
+
+    if reuse_plan is not None:
+        recorded = reusable_focused_tests(reuse_plan)
+        if recorded is not None:
+            return {**recorded, "reused_from_plan": str(reuse_plan)}
+    command = [sys.executable, "-m", "pytest", "-q", *FOCUSED_TESTS[case_id]]
     completed = RegionalLiveFixture.run(
         command,
         cwd=ROOT,
@@ -230,13 +280,20 @@ def focused_tests(case_id: str, case_dir: Path) -> dict[str, Any]:
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
+    *,
+    reuse_plan: Path | None = None,
 ) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
     nodes = [regional.node_snapshot(node) for node in settings.nodes]
     states = [regional.store_snapshot(node=node) for node in settings.nodes]
     predecessor_id = PREDECESSORS[settings.case_id]
-    predecessor = predecessor_evidence(settings.predecessor_path, predecessor_id)
-    tests = focused_tests(settings.case_id, case_dir)
+    identity = regional.evidence_identity()
+    predecessor = predecessor_evidence(
+        settings.predecessor_path,
+        predecessor_id,
+        **identity,
+    )
+    tests = focused_tests(settings.case_id, case_dir, reuse_plan=reuse_plan)
     errors = []
     if not predecessor["valid"]:
         errors.append(f"{predecessor_id} predecessor evidence is not PASS")
@@ -250,7 +307,7 @@ def read_only_preflight(
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     result = {
-        "release_id": states[0].get("release_id") if states else None,
+        **identity,
         "nodes": nodes,
         "stores": states,
         "predecessor": predecessor,
@@ -297,25 +354,160 @@ def evidence_kinds(records: list[dict[str, Any]]) -> dict[str, list[dict[str, An
     return result
 
 
+def parse_stamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def service_state_errors(
+    baseline: dict[str, Any],
+    after: dict[str, Any],
+) -> list[str]:
+    """Every unit that was active before the injection is active after it.
+
+    The fail-closed cases promise "zero side effects beyond the quarantine";
+    a collector or agent unit that died along the way is a side effect the
+    boot-ID check cannot see.
+    """
+
+    errors = []
+    for unit, before in sorted((baseline.get("services") or {}).items()):
+        if before.get("ActiveState") != "active":
+            continue
+        current = (after.get("services") or {}).get(unit) or {}
+        if current.get("ActiveState") != "active":
+            errors.append(
+                f"{unit} is {current.get('ActiveState') or 'absent'} after the "
+                "case, active before it"
+            )
+    return errors
+
+
+@dataclass
+class CaseCleanup:
+    """What a case took hold of, so ``execute_case`` can let go of it on every path.
+
+    Handlers register a state the moment the store shows a workflow for their
+    injection, and an annotation the moment they write it; the success path
+    restores through the same registry (``restore``/``remove_annotation``) and
+    marks the item done. Whatever is still registered when the case ends --
+    because an assertion raised, a wait timed out, or a handler forgot -- is
+    restored best-effort by ``finish`` and its failures are recorded as
+    cleanup errors, which fail the case.
+    """
+
+    incident_states: list[tuple[CollectorAcceptanceFixture, dict[str, Any]]] = field(
+        default_factory=list
+    )
+    annotations: list[tuple[CollectorAcceptanceFixture, str]] = field(
+        default_factory=list
+    )
+    restore_workflows: list[list[dict[str, Any]]] = field(default_factory=list)
+
+    def register_state(
+        self,
+        fixture: CollectorAcceptanceFixture,
+        state: dict[str, Any],
+    ) -> None:
+        self.incident_states.append((fixture, state))
+
+    def register_annotation(
+        self,
+        fixture: CollectorAcceptanceFixture,
+        annotation: str,
+    ) -> None:
+        self.annotations.append((fixture, annotation))
+
+    def restore(
+        self,
+        fixture: CollectorAcceptanceFixture,
+        state: dict[str, Any],
+        *,
+        profile_version: str,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        result = fixture.restore_incidents(
+            state,
+            profile_version=profile_version,
+            reason=reason,
+        )
+        # A validated restore that returned proved the node holds no ownership
+        # or quarantine taint at all (restore_incidents raises otherwise), so
+        # every state registered for this node is released, not only ``state``.
+        self.incident_states = [
+            item for item in self.incident_states if item[0] is not fixture
+        ]
+        self.restore_workflows.append(result)
+        return result
+
+    def remove_annotation(
+        self,
+        fixture: CollectorAcceptanceFixture,
+        annotation: str,
+    ) -> None:
+        fixture.regional.kubectl(
+            "gpu",
+            "annotate",
+            "node",
+            fixture.node,
+            f"{annotation}-",
+            check=False,
+        )
+        self.annotations = [
+            item for item in self.annotations if item != (fixture, annotation)
+        ]
+
+    def finish(self, *, profile_version: str, reason: str) -> dict[str, Any]:
+        """Release everything still registered; never raises, always reports."""
+
+        errors: list[str] = []
+        restored: list[list[dict[str, Any]]] = []
+        for fixture, annotation in list(self.annotations):
+            try:
+                self.remove_annotation(fixture, annotation)
+            except Exception as exc:
+                errors.append(
+                    f"{fixture.node}: annotation {annotation} removal failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        for fixture, state in list(reversed(self.incident_states)):
+            try:
+                restored.append(
+                    self.restore(
+                        fixture,
+                        state,
+                        profile_version=profile_version,
+                        reason=reason,
+                    )
+                )
+            except Exception as exc:
+                errors.append(
+                    f"{fixture.node}: validated restore failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        return {"restore_workflows": restored, "errors": errors}
+
+
 def run_collect001(
     fixture: CollectorAcceptanceFixture,
     case_dir: Path,
 ) -> dict[str, Any]:
     baseline = fixture.snapshot()
     env = baseline["collector_env"]
-    interval = max(
-        collector_setting(env, "GPU_FAULT_METRICS_INTERVAL_SECONDS"),
-        collector_setting(env, "GPU_FAULT_HOST_INTERVAL_SECONDS"),
-    )
-    summary = max(
-        collector_setting(env, "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS"),
-        collector_setting(env, "GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS"),
-    )
+    chains = {
+        kind: {
+            "interval": collector_setting(env, interval_key),
+            "summary": collector_setting(env, summary_key),
+        }
+        for kind, (interval_key, summary_key) in COLLECT001_SETTINGS.items()
+    }
+    poll_interval = min(item["interval"] for item in chains.values())
     started_at = datetime.now(timezone.utc)
-    # Two full summary cycles have to fit inside the window with room for the
-    # phase offset at either end, or "at least two deliveries" is not a
-    # property of the window.
-    duration = summary * 2 + interval * 4
+    # Two full summary cycles of the *slowest* chain have to fit inside the
+    # window with room for the phase offset at either end, or "at least two
+    # deliveries" is not a property of the window for that chain.
+    duration = max(
+        item["summary"] * 2 + item["interval"] * 4 for item in chains.values()
+    )
     # Poll the collector statuses rather than reading the evidence history once
     # at the end. Steady-state deliveries are deliberately *not* persisted as
     # evidence -- the control plane skips capture when a batch has no findings,
@@ -333,8 +525,7 @@ def run_collect001(
             if prefix is None or not str(record.get("batch_id")).startswith(prefix):
                 continue
             stamp = str(record.get("observed_at"))
-            observed_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-            if observed_at < started_at:
+            if parse_stamp(stamp) < started_at:
                 # A delivery from before the window. It is a real one, but its
                 # distance to the first in-window delivery is not a gap this
                 # window measured.
@@ -353,7 +544,7 @@ def run_collect001(
         write_json_atomic(case_dir / "timeline.json", {"entries": timeline})
         if time.monotonic() >= deadline:
             break
-        time.sleep(interval)
+        time.sleep(poll_interval)
     records = recent_evidence(
         fixture.regional,
         node=fixture.node,
@@ -362,20 +553,23 @@ def run_collect001(
     by_kind = evidence_kinds(records)
     errors = []
     observed: dict[str, Any] = {}
-    # What the sampling loop would have delivered with the filter switched off,
-    # and what a suppressed steady state should deliver instead.
-    sampled = duration // interval
-    suppressed = duration // summary
     for kind in sorted(COLLECT001_PRODUCERS):
-        stamps = sorted(
-            datetime.fromisoformat(item.replace("Z", "+00:00"))
-            for item in deliveries[kind]
-        )
+        interval = chains[kind]["interval"]
+        summary = chains[kind]["summary"]
+        # What this chain's sampling loop would have delivered with the filter
+        # switched off, and what a suppressed steady state should deliver.
+        sampled = duration // interval
+        suppressed = duration // summary
+        stamps = sorted(parse_stamp(item) for item in deliveries[kind])
         gaps = [
             (right - left).total_seconds()
             for left, right in zip(stamps, stamps[1:], strict=False)
         ]
         observed[kind] = {
+            "interval_seconds": interval,
+            "summary_seconds": summary,
+            "collection_samples_in_window": sampled,
+            "summary_deliveries_in_window": suppressed,
             "delivered": len(stamps),
             "observed_at": [item.isoformat() for item in stamps],
             "gaps_seconds": gaps,
@@ -437,8 +631,7 @@ def run_collect001(
         "errors": errors,
         "collector_env": env,
         "observation_seconds": duration,
-        "collection_samples_in_window": sampled,
-        "summary_deliveries_in_window": suppressed,
+        "chains": chains,
         "deliveries": observed,
         "persisted_health_summaries": persisted_summaries,
         "false_recovery_records": false_recoveries,
@@ -464,6 +657,27 @@ def gpu_metrics_stamp(fixture: CollectorAcceptanceFixture) -> str | None:
     return max(stamps) if stamps else None
 
 
+def seconds_until_next_summary(
+    last_stamp: str | None,
+    *,
+    summary: int,
+    now: datetime | None = None,
+) -> float:
+    """How long until the GPU chain's next periodic delivery is due.
+
+    The last status stamp is the phase of the summary clock; the next delivery
+    is one summary period after it. Sleeping until then replaces polling the
+    store every interval for up to a summary period (330s of exec calls on a
+    300s summary) with one computed pause.
+    """
+
+    if last_stamp is None:
+        return 0.0
+    current = now or datetime.now(timezone.utc)
+    due = parse_stamp(last_stamp) + timedelta(seconds=summary)
+    return max(0.0, min(float(summary), (due - current).total_seconds()))
+
+
 def run_collect002(
     fixture: CollectorAcceptanceFixture,
     case_dir: Path,
@@ -481,7 +695,10 @@ def run_collect002(
     # next health summary is a whole summary period away. Injecting just before a
     # summary would let the periodic delivery masquerade as the anomaly edge.
     opening = gpu_metrics_stamp(fixture)
-    settle_deadline = time.monotonic() + summary + interval * 2
+    phase_sleep = seconds_until_next_summary(opening, summary=summary)
+    if phase_sleep > 0:
+        time.sleep(phase_sleep)
+    settle_deadline = time.monotonic() + interval * 3
     while True:
         current = gpu_metrics_stamp(fixture)
         if current is not None and current != opening:
@@ -492,7 +709,7 @@ def run_collect002(
                 "the case cannot start from a known-quiet point"
             )
         time.sleep(interval)
-    quiet_stamp = cast(str, current)
+    quiet_stamp: str = current
     # The edge filter deliberately confirms a candidate over
     # `confirmation` consecutive samples before it speaks, so the earliest
     # honest bound is that many intervals plus the one the anomaly appeared in.
@@ -514,6 +731,8 @@ def run_collect002(
     )
     timeline: list[dict[str, Any]] = []
     delivered_at: str | None = None
+    restore: dict[str, Any] = {}
+    cleanup_error: str | None = None
     try:
         deadline = time.monotonic() + load_seconds
         while True:
@@ -531,10 +750,25 @@ def run_collect002(
             if time.monotonic() >= deadline:
                 break
             time.sleep(interval)
-    finally:
-        restore = fixture.execute(
-            "restore-gpu-power-limit", "--run-id", run_id, timeout=300
-        )
+    except BaseException:
+        # The restore must still run, but its own failure must not replace
+        # the exception that got us here: the deadman timer still covers the
+        # power limit, and the case's error is the one the operator needs.
+        try:
+            fixture.execute("restore-gpu-power-limit", "--run-id", run_id, timeout=300)
+        except Exception as exc:  # noqa: BLE001 - recorded, original re-raised
+            cleanup_error = f"{type(exc).__name__}: {exc}"
+            write_json_atomic(
+                case_dir / "cleanup-error.json", {"cleanup_error": cleanup_error}
+            )
+        raise
+    else:
+        try:
+            restore = fixture.execute(
+                "restore-gpu-power-limit", "--run-id", run_id, timeout=300
+            )
+        except Exception as exc:  # noqa: BLE001 - recorded as a case failure
+            cleanup_error = f"{type(exc).__name__}: {exc}"
     records = recent_evidence(
         fixture.regional,
         node=fixture.node,
@@ -550,6 +784,8 @@ def run_collect002(
         )
     ]
     errors = []
+    if cleanup_error:
+        errors.append(f"GPU power limit restore failed: {cleanup_error}")
     latency: float | None = None
     if delivered_at is None:
         errors.append(
@@ -557,9 +793,7 @@ def run_collect002(
             f"lowered power limit for {load_seconds}s"
         )
     else:
-        latency = (
-            datetime.fromisoformat(delivered_at.replace("Z", "+00:00")) - started_at
-        ).total_seconds()
+        latency = (parse_stamp(delivered_at) - started_at).total_seconds()
         if latency > allowed_latency:
             errors.append(
                 f"the anomaly took {latency:.1f}s to deliver, more than the "
@@ -582,9 +816,12 @@ def run_collect002(
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "collector_env": env,
+        "opening_stamp": opening,
+        "phase_sleep_seconds": phase_sleep,
         "quiet_stamp": quiet_stamp,
         "injection": injection,
         "restore": restore,
+        "cleanup_error": cleanup_error,
         "allowed_latency_seconds": allowed_latency,
         "summary_seconds": summary,
         "delivered_at": delivered_at,
@@ -618,6 +855,82 @@ def run_collect003(
     }
 
 
+def fm_cursor_entry(reading: dict[str, Any]) -> dict[str, Any] | None:
+    """The cursor the FM collector keeps for the live log, out of an `fm-cursor` read."""
+
+    log = reading.get("fabric_manager_log") or {}
+    cursor = reading.get("fabric_manager_cursor") or {}
+    files = cursor.get("files") or {}
+    entry = files.get(str(log.get("path") or ""))
+    return cast(dict[str, Any], entry) if isinstance(entry, dict) else None
+
+
+def fm_cursor_caught_up(reading: dict[str, Any]) -> bool:
+    """The collector is active and its cursor sits at the log's current EOF/inode."""
+
+    service = reading.get("service") or {}
+    log = reading.get("fabric_manager_log") or {}
+    entry = fm_cursor_entry(reading)
+    return (
+        service.get("ActiveState") == "active"
+        and entry is not None
+        and int(entry.get("offset", -1)) == int(log.get("size", -2))
+        and int(entry.get("inode", -1)) == int(log.get("inode", -2))
+    )
+
+
+def wait_fm_cursor(
+    fixture: CollectorAcceptanceFixture,
+    *,
+    timeout_seconds: int = FM_CURSOR_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Poll `fm-cursor` until the restarted collector is active and caught up."""
+
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = fixture.execute("fm-cursor", timeout=60)
+        if fm_cursor_caught_up(last):
+            return last
+        time.sleep(3)
+    raise RegionalFixtureError(
+        "Fabric Manager collector did not come back active with its cursor at "
+        f"the log's EOF: {last}"
+    )
+
+
+def cursor_errors(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> list[str]:
+    """COLLECT-005's cursor claim: it moved to EOF and survived the restart.
+
+    ``before``/``after`` are the probe's full snapshots around the injection.
+    The old check compared the log's size to its own earlier size, which any
+    unrelated FM line satisfies; the claim is about the collector's *cursor*.
+    """
+
+    errors = []
+    log_after = after.get("fabric_manager_log") or {}
+    entry_before = fm_cursor_entry(before)
+    entry_after = fm_cursor_entry(after)
+    if entry_after is None:
+        errors.append("Fabric Manager collector has no persisted cursor for the log")
+        return errors
+    if int(entry_after.get("offset", -1)) != int(log_after.get("size", -2)):
+        errors.append(
+            f"persisted cursor offset {entry_after.get('offset')} is not the log's "
+            f"EOF {log_after.get('size')}"
+        )
+    if int(entry_after.get("inode", -1)) != int(log_after.get("inode", -2)):
+        errors.append("persisted cursor inode is not the live log's inode")
+    if entry_before is not None and int(entry_after.get("offset", 0)) <= int(
+        entry_before.get("offset", 0)
+    ):
+        errors.append("persisted cursor did not advance past the appended line")
+    return errors
+
+
 def run_collect005(
     fixture: CollectorAcceptanceFixture,
     case_dir: Path,
@@ -646,22 +959,32 @@ def run_collect005(
         "--service",
         "gpu-fault-fabric-manager-collector.service",
     )
-    time.sleep(15)
+    cursor_after_restart = wait_fm_cursor(fixture)
+    # The replay claim is sampled over more than one collector cycle; a single
+    # read right after the restart could precede the re-read that would replay.
+    replay_counts = []
+    for index in range(REPLAY_OBSERVATION_SAMPLES):
+        if index:
+            time.sleep(REPLAY_OBSERVATION_SECONDS)
+        replay_counts.append(len(fixture.store_snapshot(marker).get("evidence") or []))
     second = fixture.store_snapshot(marker)
     errors = []
-    if count != 1 or len(second.get("evidence") or []) != 1:
-        errors.append("Fabric Manager event was lost or replayed")
+    if count != 1 or any(item != 1 for item in replay_counts):
+        errors.append(
+            f"Fabric Manager event was lost or replayed: first {count}, "
+            f"after restart {replay_counts}"
+        )
     if first.get("workflows") or second.get("workflows"):
         errors.append("unknown non-fatal SXID created a workflow")
     after = fixture.snapshot()
-    before_size = (before.get("fabric_manager_log") or {}).get("size", 0)
-    after_size = (after.get("fabric_manager_log") or {}).get("size", 0)
-    if int(after_size) <= int(before_size):
-        errors.append("Fabric Manager log cursor source did not advance")
+    errors.extend(cursor_errors(before, after))
+    errors.extend(service_state_errors(before, after))
     return {
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "marker": marker,
+        "replay_counts": replay_counts,
+        "cursor_after_restart": cursor_after_restart,
         "before": before,
         "after": after,
     }
@@ -676,7 +999,7 @@ def waiting_workflow(
     deadline = time.monotonic() + timeout_seconds
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last = fixture.store_snapshot(marker)
+        last = fixture.store_snapshot(marker, scan_evidence=False)
         if any(
             execution.get("status") == "WAITING"
             for workflow in last.get("workflows") or []
@@ -685,6 +1008,23 @@ def waiting_workflow(
             return last
         time.sleep(2)
     raise RegionalFixtureError(f"workflow did not reach WAITING: {last}")
+
+
+def observe_marker(
+    fixture: CollectorAcceptanceFixture,
+    marker: str,
+    *,
+    seconds: int,
+    poll_seconds: int = 5,
+) -> list[dict[str, Any]]:
+    """Light store reads over ``seconds``; every one is returned, not just the last."""
+
+    deadline = time.monotonic() + seconds
+    samples = [fixture.store_snapshot(marker, scan_evidence=False)]
+    while time.monotonic() < deadline:
+        time.sleep(max(1, min(poll_seconds, int(deadline - time.monotonic()) + 1)))
+        samples.append(fixture.store_snapshot(marker, scan_evidence=False))
+    return samples
 
 
 def mechanical_acknowledgement_details(
@@ -721,14 +1061,36 @@ def mechanical_acknowledgement_details(
     return details
 
 
+def node_isolation_errors(node: dict[str, Any], *, label: str) -> list[str]:
+    """COLLECT-009's "Ready, schedulable, untainted" reading of one node snapshot."""
+
+    errors = []
+    if node.get("ready") != "True":
+        errors.append(f"node is not Ready {label}")
+    if node.get("unschedulable"):
+        errors.append(f"node is unschedulable {label}")
+    taints = [
+        str(item.get("key"))
+        for item in node.get("taints") or []
+        if str(item.get("key") or "").startswith("gpu-fault.io/")
+    ]
+    if taints:
+        errors.append(f"node carries gpu-fault taints {taints} {label}")
+    return errors
+
+
 def run_collect009(
     fixture: CollectorAcceptanceFixture,
     case_dir: Path,
     attempt: int,
+    *,
+    cleanup: CaseCleanup | None = None,
 ) -> dict[str, Any]:
+    cleanup = cleanup or CaseCleanup()
     baseline = fixture.snapshot()
     gpu = baseline["gpu_inventory"][0]
     marker = f"c009-{int(time.time())}-a{attempt}"
+    started_at = datetime.now(timezone.utc)
     fixture.execute(
         "write-xid",
         "--xid",
@@ -741,6 +1103,15 @@ def run_collect009(
         "Auxiliary power is not connected to the GPU board",
     )
     state = waiting_workflow(fixture, marker)
+    cleanup.register_state(fixture, state)
+    errors = []
+    # The contract: the node stays Ready, schedulable and untainted for the
+    # whole wait. Read it while the step is WAITING, not only at the end.
+    errors.extend(
+        node_isolation_errors(
+            fixture.regional.node_snapshot(fixture.node), label="during WAITING"
+        )
+    )
     workflow = (state.get("workflows") or [None])[0] or {}
     execution: dict[str, Any] = next(
         (
@@ -755,6 +1126,7 @@ def run_collect009(
     expected = str(details.get("required_annotation_value") or "")
     if not annotation or not expected:
         raise RegionalFixtureError("CHECK_MECHANICALS omitted annotation details")
+    cleanup.register_annotation(fixture, annotation)
     fixture.regional.kubectl(
         "gpu",
         "annotate",
@@ -763,8 +1135,12 @@ def run_collect009(
         f"{annotation}=wrong:0",
         "--overwrite",
     )
-    time.sleep(10)
-    wrong = fixture.store_snapshot(marker)
+    # Three dispatcher cycles with the wrong value in place, each one read.
+    wrong_samples = observe_marker(
+        fixture,
+        marker,
+        seconds=WRONG_ACKNOWLEDGEMENT_OBSERVATION_SECONDS,
+    )
     fixture.regional.kubectl(
         "gpu",
         "annotate",
@@ -779,18 +1155,11 @@ def run_collect009(
         timeout_seconds=300,
         terminal_workflow=True,
     )
-    fixture.regional.kubectl(
-        "gpu",
-        "annotate",
-        "node",
-        fixture.node,
-        f"{annotation}-",
-        check=False,
-    )
-    errors = []
+    cleanup.remove_annotation(fixture, annotation)
     if any(
         workflow.get("status") == "SUCCEEDED"
-        for workflow in wrong.get("workflows") or []
+        for sample in wrong_samples
+        for workflow in sample.get("workflows") or []
     ):
         errors.append("wrong mechanical acknowledgement was accepted")
     if not any(
@@ -798,12 +1167,35 @@ def run_collect009(
         for workflow in final.get("workflows") or []
     ):
         errors.append("correct mechanical acknowledgement did not complete")
+    after = fixture.snapshot()
+    if after["boot_id"] != baseline["boot_id"]:
+        errors.append("node rebooted during the mechanical inspection wait")
+    errors.extend(
+        node_isolation_errors(
+            fixture.regional.node_snapshot(fixture.node), label="after completion"
+        )
+    )
+    errors.extend(service_state_errors(baseline, after))
+    ended_at = datetime.now(timezone.utc)
+    provider = fixture.regional.provider_events(started_at, ended_at)
+    if provider:
+        errors.append(f"provider mutations during the case: {provider}")
+    # No workflow held the node, so the final restore has nothing to do; the
+    # registry still checks that nothing owns it (a fenced step that left an
+    # annotation behind would show here).
     return {
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "marker": marker,
         "required_annotation": annotation,
         "required_value": expected,
+        "wrong_acknowledgement_samples": len(wrong_samples),
+        "provider_events": provider,
+        # CloudTrail delivers within 15 min; an empty read inside that window
+        # is a provisional negative, and is labelled so for the auditor.
+        "provider_events_provisional": fixture.regional.provider_events_provisional(
+            ended_at
+        ),
     }
 
 
@@ -814,6 +1206,8 @@ def inject_blocked_xid(
     xid: int,
     marker: str,
     message: str,
+    minimum_evidence: int = 1,
+    observed_after: datetime | None = None,
 ) -> dict[str, Any]:
     gpu = fixture.snapshot()["gpu_inventory"][0]
     fixture.execute(
@@ -827,14 +1221,13 @@ def inject_blocked_xid(
         "--message",
         message,
     )
-    return cast(
-        dict[str, Any],
-        fixture.wait_marker(
-            marker,
-            case_dir=case_dir,
-            timeout_seconds=300,
-            terminal_workflow=True,
-        ),
+    return fixture.wait_marker(
+        marker,
+        case_dir=case_dir,
+        minimum_evidence=minimum_evidence,
+        timeout_seconds=300,
+        terminal_workflow=True,
+        observed_after=observed_after,
     )
 
 
@@ -843,7 +1236,10 @@ def run_collect010(
     case_dir: Path,
     attempt: int,
     profile_version: str,
+    *,
+    cleanup: CaseCleanup | None = None,
 ) -> dict[str, Any]:
+    cleanup = cleanup or CaseCleanup()
     baseline = fixture.snapshot()
     marker = f"c010-{int(time.time())}-a{attempt}"
     state = inject_blocked_xid(
@@ -853,6 +1249,7 @@ def run_collect010(
         marker=marker,
         message="GPU firmware update required",
     )
+    cleanup.register_state(fixture, state)
     errors = []
     workflows = state.get("workflows") or []
     if not workflows or workflows[0].get("status") != "BLOCKED":
@@ -867,7 +1264,9 @@ def run_collect010(
     after = fixture.snapshot()
     if baseline["boot_id"] != after["boot_id"]:
         errors.append("blocked firmware case rebooted the node")
-    restore = fixture.restore_incidents(
+    errors.extend(service_state_errors(baseline, after))
+    restore = cleanup.restore(
+        fixture,
         state,
         profile_version=profile_version,
         reason="COLLECT-010 validated cleanup",
@@ -903,14 +1302,20 @@ def run_collect011(
     case_dir: Path,
     attempt: int,
     profile_version: str,
+    *,
+    cleanup: CaseCleanup | None = None,
 ) -> dict[str, Any]:
+    cleanup = cleanup or CaseCleanup()
     markers = [
         f"c011-access-{int(time.time())}-a{attempt}",
         f"c011-unknown-{int(time.time())}-a{attempt}",
     ]
+    baselines = []
     states = []
     for index, (fixture, marker) in enumerate(zip(fixtures, markers, strict=True)):
-        inventory = fixture.snapshot()["gpu_inventory"]
+        baseline = fixture.snapshot()
+        baselines.append(baseline)
+        inventory = baseline["gpu_inventory"]
         # The SXid line names the NVSwitch, never a GPU. With a GPU's own BDF
         # here the control plane resolves the ACCESS scope to that GPU
         # (`FaultIngestionService._enrich_sxid_scope`), the reset becomes
@@ -932,24 +1337,36 @@ def run_collect011(
             "NVLINK_FATAL_ERROR",
             "--include-switch" if index == 0 else "--no-include-switch",
         )
-        states.append(
-            fixture.wait_marker(
-                marker,
-                case_dir=case_dir / f"direction-{index + 1}",
-                timeout_seconds=300,
-                terminal_workflow=True,
-                observed_after=injected_at,
-            )
+        state = fixture.wait_marker(
+            marker,
+            case_dir=case_dir / f"direction-{index + 1}",
+            timeout_seconds=300,
+            terminal_workflow=True,
+            observed_after=injected_at,
         )
+        cleanup.register_state(fixture, state)
+        states.append(state)
     errors = []
-    for state in states:
-        if (
-            not state.get("workflows")
-            or state["workflows"][0].get("status") != "BLOCKED"
-        ):
-            errors.append("scope-dependent SXID did not fail closed")
+    selected = []
+    for fixture, baseline, state in zip(fixtures, baselines, states, strict=True):
+        workflow = select_workflow(
+            state.get("workflows") or [],
+            official_actions=SCOPE_DEPENDENT_ACTIONS,
+        )
+        selected.append(workflow)
+        if workflow is None:
+            errors.append(
+                f"{fixture.node}: no workflow decided a scope-dependent reset"
+            )
+        elif workflow.get("status") != "BLOCKED":
+            errors.append(f"{fixture.node}: scope-dependent SXID did not fail closed")
+        after = fixture.snapshot()
+        if after["boot_id"] != baseline["boot_id"]:
+            errors.append(f"{fixture.node}: node rebooted during the fail-closed SXID")
+        errors.extend(service_state_errors(baseline, after))
     restores = [
-        fixture.restore_incidents(
+        cleanup.restore(
+            fixture,
             state,
             profile_version=profile_version,
             reason="COLLECT-011 validated cleanup",
@@ -960,8 +1377,47 @@ def run_collect011(
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "markers": markers,
+        "selected_workflow_ids": [(item or {}).get("request_id") for item in selected],
         "restore_workflows": restores,
     }
+
+
+def kmsg_record_errors(
+    first: list[dict[str, Any]],
+    second: list[dict[str, Any]],
+    *,
+    boot_id: str,
+) -> list[str]:
+    """COLLECT-012 samples 1 and 2: same text, two kmsg sequences, two records.
+
+    The kernel collector names a record ``kmsg-<boot_id>-<sequence>`` and
+    points its evidence at ``kmsg://<node>/<boot_id>/...``; two writes of one
+    identical line therefore share the prefix and differ only in the suffix,
+    and each carries its own evidence_ref. Anything else means the second
+    write was deduplicated or attributed to another boot.
+    """
+
+    errors = []
+    prefix = f"kmsg-{boot_id}-"
+    first_ids = {str(item.get("record_id")) for item in first}
+    second_ids = {str(item.get("record_id")) for item in second}
+    new_ids = second_ids - first_ids
+    if len(first_ids) != 1:
+        errors.append(
+            f"sample 1 did not produce exactly one record: {sorted(first_ids)}"
+        )
+    if len(new_ids) != 1:
+        errors.append(
+            f"sample 2 did not add exactly one record: {sorted(second_ids)} "
+            f"after {sorted(first_ids)}"
+        )
+    for record_id in sorted(first_ids | second_ids):
+        if not record_id.startswith(prefix):
+            errors.append(f"record {record_id} is not kmsg-{boot_id}-<sequence>")
+    refs = {str(item.get("evidence_ref") or "") for item in second}
+    if len(refs) != len(second_ids) or any(not ref for ref in refs):
+        errors.append(f"kmsg records do not carry distinct evidence_ref values: {refs}")
+    return errors
 
 
 def run_collect012(
@@ -969,41 +1425,54 @@ def run_collect012(
     case_dir: Path,
     attempt: int,
     profile_version: str,
+    *,
+    cleanup: CaseCleanup | None = None,
 ) -> dict[str, Any]:
+    cleanup = cleanup or CaseCleanup()
+    baseline = fixture.snapshot()
+    boot_id = str(baseline.get("boot_id") or "")
     markers = []
-    states = []
+    states: list[dict[str, Any]] = []
     restores = []
-    # Samples 1 and 2 are the same XID 13 text written twice: the second write
-    # must earn its own kmsg sequence (distinct evidence) and is expected to
-    # correlate into the first incident's BLOCKED workflow. Sample 3 is the
-    # second XID (31) and has to reach BLOCKED on its own. It cannot while the
-    # node is still quarantined by sample 1: MARK_UNSCHEDULABLE then fails
-    # with "node is already isolated by another incident/token" and the
-    # workflow is FAILED/ESCALATED, which is the ownership fence doing its job,
-    # not the RESTART_APP gate (observed 2026-09-06 02:42Z). So the node is
-    # restored through the validated path between the two XIDs, exactly as
-    # the cleanup does at the end.
+    errors: list[str] = []
+    # Samples 1 and 2 are the same XID 13 text written twice -- one marker, so
+    # the kernel lines are byte-identical: the second write must earn its own
+    # kmsg sequence (distinct evidence) and is expected to correlate into the
+    # first incident's BLOCKED workflow. Sample 3 is the second XID (31) and
+    # has to reach BLOCKED on its own. It cannot while the node is still
+    # quarantined by sample 1: MARK_UNSCHEDULABLE then fails with "node is
+    # already isolated by another incident/token" and the workflow is
+    # FAILED/ESCALATED, which is the ownership fence doing its job, not the
+    # RESTART_APP gate (observed 2026-09-06 02:42Z). So the node is restored
+    # through the validated path between the two XIDs, exactly as the cleanup
+    # does at the end.
+    stamp = int(time.time())
     for offset, xid in enumerate((13, 13, 31), start=1):
         if xid == 31 and states:
             restores.append(
-                fixture.restore_incidents(
+                cleanup.restore(
+                    fixture,
                     states[-1],
                     profile_version=profile_version,
                     reason="COLLECT-012 restore before the second XID",
                 )
             )
-        marker = f"c012-{xid}-{offset}-{int(time.time())}-a{attempt}"
-        markers.append(marker)
-        states.append(
-            inject_blocked_xid(
-                fixture,
-                case_dir / f"sample-{offset}",
-                xid=xid,
-                marker=marker,
-                message="RESTART_APP collector path",
-            )
+        marker = (
+            f"c012-13-{stamp}-a{attempt}"
+            if xid == 13
+            else f"c012-31-{stamp}-a{attempt}"
         )
-    errors = []
+        markers.append(marker)
+        state = inject_blocked_xid(
+            fixture,
+            case_dir / f"sample-{offset}",
+            xid=xid,
+            marker=marker,
+            message="RESTART_APP collector path",
+            minimum_evidence=2 if offset == 2 else 1,
+        )
+        cleanup.register_state(fixture, state)
+        states.append(state)
     record_ids = {
         item.get("record_id")
         for state in states
@@ -1011,12 +1480,24 @@ def run_collect012(
     }
     if len(record_ids) < 3:
         errors.append("distinct kmsg sequences did not create distinct evidence")
+    errors.extend(
+        kmsg_record_errors(
+            states[0].get("evidence") or [],
+            states[1].get("evidence") or [],
+            boot_id=boot_id,
+        )
+    )
     for state in states:
         workflows = state.get("workflows") or []
         if not workflows or workflows[0].get("status") != "BLOCKED":
             errors.append("RESTART_APP without workload did not fail closed")
+    after = fixture.snapshot()
+    if after.get("boot_id") != baseline.get("boot_id"):
+        errors.append("node rebooted during the RESTART_APP fail-closed case")
+    errors.extend(service_state_errors(baseline, after))
     restores.append(
-        fixture.restore_incidents(
+        cleanup.restore(
+            fixture,
             states[-1],
             profile_version=profile_version,
             reason="COLLECT-012 validated cleanup",
@@ -1026,13 +1507,14 @@ def run_collect012(
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "markers": markers,
+        "boot_id": boot_id,
         "record_ids": sorted(str(item) for item in record_ids if item),
         "restore_workflows": restores,
     }
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
-    return {
+    details = {
         "risk": "case-defined",
         "case_id": settings.case_id,
         "predecessor": preflight["predecessor"],
@@ -1067,6 +1549,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight["focused_tests"])
+    return details
 
 
 def execute_case(
@@ -1077,7 +1561,11 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / settings.case_id
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(
+        settings,
+        case_dir,
+        reuse_plan=case_dir / "plan.json",
+    )
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -1099,13 +1587,15 @@ def execute_case(
         "case_id": settings.case_id,
         "attempt": attempt,
         "verdict": "FAIL",
+        **regional.evidence_identity(),
     }
+    profile_version = str(
+        (preflight["stores"][0].get("profile") or {}).get("profile_version") or ""
+    )
+    cleanup = CaseCleanup()
     try:
         for fixture in fixtures:
             fixture.create()
-        profile_version = str(
-            (preflight["stores"][0].get("profile") or {}).get("profile_version") or ""
-        )
         handlers = {
             "GF-REGIONAL-COLLECT-001": lambda: run_collect001(fixtures[0], case_dir),
             "GF-REGIONAL-COLLECT-002": lambda: run_collect002(
@@ -1116,16 +1606,16 @@ def execute_case(
                 fixtures[0], case_dir, attempt
             ),
             "GF-REGIONAL-COLLECT-009": lambda: run_collect009(
-                fixtures[0], case_dir, attempt
+                fixtures[0], case_dir, attempt, cleanup=cleanup
             ),
             "GF-REGIONAL-COLLECT-010": lambda: run_collect010(
-                fixtures[0], case_dir, attempt, profile_version
+                fixtures[0], case_dir, attempt, profile_version, cleanup=cleanup
             ),
             "GF-REGIONAL-COLLECT-011": lambda: run_collect011(
-                fixtures, case_dir, attempt, profile_version
+                fixtures, case_dir, attempt, profile_version, cleanup=cleanup
             ),
             "GF-REGIONAL-COLLECT-012": lambda: run_collect012(
-                fixtures[0], case_dir, attempt, profile_version
+                fixtures[0], case_dir, attempt, profile_version, cleanup=cleanup
             ),
         }
         outcome = handlers[settings.case_id]()
@@ -1138,6 +1628,18 @@ def execute_case(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        # Whatever the case still holds -- a quarantine its assertions never
+        # got to release, an acknowledgement annotation -- goes back through
+        # the validated path here, and a failure to do so fails the case.
+        released = cleanup.finish(
+            profile_version=profile_version,
+            reason=f"{settings.case_id} cleanup after case end",
+        )
+        if released["restore_workflows"]:
+            result["cleanup_restore_workflows"] = released["restore_workflows"]
+        if released["errors"]:
+            result.setdefault("cleanup_errors", []).extend(released["errors"])
+            result["verdict"] = "FAIL"
         residuals = {}
         for fixture in fixtures:
             try:

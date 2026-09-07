@@ -7,6 +7,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 if __package__:
     from .acceptance_scope import scoped_case_evidence
@@ -24,7 +25,6 @@ CONTROL_SERVICE = "gpu-fault-api-nlb"
 CONTROL_APP = "gpu-fault-api-ha"
 EXECUTOR_APP = "gpu-fault-cluster-executor"
 CASE_ID = "GF-REGIONAL-NET-004"
-EXECUTOR_TIMEOUT_SECONDS = 15
 TLS_NLB_IDLE_TIMEOUT_SECONDS = 350
 
 
@@ -526,6 +526,90 @@ print(json.dumps({{
     }
 
 
+def evaluate_checks(
+    *,
+    load_balancer: dict[str, Any],
+    eks: dict[str, Any],
+    nat_public_ips: list[str],
+    probes: list[dict[str, Any]],
+    credential_boundary: dict[str, Any],
+) -> dict[str, bool]:
+    """The NET-004 boundary verdicts over the facts already gathered."""
+
+    public_nlb = load_balancer["scheme"] == "internet-facing"
+    internal_nlb = load_balancer["scheme"] == "internal"
+    allowed_nat_cidrs = sorted(f"{value}/32" for value in nat_public_ips)
+    same_nlb = all(
+        probe["control_resolved_ips"] == probe["nlb_resolved_ips"] for probe in probes
+    )
+    internal_resolution = all(
+        probe["resolved_private"] and all(probe["resolved_private"]) for probe in probes
+    )
+    public_resolution = all(
+        probe["resolved_private"] and not any(probe["resolved_private"])
+        for probe in probes
+    )
+    allowed_nat_set = set(allowed_nat_cidrs)
+    configured_cidrs = set(load_balancer["inbound_443_cidrs"])
+    exact_public_allowlist = bool(configured_cidrs) and configured_cidrs <= (
+        allowed_nat_set
+    )
+    observed_public_egress = all(
+        probe["egress_ip"] in nat_public_ips
+        and f"{probe['egress_ip']}/32" in load_balancer["inbound_443_cidrs"]
+        for probe in probes
+    )
+    eks_request = credential_boundary["gpu_eks_unauthenticated_request"]
+    idle_timeout = float(load_balancer["idle_timeout_seconds"])
+    return {
+        "nlb_is_active_tls": (
+            (public_nlb or internal_nlb)
+            and load_balancer["type"] == "network"
+            and load_balancer["state"] == "active"
+            and load_balancer["listener_protocol"] == "TLS"
+            and load_balancer["listener_port"] == 443
+        ),
+        "all_executors_resolve_the_control_nlb": same_nlb,
+        "nlb_exposure_matches_deployment_mode": (internal_nlb and internal_resolution)
+        or (
+            public_nlb
+            and public_resolution
+            and exact_public_allowlist
+            and observed_public_egress
+        ),
+        "tls_handshake_verified": all(
+            str(probe["tls_version"]).startswith("TLSv1.")
+            and float(probe["tls_handshake_seconds"]) < 15
+            for probe in probes
+        ),
+        # The boundary property is that the client gives up before the NLB
+        # does; the exact client timeout is recorded next to the checks, not
+        # pinned here, so a deliberate retune does not fail the audit.
+        "executor_timeout_is_below_nlb_idle_timeout": bool(probes)
+        and all(
+            0 < float(probe["executor_timeout_seconds"]) < idle_timeout
+            for probe in probes
+        ),
+        "cpu_has_no_gpu_kubeconfig": (
+            not credential_boundary["suspect_env_names"]
+            and not credential_boundary["suspect_secret_names"]
+            and not credential_boundary["suspect_mount_paths"]
+            and not credential_boundary["runtime"]["kubeconfig_env_names"]
+            and not credential_boundary["runtime"]["kubeconfig_files_present"]
+        ),
+        "gpu_eks_reverse_boundary_is_enforced": (
+            eks["endpoint_public_access"] is True
+            and eks_request["reachable"] is True
+            and eks_request["accepted_boundary"] is True
+        )
+        or (
+            eks["endpoint_public_access"] is False
+            and eks["endpoint_private_access"] is True
+            and eks_request["reachable"] is False
+        ),
+    }
+
+
 def audit() -> dict:
     result: dict = {
         "case_id": CASE_ID,
@@ -536,7 +620,6 @@ def audit() -> dict:
         load_balancer = load_balancer_facts()
         eks, nat_public_ips = eks_and_nat_facts()
         public_nlb = load_balancer["scheme"] == "internet-facing"
-        internal_nlb = load_balancer["scheme"] == "internal"
         probes = gpu_network_probes(
             str(load_balancer["dns_name"]),
             check_egress=public_nlb,
@@ -544,84 +627,23 @@ def audit() -> dict:
         credential_boundary = cpu_credential_boundary(eks)
         safe_eks = dict(eks)
         safe_eks.pop("certificate_authority_data", None)
-
-        allowed_nat_cidrs = sorted(f"{value}/32" for value in nat_public_ips)
-        same_nlb = all(
-            probe["control_resolved_ips"] == probe["nlb_resolved_ips"]
-            for probe in probes
+        checks = evaluate_checks(
+            load_balancer=load_balancer,
+            eks=eks,
+            nat_public_ips=nat_public_ips,
+            probes=probes,
+            credential_boundary=credential_boundary,
         )
-        internal_resolution = all(
-            probe["resolved_private"] and all(probe["resolved_private"])
-            for probe in probes
-        )
-        public_resolution = all(
-            probe["resolved_private"] and not any(probe["resolved_private"])
-            for probe in probes
-        )
-        allowed_nat_set = set(allowed_nat_cidrs)
-        configured_cidrs = set(load_balancer["inbound_443_cidrs"])
-        exact_public_allowlist = bool(configured_cidrs) and configured_cidrs <= (
-            allowed_nat_set
-        )
-        observed_public_egress = all(
-            probe["egress_ip"] in nat_public_ips
-            and f"{probe['egress_ip']}/32" in load_balancer["inbound_443_cidrs"]
-            for probe in probes
-        )
-        eks_request = credential_boundary["gpu_eks_unauthenticated_request"]
-        checks = {
-            "nlb_is_active_tls": (
-                (public_nlb or internal_nlb)
-                and load_balancer["type"] == "network"
-                and load_balancer["state"] == "active"
-                and load_balancer["listener_protocol"] == "TLS"
-                and load_balancer["listener_port"] == 443
-            ),
-            "all_executors_resolve_the_control_nlb": same_nlb,
-            "nlb_exposure_matches_deployment_mode": (
-                internal_nlb and internal_resolution
-            )
-            or (
-                public_nlb
-                and public_resolution
-                and exact_public_allowlist
-                and observed_public_egress
-            ),
-            "tls_handshake_verified": all(
-                str(probe["tls_version"]).startswith("TLSv1.")
-                and float(probe["tls_handshake_seconds"]) < 15
-                for probe in probes
-            ),
-            "executor_timeout_is_below_nlb_idle_timeout": all(
-                float(probe["executor_timeout_seconds"]) == EXECUTOR_TIMEOUT_SECONDS
-                and float(probe["executor_timeout_seconds"])
-                < float(load_balancer["idle_timeout_seconds"])
-                for probe in probes
-            ),
-            "cpu_has_no_gpu_kubeconfig": (
-                not credential_boundary["suspect_env_names"]
-                and not credential_boundary["suspect_secret_names"]
-                and not credential_boundary["suspect_mount_paths"]
-                and not credential_boundary["runtime"]["kubeconfig_env_names"]
-                and not credential_boundary["runtime"]["kubeconfig_files_present"]
-            ),
-            "gpu_eks_reverse_boundary_is_enforced": (
-                eks["endpoint_public_access"] is True
-                and eks_request["reachable"] is True
-                and eks_request["accepted_boundary"] is True
-            )
-            or (
-                eks["endpoint_public_access"] is False
-                and eks["endpoint_private_access"] is True
-                and eks_request["reachable"] is False
-            ),
-        }
         errors = [name for name, passed in checks.items() if not passed]
         result = {
             "case_id": CASE_ID,
             "verdict": "PASS" if not errors else "FAIL",
             "errors": errors,
             "checks": checks,
+            "executor_timeout_seconds": sorted(
+                {float(probe["executor_timeout_seconds"]) for probe in probes}
+            ),
+            "nlb_idle_timeout_seconds": load_balancer["idle_timeout_seconds"],
             "load_balancer": load_balancer,
             "gpu_eks": safe_eks,
             "nat_public_ips": nat_public_ips,

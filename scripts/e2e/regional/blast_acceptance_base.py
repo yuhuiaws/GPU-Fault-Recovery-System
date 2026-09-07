@@ -22,8 +22,8 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from gpu_fault.admin.site import load_site  # noqa: E402
-from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
-    scoped_case_evidence,
+from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    write_json_atomic,
 )
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
@@ -32,6 +32,41 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
 EXECUTION_TOKEN_NAME = re.compile(r"execution[_.-]?token", re.IGNORECASE)
 GPU_FAULT_PREFIX = "gpu-fault.io/"
 CASE_IDS = tuple(f"GF-REGIONAL-BLAST-{number:03d}" for number in range(1, 5))
+E2E001_CASE_ID = "GF-REGIONAL-E2E-001"
+# The E2E-001 artifacts BLAST-001 reads (run_workload_acceptance writes them).
+E2E001_EXECUTION_CARD = "execution-card.json"
+E2E001_CONTROL_PLANE_STATE = "control-plane-current.json"
+E2E001_CPU_NODES_BEFORE = "cpu-nodes-before.json"
+# The four BLAST cases share one preflight (site/account/EKS/HyperPod
+# bindings); a result this young is reused rather than paid for four times.
+PREFLIGHT_REUSE_SECONDS = 30 * 60
+PREFLIGHT_CACHE_NAME = "blast-preflight.json"
+RELEASE_STATE_CONFIGMAP = "gpu-fault-regional-release-state"
+
+
+def default_e2e_dir(run_dir: Path) -> Path:
+    return run_dir / "cases" / E2E001_CASE_ID
+
+
+def default_trusted_cpu_baseline(e2e_dir: Path) -> Path:
+    return e2e_dir / E2E001_CPU_NODES_BEFORE
+
+
+def blast001_input_errors(e2e_dir: Path, trusted_cpu_baseline: Path) -> list[str]:
+    """Why BLAST-001 cannot run on these inputs: every file it reads must exist."""
+
+    errors = []
+    if not e2e_dir.is_dir():
+        errors.append(f"E2E-001 case directory is not a directory: {e2e_dir}")
+    else:
+        for name in (E2E001_EXECUTION_CARD, E2E001_CONTROL_PLANE_STATE):
+            if not (e2e_dir / name).is_file():
+                errors.append(f"E2E-001 evidence file is missing: {e2e_dir / name}")
+    if not trusted_cpu_baseline.is_file():
+        errors.append(f"trusted CPU baseline is not a file: {trusted_cpu_baseline}")
+    return errors
+
+
 FORBIDDEN_CONTROL_PLANE_ACTIONS = (
     "sagemaker:BatchReplaceClusterNodes",
     "sagemaker:RebootClusterNodes",
@@ -98,18 +133,15 @@ def json_command(args: Sequence[str]) -> Any:
         ) from exc
 
 
-def write_json(path: Path, value: Any) -> None:
-    path.write_text(
-        json.dumps(
-            scoped_case_evidence(value),
-            indent=2,
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o600)
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    """Write one evidence document all-or-nothing.
+
+    The previous ``write_text`` left a truncated file behind when the process
+    died mid-write; ``write_json_atomic`` renames a complete temporary file
+    onto ``path`` and applies the same scope check the other runners use.
+    """
+
+    write_json_atomic(path, value)
 
 
 def write_text(path: Path, value: str) -> None:
@@ -195,6 +227,7 @@ class BlastRunnerBase:
         e2e_dir: Path,
         trusted_cpu_baseline: Path,
         predecessor: dict[str, Any],
+        preflight_reuse_seconds: int = PREFLIGHT_REUSE_SECONDS,
     ) -> None:
         self.site_path = site_path.resolve()
         self.root_run_dir = run_dir.resolve()
@@ -203,6 +236,8 @@ class BlastRunnerBase:
         self.e2e_dir = e2e_dir.resolve()
         self.trusted_cpu_baseline = trusted_cpu_baseline.resolve()
         self.predecessor = predecessor
+        self.preflight_reuse_seconds = preflight_reuse_seconds
+        self._identity: dict[str, str | None] | None = None
         self.site = load_site(self.site_path)
         self.config = self.site.release_config
         self.region = str(self.config["aws_region"])
@@ -270,6 +305,37 @@ class BlastRunnerBase:
             check=check,
         ).stdout
 
+    def evidence_identity(self) -> dict[str, str | None]:
+        """The release (and, on a single-cluster site, the cluster) this audit reads.
+
+        Written into every case result so the next case can require its
+        predecessor to have passed against the same deployment. A site with
+        several GPU clusters is audited as a whole and has no single
+        ``cluster_id``; the release binding still applies.
+        """
+
+        if self._identity is None:
+            document = self.cpu_json(
+                "-n",
+                self.namespace,
+                "get",
+                "configmap",
+                RELEASE_STATE_CONFIGMAP,
+                "-o",
+                "json",
+            )
+            try:
+                state = json.loads(document["data"]["state.json"])
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise CheckError("regional release state is not valid JSON") from exc
+            self._identity = {
+                "release_id": str(state.get("release_id") or ""),
+                "cluster_id": (
+                    self.targets[0].cluster_id if len(self.targets) == 1 else None
+                ),
+            }
+        return dict(self._identity)
+
     def record_case(
         self,
         case_id: str,
@@ -277,8 +343,9 @@ class BlastRunnerBase:
         *,
         checks: Mapping[str, Any],
         limitations: Sequence[str] = (),
+        error: str | None = None,
     ) -> None:
-        payload = {
+        payload: dict[str, Any] = {
             "schema_version": 2,
             "report_type": "fault-acceptance",
             "case_id": case_id,
@@ -292,6 +359,12 @@ class BlastRunnerBase:
             ],
             "predecessor": self.predecessor,
         }
+        if error is not None:
+            payload["error"] = error
+        try:
+            payload.update(self.evidence_identity())
+        except Exception as exc:  # the identity read is itself a live call
+            payload["evidence_identity_error"] = f"{type(exc).__name__}: {exc}"
         write_json(case_evidence_path(self.root_run_dir, case_id), payload)
         self.case_statuses.append(payload)
         print(f"{case_id}: {status}", flush=True)
@@ -421,7 +494,51 @@ class BlastRunnerBase:
             "ca_matches": ca_matches,
         }
 
+    def reusable_preflight(self) -> dict[str, Any] | None:
+        """The run's cached preflight scope, if it is young enough and for this site.
+
+        The scope holds the site path and the cluster IDs it was taken for;
+        anything else -- another site, another set of clusters, or a capture
+        older than ``preflight_reuse_seconds`` -- is not this run's preflight.
+        """
+
+        path = self.root_run_dir / PREFLIGHT_CACHE_NAME
+        if not path.is_file():
+            return None
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            captured_at = parse_time(str(cached["captured_at"]))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(cached, dict):
+            return None
+        age = (datetime.now(timezone.utc) - captured_at).total_seconds()
+        if age < 0 or age > self.preflight_reuse_seconds:
+            return None
+        if cached.get("site") != str(self.site_path):
+            return None
+        cached_clusters = sorted(
+            str(item.get("cluster_id"))
+            for item in cached.get("gpu_clusters") or []
+            if isinstance(item, dict)
+        )
+        if cached_clusters != sorted(target.cluster_id for target in self.targets):
+            return None
+        return cached
+
     def preflight(self) -> None:
+        cached = self.reusable_preflight()
+        if cached is not None:
+            write_json(
+                self.run_dir / "execution-scope.json",
+                {
+                    **cached,
+                    "reused_from": str(self.root_run_dir / PREFLIGHT_CACHE_NAME),
+                    "reused_at": utc_now(),
+                },
+            )
+            print("preflight: REUSED", flush=True)
+            return
         identity = self.aws("sts", "get-caller-identity")
         _, expected_account, _ = arn_parts(self.cpu_eks_arn)
         if str(identity.get("Account")) != expected_account:
@@ -531,7 +648,44 @@ class BlastRunnerBase:
             "rollback": "none; this run creates no cluster or AWS resources",
         }
         write_json(self.run_dir / "execution-scope.json", scope)
+        write_json(self.root_run_dir / PREFLIGHT_CACHE_NAME, scope)
         print("preflight: PASS", flush=True)
+
+    def fail(self, started_at: str, exc: BaseException) -> int:
+        """Record a stopped run: a FAIL evidence file when none was written yet.
+
+        Only ``CheckError`` used to be caught; a KeyError from an unexpected
+        API shape or an OSError reading evidence left no verdict file at all,
+        so the chain's next case saw a MISSING predecessor instead of a FAIL
+        with a reason.
+        """
+
+        error = f"{type(exc).__name__}: {exc}"
+        if not any(item.get("case_id") == self.case_id for item in self.case_statuses):
+            self.record_case(
+                self.case_id,
+                "FAIL",
+                checks={},
+                limitations=[
+                    "The audit stopped before its checks completed; the error "
+                    "field names the failure and no verdict was inferred."
+                ],
+                error=error,
+            )
+        write_json(
+            self.run_dir / "phase-summary.json",
+            {
+                "phase": "爆炸半径",
+                "case_id": self.case_id,
+                "started_at": started_at,
+                "ended_at": utc_now(),
+                "status": "FAIL",
+                "error": error,
+                "cases": self.case_statuses,
+            },
+        )
+        print(f"STOP: {error}", file=sys.stderr, flush=True)
+        return 1
 
     def run(self) -> int:
         started_at = utc_now()
@@ -545,21 +699,8 @@ class BlastRunnerBase:
                 "GF-REGIONAL-BLAST-003": self.blast_003,
                 "GF-REGIONAL-BLAST-004": self.blast_004,
             }[self.case_id]()
-        except CheckError as exc:
-            write_json(
-                self.run_dir / "phase-summary.json",
-                {
-                    "phase": "爆炸半径",
-                    "case_id": self.case_id,
-                    "started_at": started_at,
-                    "ended_at": utc_now(),
-                    "status": "FAIL",
-                    "error": str(exc),
-                    "cases": self.case_statuses,
-                },
-            )
-            print(f"STOP: {exc}", file=sys.stderr, flush=True)
-            return 1
+        except Exception as exc:
+            return self.fail(started_at, exc)
         write_json(
             self.run_dir / "phase-summary.json",
             {

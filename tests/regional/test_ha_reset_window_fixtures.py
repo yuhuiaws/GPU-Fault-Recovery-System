@@ -7,11 +7,16 @@ with it.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import hashlib
+import os
+import signal
+import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from scripts.e2e.regional import executor_env_window as env_window
 from scripts.e2e.regional import regional_live_fixture as live_fixture_module
 from scripts.e2e.regional import run_ha003_aurora_failover_reset as ha003
 from scripts.e2e.regional import run_ha004_waiting_reclaim_reset as ha004
@@ -360,10 +365,16 @@ def test_ha004_removes_the_dispatching_replica_seen_through_waiting(
 
     assert killed == ["cluster/pod-a"], killed
     assert state["ha004_owners"] == ["cluster/pod-a", "cluster/pod-b"], state
-    assert {item["lease_token"] for item in timeline if item["lease_token"]} == {
-        "token-a",
-        "token-b",
+    digests = {
+        item["lease_token_sha256"] for item in timeline if item["lease_token_sha256"]
+    }
+    assert digests == {
+        hashlib.sha256(b"token-a").hexdigest(),
+        hashlib.sha256(b"token-b").hexdigest(),
     }, timeline
+    assert all("lease_token" not in item for item in timeline), (
+        "the timeline must never carry the raw lease credential"
+    )
 
 
 def test_ha004_reads_a_second_lease_from_the_owner_change_when_tokens_are_hidden() -> (
@@ -391,11 +402,171 @@ def test_ha004_reads_a_second_lease_from_the_owner_change_when_tokens_are_hidden
     )
     assert ha004.lease_reissue_observed(
         [
-            {**waiting, "status": "LEASED", "lease_token": "token-a"},
-            {**waiting, "status": "LEASED", "lease_token": "token-b"},
+            {**waiting, "status": "LEASED", "lease_token_sha256": "digest-a"},
+            {**waiting, "status": "LEASED", "lease_token_sha256": "digest-b"},
         ],
         first_owner="cluster/pod-a",
-    ), "two distinct tokens remain the direct proof"
+    ), "two distinct token digests remain the direct proof"
+
+
+def test_ha004_timeline_reads_the_probe_digest_and_never_the_raw_token() -> None:
+    """STORE_PROBE emits lease_token_sha256; a raw token from an older probe is digested."""
+
+    assert ha004.lease_token_digest({"lease_token_sha256": "abc"}) == "abc"
+    assert ha004.lease_token_digest({"lease_token": "token-a"}) == (
+        hashlib.sha256(b"token-a").hexdigest()
+    )
+    assert ha004.lease_token_digest({"lease_token": None}) is None
+    assert ha004.lease_token_digest({}) is None
+
+
+def test_ha004_watchdog_outlasts_every_phase_and_matches_the_host_probe_deadline() -> (
+    None
+):
+    """The 900s watchdog used to fire inside a 600+900+1200+180s measurement."""
+
+    assert ha004.WATCHDOG_SECONDS > sum(ha004.PHASE_BUDGETS.values())
+    assert ha004.WATCHDOG_SECONDS == ha004.HOST_PROBE_ACTIVE_DEADLINE_SECONDS
+    assert ha004.PHASE_BUDGETS["executor_rollout"] == 600
+    assert ha004.PHASE_BUDGETS["command_timeline"] == 900
+    assert ha004.PHASE_BUDGETS["workflow_wait"] == 1200
+
+
+def test_ha004_effective_sampling_period_is_measured_from_the_timeline() -> None:
+    base = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+    timeline = [
+        {"observed_at": (base + timedelta(seconds=6 * index)).isoformat()}
+        for index in range(5)
+    ]
+    assert ha004.effective_sampling_period_seconds(timeline) == 6.0
+    assert ha004.effective_sampling_period_seconds(timeline[:1]) is None
+    assert "6s" in ha004.SAMPLING_LIMITATION
+
+
+def test_ha004_stop_process_group_kills_the_detached_watchdog(tmp_path: Path) -> None:
+    process = subprocess.Popen(
+        ["/bin/bash", "-c", "sleep 600"], start_new_session=True, text=True
+    )
+    try:
+        outcome = ha004.stop_process_group(process)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+    assert outcome["disarmed"] is True
+    assert process.poll() is not None
+    assert ha004.stop_process_group(None) == {"armed": False}
+
+
+def test_ha004_lease_and_poll_window_goes_through_executor_env_window() -> None:
+    assert ha004.LEASE_ENV in env_window.ALLOWED_VARIABLES
+    assert ha004.POLL_ENV in env_window.ALLOWED_VARIABLES
+    assert ha004.DEPLOYMENT == env_window.DEPLOYMENT
+
+
+def test_ha003_failover_must_overlap_the_open_command_or_be_inconclusive() -> None:
+    """Requesting the failover while LEASED proves nothing about when the writer moved."""
+
+    after_terminal = [
+        {"rds_status": "available", "writer": "w1", "reset_command_status": "LEASED"},
+        {
+            "rds_status": "available",
+            "writer": "w1",
+            "reset_command_status": "SUCCEEDED",
+        },
+        {
+            "rds_status": "failing-over",
+            "writer": "w1",
+            "reset_command_status": "SUCCEEDED",
+        },
+        {
+            "rds_status": "available",
+            "writer": "w2",
+            "reset_command_status": "SUCCEEDED",
+        },
+    ]
+    assert (
+        ha003.failover_overlap_observed(after_terminal, previous_writer="w1") is False
+    )
+    assert ha003.verdict_for([], overlap_observed=False) == "INCONCLUSIVE"
+    assert ha003.verdict_for(["x"], overlap_observed=False) == "FAIL"
+
+    overlapping = [
+        {"rds_status": "available", "writer": "w1", "reset_command_status": "LEASED"},
+        {
+            "rds_status": "failing-over",
+            "writer": "w1",
+            "reset_command_status": "WAITING",
+        },
+        {
+            "rds_status": "available",
+            "writer": "w2",
+            "reset_command_status": "SUCCEEDED",
+        },
+    ]
+    assert ha003.failover_overlap_observed(overlapping, previous_writer="w1") is True
+    assert ha003.verdict_for([], overlap_observed=True) == "PASS"
+
+    writer_switched_while_open = [
+        {"rds_status": "available", "writer": "w2", "reset_command_status": "WAITING"}
+    ]
+    assert ha003.failover_overlap_observed(
+        writer_switched_while_open, previous_writer="w1"
+    ), "a writer change sampled while the reset is WAITING is the overlap"
+
+
+def test_ha003_wait_rds_failover_samples_the_command_alongside_each_rds_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rds = iter(
+        [
+            {"status": "failing-over", "writer": "w1"},
+            {"status": "available", "writer": "w2"},
+        ]
+    )
+    stores = iter(
+        [
+            {"commands": [{"step": {"operation": "RESET_GPU"}, "status": "WAITING"}]},
+            {"commands": [{"step": {"operation": "RESET_GPU"}, "status": "SUCCEEDED"}]},
+        ]
+    )
+    monkeypatch.setattr(ha003, "rds_snapshot", lambda _settings: next(rds))
+
+    after, samples = ha003.wait_rds_failover(
+        _ha003_settings(tmp_path),
+        previous_writer="w1",
+        timeout_seconds=30,
+        observe=lambda: next(stores),
+        sleep=lambda _seconds: None,
+    )
+
+    assert after["writer"] == "w2"
+    assert [item["reset_command_status"] for item in samples] == [
+        "WAITING",
+        "SUCCEEDED",
+    ]
+    assert [item["rds_status"] for item in samples] == ["failing-over", "available"]
+    assert ha003.failover_overlap_observed(samples, previous_writer="w1") is True
+
+
+def test_ha003_executor_result_submission_codes_come_from_rejected_reports() -> None:
+    logs = "\n".join(
+        [
+            "INFO regional cluster executor claimed command=remote-a",
+            "ERROR regional cluster executor could not report result: command=remote-a "
+            "cluster=c operation=RESET_GPU status=SUCCEEDED",
+            "Traceback (most recent call last):",
+            '  File "x.py", line 1, in <module>',
+            "gpu_fault.cluster_executor.ClusterExecutorError: regional control plane "
+            "rejected request (409): lease token is stale",
+            "INFO regional control plane rejected request (500): unrelated GET",
+            "ERROR regional cluster executor could not report result: command=remote-a "
+            "cluster=c operation=RESET_GPU status=SUCCEEDED",
+            "ClusterExecutorError: regional control plane rejected request (500): boom",
+        ]
+    )
+    assert ha003.result_submission_codes(logs) == [409, 500]
+    assert ha003.result_submission_codes("") == []
+    assert ha003.ALLOWED_RESULT_SUBMISSION_CODES == {200, 409}
 
 
 def test_store_snapshot_drains_the_queue_for_gates_but_samples_once_in_wait_loops(

@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import functools
 import json
 import os
 import signal
 import subprocess
 import time
 from pathlib import Path
+from typing import Any, Callable
 
 if __package__:
-    from .acceptance_scope import current_acceptance_scope, scoped_case_evidence
+    from . import run_ha001_control_plane_failover as COMMON
+    from .acceptance_runner_common import write_json_atomic
+    from .acceptance_scope import current_acceptance_scope
     from .live_driver_guard import (
         add_live_arguments,
         applied_site_profile,
@@ -19,9 +22,15 @@ if __package__:
     )
     from .live_driver_guard import (
         authorize_execution as guard_authorize_execution,
+    )
+    from .regional_live_fixture import (
+        install_abort_signals,
+        run_case_main,
     )
 else:
-    from acceptance_scope import current_acceptance_scope, scoped_case_evidence
+    import run_ha001_control_plane_failover as COMMON
+    from acceptance_runner_common import write_json_atomic
+    from acceptance_scope import current_acceptance_scope
     from live_driver_guard import (
         add_live_arguments,
         applied_site_profile,
@@ -30,35 +39,32 @@ else:
     from live_driver_guard import (
         authorize_execution as guard_authorize_execution,
     )
-
-HERE = Path(__file__).resolve().parent
-COMMON_SPEC = importlib.util.spec_from_file_location(
-    "ha001_common",
-    HERE / "run_ha001_control_plane_failover.py",
-)
-if COMMON_SPEC is None or COMMON_SPEC.loader is None:
-    raise RuntimeError("could not load HA-001 common helpers")
-COMMON = importlib.util.module_from_spec(COMMON_SPEC)
-COMMON_SPEC.loader.exec_module(COMMON)
+    from regional_live_fixture import (
+        install_abort_signals,
+        run_case_main,
+    )
 
 CASE_ID = "GF-REGIONAL-HA-002"
 CONFIRMATION = "HA002_CORDON_AND_EVICT"
 WATCHDOG_SECONDS = 1200
 OBSERVATION_SECONDS = 60
+ROLE_APPS = {
+    "ingress": COMMON.INGRESS_APP,
+    "worker": COMMON.WORKER_APP,
+    "spool": COMMON.SPOOL_APP,
+}
+PDB_NAMES = {
+    "ingress": "gpu-fault-api-ha-pdb",
+    "worker": "gpu-fault-control-worker-pdb",
+    "spool": "gpu-fault-telemetry-spool-worker-pdb",
+}
 
 
 class CaseError(RuntimeError):
     pass
 
 
-def write_json(path: Path, value: object) -> None:
-    path.write_text(
-        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
-    )
-    path.chmod(0o600)
-
-
-def current_node(name: str) -> dict:
+def current_node(name: str) -> dict[str, Any]:
     value = json.loads(
         COMMON.run(
             [
@@ -89,7 +95,7 @@ def current_node(name: str) -> dict:
     }
 
 
-def pod_by_name(name: str) -> dict | None:
+def pod_by_name(name: str) -> dict[str, Any] | None:
     result = COMMON.cpu("get", "pod", name, "-o", "json", check=False)
     if not result.strip():
         return None
@@ -128,7 +134,7 @@ def eviction(pod_name: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def pdb_snapshot(name: str) -> dict:
+def pdb_snapshot(name: str) -> dict[str, Any]:
     value = json.loads(COMMON.cpu("get", "pdb", name, "-o", "json"))
     return {
         "name": name,
@@ -141,9 +147,9 @@ def pdb_snapshot(name: str) -> dict:
     }
 
 
-def wait_pdb_block(name: str, timeout_seconds: int = 30) -> dict:
+def wait_pdb_block(name: str, timeout_seconds: int = 30) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
-    last = {}
+    last: dict[str, Any] = {}
     while time.monotonic() < deadline:
         last = pdb_snapshot(name)
         if int(last["disruptions_allowed"]) == 0:
@@ -152,9 +158,33 @@ def wait_pdb_block(name: str, timeout_seconds: int = 30) -> dict:
     raise CaseError(f"PDB did not enter blocked state: {last}")
 
 
+def require_pdb_still_blocked(
+    name: str,
+    *,
+    snapshot: Callable[[str], dict[str, Any]] = pdb_snapshot,
+) -> dict[str, Any]:
+    """Re-read the PDB immediately before the second Eviction, and abort if it opened.
+
+    Between ``wait_pdb_block`` and the second Eviction the replacement for the
+    first evicted Pod can become Ready, which restores ``disruptionsAllowed``
+    to 1. Issuing the second Eviction then removes a *second* Pod of the same
+    role for real -- the case would be taking the role below its floor while
+    reporting a PDB rejection it never received. The read happens right before
+    the call and the case stops if the budget is open again.
+    """
+
+    current = snapshot(name)
+    if int(current.get("disruptions_allowed", 0)) > 0:
+        raise CaseError(
+            f"{name} allows {current['disruptions_allowed']} disruption(s) again; "
+            "not issuing the second Eviction because it would succeed"
+        )
+    return current
+
+
 def require_eviction_success(
     result: subprocess.CompletedProcess[str], pod: str
-) -> dict:
+) -> dict[str, Any]:
     if result.returncode != 0:
         raise CaseError(f"Eviction failed for {pod}: {result.stderr.strip()}")
     return {
@@ -164,7 +194,9 @@ def require_eviction_success(
     }
 
 
-def require_pdb_rejection(result: subprocess.CompletedProcess[str], pod: str) -> dict:
+def require_pdb_rejection(
+    result: subprocess.CompletedProcess[str], pod: str
+) -> dict[str, Any]:
     combined = f"{result.stdout}\n{result.stderr}".strip()
     if result.returncode == 0:
         raise CaseError(f"second Eviction unexpectedly succeeded for {pod}")
@@ -179,7 +211,7 @@ def require_pdb_rejection(result: subprocess.CompletedProcess[str], pod: str) ->
 
 def start_uncordon_watchdog(
     case_dir: Path, node: str
-) -> tuple[subprocess.Popen[str], object]:
+) -> tuple[subprocess.Popen[str], Any]:
     log_path = case_dir / "uncordon-watchdog.log"
     handle = log_path.open("w")
     os.chmod(log_path, 0o600)
@@ -194,7 +226,7 @@ def start_uncordon_watchdog(
         text=True,
         start_new_session=True,
     )
-    write_json(
+    write_json_atomic(
         case_dir / "uncordon-watchdog.json",
         {
             "pid": process.pid,
@@ -205,7 +237,7 @@ def start_uncordon_watchdog(
     return process, handle
 
 
-def stop_watchdog(process: subprocess.Popen[str] | None, handle: object | None) -> None:
+def stop_watchdog(process: subprocess.Popen[str] | None, handle: Any) -> None:
     if process is not None and process.poll() is None:
         os.killpg(process.pid, signal.SIGTERM)
         try:
@@ -219,19 +251,19 @@ def stop_watchdog(process: subprocess.Popen[str] | None, handle: object | None) 
 
 def wait_recovery(
     *,
-    expected_spool_ready: int,
+    replicas: dict[str, int],
     timeout_seconds: int = 300,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     deadline = time.monotonic() + timeout_seconds
     timeline = []
     while time.monotonic() < deadline:
         sample = COMMON.control_sample(include_queue=True)
         timeline.append(sample)
         if (
-            sample["ingress_ready"] == 3
-            and sample["worker_ready"] == 6
-            and sample["endpoint_ready"] == 3
-            and sample["spool_ready"] == expected_spool_ready
+            sample["ingress_ready"] == replicas[COMMON.INGRESS_APP]
+            and sample["worker_ready"] == replicas[COMMON.WORKER_APP]
+            and sample["endpoint_ready"] == replicas[COMMON.INGRESS_APP]
+            and sample["spool_ready"] == replicas[COMMON.SPOOL_APP]
             and int(sample["queue"]["depth"]) <= 5
         ):
             return timeline
@@ -239,15 +271,37 @@ def wait_recovery(
     raise CaseError(f"control plane did not recover: {timeline[-1:]}")
 
 
-def topology_snapshot() -> dict:
+def topology_snapshot() -> dict[str, Any]:
     return {
-        "ingress": COMMON.ready_pods("gpu-fault-api-ha"),
-        "workers": COMMON.ready_pods("gpu-fault-control-worker"),
-        "spool_workers": COMMON.ready_pods("gpu-fault-telemetry-spool-worker"),
+        "ingress": COMMON.ready_pods(COMMON.INGRESS_APP),
+        "workers": COMMON.ready_pods(COMMON.WORKER_APP),
+        "spool_workers": COMMON.ready_pods(COMMON.SPOOL_APP),
     }
 
 
-def build_plan(run_dir: Path, attempt: int) -> dict:
+def schedulable_cpu_nodes(nodes: dict[str, Any]) -> list[str]:
+    """Ready, uncordoned, untainted node names from a ``kubectl get nodes`` document."""
+
+    result = []
+    for node in nodes.get("items", []):
+        ready = next(
+            (
+                value["status"]
+                for value in node.get("status", {}).get("conditions", [])
+                if value.get("type") == "Ready"
+            ),
+            None,
+        )
+        if (
+            ready == "True"
+            and not node.get("spec", {}).get("unschedulable", False)
+            and not node.get("spec", {}).get("taints", [])
+        ):
+            result.append(str(node["metadata"]["name"]))
+    return sorted(result)
+
+
+def build_plan(run_dir: Path, attempt: int) -> dict[str, Any]:
     nodes = json.loads(
         COMMON.run(
             [
@@ -262,7 +316,7 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
         ).stdout
     )
     pods = json.loads(COMMON.cpu("get", "pods", "-o", "json"))
-    active_by_node: dict[str, list[dict]] = {}
+    active_by_node: dict[str, list[dict[str, Any]]] = {}
     for item in pods.get("items", []):
         if item.get("status", {}).get("phase") not in {"Pending", "Running"}:
             continue
@@ -280,54 +334,39 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
             }
         )
     topology = COMMON.deployment_and_pdb_snapshot()
-    spool = topology["deployments"]["gpu-fault-telemetry-spool-worker"]
-    spool_replicas = int(spool["replicas"])
+    replicas = COMMON.declared_replicas(topology)
+    spool_replicas = replicas[COMMON.SPOOL_APP]
     if spool_replicas == 1:
         raise CaseError(
             "enabled spool-worker needs at least two replicas to verify PDB rejection"
         )
+    cpu_nodes = schedulable_cpu_nodes(nodes)
     candidates = []
     for node in nodes.get("items", []):
         name = node["metadata"]["name"]
-        ready = next(
-            (
-                value["status"]
-                for value in node.get("status", {}).get("conditions", [])
-                if value.get("type") == "Ready"
-            ),
-            None,
-        )
+        if name not in cpu_nodes:
+            continue
         node_pods = active_by_node.get(name, [])
         ingress = [
             item
             for item in node_pods
-            if item["app"] == "gpu-fault-api-ha" and item["ready"]
+            if item["app"] == COMMON.INGRESS_APP and item["ready"]
         ]
         workers = [
             item
             for item in node_pods
-            if item["app"] == "gpu-fault-control-worker" and item["ready"]
+            if item["app"] == COMMON.WORKER_APP and item["ready"]
         ]
         spool_workers = [
             item
             for item in node_pods
-            if item["app"] == "gpu-fault-telemetry-spool-worker" and item["ready"]
+            if item["app"] == COMMON.SPOOL_APP and item["ready"]
         ]
         extras = [
-            item
-            for item in node_pods
-            if item["app"]
-            not in {
-                "gpu-fault-api-ha",
-                "gpu-fault-control-worker",
-                "gpu-fault-telemetry-spool-worker",
-            }
+            item for item in node_pods if item["app"] not in set(ROLE_APPS.values())
         ]
         if (
-            ready == "True"
-            and not node.get("spec", {}).get("unschedulable", False)
-            and not node.get("spec", {}).get("taints", [])
-            and len(ingress) == 1
+            len(ingress) == 1
             and len(workers) >= 2
             and (spool_replicas == 0 or spool_workers)
             and not extras
@@ -354,9 +393,13 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
             "no clean CPU node carries one ingress and at least two workers"
         )
     selected = sorted(candidates, key=lambda item: item["node"]["name"])[0]
+    limits = {
+        app: COMMON.failure_window_limit(topology["deployments"][app])
+        for app in (COMMON.INGRESS_APP, COMMON.WORKER_APP)
+    }
     scope = current_acceptance_scope()
     plan = {
-        "schema_version": 2,
+        "schema_version": 3,
         "case_id": CASE_ID,
         "attempt": attempt,
         "confirmation": CONFIRMATION,
@@ -372,16 +415,20 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
             "workers": [item["name"] for item in selected["workers"][:2]],
             "spool_worker": [item["name"] for item in selected["spool_workers"][:1]],
         },
+        "replicas": replicas,
+        "cpu_nodes": cpu_nodes,
+        "failure_window_limits": limits,
         "baseline": {
             "queue": COMMON.queue_stats(),
             "topology": topology,
-            "spool_worker_replicas": spool["replicas"],
+            "spool_worker_replicas": spool_replicas,
         },
         "stop_conditions": [
             "NLB/API becomes unavailable",
-            "ingress Ready count falls below 2",
-            "worker Ready count falls below 5",
+            f"ingress Ready count falls below {replicas[COMMON.INGRESS_APP] - 1}",
+            f"worker Ready count falls below {replicas[COMMON.WORKER_APP] - 1}",
             "an Eviction affects a Pod outside the named role",
+            "the PDB allows a disruption again before the second same-role Eviction",
             "the second same-role Eviction is not rejected by the PDB",
             "processor queue exceeds the predeclared threshold",
             "uncordon or declared replica recovery fails",
@@ -395,11 +442,13 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
     }
     path = run_dir / "cases" / CASE_ID / "plan.json"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    write_json(path, plan)
+    write_json_atomic(path, plan)
     return plan
 
 
-def _execute_context(plan: dict, plan_path: Path) -> dict:
+def execute_context(plan: dict[str, Any], plan_path: Path) -> dict[str, Any]:
+    if "replicas" not in plan or "failure_window_limits" not in plan:
+        raise CaseError("plan predates the derived replica fields; re-plan")
     node_name = str(plan["target_node"]["name"])
     baseline_node = current_node(node_name)
     if (
@@ -409,6 +458,7 @@ def _execute_context(plan: dict, plan_path: Path) -> dict:
         or baseline_node["ready"] != "True"
     ):
         raise CaseError(f"target node drifted: {baseline_node}")
+    replicas = {app: int(value) for app, value in plan["replicas"].items()}
     ingress_target = str(plan["target_pods"]["ingress"][0])
     worker_targets = [str(value) for value in plan["target_pods"]["workers"]]
     spool_targets = [
@@ -416,15 +466,15 @@ def _execute_context(plan: dict, plan_path: Path) -> dict:
     ]
     ingress_peers = [
         item["name"]
-        for item in COMMON.ready_pods("gpu-fault-api-ha")
+        for item in COMMON.ready_pods(COMMON.INGRESS_APP)
         if item["name"] != ingress_target
     ]
-    if len(ingress_peers) != 2:
+    if len(ingress_peers) != replicas[COMMON.INGRESS_APP] - 1:
         raise CaseError("could not select a second ingress for PDB rejection")
     planned_pods = [
-        (ingress_target, "gpu-fault-api-ha"),
-        *[(name, "gpu-fault-control-worker") for name in worker_targets],
-        *[(name, "gpu-fault-telemetry-spool-worker") for name in spool_targets],
+        (ingress_target, COMMON.INGRESS_APP),
+        *[(name, COMMON.WORKER_APP) for name in worker_targets],
+        *[(name, COMMON.SPOOL_APP) for name in spool_targets],
     ]
     for name, app in planned_pods:
         pod = pod_by_name(name)
@@ -439,7 +489,7 @@ def _execute_context(plan: dict, plan_path: Path) -> dict:
     if not isinstance(queue_baseline, dict):
         queue_baseline = COMMON.queue_stats()
         plan["baseline"]["queue"] = queue_baseline
-        write_json(plan_path, plan)
+        write_json_atomic(plan_path, plan)
     return {
         "plan": plan,
         "node_name": node_name,
@@ -448,22 +498,72 @@ def _execute_context(plan: dict, plan_path: Path) -> dict:
         "ingress_peer": str(ingress_peers[0]),
         "worker_targets": worker_targets,
         "spool_targets": spool_targets,
-        "spool_replicas": int(plan["baseline"]["spool_worker_replicas"]),
+        "replicas": replicas,
+        "minimum_ready": COMMON.minimum_ready_from_replicas(replicas),
+        "failure_window_limit_seconds": max(
+            float(item["limit_seconds"])
+            for item in plan["failure_window_limits"].values()
+        ),
+        "spool_replicas": replicas[COMMON.SPOOL_APP],
+        "cpu_nodes": [str(value) for value in plan.get("cpu_nodes", [])],
         "baseline_depth": int(queue_baseline["depth"]),
     }
 
 
-def _run_disruptions(case_dir: Path, context: dict, state: dict) -> dict:
+def _observe(
+    context: dict[str, Any], label: str, duration: int, **kwargs: Any
+) -> dict[str, Any]:
+    return COMMON.observe_phase(
+        label,
+        duration,
+        context["baseline_depth"],
+        minimum_ready=kwargs.pop("minimum_ready", context["minimum_ready"]),
+        max_failure_window_seconds=context["failure_window_limit_seconds"],
+        **kwargs,
+    )
+
+
+def _evict_role(
+    context: dict[str, Any],
+    case_dir: Path,
+    *,
+    role: str,
+    first: str,
+    second: str,
+    minimum_ready: dict[str, int | None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Evict ``first``, wait for the PDB to close, re-check it, then try ``second``."""
+
+    first_result = require_eviction_success(eviction(first), first)
+    blocked = wait_pdb_block(PDB_NAMES[role])
+    recheck = require_pdb_still_blocked(PDB_NAMES[role])
+    second_result = require_pdb_rejection(eviction(second), second)
+    phase = _observe(
+        context,
+        f"ha002-{role}",
+        OBSERVATION_SECONDS,
+        **({"minimum_ready": minimum_ready} if minimum_ready is not None else {}),
+    )
+    write_json_atomic(case_dir / f"{role}-timeline.json", phase)
+    return (
+        first_result,
+        {**blocked, "recheck_before_second": recheck},
+        second_result,
+        phase,
+    )
+
+
+def _run_disruptions(
+    case_dir: Path, context: dict[str, Any], state: dict[str, Any]
+) -> dict[str, Any]:
     COMMON.create_probe()
     state["probe_created"] = True
     COMMON.wait_probe_file("/state/stats.json", 60)
-    baseline_phase = COMMON.observe_phase(
-        "ha002-baseline", 10, context["baseline_depth"]
-    )
-    write_json(case_dir / "baseline-timeline.json", baseline_phase)
+    baseline_phase = _observe(context, "ha002-baseline", 10)
+    write_json_atomic(case_dir / "baseline-timeline.json", baseline_phase)
     roles_before = COMMON.role_snapshot()
-    write_json(case_dir / "roles-before.json", roles_before)
-    role_errors = COMMON.validate_roles(roles_before)
+    write_json_atomic(case_dir / "roles-before.json", roles_before)
+    role_errors = COMMON.validate_roles(roles_before, context["replicas"])
     if role_errors:
         raise CaseError(f"role baseline failed: {role_errors}")
 
@@ -483,34 +583,28 @@ def _run_disruptions(case_dir: Path, context: dict, state: dict) -> dict:
     cordoned_state = current_node(context["node_name"])
     if not cordoned_state["unschedulable"]:
         raise CaseError("node did not become unschedulable")
-    write_json(case_dir / "cordoned-node.json", cordoned_state)
+    write_json_atomic(case_dir / "cordoned-node.json", cordoned_state)
 
-    ingress_first = require_eviction_success(
-        eviction(context["ingress_target"]),
-        context["ingress_target"],
+    ingress_first, ingress_pdb_blocked, ingress_second, ingress_phase = _evict_role(
+        context,
+        case_dir,
+        role="ingress",
+        first=context["ingress_target"],
+        second=context["ingress_peer"],
     )
-    ingress_pdb_blocked = wait_pdb_block("gpu-fault-api-ha-pdb")
-    ingress_second = require_pdb_rejection(
-        eviction(context["ingress_peer"]),
-        context["ingress_peer"],
-    )
-    ingress_phase = COMMON.observe_phase(
-        "ha002-ingress",
-        OBSERVATION_SECONDS,
-        context["baseline_depth"],
-    )
-    write_json(case_dir / "ingress-timeline.json", ingress_phase)
-
     worker_first, worker_second = context["worker_targets"]
-    worker_first_result = require_eviction_success(eviction(worker_first), worker_first)
-    worker_pdb_blocked = wait_pdb_block("gpu-fault-control-worker-pdb")
-    worker_second_result = require_pdb_rejection(eviction(worker_second), worker_second)
-    worker_phase = COMMON.observe_phase(
-        "ha002-worker",
-        OBSERVATION_SECONDS,
-        context["baseline_depth"],
+    (
+        worker_first_result,
+        worker_pdb_blocked,
+        worker_second_result,
+        worker_phase,
+    ) = _evict_role(
+        context,
+        case_dir,
+        role="worker",
+        first=worker_first,
+        second=worker_second,
     )
-    write_json(case_dir / "worker-timeline.json", worker_phase)
     spool_result, spool_phase = _run_spool_disruption(case_dir, context)
 
     COMMON.log(f"uncordoning CPU node {context['node_name']}")
@@ -524,8 +618,8 @@ def _run_disruptions(case_dir: Path, context: dict, state: dict) -> dict:
         ]
     )
     state["cordoned"] = False
-    recovery = wait_recovery(expected_spool_ready=context["spool_replicas"])
-    write_json(case_dir / "recovery-timeline.json", recovery)
+    recovery = wait_recovery(replicas=context["replicas"])
+    write_json_atomic(case_dir / "recovery-timeline.json", {"entries": recovery})
     return _ha002_result(
         context,
         cordoned_state,
@@ -543,28 +637,34 @@ def _run_disruptions(case_dir: Path, context: dict, state: dict) -> dict:
     )
 
 
-def _run_spool_disruption(case_dir: Path, context: dict) -> tuple[dict, dict | None]:
-    result = {"replicas": context["spool_replicas"], "status": "NOT_APPLICABLE"}
+def _run_spool_disruption(
+    case_dir: Path, context: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    result: dict[str, Any] = {
+        "replicas": context["spool_replicas"],
+        "status": "NOT_APPLICABLE",
+    }
     if not context["spool_targets"]:
         return result, None
     spool_target = context["spool_targets"][0]
     spool_peers = [
         item["name"]
-        for item in COMMON.ready_pods("gpu-fault-telemetry-spool-worker")
+        for item in COMMON.ready_pods(COMMON.SPOOL_APP)
         if item["name"] != spool_target
     ]
     if not spool_peers:
         raise CaseError("no second spool-worker Pod for PDB rejection")
-    first = require_eviction_success(eviction(spool_target), spool_target)
-    blocked = wait_pdb_block("gpu-fault-telemetry-spool-worker-pdb")
-    second = require_pdb_rejection(eviction(str(spool_peers[0])), str(spool_peers[0]))
-    phase = COMMON.observe_phase(
-        "ha002-spool",
-        OBSERVATION_SECONDS,
-        context["baseline_depth"],
-        minimum_spool_ready=context["spool_replicas"] - 1,
+    first, blocked, second, phase = _evict_role(
+        context,
+        case_dir,
+        role="spool",
+        first=spool_target,
+        second=str(spool_peers[0]),
+        minimum_ready={
+            **context["minimum_ready"],
+            "spool": context["spool_replicas"] - 1,
+        },
     )
-    write_json(case_dir / "spool-timeline.json", phase)
     return {
         "replicas": context["spool_replicas"],
         "status": "TESTED",
@@ -575,44 +675,120 @@ def _run_spool_disruption(case_dir: Path, context: dict) -> tuple[dict, dict | N
     }, phase
 
 
-def _distribution(items: list[dict]) -> dict:
-    result = {}
+def _distribution(items: list[dict[str, Any]]) -> dict[str, int]:
+    result: dict[str, int] = {}
     for item in items:
         result[item["node"]] = result.get(item["node"], 0) + 1
     return result
 
 
+def balanced_distribution(distribution: dict[str, int], replicas: int) -> bool:
+    """Whether ``replicas`` Pods sit across nodes with maxSkew 1, as the spread demands.
+
+    The old check compared against ``[1, 1, 1]``/``[2, 2, 2]`` -- three nodes
+    and 3/6 replicas assumed. The property the topology spread actually
+    guarantees is that the per-node counts differ by at most one and add up to
+    the declared replicas, whatever both numbers are.
+    """
+
+    counts = list(distribution.values())
+    if sum(counts) != replicas:
+        return False
+    if not counts:
+        return replicas == 0
+    return max(counts) - min(counts) <= 1
+
+
+def capacity_assessment(
+    *,
+    cpu_nodes: int,
+    ingress_replicas: int,
+    ingress_ready_during_cordon: int,
+    max_skew: int = 1,
+) -> dict[str, Any]:
+    """A capacity recommendation derived from what the cordon showed.
+
+    Under ``DoNotSchedule`` with ``maxSkew=1`` the replacement for an evicted
+    ingress Pod can only land on a node that keeps the skew within one; with
+    the node under maintenance cordoned that leaves ``cpu_nodes - 1``
+    candidates. The recommendation is made only when the observation confirms
+    the shortfall (the role did not return to its declared count while the
+    node was cordoned) and the arithmetic explains it.
+    """
+
+    schedulable_during_maintenance = max(0, cpu_nodes - 1)
+    shortfall = ingress_replicas - ingress_ready_during_cordon
+    constrained = ingress_replicas > schedulable_during_maintenance * max_skew
+    if shortfall > 0 and constrained:
+        recommendation = (
+            f"add a CPU node: {cpu_nodes} nodes leave {schedulable_during_maintenance} "
+            f"schedulable during one-node maintenance, so only "
+            f"{ingress_ready_during_cordon} of {ingress_replicas} ingress replicas "
+            f"were Ready while the node was cordoned (maxSkew={max_skew})"
+        )
+    elif shortfall > 0:
+        recommendation = (
+            f"ingress stayed at {ingress_ready_during_cordon} of {ingress_replicas} "
+            "while cordoned although node capacity allows the spread; inspect "
+            "scheduling events before adding capacity"
+        )
+    else:
+        recommendation = (
+            f"no additional CPU node required: all {ingress_replicas} ingress "
+            "replicas were Ready while one node was cordoned"
+        )
+    return {
+        "cpu_nodes": cpu_nodes,
+        "schedulable_during_maintenance": schedulable_during_maintenance,
+        "ingress_replicas": ingress_replicas,
+        "ingress_ready_during_cordon": ingress_ready_during_cordon,
+        "shortfall": shortfall,
+        "topology_constrained": constrained,
+        "recommendation": recommendation,
+    }
+
+
 def _ha002_result(
-    context: dict,
-    cordoned_state: dict,
-    ingress_first: dict,
-    ingress_pdb_blocked: dict,
-    ingress_second: dict,
-    ingress_phase: dict,
-    worker_first_result: dict,
-    worker_pdb_blocked: dict,
-    worker_second_result: dict,
-    worker_phase: dict,
-    spool_result: dict,
-    spool_phase: dict | None,
-    roles_before: dict,
-) -> dict:
+    context: dict[str, Any],
+    cordoned_state: dict[str, Any],
+    ingress_first: dict[str, Any],
+    ingress_pdb_blocked: dict[str, Any],
+    ingress_second: dict[str, Any],
+    ingress_phase: dict[str, Any],
+    worker_first_result: dict[str, Any],
+    worker_pdb_blocked: dict[str, Any],
+    worker_second_result: dict[str, Any],
+    worker_phase: dict[str, Any],
+    spool_result: dict[str, Any],
+    spool_phase: dict[str, Any] | None,
+    roles_before: dict[str, Any],
+) -> dict[str, Any]:
+    replicas = context["replicas"]
+    minimum_ready = context["minimum_ready"]
     roles_after = COMMON.role_snapshot()
     topology = topology_snapshot()
     final_probe = COMMON.read_probe()
-    errors = [*COMMON.validate_roles(roles_after)]
-    if ingress_phase["summary"]["min_ingress_ready"] < 2:
-        errors.append("ingress Ready fell below two")
-    if worker_phase["summary"]["min_worker_ready"] < 5:
-        errors.append("worker Ready fell below five")
+    errors = [*COMMON.validate_roles(roles_after, replicas)]
+    if ingress_phase["summary"]["min_ingress_ready"] < int(
+        minimum_ready["ingress"] or 0
+    ):
+        errors.append(f"ingress Ready fell below {minimum_ready['ingress']}")
+    if worker_phase["summary"]["min_worker_ready"] < int(minimum_ready["worker"] or 0):
+        errors.append(f"worker Ready fell below {minimum_ready['worker']}")
     if spool_phase is not None and (
         spool_phase["summary"]["min_spool_ready"] < context["spool_replicas"] - 1
     ):
         errors.append("spool-worker Ready fell below its PDB limit")
-    if ingress_phase["summary"]["min_endpoint_ready"] < 2:
-        errors.append("NLB endpoint count fell below two")
-    if final_probe.get("max_failure_window_seconds", 0) > 55:
-        errors.append("probe failure window exceeded 55 seconds")
+    if ingress_phase["summary"]["min_endpoint_ready"] < int(
+        minimum_ready["ingress"] or 0
+    ):
+        errors.append(f"NLB endpoint count fell below {minimum_ready['ingress']}")
+    measured_window = float(final_probe.get("max_failure_window_seconds", 0))
+    if measured_window > context["failure_window_limit_seconds"]:
+        errors.append(
+            "probe failure window exceeded the derived limit "
+            f"{context['failure_window_limit_seconds']}s"
+        )
     node_final = current_node(context["node_name"])
     if node_final["unschedulable"] or (
         node_final["taints"] != context["baseline_node"]["taints"]
@@ -621,16 +797,20 @@ def _ha002_result(
     ingress_distribution = _distribution(topology["ingress"])
     worker_distribution = _distribution(topology["workers"])
     spool_distribution = _distribution(topology["spool_workers"])
-    if sorted(ingress_distribution.values()) != [1, 1, 1]:
-        errors.append("ingress topology did not return to one Pod per node")
-    if sorted(worker_distribution.values()) != [2, 2, 2]:
-        errors.append("worker topology did not return to two Pods per node")
+    if not balanced_distribution(ingress_distribution, replicas[COMMON.INGRESS_APP]):
+        errors.append("ingress topology did not return to a balanced spread")
+    if not balanced_distribution(worker_distribution, replicas[COMMON.WORKER_APP]):
+        errors.append("worker topology did not return to a balanced spread")
+    last_cordoned_sample = (
+        ingress_phase["samples"][-1] if ingress_phase["samples"] else {}
+    )
     return {
         "case_id": CASE_ID,
         "attempt": context["attempt"],
         "verdict": "PASS" if not errors else "FAIL",
         "errors": errors,
         "plan": context["plan"],
+        "replicas": replicas,
         "baseline_node": context["baseline_node"],
         "cordoned_node": cordoned_state,
         "ingress": {
@@ -653,83 +833,122 @@ def _ha002_result(
             "worker_by_node": worker_distribution,
             "spool_by_node": spool_distribution,
         },
+        "failure_window": {
+            "measured_max_seconds": measured_window,
+            "limit_seconds": context["failure_window_limit_seconds"],
+            "limits": context["plan"]["failure_window_limits"],
+        },
         "final_probe": final_probe,
         "node_final": node_final,
-        "capacity_recommendation": (
-            "A fourth CPU node is required to keep all three ingress "
-            "replicas schedulable during one-node maintenance under "
-            "DoNotSchedule/maxSkew=1."
+        "capacity_assessment": capacity_assessment(
+            cpu_nodes=len(context["cpu_nodes"]),
+            ingress_replicas=replicas[COMMON.INGRESS_APP],
+            ingress_ready_during_cordon=int(
+                last_cordoned_sample.get("ingress_ready", 0)
+            ),
         ),
     }
 
 
-def _cleanup_ha002(case_dir: Path, context: dict, state: dict, result: dict) -> None:
+def cleanup_case(
+    case_dir: Path,
+    context: dict[str, Any],
+    state: dict[str, Any],
+    result: dict[str, Any],
+) -> list[str]:
+    """Every cleanup step on its own; a failing step never skips the next one."""
+
+    errors: list[str] = []
+
+    def attempt(label: str, action: Callable[[], Any]) -> None:
+        try:
+            action()
+        except Exception as exc:
+            errors.append(f"{label}: {type(exc).__name__}: {exc}")
+
     if state["cordoned"]:
-        COMMON.run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(COMMON.CPU_KUBECONFIG),
-                "uncordon",
-                context["node_name"],
-            ],
-            check=False,
+        attempt(
+            "uncordon",
+            lambda: COMMON.run(
+                [
+                    "kubectl",
+                    "--kubeconfig",
+                    str(COMMON.CPU_KUBECONFIG),
+                    "uncordon",
+                    context["node_name"],
+                ],
+                check=False,
+            ),
         )
-    stop_watchdog(state["watchdog"], state["watchdog_handle"])
-    if state["probe_created"]:
-        COMMON.gpu(
-            "exec",
-            COMMON.PROBE_POD,
-            "--",
-            "touch",
-            "/state/stop",
-            check=False,
-        )
-    COMMON.gpu("delete", "pod", COMMON.PROBE_POD, "--ignore-not-found", check=False)
-    COMMON.gpu(
-        "delete",
-        "configmap",
-        COMMON.CONFIGMAP,
-        "--ignore-not-found",
-        check=False,
+    attempt(
+        "stop watchdog",
+        lambda: stop_watchdog(state["watchdog"], state["watchdog_handle"]),
     )
-    try:
-        for deployment in ("gpu-fault-api-ha", "gpu-fault-control-worker"):
-            COMMON.cpu(
+    if state["probe_created"]:
+        attempt(
+            "stop probe",
+            lambda: COMMON.gpu(
+                "exec",
+                COMMON.PROBE_POD,
+                "--",
+                "touch",
+                "/state/stop",
+                check=False,
+            ),
+        )
+    attempt(
+        "delete probe pod",
+        lambda: COMMON.gpu(
+            "delete", "pod", COMMON.PROBE_POD, "--ignore-not-found", check=False
+        ),
+    )
+    attempt(
+        "delete probe configmap",
+        lambda: COMMON.gpu(
+            "delete",
+            "configmap",
+            COMMON.CONFIGMAP,
+            "--ignore-not-found",
+            check=False,
+        ),
+    )
+    deployments = [COMMON.INGRESS_APP, COMMON.WORKER_APP]
+    if context["spool_replicas"]:
+        deployments.append(COMMON.SPOOL_APP)
+    for deployment in deployments:
+        attempt(
+            f"rollout status {deployment}",
+            functools.partial(
+                COMMON.cpu,
                 "rollout",
                 "status",
                 f"deployment/{deployment}",
                 "--timeout=600s",
                 timeout=700,
-            )
-        if context["spool_replicas"]:
-            COMMON.cpu(
-                "rollout",
-                "status",
-                "deployment/gpu-fault-telemetry-spool-worker",
-                "--timeout=600s",
-                timeout=700,
-            )
+            ),
+        )
+
+    def postflight() -> None:
         availability = COMMON.control_sample(include_queue=True)
-        postflight = {
+        record = {
             "node": current_node(context["node_name"]),
             "probe_resources": COMMON.probe_resources(),
             "queue": availability["queue"],
             "spool_ready": availability["spool_ready"],
         }
-        result["postflight"] = postflight
-        write_json(case_dir / "postflight.json", postflight)
-        if postflight["node"]["unschedulable"]:
+        result["postflight"] = record
+        write_json_atomic(case_dir / "postflight.json", record)
+        if record["node"]["unschedulable"]:
             raise CaseError("node remains cordoned")
-        if postflight["node"]["taints"] != context["baseline_node"]["taints"]:
+        if record["node"]["taints"] != context["baseline_node"]["taints"]:
             raise CaseError("node taints changed")
-        if postflight["probe_resources"]["count"] != 0:
+        if record["probe_resources"]["count"] != 0:
             raise CaseError("probe resources remain")
-        if postflight["spool_ready"] != context["spool_replicas"]:
+        if record["spool_ready"] != context["spool_replicas"]:
             raise CaseError("spool-worker replicas did not recover")
-    except Exception as exc:
-        result["postflight_error"] = f"{type(exc).__name__}: {exc}"
-        result["verdict"] = "FAIL"
+
+    attempt("postflight", postflight)
+    return errors
 
 
 def execute(run_dir: Path, attempt: int, confirmation: str) -> int:
@@ -739,10 +958,10 @@ def execute(run_dir: Path, attempt: int, confirmation: str) -> int:
     plan_path = case_dir / "plan.json"
     if not plan_path.is_file():
         raise CaseError("HA-002 plan is missing")
-    context = _execute_context(json.loads(plan_path.read_text()), plan_path)
+    context = execute_context(json.loads(plan_path.read_text()), plan_path)
     context["attempt"] = attempt
-    result: dict = {"case_id": CASE_ID, "attempt": attempt, "verdict": "FAIL"}
-    state = {
+    result: dict[str, Any] = {"case_id": CASE_ID, "attempt": attempt, "verdict": "FAIL"}
+    state: dict[str, Any] = {
         "probe_created": False,
         "watchdog": None,
         "watchdog_handle": None,
@@ -753,8 +972,11 @@ def execute(run_dir: Path, attempt: int, confirmation: str) -> int:
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        _cleanup_ha002(case_dir, context, state, result)
-    write_json(case_dir / f"{CASE_ID}.json", result)
+        cleanup_errors = cleanup_case(case_dir, context, state, result)
+        result["cleanup_errors"] = cleanup_errors
+        if cleanup_errors:
+            result["verdict"] = "FAIL"
+    write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
 
@@ -771,6 +993,7 @@ def main() -> int:
     args = parser.parse_args()
     os.umask(0o077)
     COMMON.configure(args)
+    install_abort_signals()
     if not args.execute:
         plan = build_plan(args.run_dir, args.attempt)
         print(json.dumps(plan, indent=2, sort_keys=True))
@@ -784,9 +1007,9 @@ def main() -> int:
     plan_path = args.run_dir / "cases" / CASE_ID / "plan.json"
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     plan["maintenance_window_end"] = deadline.isoformat()
-    write_json(plan_path, plan)
+    write_json_atomic(plan_path, plan)
     return execute(args.run_dir, args.attempt, args.confirm)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_case_main(main))

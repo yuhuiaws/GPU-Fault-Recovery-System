@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""NET-003 probe executor: the control plane commits a result the client never sees.
+
+The loopback proxy in front of the control plane forwards the first result
+post upstream, waits for the control plane's response, discards it and resets
+the client connection instead -- the "server committed, client lost the
+response" window. The client then does what a client with a lost response
+does: it retries the same terminal result once, and the control plane must
+answer idempotently. An earlier version of this proxy reset the connection
+*before* forwarding, so the control plane never saw the first post and the
+case silently degenerated into a lease-expiry reclaim.
+"""
+
 from __future__ import annotations
 
 import json
@@ -10,9 +22,14 @@ import socket
 import struct
 from threading import Lock, Thread
 import time
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from gpu_fault.cluster_executor import ClusterActionExecutor, RegionalExecutorClient
+from gpu_fault.cluster_executor import (
+    ClusterActionExecutor,
+    ClusterExecutorError,
+    RegionalExecutorClient,
+)
 from gpu_fault.execution.models import WorkflowStepOutcome
 
 
@@ -25,10 +42,25 @@ READY = STATE / "ready.json"
 EXECUTOR_STATE = STATE / "executor-state.json"
 ROLLBACK_STATE = STATE / "rollback.json"
 RESULT_SUBMIT_STARTED = STATE / "result-submit-started.json"
+RESULT_INTERRUPTED = STATE / "result-interrupted.json"
 RESULT_REPLAYS = STATE / "result-replays.json"
-OWNER = "gpu-fault-net-test"
+OWNER = os.getenv("EXECUTOR_OWNER", "gpu-fault-net-test")
 DROP_ROLLBACK_SECONDS = int(os.getenv("DROP_ROLLBACK_SECONDS", "10"))
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
+LEASE_SECONDS = int(os.getenv("LEASE_SECONDS", "60"))
+# How long the upstream must stay silent after its response before the
+# client is reset. TLS is end-to-end through this proxy, so the response
+# cannot be parsed; a quiet upstream is what marks it complete.
+RESPONSE_QUIET_SECONDS = float(os.getenv("RESPONSE_QUIET_SECONDS", "2"))
+RESPONSE_MAX_WAIT_SECONDS = float(os.getenv("RESPONSE_MAX_WAIT_SECONDS", "25"))
+# The gap between the lost response and the client's single retry. Long
+# enough for the runner to snapshot the committed command in between, short
+# enough that no lease renewal fires against the now-terminal command.
+REPLAY_DELAY_SECONDS = float(os.getenv("REPLAY_DELAY_SECONDS", "5"))
+RESPONSE_LOSS_MODE = "forward-then-reset"
+TERMINAL_RESULT_REPLAYS = 1
+TLS_APPLICATION_DATA = 23
+LOST_RESPONSE_LOG = "net003 result submission lost its response"
 
 
 class LedgerAdapter:
@@ -79,52 +111,187 @@ class LedgerAdapter:
         )
 
 
+def _write_state(path: Path, value: dict[str, Any]) -> None:
+    path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+
+
 class InterruptingRegionalExecutorClient(RegionalExecutorClient):
+    """Loses the response to the first result post, then retries it once.
+
+    The retry is the client-side half of the window under test: a client that
+    never saw the control plane's answer cannot know whether the result was
+    committed, so it posts the same terminal result again and the control
+    plane has to answer idempotently. One replay is what a real client does;
+    the wider terminal-replay protocol matrix belongs to CMD-007.
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._drop_injected = False
-        self._terminal_replayed = False
 
     def complete(self, command, result):
-        if not self._drop_injected:
-            self._drop_injected = True
-            RESULT_SUBMIT_STARTED.write_text(
-                json.dumps(
-                    {
-                        "command_id": command.command_id,
-                        "observed_at_epoch": time.time(),
-                    },
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
-            DROP_NEXT.touch()
+        if self._drop_injected:
             return super().complete(command, result)
-
-        completed = super().complete(command, result)
-        if not self._terminal_replayed:
-            replayed = []
-            for _index in range(2):
-                replay = super().complete(command, result)
-                replayed.append(
+        self._drop_injected = True
+        _write_state(
+            RESULT_SUBMIT_STARTED,
+            {"command_id": command.command_id, "observed_at_epoch": time.time()},
+        )
+        DROP_NEXT.touch()
+        try:
+            first = super().complete(command, result)
+        except ClusterExecutorError:
+            # A 4xx/5xx is an answer the client did receive; that is not the
+            # lost-response window and must surface as the rejection it is.
+            raise
+        except Exception as exc:  # noqa: BLE001 - the transport error under test
+            interrupted = {
+                "command_id": command.command_id,
+                "exception": type(exc).__name__,
+                "detail": str(exc)[:500],
+                "observed_at_epoch": time.time(),
+                "first_post_succeeded": False,
+            }
+            logging.warning("%s: %s: %s", LOST_RESPONSE_LOG, type(exc).__name__, exc)
+        else:
+            _write_state(
+                RESULT_INTERRUPTED,
+                {
+                    "command_id": command.command_id,
+                    "first_post_succeeded": True,
+                    "observed_at_epoch": time.time(),
+                },
+            )
+            return first
+        _write_state(RESULT_INTERRUPTED, interrupted)
+        time.sleep(REPLAY_DELAY_SECONDS)
+        replay_sent_at = time.time()
+        replay = super().complete(command, result)
+        _write_state(
+            RESULT_REPLAYS,
+            {
+                "command_id": command.command_id,
+                "count": TERMINAL_RESULT_REPLAYS,
+                "replay_sent_at_epoch": replay_sent_at,
+                "responses": [
                     {
                         "command_id": replay.command_id,
                         "status": replay.status.value,
+                        "status_source": replay.status_source,
+                        "updated_at": replay.updated_at.isoformat(),
                     }
-                )
-            RESULT_REPLAYS.write_text(
-                json.dumps(
-                    {
-                        "command_id": command.command_id,
-                        "count": len(replayed),
-                        "responses": replayed,
-                    },
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
-            self._terminal_replayed = True
-        return completed
+                ],
+            },
+        )
+        return replay
+
+
+class TlsRecordScanner:
+    """Count application_data records in one direction of a TLS byte stream.
+
+    Records may straddle TCP segments, so the five-byte header is assembled
+    across ``feed`` calls and the body length is skipped statefully. The
+    client's first application_data record marks that the HTTP request is on
+    its way: in TLS 1.3 that record is the encrypted Finished sent in the same
+    flight as the request, in TLS 1.2 it is the request itself. Either way,
+    upstream bytes that arrive after it belong to the response.
+    """
+
+    def __init__(self) -> None:
+        self._header = b""
+        self._remaining = 0
+        self.application_records = 0
+
+    def feed(self, data: bytes) -> None:
+        while data:
+            if self._remaining:
+                take = min(self._remaining, len(data))
+                self._remaining -= take
+                data = data[take:]
+                continue
+            need = 5 - len(self._header)
+            self._header += data[:need]
+            data = data[need:]
+            if len(self._header) < 5:
+                return
+            if self._header[0] == TLS_APPLICATION_DATA:
+                self.application_records += 1
+            self._remaining = int.from_bytes(self._header[3:5], "big")
+            self._header = b""
+
+
+def relay_losing_response(
+    client: socket.socket,
+    upstream: socket.socket,
+    *,
+    quiet_seconds: float = RESPONSE_QUIET_SECONDS,
+    max_wait_seconds: float = RESPONSE_MAX_WAIT_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Relay one connection but keep the upstream's response from the client.
+
+    Everything the client sends is forwarded. Upstream bytes are forwarded
+    until the client has sent an application_data record; from then on they
+    are counted and dropped. Once the upstream has been quiet for
+    ``quiet_seconds`` after its first withheld byte (or ``max_wait_seconds``
+    have passed, or the upstream closed), the client is reset with an RST
+    rather than a FIN, so it sees a connection error and not an EOF that
+    could be mistaken for an empty response.
+    """
+
+    scanner = TlsRecordScanner()
+    response_bytes = 0
+    response_started_at: float | None = None
+    last_upstream_at: float | None = None
+    client_closed = False
+    upstream_closed = False
+    started = clock()
+    while True:
+        readable, _, _ = select.select([client, upstream], [], [], 0.1)
+        now = clock()
+        if response_started_at is not None and last_upstream_at is not None:
+            if now - last_upstream_at >= quiet_seconds:
+                break
+            if now - response_started_at >= max_wait_seconds:
+                break
+        elif now - started >= max_wait_seconds * 2:
+            break
+        if not readable:
+            continue
+        for source in readable:
+            data = source.recv(65536)
+            if source is client:
+                if not data:
+                    client_closed = True
+                    break
+                scanner.feed(data)
+                upstream.sendall(data)
+                continue
+            if not data:
+                upstream_closed = True
+                break
+            if scanner.application_records:
+                response_bytes += len(data)
+                last_upstream_at = now
+                if response_started_at is None:
+                    response_started_at = now
+            else:
+                client.sendall(data)
+        if client_closed or upstream_closed:
+            break
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    client.close()
+    return {
+        "observed_at_epoch": time.time(),
+        "connection_reset": True,
+        "mode": RESPONSE_LOSS_MODE,
+        "request_forwarded": scanner.application_records > 0,
+        "client_application_records": scanner.application_records,
+        "upstream_response_bytes": response_bytes,
+        "client_closed_first": client_closed,
+        "upstream_closed_first": upstream_closed,
+        "held_seconds": round(clock() - started, 3),
+    }
 
 
 class GateProxy:
@@ -148,27 +315,16 @@ class GateProxy:
 
     def _handle(self, client: socket.socket) -> None:
         try:
-            if DROP_NEXT.exists():
+            lose_response = DROP_NEXT.exists()
+            if lose_response:
                 DROP_NEXT.unlink(missing_ok=True)
-                client.setsockopt(
-                    socket.SOL_SOCKET,
-                    socket.SO_LINGER,
-                    struct.pack("ii", 1, 0),
-                )
-                DROP_OBSERVED.write_text(
-                    json.dumps(
-                        {
-                            "observed_at_epoch": time.time(),
-                            "connection_reset": True,
-                        },
-                        sort_keys=True,
-                    ),
-                    encoding="utf-8",
-                )
-                return
             with socket.create_connection(
                 (self.target_ip, 443), timeout=30
             ) as upstream:
+                if lose_response:
+                    observed = relay_losing_response(client, upstream)
+                    _write_state(DROP_OBSERVED, observed)
+                    return
                 self._relay(client, upstream)
         except OSError:
             logging.exception("proxy connection failed")
@@ -194,15 +350,8 @@ def rollback_stale_drop() -> None:
             continue
         if age_seconds >= DROP_ROLLBACK_SECONDS:
             DROP_NEXT.unlink(missing_ok=True)
-            ROLLBACK_STATE.write_text(
-                json.dumps(
-                    {
-                        "automatic": True,
-                        "pending_seconds": age_seconds,
-                    },
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
+            _write_state(
+                ROLLBACK_STATE, {"automatic": True, "pending_seconds": age_seconds}
             )
             logging.error(
                 "automatically removed stale connection-drop marker after %.1f seconds",
@@ -276,20 +425,22 @@ def main() -> None:
         executor_artifact_sha256=os.environ["EXECUTOR_ARTIFACT_SHA256"],
         executor_compatibility_digest=os.environ["EXECUTOR_COMPATIBILITY_DIGEST"],
     )
-    READY.write_text(
-        json.dumps(
-            {
-                "cluster_id": registration["cluster_id"],
-                "target_ip": target_ip,
-                "proxy_port": listen_port,
-                "drop_rollback_seconds": DROP_ROLLBACK_SECONDS,
-                "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
-                "result_connection_reset": True,
-                "terminal_result_replays": 2,
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    _write_state(
+        READY,
+        {
+            "cluster_id": registration["cluster_id"],
+            "owner": OWNER,
+            "target_ip": target_ip,
+            "proxy_port": listen_port,
+            "drop_rollback_seconds": DROP_ROLLBACK_SECONDS,
+            "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
+            "lease_seconds": LEASE_SECONDS,
+            "result_connection_reset": True,
+            "response_loss_mode": RESPONSE_LOSS_MODE,
+            "response_quiet_seconds": RESPONSE_QUIET_SECONDS,
+            "replay_delay_seconds": REPLAY_DELAY_SECONDS,
+            "terminal_result_replays": TERMINAL_RESULT_REPLAYS,
+        },
     )
     executor = ClusterActionExecutor(
         client,
@@ -297,7 +448,7 @@ def main() -> None:
         executor_id="net-test-executor",
         allowed_namespaces={"default"},
         poll_seconds=1,
-        lease_seconds=60,
+        lease_seconds=LEASE_SECONDS,
         batch_size=1,
         max_concurrent_commands=1,
         claim_backoff_max_seconds=4,

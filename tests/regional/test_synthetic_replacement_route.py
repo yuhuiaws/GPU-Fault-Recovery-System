@@ -224,6 +224,34 @@ def test_a_replica_still_serving_the_route_fails_the_close(tmp_path: Path) -> No
     assert json.loads(settings.baseline.read_text(encoding="utf-8"))["closed_at"] > ""
 
 
+def test_a_rollout_that_times_out_still_leaves_the_record_closed(
+    tmp_path: Path,
+) -> None:
+    # The variable is already gone from the Deployment when `rollout status`
+    # times out. A record still saying "open" there is one the next --open
+    # refuses ("close the record first") and the next --close re-runs against
+    # nothing, so the mutation has to be on disk before the wait begins.
+    class _RolloutHangs(_Regional):
+        def kubectl(self, plane: str, *arguments: str, **kwargs: Any) -> str:
+            if arguments[0] == "rollout" and self.present is False:
+                raise helper.RegionalFixtureError("rollout status timed out")
+            return super().kubectl(plane, *arguments, **kwargs)
+
+    regional = _RolloutHangs(present=False)
+    settings = _settings(tmp_path)
+    # The open's rollout runs while the variable is present, so it completes.
+    helper.open_window(settings, regional, helper.survey(regional), sleep=_no_sleep)
+    survey = helper.survey(regional)
+
+    with pytest.raises(helper.RegionalFixtureError, match="rollout status timed out"):
+        helper.close_window(settings, regional, survey, sleep=_no_sleep)
+
+    record = json.loads(settings.baseline.read_text(encoding="utf-8"))
+    assert record["closed_at"] > "", record
+    assert "rollout_after_close" not in record, record
+    assert regional.present is False, "the variable was removed before the wait"
+
+
 def test_a_referenced_value_is_refused(tmp_path: Path) -> None:
     # A restore writes a literal, so a `valueFrom` entry would be silently
     # converted into a different kind of variable.

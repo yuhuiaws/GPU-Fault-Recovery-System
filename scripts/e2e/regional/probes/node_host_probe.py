@@ -28,13 +28,18 @@ def run(
     command: list[str],
     *,
     check: bool = True,
+    timeout: int = 120,
 ) -> subprocess.CompletedProcess[str]:
+    # Bounded: `nvidia-smi` blocks on a wedged driver and `systemctl restart`
+    # on a unit whose stop hangs, and the host fixture's own exec timeout then
+    # kills kubectl while this process lingers on the node.
     completed = subprocess.run(
         command,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        timeout=timeout,
     )
     if check and completed.returncode:
         raise ProbeError(

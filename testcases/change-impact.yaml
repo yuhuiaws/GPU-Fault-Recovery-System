@@ -109,7 +109,6 @@ rules:
       - tests/test_artifact_consistency.py
     regional_cases:
       - GF-REGIONAL-BOOT-018..023
-      - GF-REGIONAL-HA-005
       - GF-REGIONAL-HA-007..010
     checks:
       - artifact-check
@@ -137,7 +136,10 @@ rules:
       - GF-REGIONAL-HA-008..009
       - GF-REGIONAL-PREEMPT-038
       - GF-REGIONAL-CMD-001..016
-      - GF-REGIONAL-PREEMPT-001..035
+      - GF-REGIONAL-PREEMPT-001..012
+      - GF-REGIONAL-PREEMPT-014..022
+      - GF-REGIONAL-PREEMPT-024..033
+      - GF-REGIONAL-PREEMPT-035
     checks:
       - config-check
     full: true
@@ -187,12 +189,10 @@ rules:
       - tests/test_artifact_consistency.py
     regional_cases:
       - GF-REGIONAL-BOOT-018..023
-      - GF-REGIONAL-HA-005
       - GF-REGIONAL-HA-007..010
     approval_cases:
       - GF-REGIONAL-BOOT-019..020
       - GF-REGIONAL-BOOT-023
-      - GF-REGIONAL-HA-005
       - GF-REGIONAL-HA-009..010
     checks:
       - config-check
@@ -291,7 +291,8 @@ rules:
       - tests/regional/test_regional_token_rotation.py
       - tests/regional/test_production_safety_config.py
     regional_cases:
-      - GF-REGIONAL-AUTH-001..011
+      - GF-REGIONAL-AUTH-001..009
+      - GF-REGIONAL-AUTH-011
       - GF-REGIONAL-AUTH-013..016
       - GF-REGIONAL-BLAST-002..004
     checks:
@@ -342,7 +343,10 @@ rules:
       - tests/orchestration
       - tests/execution
     regional_cases:
-      - GF-REGIONAL-PREEMPT-001..035
+      - GF-REGIONAL-PREEMPT-001..012
+      - GF-REGIONAL-PREEMPT-014..022
+      - GF-REGIONAL-PREEMPT-024..033
+      - GF-REGIONAL-PREEMPT-035
       - GF-REGIONAL-DESTR-015
       - GF-REGIONAL-DESTR-016
       - GF-REGIONAL-DESTR-017
@@ -489,7 +493,6 @@ rules:
     regional_cases:
       - GF-REGIONAL-DESTR-002..003
       - GF-REGIONAL-DESTR-005..008
-      - GF-REGIONAL-DESTR-011
       - GF-REGIONAL-DESTR-013..014
       - GF-REGIONAL-DESTR-016
       - GF-REGIONAL-DESTR-022
@@ -510,7 +513,8 @@ rules:
       - tests/admin/test_admin_notifications.py
       - tests/admin/test_admin_notification_bootstrap.py
     regional_cases:
-      - GF-REGIONAL-NOTIFY-001..007
+      - GF-REGIONAL-NOTIFY-001
+      - GF-REGIONAL-NOTIFY-003..007
       - GF-REGIONAL-BOOT-013..014
 
   - id: network-retry
@@ -531,10 +535,10 @@ rules:
     regional_cases:
       - GF-REGIONAL-NET-001..005
       - GF-REGIONAL-NET-008
-      - GF-REGIONAL-HA-005
+      - GF-REGIONAL-HA-009
       - GF-REGIONAL-AUTH-013..014
     approval_cases:
-      - GF-REGIONAL-HA-005
+      - GF-REGIONAL-HA-009
 
   - id: metrics-capacity
     description: Metrics, queues, connection pools, capacity, and alert rules.
@@ -556,10 +560,10 @@ rules:
       - tests/test_regional_alerting_routes.py
     regional_cases:
       - GF-REGIONAL-CAP-001..005
-      - GF-REGIONAL-HA-005..009
+      - GF-REGIONAL-HA-006..009
       - GF-REGIONAL-PREEMPT-037
     approval_cases:
-      - GF-REGIONAL-HA-005..007
+      - GF-REGIONAL-HA-006..007
       - GF-REGIONAL-HA-009
 
   - id: docs-only
@@ -664,7 +668,8 @@ rules:
       - tests/app/test_route_tenancy_security.py
     regional_cases:
       - GF-REGIONAL-BOOT-001..015
-      - GF-REGIONAL-AUTH-001..011
+      - GF-REGIONAL-AUTH-001..009
+      - GF-REGIONAL-AUTH-011
       - GF-REGIONAL-AUTH-013..016
       - GF-REGIONAL-BLAST-001..004
     checks:
@@ -740,7 +745,10 @@ rules:
       - tests/execution
       - tests/orchestration
     regional_cases:
-      - GF-REGIONAL-PREEMPT-001..035
+      - GF-REGIONAL-PREEMPT-001..012
+      - GF-REGIONAL-PREEMPT-014..022
+      - GF-REGIONAL-PREEMPT-024..033
+      - GF-REGIONAL-PREEMPT-035
       - GF-REGIONAL-E2E-001
       - GF-REGIONAL-DESTR-020..021
     fallback: true

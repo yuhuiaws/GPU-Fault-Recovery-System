@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import time
+from types import FrameType
 from typing import Any
 
 from gpu_fault.node_agent.quiesce import GpuServiceQuiesceManager
@@ -20,6 +22,10 @@ SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 
 class ProbeError(RuntimeError):
     pass
+
+
+class ProbeInterrupted(Exception):
+    """SIGTERM reached the cycle (``systemctl stop``); restore must still run."""
 
 
 def utc_now() -> str:
@@ -55,6 +61,10 @@ def evidence_path(run_id: str) -> Path:
     return STATE_ROOT / f"preempt012-{safe_id(run_id)}.json"
 
 
+def unit_name(run_id: str) -> str:
+    return f"gpu-fault-preempt012-{safe_id(run_id)}"
+
+
 def service_states() -> dict[str, str]:
     result = {}
     for service in (
@@ -71,6 +81,17 @@ def service_states() -> dict[str, str]:
     return result
 
 
+def timer_active_state(unit: str) -> str:
+    completed = run(
+        ["systemctl", "show", unit + ".timer", "--property=ActiveState"],
+        check=False,
+    )
+    for line in completed.stdout.splitlines():
+        if line.startswith("ActiveState="):
+            return line.split("=", 1)[1].strip() or "unknown"
+    return "unknown"
+
+
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
@@ -80,6 +101,10 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     )
     temporary.chmod(0o600)
     temporary.replace(path)
+
+
+def _interrupt(signum: int, _frame: FrameType | None) -> None:
+    raise ProbeInterrupted(f"signal {signum}")
 
 
 def cycle(arguments: argparse.Namespace) -> None:
@@ -101,6 +126,12 @@ def cycle(arguments: argparse.Namespace) -> None:
     }
     path = evidence_path(run_id)
     write_json(path, result)
+    # ``systemctl stop`` on the unit delivers SIGTERM; without a handler the
+    # process dies inside ``time.sleep`` and the ``finally`` below -- the
+    # restore -- never runs. The handler turns the signal into an exception so
+    # the restore path is the same one a failure takes.
+    signal.signal(signal.SIGTERM, _interrupt)
+    signal.signal(signal.SIGINT, _interrupt)
     try:
         quiesce = manager.quiesce(
             incident_id=incident_id,
@@ -112,28 +143,31 @@ def cycle(arguments: argparse.Namespace) -> None:
         result["status"] = "QUIESCED"
         write_json(path, result)
         time.sleep(arguments.hold_seconds)
+    except ProbeInterrupted as exc:
+        result["interrupted"] = str(exc)
+        result["status"] = "INTERRUPTED"
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["status"] = "FAILED"
     finally:
         try:
             result["restore"] = manager.restore(incident_id=incident_id)
-        except Exception as exc:
+        except BaseException as exc:  # noqa: BLE001 -- restore evidence must land
             result["restore_error"] = f"{type(exc).__name__}: {exc}"
             result["status"] = "FAILED"
         result["restored_at"] = utc_now()
         result["services_after"] = service_states()
         result["quiesce_state_files"] = sorted(
-            path.name for path in QUIESCE_ROOT.glob("quiesce-*.json")
+            item.name for item in QUIESCE_ROOT.glob("quiesce-*.json")
         )
-        if result["status"] != "FAILED":
+        if result["status"] == "QUIESCED":
             result["status"] = "COMPLETED"
         write_json(path, result)
 
 
 def arm(arguments: argparse.Namespace) -> dict[str, Any]:
     run_id = safe_id(arguments.run_id)
-    unit = f"gpu-fault-preempt012-{run_id}"
+    unit = unit_name(run_id)
     run(["systemctl", "stop", unit + ".timer"], check=False)
     run(["systemctl", "reset-failed", unit + ".service"], check=False)
     run(
@@ -179,35 +213,54 @@ def read_cycle(arguments: argparse.Namespace) -> dict[str, Any]:
 
 
 def cleanup(arguments: argparse.Namespace) -> dict[str, Any]:
+    """Stop the cycle, then restore, then remove the evidence -- in that order.
+
+    Restoring *before* stopping the timer let a timer that had not fired yet
+    fire after the restore and quiesce a node the runner believed was back.
+    The restore itself may raise anything (a state file half-written by an
+    interrupted cycle, a systemd error); whatever it raises, the timer is
+    already stopped and the evidence is still unlinked, and the error is
+    reported in the result rather than as an exit code that hides the rest.
+    """
+
     run_id = safe_id(arguments.run_id)
     incident_id = f"preempt012-{run_id}"
-    manager = GpuServiceQuiesceManager(
-        state_dir=str(QUIESCE_ROOT),
-        restore_settle_seconds=10,
-    )
-    restore = manager.restore(incident_id=incident_id)
-    unit = f"gpu-fault-preempt012-{run_id}"
+    unit = unit_name(run_id)
     run(["systemctl", "stop", unit + ".timer"], check=False)
+    run(["systemctl", "stop", unit + ".service"], check=False)
     run(
         ["systemctl", "reset-failed", unit + ".service", unit + ".timer"],
         check=False,
     )
+    manager = GpuServiceQuiesceManager(
+        state_dir=str(QUIESCE_ROOT),
+        restore_settle_seconds=10,
+    )
+    result: dict[str, Any] = {"unit": unit}
+    try:
+        result["restore"] = manager.restore(incident_id=incident_id)
+    except BaseException as exc:  # noqa: BLE001 -- reported, never hides the rest
+        result["restore"] = None
+        result["restore_error"] = f"{type(exc).__name__}: {exc}"
     evidence_path(run_id).unlink(missing_ok=True)
-    return {
-        "restore": restore,
-        "services": service_states(),
-        "evidence_exists": evidence_path(run_id).exists(),
-        "quiesce_state_files": sorted(
-            path.name for path in QUIESCE_ROOT.glob("quiesce-*.json")
-        ),
-    }
+    result.update(
+        {
+            "timer_active_state": timer_active_state(unit),
+            "services": service_states(),
+            "evidence_exists": evidence_path(run_id).exists(),
+            "quiesce_state_files": sorted(
+                item.name for item in QUIESCE_ROOT.glob("quiesce-*.json")
+            ),
+        }
+    )
+    return result
 
 
 def snapshot() -> dict[str, Any]:
     return {
         "services": service_states(),
         "quiesce_state_files": sorted(
-            path.name for path in QUIESCE_ROOT.glob("quiesce-*.json")
+            item.name for item in QUIESCE_ROOT.glob("quiesce-*.json")
         ),
         "gpu_count": len(
             [

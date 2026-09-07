@@ -25,6 +25,8 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -100,7 +102,17 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
 
 
-def focused_tests(case_dir: Path) -> dict[str, Any]:
+def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
+    """Run the focused pytest, or reuse the plan's result in ``--execute``.
+
+    ``reuse`` consults ``reusable_focused_tests`` on the plan this case wrote:
+    a passing result recorded against the same source digest is not re-run.
+    """
+
+    if reuse:
+        recorded = reusable_focused_tests(case_dir / "plan.json")
+        if recorded is not None:
+            return {**recorded, "focused_tests_reused": True}
     command = [
         sys.executable,
         "-m",
@@ -186,24 +198,29 @@ def preflight_errors(
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
+    *,
+    reuse_focused_tests: bool = False,
 ) -> dict[str, Any]:
     fixture = RegionalLiveFixture(settings.regional)
+    identity = fixture.evidence_identity()
     state = fixture.store_snapshot(
         node=settings.node,
         observed_after=datetime.now(timezone.utc) - timedelta(minutes=10),
     )
     node = fixture.node_snapshot(settings.node)
     workloads = fixture.business_workloads(settings.node)
-    tests = focused_tests(case_dir)
+    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
+        **identity,
     )
     errors = preflight_errors(state, node, workloads, tests)
     if not predecessor["valid"]:
         errors.append("DESTR-010 predecessor evidence is not PASS")
     result = {
         "release_id": state.get("release_id"),
+        "evidence_identity": identity,
         "node": node,
         "business_workloads": workloads,
         "store": state,
@@ -372,7 +389,7 @@ def host_errors(
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     state = preflight["store"]
-    return {
+    details = {
         "risk": "destructive",
         "predecessor": preflight["predecessor"],
         "target_node": settings.node,
@@ -405,9 +422,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "failed_validation_keeps_the_node_quarantined": True,
             "reboot_requires_a_separate_approved_case": True,
             "runner_finally_deletes_probe_resources": True,
+            "detached_sampler_is_stopped_after_the_post_reset_snapshot": True,
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight["focused_tests"])
+    return details
 
 
 def verify_plan_identity(
@@ -436,7 +456,7 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -462,13 +482,31 @@ def execute_case(
         "case_id": CASE_ID,
         "attempt": attempt,
         "verdict": "FAIL",
+        **preflight["evidence_identity"],
         "node": settings.node,
         "maintenance_window_end": maintenance_window_end.isoformat(),
+        "focused_tests_reused": bool(
+            preflight["focused_tests"].get("focused_tests_reused")
+        ),
     }
     baseline_host: dict[str, Any] | None = None
     incident_id = ""
     injection_started: datetime | None = None
     sampler_started = False
+    sampler_stopped = False
+
+    def stop_sampler() -> dict[str, Any]:
+        nonlocal sampler_stopped
+        stopped = host.execute(
+            "stop-reset-sampler",
+            "--run-id",
+            run_id,
+            timeout=60,
+        )
+        sampler_stopped = True
+        write_json_atomic(case_dir / "sampler-final.json", stopped)
+        return stopped
+
     try:
         host.create()
         baseline_host = host.execute("snapshot")
@@ -490,6 +528,12 @@ def execute_case(
                 "approved maintenance window ended before injection"
             )
 
+        # Armed before the call, not after: a start that times out or fails
+        # after the transient unit was created would otherwise leave the
+        # sampler running on the host with nothing scheduled to stop it. The
+        # stop is idempotent, so arming early costs nothing when the start
+        # never reached the host.
+        sampler_started = True
         sampler = host.execute(
             "start-reset-sampler",
             "--run-id",
@@ -498,7 +542,6 @@ def execute_case(
             host.host_script,
             timeout=60,
         )
-        sampler_started = True
         write_json_atomic(case_dir / "sampler-start.json", sampler)
         injection_started = datetime.now(timezone.utc)
         injection = host.execute(
@@ -532,6 +575,10 @@ def execute_case(
             timeout=180,
         )
         write_json_atomic(case_dir / "host-after.json", after)
+        # The sampler's job ends with the post-reset snapshot that reads its
+        # series; stopping it here rather than in `finally` keeps it from
+        # running through the node/provider/CPU checks that follow.
+        stop_sampler()
         errors.extend(
             host_errors(
                 baseline_host,
@@ -546,11 +593,17 @@ def execute_case(
             errors.append("target node is not Ready after reset")
         if node_after["unschedulable"] or node_after["ownership_annotations"]:
             errors.append("target node scheduling ownership was not restored")
-        provider = regional.provider_events(
-            injection_started,
-            datetime.now(timezone.utc),
+        provider_window_end = datetime.now(timezone.utc)
+        provider = regional.provider_events(injection_started, provider_window_end)
+        # An empty CloudTrail read inside the delivery window is not proof
+        # that no provider mutation happened; it is recorded as provisional.
+        provider_provisional = not provider and regional.provider_events_provisional(
+            provider_window_end
         )
-        write_json_atomic(case_dir / "provider-events.json", {"events": provider})
+        write_json_atomic(
+            case_dir / "provider-events.json",
+            {"events": provider, "provider_events_provisional": provider_provisional},
+        )
         if provider:
             errors.append("provider mutation appeared during GPU reset")
         cpu_after = regional.cpu_blast_snapshot()
@@ -567,6 +620,7 @@ def execute_case(
                 ),
                 "incident_id": incident_id,
                 "provider_events": provider,
+                "provider_events_provisional": provider_provisional,
                 "sampler": after.get("sampler"),
             }
         )
@@ -586,15 +640,9 @@ def execute_case(
                 recovery = {"error": f"{type(exc).__name__}: {exc}"}
                 result["verdict"] = "FAIL"
         result["quiesce_recovery"] = recovery
-        if sampler_started:
+        if sampler_started and not sampler_stopped:
             try:
-                stopped = host.execute(
-                    "stop-reset-sampler",
-                    "--run-id",
-                    run_id,
-                    timeout=60,
-                )
-                write_json_atomic(case_dir / "sampler-final.json", stopped)
+                stop_sampler()
             except Exception as exc:
                 result["sampler_cleanup_error"] = f"{type(exc).__name__}: {exc}"
                 result["verdict"] = "FAIL"

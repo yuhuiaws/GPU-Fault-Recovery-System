@@ -54,14 +54,16 @@ ORPHANED_COMMANDS_MODE = "orphaned-commands"
 RETIRED_GENERATION_MODE = "retired-generation"
 MODES = (COMPILE_BLOCKED_MODE, ORPHANED_COMMANDS_MODE, RETIRED_GENERATION_MODE)
 REFERENCE = "CHG-PREEMPT-036"
-CLUSTER_ID = "p035-cluster-a"
-NODE_ID = "p035-node-a"
+CLUSTER_ID = "p036-cluster-a"
+NODE_ID = "p036-node-a"
 STEP_OWNER = "cluster-executor"
 POLICY_VERSION = "610"
 POLICY_SOURCE = "NVIDIA"
 CANCELLED_STATUS_SOURCE = "workflow-timeout"
 RERUN_NO_OP = "no-op"
 RERUN_REFUSED = "refused"
+# The modes whose apply cancels remote commands and must report the count.
+CANCELLING_MODES = frozenset({ORPHANED_COMMANDS_MODE, RETIRED_GENERATION_MODE})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 # Every mode refuses an apply whose rebuilt digest differs from the approval,
@@ -210,11 +212,11 @@ def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ModeSeed
 
     stamp = now or datetime.now(timezone.utc)
     earlier = stamp - timedelta(hours=6)
-    blocked_id = "p035cb-blocked"
-    twin_id = "p035cb-restore-twin"
-    successor_id = "p035cb-restored"
+    blocked_id = "p036cb-blocked"
+    twin_id = "p036cb-restore-twin"
+    successor_id = "p036cb-restored"
     blocked_incident = _incident(
-        "p035cb-incident-efa",
+        "p036cb-incident-efa",
         state=IncidentState.ESCALATED,
         workflow_request_id=blocked_id,
         fencing_token=3,
@@ -232,7 +234,7 @@ def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ModeSeed
         updated_at=earlier,
     )
     twin_incident = _incident(
-        "p035cb-incident-restore",
+        "p036cb-incident-restore",
         state=IncidentState.RECOVERED,
         workflow_request_id=successor_id,
         fencing_token=4,
@@ -244,7 +246,7 @@ def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ModeSeed
         status=WorkflowStatus.BLOCKED,
         official_action="RESET_GPU",
         fencing_token=2,
-        source_plan_id="p035cb-plan-1",
+        source_plan_id="p036cb-plan-1",
         official_steps=_hardware_steps(WorkflowOperation.RESET_GPU),
         blocked_reasons=["safety settled by a later workflow"],
         created_at=earlier,
@@ -334,12 +336,12 @@ def seed_orphaned_commands(store: Any, *, now: datetime | None = None) -> ModeSe
 
     stamp = now or datetime.now(timezone.utc)
     earlier = stamp - timedelta(hours=13)
-    failed_id = "p035oc-failed"
-    running_id = "p035oc-running"
-    orphan_command = "p035oc-command-orphan"
-    live_command = "p035oc-command-live"
+    failed_id = "p036oc-failed"
+    running_id = "p036oc-running"
+    orphan_command = "p036oc-command-orphan"
+    live_command = "p036oc-command-live"
     failed_incident = _incident(
-        "p035oc-incident-failed",
+        "p036oc-incident-failed",
         state=IncidentState.ESCALATED,
         workflow_request_id=failed_id,
         fencing_token=2,
@@ -360,7 +362,7 @@ def seed_orphaned_commands(store: Any, *, now: datetime | None = None) -> ModeSe
         updated_at=earlier,
     )
     running_incident = _incident(
-        "p035oc-incident-running",
+        "p036oc-incident-running",
         state=IncidentState.ACTION_PENDING,
         workflow_request_id=running_id,
         fencing_token=7,
@@ -373,7 +375,7 @@ def seed_orphaned_commands(store: Any, *, now: datetime | None = None) -> ModeSe
         official_action="RESET_GPU",
         fencing_token=7,
         official_steps=_hardware_steps(WorkflowOperation.RESET_GPU),
-        execution_owner_id="p035-executor-b",
+        execution_owner_id="p036-executor-b",
         execution_lease_expires_at=stamp + timedelta(minutes=2),
         completed_operations=[WorkflowOperation.MARK_UNSCHEDULABLE],
         completed_step_indexes=[0],
@@ -476,12 +478,12 @@ def seed_retired_generation(store: Any, *, now: datetime | None = None) -> ModeS
 
     stamp = now or datetime.now(timezone.utc)
     earlier = stamp - timedelta(hours=3)
-    current_id = "p035rg-current"
-    retired_id = "p035rg-retired"
-    mutated_id = "p035rg-mutated"
-    command_id = "p035rg-command-retired"
+    current_id = "p036rg-current"
+    retired_id = "p036rg-retired"
+    mutated_id = "p036rg-mutated"
+    command_id = "p036rg-command-retired"
     incident = _incident(
-        "p035rg-incident",
+        "p036rg-incident",
         state=IncidentState.ACTION_PENDING,
         workflow_request_id=current_id,
         fencing_token=5,
@@ -504,7 +506,7 @@ def seed_retired_generation(store: Any, *, now: datetime | None = None) -> ModeS
         official_action="RESET_GPU",
         fencing_token=2,
         official_steps=_hardware_steps(WorkflowOperation.RESET_GPU),
-        execution_owner_id="p035-executor-a",
+        execution_owner_id="p036-executor-a",
         execution_lease_expires_at=stamp + timedelta(minutes=2),
         remediation_budget_claims=[f"{CLUSTER_ID}/RESET_GPU"],
         completed_operations=[WorkflowOperation.MARK_UNSCHEDULABLE],
@@ -929,6 +931,14 @@ def apply_errors(
                 f"apply cancelled {counted} remote commands, "
                 f"expected {len(seed.cancelled_command_ids)}"
             )
+    elif seed.mode in CANCELLING_MODES:
+        # These two modes exist to cancel commands; an apply result that does
+        # not say how many it cancelled cannot be judged, and used to slip
+        # through as "nothing to check".
+        errors.append(
+            "apply result carries no cancelled_remote_commands counters, "
+            f"expected {len(seed.cancelled_command_ids)} cancelled"
+        )
     return errors
 
 
@@ -1107,6 +1117,27 @@ def rerun_errors(
             f"rerun {settled_field} is {settled}, "
             f"expected {sorted(seed.actionable_ids)}"
         )
+    return errors
+
+
+def shipped_source_errors(evidence: Mapping[str, Any]) -> list[str]:
+    """Whether the text this run executed is the text the admin layer ships.
+
+    The runner records the digests; recording is not judging. A script that no
+    longer starts with the shipped module source is a driver executing something
+    other than what ``gpu-fault-admin workflow-reconcile`` sends into the Pod,
+    and the case would be proving the wrong code.
+    """
+
+    errors: list[str] = []
+    if evidence.get("starts_with_module_source") is not True:
+        errors.append(
+            "the executed script does not start with the shipped module source"
+        )
+    for field in ("script_sha256", "module_sha256", "driver_sha256"):
+        value = str(evidence.get(field) or "")
+        if _SHA256.fullmatch(value) is None:
+            errors.append(f"shipped-source evidence has no sha256 for {field}")
     return errors
 
 

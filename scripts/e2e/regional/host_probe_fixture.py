@@ -13,6 +13,14 @@ class HostProbeError(RuntimeError):
     pass
 
 
+# How long cleanup waits for a Pod delete to take effect before forcing it. A
+# privileged hostPID Pod whose node is mid-reboot can sit Terminating for the
+# whole reboot; waiting forever on it is what used to leave the ConfigMap and
+# the residual check unreached.
+POD_DELETE_WAIT_SECONDS = 120
+POD_FORCE_DELETE_WAIT_SECONDS = 30
+
+
 @dataclass(frozen=True)
 class HostProbeSettings:
     kubeconfig: Path
@@ -61,24 +69,29 @@ class HostProbeFixture:
         check: bool = True,
         timeout: int = 300,
     ) -> subprocess.CompletedProcess[str]:
-        completed = subprocess.run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(self.settings.kubeconfig),
-                "--context",
-                self.settings.context,
-                "-n",
-                self.settings.namespace,
-                *arguments,
-            ],
-            input=input_text,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                [
+                    "kubectl",
+                    "--kubeconfig",
+                    str(self.settings.kubeconfig),
+                    "--context",
+                    self.settings.context,
+                    "-n",
+                    self.settings.namespace,
+                    *arguments,
+                ],
+                input=input_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HostProbeError(
+                f"kubectl timed out after {timeout}s: {' '.join(arguments)}"
+            ) from exc
         if check and completed.returncode:
             raise HostProbeError(
                 f"kubectl failed ({completed.returncode}): "
@@ -204,29 +217,83 @@ class HostProbeFixture:
             timeout=timeout,
         )
         lines = completed.stdout.strip().splitlines()
-        payload = json.loads(lines[-1]) if lines else {}
-        if completed.returncode or "error" in payload:
+        stderr_tail = "\n".join(completed.stderr.strip().splitlines()[-20:])
+        payload: Any = {}
+        if lines:
+            try:
+                payload = json.loads(lines[-1])
+            except json.JSONDecodeError as exc:
+                # A probe that died before `emit` -- OOM, a missing interpreter,
+                # a chroot that failed -- leaves a traceback or nothing on its
+                # last line. That is a probe failure with a stderr to read, not
+                # a JSONDecodeError for the runner's cleanup path to trip over.
+                raise HostProbeError(
+                    f"host probe returned no JSON (exit {completed.returncode}); "
+                    f"last stdout line: {lines[-1][:200]!r}; stderr: {stderr_tail}"
+                ) from exc
+        if not isinstance(payload, dict):
             raise HostProbeError(
-                f"host probe failed: {payload or completed.stderr.strip()}"
+                f"host probe returned a non-object (exit {completed.returncode}): "
+                f"{lines[-1][:200]!r}; stderr: {stderr_tail}"
             )
+        if completed.returncode or "error" in payload:
+            raise HostProbeError(f"host probe failed: {payload or stderr_tail}")
         return payload
 
-    def residuals(self) -> dict[str, bool]:
-        result = {}
-        for kind, name in (("pod", self.pod), ("configmap", self.configmap)):
-            present = self._kubectl(
+    def _present(self, kind: str, name: str) -> bool:
+        # `--ignore-not-found` exits 0 with empty output for an absent object;
+        # any non-zero exit is an API failure, and `check=True` refuses to read
+        # its empty stdout as "gone".
+        return bool(
+            self._kubectl(
                 "get",
                 kind,
                 name,
                 "--ignore-not-found",
                 "-o",
                 "name",
-                check=False,
+                timeout=60,
             ).stdout.strip()
-            result[f"{kind}/{name}"] = bool(present)
+        )
+
+    def residuals(self) -> dict[str, bool]:
+        """Whether the Pod and ConfigMap still exist; raises when kubectl fails.
+
+        An earlier version read a failed kubectl's empty stdout as "no
+        residual", which is the one answer a residual check must never give
+        by accident: it turns an unreachable API server into a clean audit.
+        """
+
+        result = {}
+        for kind, name in (("pod", self.pod), ("configmap", self.configmap)):
+            result[f"{kind}/{name}"] = self._present(kind, name)
         return result
 
+    def _wait_pod_gone(self, seconds: int) -> bool:
+        deadline = time.monotonic() + seconds
+        while True:
+            try:
+                if not self._present("pod", self.pod):
+                    return True
+            except HostProbeError:
+                # A transient API failure mid-poll is not "still present";
+                # keep polling until the bound, then let the force path and
+                # the final residual check speak.
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(2)
+
     def cleanup(self) -> dict[str, bool]:
+        """Remove the host script, the Pod and the ConfigMap, then audit.
+
+        Every step is bounded so the ConfigMap delete and the residual check are
+        reached even when the Pod refuses to die: delete without waiting, poll
+        for it to vanish, force it, and only then move on. The residual check
+        is what the case records; a cleanup that never got there recorded
+        nothing.
+        """
+
         self._kubectl(
             "exec",
             self.pod,
@@ -242,16 +309,30 @@ class HostProbeFixture:
             "pod",
             self.pod,
             "--ignore-not-found",
-            "--wait=true",
+            "--wait=false",
             check=False,
-            timeout=180,
+            timeout=60,
         )
+        if not self._wait_pod_gone(POD_DELETE_WAIT_SECONDS):
+            self._kubectl(
+                "delete",
+                "pod",
+                self.pod,
+                "--ignore-not-found",
+                "--wait=false",
+                "--grace-period=0",
+                "--force",
+                check=False,
+                timeout=60,
+            )
+            self._wait_pod_gone(POD_FORCE_DELETE_WAIT_SECONDS)
         self._kubectl(
             "delete",
             "configmap",
             self.configmap,
             "--ignore-not-found",
             check=False,
+            timeout=60,
         )
         deadline = time.monotonic() + 30
         residuals = self.residuals()

@@ -69,10 +69,28 @@ def restore_unit(run_id: str) -> str:
     return f"gpu-fault-network-restore-{digest}"
 
 
+# The executor and collector Pods are not hostNetwork: their egress leaves a
+# veth and is routed by the host, so it traverses FORWARD, never OUTPUT. A
+# jump from OUTPUT alone cut only the node's own processes (the Node Agent),
+# and ISO-006 passed after thirty minutes in which cluster B was never
+# actually offline. Both chains get the jump; both lose it on rollback.
+HOST_CHAINS = ("OUTPUT", "FORWARD")
+
+
 def remove_chain(chain: str) -> None:
-    run(["iptables", "-D", "OUTPUT", "-j", chain], check=False)
+    for host_chain in HOST_CHAINS:
+        run(["iptables", "-D", host_chain, "-j", chain], check=False)
     run(["iptables", "-F", chain], check=False)
     run(["iptables", "-X", chain], check=False)
+
+
+def restore_script(chain: str) -> str:
+    """The rollback the systemd timer runs: every jump, then the chain."""
+
+    deletes = "; ".join(
+        f"iptables -D {host_chain} -j {chain} || true" for host_chain in HOST_CHAINS
+    )
+    return f"{deletes}; iptables -F {chain} || true; iptables -X {chain} || true"
 
 
 def block(arguments: argparse.Namespace) -> None:
@@ -81,10 +99,7 @@ def block(arguments: argparse.Namespace) -> None:
     chain = chain_name(run_id)
     remove_chain(chain)
     unit = restore_unit(run_id)
-    script = (
-        f"iptables -D OUTPUT -j {chain} || true; "
-        f"iptables -F {chain} || true; iptables -X {chain} || true"
-    )
+    script = restore_script(chain)
     run(
         [
             "systemd-run",
@@ -118,7 +133,8 @@ def block(arguments: argparse.Namespace) -> None:
                     "REJECT",
                 ]
             )
-        run(["iptables", "-I", "OUTPUT", "1", "-j", chain])
+        for host_chain in HOST_CHAINS:
+            run(["iptables", "-I", host_chain, "1", "-j", chain])
     except Exception:
         remove_chain(chain)
         run(["systemctl", "stop", unit + ".timer"], check=False)
@@ -128,6 +144,7 @@ def block(arguments: argparse.Namespace) -> None:
         {
             "run_id": run_id,
             "chain": chain,
+            "host_chains": list(HOST_CHAINS),
             "cidrs": cidrs,
             "restore_unit": unit + ".timer",
             "restore_seconds": arguments.restore_seconds,
@@ -149,11 +166,18 @@ def status(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id)
     chain = chain_name(run_id)
     completed = run(["iptables", "-S", chain], check=False)
+    jumps = {}
+    for host_chain in HOST_CHAINS:
+        listing = run(["iptables", "-S", host_chain], check=False)
+        jumps[host_chain] = any(
+            line.split()[-2:] == ["-j", chain] for line in listing.stdout.splitlines()
+        )
     emit(
         {
             "run_id": run_id,
             "chain": chain,
-            "blocked": completed.returncode == 0,
+            "blocked": completed.returncode == 0 and all(jumps.values()),
+            "jumps": jumps,
             "rules": completed.stdout.splitlines(),
         }
     )

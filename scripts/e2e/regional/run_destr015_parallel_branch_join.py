@@ -43,10 +43,15 @@ from scripts.e2e.regional import (  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.control_plane_env_window import (  # noqa: E402
+    observed_value,
+    replica_env,
+)
 from scripts.e2e.regional.destr015_verdicts import (  # noqa: E402
     AGENT_OPERATIONS,
     cloudtrail_errors,
     estimated_duration_seconds,
+    event_observed_at,
     host_errors,
     injection_errors,
     lifetime_errors,
@@ -63,6 +68,8 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
@@ -101,6 +108,18 @@ GPUS_PER_NODE = 8
 # narrow cannot absorb two kubectl execs plus collector latency.
 MIN_AGGREGATION_WINDOW_SECONDS = 5
 OBSERVATION_BUDGET_SECONDS = 2400
+# The bounds this case fits inside, read from the control-worker replicas that
+# apply them. ``orchestration/coordinator.py`` reads the aggregation window,
+# ``execution/config.py`` the job workflow lifetime; the release-state ConfigMap
+# carries neither.
+CONTROL_PLANE = "cpu"
+CONTROL_DEPLOYMENT = "gpu-fault-control-worker"
+AGGREGATION_WINDOW_VARIABLE = "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS"
+JOB_LIFETIME_VARIABLE = "GPU_FAULT_JOB_WORKFLOW_MAX_LIFETIME_SECONDS"
+CONTROL_VARIABLES = (AGGREGATION_WINDOW_VARIABLE, JOB_LIFETIME_VARIABLE)
+# Shipped defaults, used only when the deployment does not override them.
+DEFAULT_AGGREGATION_WINDOW_SECONDS = 5
+DEFAULT_JOB_LIFETIME_SECONDS = 3600
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +213,49 @@ def preflight_errors(
         )
     )
     return errors
+
+
+def control_env_record(observations: dict[str, str | None]) -> dict[str, Any]:
+    """Fold what every ready control-worker replica agrees on into the two
+    bounds this case does arithmetic against.
+
+    A value no replica agrees on (mid-rollout) or one that is not a number is
+    reported as the shipped default rather than averaged; the rollout itself is
+    caught by the runtime-identity check.
+    """
+
+    def number(name: str, default: int) -> int:
+        value = observations.get(name)
+        try:
+            return int(str(value)) if value is not None else default
+        except ValueError:
+            return default
+
+    return {
+        "observed": dict(observations),
+        "aggregation_window_seconds": number(
+            AGGREGATION_WINDOW_VARIABLE, DEFAULT_AGGREGATION_WINDOW_SECONDS
+        ),
+        "job_lifetime_seconds": number(
+            JOB_LIFETIME_VARIABLE, DEFAULT_JOB_LIFETIME_SECONDS
+        ),
+    }
+
+
+def stop_before_observation(errors: list[str]) -> None:
+    """Refuse to keep going once the injection itself has failed.
+
+    Two faults that did not land in one DAG, or landed outside the window,
+    cannot prove the join; observing the workflow for forty minutes after that
+    would only bury the real error. The faults are already on the nodes, so the
+    cleanup still waits for quiescence and restores anything left isolated.
+    """
+
+    if errors:
+        raise RegionalFixtureError(
+            "stopping before observation: the injection did not set up the case: "
+            + "; ".join(errors)
+        )
 
 
 def _digest(value: Any) -> str:
@@ -338,7 +400,7 @@ def configure(arguments: argparse.Namespace) -> Settings:
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     identity = plan_identity(preflight, nodes=settings.nodes)
-    return {
+    details: dict[str, Any] = {
         "risk": "destructive",
         "predecessor": preflight.get("predecessor"),
         "node_a": settings.node_a,
@@ -377,12 +439,31 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "no_node_reboot_or_replacement_is_authorized": True,
         },
     }
+    # The --plan's focused-test result is recorded with a source digest so
+    # --execute can reuse it instead of paying for the same run twice.
+    record_focused_tests(
+        details,
+        dict(preflight.get("focused_tests") or {"passed": False}),
+    )
+    return details
 
 
 # --------------------------------------------------------------------------- #
 # Live preflight (not unit-tested; delegates every assertion to the pure funcs)
 # --------------------------------------------------------------------------- #
-def focused_tests(case_dir: Path) -> dict[str, Any]:
+def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
+    """Run the focused pytest, or reuse the --plan's result in --execute.
+
+    ``reuse`` is set by the execution path only: the result recorded in
+    ``plan.json`` is taken when it passed against exactly this source tree
+    (``reusable_focused_tests`` compares the digest), so the same tests are
+    not paid for twice minutes apart; any edit in between forces a rerun.
+    """
+
+    if reuse:
+        recorded = reusable_focused_tests(case_dir / "plan.json")
+        if recorded is not None:
+            return {**recorded, "focused_tests_reused": True}
     command = [
         sys.executable,
         "-m",
@@ -410,18 +491,20 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
 
 
 def control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
-    document = json.loads(
-        regional.kubectl(
-            "cpu", "get", "configmap", "gpu-fault-regional-release-state", "-o", "json"
-        )
+    """What the deployed control-worker replicas actually read for the two
+    bounds this case has to fit inside. Read-only."""
+
+    replicas = replica_env(
+        regional,
+        plane=CONTROL_PLANE,
+        deployment=CONTROL_DEPLOYMENT,
+        names=CONTROL_VARIABLES,
     )
-    state = json.loads(document["data"]["state.json"])
-    return {
-        "aggregation_window_seconds": int(
-            state.get("multi_node_aggregation_window_seconds") or 5
-        ),
-        "job_lifetime_seconds": int(state.get("job_workflow_lifetime_seconds") or 3600),
-    }
+    record = control_env_record(
+        {name: observed_value(replicas, name) for name in CONTROL_VARIABLES}
+    )
+    record["replicas"] = replicas
+    return record
 
 
 ARBITER_APPS = (
@@ -483,7 +566,12 @@ def cluster_arbiter_placement(
     return {node: sorted(names) for node, names in arbiters.items()}, dns_nodes
 
 
-def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
+def read_only_preflight(
+    settings: Settings,
+    case_dir: Path,
+    *,
+    reuse_focused_tests: bool = False,
+) -> dict[str, Any]:
     if not settings.site_file.is_file() or not settings.manifest.is_file():
         raise RegionalFixtureError("site file or training manifest does not exist")
     regional = RegionalLiveFixture(settings.regional)
@@ -491,8 +579,12 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     stores = {node: regional.store_snapshot(node=node) for node in settings.nodes}
     state = stores[settings.node_a]
     runtime_identity = regional.runtime_identity()
-    tests = focused_tests(case_dir)
-    predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
+    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
+    predecessor = predecessor_evidence(
+        settings.predecessor_path,
+        PREDECESSOR_CASE_ID,
+        **regional.evidence_identity(),
+    )
     env = control_env(regional)
     arbiter_pods, dns_nodes = cluster_arbiter_placement(regional)
     result: dict[str, Any] = {
@@ -611,6 +703,7 @@ class _LiveRun:
     baselines: dict[str, dict[str, Any]] = field(default_factory=dict)
     source_uids: set[str] = field(default_factory=set)
     incident_id: str = ""
+    workflow_request_id: str = ""
     workload_submitted: bool = False
 
 
@@ -622,7 +715,7 @@ def _prepare_live_run(
 ) -> _LiveRun:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -738,8 +831,9 @@ def _inject_both(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
             "--pci-bdf",
             run.bdf[node],
         )
-        # Stamped on return: the kmsg write is the last thing the probe does,
-        # so this is within the exec round trip of the real write time.
+        # Stamped on return, i.e. one kubectl round trip after the write. Kept
+        # as evidence of when the runner acted; the spread verdict reads the
+        # events' own ``observed_at`` from the store instead.
         run.injected_at[node] = datetime.now(timezone.utc).isoformat()
         return payload
 
@@ -768,6 +862,9 @@ def _inject_both(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
                 terminal=False,
             )
         )
+    run.workflow_request_id = str(
+        (states[0].get("workflow") or {}).get("request_id") or ""
+    )
     return states[0], states[1]
 
 
@@ -785,6 +882,9 @@ def _observe_until_terminal(run: _LiveRun) -> dict[str, Any]:
             job_id=settings.job_id,
             attempt_id=settings.attempt_id,
             queue_attempts=1,
+            workflow_request_ids=(
+                [run.workflow_request_id] if run.workflow_request_id else None
+            ),
         )
         workflow = state.get("workflow") or {}
         transitions, changes = step_transitions(
@@ -838,8 +938,15 @@ def _data_plane_errors(
     snapshots = {node: run.regional.node_snapshot(node) for node in settings.nodes}
     write_json_atomic(case_dir / "nodes-after.json", snapshots)
     errors.extend(schedulability_errors(snapshots, nodes=settings.nodes))
-    provider = run.regional.provider_events(run.started_at, datetime.now(timezone.utc))
-    write_json_atomic(case_dir / "provider-events.json", {"events": provider})
+    ended_at = datetime.now(timezone.utc)
+    provider = run.regional.provider_events(run.started_at, ended_at)
+    # A negative CloudTrail claim cannot be settled inside the delivery window;
+    # it is recorded as provisional and re-checked by DESTR-013.
+    provisional = run.regional.provider_events_provisional(ended_at)
+    write_json_atomic(
+        case_dir / "provider-events.json",
+        {"events": provider, "provisional": provisional},
+    )
     errors.extend(cloudtrail_errors(provider))
     logs = workload_case.control_plane_log_snapshot(
         run.regional, run.started_at, run.workload.name
@@ -856,7 +963,7 @@ def _data_plane_errors(
         evidence_path=case_dir / "runtime-identity-after-restart.json",
         stage="after DESTR-015 workload restart",
     )
-    return errors, {
+    summary: dict[str, Any] = {
         node: {
             "boot_id_before": run.baselines[node].get("boot_id"),
             "boot_id_after": hosts[node]["after"].get("boot_id"),
@@ -865,6 +972,8 @@ def _data_plane_errors(
         }
         for node in settings.nodes
     }
+    summary["provider_events"] = {"count": len(provider), "provisional": provisional}
+    return errors, summary
 
 
 def execute_case(
@@ -890,14 +999,23 @@ def execute_case(
         _start_job_and_probes(run)
         first, second = _inject_both(run)
         errors = injection_errors(first, second, nodes=settings.nodes)
+        observed = event_observed_at(dict(zip(settings.nodes, (first, second))))
+        write_json_atomic(
+            run.case_dir / "injection-observed.json",
+            {"event_observed_at": observed, "exec_returned_at": run.injected_at},
+        )
         errors.extend(
             spread_errors(
-                run.injected_at,
+                observed,
                 aggregation_window_seconds=int(
                     run.preflight["control_env"]["aggregation_window_seconds"]
                 ),
             )
         )
+        # Two faults that did not form one in-window DAG cannot prove the join;
+        # the plan lists that as a stop condition, so stop here.
+        result["errors"] = list(errors)
+        stop_before_observation(errors)
         state = _observe_until_terminal(run)
         workflow = state.get("workflow") or {}
         incident = state.get("incident") or {}
@@ -922,6 +1040,7 @@ def execute_case(
         components = evidence_components(details)
         result.update(
             {
+                **run.regional.evidence_identity(),
                 "verdict": "PASS" if not errors else "FAIL",
                 "errors": errors,
                 "marker": run.marker,
@@ -929,6 +1048,8 @@ def execute_case(
                 "workflow_request_id": workflow.get("request_id"),
                 "dag_revision": workflow.get("dag_revision"),
                 "injected_at": run.injected_at,
+                "event_observed_at": observed,
+                "provider_events": hosts.get("provider_events"),
                 "restart_budget": state.get("restart_budget"),
                 "case_digest": case_digest(components),
                 "components": components,

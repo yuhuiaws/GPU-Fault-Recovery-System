@@ -29,13 +29,21 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from gpu_fault.admin.site import load_site  # noqa: E402
-from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
-    scoped_case_evidence,
+from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    write_json_atomic,
 )
 
 TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 CASE_IDS = tuple(f"GF-REGIONAL-CAP-{number:03d}" for number in range(1, 5))
 PROBE_DIR = Path(__file__).with_name("probes")
+CASE_LIMITATIONS = [
+    "The load is generated against disposable control-plane "
+    "Deployments and isolated databases in the selected CPU EKS; "
+    "it does not establish a fleet-wide production SLO."
+]
+# CAP-001: storm-phase B latency may degrade to at most this multiple of the
+# B-only baseline measured before the storm. Overridable per run.
+DEFAULT_B_LATENCY_FACTOR = 2.0
 
 
 class CapError(RuntimeError):
@@ -66,17 +74,14 @@ def percentile(values: Sequence[float], ratio: float) -> float | None:
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(
-        json.dumps(
-            scoped_case_evidence(value),
-            indent=2,
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o600)
+    """Write one evidence document all-or-nothing (0600, fsynced, renamed).
+
+    The case verdict file is what the next case's predecessor gate reads; a
+    half-written one is worse than none. Lists (metric samples, timelines)
+    go through the same writer.
+    """
+
+    write_json_atomic(path, value)
 
 
 def command(
@@ -113,7 +118,10 @@ class CapCoreHarness:
         run_dir: Path,
         case_id: str,
         predecessor: dict[str, Any],
+        b_latency_factor: float = DEFAULT_B_LATENCY_FACTOR,
     ) -> None:
+        if not b_latency_factor >= 1.0:
+            raise CapError("b_latency_factor must be at least 1.0")
         self.site_path = site_path.resolve()
         self.site = load_site(self.site_path)
         self.config = self.site.release_config
@@ -123,6 +131,7 @@ class CapCoreHarness:
         self.run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.run_dir.chmod(0o700)
         self.predecessor = predecessor
+        self.b_latency_factor = float(b_latency_factor)
         self.cpu_kubeconfig = str(self.config["cpu_kubeconfig"])
         self.namespace = str(self.config["namespace"])
         self.region = str(self.config["aws_region"])
@@ -1049,6 +1058,14 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as c:
         )
         if not self.predecessor.get("valid", True):
             raise CapError("formal predecessor evidence is not PASS")
+        case_path = self.run_dir / f"{self.case_id}.json"
+        # The verdict file exists from the start but says PENDING: the next
+        # case's predecessor gate reads this path, and until the production
+        # baseline has been compared after cleanup there is no PASS to claim.
+        write_json(case_path, self.case_document("PENDING", checks={}))
+        result: dict[str, Any] | None = None
+        error: str | None = None
+        cleanup_errors: list[str] = []
         try:
             self.create_common_resources()
             runner = {
@@ -1058,55 +1075,126 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as c:
                 "GF-REGIONAL-CAP-004": self.case_004,
             }[self.case_id]
             result = runner()
-            case = {
-                "schema_version": 2,
-                "report_type": "fault-acceptance",
-                "case_id": self.case_id,
-                "verdict": "PASS",
-                "executed_at": utc_now(),
-                "checks": result,
-                "predecessor": self.predecessor,
-                "limitations": [
-                    "The load is generated against disposable control-plane "
-                    "Deployments and isolated databases in the selected CPU EKS; "
-                    "it does not establish a fleet-wide production SLO."
-                ],
-            }
-            self.case_results.append(case)
-            write_json(self.run_dir / f"{self.case_id}.json", case)
-            print(f"{self.case_id}: PASS", flush=True)
         except BaseException as exc:
-            write_json(
-                self.run_dir / "phase-partial-summary.json",
-                {
-                    "status": "FAIL",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "cases": self.case_results,
-                },
-            )
+            error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            if self.active_probe is not None:
-                try:
-                    self.cleanup_probe(self.active_probe)
-                except Exception:
-                    pass
-            self.cleanup_common()
-            after = self.production_baseline()
+            cleanup_errors = self.cleanup_all()
+            after: dict[str, Any] | None = None
+            try:
+                after = self.production_baseline()
+            except Exception as exc:  # noqa: BLE001 - recorded, must not mask
+                cleanup_errors.append(
+                    f"production baseline after run: {type(exc).__name__}: {exc}"
+                )
+            production_unchanged = after is not None and before == after
             write_json(self.run_dir / "production-after.json", after)
             write_json(
                 self.run_dir / "production-unchanged.json",
-                {"unchanged": before == after},
+                {"unchanged": production_unchanged},
             )
-        if before != after:
+            verdict = self.verdict(
+                result=result,
+                error=error,
+                cleanup_errors=cleanup_errors,
+                production_unchanged=production_unchanged,
+            )
+            case = self.case_document(
+                verdict,
+                checks=result or {},
+                error=error,
+                cleanup_errors=cleanup_errors,
+                production_unchanged=production_unchanged,
+            )
+            self.case_results.append(case)
+            write_json(case_path, case)
+            write_json(
+                self.run_dir / "phase-partial-summary.json",
+                {
+                    "status": verdict,
+                    "error": error,
+                    "cleanup_errors": cleanup_errors,
+                    "cases": self.case_results,
+                },
+            )
+            print(f"{self.case_id}: {verdict}", flush=True)
+        if cleanup_errors:
+            raise CapError("capacity run cleanup failed: " + "; ".join(cleanup_errors))
+        if not production_unchanged:
             raise CapError(
                 "production control-plane baseline changed during capacity run"
             )
-        write_json(
-            self.run_dir / "phase-partial-summary.json",
-            {"status": "PASS", "cases": self.case_results},
-        )
         return 0
+
+    @staticmethod
+    def verdict(
+        *,
+        result: dict[str, Any] | None,
+        error: str | None,
+        cleanup_errors: list[str],
+        production_unchanged: bool,
+    ) -> str:
+        """PASS only when the case passed *and* it left nothing behind."""
+
+        if result is None or error is not None:
+            return "FAIL"
+        if cleanup_errors or not production_unchanged:
+            return "FAIL"
+        return "PASS"
+
+    def case_document(
+        self,
+        verdict: str,
+        *,
+        checks: dict[str, Any],
+        error: str | None = None,
+        cleanup_errors: list[str] | None = None,
+        production_unchanged: bool | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 2,
+            "report_type": "fault-acceptance",
+            "case_id": self.case_id,
+            "verdict": verdict,
+            "executed_at": utc_now(),
+            "checks": checks,
+            "error": error,
+            "cleanup_errors": list(cleanup_errors or []),
+            "production_unchanged": production_unchanged,
+            "predecessor": self.predecessor,
+            "limitations": CASE_LIMITATIONS,
+        }
+
+    def cleanup_all(self) -> list[str]:
+        """Remove every probe resource; return the failures instead of hiding them.
+
+        A probe Deployment or database that survives the run is a defect of
+        the run, so each failure is recorded and the verdict becomes FAIL.
+        """
+
+        errors: list[str] = []
+        if self.active_probe is not None:
+            probe = self.active_probe
+            try:
+                cleanup = self.cleanup_probe(probe)
+                write_json(
+                    self.run_dir / f"{probe.case.lower()}-cleanup-on-exit.json",
+                    cleanup,
+                )
+                if cleanup.get("residual_probe_pods"):
+                    errors.append(
+                        "probe Pods remain after cleanup: "
+                        f"{cleanup['residual_probe_pods']}"
+                    )
+            except Exception as exc:  # noqa: BLE001 - recorded, verdict FAIL
+                errors.append(
+                    f"probe cleanup {probe.deployment}: {type(exc).__name__}: {exc}"
+                )
+        try:
+            self.cleanup_common()
+        except Exception as exc:  # noqa: BLE001 - recorded, verdict FAIL
+            errors.append(f"common resource cleanup: {type(exc).__name__}: {exc}")
+        return errors
 
     def case_001(self) -> dict[str, Any]:
         raise NotImplementedError

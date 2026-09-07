@@ -4,147 +4,77 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-
-if __package__:
-    from .acceptance_runner_common import write_json_atomic
-    from .host_probe_fixture import (
-        HostProbeFixture,
-        HostProbeSettings,
-    )
-    from .live_driver_guard import (
-        CaseRunner,
-        add_live_arguments,
-        run_standard_case,
-    )
-    from .regional_live_fixture import run_case_main
-else:
-    from acceptance_runner_common import write_json_atomic
-    from host_probe_fixture import HostProbeFixture, HostProbeSettings
-    from live_driver_guard import (
-        CaseRunner,
-        add_live_arguments,
-        run_standard_case,
-    )
-    from regional_live_fixture import run_case_main
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    write_json_atomic,
+)
+from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
+    HostProbeFixture,
+    HostProbeSettings,
+)
+from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
+    CaseRunner,
+    add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
+    run_standard_case,
+)
+from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    RegionalFixtureError,
+    RegionalLiveFixture,
+    RegionalLiveSettings,
+    required,
+    run_case_main,
+    settings_from_arguments,
+)
+
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "node_host_probe.py"
 CASE_ID = "GF-REGIONAL-DESTR-010"
 CONFIRMATION = "DESTR010_RESTART_FABRIC_MANAGER"
-SYSTEM_NAMESPACES = {
-    "aws-hyperpod",
-    "cert-manager",
-    "gpu-fault-system",
-    "hyperpod-inference-system",
-    "kube-system",
-    "kubeflow",
-}
 FORBIDDEN_OPERATIONS = {
     "MARK_UNSCHEDULABLE",
     "QUARANTINE",
     "QUIESCE_GPU_SERVICES",
     "RESTORE_GPU_SERVICES",
 }
-PROVIDER_MUTATIONS = {
-    "BatchReplaceClusterNodes",
-    "BatchRebootClusterNodes",
-    "ReplaceClusterNodes",
-    "RebootClusterNodes",
-}
-
-
-class CaseError(RuntimeError):
-    pass
+EXPECTED_STEPS = ["FREEZE_EVIDENCE", "RESTART_FABRIC_MANAGER"]
+EXPECTED_OWNERS = ["gpu-fault-control-plane", "gpu-fault-node-agent"]
+# The Node fields a Fabric Manager restart must leave alone. `ready` is judged
+# on its own: a node that flickers NotReady and returns is a different finding
+# from one whose cordon/taint/ownership state changed.
+NODE_STATE_FIELDS = ("unschedulable", "taints", "ownership_annotations")
 
 
 @dataclass(frozen=True)
 class Settings:
-    cpu_kubeconfig: Path
-    gpu_kubeconfig: Path
-    gpu_context: str
-    namespace: str
-    cluster_id: str
+    regional: RegionalLiveSettings
     node: str
-    region: str
     host_probe_image: str
 
     def environment(self) -> dict[str, str]:
         return {
-            "CPU_KUBECONFIG": str(self.cpu_kubeconfig),
-            "GPU_KUBECONFIG": str(self.gpu_kubeconfig),
-            "GPU_EKS_CONTEXT": self.gpu_context,
-            "GPU_FAULT_NAMESPACE": self.namespace,
-            "GPU_FAULT_CLUSTER_ID": self.cluster_id,
+            **self.regional.environment(),
             "GPU_FAULT_TARGET_NODE": self.node,
-            "AWS_REGION": self.region,
             "GPU_FAULT_HOST_PROBE_IMAGE": self.host_probe_image,
         }
 
 
-def required(value: str, label: str) -> str:
-    result = value.strip()
-    if not result:
-        raise CaseError(f"{label} is required")
-    return result
-
-
 def configure(arguments: argparse.Namespace) -> Settings:
-    cpu = (
-        Path(
-            required(
-                arguments.cpu_kubeconfig
-                or os.getenv("GPU_FAULT_CONTROL_KUBECONFIG", "")
-                or os.getenv("CPU_KUBECONFIG", ""),
-                "CPU kubeconfig",
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
-    gpu = (
-        Path(
-            required(
-                arguments.gpu_kubeconfig
-                or os.getenv("GPU_KUBECONFIG", "")
-                or os.getenv("KUBECONFIG", ""),
-                "GPU kubeconfig",
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
-    if not cpu.is_file() or not gpu.is_file():
-        raise CaseError("configured CPU/GPU kubeconfig does not exist")
     return Settings(
-        cpu_kubeconfig=cpu,
-        gpu_kubeconfig=gpu,
-        gpu_context=required(
-            arguments.gpu_context
-            or os.getenv("GPU_EKS_CONTEXT", "")
-            or os.getenv("GPU_FAULT_DATAPLANE_CONTEXT", ""),
-            "GPU context",
-        ),
-        namespace=required(arguments.namespace, "namespace"),
-        cluster_id=required(
-            arguments.cluster_id or os.getenv("GPU_FAULT_CLUSTER_ID", ""),
-            "cluster ID",
-        ),
+        regional=settings_from_arguments(arguments),
         node=required(
             arguments.node or os.getenv("GPU_FAULT_TARGET_NODE", ""),
             "target node",
-        ),
-        region=required(
-            arguments.region
-            or os.getenv("AWS_REGION", "")
-            or os.getenv("AWS_DEFAULT_REGION", ""),
-            "AWS Region",
         ),
         host_probe_image=required(
             arguments.host_probe_image or os.getenv("GPU_FAULT_HOST_PROBE_IMAGE", ""),
@@ -153,224 +83,51 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
 
 
-def run(
-    command: list[str],
-    *,
-    input_text: str | None = None,
-    check: bool = True,
-    timeout: int = 300,
-) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-    )
-    if check and completed.returncode:
-        raise CaseError(
-            f"command failed ({completed.returncode}): {' '.join(command)}; "
-            f"stderr={completed.stderr.strip()}"
-        )
-    return completed
-
-
-def kubectl(
-    settings: Settings,
-    plane: str,
-    *arguments: str,
-    input_text: str | None = None,
-    check: bool = True,
-    timeout: int = 300,
-) -> str:
-    command = ["kubectl", "--kubeconfig"]
-    if plane == "cpu":
-        command.extend([str(settings.cpu_kubeconfig), "-n", settings.namespace])
-    else:
-        command.extend(
-            [
-                str(settings.gpu_kubeconfig),
-                "--context",
-                settings.gpu_context,
-                "-n",
-                settings.namespace,
-            ]
-        )
-    command.extend(arguments)
-    return run(
-        command,
-        input_text=input_text,
-        check=check,
-        timeout=timeout,
-    ).stdout
-
-
-def ready_pod(settings: Settings, plane: str, app: str) -> str:
-    payload = json.loads(
-        kubectl(
-            settings,
-            plane,
-            "get",
-            "pod",
-            "-l",
-            f"app={app}",
-            "-o",
-            "json",
-        )
-    )
-    names = sorted(
-        str(item["metadata"]["name"])
-        for item in payload.get("items", [])
-        if item.get("status", {}).get("phase") == "Running"
-        and item.get("status", {}).get("containerStatuses")
-        and all(
-            bool(status.get("ready"))
-            for status in item.get("status", {}).get("containerStatuses", [])
-        )
-    )
-    if not names:
-        raise CaseError(f"no Ready {plane} Pod for app={app}")
-    return names[0]
-
-
-def cpu_python(settings: Settings, script: str, *arguments: str) -> dict[str, Any]:
-    last_error: Exception | None = None
-    for _attempt in range(3):
-        try:
-            output = kubectl(
-                settings,
-                "cpu",
-                "exec",
-                "-i",
-                ready_pod(settings, "cpu", "gpu-fault-api-ha"),
-                "--",
-                "python3",
-                "-",
-                *arguments,
-                input_text=script,
-                timeout=120,
-            )
-            return json.loads(output.splitlines()[-1])
-        except Exception as exc:
-            last_error = exc
-            time.sleep(1)
-    raise CaseError(f"CPU store probe failed: {last_error}")
-
-
-STORE_PROBE = r"""
+# What the shared STORE_PROBE does not carry and this case needs: the policy's
+# companion window, the node's XID events inside it, its active workflow
+# incidents, and -- at the terminal read only -- the raw NVIDIA kernel evidence
+# that names the marker. The evidence scan pages through up to 1000 records,
+# which is why it is not part of the per-5s wait loop.
+FABRIC_PROBE = r"""
 import json
-import os
 import sys
 from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.models import WorkflowStatus
 from gpu_fault.policy import load_xid_policy
 from gpu_fault.telemetry import EvidenceKind
 
-cluster_id, node_id, marker, observed_after_text = sys.argv[1:]
+cluster_id, node_id, marker, include_evidence = sys.argv[1:]
 store = ApplicationContext.from_environment().store
 now = datetime.now(timezone.utc)
-observed_after = (
-    datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
-    if observed_after_text
-    else None
-)
-agent = store.get_agent(cluster_id, node_id)
-profile = store.get_profile(agent.runtime_profile_version)
-capability = next(
-    (
-        item.model_dump(mode="json")
-        for item in profile.capabilities
-        if item.capability.value == "fabricManagerRestart"
-    ),
-    None,
-)
 window = int(load_xid_policy().companion_window_seconds)
 recent = store.list_xid_events(
     cluster_id,
     node_id,
     observed_after=now - timedelta(seconds=window),
 )
-events = store.list_xid_events(
-    cluster_id,
-    node_id,
-    observed_after=observed_after,
-) if observed_after is not None else []
-matching_events = [
-    item for item in events
-    if marker and marker in str(item.raw_message or "")
-]
-evidence = store.list_raw_evidence(
-    cluster_id,
-    node_id=node_id,
-    kind=EvidenceKind.NVIDIA_KERNEL,
-    limit=1000,
-)
-matching_evidence = [
-    item for item in evidence
-    if marker and marker in json.dumps(item.payload, sort_keys=True, default=str)
-]
-event = matching_events[-1] if matching_events else None
-decision = store.get_xid_policy_decision(event.event_id) if event is not None else None
-incident = store.get_incident_by_event(event.event_id) if event is not None else None
-workflow = (
-    store.get_workflow(incident.workflow_request_id)
-    if incident is not None and incident.workflow_request_id
-    else None
-)
-commands = [
-    item for item in store.list_remote_commands()
-    if workflow is not None and item.workflow_request_id == workflow.request_id
-]
-notifications = []
-if incident is not None:
-    for item in store.list_notifications():
-        if item.incident_id != incident.incident_id:
-            continue
-        result = store.get_notification_result(item.notification_id)
-        notifications.append({
-            "notification_id": item.notification_id,
-            "category": item.category,
-            "subject": item.subject,
-            "status": result.status.value if result is not None else None,
-            "provider_message_id_present": bool(
-                result is not None and result.provider_message_id
-            ),
-        })
 active = store.list_active_workflow_incidents(
     cluster_id,
     node_ids={node_id},
 )
+evidence = []
+if include_evidence and marker:
+    evidence = [
+        {
+            "record_id": item.record_id,
+            "observed_at": item.observed_at.isoformat(),
+            "payload": item.payload,
+        }
+        for item in store.list_raw_evidence(
+            cluster_id,
+            node_id=node_id,
+            kind=EvidenceKind.NVIDIA_KERNEL,
+            limit=1000,
+        )
+        if marker in json.dumps(item.payload, sort_keys=True, default=str)
+    ]
 print(json.dumps({
-    "release_id": os.getenv("GPU_FAULT_RELEASE_ID"),
     "companion_window_seconds": window,
-    "agent": {
-        "lifecycle_state": agent.lifecycle_state.value,
-        "lease_expires_at": (
-            agent.lease_expires_at.isoformat()
-            if agent.lease_expires_at is not None else None
-        ),
-        "generation": agent.generation,
-        "agent_version": agent.agent_version,
-        "artifact_sha256": agent.artifact_sha256,
-        "compatibility_digest": (
-            agent.compatibility_digest or agent.artifact_sha256
-        ),
-        "runtime_profile_version": agent.runtime_profile_version,
-        "config_digest": agent.config_digest,
-        "node_action_key_version": agent.node_action_key_version,
-        "allowed_operations": [
-            item.value for item in agent.allowed_operations
-        ],
-    },
-    "profile": {
-        "version": profile.profile_version,
-        "warnings": profile.warnings,
-        "fabric_manager_restart": capability,
-    },
     "recent_xid_events": [
         {
             "event_id": item.event_id,
@@ -388,122 +145,76 @@ print(json.dumps({
         }
         for incident_item, workflow_item in active
     ],
-    "queue": store.processor_queue_stats(),
-    "remote_commands": store.remote_command_stats(),
-    "event": event.model_dump(mode="json") if event is not None else None,
-    "decision": (
-        decision.model_dump(mode="json") if decision is not None else None
-    ),
-    "incident": (
-        incident.model_dump(mode="json") if incident is not None else None
-    ),
-    "workflow": (
-        workflow.model_dump(mode="json") if workflow is not None else None
-    ),
-    "commands": [item.model_dump(mode="json") for item in commands],
-    "notifications": notifications,
-    "evidence": [
-        {
-            "record_id": item.record_id,
-            "observed_at": item.observed_at.isoformat(),
-            "payload": item.payload,
-        }
-        for item in matching_evidence
-    ],
+    "evidence": evidence,
 }, sort_keys=True, default=str))
 """
 
 
-def store_probe(
-    settings: Settings,
+def fabric_probe(
+    regional: RegionalLiveFixture,
+    node: str,
     *,
     marker: str = "",
-    observed_after: datetime | None = None,
+    include_evidence: bool = False,
 ) -> dict[str, Any]:
-    return cpu_python(
-        settings,
-        STORE_PROBE,
-        settings.cluster_id,
-        settings.node,
+    return regional.cpu_python(
+        FABRIC_PROBE,
+        regional.settings.cluster_id,
+        node,
         marker,
-        observed_after.isoformat() if observed_after is not None else "",
+        "1" if include_evidence else "",
     )
 
 
-def node_snapshot(settings: Settings) -> dict[str, Any]:
-    value = json.loads(
-        kubectl(settings, "gpu", "get", "node", settings.node, "-o", "json")
-    )
-    annotations = value["metadata"].get("annotations", {})
-    return {
-        "name": value["metadata"]["name"],
-        "uid": value["metadata"]["uid"],
-        "ready": next(
-            (
-                condition["status"]
-                for condition in value["status"].get("conditions", [])
-                if condition["type"] == "Ready"
-            ),
-            None,
-        ),
-        "unschedulable": value["spec"].get("unschedulable", False),
-        "taints": value["spec"].get("taints", []),
-        "gpu_allocatable": value["status"].get("allocatable", {}).get("nvidia.com/gpu"),
-        "ownership_annotations": {
-            key: value
-            for key, value in annotations.items()
-            if key.startswith("gpu-fault.io/")
-            and not key.startswith("gpu-fault.io/installer-")
-        },
-    }
+def capability(profile: dict[str, Any] | None, name: str) -> dict[str, Any] | None:
+    for item in (profile or {}).get("capabilities", []):
+        if isinstance(item, dict) and item.get("capability") == name:
+            return cast(dict[str, Any], item)
+    return None
 
 
-def business_workloads(settings: Settings) -> list[dict[str, str]]:
-    value = json.loads(
-        run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(settings.gpu_kubeconfig),
-                "--context",
-                settings.gpu_context,
-                "get",
-                "pod",
-                "-A",
-                "--field-selector",
-                f"spec.nodeName={settings.node},status.phase=Running",
-                "-o",
-                "json",
-            ]
-        ).stdout
-    )
-    return [
-        {
-            "namespace": str(item["metadata"].get("namespace", "")),
-            "name": str(item["metadata"].get("name", "")),
-        }
-        for item in value.get("items", [])
-        if item["metadata"].get("namespace") not in SYSTEM_NAMESPACES
-    ]
+def normalize_notifications(items: list[Any]) -> list[dict[str, Any]]:
+    """One notification shape for the verdict, whichever probe produced it.
+
+    The shared STORE_PROBE returns ``{"notification": {...}, "result": {...}}``
+    pairs; the flat ``{"notification_id", "category", "subject", "status"}``
+    shape is what this case recorded before it moved onto the shared fixture.
+    """
+
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "notification" in item:
+            notification = item.get("notification") or {}
+            delivery = item.get("result") or {}
+            result.append(
+                {
+                    "notification_id": notification.get("notification_id"),
+                    "category": notification.get("category"),
+                    "subject": notification.get("subject"),
+                    "status": delivery.get("status") if delivery else None,
+                    "provider_message_id_present": bool(
+                        delivery and delivery.get("provider_message_id")
+                    ),
+                }
+            )
+        else:
+            result.append(dict(item))
+    return result
 
 
-def release_id(settings: Settings) -> str:
-    value = json.loads(
-        kubectl(
-            settings,
-            "cpu",
-            "get",
-            "configmap",
-            "gpu-fault-regional-release-state",
-            "-o",
-            "json",
-        )
-    )
-    state = json.loads(value["data"]["state.json"])
-    return str(state.get("release_id") or "")
+def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
+    """Run the focused pytest, or reuse the plan's result in ``--execute``.
 
+    ``reuse`` consults ``reusable_focused_tests`` on the plan this case wrote:
+    a passing result recorded against the same source digest is not re-run.
+    """
 
-def focused_tests(case_dir: Path) -> dict[str, Any]:
+    if reuse:
+        recorded = reusable_focused_tests(case_dir / "plan.json")
+        if recorded is not None:
+            return {**recorded, "focused_tests_reused": True}
     command = [
         sys.executable,
         "-m",
@@ -518,7 +229,12 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
         "tests/policy/_policy_cases_2.py::"
         "test_xid_45_and_48_workflow_branches_are_exact",
     ]
-    completed = run(command, check=False, timeout=300)
+    completed = RegionalLiveFixture.run(
+        command,
+        cwd=ROOT,
+        check=False,
+        timeout=300,
+    )
     path = case_dir / "focused-tests.log"
     path.write_text(completed.stdout + completed.stderr, encoding="utf-8")
     path.chmod(0o600)
@@ -530,8 +246,8 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
 
 
 def validate_preflight(
-    settings: Settings,
     state: dict[str, Any],
+    fabric: dict[str, Any],
     node: dict[str, Any],
     workloads: list[dict[str, str]],
 ) -> list[str]:
@@ -544,47 +260,59 @@ def validate_preflight(
         errors.append("target node has taints")
     if workloads:
         errors.append("target node has non-system running Pods")
-    agent = state["agent"]
-    if agent["lifecycle_state"] != "ACTIVE":
+    agent = state.get("agent") or {}
+    if agent.get("lifecycle_state") != "ACTIVE":
         errors.append("target Node Agent is not ACTIVE")
-    if "RESTART_FABRIC_MANAGER" not in agent["allowed_operations"]:
+    if "RESTART_FABRIC_MANAGER" not in (agent.get("allowed_operations") or []):
         errors.append("target Node Agent does not allow RESTART_FABRIC_MANAGER")
-    capability = state["profile"]["fabric_manager_restart"]
-    if capability is None:
+    profile = state.get("profile") or {}
+    restart = capability(profile, "fabricManagerRestart")
+    if restart is None:
         errors.append("runtime profile has no fabricManagerRestart capability")
     elif (
-        capability.get("mode") != "OWN"
-        or capability.get("owner") != "gpu-fault-node-agent"
-        or capability.get("adapter") != "node-action"
+        restart.get("mode") != "OWN"
+        or restart.get("owner") != "gpu-fault-node-agent"
+        or restart.get("adapter") != "node-action"
     ):
         errors.append("fabricManagerRestart is not OWN by the Node Agent")
-    if state["profile"]["warnings"]:
+    if profile.get("warnings"):
         errors.append("runtime profile has warnings")
-    if state["active_workflow_incidents"]:
+    if fabric.get("active_workflow_incidents"):
         errors.append("target node already has an active workflow")
-    if state["recent_xid_events"]:
+    if fabric.get("recent_xid_events"):
         errors.append("target node has XID events inside the companion window")
-    if int(state["queue"].get("depth") or 0):
+    if int((state.get("queue") or {}).get("depth") or 0):
         errors.append("processor queue is not empty")
-    open_commands = state["remote_commands"].get("open_by_cluster") or {}
-    if open_commands:
+    if (state.get("remote_commands") or {}).get("open_by_cluster"):
         errors.append("remote command queue is not empty")
     return errors
 
 
-def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
-    state = store_probe(settings)
-    node = node_snapshot(settings)
-    workloads = business_workloads(settings)
-    tests = focused_tests(case_dir)
-    errors = validate_preflight(settings, state, node, workloads)
+def read_only_preflight(
+    settings: Settings,
+    case_dir: Path,
+    *,
+    reuse_focused_tests: bool = False,
+) -> dict[str, Any]:
+    regional = RegionalLiveFixture(settings.regional)
+    identity = regional.evidence_identity()
+    # The default drained queue read is the gate a preflight wants; the wait
+    # loops below take the single sample.
+    state = regional.store_snapshot(node=settings.node)
+    fabric = fabric_probe(regional, settings.node)
+    node = regional.node_snapshot(settings.node)
+    workloads = regional.business_workloads(settings.node)
+    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
+    errors = validate_preflight(state, fabric, node, workloads)
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     result = {
-        "release_id": release_id(settings),
+        "release_id": state.get("release_id"),
+        "evidence_identity": identity,
         "node": node,
         "business_workloads": workloads,
         "store": state,
+        "fabric": fabric,
         "focused_tests": tests,
         "errors": errors,
     }
@@ -601,7 +329,7 @@ def workflow_errors(state: dict[str, Any]) -> list[str]:
     evidence = state.get("evidence") or []
     notifications = [
         item
-        for item in state.get("notifications") or []
+        for item in normalize_notifications(state.get("notifications") or [])
         if item.get("category") == "ACTION_COMPLETED"
         and "Fabric Manager" in str(item.get("subject") or "")
     ]
@@ -616,12 +344,12 @@ def workflow_errors(state: dict[str, Any]) -> list[str]:
     official_steps = [
         item.get("operation") for item in workflow.get("official_steps", [])
     ]
-    if official_steps != ["FREEZE_EVIDENCE", "RESTART_FABRIC_MANAGER"]:
+    if official_steps != EXPECTED_STEPS:
         errors.append("workflow official steps differ from the two-step contract")
     owners = [
         item.get("execution_owner") for item in workflow.get("official_steps", [])
     ]
-    if owners != ["gpu-fault-control-plane", "gpu-fault-node-agent"]:
+    if owners != EXPECTED_OWNERS:
         errors.append("workflow execution owners differ from the contract")
     completed = set(workflow.get("completed_operations") or [])
     if completed.intersection(FORBIDDEN_OPERATIONS):
@@ -639,39 +367,29 @@ def workflow_errors(state: dict[str, Any]) -> list[str]:
     return errors
 
 
-def wait_for_workflow(
-    settings: Settings,
-    marker: str,
-    observed_after: datetime,
-    timeout_seconds: int,
-    case_dir: Path,
-) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_seconds
-    last: dict[str, Any] = {}
-    timeline = []
-    while time.monotonic() < deadline:
-        last = store_probe(
-            settings,
-            marker=marker,
-            observed_after=observed_after,
-        )
-        workflow = last.get("workflow") or {}
-        timeline.append(
-            {
-                "observed_at": datetime.now(timezone.utc).isoformat(),
-                "event_id": (last.get("event") or {}).get("event_id"),
-                "decision": (last.get("decision") or {}).get("disposition"),
-                "workflow_status": workflow.get("status"),
-                "command_statuses": [
-                    item.get("status") for item in last.get("commands") or []
-                ],
-            }
-        )
-        write_json_atomic(case_dir / "timeline.json", {"entries": timeline})
-        if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED"}:
-            return last
-        time.sleep(5)
-    raise CaseError(f"DESTR-010 workflow did not reach a terminal state: {last}")
+def node_state_errors(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    stage: str,
+) -> list[str]:
+    """Scheduling state must equal the baseline; readiness is its own finding.
+
+    Comparing whole snapshots also compared ``ready``, ``boot_id`` and the
+    installer annotations, so a Ready condition heartbeat or an unrelated
+    annotation rewrite reported as "node state drifted" with no way to tell
+    it from a cordon the case must never apply.
+    """
+
+    errors = []
+    for field in NODE_STATE_FIELDS:
+        if baseline.get(field) != current.get(field):
+            errors.append(f"{stage}: target node {field} differs from baseline")
+    if current.get("uid") != baseline.get("uid"):
+        errors.append(f"{stage}: target node UID changed")
+    if current.get("ready") != "True":
+        errors.append(f"{stage}: target node is not Ready")
+    return errors
 
 
 REPLAY_SCRIPT = r"""
@@ -682,7 +400,7 @@ from gpu_fault.cluster_executor import executor_from_environment
 from gpu_fault.execution import WorkflowStepContext
 from gpu_fault.regional import RemoteActionCommand
 
-command = RemoteActionCommand.model_validate(json.load(sys.stdin))
+command = RemoteActionCommand.model_validate(json.loads(sys.argv[1]))
 executor = executor_from_environment()
 adapter = next(
     item for item in executor.adapters
@@ -707,59 +425,36 @@ print(json.dumps({
 """
 
 
-def replay_command(settings: Settings, command: dict[str, Any]) -> dict[str, Any]:
-    encoded = json.dumps(command, sort_keys=True)
-    script = REPLAY_SCRIPT.replace(
-        "command = RemoteActionCommand.model_validate(json.load(sys.stdin))",
-        f"command = RemoteActionCommand.model_validate(json.loads({encoded!r}))",
-    )
-    output = kubectl(
-        settings,
-        "gpu",
-        "exec",
-        "-i",
-        ready_pod(settings, "gpu", "gpu-fault-cluster-executor"),
-        "--",
-        "python3",
-        "-",
-        input_text=script,
+def replayable_command(command: dict[str, Any]) -> dict[str, Any]:
+    """The remote command as ``RemoteActionCommand`` will accept it.
+
+    The store probe redacts the lease token into a digest and a length; the
+    model forbids unknown fields, and the replay does not present a lease --
+    it runs the adapter directly against the Node Agent, whose ledger is the
+    idempotency proof -- so the token is simply absent.
+    """
+
+    value = {
+        key: item
+        for key, item in command.items()
+        if key not in {"lease_token_sha256", "lease_token_length"}
+    }
+    value["lease_token"] = None
+    return value
+
+
+def replay_command(
+    regional: RegionalLiveFixture,
+    command: dict[str, Any],
+) -> dict[str, Any]:
+    # One attempt: the replay is expected to be a no-op on the Node Agent's
+    # ledger, but that is the fact under test, not a premise to retry on.
+    return regional.executor_python(
+        REPLAY_SCRIPT,
+        json.dumps(replayable_command(command), sort_keys=True),
         timeout=180,
+        attempts=1,
     )
-    return json.loads(output.splitlines()[-1])
-
-
-def provider_events(
-    settings: Settings,
-    started_at: datetime,
-    ended_at: datetime,
-) -> list[dict[str, str]]:
-    value = json.loads(
-        run(
-            [
-                "aws",
-                "cloudtrail",
-                "lookup-events",
-                "--region",
-                settings.region,
-                "--start-time",
-                started_at.isoformat(),
-                "--end-time",
-                ended_at.isoformat(),
-                "--lookup-attributes",
-                "AttributeKey=EventSource,AttributeValue=sagemaker.amazonaws.com",
-                "--output",
-                "json",
-            ]
-        ).stdout
-    )
-    return [
-        {
-            "event_name": str(item.get("EventName")),
-            "event_time": str(item.get("EventTime")),
-        }
-        for item in value.get("Events", [])
-        if item.get("EventName") in PROVIDER_MUTATIONS
-    ]
 
 
 def host_errors(
@@ -793,6 +488,16 @@ def host_errors(
     return errors
 
 
+def preflight_identity(preflight: dict[str, Any]) -> dict[str, Any]:
+    store = preflight["store"]
+    return {
+        "release_id": preflight["release_id"],
+        "node_uid": preflight["node"]["uid"],
+        "agent_generation": (store.get("agent") or {}).get("generation"),
+        "runtime_profile_version": (store.get("profile") or {}).get("profile_version"),
+    }
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -801,27 +506,25 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
     if preflight["errors"]:
-        raise CaseError("preflight failed: " + "; ".join(preflight["errors"]))
+        raise RegionalFixtureError(
+            "preflight failed: " + "; ".join(preflight["errors"])
+        )
     plan = json.loads((case_dir / "plan.json").read_text(encoding="utf-8"))
     planned = plan["details"]["preflight_identity"]
-    current = {
-        "release_id": preflight["release_id"],
-        "node_uid": preflight["node"]["uid"],
-        "agent_generation": preflight["store"]["agent"]["generation"],
-        "runtime_profile_version": preflight["store"]["profile"]["version"],
-    }
+    current = preflight_identity(preflight)
     if current != planned:
-        raise CaseError(f"DESTR-010 plan drifted: {planned} != {current}")
+        raise RegionalFixtureError(f"DESTR-010 plan drifted: {planned} != {current}")
 
+    regional = RegionalLiveFixture(settings.regional)
     run_id = f"destr010-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     marker = f"destr010-{int(time.time())}-a{attempt}"
     fixture = HostProbeFixture(
         HostProbeSettings(
-            kubeconfig=settings.gpu_kubeconfig,
-            context=settings.gpu_context,
-            namespace=settings.namespace,
+            kubeconfig=settings.regional.gpu_kubeconfig,
+            context=settings.regional.gpu_context,
+            namespace=settings.regional.namespace,
             node=settings.node,
             image=settings.host_probe_image,
             case_id=CASE_ID,
@@ -833,9 +536,12 @@ def execute_case(
         "case_id": CASE_ID,
         "attempt": attempt,
         "verdict": "FAIL",
-        "release_id": preflight["release_id"],
+        **preflight["evidence_identity"],
         "node": settings.node,
         "maintenance_window_end": maintenance_window_end.isoformat(),
+        "focused_tests_reused": bool(
+            preflight["focused_tests"].get("focused_tests_reused")
+        ),
     }
     baseline_node = preflight["node"]
     baseline_host: dict[str, Any] | None = None
@@ -845,13 +551,15 @@ def execute_case(
         baseline_host = fixture.execute("snapshot")
         write_json_atomic(case_dir / "host-baseline.json", baseline_host)
         if not baseline_host["kmsg_writable"]:
-            raise CaseError("/dev/kmsg is not writable from the host probe")
+            raise RegionalFixtureError("/dev/kmsg is not writable from the host probe")
         if baseline_host["compute_clients"]:
-            raise CaseError("target node has active NVIDIA compute clients")
+            raise RegionalFixtureError("target node has active NVIDIA compute clients")
         if baseline_host["fabric_manager"].get("ActiveState") != "active":
-            raise CaseError("Fabric Manager is not active at baseline")
+            raise RegionalFixtureError("Fabric Manager is not active at baseline")
         if datetime.now(timezone.utc) >= maintenance_window_end:
-            raise CaseError("approved maintenance window ended before injection")
+            raise RegionalFixtureError(
+                "approved maintenance window ended before injection"
+            )
 
         injected_at = datetime.now(timezone.utc)
         injection = fixture.execute(
@@ -864,18 +572,33 @@ def execute_case(
             baseline_host["gpu_pci_bdf"],
         )
         write_json_atomic(case_dir / "injection.json", injection)
-        timeout = int(preflight["store"]["companion_window_seconds"]) + 300
-        state = wait_for_workflow(
-            settings,
-            marker,
-            injected_at,
-            timeout,
-            case_dir,
+        timeout = int(preflight["fabric"]["companion_window_seconds"]) + 300
+        # The shared wait: one cheap store read per 5s, commands filtered to
+        # the marker's workflow, notifications to its incident, no raw
+        # evidence scan. The evidence scan happens once, at the terminal read.
+        state = regional.wait_for_workflow(
+            node=settings.node,
+            marker=marker,
+            observed_after=injected_at,
+            case_dir=case_dir,
+            timeout_seconds=timeout,
         )
+        terminal_fabric = fabric_probe(
+            regional,
+            settings.node,
+            marker=marker,
+            include_evidence=True,
+        )
+        state = {
+            **state,
+            "evidence": terminal_fabric.get("evidence") or [],
+            "notifications": normalize_notifications(state.get("notifications") or []),
+        }
         write_json_atomic(case_dir / "workflow-state.json", state)
         errors = workflow_errors(state)
-        command = state["commands"][0] if state["commands"] else {}
-        generation = int(state["agent"]["generation"])
+        workflow_request_id = str((state.get("workflow") or {}).get("request_id") or "")
+        command = state["commands"][0] if state.get("commands") else {}
+        generation = int((state.get("agent") or {}).get("generation") or 0)
         expected_command_id = (
             f"{command.get('idempotency_key')}/{settings.node}/agent-{generation}"
         )
@@ -889,26 +612,31 @@ def execute_case(
         if expected_command_id not in ledger_ids:
             errors.append("expected Node Agent command ID is absent from the ledger")
 
-        replay = {}
+        replay: dict[str, Any] = {}
         if not errors:
-            replay = replay_command(settings, command)
+            replay = replay_command(regional, command)
             write_json_atomic(case_dir / "replay.json", replay)
             if replay.get("status") != "SUCCEEDED":
                 errors.append("isolated Node Agent replay did not return SUCCEEDED")
-        after_replay_state = store_probe(
-            settings,
+        after_replay_state = regional.store_snapshot(
+            node=settings.node,
             marker=marker,
             observed_after=injected_at,
+            queue_attempts=1,
+            workflow_request_ids=[workflow_request_id] if workflow_request_id else None,
+        )
+        after_replay_state["notifications"] = normalize_notifications(
+            after_replay_state.get("notifications") or []
         )
         write_json_atomic(
             case_dir / "store-after-replay.json",
             after_replay_state,
         )
         first_notification_ids = {
-            item["notification_id"] for item in state.get("notifications") or []
+            item.get("notification_id") for item in state.get("notifications") or []
         }
         replay_notification_ids = {
-            item["notification_id"]
+            item.get("notification_id")
             for item in after_replay_state.get("notifications") or []
         }
         if replay_notification_ids != first_notification_ids:
@@ -927,14 +655,22 @@ def execute_case(
                 expected_command_id,
             )
         )
-        post_node = node_snapshot(settings)
+        post_node = regional.node_snapshot(settings.node)
         write_json_atomic(case_dir / "node-postflight.json", post_node)
-        if post_node != baseline_node:
-            errors.append("target Kubernetes Node state drifted")
-        if business_workloads(settings):
+        errors.extend(node_state_errors(baseline_node, post_node, stage="postflight"))
+        if regional.business_workloads(settings.node):
             errors.append("target node acquired a non-system workload")
-        events = provider_events(settings, injected_at, datetime.now(timezone.utc))
-        write_json_atomic(case_dir / "provider-events.json", events)
+        provider_window_end = datetime.now(timezone.utc)
+        events = regional.provider_events(injected_at, provider_window_end)
+        # "No provider mutation" is not provable inside CloudTrail's delivery
+        # window; an empty read is recorded as provisional, not as proof.
+        provider_provisional = not events and regional.provider_events_provisional(
+            provider_window_end
+        )
+        write_json_atomic(
+            case_dir / "provider-events.json",
+            {"events": events, "provider_events_provisional": provider_provisional},
+        )
         if events:
             errors.append("provider mutation appeared during DESTR-010")
         result.update(
@@ -943,7 +679,7 @@ def execute_case(
                 "errors": errors,
                 "marker": marker,
                 "workflow": {
-                    "request_id": (state.get("workflow") or {}).get("request_id"),
+                    "request_id": workflow_request_id or None,
                     "status": (state.get("workflow") or {}).get("status"),
                     "official_action": (state.get("workflow") or {}).get(
                         "official_action"
@@ -953,6 +689,8 @@ def execute_case(
                 "node_action_command_id": expected_command_id,
                 "replay": replay,
                 "notifications": after_replay_state.get("notifications") or [],
+                "provider_events": events,
+                "provider_events_provisional": provider_provisional,
             }
         )
     except Exception as exc:
@@ -979,13 +717,14 @@ def execute_case(
         if any(residuals.values()):
             result["verdict"] = "FAIL"
         try:
-            final_node = node_snapshot(settings)
+            final_node = regional.node_snapshot(settings.node)
             result["final_node"] = final_node
-            if final_node != baseline_node:
+            final_errors = node_state_errors(baseline_node, final_node, stage="final")
+            if final_errors:
                 result["verdict"] = "FAIL"
-                result.setdefault("errors", []).append(
-                    "final Kubernetes Node state differs from baseline"
-                )
+                errors_recorded = result.setdefault("errors", [])
+                if isinstance(errors_recorded, list):
+                    errors_recorded.extend(final_errors)
         except Exception as exc:
             result["postflight_error"] = f"{type(exc).__name__}: {exc}"
             result["verdict"] = "FAIL"
@@ -995,7 +734,7 @@ def execute_case(
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
-    return {
+    details = {
         "risk": "live-service-action",
         "release_id": preflight["release_id"],
         "target_node": settings.node,
@@ -1003,12 +742,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "write one synthetic XID 45 to the real host /dev/kmsg and allow "
             "the Node Agent to restart nvidia-fabricmanager exactly once"
         ),
-        "preflight_identity": {
-            "release_id": preflight["release_id"],
-            "node_uid": preflight["node"]["uid"],
-            "agent_generation": preflight["store"]["agent"]["generation"],
-            "runtime_profile_version": preflight["store"]["profile"]["version"],
-        },
+        "preflight_identity": preflight_identity(preflight),
         "stop_conditions": [
             "preflight or focused regression failure",
             "target node is not Ready/schedulable/idle",
@@ -1024,10 +758,13 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "probe_active_deadline_seconds": 1800,
             "runner_finally_ensures_fabric_manager_active": True,
             "runner_finally_deletes_probe_resources": True,
-            "node_state_must_equal_baseline": True,
+            "node_scheduling_state_must_equal_baseline": True,
+            "node_readiness_is_judged_separately": True,
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight["focused_tests"])
+    return details
 
 
 def parser() -> argparse.ArgumentParser:

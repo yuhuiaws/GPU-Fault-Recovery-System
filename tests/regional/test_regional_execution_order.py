@@ -103,16 +103,57 @@ def test_do_not_run_matches_regional_superseded_cases() -> None:
         if (case.get("evidence") or {}).get("verdict") == "SUPERSEDED"
     }
 
-    assert retired == superseded == {"GF-REGIONAL-AUTH-012", "GF-REGIONAL-DESTR-004"}
-    case = cases["GF-REGIONAL-DESTR-004"]
-    assert case["automation"] == "manual"
-    assert case["risk"] == "destructive"
-    assert case["superseded_by"] == "GF-REGIONAL-DESTR-013"
-    # A superseded case keeps its ID forever and points at its replacement, so
-    # an operator reading old evidence can find the case that now covers it.
-    rotation = cases["GF-REGIONAL-AUTH-012"]
-    assert rotation["automation"] == "manual"
-    assert rotation["superseded_by"] == "GF-REGIONAL-AUTH-016"
+    expected_replacements = {
+        "GF-REGIONAL-AUTH-012": "GF-REGIONAL-AUTH-016",
+        "GF-REGIONAL-DESTR-004": "GF-REGIONAL-DESTR-013",
+        # 2026-09-07 review folds: each retired case is a strict subset of the
+        # case that now carries its assertions.
+        "GF-REGIONAL-AUTH-010": "GF-REGIONAL-AUTH-014",
+        "GF-REGIONAL-NOTIFY-002": "GF-REGIONAL-NOTIFY-001",
+        "GF-REGIONAL-DESTR-011": "GF-REGIONAL-DESTR-013",
+        "GF-REGIONAL-HA-005": "GF-REGIONAL-HA-009",
+        "GF-REGIONAL-PREEMPT-013": "GF-REGIONAL-PREEMPT-014",
+        "GF-REGIONAL-PREEMPT-023": "GF-REGIONAL-PREEMPT-024",
+        "GF-REGIONAL-PREEMPT-034": "GF-REGIONAL-PREEMPT-035",
+    }
+    assert retired == superseded == set(expected_replacements)
+    ordered = set(_ordered_cases(order))
+    for case_id, replacement in expected_replacements.items():
+        case = cases[case_id]
+        # A superseded case keeps its ID forever and points at its replacement,
+        # so an operator reading old evidence can find the case that now covers
+        # it; the replacement itself must still run.
+        assert case["automation"] == "manual"
+        assert case["superseded_by"] == replacement
+        assert replacement in ordered, replacement
+        assert "command" not in case and "pytest_nodeid" not in case, case_id
+    assert cases["GF-REGIONAL-DESTR-004"]["risk"] == "destructive"
+
+
+def test_folded_cases_left_their_unique_assertions_in_the_replacement() -> None:
+    catalog = yaml.safe_load(CATALOG.read_text(encoding="utf-8"))
+    cases = {case["id"]: case for case in catalog["test_cases"]}
+    expected = {
+        "GF-REGIONAL-NOTIFY-001": (
+            "四次重复提交",
+            "provider_message_id 不变",
+            "通知条数不变",
+        ),
+        "GF-REGIONAL-AUTH-014": ("execution token 未出现在任何数据面 Secret",),
+        "GF-REGIONAL-DESTR-013": (
+            "reboot 仍可独立启用 (ALLOW_HYPERPOD_REBOOT=true)",
+            "所有 executor 副本数与 ALLOW_HYPERPOD_REPLACE=false",
+        ),
+    }
+    for case_id, fragments in expected.items():
+        joined = "\n".join(cases[case_id]["expected"])
+        for fragment in fragments:
+            assert fragment in joined, (case_id, fragment)
+    # PREEMPT-017 no longer double-counts PREEMPT-016's nodeid.
+    assert (
+        cases["GF-REGIONAL-PREEMPT-016"]["pytest_nodeid"]
+        not in (cases["GF-REGIONAL-PREEMPT-017"]["command"])
+    )
 
 
 def test_regional_execution_order_pins_special_dependencies() -> None:
@@ -126,7 +167,10 @@ def test_regional_execution_order_pins_special_dependencies() -> None:
     assert position["GF-REGIONAL-WORKLOAD-001"] < position["GF-REGIONAL-E2E-001"]
     assert position["GF-REGIONAL-E2E-001"] < position["GF-REGIONAL-BLAST-001"]
     assert position["GF-REGIONAL-E2E-001"] < position["GF-REGIONAL-NOTIFY-001"]
-    assert position["GF-REGIONAL-DESTR-011"] < position["GF-REGIONAL-DESTR-001"]
+    # DESTR-011 is folded into DESTR-013; the destructive phase now opens with
+    # the isolated warm-spare routing negatives.
+    assert "GF-REGIONAL-DESTR-011" not in position
+    assert position["GF-REGIONAL-DESTR-005"] < position["GF-REGIONAL-DESTR-001"]
     assert position["GF-REGIONAL-DESTR-009"] < position["GF-REGIONAL-DESTR-012"]
     assert position["GF-REGIONAL-DESTR-012"] < position["GF-REGIONAL-DESTR-015"]
     assert position["GF-REGIONAL-DESTR-015"] < position["GF-REGIONAL-DESTR-016"]

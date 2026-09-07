@@ -25,9 +25,17 @@ EXECUTOR_STATE = STATE / "executor-state.json"
 ROLLBACK_STATE = STATE / "rollback.json"
 RESULT_SUBMIT_WAITING = STATE / "result-submit-waiting.json"
 RESULT_SUBMIT_RELEASED = STATE / "result-submit-released.json"
-OWNER = "gpu-fault-net-test"
-BLOCK_ROLLBACK_SECONDS = int(os.getenv("BLOCK_ROLLBACK_SECONDS", "150"))
+OWNER = os.getenv("EXECUTOR_OWNER", "gpu-fault-net-test")
+BLOCK_ROLLBACK_SECONDS = int(os.getenv("BLOCK_ROLLBACK_SECONDS", "100"))
+# Deliberately far above the production client's 15s: the gated proxy *holds*
+# a connection while the block is on rather than refusing it, so the result
+# post and the hanging lease renewal both reach the control plane the moment
+# the block lifts -- after the lease has expired server-side -- and are refused
+# with 409. A 15s timeout would turn them into local timeouts and the case
+# would never observe the stale-lease rejection it exists to prove. The
+# runner records this as a limitation of the case, not as a pass condition.
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "180"))
+LEASE_SECONDS = int(os.getenv("LEASE_SECONDS", "60"))
 
 
 class LedgerAdapter:
@@ -257,10 +265,13 @@ def main() -> None:
         json.dumps(
             {
                 "cluster_id": registration["cluster_id"],
+                "owner": OWNER,
                 "target_ip": target_ip,
                 "proxy_port": listen_port,
+                "proxy_mode": "hold-while-blocked",
                 "block_rollback_seconds": BLOCK_ROLLBACK_SECONDS,
                 "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
+                "lease_seconds": LEASE_SECONDS,
                 "result_submission_gate": True,
                 "action_requires_network_block": True,
             },
@@ -274,7 +285,7 @@ def main() -> None:
         executor_id="net-test-executor",
         allowed_namespaces={"default"},
         poll_seconds=1,
-        lease_seconds=60,
+        lease_seconds=LEASE_SECONDS,
         batch_size=1,
         max_concurrent_commands=1,
         claim_backoff_max_seconds=4,

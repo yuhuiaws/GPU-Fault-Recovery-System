@@ -161,9 +161,13 @@ def added_ledger_rows(
 ) -> list[dict[str, Any]]:
     """Ledger rows present after the case that the baseline did not have.
 
-    Keyed by ``(command_id, attempt)`` rather than ``command_id`` alone: the
-    barrier step retries under one command id, so each attempt is its own row
-    and dropping the attempt would hide every retry but the first.
+    Keyed by ``(command_id, attempt)`` rather than ``command_id`` alone. Each
+    barrier retry is dispatched under its own command id
+    (``adapters/node_action/step_execution.py``: the VERIFY_NO_GPU_CLIENTS
+    suffix is ``<node>/attempt-<n>``), so the command id already separates the
+    retries; the attempt column is kept in the key so a ledger that re-executes
+    one command id -- a replay after an Agent restart -- still counts every
+    execution instead of collapsing them onto the first.
     """
 
     seen = {(row.get("command_id"), row.get("attempt")) for row in baseline}
@@ -412,13 +416,43 @@ def escalation_errors(
         errors.append(
             f"the successor does not record {PREEMPTION_REASON_SUBSTRING!r}: {reason!r}"
         )
-    inherited = sorted(successor.get("completed_operations") or [])
-    if inherited != sorted(INHERITED_OPERATIONS):
-        errors.append(
-            f"the successor did not inherit exactly {list(INHERITED_OPERATIONS)}: {inherited}"
-        )
-    if not successor.get("inherited_step_indexes"):
+    # The claim-time adoption appends QUIESCE_GPU_SERVICES to the inherited
+    # completed operations in the same ``model_copy`` that records the handoff
+    # (``executor._adopt_quiesce_handoff_from_predecessor``), so the list is
+    # not exactly the containment steps; what must hold is that every step the
+    # successor inherited is there, and that the inherited indexes really point
+    # at those steps in *its* graph.
+    completed = [str(item) for item in successor.get("completed_operations") or []]
+    missing = [item for item in INHERITED_OPERATIONS if item not in completed]
+    if missing:
+        errors.append(f"the successor did not inherit {missing}: completed={completed}")
+    indexes = list(successor.get("inherited_step_indexes") or [])
+    if not indexes:
         errors.append("the successor records no inherited step indexes")
+    else:
+        steps = successor.get("official_steps") or []
+        inherited_operations = {
+            str(steps[index].get("operation"))
+            for index in indexes
+            if isinstance(index, int) and 0 <= index < len(steps)
+        }
+        unresolved = [
+            index
+            for index in indexes
+            if not (isinstance(index, int) and 0 <= index < len(steps))
+        ]
+        if unresolved:
+            errors.append(
+                f"inherited step indexes point outside the successor graph: {unresolved}"
+            )
+        not_inherited = [
+            item for item in INHERITED_OPERATIONS if item not in inherited_operations
+        ]
+        if not_inherited:
+            errors.append(
+                f"the inherited step indexes {indexes} do not cover "
+                f"{not_inherited}: {sorted(inherited_operations)}"
+            )
     return errors
 
 

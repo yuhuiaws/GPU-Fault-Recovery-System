@@ -1099,7 +1099,16 @@ def test_boot_guard_resume_requires_prior_pass_evidence() -> None:
     assert 'BOOT_GUARD_START_CASE}" != "7"' in runner
     assert 'BOOT_GUARD_START_CASE}" != "8"' in runner
     assert "printf -v case_id 'GF-REGIONAL-BOOT-%03d'" in runner
-    assert 'grep -qx "PASS" "${evidence}"' in runner
+    # Every case file ends in exactly one VERDICT line and the resume gate reads
+    # only that last line: assert.sh writes a bare "PASS" before later checks
+    # of the same case run, so the old grep -x "PASS" gate could resume a case
+    # as passed after a later check had failed.
+    assert 'echo "VERDICT PASS" | tee -a "${CURRENT_EVIDENCE}"' in runner
+    assert 'printf \'FAIL: %s\\nVERDICT FAIL\\n\' "$*" >>"${CURRENT_EVIDENCE}"' in (
+        runner
+    )
+    assert '"$(tail -n 1 "$1")" == "VERDICT PASS"' in runner
+    assert 'grep -qx "PASS"' not in runner
 
 
 def test_boot008_uses_a_real_cluster_token_route() -> None:

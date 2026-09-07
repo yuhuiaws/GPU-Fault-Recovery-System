@@ -27,7 +27,11 @@ from scripts.e2e.regional import run_destr018_lifetime_deadline as destr018
 from scripts.e2e.regional import run_ha003_aurora_failover_reset as ha003
 from scripts.e2e.regional import run_ha004_waiting_reclaim_reset as ha004
 from scripts.e2e.regional import run_ha009_aurora_credential_rotation as ha009
-from scripts.e2e.regional.host_probe_fixture import HostProbeFixture, HostProbeSettings
+from scripts.e2e.regional.host_probe_fixture import (
+    HostProbeError,
+    HostProbeFixture,
+    HostProbeSettings,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 REGIONAL = ROOT / "scripts/e2e/regional"
@@ -563,37 +567,72 @@ def test_warm_spare_audit_separates_an_unrun_pytest_from_a_failed_one(
     assert "focused pytest failed" not in result["errors"], result["errors"]
 
 
-def test_host_probe_create_deletes_a_leftover_pod_before_applying(
-    tmp_path: Path,
-) -> None:
-    """The pod name is a digest of (case, run, node), so a rerun after an
-    operator abort meets the previous pod, by then Failed on its
-    activeDeadlineSeconds; `apply` onto it is a no-op and the Ready wait can
-    only time out. create() has to delete whatever carries the name first."""
-
+def _host_probe(
+    tmp_path: Path, case_id: str = "GF-REGIONAL-DESTR-001"
+) -> HostProbeFixture:
     kubeconfig = tmp_path / "gpu.kubeconfig"
     kubeconfig.write_text("apiVersion: v1\n", encoding="utf-8")
     probe = tmp_path / "probe.py"
     probe.write_text("print('{}')\n", encoding="utf-8")
-    fixture = HostProbeFixture(
+    return HostProbeFixture(
         HostProbeSettings(
             kubeconfig=kubeconfig,
             context="gpu-context",
             namespace="gpu-fault-system",
             node="node-a",
             image="registry.example/probe@sha256:" + "a" * 64,
-            case_id="GF-REGIONAL-COLLECT-014",
+            case_id=case_id,
             run_id="run-a",
             probe_script=probe,
         )
     )
+
+
+def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> Any:
+    return subprocess.CompletedProcess(
+        args=["kubectl"], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+# kubectl --kubeconfig <path> --context <name> -n <namespace> <verb> ...
+_KUBECTL_PREFIX_LENGTH = 7
+
+
+def _fake_kubectl(
+    monkeypatch: pytest.MonkeyPatch, handler: Any
+) -> list[tuple[str, ...]]:
+    """Stand in for the ``subprocess.run`` the fixture shells out through.
+
+    ``handler`` receives the kubectl arguments after the connection prefix
+    and returns a ``CompletedProcess``; every call is recorded so the tests
+    can assert on the verb sequence the public methods actually issue.
+    """
+
+    from scripts.e2e.regional import host_probe_fixture as module
+
     calls: list[tuple[str, ...]] = []
 
-    def fake_kubectl(*arguments: str, **_kwargs: Any) -> Any:
+    def run(command: list[str], **_kwargs: Any) -> Any:
+        assert command[0] == "kubectl", command
+        arguments = tuple(command[_KUBECTL_PREFIX_LENGTH:])
         calls.append(arguments)
-        return None
+        return handler(arguments)
 
-    fixture._kubectl = fake_kubectl  # type: ignore[method-assign]
+    monkeypatch.setattr(module.subprocess, "run", run)
+    return calls
+
+
+def test_host_probe_create_deletes_a_leftover_pod_before_applying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pod name is a digest of (case, run, node), so a rerun after an
+    operator abort meets the previous pod, by then Failed on its
+    activeDeadlineSeconds; `apply` onto it is a no-op and the Ready wait can
+    only time out. create() has to delete whatever carries the name first."""
+
+    fixture = _host_probe(tmp_path, case_id="GF-REGIONAL-COLLECT-014")
+    calls = _fake_kubectl(monkeypatch, lambda _arguments: _completed())
+
     fixture.create()
 
     verbs = [call[0] for call in calls]
@@ -609,6 +648,8 @@ def _ha009_snapshot(generation: int, pods: list[tuple[str, str]]) -> dict:
             "observed_generation": generation,
             "replicas": len(pods),
             "ready": len(pods),
+            "updated": len(pods),
+            "available": len(pods),
             "refresh_annotation": None,
             "pods": [
                 (pod, {"uid": uid, "ready": True, "restarts": 0}) for pod, uid in pods
@@ -642,3 +683,112 @@ def test_ha009_rollout_wait_outlives_draining_old_pods(monkeypatch) -> None:
     for name in ha009.DEPLOYMENTS:
         uids = {value["uid"] for _pod, value in after[name]["pods"]}
         assert uids == {"uid-na", "uid-nb"}, name
+
+
+def test_host_probe_residual_check_fails_closed_on_a_kubectl_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed ``get`` has empty stdout, which used to read as "no residual" --
+    the one answer a residual audit must never give by accident."""
+
+    fixture = _host_probe(tmp_path)
+
+    def failing_get(arguments: tuple[str, ...]) -> Any:
+        if arguments[0] == "get":
+            return _completed(stderr="Unable to connect to the server", returncode=1)
+        return _completed()
+
+    _fake_kubectl(monkeypatch, failing_get)
+
+    with pytest.raises(HostProbeError, match="Unable to connect"):
+        fixture.residuals()
+
+
+def test_host_probe_kubectl_timeout_is_a_probe_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional import host_probe_fixture as module
+
+    fixture = _host_probe(tmp_path)
+
+    def hang(command: list[str], **_kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired(command, 30)
+
+    monkeypatch.setattr(module.subprocess, "run", hang)
+
+    with pytest.raises(HostProbeError, match="timed out after 30s"):
+        fixture._kubectl("get", "pod", fixture.pod, timeout=30)
+
+
+def test_host_probe_cleanup_reaches_the_configmap_and_audit_past_a_stuck_pod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A privileged hostPID Pod on a rebooting node can sit Terminating for
+    the whole reboot; cleanup must bound its wait, force it, and still delete
+    the ConfigMap and run the residual check."""
+
+    from scripts.e2e.regional import host_probe_fixture as module
+
+    fixture = _host_probe(tmp_path)
+    state = {"forced": False}
+
+    def stuck_pod(arguments: tuple[str, ...]) -> Any:
+        if arguments[0] == "delete" and "--force" in arguments:
+            state["forced"] = True
+        if arguments[0] == "get" and arguments[1] == "pod":
+            # Present until forced; the graceful delete never takes effect.
+            return _completed(stdout="" if state["forced"] else f"pod/{fixture.pod}\n")
+        return _completed()
+
+    clock = {"now": 0.0}
+
+    def monotonic() -> float:
+        clock["now"] += 20.0
+        return clock["now"]
+
+    monkeypatch.setattr(module.time, "monotonic", monotonic)
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    calls = _fake_kubectl(monkeypatch, stuck_pod)
+
+    residuals = fixture.cleanup()
+
+    deletes = [call for call in calls if call[0] == "delete"]
+    assert deletes[0][1:3] == ("pod", fixture.pod) and "--wait=false" in deletes[0]
+    assert "--wait=true" not in deletes[0], deletes[0]
+    assert any("--force" in call and "--grace-period=0" in call for call in deletes), (
+        f"a pod that never leaves must be force-deleted; deletes issued: {deletes}"
+    )
+    assert deletes[-1][1:3] == ("configmap", fixture.configmap), deletes
+    assert residuals == {
+        f"pod/{fixture.pod}": False,
+        f"configmap/{fixture.configmap}": False,
+    }, residuals
+    # The residual check ran after the ConfigMap delete, not before it.
+    configmap_delete = calls.index(deletes[-1])
+    assert any(
+        call[0] == "get" and call[1] == "configmap"
+        for call in calls[configmap_delete + 1 :]
+    ), calls[configmap_delete:]
+
+
+def test_host_probe_execute_reports_a_non_json_last_line_with_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _host_probe(tmp_path)
+    _fake_kubectl(
+        monkeypatch,
+        lambda _arguments: _completed(
+            stdout="Traceback (most recent call last):\n  File ...\nOSError: boom\n",
+            stderr="chroot: failed to run command\n",
+            returncode=1,
+        ),
+    )
+
+    with pytest.raises(HostProbeError, match="chroot: failed") as raised:
+        fixture.execute("snapshot")
+
+    assert "returned no JSON" in str(raised.value), raised.value
+    assert isinstance(raised.value.__cause__, json.JSONDecodeError), (
+        "the probe error must chain the JSON parse failure, "
+        f"got {raised.value.__cause__!r}"
+    )

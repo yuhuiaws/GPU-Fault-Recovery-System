@@ -104,9 +104,11 @@ def read_only_preflight(
 ) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
     node = regional.node_snapshot(settings.node)
+    identity = regional.evidence_identity()
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
+        **identity,
     )
     command = [
         sys.executable,
@@ -142,7 +144,7 @@ def read_only_preflight(
     if completed.returncode:
         errors.append("focused regression tests failed")
     result = {
-        "release_id": regional.release_id(),
+        **identity,
         "node": node,
         "predecessor": predecessor,
         "focused_tests_passed": completed.returncode == 0,
@@ -344,21 +346,36 @@ def efa_unbind_errors(
     return errors
 
 
-def _wait_efa_inventory(
+def wait_efa_inventory(
     collector: CollectorAcceptanceFixture,
     *,
     discovered_count: int,
     timeout_seconds: int,
+    required: bool = True,
 ) -> dict[str, Any]:
+    """Poll the light `efa-inventory` read until ``discovered_count`` devices.
+
+    ``required`` makes a timeout a fixture error: the injection either took
+    (the unbind wait) or the case has nothing to measure, and it used to fall
+    through into the 600s workflow wait with the function still bound. The
+    recovery read after the workflow is judged by the verdict instead, so it
+    returns the last reading (``required=False``).
+    """
+
     deadline = time.monotonic() + timeout_seconds
-    snapshot = collector.snapshot()
+    inventory = collector.efa_inventory()
     while (
-        int(snapshot["efa_inventory"]["discovered_count"]) != discovered_count
+        int(inventory["discovered_count"]) != discovered_count
         and time.monotonic() < deadline
     ):
         time.sleep(3)
-        snapshot = collector.snapshot()
-    return cast(dict[str, Any], snapshot["efa_inventory"])
+        inventory = collector.efa_inventory()
+    if required and int(inventory["discovered_count"]) != discovered_count:
+        raise RegionalFixtureError(
+            f"EFA inventory did not reach {discovered_count} devices within "
+            f"{timeout_seconds}s: {inventory}"
+        )
+    return inventory
 
 
 def run_efa_unbind(
@@ -388,7 +405,7 @@ def run_efa_unbind(
     recovered: dict[str, Any] = {}
     bundle: dict[str, Any] = {}
     try:
-        unbound = _wait_efa_inventory(
+        unbound = wait_efa_inventory(
             collector,
             discovered_count=int(baseline["discovered_count"]) - 1,
             timeout_seconds=60,
@@ -411,10 +428,11 @@ def run_efa_unbind(
                 observed_after=started_at,
                 timeout_seconds=30,
             )
-        recovered = _wait_efa_inventory(
+        recovered = wait_efa_inventory(
             collector,
             discovered_count=int(baseline["discovered_count"]),
             timeout_seconds=30,
+            required=False,
         )
         request_id = str((bundle.get("workflow") or {}).get("request_id") or "")
         if request_id:
@@ -423,14 +441,22 @@ def run_efa_unbind(
                 **regional.cpu_python(REMOTE_COMMANDS, request_id),
             }
     finally:
-        restore = collector.execute(
-            "restore-efa",
-            "--run-id",
-            f"c017-a-{attempt}",
-            "--pci-bdf",
-            bdf,
-        )
-    errors = efa_unbind_errors(
+        # The fail-safe is disarmed on every path, but a restore that fails
+        # must not replace the exception that got here: the on-node timer
+        # still rebinds the function, and the case's own error is the one to
+        # read. On the success path the failure is a verdict error.
+        try:
+            restore = collector.execute(
+                "restore-efa",
+                "--run-id",
+                f"c017-a-{attempt}",
+                "--pci-bdf",
+                bdf,
+            )
+        except Exception as exc:  # noqa: BLE001 - recorded, never masks the case
+            restore = {"error": f"{type(exc).__name__}: {exc}"}
+    errors = [f"restore-efa failed: {restore['error']}"] if "error" in restore else []
+    errors += efa_unbind_errors(
         bundle,
         node=settings.node,
         bdf=bdf,
@@ -563,6 +589,12 @@ def run_gpu_plugin(
     info = plugin.discover()
     started_at = datetime.now(timezone.utc)
     planned: dict[str, Any] = {}
+    errors: list[str] = []
+    # The DaemonSet is restored exactly once: on the success path as soon as
+    # the restart is planned (the step needs the plugin back to run), and in
+    # the finally only when that did not happen. A second `rollout status`
+    # wait on the success path was 600s of nothing.
+    restored = False
     try:
         plugin.exclude_node()
         unavailable = plugin.wait_allocatable(0)
@@ -574,6 +606,7 @@ def run_gpu_plugin(
             observed_after=started_at,
         )
         plugin.restore()
+        restored = True
         plugin.wait_allocatable(baseline)
         workflow = base.latest_node_workflow(
             regional,
@@ -582,9 +615,13 @@ def run_gpu_plugin(
             timeout_seconds=600,
         )
     finally:
-        plugin.restore()
-    errors = plugin_workflow_errors(
-        workflow, steps=GPU_PLUGIN_STEPS, label="GPU plugin"
+        if not restored:
+            try:
+                plugin.restore()
+            except Exception as exc:  # noqa: BLE001 - recorded, never masks the case
+                errors.append(f"plugin restore failed: {type(exc).__name__}: {exc}")
+    errors.extend(
+        plugin_workflow_errors(workflow, steps=GPU_PLUGIN_STEPS, label="GPU plugin")
     )
     return {
         "errors": errors,
@@ -616,6 +653,7 @@ def run_training_plugin(
     )
     workload: ManagedWorkloadFixture | None = None
     plugin: base.DevicePluginFixture | None = None
+    plugin_restored = False
     result: dict[str, Any] = {"errors": []}
     try:
         prewarm.create(candidates)
@@ -668,6 +706,7 @@ def run_training_plugin(
         if {str(item["uid"]) for item in during["pods"]} != uids:
             result["errors"].append("EFA plugin loss recreated training Pods")
         plugin.restore()
+        plugin_restored = True
         plugin.wait_allocatable(baseline)
         workflow = base.latest_node_workflow(
             regional,
@@ -697,7 +736,7 @@ def run_training_plugin(
             }
         )
     finally:
-        if plugin is not None:
+        if plugin is not None and not plugin_restored:
             try:
                 plugin.restore()
             except Exception as exc:
@@ -778,6 +817,7 @@ def execute_case(
         "attempt": attempt,
         "verdict": "FAIL",
         "errors": [],
+        **regional.evidence_identity(),
     }
     try:
         collector.create()

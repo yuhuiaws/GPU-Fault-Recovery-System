@@ -468,7 +468,7 @@ def test_parallel_command_cases_declare_resource_locks() -> None:
         "GF-REGIONAL-PREEMPT-031",
         "GF-REGIONAL-PREEMPT-032",
         "GF-REGIONAL-PREEMPT-033",
-        "GF-REGIONAL-PREEMPT-034",
+        # PREEMPT-034 is SUPERSEDED by PREEMPT-035 and no longer a command.
         "GF-REGIONAL-PREEMPT-035",
         "GF-REGIONAL-PREEMPT-036",
     }

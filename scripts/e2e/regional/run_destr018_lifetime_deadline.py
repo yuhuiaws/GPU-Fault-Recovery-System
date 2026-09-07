@@ -52,6 +52,8 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -106,6 +108,9 @@ WORKER_METRICS_PORT = 8081
 WORKER_APP = env_window.DEPLOYMENT
 WORKFLOW_TIMEOUT_SECONDS = 1200
 ABSORB_TIMEOUT_SECONDS = 300
+# The support workflow's QUARANTINE step runs after the reset workflow has
+# already gone FAILED; the node is polled this long for the taint.
+QUARANTINE_TIMEOUT_SECONDS = 300
 
 METRICS_PROBE = r"""
 import json
@@ -223,7 +228,19 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
 
 
-def focused_tests(case_dir: Path) -> dict[str, Any]:
+def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
+    """Run the focused pytest, or reuse the --plan's result in --execute.
+
+    ``reuse`` is set by the execution path only: the result recorded in
+    ``plan.json`` is taken when it passed against exactly this source tree
+    (``reusable_focused_tests`` compares the digest), so the same tests are
+    not paid for twice minutes apart; any edit in between forces a rerun.
+    """
+
+    if reuse:
+        recorded = reusable_focused_tests(case_dir / "plan.json")
+        if recorded is not None:
+            return {**recorded, "focused_tests_reused": True}
     command = [
         sys.executable,
         "-m",
@@ -458,7 +475,12 @@ def preflight_errors(
     return errors
 
 
-def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
+def read_only_preflight(
+    settings: Settings,
+    case_dir: Path,
+    *,
+    reuse_focused_tests: bool = False,
+) -> dict[str, Any]:
     fixture = RegionalLiveFixture(settings.regional)
     state = fixture.store_snapshot(
         node=settings.node,
@@ -467,8 +489,12 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     node = fixture.node_snapshot(settings.node)
     workloads = fixture.business_workloads(settings.node)
     survey = env_window.survey(fixture)
-    tests = focused_tests(case_dir)
-    predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
+    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
+    predecessor = predecessor_evidence(
+        settings.predecessor_path,
+        PREDECESSOR_CASE_ID,
+        **fixture.evidence_identity(),
+    )
     errors = preflight_errors(settings, state, node, workloads, tests, survey)
     if not predecessor["valid"]:
         errors.append(f"{PREDECESSOR_CASE_ID} predecessor evidence is not PASS")
@@ -507,7 +533,7 @@ def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
-    return {
+    details: dict[str, Any] = {
         "risk": "live-service-action",
         "predecessor": preflight["predecessor"],
         "target_node": settings.node,
@@ -549,6 +575,13 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
+    # The --plan's focused-test result is recorded with a source digest so
+    # --execute can reuse it instead of paying for the same run twice.
+    record_focused_tests(
+        details,
+        dict(preflight.get("focused_tests") or {"passed": False}),
+    )
+    return details
 
 
 def verify_plan_identity(case_dir: Path, preflight: dict[str, Any]) -> None:
@@ -560,7 +593,7 @@ def verify_plan_identity(case_dir: Path, preflight: dict[str, Any]) -> None:
 
 
 @dataclass
-class _LiveRun:
+class LiveRun:
     settings: Settings
     regional: RegionalLiveFixture
     case_dir: Path
@@ -603,7 +636,7 @@ def _probe(settings: Settings, run_id: str, script: Path) -> HostProbeFixture:
     )
 
 
-def _open_window(run: _LiveRun) -> dict[str, Any]:
+def _open_window(run: LiveRun) -> dict[str, Any]:
     report = env_window.survey(run.regional)
     record = env_window.open_window(
         run.window,
@@ -619,7 +652,7 @@ def _open_window(run: _LiveRun) -> dict[str, Any]:
     return record
 
 
-def _arm_holder(run: _LiveRun, device: str) -> dict[str, Any]:
+def _arm_holder(run: LiveRun, device: str) -> dict[str, Any]:
     armed = run.holder.execute(
         "arm-holder",
         "--device",
@@ -654,7 +687,7 @@ def _arm_holder(run: _LiveRun, device: str) -> dict[str, Any]:
     return status
 
 
-def _absorb(run: _LiveRun, target_bdf: str) -> dict[str, Any]:
+def _absorb(run: LiveRun, target_bdf: str) -> dict[str, Any]:
     """XID 79 on the same node, after the lifetime failure."""
 
     marker = f"{run.marker}-absorb"
@@ -678,7 +711,8 @@ def _absorb(run: _LiveRun, target_bdf: str) -> dict[str, Any]:
             observed_after=started,
             queue_attempts=1,
         )
-        if snapshot.get("event"):
+        # The event row lands before the merge; the verdicts judge the merge.
+        if verdicts.absorb_settled(snapshot):
             break
         time.sleep(5)
     write_json_atomic(run.case_dir / "absorb-state.json", snapshot)
@@ -689,17 +723,17 @@ def _prepare_live_run(
     settings: Settings,
     run_dir: Path,
     attempt: int,
-) -> _LiveRun:
+) -> LiveRun:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
         )
     verify_plan_identity(case_dir, preflight)
     run_id = f"destr018-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
-    run = _LiveRun(
+    run = LiveRun(
         settings=settings,
         regional=RegionalLiveFixture(settings.regional),
         case_dir=case_dir,
@@ -721,7 +755,7 @@ def _prepare_live_run(
     return run
 
 
-def _baseline_host(run: _LiveRun, maintenance_window_end: datetime) -> None:
+def _baseline_host(run: LiveRun, maintenance_window_end: datetime) -> None:
     """Create both probes, snapshot the idle node and pick the target GPU."""
 
     run.injector.create()
@@ -748,7 +782,7 @@ def _baseline_host(run: _LiveRun, maintenance_window_end: datetime) -> None:
         raise RegionalFixtureError("approved maintenance window ended before injection")
 
 
-def _open_and_arm(run: _LiveRun) -> None:
+def _open_and_arm(run: LiveRun) -> None:
     """The env window first (it rolls the worker Deployment), then the
     holder, both before the fault is written."""
 
@@ -772,7 +806,7 @@ def _open_and_arm(run: _LiveRun) -> None:
     _arm_holder(run, run.device)
 
 
-def _inject_and_observe(run: _LiveRun) -> dict[str, Any]:
+def _inject_and_observe(run: LiveRun) -> dict[str, Any]:
     run.injected_at = datetime.now(timezone.utc)
     injection = run.injector.execute(
         "write-xid46",
@@ -799,7 +833,7 @@ def _inject_and_observe(run: _LiveRun) -> dict[str, Any]:
     return state
 
 
-def _control_plane_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
+def _control_plane_errors(run: LiveRun, state: dict[str, Any]) -> list[str]:
     workflow = state.get("workflow") or {}
     incident = state.get("incident") or {}
     commands = state.get("commands") or []
@@ -822,7 +856,7 @@ def _control_plane_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _host_snapshot(run: _LiveRun, name: str) -> dict[str, Any]:
+def _host_snapshot(run: LiveRun, name: str) -> dict[str, Any]:
     if run.injected_at is None:
         raise RegionalFixtureError("host snapshots follow the injection")
     snapshot = run.injector.execute(
@@ -837,7 +871,7 @@ def _host_snapshot(run: _LiveRun, name: str) -> dict[str, Any]:
     return snapshot
 
 
-def _data_plane_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
+def _data_plane_errors(run: LiveRun, state: dict[str, Any]) -> list[str]:
     """Ledger, kernel journal and the cadence the run actually saw."""
 
     after_host = _host_snapshot(run, "host-after.json")
@@ -874,7 +908,7 @@ def _data_plane_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _escalation_and_absorb_errors(run: _LiveRun) -> list[str]:
+def _escalation_and_absorb_errors(run: LiveRun) -> list[str]:
     """The hand-off to the operator, the node's quarantine, and the later
     XID 79 that must be absorbed record-only."""
 
@@ -886,7 +920,7 @@ def _escalation_and_absorb_errors(run: _LiveRun) -> list[str]:
         ((escalation.get("incident") or {}).get("incident_id")) or ""
     )
     errors.extend(verdicts.escalation_errors(escalation, node=settings.node))
-    node_after = regional.node_snapshot(settings.node)
+    node_after = _wait_for_quarantine(run, escalation)
     write_json_atomic(case_dir / "node-after.json", node_after)
     errors.extend(verdicts.quarantine_errors(node_after))
 
@@ -908,6 +942,8 @@ def _escalation_and_absorb_errors(run: _LiveRun) -> list[str]:
                 run.workflow_request_id,
                 f"workflow-support-after-{run.workflow_request_id}",
             },
+            started_after=run.injected_at,
+            node=settings.node,
         )
     )
     absorb_ledger = _host_snapshot(run, "host-after-absorb.json")
@@ -922,16 +958,50 @@ def _escalation_and_absorb_errors(run: _LiveRun) -> list[str]:
     return errors
 
 
-def _provider_and_metric_errors(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
+def _wait_for_quarantine(run: LiveRun, escalation: dict[str, Any]) -> dict[str, Any]:
+    """Poll the node until the taint lands or the support workflow is terminal.
+
+    The escalation's QUARANTINE step runs asynchronously after the reset
+    workflow has gone FAILED; reading the taint the instant the workflow ends
+    fails a correct run.
+    """
+
+    deadline = time.monotonic() + QUARANTINE_TIMEOUT_SECONDS
+    support = escalation.get("workflow") or {}
+    node_after: dict[str, Any] = {}
+    while True:
+        node_after = run.regional.node_snapshot(run.settings.node)
+        if verdicts.quarantine_settled(node_after, support):
+            return node_after
+        if time.monotonic() >= deadline:
+            return node_after
+        time.sleep(5)
+        support = (
+            run.regional.cpu_python(ESCALATION_CHAIN, run.workflow_request_id).get(
+                "workflow"
+            )
+            or {}
+        )
+
+
+def _provider_and_metric_errors(run: LiveRun) -> tuple[list[str], dict[str, Any]]:
     if run.injected_at is None:
         raise RegionalFixtureError("provider events follow the injection")
-    provider = run.regional.provider_events(run.injected_at, datetime.now(timezone.utc))
-    write_json_atomic(run.case_dir / "provider-events.json", {"events": provider})
+    ended_at = datetime.now(timezone.utc)
+    provider = run.regional.provider_events(run.injected_at, ended_at)
+    # A negative CloudTrail claim cannot be settled inside the delivery window;
+    # it is recorded as provisional and re-checked by DESTR-013.
+    provisional = run.regional.provider_events_provisional(ended_at)
+    write_json_atomic(
+        run.case_dir / "provider-events.json",
+        {"events": provider, "provisional": provisional},
+    )
     errors: list[str] = []
     if provider:
         errors.append("provider mutation appeared during the lifetime drill")
     metrics = verdicts.metric_evidence(run.metrics_before, worker_metrics(run.regional))
     errors.extend(verdicts.metric_errors(metrics))
+    metrics["provider_events"] = {"count": len(provider), "provisional": provisional}
     return errors, metrics
 
 
@@ -963,11 +1033,13 @@ def execute_case(
         errors.extend(provider_errors)
         result.update(
             {
+                **run.regional.evidence_identity(),
                 "verdict": "PASS" if not errors else "FAIL",
                 "errors": errors,
                 "marker": run.marker,
                 "incident_id": run.incident_id,
                 "support_incident_id": run.support_incident_id,
+                "provider_events": metrics.get("provider_events"),
                 "workflow_request_id": run.workflow_request_id,
                 "injected_at": run.injected_at.isoformat() if run.injected_at else None,
                 "cancelled_at": run.t_cancel.isoformat() if run.t_cancel else None,
@@ -984,9 +1056,9 @@ def execute_case(
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        cleanup = _cleanup(run)
-        result["cleanup"] = cleanup
-        if cleanup["errors"]:
+        cleanup_result = cleanup(run)
+        result["cleanup"] = cleanup_result
+        if cleanup_result["errors"]:
             result["verdict"] = "FAIL"
     write_json_atomic(run.case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
@@ -999,12 +1071,26 @@ def _refuse_residual_map(residuals: dict[str, bool]) -> dict[str, bool]:
     return residuals
 
 
-def _restore_isolated_node(run: _LiveRun) -> dict[str, Any]:
+def known_incidents(run: LiveRun) -> list[str]:
+    """The incidents this run owns, owner first.
+
+    The support escalation takes the node's isolation over from the failed
+    reset workflow and adds the quarantine taint, so it is the owner a restore
+    has to name first; the reset incident is closed after it, on the no-op
+    path, so it does not stay ESCALATED pointing at a healthy node.
+    """
+
+    return [item for item in (run.support_incident_id, run.incident_id) if item]
+
+
+def restore_isolated_node(run: LiveRun) -> dict[str, Any]:
     """Release the isolation through a validated restore, never by hand.
 
-    The taint is owned by whichever incident quarantined the node -- the
-    support escalation if it got that far, otherwise the reset incident -- so
-    both are offered to the validation-first workflow in that order.
+    Runs *after* the env window has closed: a restore workflow created inside
+    the window inherits the compressed lifetime and can fail on it. Both
+    incidents are restored, as DESTR-017 does -- the support incident owns the
+    taint, and the reset incident must not be left ESCALATED over a node
+    nobody isolates any more.
     """
 
     snapshot = run.regional.node_snapshot(run.settings.node)
@@ -1016,43 +1102,40 @@ def _restore_isolated_node(run: _LiveRun) -> dict[str, Any]:
             for taint in snapshot.get("taints") or []
         )
     )
-    if not isolated:
-        return {"isolated": False}
-    candidates = [item for item in (run.support_incident_id, run.incident_id) if item]
-    if not candidates:
+    report: dict[str, Any] = {"isolated": isolated}
+    ordered = known_incidents(run)
+    if isolated and not ordered:
         raise RegionalFixtureError("the node is isolated but no incident is known")
     warm = WarmSpareLiveFixture(run.regional, "")
-    failures: list[str] = []
-    for incident_id in candidates:
-        try:
-            warm.wait_incident_idle(incident_id)
-            created = warm.create_restore_workflow(
-                incident_id=incident_id,
-                node=run.settings.node,
-                profile_version=run.profile_version,
-                reason=f"{CASE_ID} validated cleanup",
-            )
-        except Exception as exc:  # noqa: BLE001 - try the next owner
-            failures.append(f"{incident_id}: {type(exc).__name__}: {exc}")
-            continue
+    for incident_id in ordered:
+        warm.wait_incident_idle(incident_id)
+        created = warm.create_restore_workflow(
+            incident_id=incident_id,
+            node=run.settings.node,
+            profile_version=run.profile_version,
+            reason=f"{CASE_ID} validated cleanup",
+        )
         restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
+        report[incident_id] = restored.get("status")
         if restored.get("status") != "SUCCEEDED":
             raise RegionalFixtureError(
-                f"{run.settings.node} restore workflow did not succeed: "
+                f"validated restore for {incident_id} did not succeed: "
                 f"{restored.get('status')}"
             )
-        return {
-            "isolated": True,
-            "incident_id": incident_id,
-            "restore": restored.get("status"),
-            "refused": failures,
-        }
-    raise RegionalFixtureError(
-        f"no incident could carry the validated restore: {failures}"
-    )
+    return report
 
 
-def _close_window(run: _LiveRun) -> dict[str, Any]:
+def _wait_incidents_idle(run: LiveRun) -> dict[str, Any]:
+    """No workflow of this run may still be running when the Deployment rolls."""
+
+    warm = WarmSpareLiveFixture(run.regional, "")
+    waited = {}
+    for incident_id in known_incidents(run):
+        waited[incident_id] = warm.wait_incident_idle(incident_id)
+    return {"idle": sorted(waited)}
+
+
+def _close_window(run: LiveRun) -> dict[str, Any]:
     record = env_window.close_window(
         run.window,
         run.regional,
@@ -1062,7 +1145,7 @@ def _close_window(run: _LiveRun) -> dict[str, Any]:
     return env_window.without_survey(record)
 
 
-def _cleanup(run: _LiveRun) -> dict[str, Any]:
+def cleanup(run: LiveRun) -> dict[str, Any]:
     result: dict[str, Any] = {"errors": []}
 
     def guard(label: str, action: Any) -> None:
@@ -1082,10 +1165,14 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
                 timeout=120,
             ),
         )
-    guard("restore_isolated_node", lambda: _restore_isolated_node(run))
-    # Only now may the Deployment roll again.
+    # Then quiescence, then the window: the Deployment may roll only once no
+    # workflow of this run is in flight -- and the restore has to be created
+    # *after* the window closed, or it inherits the compressed lifetime and can
+    # fail on the very deadline this case exists to prove.
+    guard("incidents_idle", lambda: _wait_incidents_idle(run))
     if run.window_opened:
         guard("close_env_window", lambda: _close_window(run))
+    guard("restore_isolated_node", lambda: restore_isolated_node(run))
     for label, probe in (("holder", run.holder), ("injector", run.injector)):
         guard(
             f"probe_cleanup_{label}",
@@ -1096,7 +1183,7 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     return result
 
 
-def _verify_restored_identity(run: _LiveRun) -> dict[str, Any]:
+def _verify_restored_identity(run: LiveRun) -> dict[str, Any]:
     """The deployment the drill borrowed, given back exactly.
 
     Two writes if the window was opened and closed, one if the run died with it
@@ -1125,7 +1212,7 @@ def _verify_restored_identity(run: _LiveRun) -> dict[str, Any]:
     return current
 
 
-def _final_node(run: _LiveRun) -> dict[str, Any]:
+def _final_node(run: LiveRun) -> dict[str, Any]:
     snapshot = run.regional.node_snapshot(run.settings.node)
     if snapshot["ready"] != "True":
         raise RegionalFixtureError("target node is not Ready after cleanup")

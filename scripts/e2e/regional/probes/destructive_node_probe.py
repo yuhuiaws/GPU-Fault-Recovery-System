@@ -11,6 +11,7 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import sys
 import time
 from typing import Any
 
@@ -434,6 +435,41 @@ def write_generic_xid(arguments: argparse.Namespace) -> None:
     )
 
 
+def gpu_sample() -> dict[str, Any]:
+    """One `nvidia-smi -L` reading for the detached sampler.
+
+    During the reset this sampler exists to observe, `nvidia-smi` blocks on the
+    driver and the 10s bound trips. An uncaught ``TimeoutExpired`` here used to
+    kill the sampler at exactly that moment, so the trace ended where the
+    interesting part began. A timed-out reading is itself the evidence: record
+    it and keep sampling.
+    """
+
+    observed_at = datetime.now(timezone.utc).isoformat()
+    try:
+        completed = run(["nvidia-smi", "-L"], check=False, timeout=10)
+    except subprocess.TimeoutExpired:
+        return {
+            "observed_at": observed_at,
+            "returncode": None,
+            "gpu_count": None,
+            "timed_out": True,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        }
+    lines = [
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if line.strip().startswith("GPU ")
+    ]
+    return {
+        "observed_at": observed_at,
+        "returncode": completed.returncode,
+        "gpu_count": len(lines),
+        "timed_out": False,
+        "sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
+    }
+
+
 def sample_gpus(arguments: argparse.Namespace) -> None:
     path = Path(arguments.output)
     if path.parent != SAMPLER_DIR or not path.name.startswith("reset-sampler-"):
@@ -441,18 +477,7 @@ def sample_gpus(arguments: argparse.Namespace) -> None:
     path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
     deadline = time.monotonic() + arguments.duration_seconds
     while time.monotonic() < deadline:
-        completed = run(["nvidia-smi", "-L"], check=False, timeout=10)
-        lines = [
-            line.strip()
-            for line in completed.stdout.splitlines()
-            if line.strip().startswith("GPU ")
-        ]
-        payload = {
-            "observed_at": datetime.now(timezone.utc).isoformat(),
-            "returncode": completed.returncode,
-            "gpu_count": len(lines),
-            "sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
-        }
+        payload = gpu_sample()
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, sort_keys=True) + "\n")
             stream.flush()
@@ -480,7 +505,10 @@ def start_sampler(arguments: argparse.Namespace) -> None:
             unit,
             "--property=RuntimeMaxSec=1800",
             "--property=KillMode=control-group",
-            "/opt/gpu-fault/venv/bin/python",
+            # The interpreter this probe is already running under: the host
+            # fixture chroots into the release's venv, and a hard-coded path
+            # to another venv either does not exist or runs another release.
+            sys.executable,
             str(Path(__file__).resolve()),
             "sample-gpus",
             "--output",
@@ -497,7 +525,16 @@ def start_sampler(arguments: argparse.Namespace) -> None:
         time.sleep(1)
         summary = sampler_summary(arguments.run_id)
     if summary["sample_count"] < 2:
-        raise ProbeError("detached GPU sampler did not start")
+        # The unit may well be running and merely slow to produce its first
+        # two lines; left alone it lives for RuntimeMaxSec=1800 and blocks the
+        # next start of this run ID with "already loaded".
+        run(["systemctl", "stop", unit + ".service"], check=False)
+        run(["systemctl", "reset-failed", unit + ".service"], check=False)
+        raise ProbeError(
+            "detached GPU sampler did not start "
+            f"(samples={summary['sample_count']}, active={summary['active']}); "
+            "unit stopped"
+        )
     emit(summary)
 
 

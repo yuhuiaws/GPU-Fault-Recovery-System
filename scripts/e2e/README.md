@@ -23,10 +23,11 @@ Regional procedures and safety boundaries are documented in
 ## Q118 helpers
 
 - `q118_fallback_marker.py`
-- `q118_requeue_containment.py`
 - `audit_q118_gpu_result.py`
 
 Their Kubernetes fixtures live in `regional/manifests/q118-*.yaml`.
+`q118_requeue_containment.py` was removed in the 2026-09-07 review: no case,
+test or procedure referenced it.
 
 ## Recovery helper
 

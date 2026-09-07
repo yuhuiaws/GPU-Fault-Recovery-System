@@ -8,17 +8,22 @@ import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
+
+from gpu_fault.admin.atomic_json import write_json_atomic as _write_document
 
 if __package__:
-    from .acceptance_scope import scoped_case_evidence
+    from .acceptance_runner_common import write_json_atomic
 else:
-    from acceptance_scope import scoped_case_evidence
+    from acceptance_runner_common import write_json_atomic
 
 
 ROOT = Path(__file__).resolve().parents[3]
+# CloudTrail's delivery guarantee: a negative read whose window ended inside
+# this is provisional, not proof.
+PROVIDER_EVENT_VISIBILITY_SECONDS = 900
 CPU_KUBECONFIG = Path()
 CPU_CONTEXT = ""
 GPU_KUBECONFIG = Path()
@@ -169,11 +174,13 @@ def kubectl(
 
 
 def write_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_text(
-        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
-    )
-    path.chmod(0o600)
+    """Atomic, private, scoped: a case document through the shared writer, a
+    node snapshot (a list) through the same all-or-nothing rename."""
+
+    if isinstance(value, dict):
+        write_json_atomic(path, cast(dict[str, Any], value))
+    else:
+        _write_document(path, cast(dict[str, Any], value))
 
 
 def cluster_recovery(name: str) -> dict[str, Any]:
@@ -883,6 +890,52 @@ def run_pytest(case_dir: Path, nodeids: list[str]) -> bool:
     return result.returncode == 0
 
 
+def failed_nodeids(log_text: str) -> set[str]:
+    """The nodeids pytest's short summary reports as FAILED or ERROR."""
+
+    failed = set()
+    for line in log_text.splitlines():
+        status, _, rest = line.partition(" ")
+        if status in {"FAILED", "ERROR"} and rest:
+            failed.add(rest.split(" - ", 1)[0].strip())
+    return failed
+
+
+def run_focused_pytest(
+    run_dir: Path,
+    definitions: dict[str, list[str]],
+) -> dict[str, bool]:
+    """One pytest process for every selected case's nodeids, attributed per case.
+
+    Three interpreter start-ups for five tests was the slowest part of the
+    audit. One run, then the log's FAILED lines say which case a failure
+    belongs to; a failed run whose log attributes nothing fails every case
+    rather than passing any.
+    """
+
+    if not definitions:
+        return {}
+    log_dir = run_dir / "cases"
+    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    nodeids = [nodeid for items in definitions.values() for nodeid in items]
+    passed = run_pytest(log_dir, nodeids)
+    if passed:
+        return {case_id: True for case_id in definitions}
+    log = log_dir / "pytest.log"
+    failed = failed_nodeids(log.read_text()) if log.is_file() else set()
+    if not failed:
+        return {case_id: False for case_id in definitions}
+    return {
+        case_id: not any(nodeid in failed for nodeid in items)
+        for case_id, items in definitions.items()
+    }
+
+
+def cloudtrail_provisional(ended_at: datetime, *, now: datetime | None = None) -> bool:
+    current = now or datetime.now(timezone.utc)
+    return current - ended_at < timedelta(seconds=PROVIDER_EVENT_VISIBILITY_SECONDS)
+
+
 def case_definitions() -> dict[str, list[str]]:
     return {
         "GF-REGIONAL-DESTR-005": [
@@ -979,58 +1032,118 @@ def probe_errors(
     return errors
 
 
+def automatic_cluster_recovery(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The negative cluster's recovery mode, read off the recorded snapshot.
+
+    The snapshot already carries the ``DescribeCluster`` payload the deployed
+    probe replays, so a second ``describe-cluster`` for the same three fields
+    was a duplicate read -- and one that could disagree with what the probe
+    was actually judged on.
+    """
+
+    described = (snapshot.get("payloads") or {}).get("describe_cluster") or {}
+    return {
+        "cluster_name": described.get("ClusterName"),
+        "status": described.get("ClusterStatus"),
+        "node_recovery": described.get("NodeRecovery"),
+    }
+
+
+class _Probes:
+    """Every live read of one audit, each guarded on its own.
+
+    One ``try`` around all of them meant a single probe failure -- an executor
+    Pod that would not exec, a cluster that would not describe -- failed all
+    three cases with the same error, and left the probes after it unrun. Each
+    read now records its own failure against the cases that depend on it.
+    """
+
+    def __init__(self, selected_cases: list[str]) -> None:
+        self.selected = list(selected_cases)
+        self.errors: dict[str, list[str]] = {case: [] for case in selected_cases}
+
+    def guarded(
+        self,
+        read: Callable[[], Any],
+        *,
+        cases: list[str] | None = None,
+    ) -> Any | None:
+        try:
+            return read()
+        except Exception as exc:  # noqa: BLE001 - recorded against its cases
+            message = f"{type(exc).__name__}: {exc}"
+            for case in cases if cases is not None else self.selected:
+                if case in self.errors:
+                    self.errors[case].append(message)
+            return None
+
+
 def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
     definitions = case_definitions()
     started_at = datetime.now(timezone.utc)
     baseline = node_snapshot()
     preflight_errors = node_preflight_errors(baseline)
     write_json(run_dir / "gpu-node-baseline.json", baseline)
+    for case_id in selected_cases:
+        (run_dir / "cases" / case_id).mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    gpu: dict[str, Any] = {}
+    probes = _Probes(selected_cases)
+    # The focused pytest first and once: it is independent of every live probe,
+    # and running it afterwards meant one probe exception left it unrun and
+    # reported as "focused pytest failed" -- a deployment problem disguised as
+    # a repo-side regression.
+    test_results: dict[str, bool] = (
+        probes.guarded(
+            lambda: run_focused_pytest(
+                run_dir, {case_id: definitions[case_id] for case_id in selected_cases}
+            ),
+            cases=[],
+        )
+        or {}
+    )
+    gpu: dict[str, Any] = (
+        probes.guarded(lambda: cluster_recovery(MANAGED_GPU_CLUSTER)) or {}
+    )
+    env: list[dict[str, Any]] = probes.guarded(executor_env) or []
     automatic: dict[str, Any] | None = None
-    env: list[dict[str, Any]] = []
-    managed_probe: dict[str, Any] | None = None
     automatic_probe: dict[str, Any] | None = None
+    managed_probe: dict[str, Any] | None = None
     executor_probes: dict[str, Any] | None = None
-    test_results: dict[str, bool] = {}
-    fatal_error = None
+    if "GF-REGIONAL-DESTR-006" in selected_cases:
+        only = ["GF-REGIONAL-DESTR-006"]
+        snapshot = probes.guarded(
+            lambda: record_provider_snapshot(AUTOMATIC_NEGATIVE_CLUSTER), cases=only
+        )
+        if snapshot is not None:
+            write_json(run_dir / "automatic-negative-cluster-payloads.json", snapshot)
+            automatic = automatic_cluster_recovery(snapshot)
+            automatic_probe = probes.guarded(
+                lambda: deployed_automatic_recovery_probe(snapshot), cases=only
+            )
+    if "GF-REGIONAL-DESTR-005" in selected_cases:
+        managed_probe = probes.guarded(
+            deployed_managed_owner_probe, cases=["GF-REGIONAL-DESTR-005"]
+        )
+    if "GF-REGIONAL-DESTR-007" in selected_cases:
+        executor_probes = probes.guarded(
+            deployed_executor_guard_probes, cases=["GF-REGIONAL-DESTR-007"]
+        )
+
+    ended_at = datetime.now(timezone.utc)
+    events: list[dict[str, Any]] | None = probes.guarded(
+        lambda: replace_events(started_at, ended_at)
+    )
+    provisional = cloudtrail_provisional(ended_at)
     postflight: list[dict[str, Any]] = []
     drift_errors: list[str] = []
-    events: list[dict[str, Any]] = []
-    try:
-        # The focused pytest first: it is independent of every live probe, and
-        # running it afterwards meant one probe exception left it unrun and
-        # reported as "focused pytest failed" -- a deployment problem disguised
-        # as a repo-side regression.
-        for case_id in selected_cases:
-            case_dir = run_dir / "cases" / case_id
-            case_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            test_results[case_id] = run_pytest(case_dir, definitions[case_id])
-        gpu = cluster_recovery(MANAGED_GPU_CLUSTER)
-        if "GF-REGIONAL-DESTR-006" in selected_cases:
-            automatic = cluster_recovery(AUTOMATIC_NEGATIVE_CLUSTER)
-            snapshot = record_provider_snapshot(AUTOMATIC_NEGATIVE_CLUSTER)
-            write_json(run_dir / "automatic-negative-cluster-payloads.json", snapshot)
-            automatic_probe = deployed_automatic_recovery_probe(snapshot)
-        env = executor_env()
-        if "GF-REGIONAL-DESTR-005" in selected_cases:
-            managed_probe = deployed_managed_owner_probe()
-        if "GF-REGIONAL-DESTR-007" in selected_cases:
-            executor_probes = deployed_executor_guard_probes()
-    except Exception as exc:
-        fatal_error = f"{type(exc).__name__}: {exc}"
-    finally:
-        ended_at = datetime.now(timezone.utc)
-        try:
-            events = replace_events(started_at, ended_at)
-        except Exception as exc:
-            fatal_error = fatal_error or f"{type(exc).__name__}: {exc}"
-        try:
-            postflight = node_snapshot()
-            drift_errors = node_state_drift(baseline, postflight)
-            write_json(run_dir / "gpu-node-postflight.json", postflight)
-        except Exception as exc:
-            fatal_error = fatal_error or f"{type(exc).__name__}: {exc}"
+
+    def postflight_read() -> None:
+        nonlocal postflight, drift_errors
+        postflight = node_snapshot()
+        drift_errors = node_state_drift(baseline, postflight)
+        write_json(run_dir / "gpu-node-postflight.json", postflight)
+
+    probes.guarded(postflight_read)
 
     failed = False
     for case_id in selected_cases:
@@ -1039,13 +1152,17 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
             errors.append("focused pytest did not run")
         elif not test_results[case_id]:
             errors.append("focused pytest failed")
-        if fatal_error:
-            errors.append(fatal_error)
+        errors.extend(probes.errors[case_id])
         if events:
             errors.append("CloudTrail contains provider replace")
         errors.extend(drift_errors)
         errors.extend(
-            probe_errors(case_id, managed_probe, executor_probes, automatic_probe)
+            probe_errors(
+                case_id,
+                managed_probe if case_id == "GF-REGIONAL-DESTR-005" else None,
+                executor_probes if case_id == "GF-REGIONAL-DESTR-007" else None,
+                automatic_probe if case_id == "GF-REGIONAL-DESTR-006" else None,
+            )
         )
         if gpu.get("node_recovery") != "None":
             errors.append("managed GPU cluster NodeRecovery is not None")
@@ -1062,23 +1179,32 @@ def run_audit(run_dir: Path, selected_cases: list[str]) -> int:
                 for item in env
             ):
                 errors.append("production executor safety environment is inconsistent")
-        result = {
+        result: dict[str, Any] = {
             "case_id": case_id,
             "verdict": "PASS" if not errors else "FAIL",
             "acceptance_incomplete": bool(preflight_errors or drift_errors),
             "errors": errors,
             "focused_pytest": definitions[case_id],
+            "focused_pytest_log": str(run_dir / "cases" / "pytest.log"),
             "gpu_cluster": gpu,
-            "automatic_negative_cluster": automatic,
             "executor_env": env,
-            "deployed_managed_owner_probe": managed_probe,
-            "deployed_automatic_recovery_probe": automatic_probe,
-            "deployed_executor_guard_probes": executor_probes,
-            "replace_events": events,
+            # The negative claim is provisional while CloudTrail may still be
+            # delivering; DESTR-013 re-reads the whole run's window later.
+            "replace_events": events if events is not None else [],
+            "replace_events_provisional": provisional,
             "node_baseline": baseline,
             "node_postflight": postflight,
             "node_state_identical": not drift_errors,
         }
+        # Each case carries only its own probe; the shared baseline/postflight
+        # and cluster reads are the same for all three and are kept.
+        if case_id == "GF-REGIONAL-DESTR-005":
+            result["deployed_managed_owner_probe"] = managed_probe
+        if case_id == "GF-REGIONAL-DESTR-006":
+            result["automatic_negative_cluster"] = automatic
+            result["deployed_automatic_recovery_probe"] = automatic_probe
+        if case_id == "GF-REGIONAL-DESTR-007":
+            result["deployed_executor_guard_probes"] = executor_probes
         case_dir = run_dir / "cases" / case_id
         write_json(case_dir / f"{case_id}.json", result)
         print(json.dumps(result, sort_keys=True))

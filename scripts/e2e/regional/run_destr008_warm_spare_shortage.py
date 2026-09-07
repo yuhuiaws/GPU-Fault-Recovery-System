@@ -22,6 +22,8 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
+    record_focused_tests,
+    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
@@ -94,6 +96,12 @@ SERVICE_STOP_DELAY_SECONDS = {
     "agent-unavailable": 0,
 }
 SERVICE_RESTORE_SECONDS = 420
+# How long a scenario may wait for its workflow when nothing bounds the
+# mutation, and how far short of a bounded mutation's expiry the wait stops.
+# A wait that outlives the failsafe (kubelet back, holder exited) is a wait for
+# REPLACE_NODE to *succeed* -- a real failover nobody authorised.
+WORKFLOW_WAIT_SECONDS = 900
+BOUND_MARGIN_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -258,6 +266,8 @@ def profile_errors(profile: dict[str, Any] | None) -> list[str]:
 def read_only_preflight(
     settings: Settings,
     case_dir: Path,
+    *,
+    reusable_tests: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not settings.site_file.is_file() or not settings.manifest.is_file():
         raise RegionalFixtureError("site file or training manifest does not exist")
@@ -275,8 +285,13 @@ def read_only_preflight(
     predecessor = predecessor_evidence(
         settings.predecessor_path,
         PREDECESSOR_CASE_ID,
+        **regional.evidence_identity(),
     )
-    tests = focused_tests(case_dir)
+    tests = (
+        {**reusable_tests, "reused": True}
+        if reusable_tests is not None
+        else focused_tests(case_dir)
+    )
     errors = []
     if not predecessor["valid"]:
         errors.append("DESTR-003 predecessor evidence is not PASS")
@@ -436,6 +451,11 @@ class ScenarioFixture:
         self.node_mutation: NodeMutationFixture | None = None
         self.service: WarmSpareServiceFixture | None = None
         self.holder: GpuHolderFixture | None = None
+        # When the scenario's shortage stops holding on its own: the service
+        # failsafe timer, or the GPU holder's sleep. None for the label and
+        # annotation scenarios, which hold until restored.
+        self.bound_at: datetime | None = None
+        self.bound_label = ""
 
     def apply(self) -> dict[str, Any]:
         if self.scenario == "no-spare":
@@ -477,13 +497,15 @@ class ScenarioFixture:
             )
             return {"reservation": other}
         if self.scenario == "active-gpu-pod":
+            # Named now, created in `apply_late`: the holder's sleep is the
+            # bound on this shortage, and spending it while the workload is
+            # still being scheduled let REPLACE_NODE find a free spare.
             self.holder = GpuHolderFixture(
                 self.warm,
                 node=self.settings.spare_node,
                 run_id=self.run_id,
             )
-            self.holder.create()
-            return {"holder_pod": self.holder.name}
+            return {"holder_pod": self.holder.name, "armed": "late"}
         if self.scenario in SERVICE_UNIT:
             self.service = WarmSpareServiceFixture(
                 self.warm,
@@ -497,17 +519,29 @@ class ScenarioFixture:
         raise ValueError(f"unknown scenario: {self.scenario}")
 
     def apply_late(self) -> dict[str, Any]:
-        """Take the spare's service down once the workload is already running.
+        """Arm the bounded shortages once the workload is already running.
 
-        Label, annotation and Pod mutations hold indefinitely, so `apply()`
-        makes them before the workload starts. A stopped systemd unit does
-        not: it is bounded by the failsafe timer that restores it. Submitting
-        the workload and waiting for its observation first can take minutes,
-        which would burn most of that window before the workflow ever reaches
-        `REPLACE_NODE` -- so the stop happens here, immediately before the
-        replacement signal, and the window only has to cover the workflow.
+        Label and annotation mutations hold indefinitely, so `apply()` makes
+        them before the workload starts. A stopped systemd unit and a GPU
+        holder Pod do not: the unit is bounded by the failsafe timer that
+        restores it, the holder by its own sleep. Submitting the workload and
+        waiting for its observation first can take minutes, which would burn
+        most of that window before the workflow ever reaches `REPLACE_NODE`
+        -- and a shortage that lapses mid-workflow lets REPLACE_NODE succeed,
+        which is a real failover. So both happen here, immediately before the
+        replacement signal, and `bound_at` records when each stops holding.
         """
 
+        if self.holder is not None:
+            self.holder.create()
+            self.bound_at = self.holder.deadline_at
+            self.bound_label = "GPU holder Pod"
+            return {
+                "holder_pod": self.holder.name,
+                "holder_deadline_at": (
+                    self.bound_at.isoformat() if self.bound_at else None
+                ),
+            }
         if self.service is None:
             return {}
         unit = SERVICE_UNIT[self.scenario]
@@ -516,6 +550,8 @@ class ScenarioFixture:
             restore_seconds=SERVICE_RESTORE_SECONDS,
             delay_seconds=SERVICE_STOP_DELAY_SECONDS[self.scenario],
         )
+        self.bound_at = self.service.failsafe_at
+        self.bound_label = f"{unit} failsafe"
         if self.scenario == "kubernetes-not-ready":
             self.warm.wait_node_ready(
                 self.settings.spare_node,
@@ -528,7 +564,11 @@ class ScenarioFixture:
                 ready=False,
                 timeout_seconds=180,
             )
-        return {"service": unit, "stopped": stopped}
+        return {
+            "service": unit,
+            "stopped": stopped,
+            "failsafe_at": self.bound_at.isoformat() if self.bound_at else None,
+        }
 
     def restore(self) -> dict[str, Any]:
         errors = []
@@ -575,6 +615,71 @@ class ScenarioFixture:
                 errors.append(f"node restore: {type(exc).__name__}: {exc}")
         result["errors"] = errors
         return result
+
+
+def wait_timeout_seconds(
+    bound_at: datetime | None,
+    now: datetime,
+    *,
+    default: int = WORKFLOW_WAIT_SECONDS,
+    margin: int = BOUND_MARGIN_SECONDS,
+) -> int:
+    """How long to wait for the shortage workflow without outliving its bound.
+
+    Unbounded scenarios get ``default``. A bounded one gets whatever is left
+    before ``bound_at`` less ``margin``; once that is nothing, the wait is one
+    second, so the caller fails on the timeout rather than on a REPLACE_NODE
+    that had every chance to succeed.
+    """
+
+    if bound_at is None:
+        return default
+    remaining = int((bound_at - now).total_seconds()) - margin
+    return max(1, min(default, remaining))
+
+
+def bound_errors(
+    replace: dict[str, Any] | None,
+    *,
+    bound_at: datetime | None,
+    label: str,
+) -> list[str]:
+    """Refuse a REPLACE_NODE verdict reached after the shortage stopped holding.
+
+    A REPLACE_NODE that concluded after the kubelet failsafe fired or the GPU
+    holder exited was judged against a spare that had already come back; a
+    FAILED there says nothing about the gate, and a SUCCEEDED is the failover
+    this case exists never to perform.
+    """
+
+    if bound_at is None or replace is None:
+        return []
+    concluded_text = str(replace.get("updated_at") or replace.get("started_at") or "")
+    if not concluded_text:
+        return [f"REPLACE_NODE has no timestamp to compare with the {label}"]
+    concluded = datetime.fromisoformat(concluded_text.replace("Z", "+00:00"))
+    if concluded.tzinfo is None:
+        concluded = concluded.replace(tzinfo=timezone.utc)
+    if concluded >= bound_at:
+        return [
+            f"the {label} fired at {bound_at.isoformat()} before REPLACE_NODE "
+            f"concluded at {concluded.isoformat()}; the shortage was not holding"
+        ]
+    return []
+
+
+def recover_incident_id(warm: WarmSpareLiveFixture, event_id: str) -> str:
+    """The incident the injected event opened, when the scenario lost track.
+
+    ``incident_id`` is only learned from the terminal store snapshot; a wait
+    that timed out never produced one, and a cleanup keyed on an empty id
+    released no spare and restored nothing on a node it had just quarantined.
+    """
+
+    if not event_id:
+        return ""
+    state = warm.store_snapshot(event_id=event_id)
+    return str((state.get("incident") or {}).get("incident_id") or "")
 
 
 def replacement_payload(
@@ -766,6 +871,7 @@ def run_scenario(
         "synthetic_trigger": True,
     }
     incident_id = ""
+    event_id = ""
     try:
         mutation = fixture.apply()
         write_json_atomic(scenario_dir / "scenario-mutation.json", mutation)
@@ -807,20 +913,27 @@ def run_scenario(
             job_id=job_id,
             attempt_id=attempt_id,
             case_dir=scenario_dir,
-            timeout_seconds=900,
+            timeout_seconds=wait_timeout_seconds(
+                fixture.bound_at, datetime.now(timezone.utc)
+            ),
         )
         incident_id = str((state.get("incident") or {}).get("incident_id") or "")
         state["fault_node"] = warm.node_snapshot(settings.fault_node)
         state["spare_node"] = warm.node_snapshot(settings.spare_node)
         write_json_atomic(scenario_dir / "workflow-state.json", state)
         errors = scenario_errors(state, settings, scenario, event_id=event_id)
+        errors.extend(
+            bound_errors(
+                terminal_execution(state.get("workflow") or {}, "REPLACE_NODE"),
+                bound_at=fixture.bound_at,
+                label=fixture.bound_label,
+            )
+        )
         provider_after = warm.provider_inventory()
         if provider_after != provider_baseline:
             errors.append("HyperPod provider inventory changed")
-        provider_events = regional.provider_events(
-            started_at,
-            datetime.now(timezone.utc),
-        )
+        ended_at = datetime.now(timezone.utc)
+        provider_events = regional.provider_events(started_at, ended_at)
         if any(
             item["event_name"] in PROVIDER_REPLACE_EVENTS for item in provider_events
         ):
@@ -834,13 +947,27 @@ def run_scenario(
                 "workflow_request_id": (
                     (state.get("workflow") or {}).get("request_id")
                 ),
+                "shortage_bound_at": (
+                    fixture.bound_at.isoformat() if fixture.bound_at else None
+                ),
                 "provider_events": provider_events,
+                # The negative claim cannot be proven inside CloudTrail's lag;
+                # DESTR-013 re-reads the whole run's window later.
+                "provider_events_provisional": regional.provider_events_provisional(
+                    ended_at
+                ),
                 "notifications": state.get("notifications") or [],
             }
         )
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        if not incident_id:
+            try:
+                incident_id = recover_incident_id(warm, event_id)
+                result["incident_id_recovered_from_event"] = bool(incident_id)
+            except Exception as exc:
+                result["incident_lookup_error"] = f"{type(exc).__name__}: {exc}"
         try:
             workload.delete()
         except Exception as exc:
@@ -902,7 +1029,7 @@ def run_scenario(
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     state = preflight["store"]
-    return {
+    details: dict[str, Any] = {
         "risk": "destructive-warm-spare",
         "predecessor": preflight["predecessor"],
         "fault_node": settings.fault_node,
@@ -946,6 +1073,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
+    record_focused_tests(details, preflight.get("focused_tests") or {})
+    return details
 
 
 def verify_plan_identity(
@@ -975,7 +1104,11 @@ def execute_case(
 ) -> int:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir)
+    preflight = read_only_preflight(
+        settings,
+        case_dir,
+        reusable_tests=reusable_focused_tests(case_dir / "plan.json"),
+    )
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -995,6 +1128,10 @@ def execute_case(
         "synthetic_trigger": True,
         "maintenance_window_end": maintenance_window_end.isoformat(),
         "selected_scenarios": list(settings.scenarios),
+        **regional.evidence_identity(),
+        "focused_tests_reused": bool(
+            (preflight.get("focused_tests") or {}).get("reused")
+        ),
     }
     scenario_results = []
     try:

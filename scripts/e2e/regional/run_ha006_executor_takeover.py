@@ -10,9 +10,10 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 if __package__:
-    from .acceptance_scope import scoped_case_evidence
+    from .acceptance_runner_common import write_json_atomic
     from .live_driver_guard import (
         add_live_arguments,
         authorize_execution,
@@ -20,7 +21,7 @@ if __package__:
         install_site_profile,
     )
 else:
-    from acceptance_scope import scoped_case_evidence
+    from acceptance_runner_common import write_json_atomic
     from live_driver_guard import (
         add_live_arguments,
         authorize_execution,
@@ -51,6 +52,11 @@ CASE_ID = "GF-REGIONAL-HA-006"
 OWNER = "gpu-fault-ha006-test"
 LEASE_SECONDS = 30
 WINNER_SLEEP_SECONDS = 60
+# The fixture executors poll every second but back off up to this after idle
+# claims, so a survivor may notice an expired lease up to poll+backoff late.
+POLL_SECONDS = 1
+CLAIM_BACKOFF_MAX_SECONDS = 4
+SAMPLE_INTERVAL_SECONDS = 0.5
 CONFIRMATION = "HA006_FORCE_DELETE_TEST_EXECUTOR"
 
 
@@ -63,11 +69,72 @@ def log(message: str) -> None:
     print(f"[{stamp}] {message}", flush=True)
 
 
-def write_json(path: Path, value: object) -> None:
-    path.write_text(
-        json.dumps(scoped_case_evidence(value), indent=2, sort_keys=True) + "\n"
-    )
-    path.chmod(0o600)
+def parse_timestamp(value: object) -> datetime | None:
+    if value in (None, ""):
+        return None
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def remaining_lease_seconds(post_kill: dict, killed_at: datetime) -> float | None:
+    """Seconds of lease left at the kill, or None when the command held no lease.
+
+    ``lease_expires_at`` is None outside LEASED: the kill then landed while the
+    command was WAITING or already terminal, and the LEASED-branch timing bound
+    has nothing to measure against. The caller records INCONCLUSIVE for that
+    branch rather than crashing on ``fromisoformat(None)``.
+    """
+
+    expiry = parse_timestamp(post_kill.get("lease_expires_at"))
+    if expiry is None:
+        return None
+    return max(0.0, (expiry - killed_at).total_seconds())
+
+
+def takeover_timing(
+    final: dict,
+    *,
+    killed_at: datetime,
+    observed_completed_at: datetime,
+    poll_seconds: int = POLL_SECONDS,
+    claim_backoff_max_seconds: int = CLAIM_BACKOFF_MAX_SECONDS,
+    sample_interval_seconds: float = SAMPLE_INTERVAL_SECONDS,
+) -> dict[str, Any]:
+    """Takeover duration from the store's own completion timestamp when it has one.
+
+    ``updated_at`` on the SUCCEEDED command is written by the control plane
+    when the survivor's result lands; measuring from it removes the sampler's
+    ~0.5s granularity. Only when it is missing does the sampled time stand in,
+    and then the sampling period is part of the tolerance. The tolerance itself
+    is the executor's poll plus its idle-claim backoff -- the longest a survivor
+    can legitimately take to notice an expired lease -- not a constant 5s.
+    """
+
+    store_completed_at = parse_timestamp(final.get("updated_at"))
+    if store_completed_at is not None:
+        completed_at = store_completed_at
+        source = "store.updated_at"
+        tolerance = float(poll_seconds + claim_backoff_max_seconds)
+    else:
+        completed_at = observed_completed_at
+        source = "sampled"
+        tolerance = float(poll_seconds + claim_backoff_max_seconds) + float(
+            sample_interval_seconds
+        )
+    return {
+        "completed_at": completed_at.isoformat(),
+        "completion_source": source,
+        "takeover_seconds": round((completed_at - killed_at).total_seconds(), 3),
+        "tolerance_seconds": tolerance,
+    }
+
+
+def physical_action_total(*states: dict) -> int:
+    """Physical actions across every executor's counter file, summed by the runner."""
+
+    return sum(int((state or {}).get("physical_actions", 0)) for state in states)
 
 
 def cpu_python(script: str, *arguments: str) -> dict:
@@ -255,6 +322,7 @@ print(json.dumps({
         item.lease_expires_at.isoformat()
         if item.lease_expires_at is not None else None
     ),
+    "updated_at": item.updated_at.isoformat(),
     "result_details": item.result_details,
     "error": item.error,
 }, sort_keys=True))
@@ -401,6 +469,12 @@ def pod_manifest(
                         },
                         {"name": "RUN_ID", "value": run_id},
                         {"name": "LEASE_SECONDS", "value": str(LEASE_SECONDS)},
+                        {"name": "POLL_SECONDS", "value": str(POLL_SECONDS)},
+                        {
+                            "name": "CLAIM_BACKOFF_MAX_SECONDS",
+                            "value": str(CLAIM_BACKOFF_MAX_SECONDS),
+                        },
+                        {"name": "WAIT_FIRST_ROUND", "value": "true"},
                         {
                             "name": "WINNER_SLEEP_SECONDS",
                             "value": str(WINNER_SLEEP_SECONDS),
@@ -470,23 +544,79 @@ def production_lease_seconds() -> int:
     raise CaseError("production executor lease setting is missing")
 
 
-def wait_first_owner(seed: dict, timeout_seconds: int = 120) -> tuple[dict, dict]:
+def wait_first_owner(
+    seed: dict, timeout_seconds: int = 120
+) -> tuple[dict, dict, list[dict]]:
+    """Wait for the LEASED shared-ledger winner, keeping the WAITING round on record.
+
+    The fixture adapter reports WAITING on its first claim, so the samples taken
+    here are the evidence for the WAITING branch: which replica returned
+    WAITING (``last_lease_owner`` while the status is WAITING) and which one
+    re-claimed and won the ledger.
+    """
+
     deadline = time.monotonic() + timeout_seconds
-    last_command = {}
-    last_notification = {}
+    last_command: dict = {}
+    last_notification: dict = {}
+    timeline: list[dict] = []
     while time.monotonic() < deadline:
         last_command = command_snapshot(str(seed["command_id"]))
         last_notification = notification_snapshot(str(seed["deduplication_key"]))
+        timeline.append(
+            {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "status": last_command.get("status"),
+                "lease_owner": last_command.get("lease_owner"),
+                "last_lease_owner": last_command.get("last_lease_owner"),
+                "round": (last_command.get("result_details") or {}).get("round"),
+            }
+        )
         if (
             last_command.get("status") == "LEASED"
             and last_command.get("lease_owner") in PODS
             and last_notification.get("notification_id")
         ):
-            return last_command, last_notification
-        time.sleep(0.5)
+            return last_command, last_notification, timeline
+        time.sleep(SAMPLE_INTERVAL_SECONDS)
     raise CaseError(
         f"first owner did not acquire shared ledger: {last_command} {last_notification}"
     )
+
+
+def waiting_branch(timeline: list[dict]) -> dict[str, Any]:
+    """What the pre-kill samples show about the WAITING round.
+
+    ``observed`` is True when a sample caught the command in WAITING (or a
+    result whose ``round`` is 1); ``waiting_owner`` is the replica that returned
+    it and ``reclaimed_by_other_replica`` whether a different replica took the
+    second round. Store sampling at 0.5s can miss a short WAITING phase, so
+    ``observed`` False is reported, not failed.
+    """
+
+    waiting_samples = [
+        item
+        for item in timeline
+        if item.get("status") == "WAITING" or item.get("round") == 1
+    ]
+    waiting_owner = next(
+        (
+            str(item.get("last_lease_owner") or item.get("lease_owner") or "")
+            for item in waiting_samples
+            if item.get("last_lease_owner") or item.get("lease_owner")
+        ),
+        None,
+    )
+    leased = [item for item in timeline if item.get("status") == "LEASED"]
+    second_owner = str(leased[-1].get("lease_owner") or "") if leased else None
+    return {
+        "observed": bool(waiting_samples),
+        "waiting_owner": waiting_owner,
+        "second_round_owner": second_owner,
+        "reclaimed_by_other_replica": (
+            bool(waiting_owner and second_owner) and waiting_owner != second_owner
+        ),
+        "samples": len(timeline),
+    }
 
 
 def wait_terminal(seed: dict, timeout_seconds: int = 120) -> tuple[dict, list[dict]]:
@@ -502,8 +632,52 @@ def wait_terminal(seed: dict, timeout_seconds: int = 120) -> tuple[dict, list[di
         )
         if value.get("status") == "SUCCEEDED":
             return value, timeline
-        time.sleep(0.5)
+        time.sleep(SAMPLE_INTERVAL_SECONDS)
     raise CaseError(f"command did not reach SUCCEEDED: {timeline[-5:]}")
+
+
+def takeover_errors(
+    *,
+    final: dict,
+    survivor: str,
+    notification_id: str,
+    timing: dict[str, Any],
+    remaining_lease: float,
+    survivor_state: dict,
+    physical_total: int,
+    notification_final: dict,
+) -> list[str]:
+    errors = []
+    if final.get("last_lease_owner") != survivor:
+        errors.append("survivor did not become the final lease owner")
+    details = final.get("result_details", {})
+    if details.get("cached") is not True:
+        errors.append("survivor did not reuse the shared action ledger")
+    if physical_total != 1:
+        errors.append(
+            f"physical action counters across executors sum to {physical_total}, not 1"
+        )
+    if details.get("shared_notification_id") != notification_id:
+        errors.append("shared ledger identity changed across takeover")
+    if timing["takeover_seconds"] > remaining_lease + timing["tolerance_seconds"]:
+        errors.append(
+            "takeover exceeded remaining lease plus poll/backoff tolerance "
+            f"({timing['takeover_seconds']}s > {remaining_lease}s + "
+            f"{timing['tolerance_seconds']}s)"
+        )
+    if int(survivor_state.get("claimed_total", 0)) < 1:
+        errors.append("survivor did not record a claimed command")
+    if int(survivor_state.get("unexpected_failures", 0)) != 0:
+        errors.append("survivor recorded an unexpected failure")
+    objects = notification_final.get("objects", {})
+    if notification_final.get("dedup_link_count") != 1:
+        errors.append("shared action ledger dedup link count is not one")
+    for kind in ("notification", "notification_delivery", "notification_result"):
+        if objects.get(kind, {}).get("count") != 1:
+            errors.append(f"shared ledger {kind} count is not one")
+    if objects.get("notification_result", {}).get("status") != "SKIPPED":
+        errors.append("shared ledger drill notification was not suppressed")
+    return errors
 
 
 def run_case(
@@ -519,14 +693,13 @@ def run_case(
     result: dict = {"case_id": CASE_ID, "attempt": attempt, "verdict": "FAIL"}
     seed: dict = {}
     notification_id: str | None = None
-    created_pods: set[str] = set()
     try:
         database_preflight = database_residuals()
         registry_preflight = registry_residuals()
         kubernetes_preflight = kubernetes_residuals()
-        write_json(case_dir / "database-preflight.json", database_preflight)
-        write_json(case_dir / "registry-preflight.json", registry_preflight)
-        write_json(case_dir / "kubernetes-preflight.json", kubernetes_preflight)
+        write_json_atomic(case_dir / "database-preflight.json", database_preflight)
+        write_json_atomic(case_dir / "registry-preflight.json", registry_preflight)
+        write_json_atomic(case_dir / "kubernetes-preflight.json", kubernetes_preflight)
         if database_preflight["total"] != 0:
             raise CaseError(f"database preflight residuals: {database_preflight}")
         if registry_preflight["count"] != 0:
@@ -556,23 +729,26 @@ def run_case(
                 "-",
                 stdin=json.dumps(pod_manifest(pod, image, identity, run_id)).encode(),
             )
-            created_pods.add(pod)
         for pod in PODS:
             dataplane("wait", "--for=condition=Ready", f"pod/{pod}", "--timeout=180s")
             wait_file(pod, "/state/ready.json", 60)
         ready = {pod: read_state(pod, "/state/ready.json") for pod in PODS}
-        write_json(case_dir / "executors-ready.json", ready)
+        write_json_atomic(case_dir / "executors-ready.json", ready)
 
         seed = seed_command(run_id)
-        write_json(case_dir / "seed.json", seed)
-        first, notification = wait_first_owner(seed)
+        write_json_atomic(case_dir / "seed.json", seed)
+        first, notification, pre_kill_timeline = wait_first_owner(seed)
         notification_id = str(notification["notification_id"])
-        write_json(case_dir / "first-lease.json", first)
-        write_json(case_dir / "shared-ledger-before-kill.json", notification)
+        write_json_atomic(case_dir / "first-lease.json", first)
+        write_json_atomic(
+            case_dir / "pre-kill-timeline.json", {"entries": pre_kill_timeline}
+        )
+        write_json_atomic(case_dir / "shared-ledger-before-kill.json", notification)
+        waiting = waiting_branch(pre_kill_timeline)
         owner = str(first["lease_owner"])
         survivor = next(pod for pod in PODS if pod != owner)
         owner_state = read_state(owner, "/state/executor-state.json")
-        write_json(case_dir / "owner-before-kill.json", owner_state)
+        write_json_atomic(case_dir / "owner-before-kill.json", owner_state)
         kill_requested_at = datetime.now(timezone.utc)
         log(f"force deleting lease owner {owner}; survivor={survivor}")
         dataplane(
@@ -583,62 +759,49 @@ def run_case(
             "--force",
         )
         killed_at = datetime.now(timezone.utc)
-        created_pods.discard(owner)
         post_kill = command_snapshot(str(seed["command_id"]))
-        post_kill_expiry = datetime.fromisoformat(
-            str(post_kill["lease_expires_at"]).replace("Z", "+00:00")
-        )
-        remaining_lease = max(0.0, (post_kill_expiry - killed_at).total_seconds())
-        write_json(case_dir / "post-kill-command.json", post_kill)
+        write_json_atomic(case_dir / "post-kill-command.json", post_kill)
+        remaining_lease = remaining_lease_seconds(post_kill, killed_at)
         final, timeline = wait_terminal(seed)
-        completed_at = datetime.now(timezone.utc)
-        takeover_seconds = (completed_at - killed_at).total_seconds()
-        write_json(case_dir / "command-timeline.json", timeline)
-        write_json(case_dir / "final-command.json", final)
+        observed_completed_at = datetime.now(timezone.utc)
+        timing = takeover_timing(
+            final,
+            killed_at=killed_at,
+            observed_completed_at=observed_completed_at,
+        )
+        write_json_atomic(case_dir / "command-timeline.json", {"entries": timeline})
+        write_json_atomic(case_dir / "final-command.json", final)
         survivor_state = read_state(survivor, "/state/executor-state.json")
-        write_json(case_dir / "survivor-state.json", survivor_state)
+        write_json_atomic(case_dir / "survivor-state.json", survivor_state)
         survivor_logs = dataplane("logs", survivor, check=False, timeout=120)
         (case_dir / "survivor.log").write_text(survivor_logs)
         (case_dir / "survivor.log").chmod(0o600)
         notification_final = notification_snapshot(str(seed["deduplication_key"]))
-        write_json(case_dir / "shared-ledger-final.json", notification_final)
-        errors = []
-        if final.get("last_lease_owner") != survivor:
-            errors.append("survivor did not become the final lease owner")
-        details = final.get("result_details", {})
-        if details.get("cached") is not True or details.get("physical_count") != 1:
-            errors.append("survivor did not reuse the shared action ledger")
-        if details.get("shared_notification_id") != notification_id:
-            errors.append("shared ledger identity changed across takeover")
-        if takeover_seconds > remaining_lease + 5:
-            errors.append("takeover exceeded remaining lease plus poll margin")
-        if int(survivor_state.get("claimed_total", 0)) < 1:
-            errors.append("survivor did not record a claimed command")
-        if int(survivor_state.get("unexpected_failures", 0)) != 0:
-            errors.append("survivor recorded an unexpected failure")
-        objects = notification_final.get("objects", {})
-        if notification_final.get("dedup_link_count") != 1:
-            errors.append("shared action ledger dedup link count is not one")
-        for kind in ("notification", "notification_delivery", "notification_result"):
-            if objects.get(kind, {}).get("count") != 1:
-                errors.append(f"shared ledger {kind} count is not one")
-        if objects.get("notification_result", {}).get("status") != "SKIPPED":
-            errors.append("shared ledger drill notification was not suppressed")
+        write_json_atomic(case_dir / "shared-ledger-final.json", notification_final)
+        physical_total = physical_action_total(owner_state, survivor_state)
         result = {
             "case_id": CASE_ID,
             "attempt": attempt,
-            "verdict": "PASS" if not errors else "FAIL",
-            "errors": errors,
+            "verdict": "FAIL",
+            "errors": [],
             "production_lease_seconds": production_lease_seconds(),
             "fixture_lease_seconds": LEASE_SECONDS,
+            "fixture_poll_seconds": POLL_SECONDS,
+            "fixture_claim_backoff_max_seconds": CLAIM_BACKOFF_MAX_SECONDS,
             "winner_sleep_seconds": WINNER_SLEEP_SECONDS,
             "killed_owner": owner,
             "survivor": survivor,
             "kill_requested_at": kill_requested_at.isoformat(),
             "killed_at": killed_at.isoformat(),
-            "completed_at": completed_at.isoformat(),
-            "remaining_lease_at_kill_seconds": round(remaining_lease, 3),
-            "takeover_seconds": round(takeover_seconds, 3),
+            "completed_at": timing["completed_at"],
+            "completion_source": timing["completion_source"],
+            "remaining_lease_at_kill_seconds": (
+                round(remaining_lease, 3) if remaining_lease is not None else None
+            ),
+            "takeover_seconds": timing["takeover_seconds"],
+            "takeover_tolerance_seconds": timing["tolerance_seconds"],
+            "waiting_branch": waiting,
+            "physical_actions_total": physical_total,
             "first_lease": first,
             "post_kill_command": post_kill,
             "final_command": final,
@@ -646,6 +809,27 @@ def run_case(
             "owner_state": owner_state,
             "survivor_state": survivor_state,
         }
+        if remaining_lease is None:
+            # The kill did not land on a LEASED command, so the LEASED-branch
+            # bound cannot be judged; the run is inconclusive, not failed.
+            result["verdict"] = "INCONCLUSIVE"
+            result["inconclusive_reason"] = (
+                "command held no lease at the kill (lease_expires_at is null); "
+                "the LEASED takeover bound could not be measured"
+            )
+        else:
+            errors = takeover_errors(
+                final=final,
+                survivor=survivor,
+                notification_id=notification_id,
+                timing=timing,
+                remaining_lease=remaining_lease,
+                survivor_state=survivor_state,
+                physical_total=physical_total,
+                notification_final=notification_final,
+            )
+            result["errors"] = errors
+            result["verdict"] = "PASS" if not errors else "FAIL"
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
@@ -666,7 +850,7 @@ def run_case(
             try:
                 cleanup = cleanup_seed(seed, notification_id)
                 result["seed_cleanup"] = cleanup
-                write_json(case_dir / "seed-cleanup.json", cleanup)
+                write_json_atomic(case_dir / "seed-cleanup.json", cleanup)
             except Exception as exc:
                 result["cleanup_error"] = f"{type(exc).__name__}: {exc}"
                 result["verdict"] = "FAIL"
@@ -689,7 +873,7 @@ def run_case(
                 "kubernetes": kubernetes_residuals(),
             }
             result["postflight"] = postflight
-            write_json(case_dir / "postflight.json", postflight)
+            write_json_atomic(case_dir / "postflight.json", postflight)
             if postflight["database"]["total"] != 0:
                 raise CaseError(f"database residuals: {postflight}")
             if postflight["registry"]["count"] != 0:
@@ -699,7 +883,7 @@ def run_case(
         except Exception as exc:
             result["postflight_error"] = f"{type(exc).__name__}: {exc}"
             result["verdict"] = "FAIL"
-    write_json(case_dir / f"{CASE_ID}.json", result)
+    write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
 

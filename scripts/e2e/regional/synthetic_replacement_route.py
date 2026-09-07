@@ -295,8 +295,14 @@ def close_window(
             f"--containers={CONTAINER}",
             f"{ROUTE_ENV}-",
         )
+    # On disk before anything is waited for: the Deployment has been mutated,
+    # so the record must say so even if the rollout never settles inside the
+    # timeout. A record left saying "open" after a timed-out close is one the
+    # next `--open` refuses and the next `--close` re-runs against a variable
+    # that is already gone.
     record["closed_at"] = now()
     record["close_survey"] = report
+    write_json_atomic(settings.baseline, record)
     record["rollout_after_close"] = wait_rollout(settings, regional)
     restored = deployment_env(regional)
     record["restored_state"] = restored
@@ -308,9 +314,8 @@ def close_window(
             "the restored env does not match the recorded baseline: "
             + json.dumps({"baseline": baseline, "restored": restored}, sort_keys=True)
         )
-    # The closed_at above is already on disk: the mutation happened, so the
-    # record must say so even if the fleet takes longer than the timeout to
-    # settle. What must not happen is reporting a still-live route as retired.
+    # What must not happen is reporting a still-live route as retired, so the
+    # replicas are still required to agree before the close is reported done.
     record["pod_gates_after_close"] = converge_gates(
         settings, regional, enabled=False, sleep=sleep
     )

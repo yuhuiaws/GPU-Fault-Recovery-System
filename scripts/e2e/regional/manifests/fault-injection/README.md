@@ -23,3 +23,19 @@ Remove both labels during cleanup:
 kubectl label node "${TARGET_NODE_A}" gpu-fault.io/e2e-target-a-
 kubectl label node "${TARGET_NODE_B}" gpu-fault.io/e2e-target-b-
 ```
+
+## Contents
+
+Every manifest here is named by exactly one case or procedure; a manifest
+nobody names gets removed (the 2026-09-07 review dropped ten such files).
+
+| Manifest | Named by |
+| --- | --- |
+| `kmsg-xid45-xid14.yaml` | `GF-LIVE-KMSG-XID45-XID14-20260724` (`manifest:` in `testcases/fault-scenarios.yaml`) |
+| `kmsg-xid54.yaml` | `GF-REGIONAL-COLLECT-009` CHECK_MECHANICALS loop; `tests/regional/test_regional_acceptance_fixtures.py` pins its presence |
+| `kmsg-xid63-xid48.yaml` | `GF-REGIONAL-COLLECT-008` companion-branch procedure in `docs/区域模式端到端验收测试用例.md` |
+
+The regional collector runners (`run_collector_acceptance.py`,
+`run_collector_destructive.py`) write `/dev/kmsg` through their own probe Pods
+and do not apply these manifests; they document the by-hand form of the same
+injection.

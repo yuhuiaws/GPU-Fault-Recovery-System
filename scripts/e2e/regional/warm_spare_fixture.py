@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
 import sys
 import time
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -320,6 +320,67 @@ print(json.dumps(report.model_dump(mode="json"), sort_keys=True, default=str))
 """
 
 
+OPEN_WORKFLOWS = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+
+cluster_id, job_id, nodes_text = sys.argv[1:]
+nodes = {item for item in nodes_text.split(",") if item}
+store = ApplicationContext.from_environment().store
+matches = []
+if job_id:
+    matches.extend(store.list_active_workflow_incidents(cluster_id, job_id=job_id))
+if nodes:
+    matches.extend(store.list_active_workflow_incidents(cluster_id, node_ids=nodes))
+seen = set()
+workflows = []
+for incident, workflow in matches:
+    if workflow.request_id in seen:
+        continue
+    seen.add(workflow.request_id)
+    workflows.append({
+        "request_id": workflow.request_id,
+        "status": workflow.status.value,
+        "incident_id": incident.incident_id,
+        "node_ids": list(incident.node_ids),
+        "job_id": incident.job_id,
+    })
+print(json.dumps({"workflows": workflows}, sort_keys=True, default=str))
+"""
+
+
+ACTIVE_BUDGET_CLAIMS = r"""
+import json
+from datetime import datetime, timezone
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.models import WorkflowStatus
+
+store = ApplicationContext.from_environment().store
+now = datetime.now(timezone.utc)
+# The same counting rule the store applies when a workflow claims its budget:
+# RUNNING rows whose execution lease is still live hold their scopes; every
+# other row holds nothing.
+held = []
+for workflow in store.list_workflows({WorkflowStatus.RUNNING}, limit=500):
+    expires = workflow.execution_lease_expires_at
+    if expires is None or expires <= now:
+        continue
+    held.append({
+        "request_id": workflow.request_id,
+        "claims": sorted(workflow.remediation_budget_claims),
+        "limits": dict(workflow.remediation_budget_limits),
+    })
+print(json.dumps(
+    {"observed_at": now.isoformat(), "workflows": held},
+    sort_keys=True,
+    default=str,
+))
+"""
+
+
 @dataclass(frozen=True)
 class NodePatch:
     labels: dict[str, str | None]
@@ -569,9 +630,12 @@ class WarmSpareLiveFixture:
             )
         return cast(
             dict[str, Any],
+            # One attempt: the route persists a finding and opens a workflow, so
+            # a kubectl retry after a lost receipt would inject the fault twice.
             self.regional.cpu_python(
                 SYNTHETIC_REPLACEMENT_POST,
                 json.dumps(payload, sort_keys=True),
+                attempts=1,
             ),
         )
 
@@ -619,6 +683,7 @@ class WarmSpareLiveFixture:
                 RELEASE_SPARES,
                 json.dumps(nodes),
                 incident_id,
+                attempts=1,
             ),
         )
 
@@ -629,6 +694,7 @@ class WarmSpareLiveFixture:
                 REACTIVATE_AGENT,
                 self.regional.settings.cluster_id,
                 node,
+                attempts=1,
             ),
         )
 
@@ -683,6 +749,7 @@ class WarmSpareLiveFixture:
                 node,
                 profile_version,
                 reason,
+                attempts=1,
             ),
         )
 
@@ -733,6 +800,36 @@ class WarmSpareLiveFixture:
                 node,
             ),
         )
+
+    def open_workflows(
+        self,
+        *,
+        job_id: str = "",
+        nodes: Sequence[str] = (),
+    ) -> list[dict[str, Any]]:
+        """Open workflows over ``job_id`` or any of ``nodes``, read in the store.
+
+        Open is the store's own definition -- executable rows plus BLOCKED rows
+        that still occupy their node -- so a preflight that reads ``[]`` here is
+        refusing on the same rows the dispatcher would collide with.
+        """
+
+        for node in nodes:
+            if "," in node or not node:
+                raise ValueError("node names must be non-empty, no comma")
+        value = self.regional.cpu_python(
+            OPEN_WORKFLOWS,
+            self.regional.settings.cluster_id,
+            job_id,
+            ",".join(nodes),
+        )
+        return cast(list[dict[str, Any]], value.get("workflows") or [])
+
+    def active_budget_claims(self) -> list[dict[str, Any]]:
+        """RUNNING workflows with a live lease and the budget scopes they hold."""
+
+        value = self.regional.cpu_python(ACTIVE_BUDGET_CLAIMS)
+        return cast(list[dict[str, Any]], value.get("workflows") or [])
 
     def wait_fleet_readiness(
         self,
@@ -843,6 +940,13 @@ class NodeMutationFixture:
 
 
 class GpuHolderFixture:
+    # How long the holder keeps its GPU. A holder that exits while the workflow
+    # it was meant to block is still running turns a shortage drill into a real
+    # failover, so the runner creates it as late as possible and pins its own
+    # wait to end before ``deadline_at``.
+    HOLD_SECONDS = 840
+    DEADLINE_MARGIN_SECONDS = 60
+
     def __init__(
         self,
         warm: WarmSpareLiveFixture,
@@ -850,12 +954,17 @@ class GpuHolderFixture:
         node: str,
         run_id: str,
         image: str = TRAINING_IMAGE,
+        hold_seconds: int = HOLD_SECONDS,
     ) -> None:
+        if hold_seconds < 1:
+            raise ValueError("hold_seconds must be positive")
         self.warm = warm
         self.node = node
         suffix = hashlib.sha256(f"{node}\0{run_id}".encode()).hexdigest()[:12]
         self.name = f"gpu-fault-spare-holder-{suffix}"
         self.image = image
+        self.hold_seconds = hold_seconds
+        self.deadline_at: datetime | None = None
 
     def manifest(self) -> dict[str, Any]:
         return {
@@ -872,7 +981,9 @@ class GpuHolderFixture:
             "spec": {
                 "nodeName": self.node,
                 "restartPolicy": "Never",
-                "activeDeadlineSeconds": 900,
+                "activeDeadlineSeconds": (
+                    self.hold_seconds + self.DEADLINE_MARGIN_SECONDS
+                ),
                 "terminationGracePeriodSeconds": 0,
                 "tolerations": [{"operator": "Exists"}],
                 "containers": [
@@ -886,7 +997,8 @@ class GpuHolderFixture:
                             (
                                 "exec python3 -c 'import torch,time; "
                                 'x=torch.ones(1,device="cuda:0"); '
-                                "print(float(x.item()),flush=True); time.sleep(840)'"
+                                "print(float(x.item()),flush=True); "
+                                f"time.sleep({self.hold_seconds})'"
                             ),
                         ],
                         "resources": {
@@ -907,6 +1019,11 @@ class GpuHolderFixture:
         }
 
     def create(self) -> None:
+        # Taken before the apply: the container's sleep starts after the Pod is
+        # scheduled and Ready, so this bound is conservative by construction.
+        self.deadline_at = datetime.now(timezone.utc) + timedelta(
+            seconds=self.hold_seconds
+        )
         self.warm.regional.kubectl(
             "gpu",
             "apply",
@@ -973,6 +1090,7 @@ class WarmSpareServiceFixture:
         )
         self.run_id = run_id
         self.service = ""
+        self.failsafe_at: datetime | None = None
 
     def create(self) -> None:
         self.host.create()
@@ -994,6 +1112,11 @@ class WarmSpareServiceFixture:
         """
 
         self.service = service
+        # The unit is back no later than this, whatever the caller does next;
+        # a shortage that must still hold at REPLACE_NODE has to conclude first.
+        self.failsafe_at = datetime.now(timezone.utc) + timedelta(
+            seconds=delay_seconds + restore_seconds
+        )
         return cast(
             dict[str, Any],
             self.host.execute(
