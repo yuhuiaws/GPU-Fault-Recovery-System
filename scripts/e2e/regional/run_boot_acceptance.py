@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import traceback
 import os
 from pathlib import Path
 import sys
@@ -230,6 +231,9 @@ def main() -> int:
         outcome = {
             "verdict": "FAIL",
             "error": f"{type(exc).__name__}: {exc}",
+            # A JSONDecodeError alone does not say which probe returned nothing;
+            # keep the frames so a live failure can be traced without a rerun.
+            "traceback": traceback.format_exc().splitlines()[-12:],
             "limitations": [
                 "The case stopped at the first failed assertion; later checks "
                 "were not treated as executed."

@@ -72,6 +72,25 @@ def arn_resource_name(value: str) -> str:
     return value.rsplit("/", 1)[-1]
 
 
+def parse_probe_json(output: str) -> Any:
+    """The JSON a probe printed: the whole output, or its last line.
+
+    Probes written for these fixtures print one compact line, but audit scripts
+    reused as probes (``audit_executor_readiness.py``) print an indented
+    document whose last line is ``}``. Accept both; a kubectl warning ahead of
+    a single-line document still resolves through the last line.
+    """
+
+    text = output.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        lines = text.splitlines()
+        if not lines:
+            raise
+        return json.loads(lines[-1])
+
+
 class SiteFixture:
     def __init__(self, site_file: Path, cluster_id: str = "") -> None:
         self.site_file = site_file.resolve()
@@ -156,7 +175,7 @@ class SiteFixture:
             input_text=script,
             timeout=timeout,
         )
-        value = json.loads(output.splitlines()[-1])
+        value = parse_probe_json(output)
         if not isinstance(value, dict):
             raise BootAcceptanceError("Pod probe did not return a JSON object")
         return cast(dict[str, Any], value)

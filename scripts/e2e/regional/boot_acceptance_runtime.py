@@ -17,6 +17,7 @@ from botocore.awsrequest import AWSRequest
 from gpu_fault.admin.site import load_site
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
 from scripts.e2e.regional.boot_acceptance_common import (
+    parse_probe_json,
     ROOT,
     BootAcceptanceError,
     SiteFixture,
@@ -272,8 +273,10 @@ def run_boot012(fixture: SiteFixture) -> dict[str, Any]:
             input_text=READINESS_PROBE,
             check=False,
         )
+        # audit_executor_readiness.py prints an indented JSON document, so the
+        # last line alone is "}" and never parses (BOOT-012 failed on it live).
         stale_payload = (
-            json.loads(stale.stdout.splitlines()[-1])
+            parse_probe_json(stale.stdout)
             if stale.returncode == 0 and stale.stdout.strip()
             else {}
         )
@@ -545,6 +548,7 @@ commands = ApplicationContext.from_environment().store.list_remote_commands()
 print(json.dumps({
     "count": len(commands),
     "by_status": dict(Counter(item.status.value for item in commands)),
+    "ids": sorted(item.command_id for item in commands),
 }, sort_keys=True))
 """
 
@@ -851,16 +855,28 @@ def run_boot015(
             )
             recovered.append(completed.returncode == 0)
         final = fixture.regional.cpu_python(REMOTE_BASELINE_PROBE)
+        # The control plane's retention sweep deletes old terminal commands on
+        # its own schedule, so the total count drifts during the case (live:
+        # 81 -> 80 while the case ran and the equality check failed a clean
+        # run). What the case owns is: its synthetic command is gone and it
+        # left no other command behind.
+        baseline_ids = set(baseline.get("ids") or [])
+        final_ids = set(final.get("ids") or [])
+        introduced = sorted(final_ids - baseline_ids)
         result["cleanup"] = {
             "delete": cleanup,
             "amp_resolved": resolved,
             "readiness_recovered": recovered,
-            "remote_count_restored": final["count"] == baseline["count"],
+            "synthetic_command_removed": command_id not in final_ids,
+            "commands_introduced": introduced,
+            "remote_count_before": baseline["count"],
+            "remote_count_after": final["count"],
         }
         if (
             not resolved["matched"]
             or not all(recovered)
-            or final["count"] != baseline["count"]
+            or command_id in final_ids
+            or introduced
         ):
             result["verdict"] = "FAIL"
     write_json_atomic(case_dir / "boot015-details.json", result)
