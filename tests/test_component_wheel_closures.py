@@ -51,3 +51,32 @@ def test_factory_reference_strings_name_their_module() -> None:
         "gpu_fault.collectors.gpu.dcgm",
         "gpu_fault.collectors.logs.kernel",
     }, found
+
+
+def test_repack_wheel_stored_keeps_content_and_drops_per_file_deflate(tmp_path) -> None:
+    """Whole-file xz over deflated members gains nothing; the ConfigMap ceiling
+    is 1 MiB, and the deflated control-plane wheel already exceeds it."""
+    import zipfile
+
+    wheel = tmp_path / "demo-0.1-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        entry = zipfile.ZipInfo("demo/__init__.py", date_time=(1980, 1, 1, 0, 0, 0))
+        entry.external_attr = 0o644 << 16
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        zf.writestr(entry, "x = 1\n" * 2000)
+        zf.writestr("demo-0.1.dist-info/RECORD", "demo/__init__.py,sha256=abc,12000\n")
+    before = wheel.stat().st_size
+
+    component_wheels.repack_wheel_stored(wheel)
+
+    with zipfile.ZipFile(wheel) as zf:
+        infos = zf.infolist()
+        assert [item.filename for item in infos] == [
+            "demo/__init__.py",
+            "demo-0.1.dist-info/RECORD",
+        ], infos
+        assert {item.compress_type for item in infos} == {zipfile.ZIP_STORED}, infos
+        assert zf.read("demo/__init__.py") == b"x = 1\n" * 2000, "content changed"
+        assert infos[0].external_attr == 0o644 << 16, infos[0].external_attr
+        assert infos[0].date_time == (1980, 1, 1, 0, 0, 0), infos[0].date_time
+    assert wheel.stat().st_size > before, "stored wheel must be the larger one"

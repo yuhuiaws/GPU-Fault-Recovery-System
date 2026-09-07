@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tomllib
+import zipfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -593,5 +594,35 @@ def build_component(
     wheels = sorted(set(output.glob("*.whl")) - before)
     if len(wheels) != 1:
         raise RuntimeError(f"{name} build produced {len(wheels)} wheels")
+    repack_wheel_stored(wheels[0])
     digest = package_digest(project / "src/gpu_fault")
     return wheels[0], digest, selected
+
+
+def repack_wheel_stored(wheel: Path) -> Path:
+    """Rewrite ``wheel`` in place with every entry stored, not deflated.
+
+    A wheel is a zip with per-file deflate. Everything downstream compresses
+    the *whole file* again -- xz into the control-plane and executor wheel
+    ConfigMaps, gzip into the node installer bundle -- and compressing
+    already-deflated members gains nothing: the deflated control-plane wheel
+    was 1,106,539 bytes, xz took it to 1,079,868, and both exceed the 1 MiB a
+    ConfigMap can hold. Stored entries let the outer xz see the Python source
+    itself (643,872 bytes for the same wheel). Entry order, timestamps and
+    permission bits are preserved so the wheel stays reproducible, and pip
+    installs stored wheels exactly like deflated ones.
+    """
+
+    staging = wheel.with_name(wheel.name + ".stored")
+    with (
+        zipfile.ZipFile(wheel) as source,
+        zipfile.ZipFile(staging, "w", compression=zipfile.ZIP_STORED) as target,
+    ):
+        for info in source.infolist():
+            entry = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            entry.compress_type = zipfile.ZIP_STORED
+            entry.external_attr = info.external_attr
+            entry.create_system = info.create_system
+            target.writestr(entry, source.read(info.filename))
+    staging.replace(wheel)
+    return wheel
