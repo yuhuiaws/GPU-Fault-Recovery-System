@@ -934,7 +934,11 @@ def e2e_preflight(
     nodes = regional.gpu_nodes()
     status_by_node: dict[str, set[str]] = {}
     for item in state["collector_statuses"]:
-        status_by_node.setdefault(str(item["node_id"]), set()).add(str(item["kind"]))
+        # CollectorStatus names its source ``collector``; older snapshots said
+        # ``kind`` (live 2026-09-07: E2E-001 died here before any check ran).
+        status_by_node.setdefault(str(item["node_id"]), set()).add(
+            str(item.get("collector") or item.get("kind"))
+        )
     required_kinds = {"NVIDIA_KERNEL", "GPU_METRICS", "HOST_TELEMETRY"}
     agents = state["agents"]
     active_agents = [
@@ -967,7 +971,11 @@ def e2e_preflight(
                 suspicious.append({"pod": pod["name"], "marker": marker})
     errors = []
     for node in nodes:
-        if node["ready"] != "True" or node["unschedulable"]:
+        # A spare-pool node is cordoned by design while it waits in the pool
+        # (hyperpod_spares keeps spec.unschedulable=True until it is handed
+        # over), so only its readiness is a preflight condition.
+        spare = (node.get("labels") or {}).get("gpu-fault.io/spare") == "true"
+        if node["ready"] != "True" or (node["unschedulable"] and not spare):
             errors.append(f"{node['name']} is not Ready and schedulable")
         if not required_kinds <= status_by_node.get(str(node["name"]), set()):
             errors.append(f"{node['name']} lacks required Collector status")
@@ -1116,7 +1124,11 @@ def run_e2e001(
         nodes_after = regional.gpu_nodes()
         clean_nodes = all(
             item["ready"] == "True"
-            and not item["unschedulable"]
+            and (
+                not item["unschedulable"]
+                # spare-pool nodes stay cordoned by design (see e2e_preflight)
+                or (item.get("labels") or {}).get("gpu-fault.io/spare") == "true"
+            )
             and not any(
                 str(taint.get("key", "")).startswith("gpu-fault.io/")
                 for taint in item["taints"]

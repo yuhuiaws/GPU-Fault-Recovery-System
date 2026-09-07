@@ -1103,6 +1103,7 @@ class RegionalLiveFixture:
                     ),
                     "unschedulable": item["spec"].get("unschedulable", False),
                     "taints": item["spec"].get("taints", []),
+                    "labels": item["metadata"].get("labels", {}),
                 }
             )
         return sorted(result, key=lambda item: str(item["name"]))

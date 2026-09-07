@@ -41,6 +41,9 @@ def gpu_bdf() -> str:
         ]
     ).stdout
     first = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    # nvidia-smi prints the PCI domain as eight hex digits ("00000000:59:00.0");
+    # the kernel, sysfs and the XID line use four ("0000:59:00.0").
+    first = re.sub(r"^[0-9A-Fa-f]{8}:", "0000:", first)
     if SAFE_BDF.fullmatch(first) is None:
         raise ProbeError(f"cannot parse GPU PCI BDF: {first!r}")
     return first.lower()
