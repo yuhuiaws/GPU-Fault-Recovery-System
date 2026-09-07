@@ -750,7 +750,7 @@ wait_for_spool_drain() {
     local metrics
     local depth
     local leased
-    [[ "${timeout}" =~ ^[0-9]+$ ]] && ((timeout >= 30)) || {
+    { [[ "${timeout}" =~ ^[0-9]+$ ]] && ((timeout >= 30)); } || {
         echo "GPU_FAULT_TELEMETRY_SPOOL_DRAIN_TIMEOUT_SECONDS must be at least 30" >&2
         return 2
     }

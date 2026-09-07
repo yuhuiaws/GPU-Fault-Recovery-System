@@ -31,7 +31,16 @@ class WorkflowMergedError(WorkflowLeaseError):
 
 
 class RemediationBudgetError(WorkflowLeaseError):
-    pass
+    """A claim was refused because a remediation budget scope is full.
+
+    ``scope`` is the budget scope that refused the claim (``region``,
+    ``cluster:<id>``, ``node:<cluster>:<node>``, ...), carried structurally
+    so the per-cluster saturation gauge never has to parse the message.
+    """
+
+    def __init__(self, message: str, *, scope: str = "") -> None:
+        super().__init__(message)
+        self.scope = scope
 
 
 class TransactionRequiredError(RuntimeError):

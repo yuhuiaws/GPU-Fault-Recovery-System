@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
+from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.node_agent.config import executor_from_environment
 from gpu_fault.node_agent.executor import NodeActionExecutor
@@ -65,12 +66,7 @@ def _validate_unsigned_result_query_migration() -> None:
 
 
 def _result_query_signature_required() -> bool:
-    required = (
-        os.getenv("GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED", "true")
-        .strip()
-        .lower()
-        != "false"
-    )
+    required = env_bool("GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED", True)
     if not required:
         _validate_unsigned_result_query_migration()
     return required
@@ -446,10 +442,7 @@ def run() -> None:
     certificate = os.getenv("GPU_FAULT_NODE_AGENT_TLS_CERT", "").strip()
     private_key = os.getenv("GPU_FAULT_NODE_AGENT_TLS_KEY", "").strip()
     client_ca = os.getenv("GPU_FAULT_NODE_AGENT_TLS_CLIENT_CA", "").strip()
-    allow_plaintext = (
-        os.getenv("GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT", "false").strip().lower()
-        == "true"
-    )
+    allow_plaintext = env_bool("GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT", False)
     if bool(certificate) != bool(private_key):
         raise ValueError(
             "node agent TLS needs both "

@@ -691,6 +691,7 @@ class MemoryWorkflowMixin:
                     self._workflows[request_id] = blocked_by_remediation_budget(
                         workflow,
                         str(exc),
+                        scope=exc.scope,
                         now=claimed_at,
                     )
                     raise

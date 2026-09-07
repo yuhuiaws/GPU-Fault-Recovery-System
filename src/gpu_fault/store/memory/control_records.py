@@ -317,15 +317,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
         with self._lock:
             return sum(1 for key in self._events if key not in self._decisions)
 
-    def get_decision_by_attempt(
-        self, cluster_id: str, attempt_id: str
-    ) -> CompletionDecision:
-        event = self.get_event_by_attempt(cluster_id, attempt_id)
-        decision = self.get_decision_by_event(event.event_key)
-        if decision is None:
-            raise NotFoundError(f"{cluster_id}/{attempt_id}")
-        return decision
-
     def add_marker(self, marker: NodeMarker) -> None:
         with self._lock:
             self._markers[marker.marker_id] = marker

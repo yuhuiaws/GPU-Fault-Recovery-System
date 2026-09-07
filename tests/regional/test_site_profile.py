@@ -247,8 +247,14 @@ def test_every_live_runner_installs_the_profile_before_parsing() -> None:
         source = path.read_text(encoding="utf-8")
         if "add_live_arguments(" not in source:
             continue
-        if "install_site_profile()" not in source:
-            missing.append(path.name)
+        if "install_site_profile()" in source:
+            continue
+        # A runner that hands its ``main`` to the shared spine inherits the
+        # call; tests/test_acceptance_runner_main.py pins that the spine makes
+        # it before the parser exists.
+        if "run_standard_case(CASE)" in source or "run_selected_case(CASE)" in source:
+            continue
+        missing.append(path.name)
     assert not missing, missing
 
 

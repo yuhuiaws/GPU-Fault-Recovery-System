@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tests._script_loader import load_script_module
+from gpu_fault_release import regional_release_transaction
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -36,9 +36,7 @@ class Release:
 
 
 def transaction_module():
-    return load_script_module(
-        ROOT / "deploy/control-plane/regional/regional_release_transaction.py"
-    )
+    return regional_release_transaction
 
 
 def test_commit_persists_before_deleting_rollback_backups() -> None:

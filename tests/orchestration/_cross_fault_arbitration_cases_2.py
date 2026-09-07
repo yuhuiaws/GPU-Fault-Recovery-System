@@ -7,7 +7,7 @@ import pytest
 
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import WorkflowOperation, WorkflowStatus, WorkflowStepStatus
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 from tests._builders import (
     build_context,

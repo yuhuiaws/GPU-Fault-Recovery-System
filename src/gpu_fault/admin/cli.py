@@ -42,7 +42,6 @@ from gpu_fault.admin.config import (
     AuroraCapacityConfig,
     admin_config_approval_path,
     admin_config_plan_path,
-    apply_capacity_patch,
     complete_admin_config_apply,
     create_admin_config_plan,
     load_admin_config_plan,
@@ -50,6 +49,7 @@ from gpu_fault.admin.config import (
     prepare_admin_config_apply,
     preview_admin_config_plan,
 )
+from gpu_fault.admin.config_patch import apply_capacity_patch
 from gpu_fault.admin.config_file import (
     admin_config_file_path,
     initialize_desired_admin_config,
@@ -75,6 +75,10 @@ from gpu_fault.admin.site import (
     effective_environment,
     load_site,
     materialized_release_config,
+)
+from gpu_fault.admin.failure_domain_map import (
+    add_failure_domain_map_command,
+    run_failure_domain_map_command,
 )
 from gpu_fault.admin.source_deploy import run_source_deploy
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
@@ -275,6 +279,8 @@ def _add_capacity_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--max-active-region", type=int)
     command.add_argument("--max-active-per-cluster", type=int)
     command.add_argument("--max-active-per-resource-class", type=int)
+    command.add_argument("--largest-cluster-node-count", type=int)
+    command.add_argument("--managed-node-count", type=int)
 
 
 def _add_profile_approval_command(commands: Any) -> None:
@@ -520,6 +526,7 @@ def parser() -> argparse.ArgumentParser:
     _add_profile_approval_command(commands)
     _add_admin_config_command(commands)
     _add_workflow_reconcile_command(commands)
+    add_failure_domain_map_command(commands, _add_managed_site_arguments)
     join = commands.add_parser(
         "join-cluster",
         usage=(
@@ -849,6 +856,17 @@ def _run_workflow_reconcile(arguments: argparse.Namespace) -> int:
     return 1 if result.get("failed_workflow_ids") else 0
 
 
+def _run_failure_domain_map(arguments: argparse.Namespace) -> int:
+    site_file = _managed_site_file(arguments, command="failure-domain-map")
+    assert site_file is not None
+    try:
+        return run_failure_domain_map_command(
+            arguments, site=load_site(site_file, repository_root=None)
+        )
+    except BootstrapError as exc:
+        raise SiteConfigError(str(exc)) from exc
+
+
 def _run_readonly_managed_command(
     arguments: argparse.Namespace,
     site_file: Path,
@@ -980,6 +998,13 @@ def _capacity_candidate(
             remediation[field] = value
     if remediation:
         capacity["remediation"] = remediation
+    for attribute, field in (
+        ("largest_cluster_node_count", "largestClusterNodeCount"),
+        ("managed_node_count", "managedNodeCount"),
+    ):
+        node_count = cast(int | None, getattr(arguments, attribute))
+        if node_count is not None:
+            capacity[field] = node_count
     if not capacity:
         raise AdminConfigError(
             "capacity plan requires --preset or at least one explicit setting"
@@ -998,6 +1023,8 @@ def _capacity_options_requested(arguments: argparse.Namespace) -> bool:
             "max_active_region",
             "max_active_per_cluster",
             "max_active_per_resource_class",
+            "largest_cluster_node_count",
+            "managed_node_count",
         )
     )
 
@@ -1388,6 +1415,8 @@ def run(arguments: argparse.Namespace) -> int:
         return _run_uninstall(arguments)
     if arguments.command == "workflow-reconcile":
         return _run_workflow_reconcile(arguments)
+    if arguments.command == "failure-domain-map":
+        return _run_failure_domain_map(arguments)
     if arguments.command in ("preflight", "verify", "status"):
         site_file = _managed_site_file(
             arguments,

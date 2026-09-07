@@ -359,8 +359,11 @@ if node not in data:
                   key: cluster-id
 EOF
 )"
+    # shellcheck disable=SC2016 # Spliced into the Job's remote script; ${INSTALL_RUN_ID} expands in the pod.
     CA_INSTALL_COMMAND='install -m 0644 /connection-secret/ca.crt /host/tmp/gpu-fault-control-plane-ca-${INSTALL_RUN_ID}.crt'
+    # shellcheck disable=SC2016,SC1003 # Remote payload: ${INSTALL_RUN_ID} and the trailing line-continuation backslash are for the pod shell.
     CA_CHROOT_ENV='CONTROL_PLANE_CA_CERTIFICATE=/tmp/gpu-fault-control-plane-ca-${INSTALL_RUN_ID}.crt \'
+    # shellcheck disable=SC2016 # Remote payload; the token variables exist only inside the pod.
     TOKEN_INSTALLER_ARGS='--token "${CONTROL_PLANE_TOKEN}" --ca-certificate "${CONTROL_PLANE_CA_CERTIFICATE}"'
     CONNECTION_SECRET_MOUNT="$(cat <<'EOF'
             - name: connection-secret

@@ -472,6 +472,7 @@ if [[ "${GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION}" == "true" ]]; then
         fi
     else
         CONFIRMED_SUBSCRIPTIONS="$(
+            # shellcheck disable=SC2016 # JMESPath backtick literals, not shell expansions.
             aws sns list-subscriptions-by-topic \
                 --region "${AWS_REGION}" \
                 --topic-arn "${SNS_TOPIC_ARN}" \

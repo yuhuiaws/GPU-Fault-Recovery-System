@@ -32,6 +32,20 @@ def worker_environment(monkeypatch):
     monkeypatch.delenv("GPU_FAULT_TELEMETRY_SPOOL", raising=False)
 
 
+@pytest.mark.parametrize("token", ["1", "yes", "on"])
+def test_dispatcher_switch_accepts_every_enabled_token(
+    worker_environment, monkeypatch, token: str
+):
+    """A default-on switch spelled ``=1`` used to count as switched off."""
+
+    monkeypatch.setenv("GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER", token)
+
+    estimate = AdmissionRuntimeFactory.pool_capacity({"spool_enabled": False})
+
+    assert estimate is not None
+    assert estimate.demand_by_consumer["workflow_dispatcher"] == 8
+
+
 def test_the_worker_role_counts_its_processor_and_dispatcher_threads(
     worker_environment, caplog
 ):
@@ -101,3 +115,34 @@ def test_metrics_stay_quiet_without_an_estimate():
     runtime = SimpleNamespace(context=SimpleNamespace())
 
     assert postgres_pool_metric_lines(runtime) == []
+
+
+def test_fault_reserve_must_hold_one_whole_cluster_fault_wave(monkeypatch) -> None:
+    """A correlated whole-cluster fault is one fault-priority request per node.
+
+    The renderer derives the reserve from the declared largest cluster; this is
+    the worker defending itself against an environment assembled some other
+    way (perf plan section 13.4 measured the 1000-node cluster overflowing a
+    reserve sized as an eighth of a 1024 depth).
+    """
+
+    monkeypatch.delenv("GPU_FAULT_TELEMETRY_SPOOL", raising=False)
+    monkeypatch.setenv("GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH", "65536")
+    monkeypatch.setenv("GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH", "4096")
+    monkeypatch.setenv("GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH", "128")
+    monkeypatch.setenv("GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT", "512")
+    monkeypatch.setenv("GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT", "512")
+    factory = AdmissionRuntimeFactory(SimpleNamespace(), None)
+
+    with pytest.raises(RuntimeError, match="whole-cluster fault wave"):
+        factory.limits()
+
+    monkeypatch.setenv("GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH", "512")
+    limits = factory.limits()
+    assert limits["fault_reserved_cluster_depth"] == 512
+
+    # An unknown node count (0, the default) cannot be defended and must not
+    # block a start-up that predates the declaration.
+    monkeypatch.setenv("GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH", "128")
+    monkeypatch.delenv("GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT")
+    assert factory.limits()["fault_reserved_cluster_depth"] == 128

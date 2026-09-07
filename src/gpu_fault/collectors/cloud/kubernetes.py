@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
 from gpu_fault.models import WorkloadState
@@ -128,6 +128,7 @@ class KubernetesNodeResourceCollector:
         interval_seconds: float = 15,
         required_consecutive_samples: int = 2,
         health_summary_seconds: int = 300,
+        list_page_size: int = 500,
         resource_names: dict[str, str] | None = None,
         now: Callable[[], datetime] | None = None,
         serializer: Callable[[Any], dict[str, Any]] | None = None,
@@ -138,12 +139,15 @@ class KubernetesNodeResourceCollector:
             raise ValueError("EFA Kubernetes mismatch samples must be positive")
         if health_summary_seconds <= 0:
             raise ValueError("EFA Kubernetes health summary must be positive")
+        if list_page_size < 1:
+            raise ValueError("EFA Kubernetes node list page size must be positive")
         self.sink = sink
         self.context = context
         self.core = core_api
         self.interval_seconds = interval_seconds
         self.required_consecutive_samples = required_consecutive_samples
         self.health_summary_seconds = health_summary_seconds
+        self.list_page_size = list_page_size
         self.resource_names = resource_names or {
             "efa": "vpc.amazonaws.com/efa",
             "gpu": "nvidia.com/gpu",
@@ -222,6 +226,29 @@ class KubernetesNodeResourceCollector:
             for node_id, values in workloads.items()
         }
 
+    def _list_nodes(self) -> Iterator[Any]:
+        """Yield every Node across a paginated LIST.
+
+        One unpaginated LIST of a 500-node cluster is 5-10 MB every interval
+        and, once the requested resourceVersion falls out of the apiserver
+        watch cache, an etcd read. The collector samples periodically on
+        purpose (its consecutive-mismatch counters need a fresh full sample
+        each interval), so it stays a LIST but follows ``metadata._continue``
+        in ``list_page_size`` chunks instead of asking for everything at once.
+        """
+        if self.core is None:
+            raise CollectorError(
+                "Kubernetes node resource collector has no CoreV1Api client"
+            )
+        token: str | None = None
+        while True:
+            response = self.core.list_node(limit=self.list_page_size, _continue=token)
+            yield from response.items
+            metadata = getattr(response, "metadata", None)
+            token = getattr(metadata, "_continue", None) or None
+            if not token:
+                return
+
     def collect_once(self) -> CollectorStats:
         if self.core is None:
             raise CollectorError(
@@ -230,8 +257,7 @@ class KubernetesNodeResourceCollector:
         observed_at = self.now()
         workloads = self._managed_workloads()
         stats = CollectorStats()
-        response = self.core.list_node()
-        for raw in response.items:
+        for raw in self._list_nodes():
             node = self.serializer(raw)
             metadata = node.get("metadata") or {}
             node_id = metadata.get("name")

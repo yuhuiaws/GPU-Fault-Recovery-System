@@ -65,6 +65,32 @@ metadata:
     gpu-fault.io/deploy-mode: regional_rollout
 spec:
   replicas: 1
+  # Singleton by design; Recreate, not RollingUpdate. The watcher keeps its
+  # attempt specs and observations, the missing-attempt tracker and the
+  # `_terminal_sent` / `_failure_sent` / `_workloads_stopped` sets in the
+  # process; only the write-ahead outbox and the active-attempt snapshot
+  # are durable, in the shared ConfigMap above, written with a
+  # resourceVersion compare-and-swap that gives up after three 409s. Two
+  # replicas overlapping during a rollout each run their own Pod watch and
+  # reconcile every attempt. The control plane is idempotent on event_key
+  # for /v1/attempts/terminal and /v1/attempts/failure-detected (the second
+  # POST is answered `duplicate: true`), so overlap does not open a second
+  # incident, but the sent-sets are per process, so each replica re-posts
+  # what the other already delivered, /v1/workload-observations traffic
+  # doubles, the two replicas race the outbox ConfigMap and an append that
+  # loses three CAS rounds raises and defers that attempt's delivery to the
+  # next pass, the new replica's missing-attempt count restarts at zero,
+  # and if the control plane is unreachable past
+  # GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS both replicas independently
+  # suspend the same workloads and capture their logs twice. `replicas`
+  # must stay 1; horizontal scale-out is not a supported lever because the
+  # per-cluster load is one Pod watch, not per-node work. If the watcher
+  # lags, raise GPU_FAULT_WATCHER_RECONCILE_DEBOUNCE_SECONDS so bursts of
+  # Pod events coalesce into fewer reconcile passes, and raise the CPU
+  # limit below; GPU_FAULT_WATCHER_POLL_SECONDS only paces the polling
+  # fallback used when the watch client is unavailable.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: gpu-fault-completion-watcher

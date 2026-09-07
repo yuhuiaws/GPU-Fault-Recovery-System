@@ -1,17 +1,29 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "domain": "unit",
   "coverage": {
     "branch": true,
     "floor": 78,
-    "source": "src/gpu_fault",
+    "sources": [
+      "src/gpu_fault",
+      "src/gpu_fault_release",
+      "deploy/control-plane/tools"
+    ],
+    "deployment_only_sources": [
+      "src/gpu_fault_release",
+      "deploy/control-plane/tools"
+    ],
     "deployment_only_globs": [
       "src/gpu_fault/admin/*.py",
-      "src/gpu_fault/release_state_snapshot.py"
+      "src/gpu_fault/failure_domains.py",
+      "src/gpu_fault/release_state_snapshot.py",
+      "src/gpu_fault_release/*.py",
+      "deploy/control-plane/tools/*.py"
     ],
     "application_shared_files": [
       "src/gpu_fault/admin/__init__.py",
       "src/gpu_fault/admin/atomic_json.py",
+      "src/gpu_fault/admin/capacity_evidence.py",
       "src/gpu_fault/admin/config.py",
       "src/gpu_fault/admin/config_parser.py",
       "src/gpu_fault/admin/site.py"
@@ -34,6 +46,56 @@
         ],
         "group_floor": 72,
         "file_floor": 72
+      },
+      {
+        "id": "failure-domains",
+        "description": "Node failure-domain label priority shared by the admin map renderer and the release fleet rollout; small, pure, and fully exercised by tests/test_failure_domains.py.",
+        "globs": [
+          "src/gpu_fault/failure_domains.py"
+        ],
+        "group_floor": 90,
+        "file_floor": 90
+      },
+      {
+        "id": "regional-release-orchestrator",
+        "description": "Release orchestrator and rollback path, the gpu_fault_release package under src/ (formerly deploy/control-plane/regional, loaded by path); imported by tests like any package. Measured only by the deployment shard. Floors set from the 2026-09-07 measurement (group 80.4%, lowest file regional_release_artifacts.py 50.7%); raise them, never lower them.",
+        "globs": [
+          "src/gpu_fault_release/__init__.py",
+          "src/gpu_fault_release/regional_release_*.py",
+          "src/gpu_fault_release/rollout.py"
+        ],
+        "group_floor": 78,
+        "file_floor": 50
+      },
+      {
+        "id": "regional-deployment-support",
+        "description": "The remaining modules of src/gpu_fault_release: admin checks, DNS, GPU bootstrap, endpoint and observability rollback, schema change, notifications. Listed by name so a new module lands outside every floor visibly rather than inheriting this one. Floors from the 2026-09-07 measurement (group 73.3%, lowest file regional_monitoring_safety.py 57.1%).",
+        "globs": [
+          "src/gpu_fault_release/regional_admin_checks.py",
+          "src/gpu_fault_release/regional_admin_commands.py",
+          "src/gpu_fault_release/regional_deployment_inventory.py",
+          "src/gpu_fault_release/regional_dns.py",
+          "src/gpu_fault_release/regional_endpoint_rollback.py",
+          "src/gpu_fault_release/regional_gpu_bootstrap.py",
+          "src/gpu_fault_release/regional_manifest_snapshot.py",
+          "src/gpu_fault_release/regional_monitoring_safety.py",
+          "src/gpu_fault_release/regional_notifications.py",
+          "src/gpu_fault_release/regional_observability_rollback.py",
+          "src/gpu_fault_release/regional_runtime_profile.py",
+          "src/gpu_fault_release/regional_schema_change.py",
+          "src/gpu_fault_release/regional_validation_evidence.py"
+        ],
+        "group_floor": 71,
+        "file_floor": 57
+      },
+      {
+        "id": "control-plane-tools",
+        "description": "deploy/control-plane/tools: role-split renderer and verifier, installed-resource registry sync, state cleanup. Poorly covered and now measured for the first time; floors from the 2026-09-07 measurement (group 41.6%, lowest file render_control_plane_role_split.py 17.6%). The number is low on purpose: it records where the tree is so it cannot fall further.",
+        "globs": [
+          "deploy/control-plane/tools/*.py"
+        ],
+        "group_floor": 39,
+        "file_floor": 17
       }
     ]
   },
@@ -104,6 +166,7 @@
       "CONTRIBUTING.md",
       "README.md",
       "mypy-baseline.json",
+      "mypy-convergence.json",
       "scripts/README.md",
       "scripts/ci_gate.py",
       "scripts/prune_artifacts.py",

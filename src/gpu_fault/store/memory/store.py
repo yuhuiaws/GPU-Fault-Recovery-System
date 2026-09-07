@@ -23,11 +23,14 @@ from gpu_fault.models import (
     XidMetricBaseline,
 )
 from gpu_fault.installation_resources import InstallationResource
+from gpu_fault.store.shared.compositions import SharedCompositionMixin
+from gpu_fault.store.shared.efa import SharedEfaTrafficRulesMixin
 from gpu_fault.store.shared.errors import (
     EfaTrafficAdminConflict as EfaTrafficAdminConflict,
     NotFoundError as NotFoundError,
     WorkflowLeaseError as WorkflowLeaseError,
 )
+from gpu_fault.store.shared.xid import SharedXidSignalMixin
 from gpu_fault.store.memory.control_records import MemoryControlRecordMixin
 from gpu_fault.store.memory.efa import MemoryEfaTrafficMixin
 from gpu_fault.store.memory.fleet import MemoryFleetMixin
@@ -42,6 +45,7 @@ from gpu_fault.store.memory.xid import MemoryXidMixin
 
 
 class InMemoryStore(
+    # Dict-backed implementations first: they override the shared compositions.
     MemoryControlRecordMixin,
     MemoryEfaTrafficMixin,
     MemoryNotificationMixin,
@@ -53,11 +57,18 @@ class InMemoryStore(
     MemoryProcessorQueueMixin,
     MemoryProcessorLeaseMixin,
     MemoryFleetMixin,
+    # Pure rules and public-contract compositions every store shares.
+    SharedEfaTrafficRulesMixin,
+    SharedXidSignalMixin,
+    SharedCompositionMixin,
 ):
-    """Thread-safe phase-one store.
+    """Thread-safe store for tests and single-process tooling.
 
-    The production store will replace this with DynamoDB or PostgreSQL outbox
-    implementations behind the same service boundary.
+    Everything lives in dicts guarded by one RLock and is lost with the
+    process. ``SqliteStore`` and ``PostgresStore`` are its peers behind the
+    same ``ControlPlaneStore`` contract, not subclasses: production runs on
+    ``PostgresStore``, which shares code with this store only through the
+    ``gpu_fault.store.shared`` mixins composed above.
     """
 
     def __init__(self) -> None:
@@ -118,13 +129,6 @@ class InMemoryStore(
         self._xid_correlations = {}
         self._xid74_occurrence_states = {}
         self._xid74_counted_events: set[tuple[str, tuple]] = set()
-
-    # How many failed replays a spooled sample gets before it is dropped.
-    # Telemetry is a stream: the next sample from the same node carries the
-    # same state, so a payload the endpoint cannot execute is worth far
-    # less than the spool depth it occupies. A fault would never be
-    # dropped this way, and no fault reaches the spool.
-    TELEMETRY_SPOOL_MAX_ATTEMPTS = 5
 
 
 class SimulatedDiagnosticAdapter:

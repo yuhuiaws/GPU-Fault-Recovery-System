@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
@@ -20,6 +21,7 @@ from gpu_fault.channel_registry import (
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import CollectorError, EventSink
+from gpu_fault.env import env_bool
 from gpu_fault.telemetry import CollectorKind
 
 LOGGER = logging.getLogger(__name__)
@@ -499,3 +501,36 @@ class FabricManagerLogCollector:
             return
         self._save_state()
         self._state_dirty = False
+
+
+def build_from_environment(
+    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
+) -> FabricManagerLogCollector:
+    """The ``gpu-fault-collector fabric-manager`` factory named by the registry."""
+
+    if not arguments.node_id:
+        raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
+    return FabricManagerLogCollector(
+        sink,
+        context,
+        node_id=arguments.node_id,
+        interval_seconds=arguments.interval_seconds,
+        journal_enabled=env_bool("GPU_FAULT_FABRIC_MANAGER_JOURNAL", True),
+        journal_identifiers=tuple(
+            item
+            for item in os.getenv(
+                "GPU_FAULT_FABRIC_MANAGER_IDENTIFIERS",
+                "nvidia-fabricmanager,nv-fabricmanager",
+            ).split(",")
+            if item
+        ),
+        log_paths=[
+            item
+            for item in os.getenv("GPU_FAULT_FABRIC_MANAGER_LOG_PATHS", "").split(",")
+            if item
+        ],
+        state_path=os.getenv(
+            "GPU_FAULT_FABRIC_MANAGER_STATE_PATH",
+            "/var/lib/gpu-fault/fabric-manager-collector-state.json",
+        ),
+    )

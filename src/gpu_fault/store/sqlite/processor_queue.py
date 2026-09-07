@@ -132,23 +132,17 @@ class SqliteProcessorQueueMixin:
             }
         ]
         by_cluster: dict[str, int] = {}
+        oldest_age_by_cluster: dict[str, float] = {}
         for item in incomplete:
             key = item.cluster_id or "__unscoped__"
             by_cluster[key] = by_cluster.get(key, 0) + 1
-        oldest_age = max(
-            (
-                max(
-                    0.0,
-                    (observed_at - item.created_at).total_seconds(),
-                )
-                for item in incomplete
-            ),
-            default=0.0,
-        )
+            age = max(0.0, (observed_at - item.created_at).total_seconds())
+            oldest_age_by_cluster[key] = max(oldest_age_by_cluster.get(key, 0.0), age)
         return {
             "depth": len(incomplete),
-            "oldest_age_seconds": oldest_age,
+            "oldest_age_seconds": max(oldest_age_by_cluster.values(), default=0.0),
             "by_cluster": by_cluster,
+            "oldest_age_by_cluster": oldest_age_by_cluster,
         }
 
     def processor_fault_backlog_depth(self) -> int:

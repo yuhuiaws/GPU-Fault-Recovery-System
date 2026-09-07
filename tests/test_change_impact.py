@@ -23,7 +23,7 @@ def test_default_change_impact_matrix_is_valid() -> None:
 
 def test_release_change_selects_only_release_domain_and_cases() -> None:
     plan = MODULE.build_plan(
-        ["deploy/control-plane/regional/regional_release_diff.py"], settings()
+        ["src/gpu_fault_release/regional_release_diff.py"], settings()
     )
 
     assert plan.full is False
@@ -94,7 +94,7 @@ def test_unmatched_file_escalates_to_full_acceptance() -> None:
 def test_more_than_three_domains_escalates_to_full_acceptance() -> None:
     plan = MODULE.build_plan(
         [
-            "deploy/control-plane/regional/regional_release_diff.py",
+            "src/gpu_fault_release/regional_release_diff.py",
             "src/gpu_fault/cluster_executor.py",
             "src/gpu_fault/notifications/ses.py",
             "src/gpu_fault/transport/http_client.py",

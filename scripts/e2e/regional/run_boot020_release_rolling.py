@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 import sys
@@ -11,12 +10,14 @@ from pathlib import Path
 from typing import Any, Protocol
 
 ROOT = Path(__file__).resolve().parents[3]
-REGIONAL_DEPLOY = ROOT / "deploy/control-plane/regional"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(REGIONAL_DEPLOY) not in sys.path:
-    sys.path.insert(0, str(REGIONAL_DEPLOY))
 
+from gpu_fault_release import regional_admin_commands  # noqa: E402
+from gpu_fault_release import regional_deployment_inventory  # noqa: E402
+from gpu_fault_release import regional_release_config  # noqa: E402
+from gpu_fault_release import regional_release_diff  # noqa: E402
+from gpu_fault_release import rollout as rollout_regional_release  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder  # noqa: E402
 
 CASE_ID = "GF-REGIONAL-BOOT-020"
@@ -435,11 +436,11 @@ def run_release_rolling(
 class LiveReleaseRollingBackend:
     def __init__(self, configs: dict[str, Path]) -> None:
         self.configs = configs
-        self.rollout = importlib.import_module("rollout_regional_release")
-        self.config_module = importlib.import_module("regional_release_config")
-        self.diff_module = importlib.import_module("regional_release_diff")
-        self.commands = importlib.import_module("regional_admin_commands")
-        self.inventory = importlib.import_module("regional_deployment_inventory")
+        self.rollout = rollout_regional_release
+        self.config_module = regional_release_config
+        self.diff_module = regional_release_diff
+        self.commands = regional_admin_commands
+        self.inventory = regional_deployment_inventory
 
     def _release(
         self,

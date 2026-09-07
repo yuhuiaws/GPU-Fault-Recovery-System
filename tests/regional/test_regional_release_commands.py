@@ -21,7 +21,13 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_admin_commands as ADMIN_COMMANDS_MODULE
+from gpu_fault_release import regional_release_iam as IAM_MODULE
+from gpu_fault_release import regional_release_orchestration as ORCHESTRATION_MODULE
+from gpu_fault_release import (
+    regional_release_rollback_context as ROLLBACK_CONTEXT_MODULE,
+)
+from gpu_fault_release import regional_release_state as STATE_MODULE
 from tests.regional._release_orchestrator_support import (
     CPU_EKS_ARN,
     GPU_EKS_ARN,
@@ -32,24 +38,9 @@ from tests.regional._release_orchestrator_support import (
 )
 from tests.regional._release_orchestrator_support import RELEASE_MODULE as MODULE
 
-ADMIN_COMMANDS_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_admin_commands.py"
-)
-ORCHESTRATION_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_orchestration.py"
-)
 # `build_rollback_environment` is re-exported by the orchestration module but
 # defined here, and a function resolves its globals in the module that defines
 # it, so the digest stubs below have to be installed on this one.
-ROLLBACK_CONTEXT_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_rollback_context.py"
-)
-IAM_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_iam.py"
-)
-STATE_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_state.py"
-)
 
 
 class PreflightRunner:
@@ -343,8 +334,8 @@ def test_last_cluster_can_be_removed_from_the_cpu_registry(
 def test_deploy_selects_initial_or_upgrade_path(
     tmp_path: Path, monkeypatch, state_exists: bool, phase: str | None, expected: str
 ) -> None:
-    module = MODULE.load()
-    admin = ADMIN_COMMANDS_MODULE.load()
+    module = MODULE
+    admin = ADMIN_COMMANDS_MODULE
     release = module.RegionalRelease(
         module.ReleaseConfig.load(config_file(tmp_path)), module.Runner(dry_run=False)
     )
@@ -459,10 +450,16 @@ def test_regional_release_shell_has_valid_syntax() -> None:
     )
 
 
-def test_regional_release_config_imports_with_runtime_pythonpath() -> None:
+def test_release_package_imports_with_only_src_on_pythonpath(tmp_path: Path) -> None:
+    """The launcher puts ``src`` on PYTHONPATH and nothing else.
+
+    Run from an unrelated directory so neither the repository root nor the
+    package directory is on ``sys.path`` by accident: the orchestrator has to
+    resolve every sibling through ``gpu_fault_release.*``.
+    """
     completed = subprocess.run(
-        [sys.executable, "-c", "import regional_release_config"],
-        cwd=ROOT / "deploy/control-plane/regional",
+        [sys.executable, "-c", "import gpu_fault_release.rollout"],
+        cwd=tmp_path,
         env={
             **os.environ,
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -474,6 +471,38 @@ def test_regional_release_config_imports_with_runtime_pythonpath() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_regional_release_shell_launches_the_package_entry_point(
+    tmp_path: Path,
+) -> None:
+    """The ``.sh`` path is the contract the admin CLI execs; argv passes through.
+
+    ``--help`` is the one argument that exercises the full launcher (bash ->
+    ``python3 -m gpu_fault_release.rollout`` -> argparse) without touching a
+    cluster, and its usage line proves the request reached the orchestrator's
+    own parser rather than a stub.
+    """
+    launcher = ROOT / "deploy/control-plane/regional/rollout-regional-release.sh"
+    completed = subprocess.run(
+        [str(launcher), "--help"],
+        cwd=tmp_path,
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"PYTHONPATH", "PYTHONSAFEPATH"}
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
+    assert "status" in completed.stdout
+    assert "python3 -m gpu_fault_release.rollout" in launcher.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_gpu_deployment_manifest_is_stamped_with_release_sha(tmp_path) -> None:

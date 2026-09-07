@@ -164,54 +164,6 @@ class MemoryRemoteCommandMixin:
             commands = list(self._remote_commands.values())
         return _remote_command_stats(commands, now=now)
 
-    def remote_command_cluster_health(
-        self,
-        cluster_id: str,
-        *,
-        now: datetime | None = None,
-    ) -> dict:
-        """What one cluster's executor needs to prove it is useful.
-
-        Readiness for an executor is not "the process is up" -- it is
-        "the backlog this cluster has is claimable by me". The two ways
-        that fails silently are an executor that advertises fewer
-        execution owners than the queued steps require, and an executor
-        that is running but never claims. Both are visible only by
-        comparing the advertised owners against the open backlog, which
-        is what this returns.
-        """
-
-        observed_at = now or datetime.now(timezone.utc)
-        commands = self._open_remote_command_candidates(cluster_id, None)
-        pending_owner_counts: dict[str, int] = {}
-        leased = 0
-        oldest_unclaimed = 0.0
-        oldest_unclaimed_owner: str | None = None
-        for command in commands:
-            if command.status is RemoteCommandStatus.LEASED:
-                leased += 1
-                continue
-            if command.status is not RemoteCommandStatus.PENDING:
-                continue
-            owner = command.step.execution_owner
-            pending_owner_counts[owner] = pending_owner_counts.get(owner, 0) + 1
-            age = max(
-                0.0,
-                (observed_at - command.created_at).total_seconds(),
-            )
-            if age > oldest_unclaimed:
-                oldest_unclaimed = age
-                oldest_unclaimed_owner = owner
-        return {
-            "cluster_id": cluster_id,
-            "open_total": len(commands),
-            "leased_total": leased,
-            "pending_total": sum(pending_owner_counts.values()),
-            "pending_owner_counts": pending_owner_counts,
-            "oldest_unclaimed_age_seconds": oldest_unclaimed,
-            "oldest_unclaimed_execution_owner": oldest_unclaimed_owner,
-        }
-
     def expire_unclaimed_remote_commands(
         self,
         *,

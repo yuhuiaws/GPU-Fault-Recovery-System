@@ -6,6 +6,13 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
 from gpu_fault.models import FaultIncident, RecoveryPlan, WorkflowRequest
 from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
+from gpu_fault.store.shared.primitives import (
+    GetLink,
+    GetRecord,
+    LinkRecord,
+    PutRecord,
+    StateTransaction,
+)
 from gpu_fault.retired_generation import retired_generation_records
 from gpu_fault.workflow_resolution import reconciled_restore_records
 from gpu_fault.store.shared.preemption import preemption_pending_update
@@ -117,14 +124,11 @@ class TransactionalWorkflowMixin:
     """
 
     # Attributes supplied by the composed concrete implementation.
-    _get: Callable[..., Any]
-    _get_for_update: Callable[..., Any]
-    _get_link: Callable[..., Any]
-    _get_optional: Callable[..., Any]
-    _list: Callable[..., Any]
-    _link: Callable[..., Any]
-    _put: Callable[..., Any]
-    _state_transaction: Callable[..., Any]
+    _get: GetRecord
+    _get_link: GetLink
+    _link: LinkRecord
+    _put: PutRecord
+    _state_transaction: StateTransaction
     list_remote_commands: Callable[..., list[RemoteActionCommand]]
 
     # How many ``incident_by_event`` links pointed at a record that was not

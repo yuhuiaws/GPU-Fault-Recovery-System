@@ -67,7 +67,8 @@ spec:
   # Complete and annotates the node with the new digest. The node then
   # runs the old wheel while claiming the new one, and reconcile
   # reports "current" forever. maxUnavailable alone cannot fix this:
-  # any overlap at all is enough.
+  # any overlap at all is enough. This controller is a singleton by
+  # design; replicas stays 1 and scale-out is not a supported lever.
   strategy:
     type: Recreate
   selector:

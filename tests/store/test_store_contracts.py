@@ -54,34 +54,141 @@ from tests._builders import (
     processor_request,
 )
 
-SQLITE_INHERITED_PUBLIC = frozenset(
+# The three stores are peers; each composes the shared mixins it needs.
+# These sets pin, per store, which public methods resolve to a class under
+# ``gpu_fault.store.shared`` (or, for SQLite's non-durable telemetry spool,
+# under ``gpu_fault.store.memory``), so a method silently falling through
+# to a shared fallback -- or a shared one silently overridden -- is a
+# reviewed change here.
+MEMORY_SHARED_PUBLIC = frozenset(
     {
-        "abandon_telemetry_spool_claims",
-        "claim_telemetry_spool",
         "complete_active_processor_requests_batch",
-        "complete_telemetry_spool",
         "efa_traffic_state_key",
         "get_decision_by_attempt",
-        "get_collector_metrics_snapshot",
         "get_xid_events",
         "list_xid_events_for_scopes",
         "processor_batch_transaction",
         "processor_queue_count_status",
-        "release_telemetry_spool",
         "remote_command_cluster_health",
         "save_attempt_observations_batch",
-        "save_collector_metrics_snapshot",
-        "telemetry_spool_stats",
         "try_enqueue_processor_requests_batch",
-        "try_spool_telemetry_requests",
     }
 )
 
-POSTGRES_INHERITED_PUBLIC = frozenset(
+SQLITE_SHARED_PUBLIC = frozenset(
     {
         "acquire_periodic_task_lease",
         "acquire_processor_leadership",
         "add_marker",
+        "amend_workflow",
+        "apply_efa_traffic_admin_action",
+        "complete_active_processor_requests_batch",
+        "complete_notification_delivery",
+        "complete_remote_command",
+        "complete_xid_correlation",
+        "create_incident_workflow_if_absent",
+        "delete_regional_cluster",
+        "efa_traffic_state_key",
+        "enqueue_notification_delivery",
+        "ensure_remote_command",
+        "establish_notification_watermark",
+        "get_agent",
+        "get_barrier",
+        "get_collector_metrics_snapshot",
+        "get_decision_by_attempt",
+        "get_decision_by_event",
+        "get_diagnostic",
+        "get_efa_traffic_state",
+        "get_event_by_attempt",
+        "get_fleet_deployment",
+        "get_gpu_inventory_snapshot",
+        "get_gpu_metrics_batch",
+        "get_hyperpod_node_identity",
+        "get_hyperpod_submission",
+        "get_incident",
+        "get_incident_by_event",
+        "get_notification",
+        "get_notification_result",
+        "get_notification_watermark",
+        "get_plan",
+        "get_processor_leadership",
+        "get_profile",
+        "get_regional_cluster",
+        "get_regional_registry_head",
+        "get_regional_registry_revision",
+        "get_restart_budget",
+        "get_workflow",
+        "get_xid_correlation",
+        "get_xid_event",
+        "get_xid_events",
+        "get_xid_policy_decision",
+        "link_event_to_incident",
+        "list_attempt_observation_states",
+        "list_gpu_metrics_latest",
+        "list_regional_registry_members",
+        "list_training_progress_states",
+        "list_xid_events_for_scopes",
+        "merge_attempt_fault_workflow",
+        "merge_replacement_workflow",
+        "merge_sxid_workflow",
+        "observe_efa_traffic",
+        "observe_gpu_metrics",
+        "observe_telemetry_metric",
+        "observe_training_progress",
+        "processor_batch_transaction",
+        "processor_queue_count_status",
+        "publish_regional_registry_revision",
+        "reconcile_restored_workflow",
+        "reconcile_retired_generation_workflow",
+        "record_xid74_occurrences",
+        "release_job_restart",
+        "release_notification_delivery",
+        "remote_command_cluster_health",
+        "renew_remote_command_lease",
+        "reserve_hyperpod_submission",
+        "reserve_job_restart",
+        "save_agent",
+        "save_attempt_observation",
+        "save_attempt_observations_batch",
+        "save_barrier",
+        "save_collector_metrics_snapshot",
+        "save_collector_status",
+        "save_decision",
+        "save_diagnostic",
+        "save_fleet_deployment",
+        "save_gpu_inventory_snapshot",
+        "save_gpu_metrics_batch",
+        "save_hyperpod_node_identity",
+        "save_hyperpod_submission",
+        "save_incident_and_workflow",
+        "save_notification_result",
+        "save_plan",
+        "save_profile",
+        "save_regional_cluster",
+        "save_regional_registry_member",
+        "save_triage_report",
+        "save_xid_policy_decision",
+        "try_enqueue_processor_requests_batch",
+    }
+)
+
+SQLITE_MEMORY_PUBLIC = frozenset(
+    {
+        "abandon_telemetry_spool_claims",
+        "claim_telemetry_spool",
+        "complete_telemetry_spool",
+        "release_telemetry_spool",
+        "telemetry_spool_stats",
+        "try_spool_telemetry_requests",
+    }
+)
+
+POSTGRES_SHARED_PUBLIC = frozenset(
+    {
+        "acquire_periodic_task_lease",
+        "acquire_processor_leadership",
+        "add_marker",
+        "amend_workflow",
         "apply_efa_traffic_admin_action",
         "complete_notification_delivery",
         "complete_remote_command",
@@ -94,9 +201,9 @@ POSTGRES_INHERITED_PUBLIC = frozenset(
         "establish_notification_watermark",
         "get_agent",
         "get_barrier",
-        "get_decision_by_event",
-        "get_decision_by_attempt",
         "get_collector_metrics_snapshot",
+        "get_decision_by_attempt",
+        "get_decision_by_event",
         "get_diagnostic",
         "get_efa_traffic_state",
         "get_event_by_attempt",
@@ -121,33 +228,32 @@ POSTGRES_INHERITED_PUBLIC = frozenset(
         "get_xid_event",
         "get_xid_policy_decision",
         "link_event_to_incident",
+        "list_regional_registry_members",
         "merge_attempt_fault_workflow",
         "merge_replacement_workflow",
         "merge_sxid_workflow",
         "observe_efa_traffic",
         "observe_telemetry_metric",
-        "record_xid74_occurrences",
-        "release_job_restart",
+        "publish_regional_registry_revision",
         "reconcile_restored_workflow",
         "reconcile_retired_generation_workflow",
+        "record_xid74_occurrences",
+        "release_job_restart",
         "release_notification_delivery",
         "remote_command_cluster_health",
         "renew_remote_command_lease",
         "reserve_hyperpod_submission",
         "reserve_job_restart",
-        "list_regional_registry_members",
-        "publish_regional_registry_revision",
         "save_agent",
         "save_barrier",
-        "save_collector_status",
         "save_collector_metrics_snapshot",
+        "save_collector_status",
         "save_decision",
         "save_diagnostic",
         "save_fleet_deployment",
         "save_gpu_inventory_snapshot",
         "save_hyperpod_node_identity",
         "save_hyperpod_submission",
-        "amend_workflow",
         "save_incident_and_workflow",
         "save_notification_result",
         "save_plan",
@@ -178,12 +284,9 @@ SQLITE_PROCESSOR_QUEUE_PUBLIC = frozenset(
 
 SQLITE_PROCESSOR_LEASE_PUBLIC = frozenset(
     {
-        "acquire_periodic_task_lease",
-        "acquire_processor_leadership",
         "cleanup_processor_lanes",
         "complete_active_processor_request",
         "complete_processor_request",
-        "get_processor_leadership",
         "release_active_processor_request",
         "release_processor_request",
         "renew_active_processor_request",
@@ -300,10 +403,8 @@ MEMORY_PROCESSOR_QUEUE_PUBLIC = frozenset(
         "has_incomplete_processor_requests",
         "has_incomplete_processor_requests_for_scopes",
         "processor_fault_backlog_depth",
-        "processor_queue_count_status",
         "processor_queue_stats",
         "try_enqueue_processor_request",
-        "try_enqueue_processor_requests_batch",
     }
 )
 
@@ -313,10 +414,8 @@ MEMORY_PROCESSOR_LEASE_PUBLIC = frozenset(
         "acquire_processor_leadership",
         "cleanup_processor_lanes",
         "complete_active_processor_request",
-        "complete_active_processor_requests_batch",
         "complete_processor_request",
         "get_processor_leadership",
-        "processor_batch_transaction",
         "release_active_processor_request",
         "release_processor_request",
         "renew_active_processor_request",
@@ -390,13 +489,18 @@ def _mro_public_methods(cls) -> set[str]:
     return methods
 
 
-def _layer_public_methods(cls, inherited_from) -> set[str]:
-    methods: set[str] = set()
+def _public_methods_resolved_from(cls, package: str) -> set[str]:
+    """Public methods of ``cls`` whose first definer in the MRO lives under
+    ``package``."""
+
+    resolved: set[str] = set()
+    seen: set[str] = set()
     for item in inspect.getmro(cls):
-        if item is inherited_from:
-            break
-        methods.update(_public_methods(item))
-    return methods
+        for name in _public_methods(item) - seen:
+            seen.add(name)
+            if item.__module__.startswith(package):
+                resolved.add(name)
+    return resolved
 
 
 def test_store_classes_cover_application_protocol() -> None:
@@ -488,16 +592,22 @@ def test_completion_cluster_groups_use_bounded_parallelism() -> None:
     assert max_active == 2
 
 
-def test_store_inheritance_is_an_explicit_reviewed_contract() -> None:
-    sqlite_inherited = _mro_public_methods(InMemoryStore) - (
-        _layer_public_methods(SqliteStore, InMemoryStore)
+def test_store_composition_is_an_explicit_reviewed_contract() -> None:
+    shared = "gpu_fault.store.shared"
+    memory = "gpu_fault.store.memory"
+    assert _public_methods_resolved_from(InMemoryStore, shared) == MEMORY_SHARED_PUBLIC
+    assert _public_methods_resolved_from(SqliteStore, shared) == SQLITE_SHARED_PUBLIC
+    assert _public_methods_resolved_from(SqliteStore, memory) == SQLITE_MEMORY_PUBLIC
+    assert (
+        _public_methods_resolved_from(PostgresStore, shared) == POSTGRES_SHARED_PUBLIC
     )
-    postgres_inherited = _mro_public_methods(SqliteStore) - (
-        _layer_public_methods(PostgresStore, SqliteStore)
+    assert _public_methods_resolved_from(PostgresStore, memory) == set()
+    assert _public_methods_resolved_from(PostgresStore, "gpu_fault.store.sqlite") == (
+        set()
     )
-
-    assert sqlite_inherited == SQLITE_INHERITED_PUBLIC
-    assert postgres_inherited == POSTGRES_INHERITED_PUBLIC
+    assert _mro_public_methods(PostgresStore) >= _mro_public_methods(SqliteStore) - (
+        SQLITE_MEMORY_PUBLIC
+    )
     assert _public_methods(MemoryFleetMixin) == MEMORY_FLEET_PUBLIC
     assert _public_methods(MemoryProcessorQueueMixin) == MEMORY_PROCESSOR_QUEUE_PUBLIC
     assert _public_methods(MemoryProcessorLeaseMixin) == MEMORY_PROCESSOR_LEASE_PUBLIC
@@ -580,6 +690,52 @@ def test_processor_queue_contract(processor_store) -> None:
         response_body_base64="e30=",
     )
     assert processor_store.processor_queue_stats()["depth"] == 0
+
+
+def test_processor_queue_stats_report_oldest_age_per_cluster(processor_store) -> None:
+    """S6: the claim window is FIFO across the region, so one cluster's storm
+    delays every other cluster; the per-cluster oldest age is what says which
+    cluster is actually waiting. The region-wide age stays the overall max."""
+
+    now = datetime.now(timezone.utc)
+    ages = {"node-a": ("cluster-a", 100.0), "node-b": ("cluster-a", 40.0)}
+    ages["node-c"] = ("cluster-b", 10.0)
+    for node_id, (cluster_id, age) in ages.items():
+        request = processor_request(
+            "/v1/collector-events/nvidia-kernel",
+            body=f'{{"node_id":"{node_id}"}}'.encode(),
+            cluster_id=cluster_id,
+        ).model_copy(update={"created_at": now - timedelta(seconds=age)})
+        accepted, reason = processor_store.try_enqueue_processor_request(
+            request, max_depth=10, max_cluster_depth=10
+        )
+        assert accepted is not None, reason
+
+    stats = processor_store.processor_queue_stats(now=now)
+
+    assert stats["by_cluster"] == {"cluster-a": 2, "cluster-b": 1}
+    assert stats["oldest_age_seconds"] == pytest.approx(100.0)
+    assert stats["oldest_age_by_cluster"] == {
+        "cluster-a": pytest.approx(100.0),
+        "cluster-b": pytest.approx(10.0),
+    }
+
+    claimed = processor_store.claim_active_processor_requests(
+        "contract-owner", now=now, lease_duration=timedelta(seconds=30), limit=3
+    )
+    for item in claimed:
+        processor_store.complete_active_processor_request(
+            item.request_id,
+            "contract-owner",
+            item.leader_epoch,
+            item.lease_token,
+            response_status=200,
+            response_content_type="application/json",
+            response_body_base64="e30=",
+        )
+    drained = processor_store.processor_queue_stats(now=now)
+    assert drained["oldest_age_by_cluster"] == {}
+    assert drained["oldest_age_seconds"] == 0.0
 
 
 def test_notification_status_counts_contract(processor_store) -> None:

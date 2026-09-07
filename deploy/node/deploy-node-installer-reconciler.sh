@@ -81,8 +81,8 @@ done
     printf 'ERROR: invalid GPU_FAULT_INSTALLER_MAX_UNAVAILABLE\n' >&2
     exit 2
 }
-[[ "${ACTIVE_DEADLINE_SECONDS}" =~ ^[1-9][0-9]*$ ]] &&
-    ((ACTIVE_DEADLINE_SECONDS >= 60)) || {
+{ [[ "${ACTIVE_DEADLINE_SECONDS}" =~ ^[1-9][0-9]*$ ]] &&
+    ((ACTIVE_DEADLINE_SECONDS >= 60)); } || {
     printf 'ERROR: invalid GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS\n' >&2
     exit 2
 }

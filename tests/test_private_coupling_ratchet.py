@@ -94,5 +94,5 @@ def test_the_loader_contract_is_the_only_baselined_globals_access() -> None:
     entries = {key for key in baseline if key.endswith(".__globals__")}
 
     assert entries == {
-        "tests/test_script_loader_contract.py:run_fleet_waves.__globals__"
+        "tests/test_script_loader_contract.py:file_set_identity.__globals__"
     }

@@ -16,6 +16,7 @@ from gpu_fault.admin.config import (
     admin_config_desired_path,
     load_desired_admin_config,
 )
+from gpu_fault.admin.config_parser import boolean_field
 from gpu_fault.digests import SHA256_PATTERN
 
 SITE_API_VERSION = "gpu-fault.aws/v1alpha1"
@@ -92,11 +93,7 @@ def _subject_prefix(value: object, path: str) -> str:
 
 
 def _boolean(value: object, path: str, *, default: bool) -> bool:
-    if value is None:
-        return default
-    if not isinstance(value, bool):
-        raise SiteConfigError(f"{path} must be a boolean")
-    return value
+    return boolean_field(value, path, default=default, error=SiteConfigError)
 
 
 def _integer(

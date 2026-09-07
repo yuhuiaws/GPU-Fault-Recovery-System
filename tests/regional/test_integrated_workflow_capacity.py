@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -143,14 +144,22 @@ def test_aurora_preflight_requires_declared_and_observed_124_acu(
 def test_aurora_fixture_sets_124_128_before_capacity_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    modified = []
+    """The harness resizes through the shared ``aurora_capacity`` reconciler --
+    the one writer of the ACU window -- and every AWS call still goes through
+    the registry-validated ``aws_json`` so the target check applies to it."""
+
+    modified: list[tuple[str, ...]] = []
+    shell_commands: list[list[str]] = []
 
     def fake_shell_run(arguments, **_kwargs):
-        modified.append(arguments)
+        shell_commands.append(list(arguments))
         return SimpleNamespace(stdout=b"{}")
 
     def fake_aws_json(*arguments: str, **_kwargs):
         operation = arguments[1]
+        if operation == "modify-db-cluster":
+            modified.append(arguments)
+            return {}
         if operation == "describe-db-clusters":
             target = bool(modified)
             return {
@@ -183,17 +192,60 @@ def test_aurora_fixture_sets_124_128_before_capacity_check(
                     }
                 ]
             }
-        return {"Datapoints": [{"Timestamp": "2026-08-31T17:00:00Z", "Maximum": 124.0}]}
+        return {
+            "Datapoints": [
+                {"Timestamp": datetime.now(UTC).isoformat(), "Maximum": 124.0}
+            ]
+        }
 
     monkeypatch.setattr(suite, "shell_run", fake_shell_run)
     monkeypatch.setattr(suite, "aws_json", fake_aws_json)
 
-    result = suite.ensure_aurora_capacity("aurora-a", timeout_seconds=1, configure=True)
+    result = suite.ensure_aurora_capacity("aurora-a", timeout_seconds=5, configure=True)
 
     assert modified, "Aurora modify command was not issued before validation"
     assert "MinCapacity=124,MaxCapacity=128" in modified[0]
+    assert "--apply-immediately" in modified[0]
+    assert "--region" in modified[0], "the registry-validated caller adds the region"
+    assert not any("modify-db-cluster" in command for command in shell_commands), (
+        "the harness must not spell the modify itself"
+    )
     assert result["initial_scaling"] == {"min_acu": 0.5, "max_acu": 8.0}
     assert result["scaling_modified"] is True
+    assert result["min_acu"] == 124.0
+
+
+def test_aurora_fixture_refuses_to_resize_without_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_aws_json(*arguments: str, **_kwargs):
+        assert arguments[1] != "modify-db-cluster", "an unauthorized modify"
+        if arguments[1] == "describe-db-clusters":
+            return {
+                "DBClusters": [
+                    {
+                        "Status": "available",
+                        "ServerlessV2ScalingConfiguration": {
+                            "MinCapacity": 0.5,
+                            "MaxCapacity": 8.0,
+                        },
+                        "DBClusterMembers": [
+                            {"DBInstanceIdentifier": "w", "IsClusterWriter": True},
+                            {"DBInstanceIdentifier": "r", "IsClusterWriter": False},
+                        ],
+                    }
+                ]
+            }
+        return {
+            "DBInstances": [
+                {"DBInstanceStatus": "available", "DBInstanceClass": "db.serverless"}
+            ]
+        }
+
+    monkeypatch.setattr(suite, "aws_json", fake_aws_json)
+
+    with pytest.raises(RuntimeError, match="not authorized"):
+        suite.ensure_aurora_capacity("aurora-a", timeout_seconds=1, configure=False)
 
 
 def test_remediation_budget_preflight_reads_every_live_worker(

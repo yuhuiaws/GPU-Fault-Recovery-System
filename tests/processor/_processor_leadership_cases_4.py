@@ -73,6 +73,17 @@ def test_processor_api_backpressure_and_metrics(monkeypatch) -> None:
     assert (
         'gpu_fault_processor_cluster_queue_depth{cluster_id="cluster-a"} 1'
     ) in metrics.text
+    # S6: the queued request was created moments ago, so its per-cluster age is
+    # a small non-negative float; the exact value is not the point, the label is.
+    cluster_age = [
+        line
+        for line in metrics.text.splitlines()
+        if line.startswith(
+            'gpu_fault_processor_cluster_queue_oldest_age_seconds{cluster_id="cluster-a"} '
+        )
+    ]
+    assert len(cluster_age) == 1, metrics.text
+    assert 0.0 <= float(cluster_age[0].rsplit(" ", 1)[1]) < 60.0
     assert "gpu_fault_processor_request_processing_seconds_bucket" in metrics.text
 
 

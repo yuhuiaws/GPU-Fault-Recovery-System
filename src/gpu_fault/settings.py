@@ -4,24 +4,9 @@ import json
 from dataclasses import dataclass
 from typing import Mapping
 
+from gpu_fault.env import env_bool
 from gpu_fault.execution import ProductionExecutorConfig
 from gpu_fault.fleet import CURRENT_AGENT_PROTOCOL_VERSION
-
-
-def _boolean(
-    values: Mapping[str, str],
-    name: str,
-    default: bool = False,
-) -> bool:
-    raw = values.get(name)
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    if normalized in {"1", "true", "yes"}:
-        return True
-    if normalized in {"0", "false", "no"}:
-        return False
-    raise ValueError(f"{name} must be true or false")
 
 
 def _csv(
@@ -72,10 +57,8 @@ class StoreSettings:
             postgres_pool_timeout_seconds=float(
                 values.get("GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS", "2")
             ),
-            postgres_auto_schema_init=_boolean(
-                values,
-                "GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT",
-                True,
+            postgres_auto_schema_init=env_bool(
+                "GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT", True, environ=values
             ),
         )
 
@@ -104,7 +87,7 @@ class AgentRegistrySettings:
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> AgentRegistrySettings:
-        enabled = _boolean(values, "GPU_FAULT_ENABLE_AGENT_REGISTRY")
+        enabled = env_bool("GPU_FAULT_ENABLE_AGENT_REGISTRY", False, environ=values)
         artifact = values.get("GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256", "").strip()
         config_digest = values.get("GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST", "").strip()
         compatibility_digest = (
@@ -218,10 +201,8 @@ class AgentRegistrySettings:
             endpoint_allowed_cidrs=values.get(
                 "GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS", ""
             ).strip(),
-            endpoint_require_tls=_boolean(
-                values,
-                "GPU_FAULT_AGENT_ENDPOINT_REQUIRE_TLS",
-                True,
+            endpoint_require_tls=env_bool(
+                "GPU_FAULT_AGENT_ENDPOINT_REQUIRE_TLS", True, environ=values
             ),
         )
 
@@ -327,19 +308,21 @@ class ControlPlaneSettings:
                     "single-cluster mode cannot load multiple regional "
                     "cluster registrations"
                 )
-            if not _boolean(
-                values,
-                "GPU_FAULT_ALLOW_SINGLE_CLUSTER",
-                False,
-            ):
+            if not env_bool("GPU_FAULT_ALLOW_SINGLE_CLUSTER", False, environ=values):
                 raise RuntimeError(
                     "single-cluster executor mode is Canary-only; set "
                     "GPU_FAULT_ALLOW_SINGLE_CLUSTER=true explicitly"
                 )
-        quick_diagnostics = _boolean(values, "GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS")
-        node_action = _boolean(values, "GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER")
-        kubernetes = _boolean(values, "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER")
-        hyperpod = _boolean(values, "GPU_FAULT_ENABLE_HYPERPOD_ADAPTER")
+        quick_diagnostics = env_bool(
+            "GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS", False, environ=values
+        )
+        node_action = env_bool(
+            "GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER", False, environ=values
+        )
+        kubernetes = env_bool(
+            "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER", False, environ=values
+        )
+        hyperpod = env_bool("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER", False, environ=values)
         if regional_mode and quick_diagnostics:
             raise RuntimeError(
                 "regional control plane cannot run in-cluster "
@@ -386,9 +369,8 @@ class ControlPlaneSettings:
             node_action_adapter_enabled=node_action,
             kubernetes_adapter_enabled=kubernetes,
             hyperpod_adapter_enabled=hyperpod,
-            spare_failover_enabled=_boolean(
-                values,
-                "GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER",
+            spare_failover_enabled=env_bool(
+                "GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER", False, environ=values
             ),
             managed_recovery_owners=_csv(
                 values,

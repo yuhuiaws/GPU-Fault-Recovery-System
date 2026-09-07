@@ -33,9 +33,6 @@ __all__ = [
 
 DISALLOWED_CURRENT_TARGETS = {
     "src/gpu_fault/api.py": "compatibility shim; reference gpu_fault.app",
-    "src/gpu_fault/orchestrator.py": (
-        "compatibility shim; reference gpu_fault.orchestration or planner"
-    ),
 }
 LEGACY_MONOLITH = re.compile(
     r"(?<![/A-Za-z0-9_])"

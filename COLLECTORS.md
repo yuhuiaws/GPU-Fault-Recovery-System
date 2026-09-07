@@ -28,6 +28,44 @@ HMA watcher 只发送包含 `sagemaker.amazonaws.com/node-health-status`、
 `nvidia-smi`保留为DCGM Exporter不可用时的fallback。Kubernetes HMA和
 CloudWatch HMA属于optional验证链路，不在默认拓扑中。
 
+### 新增 Collector
+
+Collector 与 operation、channel、node-action 一样是表驱动的：
+`src/gpu_fault/collector_registry.py` 是唯一要改的表，`validate_collector_registry()`
+在 import 时校验，缺项在第一次 `import gpu_fault.collectors_cli` 就失败，而不是在
+节点上第一次运行时。新增一个 collector 的步骤：
+
+1. **通道**：若数据落在新的控制面入口，先在 `src/gpu_fault/channel_registry.py`
+   的 `CHANNEL_REGISTRY` 加一行（processor 路由由 `validate_collector_routes()`
+   对账）；复用现有入口则跳过。
+2. **工厂**：在 collector 模块里写
+   `build_from_environment(sink, context, arguments) -> collector`，把该 collector
+   自己的 `os.getenv(...)` 读取放在这里（不需要 context 的 collector 用
+   `(sink, arguments)` 两参形式，并在描述符上声明 `needs_context=False`）。
+3. **描述符**：在 `COLLECTOR_REGISTRY` 加一个 `CollectorDescriptor`：
+   `cli_command`（子命令名）、`kinds`（它产出的 `CollectorKind`，可为空、可与
+   `dcgm`/`nvidia-smi` 那样多个子命令共享）、`channel_paths`（它 `post` 的全部
+   路径）、`export_name`（`gpu_fault.collectors._EXPORTS` 里的类名）、
+   `factory`（`"module:callable"`）、`runs_in`（`node`/`cluster`/`workload`）、
+   `needs_product_discovery`。若引入新的 `CollectorKind`，同时在
+   `COLLECTOR_KINDS` 加一行：producer 名、systemd unit、
+   `silent_threshold("GPU_FAULT_..._SILENT_AFTER_SECONDS", "<秒>")`。
+   `telemetry.COLLECTOR_PRODUCER_BY_CHANNEL`、
+   `collector_requirements.COLLECTOR_SYSTEMD_UNITS` 和
+   `collector_silent_thresholds()` 都由这两张表派生，不再手写。
+4. **子命令参数**：需要 argparse 选项时在 `collectors_cli.CLI_ARGUMENTS` 注册一个
+   `add_arguments(parser)`；没有则不注册，子命令自动出现。
+5. **部署**：`deploy/systemd/` 的 unit 名必须等于 `COLLECTOR_KINDS` 里的
+   `systemd_unit`；数据面清单在 `deploy/dataplane/`。
+
+校验器会拒绝：`CollectorKind` 没有描述符产出（或反之）、`channel_paths` 不在
+`CHANNEL_REGISTRY`/provider-events 前缀内、`export_name` 未被 `gpu_fault.collectors`
+导出、字典键与 `cli_command` 不一致、一个节点子命令跨两个 systemd unit、共享 unit
+的 kind 声明不同 producer。第三方 collector 通过 `gpu_fault.collectors` entry-point
+组（`PluginGroup.COLLECTORS`）提供一个与 entry point 同名的 `CollectorDescriptor`，
+CLI 启动时经 `collector_registry_with_plugins()` 合并并走同一校验；与内建子命令
+同名即拒绝。`tests/test_collector_registry.py` 覆盖以上每条规则。
+
 ## 公共配置
 
 ```text
@@ -41,8 +79,13 @@ GPU_FAULT_CUDA_VERSION=12.9
 ```
 
 生产环境必须先向控制面注册对应的 runtime profile。token 应由 Secret 注入，不能写入
-ConfigMap。当前应用本身尚未实现 bearer token 校验，生产入口必须由 API Gateway、
-service mesh 或反向代理验证 token，并由 NetworkPolicy、安全组或私有负载均衡限制。
+ConfigMap。区域模式下控制面自身校验集群 bearer token：请求按 `X-GPU-Fault-Cluster-ID`
+查注册表，`Authorization: Bearer` 的 SHA-256 摘要与注册的 token 摘要经
+`secrets.compare_digest` 常量时间比对，缺少 bearer 返回 401，集群未注册或不匹配返回
+403；执行 token 同样常量时间比对，未声明授权桶的路由默认拒绝（403），见
+`src/gpu_fault/app/middleware/auth.py::install_regional_authorization`。API Gateway、
+service mesh、NetworkPolicy、安全组或私有负载均衡仍建议作为纵深防御叠加，但不再是
+唯一的 token 校验点。`scripts/check-doc-facts.py` 守卫本段与代码一致。
 
 ## Kubernetes
 

@@ -11,7 +11,7 @@ from gpu_fault.notifications.registry import (
     NotificationBuilderRegistry,
     NotificationKind,
 )
-from gpu_fault.orchestrator import OPERATION_CAPABILITY
+from gpu_fault.orchestration import OPERATION_CAPABILITY
 from gpu_fault.policy import ActionDisposition, FaultPolicyDecision, SxidEvent, XidEvent
 
 

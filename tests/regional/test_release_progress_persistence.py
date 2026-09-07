@@ -7,19 +7,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_gpu_rollout as GPU_ROLLOUT
+from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
+from gpu_fault_release import regional_release_progress as PROGRESS
 from tests.regional._release_orchestrator_support import phase_release
 
 ROOT = Path(__file__).resolve().parents[2]
-ORCHESTRATION = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_orchestration.py"
-)
-GPU_ROLLOUT = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_gpu_rollout.py"
-)
-PROGRESS = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_progress.py"
-)
 
 
 def test_upgrade_ensures_schema_before_rolling_cpu(

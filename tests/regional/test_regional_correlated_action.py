@@ -9,7 +9,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepStatus,
 )
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from gpu_fault.policy import SxidEvent, XidEvent
 from gpu_fault.training_models import TrainingProgressHeartbeat
 from gpu_fault.watcher import AttemptObservation

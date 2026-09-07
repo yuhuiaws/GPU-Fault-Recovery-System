@@ -28,7 +28,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkloadState,
 )
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from gpu_fault.planner import PlanBuilder
 from gpu_fault.service import CompletionService
 from gpu_fault.spare_health import HyperPodSpareHealthController, SpareHealthState

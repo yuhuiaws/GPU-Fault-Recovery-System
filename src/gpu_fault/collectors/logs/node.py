@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
@@ -888,3 +889,27 @@ class NodeLogCollector:
             )
         self._bound_tracked_files(set(visited))
         return entries
+
+
+def build_from_environment(
+    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
+) -> NodeLogCollector:
+    """The ``gpu-fault-collector logs`` factory named by the registry."""
+
+    if not arguments.node_id:
+        raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
+    return NodeLogCollector(
+        sink,
+        context,
+        node_id=arguments.node_id,
+        interval_seconds=arguments.interval_seconds,
+        training_log_paths=[
+            item
+            for item in os.getenv("GPU_FAULT_TRAINING_LOG_PATHS", "").split(",")
+            if item
+        ],
+        state_path=os.getenv(
+            "GPU_FAULT_LOG_STATE_PATH",
+            "/var/lib/gpu-fault/log-collector-state.json",
+        ),
+    )

@@ -24,7 +24,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_HOST_ORCHESTRATION_INPUTS = (
-    "deploy/control-plane/regional/*.py",
+    "src/gpu_fault_release/*.py",
     "deploy/control-plane/regional/rollout-regional-release.sh",
     "scripts/ci_gate.py",
     "scripts/ci_gate_artifacts.py",

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta
 from typing import Any, Callable, ContextManager, Sequence, cast
 
 from gpu_fault.models import HealthSignalState, XidMetricBaseline
 from gpu_fault.policy import (
-    FaultPolicyDecision,
-    Nvlink74BitOccurrenceState,
     XidCorrelationRecord,
     XidCorrelationStatus,
     XidEvent,
@@ -27,19 +24,14 @@ class SqliteXidMixin:
     # readers stay `Any` because the model class is resolved at run time from a
     # string kind; every caller below states the row type with a `cast`.
     _db: Any
-    _get: Callable[[str, str], Any]
-    _get_link: Callable[[str, str], str | None]
     _get_optional: Callable[[str, str], Any]
-    _link: Callable[[str, str, str], None]
     _list: Callable[[str], list[Any]]
     _lock: Any
     _next_health_signal_state: Callable[..., tuple[HealthSignalState, bool]]
     _note_health_signal_clock_regression: Callable[..., None]
     _put: Callable[..., None]
-    _state_key: Callable[..., str]
     _state_transaction: Callable[[str], ContextManager[None]]
-    _xid74_populated_bits: Callable[[XidEvent], list[tuple[int, int]]]
-    _xid74_scope: Callable[[XidEvent], tuple[str, str, int] | None]
+    _xid_metric_key: Callable[[str, str, str], str]
 
     def save_xid_event_if_absent(
         self, event: XidEvent, *, retain_from: datetime | None = None
@@ -70,61 +62,6 @@ class SqliteXidMixin:
                 )
             return inserted
 
-    def record_xid74_occurrences(self, event: XidEvent) -> dict[str, int]:
-        scope = self._xid74_scope(event)
-        if event.xid != 74 or scope is None:
-            return {}
-        scope_key = self._state_key(scope)
-        counts: dict[str, int] = {}
-        with self._state_transaction(f"xid74-occurrence/{scope_key}"):
-            for (
-                register_index,
-                bit,
-            ) in self._xid74_populated_bits(event):
-                state_parts = (*scope, register_index, bit)
-                state_key = self._state_key(state_parts)
-                event_key = self._state_key((event.event_id, *state_parts))
-                state = cast(
-                    "Nvlink74BitOccurrenceState | None",
-                    self._get_optional("xid74_occurrence_state", state_key),
-                )
-                if self._get_link("xid74_occurrence_event", event_key) is None:
-                    state = (
-                        state.incremented(
-                            event.event_id,
-                            event.observed_at,
-                        )
-                        if state is not None
-                        else Nvlink74BitOccurrenceState(
-                            cluster_id=scope[0],
-                            gpu_identity=scope[1],
-                            link_id=scope[2],
-                            register_index=register_index,
-                            bit=bit,
-                            count=1,
-                            first_observed_at=event.observed_at,
-                            last_observed_at=event.observed_at,
-                            last_event_id=event.event_id,
-                        )
-                    )
-                    self._put(
-                        "xid74_occurrence_state",
-                        state_key,
-                        state,
-                    )
-                    self._link(
-                        "xid74_occurrence_event",
-                        event_key,
-                        state_key,
-                    )
-                if state is not None:
-                    counts[f"register{register_index + 1}.bit{bit}"] = state.count
-        return counts
-
-    def get_xid_event(self, event_id: str) -> XidEvent:
-        with self._lock:
-            return cast("XidEvent", self._get("xid_correlation_event", event_id))
-
     def list_xid_events(
         self,
         cluster_id: str,
@@ -143,21 +80,6 @@ class SqliteXidMixin:
                 and (observed_before is None or item.observed_at <= observed_before)
             ]
 
-    def save_xid_policy_decision(self, decision: FaultPolicyDecision) -> None:
-        with self._lock:
-            self._put(
-                "xid_policy_decision",
-                decision.event_id,
-                decision,
-            )
-
-    def get_xid_policy_decision(self, event_id: str) -> FaultPolicyDecision | None:
-        with self._lock:
-            return cast(
-                "FaultPolicyDecision | None",
-                self._get_optional("xid_policy_decision", event_id),
-            )
-
     def save_xid_correlation_if_absent(self, correlation: XidCorrelationRecord) -> bool:
         with self._lock:
             cursor = self._db.execute(
@@ -172,10 +94,6 @@ class SqliteXidMixin:
             )
             saved: bool = cursor.rowcount == 1
             return saved
-
-    def get_xid_correlation(self, event_id: str) -> XidCorrelationRecord:
-        with self._lock:
-            return cast("XidCorrelationRecord", self._get("xid_correlation", event_id))
 
     def claim_due_xid_correlations(
         self,
@@ -210,32 +128,6 @@ class SqliteXidMixin:
                 self._put("xid_correlation", item.event_id, value)
                 claimed.append(value)
             return claimed
-
-    def complete_xid_correlation(
-        self, event_id: str, *, owner: str, now: datetime
-    ) -> XidCorrelationRecord:
-        with self._state_transaction(f"xid-correlation/{event_id}"):
-            current = self.get_xid_correlation(event_id)
-            if current.lease_owner != owner:
-                raise ValueError("XID correlation lease owner changed")
-            completed = current.model_copy(
-                update={
-                    "status": XidCorrelationStatus.FINALIZED,
-                    "lease_owner": None,
-                    "lease_expires_at": None,
-                    "finalized_at": now,
-                }
-            )
-            self._put("xid_correlation", event_id, completed)
-            return completed
-
-    @staticmethod
-    def _xid_metric_key(cluster_id: str, node_id: str, gpu_key: str) -> str:
-        return json.dumps(
-            [cluster_id, node_id, gpu_key],
-            ensure_ascii=True,
-            separators=(",", ":"),
-        )
 
     def observe_xid_metric(
         self,

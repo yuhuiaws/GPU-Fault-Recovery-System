@@ -5,6 +5,7 @@ from datetime import timedelta
 
 import pytest
 
+from gpu_fault.adapters import NodeActionWorkflowAdapter
 from gpu_fault.fleet import (
     NODE_ACTION_KEY_VERSION_DERIVED,
     AgentLifecycleState,
@@ -24,7 +25,6 @@ from gpu_fault.fleet import (
     sign_agent_heartbeat,
 )
 from gpu_fault.models import WorkflowExecutionRequest, WorkflowOperation, WorkflowStatus
-from gpu_fault.runtime_adapters import NodeActionWorkflowAdapter
 from gpu_fault.store import NotFoundError, SqliteStore
 from tests._builders import (
     active_workflow_executor,

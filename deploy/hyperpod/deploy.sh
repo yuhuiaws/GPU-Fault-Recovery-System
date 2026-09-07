@@ -20,7 +20,23 @@ migration or canary, set GPU_FAULT_ALLOW_LEGACY_DEPLOY=1.
 EOF
     exit 64
 fi
-RUN_E2E="${RUN_E2E:-true}"
+
+# Boolean switches take exactly what the Python side takes -- 1/true/yes/on and
+# 0/false/no/off, any case -- and refuse anything else. `tr` plus `== "true"`
+# used to read a typo as false and disable the feature without a word.
+normalize_bool() {
+    case "${2,,}" in
+        1 | true | yes | on) printf true ;;
+        0 | false | no | off) printf false ;;
+        *)
+            printf 'ERROR: %s must be one of 1/true/yes/on or 0/false/no/off, got %q\n' \
+                "$1" "$2" >&2
+            exit 2
+            ;;
+    esac
+}
+
+RUN_E2E="$(normalize_bool RUN_E2E "${RUN_E2E:-true}")"
 AWS_REGION="${AWS_REGION:-us-west-2}"
 EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-}"
 HYPERPOD_CLUSTER_NAME="${HYPERPOD_CLUSTER_NAME:-}"
@@ -32,22 +48,10 @@ DEFAULT_DCGM_EXPORTER_IMAGE="nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu
 DCGM_EXPORTER_IMAGE="${GPU_FAULT_DCGM_EXPORTER_IMAGE:-${DEFAULT_DCGM_EXPORTER_IMAGE}}"
 DEFAULT_NODE_INSTALLER_IMAGE="public.ecr.aws/amazonlinux/amazonlinux:2023"
 NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-${DEFAULT_NODE_INSTALLER_IMAGE}}"
-ENABLE_NODE_LOG_COLLECTOR="$(
-    printf '%s' "${GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR:-false}" |
-        tr '[:upper:]' '[:lower:]'
-)"
-ENABLE_TRAINING_HEALTH_MONITOR="$(
-    printf '%s' "${GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR:-false}" |
-        tr '[:upper:]' '[:lower:]'
-)"
-ENABLE_KUBERNETES_HMA_COLLECTOR="$(
-    printf '%s' "${GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR:-false}" |
-        tr '[:upper:]' '[:lower:]'
-)"
-ENABLE_NVIDIA_SMI_METRICS_COLLECTOR="$(
-    printf '%s' "${GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR:-false}" |
-        tr '[:upper:]' '[:lower:]'
-)"
+ENABLE_NODE_LOG_COLLECTOR="$(normalize_bool GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR "${GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR:-false}")"
+ENABLE_TRAINING_HEALTH_MONITOR="$(normalize_bool GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR "${GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR:-false}")"
+ENABLE_KUBERNETES_HMA_COLLECTOR="$(normalize_bool GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR "${GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR:-false}")"
+ENABLE_NVIDIA_SMI_METRICS_COLLECTOR="$(normalize_bool GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR "${GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR:-false}")"
 HYPERPOD_NODE_RECOVERY=""
 HYPERPOD_CONTROL_PLANE_ROLE_ARN=""
 AURORA_CLUSTER_ID="${AURORA_CLUSTER_ID:-gpu-fault-aurora}"
@@ -66,7 +70,7 @@ PASSIVE_STOP_FALLBACK_SECONDS="${GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS-30}"
 MULTI_NODE_AGGREGATION_WINDOW_SECONDS="${GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS:-5}"
 PROCESSOR_DRAIN_MAX_WAIT_SECONDS="${GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS:-30}"
 ENABLE_WORKFLOW_PREEMPTION="${GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION:-true}"
-PROCESSOR_EXIT_ON_DEADLINE="${GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE:-true}"
+PROCESSOR_EXIT_ON_DEADLINE="$(normalize_bool GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE "${GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE:-true}")"
 PROCESSOR_EXIT_GRACE_SECONDS="${GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS:-5}"
 PROCESSOR_WORKERS="${GPU_FAULT_PROCESSOR_WORKERS:-24}"
 PROCESSOR_FAULT_WORKERS="${GPU_FAULT_PROCESSOR_FAULT_WORKERS:-4}"
@@ -75,9 +79,9 @@ PROCESSOR_OBSERVATION_WORKERS="${GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS:-4}"
 PROCESSOR_GPU_TELEMETRY_WORKERS="${GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS:-8}"
 PROCESSOR_HOST_TELEMETRY_WORKERS="${GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS:-8}"
 PROCESSOR_MAX_QUEUE_DEPTH="${GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH:-65536}"
-PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH="${GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH:-1024}"
+PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH="${GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH:-4096}"
 PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH="${GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH:-8192}"
-PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH="${GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH:-128}"
+PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH="${GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH:-512}"
 PROCESSOR_RETRY_AFTER_SECONDS="${GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS:-2}"
 PROCESSOR_MAX_REQUEST_BYTES="${GPU_FAULT_PROCESSOR_MAX_REQUEST_BYTES:-16777216}"
 PROCESSOR_GLOBAL_ADMISSION_GUARD="${GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD:-256}"
@@ -120,7 +124,7 @@ POSTGRES_FLEET_CONNECTION_BUDGET="${GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET:-
 # recurring event, so deploy_control_plane runs the DDL from
 # postgres-schema-ensure-job.yaml instead; set this to true only for a
 # throwaway database where that Job cannot run.
-POSTGRES_AUTO_SCHEMA_INIT="${GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT:-false}"
+POSTGRES_AUTO_SCHEMA_INIT="$(normalize_bool GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT "${GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT:-false}")"
 POSTGRES_HOT_STATE_MODE="${GPU_FAULT_POSTGRES_HOT_STATE_MODE:-dedicated}"
 AGENT_MAINTENANCE_WINDOW_SECONDS="${GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS:-420}"
 EFA_TRAFFIC_MIN_ACTIVE_BPS="${GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS:-1048576}"
@@ -188,10 +192,7 @@ DCGM_ROW_REMAP_CORRECTABLE_DELTA_WARNING="${GPU_FAULT_DCGM_ROW_REMAP_CORRECTABLE
 DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES="${GPU_FAULT_DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES:-3}"
 SXID_DRIVER_REMEDIATION_CODES="${GPU_FAULT_SXID_DRIVER_REMEDIATION_CODES:-}"
 SXID_FIRMWARE_UPDATE_CODES="${GPU_FAULT_SXID_FIRMWARE_UPDATE_CODES:-}"
-ENABLE_FIRMWARE_UPDATE="$(
-    printf '%s' "${GPU_FAULT_ENABLE_FIRMWARE_UPDATE:-false}" |
-        tr '[:upper:]' '[:lower:]'
-)"
+ENABLE_FIRMWARE_UPDATE="$(normalize_bool GPU_FAULT_ENABLE_FIRMWARE_UPDATE "${GPU_FAULT_ENABLE_FIRMWARE_UPDATE:-false}")"
 TARGET_DRIVER_BRANCH="${GPU_FAULT_TARGET_DRIVER_BRANCH:-}"
 TARGET_FIRMWARE_VERSION="${GPU_FAULT_TARGET_FIRMWARE_VERSION:-}"
 DRIVER_REMEDIATION_COMMAND="${GPU_FAULT_DRIVER_REMEDIATION_COMMAND:-}"
@@ -202,10 +203,7 @@ FIRMWARE_VERIFY_COMMAND="${GPU_FAULT_FIRMWARE_VERIFY_COMMAND:-}"
 FIRMWARE_VERIFY_SHA256="${GPU_FAULT_FIRMWARE_VERIFY_SHA256:-}"
 DIAGNOSTIC_S3_URI="${GPU_FAULT_DIAGNOSTIC_S3_URI:-}"
 DIAGNOSTIC_S3_URI="${DIAGNOSTIC_S3_URI%/}"
-ENABLE_FIELD_DIAGNOSTIC="$(
-    printf '%s' "${GPU_FAULT_ENABLE_FIELD_DIAGNOSTIC:-false}" |
-        tr '[:upper:]' '[:lower:]'
-)"
+ENABLE_FIELD_DIAGNOSTIC="$(normalize_bool GPU_FAULT_ENABLE_FIELD_DIAGNOSTIC "${GPU_FAULT_ENABLE_FIELD_DIAGNOSTIC:-false}")"
 FIELD_DIAGNOSTIC_COMMAND="${GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND:-}"
 FIELD_DIAGNOSTIC_SHA256="${GPU_FAULT_FIELD_DIAGNOSTIC_SHA256:-}"
 MEMORY_FIELD_DIAGNOSTIC_COMMAND="${GPU_FAULT_MEMORY_FIELD_DIAGNOSTIC_COMMAND:-}"
@@ -217,22 +215,13 @@ ENABLE_MEMORY_FIELD_DIAGNOSTIC="$(
 FIELD_DIAGNOSTIC_TIMEOUT_SECONDS="${GPU_FAULT_FIELD_DIAGNOSTIC_TIMEOUT_SECONDS:-1800}"
 EMAIL_SENDER="${GPU_FAULT_EMAIL_SENDER:-}"
 EMAIL_RECIPIENTS="${GPU_FAULT_EMAIL_RECIPIENTS:-}"
-ALLOW_EMAIL="$(
-    printf '%s' "${GPU_FAULT_ALLOW_EMAIL:-true}" |
-        tr '[:upper:]' '[:lower:]'
-)"
-ACKNOWLEDGE_NO_ALERT_CHANNEL="$(
-    printf '%s' "${GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL:-false}" |
-        tr '[:upper:]' '[:lower:]'
-)"
+ALLOW_EMAIL="$(normalize_bool GPU_FAULT_ALLOW_EMAIL "${GPU_FAULT_ALLOW_EMAIL:-true}")"
+ACKNOWLEDGE_NO_ALERT_CHANNEL="$(normalize_bool GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL "${GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL:-false}")"
 SES_CONFIGURATION_SET="${GPU_FAULT_SES_CONFIGURATION_SET:-}"
 # Notifications queue up while delivery is off; only rows older than this
 # window count as history the dispatcher suppresses on first enable.
 NOTIFICATION_BACKLOG_GRACE_SECONDS="${GPU_FAULT_NOTIFICATION_BACKLOG_GRACE_SECONDS:-300}"
-NOTIFICATION_DELIVER_BACKLOG="$(
-    printf '%s' "${GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG:-false}" |
-        tr '[:upper:]' '[:lower:]'
-)"
+NOTIFICATION_DELIVER_BACKLOG="$(normalize_bool GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG "${GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG:-false}")"
 EMAIL_SECRET_NAME="gpu-fault-email"
 WHEEL_CONFIGMAP_NAME=""
 EXECUTOR_WHEEL_CONFIGMAP_NAME=""
@@ -425,11 +414,6 @@ EOF
     printf 'ERROR: GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS must be a non-negative integer\n' >&2
     exit 2
 }
-[[ "${PROCESSOR_EXIT_ON_DEADLINE}" == "true" ||
-    "${PROCESSOR_EXIT_ON_DEADLINE}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE must be true or false\n' >&2
-    exit 2
-}
 [[ "${PROCESSOR_EXIT_GRACE_SECONDS}" =~ ^[0-9]+$ ]] || {
     printf 'ERROR: GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS must be a non-negative integer\n' >&2
     exit 2
@@ -450,8 +434,8 @@ for processor_setting in \
     POSTGRES_POOL_MAX_SIZE \
     POSTGRES_POOL_TIMEOUT_SECONDS; do
     processor_value="${!processor_setting}"
-    [[ "${processor_value}" =~ ^[0-9]+$ ]] &&
-        (( processor_value >= 1 )) || {
+    { [[ "${processor_value}" =~ ^[0-9]+$ ]] &&
+        (( processor_value >= 1 )); } || {
         printf 'ERROR: %s must be a positive integer\n' \
             "${processor_setting}" >&2
         exit 2
@@ -465,8 +449,8 @@ for processor_worker_setting in \
     PROCESSOR_GPU_TELEMETRY_WORKERS \
     PROCESSOR_HOST_TELEMETRY_WORKERS; do
     processor_value="${!processor_worker_setting}"
-    [[ "${processor_value}" =~ ^[0-9]+$ ]] &&
-        (( processor_value >= 1 )) || {
+    { [[ "${processor_value}" =~ ^[0-9]+$ ]] &&
+        (( processor_value >= 1 )); } || {
         printf 'ERROR: %s must be a positive integer\n' \
             "${processor_worker_setting}" >&2
         exit 2
@@ -494,11 +478,6 @@ done
 }
 (( PROCESSOR_GLOBAL_ADMISSION_GUARD <= PROCESSOR_MAX_QUEUE_DEPTH )) || {
     printf 'ERROR: global admission guard exceeds queue depth\n' >&2
-    exit 2
-}
-[[ "${POSTGRES_AUTO_SCHEMA_INIT}" == "true" ||
-    "${POSTGRES_AUTO_SCHEMA_INIT}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT must be true or false\n' >&2
     exit 2
 }
 for state_mode in \
@@ -607,9 +586,9 @@ for dcgm_filter_count in \
         exit 2
     }
 done
-[[ "${DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+{ [[ "${DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
     awk -v value="${DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD}" \
-        'BEGIN { exit !(value > 0 && value <= 1) }' || {
+        'BEGIN { exit !(value > 0 && value <= 1) }'; } || {
     printf 'ERROR: GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD must be within (0, 1]\n' >&2
     exit 2
 }
@@ -631,53 +610,53 @@ for host_filter_count in \
         exit 2
     }
 done
-[[ "${HUNG_STRACE_SAMPLE_COUNT}" =~ ^[0-9]+$ ]] &&
+{ [[ "${HUNG_STRACE_SAMPLE_COUNT}" =~ ^[0-9]+$ ]] &&
     (( HUNG_STRACE_SAMPLE_COUNT >= 2 &&
-       HUNG_STRACE_SAMPLE_COUNT <= 5 )) || {
+       HUNG_STRACE_SAMPLE_COUNT <= 5 )); } || {
     printf 'ERROR: GPU_FAULT_HUNG_STRACE_SAMPLE_COUNT must be an integer from 2 to 5\n' >&2
     exit 2
 }
-[[ "${HUNG_STRACE_SAMPLE_DURATION_SECONDS}" =~ ^[0-9]+$ ]] &&
+{ [[ "${HUNG_STRACE_SAMPLE_DURATION_SECONDS}" =~ ^[0-9]+$ ]] &&
     (( HUNG_STRACE_SAMPLE_DURATION_SECONDS >= 1 &&
-       HUNG_STRACE_SAMPLE_DURATION_SECONDS <= 30 )) || {
+       HUNG_STRACE_SAMPLE_DURATION_SECONDS <= 30 )); } || {
     printf 'ERROR: GPU_FAULT_HUNG_STRACE_SAMPLE_DURATION_SECONDS must be an integer from 1 to 30\n' >&2
     exit 2
 }
-[[ "${HUNG_STRACE_SAMPLE_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] &&
-    (( HUNG_STRACE_SAMPLE_INTERVAL_SECONDS <= 30 )) || {
+{ [[ "${HUNG_STRACE_SAMPLE_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] &&
+    (( HUNG_STRACE_SAMPLE_INTERVAL_SECONDS <= 30 )); } || {
     printf 'ERROR: GPU_FAULT_HUNG_STRACE_SAMPLE_INTERVAL_SECONDS must be an integer from 0 to 30\n' >&2
     exit 2
 }
-[[ "${HUNG_PYSPY_SAMPLE_COUNT}" =~ ^[0-9]+$ ]] &&
+{ [[ "${HUNG_PYSPY_SAMPLE_COUNT}" =~ ^[0-9]+$ ]] &&
     (( HUNG_PYSPY_SAMPLE_COUNT >= 3 &&
-       HUNG_PYSPY_SAMPLE_COUNT <= 5 )) || {
+       HUNG_PYSPY_SAMPLE_COUNT <= 5 )); } || {
     printf 'ERROR: GPU_FAULT_HUNG_PYSPY_SAMPLE_COUNT must be an integer from 3 to 5\n' >&2
     exit 2
 }
-[[ "${HUNG_PYSPY_SAMPLE_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] &&
-    (( HUNG_PYSPY_SAMPLE_INTERVAL_SECONDS <= 30 )) || {
+{ [[ "${HUNG_PYSPY_SAMPLE_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] &&
+    (( HUNG_PYSPY_SAMPLE_INTERVAL_SECONDS <= 30 )); } || {
     printf 'ERROR: GPU_FAULT_HUNG_PYSPY_SAMPLE_INTERVAL_SECONDS must be an integer from 0 to 30\n' >&2
     exit 2
 }
-[[ "${HUNG_PYSPY_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] &&
+{ [[ "${HUNG_PYSPY_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] &&
     (( HUNG_PYSPY_TIMEOUT_SECONDS >= 1 &&
-       HUNG_PYSPY_TIMEOUT_SECONDS <= 60 )) || {
+       HUNG_PYSPY_TIMEOUT_SECONDS <= 60 )); } || {
     printf 'ERROR: GPU_FAULT_HUNG_PYSPY_TIMEOUT_SECONDS must be an integer from 1 to 60\n' >&2
     exit 2
 }
 # 0 disables the cap. Anything from 1 to 3 nodes leaves the comparative
 # rank diagnosis without a majority to compare against, so the lower
 # bound is 4 and the practical default is 8.
-[[ "${HUNG_TRIAGE_MAX_NODES}" =~ ^[0-9]+$ ]] &&
+{ [[ "${HUNG_TRIAGE_MAX_NODES}" =~ ^[0-9]+$ ]] &&
     (( HUNG_TRIAGE_MAX_NODES == 0 ||
        ( HUNG_TRIAGE_MAX_NODES >= 4 &&
-         HUNG_TRIAGE_MAX_NODES <= 1024 ) )) || {
+         HUNG_TRIAGE_MAX_NODES <= 1024 ) )); } || {
     printf 'ERROR: GPU_FAULT_HUNG_TRIAGE_MAX_NODES must be 0 or an integer from 4 to 1024\n' >&2
     exit 2
 }
-[[ "${NODE_ACTION_MAX_PARALLEL}" =~ ^[0-9]+$ ]] &&
+{ [[ "${NODE_ACTION_MAX_PARALLEL}" =~ ^[0-9]+$ ]] &&
     (( NODE_ACTION_MAX_PARALLEL >= 1 &&
-       NODE_ACTION_MAX_PARALLEL <= 64 )) || {
+       NODE_ACTION_MAX_PARALLEL <= 64 )); } || {
     printf 'ERROR: GPU_FAULT_NODE_ACTION_MAX_PARALLEL must be an integer from 1 to 64\n' >&2
     exit 2
 }
@@ -685,8 +664,8 @@ done
     printf 'ERROR: GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED must be true or false\n' >&2
     exit 1
 }
-[[ "${EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS}" =~ ^[0-9]+$ ]] \
-    && [[ "${EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS}" -gt 0 ]] || {
+{ [[ "${EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS}" =~ ^[0-9]+$ ]] \
+    && [[ "${EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS}" -gt 0 ]]; } || {
     printf 'ERROR: GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS must be a positive integer\n' >&2
     exit 1
 }
@@ -699,9 +678,9 @@ for host_percent in \
     "${MEMORY_AVAILABLE_WARNING_PERCENT}" \
     "${PAGE_CACHE_WARNING_PERCENT}" \
     "${LOCAL_FILESYSTEM_WARNING_PERCENT}"; do
-    [[ "${host_percent}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+    { [[ "${host_percent}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
         awk -v value="${host_percent}" \
-            'BEGIN { exit !(value >= 0 && value <= 100) }' || {
+            'BEGIN { exit !(value >= 0 && value <= 100) }'; } || {
         printf 'ERROR: host resource percentage thresholds must be from 0 to 100\n' >&2
         exit 2
     }
@@ -711,44 +690,44 @@ for host_duration in \
     "${MEMORY_PRESSURE_DURATION_SECONDS}" \
     "${PAGE_CACHE_DURATION_SECONDS}" \
     "${LOCAL_FILESYSTEM_DURATION_SECONDS}"; do
-    [[ "${host_duration}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+    { [[ "${host_duration}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
         awk -v value="${host_duration}" \
-            'BEGIN { exit !(value >= 15) }' || {
+            'BEGIN { exit !(value >= 15) }'; } || {
         printf 'ERROR: host resource durations must be at least 15 seconds\n' >&2
         exit 2
     }
 done
-[[ "${AGENT_MAINTENANCE_WINDOW_SECONDS}" =~ ^[0-9]+$ ]] &&
+{ [[ "${AGENT_MAINTENANCE_WINDOW_SECONDS}" =~ ^[0-9]+$ ]] &&
     (( AGENT_MAINTENANCE_WINDOW_SECONDS >= 30 &&
-       AGENT_MAINTENANCE_WINDOW_SECONDS <= 3600 )) || {
+       AGENT_MAINTENANCE_WINDOW_SECONDS <= 3600 )); } || {
     printf 'ERROR: GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS must be an integer from 30 to 3600\n' >&2
     exit 2
 }
-[[ "${TEMPERATURE_WARNING_GRACE_SECONDS}" =~ ^[0-9]+$ ]] &&
-    (( TEMPERATURE_WARNING_GRACE_SECONDS >= 15 )) || {
+{ [[ "${TEMPERATURE_WARNING_GRACE_SECONDS}" =~ ^[0-9]+$ ]] &&
+    (( TEMPERATURE_WARNING_GRACE_SECONDS >= 15 )); } || {
     printf 'ERROR: GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS must be an integer of at least 15\n' >&2
     exit 2
 }
-[[ "${TRANSIENT_GPU_WARNING_GRACE_SECONDS}" =~ ^[0-9]+$ ]] &&
-    (( TRANSIENT_GPU_WARNING_GRACE_SECONDS >= 15 )) || {
+{ [[ "${TRANSIENT_GPU_WARNING_GRACE_SECONDS}" =~ ^[0-9]+$ ]] &&
+    (( TRANSIENT_GPU_WARNING_GRACE_SECONDS >= 15 )); } || {
     printf 'ERROR: GPU_FAULT_TRANSIENT_GPU_WARNING_GRACE_SECONDS must be an integer of at least 15\n' >&2
     exit 2
 }
-[[ "${DCGM_CORRELATION_WINDOW_SECONDS}" =~ ^[0-9]+$ ]] &&
+{ [[ "${DCGM_CORRELATION_WINDOW_SECONDS}" =~ ^[0-9]+$ ]] &&
     (( DCGM_CORRELATION_WINDOW_SECONDS >= 15 &&
-       DCGM_CORRELATION_WINDOW_SECONDS <= 300 )) || {
+       DCGM_CORRELATION_WINDOW_SECONDS <= 300 )); } || {
     printf 'ERROR: GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS must be an integer from 15 to 300\n' >&2
     exit 2
 }
-[[ "${DCGM_COMPOSITE_CONSECUTIVE_SAMPLES}" =~ ^[0-9]+$ ]] &&
+{ [[ "${DCGM_COMPOSITE_CONSECUTIVE_SAMPLES}" =~ ^[0-9]+$ ]] &&
     (( DCGM_COMPOSITE_CONSECUTIVE_SAMPLES >= 2 &&
-       DCGM_COMPOSITE_CONSECUTIVE_SAMPLES <= 10 )) || {
+       DCGM_COMPOSITE_CONSECUTIVE_SAMPLES <= 10 )); } || {
     printf 'ERROR: GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES must be an integer from 2 to 10\n' >&2
     exit 2
 }
-[[ "${DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES}" =~ ^[0-9]+$ ]] &&
+{ [[ "${DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES}" =~ ^[0-9]+$ ]] &&
     (( DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES >= 2 &&
-       DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES <= 10 )) || {
+       DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES <= 10 )); } || {
     printf 'ERROR: GPU_FAULT_DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES must be an integer from 2 to 10\n' >&2
     exit 2
 }
@@ -769,8 +748,8 @@ for metric_threshold in \
         exit 2
     }
 done
-[[ "${THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES}" =~ ^[0-9]+$ ]] &&
-    (( THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES >= 2 )) || {
+{ [[ "${THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES}" =~ ^[0-9]+$ ]] &&
+    (( THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES >= 2 )); } || {
     printf 'ERROR: GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES must be an integer >= 2\n' >&2
     exit 2
 }
@@ -782,11 +761,6 @@ done
 [[ -z "${SXID_FIRMWARE_UPDATE_CODES}" ||
     "${SXID_FIRMWARE_UPDATE_CODES}" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
     printf 'ERROR: GPU_FAULT_SXID_FIRMWARE_UPDATE_CODES must be comma-separated integers\n' >&2
-    exit 2
-}
-[[ "${ENABLE_FIRMWARE_UPDATE}" == "true" ||
-    "${ENABLE_FIRMWARE_UPDATE}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_ENABLE_FIRMWARE_UPDATE must be true or false\n' >&2
     exit 2
 }
 if [[ -n "${SXID_DRIVER_REMEDIATION_CODES}" ]]; then
@@ -821,40 +795,15 @@ fi
     printf 'ERROR: GPU_FAULT_DIAGNOSTIC_S3_URI must use s3://\n' >&2
     exit 2
 }
-[[ "${ENABLE_FIELD_DIAGNOSTIC}" == "true" ||
-    "${ENABLE_FIELD_DIAGNOSTIC}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_ENABLE_FIELD_DIAGNOSTIC must be true or false\n' >&2
-    exit 2
-}
-[[ "${ENABLE_NODE_LOG_COLLECTOR}" == "true" ||
-    "${ENABLE_NODE_LOG_COLLECTOR}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR must be true or false\n' >&2
-    exit 2
-}
-[[ "${ENABLE_TRAINING_HEALTH_MONITOR}" == "true" ||
-    "${ENABLE_TRAINING_HEALTH_MONITOR}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR must be true or false\n' >&2
-    exit 2
-}
-[[ "${ENABLE_KUBERNETES_HMA_COLLECTOR}" == "true" ||
-    "${ENABLE_KUBERNETES_HMA_COLLECTOR}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR must be true or false\n' >&2
-    exit 2
-}
-[[ "${ENABLE_NVIDIA_SMI_METRICS_COLLECTOR}" == "true" ||
-    "${ENABLE_NVIDIA_SMI_METRICS_COLLECTOR}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR must be true or false\n' >&2
-    exit 2
-}
 if [[ "${ENABLE_FIELD_DIAGNOSTIC}" == "true" ]]; then
     [[ "${FIELD_DIAGNOSTIC_COMMAND}" == /* &&
         "${FIELD_DIAGNOSTIC_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] || {
         printf 'ERROR: Field Diagnostic requires an absolute command and pinned SHA-256\n' >&2
         exit 2
     }
-    [[ "${FIELD_DIAGNOSTIC_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] &&
+    { [[ "${FIELD_DIAGNOSTIC_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] &&
         (( FIELD_DIAGNOSTIC_TIMEOUT_SECONDS >= 60 &&
-           FIELD_DIAGNOSTIC_TIMEOUT_SECONDS <= 7200 )) || {
+           FIELD_DIAGNOSTIC_TIMEOUT_SECONDS <= 7200 )); } || {
         printf 'ERROR: GPU_FAULT_FIELD_DIAGNOSTIC_TIMEOUT_SECONDS must be from 60 to 7200\n' >&2
         exit 2
     }
@@ -870,21 +819,12 @@ elif [[ "${ENABLE_MEMORY_FIELD_DIAGNOSTIC}" == "true" ||
     printf 'ERROR: memory Field Diagnostic requires GPU_FAULT_ENABLE_FIELD_DIAGNOSTIC=true\n' >&2
     exit 2
 fi
-[[ "${ALLOW_EMAIL}" == "true" || "${ALLOW_EMAIL}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_ALLOW_EMAIL must be true or false\n' >&2
-    exit 2
-}
 if [[ -n "${EMAIL_SENDER}" || -n "${EMAIL_RECIPIENTS}" ]]; then
     [[ -n "${EMAIL_SENDER}" && -n "${EMAIL_RECIPIENTS}" ]] || {
         printf 'ERROR: GPU_FAULT_EMAIL_SENDER and GPU_FAULT_EMAIL_RECIPIENTS must be configured together\n' >&2
         exit 2
     }
 fi
-[[ "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" == "true" ||
-    "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" == "false" ]] || {
-    printf 'ERROR: GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL must be true or false\n' >&2
-    exit 2
-}
 [[ "${DCGM_EXPORTER_MODE}" =~ ^(auto|existing|managed|disabled)$ ]] || {
     printf 'ERROR: GPU_FAULT_DCGM_EXPORTER_MODE must be auto, existing, managed, or disabled\n' >&2
     exit 2
@@ -1182,6 +1122,26 @@ print(json.dumps({"Version": "2012-10-17", "Statement": statements}))
     )"
 }
 
+# What this script creates is not in the installation resource registry
+# (S12). `gpu-fault-admin uninstall --cpu-cluster-arn <eks-arn>
+# --gpu-cluster-arn <eks-arn>` rebuilds ownership of the Aurora cluster,
+# its instances, subnet group, security group and the IRSA roles from the
+# live namespace -- but only while Secret ${NAMESPACE}/gpu-fault-aurora
+# exists; the cluster parameter group only while the cluster still runs on it.
+registry_warning() {
+    cat >&2 <<EOF
+
+WARNING: the legacy deploy writes no installation resource registry. The
+deletion-protected Aurora cluster ${AURORA_CLUSTER_ID}, its writer/reader,
+DB subnet group and security group ${AURORA_CLUSTER_ID}, and the IRSA roles
+are only reachable by \`gpu-fault-admin uninstall --cpu-cluster-arn ... \
+--gpu-cluster-arn ...\`, which discovers them through Secret
+${NAMESPACE}/gpu-fault-aurora -- do not delete that Secret first. The cluster
+parameter group ${AURORA_CLUSTER_ID}-pg is picked up only while it is the group
+the cluster runs on.
+EOF
+}
+
 ensure_aurora() {
     local cluster_json vpc_id node_ip node_sg subnet_json
     local subnet_group security_group endpoint secret_arn secret_json url
@@ -1189,6 +1149,7 @@ ensure_aurora() {
     local writer_id="${AURORA_CLUSTER_ID}-writer"
     local reader_id="${AURORA_CLUSTER_ID}-reader"
 
+    registry_warning
     cluster_json="$(
         aws eks describe-cluster \
             --name "${EKS_CLUSTER_NAME}" \
@@ -1355,27 +1316,19 @@ for item in json.loads(os.environ["SUBNET_JSON"]):
     if ! aws rds describe-db-clusters \
         --db-cluster-identifier "${AURORA_CLUSTER_ID}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
-        aws rds create-db-cluster \
-            --db-cluster-identifier "${AURORA_CLUSTER_ID}" \
-            --engine aurora-postgresql \
+        # The create argv -- engine, encryption, deletion protection, the ACU
+        # window, the parameter group, both tags -- is owned by
+        # gpu_fault.admin.aurora_capacity and shared with gpu-fault-admin (S11).
+        PYTHONPATH="${REPO_DIR}/src" python3.12 -m gpu_fault.admin.aurora_capacity \
+            create \
+            --region "${AWS_REGION}" \
+            --cluster-id "${AURORA_CLUSTER_ID}" \
             --engine-version "${AURORA_ENGINE_VERSION}" \
-            --engine-mode provisioned \
-            --database-name gpu_fault \
-            --master-username gpu_fault_admin \
-            --manage-master-user-password \
-            --serverless-v2-scaling-configuration \
-                "MinCapacity=${AURORA_MIN_ACU},MaxCapacity=${AURORA_MAX_ACU}" \
-            --db-subnet-group-name "${subnet_group}" \
-            --db-cluster-parameter-group-name "${parameter_group}" \
-            --vpc-security-group-ids "${security_group}" \
-            --storage-encrypted \
-            --backup-retention-period 7 \
-            --deletion-protection \
-            --copy-tags-to-snapshot \
-            --enable-iam-database-authentication \
-            --enable-cloudwatch-logs-exports postgresql \
-            --tags Key=Application,Value=gpu-fault-control-plane \
-            --region "${AWS_REGION}" >/dev/null
+            --min-acu "${AURORA_MIN_ACU}" \
+            --max-acu "${AURORA_MAX_ACU}" \
+            --subnet-group "${subnet_group}" \
+            --parameter-group "${parameter_group}" \
+            --security-group "${security_group}" >/dev/null
     else
         # The parameters above only write to the instance-local postgresql.log,
         # which RDS rotates away after rds.log_retention_period (3 days by
@@ -1893,21 +1846,9 @@ deploy_control_plane() {
         # 因此改成 :-false 大概率行为不变，但收益只是好看；代价是给历史环境
         # 的升级引入一次无法从日志区分的差异。要收敛就应该整条移除这个变量
         # （与区域清单对齐），而不是只翻默认值。
-        allow_hyperpod_mutation="$(
-            printf '%s' \
-                "${GPU_FAULT_ALLOW_HYPERPOD_MUTATION:-true}" |
-                tr '[:upper:]' '[:lower:]'
-        )"
-        allow_hyperpod_reboot="$(
-            printf '%s' \
-                "${GPU_FAULT_ALLOW_HYPERPOD_REBOOT:-true}" |
-                tr '[:upper:]' '[:lower:]'
-        )"
-        allow_hyperpod_replace="$(
-            printf '%s' \
-                "${GPU_FAULT_ALLOW_HYPERPOD_REPLACE:-false}" |
-                tr '[:upper:]' '[:lower:]'
-        )"
+        allow_hyperpod_mutation="$(normalize_bool GPU_FAULT_ALLOW_HYPERPOD_MUTATION "${GPU_FAULT_ALLOW_HYPERPOD_MUTATION:-true}")"
+        allow_hyperpod_reboot="$(normalize_bool GPU_FAULT_ALLOW_HYPERPOD_REBOOT "${GPU_FAULT_ALLOW_HYPERPOD_REBOOT:-true}")"
+        allow_hyperpod_replace="$(normalize_bool GPU_FAULT_ALLOW_HYPERPOD_REPLACE "${GPU_FAULT_ALLOW_HYPERPOD_REPLACE:-false}")"
     fi
     kubectl apply -f - <<EOF
 apiVersion: v1
@@ -3367,3 +3308,4 @@ else
 fi
 
 printf '\nDeployment workflow completed successfully.\n'
+[[ "${MODE}" != "deploy" ]] || registry_warning

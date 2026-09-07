@@ -905,9 +905,11 @@ def test_executor_builds_spare_coordinator_when_explicitly_enabled(monkeypatch) 
     assert captured["step_kwargs"]["store"] is None
 
 
-def test_executor_spare_failover_requires_remote_state(monkeypatch) -> None:
+@pytest.mark.parametrize("enabled", ["true", "1", "yes", "ON"])
+def test_executor_spare_failover_requires_remote_state(monkeypatch, enabled) -> None:
+    # Every enabled token must arm the switch (S9): `=1` used to read as off.
     _executor_environment(monkeypatch)
-    monkeypatch.setenv("GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER", "true")
+    monkeypatch.setenv("GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER", enabled)
     monkeypatch.setenv("GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE", "false")
     monkeypatch.delenv("GPU_FAULT_STORE_URL", raising=False)
     monkeypatch.setattr(

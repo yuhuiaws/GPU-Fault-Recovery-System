@@ -27,7 +27,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gpu_fault.app import ApplicationContext, _StripedAdmissionScope, create_app
-from gpu_fault.processor import ProcessorCoordinator
+from gpu_fault.processor import (
+    ProcessorCoordinator,
+    ProcessorLeaseSettings,
+    ProcessorSpoolSettings,
+)
 from gpu_fault.store import InMemoryStore
 from tests._builders import asgi_client, build_store, copy_model, processor_request
 
@@ -719,9 +723,11 @@ def test_spool_replay_batches_are_bounded_by_bytes() -> None:
         owner_id=OWNER,
         internal_token=TOKEN,
         active_consumers=False,
-        telemetry_spool_enabled=True,
-        telemetry_spool_max_in_flight_bytes=one_item_limit * 4,
-        telemetry_spool_replay_batch_max_bytes=one_item_limit,
+        spool=ProcessorSpoolSettings(
+            telemetry_spool_enabled=True,
+            telemetry_spool_max_in_flight_bytes=one_item_limit * 4,
+            telemetry_spool_replay_batch_max_bytes=one_item_limit,
+        ),
     )
 
     batches = list(processor._telemetry_spool_batches(claimed, max_items=16))
@@ -745,9 +751,10 @@ def test_spool_consumer_claims_only_immediately_executable_batches(monkeypatch) 
         owner_id=OWNER,
         internal_token=TOKEN,
         active_consumers=False,
-        telemetry_spool_enabled=True,
-        telemetry_spool_workers=2,
-        poll_seconds=0.01,
+        spool=ProcessorSpoolSettings(
+            telemetry_spool_enabled=True, telemetry_spool_workers=2
+        ),
+        lease=ProcessorLeaseSettings(poll_seconds=0.01),
     )
     replay_gate = Event()
     both_started = Event()
@@ -792,10 +799,12 @@ def test_spool_notification_listener_wakes_the_consumer(monkeypatch) -> None:
         owner_id=OWNER,
         internal_token=TOKEN,
         active_consumers=False,
-        telemetry_spool_enabled=True,
-        telemetry_spool_workers=1,
-        telemetry_spool_notification_fallback_seconds=5,
-        poll_seconds=0.01,
+        spool=ProcessorSpoolSettings(
+            telemetry_spool_enabled=True,
+            telemetry_spool_workers=1,
+            telemetry_spool_notification_fallback_seconds=5,
+        ),
+        lease=ProcessorLeaseSettings(poll_seconds=0.01),
     )
     replayed = Event()
 
@@ -837,10 +846,12 @@ def test_spool_fallback_poll_recovers_a_missed_notification(monkeypatch) -> None
         owner_id=OWNER,
         internal_token=TOKEN,
         active_consumers=False,
-        telemetry_spool_enabled=True,
-        telemetry_spool_workers=1,
-        telemetry_spool_notification_fallback_seconds=2,
-        poll_seconds=0.01,
+        spool=ProcessorSpoolSettings(
+            telemetry_spool_enabled=True,
+            telemetry_spool_workers=1,
+            telemetry_spool_notification_fallback_seconds=2,
+        ),
+        lease=ProcessorLeaseSettings(poll_seconds=0.01),
     )
     replayed = Event()
 
@@ -887,7 +898,7 @@ def test_spool_listener_reports_connection_state() -> None:
         owner_id=OWNER,
         internal_token=TOKEN,
         active_consumers=False,
-        telemetry_spool_enabled=True,
+        spool=ProcessorSpoolSettings(telemetry_spool_enabled=True),
     )
     thread = Thread(target=processor.run_telemetry_spool_notifications)
     thread.start()
@@ -945,9 +956,10 @@ def test_spool_consumer_weights_paths_and_borrows_idle_slots(monkeypatch) -> Non
         owner_id=OWNER,
         internal_token=TOKEN,
         active_consumers=False,
-        telemetry_spool_enabled=True,
-        telemetry_spool_workers=4,
-        poll_seconds=0.01,
+        spool=ProcessorSpoolSettings(
+            telemetry_spool_enabled=True, telemetry_spool_workers=4
+        ),
+        lease=ProcessorLeaseSettings(poll_seconds=0.01),
     )
     replay_gate = Event()
     all_started = Event()
@@ -1004,11 +1016,13 @@ def test_fault_backlog_throttles_spool_replay_workers(monkeypatch) -> None:
         owner_id=OWNER,
         internal_token=TOKEN,
         active_consumers=False,
-        telemetry_spool_enabled=True,
-        telemetry_spool_workers=2,
-        telemetry_spool_fault_pressure_workers=1,
-        telemetry_spool_fault_pressure_poll_seconds=0.01,
-        poll_seconds=0.01,
+        spool=ProcessorSpoolSettings(
+            telemetry_spool_enabled=True,
+            telemetry_spool_workers=2,
+            telemetry_spool_fault_pressure_workers=1,
+            telemetry_spool_fault_pressure_poll_seconds=0.01,
+        ),
+        lease=ProcessorLeaseSettings(poll_seconds=0.01),
     )
     replay_gate = Event()
     first_started = Event()

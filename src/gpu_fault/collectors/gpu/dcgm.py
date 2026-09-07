@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import logging
 import math
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from gpu_fault.channel_registry import GPU_METRICS_PATH
+from gpu_fault.env import env_bool
 from gpu_fault.gpu_metrics import (
     GpuMetricBatch,
     GpuMetricHistoryPoint,
@@ -184,8 +186,7 @@ class DcgmMetricsCollector:
         self.edge_filter_enabled = (
             edge_filter_enabled
             if edge_filter_enabled is not None
-            else os.getenv("GPU_FAULT_DCGM_EDGE_FILTER_ENABLED", "true").strip().lower()
-            == "true"
+            else env_bool("GPU_FAULT_DCGM_EDGE_FILTER_ENABLED", True)
         )
         self.health_summary_seconds = (
             health_summary_seconds
@@ -684,3 +685,19 @@ class DcgmMetricsCollector:
                 self.force_snapshot_path.unlink(missing_ok=True)
                 force_snapshot = False
             time.sleep(self.interval_seconds)
+
+
+def build_from_environment(
+    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
+) -> DcgmMetricsCollector:
+    """The ``gpu-fault-collector dcgm`` factory named by the registry."""
+
+    if not arguments.node_id:
+        raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
+    return DcgmMetricsCollector(
+        sink,
+        context,
+        node_id=arguments.node_id,
+        metrics_url=arguments.metrics_url,
+        interval_seconds=arguments.interval_seconds,
+    )

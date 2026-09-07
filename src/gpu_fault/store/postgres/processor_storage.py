@@ -271,26 +271,30 @@ class PostgresProcessorStorageMixin:
                 """
             )
             rows = cursor.fetchall()
+            # One round trip for every cluster's oldest incomplete request; the
+            # region-wide age is the max of these, so it needs no query of its
+            # own. NULL cluster ids are grouped under the same key the counter
+            # tables and the in-memory backend use for unscoped requests.
             cursor.execute(
                 """
-                SELECT min(created_at)
+                SELECT coalesce(cluster_id, '__unscoped__'), min(created_at)
                 FROM gpu_fault_processor_queue
                 WHERE status IN ('PENDING', 'LEASED')
+                GROUP BY coalesce(cluster_id, '__unscoped__')
                 """
             )
-            oldest = cursor.fetchone()[0]
+            oldest_rows = cursor.fetchall()
         by_cluster = {row[0]: row[1] for row in rows}
+        oldest_age_by_cluster: dict[str, float] = {
+            str(cluster_id): max(0.0, (observed_at - created_at).total_seconds())
+            for cluster_id, created_at in oldest_rows
+            if created_at is not None
+        }
         return {
             "depth": sum(by_cluster.values()),
-            "oldest_age_seconds": (
-                max(
-                    0.0,
-                    (observed_at - oldest).total_seconds(),
-                )
-                if oldest is not None
-                else 0.0
-            ),
+            "oldest_age_seconds": max(oldest_age_by_cluster.values(), default=0.0),
             "by_cluster": by_cluster,
+            "oldest_age_by_cluster": oldest_age_by_cluster,
         }
 
     def processor_fault_backlog_depth(self) -> int:

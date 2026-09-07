@@ -21,6 +21,7 @@ from gpu_fault.app.metric_contributors import (
 )
 from gpu_fault.app.metrics_sections import (
     render_admission_metrics,
+    render_capacity_metrics,
     render_pool_metrics,
     render_processor_metrics_1,
     render_processor_metrics_2,
@@ -33,6 +34,7 @@ from gpu_fault.app.metrics_sections import (
 )
 from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.async_store import StoreIoCapacityExceeded
+from gpu_fault.store.contracts import ProcessorQueueStats
 
 
 def get_app_runtime() -> AppRuntime:
@@ -50,7 +52,54 @@ def collector_silence_lines(runtime: AppRuntime) -> list[str]:
     return runtime.collector_metrics_snapshot.lines()
 
 
+def _escape_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _processor_cluster_queue_lines(queue: ProcessorQueueStats) -> list[str]:
+    """Render the per-cluster processor queue families.
+
+    Depth says how much of one cluster's quota is in use; the oldest age (S6)
+    says how long that cluster has actually been waiting. The claim window is
+    FIFO across the whole region, so a storm in one cluster delays every other
+    cluster's requests, and only the per-cluster age shows who is paying.
+    """
+
+    lines = [
+        "# HELP gpu_fault_processor_cluster_queue_depth "
+        "Incomplete processor requests by cluster.",
+        "# TYPE gpu_fault_processor_cluster_queue_depth gauge",
+    ]
+    for cluster_id, depth in sorted(queue["by_cluster"].items()):
+        lines.append(
+            "gpu_fault_processor_cluster_queue_depth"
+            f'{{cluster_id="{_escape_label(cluster_id)}"}} {depth}'
+        )
+    lines.extend(
+        [
+            "# HELP gpu_fault_processor_cluster_queue_oldest_age_seconds "
+            "Age of the oldest incomplete processor request by cluster.",
+            "# TYPE gpu_fault_processor_cluster_queue_oldest_age_seconds gauge",
+        ]
+    )
+    for cluster_id, age in sorted(queue["oldest_age_by_cluster"].items()):
+        lines.append(
+            "gpu_fault_processor_cluster_queue_oldest_age_seconds"
+            f'{{cluster_id="{_escape_label(cluster_id)}"}} {age:.6f}'
+        )
+    return lines
+
+
 def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
+    """Render this replica's own /metrics families, then the contributors.
+
+    The families rendered inline here are read as per-replica facts by the
+    alert rules (queue view, IO backpressure, admission counters, spool state)
+    and ``scripts/verify-regional-alerting.py`` leaves them out of its
+    aggregation check. Store-derived, cluster-level families belong in
+    ``builtin_metric_contributors``, where every alert must ``max by``.
+    """
+
     ctx = app_runtime.context
     processor = app_runtime.processor
     processor_replay_tracker = app_runtime.processor_replay_tracker
@@ -102,17 +151,8 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
         "# TYPE gpu_fault_processor_queue_oldest_age_seconds gauge",
         "gpu_fault_processor_queue_oldest_age_seconds "
         f"{queue['oldest_age_seconds']:.6f}",
-        "# HELP gpu_fault_processor_cluster_queue_depth "
-        "Incomplete processor requests by cluster.",
-        "# TYPE gpu_fault_processor_cluster_queue_depth gauge",
     ]
-    for cluster_id, depth in sorted(queue["by_cluster"].items()):
-        escaped = (
-            cluster_id.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-        )
-        lines.append(
-            f'gpu_fault_processor_cluster_queue_depth{{cluster_id="{escaped}"}} {depth}'
-        )
+    lines.extend(_processor_cluster_queue_lines(queue))
     runtime = (
         processor.metrics_snapshot()
         if processor is not None
@@ -275,8 +315,15 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
     return lines
 
 
+def capacity_metric_lines(_runtime: AppRuntime) -> list[str]:
+    lines: list[str] = []
+    render_capacity_metrics(lines)
+    return lines
+
+
 METRIC_CONTRIBUTORS = MetricContributorRegistry()
 METRIC_CONTRIBUTORS.register("core", render_prometheus_metrics)
+METRIC_CONTRIBUTORS.register("capacity", capacity_metric_lines)
 METRIC_CONTRIBUTORS.register(
     "remote-command",
     remote_command_metric_lines,

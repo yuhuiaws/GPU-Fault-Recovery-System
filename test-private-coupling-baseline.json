@@ -151,7 +151,6 @@
   "tests/processor/test_notification_shard_ownership.py:processor._claim_active_by_pool": 2,
   "tests/processor/test_notification_shard_ownership.py:processor._set_notification_state": 12,
   "tests/processor/test_notification_shard_ownership.py:processor._stream_idle_interval": 4,
-  "tests/processor/test_notification_shard_progress.py:ProcessorFactory._lease_settings": 4,
   "tests/processor/test_observation_group_commit.py:host._complete_active_processor_requests_batch": 2,
   "tests/processor/test_observation_group_commit.py:host._processor_completion_condition": 2,
   "tests/processor/test_observation_group_commit.py:host._processor_completion_queue": 4,
@@ -218,8 +217,9 @@
   "tests/store/test_postgres_workflow_indexes.py:store._db": 1,
   "tests/store/test_reconcile_narrow_reads.py:store._list": 1,
   "tests/store/test_store_error_classification.py:database._connection": 1,
+  "tests/store/test_store_layering.py:store._statement_guard": 2,
   "tests/test_body_replay_contract.py:request._body": 2,
   "tests/test_body_replay_contract.py:request._receive": 1,
   "tests/test_registry_contracts.py:processor_claims._FAULT_CLAIM_PATHS": 1,
-  "tests/test_script_loader_contract.py:run_fleet_waves.__globals__": 2
+  "tests/test_script_loader_contract.py:file_set_identity.__globals__": 2
 }

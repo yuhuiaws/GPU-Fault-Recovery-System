@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 
 from gpu_fault.notification_service import AdvisoryNotificationService
-from gpu_fault.notifications import DisabledNotificationNotifier
+from gpu_fault.notifications import DisabledNotificationNotifier, SesNotificationConfig
 from tests._builders import build_store
 from tests.notifications._support import (
     RecordingNotifier,
@@ -172,3 +172,34 @@ def test_delivery_mode_names_the_switch_that_blocks_delivery(monkeypatch) -> Non
     ).describe_delivery_mode()
     assert "NOT DELIVERED" in no_channel
     assert "GPU_FAULT_EMAIL_SENDER" in no_channel
+
+
+@pytest.mark.parametrize("token", ["1", "yes", "on"])
+def test_email_gate_accepts_every_enabled_token(monkeypatch, token: str) -> None:
+    """``GPU_FAULT_ALLOW_EMAIL=1`` used to leave the SES adapter read-only."""
+
+    monkeypatch.setenv("GPU_FAULT_EMAIL_SENDER", "gpu@example.com")
+    monkeypatch.setenv("GPU_FAULT_EMAIL_RECIPIENTS", "admin@example.com")
+    monkeypatch.setenv("GPU_FAULT_ALLOW_EMAIL", token)
+
+    assert SesNotificationConfig.from_environment().execution_enabled is True
+
+
+@pytest.mark.parametrize("token", ["1", "yes", "on"])
+def test_notification_gates_accept_every_enabled_token(monkeypatch, token: str) -> None:
+    """Dispatcher, async delivery, backlog and drills all read one way."""
+
+    for name in (
+        "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED",
+        "GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY",
+        "GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG",
+        "GPU_FAULT_NOTIFICATION_DELIVER_DRILLS",
+    ):
+        monkeypatch.setenv(name, token)
+
+    service = AdvisoryNotificationService(build_store(), RecordingNotifier())
+
+    assert service.dispatcher_enabled is True
+    assert service.async_delivery is True
+    assert service.deliver_backlog is True
+    assert service.deliver_drills is True

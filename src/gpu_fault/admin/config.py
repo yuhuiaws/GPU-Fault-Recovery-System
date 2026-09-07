@@ -6,13 +6,24 @@ import json
 import os
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Mapping, cast
 
 from gpu_fault.admin.atomic_json import write_json_atomic
+from gpu_fault.admin.capacity_evidence import (
+    DEFAULT_LARGEST_CLUSTER_NODE_COUNT,
+    DEFAULT_MANAGED_NODE_COUNT,
+    CapacityEvidenceError,
+    aurora_min_acu_floor,
+    fault_reserved_cluster_depth,
+    fault_reserved_queue_depth,
+    validate_capacity_evidence,
+)
 from gpu_fault.digests import SHA256_PATTERN
+
+__all__ = ["aurora_min_acu_floor"]
 
 ADMIN_CONFIG_API_VERSION = "gpu-fault.aws/v1alpha1"
 ADMIN_CONFIG_KIND = "AdminConfig"
@@ -109,11 +120,25 @@ class CapacityConfig:
     control_worker_replicas: int = 6
     telemetry_spool: TelemetrySpoolCapacity = TelemetrySpoolCapacity()
     remediation: RemediationCapacity = RemediationCapacity()
+    # The declared topology: the biggest single GPU cluster and the whole
+    # managed fleet. The processor depth, the fault reserve and the Aurora
+    # floor are derived from these, so they are inputs, not tuning knobs.
+    largest_cluster_node_count: int = DEFAULT_LARGEST_CLUSTER_NODE_COUNT
+    managed_node_count: int = DEFAULT_MANAGED_NODE_COUNT
 
     def validate(self) -> None:
         if not 1 <= self.control_worker_replicas <= 64:
             raise AdminConfigError(
                 "spec.capacity.controlWorkerReplicas must be within 1..64"
+            )
+        if not 1 <= self.largest_cluster_node_count <= 4096:
+            raise AdminConfigError(
+                "spec.capacity.largestClusterNodeCount must be within 1..4096"
+            )
+        if not self.largest_cluster_node_count <= self.managed_node_count <= 65536:
+            raise AdminConfigError(
+                "spec.capacity.managedNodeCount must be within "
+                f"largestClusterNodeCount ({self.largest_cluster_node_count})..65536"
             )
         self.telemetry_spool.validate()
         self.remediation.validate()
@@ -141,6 +166,14 @@ class CapacityConfig:
             "control_worker_replicas": self.control_worker_replicas,
             "telemetry_spool": self.telemetry_spool.as_dict(),
             "remediation": self.remediation.as_dict(),
+            "largest_cluster_node_count": self.largest_cluster_node_count,
+            "managed_node_count": self.managed_node_count,
+        }
+
+    def node_counts(self) -> dict[str, int]:
+        return {
+            "largest_cluster_node_count": self.largest_cluster_node_count,
+            "managed_node_count": self.managed_node_count,
         }
 
 
@@ -171,7 +204,9 @@ class AuroraCapacityConfig:
 @dataclass(frozen=True)
 class ProcessorConfig:
     max_queue_depth: int = 65536
-    max_cluster_queue_depth: int = 1024
+    # 性能压测验收方案 §13.4: one 1000-node cluster overflowed 1024 (243 HTTP
+    # 429); 4096 admitted everything.
+    max_cluster_queue_depth: int = 4096
     retry_after_seconds: int = 2
     retry_backoff_seconds: int = 1
     retry_backoff_max_seconds: int = 30
@@ -307,13 +342,64 @@ class AdminConfig:
     notification_delivery: NotificationDeliveryConfig = NotificationDeliveryConfig()
     evidence: EvidenceConfig = EvidenceConfig()
 
-    def validate(self) -> None:
+    def validate(self, *, enforce_capacity_evidence: bool = True) -> None:
+        """Check every field and the cross-object capacity rules.
+
+        ``enforce_capacity_evidence=False`` is for reading a recorded or live
+        state: a site that predates the perf-evidence floors really runs what
+        it runs, and refusing to read that fact would leave the administrator
+        unable to load the state at all to plan the fix. Every path that
+        authors a desired config (patch, preset, file, plan) keeps the
+        default and refuses.
+        """
+
         self.capacity.validate()
         self.aurora.validate()
         self.processor.validate()
         self.workflow.validate()
         self.notification_delivery.validate()
         self.evidence.validate()
+        capacity = self.capacity
+        processor = self.processor
+        # Structural in every mode: the runtime refuses a per-cluster reserve
+        # larger than the per-cluster depth, and the reserve is derived from
+        # the largest cluster.
+        if capacity.largest_cluster_node_count > processor.max_cluster_queue_depth:
+            raise AdminConfigError(
+                f"spec.processor.maxClusterQueueDepth {processor.max_cluster_queue_depth}"
+                " cannot hold one fault-priority request per node of "
+                "spec.capacity.largestClusterNodeCount "
+                f"{capacity.largest_cluster_node_count}"
+            )
+        if not enforce_capacity_evidence:
+            return
+        try:
+            validate_capacity_evidence(
+                largest_cluster_node_count=capacity.largest_cluster_node_count,
+                managed_node_count=capacity.managed_node_count,
+                max_cluster_queue_depth=processor.max_cluster_queue_depth,
+                aurora_min_acu=self.aurora.min_acu,
+            )
+        except CapacityEvidenceError as exc:
+            raise AdminConfigError(str(exc)) from exc
+
+    def fault_reserved_queue_depth(self) -> int:
+        """GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH as the renderers ship it."""
+
+        return fault_reserved_queue_depth(self.processor.max_queue_depth)
+
+    def fault_reserved_cluster_depth(self) -> int:
+        """GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH as the renderers ship it.
+
+        An eighth of the per-cluster depth, but never less than one
+        fault-priority request per node of the largest cluster: a correlated
+        whole-cluster fault arrives on that many lanes at once.
+        """
+
+        return fault_reserved_cluster_depth(
+            self.processor.max_cluster_queue_depth,
+            self.capacity.largest_cluster_node_count,
+        )
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -329,13 +415,19 @@ class AdminConfig:
     def sha256(self) -> str:
         return canonical_sha256(self.as_dict())
 
-    def role_payload(self, role: str) -> dict[str, object]:
-        common = {
+    def role_payload(self, role: str, *, node_counts: bool = True) -> dict[str, object]:
+        common: dict[str, object] = {
             "processor": self.processor.as_dict(),
             "workflow": self.workflow.as_dict(),
             "notification_delivery": self.notification_delivery.as_dict(),
             "evidence": self.evidence.as_dict(),
         }
+        # The fault reserve derived from the node counts is rendered into
+        # every role, so a node count change has to move every role digest.
+        # ``node_counts=False`` reproduces the digests a release before the
+        # node counts recorded, for verifying such a persisted state.
+        if node_counts:
+            common.update(self.capacity.node_counts())
         if role == "ingress":
             return {
                 **common,
@@ -354,9 +446,9 @@ class AdminConfig:
             }
         raise AdminConfigError(f"unknown control-plane role: {role}")
 
-    def role_sha256(self) -> dict[str, str]:
+    def role_sha256(self, *, node_counts: bool = True) -> dict[str, str]:
         return {
-            role: canonical_sha256(self.role_payload(role))
+            role: canonical_sha256(self.role_payload(role, node_counts=node_counts))
             for role in ADMIN_CONFIG_ROLES
         }
 
@@ -408,6 +500,11 @@ class AdminConfig:
                         remediation["max_active_per_resource_class"],
                     ),
                 ),
+                largest_cluster_node_count=cast(
+                    int,
+                    capacity["largest_cluster_node_count"],
+                ),
+                managed_node_count=cast(int, capacity["managed_node_count"]),
             ),
             aurora=AuroraCapacityConfig(**aurora),
             processor=ProcessorConfig(**processor),
@@ -418,7 +515,9 @@ class AdminConfig:
             notification_delivery=NotificationDeliveryConfig(**notification),
             evidence=EvidenceConfig(**evidence),
         )
-        config.validate()
+        # A mapping is a recorded desired state or a captured live state, i.e.
+        # a fact; see ``validate``. Authoring paths validate again in full.
+        config.validate(enforce_capacity_evidence=False)
         return config
 
 
@@ -440,11 +539,23 @@ def canonical_sha256(value: object) -> str:
     ).hexdigest()
 
 
+def _missing_node_counts(raw_config: Mapping[str, object]) -> bool:
+    """Whether a persisted config predates the capacity node counts."""
+
+    capacity = raw_config.get("capacity")
+    return not (
+        isinstance(capacity, Mapping) and "largest_cluster_node_count" in capacity
+    )
+
+
 def _stored_config_sha256(
     raw_config: Mapping[str, object],
     config: AdminConfig,
 ) -> str:
-    if "aurora" not in raw_config:
+    # A record from before a field existed was digested over exactly the
+    # content it had; recomputing over the filled-in config would reject
+    # every site that upgrades.
+    if "aurora" not in raw_config or _missing_node_counts(raw_config):
         return canonical_sha256(dict(raw_config))
     return config.sha256()
 
@@ -480,301 +591,8 @@ def _number(value: object, path: str, *, default: float) -> float:
     return float(value)
 
 
-def _boolean(value: object, path: str, *, default: bool) -> bool:
-    if value is None:
-        return default
-    if not isinstance(value, bool):
-        raise AdminConfigError(f"{path} must be a boolean")
-    return value
-
-
 def default_admin_config() -> AdminConfig:
     return AdminConfig()
-
-
-def preset_admin_config(name: str) -> AdminConfig:
-    normalized = name.strip().lower()
-    if normalized == "default":
-        return default_admin_config()
-    match normalized:
-        case "32-disabled":
-            region = 128
-            spool = TelemetrySpoolCapacity(enabled=False, replicas=0)
-        case "32-enabled":
-            region = 128
-            spool = TelemetrySpoolCapacity(enabled=True, replicas=3)
-        case "50-disabled":
-            region = 200
-            spool = TelemetrySpoolCapacity(enabled=False, replicas=0)
-        case "50-enabled":
-            region = 200
-            spool = TelemetrySpoolCapacity(enabled=True, replicas=3)
-        case _:
-            raise AdminConfigError(
-                "unknown capacity preset; expected one of default, "
-                "32-disabled, 32-enabled, 50-disabled, or 50-enabled"
-            )
-    config = AdminConfig(
-        capacity=CapacityConfig(
-            control_worker_replicas=6,
-            telemetry_spool=spool,
-            remediation=RemediationCapacity(
-                max_active_region=region,
-                max_active_per_cluster=4,
-                max_active_per_node=1,
-                max_active_per_failure_domain=1,
-                max_active_per_resource_class=4,
-            ),
-        )
-    )
-    config.validate()
-    return config
-
-
-def apply_capacity_patch(
-    base: AdminConfig,
-    value: object,
-    *,
-    path: str = "spec.capacity",
-) -> AdminConfig:
-    data = _mapping(
-        value or {},
-        path,
-        allowed={
-            "preset",
-            "controlWorkerReplicas",
-            "telemetrySpool",
-            "remediation",
-        },
-    )
-    raw_preset = data.get("preset")
-    if raw_preset is not None and (
-        not isinstance(raw_preset, str) or not raw_preset.strip()
-    ):
-        raise AdminConfigError(f"{path}.preset must be a non-empty string")
-    current_capacity = (
-        preset_admin_config(raw_preset).capacity
-        if isinstance(raw_preset, str)
-        else base.capacity
-    )
-    spool_data = _mapping(
-        data.get("telemetrySpool") or {},
-        f"{path}.telemetrySpool",
-        allowed={"enabled", "replicas"},
-    )
-    remediation_data = _mapping(
-        data.get("remediation") or {},
-        f"{path}.remediation",
-        allowed={
-            "maxActiveRegion",
-            "maxActivePerCluster",
-            "maxActivePerResourceClass",
-        },
-    )
-    current_spool = current_capacity.telemetry_spool
-    current_remediation = current_capacity.remediation
-    config = replace(
-        base,
-        capacity=CapacityConfig(
-            control_worker_replicas=_integer(
-                data.get("controlWorkerReplicas"),
-                f"{path}.controlWorkerReplicas",
-                default=current_capacity.control_worker_replicas,
-            ),
-            telemetry_spool=TelemetrySpoolCapacity(
-                enabled=_boolean(
-                    spool_data.get("enabled"),
-                    f"{path}.telemetrySpool.enabled",
-                    default=current_spool.enabled,
-                ),
-                replicas=_integer(
-                    spool_data.get("replicas"),
-                    f"{path}.telemetrySpool.replicas",
-                    default=current_spool.replicas,
-                ),
-            ),
-            remediation=RemediationCapacity(
-                max_active_region=_integer(
-                    remediation_data.get("maxActiveRegion"),
-                    f"{path}.remediation.maxActiveRegion",
-                    default=current_remediation.max_active_region,
-                ),
-                max_active_per_cluster=_integer(
-                    remediation_data.get("maxActivePerCluster"),
-                    f"{path}.remediation.maxActivePerCluster",
-                    default=current_remediation.max_active_per_cluster,
-                ),
-                max_active_per_node=current_remediation.max_active_per_node,
-                max_active_per_failure_domain=(
-                    current_remediation.max_active_per_failure_domain
-                ),
-                max_active_per_resource_class=_integer(
-                    remediation_data.get("maxActivePerResourceClass"),
-                    f"{path}.remediation.maxActivePerResourceClass",
-                    default=(current_remediation.max_active_per_resource_class),
-                ),
-            ),
-        ),
-    )
-    config.validate()
-    return config
-
-
-def apply_admin_config_patch(
-    base: AdminConfig,
-    value: object,
-    *,
-    path: str = "spec",
-) -> AdminConfig:
-    data = _mapping(
-        value or {},
-        path,
-        allowed={
-            "capacity",
-            "aurora",
-            "processor",
-            "workflow",
-            "notificationDelivery",
-            "evidence",
-        },
-    )
-    current = (
-        apply_capacity_patch(
-            base,
-            data.get("capacity"),
-            path=f"{path}.capacity",
-        )
-        if "capacity" in data
-        else base
-    )
-    aurora_data = _mapping(
-        data.get("aurora") or {},
-        f"{path}.aurora",
-        allowed={"minAcu", "maxAcu"},
-    )
-    processor_data = _mapping(
-        data.get("processor") or {},
-        f"{path}.processor",
-        allowed={
-            "maxQueueDepth",
-            "maxClusterQueueDepth",
-            "retryAfterSeconds",
-            "retryBackoffSeconds",
-            "retryBackoffMaxSeconds",
-            "completedRetentionSeconds",
-        },
-    )
-    workflow_data = _mapping(
-        data.get("workflow") or {},
-        f"{path}.workflow",
-        allowed={"pollIntervalSeconds", "dispatcherWorkers"},
-    )
-    notification_data = _mapping(
-        data.get("notificationDelivery") or {},
-        f"{path}.notificationDelivery",
-        allowed={
-            "batchSize",
-            "maxAttempts",
-        },
-    )
-    evidence_data = _mapping(
-        data.get("evidence") or {},
-        f"{path}.evidence",
-        allowed={"retentionHours", "maxRecordsPerNode"},
-    )
-    processor = current.processor
-    aurora = current.aurora
-    workflow = current.workflow
-    notification = current.notification_delivery
-    evidence = current.evidence
-    max_queue_depth = _integer(
-        processor_data.get("maxQueueDepth"),
-        f"{path}.processor.maxQueueDepth",
-        default=processor.max_queue_depth,
-    )
-    max_cluster_queue_depth = _integer(
-        processor_data.get("maxClusterQueueDepth"),
-        f"{path}.processor.maxClusterQueueDepth",
-        default=processor.max_cluster_queue_depth,
-    )
-    retry_backoff_max_seconds = _integer(
-        processor_data.get("retryBackoffMaxSeconds"),
-        f"{path}.processor.retryBackoffMaxSeconds",
-        default=processor.retry_backoff_max_seconds,
-    )
-    config = AdminConfig(
-        capacity=current.capacity,
-        aurora=AuroraCapacityConfig(
-            min_acu=_number(
-                aurora_data.get("minAcu"),
-                f"{path}.aurora.minAcu",
-                default=aurora.min_acu,
-            ),
-            max_acu=_number(
-                aurora_data.get("maxAcu"),
-                f"{path}.aurora.maxAcu",
-                default=aurora.max_acu,
-            ),
-        ),
-        processor=ProcessorConfig(
-            max_queue_depth=max_queue_depth,
-            max_cluster_queue_depth=max_cluster_queue_depth,
-            retry_after_seconds=_integer(
-                processor_data.get("retryAfterSeconds"),
-                f"{path}.processor.retryAfterSeconds",
-                default=processor.retry_after_seconds,
-            ),
-            retry_backoff_seconds=_integer(
-                processor_data.get("retryBackoffSeconds"),
-                f"{path}.processor.retryBackoffSeconds",
-                default=processor.retry_backoff_seconds,
-            ),
-            retry_backoff_max_seconds=retry_backoff_max_seconds,
-            completed_retention_seconds=_integer(
-                processor_data.get("completedRetentionSeconds"),
-                f"{path}.processor.completedRetentionSeconds",
-                default=processor.completed_retention_seconds,
-            ),
-        ),
-        workflow=WorkflowConfig(
-            poll_interval_seconds=_number(
-                workflow_data.get("pollIntervalSeconds"),
-                f"{path}.workflow.pollIntervalSeconds",
-                default=workflow.poll_interval_seconds,
-            ),
-            dispatcher_workers=_integer(
-                workflow_data.get("dispatcherWorkers"),
-                f"{path}.workflow.dispatcherWorkers",
-                default=workflow.dispatcher_workers,
-            ),
-        ),
-        notification_delivery=NotificationDeliveryConfig(
-            batch_size=_integer(
-                notification_data.get("batchSize"),
-                f"{path}.notificationDelivery.batchSize",
-                default=notification.batch_size,
-            ),
-            max_attempts=_integer(
-                notification_data.get("maxAttempts"),
-                f"{path}.notificationDelivery.maxAttempts",
-                default=notification.max_attempts,
-            ),
-        ),
-        evidence=EvidenceConfig(
-            retention_hours=_integer(
-                evidence_data.get("retentionHours"),
-                f"{path}.evidence.retentionHours",
-                default=evidence.retention_hours,
-            ),
-            max_records_per_node=_integer(
-                evidence_data.get("maxRecordsPerNode"),
-                f"{path}.evidence.maxRecordsPerNode",
-                default=evidence.max_records_per_node,
-            ),
-        ),
-    )
-    config.validate()
-    return config
 
 
 def admin_config_desired_path(state_dir: Path) -> Path:
@@ -883,10 +701,11 @@ def load_desired_admin_config(
     config = AdminConfig.from_mapping(raw_config)
     capacity_only_legacy = set(raw_config) == {"schema_version", "capacity"}
     missing_aurora_legacy = "aurora" not in raw_config
+    missing_node_counts_legacy = _missing_node_counts(raw_config)
     expected_config = _stored_config_sha256(raw_config, config)
     if record.get("config_sha256") != expected_config:
         raise AdminConfigError("desired admin config digest does not match its content")
-    expected_roles = config.role_sha256()
+    expected_roles = config.role_sha256(node_counts=not missing_node_counts_legacy)
     if capacity_only_legacy:
         capacity = config.capacity
         legacy_payloads = {
@@ -902,7 +721,7 @@ def load_desired_admin_config(
         }
     if record.get("role_sha256") != expected_roles:
         raise AdminConfigError("desired admin config role digests do not match")
-    if migrate_legacy and missing_aurora_legacy:
+    if migrate_legacy and (missing_aurora_legacy or missing_node_counts_legacy):
         source = record.get("source")
         migration_source = (
             "legacy-capacity-migration"

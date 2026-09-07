@@ -10,28 +10,17 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_agent_convergence as CONVERGENCE_MODULE
+from gpu_fault_release import regional_release_diff as DIFF_MODULE
+from gpu_fault_release import regional_release_fleet_rollout as FLEET_MODULE
+from gpu_fault_release import regional_release_orchestration as ORCHESTRATION_MODULE
 from tests.regional._release_orchestrator_support import (
     DNS_MODULE,
     REGION,
-    ROOT,
     config_file,
     phase_release,
 )
 from tests.regional._release_orchestrator_support import RELEASE_MODULE as MODULE
-
-DIFF_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_diff.py"
-)
-ORCHESTRATION_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_orchestration.py"
-)
-FLEET_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_fleet_rollout.py"
-)
-CONVERGENCE_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_agent_convergence.py"
-)
 
 
 def test_gpu_upgrade_is_serial_and_persists_per_cluster_attempts() -> None:
@@ -851,7 +840,7 @@ def test_nlb_service_is_created_after_dns_and_certificate_gate(
     that Service exists.
     """
 
-    dns_module = DNS_MODULE.load()
+    dns_module = DNS_MODULE
     calls: list[str] = []
     for name in ("verify_control_plane_dns_prerequisites", "ensure_control_plane_dns"):
         monkeypatch.setattr(
@@ -886,7 +875,7 @@ def test_nlb_service_is_created_after_dns_and_certificate_gate(
 
 
 def test_dns_gate_executes_the_strict_runtime_sequence(monkeypatch) -> None:
-    dns_module = DNS_MODULE.load()
+    dns_module = DNS_MODULE
     events: list[str] = []
     certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/control-plane"
     raw_hostname = "internal-nlb.elb.us-east-1.amazonaws.com"
@@ -1034,7 +1023,7 @@ def _cname_record(value: str, *, ttl: int = 60) -> dict:
 def test_dns_upsert_is_skipped_only_when_the_live_cname_already_matches() -> None:
     """A no-op UPSERT still costs Route53's propagation wait, so read first."""
 
-    dns_module = DNS_MODULE.load()
+    dns_module = DNS_MODULE
     raw_hostname = "internal-nlb.elb.us-east-1.amazonaws.com"
 
     def release_with(record: dict | None) -> tuple[SimpleNamespace, list[str]]:

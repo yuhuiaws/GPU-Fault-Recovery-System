@@ -16,7 +16,7 @@ from gpu_fault.models import (
     RecoveryAction,
     Severity,
 )
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from gpu_fault.policy import (
     GpuFaultPolicyEngine,
     SxidClassification,

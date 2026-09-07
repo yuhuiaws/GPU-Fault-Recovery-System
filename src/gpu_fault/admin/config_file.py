@@ -14,11 +14,11 @@ from gpu_fault.admin.config import (
     AdminConfigError,
     admin_config_desired_path,
     admin_config_lock,
-    apply_admin_config_patch,
     default_admin_config,
     load_desired_admin_config,
     persist_desired_admin_config,
 )
+from gpu_fault.admin.config_patch import apply_admin_config_patch
 
 ADMIN_CONFIG_EDITABLE = Path("admin-config.yaml")
 
@@ -102,6 +102,8 @@ def admin_config_file_document(config: AdminConfig) -> dict[str, object]:
         "spec": {
             "capacity": {
                 "controlWorkerReplicas": capacity.control_worker_replicas,
+                "largestClusterNodeCount": capacity.largest_cluster_node_count,
+                "managedNodeCount": capacity.managed_node_count,
                 "telemetrySpool": {
                     "enabled": spool.enabled,
                     "replicas": spool.replicas,

@@ -26,6 +26,7 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
+from typing import cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -342,146 +343,157 @@ def renderer_admin_config() -> AdminConfig:
     workflow = defaults.workflow
     notification = defaults.notification_delivery
     evidence = defaults.evidence
-    return AdminConfig.from_mapping(
-        {
-            "schema_version": 1,
-            "capacity": {
-                "control_worker_replicas": int(
-                    os.getenv(
-                        "GPU_FAULT_CONTROL_WORKER_REPLICAS",
-                        str(capacity.control_worker_replicas),
+    document: dict[str, object] = {
+        "schema_version": 1,
+        "capacity": {
+            "control_worker_replicas": int(
+                os.getenv(
+                    "GPU_FAULT_CONTROL_WORKER_REPLICAS",
+                    str(capacity.control_worker_replicas),
+                )
+            ),
+            "telemetry_spool": {
+                "enabled": (
+                    boolean_environment(
+                        "GPU_FAULT_TELEMETRY_SPOOL",
+                        str(spool.enabled).lower(),
                     )
+                    == "true"
                 ),
-                "telemetry_spool": {
-                    "enabled": (
-                        boolean_environment(
-                            "GPU_FAULT_TELEMETRY_SPOOL",
-                            str(spool.enabled).lower(),
-                        )
-                        == "true"
-                    ),
-                    "replicas": int(
-                        os.getenv(
-                            "GPU_FAULT_TELEMETRY_SPOOL_REPLICAS",
-                            str(spool.replicas),
-                        )
-                    ),
-                },
-                "remediation": {
-                    "max_active_region": int(
-                        os.getenv(
-                            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
-                            str(remediation.max_active_region),
-                        )
-                    ),
-                    "max_active_per_cluster": int(
-                        os.getenv(
-                            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
-                            str(remediation.max_active_per_cluster),
-                        )
-                    ),
-                    "max_active_per_node": int(
-                        os.getenv(
-                            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
-                            str(remediation.max_active_per_node),
-                        )
-                    ),
-                    "max_active_per_failure_domain": int(
-                        os.getenv(
-                            ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"),
-                            str(remediation.max_active_per_failure_domain),
-                        )
-                    ),
-                    "max_active_per_resource_class": int(
-                        os.getenv(
-                            ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"),
-                            str(remediation.max_active_per_resource_class),
-                        )
-                    ),
-                },
-            },
-            "processor": {
-                "max_queue_depth": int(
+                "replicas": int(
                     os.getenv(
-                        "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH",
-                        str(processor.max_queue_depth),
-                    )
-                ),
-                "max_cluster_queue_depth": int(
-                    os.getenv(
-                        "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH",
-                        str(processor.max_cluster_queue_depth),
-                    )
-                ),
-                "retry_after_seconds": int(
-                    os.getenv(
-                        "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS",
-                        str(processor.retry_after_seconds),
-                    )
-                ),
-                "retry_backoff_seconds": int(
-                    os.getenv(
-                        "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS",
-                        str(processor.retry_backoff_seconds),
-                    )
-                ),
-                "retry_backoff_max_seconds": int(
-                    os.getenv(
-                        "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS",
-                        str(processor.retry_backoff_max_seconds),
-                    )
-                ),
-                "completed_retention_seconds": int(
-                    os.getenv(
-                        "GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS",
-                        str(processor.completed_retention_seconds),
+                        "GPU_FAULT_TELEMETRY_SPOOL_REPLICAS",
+                        str(spool.replicas),
                     )
                 ),
             },
-            "workflow": {
-                "poll_interval_seconds": float(
+            "remediation": {
+                "max_active_region": int(
                     os.getenv(
-                        "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS",
-                        str(workflow.poll_interval_seconds),
+                        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
+                        str(remediation.max_active_region),
                     )
                 ),
-                "dispatcher_workers": int(
+                "max_active_per_cluster": int(
                     os.getenv(
-                        "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS",
-                        str(workflow.dispatcher_workers),
+                        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
+                        str(remediation.max_active_per_cluster),
                     )
                 ),
-            },
-            "notification_delivery": {
-                "batch_size": int(
+                "max_active_per_node": int(
                     os.getenv(
-                        "GPU_FAULT_NOTIFICATION_BATCH_SIZE",
-                        str(notification.batch_size),
+                        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
+                        str(remediation.max_active_per_node),
                     )
                 ),
-                "max_attempts": int(
+                "max_active_per_failure_domain": int(
                     os.getenv(
-                        "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS",
-                        str(notification.max_attempts),
+                        ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"),
+                        str(remediation.max_active_per_failure_domain),
                     )
                 ),
-            },
-            "evidence": {
-                "retention_hours": int(
+                "max_active_per_resource_class": int(
                     os.getenv(
-                        "GPU_FAULT_EVIDENCE_RETENTION_HOURS",
-                        str(evidence.retention_hours),
-                    )
-                ),
-                "max_records_per_node": int(
-                    os.getenv(
-                        "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE",
-                        str(evidence.max_records_per_node),
+                        ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"),
+                        str(remediation.max_active_per_resource_class),
                     )
                 ),
             },
-        }
-    )
+        },
+        "processor": {
+            "max_queue_depth": int(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH",
+                    str(processor.max_queue_depth),
+                )
+            ),
+            "max_cluster_queue_depth": int(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH",
+                    str(processor.max_cluster_queue_depth),
+                )
+            ),
+            "retry_after_seconds": int(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS",
+                    str(processor.retry_after_seconds),
+                )
+            ),
+            "retry_backoff_seconds": int(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS",
+                    str(processor.retry_backoff_seconds),
+                )
+            ),
+            "retry_backoff_max_seconds": int(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS",
+                    str(processor.retry_backoff_max_seconds),
+                )
+            ),
+            "completed_retention_seconds": int(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS",
+                    str(processor.completed_retention_seconds),
+                )
+            ),
+        },
+        "workflow": {
+            "poll_interval_seconds": float(
+                os.getenv(
+                    "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS",
+                    str(workflow.poll_interval_seconds),
+                )
+            ),
+            "dispatcher_workers": int(
+                os.getenv(
+                    "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS",
+                    str(workflow.dispatcher_workers),
+                )
+            ),
+        },
+        "notification_delivery": {
+            "batch_size": int(
+                os.getenv(
+                    "GPU_FAULT_NOTIFICATION_BATCH_SIZE",
+                    str(notification.batch_size),
+                )
+            ),
+            "max_attempts": int(
+                os.getenv(
+                    "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS",
+                    str(notification.max_attempts),
+                )
+            ),
+        },
+        "evidence": {
+            "retention_hours": int(
+                os.getenv(
+                    "GPU_FAULT_EVIDENCE_RETENTION_HOURS",
+                    str(evidence.retention_hours),
+                )
+            ),
+            "max_records_per_node": int(
+                os.getenv(
+                    "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE",
+                    str(evidence.max_records_per_node),
+                )
+            ),
+        },
+    }
+    # Left out when the environment does not declare them: the parser then
+    # reads the topology the declared depth was sized for instead of a
+    # default that depth may not hold (a legacy 1024 depth is a 256-node
+    # cluster, not a 512-node one).
+    capacity_document = cast(dict[str, object], document["capacity"])
+    for name, key in (
+        ("GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT", "largest_cluster_node_count"),
+        ("GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT", "managed_node_count"),
+    ):
+        declared = os.getenv(name)
+        if declared is not None:
+            capacity_document[key] = int(declared)
+    return AdminConfig.from_mapping(document)
 
 
 def configure_ingress_spool(container: dict, config: AdminConfig) -> None:
@@ -536,15 +548,21 @@ def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
     notification = config.notification_delivery
     evidence = config.evidence
     values = {
+        # Declared topology, so the live state carries it and the runtime can
+        # refuse a reserve smaller than one whole-cluster fault wave.
+        "GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT": (
+            config.capacity.largest_cluster_node_count
+        ),
+        "GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT": config.capacity.managed_node_count,
         "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH": processor.max_queue_depth,
         "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": (
             processor.max_cluster_queue_depth
         ),
         "GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH": (
-            max(1, processor.max_queue_depth // 8)
+            config.fault_reserved_queue_depth()
         ),
         "GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH": (
-            max(1, processor.max_cluster_queue_depth // 8)
+            config.fault_reserved_cluster_depth()
         ),
         "GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD": min(
             256,

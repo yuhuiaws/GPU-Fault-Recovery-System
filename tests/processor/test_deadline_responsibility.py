@@ -13,7 +13,11 @@ from __future__ import annotations
 import time
 from datetime import datetime, timedelta, timezone
 
-from gpu_fault.processor import ProcessorCoordinator, ProcessorRequestStatus
+from gpu_fault.processor import (
+    ProcessorCoordinator,
+    ProcessorLeaseSettings,
+    ProcessorRequestStatus,
+)
 from tests._builders import build_store, processor_request
 
 REQUEST_LEASE = timedelta(seconds=120)
@@ -58,7 +62,11 @@ def test_one_deadline_charges_the_request_not_the_process():
 def test_the_process_gives_up_only_after_distinct_requests_keep_timing_out():
     store = build_store()
     unhealthy: list[str] = []
-    processor = _processor(store, unhealthy, deadline_exceeded_process_threshold=3)
+    processor = _processor(
+        store,
+        unhealthy,
+        lease=ProcessorLeaseSettings(deadline_exceeded_process_threshold=3),
+    )
     claims = []
     for index in range(3):
         # Distinct nodes -> distinct lanes, so all three can be claimed at once.
@@ -99,8 +107,9 @@ def test_the_unhealthy_latch_expires():
     processor = _processor(
         store,
         unhealthy,
-        deadline_exceeded_process_threshold=1,
-        unhealthy_ttl_seconds=0.05,
+        lease=ProcessorLeaseSettings(
+            deadline_exceeded_process_threshold=1, unhealthy_ttl_seconds=0.05
+        ),
     )
     _, claimed = _claim(store)
 

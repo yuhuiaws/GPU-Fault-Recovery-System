@@ -151,6 +151,8 @@ def _bootstrap_state() -> dict:
                 "subnet_group_ownership": "CREATED",
                 "security_group": "sg-aurora",
                 "security_group_ownership": "CREATED",
+                "parameter_group": "gpu-fault-test-aurora-pg",
+                "parameter_group_ownership": "CREATED",
                 "master_secret_arn": (
                     "arn:aws:secretsmanager:us-east-1:123456789012:secret:rds-master"
                 ),
@@ -196,10 +198,18 @@ def test_registry_records_ownership_dependencies_and_delete_policy(tmp_path) -> 
     assert by_key["kubernetes/lbc/helm-release"].delete_policy is (
         InstallationResourceDeletePolicy.DELETE
     )
+    # The cluster depends on all three: they are deleted only after it is gone.
     assert by_key["aws/aurora/cluster"].dependencies == [
+        "aws/aurora/parameter-group",
         "aws/aurora/security-group",
         "aws/aurora/subnet-group",
     ]
+    parameter_group = by_key["aws/aurora/parameter-group"]
+    assert parameter_group.resource_type == "rds_cluster_parameter_group"
+    assert parameter_group.resource_id == "gpu-fault-test-aurora-pg"
+    assert parameter_group.ownership is InstallationResourceOwnership.CREATED
+    assert parameter_group.delete_policy is InstallationResourceDeletePolicy.DELETE
+    assert parameter_group.dependencies == []
     assert by_key["aws/ecr/runtime"].delete_policy is (
         InstallationResourceDeletePolicy.DELETE
     )
@@ -223,6 +233,26 @@ def test_registry_records_ownership_dependencies_and_delete_policy(tmp_path) -> 
         for resource in snapshot.resources
         for key in resource.attributes
     )
+
+
+def test_a_state_written_before_parameter_groups_registers_no_group(tmp_path) -> None:
+    """A cluster bootstrapped before the diagnostics group existed sits on the
+    engine default group; there is nothing of ours to delete, and inventing a
+    name would make uninstall try to delete a group it never created."""
+
+    site = load_site(site_file(tmp_path))
+    state = _bootstrap_state()
+    del state["resources"]["aurora"]["parameter_group"]
+    del state["resources"]["aurora"]["parameter_group_ownership"]
+
+    snapshot = build_installation_snapshot(site, state, {})
+    by_key = {resource.resource_key: resource for resource in snapshot.resources}
+
+    assert "aws/aurora/parameter-group" not in by_key
+    assert by_key["aws/aurora/cluster"].dependencies == [
+        "aws/aurora/security-group",
+        "aws/aurora/subnet-group",
+    ]
 
 
 def test_registry_snapshot_digest_detects_tampering(tmp_path) -> None:

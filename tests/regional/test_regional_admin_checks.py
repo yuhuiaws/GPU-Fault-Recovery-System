@@ -10,28 +10,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_admin_checks as CHECKS
+from gpu_fault_release import regional_monitoring_safety as MONITORING
+from gpu_fault_release import regional_release_probes as PROBES
+from gpu_fault_release import regional_release_state as STATE
+from gpu_fault_release import regional_validation_evidence as EVIDENCE
 
 ROOT = Path(__file__).resolve().parents[2]
-CHECKS = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_admin_checks.py"
-)
-EVIDENCE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_validation_evidence.py"
-)
-MONITORING = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_monitoring_safety.py"
-)
-PROBES = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_probes.py"
-)
-STATE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_state.py"
-)
 
 
 def _checks_module():
-    return CHECKS.load()
+    return CHECKS
 
 
 class Config:
@@ -551,7 +540,7 @@ def healthy_control_api_report() -> dict:
 
 
 def control_api_check(monkeypatch, report: dict):
-    module = CHECKS.load()
+    module = CHECKS
     monkeypatch.setattr(module, "_control_api_report", lambda _release: report)
     return module, module._check_control_api
 
@@ -797,7 +786,7 @@ def test_control_api_health_rejects_stuck_or_broken_commands(
 
 
 def test_certificate_hostname_matching_is_single_label() -> None:
-    module = CHECKS.load()
+    module = CHECKS
 
     assert module._hostname_matches("control.example", "control.example")
     assert module._hostname_matches("*.example", "control.example")
@@ -869,7 +858,7 @@ def test_nlb_runtime_check_asks_independent_questions_together() -> None:
     where the report's thread pool could not help it.
     """
 
-    module = CHECKS.load()
+    module = CHECKS
     calls: list[str] = []
     release = _nlb_release(calls)
     release._read_snapshot = lambda: STATE.read_snapshot(release)
@@ -897,7 +886,7 @@ def test_nlb_runtime_check_reports_the_first_failure_in_program_order() -> None:
     submission order rather than as they complete.
     """
 
-    module = CHECKS.load()
+    module = CHECKS
     calls: list[str] = []
     release = _nlb_release(calls, certificate_status="PENDING_VALIDATION")
     release.config.nlb = {"name": "missing", "certificate_arn": "arn:cert"}
@@ -941,7 +930,7 @@ def test_repeated_aws_reads_are_served_once_per_snapshot() -> None:
     outside a snapshot there is no observation to be consistent with.
     """
 
-    module = CHECKS.load()
+    module = CHECKS
     calls: list[tuple[str, ...]] = []
     release = _aws_cache_release(calls)
     query = ["acm", "describe-certificate", "--certificate-arn", "arn:acm:cert"]
@@ -965,7 +954,7 @@ def test_concurrent_aws_reads_collapse_into_one_call() -> None:
     ones that did not need it.
     """
 
-    module = CHECKS.load()
+    module = CHECKS
     calls: list[tuple[str, ...]] = []
     release = _aws_cache_release(calls, delay=0.2)
     query = ["ec2", "describe-route-tables", "--filters", "Name=vpc-id,Values=vpc-a"]
@@ -988,8 +977,8 @@ def test_state_changing_aws_calls_are_never_cached() -> None:
     that can never arrive.
     """
 
-    module = CHECKS.load()
-    state = STATE.load()
+    module = CHECKS
+    state = STATE
     calls: list[tuple[str, ...]] = []
     release = _aws_cache_release(calls)
     mutation = ["ec2", "create-tags", "--resources", "i-abc"]

@@ -5,19 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_probes as PROBES
+from gpu_fault_release import regional_release_workflow_safety as SAFETY
 
 ROOT = Path(__file__).resolve().parents[2]
-SAFETY = lazy_script_module(
-    ROOT
-    / "deploy"
-    / "control-plane"
-    / "regional"
-    / "regional_release_workflow_safety.py"
-)
-PROBES = lazy_script_module(
-    ROOT / "deploy" / "control-plane" / "regional" / "regional_release_probes.py"
-)
 WORKFLOW_RESOLUTION = ROOT / "src/gpu_fault/workflow_resolution.py"
 
 

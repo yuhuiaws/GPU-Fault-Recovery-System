@@ -12,6 +12,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / "mypy-baseline.json"
+# The per-file baseline stops growth but has no opinion about where the 1,400
+# recorded errors should shrink first. The convergence file does: a ceiling per
+# directory, ordered by priority, that only ever ratchets down (S19). 74% of the
+# baseline is `no-untyped-def`/`type-arg`/`no-any-return`, concentrated in the
+# store mixins, the orchestration families and the route handlers -- the three
+# layers where "dict shape written wrong" is the main failure mode.
+CONVERGENCE = ROOT / "mypy-convergence.json"
 # `deploy` is checked alongside `src` because the release orchestrator lives
 # there, not in the package: ~14k lines that mutate two clusters and hold the
 # rollback path, previously outside every type gate.
@@ -81,18 +88,103 @@ def failures(
     return result
 
 
+Targets = dict[str, dict[str, object]]
+
+
+def load_baseline() -> dict[str, int]:
+    return dict(json.loads(BASELINE.read_text(encoding="utf-8")))
+
+
+def load_convergence_targets() -> Targets:
+    if not CONVERGENCE.is_file():
+        return {}
+    return dict(json.loads(CONVERGENCE.read_text(encoding="utf-8")))
+
+
+def _key_directory_matches(key: str, directory: str) -> bool:
+    path = key.rsplit(":", 1)[0]
+    return path == directory or path.startswith(directory.rstrip("/") + "/")
+
+
+def directory_totals(targets: Targets, current: Counter[str]) -> dict[str, int]:
+    """Strict errors under each convergence directory (a file counts once)."""
+
+    return {
+        directory: sum(
+            count
+            for key, count in current.items()
+            if _key_directory_matches(key, directory)
+        )
+        for directory in targets
+    }
+
+
+def convergence_failures(targets: Targets, current: Counter[str]) -> list[str]:
+    """Only growth past a ceiling fails; shrinking is the point, not slack."""
+
+    problems = []
+    for directory, total in directory_totals(targets, current).items():
+        ceiling = int(str(targets[directory]["ceiling"]))
+        if total > ceiling:
+            problems.append(
+                f"{directory} has {total} strict mypy errors, above its "
+                f"convergence ceiling of {ceiling}; fix errors in that "
+                "directory, do not raise the ceiling"
+            )
+    return problems
+
+
+def tightened_ceilings(targets: Targets, current: Counter[str]) -> Targets:
+    """Ceilings follow the current totals downwards and never move up."""
+
+    totals = directory_totals(targets, current)
+    return {
+        directory: {
+            **target,
+            "ceiling": min(int(str(target["ceiling"])), totals[directory]),
+        }
+        for directory, target in targets.items()
+    }
+
+
+def report_lines(targets: Targets, current: Counter[str]) -> list[str]:
+    totals = directory_totals(targets, current)
+    ordered = sorted(targets.items(), key=lambda item: int(str(item[1]["priority"])))
+    return [
+        f"P{target['priority']} {directory}: {totals[directory]}/"
+        f"{target['ceiling']} ({target['why']})"
+        for directory, target in ordered
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--write-baseline", action="store_true")
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="print the per-directory convergence table and exit",
+    )
     args = parser.parse_args()
 
     current, output = current_errors()
+    targets = load_convergence_targets()
+    if args.report:
+        for line in report_lines(targets, current):
+            print(line)
+        return 0
     if args.write_baseline:
         BASELINE.write_text(
             json.dumps(dict(sorted(current.items())), indent=2) + "\n",
             encoding="utf-8",
         )
         print(f"wrote {BASELINE.name}: {sum(current.values())} errors")
+        if targets:
+            CONVERGENCE.write_text(
+                json.dumps(tightened_ceilings(targets, current), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(f"wrote {CONVERGENCE.name}")
         return 0
     if not BASELINE.is_file():
         print(
@@ -100,8 +192,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
-    problems = failures(baseline, current)
+    baseline = load_baseline()
+    problems = failures(baseline, current) + convergence_failures(targets, current)
     if problems:
         print("mypy baseline check failed:", file=sys.stderr)
         for problem in problems:

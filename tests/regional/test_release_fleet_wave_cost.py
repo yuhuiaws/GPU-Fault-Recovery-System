@@ -21,22 +21,13 @@ from typing import Any
 import pytest
 import yaml
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_agent_convergence as CONVERGENCE
+from gpu_fault_release import regional_release_config as RELEASE_CONFIG
+from gpu_fault_release import regional_release_fleet_rollout as FLEET
+from gpu_fault_release import regional_release_probes as PROBES
 from tests.regional._release_orchestrator_support import config_file
 
 ROOT = Path(__file__).resolve().parents[2]
-CONVERGENCE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_agent_convergence.py"
-)
-FLEET = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_fleet_rollout.py"
-)
-RELEASE_CONFIG = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_config.py"
-)
-PROBES = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_probes.py"
-)
 
 CLUSTER = "hp-cluster"
 ARTIFACT = "a" * 64

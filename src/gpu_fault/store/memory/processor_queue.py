@@ -12,12 +12,10 @@ from gpu_fault.processor import (
     processor_request_claimable,
 )
 from gpu_fault.store.contracts import (
-    ProcessorQueueCountStatus,
     ProcessorQueueStats,
 )
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.processor_helpers import (
-    PartialEnqueueError,
     fault_rows_blocked_by_observation as _fault_rows_blocked_by_observation,
     incomplete_observation_scope_keys as _incomplete_observation_scope_keys,
     pending_fault_scope_keys as _pending_fault_scope_keys,
@@ -110,37 +108,6 @@ class MemoryProcessorQueueMixin:
             self._processor_requests[request.request_id] = request
             return request, None
 
-    def try_enqueue_processor_requests_batch(
-        self,
-        requests,
-        *,
-        max_depth: int,
-        max_cluster_depth: int,
-        reserved_fault_depth: int = 0,
-        reserved_cluster_fault_depth: int = 0,
-        global_admission_guard: int = 0,
-    ):
-        results: list[tuple[Any, str | None]] = []
-        committed: list[str] = []
-        for request in requests:
-            try:
-                result = self.try_enqueue_processor_request(
-                    request,
-                    max_depth=max_depth,
-                    max_cluster_depth=max_cluster_depth,
-                    reserved_fault_depth=reserved_fault_depth,
-                    reserved_cluster_fault_depth=(reserved_cluster_fault_depth),
-                    global_admission_guard=global_admission_guard,
-                )
-            except Exception as exc:
-                # Rows admitted before the failure stay admitted; tell the
-                # caller which ones (F-D9), as the Postgres batch does.
-                raise PartialEnqueueError(committed=committed, cause=exc) from exc
-            results.append(result)
-            if result[0] is not None:
-                committed.append(result[0].request_id)
-        return results
-
     def processor_queue_stats(
         self, *, now: datetime | None = None
     ) -> ProcessorQueueStats:
@@ -156,34 +123,17 @@ class MemoryProcessorQueueMixin:
                 }
             ]
         by_cluster: dict[str, int] = {}
+        oldest_age_by_cluster: dict[str, float] = {}
         for item in incomplete:
             key = item.cluster_id or "__unscoped__"
             by_cluster[key] = by_cluster.get(key, 0) + 1
-        oldest_age = max(
-            (
-                max(
-                    0.0,
-                    (observed_at - item.created_at).total_seconds(),
-                )
-                for item in incomplete
-            ),
-            default=0.0,
-        )
+            age = max(0.0, (observed_at - item.created_at).total_seconds())
+            oldest_age_by_cluster[key] = max(oldest_age_by_cluster.get(key, 0.0), age)
         return {
             "depth": len(incomplete),
-            "oldest_age_seconds": oldest_age,
+            "oldest_age_seconds": max(oldest_age_by_cluster.values(), default=0.0),
             "by_cluster": by_cluster,
-        }
-
-    def processor_queue_count_status(
-        self,
-    ) -> ProcessorQueueCountStatus:
-        depth = int(self.processor_queue_stats()["depth"])
-        return {
-            "expected_total": depth,
-            "counter_total": depth,
-            "mismatched_clusters": 0,
-            "ready": True,
+            "oldest_age_by_cluster": oldest_age_by_cluster,
         }
 
     def processor_fault_backlog_depth(self) -> int:

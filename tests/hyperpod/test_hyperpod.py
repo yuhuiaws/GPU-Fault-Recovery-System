@@ -182,6 +182,56 @@ def test_automatic_node_recovery_override_is_rejected(monkeypatch) -> None:
         HyperPodAdapterConfig.from_environment()
 
 
+@pytest.mark.parametrize("token", ["1", "yes", "on", "TRUE"])
+def test_mutation_gate_accepts_every_enabled_token(monkeypatch, token: str) -> None:
+    """``GPU_FAULT_ALLOW_HYPERPOD_MUTATION=1`` used to leave execution off."""
+
+    monkeypatch.setenv("GPU_FAULT_HYPERPOD_CLUSTER", "hp-cluster")
+    monkeypatch.setenv("GPU_FAULT_ALLOW_HYPERPOD_MUTATION", token)
+    monkeypatch.delenv("GPU_FAULT_ALLOW_HYPERPOD_REBOOT", raising=False)
+
+    config = HyperPodAdapterConfig.from_environment()
+
+    assert config.execution_enabled is True
+    assert config.action_enabled(HyperPodAction.REBOOT), (
+        "reboot inherits the mutation switch when it is not set on its own"
+    )
+
+
+@pytest.mark.parametrize("token", ["0", "no", "off"])
+def test_reboot_gate_accepts_every_disabled_token(monkeypatch, token: str) -> None:
+    monkeypatch.setenv("GPU_FAULT_HYPERPOD_CLUSTER", "hp-cluster")
+    monkeypatch.setenv("GPU_FAULT_ALLOW_HYPERPOD_MUTATION", "on")
+    monkeypatch.setenv("GPU_FAULT_ALLOW_HYPERPOD_REBOOT", token)
+
+    config = HyperPodAdapterConfig.from_environment()
+
+    assert not config.action_enabled(HyperPodAction.REBOOT), (
+        "reboot stays disabled unless its own switch is set"
+    )
+
+
+@pytest.mark.parametrize("token", ["1", "yes", "on"])
+def test_replace_gate_refuses_every_enabled_token(monkeypatch, token: str) -> None:
+    """The design invariant must not be bypassable by spelling ``true`` as ``1``."""
+
+    monkeypatch.setenv("GPU_FAULT_HYPERPOD_CLUSTER", "hp-cluster")
+    monkeypatch.setenv("GPU_FAULT_ALLOW_HYPERPOD_REPLACE", token)
+
+    with pytest.raises(ValueError, match="must remain false"):
+        HyperPodAdapterConfig.from_environment()
+
+
+def test_misspelled_mutation_gate_is_loud(monkeypatch) -> None:
+    """A typo on a destructive gate must not read as "off" in silence."""
+
+    monkeypatch.setenv("GPU_FAULT_HYPERPOD_CLUSTER", "hp-cluster")
+    monkeypatch.setenv("GPU_FAULT_ALLOW_HYPERPOD_MUTATION", "ture")
+
+    with pytest.raises(ValueError, match="GPU_FAULT_ALLOW_HYPERPOD_MUTATION"):
+        HyperPodAdapterConfig.from_environment()
+
+
 def adapter(
     *,
     execution_enabled: bool = False,

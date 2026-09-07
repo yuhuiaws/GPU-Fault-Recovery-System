@@ -77,7 +77,10 @@ def gate_groups(python: str) -> dict[str, GateGroup]:
             commands=((python, "-m", "compileall", "-q", *quality_roots),)
         ),
         "architecture": GateGroup(
-            commands=((python, "scripts/check-python-architecture.py"),)
+            commands=(
+                (python, "scripts/check-python-architecture.py"),
+                (python, "scripts/check-lazy-exports.py"),
+            )
         ),
         "contracts": GateGroup(
             commands=(
@@ -133,6 +136,8 @@ def gate_groups(python: str) -> dict[str, GateGroup]:
                     "scripts/e2e",
                     "scripts/perf",
                 ),
+                # Advisory when cfn-lint is absent locally, strict under CI=true.
+                ("make", "cfn-lint-check", f"PYTHON={python}"),
             )
         ),
         "shell": GateGroup(commands=(("make", "shell-check", f"PYTHON={python}"),)),

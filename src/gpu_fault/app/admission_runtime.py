@@ -20,6 +20,7 @@ from gpu_fault.async_store import (
     StoreIoCapacityExceeded,
 )
 from gpu_fault.channel_registry import CHANNEL_REGISTRY
+from gpu_fault.env import env_bool
 from gpu_fault.processor import ProcessorCoordinator
 from gpu_fault.processor_diagnostics import report_processor_replay_phase
 
@@ -173,7 +174,7 @@ class AdmissionRuntimeFactory:
         self.processor = processor
 
     def build(self) -> AdmissionRuntime:
-        limits = self._limits()
+        limits = self.limits()
         executors = self._executors(limits)
         # Published on the context the way the periodic runner is (F-L1), so
         # /metrics can export the ratio; a startup WARNING is invisible during a
@@ -188,7 +189,7 @@ class AdmissionRuntimeFactory:
             bounded_io_endpoint=self._bounded_endpoint(executors["store_io"]),
         )
 
-    def _limits(self) -> dict:
+    def limits(self) -> dict:
         max_depth = int(os.getenv("GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH", "10000"))
         max_cluster = int(
             os.getenv("GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH", "1000")
@@ -238,7 +239,23 @@ class AdmissionRuntimeFactory:
                 "processor queue limits, fault reserves, retry delay, and "
                 "response timeout are invalid"
             )
-        spool_enabled = _enabled("GPU_FAULT_TELEMETRY_SPOOL")
+        # The declared topology (0 = not declared). A correlated whole-cluster
+        # fault is one fault-priority request per node on that many lanes at
+        # once; a reserve that cannot hold it turns the fault lane into the
+        # first thing that returns 429 (性能压测验收方案 §13.4).
+        largest_cluster_nodes = int(
+            os.getenv("GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT", "0")
+        )
+        managed_nodes = int(os.getenv("GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT", "0"))
+        if largest_cluster_nodes < 0 or managed_nodes < 0:
+            raise RuntimeError("declared capacity node counts cannot be negative")
+        if 0 < largest_cluster_nodes and reserved_cluster < largest_cluster_nodes:
+            raise RuntimeError(
+                f"fault-reserved cluster depth {reserved_cluster} cannot hold one "
+                "correlated whole-cluster fault wave of "
+                f"{largest_cluster_nodes} nodes"
+            )
+        spool_enabled = env_bool("GPU_FAULT_TELEMETRY_SPOOL", False)
         spool_item_bytes = int(
             os.getenv(
                 "GPU_FAULT_TELEMETRY_SPOOL_MAX_ITEM_BYTES",
@@ -296,7 +313,9 @@ class AdmissionRuntimeFactory:
                 for path, channel in CHANNEL_REGISTRY.items()
                 if channel.snapshot_bypass
             ),
-            "queue_bypass_enabled": _enabled("GPU_FAULT_PROCESSOR_SNAPSHOT_BYPASS"),
+            "queue_bypass_enabled": env_bool(
+                "GPU_FAULT_PROCESSOR_SNAPSHOT_BYPASS", False
+            ),
             "queue_bypasses_by_path": {},
             "spool_enabled": spool_enabled,
             "spool_max_depth": int(
@@ -405,8 +424,8 @@ class AdmissionRuntimeFactory:
                 )
         if background_services and queued_processor:
             demand["processor_workers"] = processor_workers
-        if background_services and _enabled_default_true(
-            "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER"
+        if background_services and env_bool(
+            "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER", True
         ):
             demand["workflow_dispatcher"] = int(
                 env("GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS", "8")
@@ -611,20 +630,6 @@ class AdmissionRuntimeFactory:
             return wrapped
 
         return decorate
-
-
-def _enabled(name: str) -> bool:
-    return os.getenv(name, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-
-
-def _enabled_default_true(name: str) -> bool:
-    # Mirrors ``WorkflowDispatcherConfig.from_environment``: only the literal
-    # "true" (default) enables the dispatcher.
-    return os.getenv(name, "true").strip().lower() == "true"
 
 
 def _executor(

@@ -7,39 +7,20 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_observability_rollback as OBSERVABILITY
+from gpu_fault_release import regional_release_diff as DIFF
+from gpu_fault_release import regional_release_fleet_rollout as FLEET_ROLLOUT
+from gpu_fault_release import regional_release_legacy as LEGACY
+from gpu_fault_release import (
+    regional_release_node_runtime_rollout as NODE_RUNTIME_ROLLOUT,
+)
+from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
+from gpu_fault_release import regional_release_rollback_context as ROLLBACK_CONTEXT
+from gpu_fault_release import regional_release_state as STATE
+from gpu_fault_release import regional_release_validation as VALIDATION
+from gpu_fault_release import rollout as MODULE
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
-DIFF = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_diff.py"
-)
-ORCHESTRATION = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_orchestration.py"
-)
-ROLLBACK_CONTEXT = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_rollback_context.py"
-)
-VALIDATION = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_validation.py"
-)
-STATE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_state.py"
-)
-OBSERVABILITY = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_observability_rollback.py"
-)
-FLEET_ROLLOUT = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_fleet_rollout.py"
-)
-NODE_RUNTIME_ROLLOUT = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_node_runtime_rollout.py"
-)
-LEGACY = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_legacy.py"
-)
 
 
 def _legacy_agent_identity(node_ids: tuple[str, ...] = ("node-a",)) -> dict:
@@ -1315,10 +1296,8 @@ def test_snapshot_after_failed_rollback_keeps_the_recorded_state() -> None:
 
 
 def _fleet_id(state: dict) -> str:
-    import regional_release_fleet_rollout as fleet
-
     release = SimpleNamespace(release_id="cand", state=state)
-    return fleet.fleet_deployment_id(
+    return FLEET_ROLLOUT.fleet_deployment_id(
         release,
         SimpleNamespace(cluster_id="gpu-a"),
         phase="upgrade",

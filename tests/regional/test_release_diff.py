@@ -2,6 +2,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gpu_fault.admin.config import default_admin_config
+from gpu_fault_release import regional_release_config as CONFIG
+from gpu_fault_release import regional_release_diff as DIFF
 from scripts import component_wheels
 from scripts.component_wheels import (
     COMPONENTS,
@@ -11,15 +13,8 @@ from scripts.component_wheels import (
     dependency_closure,
     entrypoint_modules,
 )
-from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
-DIFF = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_diff.py"
-)
-CONFIG = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_config.py"
-)
 
 
 def _release() -> SimpleNamespace:

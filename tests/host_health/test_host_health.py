@@ -28,6 +28,7 @@ from ._host_health_cases_1 import (
     test_sustained_host_resource_risk_sends_fixed_email,
     test_sustained_host_resource_state_survives_sqlite_restart,
     test_sustained_zero_efa_traffic_captures_hung_context,
+    test_zero_traffic_progress_suppression_accepts_every_enabled_token,
     test_zero_traffic_progress_suppression_can_be_disabled,
 )
 from ._host_health_cases_2 import (

@@ -4,7 +4,7 @@
 
 **Goal:** Cut the wall-clock of `gpu-fault-admin deploy` (measured 40 min for a 4-node repeat deploy, 25.6 min of it in `rollout deploy`) by removing duplicated work, dead caches, an always-firing probe defect, and unnecessary serialization, without weakening any fail-closed gate.
 
-**Architecture:** The deploy is a chain `cli.py → scripts/staging_deploy.py → cli.py --prepared-source-release → admin/bootstrap.py → scripts/release_deploy.py → deploy/control-plane/regional/rollout_regional_release.py`. Each WP below edits one link of that chain. Speed-ups come from (1) fixing defects that make work re-run every time, (2) caching/reusing evidence inside one transaction, (3) running independent steps concurrently while keeping the hard ordering `schema → ingress-staged → data plane → cpu-finalize`, and (4) letting wave size follow the scale cap the code already has.
+**Architecture:** The deploy is a chain `cli.py → scripts/staging_deploy.py → cli.py --prepared-source-release → admin/bootstrap.py → scripts/release_deploy.py → src/gpu_fault_release/rollout.py`. Each WP below edits one link of that chain. Speed-ups come from (1) fixing defects that make work re-run every time, (2) caching/reusing evidence inside one transaction, (3) running independent steps concurrently while keeping the hard ordering `schema → ingress-staged → data plane → cpu-finalize`, and (4) letting wave size follow the scale cap the code already has.
 
 **Tech Stack:** Python 3.12, pytest (`make test-parallel PYTEST_XDIST_WORKERS=16`), bash, kubectl/aws CLIs behind `CommandRunner`; ten static gates via `make check-static`.
 
@@ -127,7 +127,7 @@ Digests for `nlb_network`, `pki`, `aurora`, `pod_identity_agent` embed `bootstra
 
 ---
 
-## WP-C: rollout ordering and checkpoints (`deploy/control-plane/regional/regional_release_orchestration.py`, `regional_release_mutation_preflight.py`, `regional_release_progress.py`, `tests/regional/test_regional_release_orchestrator.py`, `tests/regional/_release_orchestrator_support.py`, `tests/regional/test_release_progress_persistence.py`, `tests/regional/test_release_phase_narration.py`)
+## WP-C: rollout ordering and checkpoints (`src/gpu_fault_release/regional_release_orchestration.py`, `regional_release_mutation_preflight.py`, `regional_release_progress.py`, `tests/regional/test_regional_release_orchestrator.py`, `tests/regional/_release_orchestrator_support.py`, `tests/regional/test_release_progress_persistence.py`, `tests/regional/test_release_phase_narration.py`)
 
 Hard ordering that must survive every task here: `schema-ready` → `registry-staged` → **ingress** `cpu-staged` → `upgrade_gpu_clusters` → `data-converged` → `cpu-finalized` → `verified`. Everything else is movable.
 
@@ -206,7 +206,7 @@ When `upgrade_max_parallel_clusters > 1`, roll the first pending cluster (site o
 
 ### Task C7: agent convergence timeout is a cluster-local failure
 
-**Files:** Modify `deploy/control-plane/regional/regional_release_agent_convergence.py` (this file is shared with WP-D; WP-C owns only this one-line change plus its test; WP-D must not edit line 227).
+**Files:** Modify `src/gpu_fault_release/regional_release_agent_convergence.py` (this file is shared with WP-D; WP-C owns only this one-line change plus its test; WP-D must not edit line 227).
 
 `ReleaseError(f"{cluster_id} agents did not converge")` → `ClusterLocalReleaseError`. Effect: a single cluster's convergence timeout pauses the release (`PAUSED`, resume from that cluster) instead of rolling back every converged cluster.
 
@@ -215,7 +215,7 @@ When `upgrade_max_parallel_clusters > 1`, roll the first pending cluster (site o
 
 ---
 
-## WP-D: data-plane waves (`deploy/control-plane/regional/regional_release_fleet_rollout.py`, `regional_release_node_runtime_rollout.py`, `regional_release_agent_convergence.py` except line 227, `regional_release_config.py`, `src/gpu_fault/admin/site.py`, `tests/regional/test_release_fleet_wave_narration.py`, `tests/regional/test_release_rollout_wait.py`, `tests/admin/test_admin_site*.py`, `tests/regional/test_env_validation.py`)
+## WP-D: data-plane waves (`src/gpu_fault_release/regional_release_fleet_rollout.py`, `regional_release_node_runtime_rollout.py`, `regional_release_agent_convergence.py` except line 227, `regional_release_config.py`, `src/gpu_fault/admin/site.py`, `tests/regional/test_release_fleet_wave_narration.py`, `tests/regional/test_release_rollout_wait.py`, `tests/admin/test_admin_site*.py`, `tests/regional/test_env_validation.py`)
 
 ### Task D1: one wave-safety probe per wave
 
@@ -252,7 +252,7 @@ The second `ensure_rollout_wave_safe(timeout_seconds=0, margin=ROLLOUT_AGENT_POS
 
 ---
 
-## WP-E: driver, verify and stability (`scripts/release_deploy.py`, `deploy/control-plane/regional/regional_admin_commands.py`, `regional_release_validation.py`, `regional_validation_evidence.py`, `tests/admin/test_release_deploy.py`, `tests/admin/test_admin_quick_validation_evidence.py`, `tests/regional/test_regional_release_validation*.py`)
+## WP-E: driver, verify and stability (`scripts/release_deploy.py`, `src/gpu_fault_release/regional_admin_commands.py`, `regional_release_validation.py`, `regional_validation_evidence.py`, `tests/admin/test_release_deploy.py`, `tests/admin/test_admin_quick_validation_evidence.py`, `tests/regional/test_regional_release_validation*.py`)
 
 ### Task E1: quick validation evidence is reusable after a real deploy
 

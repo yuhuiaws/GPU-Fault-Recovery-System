@@ -148,6 +148,7 @@ rules:
       - deploy/control-plane/base/**
       - deploy/control-plane/regional/**
       - deploy/control-plane/tools/**
+      - src/gpu_fault_release/**
       - src/gpu_fault/admin/release_artifacts.py
       - src/gpu_fault/admin/source_deploy.py
       - src/gpu_fault/admin/site.py

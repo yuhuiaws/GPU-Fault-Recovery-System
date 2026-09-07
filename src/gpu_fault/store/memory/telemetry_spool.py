@@ -6,16 +6,27 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from gpu_fault.store.shared.telemetry_models import (
+    TELEMETRY_SPOOL_MAX_ATTEMPTS,
     SpooledTelemetry,
 )
 
 
 class MemoryTelemetrySpoolMixin:
+    """The in-process spool.
+
+    ``InMemoryStore`` uses it because it has nothing else; ``SqliteStore``
+    composes it too, so a single-process deployment spools telemetry in
+    memory and loses it with the process -- acceptable for a stream whose
+    next sample restates the same node state, and why the ingress warns when
+    the spool is enabled against a store that is not Postgres.
+    """
+
     # Attributes supplied by the composed concrete implementation.
     _telemetry_spool: Any
 
-    TELEMETRY_SPOOL_MAX_ATTEMPTS: Any
     _lock: Any
+
+    TELEMETRY_SPOOL_MAX_ATTEMPTS = TELEMETRY_SPOOL_MAX_ATTEMPTS
 
     def try_spool_telemetry_requests(
         self,

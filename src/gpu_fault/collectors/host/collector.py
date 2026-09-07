@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import shlex
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
+from gpu_fault.env import env_bool
 from gpu_fault.models import WorkloadState
 from gpu_fault.host_health import (
     HostMetricSample,
@@ -104,8 +106,7 @@ class HostTelemetryCollector(
         self.edge_filter_enabled = (
             edge_filter_enabled
             if edge_filter_enabled is not None
-            else os.getenv("GPU_FAULT_HOST_EDGE_FILTER_ENABLED", "true").strip().lower()
-            == "true"
+            else env_bool("GPU_FAULT_HOST_EDGE_FILTER_ENABLED", True)
         )
         self.health_summary_seconds = (
             health_summary_seconds
@@ -175,10 +176,7 @@ class HostTelemetryCollector(
             raise ValueError("GPU_FAULT_EFA_TRAFFIC_DROP_RATIO must be in (0, 1)")
         if self.efa_spike_ratio <= 1:
             raise ValueError("GPU_FAULT_EFA_TRAFFIC_SPIKE_RATIO must be greater than 1")
-        self.rank_liveness_enabled = (
-            os.getenv("GPU_FAULT_RANK_LIVENESS_ENABLED", "true").strip().lower()
-            == "true"
-        )
+        self.rank_liveness_enabled = env_bool("GPU_FAULT_RANK_LIVENESS_ENABLED", True)
         self.rank_progress_min_write_bps = float(
             os.getenv("GPU_FAULT_RANK_PROGRESS_MIN_WRITE_BPS", "1048576")
         )
@@ -421,3 +419,42 @@ class HostTelemetryCollector(
         return max(0.0, value - previous[0]), (
             observed_at - previous[1]
         ).total_seconds()
+
+
+def build_from_environment(
+    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
+) -> HostTelemetryCollector:
+    """The ``gpu-fault-collector host`` factory named by the registry."""
+
+    if not arguments.node_id:
+        raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
+    expected_gpu_count = os.getenv("GPU_FAULT_EXPECTED_GPU_COUNT")
+    expected_efa_device_count = os.getenv("GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT")
+    return HostTelemetryCollector(
+        sink,
+        context,
+        node_id=arguments.node_id,
+        interval_seconds=arguments.interval_seconds,
+        filesystems=[
+            item
+            for item in os.getenv("GPU_FAULT_FILESYSTEMS", "/,/var,/tmp").split(",")
+            if item
+        ],
+        required_interfaces=[
+            item
+            for item in os.getenv("GPU_FAULT_REQUIRED_INTERFACES", "").split(",")
+            if item
+        ],
+        pci_devices_root=(os.getenv("GPU_FAULT_PCI_DEVICES_ROOT") or None),
+        node_instance_type=(os.getenv("GPU_FAULT_NODE_INSTANCE_TYPE") or None),
+        expected_gpu_count=(int(expected_gpu_count) if expected_gpu_count else None),
+        expected_efa_device_count=(
+            int(expected_efa_device_count) if expected_efa_device_count else None
+        ),
+        inventory_mismatch_consecutive_samples=int(
+            os.getenv(
+                "GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES",
+                "2",
+            )
+        ),
+    )

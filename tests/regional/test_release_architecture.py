@@ -10,28 +10,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module, load_script_module
+from gpu_fault_release import regional_release_fleet_rollout as FLEET_MODULE
+from gpu_fault_release import regional_release_node_preflight as NODE_PREFLIGHT_MODULE
+from gpu_fault_release import regional_release_node_runtime_rollout as RUNTIME_MODULE
+from gpu_fault_release import regional_release_validation as VALIDATION_MODULE
+from gpu_fault_release import rollout as MODULE
 from tests.regional._release_orchestrator_support import config_file
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
-FLEET_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_fleet_rollout.py"
-)
-VALIDATION_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_validation.py"
-)
-NODE_PREFLIGHT_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_node_preflight.py"
-)
 
 
 def test_node_runtime_rollout_uses_fleet_waves(tmp_path: Path, monkeypatch) -> None:
-    runtime_module = load_script_module(
-        ROOT / "deploy/control-plane/regional/regional_release_node_runtime_rollout.py"
-    )
+    runtime_module = RUNTIME_MODULE
     config = replace(
         MODULE.ReleaseConfig.load(config_file(tmp_path)), upgrade_max_unavailable=2
     )
@@ -304,9 +294,7 @@ def test_wave_handoff_requires_the_patched_wave_to_be_observed(
 def test_pre_node_barrier_failure_starts_no_reconciler_or_fleet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime_module = load_script_module(
-        ROOT / "deploy/control-plane/regional/regional_release_node_runtime_rollout.py"
-    )
+    runtime_module = RUNTIME_MODULE
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     target = config.clusters[0]

@@ -11,6 +11,7 @@ from ._support import (
     WorkflowOperation,
     agent_config_digest,
     agent_config_payload,
+    executor_from_environment,
     heartbeat_reporter_from_environment,
     io,
     logging,
@@ -32,6 +33,26 @@ def test_node_agent_plaintext_requires_explicit_opt_in(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="TLS is required"):
         run()
+
+
+@pytest.mark.parametrize("token", ["1", "yes", "on"])
+def test_node_agent_destructive_gates_accept_every_enabled_token(
+    tmp_path, monkeypatch, token: str
+) -> None:
+    """``GPU_FAULT_NODE_ALLOW_GPU_RESET=1`` used to leave the reset gate shut."""
+
+    monkeypatch.setenv("GPU_FAULT_NODE_ACTION_SECRET", SECRET)
+    monkeypatch.setenv("NODE_NAME", "node-a")
+    monkeypatch.setenv("GPU_FAULT_NODE_ALLOWED_OPERATIONS", "VERIFY_NO_GPU_CLIENTS")
+    monkeypatch.setenv("GPU_FAULT_NODE_ACTION_DB", str(tmp_path / "actions.db"))
+    monkeypatch.delenv("GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE", raising=False)
+    monkeypatch.setenv("GPU_FAULT_NODE_ALLOW_GPU_RESET", token)
+    monkeypatch.setenv("GPU_FAULT_NODE_ALLOW_FABRIC_RESET", token)
+
+    agent = executor_from_environment(validate_runtime_paths=False)
+
+    assert agent.reset_enabled is True
+    assert agent.fabric_reset_enabled is True
 
 
 def test_device_clients_use_configured_host_proc_root(tmp_path) -> None:

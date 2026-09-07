@@ -33,9 +33,9 @@ renderer_inputs:
   - deploy/control-plane/tools/apply-control-plane-role-split.sh
   - deploy/control-plane/tools/render-control-plane-role-split.sh
   - deploy/control-plane/tools/render_control_plane_role_split.py
-  - deploy/control-plane/regional/regional_dns.py
-  - deploy/control-plane/regional/regional_gpu_bootstrap.py
-  - deploy/control-plane/regional/regional_release_rendering.py
+  - src/gpu_fault_release/regional_dns.py
+  - src/gpu_fault_release/regional_gpu_bootstrap.py
+  - src/gpu_fault_release/regional_release_rendering.py
   - deploy/node/deploy-node-installer-reconciler.sh
   - scripts/build-release-artifacts.py
   - scripts/component_wheels.py
@@ -78,19 +78,19 @@ component_inputs:
   dcgm:
     - deploy/dataplane/dcgm-counters.csv
     - deploy/dataplane/hyperpod-dcgm-exporter.yaml
-    - deploy/control-plane/regional/regional_gpu_bootstrap.py
+    - src/gpu_fault_release/regional_gpu_bootstrap.py
   endpoint:
     - deploy/control-plane/regional/regional-control-plane-nlb.yaml
-    - deploy/control-plane/regional/regional_dns.py
+    - src/gpu_fault_release/regional_dns.py
   executor:
     - deploy/dataplane/cluster-action-executor.yaml
-    - deploy/control-plane/regional/regional_release_rendering.py
+    - src/gpu_fault_release/regional_release_rendering.py
   watcher:
     - deploy/dataplane/completion-watcher.yaml
-    - deploy/control-plane/regional/regional_release_rendering.py
+    - src/gpu_fault_release/regional_release_rendering.py
   collector:
     - deploy/dataplane/kubernetes-node-resource-collector.yaml
-    - deploy/control-plane/regional/regional_release_rendering.py
+    - src/gpu_fault_release/regional_release_rendering.py
   node:
     - deploy/control-plane/regional/cleanup-inventory.json
     - deploy/control-plane/tools/sync_installed_resource_registry.py

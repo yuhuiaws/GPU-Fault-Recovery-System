@@ -2,42 +2,47 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Callable, Mapping
 
+from gpu_fault.collector_registry import (
+    COLLECTOR_REGISTRY,
+    CollectorDescriptor,
+    collector_registry_with_plugins,
+)
 from gpu_fault.collectors import (
-    DcgmMetricsCollector,
-    FabricManagerLogCollector,
-    HostTelemetryCollector,
-    KernelLogCollector,
-    KubernetesNodeResourceCollector,
     KubernetesHmaNodeCollector,
-    NodeLogCollector,
-    NvidiaSmiMetricsCollector,
+    KubernetesNodeResourceCollector,
     SqsHmaConsumer,
-    TrainingProgressCollector,
     context_from_environment,
     sink_from_environment,
 )
+from gpu_fault.collectors.models import CollectorContext
+from gpu_fault.collectors.sinks import EventSink
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
 
 
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(
-        description="Read-only GPU fault signal collectors"
-    )
-    subcommands = result.add_subparsers(dest="command", required=True)
-    kernel = subcommands.add_parser("kernel")
-    kernel.add_argument(
+def _add_node_id(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
         "--node-id",
         default=os.getenv("NODE_NAME") or os.getenv("HOSTNAME"),
     )
-    kernel.add_argument(
+
+
+def _add_interval(command: argparse.ArgumentParser, default: float) -> None:
+    command.add_argument("--interval-seconds", type=float, default=default)
+
+
+def _kernel_arguments(command: argparse.ArgumentParser) -> None:
+    _add_node_id(command)
+    command.add_argument(
         "--kmsg-path",
         default=os.getenv("GPU_FAULT_KMSG_PATH", "/dev/kmsg"),
     )
-    subcommands.add_parser("kubernetes-hma")
-    kubernetes_resources = subcommands.add_parser("kubernetes-node-resources")
-    kubernetes_resources.add_argument(
+
+
+def _kubernetes_node_resources_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
         "--interval-seconds",
         type=float,
         default=float(
@@ -50,281 +55,164 @@ def parser() -> argparse.ArgumentParser:
             )
         ),
     )
-    subcommands.add_parser("sqs-hma")
-    dcgm = subcommands.add_parser("dcgm")
-    dcgm.add_argument(
-        "--node-id",
-        default=os.getenv("NODE_NAME") or os.getenv("HOSTNAME"),
-    )
-    dcgm.add_argument(
+
+
+def _dcgm_arguments(command: argparse.ArgumentParser) -> None:
+    _add_node_id(command)
+    command.add_argument(
         "--metrics-url",
         default=os.getenv(
             "GPU_FAULT_DCGM_METRICS_URL",
             "http://127.0.0.1:9400/metrics",
         ),
     )
-    dcgm.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=float(os.getenv("GPU_FAULT_METRICS_INTERVAL_SECONDS", "15")),
-    )
-    smi = subcommands.add_parser("nvidia-smi")
-    smi.add_argument(
-        "--node-id",
-        default=os.getenv("NODE_NAME") or os.getenv("HOSTNAME"),
-    )
-    smi.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=float(os.getenv("GPU_FAULT_METRICS_INTERVAL_SECONDS", "30")),
-    )
-    host = subcommands.add_parser("host")
-    host.add_argument(
-        "--node-id",
-        default=os.getenv("NODE_NAME") or os.getenv("HOSTNAME"),
-    )
-    host.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=float(os.getenv("GPU_FAULT_HOST_INTERVAL_SECONDS", "15")),
-    )
-    logs = subcommands.add_parser("logs")
-    logs.add_argument(
-        "--node-id",
-        default=os.getenv("NODE_NAME") or os.getenv("HOSTNAME"),
-    )
-    fabric = subcommands.add_parser("fabric-manager")
-    fabric.add_argument(
-        "--node-id",
-        default=os.getenv("NODE_NAME") or os.getenv("HOSTNAME"),
-    )
-    fabric.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=float(
+    _add_interval(command, float(os.getenv("GPU_FAULT_METRICS_INTERVAL_SECONDS", "15")))
+
+
+def _nvidia_smi_arguments(command: argparse.ArgumentParser) -> None:
+    _add_node_id(command)
+    _add_interval(command, float(os.getenv("GPU_FAULT_METRICS_INTERVAL_SECONDS", "30")))
+
+
+def _host_arguments(command: argparse.ArgumentParser) -> None:
+    _add_node_id(command)
+    _add_interval(command, float(os.getenv("GPU_FAULT_HOST_INTERVAL_SECONDS", "15")))
+
+
+def _logs_arguments(command: argparse.ArgumentParser) -> None:
+    _add_node_id(command)
+    _add_interval(command, float(os.getenv("GPU_FAULT_LOG_INTERVAL_SECONDS", "10")))
+
+
+def _fabric_manager_arguments(command: argparse.ArgumentParser) -> None:
+    _add_node_id(command)
+    _add_interval(
+        command,
+        float(
             os.getenv(
                 "GPU_FAULT_FABRIC_MANAGER_LOG_INTERVAL_SECONDS",
                 "5",
             )
         ),
     )
-    progress = subcommands.add_parser("training-progress")
-    progress.add_argument(
+
+
+def _training_progress_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
         "--attempt-id",
         default=os.getenv("GPU_FAULT_ATTEMPT_ID"),
     )
-    progress.add_argument(
+    command.add_argument(
         "--rank",
         type=int,
         default=(int(os.environ["RANK"]) if os.getenv("RANK") else None),
     )
-    progress.add_argument(
+    command.add_argument(
         "--progress-file",
         default=os.getenv(
             "GPU_FAULT_TRAINING_PROGRESS_FILE",
             "/var/run/gpu-fault/progress.json",
         ),
     )
-    progress.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=float(
+    _add_interval(
+        command,
+        float(
             os.getenv(
                 "GPU_FAULT_TRAINING_PROGRESS_INTERVAL_SECONDS",
                 "15",
             )
         ),
     )
-    logs.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=float(os.getenv("GPU_FAULT_LOG_INTERVAL_SECONDS", "10")),
+
+
+# Per-command argparse options. A command absent here takes no options; a
+# plugin collector reads its configuration from the environment.
+CLI_ARGUMENTS: dict[str, Callable[[argparse.ArgumentParser], None]] = {
+    "kernel": _kernel_arguments,
+    "kubernetes-node-resources": _kubernetes_node_resources_arguments,
+    "dcgm": _dcgm_arguments,
+    "nvidia-smi": _nvidia_smi_arguments,
+    "host": _host_arguments,
+    "logs": _logs_arguments,
+    "fabric-manager": _fabric_manager_arguments,
+    "training-progress": _training_progress_arguments,
+}
+
+
+def parser(
+    registry: Mapping[str, CollectorDescriptor] | None = None,
+) -> argparse.ArgumentParser:
+    registry = COLLECTOR_REGISTRY if registry is None else registry
+    result = argparse.ArgumentParser(
+        description="Read-only GPU fault signal collectors"
     )
+    subcommands = result.add_subparsers(dest="command", required=True)
+    for command in registry:
+        subparser = subcommands.add_parser(command)
+        add_arguments = CLI_ARGUMENTS.get(command)
+        if add_arguments is not None:
+            add_arguments(subparser)
     return result
+
+
+# Factories for the cluster-side commands whose collector modules are shared
+# with the Lambda and control-plane surfaces; the node collectors carry their
+# own ``build_from_environment``.
+def build_sqs_hma(sink: EventSink, arguments: argparse.Namespace) -> SqsHmaConsumer:
+    queue_url = os.getenv("GPU_FAULT_HMA_QUEUE_URL")
+    if not queue_url:
+        raise SystemExit("GPU_FAULT_HMA_QUEUE_URL is required")
+    return SqsHmaConsumer(sink, queue_url)
+
+
+def build_kubernetes_hma(
+    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
+) -> KubernetesHmaNodeCollector:
+    return KubernetesHmaNodeCollector(sink, context)
+
+
+def build_kubernetes_node_resources(
+    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
+) -> KubernetesNodeResourceCollector:
+    return KubernetesNodeResourceCollector(
+        sink,
+        context,
+        interval_seconds=arguments.interval_seconds,
+        required_consecutive_samples=int(
+            os.getenv(
+                "GPU_FAULT_KUBERNETES_EFA_MISMATCH_SAMPLES",
+                "2",
+            )
+        ),
+        health_summary_seconds=int(
+            os.getenv(
+                "GPU_FAULT_KUBERNETES_EFA_HEALTH_SUMMARY_SECONDS",
+                "300",
+            )
+        ),
+        list_page_size=int(
+            os.getenv("GPU_FAULT_KUBERNETES_NODE_LIST_PAGE_SIZE", "500")
+        ),
+    )
 
 
 def main() -> None:
     configure_logging()
     validate_gpu_fault_environment(process_name="gpu-fault-collector")
-    args = parser().parse_args()
+    registry = collector_registry_with_plugins()
+    args = parser(registry).parse_args()
+    descriptor = registry[args.command]
     os.environ.setdefault(
         "GPU_FAULT_COLLECTOR_OUTBOX_PATH",
         f"/var/lib/gpu-fault/outbox/{args.command}.ndjson",
     )
     sink = sink_from_environment()
-    if args.command == "sqs-hma":
-        queue_url = os.getenv("GPU_FAULT_HMA_QUEUE_URL")
-        if not queue_url:
-            raise SystemExit("GPU_FAULT_HMA_QUEUE_URL is required")
-        SqsHmaConsumer(sink, queue_url).run()
-        return
-    context = context_from_environment(
-        discover_product=args.command
-        in {
-            "kernel",
-            "dcgm",
-            "nvidia-smi",
-            "host",
-            "logs",
-            "fabric-manager",
-        }
+    context = (
+        context_from_environment(discover_product=descriptor.needs_product_discovery)
+        if descriptor.needs_context
+        else None
     )
-    if args.command == "kernel":
-        if not args.node_id:
-            raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
-        KernelLogCollector(
-            sink,
-            context,
-            node_id=args.node_id,
-            kmsg_path=args.kmsg_path,
-        ).run()
-        return
-    if args.command == "dcgm":
-        if not args.node_id:
-            raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
-        DcgmMetricsCollector(
-            sink,
-            context,
-            node_id=args.node_id,
-            metrics_url=args.metrics_url,
-            interval_seconds=args.interval_seconds,
-        ).run()
-        return
-    if args.command == "nvidia-smi":
-        if not args.node_id:
-            raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
-        NvidiaSmiMetricsCollector(
-            sink,
-            context,
-            node_id=args.node_id,
-            interval_seconds=args.interval_seconds,
-        ).run()
-        return
-    if args.command == "host":
-        if not args.node_id:
-            raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
-        expected_gpu_count = os.getenv("GPU_FAULT_EXPECTED_GPU_COUNT")
-        expected_efa_device_count = os.getenv("GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT")
-        HostTelemetryCollector(
-            sink,
-            context,
-            node_id=args.node_id,
-            interval_seconds=args.interval_seconds,
-            filesystems=[
-                item
-                for item in os.getenv("GPU_FAULT_FILESYSTEMS", "/,/var,/tmp").split(",")
-                if item
-            ],
-            required_interfaces=[
-                item
-                for item in os.getenv("GPU_FAULT_REQUIRED_INTERFACES", "").split(",")
-                if item
-            ],
-            pci_devices_root=(os.getenv("GPU_FAULT_PCI_DEVICES_ROOT") or None),
-            node_instance_type=(os.getenv("GPU_FAULT_NODE_INSTANCE_TYPE") or None),
-            expected_gpu_count=(
-                int(expected_gpu_count) if expected_gpu_count else None
-            ),
-            expected_efa_device_count=(
-                int(expected_efa_device_count) if expected_efa_device_count else None
-            ),
-            inventory_mismatch_consecutive_samples=int(
-                os.getenv(
-                    "GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES",
-                    "2",
-                )
-            ),
-        ).run()
-        return
-    if args.command == "logs":
-        if not args.node_id:
-            raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
-        NodeLogCollector(
-            sink,
-            context,
-            node_id=args.node_id,
-            interval_seconds=args.interval_seconds,
-            training_log_paths=[
-                item
-                for item in os.getenv("GPU_FAULT_TRAINING_LOG_PATHS", "").split(",")
-                if item
-            ],
-            state_path=os.getenv(
-                "GPU_FAULT_LOG_STATE_PATH",
-                "/var/lib/gpu-fault/log-collector-state.json",
-            ),
-        ).run()
-        return
-    if args.command == "fabric-manager":
-        if not args.node_id:
-            raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
-        FabricManagerLogCollector(
-            sink,
-            context,
-            node_id=args.node_id,
-            interval_seconds=args.interval_seconds,
-            journal_enabled=(
-                os.getenv("GPU_FAULT_FABRIC_MANAGER_JOURNAL", "true").lower() == "true"
-            ),
-            journal_identifiers=tuple(
-                item
-                for item in os.getenv(
-                    "GPU_FAULT_FABRIC_MANAGER_IDENTIFIERS",
-                    "nvidia-fabricmanager,nv-fabricmanager",
-                ).split(",")
-                if item
-            ),
-            log_paths=[
-                item
-                for item in os.getenv("GPU_FAULT_FABRIC_MANAGER_LOG_PATHS", "").split(
-                    ","
-                )
-                if item
-            ],
-            state_path=os.getenv(
-                "GPU_FAULT_FABRIC_MANAGER_STATE_PATH",
-                "/var/lib/gpu-fault/fabric-manager-collector-state.json",
-            ),
-        ).run()
-        return
-    if args.command == "training-progress":
-        if not args.attempt_id or args.rank is None:
-            raise SystemExit("training-progress requires --attempt-id and --rank")
-        TrainingProgressCollector(
-            sink,
-            cluster_id=context.cluster_id,
-            attempt_id=args.attempt_id,
-            rank=args.rank,
-            progress_path=args.progress_file,
-            node_id=os.getenv("NODE_NAME") or os.getenv("HOSTNAME"),
-            pod_uid=os.getenv("POD_UID"),
-            container_name=os.getenv("CONTAINER_NAME", "trainer"),
-            gpu_uuids=[
-                item for item in os.getenv("GPU_FAULT_GPU_UUIDS", "").split(",") if item
-            ],
-            interval_seconds=args.interval_seconds,
-        ).run()
-        return
-    if args.command == "kubernetes-node-resources":
-        KubernetesNodeResourceCollector(
-            sink,
-            context,
-            interval_seconds=args.interval_seconds,
-            required_consecutive_samples=int(
-                os.getenv(
-                    "GPU_FAULT_KUBERNETES_EFA_MISMATCH_SAMPLES",
-                    "2",
-                )
-            ),
-            health_summary_seconds=int(
-                os.getenv(
-                    "GPU_FAULT_KUBERNETES_EFA_HEALTH_SUMMARY_SECONDS",
-                    "300",
-                )
-            ),
-        ).run()
-        return
-    KubernetesHmaNodeCollector(sink, context).run()
+    descriptor.build(sink, context, args).run()
 
 
 if __name__ == "__main__":

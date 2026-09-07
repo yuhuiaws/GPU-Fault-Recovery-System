@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import fnmatch
 import hashlib
 import io
@@ -34,11 +35,16 @@ def _identity_root(tmp_path: Path) -> Path:
         "config/ci-unit-gate.json": (ROOT / "config/ci-unit-gate.json").read_text(
             encoding="utf-8"
         ),
+        "deploy/control-plane/regional/probes/node_probe.py": "VALUE = 'probe'\n",
+        "src/gpu_fault_release/regional_dns.py": "VALUE = 'dns'\n",
+        "src/gpu_fault_release/regional_release_config.py": ("VALUE = 'release'\n"),
+        "deploy/control-plane/tools/cleanup_state.py": "VALUE = 'tool'\n",
         "deploy/manifest.yaml": "kind: Deployment\n",
         "docs/guide.md": "guide\n",
         "requirements/build.lock": "build==1\n",
         "src/gpu_fault/admin/config.py": "VALUE = 'shared'\n",
         "src/gpu_fault/admin/only.py": "VALUE = 'deployment'\n",
+        "src/gpu_fault/failure_domains.py": "VALUE = 'domains'\n",
         "src/gpu_fault/release_state_snapshot.py": "VALUE = 'snapshot'\n",
         "src/gpu_fault/runtime.py": "VALUE = 'runtime'\n",
         "testcases/fault-scenarios.yaml": "schema_version: 1\n",
@@ -152,7 +158,7 @@ def test_deployment_only_coverage_scope_matches_distribution_split() -> None:
         for module in component_modules(component)
     }
     deploy_host_only = set(component_modules("deploy_host")) - application_modules
-    expected = {
+    expected_package_files = {
         (
             "src/"
             + module.replace(".", "/")
@@ -164,8 +170,172 @@ def test_deployment_only_coverage_scope_matches_distribution_split() -> None:
         )
         for module in deploy_host_only
     }
+    deploy_roots = set(
+        ci_coverage_gate.load_config(ROOT)["coverage"]["deployment_only_sources"]
+    )
+    # The release orchestrator (``src/gpu_fault_release``) and the control-plane
+    # tools are not application wheels: they are the modules sitting directly in
+    # the deployment-only source roots, whichever tree the root lives in.
+    # ``probes/`` is left out on purpose -- most probes are only parsed by
+    # tests, never executed.
+    expected_root_files = {
+        path.relative_to(ROOT).as_posix()
+        for path in ci_gate_artifacts.repository_files(ROOT)
+        if path.suffix == ".py"
+        and path.parent.relative_to(ROOT).as_posix() in deploy_roots
+    }
+    assert "src/gpu_fault_release" in deploy_roots
+    assert "src/gpu_fault" not in deploy_roots
 
-    assert set(ci_coverage_gate.deployment_only_source_files(ROOT)) == expected
+    measured = set(ci_coverage_gate.deployment_only_source_files(ROOT))
+    assert {item for item in measured if item.startswith("src/gpu_fault/")} == (
+        expected_package_files
+    )
+    assert {
+        item for item in measured if not item.startswith("src/gpu_fault/")
+    } == expected_root_files
+    assert not any("/probes/" in item for item in measured), "probes are not measured"
+
+
+def test_coverage_config_names_the_deploy_roots_as_deployment_only_sources() -> None:
+    """The gate measures three source roots; two of them only in ``deployment``.
+
+    ``coverage.source`` was a single string, so the release orchestrator under
+    ``deploy/`` sat outside every floor. Schema 3 replaces it with ``sources``
+    plus the subset runtime shards must not measure.
+    """
+
+    config = ci_coverage_gate.load_config(ROOT)
+    coverage = config["coverage"]
+
+    assert config["schema_version"] == 3
+    assert "source" not in coverage
+    assert coverage["sources"] == [
+        "src/gpu_fault",
+        "src/gpu_fault_release",
+        "deploy/control-plane/tools",
+    ]
+    assert coverage["deployment_only_sources"] == [
+        "src/gpu_fault_release",
+        "deploy/control-plane/tools",
+    ]
+    assert all((ROOT / root).is_dir() for root in coverage["sources"]), (
+        "every coverage source root must exist"
+    )
+
+
+def _mutated_config(mutate) -> dict:
+    config = ci_coverage_gate.load_config(ROOT)
+    mutate(config)
+    return config
+
+
+def _legacy_source_key(config: dict) -> None:
+    config["coverage"]["source"] = "src/gpu_fault"
+
+
+def _empty_sources(config: dict) -> None:
+    config["coverage"]["sources"] = []
+
+
+def _foreign_deployment_only_source(config: dict) -> None:
+    config["coverage"]["deployment_only_sources"] = ["deploy/dataplane"]
+
+
+def _every_source_deployment_only(config: dict) -> None:
+    config["coverage"]["deployment_only_sources"] = list(config["coverage"]["sources"])
+
+
+def _previous_schema(config: dict) -> None:
+    config["schema_version"] = 2
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _legacy_source_key,
+        _empty_sources,
+        _foreign_deployment_only_source,
+        _every_source_deployment_only,
+        _previous_schema,
+    ],
+)
+def test_coverage_config_rejects_an_incomplete_source_declaration(
+    tmp_path: Path, mutate
+) -> None:
+    root = tmp_path / "repo"
+    (root / "config").mkdir(parents=True)
+    (root / "config/ci-unit-gate.json").write_text(
+        json.dumps(_mutated_config(mutate)), encoding="utf-8"
+    )
+
+    with pytest.raises(ci_coverage_gate.CoverageGateError):
+        ci_coverage_gate.load_config(root)
+
+
+def _coverage_ini_list(path: Path, option: str) -> set[str]:
+    parser = configparser.ConfigParser()
+    parser.read(path, encoding="utf-8")
+    if not parser.has_option("run", option):
+        return set()
+    return {
+        line.strip() for line in parser.get("run", option).splitlines() if line.strip()
+    }
+
+
+@pytest.mark.parametrize("shard", sorted(ci_coverage_gate.SHARDS))
+def test_only_the_deployment_shard_measures_the_deploy_roots(
+    tmp_path: Path, shard: str
+) -> None:
+    """Runtime shards keep measuring ``src/gpu_fault`` alone.
+
+    Their identities exclude ``deploy/``, so a runtime shard that measured the
+    release orchestrator could be reused against a changed orchestrator.
+    """
+
+    root = _identity_root(tmp_path)
+    output = tmp_path / "coverage.ini"
+
+    ci_coverage_gate.write_coverage_config(root, shard, output)
+
+    sources = _coverage_ini_list(output, "source")
+    omitted = _coverage_ini_list(output, "omit")
+    protocol = _identity(root, shard)["protocol"]
+    assert "coverage_source" not in protocol
+    assert set(protocol["coverage_sources"]) == sources
+    if shard == "deployment":
+        assert sources == {
+            "src/gpu_fault",
+            "src/gpu_fault_release",
+            "deploy/control-plane/tools",
+        }
+        assert omitted == set()
+    else:
+        assert sources == {"src/gpu_fault"}
+        assert "src/gpu_fault/admin/only.py" in omitted
+        assert not any(item.startswith("deploy/") for item in omitted), (
+            "a root that is not measured has nothing to omit"
+        )
+
+
+def test_non_deployment_shard_measuring_deploy_source_is_rejected(
+    tmp_path: Path,
+) -> None:
+    root = _identity_root(tmp_path)
+    data_path = tmp_path / "coverage-data"
+    data = CoverageData(basename=str(data_path))
+    data.add_lines(
+        {
+            "src/gpu_fault/runtime.py": {1},
+            "src/gpu_fault_release/regional_release_config.py": {1},
+        }
+    )
+    data.write()
+
+    with pytest.raises(
+        ci_coverage_gate.CoverageGateError, match="deploy-host-only source"
+    ):
+        ci_coverage_gate.verify_coverage_data(root, "runtime_0", data_path)
 
 
 @pytest.mark.parametrize(
@@ -175,6 +345,9 @@ def test_deployment_only_coverage_scope_matches_distribution_split() -> None:
         ("Makefile", set(ci_coverage_gate.SHARDS)),
         ("src/gpu_fault/runtime.py", set(ci_coverage_gate.SHARDS)),
         ("src/gpu_fault/admin/only.py", {"deployment"}),
+        ("src/gpu_fault_release/regional_release_config.py", {"deployment"}),
+        ("deploy/control-plane/regional/probes/node_probe.py", {"deployment"}),
+        ("deploy/control-plane/tools/cleanup_state.py", {"deployment"}),
         ("tests/test_runtime.py", set(ci_coverage_gate.RUNTIME_SHARDS)),
         ("tests/admin/test_admin.py", {"deployment"}),
         ("tests/test_case_scheduler.py", {"fault_runner"}),
@@ -212,7 +385,14 @@ def _write_coverage_data(root: Path, path: Path, shard: str) -> None:
         # them has to measure all of them.
         measured += [
             root / "src/gpu_fault/admin/only.py",
+            root / "src/gpu_fault/failure_domains.py",
             root / "src/gpu_fault/release_state_snapshot.py",
+            root / "src/gpu_fault_release/regional_release_config.py",
+            root / "src/gpu_fault_release/regional_dns.py",
+            root / "deploy/control-plane/tools/cleanup_state.py",
+            # Measured because a test loaded it, floored by nothing: the probe
+            # family is mostly parsed rather than executed, so it has no group.
+            root / "deploy/control-plane/regional/probes/node_probe.py",
         ]
     else:
         measured.append(root / "src/gpu_fault/admin/config.py")

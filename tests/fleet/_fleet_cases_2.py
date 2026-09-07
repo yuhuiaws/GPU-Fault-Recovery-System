@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+from gpu_fault.adapters import NodeActionWorkflowAdapter
 from gpu_fault.app import ApplicationContext
 from gpu_fault.fleet import (
     AgentTransitionRequest,
@@ -14,7 +15,6 @@ from gpu_fault.fleet import (
 )
 from gpu_fault.models import WorkflowExecutionRequest, WorkflowOperation, WorkflowStatus
 from gpu_fault.node_agent import AgentHeartbeatReporter, NodeActionStatus
-from gpu_fault.runtime_adapters import NodeActionWorkflowAdapter
 from gpu_fault.store import SqliteStore
 from gpu_fault.telemetry import CollectorKind, CollectorStatus
 from tests._builders import (

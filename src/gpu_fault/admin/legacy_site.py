@@ -15,6 +15,7 @@ from gpu_fault.admin.bootstrap import (
     _require_same_scope,
     discover_cluster,
 )
+from gpu_fault.admin.bootstrap_aurora import cluster_parameter_group_name
 from gpu_fault.admin.bootstrap_common import (
     BOOTSTRAP_STATE_VERSION,
     BootstrapError,
@@ -198,8 +199,9 @@ def _aurora(
     groups = cluster.get("VpcSecurityGroups") or []
     if len(groups) != 1:
         raise BootstrapError("legacy Aurora must have exactly one solution SG")
-    return {
-        "cluster_id": cluster["DBClusterIdentifier"],
+    cluster_id = str(cluster["DBClusterIdentifier"])
+    aurora: dict[str, Any] = {
+        "cluster_id": cluster_id,
         "cluster_ownership": "CREATED",
         "instance_ids": [
             item["DBInstanceIdentifier"] for item in cluster.get("DBClusterMembers", [])
@@ -213,6 +215,16 @@ def _aurora(
             (cluster.get("MasterUserSecret") or {}).get("KmsKeyId") or ""
         ),
     }
+    # deploy.sh and bootstrap both name the diagnostics group ``<cluster>-pg``.
+    # It is ours only while it is the group the cluster runs on; a cluster still
+    # on the engine default group (a deploy from before the group existed) has
+    # nothing of ours to delete, and a same-named group that is *not* attached
+    # cannot be told from someone else's.
+    parameter_group = cluster_parameter_group_name(cluster_id, safe_name=safe_name)
+    if str(cluster.get("DBClusterParameterGroup") or "") == parameter_group:
+        aurora["parameter_group"] = parameter_group
+        aurora["parameter_group_ownership"] = "CREATED"
+    return aurora
 
 
 def _pki_secret(

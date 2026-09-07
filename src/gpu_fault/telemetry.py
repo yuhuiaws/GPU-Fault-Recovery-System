@@ -6,6 +6,12 @@ from enum import StrEnum
 
 from pydantic import Field
 
+# ``CollectorKind`` and the producer view are rows of the collector registry;
+# they keep their historical import path here.
+from gpu_fault.collector_registry import (
+    COLLECTOR_PRODUCER_BY_CHANNEL as COLLECTOR_PRODUCER_BY_CHANNEL,
+)
+from gpu_fault.collector_registry import CollectorKind as CollectorKind
 from gpu_fault.models import StrictModel
 from gpu_fault.telemetry_models import (
     TelemetryMetricLatest as TelemetryMetricLatest,
@@ -14,29 +20,6 @@ from gpu_fault.telemetry_models import (
     WorkloadObservationState as WorkloadObservationState,
 )
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
-
-
-class CollectorKind(StrEnum):
-    GPU_INVENTORY = "GPU_INVENTORY"
-    GPU_METRICS = "GPU_METRICS"
-    HOST_TELEMETRY = "HOST_TELEMETRY"
-    NODE_LOGS = "NODE_LOGS"
-    NVIDIA_KERNEL = "NVIDIA_KERNEL"
-    FABRIC_MANAGER_LOG = "FABRIC_MANAGER_LOG"
-    HMA_NODE = "HMA_NODE"
-    HMA_CLOUDWATCH = "HMA_CLOUDWATCH"
-
-
-COLLECTOR_PRODUCER_BY_CHANNEL = {
-    CollectorKind.GPU_INVENTORY: "DCGM_METRICS_COLLECTOR",
-    CollectorKind.GPU_METRICS: "DCGM_METRICS_COLLECTOR",
-    CollectorKind.HOST_TELEMETRY: "HOST_TELEMETRY_COLLECTOR",
-    CollectorKind.NODE_LOGS: "NODE_LOG_COLLECTOR",
-    CollectorKind.NVIDIA_KERNEL: "KERNEL_LOG_COLLECTOR",
-    CollectorKind.FABRIC_MANAGER_LOG: ("FABRIC_MANAGER_LOG_COLLECTOR"),
-    CollectorKind.HMA_NODE: "KUBERNETES_HMA_NODE_COLLECTOR",
-    CollectorKind.HMA_CLOUDWATCH: "CLOUDWATCH_HMA_COLLECTOR",
-}
 
 
 def collector_producer(channel: CollectorKind) -> str:

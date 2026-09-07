@@ -6,19 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_narration as NARRATION
+from gpu_fault_release import regional_release_state as STATE
+from gpu_fault_release import rollout as ROLLOUT
 
 ROOT = Path(__file__).resolve().parents[2]
-STATE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_state.py"
-)
-NARRATION = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_narration.py"
-)
 
-ROLLOUT = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
 
 TIMESTAMPED_PHASE = re.compile(
     r"^release-phase \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z (?P<phase>[a-z-]+)"

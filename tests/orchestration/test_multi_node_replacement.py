@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from gpu_fault.app import default_simulated_profile
 from gpu_fault.host_health import NodeHealthCategory, NodeHealthFinding
 from gpu_fault.models import RecoveryAction, WorkloadState
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from gpu_fault.store import SqliteStore
 from gpu_fault.watcher import AttemptObservation
 from tests._builders import (

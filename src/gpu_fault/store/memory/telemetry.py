@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Callable, Iterator, Literal, Sequence
+from typing import Any, Iterator, Literal, Sequence
 
 from gpu_fault.attempt_observation_state import (
     attempt_observation_state_is_terminal,
@@ -21,7 +21,6 @@ from gpu_fault.store.shared.attempt_observation_support import (
     memory_attempt_terminal_event,
     memory_terminal_events,
 )
-from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.telemetry_models import (
     GpuFindingKey,
     GpuMetricKey,
@@ -51,34 +50,17 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
     _telemetry_metric_latest: dict[tuple[str, str, str, str], TelemetryMetricLatest]
     _training_progress: dict[tuple[str, str, int], TrainingProgressState]
 
-    _get: Callable[..., Any]
     _gpu_finding_history: dict[str, GpuHealthFinding]
     _lock: Any
-    _put: Callable[..., Any]
 
     def save_collector_metrics_snapshot(
         self, record: CollectorMetricsSnapshotRecord
     ) -> CollectorMetricsSnapshotRecord:
-        if hasattr(self, "_put"):
-            self._put(
-                "collector_metrics_snapshot",
-                "current",
-                record,
-            )
-            return record
         with self._lock:
             self._collector_metrics_snapshot = record
         return record
 
     def get_collector_metrics_snapshot(self) -> CollectorMetricsSnapshotRecord | None:
-        if hasattr(self, "_get"):
-            try:
-                snapshot: CollectorMetricsSnapshotRecord = self._get(
-                    "collector_metrics_snapshot", "current"
-                )
-                return snapshot
-            except NotFoundError:
-                return None
         with self._lock:
             return self._collector_metrics_snapshot
 
@@ -376,13 +358,6 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
         return sum(
             int(self._terminalize_attempt_observation(event)) for event in candidates
         )
-
-    def save_attempt_observations_batch(
-        self, observations: Sequence[AttemptObservation]
-    ) -> list[bool]:
-        return [
-            self.save_attempt_observation(observation) for observation in observations
-        ]
 
     def list_attempt_observations(self, cluster_id: str) -> list[AttemptObservation]:
         with self._lock:

@@ -887,6 +887,29 @@ def _aurora_resources(
                 delete_policy=_policy(security_ownership),
             )
         )
+    # The diagnostics parameter group (``<cluster>-pg``) is ours the same way the
+    # subnet group is: created by name, attached to the cluster, and deletable
+    # only once the cluster is gone -- so the cluster depends on it. States
+    # written before the group existed carry no name and register nothing.
+    parameter_group = aurora.get("parameter_group")
+    if parameter_group:
+        group_ownership = _ownership(
+            aurora.get("parameter_group_ownership"),
+            default=InstallationResourceOwnership.CREATED,
+        )
+        cluster_dependencies.append("aws/aurora/parameter-group")
+        resources.append(
+            _record(
+                site_id=site_id,
+                resource_key="aws/aurora/parameter-group",
+                resource_type="rds_cluster_parameter_group",
+                resource_id=str(parameter_group),
+                region=region,
+                account_id=account_id,
+                ownership=group_ownership,
+                delete_policy=_policy(group_ownership),
+            )
+        )
     resources.append(
         _record(
             site_id=site_id,

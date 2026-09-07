@@ -52,13 +52,22 @@ def test_the_diagnostic_parameters_and_apply_methods_are_pinned() -> None:
 
 
 def test_the_group_is_attached_on_create_and_by_a_guarded_modify() -> None:
+    """The create itself is issued by ``gpu_fault.admin.aurora_capacity`` -- the
+    one writer of the ACU window, shared with ``gpu-fault-admin`` -- so the
+    script hands the group over as ``--parameter-group`` and the module's argv
+    builder (pinned in ``tests/admin/test_admin_aurora_capacity.py``) attaches
+    it. What stays the script's job is the guarded modify for an existing
+    cluster."""
+
     body = _ensure_aurora()
 
-    create = body.index("aws rds create-db-cluster \\")
-    create_end = body.index("--region", body.index("--tags", create))
-    assert (
-        '--db-cluster-parameter-group-name "${parameter_group}"'
-        in body[create:create_end]
+    create = body.index("python3.12 -m gpu_fault.admin.aurora_capacity")
+    create_end = body.index("\n    else\n", create)
+    assert "\n            create \\\n" in body[create:create_end]
+    assert '--parameter-group "${parameter_group}"' in body[create:create_end]
+    assert '--engine-version "${AURORA_ENGINE_VERSION}"' in body[create:create_end]
+    assert "aws rds create-db-cluster \\" not in body, (
+        "the script must not spell the create itself"
     )
     assert "--query 'DBClusters[0].DBClusterParameterGroup'" in body
     guard = body.index('[[ "${current_parameter_group}" != "${parameter_group}" ]]')

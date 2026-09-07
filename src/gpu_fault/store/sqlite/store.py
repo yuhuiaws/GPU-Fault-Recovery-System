@@ -1,31 +1,16 @@
 from __future__ import annotations
 
 import sqlite3
+from threading import RLock
+from typing import TYPE_CHECKING
 
-from pydantic import BaseModel
-
-from gpu_fault.models import (
-    AdvisoryNotification,
-    CompletionDecision,
-    DiagnosticRequest,
-    EfaTrafficAdminDecision,
-    EfaTrafficState,
-    EffectiveRuntimeProfile,
-    FaultIncident,
-    HealthSignalState,
-    NodeMarker,
-    NotificationDelivery,
-    NotificationDispatchWatermark,
-    NotificationResult,
-    RecoveryPlan,
-    RestartBudgetState,
-    TerminalEvent,
-    TriageReport,
-    WorkflowRequest,
-    XidMetricBaseline,
+from gpu_fault.store.memory.telemetry_spool import MemoryTelemetrySpoolMixin
+from gpu_fault.store.shared.compositions import SharedCompositionMixin
+from gpu_fault.store.shared.control_records import SharedControlRecordMixin
+from gpu_fault.store.shared.efa import (
+    SharedEfaTrafficMixin,
+    SharedEfaTrafficRulesMixin,
 )
-from gpu_fault.policy import Nvlink74BitOccurrenceState
-from gpu_fault.store.memory.store import InMemoryStore
 from gpu_fault.store.shared.errors import (
     EfaTrafficAdminConflict as EfaTrafficAdminConflict,
 )
@@ -35,10 +20,21 @@ from gpu_fault.store.shared.errors import (
 from gpu_fault.store.shared.errors import (
     WorkflowLeaseError as WorkflowLeaseError,
 )
+from gpu_fault.store.shared.fleet import SharedFleetMixin
+from gpu_fault.store.shared.notifications import SharedNotificationMixin
+from gpu_fault.store.shared.primitives import (
+    SharedRecordAccessMixin,
+    StorePrimitives,
+)
+from gpu_fault.store.shared.processor_leases import SharedProcessorLeaseMixin
+from gpu_fault.store.shared.record_models import record_models
+from gpu_fault.store.shared.remote_commands import SharedRemoteCommandMixin
+from gpu_fault.store.shared.telemetry_records import SharedTelemetryRecordMixin
 from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflowMixin
+from gpu_fault.store.shared.workflow_records import SharedWorkflowRecordMixin
+from gpu_fault.store.shared.xid import SharedXidMixin, SharedXidSignalMixin
 from gpu_fault.store.sqlite.control_records import SqliteControlRecordMixin
 from gpu_fault.store.sqlite.core import SqliteCoreMixin
-from gpu_fault.store.sqlite.efa import SqliteEfaTrafficMixin
 from gpu_fault.store.sqlite.fleet import SqliteFleetMixin
 from gpu_fault.store.sqlite.notifications import SqliteNotificationMixin
 from gpu_fault.store.sqlite.processor_leases import SqliteProcessorLeaseMixin
@@ -50,9 +46,9 @@ from gpu_fault.store.sqlite.xid import SqliteXidMixin
 
 
 class SqliteStore(
+    # SQLite-specific statements first: they override the shared templates.
     SqliteCoreMixin,
     SqliteControlRecordMixin,
-    SqliteEfaTrafficMixin,
     SqliteFleetMixin,
     SqliteNotificationMixin,
     SqliteRemoteCommandMixin,
@@ -62,7 +58,23 @@ class SqliteStore(
     SqliteTelemetryMixin,
     SqliteProcessorQueueMixin,
     SqliteProcessorLeaseMixin,
-    InMemoryStore,
+    # Dialect-neutral templates over the key/value primitives.
+    SharedRecordAccessMixin,
+    SharedControlRecordMixin,
+    SharedEfaTrafficMixin,
+    SharedFleetMixin,
+    SharedNotificationMixin,
+    SharedRemoteCommandMixin,
+    SharedWorkflowRecordMixin,
+    SharedXidMixin,
+    SharedTelemetryRecordMixin,
+    SharedProcessorLeaseMixin,
+    # Pure rules and public-contract compositions every store shares.
+    SharedEfaTrafficRulesMixin,
+    SharedXidSignalMixin,
+    SharedCompositionMixin,
+    # The telemetry spool is not durable on SQLite; see the mixin docstring.
+    MemoryTelemetrySpoolMixin,
 ):
     """Durable single-writer store for active executor deployments.
 
@@ -71,112 +83,13 @@ class SqliteStore(
     with PostgreSQL or DynamoDB conditional writes.
     """
 
-    _MODELS: dict[str, type[BaseModel]] = {
-        "event": TerminalEvent,
-        "decision": CompletionDecision,
-        "marker": NodeMarker,
-        "diagnostic": DiagnosticRequest,
-        "triage": TriageReport,
-        "plan": RecoveryPlan,
-        "profile": EffectiveRuntimeProfile,
-        "incident": FaultIncident,
-        "workflow": WorkflowRequest,
-        "notification": AdvisoryNotification,
-        "notification_delivery": NotificationDelivery,
-        "notification_result": NotificationResult,
-        "notification_watermark": NotificationDispatchWatermark,
-        "restart_budget": RestartBudgetState,
-        "xid_metric_baseline": XidMetricBaseline,
-        "health_signal_state": HealthSignalState,
-        "efa_traffic_state": EfaTrafficState,
-        "efa_traffic_admin_decision": EfaTrafficAdminDecision,
-    }
-
     def __init__(self, path: str) -> None:
-        super().__init__()
-        from gpu_fault.fleet import (
-            AgentRecord,
-            FleetDeployment,
-            MultiNodeBarrier,
-        )
-        from gpu_fault.gpu_metrics import (
-            GpuFindingState,
-            GpuHealthFinding,
-            GpuInventorySnapshot,
-            GpuMetricLatest,
-            GpuMetricsIngestionResult,
-        )
-        from gpu_fault.hyperpod import (
-            HyperPodSubmissionRecord,
-        )
-        from gpu_fault.installation_resources import InstallationResource
-        from gpu_fault.managed_recovery import (
-            HyperPodNodeIdentity,
-        )
-        from gpu_fault.policy import (
-            FaultPolicyDecision,
-            XidCorrelationRecord,
-            XidEvent,
-        )
-        from gpu_fault.processor import (
-            PeriodicTaskLease,
-            ProcessorLaneLease,
-            ProcessorLeadership,
-            ProcessorRequest,
-        )
-        from gpu_fault.regional import (
-            RegionalClusterRegistration,
-            RegionalRegistryHead,
-            RegionalRegistryMember,
-            RegionalRegistryRevision,
-            RemoteActionCommand,
-        )
-        from gpu_fault.telemetry import (
-            CollectorMetricsSnapshotRecord,
-            CollectorStatus,
-            RawEvidenceRecord,
-            TelemetryMetricLatest,
-            WorkloadObservationState,
-        )
-        from gpu_fault.training_health import (
-            TrainingProgressState,
-        )
-
-        self._models = {
-            **self._MODELS,
-            "agent": AgentRecord,
-            "fleet_deployment": FleetDeployment,
-            "barrier": MultiNodeBarrier,
-            "gpu_metric_latest": GpuMetricLatest,
-            "gpu_inventory_snapshot": GpuInventorySnapshot,
-            "gpu_finding_state": GpuFindingState,
-            "gpu_finding_history": GpuHealthFinding,
-            "gpu_metrics_batch": GpuMetricsIngestionResult,
-            "collector_status": CollectorStatus,
-            "collector_metrics_snapshot": CollectorMetricsSnapshotRecord,
-            "telemetry_metric_latest": TelemetryMetricLatest,
-            "attempt_observation": WorkloadObservationState,
-            "training_progress": TrainingProgressState,
-            "raw_evidence": RawEvidenceRecord,
-            "hyperpod_node_identity": HyperPodNodeIdentity,
-            "hyperpod_submission": HyperPodSubmissionRecord,
-            "regional_cluster": RegionalClusterRegistration,
-            "regional_registry_head": RegionalRegistryHead,
-            "regional_registry_member": RegionalRegistryMember,
-            "regional_registry_revision": RegionalRegistryRevision,
-            "installation_resource": InstallationResource,
-            "remote_command": RemoteActionCommand,
-            "processor_leadership": ProcessorLeadership,
-            "periodic_task_lease": PeriodicTaskLease,
-            "processor_lane": ProcessorLaneLease,
-            "processor_request": ProcessorRequest,
-            "xid_correlation_event": XidEvent,
-            "xid_policy_decision": FaultPolicyDecision,
-            "xid_correlation": XidCorrelationRecord,
-            "xid74_occurrence_state": Nvlink74BitOccurrenceState,
-            "efa_traffic_state": EfaTrafficState,
-            "efa_traffic_admin_decision": EfaTrafficAdminDecision,
-        }
+        # One connection for the process, so every statement and every
+        # transaction runs under this lock (see ``_statement_guard`` and
+        # ``_state_transaction``).
+        self._lock = RLock()
+        self._telemetry_spool = {}
+        self._models = record_models()
         self.path = path
         self._db = sqlite3.connect(
             path,
@@ -247,3 +160,9 @@ class SqliteStore(
             WHERE kind='marker'
             """
         )
+
+
+if TYPE_CHECKING:
+
+    def _assert_primitives(store: SqliteStore) -> None:
+        _primitives: StorePrimitives = store

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +12,7 @@ from typing import Callable
 from gpu_fault.channel_registry import TRAINING_PROGRESS_PATH
 from gpu_fault.training_health import TrainingProgressHeartbeat
 
+from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.sinks import CollectorError, EventSink
 
 LOGGER = logging.getLogger(__name__)
@@ -85,3 +88,26 @@ class TrainingProgressCollector:
             except Exception:
                 LOGGER.exception("training progress collection failed")
             time.sleep(self.interval_seconds)
+
+
+def build_from_environment(
+    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
+) -> TrainingProgressCollector:
+    """The ``gpu-fault-collector training-progress`` factory named by the registry."""
+
+    if not arguments.attempt_id or arguments.rank is None:
+        raise SystemExit("training-progress requires --attempt-id and --rank")
+    return TrainingProgressCollector(
+        sink,
+        cluster_id=context.cluster_id,
+        attempt_id=arguments.attempt_id,
+        rank=arguments.rank,
+        progress_path=arguments.progress_file,
+        node_id=os.getenv("NODE_NAME") or os.getenv("HOSTNAME"),
+        pod_uid=os.getenv("POD_UID"),
+        container_name=os.getenv("CONTAINER_NAME", "trainer"),
+        gpu_uuids=[
+            item for item in os.getenv("GPU_FAULT_GPU_UUIDS", "").split(",") if item
+        ],
+        interval_seconds=arguments.interval_seconds,
+    )

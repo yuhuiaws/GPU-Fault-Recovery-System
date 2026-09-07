@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import default_simulated_profile
 from gpu_fault.models import WorkflowOperation, WorkloadState
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from gpu_fault.policy import (
     GpuFaultPolicyEngine,
     SxidClassification,

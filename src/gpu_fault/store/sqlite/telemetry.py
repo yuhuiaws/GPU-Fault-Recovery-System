@@ -5,24 +5,14 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Callable, ContextManager, Literal, Sequence, cast
 
-from gpu_fault.attempt_observation_state import (
-    attempt_observation_state_is_terminal,
-    terminal_attempt_observation_state,
-)
 from gpu_fault.gpu_metric_models import GpuFindingState, GpuHealthFinding
 from gpu_fault.gpu_metrics import (
     GpuInventorySnapshot,
     GpuMetricLatest,
-    GpuMetricsIngestionResult,
-)
-from gpu_fault.models import TerminalEvent
-from gpu_fault.store.shared.attempt_observation_support import (
-    bound_attempt_observation_states,
 )
 from gpu_fault.store.shared.telemetry_models import (
     GpuFindingKey,
     GpuMetricKey,
-    GpuMetricsBatchKey,
 )
 from gpu_fault.telemetry import CollectorStatus
 from gpu_fault.telemetry_models import (
@@ -43,6 +33,11 @@ class SqliteTelemetryMixin:
     _put: Callable[..., Any]
     _state_key: Callable[..., str]
     _state_transaction: Callable[[str], ContextManager[None]]
+    # From SharedTelemetryRecordMixin; the single-sample form below wraps it.
+    observe_gpu_metrics: Callable[
+        [Sequence[tuple[GpuMetricKey, GpuMetricLatest]]],
+        list[GpuMetricLatest | Literal[False] | None],
+    ]
 
     @contextmanager
     def collector_ingestion_transaction(
@@ -57,64 +52,10 @@ class SqliteTelemetryMixin:
         ):
             yield
 
-    def get_gpu_metrics_batch(
-        self, key: GpuMetricsBatchKey
-    ) -> GpuMetricsIngestionResult | None:
-        return cast(
-            "GpuMetricsIngestionResult | None",
-            self._get_optional("gpu_metrics_batch", self._state_key(key)),
-        )
-
-    def save_gpu_metrics_batch(
-        self,
-        key: GpuMetricsBatchKey,
-        result: GpuMetricsIngestionResult,
-    ) -> GpuMetricsIngestionResult:
-        storage_key = self._state_key(key)
-        with self._state_transaction(f"gpu_metrics_batch/{storage_key}"):
-            existing = cast(
-                "GpuMetricsIngestionResult | None",
-                self._get_optional("gpu_metrics_batch", storage_key),
-            )
-            if existing is not None:
-                return existing.model_copy(update={"duplicate": True})
-            self._put("gpu_metrics_batch", storage_key, result)
-            return result
-
-    def observe_gpu_metrics(
-        self, items: Sequence[tuple[GpuMetricKey, GpuMetricLatest]]
-    ) -> list[GpuMetricLatest | Literal[False] | None]:
-        if not items:
-            return []
-        lock_key = self._state_key(items[0][0][:2])
-        with self._state_transaction(f"gpu_metric_latest/batch/{lock_key}"):
-            results: list[GpuMetricLatest | Literal[False] | None] = []
-            for key, latest in items:
-                storage_key = self._state_key(key)
-                previous = cast(
-                    "GpuMetricLatest | None",
-                    self._get_optional("gpu_metric_latest", storage_key),
-                )
-                if previous is not None and latest.observed_at <= previous.observed_at:
-                    results.append(False)
-                    continue
-                self._put("gpu_metric_latest", storage_key, latest)
-                results.append(previous)
-            return results
-
     def observe_gpu_metric(
         self, key: GpuMetricKey, latest: GpuMetricLatest
     ) -> GpuMetricLatest | Literal[False] | None:
         return self.observe_gpu_metrics([(key, latest)])[0]
-
-    def list_gpu_metrics_latest(
-        self, cluster_id: str, node_id: str
-    ) -> list[GpuMetricLatest]:
-        return [
-            item
-            for item in cast("list[GpuMetricLatest]", self._list("gpu_metric_latest"))
-            if item.cluster_id == cluster_id and item.node_id == node_id
-        ]
 
     def observe_gpu_inventory_snapshots(
         self, snapshots: Sequence[GpuInventorySnapshot]
@@ -169,27 +110,6 @@ class SqliteTelemetryMixin:
                     snapshot,
                 )
             return results
-
-    def save_gpu_inventory_snapshot(
-        self, snapshot: GpuInventorySnapshot
-    ) -> GpuInventorySnapshot | None:
-        previous = self.observe_gpu_inventory_snapshots([snapshot])[0]
-        if previous is False:
-            return self.get_gpu_inventory_snapshot(
-                snapshot.cluster_id, snapshot.node_id
-            )
-        return snapshot
-
-    def get_gpu_inventory_snapshot(
-        self, cluster_id: str, node_id: str
-    ) -> GpuInventorySnapshot | None:
-        return cast(
-            "GpuInventorySnapshot | None",
-            self._get_optional(
-                "gpu_inventory_snapshot",
-                self._state_key((cluster_id, node_id)),
-            ),
-        )
 
     def get_gpu_finding_states(
         self, keys: Sequence[GpuFindingKey]
@@ -338,9 +258,6 @@ class SqliteTelemetryMixin:
                 self._put("collector_status", storage_key, status)
             return results
 
-    def save_collector_status(self, status: CollectorStatus) -> bool:
-        return self.save_collector_statuses_batch([status])[0]
-
     def list_collector_statuses(
         self, cluster_id: str, node_id: str | None = None
     ) -> list[CollectorStatus]:
@@ -396,9 +313,6 @@ class SqliteTelemetryMixin:
                 )
             return results
 
-    def observe_telemetry_metric(self, latest: TelemetryMetricLatest) -> bool:
-        return self.observe_telemetry_metrics([latest])[0]
-
     def list_telemetry_metrics_latest(
         self, cluster_id: str, node_id: str
     ) -> list[TelemetryMetricLatest]:
@@ -410,77 +324,6 @@ class SqliteTelemetryMixin:
             if item.cluster_id == cluster_id and item.node_id == node_id
         ]
 
-    def save_attempt_observation(self, observation: AttemptObservation) -> bool:
-        storage_key = self._state_key((observation.cluster_id, observation.attempt_id))
-        with self._state_transaction(f"attempt_observation/{storage_key}"):
-            event = cast(
-                "TerminalEvent | None",
-                self._get_optional(
-                    "event",
-                    (
-                        f"{observation.cluster_id}/{observation.attempt_id}/"
-                        "TrainingAttemptTerminal"
-                    ),
-                ),
-            )
-            if event is not None:
-                self._terminalize_attempt_observation(event)
-                return False
-            previous = cast(
-                "WorkloadObservationState | None",
-                self._get_optional("attempt_observation", storage_key),
-            )
-            if (
-                previous is not None
-                and observation.observed_at < previous.observation.observed_at
-            ):
-                return False
-            self._put(
-                "attempt_observation",
-                storage_key,
-                WorkloadObservationState(
-                    first_observed_at=(
-                        previous.first_observed_at
-                        if previous is not None
-                        else observation.observed_at
-                    ),
-                    observation=observation,
-                ),
-            )
-            return True
-
-    def _terminalize_attempt_observation(self, event: TerminalEvent) -> bool:
-        storage_key = self._state_key((event.cluster_id, event.attempt_id))
-        previous = cast(
-            "WorkloadObservationState | None",
-            self._get_optional("attempt_observation", storage_key),
-        )
-        terminal = terminal_attempt_observation_state(event, previous)
-        if terminal == previous:
-            return False
-        self._put("attempt_observation", storage_key, terminal)
-        return True
-
-    def _reconcile_terminal_attempt_observations(self, limit: int) -> int:
-        if limit < 1:
-            return 0
-        candidates = [
-            item
-            for item in sorted(
-                cast("list[TerminalEvent]", self._list("event")),
-                key=lambda value: (value.ended_at, value.event_key),
-            )
-            if not attempt_observation_state_is_terminal(
-                self._get_optional(
-                    "attempt_observation",
-                    self._state_key((item.cluster_id, item.attempt_id)),
-                )
-            )
-        ][:limit]
-        return sum(
-            int(self._terminalize_attempt_observation(event)) for event in candidates
-        )
-
     def list_attempt_observations(self, cluster_id: str) -> list[AttemptObservation]:
         return [
             item.observation
@@ -490,82 +333,11 @@ class SqliteTelemetryMixin:
             if item.observation.cluster_id == cluster_id
         ]
 
-    def list_attempt_observation_states(
-        self,
-        cluster_id: str | None = None,
-        *,
-        limit: int | None = None,
-        newest_first: bool = False,
-    ) -> list[WorkloadObservationState]:
-        return bound_attempt_observation_states(
-            [
-                item
-                for item in cast(
-                    "list[WorkloadObservationState]", self._list("attempt_observation")
-                )
-                if cluster_id is None or item.observation.cluster_id == cluster_id
-            ],
-            limit=limit,
-            newest_first=newest_first,
-        )
-
-    def observe_training_progress(
-        self, progress: TrainingProgressHeartbeat
-    ) -> TrainingProgressHeartbeat | Literal[False] | None:
-        storage_key = self._state_key(
-            (
-                progress.cluster_id,
-                progress.attempt_id,
-                progress.rank,
-            )
-        )
-        with self._state_transaction(f"training_progress/{storage_key}"):
-            previous = cast(
-                "TrainingProgressState | None",
-                self._get_optional("training_progress", storage_key),
-            )
-            if (
-                previous is not None
-                and progress.observed_at <= previous.heartbeat.observed_at
-            ):
-                return False
-            advanced = (
-                previous is None
-                or progress.step is None
-                or previous.heartbeat.step is None
-                or progress.step > previous.heartbeat.step
-            )
-            self._put(
-                "training_progress",
-                storage_key,
-                TrainingProgressState(
-                    heartbeat=progress,
-                    last_progress_at=(
-                        progress.observed_at
-                        if previous is None or advanced
-                        else previous.last_progress_at
-                    ),
-                ),
-            )
-            return previous.heartbeat if previous is not None else None
-
     def list_training_progress(
         self, cluster_id: str, attempt_id: str | None = None
     ) -> list[TrainingProgressHeartbeat]:
         return [
             item.heartbeat
-            for item in cast(
-                "list[TrainingProgressState]", self._list("training_progress")
-            )
-            if item.heartbeat.cluster_id == cluster_id
-            and (attempt_id is None or item.heartbeat.attempt_id == attempt_id)
-        ]
-
-    def list_training_progress_states(
-        self, cluster_id: str, attempt_id: str | None = None
-    ) -> list[TrainingProgressState]:
-        return [
-            item
             for item in cast(
                 "list[TrainingProgressState]", self._list("training_progress")
             )

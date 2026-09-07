@@ -5,16 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_resume_validation as RESUME
 
 ROOT = Path(__file__).resolve().parents[2]
-RESUME = lazy_script_module(
-    ROOT
-    / "deploy"
-    / "control-plane"
-    / "regional"
-    / "regional_release_resume_validation.py"
-)
 
 
 def _fixture(*, candidate_agent: str = "a" * 64):

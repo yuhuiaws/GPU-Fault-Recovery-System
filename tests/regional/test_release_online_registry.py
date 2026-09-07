@@ -4,12 +4,9 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_online_registry as REGISTRY
 
 ROOT = Path(__file__).resolve().parents[2]
-REGISTRY = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_online_registry.py"
-)
 
 
 def test_join_transition_uses_one_cpu_pod_client(monkeypatch) -> None:

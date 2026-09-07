@@ -7,6 +7,15 @@ from typing import Annotated
 
 from pydantic import BeforeValidator, field_validator
 
+# The unit and silence tables are rows of the collector registry; they keep
+# their historical import path here.
+from gpu_fault.collector_registry import (
+    COLLECTOR_SYSTEMD_UNITS as COLLECTOR_SYSTEMD_UNITS,
+)
+from gpu_fault.collector_registry import (
+    collector_silent_thresholds as collector_silent_thresholds,
+)
+from gpu_fault.env import env_bool
 from gpu_fault.models import StrictModel
 from gpu_fault.telemetry import CollectorKind
 
@@ -71,16 +80,6 @@ class CollectorServiceState(StrictModel):
         }
 
 
-COLLECTOR_SYSTEMD_UNITS = {
-    CollectorKind.NVIDIA_KERNEL: "gpu-fault-kernel-collector",
-    CollectorKind.FABRIC_MANAGER_LOG: ("gpu-fault-fabric-manager-collector"),
-    CollectorKind.GPU_INVENTORY: "gpu-fault-metrics-collector",
-    CollectorKind.GPU_METRICS: "gpu-fault-metrics-collector",
-    CollectorKind.HOST_TELEMETRY: "gpu-fault-host-collector",
-    CollectorKind.NODE_LOGS: "gpu-fault-log-collector",
-}
-
-
 def validate_collector_services(value):
     if not isinstance(value, dict):
         return value
@@ -93,29 +92,6 @@ CollectorServices = Annotated[
     BeforeValidator(validate_collector_services),
 ]
 ReportedCollectorServices = dict[str, CollectorServiceState]
-
-
-def collector_silent_thresholds() -> dict[CollectorKind, float]:
-    return {
-        CollectorKind.GPU_INVENTORY: float(
-            os.getenv("GPU_FAULT_GPU_INVENTORY_SILENT_AFTER_SECONDS", "180")
-        ),
-        CollectorKind.GPU_METRICS: float(
-            os.getenv("GPU_FAULT_GPU_METRICS_SILENT_AFTER_SECONDS", "420")
-        ),
-        CollectorKind.HOST_TELEMETRY: float(
-            os.getenv("GPU_FAULT_HOST_TELEMETRY_SILENT_AFTER_SECONDS", "420")
-        ),
-        CollectorKind.NVIDIA_KERNEL: float(
-            os.getenv("GPU_FAULT_KERNEL_SILENT_AFTER_SECONDS", "900")
-        ),
-        CollectorKind.FABRIC_MANAGER_LOG: float(
-            os.getenv("GPU_FAULT_FABRIC_MANAGER_SILENT_AFTER_SECONDS", "900")
-        ),
-        CollectorKind.NODE_LOGS: float(
-            os.getenv("GPU_FAULT_NODE_LOG_SILENT_AFTER_SECONDS", "900")
-        ),
-    }
 
 
 def agent_is_current(agent, *, observed_at: datetime) -> bool:
@@ -133,10 +109,7 @@ def agent_is_current(agent, *, observed_at: datetime) -> bool:
 
 def required_collectors_for_agent(agent) -> set[CollectorKind]:
     states = getattr(agent, "collector_services", {}) or {}
-    require_node_log = (
-        os.getenv("GPU_FAULT_REQUIRE_NODE_LOG_COLLECTOR", "false").strip().lower()
-        == "true"
-    )
+    require_node_log = env_bool("GPU_FAULT_REQUIRE_NODE_LOG_COLLECTOR")
     result = set()
     for kind, unit in COLLECTOR_SYSTEMD_UNITS.items():
         state = states.get(unit)

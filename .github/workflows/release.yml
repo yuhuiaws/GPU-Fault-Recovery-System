@@ -124,6 +124,8 @@ jobs:
             printf 'RUNTIME_IMAGE_CACHE_TO=type=registry,ref=%s:buildcache-linux-amd64,mode=max,image-manifest=true,oci-mediatypes=true\n' \
               "${CACHE_REPOSITORY}" >> "${GITHUB_ENV}"
           fi
+      - name: Install pinned supply-chain tools for the SBOM
+        run: make ci-supply-chain-tools PYTHON=python
       - name: Promote tested candidate to signed release
         run: >-
           make release-build-promoted

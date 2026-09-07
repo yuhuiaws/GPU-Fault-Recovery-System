@@ -6,6 +6,9 @@ from typing import Any
 
 
 class PluginGroup(StrEnum):
+    # Each entry point is a ``gpu_fault.collector_registry.CollectorDescriptor``
+    # named after its CLI command; the collector CLI merges them at start-up.
+    COLLECTORS = "gpu_fault.collectors"
     COLLECTOR_SINKS = "gpu_fault.collector_sinks"
     WORKFLOW_ADAPTERS = "gpu_fault.workflow_adapters"
     NOTIFICATION_BUILDERS = "gpu_fault.notification_builders"

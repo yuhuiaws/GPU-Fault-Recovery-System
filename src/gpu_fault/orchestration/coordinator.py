@@ -9,6 +9,7 @@ from functools import cached_property
 from threading import RLock
 from typing import Any, Sequence
 
+from gpu_fault.env import env_bool
 from gpu_fault.models import (
     bounded_reasons,
     BlockedKind,
@@ -195,13 +196,7 @@ class IncidentOrchestrator:
         self.workflow_preemption_enabled = (
             workflow_preemption_enabled
             if workflow_preemption_enabled is not None
-            else os.getenv(
-                "GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION",
-                "true",
-            )
-            .strip()
-            .lower()
-            == "true"
+            else env_bool("GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION", True)
         )
         self.fault_action_max_age_seconds = (
             fault_action_max_age_seconds

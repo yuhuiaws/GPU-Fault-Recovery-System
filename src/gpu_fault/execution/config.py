@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 from uuid import uuid4
 
+from gpu_fault.env import env_bool
 from gpu_fault.models import (
     WorkflowOperation,
 )
@@ -306,11 +307,8 @@ class ProductionExecutorConfig:
             step_waiting_warning_seconds=step_warning,
             step_waiting_timeout_overrides=overrides,
             node_busy_wait_seconds=node_busy_wait_seconds(values),
-            workflow_preemption_enabled=(
-                values.get("GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION", "true")
-                .strip()
-                .lower()
-                == "true"
+            workflow_preemption_enabled=env_bool(
+                "GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION", True, environ=values
             ),
             remediation_budget=RemediationBudgetPolicy.from_mapping(values),
             workflow_invariant_mode=workflow_invariant_mode(values),
@@ -358,12 +356,14 @@ class WorkflowDispatcherConfig:
     def from_mapping(
         cls, values: Mapping[str, str], executor_enabled: bool
     ) -> WorkflowDispatcherConfig:
-        raw_enabled = values.get("GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER", "true")
+        dispatcher_enabled = env_bool(
+            "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER", True, environ=values
+        )
         poll_interval_seconds = float(
             values.get("GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS", "5")
         )
         return cls(
-            enabled=(executor_enabled and raw_enabled.strip().lower() == "true"),
+            enabled=(executor_enabled and dispatcher_enabled),
             poll_interval_seconds=poll_interval_seconds,
             batch_size=int(values.get("GPU_FAULT_WORKFLOW_BATCH_SIZE", "100")),
             max_workers=int(values.get("GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS", "8")),

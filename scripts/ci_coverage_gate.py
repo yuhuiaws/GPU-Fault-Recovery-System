@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import fnmatch
 import hashlib
 import importlib.metadata
 import json
@@ -20,9 +19,22 @@ from typing import Any, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 
 if __package__:
+    from scripts.ci_coverage_config import (
+        IDENTITY_GROUPS,
+        ROOT,
+        RUNTIME_SHARDS,
+        SHARDS,
+        TEST_DOMAINS as TEST_DOMAINS,
+        _is_excluded,
+        _test_owner,
+        deployment_only_source_files,
+        load_config,
+        pytest_targets,
+        shard_coverage_sources,
+        validate_test_partition,
+    )
     from scripts.ci_coverage_floors import (
         module_floor_violations,
-        validate_module_floors,
     )
     from scripts.ci_gate_artifacts import (
         CoverageGateError,
@@ -39,9 +51,22 @@ if __package__:
         write_outputs,
     )
 else:
+    from ci_coverage_config import (
+        IDENTITY_GROUPS,
+        ROOT,
+        RUNTIME_SHARDS,
+        SHARDS,
+        TEST_DOMAINS as TEST_DOMAINS,
+        _is_excluded,
+        _test_owner,
+        deployment_only_source_files,
+        load_config,
+        pytest_targets,
+        shard_coverage_sources,
+        validate_test_partition,
+    )
     from ci_coverage_floors import (
         module_floor_violations,
-        validate_module_floors,
     )
     from ci_gate_artifacts import (
         CoverageGateError,
@@ -59,12 +84,7 @@ else:
     )
 
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = ROOT / "config/ci-unit-gate.json"
 SCHEMA_VERSION = 1
-RUNTIME_SHARDS = ("runtime_0", "runtime_1", "runtime_2")
-SHARDS = (*RUNTIME_SHARDS, "deployment", "fault_runner", "postgres")
-TEST_DOMAINS = ("runtime", "deployment", "fault_runner", "postgres")
 GATE_NAME = "coverage-shard-gate.json"
 BUNDLE_NAME = "coverage-shard-gate.bundle.json"
 BASE_GATE_NAME = "base-coverage-shard-gate.json"
@@ -74,18 +94,6 @@ PYTEST_RESULTS_NAME = "pytest-results.json"
 STRESS_RESULTS_NAME = "postgres-stress-results.json"
 DURATIONS_NAME = "durations.json"
 ARTIFACT_PREFIX = "gpu-fault-coverage-"
-IDENTITY_GROUPS = {
-    "dependencies",
-    "deployment_source",
-    "deployment_tests",
-    "fault_runner_source",
-    "fault_runner_tests",
-    "postgres_tests",
-    "protocol",
-    "runtime_source",
-    "runtime_tests",
-    "shared_tests",
-}
 FAULT_RUNNER_FILES = {
     "scripts/build-regional-case-index.py",
     "tools/case_scheduler.py",
@@ -104,182 +112,6 @@ def _clean_directory(root: Path, path: Path, label: str) -> Path:
     shutil.rmtree(resolved, ignore_errors=True)
     resolved.mkdir(parents=True)
     return resolved
-
-
-def load_config(root: Path = ROOT) -> dict[str, Any]:
-    path = root / CONFIG_PATH.relative_to(ROOT)
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise CoverageGateError("coverage shard config is invalid") from exc
-    if (
-        not isinstance(value, dict)
-        or value.get("schema_version") != 2
-        or value.get("domain") != "unit"
-        or not isinstance(value.get("coverage"), dict)
-        or not isinstance(value.get("tests"), dict)
-        or not isinstance(value.get("identity"), dict)
-        or not isinstance(value.get("protocol"), dict)
-        or set(value.get("shards", {})) != set(SHARDS)
-        or value["protocol"].get("runtime_partitions") != len(RUNTIME_SHARDS)
-    ):
-        raise CoverageGateError("coverage shard config is incomplete")
-    identity = value["identity"]
-    tests = value["tests"]
-    coverage = value["coverage"]
-    required_lists = (
-        (identity, "exclude_prefixes"),
-        (identity, "exclude_globs"),
-        (identity, "exclude_files"),
-        (identity, "protocol_files"),
-        (tests, "coverage_excluded_files"),
-        (tests, "postgres_files"),
-        (tests, "fault_runner_files"),
-        (tests, "deployment_prefixes"),
-        (tests, "deployment_globs"),
-        (tests, "shared_files"),
-        (coverage, "deployment_only_globs"),
-        (coverage, "application_shared_files"),
-        (coverage, "module_floors"),
-    )
-    if any(not isinstance(mapping.get(name), list) for mapping, name in required_lists):
-        raise CoverageGateError("coverage shard config lists are incomplete")
-    validate_module_floors(coverage["module_floors"])
-    for shard in SHARDS:
-        raw = value["shards"][shard]
-        if (
-            not isinstance(raw, dict)
-            or not isinstance(raw.get("identity_groups"), list)
-            or not isinstance(raw.get("omit_deployment_source"), bool)
-            or not set(raw["identity_groups"]) <= IDENTITY_GROUPS
-        ):
-            raise CoverageGateError(f"coverage shard config is invalid: {shard}")
-    return value
-
-
-def _is_excluded(relative: str, config: Mapping[str, Any]) -> bool:
-    identity = config["identity"]
-    return (
-        relative in set(identity["exclude_files"])
-        or any(
-            relative.startswith(str(value)) for value in identity["exclude_prefixes"]
-        )
-        or any(
-            fnmatch.fnmatchcase(relative, str(pattern))
-            for pattern in identity["exclude_globs"]
-        )
-    )
-
-
-def deployment_only_source_files(
-    root: Path = ROOT,
-    *,
-    config: Mapping[str, Any] | None = None,
-) -> tuple[str, ...]:
-    current = load_config(root) if config is None else config
-    coverage = current["coverage"]
-    shared = set(str(value) for value in coverage["application_shared_files"])
-    result = {
-        path.relative_to(root).as_posix()
-        for path in repository_files(root)
-        if any(
-            fnmatch.fnmatchcase(
-                path.relative_to(root).as_posix(),
-                str(pattern),
-            )
-            for pattern in coverage["deployment_only_globs"]
-        )
-        and path.relative_to(root).as_posix() not in shared
-    }
-    if not result:
-        raise CoverageGateError("deployment-only coverage source is empty")
-    return tuple(sorted(result))
-
-
-def _test_owner(relative: str, config: Mapping[str, Any]) -> str | None:
-    tests = config["tests"]
-    if relative in set(tests["shared_files"]):
-        return "shared_tests"
-    if relative in set(tests["coverage_excluded_files"]):
-        return None
-    if relative in set(tests["postgres_files"]) or relative.startswith(
-        "tests/store/_postgres"
-    ):
-        return "postgres_tests"
-    if relative in set(tests["fault_runner_files"]):
-        return "fault_runner_tests"
-    if any(relative.startswith(str(value)) for value in tests["deployment_prefixes"]):
-        return "deployment_tests"
-    if any(
-        fnmatch.fnmatchcase(relative, str(pattern))
-        for pattern in tests["deployment_globs"]
-    ):
-        return "deployment_tests"
-    return "runtime_tests"
-
-
-def logical_test_domain(shard: str) -> str:
-    return "runtime" if shard in RUNTIME_SHARDS else shard
-
-
-def pytest_targets(root: Path, shard: str) -> tuple[str, ...]:
-    if shard not in SHARDS:
-        raise CoverageGateError(f"unknown coverage shard: {shard}")
-    config = load_config(root)
-    expected_group = f"{logical_test_domain(shard)}_tests"
-    targets = []
-    for path in repository_files(root):
-        relative = path.relative_to(root).as_posix()
-        if (
-            relative.startswith("tests/")
-            and path.name.startswith("test_")
-            and path.suffix == ".py"
-            and _test_owner(relative, config) == expected_group
-        ):
-            targets.append(relative)
-    if not targets:
-        raise CoverageGateError(f"coverage shard has no pytest targets: {shard}")
-    return tuple(sorted(targets))
-
-
-def validate_test_partition(root: Path = ROOT) -> dict[str, int]:
-    config = load_config(root)
-    excluded = set(config["tests"]["coverage_excluded_files"])
-    assigned: dict[str, str] = {}
-    counts = {domain: 0 for domain in TEST_DOMAINS}
-    for path in repository_files(root):
-        relative = path.relative_to(root).as_posix()
-        if (
-            not relative.startswith("tests/")
-            or not path.name.startswith("test_")
-            or path.suffix != ".py"
-        ):
-            continue
-        owner = _test_owner(relative, config)
-        if owner is None:
-            if relative not in excluded:
-                raise CoverageGateError(f"unclassified coverage test: {relative}")
-            continue
-        shard = owner.removesuffix("_tests")
-        if shard not in TEST_DOMAINS or relative in assigned:
-            raise CoverageGateError(f"coverage test has invalid owner: {relative}")
-        assigned[relative] = shard
-        counts[shard] += 1
-    configured = {
-        *config["tests"]["postgres_files"],
-        *config["tests"]["fault_runner_files"],
-        *excluded,
-    }
-    missing = sorted(
-        relative for relative in configured if not (root / relative).is_file()
-    )
-    if missing:
-        raise CoverageGateError(
-            "configured coverage tests are missing: " + ", ".join(missing)
-        )
-    if any(not count for count in counts.values()):
-        raise CoverageGateError("one or more coverage shards are empty")
-    return counts
 
 
 def _is_dependency(relative: str) -> bool:
@@ -452,7 +284,7 @@ def shard_identity(
     }
     protocol = dict(config["protocol"])
     protocol["coverage_branch"] = bool(config["coverage"]["branch"])
-    protocol["coverage_source"] = str(config["coverage"]["source"])
+    protocol["coverage_sources"] = list(shard_coverage_sources(config, shard))
     protocol["pytest_workers"] = (
         pytest_workers
         or os.getenv("PYTEST_XDIST_WORKERS")
@@ -849,20 +681,30 @@ def build_shard_gate(
     return gate
 
 
-def write_coverage_config(root: Path, shard: str, output: Path) -> None:
-    config = load_config(root)
-    lines = [
+def _coverage_run_section(
+    config: Mapping[str, Any], sources: Sequence[str]
+) -> list[str]:
+    return [
         "[run]",
         f"branch = {str(bool(config['coverage']['branch'])).lower()}",
         "relative_files = true",
         "source =",
-        f"    {config['coverage']['source']}",
+        *(f"    {source}" for source in sources),
     ]
+
+
+def write_coverage_config(root: Path, shard: str, output: Path) -> None:
+    config = load_config(root)
+    sources = shard_coverage_sources(config, shard)
+    lines = _coverage_run_section(config, sources)
     if config["shards"][shard]["omit_deployment_source"]:
+        # Only files under a root this shard measures need omitting; the
+        # deployment-only roots are already absent from ``source``.
         lines.extend(["omit ="])
         lines.extend(
             f"    {relative}"
             for relative in deployment_only_source_files(root, config=config)
+            if any(relative.startswith(f"{source}/") for source in sources)
         )
     lines.extend(["", "[report]", "show_missing = true", ""])
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -986,7 +828,7 @@ def run_shard(
         [
             "-p",
             "tools.pytest_case_reporter",
-            f"--cov={config['coverage']['source']}",
+            *(f"--cov={source}" for source in shard_coverage_sources(config, shard)),
             "--cov-branch",
             f"--cov-config={coverage_config}",
             "--cov-report=",
@@ -1229,11 +1071,9 @@ def combine_shards(
     final_config.write_text(
         "\n".join(
             [
-                "[run]",
-                f"branch = {str(bool(config['coverage']['branch'])).lower()}",
-                "relative_files = true",
-                "source =",
-                f"    {config['coverage']['source']}",
+                *_coverage_run_section(
+                    config, [str(item) for item in config["coverage"]["sources"]]
+                ),
                 "",
                 "[report]",
                 "show_missing = true",

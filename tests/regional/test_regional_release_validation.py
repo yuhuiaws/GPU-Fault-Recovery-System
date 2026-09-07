@@ -20,15 +20,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_admin_commands as ADMIN
+from gpu_fault_release import regional_validation_evidence as EVIDENCE
 
 ROOT = Path(__file__).resolve().parents[2]
-ADMIN = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_admin_commands.py"
-)
-EVIDENCE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_validation_evidence.py"
-)
 
 
 def _release() -> SimpleNamespace:
@@ -48,7 +43,7 @@ def _persisted_diff(module, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_next_deploy_labels_a_completed_transaction_pending_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = ADMIN.load()
+    module = ADMIN
     _persisted_diff(module, monkeypatch)
 
     result = module.next_deploy(
@@ -87,7 +82,7 @@ def test_next_deploy_withholds_pending_commit_from_every_other_resume(
     the finished release.
     """
 
-    module = ADMIN.load()
+    module = ADMIN
     _persisted_diff(module, monkeypatch)
     state: dict[str, object] = {"phase": phase, "release_id": "release-a"}
     if committed is not None:
@@ -102,7 +97,7 @@ def test_next_deploy_withholds_pending_commit_from_every_other_resume(
 def test_next_deploy_withholds_pending_commit_from_a_rollback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = ADMIN.load()
+    module = ADMIN
     _persisted_diff(module, monkeypatch)
 
     result = module.next_deploy(
@@ -128,7 +123,7 @@ def test_reused_checks_replace_the_verifier_scripts_they_name() -> None:
     exactly the part it covers.
     """
 
-    module = EVIDENCE.load()
+    module = EVIDENCE
     commands: list[list[str]] = []
 
     def run(arguments, **_kwargs):

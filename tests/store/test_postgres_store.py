@@ -558,14 +558,17 @@ def test_postgres_remediation_budget_claim_is_atomic() -> None:
             left.fencing_token,
             remediation_budget_claims=claims,
         )
-        with pytest.raises(RemediationBudgetError, match="cluster:cluster-a"):
+        with pytest.raises(RemediationBudgetError, match="cluster:cluster-a") as raised:
             second.claim_workflow(
                 right.request_id,
                 "executor-right",
                 right.fencing_token,
                 remediation_budget_claims=claims,
             )
-        assert second.get_workflow(right.request_id).remediation_budget_wait_count == 1
+        assert raised.value.scope == "cluster:cluster-a"
+        blocked = second.get_workflow(right.request_id)
+        assert blocked.remediation_budget_wait_count == 1
+        assert blocked.remediation_budget_last_blocked_scope == "cluster:cluster-a"
     finally:
         first.close()
         second.close()

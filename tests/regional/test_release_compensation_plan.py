@@ -2,15 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_diff as DIFF
+from gpu_fault_release import regional_release_progress as PROGRESS
 
 ROOT = Path(__file__).resolve().parents[2]
-PROGRESS = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_progress.py"
-)
-DIFF = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_diff.py"
-)
 
 
 def _state(*components, completed_phases=(), completed_clusters=()):

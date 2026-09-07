@@ -1,14 +1,10 @@
-from importlib import import_module
-from typing import Any
+from gpu_fault.lazy_exports import lazy_module
 
-__all__ = ["KubernetesWorkflowAdapter"]
+_EXPORTS = {
+    "KubernetesWorkflowAdapter": (
+        "gpu_fault.adapters.kubernetes.adapter",
+        "KubernetesWorkflowAdapter",
+    ),
+}
 
-
-def __getattr__(name: str) -> Any:
-    if name != "KubernetesWorkflowAdapter":
-        raise AttributeError(name)
-    value = import_module(
-        "gpu_fault.adapters.kubernetes.adapter"
-    ).KubernetesWorkflowAdapter
-    globals()[name] = value
-    return value
+__getattr__, __dir__, __all__ = lazy_module(globals(), _EXPORTS)

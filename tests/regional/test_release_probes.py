@@ -16,14 +16,13 @@ from pathlib import Path
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_probes as PROBES
+from gpu_fault_release import rollout as RUNNER
 
 ROOT = Path(__file__).resolve().parents[2]
-REGIONAL = ROOT / "deploy/control-plane/regional"
-PROBE_DIR = REGIONAL / "probes"
+ENGINE = ROOT / "src/gpu_fault_release"
+PROBE_DIR = ROOT / "deploy/control-plane/regional/probes"
 
-PROBES = lazy_script_module(REGIONAL / "regional_release_probes.py")
-RUNNER = lazy_script_module(REGIONAL / "rollout_regional_release.py")
 
 # The one probe that runs on the deploy host rather than in a Pod, so it is the
 # only one allowed the deploy host's dependencies. Adding a name here means
@@ -53,7 +52,7 @@ def call_sites() -> dict[str, list[Path]]:
 
     pattern = re.compile(r'probe_source\(\s*"([a-z0-9_]+)"\s*\)')
     sites: dict[str, list[Path]] = {}
-    for path in sorted(REGIONAL.glob("*.py")):
+    for path in sorted(ENGINE.glob("*.py")):
         for name in pattern.findall(path.read_text(encoding="utf-8")):
             sites.setdefault(name, []).append(path)
     return sites
@@ -89,7 +88,7 @@ def test_no_engine_module_still_carries_an_inline_program() -> None:
     """
 
     offenders: list[str] = []
-    for path in sorted(REGIONAL.glob("*.py")):
+    for path in sorted(ENGINE.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):

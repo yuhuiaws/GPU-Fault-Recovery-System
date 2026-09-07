@@ -27,9 +27,9 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkloadState,
 )
+from gpu_fault.orchestration import IncidentOrchestrator
 from gpu_fault.orchestration.arbitration import RecoveryArbiter
 from gpu_fault.orchestration.families.conflicts import NodeConflictService
-from gpu_fault.orchestrator import IncidentOrchestrator
 from gpu_fault.store import InMemoryStore, NotFoundError, SqliteStore
 from gpu_fault.watcher import AttemptObservation
 from tests._builders import (

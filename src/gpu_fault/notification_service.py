@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any
 
+from gpu_fault.env import env_bool
 from gpu_fault.models import (
     AdvisoryNotification,
     NotificationDelivery,
@@ -221,27 +222,15 @@ class AdvisoryNotificationService:
             ),
         )
         self.async_delivery = (
-            os.getenv(
-                "GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY",
-                "false",
-            ).lower()
-            == "true"
+            env_bool("GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY", False)
             if async_delivery is None
             else async_delivery
         )
-        self.dispatcher_enabled = (
-            os.getenv(
-                "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED",
-                "false",
-            ).lower()
-            == "true"
+        self.dispatcher_enabled = env_bool(
+            "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED", False
         )
         self.deliver_backlog = (
-            os.getenv(
-                "GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG",
-                "false",
-            ).lower()
-            == "true"
+            env_bool("GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG", False)
             if deliver_backlog is None
             else deliver_backlog
         )
@@ -275,11 +264,7 @@ class AdvisoryNotificationService:
         # pressure test raising 16,384: opt in per deployment if the point
         # of the drill is to exercise the mail path itself.
         self.deliver_drills = (
-            os.getenv(
-                "GPU_FAULT_NOTIFICATION_DELIVER_DRILLS",
-                "false",
-            ).lower()
-            == "true"
+            env_bool("GPU_FAULT_NOTIFICATION_DELIVER_DRILLS", False)
             if deliver_drills is None
             else deliver_drills
         )

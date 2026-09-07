@@ -459,7 +459,7 @@ def test_regional_production_assets_have_no_implicit_region() -> None:
     paths = (
         "deploy/control-plane/regional/regional-env.example.sh",
         "deploy/control-plane/regional/regional-release.example.json",
-        "deploy/control-plane/regional/rollout_regional_release.py",
+        "src/gpu_fault_release/rollout.py",
         "deploy/control-plane/regional/regional-control-plane-patch.yaml",
         "deploy/control-plane/regional/regional-control-plane-nlb.yaml",
         "deploy/control-plane/tools/apply-control-plane-role-split.sh",

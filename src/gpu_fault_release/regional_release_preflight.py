@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+import ipaddress
+import json
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+from gpu_fault_release.regional_release_config import (
+    EKS_ARN_PATTERN,
+    ReleaseError,
+)
+
+
+def _context_eks_arn(runner: Any, kubectl: list[str], *, label: str) -> str:
+    cluster = runner.run(
+        kubectl
+        + [
+            "config",
+            "view",
+            "--minify",
+            "-o",
+            "jsonpath={.contexts[0].context.cluster}",
+        ],
+        capture=True,
+    )
+    if EKS_ARN_PATTERN.fullmatch(cluster) is None:
+        raise ReleaseError(
+            f"{label} kubeconfig cluster identity is not an EKS ARN; "
+            "regenerate it with aws eks update-kubeconfig"
+        )
+    return cluster
+
+
+def _validate_hyperpod_cluster(
+    runner: Any,
+    *,
+    region: str,
+    cluster_name: str,
+    expected_eks_arn: str,
+    require_node_recovery_none: bool,
+) -> None:
+    raw = runner.run(
+        [
+            "aws",
+            "sagemaker",
+            "describe-cluster",
+            "--region",
+            region,
+            "--cluster-name",
+            cluster_name,
+            "--query",
+            "{EksClusterArn:Orchestrator.Eks.ClusterArn,NodeRecovery:NodeRecovery}",
+            "--output",
+            "json",
+        ],
+        capture=True,
+    )
+    value = json.loads(raw)
+    if value.get("EksClusterArn") != expected_eks_arn:
+        raise ReleaseError(
+            f"HyperPod cluster {cluster_name} does not target "
+            f"configured EKS ARN {expected_eks_arn}"
+        )
+    if require_node_recovery_none and value.get("NodeRecovery") != "None":
+        raise ReleaseError(
+            f"HyperPod cluster {cluster_name} must set NodeRecovery=None"
+        )
+
+
+def _validate_agent_endpoint_cidrs(
+    runner: Any,
+    kubectl: list[str],
+    *,
+    cluster_id: str,
+    hyperpod_cluster_name: str,
+    configured_cidrs: tuple[str, ...],
+) -> None:
+    networks = tuple(
+        ipaddress.ip_network(value, strict=False) for value in configured_cidrs
+    )
+    if not networks:
+        raise ReleaseError(f"{cluster_id} requires Agent endpoint CIDRs")
+    raw = runner.run(
+        kubectl
+        + [
+            "get",
+            "nodes",
+            "-l",
+            f"sagemaker.amazonaws.com/cluster-name={hyperpod_cluster_name}",
+            "-o",
+            "json",
+        ],
+        capture=True,
+    )
+    nodes = json.loads(raw).get("items") or []
+    if not nodes:
+        raise ReleaseError(f"{cluster_id} has no Kubernetes nodes")
+    uncovered: list[str] = []
+    for node in nodes:
+        addresses = [
+            item.get("address")
+            for item in node.get("status", {}).get("addresses", [])
+            if item.get("type") == "InternalIP"
+        ]
+        if not addresses or any(
+            not any(ipaddress.ip_address(value) in network for network in networks)
+            for value in addresses
+        ):
+            uncovered.append(str(node.get("metadata", {}).get("name") or "unknown"))
+    if uncovered:
+        raise ReleaseError(
+            f"{cluster_id} Agent endpoint CIDRs do not cover nodes: "
+            + ", ".join(sorted(uncovered))
+        )
+
+
+def ensure_region_contexts(release: Any) -> None:
+    config = release.config
+    runner = release.runner
+    cpu_command = release._cpu
+    gpu_command = release._gpu
+    cpu_eks_arn = _context_eks_arn(runner, cpu_command(), label="CPU")
+    if cpu_eks_arn != config.cpu_eks_arn:
+        raise ReleaseError(
+            "CPU kubeconfig EKS ARN does not match configured cpu_eks_arn"
+        )
+    _validate_hyperpod_cluster(
+        runner,
+        region=config.aws_region,
+        cluster_name=config.cpu_hyperpod_cluster_name,
+        expected_eks_arn=config.cpu_eks_arn,
+        require_node_recovery_none=False,
+    )
+    runner.run(cpu_command("get", "--raw=/readyz"), capture=True)
+
+    def validate_cluster(target: Any) -> None:
+        gpu_eks_arn = _context_eks_arn(
+            runner,
+            gpu_command(target),
+            label=f"GPU cluster {target.cluster_id}",
+        )
+        if gpu_eks_arn != target.eks_cluster_arn:
+            raise ReleaseError(
+                f"GPU context for {target.cluster_id} does not match "
+                "configured eks_cluster_arn"
+            )
+        _validate_hyperpod_cluster(
+            runner,
+            region=target.region,
+            cluster_name=target.hyperpod_cluster_name,
+            expected_eks_arn=target.eks_cluster_arn,
+            require_node_recovery_none=True,
+        )
+        runner.run(gpu_command(target, "get", "--raw=/readyz"), capture=True)
+        _validate_agent_endpoint_cidrs(
+            runner,
+            gpu_command(target),
+            cluster_id=target.cluster_id,
+            hyperpod_cluster_name=target.hyperpod_cluster_name,
+            configured_cidrs=target.agent_endpoint_allowed_cidrs,
+        )
+        release._validate_executor_iam_role(target)
+
+    if not config.clusters:
+        return
+    # The CPU checks above gate everything, so they stay ahead of this; the
+    # clusters themselves are independent, and each one is a handful of reads
+    # against a different API server plus a whole IAM role expansion. Every
+    # future is resolved in configuration order, so a fleet where two clusters
+    # are both wrong reports the same one every time instead of whichever
+    # thread lost the race.
+    with ThreadPoolExecutor(max_workers=min(8, len(config.clusters))) as executor:
+        futures = [
+            executor.submit(validate_cluster, target) for target in config.clusters
+        ]
+    for future in futures:
+        future.result()

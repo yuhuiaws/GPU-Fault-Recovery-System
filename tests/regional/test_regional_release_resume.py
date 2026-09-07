@@ -5,12 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import rollout as MODULE
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
 
 
 def test_bootstrap_cleaned_forces_full_cpu_and_gpu_recovery() -> None:

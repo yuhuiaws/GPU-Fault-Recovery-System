@@ -3,12 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_timing as TIMING
 
 ROOT = Path(__file__).resolve().parents[2]
-TIMING = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_timing.py"
-)
 
 
 def test_rollback_timing_records_safe_and_full_rto() -> None:

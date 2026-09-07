@@ -32,6 +32,29 @@ PREBUILT_BUNDLE ?= $(RELEASE_ATTESTATION_BUNDLE)
 STAGING_IMPACT_PLAN ?= dist/staging-impact-plan.json
 SOURCE_COMPONENT_ARTIFACTS ?= dist/current-release.json
 COMPONENT_ARTIFACT_CACHE_ROOT ?=
+# Supply-chain tools (review items S8/S10). Versions are pinned here and only
+# here; ci.yml installs them through `make ci-supply-chain-tools`, so the
+# workflow cannot drift from the Makefile. They live in their own venv so
+# their transitive dependencies never touch the hash-locked environment the
+# other gates run in. `$(CI)` decides strictness: GitHub sets CI=true, so a
+# missing tool is a hard failure there and a printed skip on a laptop.
+PIP_AUDIT_VERSION ?= 2.10.1
+CFN_LINT_VERSION ?= 1.56.0
+CYCLONEDX_BOM_VERSION ?= 7.3.1
+# promtool is a Go binary from the Prometheus release tarball, not a pip
+# package: pinned by version AND by the tarball's published sha256 so the gate
+# runs the bytes it was written against.
+PROMTOOL_VERSION ?= 3.14.0
+PROMTOOL_SHA256_LINUX_AMD64 ?= f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d
+SUPPLY_CHAIN_TOOLS_VENV ?= /tmp/gpu-fault-supply-chain-tools
+SUPPLY_CHAIN_PYTHON ?= $(firstword $(wildcard $(SUPPLY_CHAIN_TOOLS_VENV)/bin/python) $(PYTHON))
+SUPPLY_CHAIN_BIN = $(dir $(SUPPLY_CHAIN_PYTHON))
+# Every lock a shipped artifact is installed from: runtime.lock builds the
+# runtime image, build.lock and deploy-host.lock go into the deploy-host bundle.
+SHIPPED_LOCKS = requirements/build.lock requirements/runtime.lock requirements/deploy-host.lock
+PIP_AUDIT_IGNORE_FILE = requirements/pip-audit-ignore.txt
+CFN_TEMPLATES = deploy/aws/lambda/*.yaml
+SBOM_DIR = dist/sbom
 DEPLOY_HOST_PLATFORM ?= $(shell $(PYTHON) -c "from scripts.deploy_host_bundle import bundle_platform_id; print(bundle_platform_id())")
 DEPLOY_HOST_ARCHIVE ?= dist/gpu-fault-deploy-host-$(DEPLOY_HOST_PLATFORM).tar.gz
 DEPLOY_HOST_SIGNATURE_BUNDLE ?= dist/gpu-fault-deploy-host-$(DEPLOY_HOST_PLATFORM).sigstore.json
@@ -102,7 +125,7 @@ POSTGRES_TESTS = \
 	tests/store/test_store_contracts.py
 COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS) $(POSTGRES_TESTS),--ignore=$(test))
 
-.PHONY: test test-postgres test-postgres-stress test-shuffled test-parallel test-parallel-release test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check check-static check-static-sequential python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check test-source-assertion-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check doc-anchor-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check
+.PHONY: test test-postgres test-postgres-stress test-shuffled test-parallel test-parallel-release test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check check-static check-static-sequential python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check test-source-assertion-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check doc-anchor-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check lazy-export-check cfn-lint-check doc-facts-check pip-audit-check sbom ci-supply-chain-tools promtool-check
 
 test:
 	$(PYTHON) -m pytest
@@ -161,12 +184,12 @@ coverage:
 		--dist=$(PYTEST_XDIST_DIST) \
 		-p tools.pytest_case_reporter \
 		$(COVERAGE_IGNORE_ARGS) \
-		--cov=src/gpu_fault \
+		--cov=src/gpu_fault --cov=src/gpu_fault_release --cov=deploy/control-plane/tools \
 		--cov-branch \
 		--cov-report= \
 		--durations=$(PYTEST_DURATIONS)
 	$(PYTHON) -m pytest $(POSTGRES_TESTS) \
-		--cov=src/gpu_fault \
+		--cov=src/gpu_fault --cov=src/gpu_fault_release --cov=deploy/control-plane/tools \
 		--cov-branch \
 		--cov-append \
 		--cov-fail-under=$(COVERAGE_FLOOR) \
@@ -270,6 +293,7 @@ check-static-sequential:
 	$(PYTHON) -m compileall -q \
 		src tests deploy $(QUALITY_SCRIPTS)
 	$(MAKE) architecture-check
+	$(MAKE) lazy-export-check
 	$(MAKE) mixin-check
 	$(MAKE) private-test-coupling-check
 	$(MAKE) test-source-assertion-check
@@ -282,6 +306,7 @@ check-static-sequential:
 	$(MAKE) deploy-check
 	$(MAKE) artifacts-safety-check
 	$(MAKE) yaml-check
+	$(MAKE) cfn-lint-check
 	$(MAKE) shell-check
 
 check:
@@ -294,6 +319,12 @@ architecture-check:
 
 architecture-baseline:
 	$(PYTHON) scripts/check-python-architecture.py --write-baseline
+
+# Every `_EXPORTS` tuple in a package __init__ and every Python entry point a
+# manifest declares (Lambda `Handler:`) must import; the tuples are only
+# executed on first attribute access, so nothing else exercises them.
+lazy-export-check:
+	$(PYTHON) scripts/check-lazy-exports.py
 
 code-size-audit:
 	@mkdir -p artifacts/audit
@@ -340,6 +371,7 @@ docs-static-check:
 	$(MAKE) doc-reference-check
 	$(MAKE) doc-anchor-check
 	$(MAKE) fault-evidence-check
+	$(MAKE) doc-facts-check
 
 doc-impact-check:
 	$(PYTHON) scripts/check-doc-impact.py
@@ -364,6 +396,10 @@ doc-anchor-check:
 
 fault-evidence-check:
 	$(PYTHON) scripts/build-fault-evidence-index.py --check
+
+# Declared prose facts (test-tree shape, collector auth model) against the code.
+doc-facts-check:
+	$(PYTHON) scripts/check-doc-facts.py
 
 config-check:
 	PYTHONPATH=src $(PYTHON) -m gpu_fault.config_cli validate \
@@ -444,7 +480,9 @@ release-build:
 		--reuse-artifacts-from "$(SOURCE_COMPONENT_ARTIFACTS)"
 	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
 		env -u COSIGN_PASSWORD $(PYTHON) -m pytest tests/test_artifact_consistency.py
-	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py
+	env -u COSIGN_PASSWORD $(MAKE) sbom PYTHON="$(PYTHON)"
+	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py \
+		--sbom-dir "$(SBOM_DIR)"
 	$(COSIGN) sign-blob --yes \
 		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
@@ -477,8 +515,10 @@ release-build-promoted:
 		--reuse-artifacts-from "$(SOURCE_COMPONENT_ARTIFACTS)"
 	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
 		env -u COSIGN_PASSWORD $(PYTHON) -m pytest tests/test_artifact_consistency.py
+	env -u COSIGN_PASSWORD $(MAKE) sbom PYTHON="$(PYTHON)"
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py \
-		--ci-gate "$(CI_GATE)"
+		--ci-gate "$(CI_GATE)" \
+		--sbom-dir "$(SBOM_DIR)"
 	$(COSIGN) sign-blob --yes \
 		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
@@ -522,10 +562,12 @@ release-build-staging:
 		--staging-only
 	GPU_FAULT_REQUIRE_BUILD_ARTIFACTS=1 \
 		env -u COSIGN_PASSWORD $(PYTHON) -m pytest tests/test_artifact_consistency.py
+	env -u COSIGN_PASSWORD $(MAKE) sbom PYTHON="$(PYTHON)"
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py \
 		--staging-only \
 		--impact-base "$(BASE)" \
-		--impact-plan "$(STAGING_IMPACT_PLAN)"
+		--impact-plan "$(STAGING_IMPACT_PLAN)" \
+		--sbom-dir "$(SBOM_DIR)"
 	$(COSIGN) sign-blob --yes \
 		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
@@ -632,9 +674,96 @@ shell-check:
 		sort -z | xargs -0 -n1 bash -n
 	@if command -v shellcheck >/dev/null 2>&1; then \
 		find $(QUALITY_SHELL_ROOTS) -type f -name '*.sh' -print0 | \
-			sort -z | xargs -0 shellcheck --severity=warning; \
+			sort -z | xargs -0 shellcheck --severity=info; \
 	else \
 		printf 'shellcheck is not installed; bash syntax passed, CI runs shellcheck\\n'; \
+	fi
+
+# Pinned supply-chain tools in a venv of their own (see the variables at the
+# top). CI and the release workflow run this before the checks below.
+ci-supply-chain-tools:
+	$(PYTHON) -m venv "$(SUPPLY_CHAIN_TOOLS_VENV)"
+	"$(SUPPLY_CHAIN_TOOLS_VENV)/bin/python" -m pip install --quiet --upgrade pip
+	"$(SUPPLY_CHAIN_TOOLS_VENV)/bin/python" -m pip install --quiet \
+		pip-audit==$(PIP_AUDIT_VERSION) \
+		cfn-lint==$(CFN_LINT_VERSION) \
+		cyclonedx-bom==$(CYCLONEDX_BOM_VERSION)
+	curl -sSfL --retry 3 -o "$(SUPPLY_CHAIN_TOOLS_VENV)/promtool.tar.gz" \
+		"https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/prometheus-$(PROMTOOL_VERSION).linux-amd64.tar.gz"
+	printf '%s  %s\n' "$(PROMTOOL_SHA256_LINUX_AMD64)" "$(SUPPLY_CHAIN_TOOLS_VENV)/promtool.tar.gz" | sha256sum -c -
+	tar -xzf "$(SUPPLY_CHAIN_TOOLS_VENV)/promtool.tar.gz" -C "$(SUPPLY_CHAIN_TOOLS_VENV)/bin" \
+		--strip-components=1 "prometheus-$(PROMTOOL_VERSION).linux-amd64/promtool"
+
+# verify-regional-alerting.py proves runbooks, annotations and aggregation;
+# promtool proves the PromQL itself parses and type-checks. The Kubernetes
+# PrometheusRule envelope is unwrapped by the script before promtool sees it.
+promtool-check:
+	@if [ -x "$(SUPPLY_CHAIN_BIN)promtool" ]; then \
+		$(PYTHON) scripts/check-alert-rules.py \
+			--promtool "$(SUPPLY_CHAIN_BIN)promtool" --version "$(PROMTOOL_VERSION)"; \
+	elif [ -n "$(CI)" ]; then \
+		printf 'promtool is required in CI: run make ci-supply-chain-tools\n' >&2; \
+		exit 2; \
+	else \
+		printf 'promtool is not installed; PromQL check skipped, CI runs promtool %s\n' \
+			"$(PROMTOOL_VERSION)"; \
+	fi
+
+# yamllint proves the Lambda templates are YAML; cfn-lint proves they are
+# CloudFormation (resource schemas, intrinsic functions, property types).
+cfn-lint-check:
+	@if [ -x "$(SUPPLY_CHAIN_BIN)cfn-lint" ]; then \
+		"$(SUPPLY_CHAIN_BIN)cfn-lint" $(CFN_TEMPLATES); \
+	elif [ -n "$(CI)" ]; then \
+		printf 'cfn-lint is required in CI: run make ci-supply-chain-tools\n' >&2; \
+		exit 2; \
+	else \
+		printf 'cfn-lint is not installed; CloudFormation lint skipped, CI runs cfn-lint==%s\n' \
+			"$(CFN_LINT_VERSION)"; \
+	fi
+
+# Known-vulnerability audit of every shipped lock, hash-pinned so the audited
+# set is exactly what installs. Accepted findings live in
+# $(PIP_AUDIT_IGNORE_FILE), one id per line with the fix version; remove the
+# line when the lock moves past it.
+pip-audit-check:
+	@if [ -x "$(SUPPLY_CHAIN_BIN)pip-audit" ]; then \
+		ignores="$$(sed -e 's/#.*//' $(PIP_AUDIT_IGNORE_FILE) | \
+			awk 'NF { printf "--ignore-vuln %s ", $$1 }')"; \
+		for lock in $(SHIPPED_LOCKS); do \
+			printf 'pip-audit %s\n' "$$lock"; \
+			"$(SUPPLY_CHAIN_BIN)pip-audit" --require-hashes --progress-spinner off \
+				$$ignores --requirement "$$lock" || exit 1; \
+		done; \
+	elif [ -n "$(CI)" ]; then \
+		printf 'pip-audit is required in CI: run make ci-supply-chain-tools\n' >&2; \
+		exit 2; \
+	else \
+		printf 'pip-audit is not installed; dependency audit skipped, CI runs pip-audit==%s\n' \
+			"$(PIP_AUDIT_VERSION)"; \
+	fi
+
+# CycloneDX SBOM per shipped lock. build-release-attestation.py --sbom-dir
+# binds each file's SHA-256 into the attestation cosign signs, so the SBOM is
+# covered by the release signature without a second signing step. Stale files
+# are removed first: an SBOM from a previous lock must never be attested.
+sbom:
+	@rm -rf "$(SBOM_DIR)"
+	@if [ -x "$(SUPPLY_CHAIN_BIN)cyclonedx-py" ]; then \
+		mkdir -p "$(SBOM_DIR)"; \
+		for lock in $(SHIPPED_LOCKS); do \
+			name="$$(basename "$$lock" .lock)"; \
+			"$(SUPPLY_CHAIN_BIN)cyclonedx-py" requirements "$$lock" \
+				--output-reproducible --of JSON \
+				-o "$(SBOM_DIR)/$$name.cdx.json" || exit 1; \
+			printf 'sbom %s -> %s/%s.cdx.json\n' "$$lock" "$(SBOM_DIR)" "$$name"; \
+		done; \
+	elif [ -n "$(CI)" ]; then \
+		printf 'cyclonedx-py is required in CI: run make ci-supply-chain-tools\n' >&2; \
+		exit 2; \
+	else \
+		printf 'warning: cyclonedx-py is not installed; the release attestation will carry no SBOM (CI installs cyclonedx-bom==%s)\n' \
+			"$(CYCLONEDX_BOM_VERSION)" >&2; \
 	fi
 
 # Rebuild the wheel and prove it is the current source. A manual roll

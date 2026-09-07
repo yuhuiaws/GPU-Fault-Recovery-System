@@ -19,27 +19,20 @@ if __package__:
         HostProbeSettings,
     )
     from .live_driver_guard import (
+        CaseRunner,
         add_live_arguments,
-        authorize_execution,
-        build_plan,
+        run_standard_case,
     )
-    from .regional_live_fixture import (
-        install_abort_signals,
-        run_case_main,
-    )
+    from .regional_live_fixture import run_case_main
 else:
     from acceptance_runner_common import write_json_atomic
     from host_probe_fixture import HostProbeFixture, HostProbeSettings
     from live_driver_guard import (
+        CaseRunner,
         add_live_arguments,
-        authorize_execution,
-        build_plan,
-        install_site_profile,
+        run_standard_case,
     )
-    from regional_live_fixture import (
-        install_abort_signals,
-        run_case_main,
-    )
+    from regional_live_fixture import run_case_main
 
 ROOT = Path(__file__).resolve().parents[3]
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "node_host_probe.py"
@@ -1053,38 +1046,19 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+CASE = CaseRunner(
+    case_id=CASE_ID,
+    confirmation=CONFIRMATION,
+    parser=parser,
+    configure=configure,
+    read_only_preflight=read_only_preflight,
+    plan_details=plan_details,
+    execute_case=execute_case,
+)
+
+
 def main() -> int:
-    install_site_profile()
-    arguments = parser().parse_args()
-    os.umask(0o077)
-    install_abort_signals()
-    settings = configure(arguments)
-    case_dir = arguments.run_dir / "cases" / CASE_ID
-    case_dir.mkdir(parents=True, exist_ok=True)
-    if not arguments.execute:
-        preflight = read_only_preflight(settings, case_dir)
-        plan = build_plan(
-            run_dir=arguments.run_dir,
-            case_id=CASE_ID,
-            attempt=arguments.attempt,
-            confirmation=CONFIRMATION,
-            environment=settings.environment(),
-            details=plan_details(settings, preflight),
-        )
-        print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if not preflight["errors"] else 1
-    deadline = authorize_execution(
-        arguments,
-        case_id=CASE_ID,
-        confirmation=CONFIRMATION,
-        environment=settings.environment(),
-    )
-    return execute_case(
-        settings,
-        arguments.run_dir,
-        arguments.attempt,
-        deadline,
-    )
+    return run_standard_case(CASE)
 
 
 if __name__ == "__main__":

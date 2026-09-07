@@ -842,6 +842,51 @@ groups:
             gpu_fault_remediation_budget_active_claims against the configured
             scope limits and check whether an active claim belongs to a
             workflow that is no longer making progress.
+      # S1: the per-cluster remediation budget is a safety limit (five
+      # concurrent remediations per cluster as shipped). A correlated
+      # whole-cluster fault -- one AZ, 500+ nodes -- therefore drains five at a
+      # time and is EXPECTED to hold this alert for hours; what it adds over
+      # GpuFaultRemediationBudgetStarved is which cluster is saturated, so the
+      # operator can estimate the drain time instead of guessing at it. Both
+      # sides are Store-derived, so both are `max by` with the grouping labels;
+      # the limit gauge carries no cluster_id and is joined with `group_left`.
+      - alert: GpuFaultRemediationBudgetClusterSaturated
+        expr: >-
+          max by (control_plane_cluster, region, cluster_id)
+          (gpu_fault_remediation_budget_cluster_waiting_workflows) > 0
+          and on (control_plane_cluster, region, cluster_id)
+          (
+            max by (control_plane_cluster, region, cluster_id)
+            (gpu_fault_remediation_budget_cluster_active_claims)
+            >= on (control_plane_cluster, region) group_left
+            max by (control_plane_cluster, region)
+            (gpu_fault_remediation_budget_cluster_limit)
+          )
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: One GPU cluster's remediation budget has been saturated for 30 minutes
+          runbook_url: docs/管理员日常运维.md#gpufaultremediationbudgetclustersaturated
+          description: >-
+            Cluster {{ $labels.cluster_id }} has {{ $value }} recovery workflows
+            waiting on its remediation budget while its active claims sit at
+            the per-cluster limit. This is EXPECTED during a correlated
+            whole-cluster fault: the cluster drains at
+            gpu_fault_remediation_budget_cluster_limit remediations at a time,
+            so the drain time is roughly waiting / limit times the
+            per-remediation duration (see
+            gpu_fault_workflow_duration_seconds), which for hundreds of nodes
+            is tens of hours. The per-cluster limit is a safety limit on how
+            many nodes the system mutates at once and must not be widened just
+            to clear this alert. Check
+            gpu_fault_remediation_budget_cluster_active_claims against the
+            limit for this cluster, confirm the active claims belong to
+            workflows that are still progressing (a claim holder whose lease
+            never expires is GpuFaultRemediationBudgetStarved territory), and
+            read the oldest waiting workflow via
+            gpu_fault_workflow_pending_age_seconds_max and its
+            remediation_budget_last_blocked_reason.
       # The completion path records every attempt outcome as a decision. A
       # decision left in PENDING_TRIAGE is one the system could not classify
       # on arrival and parked for a bounded look

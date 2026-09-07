@@ -19,12 +19,12 @@ from gpu_fault.admin.config import (
     create_admin_config_plan,
     load_desired_admin_config,
     prepare_admin_config_apply,
-    preset_admin_config,
 )
 from gpu_fault.admin.config_file import (
     admin_config_file_path,
     initialize_desired_admin_config,
 )
+from gpu_fault.admin.config_patch import preset_admin_config
 from gpu_fault.admin.site import (
     RegionalSite,
     SiteConfigError,
@@ -32,13 +32,10 @@ from gpu_fault.admin.site import (
     load_site,
     materialized_release_config,
 )
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_config as RELEASE_CONFIG
 
 REGION = "us-east-1"
 ROOT = Path(__file__).resolve().parents[2]
-RELEASE_CONFIG = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_config.py"
-)
 
 
 def site_file(tmp_path: Path) -> Path:
@@ -176,6 +173,11 @@ def mock_live_release(
         return state
 
     monkeypatch.setattr(admin_cli, "_live_release_state", live_state)
+
+
+def reconcile_aurora_stub(**_kwargs):
+    # A 32/50 preset's Aurora floor (82/128 ACU) makes applying it an RDS change.
+    return {"modified": True, "before": {}, "after": {}}
 
 
 def test_effective_environment_pins_repository_pythonpath(
@@ -830,6 +832,7 @@ def test_config_preset_uses_existing_signed_release_without_building(
     monkeypatch.setattr(
         admin_cli, "_run_automatic_release", lambda **kwargs: calls.append(kwargs) or 0
     )
+    monkeypatch.setattr(admin_cli, "reconcile_aurora_capacity", reconcile_aurora_stub)
     arguments = admin_cli.parser().parse_args(
         [
             "config",
@@ -846,7 +849,7 @@ def test_config_preset_uses_existing_signed_release_without_building(
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "APPLIED"
     assert output["release_id"] == "release-a"
-    assert output["affected_roles"] == ["worker"]
+    assert output["affected_roles"] == ["ingress", "spool", "worker"]
     assert calls[0]["site_file"] == tmp_path / "site.yaml"
     assert admin_config_file_path(tmp_path).is_file(), (
         "config preset did not materialize the canonical editable file"
@@ -1067,6 +1070,7 @@ def test_config_resumes_matching_approved_uncommitted_live_state(
     monkeypatch.setattr(
         admin_cli, "_run_automatic_release", lambda **kwargs: calls.append(kwargs) or 0
     )
+    monkeypatch.setattr(admin_cli, "reconcile_aurora_capacity", reconcile_aurora_stub)
     arguments = admin_cli.parser().parse_args(
         [
             "config",

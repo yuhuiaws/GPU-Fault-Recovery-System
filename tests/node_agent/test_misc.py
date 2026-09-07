@@ -128,13 +128,16 @@ def test_node_agent_result_query_migration_escape_hatch(tmp_path, monkeypatch) -
     assert forged.status_code == 401
 
 
+@pytest.mark.parametrize("token", ["false", "0", "no", "off"])
 def test_unsigned_result_query_escape_hatch_requires_expiry(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, token: str
 ) -> None:
+    """Every disabled token opens the hatch, and the hatch still needs an expiry."""
+
     agent = executor(tmp_path, FakeRunner())
     monkeypatch.delenv("GPU_FAULT_NODE_CONTROL_PLANE_URL", raising=False)
     monkeypatch.delenv("GPU_FAULT_NODE_CLUSTER_ID", raising=False)
-    monkeypatch.setenv("GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED", "false")
+    monkeypatch.setenv("GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED", token)
     monkeypatch.setenv("GPU_FAULT_RELEASE_ID", "release-a")
     monkeypatch.delenv(
         "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_EXPIRES_AT", raising=False

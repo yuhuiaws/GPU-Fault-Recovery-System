@@ -64,8 +64,9 @@ def test_kubernetes_collector_filters_and_deduplicates_node() -> None:
 
 def test_kubernetes_node_resource_collector_detects_allocatable_loss() -> None:
     class Core:
-        def list_node(self):
+        def list_node(self, **_kwargs):
             return SimpleNamespace(
+                metadata=SimpleNamespace(_continue=None),
                 items=[
                     {
                         "metadata": {
@@ -81,7 +82,7 @@ def test_kubernetes_node_resource_collector_detects_allocatable_loss() -> None:
                             }
                         },
                     }
-                ]
+                ],
             )
 
         def list_pod_for_all_namespaces(self, **_kwargs):
@@ -140,8 +141,9 @@ def test_kubernetes_node_resource_summary_is_not_reported_as_a_recovery() -> Non
     allocatable = {"vpc.amazonaws.com/efa": "16", "nvidia.com/gpu": "8"}
 
     class Core:
-        def list_node(self):
+        def list_node(self, **_kwargs):
             return SimpleNamespace(
+                metadata=SimpleNamespace(_continue=None),
                 items=[
                     {
                         "metadata": {
@@ -152,7 +154,7 @@ def test_kubernetes_node_resource_summary_is_not_reported_as_a_recovery() -> Non
                         },
                         "status": {"allocatable": dict(allocatable)},
                     }
-                ]
+                ],
             )
 
         def list_pod_for_all_namespaces(self, **_kwargs):
@@ -198,6 +200,73 @@ def test_kubernetes_node_resource_summary_is_not_reported_as_a_recovery() -> Non
     collector.now = lambda: NOW + timedelta(seconds=1245)
     assert collector.collect_once().delivered == 1
     assert sink.requests[-1][1]["edge_filter_reasons"] == ["recovered:efa"]
+
+
+def _paged_node(name: str) -> dict:
+    return {
+        "metadata": {
+            "name": name,
+            "labels": {"node.kubernetes.io/instance-type": "ml.p5en.48xlarge"},
+        },
+        "status": {
+            "allocatable": {"vpc.amazonaws.com/efa": "16", "nvidia.com/gpu": "8"}
+        },
+    }
+
+
+def test_kubernetes_node_resource_collector_follows_list_continue_tokens() -> None:
+    """The periodic node LIST is paginated, and every page is processed.
+
+    A 500-node cluster answered with one unpaginated LIST every 15 seconds is
+    5-10 MB per call and, past the watch-cache window, an etcd read. The
+    collector must ask for ``limit`` and follow ``metadata._continue`` until
+    the apiserver hands back an empty token, observing the nodes on every page.
+    """
+
+    class Core:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def list_node(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if kwargs.get("_continue"):
+                return SimpleNamespace(
+                    metadata=SimpleNamespace(_continue=None),
+                    items=[_paged_node("gpu-worker-b")],
+                )
+            return SimpleNamespace(
+                metadata=SimpleNamespace(_continue="page-two"),
+                items=[_paged_node("gpu-worker-a")],
+            )
+
+        def list_pod_for_all_namespaces(self, **_kwargs):
+            return SimpleNamespace(items=[])
+
+    core = Core()
+    sink = RecordingSink()
+    collector = KubernetesNodeResourceCollector(
+        sink, context(), core_api=core, list_page_size=1, now=lambda: NOW
+    )
+
+    stats = collector.collect_once()
+
+    assert stats.observed == 2
+    assert stats.delivered == 2
+    assert sorted(payload["node_id"] for _, payload in sink.requests) == [
+        "gpu-worker-a",
+        "gpu-worker-b",
+    ]
+    assert core.calls == [
+        {"limit": 1, "_continue": None},
+        {"limit": 1, "_continue": "page-two"},
+    ]
+
+
+def test_kubernetes_node_resource_collector_rejects_non_positive_page_size() -> None:
+    with pytest.raises(ValueError):
+        KubernetesNodeResourceCollector(
+            RecordingSink(), context(), core_api=None, list_page_size=0
+        )
 
 
 def test_cloudwatch_collector_decodes_filters_and_delivers() -> None:

@@ -1,5 +1,4 @@
-from importlib import import_module
-from typing import Any
+from gpu_fault.lazy_exports import lazy_module
 
 _EXPORTS = {
     "CloudWatchHmaCollector": (
@@ -16,11 +15,5 @@ _EXPORTS = {
     ),
     "SqsHmaConsumer": ("gpu_fault.collectors.cloud.cloudwatch", "SqsHmaConsumer"),
 }
-__all__ = list(_EXPORTS)
 
-
-def __getattr__(name: str) -> Any:
-    module, attr = _EXPORTS[name]
-    value = getattr(import_module(module), attr)
-    globals()[name] = value
-    return value
+__getattr__, __dir__, __all__ = lazy_module(globals(), _EXPORTS)

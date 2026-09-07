@@ -37,7 +37,6 @@ class SqliteWorkflowMixin:
     # Attributes supplied by the composed concrete implementation.
     _db: Any
     _get: Callable[..., Any]
-    _get_link: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _link: Callable[..., Any]
     _list: Callable[..., Any]
@@ -53,18 +52,6 @@ class SqliteWorkflowMixin:
                 incident.event_id,
                 incident.incident_id,
             )
-
-    def get_incident(self, incident_id: str) -> FaultIncident:
-        return self._get("incident", incident_id)
-
-    def get_incident_by_event(self, event_id: str) -> FaultIncident | None:
-        incident_id = self._get_link("incident_by_event", event_id)
-        return self._get_optional("incident", incident_id) if incident_id else None
-
-    def link_event_to_incident(self, event_id: str, incident_id: str) -> None:
-        self.get_incident(incident_id)
-        with self._lock:
-            self._link("incident_by_event", event_id, incident_id)
 
     def save_workflow(
         self,
@@ -90,9 +77,6 @@ class SqliteWorkflowMixin:
                 if stale is not None:
                     raise stale
             self._put("workflow", workflow.request_id, workflow)
-
-    def get_workflow(self, request_id: str) -> WorkflowRequest:
-        return self._get("workflow", request_id)
 
     def list_workflows(
         self,
@@ -493,6 +477,7 @@ class SqliteWorkflowMixin:
                         workflow = blocked_by_remediation_budget(
                             workflow,
                             str(exc),
+                            scope=exc.scope,
                             now=claimed_at,
                         )
                         self._put("workflow", request_id, workflow)

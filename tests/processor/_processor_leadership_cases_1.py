@@ -7,6 +7,7 @@ import pytest
 
 from gpu_fault.processor import (
     ProcessorCoordinator,
+    ProcessorPoolSettings,
     ProcessorRequest,
     ProcessorRequestStatus,
 )
@@ -284,11 +285,13 @@ def test_fault_pressure_caps_but_does_not_stop_evidence_pools(stores) -> None:
         owner_id="pod-pressure",
         internal_token="pressure-token",
         active_consumers=True,
-        fault_worker_count=1,
-        observation_worker_count=0,
-        gpu_telemetry_worker_count=4,
-        host_telemetry_worker_count=4,
-        fault_pressure_evidence_workers=1,
+        pools=ProcessorPoolSettings(
+            fault_worker_count=1,
+            observation_worker_count=0,
+            gpu_telemetry_worker_count=4,
+            host_telemetry_worker_count=4,
+            fault_pressure_evidence_workers=1,
+        ),
     )
 
     claimed = processor._claim_active_by_pool(

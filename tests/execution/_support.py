@@ -14,6 +14,17 @@ import httpx
 import pytest
 
 import gpu_fault.app.context as context_module
+from gpu_fault.adapters import (
+    ANNOTATION_MECHANICAL_INSPECTION_COMPLETE,
+    GpuValidationAdapter,
+    HyperPodLifecycleStepAdapter,
+    KubernetesWorkflowAdapter,
+    ManagedRecoveryObserverAdapter,
+    NodeActionPending,
+    NodeActionWorkflowAdapter,
+    SupportEscalationAdapter,
+    quarantine_taint_value,
+)
 from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.execution import (
     ProductionExecutorConfig,
@@ -58,17 +69,6 @@ from gpu_fault.regional import (
     RemoteActionCommand,
     RemoteCommandResult,
     RemoteCommandStatus,
-)
-from gpu_fault.runtime_adapters import (
-    ANNOTATION_MECHANICAL_INSPECTION_COMPLETE,
-    GpuValidationAdapter,
-    HyperPodLifecycleStepAdapter,
-    KubernetesWorkflowAdapter,
-    ManagedRecoveryObserverAdapter,
-    NodeActionPending,
-    NodeActionWorkflowAdapter,
-    SupportEscalationAdapter,
-    quarantine_taint_value,
 )
 from gpu_fault.store import (
     InMemoryStore,

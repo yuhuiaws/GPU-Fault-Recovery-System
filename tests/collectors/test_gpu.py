@@ -494,6 +494,19 @@ def test_dcgm_transient_candidate_is_fully_suppressed() -> None:
     assert sink.requests[0][1]["edge_filter_reasons"] == ["initial-baseline"]
 
 
+@pytest.mark.parametrize(("token", "expected"), [("1", True), ("off", False)])
+def test_dcgm_edge_filter_switch_reads_every_token(
+    monkeypatch: pytest.MonkeyPatch, token: str, expected: bool
+) -> None:
+    """``GPU_FAULT_DCGM_EDGE_FILTER_ENABLED=1`` used to switch the filter off."""
+
+    monkeypatch.setenv("GPU_FAULT_DCGM_EDGE_FILTER_ENABLED", token)
+
+    collector = DcgmMetricsCollector(RecordingSink(), context(), node_id="worker-1")
+
+    assert collector.edge_filter_enabled is expected
+
+
 def test_dcgm_edge_state_has_bounded_lru() -> None:
     collector = DcgmMetricsCollector(
         RecordingSink(),

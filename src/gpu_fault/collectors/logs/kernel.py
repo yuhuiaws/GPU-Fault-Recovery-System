@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import io
 import logging
@@ -336,3 +337,18 @@ class KernelLogCollector:
             )
         except OSError:
             return "unknown-boot"
+
+
+def build_from_environment(
+    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
+) -> KernelLogCollector:
+    """The ``gpu-fault-collector kernel`` factory named by the registry."""
+
+    if not arguments.node_id:
+        raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
+    return KernelLogCollector(
+        sink,
+        context,
+        node_id=arguments.node_id,
+        kmsg_path=arguments.kmsg_path,
+    )

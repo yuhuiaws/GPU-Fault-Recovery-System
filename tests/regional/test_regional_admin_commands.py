@@ -6,22 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_admin_checks as CHECKS
+from gpu_fault_release import regional_admin_commands as ADMIN
+from gpu_fault_release import regional_release_state as STATE
 
 ROOT = Path(__file__).resolve().parents[2]
-ADMIN = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_admin_commands.py"
-)
-CHECKS = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_admin_checks.py"
-)
-STATE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_state.py"
-)
 
 
 def _admin_module():
-    return ADMIN.load()
+    return ADMIN
 
 
 def test_full_status_keeps_health_when_release_summary_is_missing(monkeypatch) -> None:

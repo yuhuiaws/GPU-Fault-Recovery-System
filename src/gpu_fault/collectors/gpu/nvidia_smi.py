@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import io
 import logging
@@ -323,3 +324,18 @@ class NvidiaSmiMetricsCollector:
                     )
                 )
         return samples
+
+
+def build_from_environment(
+    sink: EventSink, context: CollectorContext, arguments: argparse.Namespace
+) -> NvidiaSmiMetricsCollector:
+    """The ``gpu-fault-collector nvidia-smi`` factory named by the registry."""
+
+    if not arguments.node_id:
+        raise SystemExit("--node-id, NODE_NAME, or HOSTNAME is required")
+    return NvidiaSmiMetricsCollector(
+        sink,
+        context,
+        node_id=arguments.node_id,
+        interval_seconds=arguments.interval_seconds,
+    )

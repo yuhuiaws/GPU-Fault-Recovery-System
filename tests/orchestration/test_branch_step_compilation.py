@@ -28,7 +28,7 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowRequest,
 )
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from tests._builders import build_store, workflow_request, workflow_step
 
 REBOOT_RUNG = [WorkflowOperation.RESTART_NODE, *ESCALATION_TAIL]

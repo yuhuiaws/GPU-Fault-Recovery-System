@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from gpu_fault.adapters import KubernetesWorkflowAdapter
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
 from gpu_fault.models import (
     IncidentState,
@@ -12,7 +13,6 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepStatus,
 )
-from gpu_fault.runtime_adapters import KubernetesWorkflowAdapter
 from gpu_fault.store import NotFoundError, SqliteStore
 from tests._builders import (
     build_store,

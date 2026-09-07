@@ -1,18 +1,6 @@
-from typing import Any
+from typing import Any, Callable
 from datetime import datetime
 
-from gpu_fault.efa_traffic_state import (
-    apply_efa_traffic_admin_action as _apply_efa_action,
-)
-from gpu_fault.efa_traffic_state import (
-    efa_traffic_admin_decision_id as _efa_decision_id,
-)
-from gpu_fault.efa_traffic_state import (
-    efa_traffic_state_key as _efa_state_key,
-)
-from gpu_fault.efa_traffic_state import (
-    next_efa_traffic_state as _next_efa_state,
-)
 from gpu_fault.models import (
     EfaTrafficAdminAction,
     EfaTrafficAdminDecision,
@@ -28,18 +16,12 @@ class MemoryEfaTrafficMixin:
 
     _lock: Any
 
-    _next_efa_traffic_state = staticmethod(_next_efa_state)
-    _efa_traffic_admin_decision_id = staticmethod(_efa_decision_id)
-    _apply_efa_traffic_admin_action = staticmethod(_apply_efa_action)
-
-    @staticmethod
-    def efa_traffic_state_key(
-        cluster_id: str,
-        node_id: str,
-        job_id: str,
-        attempt_id: str,
-    ) -> str:
-        return str(_efa_state_key(cluster_id, node_id, job_id, attempt_id))
+    # The state machine, from SharedEfaTrafficRulesMixin.
+    _apply_efa_traffic_admin_action: Callable[
+        ..., tuple[EfaTrafficState, EfaTrafficAdminDecision]
+    ]
+    _efa_traffic_admin_decision_id: Callable[[str, EfaTrafficAdminAction], str]
+    _next_efa_traffic_state: Callable[..., tuple[EfaTrafficState, bool]]
 
     def observe_efa_traffic(self, **parameters):
         state_key = parameters["state_key"]

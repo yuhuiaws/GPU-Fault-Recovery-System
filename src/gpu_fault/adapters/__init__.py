@@ -1,5 +1,4 @@
-from importlib import import_module
-from typing import Any
+from gpu_fault.lazy_exports import lazy_module
 
 _EXPORTS = {
     "ControlPlaneEvidenceAdapter": (
@@ -42,14 +41,4 @@ _EXPORTS = {
     "quarantine_taint_value": ("gpu_fault.adapters.common", "quarantine_taint_value"),
 }
 
-__all__ = list(_EXPORTS)
-
-
-def __getattr__(name: str) -> Any:
-    target = _EXPORTS.get(name)
-    if target is None:
-        raise AttributeError(name)
-    module_name, attribute = target
-    value = getattr(import_module(module_name), attribute)
-    globals()[name] = value
-    return value
+__getattr__, __dir__, __all__ = lazy_module(globals(), _EXPORTS)

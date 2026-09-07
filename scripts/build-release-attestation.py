@@ -16,6 +16,14 @@ def main() -> None:
     parser.add_argument("--impact-base")
     parser.add_argument("--impact-plan", type=Path)
     parser.add_argument("--ci-gate", type=Path)
+    parser.add_argument(
+        "--sbom-dir",
+        type=Path,
+        help=(
+            "directory of *.cdx.json CycloneDX documents (make sbom); each file's "
+            "path and SHA-256 is bound into the signed attestation"
+        ),
+    )
     arguments = parser.parse_args()
     manifest = ROOT / "dist/current-release.json"
     attestation = build_attestation(
@@ -25,6 +33,7 @@ def main() -> None:
         impact_base=arguments.impact_base,
         impact_plan_path=arguments.impact_plan,
         ci_gate_path=arguments.ci_gate,
+        sbom_dir=arguments.sbom_dir,
     )
     release_id = attestation["subject"]["release_id"]
     path = ROOT / "dist" / release_id / "attestation.json"

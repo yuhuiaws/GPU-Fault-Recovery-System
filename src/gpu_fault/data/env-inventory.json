@@ -108,10 +108,20 @@
     }
   },
   "value_kinds": {
+    "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "on",
+        "true",
+        "yes"
+      ]
+    },
     "GPU_FAULT_AGENT_ENDPOINT_REQUIRE_TLS": {
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
@@ -125,31 +135,44 @@
     "GPU_FAULT_ALLOW_EMAIL": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_ALLOW_HYPERPOD_MUTATION": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_ALLOW_HYPERPOD_REBOOT": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_ALLOW_HYPERPOD_REPLACE": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_ALLOW_SINGLE_CLUSTER": {
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
@@ -157,7 +180,10 @@
     "GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_API_PORT": {
@@ -167,6 +193,12 @@
       "kind": "integer"
     },
     "GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT": {
+      "kind": "integer"
+    },
+    "GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT": {
       "kind": "integer"
     },
     "GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE": {
@@ -187,7 +219,10 @@
     "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_COLLECTOR_GZIP_MIN_BYTES": {
@@ -211,7 +246,10 @@
     "GPU_FAULT_COMPLETION_OBSERVE_UNMANAGED": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_COMPLETION_OUTBOX_MAX_BYTES": {
@@ -247,7 +285,10 @@
     "GPU_FAULT_DCGM_EDGE_FILTER_ENABLED": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_DCGM_EXPORTER_PORT": {
@@ -292,7 +333,10 @@
     "GPU_FAULT_DISCOVER_POD_GPU_UUIDS": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_DRIVER_BRANCH": {
@@ -310,7 +354,10 @@
     "GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS": {
@@ -319,7 +366,10 @@
     "GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_EFA_TRAFFIC_SPIKE_RATIO": {
@@ -341,6 +391,7 @@
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
@@ -349,6 +400,7 @@
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
@@ -356,13 +408,17 @@
     "GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER": {
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
@@ -371,6 +427,7 @@
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
@@ -379,6 +436,7 @@
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
@@ -387,6 +445,25 @@
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "on",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "on",
         "true",
         "yes"
       ]
@@ -394,13 +471,19 @@
     "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE": {
@@ -433,7 +516,10 @@
     "GPU_FAULT_FABRIC_MANAGER_JOURNAL": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_FABRIC_MANAGER_LOG_INTERVAL_SECONDS": {
@@ -481,7 +567,10 @@
     "GPU_FAULT_HOST_EDGE_FILTER_ENABLED": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS": {
@@ -586,6 +675,9 @@
     "GPU_FAULT_KUBERNETES_EFA_MISMATCH_SAMPLES": {
       "kind": "integer"
     },
+    "GPU_FAULT_KUBERNETES_NODE_LIST_PAGE_SIZE": {
+      "kind": "integer"
+    },
     "GPU_FAULT_KUBERNETES_RESOURCE_INTERVAL_SECONDS": {
       "kind": "number"
     },
@@ -655,6 +747,15 @@
     "GPU_FAULT_NODE_ACTION_POLL_TIMEOUT_SECONDS": {
       "kind": "integer"
     },
+    "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "on",
+        "true",
+        "yes"
+      ]
+    },
     "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_SKEW_SECONDS": {
       "kind": "integer"
     },
@@ -670,7 +771,10 @@
     "GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_AGENT_PORT": {
@@ -679,49 +783,73 @@
     "GPU_FAULT_NODE_ALLOW_DRIVER_REMEDIATION": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_ALLOW_FABRIC_RESET": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_ALLOW_FIELD_DIAGNOSTIC": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_ALLOW_FIRMWARE_UPDATE": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_ALLOW_GPU_RESET": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_HEARTBEAT_INTERVAL_SECONDS": {
@@ -763,7 +891,10 @@
     "GPU_FAULT_NODE_SINGLE_GPU_RESET_SUPPORTED": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS": {
@@ -772,7 +903,10 @@
     "GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NOTIFICATION_BACKLOG_GRACE_SECONDS": {
@@ -781,19 +915,28 @@
     "GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NOTIFICATION_DELIVER_DRILLS": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_NOTIFICATION_DISPATCH_SCAN_LIMIT": {
@@ -839,6 +982,7 @@
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
@@ -903,6 +1047,15 @@
     "GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS": {
       "kind": "number"
     },
+    "GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "on",
+        "true",
+        "yes"
+      ]
+    },
     "GPU_FAULT_PROCESSOR_FAULT_BUSY_BACKOFF_MAX_SECONDS": {
       "kind": "number"
     },
@@ -924,8 +1077,14 @@
     "GPU_FAULT_PROCESSOR_GLOBAL_ADMISSION_GUARD": {
       "kind": "integer"
     },
+    "GPU_FAULT_PROCESSOR_GPU_INVENTORY_STALE_SECONDS": {
+      "kind": "number"
+    },
     "GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS": {
       "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_HEALTH_SUMMARY_STALE_SECONDS": {
+      "kind": "number"
     },
     "GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS": {
       "kind": "integer"
@@ -956,6 +1115,9 @@
     },
     "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS": {
       "kind": "integer"
+    },
+    "GPU_FAULT_PROCESSOR_OBSERVATION_STALE_SECONDS": {
+      "kind": "number"
     },
     "GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS": {
       "kind": "integer"
@@ -997,9 +1159,13 @@
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
+    },
+    "GPU_FAULT_PROCESSOR_TRAINING_PROGRESS_STALE_SECONDS": {
+      "kind": "number"
     },
     "GPU_FAULT_PROCESSOR_UNHEALTHY_TTL_SECONDS": {
       "kind": "number"
@@ -1010,13 +1176,19 @@
     "GPU_FAULT_PROXY_HEADERS_ENABLED": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_QUICK_DIAGNOSTIC_TIMEOUT_SECONDS": {
@@ -1034,7 +1206,10 @@
     "GPU_FAULT_RANK_LIVENESS_ENABLED": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_RANK_PROGRESS_GPU_IDLE_PERCENT": {
@@ -1085,7 +1260,10 @@
     "GPU_FAULT_REQUIRE_NODE_LOG_COLLECTOR": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_RESTORE_SETTLE_SECONDS": {
@@ -1125,6 +1303,7 @@
       "kind": "boolean",
       "true_tokens": [
         "1",
+        "on",
         "true",
         "yes"
       ]
@@ -1213,7 +1392,10 @@
     "GPU_FAULT_VALIDATION_REQUIRE_RDMA": {
       "kind": "boolean",
       "true_tokens": [
-        "true"
+        "1",
+        "on",
+        "true",
+        "yes"
       ]
     },
     "GPU_FAULT_WATCHER_CLEANUP_TIMEOUT_SECONDS": {
@@ -1324,6 +1506,8 @@
     "GPU_FAULT_AWS_REGION",
     "GPU_FAULT_BOOT_ID_PATH",
     "GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS",
+    "GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT",
+    "GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT",
     "GPU_FAULT_CERTIFICATE_MIN_VALIDITY_SECONDS",
     "GPU_FAULT_CHECKPOINT_MANIFEST_REF",
     "GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE",
@@ -1549,6 +1733,7 @@
     "GPU_FAULT_KUBERNETES_EFA_HEALTH_SUMMARY_SECONDS",
     "GPU_FAULT_KUBERNETES_EFA_INTERVAL_SECONDS",
     "GPU_FAULT_KUBERNETES_EFA_MISMATCH_SAMPLES",
+    "GPU_FAULT_KUBERNETES_NODE_LIST_PAGE_SIZE",
     "GPU_FAULT_KUBERNETES_OWNER",
     "GPU_FAULT_KUBERNETES_RESOURCE_INTERVAL_SECONDS",
     "GPU_FAULT_KUBE_CONTEXT",
@@ -1776,6 +1961,7 @@
     "GPU_FAULT_REGISTRY_STALE_SECONDS",
     "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE",
     "GPU_FAULT_RELEASE_ID",
+    "GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP",
     "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
     "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN",
     "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",

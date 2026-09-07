@@ -43,7 +43,7 @@ hyperpod = [
 ]
 collectors = [
   "boto3>=1.42,<2",
-  "kubernetes>=31,<35",
+  "kubernetes>=31,<36",
   "prometheus-client>=0.21,<1",
 ]
 postgres = [

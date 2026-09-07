@@ -70,6 +70,11 @@ class ProcessorQueueStats(TypedDict):
     depth: int
     oldest_age_seconds: float
     by_cluster: dict[str, int]
+    # Age of the oldest PENDING/LEASED request per cluster (S6). The claim
+    # window is FIFO across the region, so the region-wide age alone cannot say
+    # which cluster's storm is delaying the others. Clusters with no incomplete
+    # request are absent, not zero.
+    oldest_age_by_cluster: dict[str, float]
 
 
 class ProcessorQueueCountStatus(TypedDict):

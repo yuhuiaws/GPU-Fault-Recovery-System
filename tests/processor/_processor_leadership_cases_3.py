@@ -14,8 +14,11 @@ from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.processor import (
     ProcessorCoordinator,
     ProcessorLanePolicy,
+    ProcessorLeaseSettings,
+    ProcessorPoolSettings,
     ProcessorRequest,
     ProcessorRequestStatus,
+    ProcessorStaleSettings,
     processor_partition_id,
 )
 from gpu_fault.training_health import TrainingProgressHeartbeat
@@ -289,10 +292,12 @@ def test_processor_discards_result_after_hard_deadline(monkeypatch) -> None:
         store,
         owner_id="pod-a:1",
         internal_token="processor-token",
-        request_lease_seconds=1,
-        request_renew_seconds=0.005,
-        request_max_execution_seconds=0.02,
-        worker_count=1,
+        lease=ProcessorLeaseSettings(
+            request_lease_seconds=1,
+            request_renew_seconds=0.005,
+            request_max_execution_seconds=0.02,
+        ),
+        pools=ProcessorPoolSettings(worker_count=1),
         active_consumers=True,
         on_unhealthy=unhealthy_reasons.append,
     )
@@ -407,9 +412,11 @@ def test_processor_retries_fresh_5xx_but_bounds_old_requests(
         owner_id="pod-a:1",
         internal_token="processor-token",
         active_consumers=True,
-        retryable_response_max_age_seconds=300,
-        retry_backoff_seconds=2,
-        retry_backoff_max_seconds=10,
+        lease=ProcessorLeaseSettings(
+            retryable_response_max_age_seconds=300,
+            retry_backoff_seconds=2,
+            retry_backoff_max_seconds=10,
+        ),
     )
 
     class Response:
@@ -621,13 +628,17 @@ def test_idle_streams_back_off_with_a_short_fault_ceiling() -> None:
         store,
         owner_id="pod-a:1",
         internal_token="token-" + "x" * 32,
-        fault_worker_count=2,
-        observation_worker_count=2,
-        gpu_telemetry_worker_count=2,
-        host_telemetry_worker_count=2,
-        poll_seconds=0.1,
-        idle_backoff_max_seconds=2.0,
-        fault_idle_backoff_max_seconds=0.5,
+        pools=ProcessorPoolSettings(
+            fault_worker_count=2,
+            observation_worker_count=2,
+            gpu_telemetry_worker_count=2,
+            host_telemetry_worker_count=2,
+        ),
+        lease=ProcessorLeaseSettings(
+            poll_seconds=0.1,
+            idle_backoff_max_seconds=2.0,
+            fault_idle_backoff_max_seconds=0.5,
+        ),
         active_consumers=True,
     )
     calls: list[frozenset[str] | None] = []
@@ -695,10 +706,12 @@ def test_processor_notifications_wake_claims_and_extend_fallback(monkeypatch) ->
         store,
         owner_id="pod-a:1",
         internal_token="token-" + "x" * 32,
-        fault_worker_count=1,
-        poll_seconds=0.1,
-        fault_idle_backoff_max_seconds=0.5,
-        processor_notification_fallback_seconds=5.0,
+        pools=ProcessorPoolSettings(fault_worker_count=1),
+        lease=ProcessorLeaseSettings(
+            poll_seconds=0.1,
+            fault_idle_backoff_max_seconds=0.5,
+            processor_notification_fallback_seconds=5.0,
+        ),
         active_consumers=True,
     )
     thread = Thread(target=processor.run_queue_notifications)
@@ -746,10 +759,10 @@ def test_claimed_stream_resets_its_idle_backoff() -> None:
         store,
         owner_id="pod-a:1",
         internal_token="token-" + "x" * 32,
-        fault_worker_count=1,
-        host_telemetry_worker_count=1,
-        poll_seconds=0.1,
-        idle_backoff_max_seconds=2.0,
+        pools=ProcessorPoolSettings(
+            fault_worker_count=1, host_telemetry_worker_count=1
+        ),
+        lease=ProcessorLeaseSettings(poll_seconds=0.1, idle_backoff_max_seconds=2.0),
         active_consumers=True,
     )
     available = {"fault": 1, "observation": 0, "gpu": 0, "host": 1}
@@ -787,11 +800,12 @@ def test_lane_blocked_backlog_caps_the_claim_backoff() -> None:
         store,
         owner_id="pod-a:1",
         internal_token="token-" + "x" * 32,
-        fault_worker_count=1,
-        host_telemetry_worker_count=1,
-        poll_seconds=0.1,
-        idle_backoff_max_seconds=2.0,
-        busy_backoff_max_seconds=0.4,
+        pools=ProcessorPoolSettings(
+            fault_worker_count=1, host_telemetry_worker_count=1
+        ),
+        lease=ProcessorLeaseSettings(
+            poll_seconds=0.1, idle_backoff_max_seconds=2.0, busy_backoff_max_seconds=0.4
+        ),
         active_consumers=True,
     )
     for index in range(3):
@@ -850,11 +864,12 @@ def test_idle_queue_keeps_the_full_claim_backoff() -> None:
         store,
         owner_id="pod-a:1",
         internal_token="token-" + "x" * 32,
-        fault_worker_count=1,
-        host_telemetry_worker_count=1,
-        poll_seconds=0.1,
-        idle_backoff_max_seconds=2.0,
-        busy_backoff_max_seconds=0.4,
+        pools=ProcessorPoolSettings(
+            fault_worker_count=1, host_telemetry_worker_count=1
+        ),
+        lease=ProcessorLeaseSettings(
+            poll_seconds=0.1, idle_backoff_max_seconds=2.0, busy_backoff_max_seconds=0.4
+        ),
         active_consumers=True,
     )
     available = {"fault": 1, "observation": 0, "gpu": 0, "host": 1}
@@ -872,7 +887,7 @@ def test_processor_completes_expired_inventory_as_stale() -> None:
         owner_id="processor-a",
         internal_token="token-" + "x" * 32,
         active_consumers=True,
-        gpu_inventory_stale_seconds=60,
+        stale=ProcessorStaleSettings(gpu_inventory_stale_seconds=60),
     )
     observed_at = datetime.now(timezone.utc) - timedelta(minutes=5)
     request = processor_request(
@@ -917,7 +932,7 @@ def test_processor_only_expires_healthy_telemetry_summaries() -> None:
         owner_id="processor-a",
         internal_token="token-" + "x" * 32,
         active_consumers=False,
-        health_summary_stale_seconds=60,
+        stale=ProcessorStaleSettings(health_summary_stale_seconds=60),
     )
     observed_at = datetime.now(timezone.utc) - timedelta(minutes=5)
 
@@ -970,8 +985,9 @@ def test_processor_expires_context_only_after_newer_state_exists() -> None:
         owner_id="processor-a",
         internal_token="token-" + "x" * 32,
         active_consumers=False,
-        observation_stale_seconds=60,
-        training_progress_stale_seconds=60,
+        stale=ProcessorStaleSettings(
+            observation_stale_seconds=60, training_progress_stale_seconds=60
+        ),
     )
     observed_at = datetime.now(timezone.utc) - timedelta(minutes=5)
     observation = attempt_observation(

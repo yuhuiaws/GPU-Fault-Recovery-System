@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -23,6 +24,57 @@ LIMITS = {
     "functions": DEFAULT_FUNCTION_LIMIT,
     "classes": DEFAULT_CLASS_LIMIT,
 }
+# Shell scripts (S18) share the Python limits on purpose: at 1500/200 only
+# deploy/hyperpod/deploy.sh, deploy/node/install-gpu-fault-collector.sh and a
+# handful of deploy.sh functions land in the baseline, so the ratchet already
+# bites where the review pointed without grandfathering the other 29 scripts.
+# A looser shell-specific limit would let the big two grow; a tighter one would
+# only add baseline entries nobody plans to shrink. One number, one meaning.
+SHELL_FUNCTION_HEAD = re.compile(
+    r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_-]*)\s*\(\)\s*\{\s*$"
+)
+SHELL_COMMENT = re.compile(r"(?:^|\s)#.*$")
+# A brace behind an odd run of backslashes is a literal (``\{``); behind an
+# even run the backslashes escape each other and the brace is real
+# (``${value//\\/\\\\}``).
+SHELL_ESCAPED_BRACE = re.compile(r"(?<!\\)((?:\\\\)*)\\[{}]")
+# ``<<EOF`` / ``<<-EOF`` / ``<<'EOF'``; ``<<<`` here-strings do not match.
+SHELL_HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def shell_functions(text: str) -> dict[str, int]:
+    """Line counts of ``name() {`` ... ``}`` functions in a bash script.
+
+    A brace-depth scan that is good enough for this repository's style: one
+    function head per line, closing brace at any indentation. Heredoc bodies
+    are skipped (their braces belong to YAML, JSON or a remote shell), then
+    comments and escaped braces are stripped before counting. ``${var}`` and
+    awk programs carry balanced braces, so they leave the depth where it was.
+    """
+    sizes: dict[str, int] = {}
+    name: str | None = None
+    start = 0
+    depth = 0
+    terminator: str | None = None
+    for number, line in enumerate(text.splitlines(), start=1):
+        if terminator is not None:
+            if line.strip() == terminator:
+                terminator = None
+            continue
+        code = SHELL_ESCAPED_BRACE.sub(r"\1", SHELL_COMMENT.sub("", line))
+        heredoc = SHELL_HEREDOC.search(code)
+        if heredoc is not None:
+            terminator = heredoc.group(2)
+        if name is None:
+            match = SHELL_FUNCTION_HEAD.match(line)
+            if match is not None:
+                name, start, depth = match.group(1), number, 1
+            continue
+        depth += code.count("{") - code.count("}")
+        if depth <= 0:
+            sizes[name] = number - start + 1
+            name = None
+    return sizes
 
 
 class DefinitionCollector(ast.NodeVisitor):
@@ -50,11 +102,11 @@ class DefinitionCollector(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
 
 
-def module_name(path: Path) -> str:
-    if path.is_relative_to(SOURCE):
-        relative = path.relative_to(SOURCE).with_suffix("")
+def module_name(path: Path, root: Path = ROOT) -> str:
+    if path.is_relative_to(root / "src"):
+        relative = path.relative_to(root / "src").with_suffix("")
     else:
-        relative = path.relative_to(ROOT).with_suffix("")
+        relative = path.relative_to(root).with_suffix("")
     parts = list(relative.parts)
     if parts[-1] == "__init__":
         parts.pop()
@@ -85,8 +137,8 @@ class RuntimeImportCollector(ast.NodeVisitor):
             self.targets.append(node.module)
 
 
-def import_graph(paths: list[Path]) -> dict[str, set[str]]:
-    modules = {module_name(path): path for path in paths}
+def import_graph(paths: list[Path], root: Path = ROOT) -> dict[str, set[str]]:
+    modules = {module_name(path, root): path for path in paths}
     graph = {name: set() for name in modules}
     for name, path in modules.items():
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -143,31 +195,43 @@ def strongly_connected(
     return sorted(result)
 
 
-def collect_architecture() -> tuple[
+def collect_architecture(
+    source_roots: tuple[Path, ...] = SOURCE_ROOTS,
+    root: Path = ROOT,
+) -> tuple[
     dict[str, dict[str, int]],
     list[list[str]],
 ]:
     paths = sorted(
-        path for source_root in SOURCE_ROOTS for path in source_root.rglob("*.py")
+        path for source_root in source_roots for path in source_root.rglob("*.py")
+    )
+    shell_paths = sorted(
+        path for source_root in source_roots for path in source_root.rglob("*.sh")
     )
     current_files: dict[str, int] = {}
     current_functions: dict[str, int] = {}
     current_classes: dict[str, int] = {}
     for path in paths:
-        relative = path.relative_to(ROOT).as_posix()
+        relative = path.relative_to(root).as_posix()
         text = path.read_text(encoding="utf-8")
         current_files[relative] = len(text.splitlines())
         collector = DefinitionCollector(relative)
         collector.visit(ast.parse(text))
         current_functions.update(collector.functions)
         current_classes.update(collector.classes)
+    for path in shell_paths:
+        relative = path.relative_to(root).as_posix()
+        text = path.read_text(encoding="utf-8")
+        current_files[relative] = len(text.splitlines())
+        for name, size in shell_functions(text).items():
+            current_functions[f"{relative}:{name}"] = size
     return (
         {
             "files": current_files,
             "functions": current_functions,
             "classes": current_classes,
         },
-        strongly_connected(import_graph(paths)),
+        strongly_connected(import_graph(paths, root)),
     )
 
 

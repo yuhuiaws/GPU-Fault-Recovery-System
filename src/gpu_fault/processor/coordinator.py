@@ -37,6 +37,13 @@ from gpu_fault.processor.lane_runtime import ProcessorLaneRuntimeMixin
 from gpu_fault.processor.replay_completion import (
     finalize_replay_response,
 )
+from gpu_fault.processor.settings import (
+    TELEMETRY_SPOOL_REPLAY_BATCH_MAX_ITEMS,
+    ProcessorLeaseSettings,
+    ProcessorPoolSettings,
+    ProcessorSpoolSettings,
+    ProcessorStaleSettings,
+)
 from gpu_fault.processor.telemetry_spool import TelemetrySpoolCoordinatorMixin
 from gpu_fault.processor.models import (
     ProcessorLeadership,
@@ -70,7 +77,7 @@ class ProcessorCoordinator(
     # One claim, one business transaction and one fenced completion may
     # carry up to 64 routine samples, bounded independently by the 8 MiB
     # replay envelope.
-    _TELEMETRY_BATCH_MAX = 64
+    _TELEMETRY_BATCH_MAX = TELEMETRY_SPOOL_REPLAY_BATCH_MAX_ITEMS
     _TELEMETRY_BATCH_ENVELOPE_BYTES = 8192
     _TELEMETRY_SPOOL_PATH_SCHEDULE = TELEMETRY_SPOOL_PATH_SCHEDULE
     # F-D3: how often an under-filled fault claim may ask the store how many
@@ -86,104 +93,48 @@ class ProcessorCoordinator(
         internal_token: str,
         execution_token: str | None = None,
         local_url: str = "http://127.0.0.1:8080",
-        lease_seconds: int = 15,
-        renew_seconds: float = 3,
-        request_lease_seconds: int = 120,
-        request_renew_seconds: float = 5,
-        request_max_execution_seconds: float = 30,
-        deadline_exceeded_process_threshold: int = 3,
-        unhealthy_ttl_seconds: float = 300,
-        retryable_response_max_age_seconds: float = 300,
-        retry_backoff_seconds: float = 1,
-        retry_backoff_max_seconds: float = 30,
-        poll_seconds: float = 0.1,
-        idle_backoff_max_seconds: float = 2.0,
-        busy_backoff_max_seconds: float = 0.4,
-        fault_idle_backoff_max_seconds: float = 0.5,
-        fault_busy_backoff_max_seconds: float = 0.1,
-        processor_notification_fallback_seconds: float = 5.0,
-        processor_notification_shard_count: int = 8,
-        routine_starvation_seconds: float = 30.0,
-        fault_pressure_evidence_workers: int = 1,
-        worker_count: int = 4,
-        fault_worker_count: int | None = None,
-        observation_worker_count: int | None = None,
-        gpu_telemetry_worker_count: int | None = None,
-        host_telemetry_worker_count: int | None = None,
-        gpu_inventory_stale_seconds: float = 180,
-        health_summary_stale_seconds: float = 420,
-        observation_stale_seconds: float = 120,
-        training_progress_stale_seconds: float = 120,
         active_consumers: bool,
-        telemetry_spool_enabled: bool = False,
-        telemetry_spool_workers: int = 4,
-        telemetry_spool_lease_seconds: float = 60,
-        telemetry_spool_retry_backoff_seconds: float = 1.0,
-        telemetry_spool_notification_fallback_seconds: float = 5.0,
-        telemetry_spool_fault_pressure_workers: int = 1,
-        telemetry_spool_fault_pressure_poll_seconds: float = 0.5,
-        telemetry_spool_max_in_flight_bytes: int = (64 * 1024 * 1024),
-        telemetry_spool_replay_batch_max_items: int = 64,
-        telemetry_spool_replay_batch_max_bytes: int = (8 * 1024 * 1024),
+        lease: ProcessorLeaseSettings = ProcessorLeaseSettings(),
+        pools: ProcessorPoolSettings = ProcessorPoolSettings(),
+        stale: ProcessorStaleSettings = ProcessorStaleSettings(),
+        spool: ProcessorSpoolSettings = ProcessorSpoolSettings(),
         on_unhealthy: Callable[[str], None] | None = None,
     ) -> None:
-        if lease_seconds < 5:
-            raise ValueError("processor leader lease must be at least 5s")
-        if renew_seconds <= 0 or renew_seconds >= lease_seconds:
-            raise ValueError("processor renew interval must be below its lease")
-        if worker_count <= 0:
-            raise ValueError("processor worker count must be positive")
-        if routine_starvation_seconds <= 0:
-            raise ValueError("processor routine starvation bound must be positive")
-        self.routine_starvation_seconds = routine_starvation_seconds
-        if request_renew_seconds <= 0 or request_renew_seconds >= request_lease_seconds:
-            raise ValueError("processor request renew interval must be below its lease")
-        if request_max_execution_seconds <= 0:
-            raise ValueError(
-                "processor request maximum execution time must be positive"
-            )
-        stale_limits = {
-            "GPU inventory": gpu_inventory_stale_seconds,
-            "health summary": health_summary_stale_seconds,
-            "workload observation": observation_stale_seconds,
-            "training progress": training_progress_stale_seconds,
-            "retryable response": retryable_response_max_age_seconds,
-        }
-        invalid_stale_limits = [
-            name for name, value in stale_limits.items() if value <= 0
-        ]
-        if invalid_stale_limits:
-            raise ValueError(
-                "processor stale limits must be positive: "
-                + ", ".join(invalid_stale_limits)
-            )
+        # Each settings group validated its own fields when it was built; the
+        # flat attributes below are what the rest of the class reads.
+        self.lease = lease
+        self.pools = pools
+        self.stale = stale
+        self.spool = spool
+        self.routine_starvation_seconds = pools.routine_starvation_seconds
         self.store = store
         self.owner_id = owner_id
         self.internal_token = internal_token
         self.execution_token = execution_token
         self.local_url = local_url.rstrip("/")
-        self.lease_seconds = lease_seconds
-        self.renew_seconds = renew_seconds
-        self.request_lease_seconds = request_lease_seconds
-        self.request_renew_seconds = request_renew_seconds
-        self.request_max_execution_seconds = request_max_execution_seconds
+        self.lease_seconds = lease.lease_seconds
+        self.renew_seconds = lease.renew_seconds
+        self.request_lease_seconds = lease.request_lease_seconds
+        self.request_renew_seconds = lease.request_renew_seconds
+        self.request_max_execution_seconds = lease.request_max_execution_seconds
         # F-D7: a deadline is charged to the request first; the process gives
         # up only after this many *distinct* requests timed out, and the
         # unhealthy latch expires instead of gating every background service
         # for the life of the process.
         self.deadline_exceeded_process_threshold = max(
-            1, int(deadline_exceeded_process_threshold)
+            1, int(lease.deadline_exceeded_process_threshold)
         )
-        self.unhealthy_ttl_seconds = float(unhealthy_ttl_seconds)
-        self._retry_max_age = retryable_response_max_age_seconds
+        self.unhealthy_ttl_seconds = float(lease.unhealthy_ttl_seconds)
+        self._retry_max_age = lease.retryable_response_max_age_seconds
         self._configure_retry_backoff(
-            retry_backoff_seconds,
-            retry_backoff_max_seconds,
+            lease.retry_backoff_seconds,
+            lease.retry_backoff_max_seconds,
         )
-        self.gpu_inventory_stale_seconds = gpu_inventory_stale_seconds
-        self.health_summary_stale_seconds = health_summary_stale_seconds
-        self.observation_stale_seconds = observation_stale_seconds
-        self.training_progress_stale_seconds = training_progress_stale_seconds
+        self.gpu_inventory_stale_seconds = stale.gpu_inventory_stale_seconds
+        self.health_summary_stale_seconds = stale.health_summary_stale_seconds
+        self.observation_stale_seconds = stale.observation_stale_seconds
+        self.training_progress_stale_seconds = stale.training_progress_stale_seconds
+        poll_seconds = lease.poll_seconds
         self.poll_seconds = poll_seconds
         # Each claim is its own transaction. Six worker replicas
         # polling seven streams every 100ms cost about 500 commits a
@@ -194,7 +145,9 @@ class ProcessorCoordinator(
         # for a doubling interval, capped here. The fault stream is
         # exempt (see _claim_active_by_pool) so escalation latency is
         # unchanged.
-        self.idle_backoff_max_seconds = max(poll_seconds, idle_backoff_max_seconds)
+        self.idle_backoff_max_seconds = max(
+            poll_seconds, lease.idle_backoff_max_seconds
+        )
         # "Empty claim" and "idle queue" are not the same thing. A claim
         # comes back empty whenever every eligible lane is already
         # leased, which is exactly what a backlog on few lanes looks
@@ -208,135 +161,54 @@ class ProcessorCoordinator(
         # (_backlog_is_lane_blocked).
         self.busy_backoff_max_seconds = max(
             poll_seconds,
-            min(busy_backoff_max_seconds, idle_backoff_max_seconds),
+            min(lease.busy_backoff_max_seconds, lease.idle_backoff_max_seconds),
         )
         self.fault_idle_backoff_max_seconds = max(
-            poll_seconds, fault_idle_backoff_max_seconds
+            poll_seconds, lease.fault_idle_backoff_max_seconds
         )
         self.fault_busy_backoff_max_seconds = max(
             poll_seconds,
             min(
-                fault_busy_backoff_max_seconds,
-                fault_idle_backoff_max_seconds,
+                lease.fault_busy_backoff_max_seconds,
+                lease.fault_idle_backoff_max_seconds,
             ),
         )
-        if processor_notification_fallback_seconds <= 0:
-            raise ValueError("processor notification fallback must be positive")
         self.processor_notification_fallback_seconds = max(
-            poll_seconds, processor_notification_fallback_seconds
+            poll_seconds, lease.processor_notification_fallback_seconds
         )
-        if processor_notification_shard_count <= 0:
-            raise ValueError("processor notification shard count must be positive")
-        self.processor_notification_shard_count = processor_notification_shard_count
+        self.processor_notification_shard_count = (
+            lease.processor_notification_shard_count
+        )
         self._stream_idle_until: dict[str, float] = {}
         self._stream_idle_interval: dict[str, float] = {}
         self._initialize_claim_metrics()
-        explicit_pools = any(
-            value is not None
-            for value in (
-                fault_worker_count,
-                observation_worker_count,
-                gpu_telemetry_worker_count,
-                host_telemetry_worker_count,
-            )
-        )
-        self.worker_counts = (
-            {
-                "fault": fault_worker_count or 0,
-                "observation": observation_worker_count or 0,
-                "gpu": gpu_telemetry_worker_count or 0,
-                "host": host_telemetry_worker_count or 0,
-            }
-            if explicit_pools
-            else {
-                "fault": worker_count,
-                "observation": 0,
-                "gpu": 0,
-                "host": 0,
-            }
-        )
-        if self.worker_counts["fault"] <= 0 or any(
-            value < 0 for value in self.worker_counts.values()
-        ):
-            raise ValueError(
-                "processor fault workers must be positive and "
-                "other pool workers cannot be negative"
-            )
-        evidence_pool_sizes = [
-            self.worker_counts[name]
-            for name in ("gpu", "host")
-            if self.worker_counts[name] > 0
-        ]
-        if fault_pressure_evidence_workers <= 0 or (
-            evidence_pool_sizes
-            and fault_pressure_evidence_workers > min(evidence_pool_sizes)
-        ):
-            raise ValueError(
-                "processor fault-pressure evidence workers must be "
-                "positive and not exceed a dedicated evidence pool"
-            )
-        self.fault_pressure_evidence_workers = fault_pressure_evidence_workers
+        self.worker_counts = pools.worker_counts()
+        self.fault_pressure_evidence_workers = pools.fault_pressure_evidence_workers
         self.worker_count = sum(self.worker_counts.values())
         self.active_consumers = active_consumers
-        self.telemetry_spool_enabled = telemetry_spool_enabled
-        if telemetry_spool_enabled and telemetry_spool_workers <= 0:
-            raise ValueError(
-                "telemetry spool workers must be positive when the spool is enabled"
-            )
-        self.telemetry_spool_workers = telemetry_spool_workers
-        self.telemetry_spool_lease_seconds = telemetry_spool_lease_seconds
+        self.telemetry_spool_enabled = spool.telemetry_spool_enabled
+        self.telemetry_spool_workers = spool.telemetry_spool_workers
+        self.telemetry_spool_lease_seconds = spool.telemetry_spool_lease_seconds
         self.telemetry_spool_retry_backoff_seconds = (
-            telemetry_spool_retry_backoff_seconds
+            spool.telemetry_spool_retry_backoff_seconds
         )
-        if not 2 <= telemetry_spool_notification_fallback_seconds <= 5:
-            raise ValueError(
-                "telemetry spool notification fallback must be between 2 and 5 seconds"
-            )
         self.telemetry_spool_notification_fallback_seconds = (
-            telemetry_spool_notification_fallback_seconds
+            spool.telemetry_spool_notification_fallback_seconds
         )
-        if (
-            telemetry_spool_fault_pressure_workers <= 0
-            or telemetry_spool_fault_pressure_workers > telemetry_spool_workers
-        ):
-            raise ValueError(
-                "telemetry spool fault-pressure workers must be "
-                "positive and not exceed normal spool workers"
-            )
-        if telemetry_spool_fault_pressure_poll_seconds <= 0:
-            raise ValueError(
-                "telemetry spool fault-pressure poll interval must be positive"
-            )
         self.telemetry_spool_fault_pressure_workers = (
-            telemetry_spool_fault_pressure_workers
+            spool.telemetry_spool_fault_pressure_workers
         )
         self.telemetry_spool_fault_pressure_poll_seconds = (
-            telemetry_spool_fault_pressure_poll_seconds
+            spool.telemetry_spool_fault_pressure_poll_seconds
         )
-        if telemetry_spool_max_in_flight_bytes <= 0:
-            raise ValueError("telemetry spool in-flight byte limit must be positive")
-        if not (
-            1 <= telemetry_spool_replay_batch_max_items <= self._TELEMETRY_BATCH_MAX
-        ):
-            raise ValueError(
-                "telemetry spool replay batch item limit must be "
-                f"between 1 and {self._TELEMETRY_BATCH_MAX}"
-            )
-        if (
-            telemetry_spool_replay_batch_max_bytes <= 0
-            or telemetry_spool_replay_batch_max_bytes
-            > telemetry_spool_max_in_flight_bytes
-        ):
-            raise ValueError(
-                "telemetry spool replay batch byte limit must be "
-                "positive and not exceed the in-flight byte limit"
-            )
-        self.telemetry_spool_max_in_flight_bytes = telemetry_spool_max_in_flight_bytes
+        self.telemetry_spool_max_in_flight_bytes = (
+            spool.telemetry_spool_max_in_flight_bytes
+        )
         self.telemetry_spool_replay_batch_max_items = (
-            telemetry_spool_replay_batch_max_items
+            spool.telemetry_spool_replay_batch_max_items
         )
         self.telemetry_spool_replay_batch_max_bytes = (
-            telemetry_spool_replay_batch_max_bytes
+            spool.telemetry_spool_replay_batch_max_bytes
         )
         self._initialize_spool_metrics()
         self._initialize_runtime_state(on_unhealthy)

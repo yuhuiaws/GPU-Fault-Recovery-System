@@ -14,6 +14,11 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
 
+from gpu_fault.adapters import (
+    HyperPodLifecycleStepAdapter,
+    KubernetesWorkflowAdapter,
+    NodeActionWorkflowAdapter,
+)
 from gpu_fault.aws_errors import (
     aws_configuration_error,
     missing_aws_credentials,
@@ -21,6 +26,7 @@ from gpu_fault.aws_errors import (
 from gpu_fault.env_validation import (
     validate_gpu_fault_environment,
 )
+from gpu_fault.env import env_bool
 from gpu_fault.execution import WorkflowStepContext
 from gpu_fault.execution.fleet_preflight import (
     command_requires_fleet_preflight,
@@ -67,11 +73,6 @@ from gpu_fault.regional import (
 )
 from gpu_fault.regional_compatibility import (
     CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
-)
-from gpu_fault.runtime_adapters import (
-    HyperPodLifecycleStepAdapter,
-    KubernetesWorkflowAdapter,
-    NodeActionWorkflowAdapter,
 )
 from gpu_fault.telemetry import RawEvidenceRecord
 from gpu_fault.transport.http_client import urlopen
@@ -1112,13 +1113,7 @@ def executor_from_environment() -> ClusterActionExecutor:
         "GPU_FAULT_CLUSTER_EXECUTOR_ID",
         f"{cluster_id}/{socket.gethostname()}",
     )
-    use_remote_state = (
-        os.getenv(
-            "GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE",
-            "true",
-        ).lower()
-        == "true"
-    )
+    use_remote_state = env_bool("GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE", True)
     store = None if use_remote_state else _persistent_store_from_environment()
     regional_client = _regional_client_from_environment()
     fleet_registry = RegionalFleetRegistry(regional_client)
@@ -1162,12 +1157,12 @@ def executor_from_environment() -> ClusterActionExecutor:
     # at the moment a node action is dispatched, with no prior signal.
     # The control-plane wiring already passes a registry (api.py:615).
     node_action_adapter = None
-    if os.getenv("GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER", "").lower() == "true":
+    if env_bool("GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER"):
         node_action_adapter = NodeActionWorkflowAdapter.from_environment(
             registry=fleet_registry,
         )
         adapters.append(node_action_adapter)
-    if os.getenv("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER", "").lower() == "true":
+    if env_bool("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER"):
         hyperpod_confirm_cluster = os.getenv(
             "GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER", ""
         ).strip()
@@ -1216,13 +1211,7 @@ def executor_from_environment() -> ClusterActionExecutor:
                 "HyperPod lifecycle execution requires a fleet "
                 "registry for reboot confirmation"
             )
-        if (
-            os.getenv(
-                "GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER",
-                "",
-            ).lower()
-            == "true"
-        ):
+        if env_bool("GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER"):
             if not use_remote_state:
                 raise ClusterExecutorError(
                     "regional HyperPod spare failover requires "

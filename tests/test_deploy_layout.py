@@ -138,5 +138,5 @@ def test_quality_gates_cover_deploy_tree() -> None:
     assert "ruff check src tests deploy" in workflow
     assert "check-deploy-layout.py" in workflow
     assert "check-assert-messages.py" in workflow
-    assert "shellcheck --severity=warning" in workflow
+    assert "shellcheck --severity=info" in workflow
     assert "SOURCE_ROOTS = (SOURCE, DEPLOY, SCRIPTS, TOOLS, TESTS)" in architecture

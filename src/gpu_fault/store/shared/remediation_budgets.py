@@ -32,13 +32,15 @@ def apply_remediation_budget(
             continue
         raise RemediationBudgetError(
             "remediation concurrency budget is full: "
-            f"scope={scope} active={active} limit={limit}"
+            f"scope={scope} active={active} limit={limit}",
+            scope=scope,
         )
     return workflow.model_copy(
         update={
             "remediation_budget_claims": sorted(normalized),
             "remediation_budget_limits": normalized,
             "remediation_budget_last_blocked_reason": None,
+            "remediation_budget_last_blocked_scope": None,
         }
     )
 
@@ -74,8 +76,14 @@ def blocked_by_remediation_budget(
     workflow: WorkflowRequest,
     reason: str,
     *,
+    scope: str | None = None,
     now: datetime,
 ) -> WorkflowRequest:
+    """Record a refused claim on the workflow.
+
+    ``scope`` is the refusing budget scope (``RemediationBudgetError.scope``);
+    an empty string means the caller did not know it and is stored as None.
+    """
     return workflow.model_copy(
         update={
             "execution_owner_id": None,
@@ -84,6 +92,7 @@ def blocked_by_remediation_budget(
                 workflow.remediation_budget_wait_count + 1
             ),
             "remediation_budget_last_blocked_reason": reason,
+            "remediation_budget_last_blocked_scope": scope or None,
             "updated_at": now,
         }
     )

@@ -22,7 +22,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from gpu_fault.processor import ProcessorCoordinator, ProcessorRequestStatus
+from gpu_fault.processor import (
+    ProcessorCoordinator,
+    ProcessorLeaseSettings,
+    ProcessorPoolSettings,
+    ProcessorRequestStatus,
+    ProcessorStaleSettings,
+)
 from gpu_fault.processor.replay_completion import finalize_replay_response
 from gpu_fault.store import InMemoryStore, SqliteStore
 from tests._builders import build_store, copy_model, processor_request
@@ -39,7 +45,7 @@ def _processor(store, **overrides) -> ProcessorCoordinator:
         owner_id=OWNER,
         internal_token="processor-token",
         active_consumers=True,
-        fault_worker_count=1,
+        pools=ProcessorPoolSettings(fault_worker_count=1),
         **overrides,
     )
 
@@ -147,7 +153,9 @@ def test_an_observation_past_its_stale_limit_stops_retrying() -> None:
         store, OBSERVATION_PATH, age_seconds=130, body=_OBSERVATION_BODY
     )
     processor = _processor(
-        store, retryable_response_max_age_seconds=300, observation_stale_seconds=120
+        store,
+        lease=ProcessorLeaseSettings(retryable_response_max_age_seconds=300),
+        stale=ProcessorStaleSettings(observation_stale_seconds=120),
     )
 
     finalize_replay_response(
@@ -175,7 +183,9 @@ def test_a_telemetry_row_of_the_same_age_keeps_the_generic_horizon() -> None:
         body=b'{"node_id":"node-a"}',
     )
     processor = _processor(
-        store, retryable_response_max_age_seconds=300, observation_stale_seconds=120
+        store,
+        lease=ProcessorLeaseSettings(retryable_response_max_age_seconds=300),
+        stale=ProcessorStaleSettings(observation_stale_seconds=120),
     )
 
     finalize_replay_response(
@@ -199,7 +209,9 @@ def test_a_completion_failure_release_uses_the_observation_horizon(monkeypatch) 
         store, OBSERVATION_PATH, age_seconds=130, body=_OBSERVATION_BODY
     )
     processor = _processor(
-        store, retryable_response_max_age_seconds=300, observation_stale_seconds=120
+        store,
+        lease=ProcessorLeaseSettings(retryable_response_max_age_seconds=300),
+        stale=ProcessorStaleSettings(observation_stale_seconds=120),
     )
 
     processor._release(claimed, failure="completion failed: RuntimeError")

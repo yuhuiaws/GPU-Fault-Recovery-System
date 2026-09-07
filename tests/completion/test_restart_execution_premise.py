@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from gpu_fault.adapters import KubernetesWorkflowAdapter
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
 from gpu_fault.models import (
     IncidentState,
@@ -18,7 +19,6 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from gpu_fault.regional import RemoteIncidentOwnershipReport
-from gpu_fault.runtime_adapters import KubernetesWorkflowAdapter
 from tests._builders import (
     build_store,
     copy_model,

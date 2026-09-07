@@ -1,12 +1,46 @@
+"""The one place that writes an Aurora Serverless v2 capacity window.
+
+Two RDS calls set the ACU window of the control-plane database: the
+``create-db-cluster`` that brings the cluster up and the ``modify-db-cluster``
+that moves an existing one. Both live here, and only here. Bootstrap, the
+legacy ``deploy/hyperpod/deploy.sh`` (through ``python -m`` below), the perf
+harness and the administrator's ``config apply`` all call in; none of them
+spells the flag itself. The repository test
+``test_the_scaling_flag_is_written_from_exactly_one_module`` holds that line.
+
+The reason is an incident, not tidiness: a rollback once wrote 0.5/8 ACU through
+a path the deploy did not know about, and the deploy could not correct it because
+its own path compared against a different record. Five writers in three trees and
+two languages is how that happens.
+"""
+
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
+import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Protocol, Sequence
 
 from gpu_fault.admin.config import AdminConfigError, AuroraCapacityConfig
+
+AURORA_ENGINE_VERSION = "16.8"
+"""Engine version every new control-plane cluster is created on.
+
+One constant, read by bootstrap and by the legacy deploy script's ``create``
+entry; the parameter group family is derived from it, so the two cannot drift
+apart.
+"""
+
+CONTROL_PLANE_APPLICATION_TAG = "Key=Application,Value=gpu-fault-control-plane"
+"""The console-filter tag deploy.sh always wrote; bootstrap adds the site tag."""
+
+SITE_TAG_KEY = "gpu-fault:site-id"
+
+SERVERLESS_V2_SCALING_FLAG = "--serverless-v2-scaling-configuration"
 
 CAPACITY_SETTLE_STABLE_POLLS = 3
 """Consecutive settled observations required after a capacity change.
@@ -22,11 +56,31 @@ preflight check a few hundred lines after scaling the cluster itself.
 """
 
 
+class AwsJsonCaller(Protocol):
+    """``aws <arguments> --region R --output json`` as a parsed object.
+
+    ``mutate`` marks the calls that change AWS state so a dry-run runner can hold
+    them back; read-only callers ignore it. ``CommandRunner.aws_json`` satisfies
+    this directly.
+    """
+
+    def __call__(
+        self,
+        region: str,
+        /,
+        *arguments: str,
+        mutate: bool = False,
+    ) -> dict[str, Any]: ...
+
+
 def _aws_json(
     aws_region: str,
+    /,
     *arguments: str,
+    mutate: bool = False,
     timeout_seconds: int = 120,
 ) -> dict[str, Any]:
+    del mutate  # every call here is live; the flag is for injected runners
     command = [
         "aws",
         *arguments,
@@ -44,14 +98,121 @@ def _aws_json(
     )
     if completed.returncode:
         operation = " ".join(arguments[:2])
-        raise AdminConfigError(f"Aurora capacity command failed: aws {operation}")
+        detail = completed.stderr.strip()
+        raise AdminConfigError(
+            f"Aurora capacity command failed: aws {operation}"
+            + (f": {detail}" if detail else "")
+        )
     try:
-        value = json.loads(completed.stdout)
+        value = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError as exc:
         raise AdminConfigError("Aurora capacity command returned invalid JSON") from exc
     if not isinstance(value, dict):
         raise AdminConfigError("Aurora capacity command returned a non-object")
     return value
+
+
+def _caller(aws_json: AwsJsonCaller | None) -> AwsJsonCaller:
+    # Resolved at call time so a test can swap the module-level ``_aws_json``.
+    return aws_json if aws_json is not None else _aws_json
+
+
+def scaling_configuration(capacity: AuroraCapacityConfig) -> str:
+    capacity.validate()
+    return f"MinCapacity={capacity.min_acu:g},MaxCapacity={capacity.max_acu:g}"
+
+
+@dataclass(frozen=True)
+class AuroraClusterSpec:
+    """Everything ``create-db-cluster`` needs that differs between clusters.
+
+    The rest -- engine, encryption, deletion protection, IAM auth, log export,
+    seven-day backups, the managed master password -- is the same for every
+    control-plane database and is not a parameter.
+    """
+
+    cluster_id: str
+    subnet_group: str
+    security_group_ids: tuple[str, ...]
+    parameter_group: str
+    capacity: AuroraCapacityConfig
+    site_id: str | None = None
+    engine_version: str = AURORA_ENGINE_VERSION
+    database_name: str = "gpu_fault"
+    master_username: str = "gpu_fault_admin"
+    backup_retention_days: int = 7
+
+
+def create_db_cluster_arguments(spec: AuroraClusterSpec) -> list[str]:
+    """``aws rds create-db-cluster`` arguments, without ``aws``/region/output.
+
+    Feed the list to ``CommandRunner.aws_json(region, *arguments, mutate=True)``
+    or to ``_aws_json``; both append the region and output format.
+    """
+
+    if not spec.security_group_ids:
+        raise AdminConfigError("an Aurora cluster needs at least one security group")
+    tags = [CONTROL_PLANE_APPLICATION_TAG]
+    if spec.site_id:
+        tags.insert(0, f"Key={SITE_TAG_KEY},Value={spec.site_id}")
+    return [
+        "rds",
+        "create-db-cluster",
+        "--db-cluster-identifier",
+        spec.cluster_id,
+        "--engine",
+        "aurora-postgresql",
+        "--engine-version",
+        spec.engine_version,
+        "--engine-mode",
+        "provisioned",
+        "--database-name",
+        spec.database_name,
+        "--master-username",
+        spec.master_username,
+        "--manage-master-user-password",
+        SERVERLESS_V2_SCALING_FLAG,
+        scaling_configuration(spec.capacity),
+        "--db-subnet-group-name",
+        spec.subnet_group,
+        "--vpc-security-group-ids",
+        *spec.security_group_ids,
+        "--storage-encrypted",
+        "--backup-retention-period",
+        str(spec.backup_retention_days),
+        "--deletion-protection",
+        "--copy-tags-to-snapshot",
+        "--enable-iam-database-authentication",
+        "--db-cluster-parameter-group-name",
+        spec.parameter_group,
+        "--enable-cloudwatch-logs-exports",
+        "postgresql",
+        "--tags",
+        *tags,
+    ]
+
+
+def create_aurora_cluster(
+    spec: AuroraClusterSpec,
+    *,
+    aws_region: str,
+    aws_json: AwsJsonCaller | None = None,
+) -> dict[str, Any]:
+    """Issue the create and return the identifier and status RDS answered with."""
+
+    document = _caller(aws_json)(
+        aws_region,
+        *create_db_cluster_arguments(spec),
+        mutate=True,
+    )
+    cluster = document.get("DBCluster") or {}
+    return {
+        "cluster_id": str(cluster.get("DBClusterIdentifier") or spec.cluster_id),
+        "status": cluster.get("Status"),
+        "engine_version": str(cluster.get("EngineVersion") or spec.engine_version),
+        "min_acu": spec.capacity.min_acu,
+        "max_acu": spec.capacity.max_acu,
+    }
 
 
 def _first(items: object, description: str) -> dict[str, Any]:
@@ -61,11 +222,12 @@ def _first(items: object, description: str) -> dict[str, Any]:
 
 
 def _latest_capacity(
+    aws_json: AwsJsonCaller,
     aws_region: str,
     instance_id: str,
 ) -> tuple[float, str] | None:
     end = datetime.now(UTC)
-    document = _aws_json(
+    document = aws_json(
         aws_region,
         "cloudwatch",
         "get-metric-statistics",
@@ -115,9 +277,11 @@ def observe_aurora_capacity(
     aws_region: str,
     cluster_id: str,
     include_observed_capacity: bool,
+    aws_json: AwsJsonCaller | None = None,
 ) -> dict[str, Any]:
+    caller = _caller(aws_json)
     cluster = _first(
-        _aws_json(
+        caller(
             aws_region,
             "rds",
             "describe-db-clusters",
@@ -142,7 +306,7 @@ def observe_aurora_capacity(
         if not isinstance(instance_id, str) or not instance_id:
             raise AdminConfigError("Aurora cluster member has no instance identifier")
         instance = _first(
-            _aws_json(
+            caller(
                 aws_region,
                 "rds",
                 "describe-db-instances",
@@ -152,7 +316,7 @@ def observe_aurora_capacity(
             "Aurora instance lookup",
         )
         sample = (
-            _latest_capacity(aws_region, instance_id)
+            _latest_capacity(caller, aws_region, instance_id)
             if include_observed_capacity
             else None
         )
@@ -228,41 +392,64 @@ def reconcile_aurora_capacity(
     *,
     aws_region: str,
     cluster_id: str,
-    expected: AuroraCapacityConfig,
     desired: AuroraCapacityConfig,
+    expected: AuroraCapacityConfig | None = None,
     timeout_seconds: int = 1800,
     poll_seconds: float = 10.0,
+    aws_json: AwsJsonCaller | None = None,
+    wait_for_settle: bool = True,
 ) -> dict[str, Any]:
-    expected.validate()
+    """Move the cluster to ``desired`` and wait until RDS has really done it.
+
+    ``expected`` is the reviewed current window of a plan/apply transaction: the
+    live cluster must match it or ``desired`` (a resumed apply), anything else is
+    somebody else's change and is refused. Callers without such a record --
+    bootstrap, the legacy deploy, the perf harness -- leave it ``None`` and
+    reconcile whatever is live.
+
+    ``wait_for_settle=False`` is for a dry-run runner that held the modify back;
+    waiting for a change nobody made would wait forever.
+    """
+
+    caller = _caller(aws_json)
     desired.validate()
-    require_observed_capacity = desired.min_acu > expected.min_acu
+    if expected is not None:
+        expected.validate()
     initial = observe_aurora_capacity(
         aws_region=aws_region,
         cluster_id=cluster_id,
         include_observed_capacity=False,
+        aws_json=caller,
     )
     live_capacity = _configured_capacity(initial)
-    accepted = {
+    if expected is not None and live_capacity not in {
         (expected.min_acu, expected.max_acu),
         (desired.min_acu, desired.max_acu),
-    }
-    if live_capacity not in accepted:
+    }:
         raise AdminConfigError(
             "live Aurora capacity differs from both the reviewed current and "
             "desired administrator configuration"
         )
+    # A scale-up is only done when the instances actually run at the new floor;
+    # the reviewed record is the baseline when there is one (a resumed apply
+    # still proves the ACU it asked for), the live window otherwise.
+    baseline = expected.min_acu if expected is not None else live_capacity[0]
+    require_observed_capacity = desired.min_acu > baseline
     modified = live_capacity != (desired.min_acu, desired.max_acu)
     if modified:
-        _aws_json(
+        caller(
             aws_region,
             "rds",
             "modify-db-cluster",
             "--db-cluster-identifier",
             cluster_id,
-            "--serverless-v2-scaling-configuration",
-            f"MinCapacity={desired.min_acu:g},MaxCapacity={desired.max_acu:g}",
+            SERVERLESS_V2_SCALING_FLAG,
+            scaling_configuration(desired),
             "--apply-immediately",
+            mutate=True,
         )
+        if not wait_for_settle:
+            return {"before": initial, "after": None, "modified": True}
     # A cluster nobody touched is already settled, so one confirming observation
     # answers the question; after a modify it cannot.
     required_stable = CAPACITY_SETTLE_STABLE_POLLS if modified else 1
@@ -274,6 +461,7 @@ def reconcile_aurora_capacity(
             aws_region=aws_region,
             cluster_id=cluster_id,
             include_observed_capacity=require_observed_capacity,
+            aws_json=caller,
         )
         stable = (
             stable + 1
@@ -302,3 +490,77 @@ def aurora_capacity_changed(
     desired: AuroraCapacityConfig,
 ) -> bool:
     return current != desired
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m gpu_fault.admin.aurora_capacity",
+        description=(
+            "Create or resize the control-plane Aurora Serverless v2 cluster. "
+            "This is the only writer of the ACU window; shell callers use it "
+            "instead of spelling the RDS flags themselves."
+        ),
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name, help_text in (
+        ("create", "create the cluster (the caller has checked it is absent)"),
+        ("reconcile", "move an existing cluster to the window and wait to settle"),
+    ):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument("--region", required=True)
+        command.add_argument("--cluster-id", required=True)
+        command.add_argument("--min-acu", type=float, required=True)
+        command.add_argument("--max-acu", type=float, required=True)
+        if name == "create":
+            command.add_argument("--subnet-group", required=True)
+            command.add_argument(
+                "--security-group",
+                action="append",
+                required=True,
+                dest="security_groups",
+            )
+            command.add_argument("--parameter-group", required=True)
+            command.add_argument("--site-id", default=None)
+            command.add_argument("--engine-version", default=AURORA_ENGINE_VERSION)
+        else:
+            command.add_argument("--timeout-seconds", type=int, default=1800)
+            command.add_argument("--poll-seconds", type=float, default=10.0)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = _parser().parse_args(argv)
+    capacity = AuroraCapacityConfig(
+        min_acu=float(arguments.min_acu), max_acu=float(arguments.max_acu)
+    )
+    try:
+        if arguments.command == "create":
+            result = create_aurora_cluster(
+                AuroraClusterSpec(
+                    cluster_id=arguments.cluster_id,
+                    subnet_group=arguments.subnet_group,
+                    security_group_ids=tuple(arguments.security_groups),
+                    parameter_group=arguments.parameter_group,
+                    capacity=capacity,
+                    site_id=arguments.site_id,
+                    engine_version=arguments.engine_version,
+                ),
+                aws_region=arguments.region,
+            )
+        else:
+            result = reconcile_aurora_capacity(
+                aws_region=arguments.region,
+                cluster_id=arguments.cluster_id,
+                desired=capacity,
+                timeout_seconds=arguments.timeout_seconds,
+                poll_seconds=arguments.poll_seconds,
+            )
+    except AdminConfigError as exc:
+        print(f"aurora_capacity {arguments.command}: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

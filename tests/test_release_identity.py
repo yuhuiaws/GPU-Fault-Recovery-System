@@ -164,17 +164,13 @@ def test_application_release_identity_excludes_deploy_host_inputs() -> None:
     assert "scripts/deploy_host_component.py" not in patterns
     assert "src/**/*.py" not in config["runtime_image_inputs"]
     assert (
-        "deploy/control-plane/regional/regional_release_*.py"
-        not in config["renderer_inputs"]
+        "src/gpu_fault_release/regional_release_*.py" not in config["renderer_inputs"]
     )
     assert (
-        "deploy/control-plane/regional/regional_release_validation.py"
+        "src/gpu_fault_release/regional_release_validation.py"
         not in config["renderer_inputs"]
     )
-    assert (
-        "deploy/control-plane/regional/rollout_regional_release.py"
-        not in config["renderer_inputs"]
-    )
+    assert "src/gpu_fault_release/rollout.py" not in config["renderer_inputs"]
 
 
 def test_release_identity_includes_file_modes(tmp_path: Path) -> None:

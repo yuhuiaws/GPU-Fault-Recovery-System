@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from pydantic import TypeAdapter
 
 from gpu_fault.collector_requirements import (
@@ -33,6 +34,16 @@ def test_enabled_but_failed_collector_remains_required() -> None:
             )
         }
     )
+    assert CollectorKind.NODE_LOGS in required_collectors_for_agent(agent)
+
+
+@pytest.mark.parametrize("token", ["true", "1", "yes", "ON"])
+def test_every_enabled_token_makes_node_logs_required(monkeypatch, token) -> None:
+    # `=1` used to read as "not required" (S9): the switch must take every
+    # enabled token the validator documents.
+    monkeypatch.setenv("GPU_FAULT_REQUIRE_NODE_LOG_COLLECTOR", token)
+    agent = SimpleNamespace(collector_services={})
+
     assert CollectorKind.NODE_LOGS in required_collectors_for_agent(agent)
 
 

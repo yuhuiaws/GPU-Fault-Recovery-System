@@ -901,6 +901,29 @@ def render_spool_metrics_two(
     return pool_metrics
 
 
+def render_capacity_metrics(lines: list[str]) -> None:
+    """The declared fleet topology, so a scrape can size the fault reserve.
+
+    Site-wide facts shipped by the release renderer; 0 means the release did
+    not declare them. No labels: never a node id.
+    """
+
+    largest: int = int(os.getenv("GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT", "0"))
+    managed: int = int(os.getenv("GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT", "0"))
+    lines.extend(
+        [
+            "# HELP gpu_fault_capacity_largest_cluster_node_count "
+            "Declared node count of the largest managed GPU cluster.",
+            "# TYPE gpu_fault_capacity_largest_cluster_node_count gauge",
+            f"gpu_fault_capacity_largest_cluster_node_count {largest}",
+            "# HELP gpu_fault_capacity_managed_node_count "
+            "Declared node count across every managed GPU cluster.",
+            "# TYPE gpu_fault_capacity_managed_node_count gauge",
+            f"gpu_fault_capacity_managed_node_count {managed}",
+        ]
+    )
+
+
 def render_pool_metrics(lines, pool_metrics, runtime):
     lines.extend(
         [

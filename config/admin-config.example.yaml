@@ -5,6 +5,11 @@ spec:
   # Omitted fields keep their current persisted value.
   capacity:
     controlWorkerReplicas: 6
+    # Declared topology. maxClusterQueueDepth must be >= 4 x largest,
+    # aurora.minAcu >= managed / 100 (rounded up to 0.5); the fault reserve
+    # is derived as max(depth / 8, largest).
+    largestClusterNodeCount: 512
+    managedNodeCount: 512
     telemetrySpool:
       enabled: false
       replicas: 0
@@ -17,7 +22,7 @@ spec:
     maxAcu: 32
   processor:
     maxQueueDepth: 65536
-    maxClusterQueueDepth: 1024
+    maxClusterQueueDepth: 4096
     retryAfterSeconds: 2
     retryBackoffSeconds: 1
     retryBackoffMaxSeconds: 30

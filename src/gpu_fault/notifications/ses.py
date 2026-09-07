@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from gpu_fault.env import env_bool
 from gpu_fault.notifications.common import (
     AdvisoryNotification,
     Any,
@@ -62,9 +63,7 @@ class SesNotificationConfig(StrictModel):
             site_id=os.getenv("GPU_FAULT_SITE_ID"),
             account_id=os.getenv("GPU_FAULT_AWS_ACCOUNT_ID"),
             subject_prefix=os.getenv("GPU_FAULT_EMAIL_SUBJECT_PREFIX", "").strip(),
-            execution_enabled=(
-                os.getenv("GPU_FAULT_ALLOW_EMAIL", "").lower() == "true"
-            ),
+            execution_enabled=env_bool("GPU_FAULT_ALLOW_EMAIL", False),
             configuration_set_name=os.getenv("GPU_FAULT_SES_CONFIGURATION_SET"),
         )
 

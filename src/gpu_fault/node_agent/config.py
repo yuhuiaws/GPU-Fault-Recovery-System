@@ -8,6 +8,7 @@ import socket
 import tempfile
 from pathlib import Path
 
+from gpu_fault.env import env_bool
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.common import (
     DEFAULT_DEVICE_SWEEP_PROCESSES,
@@ -184,9 +185,7 @@ def executor_from_environment(
 
 
 def _quiesce_from_environment(proc_root, operations):
-    quiesce_enabled = (
-        os.getenv("GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE", "").lower() == "true"
-    )
+    quiesce_enabled = env_bool("GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE", False)
     state_dir = os.getenv(
         "GPU_FAULT_QUIESCE_STATE_DIR",
         "/var/lib/gpu-fault/quiesce",
@@ -280,22 +279,13 @@ def _executor_from_settings(
         ),
         node_ids=node_ids,
         allowed_operations=operations,
-        reset_enabled=(
-            os.getenv("GPU_FAULT_NODE_ALLOW_GPU_RESET", "").lower() == "true"
+        reset_enabled=env_bool("GPU_FAULT_NODE_ALLOW_GPU_RESET", False),
+        single_gpu_reset_supported=env_bool(
+            "GPU_FAULT_NODE_SINGLE_GPU_RESET_SUPPORTED", True
         ),
-        single_gpu_reset_supported=(
-            os.getenv(
-                "GPU_FAULT_NODE_SINGLE_GPU_RESET_SUPPORTED",
-                "true",
-            ).lower()
-            == "true"
-        ),
-        fabric_reset_enabled=(
-            os.getenv("GPU_FAULT_NODE_ALLOW_FABRIC_RESET", "").lower() == "true"
-        ),
-        fabric_manager_restart_enabled=(
-            os.getenv("GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART", "").lower()
-            == "true"
+        fabric_reset_enabled=env_bool("GPU_FAULT_NODE_ALLOW_FABRIC_RESET", False),
+        fabric_manager_restart_enabled=env_bool(
+            "GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART", False
         ),
         service_quiesce_enabled=quiesce_enabled,
         diagnostic_output_dir=os.getenv(
@@ -316,12 +306,8 @@ def _executor_from_settings(
             "GPU_FAULT_INFINIBAND_ROOT",
             "/sys/class/infiniband",
         ),
-        efa_driver_remediation_enabled=(
-            os.getenv(
-                "GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION",
-                "",
-            ).lower()
-            == "true"
+        efa_driver_remediation_enabled=env_bool(
+            "GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION", False
         ),
         efa_pci_devices_root=os.getenv(
             "GPU_FAULT_PCI_DEVICES_ROOT",
@@ -341,8 +327,8 @@ def _executor_from_settings(
             "GPU_FAULT_PYTHON_STACK_TOOL",
             "/opt/gpu-fault/venv/bin/py-spy",
         ),
-        field_diagnostic_enabled=(
-            os.getenv("GPU_FAULT_NODE_ALLOW_FIELD_DIAGNOSTIC", "").lower() == "true"
+        field_diagnostic_enabled=env_bool(
+            "GPU_FAULT_NODE_ALLOW_FIELD_DIAGNOSTIC", False
         ),
         field_diagnostic_command=tuple(
             shlex.split(os.getenv("GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND", ""))
@@ -367,8 +353,8 @@ def _executor_from_settings(
                 "1800",
             )
         ),
-        driver_remediation_enabled=(
-            os.getenv("GPU_FAULT_NODE_ALLOW_DRIVER_REMEDIATION", "").lower() == "true"
+        driver_remediation_enabled=env_bool(
+            "GPU_FAULT_NODE_ALLOW_DRIVER_REMEDIATION", False
         ),
         driver_remediation_command=tuple(
             shlex.split(os.getenv("GPU_FAULT_DRIVER_REMEDIATION_COMMAND", ""))
@@ -381,9 +367,7 @@ def _executor_from_settings(
             if os.getenv("GPU_FAULT_TARGET_DRIVER_BRANCH")
             else None
         ),
-        firmware_update_enabled=(
-            os.getenv("GPU_FAULT_NODE_ALLOW_FIRMWARE_UPDATE", "").lower() == "true"
-        ),
+        firmware_update_enabled=env_bool("GPU_FAULT_NODE_ALLOW_FIRMWARE_UPDATE", False),
         firmware_update_command=tuple(
             shlex.split(os.getenv("GPU_FAULT_FIRMWARE_UPDATE_COMMAND", ""))
         ),

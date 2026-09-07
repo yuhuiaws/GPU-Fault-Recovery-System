@@ -51,8 +51,8 @@ from gpu_fault.models import (
 from gpu_fault.notifications import (
     WarmSpareReplacementEmailBuilder,
 )
+from gpu_fault.orchestration import WorkflowFencingError
 from gpu_fault.orchestration.preemption_boundary import preemption_boundary
-from gpu_fault.orchestrator import WorkflowFencingError
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 from gpu_fault.store.shared.errors import RemediationBudgetError

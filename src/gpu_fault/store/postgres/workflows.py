@@ -590,10 +590,10 @@ class PostgresWorkflowMixin:
                         now=claimed_at,
                     )
                 except RemediationBudgetError as exc:
+                    # The refusing scope is recorded too, so the per-cluster
+                    # saturation gauge never has to parse the message (S1).
                     workflow = blocked_by_remediation_budget(
-                        workflow,
-                        str(exc),
-                        now=claimed_at,
+                        workflow, str(exc), scope=exc.scope, now=claimed_at
                     )
                     budget_error = exc
             if budget_error is not None:

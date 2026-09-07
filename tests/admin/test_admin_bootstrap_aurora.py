@@ -1,26 +1,31 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
 
 import pytest
 
 from gpu_fault.admin import bootstrap_aurora as aurora
-from gpu_fault.admin.config import AdminConfigError, AuroraCapacityConfig
+from gpu_fault.admin.config import AuroraCapacityConfig
 from gpu_fault.admin.config_file import initialize_desired_admin_config
 
 
 class Runner:
-    """Records the mutating AWS calls instead of making them."""
+    """Records the AWS calls instead of making them, and plays a two-instance
+    Serverless v2 cluster whose window only changes after ``modify-db-cluster``."""
 
     dry_run = False
 
-    def __init__(self, statuses: Sequence[str] = ()) -> None:
+    def __init__(
+        self, statuses: Sequence[str] = (), *, window: tuple[float, float] = (0.5, 8.0)
+    ) -> None:
         self.calls: list[tuple[str, ...]] = []
         # Each entry is the cluster status one settle poll observes; the list is
         # consumed in order and the last value repeats forever.
         self.statuses = list(statuses) or ["available"]
+        self.window = window
 
     def run(self, arguments: Sequence[str], **_keywords: Any) -> str:
         self.calls.append(tuple(arguments))
@@ -28,16 +33,55 @@ class Runner:
 
     def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> dict:
         self.calls.append(("aws", *arguments))
-        if arguments[1] == "describe-db-clusters":
+        operation = arguments[1]
+        if operation == "describe-db-clusters":
             status = self.statuses[0]
             if len(self.statuses) > 1:
                 self.statuses.pop(0)
-            return {"DBClusters": [{"Status": status}]}
-        return {"DBInstances": [{"DBInstanceStatus": "available"}]}
+            return {
+                "DBClusters": [
+                    {
+                        "Status": status,
+                        "ServerlessV2ScalingConfiguration": {
+                            "MinCapacity": self.window[0],
+                            "MaxCapacity": self.window[1],
+                        },
+                        "DBClusterMembers": [
+                            {"DBInstanceIdentifier": "w", "IsClusterWriter": True},
+                            {"DBInstanceIdentifier": "r", "IsClusterWriter": False},
+                        ],
+                    }
+                ]
+            }
+        if operation == "modify-db-cluster":
+            window = arguments[arguments.index("--apply-immediately") - 1]
+            low, high = (float(item.split("=")[1]) for item in window.split(","))
+            self.window = (low, high)
+            return {}
+        if operation == "get-metric-statistics":
+            return {
+                "Datapoints": [
+                    {
+                        "Timestamp": datetime.now(UTC).isoformat(),
+                        "Maximum": self.window[0],
+                    }
+                ]
+            }
+        return {
+            "DBInstances": [
+                {"DBInstanceStatus": "available", "DBInstanceClass": "db.serverless"}
+            ]
+        }
 
 
 def _operations(runner: Runner) -> list[str]:
     return [arguments[2] for arguments in runner.calls]
+
+
+def _modify(runner: Runner) -> tuple[str, ...]:
+    modifies = [call for call in runner.calls if call[2] == "modify-db-cluster"]
+    assert len(modifies) == 1, _operations(runner)
+    return modifies[0]
 
 
 def test_bootstrap_reads_the_desired_capacity_rather_than_a_default(
@@ -55,22 +99,6 @@ def test_bootstrap_reads_the_desired_capacity_rather_than_a_default(
     capacity = aurora.bootstrap_aurora_capacity(tmp_path)
 
     assert (capacity.min_acu, capacity.max_acu) == (8.0, 32.0)
-
-
-def test_scaling_configuration_validates_before_rendering() -> None:
-    """An invalid window must fail before it reaches the AWS argument list.
-
-    ``modify-db-cluster`` accepts a syntactically valid pair, so rendering first
-    would turn a rejected config into a live capacity change.
-    """
-
-    assert (
-        aurora.scaling_configuration(AuroraCapacityConfig(min_acu=0.5, max_acu=32.0))
-        == "MinCapacity=0.5,MaxCapacity=32"
-    )
-
-    with pytest.raises(AdminConfigError, match="0.5 ACU increments"):
-        aurora.scaling_configuration(AuroraCapacityConfig(min_acu=0.7, max_acu=32.0))
 
 
 def test_reconcile_leaves_a_cluster_that_already_matches_alone() -> None:
@@ -111,6 +139,10 @@ def test_reconcile_leaves_a_cluster_that_already_matches_alone() -> None:
 def test_reconcile_scales_a_cluster_that_does_not_match(
     cluster: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The modify goes through the runner (so ``--dry-run`` can hold it back)
+    and is the same call ``aurora_capacity`` makes for ``config apply``: one
+    writer, one settle rule."""
+
     monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
     runner = Runner()
 
@@ -122,9 +154,12 @@ def test_reconcile_scales_a_cluster_that_does_not_match(
         capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
     )
 
-    assert _operations(runner)[0] == "modify-db-cluster"
-    assert "MinCapacity=8,MaxCapacity=32" in runner.calls[0]
-    assert "--apply-immediately" in runner.calls[0]
+    modify = _modify(runner)
+    assert "MinCapacity=8,MaxCapacity=32" in modify
+    assert "--apply-immediately" in modify
+    assert runner.window == (8.0, 32.0)
+    # A scale-up is not done until CloudWatch shows the instances at the floor.
+    assert "get-metric-statistics" in _operations(runner)
 
 
 def test_reconcile_waits_out_a_flip_that_starts_after_the_modify_returns(
@@ -140,6 +175,8 @@ def test_reconcile_waits_out_a_flip_that_starts_after_the_modify_returns(
     """
 
     monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    # The first status is the pre-modify observation; the loop then sees the
+    # late flip and needs three quiet polls after it.
     runner = Runner(["available", "modifying", "modifying", "available"])
 
     aurora.reconcile_existing_capacity(
@@ -152,11 +189,35 @@ def test_reconcile_waits_out_a_flip_that_starts_after_the_modify_returns(
         capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
     )
 
-    polls = _operations(runner).count("describe-db-clusters")
-    assert polls == 6, (
+    operations = _operations(runner)
+    polls = operations[operations.index("modify-db-cluster") :].count(
+        "describe-db-clusters"
+    )
+    assert polls == 5, (
         "the settle loop stopped on the first quiet poll instead of requiring "
         f"{aurora.CAPACITY_SETTLE_STABLE_POLLS} consecutive ones: {polls} polls"
     )
+
+
+def test_a_scale_that_never_settles_is_a_bootstrap_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared reconciler raises the admin-config error type; bootstrap's
+    callers handle ``BootstrapError``, so it must arrive as one."""
+
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    elapsed = iter([0.0, 600.0, 1200.0, 1800.0, 2400.0])
+    monkeypatch.setattr(aurora.time, "monotonic", lambda: next(elapsed))
+    runner = Runner(["modifying"])
+
+    with pytest.raises(aurora.BootstrapError, match="did not converge"):
+        aurora.reconcile_existing_capacity(
+            runner,
+            aws_region="us-east-1",
+            cluster_id="aurora-a",
+            cluster={},
+            capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
+        )
 
 
 def test_settle_gives_up_rather_than_polling_a_stuck_cluster_forever(
@@ -190,7 +251,9 @@ def test_a_dry_run_never_polls_for_a_change_it_did_not_make(
         capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
     )
 
-    assert _operations(runner) == ["modify-db-cluster"]
+    operations = _operations(runner)
+    assert operations.count("modify-db-cluster") == 1
+    assert operations[operations.index("modify-db-cluster") + 1 :] == []
 
 
 def test_missing_instances_are_created_in_their_own_availability_zone(

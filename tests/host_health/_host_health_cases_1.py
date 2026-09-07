@@ -152,6 +152,24 @@ def test_checkpoint_progress_defers_zero_traffic_escalation(monkeypatch) -> None
     ]
 
 
+@pytest.mark.parametrize("token", ["1", "yes", "on"])
+def test_zero_traffic_progress_suppression_accepts_every_enabled_token(
+    monkeypatch, token: str
+) -> None:
+    """A default-on switch spelled ``=1`` used to switch the suppression off."""
+
+    monkeypatch.setenv("GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED", token)
+
+    signals = zero_traffic_with_progress(
+        monkeypatch, progress_at=(20, 35), samples=(0, 15, 30, 45, 60, 75)
+    )
+
+    assert signals == [
+        (60, "EFA_TRAFFIC_ZERO_WARNING"),
+        (75, "EFA_TRAFFIC_HUNG_SUSPECTED"),
+    ]
+
+
 def test_zero_traffic_progress_suppression_can_be_disabled(monkeypatch) -> None:
     monkeypatch.setenv("GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED", "false")
 

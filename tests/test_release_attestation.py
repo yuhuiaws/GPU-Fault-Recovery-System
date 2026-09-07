@@ -278,3 +278,138 @@ def test_production_attestation_binds_ci_gate(tmp_path: Path, monkeypatch) -> No
     assert {item["command"] for item in value["quality_gates"]} == set(
         release_attestation.PROMOTED_QUALITY_GATES
     )
+
+
+def _sbom_dir(root: Path, *names: str) -> Path:
+    directory = root / "dist/sbom"
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (directory / name).write_text(
+            json.dumps({"bomFormat": "CycloneDX", "components": [{"name": name}]}),
+            encoding="utf-8",
+        )
+    return directory
+
+
+def test_attestation_binds_every_sbom_in_the_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = manifest(tmp_path)
+    directory = _sbom_dir(tmp_path, "runtime.cdx.json", "build.cdx.json")
+    (directory / "notes.txt").write_text("not an sbom", encoding="utf-8")
+    monkeypatch.setattr(
+        release_attestation,
+        "source_state",
+        lambda _root: {"git_commit": "a" * 40, "dirty": False, "diff_sha256": "b" * 64},
+    )
+
+    value = release_attestation.build_attestation(tmp_path, path, sbom_dir=directory)
+
+    assert value["sbom"] == [
+        {
+            "path": "dist/sbom/build.cdx.json",
+            "sha256": release_attestation.sha256(directory / "build.cdx.json"),
+        },
+        {
+            "path": "dist/sbom/runtime.cdx.json",
+            "sha256": release_attestation.sha256(directory / "runtime.cdx.json"),
+        },
+    ]
+
+
+def test_attestation_without_sbom_files_carries_no_sbom_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = manifest(tmp_path)
+    monkeypatch.setattr(
+        release_attestation,
+        "source_state",
+        lambda _root: {"git_commit": "a" * 40, "dirty": False, "diff_sha256": "b" * 64},
+    )
+
+    value = release_attestation.build_attestation(
+        tmp_path, path, sbom_dir=tmp_path / "dist/sbom"
+    )
+
+    assert "sbom" not in value
+
+
+def test_sbom_directory_outside_the_repository_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    path = manifest(root)
+    outside = _sbom_dir(tmp_path / "elsewhere", "runtime.cdx.json")
+    monkeypatch.setattr(
+        release_attestation,
+        "source_state",
+        lambda _root: {"git_commit": "a" * 40, "dirty": False, "diff_sha256": "b" * 64},
+    )
+
+    with pytest.raises(release_attestation.ReleaseAttestationError, match="SBOM"):
+        release_attestation.build_attestation(root, path, sbom_dir=outside)
+
+
+def _signed_attestation_with_sbom(root: Path, path: Path, sbom_sha256: str) -> Path:
+    attestation = {
+        "schema_version": 1,
+        "subject": {
+            "release_id": "release-a",
+            "manifest": "dist/current-release.json",
+            "manifest_sha256": release_attestation.sha256(path),
+            "delivery_sha256": "d" * 64,
+        },
+        "source": {"dirty": False},
+        "quality_gates": [
+            {"command": "make check", "status": "PASSED"},
+            {"command": "make test-postgres-stress", "status": "PASSED"},
+        ],
+        "sbom": [{"path": "dist/sbom/runtime.cdx.json", "sha256": sbom_sha256}],
+    }
+    attestation_path = root / "attestation.json"
+    attestation_path.write_text(json.dumps(attestation), encoding="utf-8")
+    return attestation_path
+
+
+def test_verify_attestation_checks_sbom_digests(tmp_path: Path, monkeypatch) -> None:
+    path = manifest(tmp_path)
+    directory = _sbom_dir(tmp_path, "runtime.cdx.json")
+    attestation_path = _signed_attestation_with_sbom(
+        tmp_path, path, release_attestation.sha256(directory / "runtime.cdx.json")
+    )
+    bundle = tmp_path / "attestation.bundle.json"
+    bundle.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        release_attestation.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    verified = release_attestation.verify_attestation(
+        tmp_path,
+        attestation_path,
+        signature=None,
+        bundle=bundle,
+        cosign_key="cosign.pub",
+        certificate=None,
+        certificate_identity=None,
+        certificate_oidc_issuer=None,
+    )
+    assert verified["sbom"][0]["path"] == "dist/sbom/runtime.cdx.json"
+
+    (directory / "runtime.cdx.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(
+        release_attestation.ReleaseAttestationError, match="SBOM SHA-256"
+    ):
+        release_attestation.verify_attestation(
+            tmp_path,
+            attestation_path,
+            signature=None,
+            bundle=bundle,
+            cosign_key="cosign.pub",
+            certificate=None,
+            certificate_identity=None,
+            certificate_oidc_issuer=None,
+        )

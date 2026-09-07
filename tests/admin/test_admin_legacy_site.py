@@ -110,6 +110,7 @@ class Legacy:
                 ],
                 "DBSubnetGroup": "gpu-fault-aurora-subnets",
                 "VpcSecurityGroups": [{"VpcSecurityGroupId": "sg-aurora"}],
+                "DBClusterParameterGroup": "gpu-fault-aurora-pg",
             }
         ]
         self.pki_secret_names = ["gpu-fault-nlb-private-pki-legacy"]
@@ -354,6 +355,10 @@ def test_discovered_bootstrap_state_marks_what_uninstall_may_delete(
         "gpu-fault-aurora-writer",
         "gpu-fault-aurora-reader",
     ]
+    # deploy.sh names the diagnostics group ``<cluster>-pg`` exactly as bootstrap
+    # does; it is ours only while it is the group the cluster actually runs on.
+    assert resources["aurora"]["parameter_group"] == "gpu-fault-aurora-pg"
+    assert resources["aurora"]["parameter_group_ownership"] == "CREATED"
     assert resources["nlb_network"]["vpc_id"] == "vpc-legacy"
     assert resources["monitoring_resources"]["workspace_ownership"] == "CREATED"
     assert resources["load_balancer_controller"] == {"external": True}
@@ -366,6 +371,24 @@ def test_discovered_bootstrap_state_marks_what_uninstall_may_delete(
         f"arn:aws:iam::{ACCOUNT}:oidc-provider/oidc.eks.{REGION}"
         ".amazonaws.com/id/LEGACY"
     )
+
+
+def test_a_cluster_on_the_engine_default_group_registers_no_parameter_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deploy.sh run from before the diagnostics group left the cluster on
+    ``default.aurora-postgresql16``. That group is AWS's, not ours: recording the
+    derived name would have uninstall delete a group that may not exist, or
+    worse, one another team created under the same name."""
+
+    legacy = Legacy(tmp_path)
+    legacy.db_clusters[0]["DBClusterParameterGroup"] = "default.aurora-postgresql16"
+
+    legacy.discover(monkeypatch)
+    aurora = legacy.bootstrap_state()["resources"]["aurora"]
+
+    assert "parameter_group" not in aurora
+    assert "parameter_group_ownership" not in aurora
 
 
 def test_a_cloudformation_managed_workspace_is_recorded_as_external(

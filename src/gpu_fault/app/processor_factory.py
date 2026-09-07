@@ -8,7 +8,14 @@ from threading import Thread
 from urllib.parse import urlsplit
 
 from gpu_fault.app.identity import pod_process_owner
-from gpu_fault.processor import ProcessorCoordinator
+from gpu_fault.env import env_bool
+from gpu_fault.processor import (
+    ProcessorCoordinator,
+    ProcessorLeaseSettings,
+    ProcessorPoolSettings,
+    ProcessorSpoolSettings,
+    ProcessorStaleSettings,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -41,14 +48,7 @@ class ProcessorFactory:
         if self.mode == "direct":
             return None
         owner_id, replay_secret, local_url = self._identity()
-        worker_count = int(os.getenv("GPU_FAULT_PROCESSOR_WORKERS", "4"))
-        default_pool = max(1, worker_count // 4)
-        kwargs = {
-            **self._lease_settings(),
-            **self._pool_settings(worker_count, default_pool),
-            **self._stale_settings(),
-            **self._spool_settings(default_pool),
-        }
+        pools = ProcessorPoolSettings.from_environment()
         self.processor = ProcessorCoordinator(
             self.context.store,
             owner_id=owner_id,
@@ -56,8 +56,13 @@ class ProcessorFactory:
             execution_token=self.context.execution_token,
             local_url=local_url,
             active_consumers=self.mode == "active-active",
+            lease=ProcessorLeaseSettings.from_environment(),
+            pools=pools,
+            stale=ProcessorStaleSettings.from_environment(),
+            spool=ProcessorSpoolSettings.from_environment(
+                default_pool=pools.default_pool
+            ),
             on_unhealthy=self._recycle,
-            **kwargs,
         )
         return self.processor
 
@@ -96,251 +101,11 @@ class ProcessorFactory:
             )
         return owner_id, replay_secret, local_url
 
-    @staticmethod
-    def _lease_settings() -> dict:
-        return {
-            "lease_seconds": int(
-                os.getenv("GPU_FAULT_PROCESSOR_LEADER_LEASE_SECONDS", "15")
-            ),
-            "renew_seconds": float(
-                os.getenv("GPU_FAULT_PROCESSOR_LEADER_RENEW_SECONDS", "3")
-            ),
-            "request_lease_seconds": int(
-                os.getenv("GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS", "120")
-            ),
-            "request_renew_seconds": float(
-                os.getenv("GPU_FAULT_PROCESSOR_REQUEST_RENEW_SECONDS", "5")
-            ),
-            "request_max_execution_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_REQUEST_MAX_EXECUTION_SECONDS",
-                    "30",
-                )
-            ),
-            "deadline_exceeded_process_threshold": int(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_DEADLINE_EXCEEDED_PROCESS_THRESHOLD",
-                    "3",
-                )
-            ),
-            "unhealthy_ttl_seconds": float(
-                os.getenv("GPU_FAULT_PROCESSOR_UNHEALTHY_TTL_SECONDS", "300")
-            ),
-            "retryable_response_max_age_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_RETRYABLE_RESPONSE_MAX_AGE_SECONDS",
-                    "300",
-                )
-            ),
-            "retry_backoff_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS",
-                    "1",
-                )
-            ),
-            "retry_backoff_max_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS",
-                    "30",
-                )
-            ),
-            "idle_backoff_max_seconds": float(
-                os.getenv("GPU_FAULT_PROCESSOR_IDLE_BACKOFF_MAX_SECONDS", "2")
-            ),
-            "busy_backoff_max_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_BUSY_BACKOFF_MAX_SECONDS",
-                    "0.4",
-                )
-            ),
-            "fault_idle_backoff_max_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_FAULT_IDLE_BACKOFF_MAX_SECONDS",
-                    "0.5",
-                )
-            ),
-            "fault_busy_backoff_max_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_FAULT_BUSY_BACKOFF_MAX_SECONDS",
-                    "0.1",
-                )
-            ),
-            "processor_notification_fallback_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS",
-                    "5",
-                )
-            ),
-            "processor_notification_shard_count": (
-                ProcessorFactory._notification_shard_count()
-            ),
-            "routine_starvation_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS",
-                    "30",
-                )
-            ),
-        }
-
-    @staticmethod
-    def _notification_shard_count() -> int:
-        """Shards must cover the consumer processes, or the losers are pollers.
-
-        The deployment computes ``GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS`` as
-        replicas x uvicorn workers; the code default of 8 knew nothing of
-        that and left 16 of 24 processes without a shard (F-D11). With
-        ``GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES`` set the shard count is
-        derived from it, and an explicit shard count below it is refused at
-        startup rather than discovered as a warning per process at run time.
-        """
-
-        shards_raw = os.getenv("GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS")
-        processes_raw = os.getenv("GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES")
-        if processes_raw is None:
-            return int(shards_raw if shards_raw is not None else "8")
-        processes = int(processes_raw)
-        if processes <= 0:
-            raise RuntimeError(
-                "GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES must be a positive integer"
-            )
-        if shards_raw is None:
-            return processes
-        shards = int(shards_raw)
-        if shards < processes:
-            raise RuntimeError(
-                "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS "
-                f"({shards}) is below GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES "
-                f"({processes}); every consumer process needs a shard or it "
-                "never receives a notification"
-            )
-        return shards
-
-    @staticmethod
-    def _pool_settings(
-        worker_count: int,
-        default_pool: int,
-    ) -> dict:
-        return {
-            "fault_pressure_evidence_workers": int(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS",
-                    "1",
-                )
-            ),
-            "worker_count": worker_count,
-            "fault_worker_count": int(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_FAULT_WORKERS",
-                    str(default_pool),
-                )
-            ),
-            "observation_worker_count": int(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_OBSERVATION_WORKERS",
-                    str(default_pool),
-                )
-            ),
-            "gpu_telemetry_worker_count": int(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS",
-                    str(default_pool),
-                )
-            ),
-            "host_telemetry_worker_count": int(
-                os.getenv(
-                    "GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS",
-                    str(default_pool),
-                )
-            ),
-        }
-
-    @staticmethod
-    def _stale_settings() -> dict:
-        names = {
-            "gpu_inventory_stale_seconds": (
-                "GPU_FAULT_PROCESSOR_GPU_INVENTORY_STALE_SECONDS",
-                "180",
-            ),
-            "health_summary_stale_seconds": (
-                "GPU_FAULT_PROCESSOR_HEALTH_SUMMARY_STALE_SECONDS",
-                "420",
-            ),
-            "observation_stale_seconds": (
-                "GPU_FAULT_PROCESSOR_OBSERVATION_STALE_SECONDS",
-                "120",
-            ),
-            "training_progress_stale_seconds": (
-                "GPU_FAULT_PROCESSOR_TRAINING_PROGRESS_STALE_SECONDS",
-                "120",
-            ),
-        }
-        return {
-            key: float(os.getenv(env_name, default))
-            for key, (env_name, default) in names.items()
-        }
-
-    @staticmethod
-    def _spool_settings(default_pool: int) -> dict:
-        return {
-            "telemetry_spool_enabled": os.getenv("GPU_FAULT_TELEMETRY_SPOOL", "0")
-            .strip()
-            .lower()
-            in {"1", "true", "yes"},
-            "telemetry_spool_workers": int(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_WORKERS",
-                    str(default_pool * 2),
-                )
-            ),
-            "telemetry_spool_lease_seconds": float(
-                os.getenv("GPU_FAULT_TELEMETRY_SPOOL_LEASE_SECONDS", "60")
-            ),
-            "telemetry_spool_retry_backoff_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_RETRY_BACKOFF_SECONDS",
-                    "1",
-                )
-            ),
-            "telemetry_spool_notification_fallback_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_NOTIFICATION_FALLBACK_SECONDS",
-                    "5",
-                )
-            ),
-            "telemetry_spool_fault_pressure_workers": int(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_FAULT_PRESSURE_WORKERS",
-                    "1",
-                )
-            ),
-            "telemetry_spool_fault_pressure_poll_seconds": float(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_FAULT_PRESSURE_POLL_SECONDS",
-                    "0.5",
-                )
-            ),
-            "telemetry_spool_max_in_flight_bytes": int(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_MAX_IN_FLIGHT_BYTES",
-                    str(64 * 1024 * 1024),
-                )
-            ),
-            "telemetry_spool_replay_batch_max_items": int(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_ITEMS",
-                    "64",
-                )
-            ),
-            "telemetry_spool_replay_batch_max_bytes": int(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_BYTES",
-                    str(8 * 1024 * 1024),
-                )
-            ),
-        }
-
     def _recycle(self, reason: str) -> None:
-        if os.getenv("GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE", "false").lower() != "true":
+        if not env_bool("GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE"):
+            return
+        processor = self.processor
+        if processor is None:
             return
 
         def exit_process() -> None:
@@ -351,7 +116,7 @@ class ProcessorFactory:
             )
             if self.exit_grace_seconds > 0:
                 time.sleep(self.exit_grace_seconds)
-            abandon = self.processor.abandon_in_flight()
+            abandon = processor.abandon_in_flight()
             LOGGER.critical(
                 "terminating unhealthy processor process "
                 "in_flight=%s released=%s failed=%s",

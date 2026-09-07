@@ -18,7 +18,7 @@ from gpu_fault.models import (
     WorkflowDispatchReport,
     WorkflowRequest,
 )
-from gpu_fault.orchestrator import WorkflowFencingError
+from gpu_fault.orchestration import WorkflowFencingError
 
 
 @dataclass(frozen=True)

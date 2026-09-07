@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
-
-MODULE = lazy_script_module(
-    Path("deploy/control-plane/regional/regional_release_runtime_identity.py")
-)
+from gpu_fault_release import regional_release_runtime_identity as MODULE
 
 
 class Runner:

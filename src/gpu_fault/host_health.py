@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from pydantic import Field
 
+from gpu_fault.env import env_bool
 from gpu_fault.models import (
     EfaTrafficSignal,
     MarkerScope,
@@ -541,23 +542,11 @@ class NodeHealthPolicy:
         self.efa_zero_hung_seconds = float(
             os.getenv("GPU_FAULT_EFA_TRAFFIC_ZERO_HUNG_SECONDS", "600")
         )
-        self.efa_progress_suppression_enabled = (
-            os.getenv(
-                "GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED",
-                "true",
-            )
-            .strip()
-            .lower()
-            == "true"
+        self.efa_progress_suppression_enabled = env_bool(
+            "GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED", True
         )
-        self.efa_rank_liveness_enabled = (
-            os.getenv(
-                "GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED",
-                "true",
-            )
-            .strip()
-            .lower()
-            == "true"
+        self.efa_rank_liveness_enabled = env_bool(
+            "GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED", True
         )
         self.efa_progress_suppression_max_seconds = float(
             os.getenv(

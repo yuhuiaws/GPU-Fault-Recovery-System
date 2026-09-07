@@ -7,12 +7,16 @@ from functools import cache
 from importlib.resources import files
 from typing import Any, Mapping
 
+# The token sets are re-exported on purpose: this module is where the schema
+# check reads them, and they must be the very objects ``env_bool`` accepts.
+from gpu_fault.env import BOOLEAN_TOKENS as BOOLEAN_TOKENS
+from gpu_fault.env import TRUE_TOKENS as TRUE_TOKENS
+from gpu_fault.env import env_bool, invalid_boolean_message
+
 LOGGER = logging.getLogger(__name__)
 PREFIX = "GPU_FAULT_"
 POLICY_ENV = "GPU_FAULT_UNKNOWN_ENV_POLICY"
 TRAINING_HEALTH_MONITOR_ENV = "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR"
-BOOLEAN_TOKENS = frozenset({"0", "1", "true", "false", "yes", "no", "on", "off"})
-TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 
 
 def training_health_monitor_enabled(
@@ -26,10 +30,7 @@ def training_health_monitor_enabled(
     instead of at each call site.
     """
 
-    environment = os.environ if values is None else values
-    return (
-        environment.get(TRAINING_HEALTH_MONITOR_ENV, "false").strip().lower() == "true"
-    )
+    return env_bool(TRAINING_HEALTH_MONITOR_ENV, False, environ=values)
 
 
 @cache
@@ -156,9 +157,7 @@ def invalid_gpu_fault_environment_values(
         elif kind == "boolean":
             token = text.lower()
             if token not in BOOLEAN_TOKENS:
-                problems.append(
-                    f"{name} must be one of {'/'.join(sorted(BOOLEAN_TOKENS))}"
-                )
+                problems.append(invalid_boolean_message(name))
             elif true_tokens and token in TRUE_TOKENS - true_tokens:
                 # Refusing only the enabled-looking tokens keeps this sound: no
                 # deployment writes "on" meaning off, while "no"/"0"/"off" are

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import logging
-
 from datetime import datetime, timedelta
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Sequence
 
 from gpu_fault.models import (
     HealthSignalState,
@@ -19,7 +17,6 @@ from gpu_fault.policy import (
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.health_signals import (
     latched_health_signal_state,
-    previous_clock,
     sample_disposition,
     signal_clock,
 )
@@ -29,15 +26,18 @@ from gpu_fault.store.shared.health_signals import (
 _Xid74StateKey = tuple[str, str, int, int, int]
 
 
-LOGGER = logging.getLogger(__name__)
-
-
 class MemoryXidMixin:
     # Attributes supplied by the composed concrete implementation.
     _health_signal_states: dict[str, HealthSignalState]
     _xid_correlation_events: dict[str, XidEvent]
     _xid_correlations: dict[str, XidCorrelationRecord]
     _xid_policy_decisions: dict[str, FaultPolicyDecision]
+
+    # The rules, from SharedXidSignalMixin.
+    _next_health_signal_state: Callable[..., tuple[HealthSignalState, bool]]
+    _note_health_signal_clock_regression: Callable[..., None]
+    _xid74_populated_bits: Callable[[XidEvent], list[tuple[int, int]]]
+    _xid74_scope: Callable[[XidEvent], tuple[str, str, int] | None]
 
     _lock: Any
     _xid74_counted_events: set[tuple[str, _Xid74StateKey]]
@@ -60,34 +60,6 @@ class MemoryXidMixin:
                     ):
                         self._xid_correlation_events.pop(key, None)
             return True
-
-    @staticmethod
-    def _xid74_scope(event: XidEvent) -> tuple[str, str, int] | None:
-        gpu_key = (
-            f"uuid:{event.gpu_uuid}"
-            if event.gpu_uuid
-            else (
-                f"node-pci:{event.node_id}:{event.pci_bdf.lower()}"
-                if event.pci_bdf
-                else None
-            )
-        )
-        if gpu_key is None or event.nvlink_link_id is None:
-            return None
-        return (
-            event.cluster_id,
-            gpu_key,
-            event.nvlink_link_id,
-        )
-
-    @staticmethod
-    def _xid74_populated_bits(event: XidEvent) -> list[tuple[int, int]]:
-        return [
-            (register_index, bit)
-            for register_index, value in enumerate(event.registers)
-            for bit in range(value.bit_length())
-            if value & (1 << bit)
-        ]
 
     def record_xid74_occurrences(self, event: XidEvent) -> dict[str, int]:
         scope = self._xid74_scope(event)
@@ -134,24 +106,6 @@ class MemoryXidMixin:
             except KeyError as exc:
                 raise NotFoundError(event_id) from exc
 
-    def get_xid_events(self, event_ids: Iterable[str]) -> dict[str, XidEvent]:
-        """Load the events behind a whole claimed batch at once.
-
-        Correlation claims up to ``batch_size`` correlations and then
-        needs the event behind each one. One round trip per correlation
-        put the pass's latency at ``batch_size × RTT`` before any policy
-        ran, which is what made a 100-deep batch miss its poll interval.
-        Missing ids are absent from the result rather than raising, so
-        the caller can log and skip them the same way it did before.
-        """
-        found: dict[str, XidEvent] = {}
-        for event_id in event_ids:
-            try:
-                found[event_id] = self.get_xid_event(event_id)
-            except NotFoundError:
-                continue
-        return found
-
     def list_xid_events(
         self,
         cluster_id: str,
@@ -169,32 +123,6 @@ class MemoryXidMixin:
                 and (observed_after is None or item.observed_at >= observed_after)
                 and (observed_before is None or item.observed_at <= observed_before)
             ]
-
-    def list_xid_events_for_scopes(
-        self,
-        scopes: Iterable[tuple[str, str, datetime | None, datetime | None]],
-    ) -> dict[tuple[str, str], list[XidEvent]]:
-        """Companion candidates for several node windows in one call.
-
-        ``scopes`` is an iterable of ``(cluster_id, node_id,
-        observed_after, observed_before)``. The result is keyed by
-        ``(cluster_id, node_id)`` and holds the union of the matching
-        events for that node - the caller still narrows to each event's
-        own window, because two events on the same node have different
-        ones. Stores with a query planner override this with a single
-        statement; here the loop is the whole point of the default.
-        """
-        grouped: dict[tuple[str, str], dict[str, XidEvent]] = {}
-        for cluster_id, node_id, after, before in scopes:
-            bucket = grouped.setdefault((cluster_id, node_id), {})
-            for item in self.list_xid_events(
-                cluster_id,
-                node_id,
-                observed_after=after,
-                observed_before=before,
-            ):
-                bucket[item.event_id] = item
-        return {scope: list(bucket.values()) for scope, bucket in grouped.items()}
 
     def save_xid_policy_decision(self, decision: FaultPolicyDecision) -> None:
         with self._lock:
@@ -366,75 +294,3 @@ class MemoryXidMixin:
                 return False
             self._xid_metric_baselines[key] = baseline
             return previous is not None and xid > 0 and xid != previous.xid
-
-    # Node clocks that stepped backwards while the control plane's moved on
-    # (F-M2). The sample is still judged; this only says it happened.
-    health_signal_clock_regressions_total: int = 0
-
-    def _note_health_signal_clock_regression(
-        self, signal_key: str, observed_at: datetime
-    ) -> None:
-        self.health_signal_clock_regressions_total += 1
-        LOGGER.warning(
-            "health signal %s reported a node time (%s) not after its previous "
-            "sample; judged on control-plane time instead",
-            signal_key,
-            observed_at.isoformat(),
-        )
-
-    @staticmethod
-    def _next_health_signal_state(
-        signal_key: str,
-        active: bool,
-        observed_at: datetime,
-        previous: HealthSignalState | None,
-        minimum_active_seconds: float,
-        *,
-        clock: datetime | None = None,
-    ) -> tuple[HealthSignalState, bool]:
-        """Advance one signal. ``clock`` is the time durations are measured on
-        (the control plane's receive time when the caller has it); it defaults
-        to the node's ``observed_at`` for callers without one.
-
-        The ``notified`` latch is carried over, never set here (P0-38B): the
-        claim decides to emit, the deliverer latches through
-        ``mark_health_signal_notified`` once the incident has committed. Until
-        then a still-active signal emits again on its next sample."""
-
-        minimum_active_seconds = max(0.0, minimum_active_seconds)
-        now_on_clock = clock if clock is not None else observed_at
-        if not active:
-            return (
-                HealthSignalState(
-                    signal_key=signal_key,
-                    active=False,
-                    observed_at=observed_at,
-                    active_since=None,
-                    notified=False,
-                    clock_at=now_on_clock,
-                ),
-                False,
-            )
-        active_since = (
-            previous.active_since or previous_clock(previous)
-            if previous is not None and previous.active
-            else now_on_clock
-        )
-        previously_notified = (
-            (previous.notified if previous.notified is not None else previous.active)
-            if previous is not None
-            else False
-        )
-        duration = (now_on_clock - active_since).total_seconds()
-        emit = not previously_notified and duration >= minimum_active_seconds
-        return (
-            HealthSignalState(
-                signal_key=signal_key,
-                active=True,
-                observed_at=observed_at,
-                active_since=active_since,
-                notified=previously_notified,
-                clock_at=now_on_clock,
-            ),
-            emit,
-        )

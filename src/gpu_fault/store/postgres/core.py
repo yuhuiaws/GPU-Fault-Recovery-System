@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Iterator, cast
 
 from pydantic import BaseModel
@@ -13,9 +13,30 @@ from gpu_fault.store.shared.errors import (
 
 
 class PostgresCoreMixin:
+    """The PostgreSQL half of :class:`gpu_fault.store.shared.primitives.StorePrimitives`.
+
+    ``_get_optional`` and ``_state_key`` come from ``SharedRecordAccessMixin``.
+    """
+
     # Attributes supplied by the composed concrete implementation.
     _db: Any
     _models: dict[str, type[BaseModel]]
+
+    def _statement_guard(self) -> AbstractContextManager[object]:
+        """Deliberately a no-op.
+
+        The shared single-row writers -- save_workflow, save_incident,
+        save_agent and the rest -- take this guard around one statement.
+        On SQLite it is the process RLock that keeps the shared connection
+        single-threaded. Here every statement gets its own pooled
+        connection and three replicas times four uvicorn workers already
+        run these paths concurrently, so a process-level lock could not
+        mean anything: all it would do is funnel every store I/O thread of
+        a process through one RLock. Anything that needs mutual exclusion
+        uses ``_state_transaction``'s advisory lock instead.
+        """
+
+        return nullcontext()
 
     # `_decode`, `_get`, `_get_for_update` and `_list` return `Any` on purpose:
     # the model class is looked up in `_models` at run time from a string kind,

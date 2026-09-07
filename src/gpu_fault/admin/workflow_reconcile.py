@@ -301,7 +301,7 @@ def _gpu_kubectl(site: RenderedSite, target: dict[str, Any]) -> list[str]:
     return command
 
 
-def _cluster_nodes(
+def cluster_nodes(
     site: RenderedSite,
     cluster_id: str,
 ) -> dict[str, dict[str, Any]]:
@@ -418,7 +418,7 @@ def _scheduling_evidence(
             continue
         inventory = inventories.get(cluster_id)
         if inventory is None:
-            inventory = _cluster_nodes(site, cluster_id)
+            inventory = cluster_nodes(site, cluster_id)
             inventories[cluster_id] = inventory
         nodes = [
             _node_scheduling_evidence(node_id, inventory.get(node_id))

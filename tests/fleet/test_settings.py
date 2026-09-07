@@ -19,6 +19,29 @@ def active_values() -> dict[str, str]:
     }
 
 
+@pytest.mark.parametrize(("token", "expected"), [("on", True), ("off", False)])
+def test_settings_switches_accept_on_and_off(token: str, expected: bool) -> None:
+    """The settings parser used to stop at ``1/true/yes``; ``on`` was refused."""
+
+    values = active_values()
+    values["GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT"] = token
+
+    settings = ControlPlaneSettings.from_mapping(values)
+
+    assert settings.store is not None
+    assert settings.store.postgres_auto_schema_init is expected
+
+
+def test_blank_settings_switch_means_its_default() -> None:
+    values = active_values()
+    values["GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT"] = ""
+
+    settings = ControlPlaneSettings.from_mapping(values)
+
+    assert settings.store is not None
+    assert settings.store.postgres_auto_schema_init is True
+
+
 def test_simulation_settings_do_not_require_active_secrets() -> None:
     settings = ControlPlaneSettings.from_mapping({})
 

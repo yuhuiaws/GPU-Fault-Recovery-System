@@ -1,5 +1,4 @@
-from importlib import import_module
-from typing import Any
+from gpu_fault.lazy_exports import lazy_module
 
 _EXPORTS = {
     "PeriodicTaskLease": ("gpu_fault.processor.models", "PeriodicTaskLease"),
@@ -11,8 +10,21 @@ _EXPORTS = {
     "ProcessorLaneLease": ("gpu_fault.processor.models", "ProcessorLaneLease"),
     "ProcessorLeadership": ("gpu_fault.processor.models", "ProcessorLeadership"),
     "ProcessorLanePolicy": ("gpu_fault.processor.models", "ProcessorLanePolicy"),
+    "ProcessorLeaseSettings": (
+        "gpu_fault.processor.settings",
+        "ProcessorLeaseSettings",
+    ),
+    "ProcessorPoolSettings": ("gpu_fault.processor.settings", "ProcessorPoolSettings"),
     "ProcessorRequest": ("gpu_fault.processor.models", "ProcessorRequest"),
     "ProcessorRequestStatus": ("gpu_fault.processor.models", "ProcessorRequestStatus"),
+    "ProcessorSpoolSettings": (
+        "gpu_fault.processor.settings",
+        "ProcessorSpoolSettings",
+    ),
+    "ProcessorStaleSettings": (
+        "gpu_fault.processor.settings",
+        "ProcessorStaleSettings",
+    ),
     "deferred_strict_processor_lanes": (
         "gpu_fault.processor.models",
         "deferred_strict_processor_lanes",
@@ -28,14 +40,4 @@ _EXPORTS = {
     "processor_partition_id": ("gpu_fault.processor.models", "processor_partition_id"),
 }
 
-__all__ = list(_EXPORTS)
-
-
-def __getattr__(name: str) -> Any:
-    target = _EXPORTS.get(name)
-    if target is None:
-        raise AttributeError(name)
-    module_name, attribute = target
-    value = getattr(import_module(module_name), attribute)
-    globals()[name] = value
-    return value
+__getattr__, __dir__, __all__ = lazy_module(globals(), _EXPORTS)

@@ -8,21 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_orchestration as ORCHESTRATION_MODULE
+from gpu_fault_release import regional_release_registry as REGISTRY_MODULE
+from gpu_fault_release import regional_release_state as STATE_MODULE
+from gpu_fault_release import rollout as ROLLOUT_MODULE
 
 ROOT = Path(__file__).resolve().parents[2]
-REGISTRY_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_registry.py"
-)
-STATE_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_state.py"
-)
-ROLLOUT_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
-ORCHESTRATION_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_orchestration.py"
-)
 
 
 def cluster_target(
@@ -460,3 +451,52 @@ def test_previous_state_captures_the_live_administrator_config() -> None:
     assert config.capacity.telemetry_spool.enabled is True
     assert config.capacity.telemetry_spool.replicas == 3
     assert config.capacity.remediation.max_active_region == 128
+
+
+def test_previous_state_captures_node_counts_only_from_the_live_environment() -> None:
+    # A rollback restores what this returns, so a node count that was never in
+    # the live ConfigMaps must not be invented from the release defaults (the
+    # Aurora 0.5/8 fabrication had exactly that shape).
+    class SnapshotRelease:
+        config = SimpleNamespace(namespace="gpu-fault-system")
+
+        @staticmethod
+        def _cpu(*args):
+            return ["kubectl", *args]
+
+        @staticmethod
+        def _get_json(arguments):
+            name = arguments[arguments.index("deployment") + 1]
+            return {
+                "spec": {
+                    "replicas": (0 if name == "gpu-fault-telemetry-spool-worker" else 6)
+                }
+            }
+
+    declared = STATE_MODULE.captured_admin_config(
+        SnapshotRelease(),
+        {
+            "gpu-fault-control-worker-config-core": {
+                "GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT": "1000",
+                "GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT": "4000",
+            },
+            "gpu-fault-api-ha-config-processor": {
+                "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": "4096"
+            },
+        },
+    )
+    assert declared.capacity.largest_cluster_node_count == 1000
+    assert declared.capacity.managed_node_count == 4000
+    assert declared.fault_reserved_cluster_depth() == 1000
+
+    legacy = STATE_MODULE.captured_admin_config(
+        SnapshotRelease(),
+        {
+            "gpu-fault-api-ha-config-processor": {
+                "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": "1024"
+            }
+        },
+    )
+    assert legacy.processor.max_cluster_queue_depth == 1024
+    assert legacy.capacity.largest_cluster_node_count == 256
+    assert legacy.capacity.managed_node_count == 256

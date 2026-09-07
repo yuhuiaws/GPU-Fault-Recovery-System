@@ -202,7 +202,45 @@ def _guarded_by_except(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     return False
 
 
-def _string_tokens(node: ast.AST) -> frozenset[str] | None:
+def _module_constants(tree: ast.Module) -> dict[str, ast.AST]:
+    """Module-level names bound exactly once, so ``token in TRUE_TOKENS`` and
+    ``env_bool(MONITOR_ENV, ...)`` resolve to the literal they stand for."""
+
+    assigned: dict[str, ast.AST | None] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name):
+            assigned[target.id] = None if target.id in assigned else node.value
+    return {name: value for name, value in assigned.items() if value is not None}
+
+
+def _constant_string(
+    node: ast.AST,
+    constants: dict[str, ast.AST] | None = None,
+) -> str | None:
+    if isinstance(node, ast.Name) and constants is not None:
+        node = constants.get(node.id, node)
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _string_tokens(
+    node: ast.AST,
+    constants: dict[str, ast.AST] | None = None,
+) -> frozenset[str] | None:
+    if isinstance(node, ast.Name) and constants is not None:
+        node = constants.get(node.id, node)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"frozenset", "set"}
+        and len(node.args) == 1
+        and not node.keywords
+    ):
+        node = node.args[0]
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return frozenset({node.value.strip().lower()})
     if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
@@ -247,6 +285,7 @@ def _skip_string_methods(
 def _observe_use(
     node: ast.AST,
     parents: dict[ast.AST, ast.AST],
+    constants: dict[str, ast.AST] | None = None,
 ) -> tuple[str, frozenset[str]] | None:
     """Classify one use of an environment value by the coercion applied to it."""
 
@@ -267,7 +306,7 @@ def _observe_use(
         and len(parent.ops) == 1
         and isinstance(parent.ops[0], (ast.Eq, ast.In))
     ):
-        tokens = _string_tokens(parent.comparators[0])
+        tokens = _string_tokens(parent.comparators[0], constants)
         if tokens and tokens <= BOOLEAN_TOKENS:
             return "boolean", frozenset(tokens & TRUE_TOKENS)
     return None
@@ -335,6 +374,7 @@ def _module_observations(
     dict[tuple[str, int], set[tuple[str, frozenset[str]]]],
 ]:
     parents = _parent_map(tree)
+    constants = _module_constants(tree)
     by_name: dict[str, set[tuple[str, frozenset[str]]]] = defaultdict(set)
     by_parameter: dict[tuple[str, int], set[tuple[str, frozenset[str]]]] = defaultdict(
         set
@@ -347,7 +387,7 @@ def _module_observations(
                 argument.arg: index for index, argument in enumerate(positional)
             }
         for node, key in _keyed_nodes(scope).items():
-            observation = _observe_use(node, parents)
+            observation = _observe_use(node, parents, constants)
             if observation is None:
                 continue
             if concrete_name(key):
@@ -361,15 +401,17 @@ def _named_arguments(tree: ast.Module) -> dict[str, list[dict[int, str]]]:
     """Positional ``GPU_FAULT_*`` constants passed to each plain function name."""
 
     calls: dict[str, list[dict[int, str]]] = defaultdict(list)
+    constants = _module_constants(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
             continue
         positions = {
-            index: argument.value
-            for index, argument in enumerate(node.args)
-            if isinstance(argument, ast.Constant)
-            and isinstance(argument.value, str)
-            and concrete_name(argument.value)
+            index: name
+            for index, name in (
+                (index, _constant_string(argument, constants))
+                for index, argument in enumerate(node.args)
+            )
+            if name is not None and concrete_name(name)
         }
         if positions:
             calls[node.func.id].append(positions)
@@ -628,6 +670,7 @@ def extract() -> tuple[
             parameters[parameter].update(items)
         for function, positions in _named_arguments(tree).items():
             calls[function].extend(positions)
+        constants = _module_constants(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 for name in NAME_PATTERN.findall(node.value):
@@ -635,14 +678,10 @@ def extract() -> tuple[
                         modules[name].add(module)
             if not isinstance(node, ast.Call) or not node.args:
                 continue
-            first = node.args[0]
-            if not (
-                isinstance(first, ast.Constant)
-                and isinstance(first.value, str)
-                and concrete_name(first.value)
-            ):
+            first = _constant_string(node.args[0], constants)
+            if first is None or not concrete_name(first):
                 continue
-            name = first.value
+            name = first
             modules[name].add(module)
             if len(node.args) > 1:
                 defaults[name].add(expression(node.args[1]))

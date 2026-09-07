@@ -96,6 +96,7 @@ def build_attestation(
     impact_base: str | None = None,
     impact_plan_path: Path | None = None,
     ci_gate_path: Path | None = None,
+    sbom_dir: Path | None = None,
 ) -> dict[str, Any]:
     manifest = load_manifest(manifest_path, allow_staging=staging_only)
     if manifest.get("staging_only", False) is not staging_only:
@@ -170,7 +171,38 @@ def build_attestation(
             "path": str(relative_gate),
             "sha256": sha256(resolved_gate),
         }
+    if sbom_dir is not None:
+        sbom_entries = _sbom_entries(root, sbom_dir)
+        if sbom_entries:
+            result["sbom"] = sbom_entries
     return result
+
+
+def _sbom_entries(root: Path, sbom_dir: Path) -> list[dict[str, str]]:
+    """Path and digest of every CycloneDX document under ``sbom_dir``.
+
+    The SBOM is generated from the shipped lock files by ``make sbom`` and is
+    not itself signed; listing each file's SHA-256 here puts it under the
+    cosign signature of the attestation, the same way the CI gate and the
+    staging impact plan are bound. An empty or missing directory yields no
+    entries: outside CI the generator may be absent, and ``make sbom`` is the
+    place that decides whether that is acceptable.
+    """
+    resolved_dir = sbom_dir.resolve()
+    try:
+        resolved_dir.relative_to(root.resolve())
+    except ValueError as exc:
+        raise ReleaseAttestationError("SBOM directory leaves repository") from exc
+    if not resolved_dir.is_dir():
+        return []
+    return [
+        {
+            "path": str(path.relative_to(root.resolve())),
+            "sha256": sha256(path),
+        }
+        for path in sorted(resolved_dir.glob("*.cdx.json"))
+        if path.is_file()
+    ]
 
 
 def verify_attestation(
@@ -236,6 +268,22 @@ def verify_attestation(
             raise ReleaseAttestationError("attested CI gate leaves repository") from exc
         if not gate_path.is_file() or sha256(gate_path) != ci_gate.get("sha256"):
             raise ReleaseAttestationError("attested CI gate SHA-256 does not match")
+    sbom = value.get("sbom")
+    if sbom is not None:
+        if not isinstance(sbom, list) or not sbom:
+            raise ReleaseAttestationError("attestation SBOM list is invalid")
+        for entry in sbom:
+            if not isinstance(entry, dict):
+                raise ReleaseAttestationError("attestation SBOM entry is invalid")
+            sbom_path = (root / str(entry.get("path") or "")).resolve()
+            try:
+                sbom_path.relative_to(root.resolve())
+            except ValueError as exc:
+                raise ReleaseAttestationError(
+                    "attested SBOM leaves repository"
+                ) from exc
+            if not sbom_path.is_file() or sha256(sbom_path) != entry.get("sha256"):
+                raise ReleaseAttestationError("attested SBOM SHA-256 does not match")
     expected_commands = set(
         STAGING_QUALITY_GATES
         if staging_only

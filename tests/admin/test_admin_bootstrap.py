@@ -6,8 +6,8 @@ import time
 
 import pytest
 
+from gpu_fault.admin import aurora_capacity as admin_aurora_capacity
 from gpu_fault.admin import bootstrap as admin_bootstrap
-from gpu_fault.admin import bootstrap_aurora as admin_bootstrap_aurora
 from gpu_fault.admin import bootstrap_dependencies as admin_bootstrap_dependencies
 from gpu_fault.admin import release_artifacts as admin_release_artifacts
 from gpu_fault.admin import release_repositories as admin_release_repositories
@@ -224,7 +224,7 @@ def test_independent_bootstrap_tasks_run_in_parallel(tmp_path) -> None:
 
 def test_bootstrap_aurora_formats_admin_config_capacity() -> None:
     assert (
-        admin_bootstrap_aurora.scaling_configuration(
+        admin_aurora_capacity.scaling_configuration(
             AuroraCapacityConfig(min_acu=8.0, max_acu=32.0)
         )
         == "MinCapacity=8,MaxCapacity=32"

@@ -30,9 +30,16 @@ import pytest
 from gpu_fault.store import PostgresStore
 from gpu_fault.store.postgres import remote_commands as postgres_module
 from gpu_fault.store.postgres.remote_commands import PostgresRemoteCommandMixin
+from gpu_fault.store.shared import remote_commands as shared_module
 from gpu_fault.store.sqlite import remote_commands as sqlite_module
 
-MODULES = {"postgres": postgres_module, "sqlite": sqlite_module}
+# The shared module holds the single-row writers both key/value stores run
+# (S13); the two dialect modules hold the statements each one adds.
+MODULES = {
+    "postgres": postgres_module,
+    "shared": shared_module,
+    "sqlite": sqlite_module,
+}
 
 # The per-command key: ``remote_command/{<something>.command_id}`` or
 # ``remote_command/{command_id}`` / ``{key}``, and nothing after the id.
@@ -97,13 +104,15 @@ def test_the_writer_set_is_the_reviewed_one(name: str) -> None:
             "cleanup_terminal_remote_commands",
             "expire_unclaimed_remote_commands",
         },
-        "sqlite": {
+        "shared": {
             "ensure_remote_command",
+            "renew_remote_command_lease",
+            "complete_remote_command",
+        },
+        "sqlite": {
             "claim_remote_commands",
             "expire_unclaimed_remote_commands",
-            "renew_remote_command_lease",
             "cleanup_terminal_remote_commands",
-            "complete_remote_command",
             "cancel_remote_commands_for_workflow",
             "cancel_remote_command",
         },
@@ -135,27 +144,31 @@ def _serialisation(body: str) -> str:
     return "none"
 
 
-def test_every_postgres_writer_serialises_on_the_per_command_lock() -> None:
-    """Postgres has no whole-connection transaction to fall back on."""
+@pytest.mark.parametrize("name", ["postgres", "shared"])
+def test_every_writer_postgres_runs_serialises_on_the_per_command_lock(
+    name: str,
+) -> None:
+    """Postgres has no whole-connection transaction to fall back on, and the
+    shared writers run on Postgres unchanged."""
 
-    for function, body in sorted(_writer_functions(postgres_module).items()):
+    for function, body in sorted(_writer_functions(MODULES[name]).items()):
         assert _serialisation(body) in {
             "per-command",
             "bulk-ordered",
             "terminal-cleanup",
         }, (
-            f"postgres {function}: writes a remote_command row without the "
+            f"{name} {function}: writes a remote_command row without the "
             "remote_command/<command_id> advisory lock (or the ordered bulk "
             "form / terminal cleanup)"
         )
 
 
 def test_sqlite_writers_without_a_per_command_key_are_overridden_on_postgres() -> None:
-    """The SQLite sweeps rely on ``BEGIN IMMEDIATE``; Postgres must not inherit them.
+    """The SQLite sweeps rely on ``BEGIN IMMEDIATE``; Postgres must not run them.
 
-    ``PostgresStore`` inherits about eighty public methods from the SQLite
-    layer, so a SQLite writer that never takes the per-command key is safe only
-    while the Postgres mixin overrides it.
+    ``PostgresStore`` no longer inherits from ``SqliteStore`` (S13), so a
+    SQLite-only writer cannot reach Postgres by accident; this pins that every
+    such writer has a Postgres statement of its own rather than a shared one.
     """
 
     for function, body in sorted(_writer_functions(sqlite_module).items()):

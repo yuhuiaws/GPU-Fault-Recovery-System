@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from gpu_fault.adapters import ManagedRecoveryObserverAdapter
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.fleet import (
     AgentLifecycleState,
@@ -23,7 +24,6 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepStatus,
 )
-from gpu_fault.runtime_adapters import ManagedRecoveryObserverAdapter
 from gpu_fault.store import SqliteStore
 from tests._builders import (
     active_workflow_executor,

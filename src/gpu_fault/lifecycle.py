@@ -37,13 +37,6 @@ def validate_lifespan_shutdown_budget(
     return configured_seconds
 
 
-def daemon_thread(
-    name: str,
-    target: Callable[[], None],
-) -> Thread:
-    return Thread(target=target, name=name, daemon=True)
-
-
 @dataclass
 class ShutdownCoordinator:
     max_seconds: float

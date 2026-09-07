@@ -89,12 +89,14 @@ aws cloudformation deploy --region "${AWS_REGION}" \
         "OidcProviderArn=${oidc_provider_arn}"
 
 queue_url="$(
+    # shellcheck disable=SC2016 # JMESPath backtick literal, not a shell expansion.
     aws cloudformation describe-stacks --region "${AWS_REGION}" \
         --stack-name "${STACK_NAME}" \
         --query 'Stacks[0].Outputs[?OutputKey==`QueueUrl`].OutputValue' \
         --output text
 )"
 consumer_role="$(
+    # shellcheck disable=SC2016 # JMESPath backtick literal, not a shell expansion.
     aws cloudformation describe-stacks --region "${AWS_REGION}" \
         --stack-name "${STACK_NAME}" \
         --query \

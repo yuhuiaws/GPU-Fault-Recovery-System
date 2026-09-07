@@ -17,7 +17,7 @@ from gpu_fault.watcher import AttemptObservation
 
 if TYPE_CHECKING:
     from gpu_fault.execution.dispatcher import WorkflowDispatcher
-    from gpu_fault.orchestrator import IncidentOrchestrator
+    from gpu_fault.orchestration import IncidentOrchestrator
     from gpu_fault.telemetry import WorkloadTopologyService
 
 LOGGER = logging.getLogger(__name__)

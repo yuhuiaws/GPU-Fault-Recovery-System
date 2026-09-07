@@ -1,0 +1,13 @@
+# pip-audit findings accepted for now (`make pip-audit-check` passes each id as
+# --ignore-vuln). One id per line; the comment must name the package, the pinned
+# version and the fix version, and tests/test_supply_chain_gates.py enforces
+# that shape. Delete the line when the lock moves past the fix version.
+#
+#
+# Example (a transitive pin blocked by a direct dependency's upper bound):
+#   PYSEC-2026-141   # urllib3 2.3.0, fix: 2.7.0
+#
+# Currently empty: the urllib3 2.3.0 entries (PYSEC-2026-141/-1994/-1996/-1997/
+# -1998/-1999) were closed on 2026-09-07 by raising kubernetes to 35.0.0 and
+# urllib3 to 2.7.0 in uv.lock and re-exporting the locks; see
+# docs/开发者部署实现.md §9.3 for the bump-and-re-export procedure.

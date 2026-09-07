@@ -5,15 +5,10 @@ from typing import Any
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_endpoint_rollback as ENDPOINT
+from gpu_fault_release import rollout as MODULE
 
 ROOT = Path(__file__).resolve().parents[2]
-ENDPOINT = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_endpoint_rollback.py"
-)
-MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
 
 HOSTED_ZONE = "Z0EXAMPLE"
 HOSTNAME = "control-plane.gpu-fault.internal"

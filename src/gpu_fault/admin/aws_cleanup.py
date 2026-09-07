@@ -40,6 +40,7 @@ SUPPORTED_RESOURCE_TYPES = frozenset(
         "nlb",
         "nlb_listener",
         "nlb_target_group",
+        "rds_cluster_parameter_group",
         "rds_db_subnet_group",
         "rds_managed_secret",
         "rds_snapshot",
@@ -89,6 +90,7 @@ AURORA_RESOURCE_TYPES = frozenset(
     {
         "aurora_cluster",
         "aurora_instance",
+        "rds_cluster_parameter_group",
         "rds_db_subnet_group",
         "rds_managed_secret",
     }
@@ -486,6 +488,16 @@ class ResourceProbe:
                     identifier,
                 ),
                 not_found=("DBSubnetGroupNotFoundFault",),
+            )
+        if resource_type == "rds_cluster_parameter_group":
+            return self._exists_command(
+                self._aws(
+                    "rds",
+                    "describe-db-cluster-parameter-groups",
+                    "--db-cluster-parameter-group-name",
+                    identifier,
+                ),
+                not_found=("DBParameterGroupNotFound",),
             )
         if resource_type == "aurora_cluster":
             return self._exists_command(
@@ -1155,6 +1167,18 @@ class ResourceDeletion(ResourceProbe):
                     identifier,
                 ),
                 not_found=("DBSubnetGroupNotFoundFault",),
+            )
+        elif resource_type == "rds_cluster_parameter_group":
+            # Reached from the Aurora phase after the cluster is gone; RDS
+            # refuses (InvalidDBParameterGroupState) while a cluster uses it.
+            _checked(
+                self._aws(
+                    "rds",
+                    "delete-db-cluster-parameter-group",
+                    "--db-cluster-parameter-group-name",
+                    identifier,
+                ),
+                not_found=("DBParameterGroupNotFound",),
             )
         else:
             return False

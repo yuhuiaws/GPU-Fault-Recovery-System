@@ -47,6 +47,7 @@ jobs:
       - run: python scripts/check-public-release.py
       - run: python -m compileall -q src tests deploy scripts tools
       - run: python scripts/check-python-architecture.py
+      - run: make lazy-export-check PYTHON=python
       - run: >-
           PYTHON=python
           deploy/control-plane/tools/update-deployment-contracts.sh --check
@@ -62,7 +63,13 @@ jobs:
       - run: >-
           find deploy scripts tools -type f -name '*.sh' -print0 |
           sort -z |
-          xargs -0 shellcheck --severity=warning
+          xargs -0 shellcheck --severity=info
+      # Supply-chain gates (S8/S10). Tool versions come from the Makefile; the
+      # targets are strict here because GitHub sets CI=true.
+      - run: make ci-supply-chain-tools PYTHON=python
+      - run: make cfn-lint-check PYTHON=python
+      - run: make promtool-check PYTHON=python
+      - run: make pip-audit-check PYTHON=python
       - run: >-
           PYTHONPATH=src
           python tools/generate_nvidia_xid_policy.py --check

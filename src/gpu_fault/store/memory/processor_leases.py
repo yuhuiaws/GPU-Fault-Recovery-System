@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from gpu_fault.processor import (
@@ -21,16 +20,6 @@ class MemoryProcessorLeaseMixin:
     get_processor_request: Callable[..., Any]
 
     _lock: Any
-
-    def complete_active_processor_requests_batch(self, completions):
-        return [
-            self.complete_active_processor_request(**completion)
-            for completion in completions
-        ]
-
-    @contextmanager
-    def processor_batch_transaction(self):
-        yield
 
     def acquire_processor_leadership(
         self,

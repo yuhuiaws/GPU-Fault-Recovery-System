@@ -5,11 +5,18 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from gpu_fault.admin.aurora_capacity import (
+    CAPACITY_SETTLE_STABLE_POLLS,
+    reconcile_aurora_capacity,
+)
 from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
-from gpu_fault.admin.config import AuroraCapacityConfig, load_desired_admin_config
+from gpu_fault.admin.config import (
+    AdminConfigError,
+    AuroraCapacityConfig,
+    load_desired_admin_config,
+)
 
 CAPACITY_SETTLE_POLL_SECONDS = 10.0
-CAPACITY_SETTLE_STABLE_POLLS = 3
 CAPACITY_SETTLE_TIMEOUT_SECONDS = 1800.0
 
 # What the control plane needs the database to record about itself (store
@@ -37,11 +44,6 @@ def bootstrap_aurora_capacity(state_dir: Path) -> AuroraCapacityConfig:
     ).aurora
 
 
-def scaling_configuration(capacity: AuroraCapacityConfig) -> str:
-    capacity.validate()
-    return f"MinCapacity={capacity.min_acu:g},MaxCapacity={capacity.max_acu:g}"
-
-
 def reconcile_existing_capacity(
     runner: CommandRunner,
     *,
@@ -50,6 +52,15 @@ def reconcile_existing_capacity(
     cluster: dict[str, Any],
     capacity: AuroraCapacityConfig,
 ) -> None:
+    """Bring an existing cluster to the administrator's window.
+
+    The modify itself and the settle rule live in ``aurora_capacity`` -- the one
+    writer shared with ``config apply`` -- and go through the runner so a
+    ``--dry-run`` holds the mutation back. The caller has just described the
+    cluster; a window that already matches costs no further call. Both member
+    instances must exist: the reconciler proves the change on them.
+    """
+
     scaling = cluster.get("ServerlessV2ScalingConfiguration") or {}
     live_capacity = (
         float(scaling.get("MinCapacity") or 0),
@@ -57,29 +68,18 @@ def reconcile_existing_capacity(
     )
     if live_capacity == (capacity.min_acu, capacity.max_acu):
         return
-    runner.run(
-        [
-            "aws",
-            "rds",
-            "modify-db-cluster",
-            "--region",
-            aws_region,
-            "--db-cluster-identifier",
-            cluster_id,
-            "--serverless-v2-scaling-configuration",
-            scaling_configuration(capacity),
-            "--apply-immediately",
-        ],
-        mutate=True,
-        capture=False,
-    )
-    if runner.dry_run:
-        return
-    wait_for_capacity_to_settle(
-        runner,
-        aws_region=aws_region,
-        cluster_id=cluster_id,
-    )
+    try:
+        reconcile_aurora_capacity(
+            aws_region=aws_region,
+            cluster_id=cluster_id,
+            desired=capacity,
+            timeout_seconds=int(CAPACITY_SETTLE_TIMEOUT_SECONDS),
+            poll_seconds=CAPACITY_SETTLE_POLL_SECONDS,
+            aws_json=runner.aws_json,
+            wait_for_settle=not runner.dry_run,
+        )
+    except AdminConfigError as exc:
+        raise BootstrapError(f"Aurora cluster {cluster_id}: {exc}") from exc
 
 
 def wait_for_capacity_to_settle(
@@ -92,14 +92,13 @@ def wait_for_capacity_to_settle(
 ) -> None:
     """Block until the cluster and every member instance read ``available``.
 
+    Used after the diagnostics modify (parameter group, log export). The
+    capacity change has its own, stricter settle in ``aurora_capacity`` -- it
+    also proves the window and the observed ACU -- but the rule is the same:
     ``modify-db-cluster --apply-immediately`` answers before RDS moves the
-    cluster: the response still says ``available`` and already reports the new
-    scaling configuration. So neither ``rds wait db-cluster-available`` nor a
-    configuration comparison can tell "settled" from "not started yet" -- both
-    return instantly and the cluster flips to ``modifying`` seconds later, which
-    is how a capacity change made the very same deployment fail its own
-    ``aurora`` preflight check. Require several consecutive quiet polls instead,
-    so a late flip is still caught.
+    cluster, so neither ``rds wait db-cluster-available`` nor a configuration
+    comparison can tell "settled" from "not started yet". Require several
+    consecutive quiet polls instead, so a late flip is still caught.
     """
 
     deadline = time.monotonic() + timeout_seconds

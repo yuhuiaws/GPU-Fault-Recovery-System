@@ -40,6 +40,23 @@ metadata:
     gpu-fault.io/deploy-mode: regional_rollout
 spec:
   replicas: 1
+  # Singleton by design; Recreate, not RollingUpdate. All of the collector's
+  # edge state lives in the process: per node/resource consecutive-mismatch
+  # counters, the last persistent/healthy verdict, the last delivery time
+  # and the next health-summary slot. A second replica overlapping during a
+  # rollout starts with none of that, so on its first sample it re-posts a
+  # `baseline:*` host-telemetry batch for every GPU node in the cluster,
+  # and for as long as both run every edge and every health summary is
+  # delivered twice -- each batch_id carries its own observed_at, so the
+  # control plane sees two distinct batches and nothing deduplicates them.
+  # `replicas` must stay 1; horizontal scale-out is not a supported lever
+  # because the per-cluster load is one paginated node LIST plus one
+  # managed-pod LIST per interval, not per-node work, so a second replica
+  # doubles the posts without splitting the work. If the collector lags,
+  # raise GPU_FAULT_KUBERNETES_RESOURCE_INTERVAL_SECONDS or
+  # GPU_FAULT_KUBERNETES_NODE_LIST_PAGE_SIZE instead.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: gpu-fault-kubernetes-node-resource-collector
@@ -88,6 +105,8 @@ spec:
               value: "2"
             - name: GPU_FAULT_KUBERNETES_EFA_HEALTH_SUMMARY_SECONDS
               value: "300"
+            - name: GPU_FAULT_KUBERNETES_NODE_LIST_PAGE_SIZE
+              value: "500"
             - name: SSL_CERT_FILE
               value: /etc/gpu-fault/tls/ca.crt
           resources:

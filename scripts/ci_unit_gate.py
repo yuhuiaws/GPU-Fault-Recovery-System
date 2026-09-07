@@ -90,7 +90,7 @@ def unit_identity(
         "branch": bool(config["coverage"]["branch"]),
         "floor": int(config["coverage"]["floor"]),
         "shards": shards,
-        "source": str(config["coverage"]["source"]),
+        "sources": [str(item) for item in config["coverage"]["sources"]],
     }
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,

@@ -5,17 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from gpu_fault.admin.config import preset_admin_config
-from tests._script_loader import lazy_script_module
+from gpu_fault.admin.config_patch import preset_admin_config
+from gpu_fault_release import regional_release_diff as DIFF_MODULE
+from gpu_fault_release import rollout as MODULE
 from tests.regional._release_orchestrator_support import config_file
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
-DIFF_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_diff.py"
-)
 
 
 def test_admin_config_renders_and_targets_only_changed_cpu_role(

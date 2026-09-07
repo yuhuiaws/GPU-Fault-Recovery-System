@@ -23,16 +23,14 @@ from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     collector_setting,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
+    CaseSurface,
     add_live_arguments,
-    authorize_execution,
-    build_plan,
-    install_site_profile,
+    run_selected_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
     RegionalLiveSettings,
-    install_abort_signals,
     predecessor_evidence,
     required,
     run_case_main,
@@ -1176,37 +1174,17 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+CASE = CaseSurface(
+    parser=parser,
+    configure=configure,
+    read_only_preflight=read_only_preflight,
+    plan_details=plan_details,
+    execute_case=execute_case,
+)
+
+
 def main() -> int:
-    install_site_profile()
-    arguments = parser().parse_args()
-    os.umask(0o077)
-    install_abort_signals()
-    settings = configure(arguments)
-    case_dir = arguments.run_dir / "cases" / settings.case_id
-    case_dir.mkdir(parents=True, exist_ok=True)
-    if not arguments.execute:
-        preflight = read_only_preflight(settings, case_dir)
-        plan = build_plan(
-            run_dir=arguments.run_dir,
-            case_id=settings.case_id,
-            attempt=arguments.attempt,
-            confirmation=settings.confirmation,
-            environment=settings.environment(),
-            details=plan_details(settings, preflight),
-        )
-        print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if not preflight["errors"] else 1
-    if arguments.confirm != settings.confirmation:
-        raise RegionalFixtureError(
-            f"confirmation must be exactly {settings.confirmation}"
-        )
-    deadline = authorize_execution(
-        arguments,
-        case_id=settings.case_id,
-        confirmation=settings.confirmation,
-        environment=settings.environment(),
-    )
-    return execute_case(settings, arguments.run_dir, arguments.attempt, deadline)
+    return run_selected_case(CASE)
 
 
 if __name__ == "__main__":

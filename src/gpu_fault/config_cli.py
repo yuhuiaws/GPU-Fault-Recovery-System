@@ -10,6 +10,12 @@ from urllib import request as urllib_request
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.env import env_bool
+from gpu_fault.env_validation import (
+    environment_value_kinds,
+    invalid_gpu_fault_environment_values,
+    unknown_gpu_fault_environment,
+)
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.operation_registry import (
     OperationAdapter,
@@ -194,16 +200,26 @@ def validate_role(
             )
     if role == "worker" and not PROCESSOR_POOL_ENV.issubset(values):
         errors.append(f"{name}: worker is missing processor pool configuration")
+    # The switches are read the way the processes read them, so a manifest the
+    # lint accepts is one the worker will not refuse at start-up.
+    configured = {key: value for key, value in values.items() if value is not None}
+    try:
+        spool_enabled = env_bool("GPU_FAULT_TELEMETRY_SPOOL", False, environ=configured)
+        registry_enabled = env_bool(
+            "GPU_FAULT_ENABLE_AGENT_REGISTRY", False, environ=configured
+        )
+    except ValueError as error:
+        errors.append(f"{name}: {error}")
+        return errors
     if (
         role == "spool-worker"
         and int(deployment["spec"].get("replicas", 0)) > 0
-        and values.get("GPU_FAULT_TELEMETRY_SPOOL") != "true"
+        and not spool_enabled
     ):
         errors.append(
             f"{name}: enabled spool worker must set GPU_FAULT_TELEMETRY_SPOOL=true"
         )
-    registry = values.get("GPU_FAULT_ENABLE_AGENT_REGISTRY")
-    if registry == "true":
+    if registry_enabled:
         for pin in (
             "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256",
             "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST",
@@ -299,6 +315,47 @@ def validate_connections(
     return []
 
 
+def validate_environment_inventory(
+    deployment_name: str,
+    values: dict[str, str | None],
+) -> list[str]:
+    """Hold a manifest to the same contract the Pod enforces at start-up.
+
+    `validate_gpu_fault_environment` makes a process refuse unknown
+    ``GPU_FAULT_*`` names and unusable values, so a manifest carrying either
+    is a rollout that crash-loops. Catching it here means the release fails
+    at render time, with the file name, instead of minutes into the rollout.
+    Values resolved from Secrets (``<valueFrom>``) are not literal and are not
+    judged. Blank booleans are refused even though the runtime reads blank as
+    "unset": a manifest key that says nothing while looking like a setting is
+    exactly the ambiguity the boolean rework removed everywhere else.
+    """
+
+    literal = {
+        key: value
+        for key, value in values.items()
+        if value is not None and value != "<valueFrom>"
+    }
+    errors = [
+        f"{deployment_name}: {name} is not in the runtime inventory; the Pod would "
+        "refuse to start (regenerate the inventory or drop the key)"
+        for name in unknown_gpu_fault_environment(literal)
+    ]
+    kinds = environment_value_kinds()
+    for name, value in sorted(literal.items()):
+        kind = kinds.get(name)
+        if kind is not None and kind[0] == "boolean" and not value.strip():
+            errors.append(
+                f"{deployment_name}: {name} is a blank boolean; delete the key or "
+                "set one of 0/1/true/false/yes/no/on/off"
+            )
+    errors.extend(
+        f"{deployment_name}: {problem}"
+        for problem in invalid_gpu_fault_environment_values(literal)
+    )
+    return errors
+
+
 def validate(
     paths: list[Path],
     *,
@@ -317,6 +374,9 @@ def validate(
         values, env_errors = resolve_environment(deployment, config_maps)
         environments[deployment["metadata"]["name"]] = values
         errors.extend(env_errors)
+        errors.extend(
+            validate_environment_inventory(deployment["metadata"]["name"], values)
+        )
         errors.extend(validate_shutdown(deployment, values))
         errors.extend(validate_role(deployment, values))
     errors.extend(validate_connections(deployments, environments))

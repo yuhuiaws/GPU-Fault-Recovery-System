@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from gpu_fault.admin.capacity_evidence import legacy_largest_cluster_node_count
+
 
 class AdminConfigParseError(ValueError):
     pass
@@ -39,11 +41,24 @@ def _number(value: object, path: str, *, default: float) -> float:
     return float(value)
 
 
-def _boolean(value: object, path: str, *, default: bool) -> bool:
+def boolean_field(
+    value: object,
+    path: str,
+    *,
+    default: bool,
+    error: type[ValueError] = AdminConfigParseError,
+) -> bool:
+    """Validate an already-parsed YAML boolean; ``None`` means ``default``.
+
+    This is the one rule for YAML switches across the admin modules. Each
+    caller keeps its own exception family by passing ``error``, so the text a
+    site-config reader raises is the same text an admin-config reader raises.
+    """
+
     if value is None:
         return default
     if not isinstance(value, bool):
-        raise AdminConfigParseError(f"{path} must be a boolean")
+        raise error(f"{path} must be a boolean")
     return value
 
 
@@ -55,7 +70,20 @@ def _capacity(data: Mapping[str, object]) -> dict[str, object]:
             "control_worker_replicas",
             "telemetry_spool",
             "remediation",
+            "largest_cluster_node_count",
+            "managed_node_count",
         },
+    )
+    # A document from before the node counts existed is read as the topology
+    # its own per-cluster depth was sized for (1024 -> 256 nodes), so a legacy
+    # site loads valid instead of as a 512-node default its depth cannot hold.
+    # A fresh document gets 512/512 from the same rule at the default depth.
+    largest_cluster_node_count = _integer(
+        capacity.get("largest_cluster_node_count"),
+        "admin config capacity.largest_cluster_node_count",
+        default=legacy_largest_cluster_node_count(
+            _processor(data)["max_cluster_queue_depth"]
+        ),
     )
     spool = _mapping(
         capacity.get("telemetry_spool") or {},
@@ -80,7 +108,7 @@ def _capacity(data: Mapping[str, object]) -> dict[str, object]:
             default=6,
         ),
         "telemetry_spool": {
-            "enabled": _boolean(
+            "enabled": boolean_field(
                 spool.get("enabled"),
                 "admin config telemetry_spool.enabled",
                 default=False,
@@ -118,6 +146,12 @@ def _capacity(data: Mapping[str, object]) -> dict[str, object]:
                 default=2,
             ),
         },
+        "largest_cluster_node_count": largest_cluster_node_count,
+        "managed_node_count": _integer(
+            capacity.get("managed_node_count"),
+            "admin config capacity.managed_node_count",
+            default=largest_cluster_node_count,
+        ),
     }
 
 
@@ -157,7 +191,7 @@ def _processor(data: Mapping[str, object]) -> dict[str, int]:
     )
     defaults = {
         "max_queue_depth": 65536,
-        "max_cluster_queue_depth": 1024,
+        "max_cluster_queue_depth": 4096,
         "retry_after_seconds": 2,
         "retry_backoff_seconds": 1,
         "retry_backoff_max_seconds": 30,

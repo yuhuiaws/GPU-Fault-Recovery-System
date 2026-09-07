@@ -7,11 +7,15 @@ from pathlib import Path
 import pytest
 import yaml
 
+from gpu_fault import env_validation
+from gpu_fault.env import TRUE_TOKENS
 from gpu_fault.env_validation import (
+    TRAINING_HEALTH_MONITOR_ENV,
     environment_inventory,
     environment_value_bounds,
     environment_value_kinds,
     invalid_gpu_fault_environment_values,
+    training_health_monitor_enabled,
     unknown_gpu_fault_environment,
     validate_gpu_fault_environment,
 )
@@ -155,17 +159,24 @@ def test_boolean_typo_is_rejected() -> None:
     ]
 
 
-def test_enabled_token_a_switch_does_not_recognise_is_rejected() -> None:
-    """Several switches accept `true` only, so `yes` there means "off".
+def test_enabled_token_a_switch_does_not_recognise_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch that reads `true` only turns `yes` into "silently off".
 
-    Refusing it is sound in one direction only: an operator never writes an
+    Every switch now reads through ``env_bool``, so the packaged inventory no
+    longer carries such a switch; the rule stays because the inventory is
+    derived from the code and a future narrow read site would bring it back.
+    Refusing is sound in one direction only: an operator never writes an
     enabled-looking token meaning disabled, while `no`/`0`/`off` mean disabled to
     every reader and stay acceptable.
     """
 
-    kind, true_tokens = environment_value_kinds()["GPU_FAULT_NODE_ALLOW_GPU_RESET"]
+    def narrow_kinds() -> dict[str, tuple[str, frozenset[str]]]:
+        return {"GPU_FAULT_NODE_ALLOW_GPU_RESET": ("boolean", frozenset({"true"}))}
 
-    assert (kind, true_tokens) == ("boolean", frozenset({"true"}))
+    monkeypatch.setattr(env_validation, "environment_value_kinds", narrow_kinds)
+
     assert invalid_gpu_fault_environment_values(
         {"GPU_FAULT_NODE_ALLOW_GPU_RESET": "yes"}
     ) == [
@@ -271,6 +282,40 @@ def test_value_validation_runs_even_when_unknown_names_only_warn() -> None:
 
     with pytest.raises(RuntimeError, match="GPU_FAULT_API_PORT must be an integer"):
         validate_gpu_fault_environment(values, process_name="test-process")
+
+
+@pytest.mark.parametrize("token", ["1", "yes", "on", "TRUE"])
+def test_training_health_monitor_accepts_every_enabled_token(token: str) -> None:
+    """``=1`` used to leave the monitor silently off."""
+
+    assert training_health_monitor_enabled({TRAINING_HEALTH_MONITOR_ENV: token}), (
+        f"{token!r} must enable the monitor"
+    )
+
+
+def test_training_health_monitor_typo_is_loud() -> None:
+    with pytest.raises(ValueError, match=TRAINING_HEALTH_MONITOR_ENV):
+        training_health_monitor_enabled({TRAINING_HEALTH_MONITOR_ENV: "ture"})
+
+
+def test_every_boolean_switch_accepts_the_same_enabled_tokens() -> None:
+    """One parser, one token set: no switch may still be ``true``-only.
+
+    Reads the packaged inventory, which ``scripts/generate-env-reference.py``
+    derives from the read sites, so this is red until the inventory is
+    regenerated after the last ``== "true"`` read is gone.
+    """
+
+    true_only = sorted(
+        name
+        for name, (kind, true_tokens) in environment_value_kinds().items()
+        if kind == "boolean" and true_tokens != TRUE_TOKENS
+    )
+
+    assert true_only == [], (
+        "these switches still accept a narrower set of enabled tokens: "
+        + ", ".join(true_only)
+    )
 
 
 def test_hyperpod_safety_switches_are_typed() -> None:

@@ -15,6 +15,12 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
+from gpu_fault.admin.aurora_capacity import (  # noqa: E402
+    observe_aurora_capacity,
+    reconcile_aurora_capacity,
+)
+from gpu_fault.admin.config import AuroraCapacityConfig  # noqa: E402
+
 if __package__:
     from .regional_action_capacity_suite import (
         aggregate_executor_documents,
@@ -294,24 +300,41 @@ def aurora_capacity_preflight(
     raise RuntimeError(f"Aurora formal capacity preflight failed: {last}")
 
 
+def _registry_aws_json(region: str, /, *arguments: str, mutate: bool = False) -> dict:
+    """``aurora_capacity``'s caller shape over the registry-validated ``aws_json``.
+
+    The perf registry's target check wraps every ``aws`` call the harness makes;
+    the shared reconciler must not sidestep it.
+    """
+
+    del mutate
+    return aws_json(*arguments, "--region", region)
+
+
 def ensure_aurora_capacity(
     cluster_id: str,
     *,
     timeout_seconds: int,
     configure: bool,
 ) -> dict:
-    cluster = aws_json(
-        "rds",
-        "describe-db-clusters",
-        "--region",
-        AWS_REGION,
-        "--db-cluster-identifier",
-        cluster_id,
-    )["DBClusters"][0]
-    scaling = cluster.get("ServerlessV2ScalingConfiguration") or {}
+    """Hold the formal 124/128 window through the one writer of the ACU window.
+
+    ``aurora_capacity.reconcile_aurora_capacity`` issues the modify (when
+    authorized) and waits for RDS to really settle -- the same settle rule
+    ``config apply`` uses, so the harness cannot start against a cluster that
+    is about to flip to ``modifying``. The harness's own preflight then reads
+    the window and per-instance ACU into the report shape the suite expects.
+    """
+
+    initial_state = observe_aurora_capacity(
+        aws_region=AWS_REGION,
+        cluster_id=cluster_id,
+        include_observed_capacity=False,
+        aws_json=_registry_aws_json,
+    )
     initial = {
-        "min_acu": scaling.get("MinCapacity"),
-        "max_acu": scaling.get("MaxCapacity"),
+        "min_acu": initial_state["min_acu"],
+        "max_acu": initial_state["max_acu"],
     }
     modified = (
         float(initial["min_acu"] or 0) != FORMAL_AURORA_MIN_ACU
@@ -323,20 +346,15 @@ def ensure_aurora_capacity(
                 "Aurora is not at 124/128 and automatic capacity configuration "
                 "was not authorized"
             )
-        shell_run(
-            [
-                "aws",
-                "rds",
-                "modify-db-cluster",
-                "--region",
-                AWS_REGION,
-                "--db-cluster-identifier",
-                cluster_id,
-                "--serverless-v2-scaling-configuration",
-                "MinCapacity=124,MaxCapacity=128",
-                "--apply-immediately",
-            ],
-            timeout=120,
+        reconcile_aurora_capacity(
+            aws_region=AWS_REGION,
+            cluster_id=cluster_id,
+            desired=AuroraCapacityConfig(
+                min_acu=FORMAL_AURORA_MIN_ACU, max_acu=FORMAL_AURORA_MAX_ACU
+            ),
+            timeout_seconds=timeout_seconds,
+            poll_seconds=0 if timeout_seconds < 60 else 10.0,
+            aws_json=_registry_aws_json,
         )
     result = aurora_capacity_preflight(
         cluster_id,

@@ -16,6 +16,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from gpu_fault.collectors import EventSink
+from gpu_fault.env import env_bool
 from gpu_fault.completion_attempt_state import (
     AttemptSpec,
     cache_terminal_attempt_observation,
@@ -1538,7 +1539,7 @@ def controller_from_environment() -> KubernetesCompletionController:
 
     resolver = (
         discover_gpu_uuids
-        if os.getenv("GPU_FAULT_DISCOVER_POD_GPU_UUIDS", "true").lower() == "true"
+        if env_bool("GPU_FAULT_DISCOVER_POD_GPU_UUIDS", True)
         else None
     )
     fallback_value = os.getenv("GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS", "30").strip()
@@ -1603,14 +1604,10 @@ def controller_from_environment() -> KubernetesCompletionController:
                 "0.5",
             )
         ),
-        publish_observations=os.getenv(
-            "GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS", "true"
-        ).lower()
-        == "true",
-        observe_unmanaged_workloads=os.getenv(
-            "GPU_FAULT_COMPLETION_OBSERVE_UNMANAGED", "false"
-        ).lower()
-        == "true",
+        publish_observations=env_bool("GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS", True),
+        observe_unmanaged_workloads=env_bool(
+            "GPU_FAULT_COMPLETION_OBSERVE_UNMANAGED", False
+        ),
         observation_runtime_profile_version=(
             os.getenv("GPU_FAULT_COMPLETION_OBSERVATION_RUNTIME_PROFILE") or None
         ),

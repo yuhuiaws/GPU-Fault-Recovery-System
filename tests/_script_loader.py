@@ -1,9 +1,11 @@
 """Import path-only repository scripts as modules for tests.
 
-``deploy/control-plane/regional/*.py`` and a few ``scripts/*.py`` files are
-executable scripts rather than part of the installed package. They import each
-other by bare module name (``from regional_release_config import ReleaseError``),
-so tests cannot reach them through ``gpu_fault.*``.
+A few ``scripts/*.py`` files are executable scripts rather than part of an
+installed package. They import each other by bare module name when run as
+files (``from release_identity import file_set_identity`` behind an
+``if __package__`` guard), so tests cannot reach them through a package
+import. The release orchestrator used to be loaded here too; it is the
+``gpu_fault_release`` package now and tests import it directly.
 
 Two invariants hold here, and both exist because the earlier alias-based loader
 broke them:

@@ -25,7 +25,11 @@ from gpu_fault.channel_registry import (
     SPOOLABLE_CHANNEL_PATHS,
     TELEMETRY_SPOOL_PATH_SCHEDULE,
 )
-from gpu_fault.processor import ProcessorCoordinator
+from gpu_fault.processor import (
+    ProcessorCoordinator,
+    ProcessorLeaseSettings,
+    ProcessorSpoolSettings,
+)
 from tests._builders import build_store, copy_model, processor_request
 
 CLUSTER = "cluster-a"
@@ -137,10 +141,12 @@ def test_the_last_spool_path_is_tried_before_the_fallback_sleep(monkeypatch) -> 
         owner_id=OWNER,
         internal_token=TOKEN,
         active_consumers=False,
-        telemetry_spool_enabled=True,
-        telemetry_spool_workers=1,
-        telemetry_spool_notification_fallback_seconds=5,
-        poll_seconds=0.01,
+        spool=ProcessorSpoolSettings(
+            telemetry_spool_enabled=True,
+            telemetry_spool_workers=1,
+            telemetry_spool_notification_fallback_seconds=5,
+        ),
+        lease=ProcessorLeaseSettings(poll_seconds=0.01),
     )
     replayed = Event()
 

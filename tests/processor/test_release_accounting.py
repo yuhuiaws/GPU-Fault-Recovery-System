@@ -18,7 +18,11 @@ from threading import Event
 
 import pytest
 
-from gpu_fault.processor import ProcessorCoordinator, ProcessorRequestStatus
+from gpu_fault.processor import (
+    ProcessorCoordinator,
+    ProcessorLeaseSettings,
+    ProcessorRequestStatus,
+)
 from gpu_fault.processor.replay_completion import finalize_replay_response
 from tests._builders import build_store, processor_request
 
@@ -107,7 +111,9 @@ def test_a_lane_lease_changed_fence_releases_with_a_backoff():
 def test_a_release_past_the_retry_horizon_completes_as_failed():
     store = build_store()
     request, claimed = _claimed(store)
-    processor = _processor(store, retryable_response_max_age_seconds=0.001)
+    processor = _processor(
+        store, lease=ProcessorLeaseSettings(retryable_response_max_age_seconds=0.001)
+    )
     # Any measurable age is past a one-millisecond horizon.
     time.sleep(0.01)
 
@@ -129,7 +135,9 @@ def test_a_release_past_the_retry_horizon_completes_as_failed():
 def test_renewal_survives_a_store_exception_and_stops_only_when_fenced():
     store = build_store()
     _, claimed = _claimed(store)
-    processor = _processor(store, request_renew_seconds=0.01)
+    processor = _processor(
+        store, lease=ProcessorLeaseSettings(request_renew_seconds=0.01)
+    )
     calls: list[int] = []
     answers = iter([RuntimeError("40001"), True, True, False])
 

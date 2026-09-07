@@ -367,9 +367,48 @@ def test_role_split_applies_common_administrator_tuning_to_all_roles() -> None:
     ):
         values = _effective_env(items, items[deployment_name])
         assert values["GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH"] == "131072"
+        assert values["GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH"] == "2048"
         assert values["GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS"] == "10"
         assert values["GPU_FAULT_NOTIFICATION_BATCH_SIZE"] == "50"
         assert values["GPU_FAULT_EVIDENCE_RETENTION_HOURS"] == "48"
+
+
+def test_role_split_derives_the_fault_reserve_from_the_declared_node_count() -> None:
+    # Perf plan section 2 / product requirement: one correlated whole-cluster
+    # fault is one fault-priority request per node, so the per-cluster reserve
+    # must be at least the largest cluster, not a fixed eighth of the depth.
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy/control-plane/tools/render_control_plane_role_split.py"),
+            "--json",
+        ],
+        input=json.dumps(_deployment()),
+        text=True,
+        capture_output=True,
+        check=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            "GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT": "1000",
+            "GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT": "4000",
+            "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": "4096",
+        },
+    )
+    items = {
+        item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
+    }
+
+    for deployment_name in (
+        "gpu-fault-api-ha",
+        "gpu-fault-control-worker",
+        "gpu-fault-telemetry-spool-worker",
+    ):
+        values = _effective_env(items, items[deployment_name])
+        assert values["GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT"] == "1000"
+        assert values["GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT"] == "4000"
+        assert values["GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH"] == "1000"
+        assert values["GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH"] == "8192"
 
 
 POOL_ENV = (

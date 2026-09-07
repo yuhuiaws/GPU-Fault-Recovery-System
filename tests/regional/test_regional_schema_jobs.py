@@ -12,16 +12,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_rendering as RENDERING_MODULE
+from gpu_fault_release import rollout as MODULE
 from tests.regional._release_orchestrator_support import config_file
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
-RENDERING_MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_rendering.py"
-)
 TOOL = ROOT / "deploy/control-plane/tools/ensure-postgres-schema.sh"
 JOBS = (
     "gpu-fault-postgres-index-build",

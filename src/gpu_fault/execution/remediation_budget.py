@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping, Sequence
 
 from gpu_fault.models import (
@@ -17,6 +19,48 @@ from gpu_fault.operation_registry import (
 )
 
 
+FAILURE_DOMAIN_MAP_ENV = "GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP"
+
+# cluster_id -> node_id -> failure domain. The map is the only source of a
+# node's failure domain: the control plane holds no node topology of its own
+# (an incident carries node ids, an agent heartbeat carries versions), and a
+# GPU cluster here is one availability zone, so the zone cannot tell two of its
+# nodes apart. A rack, PDU, NVSwitch partition or HyperPod instance group can.
+NodeFailureDomains = Mapping[str, Mapping[str, str]]
+
+
+def load_failure_domain_map(path: str | Path) -> dict[str, dict[str, str]]:
+    """Read ``{cluster_id: {node_id: failure_domain}}`` or raise ``ValueError``.
+
+    Malformed input is refused rather than skipped: a limiter that quietly
+    ignores half its map is the "protection that never was" this replaces.
+    """
+
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"failure domain map {path} is unreadable: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"failure domain map {path} must be a JSON object")
+    mapping: dict[str, dict[str, str]] = {}
+    for cluster_id, nodes in document.items():
+        if not isinstance(nodes, dict):
+            raise ValueError(
+                f"failure domain map {path}: cluster {cluster_id!r} must map "
+                "node ids to failure domains"
+            )
+        for node_id, domain in nodes.items():
+            if not isinstance(domain, str) or not domain:
+                raise ValueError(
+                    f"failure domain map {path}: {cluster_id}/{node_id} must "
+                    "name a non-empty failure domain"
+                )
+        mapping[str(cluster_id)] = {
+            str(node_id): domain for node_id, domain in nodes.items()
+        }
+    return mapping
+
+
 @dataclass(frozen=True)
 class RemediationBudgetPolicy:
     region_limit: int = 20
@@ -24,10 +68,15 @@ class RemediationBudgetPolicy:
     node_limit: int = 1
     failure_domain_limit: int = 1
     resource_class_limit: int = 2
+    node_failure_domains: NodeFailureDomains = field(default_factory=dict, hash=False)
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> RemediationBudgetPolicy:
+        map_path = values.get(FAILURE_DOMAIN_MAP_ENV, "")
         policy = cls(
+            node_failure_domains=(
+                load_failure_domain_map(map_path) if map_path else {}
+            ),
             region_limit=int(
                 values.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION", "20")
             ),
@@ -144,13 +193,23 @@ def _scopes_for_steps(
     ):
         claims[f"node:{cluster_id}:{node_id}"] = policy.node_limit
 
+    # Two sources, both real: the fabric partition the SXID planner writes into
+    # the step, and the operator-declared node map. There is deliberately no
+    # third key read "in case something sets it": `failure_domain` and
+    # `availability_zone` were read here while no code path ever wrote them,
+    # so the per-domain tier read as enforced and was inert.
     failure_domains: set[str] = set()
     resource_classes: set[str] = set()
+    cluster_domains = policy.node_failure_domains.get(cluster_id, {})
     for step in pending:
-        for key in ("fabric_partition", "failure_domain", "availability_zone"):
-            raw = step.parameters.get(key)
-            values = raw if isinstance(raw, list) else [raw]
-            failure_domains.update(str(value) for value in values if value)
+        raw = step.parameters.get("fabric_partition")
+        values = raw if isinstance(raw, list) else [raw]
+        failure_domains.update(str(value) for value in values if value)
+        failure_domains.update(
+            cluster_domains[node_id]
+            for node_id in step.node_ids
+            if node_id in cluster_domains
+        )
         if step.operation is WorkflowOperation.QUARANTINE:
             resource_classes.add(_ISOLATION_RESOURCE_CLASS)
             continue

@@ -3,6 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+# How many failed replays a spooled sample gets before it is dropped.
+# Telemetry is a stream: the next sample from the same node carries the
+# same state, so a payload the endpoint cannot execute is worth far
+# less than the spool depth it occupies. A fault would never be
+# dropped this way, and no fault reaches the spool.
+TELEMETRY_SPOOL_MAX_ATTEMPTS = 5
+
 # Keys for the telemetry tables. They are shared because all three backends
 # slice them positionally -- the batch lock in the sqlite and postgres mixins
 # takes `key[:2]` to mean "this node" -- so a backend that changed the order

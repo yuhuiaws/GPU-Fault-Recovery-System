@@ -18,22 +18,13 @@ from types import SimpleNamespace
 import pytest
 
 from gpu_fault.admin import cli as admin_cli
+from gpu_fault_release import regional_release_diff as DIFF
+from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
+from gpu_fault_release import regional_schema_change as SCHEMA_CHANGE
+from gpu_fault_release import rollout as MODULE
 from scripts import release_failure_recovery
-from tests._script_loader import lazy_script_module
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
-DIFF = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_diff.py"
-)
-ORCHESTRATION = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_orchestration.py"
-)
-SCHEMA_CHANGE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_schema_change.py"
-)
 
 ENV = "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE"
 

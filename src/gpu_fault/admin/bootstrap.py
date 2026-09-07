@@ -14,13 +14,17 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 from urllib.parse import quote
 
+from gpu_fault.admin.aurora_capacity import (
+    AURORA_ENGINE_VERSION,
+    AuroraClusterSpec,
+    create_db_cluster_arguments,
+)
 from gpu_fault.admin.bootstrap_aurora import (
     bootstrap_aurora_capacity,
     ensure_cluster_parameter_group,
     ensure_serverless_instances,
     reconcile_cluster_diagnostics,
     reconcile_existing_capacity,
-    scaling_configuration,
 )
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
@@ -1679,13 +1683,6 @@ def _ensure_aurora(
             site_id=site_id,
             description=f"Aurora cluster {cluster_id}",
         )
-        reconcile_existing_capacity(
-            runner,
-            aws_region=cpu.region,
-            cluster_id=cluster_id,
-            cluster=existing_cluster,
-            capacity=capacity,
-        )
         # Diagnostics (lock-wait and slow-statement logging, pg_stat_statements,
         # CloudWatch log export) are reconciled on every deploy like capacity
         # is, so a cluster created before they existed gets them on its next
@@ -1694,7 +1691,9 @@ def _ensure_aurora(
             runner,
             aws_region=cpu.region,
             cluster_id=cluster_id,
-            engine_version=str(existing_cluster.get("EngineVersion") or "16.8"),
+            engine_version=str(
+                existing_cluster.get("EngineVersion") or AURORA_ENGINE_VERSION
+            ),
             safe_name=_safe_name,
         )
         reconcile_cluster_diagnostics(
@@ -1709,50 +1708,24 @@ def _ensure_aurora(
             runner,
             aws_region=cpu.region,
             cluster_id=cluster_id,
-            engine_version="16.8",
+            engine_version=AURORA_ENGINE_VERSION,
             safe_name=_safe_name,
         )
-        runner.run(
-            [
-                "aws",
-                "rds",
-                "create-db-cluster",
-                "--region",
-                cpu.region,
-                "--db-cluster-identifier",
-                cluster_id,
-                "--engine",
-                "aurora-postgresql",
-                "--engine-version",
-                "16.8",
-                "--engine-mode",
-                "provisioned",
-                "--database-name",
-                "gpu_fault",
-                "--master-username",
-                "gpu_fault_admin",
-                "--manage-master-user-password",
-                "--serverless-v2-scaling-configuration",
-                scaling_configuration(capacity),
-                "--db-subnet-group-name",
-                subnet_group,
-                "--vpc-security-group-ids",
-                security_group["group_id"],
-                "--storage-encrypted",
-                "--backup-retention-period",
-                "7",
-                "--deletion-protection",
-                "--copy-tags-to-snapshot",
-                "--enable-iam-database-authentication",
-                "--db-cluster-parameter-group-name",
-                parameter_group,
-                "--enable-cloudwatch-logs-exports",
-                "postgresql",
-                "--tags",
-                f"Key=gpu-fault:site-id,Value={site_id}",
-            ],
+        # The argument list is owned by ``aurora_capacity`` -- the one writer of
+        # the ACU window, shared with the legacy deploy script's ``create``.
+        runner.aws_json(
+            cpu.region,
+            *create_db_cluster_arguments(
+                AuroraClusterSpec(
+                    cluster_id=cluster_id,
+                    subnet_group=subnet_group,
+                    security_group_ids=(security_group["group_id"],),
+                    parameter_group=parameter_group,
+                    capacity=capacity,
+                    site_id=site_id,
+                )
+            ),
             mutate=True,
-            capture=False,
         )
     instance_ids = ensure_serverless_instances(
         runner,
@@ -1761,6 +1734,17 @@ def _ensure_aurora(
         availability_zones=availability_zones,
         safe_name=_safe_name,
     )
+    if cluster_exists:
+        # After the instances: the shared reconciler proves the window on both
+        # members, so a resumed bootstrap that had created the cluster but not
+        # its instances must not reach it first.
+        reconcile_existing_capacity(
+            runner,
+            aws_region=cpu.region,
+            cluster_id=cluster_id,
+            cluster=existing_cluster,
+            capacity=capacity,
+        )
     if runner.dry_run:
         return {
             "cluster_id": cluster_id,
@@ -1772,6 +1756,8 @@ def _ensure_aurora(
             "subnet_group_ownership": "CREATED",
             "security_group": security_group["group_id"],
             "security_group_ownership": security_group["ownership"],
+            "parameter_group": parameter_group,
+            "parameter_group_ownership": "CREATED",
             "master_secret_arn": "arn:aws:secretsmanager:dry-run",
             "master_secret_kms_key_arn": "",
         }
@@ -1834,6 +1820,10 @@ def _ensure_aurora(
         "subnet_group_ownership": "CREATED",
         "security_group": security_group["group_id"],
         "security_group_ownership": security_group["ownership"],
+        # Created by name (or adopted under it) in ensure_cluster_parameter_group;
+        # registered so uninstall deletes it after the cluster.
+        "parameter_group": parameter_group,
+        "parameter_group_ownership": "CREATED",
         "master_secret_arn": secret_arn,
         "master_secret_kms_key_arn": str(
             database["MasterUserSecret"].get("KmsKeyId") or ""

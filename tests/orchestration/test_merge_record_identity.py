@@ -24,7 +24,7 @@ import asyncio
 from datetime import timedelta
 
 from gpu_fault.models import WorkflowOperation, WorkflowRequest, WorkflowStatus
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from tests._builders import build_context, copy_model, workflow_step_execution
 from tests.orchestration._cross_fault_support import (
     observation,

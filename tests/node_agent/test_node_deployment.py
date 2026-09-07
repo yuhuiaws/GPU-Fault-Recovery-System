@@ -531,8 +531,12 @@ def test_training_progress_monitor_is_disabled_by_default() -> None:
     assert (
         training_health_monitor_enabled({TRAINING_HEALTH_MONITOR_ENV: "true"}) is True
     )
-    assert "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR:-false" in deploy
-    assert "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR must be true or false" in deploy
+    # Off by default, and every value goes through the one bash boolean parser
+    # (S9): an unknown token is a hard error, not a silent "off".
+    assert (
+        "normalize_bool GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR "
+        '"${GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR:-false}"'
+    ) in deploy
     for manifest in (
         ROOT / "deploy/control-plane/base/control-plane-deployment.yaml",
         ROOT / "scripts/e2e/regional/manifests/xid45-correlation-canary.yaml",
@@ -549,8 +553,10 @@ def test_kubernetes_hma_collector_is_disabled_by_default() -> None:
     installer = NODE_SCRIPTS[0].read_text()
     verifier = NODE_SCRIPTS[1].read_text()
 
-    assert "GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR:-false" in deploy
-    assert "GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR must be true or false" in deploy
+    assert (
+        "normalize_bool GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR "
+        '"${GPU_FAULT_ENABLE_KUBERNETES_HMA_COLLECTOR:-false}"'
+    ) in deploy
     assert 'if [[ "${ENABLE_KUBERNETES_HMA_COLLECTOR}" == "true" ]]' in deploy
     assert (
         "delete deployment \\\n"

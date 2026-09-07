@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
 from threading import Condition
+from typing import TYPE_CHECKING
 
-from gpu_fault.models import (
-    EfaTrafficAdminDecision,
-    EfaTrafficState,
-)
 from gpu_fault.schema_migrations import (
     LATEST_POSTGRES_SCHEMA_VERSION,
 )
@@ -42,15 +38,32 @@ from gpu_fault.store.postgres.schema_state import PostgresSchemaMixin
 from gpu_fault.store.postgres.telemetry_spool import PostgresTelemetrySpoolMixin
 from gpu_fault.store.postgres.workflows import PostgresWorkflowMixin
 from gpu_fault.store.postgres.xid import PostgresXidMixin
-from gpu_fault.policy import Nvlink74BitOccurrenceState
-from gpu_fault.store.memory.store import InMemoryStore
-from gpu_fault.store.sqlite.store import SqliteStore
+from gpu_fault.store.shared.compositions import SharedCompositionMixin
+from gpu_fault.store.shared.control_records import SharedControlRecordMixin
+from gpu_fault.store.shared.efa import (
+    SharedEfaTrafficMixin,
+    SharedEfaTrafficRulesMixin,
+)
+from gpu_fault.store.shared.fleet import SharedFleetMixin
+from gpu_fault.store.shared.notifications import SharedNotificationMixin
+from gpu_fault.store.shared.primitives import (
+    SharedRecordAccessMixin,
+    StorePrimitives,
+)
+from gpu_fault.store.shared.processor_leases import SharedProcessorLeaseMixin
+from gpu_fault.store.shared.record_models import record_models
+from gpu_fault.store.shared.remote_commands import SharedRemoteCommandMixin
+from gpu_fault.store.shared.telemetry_records import SharedTelemetryRecordMixin
+from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflowMixin
+from gpu_fault.store.shared.workflow_records import SharedWorkflowRecordMixin
+from gpu_fault.store.shared.xid import SharedXidMixin, SharedXidSignalMixin
 
 _PooledPostgresDatabase = PooledPostgresDatabase
 POSTGRES_SCHEMA_VERSION = LATEST_POSTGRES_SCHEMA_VERSION
 
 
 class PostgresStore(
+    # PostgreSQL-specific statements first: they override the shared templates.
     PostgresCoreMixin,
     PostgresSchemaMixin,
     PostgresControlRecordMixin,
@@ -68,7 +81,22 @@ class PostgresStore(
     PostgresProcessorCompletionMixin,
     PostgresProcessorLeaseMixin,
     PostgresProcessorStorageMixin,
-    SqliteStore,
+    # Dialect-neutral templates over the key/value primitives.
+    TransactionalWorkflowMixin,
+    SharedRecordAccessMixin,
+    SharedControlRecordMixin,
+    SharedEfaTrafficMixin,
+    SharedFleetMixin,
+    SharedNotificationMixin,
+    SharedRemoteCommandMixin,
+    SharedWorkflowRecordMixin,
+    SharedXidMixin,
+    SharedTelemetryRecordMixin,
+    SharedProcessorLeaseMixin,
+    # Pure rules and public-contract compositions every store shares.
+    SharedEfaTrafficRulesMixin,
+    SharedXidSignalMixin,
+    SharedCompositionMixin,
 ):
     """Shared active-active store with transactional workflow leases."""
 
@@ -82,18 +110,6 @@ class PostgresStore(
         initialize_schema: bool = True,
         hot_state_mode: str | None = None,
     ) -> None:
-        InMemoryStore.__init__(self)
-        # The in-memory and SQLite stores guard their dict/file writes
-        # with one process-wide RLock, and 19 small writers inherit it
-        # unchanged - save_workflow, save_incident, save_agent and the
-        # rest. On PostgreSQL that lock cannot mean anything: three
-        # replicas times four uvicorn workers already run these paths
-        # concurrently, so anything that needs mutual exclusion uses
-        # _state_transaction's advisory lock instead. All it did here was
-        # funnel all 32 store I/O threads of a process through one
-        # RLock. Cross-replica atomicity comes from the transaction; the
-        # multi-statement writers below take one explicitly.
-        self._lock = nullcontext()
         if (
             pool_min_size < 0
             or pool_max_size < 1
@@ -105,83 +121,7 @@ class PostgresStore(
             from psycopg_pool import ConnectionPool
         except ImportError as exc:
             raise RuntimeError("install gpu-fault-control-plane[postgres]") from exc
-        from gpu_fault.gpu_metrics import (
-            GpuFindingState,
-            GpuHealthFinding,
-            GpuInventorySnapshot,
-            GpuMetricLatest,
-            GpuMetricsIngestionResult,
-        )
-        from gpu_fault.fleet import (
-            AgentRecord,
-            FleetDeployment,
-            MultiNodeBarrier,
-        )
-        from gpu_fault.telemetry import (
-            CollectorMetricsSnapshotRecord,
-            CollectorStatus,
-            RawEvidenceRecord,
-            TelemetryMetricLatest,
-            WorkloadObservationState,
-        )
-        from gpu_fault.training_health import (
-            TrainingProgressState,
-        )
-        from gpu_fault.managed_recovery import (
-            HyperPodNodeIdentity,
-        )
-        from gpu_fault.hyperpod import (
-            HyperPodSubmissionRecord,
-        )
-        from gpu_fault import regional as regional_models
-        from gpu_fault.installation_resources import InstallationResource
-        from gpu_fault.processor import (
-            PeriodicTaskLease,
-            ProcessorLaneLease,
-            ProcessorLeadership,
-            ProcessorRequest,
-        )
-        from gpu_fault.policy import (
-            FaultPolicyDecision,
-            XidCorrelationRecord,
-            XidEvent,
-        )
-
-        self._models = {
-            **self._MODELS,
-            "agent": AgentRecord,
-            "fleet_deployment": FleetDeployment,
-            "barrier": MultiNodeBarrier,
-            "gpu_metric_latest": GpuMetricLatest,
-            "gpu_inventory_snapshot": GpuInventorySnapshot,
-            "gpu_finding_state": GpuFindingState,
-            "gpu_finding_history": GpuHealthFinding,
-            "gpu_metrics_batch": GpuMetricsIngestionResult,
-            "collector_status": CollectorStatus,
-            "collector_metrics_snapshot": CollectorMetricsSnapshotRecord,
-            "telemetry_metric_latest": TelemetryMetricLatest,
-            "attempt_observation": WorkloadObservationState,
-            "training_progress": TrainingProgressState,
-            "raw_evidence": RawEvidenceRecord,
-            "hyperpod_node_identity": HyperPodNodeIdentity,
-            "hyperpod_submission": HyperPodSubmissionRecord,
-            "regional_cluster": regional_models.RegionalClusterRegistration,
-            "regional_registry_head": regional_models.RegionalRegistryHead,
-            "regional_registry_member": regional_models.RegionalRegistryMember,
-            "regional_registry_revision": regional_models.RegionalRegistryRevision,
-            "installation_resource": InstallationResource,
-            "remote_command": regional_models.RemoteActionCommand,
-            "processor_leadership": ProcessorLeadership,
-            "periodic_task_lease": PeriodicTaskLease,
-            "processor_lane": ProcessorLaneLease,
-            "processor_request": ProcessorRequest,
-            "xid_correlation_event": XidEvent,
-            "xid_policy_decision": FaultPolicyDecision,
-            "xid_correlation": XidCorrelationRecord,
-            "xid74_occurrence_state": Nvlink74BitOccurrenceState,
-            "efa_traffic_state": EfaTrafficState,
-            "efa_traffic_admin_decision": EfaTrafficAdminDecision,
-        }
+        self._models = record_models()
         self.url = url
         self.hot_state_mode = (
             (
@@ -307,3 +247,9 @@ class PostgresStore(
                 )
             self._pool.close()
             raise
+
+
+if TYPE_CHECKING:
+
+    def _assert_primitives(store: PostgresStore) -> None:
+        _primitives: StorePrimitives = store

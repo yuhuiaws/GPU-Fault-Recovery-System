@@ -400,6 +400,20 @@ PROBES: list[tuple[str, dict[str, Any], list[str], str]] = [
         "DBClusterNotFoundFault",
     ),
     (
+        "rds_cluster_parameter_group",
+        {"resource_id": "gpu-fault-aurora-pg"},
+        [
+            "aws",
+            "rds",
+            "describe-db-cluster-parameter-groups",
+            "--region",
+            REGION,
+            "--db-cluster-parameter-group-name",
+            "gpu-fault-aurora-pg",
+        ],
+        "DBParameterGroupNotFound",
+    ),
+    (
         "aurora_instance",
         {"resource_id": "gpu-fault-aurora-writer"},
         [

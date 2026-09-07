@@ -163,6 +163,12 @@ spec:
               key: compatible-regional-executor-compatibility-digests
               name: gpu-fault-release-metadata
               optional: true
+        - name: GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP
+          valueFrom:
+            configMapKeyRef:
+              key: map-path
+              name: gpu-fault-failure-domain-map
+              optional: true
         - name: GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST
           valueFrom:
             configMapKeyRef:
@@ -246,6 +252,9 @@ spec:
         - mountPath: /etc/gpu-fault/node-action-keys
           name: node-action-keys
           readOnly: true
+        - mountPath: /etc/gpu-fault/failure-domains
+          name: failure-domain-map
+          readOnly: true
         envFrom:
         - configMapRef:
             name: gpu-fault-control-worker-config-core
@@ -290,3 +299,7 @@ spec:
       - name: node-action-keys
         secret:
           secretName: gpu-fault-node-action-keys
+      - configMap:
+          name: gpu-fault-failure-domain-map
+          optional: true
+        name: failure-domain-map

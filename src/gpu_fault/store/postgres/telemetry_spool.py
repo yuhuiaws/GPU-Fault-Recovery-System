@@ -9,15 +9,17 @@ from threading import Event as ThreadEvent
 from typing import Callable
 
 from gpu_fault.store.shared.telemetry_models import (
+    TELEMETRY_SPOOL_MAX_ATTEMPTS,
     SpooledTelemetry,
 )
 
 
 class PostgresTelemetrySpoolMixin:
     # Attributes supplied by the composed concrete implementation.
-    TELEMETRY_SPOOL_MAX_ATTEMPTS: Any
     _db: Any
     url: Any
+
+    TELEMETRY_SPOOL_MAX_ATTEMPTS = TELEMETRY_SPOOL_MAX_ATTEMPTS
 
     _TELEMETRY_SPOOL_DEPTH_TTL_SECONDS = 0.25
 

@@ -23,7 +23,7 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStatus,
 )
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from tests._builders import (
     attempt_observation,
     build_store,

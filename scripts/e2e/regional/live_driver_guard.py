@@ -3,13 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, Protocol, TypeVar
 
 if __package__:
     from .acceptance_runner_common import write_json_atomic
     from .acceptance_scope import current_acceptance_scope
+    from .regional_live_fixture import RegionalFixtureError, install_abort_signals
     from .site_profile import (
         SITE_PROFILE_ENV,
         applied_site_profile,
@@ -19,6 +22,7 @@ if __package__:
 else:
     from acceptance_runner_common import write_json_atomic
     from acceptance_scope import current_acceptance_scope
+    from regional_live_fixture import RegionalFixtureError, install_abort_signals
     from site_profile import (
         SITE_PROFILE_ENV,
         applied_site_profile,
@@ -29,12 +33,16 @@ else:
 # Re-exported so the runners keep one import site for the live-driver contract:
 # every one of them already imports `add_live_arguments` from here.
 __all__ = [
+    "CaseRunner",
+    "CaseSurface",
     "add_live_arguments",
     "bind_site_profile",
     "authorize_execution",
     "build_plan",
     "environment_snapshot",
     "install_site_profile",
+    "run_selected_case",
+    "run_standard_case",
 ]
 
 
@@ -164,3 +172,169 @@ def authorize_execution(
         if plan.get(key) != value:
             raise RuntimeError(f"live-driver plan drifted at {key}")
     return deadline
+
+
+class CaseSettings(Protocol):
+    """What the shared ``main`` needs from a runner's configured settings."""
+
+    def environment(self) -> dict[str, str]: ...
+
+
+class SelectedCaseSettings(CaseSettings, Protocol):
+    """Settings of a runner that picks its case at configure time."""
+
+    @property
+    def case_id(self) -> str: ...
+
+    @property
+    def confirmation(self) -> str: ...
+
+
+S = TypeVar("S", bound=CaseSettings)
+T = TypeVar("T", bound=SelectedCaseSettings)
+
+
+@dataclass(frozen=True)
+class CaseSurface(Generic[S]):
+    """The functions one live runner hands to the shared ``main``.
+
+    A dataclass rather than a module looked up by attribute, so a runner that
+    forgets one of these fails while the module declares ``CASE`` -- at import,
+    under the unit suite -- instead of on the first ``--execute`` against a
+    cluster.
+    """
+
+    parser: Callable[[], argparse.ArgumentParser]
+    configure: Callable[[argparse.Namespace], S]
+    read_only_preflight: Callable[[S, Path], dict[str, Any]]
+    plan_details: Callable[[S, dict[str, Any]], dict[str, Any]]
+    execute_case: Callable[[S, Path, int, datetime], int]
+
+
+@dataclass(frozen=True)
+class CaseRunner(CaseSurface[S]):
+    """A runner whose case identity is fixed by its module constants."""
+
+    case_id: str
+    confirmation: str
+
+
+def _start_case(case: CaseSurface[S]) -> tuple[argparse.Namespace, S]:
+    install_site_profile()
+    arguments = case.parser().parse_args()
+    os.umask(0o077)
+    install_abort_signals()
+    return arguments, case.configure(arguments)
+
+
+def _case_dir(arguments: argparse.Namespace, case_id: str) -> Path:
+    case_dir = Path(arguments.run_dir) / "cases" / case_id
+    case_dir.mkdir(parents=True, exist_ok=True)
+    return case_dir
+
+
+def _plan_case(
+    case: CaseSurface[S],
+    arguments: argparse.Namespace,
+    settings: S,
+    *,
+    case_dir: Path,
+    case_id: str,
+    confirmation: str,
+) -> int:
+    preflight = case.read_only_preflight(settings, case_dir)
+    plan = build_plan(
+        run_dir=arguments.run_dir,
+        case_id=case_id,
+        attempt=arguments.attempt,
+        confirmation=confirmation,
+        environment=settings.environment(),
+        details=case.plan_details(settings, preflight),
+    )
+    print(json.dumps(plan, indent=2, sort_keys=True))
+    return 0 if not preflight["errors"] else 1
+
+
+def _execute_case(
+    case: CaseSurface[S],
+    arguments: argparse.Namespace,
+    settings: S,
+    *,
+    case_id: str,
+    confirmation: str,
+) -> int:
+    deadline = authorize_execution(
+        arguments,
+        case_id=case_id,
+        confirmation=confirmation,
+        environment=settings.environment(),
+    )
+    return case.execute_case(
+        settings,
+        arguments.run_dir,
+        arguments.attempt,
+        deadline,
+    )
+
+
+def run_standard_case(case: CaseRunner[S]) -> int:
+    """The ``main`` every fixed-identity live runner used to carry verbatim.
+
+    Site profile first (the parser's defaults read the environment it fills),
+    then parse, then a ``0o077`` umask before anything under ``--run-dir``
+    exists, then the abort signals, then the case's own configuration. Without
+    ``--execute`` this writes and prints the plan and exits 0 only when the
+    read-only preflight found nothing wrong; with it, ``authorize_execution``
+    must pass before ``execute_case`` runs, and its verdict is the exit code.
+    """
+
+    arguments, settings = _start_case(case)
+    case_dir = _case_dir(arguments, case.case_id)
+    if not arguments.execute:
+        return _plan_case(
+            case,
+            arguments,
+            settings,
+            case_dir=case_dir,
+            case_id=case.case_id,
+            confirmation=case.confirmation,
+        )
+    return _execute_case(
+        case,
+        arguments,
+        settings,
+        case_id=case.case_id,
+        confirmation=case.confirmation,
+    )
+
+
+def run_selected_case(case: CaseSurface[T]) -> int:
+    """`run_standard_case` for a runner that selects its case from ``--case``.
+
+    The identity comes from the configured settings, and a confirmation for a
+    different case is refused as a fixture error before the live-driver guard
+    sees it, so the operator reads which case they actually named.
+    """
+
+    arguments, settings = _start_case(case)
+    case_dir = _case_dir(arguments, settings.case_id)
+    if not arguments.execute:
+        return _plan_case(
+            case,
+            arguments,
+            settings,
+            case_dir=case_dir,
+            case_id=settings.case_id,
+            confirmation=settings.confirmation,
+        )
+    if arguments.confirm != settings.confirmation:
+        raise RegionalFixtureError(
+            f"confirmation must be exactly {settings.confirmation}"
+        )
+    return _execute_case(
+        case,
+        arguments,
+        settings,
+        case_id=settings.case_id,
+        confirmation=settings.confirmation,
+    )

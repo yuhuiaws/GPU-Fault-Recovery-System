@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from gpu_fault.app.authorization import authorization_bucket
 
-import os
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,6 +9,7 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
+from gpu_fault.env import env_bool
 from gpu_fault.channel_registry import (
     COLLECTOR_HEALTH_PATH,
     FABRIC_MANAGER_PATH,
@@ -311,7 +311,7 @@ async def inject_test_node_replacement(
     dependencies: CollectorRouterDependencies = Depends(get_collector_dependencies),
 ) -> NodeHealthIngestionResult:
     ctx = dependencies.context
-    if os.getenv("GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS", "").lower() != "true":
+    if not env_bool("GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS", False):
         raise HTTPException(status_code=404, detail="resource not found")
     if (
         not ctx.execution_token

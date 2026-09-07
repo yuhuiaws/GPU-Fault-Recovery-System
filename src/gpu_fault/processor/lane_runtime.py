@@ -15,11 +15,6 @@ from gpu_fault.processor.models import ProcessorRequest
 LOGGER = logging.getLogger(__name__)
 
 
-class LaneInFlightState(Protocol):
-    item: ProcessorRequest
-    started: float
-
-
 class ProcessorCoordinatorStore(Protocol):
     def acquire_processor_leadership(self, *args: Any, **kwargs: Any) -> Any: ...
 

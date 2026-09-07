@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+from gpu_fault.adapters import (
+    ControlPlaneEvidenceAdapter,
+    ManagedRecoveryObserverAdapter,
+)
 from gpu_fault.app import ApplicationContext, default_simulated_profile
 from gpu_fault.execution import ProductionExecutorConfig
 from gpu_fault.models import (
@@ -12,10 +16,6 @@ from gpu_fault.models import (
     NotificationResult,
     NotificationStatus,
     WorkflowOperation,
-)
-from gpu_fault.runtime_adapters import (
-    ControlPlaneEvidenceAdapter,
-    ManagedRecoveryObserverAdapter,
 )
 from gpu_fault.store import SqliteStore
 from tests._builders import asgi_client, copy_model

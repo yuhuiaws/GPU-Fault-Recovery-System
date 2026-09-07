@@ -71,6 +71,8 @@ from ._notifications_cases_3 import (
     test_an_unbounded_notification_read_is_unchanged,
     test_delivery_mode_names_the_switch_that_blocks_delivery,
     test_delivery_mode_states_whether_notifications_reach_anyone,
+    test_email_gate_accepts_every_enabled_token,
+    test_notification_gates_accept_every_enabled_token,
     test_the_bulk_resend_scan_is_bounded_and_says_when_it_truncated,
     test_the_load_suites_label_every_synthetic_fault_as_a_drill,
 )

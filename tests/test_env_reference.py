@@ -165,6 +165,50 @@ def test_flag_helper_parameters_type_their_call_sites() -> None:
     assert generator["_named_arguments"](tree)["_enabled"] == [{0: "GPU_FAULT_SPOOL"}]
 
 
+def test_shared_boolean_helper_types_its_call_sites_through_named_token_sets() -> None:
+    """``env_bool`` compares against module constants, not inline literals.
+
+    The token sets have to be one definition shared with the validator, so the
+    recogniser must see through a module-level ``frozenset`` name and through a
+    module-level ``NAME = "GPU_FAULT_..."`` constant handed to the helper.
+    """
+
+    generator = runpy.run_path(str(ROOT / "scripts/generate-env-reference.py"))
+    tree = ast.parse(
+        textwrap.dedent(
+            """
+            import os
+
+            TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+            FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
+            MONITOR = "GPU_FAULT_MONITOR"
+
+            def env_bool(name, default=False, *, environ=None):
+                environment = os.environ if environ is None else environ
+                raw = environment.get(name, "")
+                token = raw.strip().lower()
+                if token in TRUE_TOKENS:
+                    return True
+                if token in FALSE_TOKENS:
+                    return False
+                if not token:
+                    return default
+                raise ValueError(name)
+
+            SWITCH = env_bool("GPU_FAULT_SWITCH", True)
+            WATCHING = env_bool(MONITOR, False, environ={})
+            """
+        )
+    )
+
+    _, by_parameter = generator["_module_observations"](tree)
+    merged = generator["_merge_observations"](by_parameter[("env_bool", 0)])
+    named = generator["_named_arguments"](tree)["env_bool"]
+
+    assert merged == ("boolean", frozenset({"1", "true", "yes", "on"}))
+    assert named == [{0: "GPU_FAULT_SWITCH"}, {0: "GPU_FAULT_MONITOR"}]
+
+
 def test_conflicting_read_sites_leave_a_variable_unvalidated() -> None:
     """A guessed kind would refuse a legal production value."""
 

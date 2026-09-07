@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from pydantic import Field, model_validator
 
+from gpu_fault.env import env_bool
 from gpu_fault.models import (
     CapabilityClaim,
     CapabilityMode,
@@ -200,23 +201,13 @@ class HyperPodAdapterConfig(StrictModel):
         cluster_name = cluster_name or os.getenv("GPU_FAULT_HYPERPOD_CLUSTER")
         if not cluster_name:
             raise ValueError("GPU_FAULT_HYPERPOD_CLUSTER is required")
-        legacy_mutation_enabled = (
-            os.getenv("GPU_FAULT_ALLOW_HYPERPOD_MUTATION", "").lower() == "true"
-        )
-        reboot_value = os.getenv("GPU_FAULT_ALLOW_HYPERPOD_REBOOT")
-        replace_value = os.getenv("GPU_FAULT_ALLOW_HYPERPOD_REPLACE")
-        if replace_value is not None and replace_value.lower() == "true":
+        legacy_mutation_enabled = env_bool("GPU_FAULT_ALLOW_HYPERPOD_MUTATION", False)
+        if env_bool("GPU_FAULT_ALLOW_HYPERPOD_REPLACE", False):
             raise ValueError(
                 "GPU_FAULT_ALLOW_HYPERPOD_REPLACE must remain false; "
                 "provider replacement is outside the supported design"
             )
-        if (
-            os.getenv(
-                "GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY",
-                "",
-            ).lower()
-            == "true"
-        ):
+        if env_bool("GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY", False):
             raise ValueError(
                 "GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY must remain false"
             )
@@ -226,10 +217,9 @@ class HyperPodAdapterConfig(StrictModel):
             or os.getenv("AWS_REGION")
             or os.getenv("AWS_DEFAULT_REGION"),
             execution_enabled=legacy_mutation_enabled,
-            reboot_enabled=(
-                legacy_mutation_enabled
-                if reboot_value is None
-                else reboot_value.lower() == "true"
+            # Unset (or blank) inherits the legacy mutation switch.
+            reboot_enabled=env_bool(
+                "GPU_FAULT_ALLOW_HYPERPOD_REBOOT", legacy_mutation_enabled
             ),
             replace_enabled=False,
             allow_when_node_recovery_automatic=False,

@@ -16,18 +16,11 @@ from typing import Any
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_agent_convergence as CONVERGENCE
+from gpu_fault_release import regional_release_fleet_rollout as FLEET
+from gpu_fault_release import regional_release_narration as NARRATION
 
 ROOT = Path(__file__).resolve().parents[2]
-CONVERGENCE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_agent_convergence.py"
-)
-FLEET = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_fleet_rollout.py"
-)
-NARRATION = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_narration.py"
-)
 
 CLUSTER = "hp-cluster"
 ARTIFACT = "a" * 64

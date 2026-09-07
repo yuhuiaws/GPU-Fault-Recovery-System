@@ -436,7 +436,7 @@ validate_fabric_manager_log_paths() {
         [[ -n "${path}" && "${path}" == /* ]] ||
             die "Fabric Manager log paths must be non-empty absolute globs"
         for forbidden in $'\t' ' ' '`' '$' ';' '|' '&' '<' '>' \
-            '"' "'" '\' '(' ')' '{' '}' '!'; do
+            '"' "'" "\\" '(' ')' '{' '}' '!'; do
             [[ "${path}" != *"${forbidden}"* ]] ||
                 die "Fabric Manager log path contains an unsafe character"
         done
@@ -631,9 +631,9 @@ for dcgm_filter_count in \
     [[ "${!dcgm_filter_count}" =~ ^[1-9][0-9]*$ ]] ||
         die "${dcgm_filter_count} must be a positive integer"
 done
-[[ "${DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+{ [[ "${DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
     awk -v value="${DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD}" \
-        'BEGIN { exit !(value > 0 && value <= 1) }' ||
+        'BEGIN { exit !(value > 0 && value <= 1) }'; } ||
     die "GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD must be within (0, 1]"
 [[ "${COLLECTOR_GZIP_MIN_BYTES}" =~ ^[0-9]+$ ]] ||
     die "GPU_FAULT_COLLECTOR_GZIP_MIN_BYTES must be a non-negative integer"
@@ -643,13 +643,13 @@ done
     die "GPU_FAULT_RANK_LIVENESS_ENABLED must be true or false"
 [[ "${RANK_PROGRESS_MIN_WRITE_BPS}" =~ ^[0-9]+$ ]] ||
     die "GPU_FAULT_RANK_PROGRESS_MIN_WRITE_BPS must be a non-negative integer"
-[[ "${RANK_PROGRESS_MIN_CPU_CORES}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+{ [[ "${RANK_PROGRESS_MIN_CPU_CORES}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
     awk -v value="${RANK_PROGRESS_MIN_CPU_CORES}" \
-        'BEGIN { exit !(value > 0) }' ||
+        'BEGIN { exit !(value > 0) }'; } ||
     die "GPU_FAULT_RANK_PROGRESS_MIN_CPU_CORES must be positive"
-[[ "${RANK_PROGRESS_GPU_IDLE_PERCENT}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+{ [[ "${RANK_PROGRESS_GPU_IDLE_PERCENT}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
     awk -v value="${RANK_PROGRESS_GPU_IDLE_PERCENT}" \
-        'BEGIN { exit !(value >= 0 && value <= 100) }' ||
+        'BEGIN { exit !(value >= 0 && value <= 100) }'; } ||
     die "GPU_FAULT_RANK_PROGRESS_GPU_IDLE_PERCENT must be from 0 to 100"
 for host_filter_count in \
     HOST_HEALTH_SUMMARY_SECONDS \
@@ -901,9 +901,9 @@ if [[ "${ALLOW_FIELD_DIAGNOSTIC}" == "true" ]]; then
         die "--field-diagnostic-command must start with an absolute path"
     [[ "${FIELD_DIAGNOSTIC_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] ||
         die "--field-diagnostic-sha256 must contain 64 hex characters"
-    [[ "${FIELD_DIAGNOSTIC_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] &&
+    { [[ "${FIELD_DIAGNOSTIC_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] &&
         (( FIELD_DIAGNOSTIC_TIMEOUT_SECONDS >= 60 &&
-           FIELD_DIAGNOSTIC_TIMEOUT_SECONDS <= 7200 )) ||
+           FIELD_DIAGNOSTIC_TIMEOUT_SECONDS <= 7200 )); } ||
         die "--field-diagnostic-timeout must be from 60 to 7200"
     if [[ -n "${MEMORY_FIELD_DIAGNOSTIC_COMMAND}" ]]; then
         [[ "${MEMORY_FIELD_DIAGNOSTIC_COMMAND}" == /* ]] ||

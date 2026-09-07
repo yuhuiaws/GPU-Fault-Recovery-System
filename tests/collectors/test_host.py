@@ -15,6 +15,21 @@ from ._support import (
 )
 
 
+@pytest.mark.parametrize(("token", "expected"), [("1", True), ("off", False)])
+def test_host_edge_filter_switch_reads_every_token(
+    monkeypatch: pytest.MonkeyPatch, token: str, expected: bool
+) -> None:
+    """``GPU_FAULT_HOST_EDGE_FILTER_ENABLED=1`` used to switch the filter off."""
+
+    monkeypatch.setenv("GPU_FAULT_HOST_EDGE_FILTER_ENABLED", token)
+    monkeypatch.setenv("GPU_FAULT_RANK_LIVENESS_ENABLED", token)
+
+    collector = HostTelemetryCollector(RecordingSink(), context(), node_id="worker-1")
+
+    assert collector.edge_filter_enabled is expected
+    assert collector.rank_liveness_enabled is expected
+
+
 def test_host_collector_exposes_targeted_rdma_sampling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

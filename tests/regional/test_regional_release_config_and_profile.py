@@ -188,7 +188,7 @@ def test_regional_parser_exposes_admin_health_commands() -> None:
 def test_status_keeps_health_report_when_release_summary_is_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:
-    module = MODULE.load()
+    module = MODULE
     config = module.ReleaseConfig.load(config_file(tmp_path))
     release = module.RegionalRelease(config, module.Runner(dry_run=True))
     monkeypatch.setattr(

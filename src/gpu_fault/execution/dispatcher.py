@@ -56,7 +56,7 @@ from gpu_fault.models import (
     record_workflow_event,
     workflow_is_open,
 )
-from gpu_fault.orchestrator import WorkflowFencingError
+from gpu_fault.orchestration import WorkflowFencingError
 from gpu_fault.store import (
     NotFoundError,
     WorkflowLeaseError,

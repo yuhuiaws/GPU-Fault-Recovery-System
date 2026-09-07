@@ -9,6 +9,8 @@ from typing import Callable, NamedTuple
 from fastapi.routing import APIRoute
 from starlette.routing import Match
 
+from gpu_fault.env import env_bool
+
 AUTHORIZATION_BUCKET_ATTRIBUTE = "__gpu_fault_authorization_bucket__"
 CLUSTER_ID_HEADER = "X-GPU-Fault-Cluster-ID"
 EXECUTION_TOKEN_HEADER = "X-GPU-Fault-Execution-Token"
@@ -43,7 +45,7 @@ def validate_direct_client_identity_environment() -> None:
             "FORWARDED_ALLOW_IPS is forbidden: replay and metrics "
             "loopback authorization require the direct socket peer"
         )
-    if os.getenv("GPU_FAULT_PROXY_HEADERS_ENABLED", "false").strip().lower() == "true":
+    if env_bool("GPU_FAULT_PROXY_HEADERS_ENABLED", False):
         raise RuntimeError("proxy-derived client identity is forbidden")
 
 

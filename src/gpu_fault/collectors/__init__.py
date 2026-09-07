@@ -1,5 +1,4 @@
-from importlib import import_module
-from typing import Any
+from gpu_fault.lazy_exports import lazy_module
 
 _EXPORTS = {
     "CONNECTION_POOL": ("gpu_fault.transport.http_client", "CONNECTION_POOL"),
@@ -48,6 +47,12 @@ _EXPORTS = {
         "gpu_fault.collectors.training_progress",
         "TrainingProgressCollector",
     ),
+    # deploy/aws/lambda/cloudwatch-hma-template.yaml names this as the Lambda
+    # ``Handler``; scripts/check-lazy-exports.py holds the two in step.
+    "cloudwatch_lambda_handler": (
+        "gpu_fault.collectors.cloud.cloudwatch",
+        "cloudwatch_lambda_handler",
+    ),
     "context_from_environment": (
         "gpu_fault.collectors.context",
         "context_from_environment",
@@ -73,14 +78,4 @@ _EXPORTS = {
     "stable_phase_seconds": ("gpu_fault.collectors.scheduling", "stable_phase_seconds"),
 }
 
-__all__ = list(_EXPORTS)
-
-
-def __getattr__(name: str) -> Any:
-    target = _EXPORTS.get(name)
-    if target is None:
-        raise AttributeError(name)
-    module_name, attribute = target
-    value = getattr(import_module(module_name), attribute)
-    globals()[name] = value
-    return value
+__getattr__, __dir__, __all__ = lazy_module(globals(), _EXPORTS)

@@ -15,6 +15,7 @@ from gpu_fault.app.builtin_metric_contributors import (
 from gpu_fault.app.collector_metrics import CollectorMetricsSnapshot
 from gpu_fault.app.metric_contributors import MetricContributorRegistry
 from gpu_fault.app.metrics import collector_silence_lines
+from gpu_fault.app.metrics_sections import render_capacity_metrics
 from gpu_fault.models import (
     AdvisoryNotification,
     IncidentState,
@@ -77,6 +78,40 @@ def test_process_local_store_rejection_counter_has_process_label(
     assert 'gpu_fault_store_io_rejections_total{process_id="4321"} 0' in metrics, (
         metrics
     )
+
+
+def test_declared_node_counts_are_exported_as_capacity_gauges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The renderer ships the declared topology to every role; a scrape can
+    # then compare the fault reserve with the wave it has to hold. Labels are
+    # deliberately absent: these are site-wide facts, never per node.
+    monkeypatch.setenv("GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT", "1000")
+    monkeypatch.setenv("GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT", "4000")
+    lines: list[str] = []
+
+    render_capacity_metrics(lines)
+
+    assert "gpu_fault_capacity_largest_cluster_node_count 1000" in lines
+    assert "gpu_fault_capacity_managed_node_count 4000" in lines
+    assert "# TYPE gpu_fault_capacity_largest_cluster_node_count gauge" in lines
+    assert "# TYPE gpu_fault_capacity_managed_node_count gauge" in lines
+
+    # Wired into /metrics: an undeclared topology reads as an explicit 0.
+    monkeypatch.delenv("GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT")
+    monkeypatch.delenv("GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT")
+    app = create_app(ApplicationContext(store=build_store()))
+
+    async def fetch() -> str:
+        async with asgi_client(app) as client:
+            response = await client.get("/metrics")
+            assert response.status_code == 200, response.text
+            return response.text
+
+    metrics = asyncio.run(fetch())
+
+    assert "gpu_fault_capacity_largest_cluster_node_count 0" in metrics, metrics
+    assert "gpu_fault_capacity_managed_node_count 0" in metrics, metrics
 
 
 def test_remote_internal_error_metrics_do_not_treat_retention_as_a_counter() -> None:
@@ -173,6 +208,47 @@ def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
     )
     incident = incident.model_copy(update={"workflow_request_id": workflow.request_id})
     store.save_incident_and_workflow(incident, workflow)
+    # One RUNNING workflow with a live lease holds cluster-a's budget, and one
+    # PENDING workflow was last refused by that same cluster scope: the
+    # per-cluster families have to name cluster-a, and only cluster-a, for both.
+    holder_incident = fault_incident(
+        "incident-holder", "event-holder", state=IncidentState.ACTION_PENDING
+    )
+    holder = workflow_request(
+        "workflow-holder",
+        holder_incident.incident_id,
+        WorkflowStatus.RUNNING,
+        execution_owner_id="executor-a",
+        execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        remediation_budget_claims=[
+            "class:cluster-a:NODE_LIFECYCLE_MUTATION",
+            "cluster:cluster-a",
+            "node:cluster-a:node-a",
+            "region",
+        ],
+    )
+    store.save_incident_and_workflow(
+        holder_incident.model_copy(update={"workflow_request_id": holder.request_id}),
+        holder,
+    )
+    waiter_incident = fault_incident(
+        "incident-waiter", "event-waiter", state=IncidentState.ACTION_PENDING
+    )
+    waiter = workflow_request(
+        "workflow-waiter",
+        waiter_incident.incident_id,
+        WorkflowStatus.PENDING,
+        remediation_budget_wait_count=3,
+        remediation_budget_last_blocked_reason=(
+            "remediation concurrency budget is full: "
+            "scope=cluster:cluster-a active=5 limit=5"
+        ),
+        remediation_budget_last_blocked_scope="cluster:cluster-a",
+    )
+    store.save_incident_and_workflow(
+        waiter_incident.model_copy(update={"workflow_request_id": waiter.request_id}),
+        waiter,
+    )
     notification = store.save_notification_if_absent(
         AdvisoryNotification(
             notification_id="notification-metrics",
@@ -202,8 +278,47 @@ def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
     assert (
         'gpu_fault_closed_loop_milestone_seconds_count{milestone="readmission"} 1'
     ) in lines
-    assert "gpu_fault_remediation_budget_wait_total 2" in lines
+    assert "gpu_fault_remediation_budget_wait_total 5" in lines
+    assert "gpu_fault_remediation_budget_waiting_workflows 1" in lines
+    assert 'gpu_fault_remediation_budget_active_claims{scope_type="cluster"} 1' in lines
+    # S1: the saturation has to be visible per cluster. The SUCCEEDED workflow
+    # also names cluster:cluster-a in its claims and must not count.
+    assert (
+        'gpu_fault_remediation_budget_cluster_active_claims{cluster_id="cluster-a"} 1'
+    ) in lines
+    assert "gpu_fault_remediation_budget_cluster_limit 5" in lines
+    assert (
+        "gpu_fault_remediation_budget_cluster_waiting_workflows"
+        '{cluster_id="cluster-a"} 1'
+    ) in lines
+    assert (
+        'gpu_fault_remediation_budget_waiting_workflows_by_scope{scope_type="cluster"} 1'
+    ) in lines
+    assert not [
+        line
+        for line in lines
+        if "remediation_budget_cluster" in line and "node" in line
+    ], "per-cluster budget families must never carry a node label"
     assert 'gpu_fault_notification_total{status="SENT"} 1' in lines
+
+
+def test_remediation_budget_cluster_limit_is_omitted_without_executor_config() -> None:
+    """The limit gauge reports the executor policy; with no policy there is no
+    number to report, and a fabricated zero would make the saturation alert's
+    ``limit > 0`` guard read as "never saturated"."""
+
+    store = build_store()
+    context = ApplicationContext(store=store)
+    context.production_executor_config = None
+
+    lines = closed_loop_metric_lines(SimpleNamespace(context=context))
+
+    assert not [
+        line
+        for line in lines
+        if line.startswith("gpu_fault_remediation_budget_cluster_limit ")
+    ]
+    assert "gpu_fault_remediation_budget_waiting_workflows 0" in lines
 
 
 def test_closed_loop_metrics_use_aggregate_notification_counts(monkeypatch) -> None:

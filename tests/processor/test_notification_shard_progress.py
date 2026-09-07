@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gpu_fault.processor import ProcessorCoordinator
+from gpu_fault.processor import ProcessorCoordinator, ProcessorLeaseSettings
 from gpu_fault.store.postgres.processor_admin import PostgresProcessorAdminMixin
 from tests._builders import build_store
 
@@ -173,41 +173,35 @@ def test_the_coordinator_hands_its_claim_counter_to_the_listener(monkeypatch) ->
 
 
 def test_factory_derives_shards_from_the_consumer_process_count(monkeypatch) -> None:
-    from gpu_fault.app.processor_factory import ProcessorFactory
-
     monkeypatch.delenv("GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS", raising=False)
     monkeypatch.setenv("GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES", "24")
 
-    settings = ProcessorFactory._lease_settings()
+    settings = ProcessorLeaseSettings.from_environment()
 
-    assert settings["processor_notification_shard_count"] == 24
+    assert settings.processor_notification_shard_count == 24
 
 
 def test_factory_refuses_fewer_shards_than_consumer_processes(monkeypatch) -> None:
-    from gpu_fault.app.processor_factory import ProcessorFactory
-
     monkeypatch.setenv("GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS", "8")
     monkeypatch.setenv("GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES", "24")
 
     with pytest.raises(RuntimeError, match="GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS"):
-        ProcessorFactory._lease_settings()
+        ProcessorLeaseSettings.from_environment()
 
 
 def test_factory_keeps_an_explicit_larger_shard_count(monkeypatch) -> None:
-    from gpu_fault.app.processor_factory import ProcessorFactory
-
     monkeypatch.setenv("GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS", "32")
     monkeypatch.setenv("GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES", "24")
 
-    assert (
-        ProcessorFactory._lease_settings()["processor_notification_shard_count"] == 32
-    )
+    settings = ProcessorLeaseSettings.from_environment()
+
+    assert settings.processor_notification_shard_count == 32
 
 
 def test_factory_default_is_unchanged_without_a_process_count(monkeypatch) -> None:
-    from gpu_fault.app.processor_factory import ProcessorFactory
-
     monkeypatch.delenv("GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS", raising=False)
     monkeypatch.delenv("GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES", raising=False)
 
-    assert ProcessorFactory._lease_settings()["processor_notification_shard_count"] == 8
+    settings = ProcessorLeaseSettings.from_environment()
+
+    assert settings.processor_notification_shard_count == 8

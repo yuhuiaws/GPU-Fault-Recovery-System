@@ -202,14 +202,21 @@ def test_gpu_cleanup_verification_uses_site_kubeconfig_environment(tmp_path) -> 
 
 
 def test_aurora_cleanup_runs_after_non_aurora_resources(tmp_path) -> None:
+    """The cluster parameter group is an Aurora-phase resource: RDS refuses to
+    delete a group a cluster still uses, so it goes after the cluster, never in
+    the non-Aurora pass."""
+
     site = load_site(site_file(tmp_path))
     nlb = _resource("aws/nlb", "nlb", "test-nlb")
     aurora = _resource("aws/aurora/cluster", "aurora_cluster", "test-aurora")
     instance = _resource(
         "aws/aurora/instance/writer", "aurora_instance", "test-aurora-writer"
     )
+    parameter_group = _resource(
+        "aws/aurora/parameter-group", "rds_cluster_parameter_group", "test-aurora-pg"
+    )
     snapshot = InstallationResourceSnapshot(
-        site_id="test-site", resources=[nlb, aurora, instance]
+        site_id="test-site", resources=[nlb, parameter_group, aurora, instance]
     )
     calls: list[str] = []
 
@@ -241,7 +248,65 @@ def test_aurora_cleanup_runs_after_non_aurora_resources(tmp_path) -> None:
     )
     _delete_aurora_last(cleaner, snapshot, request, state)
 
-    assert calls == ["aws/nlb", "aws/aurora/cluster"]
+    assert calls == ["aws/nlb", "aws/aurora/cluster", "aws/aurora/parameter-group"]
+
+
+def test_the_cluster_parameter_group_is_deleted_by_name_and_absence_is_fine(
+    tmp_path, monkeypatch
+) -> None:
+    """One ``delete-db-cluster-parameter-group`` in the site's region, then the
+    probe confirms it is gone. A group that is already absent (a re-run after a
+    half-finished uninstall) is success, not an error."""
+
+    site = load_site(site_file(tmp_path))
+    calls: list[list[str]] = []
+
+    def rds(arguments, **kwargs):
+        del kwargs
+        calls.append(list(arguments))
+        if "describe-db-cluster-parameter-groups" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                254,
+                stdout="",
+                stderr="An error occurred (DBParameterGroupNotFound) ...",
+            )
+        return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", rds)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+    group = _resource(
+        "aws/aurora/parameter-group", "rds_cluster_parameter_group", "test-aurora-pg"
+    )
+
+    cleaner.validate_supported([group])
+    assert admin_aws_cleanup.is_aurora_resource(group), (
+        "the parameter group belongs to the Aurora deletion phase"
+    )
+    cleaner.delete(group)
+
+    assert calls[0] == [
+        "aws",
+        "rds",
+        "delete-db-cluster-parameter-group",
+        "--region",
+        "us-east-1",
+        "--db-cluster-parameter-group-name",
+        "test-aurora-pg",
+    ]
+
+    def already_gone(arguments, **kwargs):
+        del kwargs
+        return subprocess.CompletedProcess(
+            arguments,
+            254,
+            stdout="",
+            stderr="An error occurred (DBParameterGroupNotFound) ...",
+        )
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", already_gone)
+
+    cleaner.delete(group)
 
 
 def test_aurora_instances_are_deleted_readers_before_writer() -> None:

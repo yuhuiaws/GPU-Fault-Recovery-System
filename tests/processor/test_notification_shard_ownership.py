@@ -15,7 +15,11 @@ from datetime import timedelta
 
 import pytest
 
-from gpu_fault.processor import ProcessorCoordinator
+from gpu_fault.processor import (
+    ProcessorCoordinator,
+    ProcessorLeaseSettings,
+    ProcessorPoolSettings,
+)
 from tests._builders import build_store
 
 AVAILABLE = {"fault": 1, "observation": 0, "gpu": 0, "host": 0}
@@ -26,10 +30,12 @@ def _processor(store) -> ProcessorCoordinator:
         store,
         owner_id="pod-a:1",
         internal_token="token-" + "x" * 32,
-        fault_worker_count=1,
-        poll_seconds=0.1,
-        fault_idle_backoff_max_seconds=0.5,
-        processor_notification_fallback_seconds=5.0,
+        pools=ProcessorPoolSettings(fault_worker_count=1),
+        lease=ProcessorLeaseSettings(
+            poll_seconds=0.1,
+            fault_idle_backoff_max_seconds=0.5,
+            processor_notification_fallback_seconds=5.0,
+        ),
         active_consumers=True,
     )
 

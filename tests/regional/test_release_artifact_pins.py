@@ -5,13 +5,10 @@ from pathlib import Path
 
 import yaml
 
-from gpu_fault.admin.config import preset_admin_config
-from tests._script_loader import lazy_script_module
+from gpu_fault.admin.config_patch import preset_admin_config
+from gpu_fault_release import rollout as MODULE
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/rollout_regional_release.py"
-)
 REGION = "us-east-1"
 
 

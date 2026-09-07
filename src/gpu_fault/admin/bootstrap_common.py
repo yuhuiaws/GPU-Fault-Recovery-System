@@ -6,7 +6,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -523,16 +522,3 @@ def ensure_namespace(
     )
     manifest = runner.run(arguments)
     kubectl_apply(runner, kubeconfig, manifest, context=context)
-
-
-def temporary_json_file(value: dict[str, Any]) -> Path:
-    handle = tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        delete=False,
-    )
-    with handle:
-        json.dump(value, handle)
-    path = Path(handle.name)
-    path.chmod(0o600)
-    return path

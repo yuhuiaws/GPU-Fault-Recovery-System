@@ -4,13 +4,23 @@ import logging
 import os
 from datetime import timedelta
 
-from gpu_fault.adapters import SimulatedRecoveryExecutor
+from gpu_fault.adapters import (
+    ControlPlaneEvidenceAdapter,
+    GpuValidationAdapter,
+    HyperPodLifecycleStepAdapter,
+    KubernetesWorkflowAdapter,
+    ManagedRecoveryObserverAdapter,
+    NodeActionWorkflowAdapter,
+    SimulatedRecoveryExecutor,
+    SupportEscalationAdapter,
+)
 from gpu_fault.app.identity import pod_process_owner
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.control_record_archive import ControlRecordArchiver
 from gpu_fault.diagnostics import KubernetesDcgmDiagnosticAdapter
 from gpu_fault.execution.branch_escalation import BranchEscalator
 from gpu_fault.execution.config import validate_timing_from_environment
+from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.execution import (
     ProductionExecutorConfig,
@@ -53,21 +63,12 @@ from gpu_fault.models import (
 )
 from gpu_fault.notification_service import AdvisoryNotificationService
 from gpu_fault.notifications import notification_notifier_from_environment
-from gpu_fault.orchestrator import IncidentOrchestrator
+from gpu_fault.orchestration import IncidentOrchestrator
 from gpu_fault.passive import PassiveWorkflowCompiler
 from gpu_fault.policy import GpuFaultPolicyEngine
 from gpu_fault.regional import RegionalRemoteWorkflowAdapter
 from gpu_fault.regional_registry import (
     sync_regional_cluster_registry,
-)
-from gpu_fault.runtime_adapters import (
-    ControlPlaneEvidenceAdapter,
-    GpuValidationAdapter,
-    HyperPodLifecycleStepAdapter,
-    KubernetesWorkflowAdapter,
-    ManagedRecoveryObserverAdapter,
-    NodeActionWorkflowAdapter,
-    SupportEscalationAdapter,
 )
 from gpu_fault.service import CompletionService
 from gpu_fault.settings import ControlPlaneSettings
@@ -371,12 +372,7 @@ class ApplicationContext:
         # from a healthy one. Fail closed unless the operator states in
         # the manifest that alerting is handled outside this process.
         if not context.advisory_notifications.delivers_externally():
-            if (
-                os.getenv("GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL", "false")
-                .strip()
-                .lower()
-                != "true"
-            ):
+            if not env_bool("GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL"):
                 raise RuntimeError(
                     "active executor has no external alert channel: "
                     + context.advisory_notifications.describe_delivery_mode()
@@ -537,8 +533,7 @@ class ApplicationContext:
                         )
                     )
                 ),
-                require_rdma=os.getenv("GPU_FAULT_VALIDATION_REQUIRE_RDMA", "").lower()
-                == "true",
+                require_rdma=env_bool("GPU_FAULT_VALIDATION_REQUIRE_RDMA"),
                 temperature_warning_grace=timedelta(
                     seconds=int(
                         os.getenv(
@@ -597,11 +592,7 @@ class ApplicationContext:
         enable_spare_failover = settings.spare_failover_enabled
         enable_managed_observer = (
             (context.regional_mode or bool(os.getenv("GPU_FAULT_HYPERPOD_CLUSTER")))
-            and os.getenv(
-                "GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER",
-                "true",
-            ).lower()
-            == "true"
+            and env_bool("GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER", True)
             and "hyperpod-managed-node-recovery" in managed_owners
         )
         hp = (

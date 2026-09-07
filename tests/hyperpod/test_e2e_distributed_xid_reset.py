@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+from gpu_fault.adapters import NodeActionWorkflowAdapter
 from gpu_fault.app import ApplicationContext, default_simulated_profile
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.fleet import (
@@ -15,7 +16,6 @@ from gpu_fault.fleet import (
     sign_agent_heartbeat,
 )
 from gpu_fault.models import CapabilityName, WorkflowOperation, WorkflowStatus
-from gpu_fault.runtime_adapters import NodeActionWorkflowAdapter
 from gpu_fault.store import InMemoryStore
 from tests._builders import (
     active_workflow_executor,

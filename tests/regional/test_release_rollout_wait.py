@@ -8,18 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests._script_loader import lazy_script_module
+from gpu_fault_release import regional_release_fleet_rollout as FLEET_ROLLOUT
+from gpu_fault_release import regional_release_gpu_rollout as GPU_ROLLOUT
+from gpu_fault_release import regional_release_rollout_wait as WAIT
 
 ROOT = Path(__file__).resolve().parents[2]
-WAIT = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_rollout_wait.py"
-)
-GPU_ROLLOUT = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_gpu_rollout.py"
-)
-FLEET_ROLLOUT = lazy_script_module(
-    ROOT / "deploy/control-plane/regional/regional_release_fleet_rollout.py"
-)
 
 
 def _deployment(*, ready: int = 0) -> dict:

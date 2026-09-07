@@ -33,13 +33,12 @@ from gpu_fault.admin.bootstrap_services import (
     executor_policy_document,
 )
 from gpu_fault.regional_registry import sync_regional_cluster_registry
+from gpu_fault_release import regional_release_iam as IAM
 from tests._builders import build_store
-from tests._script_loader import lazy_script_module
 from tests.regional._regional_support import TOKEN_A, TOKEN_B
 
 ROOT = Path(__file__).resolve().parents[2]
 EXECUTOR_MANIFEST = ROOT / "deploy/dataplane/cluster-action-executor.yaml"
-IAM = lazy_script_module(ROOT / "deploy/control-plane/regional/regional_release_iam.py")
 
 REGION = "us-west-2"
 ACCOUNT = "123456789012"

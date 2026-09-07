@@ -204,3 +204,15 @@ def test_proxy_derived_client_identity_is_rejected(monkeypatch) -> None:
     monkeypatch.setenv("FORWARDED_ALLOW_IPS", "127.0.0.1")
     with pytest.raises(RuntimeError, match="FORWARDED_ALLOW_IPS"):
         validate_direct_client_identity_environment()
+
+
+@pytest.mark.parametrize("token", ["1", "yes", "on"])
+def test_proxy_headers_switch_is_refused_however_it_is_spelled(
+    monkeypatch, token: str
+) -> None:
+    """``GPU_FAULT_PROXY_HEADERS_ENABLED=1`` used to slip past the guard."""
+
+    monkeypatch.delenv("FORWARDED_ALLOW_IPS", raising=False)
+    monkeypatch.setenv("GPU_FAULT_PROXY_HEADERS_ENABLED", token)
+    with pytest.raises(RuntimeError, match="proxy-derived"):
+        validate_direct_client_identity_environment()

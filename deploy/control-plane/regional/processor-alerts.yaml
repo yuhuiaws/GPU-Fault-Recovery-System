@@ -190,3 +190,30 @@ spec:
               are excluded from node mutation ownership. Check the live
               training Pod, Completion Watcher health/logs, and observation
               delivery; do not delete Store rows to silence this warning.
+        - alert: GpuFaultRemediationBudgetClusterSaturated
+          expr: >-
+            max by (control_plane_cluster, region, cluster_id)
+            (gpu_fault_remediation_budget_cluster_waiting_workflows) > 0
+            and on (control_plane_cluster, region, cluster_id)
+            (
+              max by (control_plane_cluster, region, cluster_id)
+              (gpu_fault_remediation_budget_cluster_active_claims)
+              >= on (control_plane_cluster, region) group_left
+              max by (control_plane_cluster, region)
+              (gpu_fault_remediation_budget_cluster_limit)
+            )
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: One GPU cluster's remediation budget has been saturated for 30 minutes
+            description: >-
+              Cluster {{ $labels.cluster_id }} has {{ $value }} recovery
+              workflows waiting on its remediation budget while its active
+              claims sit at the per-cluster limit. EXPECTED during a
+              correlated whole-cluster fault, which drains at the limit's
+              pace; the limit is a safety limit and must not be widened to
+              clear this alert. Compare
+              gpu_fault_remediation_budget_cluster_active_claims with
+              gpu_fault_remediation_budget_cluster_limit and read the oldest
+              waiting workflow.

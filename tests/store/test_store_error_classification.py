@@ -28,7 +28,7 @@ from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.dispatcher import WorkflowDispatcher
 from gpu_fault.execution.transient_errors import transient_store_error
 from gpu_fault.models import IncidentState, WorkflowStatus
-from gpu_fault.orchestrator import WorkflowFencingError
+from gpu_fault.orchestration import WorkflowFencingError
 from gpu_fault.store import SqliteStore
 from gpu_fault.store.postgres.pool import PooledPostgresDatabase
 from gpu_fault.store.shared.errors import (
