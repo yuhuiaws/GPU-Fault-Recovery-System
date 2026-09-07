@@ -1249,3 +1249,66 @@ def _snapshot_release(
         },
         _target_node_names=lambda _target: ("node-a",),
     )
+
+
+def _rolled_back_state(*, status: str) -> dict:
+    return {
+        "phase": "rolled-back",
+        "rollback_result": {"status": status},
+        "release_id": "candidate",
+        "component_digests": {"executor": "candidate-executor"},
+        "release_delivery_sha256": "candidate-delivery",
+        "rendered_manifest_sha256": "candidate-rendered",
+        "node_template_sha256": "candidate-template",
+        "node_installer_image": "registry.example/installer:previous",
+        "adot_image": "registry.example/adot:previous",
+        "previous": {
+            "release_id": "previous",
+            "component_digests": {"executor": "previous-executor"},
+            "release_delivery_sha256": "previous-delivery",
+            "rendered_manifest_sha256": "previous-rendered",
+            "node_template_sha256": "previous-template",
+        },
+    }
+
+
+def _capture_after_rollback(state: dict) -> dict:
+    release = _snapshot_release(
+        target=SimpleNamespace(cluster_id="gpu-a"),
+        previous_runtime="registry.example/runtime:previous",
+        previous_installer="registry.example/installer:previous",
+        previous_adot="registry.example/adot:previous",
+        previous_dcgm="registry.example/dcgm:previous",
+        state=state,
+    )
+    plan = STATE.ReleaseExecutionPlan(
+        nodes=(STATE.ReleaseComponent.CPU_FINALIZE, STATE.ReleaseComponent.VERIFY)
+    )
+    return STATE.capture_previous(release, plan)
+
+
+def test_snapshot_after_passed_rollback_describes_the_live_previous_release() -> None:
+    """A rolled-back state names the failed candidate; live is `previous`.
+
+    BOOT-020 stage 2 (live 2026-09-07) read the candidate's rendered-manifest
+    digest out of the post-rollback state, so the next rollback target would
+    have carried a rendering that was never live.
+    """
+
+    previous = _capture_after_rollback(_rolled_back_state(status="PASSED"))
+
+    assert previous["release_id"] == "previous"
+    assert previous["component_digests"] == {"executor": "previous-executor"}
+    assert previous["release_delivery_sha256"] == "previous-delivery"
+    assert previous["rendered_manifest_sha256"] == "previous-rendered"
+    assert previous["node_template_sha256"] == "previous-template"
+
+
+def test_snapshot_after_failed_rollback_keeps_the_recorded_state() -> None:
+    """Only a PASSED rollback proves `previous` is what runs; otherwise the
+    state is left alone and the operator's recovery decides."""
+
+    previous = _capture_after_rollback(_rolled_back_state(status="FAILED"))
+
+    assert previous["release_id"] == "candidate"
+    assert previous["rendered_manifest_sha256"] == "candidate-rendered"

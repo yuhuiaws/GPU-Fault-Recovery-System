@@ -846,6 +846,39 @@ def _map_clusters(
     return results
 
 
+# State fields that describe the release the transaction was *for*. After a
+# rollback that PASSED, the state still names the failed candidate (the admin
+# retry path needs exactly that), while everything actually running is the
+# `previous` snapshot. A snapshot taken from such a state must read these from
+# `previous`, or the next upgrade's rollback target would carry the candidate's
+# manifest, delivery and rendering digests (live 2026-09-07, BOOT-020 stage 2).
+_ROLLED_BACK_TRUTH_KEYS = (
+    "release_id",
+    "component_digests",
+    "release_delivery_sha256",
+    "rendered_manifest_sha256",
+    "node_template_sha256",
+)
+
+
+def _live_truth_state(state: dict[str, Any]) -> dict[str, Any]:
+    """The state with candidate-descriptive fields replaced by what is live."""
+
+    previous = state.get("previous")
+    rollback_result = state.get("rollback_result")
+    if (
+        str(state.get("phase") or "") != "rolled-back"
+        or not isinstance(previous, dict)
+        or not isinstance(rollback_result, dict)
+        or rollback_result.get("status") != "PASSED"
+    ):
+        return state
+    return {
+        **state,
+        **{key: previous[key] for key in _ROLLED_BACK_TRUTH_KEYS if key in previous},
+    }
+
+
 def _capture_previous(
     release: Any,
     plan: ReleaseExecutionPlan | None = None,
@@ -859,7 +892,9 @@ def _capture_previous(
         ReleaseComponent.OBSERVABILITY
     )
     capture_endpoint_state = plan is None or plan.has(ReleaseComponent.ENDPOINT)
-    live_state = dict(release.state) if release.state else release._load_state()
+    live_state = _live_truth_state(
+        dict(release.state) if release.state else release._load_state()
+    )
     probe = getattr(release, "_remote_command_stats", None)
     remote = probe() if probe is not None else remote_command_stats(release)
     metadata = release._config_map_data("gpu-fault-release-metadata")
