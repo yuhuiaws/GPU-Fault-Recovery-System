@@ -23,6 +23,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from gpu_fault.execution.config import OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
 from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import (
     StepPhase,
@@ -406,7 +407,31 @@ def step_elapsed_since(
     since = previous.started_at
     if workflow.execution_deadline is None:
         return since
-    window_start = workflow.execution_deadline - timedelta(
-        seconds=executor.config.workflow_execution_timeout_seconds
-    )
+    # Recover the window the deadline was stamped from -- with the same budget
+    # ``claim_deadlines`` used. A workflow holding an operator-acknowledgement
+    # step (CHECK_MECHANICALS) is floored at ``now + acknowledgement timeout``
+    # at claim time; subtracting only the plain execution timeout put the
+    # window start ~24 h in the future and ``step_waiting_seconds`` went
+    # negative (-84599 observed live), so the step's age -- and the alert that
+    # watches the oldest waiting step -- reported a wait that never grew.
+    budget_seconds = float(executor.config.workflow_execution_timeout_seconds)
+    if any(
+        step.operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
+        for step in workflow.official_steps
+    ):
+        budget_seconds = max(
+            budget_seconds,
+            float(
+                getattr(
+                    executor.config,
+                    "operator_acknowledgement_timeout_seconds",
+                    budget_seconds,
+                )
+            ),
+        )
+    window_start = workflow.execution_deadline - timedelta(seconds=budget_seconds)
+    # A window cannot start in the future: whatever stamped the deadline did so
+    # no later than now, so the clamp only ever restores a wait that the budget
+    # arithmetic above would otherwise deny.
+    window_start = min(window_start, datetime.now(timezone.utc))
     return max(since, window_start)

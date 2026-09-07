@@ -742,6 +742,53 @@ def test_inherited_step_start_time_cannot_fire_the_cap_early() -> None:
     assert "step_waiting_slow" not in execution.details
 
 
+def test_acknowledgement_wait_is_measured_from_its_own_claim() -> None:
+    """CHECK_MECHANICALS reports how long it has really waited, never a negative.
+
+    ``claim_deadlines`` floors an acknowledgement workflow's execution deadline
+    at ``now + operator_acknowledgement_timeout`` (24 h). Reconstructing the
+    window start by subtracting only the 30-minute execution timeout put it a
+    day in the future and ``step_waiting_seconds`` came out as -84599 live, so
+    the oldest-waiting-step age never grew for the one step that waits longest.
+    """
+
+    store = build_store()
+    operation = WorkflowOperation.CHECK_MECHANICALS
+    _, workflow = workflow_state(store, [operation])
+    now = datetime.now(timezone.utc)
+    waited = 300
+    workflow = copy_model(
+        workflow,
+        # Stamped by the claim that admitted the step: now - waited + 24 h.
+        execution_deadline=now + timedelta(seconds=86400 - waited),
+        step_executions=[
+            workflow_step_execution(
+                0,
+                operation,
+                WorkflowStepStatus.WAITING,
+                adapter_operation_id="ack-op-1",
+                started_at=now - timedelta(seconds=waited),
+            )
+        ],
+    )
+    store.save_workflow(workflow)
+    adapter = FakeAdapter(
+        {operation: WorkflowStepOutcome.waiting(operation_id="ack-op-1")}
+    )
+    active = active_workflow_executor(store, [adapter], [operation])
+
+    result = execute_workflow(active, workflow.request_id)
+
+    assert result.status is WorkflowStatus.RUNNING
+    execution = store.get_workflow(workflow.request_id).step_executions[-1]
+    assert execution.status is WorkflowStepStatus.WAITING
+    reported = execution.details["step_waiting_seconds"]
+    assert waited - 5 <= reported <= waited + 60, execution.details
+    assert execution.details.get("step_waiting_timeout_seconds") in (None, 86400), (
+        execution.details
+    )
+
+
 def test_step_start_time_survives_retries_but_not_a_rebound_index() -> None:
     """``started_at`` is the step's clock, and only while it is the same step.
 

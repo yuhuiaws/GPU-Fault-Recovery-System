@@ -82,6 +82,38 @@ def test_a_workflow_waiting_on_an_inspection_is_not_killed_by_the_hour_deadlines
     assert plain_lifetime == NOW + timedelta(hours=1)
 
 
+def test_a_reclaim_does_not_slide_the_acknowledgement_deadline():
+    """The 24 h window starts at the claim that stamped it, not the latest one.
+
+    A WAITING inspection is re-claimed every dispatcher cycle. Re-flooring the
+    execution deadline at ``now + 24 h`` on each of those claims meant the
+    deadline was always a day away: the step could never hit its ceiling and
+    its measured wait restarted from every claim.
+    """
+
+    first_claim = NOW - timedelta(minutes=5)
+    inspecting = workflow_request(
+        "wf-inspect",
+        "inc",
+        official_steps=[workflow_step(INSPECT, node_ids=["node-a"])],
+        execution_deadline=first_claim + timedelta(days=1),
+        lifetime_deadline_at=first_claim + timedelta(days=1),
+    )
+
+    execution, lifetime = claim_deadlines(
+        inspecting,
+        NOW,
+        timeout_seconds=1800,
+        job_lifetime_seconds=3600,
+        node_lifetime_seconds=3600,
+        operator_acknowledgement_seconds=86400,
+    )
+
+    assert execution == first_claim + timedelta(days=1), "deadline must not slide"
+    # The lifetime floor still protects an inherited lifetime that is shorter.
+    assert lifetime == NOW + timedelta(days=1)
+
+
 def test_an_inherited_shorter_lifetime_is_lifted_to_the_acknowledgement_floor():
     """A replacement workflow inherits its predecessor's lifetime (F-N1); if
     it now waits on an inspection, that lifetime is extended to the floor

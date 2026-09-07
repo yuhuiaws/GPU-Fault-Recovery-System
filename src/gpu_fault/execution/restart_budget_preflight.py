@@ -116,18 +116,22 @@ def claim_deadlines(
             seconds=job_lifetime_seconds if is_job else node_lifetime_seconds
         )
     budget = timedelta(seconds=timeout_seconds)
-    execution = (
-        now + budget
-        if (workflow.dag_enabled or workflow.execution_deadline is None)
-        else workflow.execution_deadline
-    )
+    existing = workflow.execution_deadline
+    fresh_execution = workflow.dag_enabled or existing is None
+    execution = now + budget if (workflow.dag_enabled or existing is None) else existing
     if operator_acknowledgement_seconds is not None and any(
         step.operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
         for step in workflow.official_steps
     ):
         floor = now + timedelta(seconds=operator_acknowledgement_seconds)
         lifetime = max(lifetime, floor)
-        execution = max(execution, floor)
+        # The floor belongs to the claim that stamps the deadline. Re-applying
+        # it on every later claim slid the deadline forward each dispatcher
+        # cycle, so the inspection step could never reach its own ceiling and
+        # ``step_bounds`` measured its wait from the latest claim (observed
+        # live as step_waiting_seconds = -84599, then 0).
+        if fresh_execution:
+            execution = max(execution, floor)
     return min(execution, lifetime), lifetime
 
 
