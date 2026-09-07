@@ -345,21 +345,29 @@ def fleet_deployment_id(
     config_digest: str,
     runtime_profile_version: str,
 ) -> str:
+    inputs: dict[str, Any] = {
+        "phase": phase,
+        "release_id": release.release_id,
+        "cluster_id": target.cluster_id,
+        "artifact_sha256": artifact_sha,
+        "bundle_sha256": bundle_sha,
+        "template_sha256": template_sha,
+        "config_digest": config_digest,
+        "runtime_profile_version": runtime_profile_version,
+    }
+    # One rollout record per upgrade transaction. The same candidate applied
+    # again after its rollback must not resume the FAILED record that rollback
+    # left behind; a resume of the same transaction keeps the same nonce and so
+    # the same id. A state without the nonce (written before it existed) keeps
+    # the historical id, so an in-flight legacy transaction still finds its
+    # own deployment.
+    transaction = str(
+        (getattr(release, "state", None) or {}).get("fleet_rollout_transaction") or ""
+    )
+    if transaction:
+        inputs["transaction"] = transaction
     identity = hashlib.sha256(
-        json.dumps(
-            {
-                "phase": phase,
-                "release_id": release.release_id,
-                "cluster_id": target.cluster_id,
-                "artifact_sha256": artifact_sha,
-                "bundle_sha256": bundle_sha,
-                "template_sha256": template_sha,
-                "config_digest": config_digest,
-                "runtime_profile_version": runtime_profile_version,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+        json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:20]
     return f"release-{phase}-{release.release_id}-{identity}"
 

@@ -1312,3 +1312,39 @@ def test_snapshot_after_failed_rollback_keeps_the_recorded_state() -> None:
 
     assert previous["release_id"] == "candidate"
     assert previous["rendered_manifest_sha256"] == "candidate-rendered"
+
+
+def _fleet_id(state: dict) -> str:
+    import regional_release_fleet_rollout as fleet
+
+    release = SimpleNamespace(release_id="cand", state=state)
+    return fleet.fleet_deployment_id(
+        release,
+        SimpleNamespace(cluster_id="gpu-a"),
+        phase="upgrade",
+        artifact_sha="a" * 64,
+        bundle_sha="b" * 64,
+        template_sha="c" * 64,
+        config_digest="d" * 64,
+        runtime_profile_version="profile-v1",
+    )
+
+
+def test_fleet_deployment_id_is_unique_per_upgrade_transaction() -> None:
+    """A candidate re-applied after its own rollback must start a fresh fleet
+    rollout: the identity-derived id would hand it the FAILED record the
+    rollback left behind (live 2026-09-07, BOOT-020 agent stage)."""
+
+    first = _fleet_id({"fleet_rollout_transaction": "1111aaaa2222"})
+    second = _fleet_id({"fleet_rollout_transaction": "3333bbbb4444"})
+    resumed = _fleet_id({"fleet_rollout_transaction": "1111aaaa2222"})
+
+    assert first != second, "a new transaction must not reuse the old record"
+    assert first == resumed, "a resumed transaction must find its own record"
+    assert first.startswith("release-upgrade-cand-"), first
+
+
+def test_fleet_deployment_id_without_nonce_keeps_the_historical_shape() -> None:
+    legacy = _fleet_id({})
+    assert legacy == _fleet_id({"fleet_rollout_transaction": ""}), legacy
+    assert legacy != _fleet_id({"fleet_rollout_transaction": "1111aaaa2222"}), legacy

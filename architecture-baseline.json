@@ -15,7 +15,7 @@
   },
   "cycles": [],
   "files": {
-    "deploy/control-plane/regional/regional_release_orchestration.py": 1782,
+    "deploy/control-plane/regional/regional_release_orchestration.py": 1786,
     "src/gpu_fault/admin/aws_cleanup.py": 1540,
     "src/gpu_fault/admin/bootstrap.py": 2109,
     "src/gpu_fault/admin/cli.py": 1580,

@@ -737,3 +737,61 @@ def test_ha008_acceptance_runs_both_fatal_exit_branches(tmp_path: Path) -> None:
     )
     assert not list(tmp_path.glob("*.db")), "HA-008 left a temporary database"
     assert not list(tmp_path.glob("*claim*")), "HA-008 left a claim state file"
+
+
+def test_boot020_runner_resumes_at_a_later_stage(tmp_path: Path) -> None:
+    """A rerun over the same evidence must not touch the site for stages that
+    already ran; --start-stage skips them and records where it restarted."""
+
+    evidence = tmp_path / "GF-REGIONAL-BOOT-020.json"
+    first = FakeReleaseRollingBackend()
+    recorder = EvidenceRecorder(
+        evidence, case_id="GF-REGIONAL-BOOT-020", inputs={"configs": "test"}
+    )
+    run_release_rolling(first, recorder)
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    for name in (
+        "agent_apply_after_rollback",
+        "agent_after",
+        "agent_next_classification",
+    ):
+        document["stages"].pop(name)
+    for name in [key for key in document["stages"] if key.startswith("full")]:
+        document["stages"].pop(name)
+    document["status"] = "FAILED"
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+
+    second = FakeReleaseRollingBackend()
+    second.completed.update({"control_plane", "executor"})
+    second.live["cpu_wheel"] = "cpu-v2"
+    second.live["clusters"]["cluster-a"]["wheel"] = "executor-v2"
+    resumed = EvidenceRecorder(
+        evidence, case_id="GF-REGIONAL-BOOT-020", inputs={"configs": "test"}
+    )
+
+    result = run_release_rolling(second, resumed, start_stage="agent")
+
+    assert result["status"] == "COMPLETED", result["status"]
+    assert result["stages"]["resumed_at_agent"]["skipped_stages"] == [
+        "noop",
+        "control_plane",
+        "executor",
+    ], result["stages"]["resumed_at_agent"]
+    # Only the missing agent apply and the whole full stage touched the site.
+    assert second.calls == [
+        ("agent", None, False, None, "DATA_PLANE_COMPATIBLE"),
+        ("full", "data-converged", False, True, "FULL"),
+        ("full", None, False, None, "FULL"),
+    ], second.calls
+
+
+def test_boot020_runner_refuses_to_resume_without_earlier_evidence(
+    tmp_path: Path,
+) -> None:
+    recorder = EvidenceRecorder(
+        tmp_path / "GF-REGIONAL-BOOT-020.json",
+        case_id="GF-REGIONAL-BOOT-020",
+        inputs={"configs": "test"},
+    )
+    with pytest.raises(RuntimeError, match="earlier stages have no recorded result"):
+        run_release_rolling(FakeReleaseRollingBackend(), recorder, start_stage="agent")

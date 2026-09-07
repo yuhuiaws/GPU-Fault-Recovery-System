@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
@@ -1002,6 +1003,9 @@ def upgrade_release(
         self._save_state(
             "preflight",
             previous=previous,
+            # Folded into every fleet deployment id of this transaction, so a
+            # candidate re-applied after its rollback gets a fresh rollout.
+            fleet_rollout_transaction=uuid.uuid4().hex[:12],
             release_diff=active_diff.as_dict(),
             execution_plan=plan.as_dict(),
             completed_phases=[],
