@@ -34,7 +34,10 @@ def test_chain_changes_one_dimension_per_step() -> None:
         "D": "/wt-D/dist/m.json",
     }
     chain = chain_configs(
-        _base(), live_manifest="/live/m.json", candidate_manifests=manifests
+        _base(),
+        live_manifest="/live/m.json",
+        candidate_manifests=manifests,
+        full_agent_config_digest="f" * 64,
     )
 
     assert list(chain) == ["noop", "control-plane", "data-plane", "agent", "full"]
@@ -62,6 +65,9 @@ def test_chain_changes_one_dimension_per_step() -> None:
         chain["full"]["runtime_profile"]["version"]
         == "regional-hyperpod-abc123-boot020"
     )
+    # The Agent digest follows the profile version; earlier configs keep the live one.
+    assert chain["full"]["release"]["agent_config_digest"] == "f" * 64
+    assert "agent_config_digest" not in chain["agent"]["release"]
 
 
 def test_candidate_edits_touch_only_the_intended_modules() -> None:

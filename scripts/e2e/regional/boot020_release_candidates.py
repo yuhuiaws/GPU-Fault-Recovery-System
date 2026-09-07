@@ -200,8 +200,19 @@ def chain_configs(
     candidate_manifests: dict[str, str],
     replicas_delta: int = 1,
     profile_suffix: str = "-boot020",
+    full_agent_config_digest: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """The five configs, each one step past the previous."""
+    """The five configs, each one step past the previous.
+
+    ``full_agent_config_digest`` is the Agent config digest for the suffixed
+    Runtime Profile version. Agents digest their allowed operations *and* the
+    profile version they run, and the control plane waits for heartbeats to
+    report the pinned digest, so a FULL config that changes the version but
+    keeps the old digest can never converge (live 2026-09-07: the first FULL
+    wave installed fine and then waited 15 minutes for a digest that no agent
+    would ever report). The CLI derives it with the same function
+    gpu-fault-admin uses; tests may pass any string.
+    """
 
     noop = with_manifest(base, live_manifest)
     control = with_control_worker_replicas(noop, replicas_delta)
@@ -211,6 +222,8 @@ def chain_configs(
     full["runtime_profile"]["version"] = (
         str(base["runtime_profile"]["version"]) + profile_suffix
     )
+    if full_agent_config_digest:
+        full["release"]["agent_config_digest"] = full_agent_config_digest
     return {
         "noop": noop,
         "control-plane": control,
@@ -248,12 +261,24 @@ def write_configs(arguments: argparse.Namespace) -> None:
         (arguments.work_dir.resolve() / "candidates.json").read_text("utf-8")
     )["candidates"]
     live_manifest = arguments.snapshot_repo.resolve() / "dist/current-release.json"
+    from gpu_fault.admin.bootstrap_common import (
+        CommandRunner,
+        compute_agent_config_digest,
+    )
+
+    full_version = str(base["runtime_profile"]["version"]) + arguments.profile_suffix
+    full_agent_config_digest = compute_agent_config_digest(
+        CommandRunner(),
+        repository_root=Path(candidates["D"]["manifest"]).parent.parent,
+        runtime_profile_version=full_version,
+    )
     configs = chain_configs(
         base,
         live_manifest=str(live_manifest),
         candidate_manifests={name: candidates[name]["manifest"] for name in CANDIDATES},
         replicas_delta=arguments.replicas_delta,
         profile_suffix=arguments.profile_suffix,
+        full_agent_config_digest=full_agent_config_digest,
     )
     out = arguments.out_dir.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
