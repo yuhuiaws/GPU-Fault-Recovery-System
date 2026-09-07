@@ -5426,7 +5426,13 @@ test_cases:
   - 任一不一致即判定为配置缺陷
   - 每次机型变更后必须重跑
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 5fb4de0a0d0893fdcd55da0938031c1edc010f95323b380f9387ff68f4b0cbd3
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-003
   related_pytest: tests/collectors/test_host.py::test_efa_inventory_ignores_non_efa_rdma_devices
@@ -5444,7 +5450,13 @@ test_cases:
   - 2个周期报事件且延迟约为2乘live采集周期
   - 配置原字节恢复、节点reboot后完成DCGM与正式restore
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 70af99d86b337df8b07a9afb1c89da510bce59a6205afcbfe443741329e1904d
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-004
   related_pytest: tests/collectors/test_gpu.py::test_host_collector_reports_persistent_gpu_and_efa_card_loss
@@ -5464,7 +5476,13 @@ test_cases:
   - 游标前进并持久化落盘
   - 重启采集器不重复投递同一条
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f98e01c4220151819103f09b8431bc9210d69cadcb0c30ee5f2b3bf861b0c930
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-005
   related_pytest: tests/collectors/test_logs.py::test_fabric_manager_file_collector_persists_offsets
@@ -5524,7 +5542,13 @@ test_cases:
   - 真的执行 GPU reset 并 quiesce kubelet
   - 恢复后节点回到可调度状态
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6fe4ff3eaa3f638364a250e87894b2ff1c9d9892604d69d4e9aabeba4ce408a5
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-008
   related_pytest: tests/orchestration/test_xid.py::test_xid_48_solo_and_companion_compile_the_same_containment
@@ -5568,7 +5592,13 @@ test_cases:
   - 任一检查失败即 quarantine 且节点不恢复调度
   - 除 quarantine 外零副作用
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: d0a5b5db1a9194f4d6289ccfd1e45057ec040f5128c2081add3ecf92b3f1dd9b
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-010
   related_pytest: tests/orchestration/test_misc.py::test_failed_firmware_remediation_escalates_directly_to_support
@@ -5588,7 +5618,13 @@ test_cases:
   - 零破坏，只有控制面侧 quarantine
   - 游标正确前进
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: ee96335cb63a5e13430fb4802baf6808becc4bc1d54bffe8e0bad1d9c8cbd2a7
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-011
   related_pytest: tests/orchestration/test_sxid_topology.py::test_conflicting_or_untrusted_topology_fails_closed
@@ -5607,7 +5643,13 @@ test_cases:
   - 空闲节点上有一道真实安全闸阻止执行段完成
   - 本用例只验采集层前半段与判定正确性，不验执行
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: bc5cc1b7ea56c0148c778579eda0e06951c83d7c084b1f2c3c20ea3ed38415e4
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-012
   related_pytest: tests/orchestration/test_misc.py::test_restart_app_requires_workload_identity
@@ -5625,7 +5667,13 @@ test_cases:
   - boot_id 不变，证明没有重启节点
   - quiesce 期间的证据由宿主机侧采样器完整留存
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: ca35b3af488bae700fe6697334b9092d18b3ce5db8befe0d374fdb7e1e3ee76b
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-013
   related_pytest: tests/node_agent/test_remediation.py::test_gpu_reset_is_idempotent_and_rechecks_clients
@@ -5644,7 +5692,13 @@ test_cases:
   - 节点被 quiesce 后自动恢复
   - 两个方向都不降级为节点重启或替换
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 933ba2f80f3ceee379760b2cbb6aeb646f0797c1e05dc17e23f5597e43e87e41
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-014
   related_pytest: tests/node_agent/test_remediation.py::test_full_fabric_reset_verifies_inventory_and_is_idempotent
@@ -5663,7 +5717,13 @@ test_cases:
   - 多采样交集按 gpu_uuid 与 pid 与 device 三元组判定，瞬时放行、持久拒绝复位
   - 必须排在 COLLECT-015 之前，否则真重启会毁掉训练作业与采样器
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 546908fe2f515010f97fd8c23e82c097f985f278722aeecdc325864f49131629
+      components:
+        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
+        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
+        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-016
   related_pytest: tests/hyperpod/test_e2e_distributed_xid_reset.py::test_three_node_job_stops_before_two_fault_gpu_resets
