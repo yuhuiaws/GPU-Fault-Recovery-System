@@ -14,6 +14,7 @@ if __package__:
     from .acceptance_scope import current_acceptance_scope, scoped_case_evidence
     from .live_driver_guard import (
         add_live_arguments,
+        applied_site_profile,
         install_site_profile,
     )
     from .live_driver_guard import (
@@ -23,6 +24,7 @@ else:
     from acceptance_scope import current_acceptance_scope, scoped_case_evidence
     from live_driver_guard import (
         add_live_arguments,
+        applied_site_profile,
         install_site_profile,
     )
     from live_driver_guard import (
@@ -359,6 +361,7 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
         "attempt": attempt,
         "confirmation": CONFIRMATION,
         "environment": COMMON.environment_values(),
+        "site_profile": applied_site_profile(),
         **scope.plan_fields(),
         "mutation_performed": False,
         "region": COMMON.AWS_REGION,

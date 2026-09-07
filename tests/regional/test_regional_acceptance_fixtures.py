@@ -850,3 +850,21 @@ def test_probe_pod_commands_run_the_script_the_configmap_publishes() -> None:
         assert "/scripts/{SCRIPT.name}" in source, (
             f"{module_name} must exec SCRIPT.name"
         )
+
+
+def test_runners_with_their_own_plan_builder_record_the_site_profile() -> None:
+    """HA-001 once built its own plan without ``site_profile``.
+
+    ``authorize_execution`` compares the plan against ``applied_site_profile()``
+    at --execute time, so a runner that writes its own plan.json must record
+    the profile or every --execute under a profile fails with plan drift.
+    """
+    regional = Path(__file__).resolve().parents[2] / "scripts" / "e2e" / "regional"
+    offenders = []
+    for path in sorted(regional.glob("run_*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "def build_plan(" not in source or "authorize_execution(" not in source:
+            continue
+        if '"site_profile": applied_site_profile()' not in source:
+            offenders.append(path.name)
+    assert not offenders, f"plan builders without site_profile: {offenders}"
