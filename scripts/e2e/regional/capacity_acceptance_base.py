@@ -909,10 +909,18 @@ with psycopg.connect(url) as c:
         worker = self.kubectl_json(
             "get", "pods", "-l", "app=gpu-fault-control-worker", "-o", "json"
         )
+        # The capacity probes carry the same app label but talk to their own
+        # isolated database through their own environment; only a production
+        # worker knows GPU_FAULT_STORE_URL (live 2026-09-07: KeyError inside a
+        # probe Pod ended CAP-003 after all four scale points had run).
         pod = next(
             item["metadata"]["name"]
             for item in worker["items"]
             if item.get("status", {}).get("phase") == "Running"
+            and not item.get("metadata", {}).get("deletionTimestamp")
+            and not item.get("metadata", {})
+            .get("labels", {})
+            .get("gpu-fault.io/capacity-probe")
         )
         script = r"""
 import os,json,psycopg
