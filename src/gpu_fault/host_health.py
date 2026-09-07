@@ -340,6 +340,23 @@ class NodeHealthPolicy:
         ),
     }
 
+    # Single-sample rules whose reading is noisy on a healthy node must hold
+    # for a window before a finding is minted (the health-signal state
+    # machine's minimum active time). Disk saturation and packet drops are the
+    # siblings of the TCP-retransmit flapper: one busy flush or one congested
+    # second is not a node fault, the same reading held for a window is. They
+    # stay in METRIC_RULES rather than SUSTAINED_METRIC_RULES because the
+    # host collector's edge filter reads that table to decide which breaches
+    # are worth shipping; a rule the collector cannot see is a rule the
+    # control plane never gets a sample for.
+    DISK_IO_SUSTAIN_SECONDS = 120.0
+    NETWORK_DROPS_SUSTAIN_SECONDS = 60.0
+    METRIC_RULE_SUSTAIN_SECONDS: dict[str, float] = {
+        "disk_io_util_percent": DISK_IO_SUSTAIN_SECONDS,
+        "disk_io_await_ms": DISK_IO_SUSTAIN_SECONDS,
+        "network_drops_delta": NETWORK_DROPS_SUSTAIN_SECONDS,
+    }
+
     METRIC_RULES = {
         "cpu_usage_percent": (
             98.0,
@@ -716,6 +733,9 @@ class NodeHealthPolicy:
             if rule is None:
                 continue
             threshold, category, severity, action, reason = rule
+            minimum_active_seconds = self.METRIC_RULE_SUSTAIN_SECONDS.get(
+                sample.name, 0.0
+            )
             active = sample.value >= threshold
             signal_key = "/".join(
                 [
@@ -725,7 +745,9 @@ class NodeHealthPolicy:
                     sample.device or "node",
                 ]
             )
-            transitions.append((signal_key, active, batch.observed_at, 0))
+            transitions.append(
+                (signal_key, active, batch.observed_at, minimum_active_seconds)
+            )
             event_id = (
                 f"{batch.batch_id}-{sample.name}-{self._safe(sample.device or 'node')}"
             )

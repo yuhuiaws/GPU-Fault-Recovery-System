@@ -13,9 +13,13 @@ from gpu_fault.models import (
     NotificationDeliveryStatus,
     NotificationDispatchWatermark,
     NotificationResult,
-    NotificationStatus,
 )
 from gpu_fault.store.shared.errors import WorkflowLeaseError
+from gpu_fault.store.shared.notification_helpers import (
+    check_delivery_lease,
+    completed_delivery,
+    released_delivery,
+)
 from gpu_fault.store.shared.primitives import (
     GetOptionalRecord,
     GetRecord,
@@ -150,37 +154,25 @@ class SharedNotificationMixin:
         terminal: bool = False,
     ) -> NotificationDelivery:
         with self._state_transaction(f"notification_delivery/{notification_id}"):
-            current = self._get("notification_delivery", notification_id)
-            if (
-                current.status is not NotificationDeliveryStatus.LEASED
-                or current.lease_owner != owner_id
-                or current.lease_epoch != lease_epoch
-                or current.lease_expires_at is None
-                or current.lease_expires_at <= now
-            ):
-                raise WorkflowLeaseError("notification delivery lease is stale")
-            if result.status is NotificationStatus.SENT:
-                status = NotificationDeliveryStatus.SENT
-            elif terminal:
-                status = NotificationDeliveryStatus.DEAD
-            else:
-                status = NotificationDeliveryStatus.RETRY
-            value = current.model_copy(
-                update={
-                    "status": status,
-                    "attempts": current.attempts + 1,
-                    "available_at": retry_at or now,
-                    "lease_owner": None,
-                    "lease_expires_at": None,
-                    "last_error": result.reason,
-                    "updated_at": now,
-                }
+            current = check_delivery_lease(
+                self._get("notification_delivery", notification_id),
+                owner_id=owner_id,
+                lease_epoch=lease_epoch,
+                now=now,
             )
-            self._put(
-                "notification_result",
-                notification_id,
-                result,
+            value, record_result = completed_delivery(
+                current,
+                result=result,
+                now=now,
+                retry_at=retry_at,
+                terminal=terminal,
             )
+            if record_result:
+                self._put(
+                    "notification_result",
+                    notification_id,
+                    result,
+                )
             self._put(
                 "notification_delivery",
                 notification_id,
@@ -198,23 +190,16 @@ class SharedNotificationMixin:
         retry_at: datetime,
     ) -> NotificationDelivery | None:
         with self._state_transaction(f"notification_delivery/{notification_id}"):
-            current = self._get_optional("notification_delivery", notification_id)
-            if (
-                current is None
-                or current.status is not NotificationDeliveryStatus.LEASED
-                or current.lease_owner != owner_id
-                or current.lease_epoch != lease_epoch
-            ):
+            try:
+                current = check_delivery_lease(
+                    self._get_optional("notification_delivery", notification_id),
+                    owner_id=owner_id,
+                    lease_epoch=lease_epoch,
+                    now=None,
+                )
+            except WorkflowLeaseError:
                 return None
-            value = current.model_copy(
-                update={
-                    "status": NotificationDeliveryStatus.RETRY,
-                    "available_at": retry_at,
-                    "lease_owner": None,
-                    "lease_expires_at": None,
-                    "updated_at": now,
-                }
-            )
+            value = released_delivery(current, now=now, retry_at=retry_at)
             self._put(
                 "notification_delivery",
                 notification_id,

@@ -941,3 +941,74 @@ def test_node_log_collector_truncates_oversize_entry(tmp_path) -> None:
     assert "node-log-entry-truncated" in batch.entries[0].message
     assert len(batch.entries[0].message.encode("utf-8")) <= 512
     assert len(json.dumps(sink.requests[0][1]).encode()) < 4096
+
+
+def test_fabric_manager_skips_a_file_that_vanishes_between_glob_and_stat(
+    tmp_path, monkeypatch
+) -> None:
+    kept = tmp_path / "fabricmanager.log"
+    kept.write_text(
+        "nvidia-nvswitch0: SXid (PCI:0000:ab:00.0): 22013, Non-fatal, Link 12 x\n"
+    )
+    vanishing = tmp_path / "fabricmanager.1.log"
+    vanishing.write_text("old\n")
+    state = tmp_path / "state.json"
+    _write_fabric_file_state(state, kept, offset=0)
+    real_stat = os.stat
+
+    def flaky_stat(path, *args, **kwargs):
+        if str(path) == str(vanishing):
+            raise FileNotFoundError(str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", flaky_stat)
+    sink = RecordingSink()
+    collector = FabricManagerLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        journal_enabled=False,
+        log_paths=[str(tmp_path / "fabricmanager*.log")],
+        state_path=str(state),
+        now=lambda: NOW,
+    )
+
+    stats = collector.collect_once()
+
+    assert stats.delivered == 1, "a vanished sibling file stopped the whole round"
+    assert len(sink.requests) == 1, "the surviving file's SXID was not delivered"
+
+
+def test_fabric_manager_bounds_the_tracked_file_table(tmp_path, caplog) -> None:
+    state = tmp_path / "state.json"
+    stale = {
+        f"/var/log/fabricmanager.{index}.log": {
+            "device": 1,
+            "inode": 1000 + index,
+            "offset": 10,
+        }
+        for index in range(5)
+    }
+    state.write_text(json.dumps({"journal_cursor": None, "files": stale}))
+    live = tmp_path / "fabricmanager.log"
+    live.write_text("Fabric Manager started\n")
+    collector = FabricManagerLogCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        journal_enabled=False,
+        log_paths=[str(live)],
+        state_path=str(state),
+        now=lambda: NOW,
+        max_tracked_files=3,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="gpu_fault.collectors.logs.fabric_manager"
+    ):
+        collector.collect_once()
+
+    files = json.loads(state.read_text())["files"]
+    assert len(files) <= 3, files
+    assert str(live) in files, "the live file was evicted instead of a stale one"
+    assert "tracked" in caplog.text.lower(), "the eviction was not logged"

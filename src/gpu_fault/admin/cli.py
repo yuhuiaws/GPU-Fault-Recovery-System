@@ -35,7 +35,12 @@ from gpu_fault.admin.cluster_removal import (
     RemoveClusterRequest,
     remove_cluster,
 )
-from gpu_fault.admin.command_log import announce, command_log
+from gpu_fault.admin.command_log import (
+    ADMIN_LOG_KIND_MUTATING,
+    ADMIN_LOG_KIND_READONLY,
+    announce,
+    command_log,
+)
 from gpu_fault.admin.config import (
     AdminConfig,
     AdminConfigError,
@@ -99,6 +104,9 @@ COMMANDS = {
     "verify": "verify",
     "status": "status",
 }
+# The managed commands that write nothing; their console logs rotate under
+# ``logs/readonly/`` so they cannot age out a failed deploy's log (I3).
+READONLY_COMMANDS = frozenset({"preflight", "verify", "status"})
 DEPLOY_HOST_STATE_BINDING = "gpu-fault-managed-state-dir.json"
 QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
 QUICK_VALIDATION_EVIDENCE_FILE = "quick-validation.json"
@@ -110,6 +118,23 @@ QUICK_VALIDATION_EVIDENCE_FILE = "quick-validation.json"
 ACCEPT_SCHEMA_CHANGE_ENV = "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE"
 SCHEMA_CHANGE_SNAPSHOT_MODE = "snapshot"
 SCHEMA_CHANGE_NO_SNAPSHOT_MODE = "no-snapshot"
+
+
+RELEASE_HISTORY_DIR_ENV = "GPU_FAULT_RELEASE_HISTORY_DIR"
+
+
+def release_history_environment(arguments: argparse.Namespace) -> dict[str, str]:
+    """Where the release engine mirrors its append-only audit history.
+
+    The history ConfigMap lives in the namespace a `remove`/uninstall deletes,
+    so the engine also appends each entry under the admin state directory --
+    the one place that outlives the cluster and already holds the command logs.
+    """
+
+    state_dir = getattr(arguments, "state_dir", None)
+    if not isinstance(state_dir, Path):
+        return {}
+    return {RELEASE_HISTORY_DIR_ENV: str(state_dir.expanduser().resolve() / "history")}
 
 
 def schema_change_environment(arguments: argparse.Namespace) -> dict[str, str]:
@@ -945,6 +970,7 @@ def _run_profile_approval(arguments: argparse.Namespace) -> int:
                 "plan_sha256": record["plan_sha256"],
                 "reference": record["reference"],
                 "approved_at": record["approved_at"],
+                "approver_identity": record["approver_identity"],
             },
             indent=2,
             sort_keys=True,
@@ -1410,7 +1436,7 @@ def run(arguments: argparse.Namespace) -> int:
         return _run_workflow_reconcile(arguments)
     if arguments.command == "failure-domain-map":
         return _run_failure_domain_map(arguments)
-    if arguments.command in ("preflight", "verify", "status"):
+    if arguments.command in READONLY_COMMANDS:
         site_file = _managed_site_file(
             arguments,
             command=arguments.command,
@@ -1543,6 +1569,7 @@ def run(arguments: argparse.Namespace) -> int:
             **effective_environment(site),
             **quick_validation_evidence_environment(arguments),
             **schema_change_environment(arguments),
+            **release_history_environment(arguments),
         }
         if arguments.command == "deploy":
             preflight = subprocess.run(
@@ -1590,9 +1617,17 @@ def _run_reporting_failures(arguments: argparse.Namespace) -> int:
 
 def main() -> int:
     arguments = parser().parse_args()
+    command = str(getattr(arguments, "command", "admin"))
     with command_log(
         getattr(arguments, "state_dir", None),
-        command=str(getattr(arguments, "command", "admin")),
+        command=command,
+        # Read-only commands rotate separately (I3), so a habit of ``status``
+        # cannot age out the log of the deploy that failed.
+        kind=(
+            ADMIN_LOG_KIND_READONLY
+            if command in READONLY_COMMANDS
+            else ADMIN_LOG_KIND_MUTATING
+        ),
     ) as log_path:
         status = _run_reporting_failures(arguments)
         if status and log_path is not None:

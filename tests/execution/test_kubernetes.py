@@ -4,6 +4,7 @@
 from ._kubernetes_cases_1 import (
     test_fabric_manager_restart_sends_one_idempotent_email,
     test_failure_after_isolation_keeps_incident_quarantined,
+    test_kubernetes_adapter_fails_closed_when_the_node_to_isolate_is_absent,
     test_kubernetes_adapter_hashes_long_incident_id_for_taint,
     test_kubernetes_adapter_preserves_initial_schedulability_across_isolation_steps,
     test_kubernetes_adapter_preserves_provider_taint,
@@ -11,7 +12,6 @@ from ._kubernetes_cases_1 import (
     test_kubernetes_adapter_restarts_efa_device_plugin,
     test_kubernetes_adapter_retries_node_isolation_conflict,
     test_kubernetes_adapter_takes_over_terminal_isolation,
-    test_kubernetes_adapter_treats_absent_node_as_isolated,
     test_kubernetes_adapter_waits_when_device_plugin_pod_is_absent,
     test_kubernetes_stop_deletes_active_suspended_pytorch_pods,
     test_kubernetes_stop_waits_for_job_to_be_inactive,

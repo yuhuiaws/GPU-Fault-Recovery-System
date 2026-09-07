@@ -217,9 +217,7 @@ def test_schema_job_manifest_change_keeps_automatic_rollback_available() -> None
         pass
 
     release = SimpleNamespace(
-        config=SimpleNamespace(
-            auto_rollback=True, schema_rollback_compatible=False, clusters=()
-        ),
+        config=SimpleNamespace(auto_rollback=True, clusters=()),
         state={"release_diff": {"changed": ["schema_manifests"]}},
         _ensure_contexts=lambda: None,
         _require_cpu_secrets=lambda: None,
@@ -240,7 +238,7 @@ def test_schema_job_manifest_change_keeps_automatic_rollback_available() -> None
 
 def test_database_schema_change_still_requires_rollback_compatibility() -> None:
     release = SimpleNamespace(
-        config=SimpleNamespace(auto_rollback=True, schema_rollback_compatible=False),
+        config=SimpleNamespace(auto_rollback=True),
         state={"release_diff": {"changed": ["database_schema"]}},
         _ensure_contexts=lambda: None,
         _require_cpu_secrets=lambda: None,
@@ -573,8 +571,12 @@ def test_previous_snapshot_configmaps_are_immutable_and_content_addressed(
     assert len(creates) == len(reference["chunks"])
 
 
-def test_snapshot_cleanup_preserves_only_current_reference() -> None:
+def test_snapshot_cleanup_preserves_current_reference_and_newest_retained() -> None:
     calls = []
+
+    def item(name: str, created: str) -> dict:
+        return {"metadata": {"name": name, "creationTimestamp": created}}
+
     release = SimpleNamespace(
         state={
             "previous_snapshot": {
@@ -589,8 +591,10 @@ def test_snapshot_cleanup_preserves_only_current_reference() -> None:
         _cpu=lambda *args: list(args),
         _get_json=lambda _arguments: {
             "items": [
-                {"metadata": {"name": "gpu-fault-release-previous-current-000"}},
-                {"metadata": {"name": "gpu-fault-release-previous-stale-000"}},
+                item("gpu-fault-release-previous-current-000", "2026-09-07T00:00:00Z"),
+                item("gpu-fault-release-previous-recent-000", "2026-09-06T00:00:00Z"),
+                item("gpu-fault-release-previous-older-000", "2026-09-05T00:00:00Z"),
+                item("gpu-fault-release-previous-stale-000", "2026-09-01T00:00:00Z"),
             ]
         },
     )
@@ -605,7 +609,7 @@ def test_snapshot_cleanup_preserves_only_current_reference() -> None:
             "configmap",
             "gpu-fault-release-previous-stale-000",
         ]
-    ]
+    ], f"only snapshots beyond the {STATE.PREVIOUS_SNAPSHOTS_RETAINED} retained go"
 
 
 def test_observability_snapshot_restores_amp_rules_and_alertmanager() -> None:
@@ -1008,8 +1012,7 @@ def rollback_release_fake(
         config=SimpleNamespace(
             clusters=tuple(
                 SimpleNamespace(cluster_id=cluster_id) for cluster_id in cluster_ids
-            ),
-            schema_rollback_compatible=True,
+            )
         ),
         _save_state=lambda phase, **_updates: saved.append(phase),
     )

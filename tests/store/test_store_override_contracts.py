@@ -85,6 +85,7 @@ POSTGRES_LAYER = (
     "PostgresFleetMixin",
     "PostgresNotificationMixin",
     "PostgresRemoteCommandMixin",
+    "PostgresRecordCasMixin",
     "PostgresWorkflowMixin",
     "PostgresXidMixin",
     "PostgresGpuTelemetryMixin",

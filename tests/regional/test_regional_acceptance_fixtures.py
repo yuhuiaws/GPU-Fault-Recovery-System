@@ -54,6 +54,19 @@ PROMOTED_MANUAL_DRIVERS = {
     "GF-REGIONAL-DESTR-016": "run_destr016_preempting_reboot.py",
     "GF-REGIONAL-DESTR-017": "run_destr017_out_of_band_reboot_fence.py",
     "GF-REGIONAL-DESTR-018": "run_destr018_lifetime_deadline.py",
+    "GF-REGIONAL-DESTR-019": "run_destr019_agent_restart_ledger.py",
+    "GF-REGIONAL-DESTR-020": "run_destr020_identity_mismatch_isolation.py",
+    "GF-REGIONAL-DESTR-021": "run_destr021_adversarial_node_metadata.py",
+    "GF-REGIONAL-DESTR-022": "run_destr022_spare_reservation_reclaim.py",
+    "GF-REGIONAL-HA-010": "run_ha010_aurora_blackout_liveness.py",
+    "GF-REGIONAL-BOOT-023": "run_boot023_release_history.py",
+    "GF-REGIONAL-CMD-017": "run_cmd017_barrier_hold.py",
+    "GF-REGIONAL-CMD-018": "run_cmd018_open_sibling_hold.py",
+    "GF-REGIONAL-NET-006": "run_net006_lease_loss_withheld_result.py",
+    "GF-REGIONAL-NET-008": "run_net008_outbox_dead_letter.py",
+    "GF-REGIONAL-NOTIFY-007": "run_notify007_delivery_states.py",
+    "GF-REGIONAL-PREEMPT-037": "run_preempt037_dispatcher_liveness.py",
+    "GF-REGIONAL-PREEMPT-038": "run_preempt038_evidence_pins.py",
     "GF-REGIONAL-ISO-006": "run_iso006_cluster_offline.py",
     "GF-REGIONAL-E2E-002": "run_e2e002_multicluster_fault.py",
     "GF-REGIONAL-COLLECT-001": "run_collector_acceptance.py",
@@ -70,6 +83,9 @@ PROMOTED_MANUAL_DRIVERS = {
     "GF-REGIONAL-COLLECT-014": "run_collector_destructive.py",
     "GF-REGIONAL-COLLECT-016": "run_collect016_training_recovery.py",
     "GF-REGIONAL-COLLECT-017": "run_collect017_efa_plugin.py",
+    "GF-REGIONAL-COLLECT-018": "run_collect018_rejected_event.py",
+    "GF-REGIONAL-COLLECT-019": "run_collect019_nvidia_smi_hang.py",
+    "GF-REGIONAL-COLLECT-020": "run_collect020_gpu_identity.py",
     "GF-REGIONAL-COLLECT-015": "run_collector_destructive.py",
 }
 PLAN_ONLY_SMOKE_CASES = {
@@ -77,6 +93,9 @@ PLAN_ONLY_SMOKE_CASES = {
     "GF-REGIONAL-NET-003": "NET003_RESULT_CONNECTION_RESET",
     "GF-REGIONAL-HA-005": "HA005_CONTROL_PLANE_ROLLOUT",
     "GF-REGIONAL-HA-006": "HA006_FORCE_DELETE_TEST_EXECUTOR",
+    "GF-REGIONAL-NET-006": "NET006_LIVE_LEASE_LOSS_WITHHELD_RESULT",
+    "GF-REGIONAL-CMD-017": "CMD017_LIVE_BARRIER_HOLD",
+    "GF-REGIONAL-CMD-018": "CMD018_EXECUTE",
 }
 
 
@@ -156,12 +175,15 @@ def test_local_executor_guard_fixture_covers_iso002_and_cmd011() -> None:
 
 
 def test_command_protocol_fixtures_cover_every_cmd_case() -> None:
-    local = {"GF-REGIONAL-CMD-011"}
-    expected = {f"GF-REGIONAL-CMD-{number:03d}" for number in range(1, 17)}
+    # CMD-011 uses the Executor-local guard fixture; CMD-017 seeds a synthetic
+    # barrier command for its own probe executor (run_cmd017_barrier_hold.py);
+    # CMD-018 drives the deployed adapter in-Pod (run_cmd018_open_sibling_hold.py).
+    local = {"GF-REGIONAL-CMD-011", "GF-REGIONAL-CMD-017", "GF-REGIONAL-CMD-018"}
+    expected = {f"GF-REGIONAL-CMD-{number:03d}" for number in range(1, 19)}
 
     assert set(AUDITED_CASE_IDS) | local == expected
     assert set(AUDITED_CASE_IDS).isdisjoint(local), (
-        "CMD-011 must remain owned by the Executor-local fixture"
+        "CMD-011, CMD-017 and CMD-018 must remain owned by their own fixtures"
     )
 
 

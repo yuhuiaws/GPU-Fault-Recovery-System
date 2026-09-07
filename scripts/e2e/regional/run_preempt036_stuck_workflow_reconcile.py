@@ -40,7 +40,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -49,6 +49,11 @@ if str(ROOT / "src") not in sys.path:
 if str(ROOT) not in sys.path:
     sys.path.insert(1, str(ROOT))
 
+from gpu_fault.admin.command_log import command_log  # noqa: E402
+from gpu_fault.admin.operator_identity import (  # noqa: E402
+    local_operator_identity,
+    resolve_operator_identity,
+)
 from gpu_fault.admin.workflow_reconcile import (  # noqa: E402
     compile_blocked_script,
     orphaned_commands_script,
@@ -74,12 +79,15 @@ from scripts.e2e.regional.preempt036_verdicts import (  # noqa: E402
     apply_errors,
     case_verdict,
     command_errors,
+    command_log_errors,
     command_snapshot,
+    event_errors,
     open_command_errors,
     plan_errors,
     record_errors,
     refusal_errors,
     rerun_errors,
+    rerun_event_errors,
     safety_errors,
     seed_mode,
     workflow_snapshot,
@@ -383,12 +391,39 @@ def _safety(provisioner: StoreProvisioner, url: str, source: str) -> dict[str, A
     return _run_json(provisioner, url, source, None)
 
 
+def admin_plan_digest(plan: Mapping[str, Any]) -> str:
+    """The admin-side digest of a plan document, as the CLI's apply payload carries."""
+
+    return _sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")))
+
+
+def apply_payload(
+    workflow_ids: Sequence[str],
+    *,
+    plan_sha256: str,
+    actor: str,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """What ``gpu-fault-admin workflow-reconcile --apply`` sends into the Pod (I1)."""
+
+    return {
+        "mode": "apply",
+        "workflow_ids": list(workflow_ids),
+        "plan_sha256": plan_sha256,
+        "reference": REFERENCE,
+        "actor": actor,
+        "admin_plan_sha256": admin_plan_digest(plan),
+    }
+
+
 def run_mode(
     mode: str,
     provisioner: StoreProvisioner,
     *,
     safety_probe: str,
     stats_probe: str,
+    actor: str,
+    state_dir: Path,
 ) -> dict[str, Any]:
     """Drive one mode end to end and return its evidence, verdict included."""
 
@@ -413,12 +448,12 @@ def run_mode(
         provisioner,
         url,
         script,
-        {
-            "mode": "apply",
-            "workflow_ids": list(seed.workflow_ids),
-            "plan_sha256": full_plan["plan_sha256"],
-            "reference": REFERENCE,
-        },
+        apply_payload(
+            seed.workflow_ids,
+            plan_sha256=str(full_plan["plan_sha256"]),
+            actor=actor,
+            plan=full_plan,
+        ),
     )
     stages["refuse_ineligible"] = refusal_errors(
         "ineligible",
@@ -445,12 +480,12 @@ def run_mode(
         provisioner,
         url,
         script,
-        {
-            "mode": "apply",
-            "workflow_ids": list(seed.actionable_ids),
-            "plan_sha256": TAMPERED_DIGEST,
-            "reference": REFERENCE,
-        },
+        apply_payload(
+            seed.actionable_ids,
+            plan_sha256=TAMPERED_DIGEST,
+            actor=actor,
+            plan=approved,
+        ),
     )
     stages["refuse_tampered_plan"] = refusal_errors(
         "tampered plan",
@@ -459,21 +494,26 @@ def run_mode(
     )
 
     commands_before = command_snapshot(store, seed.workflow_ids)
-    result = _run_json(
-        provisioner,
-        url,
-        script,
-        {
-            "mode": "apply",
-            "workflow_ids": list(seed.actionable_ids),
-            "plan_sha256": approved_digest,
-            "reference": REFERENCE,
-        },
+    approved_payload = apply_payload(
+        seed.actionable_ids, plan_sha256=approved_digest, actor=actor, plan=approved
     )
+    # The admin CLI wraps every mutating command in ``command_log`` (I3); the
+    # same context is opened here around the apply, into this run's own state
+    # directory, so the evidence shows where the console record lands.
+    with command_log(
+        state_dir, command=f"workflow-reconcile --mode {mode} --apply", kind="mutating"
+    ) as log_path:
+        result = _run_json(provisioner, url, script, approved_payload)
+    stages["command_log"] = command_log_errors(log_path, state_dir=state_dir)
     stages["apply"] = apply_errors(result, seed, approved_plan_sha256=approved_digest)
-    stages["records"] = record_errors(
-        workflow_snapshot(store, seed.statuses_after),
+    records_after = workflow_snapshot(store, seed.statuses_after)
+    stages["records"] = record_errors(records_after, seed)
+    stages["operator_events"] = event_errors(
+        records_after,
         seed,
+        actor=actor,
+        admin_plan_sha256=str(approved_payload["admin_plan_sha256"]),
+        approved_plan_sha256=approved_digest,
     )
     commands_after = command_snapshot(store, seed.workflow_ids)
     stages["commands"] = command_errors(commands_before, commands_after, seed)
@@ -493,12 +533,12 @@ def run_mode(
         script,
         {"mode": "plan", "workflow_ids": list(seed.actionable_ids)},
     )
-    rerun_payload = {
-        "mode": "apply",
-        "workflow_ids": list(seed.actionable_ids),
-        "plan_sha256": rerun_plan["plan_sha256"],
-        "reference": REFERENCE,
-    }
+    rerun_payload = apply_payload(
+        seed.actionable_ids,
+        plan_sha256=str(rerun_plan["plan_sha256"]),
+        actor=actor,
+        plan=rerun_plan,
+    )
     rerun_output = ""
     rerun_result: dict[str, Any] | None = None
     if seed.rerun_contract == RERUN_REFUSED:
@@ -511,10 +551,11 @@ def run_mode(
         result=rerun_result,
         output=rerun_output,
     )
-    stages["untouched_by_rerun"] = record_errors(
-        workflow_snapshot(store, seed.statuses_after),
-        seed,
-    )
+    records_after_rerun = workflow_snapshot(store, seed.statuses_after)
+    stages["untouched_by_rerun"] = [
+        *record_errors(records_after_rerun, seed),
+        *rerun_event_errors(records_after, records_after_rerun, seed),
+    ]
 
     return {
         "mode": mode,
@@ -541,6 +582,17 @@ def run_mode(
         },
         "records_deleted": result.get("records_deleted"),
         "rerun_contract": seed.rerun_contract,
+        "actor_sha256": _sha256(actor),
+        "admin_plan_sha256": approved_payload["admin_plan_sha256"],
+        "operator_events": {
+            request_id: (records_after.get(request_id) or {}).get("events")
+            for request_id in seed.workflow_ids
+        },
+        "command_log_sha256": (
+            _sha256(Path(log_path).read_text(encoding="utf-8", errors="replace"))
+            if log_path is not None and Path(log_path).is_file()
+            else None
+        ),
     }
 
 
@@ -607,12 +659,22 @@ def main(argv: list[str] | None = None) -> int:
                 "workflow_safety": _sha256(safety_probe),
                 "remote_command_stats": _sha256(stats_probe),
             }
+            # The identity the admin CLI would resolve: the STS caller ARN when
+            # the AWS CLI answers, else user@host -- never ``unknown-identity``
+            # while there is a local identity to fall back to (I1). Only its
+            # digest is recorded.
+            actor = resolve_operator_identity(fallback=local_operator_identity())
+            document["actor_sha256"] = _sha256(actor)
+            state_dir = workdir / "admin-state"
+            state_dir.mkdir(parents=True, exist_ok=True)
             for mode in modes:
                 document["modes"][mode] = run_mode(
                     mode,
                     provisioner,
                     safety_probe=safety_probe,
                     stats_probe=stats_probe,
+                    actor=actor,
+                    state_dir=state_dir,
                 )
                 document["completed_at"] = utc_now()
                 write_json_atomic(evidence_path, document)

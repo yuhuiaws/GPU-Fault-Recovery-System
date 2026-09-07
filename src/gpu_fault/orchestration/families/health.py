@@ -416,12 +416,17 @@ class NodeHealthPlanBuilder:
             and not finding.gpu_uuids
         ):
             errors.append("RESET_GPU requires an explicit GPU UUID")
+        # The finding's workload state reaches the shared gate: a plan that
+        # mutates the node is refused while that state is UNKNOWN, the same
+        # way the fault family refuses it (ARCH-B2). ``_operations`` only ever
+        # asked "is it ACTIVE?" to insert STOP_WORKLOADS.
         steps, compile_errors = self.workflow_builder.compile_steps(
             operations,
             profile,
             context.target_node_ids,
             finding.gpu_uuids,
             finding.affected_workload_ids,
+            workload_state=finding.workload_state,
         )
         restart = self.workflow_builder.restart_step_parameters(
             finding.cluster_id,

@@ -22,9 +22,10 @@ from gpu_fault.host_health import (
 )
 
 
+from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.scheduling import next_stable_phase
-from gpu_fault.collectors.sinks import EventSink
+from gpu_fault.collectors.sinks import CollectorError, EventSink
 from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
 from gpu_fault.collectors.host.network import HostNetworkMixin
@@ -65,6 +66,9 @@ class HostTelemetryCollector(
         history_max_points: int | None = None,
         startup_spread_seconds: int | None = None,
         force_snapshot_path: str | None = None,
+        nvidia_smi_timeout_seconds: float = 15,
+        nvidia_smi_breaker_rounds: int = 3,
+        nvidia_smi_breaker_cooldown_rounds: int = 4,
     ) -> None:
         self.sink = sink
         self.context = context
@@ -86,6 +90,26 @@ class HostTelemetryCollector(
         self.node_instance_type = node_instance_type
         self.expected_gpu_count = expected_gpu_count
         self.expected_efa_device_count = expected_efa_device_count
+        self._default_expected_counts_from_instance_type()
+        if (
+            nvidia_smi_timeout_seconds <= 0
+            or nvidia_smi_breaker_rounds < 1
+            or nvidia_smi_breaker_cooldown_rounds < 1
+        ):
+            raise ValueError(
+                "nvidia-smi timeout must be positive and breaker rounds at least 1"
+            )
+        self.nvidia_smi_timeout_seconds = nvidia_smi_timeout_seconds
+        self.nvidia_smi_breaker_rounds = nvidia_smi_breaker_rounds
+        self.nvidia_smi_breaker_cooldown_rounds = nvidia_smi_breaker_cooldown_rounds
+        self._nvidia_smi_round: dict[
+            tuple[str, ...], subprocess.CompletedProcess[str] | CollectorError
+        ] = {}
+        self._nvidia_smi_round_at: datetime | None = None
+        self._nvidia_smi_round_timed_out = False
+        self._nvidia_smi_round_skipped = False
+        self._nvidia_smi_consecutive_timeouts = 0
+        self._nvidia_smi_breaker_skips_remaining = 0
         if inventory_mismatch_consecutive_samples < 1:
             raise ValueError("inventory mismatch consecutive samples must be positive")
         self.inventory_mismatch_consecutive_samples = (
@@ -230,10 +254,120 @@ class HostTelemetryCollector(
         "_bmc",
     )
 
+    def _default_expected_counts_from_instance_type(self) -> None:
+        """Fill the expected GPU/EFA counts from the instance type.
+
+        ``--expected-gpu-count`` was optional and the installer left it
+        unset, so the ``gpu_inventory_mismatch`` finding never fired on a
+        fleet whose instance type already names the count. An explicit count
+        still wins; an unknown type is logged once, not guessed.
+        """
+
+        if self.expected_gpu_count is not None and (
+            self.expected_efa_device_count is not None
+        ):
+            return
+        counts = expected_accelerator_counts(self.node_instance_type)
+        if counts is None:
+            if self.node_instance_type:
+                LOGGER.warning(
+                    "instance type %s is not in the accelerator table and no "
+                    "explicit expected GPU/EFA count was configured; the "
+                    "inventory invariant is not checked",
+                    self.node_instance_type,
+                )
+            return
+        if self.expected_gpu_count is None:
+            self.expected_gpu_count = counts["gpu"]
+        if self.expected_efa_device_count is None:
+            self.expected_efa_device_count = counts["efa"]
+        LOGGER.info(
+            "expected accelerator counts default from instance type %s: gpu=%d efa=%d",
+            self.node_instance_type,
+            self.expected_gpu_count,
+            self.expected_efa_device_count,
+        )
+
+    def _begin_nvidia_smi_round(self) -> None:
+        """Reset the per-round nvidia-smi memo and advance the circuit breaker."""
+
+        self._nvidia_smi_round = {}
+        if self._nvidia_smi_round_skipped:
+            self._nvidia_smi_breaker_skips_remaining -= 1
+        if self._nvidia_smi_round_timed_out:
+            self._nvidia_smi_consecutive_timeouts += 1
+            if self._nvidia_smi_consecutive_timeouts >= self.nvidia_smi_breaker_rounds:
+                self._nvidia_smi_breaker_skips_remaining = (
+                    self.nvidia_smi_breaker_cooldown_rounds
+                )
+                LOGGER.warning(
+                    "nvidia-smi timed out %d rounds in a row; skipping GPU "
+                    "queries for the next %d rounds",
+                    self._nvidia_smi_consecutive_timeouts,
+                    self.nvidia_smi_breaker_cooldown_rounds,
+                )
+        self._nvidia_smi_round_timed_out = False
+        self._nvidia_smi_round_skipped = self._nvidia_smi_breaker_skips_remaining > 0
+
+    def _nvidia_smi(
+        self, argv: list[str], observed_at: datetime
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one nvidia-smi query per round, bounded and circuit-broken.
+
+        Three contributors used to shell out separately with 30 s timeouts,
+        so a hung driver stretched a 15 s round to 90 s and the batch never
+        said why. The result is memoised per round so the utilization and
+        inventory readers share one query, a timeout is bounded per call,
+        and after ``nvidia_smi_breaker_rounds`` consecutive timed-out rounds
+        the queries are skipped for a cooldown with the reason recorded as a
+        collection error rather than as a slow, quiet node.
+        """
+
+        if observed_at != self._nvidia_smi_round_at:
+            # A contributor called outside ``collect_once`` with a new sample
+            # time starts a fresh memo; the round bookkeeping is unchanged.
+            self._nvidia_smi_round = {}
+            self._nvidia_smi_round_at = observed_at
+        key = tuple(argv)
+        cached = self._nvidia_smi_round.get(key)
+        if isinstance(cached, CollectorError):
+            # The same query already hung this round; a second caller must
+            # not pay the timeout again.
+            raise cached
+        if cached is not None:
+            return cached
+        if self._nvidia_smi_round_skipped:
+            raise CollectorError(
+                "nvidia-smi circuit breaker open "
+                f"({self._nvidia_smi_consecutive_timeouts} consecutive timeouts); "
+                "GPU queries skipped this round"
+            )
+        try:
+            completed: subprocess.CompletedProcess[str] = self.runner(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=self.nvidia_smi_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            self._nvidia_smi_round_timed_out = True
+            error = CollectorError(
+                f"nvidia-smi timed out after {self.nvidia_smi_timeout_seconds:g}s"
+            )
+            error.__cause__ = exc
+            self._nvidia_smi_round[key] = error
+            raise error
+        self._nvidia_smi_consecutive_timeouts = 0
+        self._nvidia_smi_round[key] = completed
+        return completed
+
     def collect_once(self) -> HostTelemetryBatch:
         observed_at = self.now()
         samples: list[HostMetricSample] = []
         errors: list[str] = []
+        self._begin_nvidia_smi_round()
+        self._nvidia_smi_round_at = observed_at
         for name in self.CONTRIBUTORS:
             collector = getattr(self, name)
             try:

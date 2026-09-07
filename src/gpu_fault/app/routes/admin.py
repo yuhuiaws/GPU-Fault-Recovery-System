@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from fastapi import APIRouter, Depends
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from gpu_fault import __version__, module_digest
@@ -85,6 +86,42 @@ async def healthz(
         ),
     }
     if not processor_healthy or not registry_ready:
+        # The registry status carries datetimes; an unencoded payload made the
+        # 503 branch itself raise, which the probe read as a crash, not a 503.
+        return JSONResponse(status_code=503, content=jsonable_encoder(payload))
+    return payload
+
+
+@router.get("/livez")
+@authorization_bucket("public")
+async def livez(
+    dependencies: AdminRouterDependencies = Depends(get_admin_dependencies),
+) -> Any:
+    """Process-local liveness for the kubelet.
+
+    Deliberately blind to Aurora: it asserts that the event loop answers and
+    that the background threads this process cannot run without are alive.
+    Registry freshness, store round trips and leadership belong to readiness
+    (``/healthz``); a writer failover must make Pods NotReady, never restart
+    them, because the restarted process would need Aurora again to start.
+    """
+
+    processor = dependencies.processor
+    dead_threads: list[str] = []
+    if (
+        dependencies.service_role == "spool-worker"
+        and processor is not None
+        and not processor.spool_consumer_running
+    ):
+        dead_threads.append("telemetry-spool-consumer")
+    payload = {
+        "status": "alive" if not dead_threads else "dead",
+        "service_role": (
+            dependencies.environment.get("GPU_FAULT_SERVICE_ROLE") or "combined"
+        ),
+        "dead_threads": dead_threads,
+    }
+    if dead_threads:
         return JSONResponse(status_code=503, content=payload)
     return payload
 

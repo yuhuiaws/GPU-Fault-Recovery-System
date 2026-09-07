@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Callable, Protocol, runtime_checkable
 
+from gpu_fault.adapters.kubernetes.primitives import patch_node_with_retry
 from gpu_fault.fleet import FleetRegistry
 from gpu_fault.hyperpod import (
     HyperPodAdapterError,
@@ -21,6 +22,7 @@ from gpu_fault.models import AdvisoryNotification
 LOGGER = logging.getLogger(__name__)
 
 SPARE_RESERVATION_ANNOTATION = "gpu-fault.io/spare-reservation"
+SPARE_RESERVED_AT_ANNOTATION = "gpu-fault.io/spare-reserved-at"
 SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
 HYPERPOD_NODE_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
 HYPERPOD_SCHEDULABLE = "Schedulable"
@@ -79,8 +81,10 @@ class HyperPodSpareCoordinator:
         spare_label: str = "gpu-fault.io/spare",
         spare_label_value: str = "true",
         alert_sender: Callable[[str], object] | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self.lifecycle = lifecycle
+        self.now = now or (lambda: datetime.now(timezone.utc))
         self.store = store
         self.notification_sink: NotificationSink | None = (
             store if isinstance(store, NotificationSink) else None
@@ -370,6 +374,22 @@ class HyperPodSpareCoordinator:
     def release(self, node_ids: list[str], incident_id: str) -> None:
         self._rollback(node_ids, incident_id)
 
+    def reserve(
+        self,
+        provider_node: HyperPodNode,
+        node_name: str,
+        incident_id: str,
+        *,
+        gpu_client_checker: GpuClientChecker | None = None,
+    ) -> None:
+        """Reserve one spare for ``incident_id`` and uncordon it."""
+        self._reserve_and_activate(
+            provider_node,
+            node_name,
+            incident_id,
+            gpu_client_checker=gpu_client_checker,
+        )
+
     def _healthy(
         self,
         cluster_id: str,
@@ -503,19 +523,31 @@ class HyperPodSpareCoordinator:
             raise ValueError(
                 f"spare {node_name} became occupied: " + "; ".join(occupancy_reasons)
             )
-        self.core.patch_node(
-            node_name,
-            {
+        reserved_at = self.now().isoformat()
+
+        def body(current: Any) -> dict[str, Any] | None:
+            current_reservation = self._annotation(current)
+            if current_reservation == incident_id:
+                return None
+            if current_reservation:
+                raise ValueError(
+                    f"node {node_name} is reserved by {current_reservation}"
+                )
+            return {
                 "metadata": {
-                    "resourceVersion": self._resource_version(node),
+                    "resourceVersion": self._resource_version(current),
                     "annotations": {
                         SPARE_RESERVATION_ANNOTATION: incident_id,
+                        # The timestamp lets the health scan expire a
+                        # reservation whose owner it can no longer ask.
+                        SPARE_RESERVED_AT_ANNOTATION: reserved_at,
                         SPARE_POOL_STATE_ANNOTATION: (SparePoolState.ALLOCATED.value),
                     },
                 },
                 "spec": {"unschedulable": False},
-            },
-        )
+            }
+
+        patch_node_with_retry(self.core, node_name, body)
 
     def _active_gpu_pod_reasons(self, node_name: str) -> list[str]:
         try:
@@ -603,26 +635,49 @@ class HyperPodSpareCoordinator:
             name = getattr(metadata, "name", None) or "unknown"
         return f"{namespace}/{name}"
 
-    def _rollback(self, node_ids: list[str], incident_id: str) -> None:
-        for node_name in reversed(node_ids):
-            node = self.core.read_node(node_name)
-            if self._annotation(node) != incident_id:
-                continue
-            self.core.patch_node(
-                node_name,
-                {
-                    "metadata": {
-                        "resourceVersion": self._resource_version(node),
-                        "annotations": {
-                            SPARE_RESERVATION_ANNOTATION: None,
-                            SPARE_POOL_STATE_ANNOTATION: (
-                                SparePoolState.AVAILABLE.value
-                            ),
-                        },
-                    },
-                    "spec": {"unschedulable": True},
+    def _release_body(self, node: Any, incident_id: str) -> dict[str, Any] | None:
+        if self._annotation(node) != incident_id:
+            return None
+        return {
+            "metadata": {
+                "resourceVersion": self._resource_version(node),
+                "annotations": {
+                    SPARE_RESERVATION_ANNOTATION: None,
+                    SPARE_RESERVED_AT_ANNOTATION: None,
+                    SPARE_POOL_STATE_ANNOTATION: (SparePoolState.AVAILABLE.value),
                 },
-            )
+            },
+            "spec": {"unschedulable": True},
+        }
+
+    def _rollback(self, node_ids: list[str], incident_id: str) -> None:
+        """Release every reservation ``incident_id`` holds on ``node_ids``.
+
+        One node's failure must not strand the others: a release that
+        stopped at the first error left the rest reserved forever, and no
+        later path ever came back for them. The first error is re-raised
+        after the loop.
+        """
+        first_error: Exception | None = None
+        for node_name in reversed(node_ids):
+            try:
+                patch_node_with_retry(
+                    self.core,
+                    node_name,
+                    lambda node: self._release_body(node, incident_id),
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) == 404:
+                    continue
+                LOGGER.exception(
+                    "cannot release spare reservation: node=%s incident=%s",
+                    node_name,
+                    incident_id,
+                )
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def _alert(
         self,

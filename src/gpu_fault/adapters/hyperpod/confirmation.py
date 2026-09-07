@@ -348,6 +348,12 @@ class HyperPodConfirmationMixin:
                 idempotency_key=(context.idempotency_key + "/spare-isolation"),
             )
             outcome = self.kubernetes_adapter._isolate(replacement_context)
+            if outcome.status is WorkflowStepStatus.WAITING:
+                # A scheduler write conflict that outlasted the adapter's own
+                # retries: the spares stay reserved and the step comes back.
+                raise SpareHealthPending(
+                    "warm-spare isolation is retrying a scheduler conflict"
+                )
             if outcome.status is not WorkflowStepStatus.SUCCEEDED:
                 raise ValueError(outcome.error or "warm-spare isolation failed")
         rebindings = {}

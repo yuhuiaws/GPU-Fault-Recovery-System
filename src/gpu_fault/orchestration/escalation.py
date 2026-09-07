@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 from gpu_fault.models import (
@@ -10,8 +11,11 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
+    WorkflowStepExecution,
     WorkflowStepStatus,
+    bounded_reasons,
 )
+from gpu_fault.notifications import HardwareEscalationEmailBuilder
 from gpu_fault.operation_registry import (
     HARDWARE_ESCALATION_RELEVANT_OPERATIONS,
     NODE_ACTION_SCOPE_OPERATIONS,
@@ -59,6 +63,66 @@ _CLASSIFIABLE_OPERATIONS = (
     | _VALIDATION_OPERATIONS
 )
 
+# Stage names the classifier hands to ``emit``. A containment or release step
+# that failed for an ordinary reason is re-cordoned by the support workflow
+# (F-H1); one the adapter *refused* -- the node is absent, or owned by another
+# generation -- cannot be isolated by planning the same step again, so the
+# support workflow carries no isolation (ARCH-E2E-2A finding 1, DESTR-020).
+CONTAINMENT_STAGE = "containment_or_release"
+CONTAINMENT_REFUSED_STAGE = "containment_refused"
+# Written by the Kubernetes node adapter on a step it refused rather than
+# failed: ``safety_rejection`` on every refusal, ``absent`` when the node
+# could not be read at all.
+SAFETY_REJECTION_DETAIL = "safety_rejection"
+NODE_ABSENT_DETAIL = "absent"
+
+ESCALATION_NAMES: dict[RecoveryAction, str] = {
+    RecoveryAction.DRAIN: "drain",
+    RecoveryAction.REBOOT_NODE: "reboot",
+    RecoveryAction.REPLACE_NODE: "replace",
+    RecoveryAction.ESCALATE_OPERATOR: "support",
+}
+_ESCALATION_EVENT_SEPARATOR = "-after-"
+# Escalations that are the last rung. Their product is an operator hand-off;
+# when that product fails, opening another one on the same node answers
+# nothing and, driven by the failed-workflow reconcile, never stops.
+CHAIN_TERMINAL_ESCALATIONS = frozenset({"support"})
+ESCALATION_CHAIN_TERMINATED_REASON = "escalation chain terminated"
+
+
+def escalation_origin(event_id: str) -> tuple[str, str] | None:
+    """``(escalation_name, source_workflow_request_id)`` when ``event_id`` was
+    minted by :meth:`HardwareEscalationService.escalate`, else ``None``.
+
+    The event id is the field the escalation is deduplicated on
+    (``create_incident_workflow_if_absent``), so it is the authoritative record
+    of an incident being an escalation product; the workflow request id
+    repeats it with a ``workflow-`` prefix.
+    """
+
+    name, separator, source_request_id = event_id.partition(_ESCALATION_EVENT_SEPARATOR)
+    if not separator or not source_request_id:
+        return None
+    if name not in ESCALATION_NAMES.values():
+        return None
+    return name, source_request_id
+
+
+def _refused_containment(
+    executions: list[WorkflowStepExecution],
+) -> bool:
+    """Every failed containment/release execution was a safety refusal."""
+
+    refusals = [
+        execution
+        for execution in executions
+        if execution.status is WorkflowStepStatus.FAILED
+        and execution.operation in _CONTAINMENT_RELEASE_OPERATIONS
+    ]
+    return bool(refusals) and all(
+        execution.details.get(SAFETY_REJECTION_DETAIL) is True for execution in refusals
+    )
+
 
 def next_rung(
     failed_operation: WorkflowOperation,
@@ -90,10 +154,123 @@ def next_rung(
     return None
 
 
+def _escalation_operations(
+    failed_stage: str,
+    next_action: RecoveryAction,
+    next_operation: WorkflowOperation | None,
+    workload_ids: list[str],
+) -> list[WorkflowOperation]:
+    """The operation sequence the escalation workflow plans (see ``emit``)."""
+
+    if failed_stage == CONTAINMENT_REFUSED_STAGE:
+        # The adapter refused the isolation (absent node, foreign
+        # generation): there is nothing this workflow can isolate, and
+        # planning MARK_UNSCHEDULABLE / QUARANTINE again on the same node
+        # only reproduces the refusal. Evidence and the hand-off remain.
+        operations = [WorkflowOperation.FREEZE_EVIDENCE]
+    elif next_action is RecoveryAction.DRAIN:
+        operations = [
+            WorkflowOperation.FREEZE_EVIDENCE,
+            WorkflowOperation.MARK_UNSCHEDULABLE,
+        ]
+        if workload_ids:
+            operations.append(WorkflowOperation.STOP_WORKLOADS)
+        operations.extend(
+            [
+                WorkflowOperation.QUARANTINE,
+                WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+                WorkflowOperation.VALIDATE_GPU,
+            ]
+        )
+    else:
+        operations = [
+            WorkflowOperation.FREEZE_EVIDENCE,
+            WorkflowOperation.MARK_UNSCHEDULABLE,
+            WorkflowOperation.QUARANTINE,
+        ]
+    if next_operation is WorkflowOperation.ESCALATE_SUPPORT:
+        operations.append(WorkflowOperation.ESCALATE_SUPPORT)
+    elif next_action is not RecoveryAction.DRAIN:
+        if workload_ids:
+            operations.append(WorkflowOperation.STOP_WORKLOADS)
+        operations.extend(
+            [
+                next_operation,
+                WorkflowOperation.VALIDATE_GPU,
+                WorkflowOperation.VALIDATE_HOST,
+                WorkflowOperation.VALIDATE_FABRIC,
+                WorkflowOperation.RESTORE_SCHEDULING,
+            ]
+        )
+        if workload_ids:
+            operations.append(WorkflowOperation.RESTART_WORKLOAD)
+    return operations
+
+
+def _successor_lifetime(
+    workflow: WorkflowRequest,
+    next_action: RecoveryAction,
+    next_operation: WorkflowOperation | None,
+    now: datetime,
+) -> datetime | None:
+    """The lifetime the escalation successor starts with.
+
+    The hard lifetime (F-N1) bounds *automatic* remediation: a reboot or a
+    replacement emitted after a failed reset shares the chain's single
+    clock, so an escalation ladder cannot outlive the window by re-issuing
+    itself. An operator hand-off -- the support ticket, a drain -- is the
+    thing the window ends *in*: inheriting an already-expired deadline
+    failed the support workflow at its first claim, before
+    FREEZE_EVIDENCE ran, and the node never reached an operator
+    (DESTR-018). Hand-offs therefore start their own clock; ``None`` lets
+    the first claim stamp the node lifetime (and, for CHECK_MECHANICALS,
+    the operator-acknowledgement floor). An automatic rung emitted while
+    the chain's lifetime is still ahead keeps it; one emitted after the
+    lifetime passed keeps the expired value on purpose, so it fails closed
+    instead of running hardware actions past the window.
+    """
+
+    operator_hand_off = (
+        next_operation is WorkflowOperation.ESCALATE_SUPPORT
+        or next_operation is WorkflowOperation.CHECK_MECHANICALS
+        or next_action in {RecoveryAction.ESCALATE_OPERATOR, RecoveryAction.DRAIN}
+    )
+    if operator_hand_off:
+        return None
+    return workflow.lifetime_deadline_at
+
+
+def _chain_termination_reason(
+    workflow: WorkflowRequest,
+    source: FaultIncident,
+    origin: tuple[str, str],
+    failed_operations: list[str],
+) -> str:
+    """The incident reason ``_terminate_chain`` records; also its idempotency
+    key, so the text must stay stable for a given failure."""
+
+    escalation_name, source_request_id = origin
+    return (
+        f"{ESCALATION_CHAIN_TERMINATED_REASON}: {escalation_name} escalation "
+        f"{source.event_id} (after {source_request_id}) failed again in "
+        f"{workflow.request_id} at "
+        f"{', '.join(failed_operations) or 'no recorded step'}; no further "
+        f"{escalation_name} workflow is opened, operator attention required"
+    )
+
+
 class HardwareEscalationService:
     def __init__(self, store, builder) -> None:
         self.store = store
         self.builder = builder
+        # Failed support escalations that were handed to an operator instead
+        # of a further support escalation (the chain bound), and the Unix
+        # time of the newest one (ARCH-E E4 convention).
+        self.escalation_chain_terminated_total = 0
+        self.escalation_chain_terminated_last_seen_timestamp_seconds = 0.0
+        # Support escalations opened for a refused containment, without
+        # re-planning the isolation the adapter refused.
+        self.containment_refused_escalations_total = 0
 
     @staticmethod
     def _active_workload_dcgm_execution_review(
@@ -288,7 +465,11 @@ class HardwareEscalationService:
             else:
                 return None
         elif failed_operation_set.intersection(_CONTAINMENT_RELEASE_OPERATIONS):
-            failed_stage = "containment_or_release"
+            failed_stage = (
+                CONTAINMENT_REFUSED_STAGE
+                if _refused_containment(workflow.step_executions)
+                else CONTAINMENT_STAGE
+            )
             next_action = RecoveryAction.ESCALATE_OPERATOR
             next_operation = WorkflowOperation.ESCALATE_SUPPORT
         else:
@@ -628,42 +809,9 @@ class HardwareEscalationService:
             created_at=now,
             updated_at=now,
         )
-        if next_action is RecoveryAction.DRAIN:
-            operations = [
-                WorkflowOperation.FREEZE_EVIDENCE,
-                WorkflowOperation.MARK_UNSCHEDULABLE,
-            ]
-            if workload_ids:
-                operations.append(WorkflowOperation.STOP_WORKLOADS)
-            operations.extend(
-                [
-                    WorkflowOperation.QUARANTINE,
-                    WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
-                    WorkflowOperation.VALIDATE_GPU,
-                ]
-            )
-        else:
-            operations = [
-                WorkflowOperation.FREEZE_EVIDENCE,
-                WorkflowOperation.MARK_UNSCHEDULABLE,
-                WorkflowOperation.QUARANTINE,
-            ]
-        if next_operation is WorkflowOperation.ESCALATE_SUPPORT:
-            operations.append(WorkflowOperation.ESCALATE_SUPPORT)
-        elif next_action is not RecoveryAction.DRAIN:
-            if workload_ids:
-                operations.append(WorkflowOperation.STOP_WORKLOADS)
-            operations.extend(
-                [
-                    next_operation,
-                    WorkflowOperation.VALIDATE_GPU,
-                    WorkflowOperation.VALIDATE_HOST,
-                    WorkflowOperation.VALIDATE_FABRIC,
-                    WorkflowOperation.RESTORE_SCHEDULING,
-                ]
-            )
-            if workload_ids:
-                operations.append(WorkflowOperation.RESTART_WORKLOAD)
+        operations = _escalation_operations(
+            failed_stage, next_action, next_operation, workload_ids
+        )
 
         workload_scope = list(
             dict.fromkeys(
@@ -697,7 +845,7 @@ class HardwareEscalationService:
             official_steps=replacement_steps,
             blocked_reasons=errors,
             blocked_kind=(BlockedKind.NEEDS_OPERATOR if errors else None),
-            lifetime_deadline_at=self._successor_lifetime(
+            lifetime_deadline_at=_successor_lifetime(
                 workflow, next_action, next_operation, now
             ),
             created_at=now,
@@ -716,50 +864,94 @@ class HardwareEscalationService:
         # One transaction, keyed by the deterministic event id: two workers
         # escalating the same failed workflow get the same pair, and a
         # workflow never exists ahead of its incident (F-H1 / F-B1).
-        created_incident, created_workflow, _ = (
+        created_incident, created_workflow, created = (
             self.store.create_incident_workflow_if_absent(
                 event_id, lambda: (incident, replacement)
             )
         )
+        if created and failed_stage == CONTAINMENT_REFUSED_STAGE:
+            self.containment_refused_escalations_total += 1
         return created_incident, created_workflow
 
-    @staticmethod
-    def _successor_lifetime(
+    def _terminate_chain(
+        self,
         workflow: WorkflowRequest,
-        next_action: RecoveryAction,
-        next_operation: WorkflowOperation | None,
-        now: datetime,
-    ) -> datetime | None:
-        """The lifetime the escalation successor starts with.
+        source: FaultIncident,
+        origin: tuple[str, str],
+    ) -> None:
+        """Hand a failed operator hand-off to an operator without opening
+        another one.
 
-        The hard lifetime (F-N1) bounds *automatic* remediation: a reboot or a
-        replacement emitted after a failed reset shares the chain's single
-        clock, so an escalation ladder cannot outlive the window by re-issuing
-        itself. An operator hand-off -- the support ticket, a drain -- is the
-        thing the window ends *in*: inheriting an already-expired deadline
-        failed the support workflow at its first claim, before
-        FREEZE_EVIDENCE ran, and the node never reached an operator
-        (DESTR-018). Hand-offs therefore start their own clock; ``None`` lets
-        the first claim stamp the node lifetime (and, for CHECK_MECHANICALS,
-        the operator-acknowledgement floor). An automatic rung emitted while
-        the chain's lifetime is still ahead keeps it; one emitted after the
-        lifetime passed keeps the expired value on purpose, so it fails closed
-        instead of running hardware actions past the window.
+        ``source`` is itself the product of a terminal escalation (a support
+        ticket) and the workflow that was to deliver it failed. Escalating that
+        failure would mint one more FAILED incident/workflow pair on the same
+        node every reconcile tick (ARCH-E2E-2A finding 1). Instead the incident
+        stays ESCALATED with the reason recorded, the operator receives the
+        hardware-escalation notification the ESCALATE_SUPPORT step would have
+        sent (same builder, same deduplication key, so a step that did run
+        never doubles it), and the event is counted. Idempotent per incident:
+        a replay finds the reason and the notification already there.
         """
 
-        operator_hand_off = (
-            next_operation is WorkflowOperation.ESCALATE_SUPPORT
-            or next_operation is WorkflowOperation.CHECK_MECHANICALS
-            or next_action in {RecoveryAction.ESCALATE_OPERATOR, RecoveryAction.DRAIN}
+        failed_operations = sorted(
+            {
+                execution.operation.value
+                for execution in workflow.step_executions
+                if execution.status is WorkflowStepStatus.FAILED
+            }
         )
-        if operator_hand_off:
-            return None
-        return workflow.lifetime_deadline_at
+        reason = _chain_termination_reason(workflow, source, origin, failed_operations)
+        first_termination = reason not in source.reasons
+        if first_termination or source.state is not IncidentState.ESCALATED:
+            now = datetime.now(timezone.utc)
+            self.store.save_incident(
+                source.model_copy(
+                    update={
+                        "state": IncidentState.ESCALATED,
+                        "reasons": bounded_reasons([*source.reasons, reason]),
+                        "updated_at": now,
+                    }
+                ),
+                expected=source,
+            )
+        workload_ids = list(
+            dict.fromkeys(
+                workload_id
+                for step in workflow.official_steps
+                for workload_id in step.workload_ids
+            )
+        )
+        notification = HardwareEscalationEmailBuilder().build(
+            cluster_id=source.cluster_id,
+            incident_id=source.incident_id,
+            workflow_id=workflow.request_id,
+            event_id=source.event_id,
+            event_type=source.event_type,
+            node_ids=list(source.node_ids),
+            workload_ids=workload_ids,
+            reasons=[*source.reasons, reason],
+            failed_operations=failed_operations,
+            policy_source=source.policy_source,
+            official_action=source.official_action,
+            ticket_id=f"vendor-ticket-{source.incident_id}",
+        )
+        self.store.save_notification_if_absent(notification)
+        if first_termination:
+            self.escalation_chain_terminated_total += 1
+            self.escalation_chain_terminated_last_seen_timestamp_seconds = time.time()
 
     def escalate(
         self, workflow: WorkflowRequest
     ) -> tuple[FaultIncident, WorkflowRequest] | None:
         if workflow.status is not WorkflowStatus.FAILED:
+            return None
+        source = self.store.get_incident(workflow.incident_id)
+        origin = escalation_origin(source.event_id)
+        if origin is not None and origin[0] in CHAIN_TERMINAL_ESCALATIONS:
+            # Bound on the escalation chain: a failed support escalation is
+            # handed over, never escalated into another support escalation,
+            # whatever its failed step would otherwise classify as.
+            self._terminate_chain(workflow, source, origin)
             return None
         classification = self.classify(workflow)
         if classification is None:
@@ -770,13 +962,10 @@ class HardwareEscalationService:
             next_operation,
             failed_executions,
         ) = classification
-        escalation_name = {
-            RecoveryAction.DRAIN: "drain",
-            RecoveryAction.REBOOT_NODE: "reboot",
-            RecoveryAction.REPLACE_NODE: "replace",
-            RecoveryAction.ESCALATE_OPERATOR: "support",
-        }[next_action]
-        event_id = f"{escalation_name}-after-{workflow.request_id}"
+        escalation_name = ESCALATION_NAMES[next_action]
+        event_id = (
+            f"{escalation_name}{_ESCALATION_EVENT_SEPARATOR}{workflow.request_id}"
+        )
         existing = self.store.get_incident_by_event(event_id)
         if existing is not None:
             if not existing.workflow_request_id:
@@ -785,7 +974,6 @@ class HardwareEscalationService:
                 existing,
                 self.store.get_workflow(existing.workflow_request_id),
             )
-        source = self.store.get_incident(workflow.incident_id)
         scope = self.collect_scope(workflow, source, failed_executions)
         return self.emit(
             workflow,

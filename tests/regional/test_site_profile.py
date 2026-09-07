@@ -252,7 +252,10 @@ def test_every_live_runner_installs_the_profile_before_parsing() -> None:
         # A runner that hands its ``main`` to the shared spine inherits the
         # call; tests/test_acceptance_runner_main.py pins that the spine makes
         # it before the parser exists.
-        if "run_standard_case(CASE)" in source or "run_selected_case(CASE)" in source:
+        if any(
+            f"{spine}(CASE)" in source
+            for spine in ("run_standard_case", "run_selected_case", "run_plain_case")
+        ):
             continue
         missing.append(path.name)
     assert not missing, missing

@@ -1,6 +1,6 @@
 {
   "src/gpu_fault/store": {
-    "ceiling": 300,
+    "ceiling": 289,
     "priority": 1,
     "why": "store mixins: dict-shaped rows read back as Any; the _get()->Any design relies on caller casts that never spread"
   },

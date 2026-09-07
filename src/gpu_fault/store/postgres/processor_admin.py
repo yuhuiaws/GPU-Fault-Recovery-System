@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from typing import Any
-
 import hashlib
 import time
 from contextlib import contextmanager
 from datetime import datetime
 from threading import Event as ThreadEvent
-from typing import Callable
+from typing import Any, Callable
 
 from gpu_fault.store.contracts import ProcessorQueueCountStatus
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 
 
 class PostgresProcessorAdminMixin:
@@ -538,4 +537,4 @@ class PostgresProcessorAdminMixin:
                         """,
                         (request_ids,),
                     )
-            return len(request_ids)
+            return log_cleanup("processor_request", request_ids)

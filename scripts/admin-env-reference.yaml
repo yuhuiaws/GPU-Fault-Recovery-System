@@ -31,7 +31,7 @@ categories:
         production: "1"
         description: "CPU 进程轮询 durable registry head 的周期。"
       - name: GPU_FAULT_REGISTRY_STALE_SECONDS
-        production: "10"
+        production: "90"
         description: "超过该时间未成功刷新 registry 时 readiness 和 cluster-token 请求 fail closed。"
       - name: GPU_FAULT_UNKNOWN_ENV_POLICY
         description: "发现未知 GPU_FAULT_* 变量时的策略。生产保持 error，避免拼写错误静默生效。"

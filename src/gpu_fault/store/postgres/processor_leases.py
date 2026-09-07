@@ -4,6 +4,8 @@ from typing import Any, Callable
 
 from datetime import datetime, timedelta, timezone
 
+from gpu_fault.store.shared.cleanup_log import log_cleanup
+
 
 class PostgresProcessorLeaseMixin:
     # Attributes supplied by the composed concrete implementation.
@@ -347,9 +349,9 @@ class PostgresProcessorLeaseMixin:
                         WHERE target.ordering_key=victims.ordering_key
                         RETURNING target.ordering_key
                     )
-                    SELECT count(*) FROM deleted
+                    SELECT ordering_key FROM deleted ORDER BY ordering_key
                     """,
                     (older_than, limit),
                 )
-                deleted = cursor.fetchone()[0]
-            return deleted
+                keys = [row[0] for row in cursor.fetchall()]
+            return log_cleanup("processor_lane", keys)

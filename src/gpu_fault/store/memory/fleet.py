@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from datetime import datetime
-
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import NotFoundError
 
 if TYPE_CHECKING:
@@ -241,7 +241,7 @@ class MemoryFleetMixin:
             ][:limit]
             for deployment_id in deployment_ids:
                 del self._fleet_deployments[deployment_id]
-            return len(deployment_ids)
+            return log_cleanup("fleet_deployment", deployment_ids)
 
     def save_barrier(self, barrier) -> None:
         with self._lock:

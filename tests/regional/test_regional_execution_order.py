@@ -85,7 +85,7 @@ def test_regional_execution_order_covers_every_documented_case() -> None:
     indexed = [*ordered, *do_not_run]
     assert len(indexed) == len(set(indexed))
     assert set(indexed) == set(document_cases)
-    assert len(indexed) == len(document_cases) == 164
+    assert len(indexed) == len(document_cases) == 181
 
 
 def test_do_not_run_matches_regional_superseded_cases() -> None:
@@ -132,8 +132,19 @@ def test_regional_execution_order_pins_special_dependencies() -> None:
     assert position["GF-REGIONAL-DESTR-015"] < position["GF-REGIONAL-DESTR-016"]
     assert position["GF-REGIONAL-DESTR-016"] < position["GF-REGIONAL-DESTR-017"]
     assert position["GF-REGIONAL-DESTR-017"] < position["GF-REGIONAL-DESTR-018"]
-    assert position["GF-REGIONAL-DESTR-018"] < position["GF-REGIONAL-DESTR-003"]
+    assert position["GF-REGIONAL-DESTR-018"] < position["GF-REGIONAL-DESTR-019"]
+    assert position["GF-REGIONAL-DESTR-019"] < position["GF-REGIONAL-DESTR-003"]
+    assert position["GF-REGIONAL-CMD-016"] < position["GF-REGIONAL-CMD-017"]
+    assert position["GF-REGIONAL-NET-005"] < position["GF-REGIONAL-NET-006"]
+    assert position["GF-REGIONAL-NET-006"] < position["GF-REGIONAL-NET-007"]
     assert position["GF-REGIONAL-PREEMPT-036"] < position["GF-REGIONAL-E2E-001"]
+    assert position["GF-REGIONAL-CMD-017"] < position["GF-REGIONAL-CMD-018"]
+    assert position["GF-REGIONAL-NET-007"] < position["GF-REGIONAL-NET-008"]
+    assert position["GF-REGIONAL-NOTIFY-006"] < position["GF-REGIONAL-NOTIFY-007"]
+    assert position["GF-REGIONAL-PREEMPT-036"] < position["GF-REGIONAL-PREEMPT-037"]
+    assert position["GF-REGIONAL-PREEMPT-038"] < position["GF-REGIONAL-E2E-001"]
+    assert position["GF-REGIONAL-COLLECT-017"] < position["GF-REGIONAL-COLLECT-018"]
+    assert position["GF-REGIONAL-COLLECT-020"] < position["GF-REGIONAL-COLLECT-015"]
     assert position["GF-REGIONAL-HA-003"] < position["GF-REGIONAL-DESTR-013"]
     assert ordered[-1] == "GF-REGIONAL-COLLECT-015"
 

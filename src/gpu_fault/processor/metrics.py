@@ -13,6 +13,8 @@ class ProcessorMetricsMixin:
     _completion_failures_total: Any
     _completion_retries_total: Any
     _completion_failure_releases_total: int
+    _completions_by_path_status: dict[str, dict[str, int]]
+    _fault_rejections_total: int
     _retry_horizon_failures_total: int
     _renewal_errors_total: int
     _renewal_fenced_total: int
@@ -146,6 +148,15 @@ class ProcessorMetricsMixin:
                     self._completion_failure_releases_total
                 ),
                 "retry_horizon_failures_total": (self._retry_horizon_failures_total),
+                # G1: a 4xx after the collector's 202 is the handler's real
+                # verdict; counted per path and status class so a shape
+                # drift on one channel is visible, and the fault-layer
+                # subset separately because those are thrown-away faults.
+                "completions_by_path_status": {
+                    path: dict(values)
+                    for path, values in self._completions_by_path_status.items()
+                },
+                "fault_rejections_total": self._fault_rejections_total,
                 "renewal_errors_total": self._renewal_errors_total,
                 "renewal_fenced_total": self._renewal_fenced_total,
                 "retry_rescheduled_total": self._retry_rescheduled_total,

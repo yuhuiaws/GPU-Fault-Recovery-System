@@ -9,6 +9,7 @@ import logging
 import time
 from urllib import request as urllib_request
 
+from gpu_fault.processor.rejected_events import status_class
 from gpu_fault.transport.http_client import urlopen
 
 LOGGER = logging.getLogger(__name__)
@@ -16,6 +17,7 @@ LOGGER = logging.getLogger(__name__)
 
 class TelemetrySpoolCoordinatorMixin:
     # Attributes supplied by the composed concrete implementation.
+    _completions_by_path_status: dict[str, dict[str, int]]
     _telemetry_spool_batch_bytes: Callable[..., Any]
     spool_replay_seconds_sum: Any
     telemetry_spool_enabled: Any
@@ -387,6 +389,13 @@ class TelemetrySpoolCoordinatorMixin:
                     (result or {}).get("body"),
                 )
             done.append(item)
+            # Same per-path/status-class ledger as the queue path (G1), so a
+            # spooled channel that starts answering 4xx is visible too.
+            with self._state_lock:
+                by_status = self._completions_by_path_status.setdefault(item.path, {})
+                by_status[status_class(status)] = (
+                    by_status.get(status_class(status), 0) + 1
+                )
         if done:
             completed = self.store.complete_telemetry_spool(done)
             with self._state_lock:

@@ -264,6 +264,28 @@ class AgentHeartbeatReporter:
             )
         )
         self.now = now or (lambda: datetime.now(timezone.utc))
+        # Local health view for /healthz: the control plane already tracks
+        # staleness, so this is informational and never gates the agent.
+        self.last_success_at: datetime | None = None
+        self.consecutive_failures = 0
+
+    def health_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
+        reference = now or self.now()
+        age = (
+            (reference - self.last_success_at).total_seconds()
+            if self.last_success_at is not None
+            else None
+        )
+        return {
+            "configured": True,
+            "consecutive_failures": self.consecutive_failures,
+            "last_success_at": (
+                self.last_success_at.isoformat()
+                if self.last_success_at is not None
+                else None
+            ),
+            "last_success_age_seconds": age,
+        }
 
     def report_once(self):
         policy_version = (
@@ -343,8 +365,11 @@ class AgentHeartbeatReporter:
             try:
                 self.report_once()
                 refused = 0
+                self.consecutive_failures = 0
+                self.last_success_at = self.now()
             except AgentHeartbeatRejected as exc:
                 refused += 1
+                self.consecutive_failures += 1
                 if exc.status in {403, 409}:
                     # These never clear on their own: the agent keeps
                     # sending the same identity the control plane just
@@ -361,6 +386,7 @@ class AgentHeartbeatReporter:
                 else:
                     LOGGER.error("node agent heartbeat failed: %s", exc)
             except Exception:
+                self.consecutive_failures += 1
                 LOGGER.exception("node agent heartbeat failed")
             stop.wait(self.interval_seconds)
 

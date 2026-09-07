@@ -16,6 +16,7 @@ from gpu_fault.admin.compile_blocked import (
 )
 from gpu_fault.models import (
     IncidentState,
+    WorkflowEventKind,
     WorkflowOperation,
     WorkflowStatus,
     WorkflowStepStatus,
@@ -96,6 +97,43 @@ def test_a_compile_time_blocked_no_op_is_eligible_and_closed() -> None:
     assert closed.superseded_at == datetime(2026, 9, 6, 14, 0, tzinfo=timezone.utc)
     # The incident is deliberately not written.
     assert store.get_incident(INCIDENT).state is IncidentState.ESCALATED
+
+
+def test_the_close_leaves_an_attributed_event_in_the_same_write() -> None:
+    """Who closed it, under which approval, from which status (I1)."""
+
+    store = build_store()
+    _compile_blocked_pair(store)
+    plan = build_compile_blocked_plan(store, [WORKFLOW])
+    actor = "arn:aws:sts::123456789012:assumed-role/Admin/alice"
+    at = datetime(2026, 9, 7, 9, 0, tzinfo=timezone.utc)
+
+    result = apply_compile_blocked_plan(
+        store,
+        workflow_ids=[WORKFLOW],
+        expected_plan_sha256=plan["plan_sha256"],
+        reference=REFERENCE,
+        now=at,
+        actor=actor,
+        admin_plan_sha256="c" * 64,
+    )
+
+    assert result["actor"] == actor, result
+    events = [
+        event
+        for event in store.get_workflow(WORKFLOW).events
+        if event.kind is WorkflowEventKind.OPERATOR_RECONCILED
+    ]
+    assert len(events) == 1, f"expected one operator event, found {events}"
+    (event,) = events
+    assert event.actor == actor, "the STS identity must be the event actor"
+    assert event.at == at, event
+    assert event.status == WorkflowStatus.SUPERSEDED.value, event
+    assert event.details["previous_status"] == WorkflowStatus.BLOCKED.value, event
+    assert event.details["reference"] == REFERENCE, event
+    assert event.details["terminalization"] == CLOSE_MARKER, event
+    assert event.details["plan_sha256"] == plan["plan_sha256"], event
+    assert event.details["admin_plan_sha256"] == "c" * 64, event
 
 
 def test_a_rerun_skips_what_an_earlier_apply_closed() -> None:

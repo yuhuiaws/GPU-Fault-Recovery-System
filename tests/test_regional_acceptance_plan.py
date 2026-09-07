@@ -59,8 +59,8 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
     assert plan.collect_all is False
     assert plan.read_only is False
     assert plan.repair_allowed is False
-    assert len(plan.execution_order) == 162
-    assert len(plan.cases) == 164
+    assert len(plan.execution_order) == 179
+    assert len(plan.cases) == 181
     assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-011", "GF-REGIONAL-BOOT-012")
     assert plan.execution_order[-1] == "GF-REGIONAL-COLLECT-015"
     assert plan.do_not_run_case_ids == ("GF-REGIONAL-DESTR-004", "GF-REGIONAL-AUTH-012")
@@ -233,9 +233,11 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
         if case.executor in {ExecutorKind.PYTEST, ExecutorKind.COMMAND}
         and not case.blocked
     ]
-    # 78 pytest + 27 command of the 164 cases. The number only moves when a case
-    # gains or loses a local answer, so it is stated rather than derived.
-    assert len(automated) == 105
+    # pytest + command cases plus the live-non-destructive manual cases whose
+    # related_pytest is a local proxy (NET-006, CMD-017, DESTR-020, ...) of the
+    # 181 cases. The number only moves when a case gains or loses a local
+    # answer, so it is stated rather than derived.
+    assert len(automated) == 112
     assert all(
         case.risk == "non-destructive" or case.local_proxy for case in automated
     ), [case.id for case in automated]

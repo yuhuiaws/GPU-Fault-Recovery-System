@@ -9,6 +9,13 @@ EnvironmentFile=/etc/gpu-fault/node-agent.env
 ExecStart=/opt/gpu-fault/current/venv/bin/gpu-fault-node-agent
 Restart=always
 RestartSec=5
+# The agent writes one structured INFO line per command accept/start/
+# completion (command_id, incident_id, operation, attempt, status, duration).
+# Keep them in the journal, unfiltered, under a stable identifier:
+#   journalctl -t gpu-fault-node-agent -g 'command_id='
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gpu-fault-node-agent
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

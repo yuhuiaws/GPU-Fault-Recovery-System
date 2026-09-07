@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
-
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from gpu_fault.processor import (
     ProcessorLaneLease,
@@ -14,10 +13,15 @@ from gpu_fault.processor import (
 from gpu_fault.store.contracts import (
     ProcessorQueueStats,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.processor_helpers import (
     fault_rows_blocked_by_observation as _fault_rows_blocked_by_observation,
+)
+from gpu_fault.store.shared.processor_helpers import (
     incomplete_observation_scope_keys as _incomplete_observation_scope_keys,
+)
+from gpu_fault.store.shared.processor_helpers import (
     pending_fault_scope_keys as _pending_fault_scope_keys,
 )
 
@@ -375,7 +379,7 @@ class MemoryProcessorQueueMixin:
             ][:limit]
             for request_id in request_ids:
                 del self._processor_requests[request_id]
-            return len(request_ids)
+            return log_cleanup("processor_request", request_ids)
 
     def active_backlog_is_lane_blocked(
         self,

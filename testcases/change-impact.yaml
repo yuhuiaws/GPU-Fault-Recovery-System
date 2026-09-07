@@ -108,9 +108,9 @@ rules:
       - tests/test_release_gates.py
       - tests/test_artifact_consistency.py
     regional_cases:
-      - GF-REGIONAL-BOOT-018..022
+      - GF-REGIONAL-BOOT-018..023
       - GF-REGIONAL-HA-005
-      - GF-REGIONAL-HA-007..009
+      - GF-REGIONAL-HA-007..010
     checks:
       - artifact-check
       - runtime-image-check
@@ -135,6 +135,7 @@ rules:
       - GF-REGIONAL-CAP-001..005
       - GF-REGIONAL-HA-003
       - GF-REGIONAL-HA-008..009
+      - GF-REGIONAL-PREEMPT-038
       - GF-REGIONAL-CMD-001..016
       - GF-REGIONAL-PREEMPT-001..035
     checks:
@@ -178,13 +179,14 @@ rules:
       - tests/regional/test_release_rollback_state.py
       - tests/test_artifact_consistency.py
     regional_cases:
-      - GF-REGIONAL-BOOT-018..022
+      - GF-REGIONAL-BOOT-018..023
       - GF-REGIONAL-HA-005
-      - GF-REGIONAL-HA-007..009
+      - GF-REGIONAL-HA-007..010
     approval_cases:
       - GF-REGIONAL-BOOT-019..020
+      - GF-REGIONAL-BOOT-023
       - GF-REGIONAL-HA-005
-      - GF-REGIONAL-HA-009
+      - GF-REGIONAL-HA-009..010
     checks:
       - config-check
       - deployment-contracts-check
@@ -307,10 +309,11 @@ rules:
       - tests/regional/test_regional_control_plane.py
       - tests/execution
     regional_cases:
-      - GF-REGIONAL-CMD-001..016
+      - GF-REGIONAL-CMD-001..018
       - GF-REGIONAL-HA-004
       - GF-REGIONAL-HA-006
       - GF-REGIONAL-NET-002..003
+      - GF-REGIONAL-NET-006..007
       - GF-REGIONAL-DESTR-018
     checks:
       - config-check
@@ -429,7 +432,7 @@ rules:
       - tests/policy
       - tests/hma
     regional_cases:
-      - GF-REGIONAL-COLLECT-001..017
+      - GF-REGIONAL-COLLECT-001..020
     checks:
       - xid-catalog-check
 
@@ -456,6 +459,7 @@ rules:
       - GF-REGIONAL-DESTR-016
       - GF-REGIONAL-DESTR-017
       - GF-REGIONAL-DESTR-018
+      - GF-REGIONAL-DESTR-019
       - GF-REGIONAL-COLLECT-013..014
     checks:
       - config-check
@@ -479,6 +483,7 @@ rules:
       - GF-REGIONAL-DESTR-011
       - GF-REGIONAL-DESTR-013..014
       - GF-REGIONAL-DESTR-016
+      - GF-REGIONAL-DESTR-022
       - GF-REGIONAL-ISO-004
 
   - id: notifications
@@ -496,7 +501,7 @@ rules:
       - tests/admin/test_admin_notifications.py
       - tests/admin/test_admin_notification_bootstrap.py
     regional_cases:
-      - GF-REGIONAL-NOTIFY-001..006
+      - GF-REGIONAL-NOTIFY-001..007
       - GF-REGIONAL-BOOT-013..014
 
   - id: network-retry
@@ -516,6 +521,7 @@ rules:
       - tests/processor/test_telemetry_spool.py
     regional_cases:
       - GF-REGIONAL-NET-001..005
+      - GF-REGIONAL-NET-008
       - GF-REGIONAL-HA-005
       - GF-REGIONAL-AUTH-013..014
     approval_cases:
@@ -541,6 +547,7 @@ rules:
     regional_cases:
       - GF-REGIONAL-CAP-001..005
       - GF-REGIONAL-HA-005..009
+      - GF-REGIONAL-PREEMPT-037
     approval_cases:
       - GF-REGIONAL-HA-005..007
       - GF-REGIONAL-HA-009
@@ -723,6 +730,7 @@ rules:
     regional_cases:
       - GF-REGIONAL-PREEMPT-001..035
       - GF-REGIONAL-E2E-001
+      - GF-REGIONAL-DESTR-020..021
     fallback: true
 
   - id: changed-tests

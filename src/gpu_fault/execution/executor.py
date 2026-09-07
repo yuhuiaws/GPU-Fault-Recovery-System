@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator, Mapping
+import os
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -30,7 +31,10 @@ from gpu_fault.execution.models import (
     _failure_details,
 )
 from gpu_fault.execution.remediation_budget import escalation_budget_claims
-from gpu_fault.execution.transient_errors import transient_store_error
+from gpu_fault.execution.transient_errors import (
+    retryable_adapter_error,
+    transient_store_error,
+)
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
@@ -84,6 +88,33 @@ HOLD_REASON_INCIDENT_NOT_RECOVERABLE = "INCIDENT_NOT_RECOVERABLE"
 DISPATCHER_WATCHDOG_ACTOR = "dispatcher-watchdog"
 DISPATCHER_INTERNAL_ERROR_ACTOR = "dispatcher-internal-error"
 DISPATCHER_ACTOR = "dispatcher"
+
+# ARCH-B1: ``details["reason"]`` of a step that is waiting only because its
+# adapter hit a retryable error (a Kubernetes 5xx, a torn connection). Not a
+# hold: nothing is being waited on but the next dispatcher tick.
+STEP_RETRY_REASON_ADAPTER_ERROR = "RETRYABLE_ADAPTER_ERROR"
+
+# ARCH-B3: called from the one place every terminal write lands, with the
+# workflow as written, the incident as written (``None`` when the incident row
+# is gone or belongs to a successor) and the steps the workflow executed.
+TerminalHook = Callable[
+    [WorkflowRequest, FaultIncident | None, list[WorkflowStepSpec]], None
+]
+
+
+def configured_step_transient_retry_limit(values: Mapping[str, str]) -> int:
+    """How many consecutive retryable adapter errors one step may absorb.
+
+    Past the limit the last error fails the step on the established path. Zero
+    disables the retry, which is the pre-ARCH-B1 behaviour.
+    """
+
+    limit = int(values.get("GPU_FAULT_WORKFLOW_STEP_TRANSIENT_RETRY_LIMIT", "5"))
+    if limit < 0:
+        raise WorkflowExecutionError(
+            "GPU_FAULT_WORKFLOW_STEP_TRANSIENT_RETRY_LIMIT must not be negative"
+        )
+    return limit
 
 
 def record_hold_event(
@@ -144,12 +175,28 @@ class ProductionWorkflowExecutor:
         config: ProductionExecutorConfig,
         *,
         notification_sender=None,
+        step_transient_retry_limit: int | None = None,
     ) -> None:
         if config.workflow_execution_timeout_seconds <= 0:
             raise WorkflowExecutionError("workflow execution timeout must be positive")
         self.store = store
         self.adapters = adapters
         self.config = config
+        # ARCH-B1: consecutive retryable adapter errors one step may absorb
+        # before the last one fails it; from the environment unless given.
+        self.step_transient_retry_limit = (
+            step_transient_retry_limit
+            if step_transient_retry_limit is not None
+            else configured_step_transient_retry_limit(os.environ)
+        )
+        if self.step_transient_retry_limit < 0:
+            raise WorkflowExecutionError(
+                "step transient retry limit must not be negative"
+            )
+        # ARCH-B3: release hooks for state that outlives the workflow record
+        # (a warm-spare reservation, a Kubernetes-side lease). The application
+        # context registers them; every terminal write calls each one.
+        self.on_terminal: list[TerminalHook] = []
         # F-N1: set by the application context; ``None`` keeps the
         # whole-workflow failure semantics for a failed node branch.
         self.branch_escalator: BranchEscalator | None = None
@@ -1141,13 +1188,17 @@ class ProductionWorkflowExecutor:
                 "preempted_by_workflow_id": successor.request_id,
             },
         )
-        restart_preflight.release_unattempted_restart_reservations(
-            self.store,
+        # The incident already names the successor, so nothing is written for
+        # it here (``incident=None``); the workflow itself ends through the
+        # same terminal funnel as every other ending (F-C9 release of the
+        # restart reservations, ARCH-B3 terminal hooks). The step about to
+        # run is released too: it never left the gate.
+        self._save_terminal(
             superseded,
+            None,
+            execution_epoch,
             release_step_indexes={next_index},
-            waiting_ttl=self._restart_waiting_ttl,
         )
-        self._save_leased(superseded, execution_epoch)
         LOGGER.info(
             "workflow safely superseded at step boundary: "
             "workflow=%s next_step=%s/%s successor=%s",
@@ -1975,11 +2026,23 @@ class ProductionWorkflowExecutor:
         workflow: WorkflowRequest,
         incident: FaultIncident | None,
         execution_epoch: int,
+        *,
+        release_step_indexes: set[int] | None = None,
     ) -> None:
+        """The one write every terminal transition lands through.
+
+        ``_terminalize`` (and so the dispatcher's ``terminalize_claimed``) and
+        the step-boundary preemption in ``_supersede_if_safe`` both end here:
+        the unattempted restart reservations are released (F-C9), the record
+        -- and the incident, when this workflow is still its plan -- is saved,
+        and the ``on_terminal`` hooks run once the write has landed (ARCH-B3).
+        """
+
         self._check_invariants(workflow)
         restart_preflight.release_unattempted_restart_reservations(
             self.store,
             workflow,
+            release_step_indexes=release_step_indexes,
             waiting_ttl=self._restart_waiting_ttl,
         )
         current_incident = (
@@ -2000,6 +2063,7 @@ class ProductionWorkflowExecutor:
                 self.config.executor_id,
                 execution_epoch,
             )
+            self._notify_terminal(workflow, None)
             return
         self.store.save_workflow_and_incident_if_leased(
             workflow,
@@ -2007,6 +2071,37 @@ class ProductionWorkflowExecutor:
             self.config.executor_id,
             execution_epoch,
         )
+        self._notify_terminal(workflow, incident)
+
+    def _notify_terminal(
+        self,
+        workflow: WorkflowRequest,
+        incident: FaultIncident | None,
+    ) -> None:
+        """Run every ``on_terminal`` hook, each isolated from the others.
+
+        A hook releases state the workflow held outside the store; a failure
+        there is logged and must neither stop the next hook nor unwind the
+        terminal write that already landed (ARCH-B3).
+        """
+
+        if not self.on_terminal:
+            return
+        steps = (
+            workflow.safety_steps
+            if workflow.executes_safety_steps
+            else workflow.official_steps
+        )
+        for hook in list(self.on_terminal):
+            try:
+                hook(workflow, incident, list(steps))
+            except Exception:  # noqa: BLE001 - one hook must not stop the rest
+                LOGGER.exception(
+                    "on_terminal hook failed: workflow=%s status=%s hook=%s",
+                    workflow.request_id,
+                    workflow.status.value,
+                    getattr(hook, "__qualname__", repr(hook)),
+                )
 
     def _execute_step(
         self,
@@ -2087,6 +2182,30 @@ class ProductionWorkflowExecutor:
                     exc,
                 )
                 raise
+            retryable = retryable_adapter_error(exc)
+            attempt = self._adapter_error_attempt(workflow, step, index)
+            if retryable and attempt <= self.step_transient_retry_limit:
+                # Symmetric with the store case (ARCH-B1): a Kubernetes 5xx or
+                # a torn connection says nothing about the node. The step
+                # waits for the next tick instead of failing into isolation;
+                # the per-step waiting cap (``step_bounds``) still bounds the
+                # wall-clock, this counter bounds the attempts.
+                LOGGER.warning(
+                    "workflow step hit a retryable adapter error and will be "
+                    "retried: workflow=%s step=%s/%s adapter=%s attempt=%s/%s "
+                    "error=%s: %s",
+                    workflow.request_id,
+                    index,
+                    step.operation.value,
+                    type(adapter).__name__,
+                    attempt,
+                    self.step_transient_retry_limit,
+                    type(exc).__name__,
+                    exc,
+                )
+                return self._retry_adapter_error_outcome(
+                    workflow, step, index, exc, attempt
+                )
             LOGGER.exception(
                 "workflow step raised: workflow=%s step=%s/%s "
                 "adapter=%s incident=%s nodes=%s",
@@ -2097,10 +2216,85 @@ class ProductionWorkflowExecutor:
                 incident.incident_id,
                 ",".join(step.node_ids),
             )
+            details = _failure_details(adapter, exc)
+            if retryable:
+                # The bound is exhausted: the last error fails the step on the
+                # established path, and the record says how many it absorbed.
+                details.update(
+                    {
+                        "retryable_adapter_error": True,
+                        "error_class": type(exc).__name__,
+                        "attempt": attempt,
+                        "retry_limit": self.step_transient_retry_limit,
+                        "reason": STEP_RETRY_REASON_ADAPTER_ERROR,
+                    }
+                )
             return WorkflowStepOutcome.failed(
                 f"{type(exc).__name__}: {exc}",
-                details=_failure_details(adapter, exc),
+                details=details,
             )
+
+    @staticmethod
+    def _adapter_error_attempt(
+        workflow: WorkflowRequest,
+        step: WorkflowStepSpec,
+        index: int,
+    ) -> int:
+        """Which consecutive retryable-error attempt this one is (ARCH-B1).
+
+        Read off the step's own last record: the count continues only while
+        that record is a retryable-error wait, so a run of errors after a
+        legitimate adapter wait starts again at one.
+        """
+
+        previous = step_bounds.previous_execution(workflow, step, index)
+        if (
+            previous is None
+            or previous.status is not WorkflowStepStatus.WAITING
+            or not previous.details.get("retryable_adapter_error")
+        ):
+            return 1
+        prior = previous.details.get("attempt")
+        return prior + 1 if isinstance(prior, int) and prior > 0 else 1
+
+    @staticmethod
+    def _retry_adapter_error_outcome(
+        workflow: WorkflowRequest,
+        step: WorkflowStepSpec,
+        index: int,
+        exc: BaseException,
+        attempt: int,
+    ) -> WorkflowStepOutcome:
+        """The WAITING outcome a retryable adapter error turns into (ARCH-B1).
+
+        ``record_attempt`` replaces the step's record with this outcome, so the
+        pointers a previous wait carried -- a remote command id and status, a
+        node-action command -- are kept: the adapter resumes polling them on
+        the next tick and the preemption boundary still sees the in-flight
+        command. A ``reason`` a previous hold recorded is kept for the same
+        reason; otherwise the record says why it waits.
+        """
+
+        previous = step_bounds.previous_execution(workflow, step, index)
+        inherited: dict[str, Any] = {}
+        operation_id: str | None = None
+        if previous is not None and previous.status is WorkflowStepStatus.WAITING:
+            inherited = dict(previous.details)
+            operation_id = previous.adapter_operation_id
+        details: dict[str, Any] = {
+            **inherited,
+            "retryable_adapter_error": True,
+            "error_class": type(exc).__name__,
+            "attempt": attempt,
+            "adapter_error": f"{type(exc).__name__}: {exc}"[:300],
+        }
+        details.setdefault("reason", STEP_RETRY_REASON_ADAPTER_ERROR)
+        return WorkflowStepOutcome(
+            status=WorkflowStepStatus.WAITING,
+            adapter_operation_id=operation_id,
+            error=f"{type(exc).__name__}: {exc}",
+            details=details,
+        )
 
     def _validate_fencing(
         self,

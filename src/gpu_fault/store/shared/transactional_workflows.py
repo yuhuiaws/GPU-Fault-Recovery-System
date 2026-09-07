@@ -4,8 +4,15 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
-from gpu_fault.models import FaultIncident, RecoveryPlan, WorkflowRequest
-from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
+from gpu_fault.models import (
+    FaultIncident,
+    RecoveryPlan,
+    WorkflowEvent,
+    WorkflowEventKind,
+    WorkflowRequest,
+    append_workflow_event,
+    record_operator_event,
+)
 from gpu_fault.store.shared.primitives import (
     GetLink,
     GetRecord,
@@ -14,8 +21,9 @@ from gpu_fault.store.shared.primitives import (
     StateTransaction,
 )
 from gpu_fault.retired_generation import retired_generation_records
-from gpu_fault.workflow_resolution import reconciled_restore_records
+from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
 from gpu_fault.store.shared.preemption import preemption_pending_update
+from gpu_fault.workflow_resolution import reconciled_restore_records
 
 if TYPE_CHECKING:
     from gpu_fault.regional import RemoteActionCommand
@@ -248,7 +256,17 @@ class TransactionalWorkflowMixin:
         self,
         request_id: str,
         updates: Mapping[str, object],
+        *,
+        event: WorkflowEvent | None = None,
     ) -> WorkflowRequest:
+        """Apply ``updates`` from outside the lease; see the Store contract.
+
+        ``event`` is appended to the row's audit history inside the same
+        transaction as the amend (I1), so an operator write and the record of
+        who made it cannot land separately. It is bounded like every other
+        event and costs no extra merge-revision bump.
+        """
+
         with self._state_transaction(f"workflow/{request_id}"):
             current = self._locked_optional("workflow", request_id)
             if current is None:
@@ -260,6 +278,8 @@ class TransactionalWorkflowMixin:
                     "updated_at": datetime.now(timezone.utc),
                 }
             )
+            if event is not None:
+                amended = append_workflow_event(amended, event)
             self._put("workflow", request_id, amended)
             return amended
 
@@ -298,7 +318,16 @@ class TransactionalWorkflowMixin:
         expected_workflow_updated_at: datetime | None = None,
         reference: str,
         reconciled_at: datetime,
+        actor: str | None = None,
+        approval: Mapping[str, object] | None = None,
     ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
+        """Terminalize a BLOCKED record whose successor restored the node.
+
+        ``actor`` (the operator's STS ARN) and ``approval`` (the plan digests
+        the operator approved) go on the ``OPERATOR_RECONCILED`` event appended
+        in this same transaction (I1); a refused write records nothing.
+        """
+
         with self._state_transaction(f"workflow_reconcile/{workflow_request_id}"):
             # Lock order rule: an unlocked read only to learn the incident,
             # then incident -> workflows (key order) -> plan; the pointer is
@@ -330,6 +359,20 @@ class TransactionalWorkflowMixin:
                     reconciled_at=reconciled_at,
                 )
             )
+            updated_workflow = record_operator_event(
+                updated_workflow,
+                WorkflowEventKind.OPERATOR_RECONCILED,
+                actor=actor,
+                reference=reference,
+                previous_status=workflow.status,
+                at=reconciled_at,
+                details={
+                    "successor_workflow_id": successor_workflow_id,
+                    "expected_fencing_token": expected_fencing_token,
+                    "expected_execution_epoch": expected_execution_epoch,
+                    **dict(approval or {}),
+                },
+            )
             self._put("workflow", workflow_request_id, updated_workflow)
             self._put("incident", incident.incident_id, updated_incident)
             self._put("plan", source_plan.plan_id, updated_plan)
@@ -343,8 +386,14 @@ class TransactionalWorkflowMixin:
         expected_fencing_token: int,
         reference: str | None,
         reconciled_at: datetime,
+        actor: str | None = None,
+        approval: Mapping[str, object] | None = None,
     ) -> tuple[WorkflowRequest, FaultIncident]:
         """Terminalize a workflow whose incident has moved to a later generation.
+
+        ``actor`` and ``approval`` go on the ``OPERATOR_RETIRED_GENERATION`` event
+        ``retired_generation_records`` appends for an operator write (one with a
+        ``reference``); the dispatcher's sweep passes neither and records none.
 
         Unlike ``reconcile_restored_workflow`` this takes no expected
         ``updated_at``. A retired generation is still being dispatched, and each
@@ -376,6 +425,8 @@ class TransactionalWorkflowMixin:
                 expected_fencing_token=expected_fencing_token,
                 reference=reference,
                 reconciled_at=reconciled_at,
+                actor=actor,
+                approval=approval,
             )
             self._put("workflow", workflow_request_id, updated_workflow)
             self._put("incident", incident.incident_id, updated_incident)

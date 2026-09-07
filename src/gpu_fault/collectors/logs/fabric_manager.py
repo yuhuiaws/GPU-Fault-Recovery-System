@@ -20,11 +20,15 @@ from gpu_fault.channel_registry import (
 
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
 from gpu_fault.collectors.scheduling import next_stable_phase
-from gpu_fault.collectors.sinks import CollectorError, EventSink
+from gpu_fault.collectors.sinks import CollectorError, EventSink, deliver_event
 from gpu_fault.env import env_bool
 from gpu_fault.telemetry import CollectorKind
 
 LOGGER = logging.getLogger(__name__)
+
+#: How many log files the collector keeps offsets for. A glob over rotated
+#: files grows the persisted table forever otherwise (ARCH-G9).
+DEFAULT_MAX_TRACKED_FILES = 256
 
 SXID_SUMMARY_PATTERN = re.compile(
     r"\bSXid\b\s*\(PCI:[0-9a-fA-F:.]+\)\s*:\s*\d+\s*,\s*"
@@ -54,11 +58,16 @@ class FabricManagerLogCollector:
         state_path: str | None = None,
         now: Callable[[], datetime] | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
+        max_tracked_files: int = DEFAULT_MAX_TRACKED_FILES,
     ) -> None:
+        if max_tracked_files < 1:
+            raise ValueError("Fabric Manager tracked file limit must be at least 1")
         self.sink = sink
         self.context = context
         self.node_id = node_id
         self.interval_seconds = interval_seconds
+        self.max_tracked_files = max_tracked_files
+        self._files_bound_warned = False
         self.journal_enabled = journal_enabled
         self.journal_identifiers = tuple(
             item.lower() for item in journal_identifiers if item
@@ -110,7 +119,8 @@ class FabricManagerLogCollector:
                     continue
                 checkpoint = record.pop("_checkpoint", None)
                 try:
-                    self.sink.post(
+                    result = deliver_event(
+                        self.sink,
                         FABRIC_MANAGER_PATH,
                         {
                             **self.context.model_dump(mode="json"),
@@ -119,11 +129,22 @@ class FabricManagerLogCollector:
                             "collected_at": collected_at.isoformat(),
                         },
                     )
+                    # Only a record that went nowhere pins the checkpoint; one
+                    # the outbox took is replayed from there (ARCH-G3).
+                    result.raise_for_failure()
                 except Exception:
                     if checkpoint is not None:
                         record["_checkpoint"] = checkpoint
                     raise
-                stats = stats.model_copy(update={"delivered": stats.delivered + 1})
+                if result.buffered:
+                    LOGGER.warning(
+                        "Fabric Manager record persisted to the collector "
+                        "outbox; advancing the checkpoint: record=%s error=%s",
+                        record.get("record_id"),
+                        result.error,
+                    )
+                else:
+                    stats = stats.model_copy(update={"delivered": stats.delivered + 1})
                 if checkpoint is not None:
                     record["_checkpoint"] = checkpoint
                 self._commit_record(record)
@@ -280,13 +301,26 @@ class FabricManagerLogCollector:
         )
 
     def _file_records(self, collected_at: datetime) -> list[dict[str, Any]]:
-        records = []
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for configured in self.log_paths:
             for path in sorted(Path("/").glob(configured.lstrip("/"))):
-                if not path.is_file():
+                try:
+                    if not path.is_file():
+                        continue
+                    stat = path.stat()
+                except OSError as exc:
+                    # Rotated away between the glob and the stat: the next
+                    # round sees the successor. One vanished sibling must
+                    # not abort the whole round (ARCH-G9).
+                    LOGGER.warning(
+                        "Fabric Manager log file unreadable this round: %s (%s)",
+                        path,
+                        exc,
+                    )
                     continue
-                stat = path.stat()
                 key = str(path)
+                seen.add(key)
                 previous = self._files.get(key)
                 identity_changed = previous is not None and (
                     previous.get("device") != stat.st_dev
@@ -366,7 +400,34 @@ class FabricManagerLogCollector:
                                 "evidence_ref": (f"file://{key}#{stable}"),
                             }
                         )
+        self._bound_tracked_files(seen)
         return records
+
+    def _bound_tracked_files(self, seen: set[str]) -> None:
+        """Forget the oldest offsets of files the glob no longer finds.
+
+        Files still present are never evicted: dropping a live file's offset
+        would re-baseline it at EOF next round and skip whatever it gained.
+        """
+
+        excess = len(self._files) - self.max_tracked_files
+        if excess <= 0:
+            return
+        stale = [key for key in self._files if key not in seen]
+        evicted = stale[:excess]
+        for key in evicted:
+            del self._files[key]
+        if evicted:
+            self._state_dirty = True
+        if not self._files_bound_warned:
+            self._files_bound_warned = True
+            LOGGER.warning(
+                "Fabric Manager tracked file table exceeded %d entries; "
+                "forgot %d stale offset(s), %d live file(s) kept",
+                self.max_tracked_files,
+                len(evicted),
+                len(self._files),
+            )
 
     def _is_fabric_manager(self, unit: str, identifier: str) -> bool:
         values = {

@@ -76,22 +76,53 @@ class MarkerRetirementStore(Protocol):
     def add_marker(self, marker: NodeMarker) -> None: ...
 
 
+#: Upper bounds on the retirement text written onto a marker. ``model_copy``
+#: does not validate, so the bound is applied here rather than on the model:
+#: a field constraint would let an over-long reason be written and then refuse
+#: to load the row.
+MARKER_RETIRED_TEXT_LIMIT = 512
+
+
+def _bounded_text(value: str | None) -> str | None:
+    if value is None or len(value) <= MARKER_RETIRED_TEXT_LIMIT:
+        return value
+    return value[: MARKER_RETIRED_TEXT_LIMIT - 1] + "…"
+
+
 def retire_markers_for_incident(
-    store: MarkerRetirementStore, incident_id: str, *, reason: str
+    store: MarkerRetirementStore,
+    incident_id: str,
+    *,
+    reason: str,
+    retired_by: str | None = None,
+    now: datetime | None = None,
 ) -> int:
     """Set ``active=False`` on every live marker of a recovered incident.
 
     ``add_marker`` upserts by ``marker_id`` in every store, so this rewrites
     the marker in place. Returns how many markers were retired. Safe to call
-    repeatedly: an already-retired marker is skipped.
+    repeatedly: an already-retired marker is skipped, so the first retirement's
+    ``retired_at`` / ``retired_reason`` / ``retired_by`` are what the marker
+    keeps (I4). ``retired_by`` names the path that retired it (the completion
+    service, the spare-health controller); ``now`` is the retirement time.
     """
     if not incident_id:
         return 0
+    retired_at = now if now is not None else datetime.now(timezone.utc)
     retired = 0
     for marker in store.list_markers_for_incident(incident_id):
         if not marker.active:
             continue
-        store.add_marker(marker.model_copy(update={"active": False}))
+        store.add_marker(
+            marker.model_copy(
+                update={
+                    "active": False,
+                    "retired_at": retired_at,
+                    "retired_reason": _bounded_text(reason),
+                    "retired_by": _bounded_text(retired_by),
+                }
+            )
+        )
         retired += 1
     if retired:
         LOGGER.info(

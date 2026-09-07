@@ -34,6 +34,7 @@ from gpu_fault.remote_command_models import (
     lease_deadline as lease_deadline,
 )
 from gpu_fault.store import NotFoundError
+from gpu_fault.store.shared.remote_helpers import workflow_step_space
 from gpu_fault.telemetry import EvidenceKind
 
 TOKEN_SLOT_CURRENT = "current"
@@ -668,6 +669,10 @@ class RegionalRemoteWorkflowAdapter:
         self.store = store
         self.owners = owners
         self.operations = operations or set(WorkflowOperation)
+        # How many dispatches were held because another command for the same
+        # (workflow, step index, step space) was still open (item D5). Read by
+        # the metrics family like the dispatcher's counters.
+        self.open_sibling_holds_total = 0
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner in self.owners and step.operation in self.operations
@@ -716,6 +721,37 @@ class RegionalRemoteWorkflowAdapter:
                 )
             ).encode()
         ).hexdigest()[:24]
+        command_id = f"remote-{digest}"
+        # The open-command invariant (architecture review 2026-09-07, item D5):
+        # the digest above changes whenever a merge rewrites the step's targets
+        # or parameters, but the physical action the previous digest named may
+        # still be executing on the node. One open command per step identity
+        # within a generation: while a sibling with another id is PENDING,
+        # LEASED or WAITING under this fencing token, hold rather than mint a
+        # second command. An older generation's command is the generation
+        # fence's business -- the claim and completion paths already refuse it.
+        sibling = self.store.find_open_remote_command(
+            context.workflow.request_id,
+            context.step_index,
+            workflow_step_space(context.workflow),
+            exclude_command_id=command_id,
+        )
+        if (
+            sibling is not None
+            and sibling.fencing_token == context.workflow.fencing_token
+        ):
+            self.open_sibling_holds_total += 1
+            return WorkflowStepOutcome.waiting(
+                operation_id=f"remote/{sibling.command_id}",
+                details={
+                    "reason": "OPEN_SIBLING_COMMAND",
+                    "remote_command_id": sibling.command_id,
+                    "remote_cluster_id": sibling.cluster_id,
+                    "remote_status": sibling.status.value,
+                    "held_command_id": command_id,
+                    "mutation_submitted_by_control_plane": False,
+                },
+            )
         restart_authorization = None
         restart_reservation: tuple[str, str, str] | None = None
         if context.step.operation is WorkflowOperation.RESTART_WORKLOAD:
@@ -764,7 +800,7 @@ class RegionalRemoteWorkflowAdapter:
                 reservation_id=context.idempotency_key,
             )
         command = RemoteActionCommand(
-            command_id=f"remote-{digest}",
+            command_id=command_id,
             cluster_id=context.incident.cluster_id,
             workflow_request_id=context.workflow.request_id,
             incident_id=context.incident.incident_id,

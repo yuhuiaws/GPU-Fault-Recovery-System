@@ -20,6 +20,7 @@ from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
     ReleaseExecutionPlan,
 )
+from gpu_fault_release.regional_release_history import record_release_history
 from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
 from gpu_fault_release.regional_release_narration import narrate_phase
 from gpu_fault_release.regional_release_probes import probe_source
@@ -41,6 +42,11 @@ from gpu_fault.release_state_snapshot import (
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 PREVIOUS_SNAPSHOT_LABEL = "gpu-fault.io/release-previous-snapshot"
 PREVIOUS_SNAPSHOT_DIGEST_ANNOTATION = "gpu-fault.io/snapshot-sha256"
+# Previous snapshots retained after a commit: the one the live state
+# references plus the newest others, so an operator can still diff the last
+# few baselines a release was rolled back to (review H5). Deleting all but
+# the current one left no way to reconstruct what a rollback restored.
+PREVIOUS_SNAPSHOTS_RETAINED = 3
 MAX_RELEASE_STATE_BYTES = 700 * 1024
 MAX_CAPTURE_WORKERS = 8
 SENSITIVE_CONFIG_KEY = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
@@ -1194,6 +1200,34 @@ def ensure_previous_snapshot(
     return reference
 
 
+def _snapshot_groups(items: list[dict[str, Any]]) -> list[list[str]]:
+    """Chunk ConfigMap names grouped per snapshot, newest snapshot first."""
+
+    groups: dict[str, tuple[str, list[str]]] = {}
+    for item in items:
+        metadata = item.get("metadata") or {}
+        name = str(metadata.get("name") or "")
+        if not name:
+            continue
+        annotations = metadata.get("annotations") or {}
+        # Chunks of one snapshot share the digest annotation; the name prefix
+        # (everything before the chunk index) is the fallback for old chunks.
+        digest = str(annotations.get(PREVIOUS_SNAPSHOT_DIGEST_ANNOTATION) or "")
+        key = digest or name.rsplit("-", 1)[0]
+        created = str(metadata.get("creationTimestamp") or "")
+        existing = groups.get(key)
+        if existing is None:
+            groups[key] = (created, [name])
+        else:
+            groups[key] = (max(existing[0], created), [*existing[1], name])
+    return [
+        sorted(names)
+        for _created, names in sorted(
+            groups.values(), key=lambda value: value[0], reverse=True
+        )
+    ]
+
+
 def cleanup_previous_snapshots(release: Any) -> None:
     if release.runner.dry_run:
         return
@@ -1213,11 +1247,16 @@ def cleanup_previous_snapshots(release: Any) -> None:
             f"{PREVIOUS_SNAPSHOT_LABEL}=true",
         )
     )
+    groups = _snapshot_groups(list(value.get("items", [])))
+    retained: list[list[str]] = [group for group in groups if keep.intersection(group)]
+    for group in groups:
+        if len(retained) >= PREVIOUS_SNAPSHOTS_RETAINED:
+            break
+        if group not in retained:
+            retained.append(group)
+    retained_names = {name for group in retained for name in group}
     stale = sorted(
-        str((item.get("metadata") or {}).get("name") or "")
-        for item in value.get("items", [])
-        if str((item.get("metadata") or {}).get("name") or "")
-        and str((item.get("metadata") or {}).get("name") or "") not in keep
+        name for group in groups for name in group if name not in retained_names
     )
     if stale:
         release.runner.run(
@@ -1321,11 +1360,14 @@ def template_bundle(
 
 def save_state(release: Any, phase: str, **updates: Any) -> None:
     with state_transaction(release):
-        _write_state(release, phase, **updates)
+        state_text = _write_state(release, phase, **updates)
         narrate_phase(release, phase)
+        # After the checkpoint: the history entry is a record of a transition
+        # that survived, and its digest is of the document that was written.
+        record_release_history(release, phase=phase, state_text=state_text)
 
 
-def _write_state(release: Any, phase: str, **updates: Any) -> None:
+def _write_state(release: Any, phase: str, **updates: Any) -> str:
     if release.state.get("release_id") not in {None, release.release_id}:
         release.state.pop("adopted_live_runtime_image", None)
     release.state.update(
@@ -1424,7 +1466,7 @@ def _write_state(release: Any, phase: str, **updates: Any) -> None:
     )
     _persisted, text = render_persisted_state(release)
     if release.runner.dry_run:
-        return
+        return text
     # Every component STARTED/FAILED transition checkpoints this ConfigMap, so
     # the write is one `apply` of a manifest built in-process instead of a
     # temp file plus a `create --dry-run=client` render round-trip. The manifest
@@ -1443,6 +1485,7 @@ def _write_state(release: Any, phase: str, **updates: Any) -> None:
             }
         ),
     )
+    return text
 
 
 def load_state(release: Any) -> dict[str, Any]:

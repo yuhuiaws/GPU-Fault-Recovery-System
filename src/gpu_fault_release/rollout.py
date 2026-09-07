@@ -113,6 +113,8 @@ from gpu_fault_release.regional_release_online_registry import (
     drain_registry_cluster,
     fail_join_registry,
     prepare_join_registry,
+    publish_restored_registry,
+    publish_staged_registry,
     purge_registry_cluster,
     revoke_registry_cluster,
     rollback_join_registry,
@@ -515,6 +517,8 @@ class RegionalRelease:
     _save_state = save_state
     _cleanup_previous_snapshots = cleanup_previous_snapshots
     _stage_registry = stage_registry
+    _publish_staged_registry = publish_staged_registry
+    _publish_restored_registry = publish_restored_registry
     _stamp_gpu_deployments = stamp_gpu_deployments
     _template_bundle = template_bundle
     _update_registry = update_registry

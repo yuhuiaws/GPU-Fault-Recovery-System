@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from threading import RLock
-
+from typing import Any
 
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
@@ -12,13 +15,64 @@ from gpu_fault.node_agent.protocol import (
     NodeActionStatus,
 )
 
+LOGGER = logging.getLogger(__name__)
+
+# ``PRAGMA user_version`` of a ledger whose ``results`` table is keyed by
+# ``(command_id, attempt)``. Ledgers written before that carry version 0 and a
+# single-row-per-command table; they are migrated in place on open.
+LEDGER_SCHEMA_VERSION = 2
+DEFAULT_RETENTION_SECONDS = 30 * 24 * 3600
+
+_RESULTS_TABLE = """
+CREATE TABLE IF NOT EXISTS results (
+    command_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    completed_at TEXT,
+    state TEXT NOT NULL DEFAULT 'COMPLETED',
+    operation TEXT,
+    started_at TEXT,
+    incident_id TEXT,
+    workflow_request_id TEXT,
+    fencing_token INTEGER,
+    gpu_uuids TEXT,
+    parameters_digest TEXT,
+    signature_digest TEXT,
+    exit_code INTEGER,
+    PRIMARY KEY (command_id, attempt)
+)
+"""
+
+_AUDIT_COLUMNS = (
+    "attempt",
+    "state",
+    "operation",
+    "started_at",
+    "completed_at",
+    "incident_id",
+    "workflow_request_id",
+    "fencing_token",
+    "gpu_uuids",
+    "parameters_digest",
+    "signature_digest",
+    "exit_code",
+)
+
+
+def canonical_digest(value: Any) -> str:
+    """sha256 of the canonical JSON form; what the ledger keeps of parameters."""
+
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
 
 class NodeActionLedger:
     def __init__(
         self,
         path: str,
         *,
-        retention_seconds: int = 604800,
+        retention_seconds: int = DEFAULT_RETENTION_SECONDS,
         max_results: int = 10000,
     ) -> None:
         if retention_seconds < 600:
@@ -34,15 +88,6 @@ class NodeActionLedger:
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute(
             """
-            CREATE TABLE IF NOT EXISTS results (
-                command_id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                completed_at TEXT
-            )
-            """
-        )
-        self._db.execute(
-            """
             CREATE TABLE IF NOT EXISTS fencing (
                 incident_id TEXT PRIMARY KEY,
                 token INTEGER NOT NULL,
@@ -50,16 +95,16 @@ class NodeActionLedger:
             )
             """
         )
-        self._ensure_column("results", "completed_at", "TEXT")
-        self._ensure_column("results", "attempt", "INTEGER NOT NULL DEFAULT 1")
-        self._ensure_column(
-            "results",
-            "state",
-            "TEXT NOT NULL DEFAULT 'COMPLETED'",
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ledger_health (
+                id INTEGER PRIMARY KEY,
+                probed_at TEXT
+            )
+            """
         )
-        self._ensure_column("results", "operation", "TEXT")
-        self._ensure_column("results", "started_at", "TEXT")
         self._ensure_column("fencing", "updated_at", "TEXT")
+        self._migrate_results_table()
         self._interrupt_in_progress()
         self.cleanup()
 
@@ -68,20 +113,107 @@ class NodeActionLedger:
         if column not in columns:
             self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+    def _migrate_results_table(self) -> None:
+        """Bring ``results`` to the per-attempt schema without losing rows.
+
+        Nodes upgrade with a populated ledger. SQLite cannot change a primary
+        key in place, so the old table is renamed, the new one created, and
+        the rows copied -- one transaction, so a crash mid-way leaves either
+        the old or the new table, never neither.
+        """
+
+        version = int(self._db.execute("PRAGMA user_version").fetchone()[0])
+        if version >= LEDGER_SCHEMA_VERSION:
+            return
+        has_results = self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='results'"
+        ).fetchone()
+        if not has_results:
+            self._db.execute(_RESULTS_TABLE)
+            self._db.execute(f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}")
+            return
+        # The pre-audit code added these lazily; a ledger opened only by a
+        # very old agent may still be missing some.
+        self._ensure_column("results", "completed_at", "TEXT")
+        self._ensure_column("results", "attempt", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column("results", "state", "TEXT NOT NULL DEFAULT 'COMPLETED'")
+        self._ensure_column("results", "operation", "TEXT")
+        self._ensure_column("results", "started_at", "TEXT")
+        legacy_rows = int(
+            self._db.execute("SELECT COUNT(*) FROM results").fetchone()[0]
+        )
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.execute("ALTER TABLE results RENAME TO results_legacy")
+            self._db.execute(_RESULTS_TABLE)
+            self._db.execute(
+                """
+                INSERT INTO results(
+                    command_id, attempt, payload, completed_at, state,
+                    operation, started_at
+                )
+                SELECT command_id, attempt, payload, completed_at, state,
+                       operation, started_at
+                FROM results_legacy
+                """
+            )
+            self._db.execute("DROP TABLE results_legacy")
+            self._db.execute(f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}")
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+        LOGGER.info(
+            "node action ledger migrated to per-attempt schema "
+            "schema_version=%d rows=%d",
+            LEDGER_SCHEMA_VERSION,
+            legacy_rows,
+        )
+
     def get(self, command_id: str) -> NodeActionResult | None:
+        """The latest attempt's result, or None while it is still running."""
+
         with self._lock:
             row = self._db.execute(
-                "SELECT state, payload FROM results WHERE command_id=?",
+                """
+                SELECT state, payload FROM results
+                WHERE command_id=?
+                ORDER BY attempt DESC
+                LIMIT 1
+                """,
                 (command_id,),
             ).fetchone()
         if row and row[0] == "IN_PROGRESS":
             return None
         return NodeActionResult.model_validate_json(row[1]) if row else None
 
+    def attempt_history(self, command_id: str) -> list[dict[str, Any]]:
+        """Every attempt of one command, oldest first: the audit view."""
+
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT "
+                + ", ".join(_AUDIT_COLUMNS)
+                + " FROM results WHERE command_id=? ORDER BY attempt",
+                (command_id,),
+            ).fetchall()
+        history = []
+        for row in rows:
+            entry = dict(zip(_AUDIT_COLUMNS, row))
+            entry["command_id"] = command_id
+            raw_uuids = entry.get("gpu_uuids")
+            entry["gpu_uuids"] = (
+                json.loads(raw_uuids) if isinstance(raw_uuids, str) else None
+            )
+            history.append(entry)
+        return history
+
     def mark_in_progress(
         self,
         command: NodeActionCommand,
         attempt: int,
+        *,
+        signature: str | None = None,
     ) -> None:
         marker = NodeActionResult(
             command_id=command.command_id,
@@ -96,24 +228,40 @@ class NodeActionLedger:
             self._db.execute(
                 """
                 INSERT INTO results(
-                    command_id, payload, completed_at, attempt,
-                    state, operation, started_at
-                ) VALUES (?, ?, NULL, ?, 'IN_PROGRESS', ?, ?)
-                ON CONFLICT(command_id) DO UPDATE SET
+                    command_id, attempt, payload, completed_at, state,
+                    operation, started_at, incident_id, workflow_request_id,
+                    fencing_token, gpu_uuids, parameters_digest,
+                    signature_digest
+                ) VALUES (?, ?, ?, NULL, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(command_id, attempt) DO UPDATE SET
                     payload=excluded.payload,
                     completed_at=NULL,
-                    attempt=excluded.attempt,
                     state='IN_PROGRESS',
                     operation=excluded.operation,
-                    started_at=excluded.started_at
-                WHERE excluded.attempt >= results.attempt
+                    started_at=excluded.started_at,
+                    incident_id=excluded.incident_id,
+                    workflow_request_id=excluded.workflow_request_id,
+                    fencing_token=excluded.fencing_token,
+                    gpu_uuids=excluded.gpu_uuids,
+                    parameters_digest=excluded.parameters_digest,
+                    signature_digest=excluded.signature_digest
                 """,
                 (
                     command.command_id,
-                    marker.model_dump_json(),
                     attempt,
+                    marker.model_dump_json(),
                     command.operation.value,
                     now,
+                    command.incident_id,
+                    command.workflow_request_id,
+                    command.fencing_token,
+                    json.dumps(list(command.gpu_uuids)),
+                    canonical_digest(command.parameters),
+                    (
+                        hashlib.sha256(signature.encode()).hexdigest()
+                        if signature
+                        else None
+                    ),
                 ),
             )
 
@@ -121,12 +269,12 @@ class NodeActionLedger:
         with self._lock:
             rows = self._db.execute(
                 """
-                SELECT command_id, payload, attempt
+                SELECT command_id, attempt, payload
                 FROM results
                 WHERE state='IN_PROGRESS'
                 """
             ).fetchall()
-            for command_id, payload, attempt in rows:
+            for command_id, attempt, payload in rows:
                 marker = NodeActionResult.model_validate_json(payload)
                 interrupted = marker.model_copy(
                     update={
@@ -144,38 +292,41 @@ class NodeActionLedger:
                     """
                     UPDATE results
                     SET payload=?, completed_at=?, state='INTERRUPTED'
-                    WHERE command_id=?
+                    WHERE command_id=? AND attempt=?
                     """,
                     (
                         interrupted.model_dump_json(),
                         interrupted.completed_at.isoformat(),
                         command_id,
+                        attempt,
                     ),
                 )
 
-    def save(self, result: NodeActionResult) -> None:
+    def save(self, result: NodeActionResult, *, exit_code: int | None = None) -> None:
+        """Record one attempt's result; audit columns set at start are kept."""
+
         with self._lock:
             self._db.execute(
                 """
                 INSERT INTO results(
-                    command_id, payload, completed_at, attempt,
-                    state, operation
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(command_id) DO UPDATE SET
+                    command_id, attempt, payload, completed_at, state,
+                    operation, exit_code
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(command_id, attempt) DO UPDATE SET
                     payload=excluded.payload,
                     completed_at=excluded.completed_at,
-                    attempt=excluded.attempt,
                     state=excluded.state,
-                    operation=excluded.operation
-                WHERE excluded.attempt >= results.attempt
+                    operation=excluded.operation,
+                    exit_code=COALESCE(excluded.exit_code, results.exit_code)
                 """,
                 (
                     result.command_id,
+                    result.attempt,
                     result.model_dump_json(),
                     result.completed_at.isoformat(),
-                    result.attempt,
                     result.status.value,
                     result.operation.value,
+                    exit_code,
                 ),
             )
         self._maybe_cleanup()
@@ -186,6 +337,27 @@ class NodeActionLedger:
                 "DELETE FROM results WHERE command_id=?",
                 (command_id,),
             )
+
+    def probe_writable(self) -> None:
+        """Raise ``sqlite3.Error`` unless a write commits right now.
+
+        ``/healthz`` calls this: a read-only or full filesystem under the
+        ledger means every accepted command will fail at ``mark_in_progress``,
+        which is worth a 503 before the first command arrives.
+        """
+
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO ledger_health(id, probed_at) VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET probed_at=excluded.probed_at
+                """,
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
 
     def _maybe_cleanup(self) -> None:
         now = time.monotonic()
@@ -208,11 +380,11 @@ class NodeActionLedger:
             overflow = self._db.execute(
                 """
                 DELETE FROM results
-                WHERE command_id IN (
-                    SELECT command_id
+                WHERE (command_id, attempt) IN (
+                    SELECT command_id, attempt
                     FROM results
                     WHERE state != 'IN_PROGRESS'
-                    ORDER BY completed_at DESC, command_id DESC
+                    ORDER BY completed_at DESC, command_id DESC, attempt DESC
                     LIMIT -1 OFFSET ?
                 )
                 """,
@@ -227,10 +399,16 @@ class NodeActionLedger:
                 (cutoff,),
             ).rowcount
             self._last_cleanup_monotonic = time.monotonic()
-        return {
-            "results": results + overflow,
-            "fencing": fencing,
-        }
+        removed = {"results": results + overflow, "fencing": fencing}
+        LOGGER.info(
+            "node action ledger retention purge results=%d fencing=%d "
+            "retention_seconds=%d max_results=%d",
+            removed["results"],
+            removed["fencing"],
+            self.retention_seconds,
+            self.max_results,
+        )
+        return removed
 
     def accept_fencing(self, incident_id: str, token: int) -> bool:
         with self._lock:

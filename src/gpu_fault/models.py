@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -557,6 +558,14 @@ class NodeMarker(StrictModel):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     )
     active: bool = True
+    # Why, when and by whom the marker was retired (I4). Retirement used to be
+    # an ``active=False`` upsert whose reason lived in a log line only, so the
+    # marker table could say a node was cleared but never why. Optional so a
+    # payload written before these fields still loads; ``markers`` bounds the
+    # text before writing because ``model_copy`` does not validate.
+    retired_at: datetime | None = None
+    retired_reason: str | None = None
+    retired_by: str | None = None
 
     @model_validator(mode="after")
     def validate_window(self) -> NodeMarker:
@@ -773,6 +782,16 @@ class WorkflowEventKind(StrEnum):
     PREEMPTION = "PREEMPTION"
     HOLD = "HOLD"
     TERMINAL = "TERMINAL"
+    # Operator writes (``gpu-fault-admin workflow-reconcile``): who closed the
+    # record, under which approval, from which status (I1). ``kind`` is
+    # enum-typed, so a row carrying one of these does not load on a release
+    # that predates them; they are only written by an operator action taken
+    # after this release is live, never by the runtime on its own.
+    OPERATOR_RECONCILED = "OPERATOR_RECONCILED"
+    OPERATOR_RETIRED_GENERATION = "OPERATOR_RETIRED_GENERATION"
+    # One marker at the seam of a bounded history saying how much was dropped
+    # and over what time range (I5).
+    HISTORY_TRUNCATED = "HISTORY_TRUNCATED"
 
 
 class WorkflowEventCode(StrEnum):
@@ -816,6 +835,11 @@ class WorkflowEventCode(StrEnum):
     # Placement hold (orchestrator opens, dispatcher dissolves)
     PLACEMENT_HOLD_OPENED = "PLACEMENT_HOLD_OPENED"
     PLACEMENT_HOLD_DISSOLVED = "PLACEMENT_HOLD_DISSOLVED"
+    # Operator reconciliation (``record_operator_event`` via the Store)
+    OPERATOR_RECONCILED = "OPERATOR_RECONCILED"
+    OPERATOR_RETIRED_GENERATION = "OPERATOR_RETIRED_GENERATION"
+    # Bounded history (``append_workflow_event``)
+    HISTORY_TRUNCATED = "HISTORY_TRUNCATED"
 
 
 class WorkflowEvent(StrictModel):
@@ -976,18 +1000,53 @@ def lifetime_exceeded(workflow: "WorkflowRequest", now: datetime | None = None) 
 # keeps re-reporting) grew the list without bound and squeezed the row (F-J6).
 INCIDENT_REASONS_LIMIT = 200
 
+# The one entry a truncated reason list keeps at its seam (I5). Reasons carry
+# no clock, so the marker can only say how many were dropped; it is parsed back
+# on the next bound so the count accumulates instead of a second marker
+# appearing.
+REASONS_TRUNCATED_PREFIX = "[reasons truncated]"
+_REASONS_TRUNCATED_MARKER = re.compile(
+    r"^\[reasons truncated\] (\d+) earlier reasons dropped$"
+)
+
+
+def _reasons_truncated_marker(dropped: int) -> str:
+    return f"{REASONS_TRUNCATED_PREFIX} {dropped} earlier reasons dropped"
+
 
 def bounded_reasons(
     values: Iterable[str], *, limit: int = INCIDENT_REASONS_LIMIT
 ) -> list[str]:
     """Deduplicated reasons within ``limit``: the first half of the budget
-    keeps the reasons the incident opened with, the rest the most recent."""
+    keeps the reasons the incident opened with, the rest the most recent.
 
-    unique = list(dict.fromkeys(values))
-    if len(unique) <= limit:
+    When the budget overflows, one marker at the seam between the two halves
+    records how many reasons have been dropped so far, so a full list reads as
+    "the middle is missing" rather than as a quiet incident. The bound holds
+    with the marker counted; below three entries there is no room for a seam
+    and the plain head-plus-tail shape is kept.
+    """
+
+    previously_dropped = 0
+    unique: list[str] = []
+    for value in dict.fromkeys(values):
+        match = _REASONS_TRUNCATED_MARKER.fullmatch(value)
+        if match is not None:
+            previously_dropped += int(match.group(1))
+            continue
+        unique.append(value)
+    if limit < 3:
+        if len(unique) <= limit:
+            return unique
+        head = limit // 2
+        return [*unique[:head], *unique[-(limit - head) :]]
+    if previously_dropped == 0 and len(unique) <= limit:
         return unique
     head = limit // 2
-    return [*unique[:head], *unique[-(limit - head) :]]
+    tail = limit - head - 1
+    dropped = previously_dropped + max(0, len(unique) - head - tail)
+    recent = unique[-tail:] if len(unique) > head + tail else unique[head:]
+    return [*unique[:head], _reasons_truncated_marker(dropped), *recent]
 
 
 def resolved_step_indexes(workflow: "WorkflowRequest") -> frozenset[int]:
@@ -1047,11 +1106,193 @@ def record_workflow_event(
         dag_revision=workflow.dag_revision,
         details=dict(details or {}),
     )
+    return append_workflow_event(workflow, event)
+
+
+def append_workflow_event(
+    workflow: "WorkflowRequest", event: WorkflowEvent
+) -> "WorkflowRequest":
+    """Return ``workflow`` with ``event`` appended, inside the event budget.
+
+    The bound is the one ``record_workflow_event`` documents: the first fifth
+    of the budget keeps the events the workflow opened with, the rest the most
+    recent. When the budget overflows, one ``HISTORY_TRUNCATED`` marker sits at
+    the seam (I5) saying how many events were dropped and the ``at`` range they
+    covered, accumulating across overflows so there is only ever one. The bound
+    holds with the marker counted. Callers that already built a ``WorkflowEvent``
+    (an amend that must land its audit event in the same transaction) come in
+    here; everything else goes through ``record_workflow_event``.
+    """
+
     events = [*workflow.events, event]
-    if len(events) > WORKFLOW_EVENTS_LIMIT:
-        head = WORKFLOW_EVENTS_LIMIT // 5
-        events = [*events[:head], *events[-(WORKFLOW_EVENTS_LIMIT - head) :]]
-    return workflow.model_copy(update={"events": events})
+    if len(events) <= WORKFLOW_EVENTS_LIMIT:
+        return workflow.model_copy(update={"events": events})
+    head = WORKFLOW_EVENTS_LIMIT // 5
+    tail = WORKFLOW_EVENTS_LIMIT - head - 1
+    previously_dropped = 0
+    dropped_from: str | None = None
+    remaining: list[WorkflowEvent] = []
+    for item in events:
+        if item.kind is not WorkflowEventKind.HISTORY_TRUNCATED:
+            remaining.append(item)
+            continue
+        raw_dropped = item.details.get("dropped")
+        previously_dropped += int(raw_dropped) if isinstance(raw_dropped, int) else 0
+        raw_from = item.details.get("dropped_from")
+        if dropped_from is None and isinstance(raw_from, str):
+            dropped_from = raw_from
+    dropped_events = remaining[head : len(remaining) - tail]
+    dropped = previously_dropped + len(dropped_events)
+    dropped_to: str | None
+    if dropped_events:
+        if dropped_from is None:
+            dropped_from = dropped_events[0].at.isoformat()
+        dropped_to = dropped_events[-1].at.isoformat()
+        marker_at = dropped_events[-1].at
+    else:
+        dropped_to = dropped_from
+        marker_at = remaining[head - 1].at if head else event.at
+    marker = WorkflowEvent(
+        kind=WorkflowEventKind.HISTORY_TRUNCATED,
+        at=marker_at,
+        code=WorkflowEventCode.HISTORY_TRUNCATED.value,
+        reason=(
+            f"{dropped} events dropped from this history between "
+            f"{dropped_from} and {dropped_to}"
+        ),
+        dag_revision=workflow.dag_revision,
+        details={
+            "dropped": dropped,
+            "dropped_from": dropped_from,
+            "dropped_to": dropped_to,
+        },
+    )
+    kept = [*remaining[:head], marker, *remaining[len(remaining) - tail :]]
+    return workflow.model_copy(update={"events": kept})
+
+
+# The actor an operator event names when ``aws sts get-caller-identity`` could
+# not be resolved: never empty, so the gap itself is on the record.
+UNKNOWN_OPERATOR_IDENTITY = "unknown-identity"
+OPERATOR_EVENT_TEXT_LIMIT = 512
+OPERATOR_EVENT_ITEMS_LIMIT = 50
+
+
+def bounded_event_details(details: Mapping[str, Any]) -> dict[str, Any]:
+    """``details`` cut down to what an event row should carry.
+
+    Strings are truncated to ``OPERATOR_EVENT_TEXT_LIMIT``, lists to
+    ``OPERATOR_EVENT_ITEMS_LIMIT`` entries (with a count of what was cut), and
+    nested mappings are bounded the same way one level down; anything else is
+    rendered as text. Events are for ids, digests and statuses, not payloads.
+    """
+
+    def bound(value: Any, *, depth: int) -> Any:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            if len(value) <= OPERATOR_EVENT_TEXT_LIMIT:
+                return value
+            return value[: OPERATOR_EVENT_TEXT_LIMIT - 1] + "\u2026"
+        if isinstance(value, Mapping) and depth < 2:
+            return {
+                str(key): bound(item, depth=depth + 1) for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set, frozenset)) and depth < 2:
+            items = (
+                sorted(value, key=str)
+                if isinstance(value, (set, frozenset))
+                else list(value)
+            )
+            bounded = [
+                bound(item, depth=depth + 1)
+                for item in items[:OPERATOR_EVENT_ITEMS_LIMIT]
+            ]
+            if len(items) > OPERATOR_EVENT_ITEMS_LIMIT:
+                bounded.append(
+                    f"\u2026(+{len(items) - OPERATOR_EVENT_ITEMS_LIMIT} more)"
+                )
+            return bounded
+        return bound(str(value), depth=depth)
+
+    return {str(key): bound(value, depth=0) for key, value in details.items()}
+
+
+def record_operator_event(
+    workflow: "WorkflowRequest",
+    kind: WorkflowEventKind,
+    *,
+    actor: str | None,
+    reference: str | None,
+    previous_status: "WorkflowStatus | str",
+    details: Mapping[str, Any] | None = None,
+    at: datetime | None = None,
+) -> "WorkflowRequest":
+    """Return ``workflow`` with the audit event of an operator write appended.
+
+    ``workflow`` is the record *after* the write, so ``status`` on the event is
+    the new status and ``previous_status`` is what the operator moved it from.
+    ``actor`` is the STS caller ARN the admin CLI resolved, or
+    ``UNKNOWN_OPERATOR_IDENTITY`` when it could not be; ``reference`` is the
+    operator's ticket; ``details`` carries the approval digests and the ids the
+    write bound (the per-record projection of the archived ``applied.json``),
+    bounded by ``bounded_event_details``.
+    """
+
+    previous = (
+        previous_status.value
+        if isinstance(previous_status, WorkflowStatus)
+        else str(previous_status)
+    )
+    payload: dict[str, Any] = {
+        "reference": reference,
+        "previous_status": previous,
+        "new_status": workflow.status.value,
+        **dict(details or {}),
+    }
+    return record_workflow_event(
+        workflow,
+        kind,
+        code=kind.value,
+        actor=actor or UNKNOWN_OPERATOR_IDENTITY,
+        status=workflow.status.value,
+        reason=(
+            f"operator reconciliation {reference}"
+            if reference
+            else "operator reconciliation"
+        ),
+        details=bounded_event_details(payload),
+        at=at,
+    )
+
+
+def build_operator_event(
+    workflow: "WorkflowRequest",
+    kind: WorkflowEventKind,
+    *,
+    actor: str | None,
+    reference: str | None,
+    previous_status: "WorkflowStatus | str",
+    details: Mapping[str, Any] | None = None,
+    at: datetime | None = None,
+) -> WorkflowEvent:
+    """The event ``record_operator_event`` would append, without appending it.
+
+    For writers that hand the event to the Store separately -- ``amend_workflow``
+    lands it in the same transaction as the amend -- so the amend and its audit
+    record cannot be written apart. The newest event always survives the bound,
+    so the last event of the appended copy is the one built.
+    """
+
+    return record_operator_event(
+        workflow,
+        kind,
+        actor=actor,
+        reference=reference,
+        previous_status=previous_status,
+        details=details,
+        at=at,
+    ).events[-1]
 
 
 def execution_phase(workflow: "WorkflowRequest") -> StepPhase:

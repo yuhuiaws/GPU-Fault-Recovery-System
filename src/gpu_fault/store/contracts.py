@@ -3,12 +3,12 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
 from typing import (
-    Collection,
-    Mapping,
     TYPE_CHECKING,
     Any,
     Callable,
+    Collection,
     Iterable,
+    Mapping,
     Protocol,
     TypedDict,
     runtime_checkable,
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         RecoveryPlan,
         TerminalEvent,
         TriageReport,
+        WorkflowEvent,
         WorkflowRequest,
         WorkflowStatus,
     )
@@ -320,7 +321,15 @@ class WorkflowStore(Protocol):
         expected_workflow_updated_at: datetime | None = None,
         reference: str,
         reconciled_at: datetime,
-    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]: ...
+        actor: str | None = None,
+        approval: Mapping[str, object] | None = None,
+    ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
+        """Terminalize a BLOCKED record whose successor restored the node.
+
+        ``actor`` and ``approval`` go on the ``OPERATOR_RECONCILED`` event
+        appended in the same transaction (audit trail I1).
+        """
+        ...
 
     def reconcile_retired_generation_workflow(
         self,
@@ -330,11 +339,42 @@ class WorkflowStore(Protocol):
         expected_fencing_token: int,
         reference: str | None,
         reconciled_at: datetime,
-    ) -> tuple[WorkflowRequest, FaultIncident]: ...
+        actor: str | None = None,
+        approval: Mapping[str, object] | None = None,
+    ) -> tuple[WorkflowRequest, FaultIncident]:
+        """Terminalize a workflow whose incident moved to a later generation.
+
+        ``actor`` and ``approval`` go on the ``OPERATOR_RETIRED_GENERATION``
+        event an operator write (one with a ``reference``) appends; the
+        dispatcher's sweep passes neither and records none (audit trail I1).
+        """
+        ...
 
     def get_incident(self, incident_id: str) -> FaultIncident: ...
 
-    def save_incident(self, incident: FaultIncident) -> None: ...
+    def save_incident(
+        self,
+        incident: FaultIncident,
+        *,
+        expected: FaultIncident | None = None,
+    ) -> None:
+        """Write one incident row and its event link without overwriting a row
+        that has moved (architecture review 2026-09-07, item D1).
+
+        Without ``expected`` the write is version-guarded like
+        ``save_workflow``: a missing row is inserted; an existing row is
+        replaced only while its ``fencing_token`` is not ahead of the caller's
+        copy -- the generation only moves forward, so a lower token is a copy
+        read before a generation change. That raises :class:`StaleWriteError`
+        naming the field. ``state``, ``reasons`` and
+        ``workflow_request_id`` are what callers and the reconcile paths change
+        through this method, so they are not guarded this way: a caller that
+        read the row and writes it back (the coordinator's reason trail, the
+        executor's terminal state, the retired-generation audit) must pass its
+        read copy as ``expected``, which makes the write a full compare-and-set
+        on the payload it read.
+        """
+        ...
 
     def get_incident_by_event(self, event_id: str) -> FaultIncident | None: ...
 
@@ -371,6 +411,8 @@ class WorkflowStore(Protocol):
         self,
         request_id: str,
         updates: Mapping[str, object],
+        *,
+        event: WorkflowEvent | None = None,
     ) -> WorkflowRequest:
         """Apply ``updates`` to a live workflow row from outside its lease.
 
@@ -378,6 +420,8 @@ class WorkflowStore(Protocol):
         stale copy fails its next leased write and re-reads (F-B1). Used for
         out-of-band verdicts: the job was withdrawn (F-N1 §7), the plan was
         rewritten after a node-busy timeout (F-N1 §8). Raises NotFoundError.
+        ``event`` is appended to the row's audit history in the same write,
+        bounded, without a second merge-revision bump (audit trail I1).
         """
         ...
 
@@ -588,6 +632,27 @@ class WorkflowStore(Protocol):
         item D)."""
         ...
 
+    def find_open_remote_command(
+        self,
+        workflow_request_id: str,
+        step_index: int,
+        command_step_space: str,
+        *,
+        exclude_command_id: str | None = None,
+    ) -> RemoteActionCommand | None:
+        """The oldest open (PENDING/LEASED/WAITING) command for one step identity.
+
+        The step identity is (workflow, step index, step space) -- safety and
+        official steps share indexes (F-C2); ``command_step_space`` is
+        ``"official"`` or ``"safety"`` (``remote_helpers.workflow_step_space``).
+        Command ids are digests of the whole step, so a merge that rewrites a
+        step's targets or parameters gives the next dispatch a new id while the
+        old command may still be executing; the adapter asks this before it
+        creates a command and holds instead (architecture review 2026-09-07,
+        item D5). ``exclude_command_id`` leaves the caller's own id out.
+        """
+        ...
+
     def cancel_remote_commands_for_workflow(
         self,
         workflow_request_id: str,
@@ -736,7 +801,21 @@ class CompletionStore(Protocol):
 
     def save_diagnostic(self, request: DiagnosticRequest) -> None: ...
 
-    def save_plan(self, plan: RecoveryPlan) -> None: ...
+    def save_plan(
+        self,
+        plan: RecoveryPlan,
+        *,
+        expected: RecoveryPlan | None = None,
+    ) -> None:
+        """Upsert one plan row; with ``expected`` only while it still equals it.
+
+        ``RecoveryPlan`` has no version field, so the unconditional form stays
+        a blind upsert. Callers that read the plan and write it back -- the
+        dispatcher's status mirror -- pass the copy they read as ``expected``
+        and get :class:`StaleWriteError` instead of overwriting a reconcile
+        that landed in between (architecture review 2026-09-07, item D2).
+        """
+        ...
 
     def get_plan(self, plan_id: str) -> RecoveryPlan: ...
 
@@ -806,6 +885,20 @@ class NotificationStore(Protocol):
     ) -> list[AdvisoryNotification]: ...
 
     def notification_status_counts(self) -> dict[NotificationStatus, int]: ...
+
+    def notification_delivery_stats(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """The outbox state machine as an aggregate (ARCH-E E1).
+
+        ``by_status`` counts delivery rows per ``NotificationDeliveryStatus`` as
+        the outbox treats them (a row whose result is already SENT counts as
+        SENT, a SKIPPED verdict on an undelivered row counts as DEAD);
+        ``pending`` is the undelivered count and ``oldest_pending_age_seconds``
+        how long the oldest of them has waited since it was queued or last
+        re-queued. Read by ``/metrics``; never decodes a notification body.
+        """
+        ...
 
     def save_notification_result(self, result: NotificationResult) -> None: ...
 

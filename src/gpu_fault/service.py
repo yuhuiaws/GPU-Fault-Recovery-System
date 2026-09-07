@@ -817,6 +817,7 @@ class CompletionService:
                     f"incident recovered for attempt {incident.attempt_id}; "
                     f"terminal of attempt {event.attempt_id} goes to triage"
                 ),
+                retired_by="completion-service",
             )
         return live
 

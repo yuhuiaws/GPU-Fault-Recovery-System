@@ -326,6 +326,11 @@ class MultiNodeBarrier(StrictModel):
     updated_at: datetime
 
 
+# The two verdicts ``FleetRegistry._annotate_pin_drift`` can reach for a
+# mismatched pin: the node is behind the fleet, or the pin is ahead of it.
+PIN_DRIFT_KINDS = ("NODE_STALE", "PIN_AHEAD_OF_FLEET")
+
+
 class FleetRegistry:
     _deployment_status = staticmethod(deployment_status)
     _active_wave = staticmethod(active_deployment_wave)
@@ -367,6 +372,11 @@ class FleetRegistry:
         self.now = now or (lambda: datetime.now(timezone.utc))
         self._lock = RLock()
         self._node_locks = tuple(RLock() for _ in range(64))
+        # ARCH-E E5: drifted nodes by cluster and kind as of that cluster's
+        # latest readiness evaluation. PIN_AHEAD_OF_FLEET used to exist only
+        # as a readiness reason, so a pin nobody had shipped stalled every
+        # node action on the cluster without a single exported signal.
+        self.pin_drift_nodes: dict[str, dict[str, int]] = {}
 
     def register(self, envelope: SignedAgentHeartbeat) -> AgentRecord:
         heartbeat = envelope.heartbeat
@@ -676,6 +686,8 @@ class FleetRegistry:
         off to "restart the agent" on a node that is already current.
         """
         pins = self._pinned_fields()
+        drift_counts = {kind: 0 for kind in PIN_DRIFT_KINDS}
+        self.pin_drift_nodes[cluster_id] = drift_counts
         if not pins or not records:
             return
         drifted = {
@@ -697,6 +709,7 @@ class FleetRegistry:
         fleet = self._live_fleet_agents(self._fleet_agents(cluster_id, records))
         for node_id, items in drifted.items():
             hints = []
+            kinds: set[str] = set()
             for label, attribute, required in items:
                 aligned = sorted(
                     agent.node_id
@@ -705,6 +718,7 @@ class FleetRegistry:
                     and agent.node_id != node_id
                 )
                 if aligned:
+                    kinds.add("NODE_STALE")
                     shown = ", ".join(aligned[:3])
                     hints.append(
                         f"{label} drift is NODE_STALE: "
@@ -713,12 +727,15 @@ class FleetRegistry:
                         f"the agent on {node_id}"
                     )
                 else:
+                    kinds.add("PIN_AHEAD_OF_FLEET")
                     hints.append(
                         f"{label} drift is PIN_AHEAD_OF_FLEET: no live "
                         f"agent in {cluster_id} runs the pinned value; "
                         f"correct the control-plane pin or roll out the "
                         f"build first"
                     )
+            for kind in kinds:
+                drift_counts[kind] += 1
             result = results[node_id]
             results[node_id] = result.model_copy(
                 update={"reasons": [*result.reasons, *hints]}

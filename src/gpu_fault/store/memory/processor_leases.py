@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 from gpu_fault.processor import (
     PeriodicTaskLease,
     ProcessorLeadership,
     ProcessorRequestStatus,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import StaleFencingTokenError
 
 
@@ -400,4 +400,4 @@ class MemoryProcessorLeaseMixin:
             ][:limit]
             for key in victims:
                 del self._processor_lanes[key]
-            return len(victims)
+            return log_cleanup("processor_lane", victims)

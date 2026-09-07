@@ -52,30 +52,33 @@ def start_processor_threads(
     def run_dispatch() -> None:
         next_dispatch = 0.0
         while not stop.wait(0.05):
-            if not context.dispatcher.config.enabled or not services_are_active():
-                continue
-            now = time.monotonic()
-            if not (now >= next_dispatch or context.dispatcher.consume_wake()):
-                continue
+            # The whole cycle sits inside the guard: the enabled/active reads
+            # used to run outside it, so one raise there ended the thread
+            # silently while the Pod stayed Ready (review H1).
             try:
+                if not context.dispatcher.config.enabled or not services_are_active():
+                    continue
+                now = time.monotonic()
+                if not (now >= next_dispatch or context.dispatcher.consume_wake()):
+                    continue
                 context.dispatcher.run_once()
+                next_dispatch = now + context.dispatcher.config.poll_interval_seconds
             except Exception:
                 LOGGER.exception("workflow dispatch cycle failed")
-            next_dispatch = now + context.dispatcher.config.poll_interval_seconds
 
     def run_xid_correlation() -> None:
         next_xid = 0.0
         while not stop.wait(0.05):
-            if not services_are_active():
-                continue
-            now = time.monotonic()
-            if now < next_xid:
-                continue
             try:
+                if not services_are_active():
+                    continue
+                now = time.monotonic()
+                if now < next_xid:
+                    continue
                 context.xid_correlation.run_once()
+                next_xid = now + context.xid_correlation.poll_interval_seconds
             except Exception:
                 LOGGER.exception("XID correlation cycle failed")
-            next_xid = now + context.xid_correlation.poll_interval_seconds
 
     periodic_runner = PeriodicServiceRunner(
         context=context,

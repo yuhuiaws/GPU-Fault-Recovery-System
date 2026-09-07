@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -178,6 +179,10 @@ class NodeActionExecutionService:
             len(context.step.node_ids),
             self.adapter.max_parallel_node_actions,
         )
+        # Worker threads start with an empty context, so the regional
+        # executor's lease guard (a context variable) would not reach the
+        # per-node sends. Each task runs in a copy of this thread's context.
+        contexts = [contextvars.copy_context() for _ in context.step.node_ids]
         with ThreadPoolExecutor(
             max_workers=workers,
             thread_name_prefix="gpu-fault-node-action",
@@ -185,7 +190,10 @@ class NodeActionExecutionService:
             return dict(
                 zip(
                     context.step.node_ids,
-                    executor.map(send, context.step.node_ids),
+                    executor.map(
+                        lambda item: item[0].run(send, item[1]),
+                        zip(contexts, context.step.node_ids),
+                    ),
                 )
             )
 
@@ -251,9 +259,17 @@ class NodeActionExecutionService:
                     "reason": result.error,
                 },
             )
+        failure_details: dict[str, Any] = {
+            "gpu_client_quiesce_attempt": state.verify_attempt
+        }
+        if result.details.get("node_action_retry_exhausted"):
+            # The transport turned a retryable failure terminal after the
+            # re-submit bound; the attempt count and last error it recorded
+            # are the operator's only view of what the agent tried.
+            failure_details.update(result.details)
         return WorkflowStepOutcome.failed(
             f"node agent {node_id}: {result.error or 'action failed'}",
-            details={"gpu_client_quiesce_attempt": state.verify_attempt},
+            details=failure_details,
         )
 
     @staticmethod

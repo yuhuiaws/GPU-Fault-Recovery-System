@@ -5,12 +5,14 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Callable
 
+from gpu_fault.adapters.kubernetes.primitives import patch_node_with_retry
 from gpu_fault.host_health import (
     NodeHealthCategory,
     NodeHealthFinding,
 )
 from gpu_fault.hyperpod_spares import (
     SPARE_POOL_STATE_ANNOTATION,
+    SPARE_RESERVED_AT_ANNOTATION,
     HyperPodSpareCoordinator,
     SparePoolState,
 )
@@ -19,7 +21,9 @@ from gpu_fault.models import (
     AdvisoryNotification,
     RecoveryAction,
     Severity,
+    WorkflowOperation,
     WorkflowStatus,
+    WorkflowStepStatus,
     WorkloadState,
 )
 from gpu_fault.store import NotFoundError
@@ -47,6 +51,84 @@ class SpareHealthReasonClass(StrEnum):
     HARDWARE = "HARDWARE"
 
 
+class SpareReservationReclaimer:
+    """Decides whether a warm-spare reservation still has a living owner."""
+
+    def __init__(
+        self,
+        coordinator: HyperPodSpareCoordinator,
+        store: Any,
+        *,
+        now: Callable[[], datetime],
+        ttl_seconds: float,
+    ) -> None:
+        self.coordinator = coordinator
+        self.store = store
+        self.now = now
+        self.ttl_seconds = ttl_seconds
+
+    def reason(
+        self,
+        node_name: str,
+        kubernetes_node: Any,
+        reservation: str,
+    ) -> str | None:
+        """Why a reservation no longer has an owner, or ``None`` to keep it.
+
+        A spare a successful failover consumed is a training node now and is
+        never touched, nor is any node still running GPU pods. With a store,
+        the owning workflow decides: terminal means orphaned. Without one
+        (the regional executor runs storeless), or when the incident is
+        unknown, only the reservation timestamp can decide, so a reservation
+        written before the timestamp existed is kept -- a documented limit.
+        """
+        if self.coordinator._active_gpu_pod_reasons(node_name):
+            return None
+        annotations = HyperPodSpareHealthController._annotations(kubernetes_node)
+        reserved_at = HyperPodSpareHealthController._timestamp(
+            annotations.get(SPARE_RESERVED_AT_ANNOTATION),
+            node_name=node_name,
+            annotation=SPARE_RESERVED_AT_ANNOTATION,
+        )
+        expired = (
+            reserved_at is not None
+            and (self.now() - reserved_at).total_seconds() >= self.ttl_seconds
+        )
+        ttl_reason = f"reservation by {reservation} exceeded {self.ttl_seconds:g}s TTL"
+        if self.store is None:
+            return ttl_reason if expired else None
+        try:
+            incident = self.store.get_incident(reservation)
+        except NotFoundError:
+            return ttl_reason if expired else None
+        workflow = None
+        if incident.workflow_request_id:
+            try:
+                workflow = self.store.get_workflow(incident.workflow_request_id)
+            except NotFoundError:
+                workflow = None
+        if workflow is not None:
+            consumed = any(
+                execution.operation is WorkflowOperation.REPLACE_NODE
+                and execution.status is WorkflowStepStatus.SUCCEEDED
+                and node_name in (execution.details.get("activated_spare_nodes") or [])
+                for execution in workflow.step_executions
+            )
+            if consumed:
+                return None
+            if workflow.status in {
+                WorkflowStatus.PENDING,
+                WorkflowStatus.SAFETY_PENDING,
+                WorkflowStatus.RUNNING,
+            }:
+                return ttl_reason if expired else None
+            return (
+                f"workflow {workflow.request_id} of {reservation} is "
+                f"{workflow.status.value}"
+            )
+        return f"incident {reservation} has no workflow"
+
+
 class HyperPodSpareHealthController:
     """Continuously remediates declared, unallocated HyperPod spares."""
 
@@ -61,6 +143,7 @@ class HyperPodSpareHealthController:
         unavailable_recheck_seconds: float = 3600,
         unavailable_alert_seconds: float = 86400,
         now: Callable[[], datetime] | None = None,
+        reservation_ttl_seconds: float = 86400,
     ) -> None:
         if failure_threshold < 1:
             raise ValueError("failure_threshold must be positive")
@@ -75,10 +158,35 @@ class HyperPodSpareHealthController:
             raise ValueError("unavailable_alert_seconds must be positive")
         self.unavailable_recheck_seconds = unavailable_recheck_seconds
         self.unavailable_alert_seconds = unavailable_alert_seconds
+        if reservation_ttl_seconds < 1:
+            raise ValueError("reservation_ttl_seconds must be positive")
+        self.reservation_ttl_seconds = reservation_ttl_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
+        self.reclaimer = SpareReservationReclaimer(
+            coordinator,
+            store,
+            now=self.now,
+            ttl_seconds=reservation_ttl_seconds,
+        )
+        self._active_reservations = 0
+        self._reclaimed_reservations = 0
+        self._reservations_observed_at: datetime | None = None
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """Gauge-able reservation state from the last ``scan``."""
+        return {
+            "spare_reservations_active": self._active_reservations,
+            "spare_reservations_reclaimed_total": self._reclaimed_reservations,
+            "spare_reservations_observed_at": (
+                self._reservations_observed_at.isoformat()
+                if self._reservations_observed_at is not None
+                else None
+            ),
+        }
 
     def scan(self) -> list[dict[str, Any]]:
         results = []
+        active_reservations = 0
         lifecycle = self.coordinator.lifecycle
         for node in lifecycle.list_nodes(enrich=True):
             if (
@@ -91,7 +199,25 @@ class HyperPodSpareHealthController:
                 continue
             try:
                 kubernetes_node = self.coordinator.core.read_node(node_name)
-                if self.coordinator._annotation(kubernetes_node):
+                reservation = self.coordinator._annotation(kubernetes_node)
+                if reservation:
+                    reason = self.reclaimer.reason(
+                        node_name, kubernetes_node, reservation
+                    )
+                    if reason is None:
+                        active_reservations += 1
+                        continue
+                    self.coordinator.release([node_name], reservation)
+                    self._reclaimed_reservations += 1
+                    results.append(
+                        {
+                            "node_id": node_name,
+                            "state": SpareHealthState.SUSPECT.value,
+                            "reasons": ["reclaimed stale spare reservation: " + reason],
+                            "incident_id": reservation,
+                            "notification_id": None,
+                        }
+                    )
                     continue
                 results.append(
                     self._reconcile(
@@ -112,6 +238,8 @@ class HyperPodSpareHealthController:
                         ["spare health reconciliation failed"],
                     )
                 )
+        self._active_reservations = active_reservations
+        self._reservations_observed_at = self.now()
         return results
 
     def _reconcile(
@@ -322,6 +450,7 @@ class HyperPodSpareHealthController:
                 self.store,
                 incident_id,
                 reason=f"spare {node_name} rechecked healthy after remediation",
+                retired_by="spare-health",
             )
         except Exception:  # noqa: BLE001 - never undo a HEALTHY verdict for this
             LOGGER.exception(
@@ -647,43 +776,45 @@ class HyperPodSpareHealthController:
         unavailable_at: datetime | None | object = ...,
         last_alert_at: datetime | None | object = ...,
     ) -> None:
-        node = self.coordinator.core.read_node(node_name)
-        body = {
-            "metadata": {
-                "resourceVersion": (self.coordinator._resource_version(node)),
-                "annotations": {
-                    HEALTH_ANNOTATION: state.value,
-                    FAILURES_ANNOTATION: str(failures),
-                    INCIDENT_ANNOTATION: incident_id,
-                    SPARE_POOL_STATE_ANNOTATION: (self._pool_state(state).value),
-                    **(
-                        {}
-                        if unavailable_at is ...
-                        else {
-                            UNAVAILABLE_AT_ANNOTATION: (
-                                unavailable_at.isoformat()
-                                if isinstance(unavailable_at, datetime)
-                                else None
-                            )
-                        }
-                    ),
-                    **(
-                        {}
-                        if last_alert_at is ...
-                        else {
-                            LAST_ALERT_AT_ANNOTATION: (
-                                last_alert_at.isoformat()
-                                if isinstance(last_alert_at, datetime)
-                                else None
-                            )
-                        }
-                    ),
-                },
+        def body(node: Any) -> dict[str, Any]:
+            patch: dict[str, Any] = {
+                "metadata": {
+                    "resourceVersion": (self.coordinator._resource_version(node)),
+                    "annotations": {
+                        HEALTH_ANNOTATION: state.value,
+                        FAILURES_ANNOTATION: str(failures),
+                        INCIDENT_ANNOTATION: incident_id,
+                        SPARE_POOL_STATE_ANNOTATION: (self._pool_state(state).value),
+                        **(
+                            {}
+                            if unavailable_at is ...
+                            else {
+                                UNAVAILABLE_AT_ANNOTATION: (
+                                    unavailable_at.isoformat()
+                                    if isinstance(unavailable_at, datetime)
+                                    else None
+                                )
+                            }
+                        ),
+                        **(
+                            {}
+                            if last_alert_at is ...
+                            else {
+                                LAST_ALERT_AT_ANNOTATION: (
+                                    last_alert_at.isoformat()
+                                    if isinstance(last_alert_at, datetime)
+                                    else None
+                                )
+                            }
+                        ),
+                    },
+                }
             }
-        }
-        if unschedulable is not None:
-            body["spec"] = {"unschedulable": unschedulable}
-        self.coordinator.core.patch_node(node_name, body)
+            if unschedulable is not None:
+                patch["spec"] = {"unschedulable": unschedulable}
+            return patch
+
+        patch_node_with_retry(self.coordinator.core, node_name, body)
 
     @staticmethod
     def _health_state(value: str | None, *, node_name: str) -> SpareHealthState:

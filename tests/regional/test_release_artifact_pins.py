@@ -172,6 +172,11 @@ def test_rollback_uses_previous_executor_and_node_pins(
     )
     monkeypatch.setattr(
         release,
+        "_publish_restored_registry",
+        lambda: restore_calls.append("publish-registry") or {},
+    )
+    monkeypatch.setattr(
+        release,
         "_restore_cpu_role_config_maps",
         lambda snapshots: restore_calls.append(("config-maps", snapshots)) or True,
     )
@@ -281,9 +286,11 @@ def test_rollback_uses_previous_executor_and_node_pins(
 
     assert restore_calls == [
         "registry",
+        "publish-registry",
         "registry",
+        "publish-registry",
         ("config-maps", previous["cpu_role_config_maps"]),
-    ]
+    ], "a restored registry backup must be republished to the durable head"
     cpu_applies = [
         kwargs
         for args, kwargs in release.runner.calls

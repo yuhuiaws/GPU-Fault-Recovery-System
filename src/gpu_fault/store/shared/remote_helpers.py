@@ -1,10 +1,45 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from gpu_fault.remote_command_models import RemoteCommandStatus
 
+if TYPE_CHECKING:
+    from gpu_fault.models import WorkflowRequest
+    from gpu_fault.regional import RemoteActionCommand
+
 UNCLAIMED_DEADLINE_STATUS_SOURCE = "unclaimed-deadline-exceeded"
+
+# Which step list a remote command was compiled from. Safety and official
+# steps share indexes (F-C2), so the open-command invariant of item D5 is keyed
+# by (workflow, step_index, step space); the command carries the workflow it
+# was minted from, whose ``safety_only`` flag says which list that was.
+COMMAND_STEP_SPACE_OFFICIAL = "official"
+COMMAND_STEP_SPACE_SAFETY = "safety"
+OPEN_REMOTE_COMMAND_STATUSES = frozenset(
+    {
+        RemoteCommandStatus.PENDING,
+        RemoteCommandStatus.LEASED,
+        RemoteCommandStatus.WAITING,
+    }
+)
+
+
+def workflow_step_space(workflow: WorkflowRequest) -> str:
+    """The step space a command minted from ``workflow`` belongs to."""
+
+    return (
+        COMMAND_STEP_SPACE_SAFETY
+        if workflow.executes_safety_steps
+        else COMMAND_STEP_SPACE_OFFICIAL
+    )
+
+
+def remote_command_step_space(command: RemoteActionCommand) -> str:
+    return workflow_step_space(command.workflow)
+
+
 LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS = frozenset(
     {
         "ValueError: node is already isolated by another incident/token",

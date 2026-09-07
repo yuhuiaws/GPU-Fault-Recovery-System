@@ -8,6 +8,7 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Callable, Protocol
@@ -38,6 +39,29 @@ def is_retryable_delivery_status(status_code: int | None) -> bool:
     return status_code is None or status_code >= 500 or status_code in {408, 425, 429}
 
 
+#: Authentication verdicts a collector treats as "not now" (ARCH-G2). A cluster
+#: token rotates, and for the length of the rotation window every node gets a
+#: 401/403 from a control plane that will accept the same event a minute later.
+#: A live token-drift incident held every node's fault stream for exactly that
+#: long because these were dead-lettered. The completion outbox keeps the
+#: stricter shared rule above: its records are node-action results whose
+#: token is per workflow, not per cluster.
+AUTH_TRANSIENT_STATUSES = frozenset({401, 403})
+
+
+def is_retryable_collector_status(status_code: int | None) -> bool:
+    """Whether a collector may try the same event again later.
+
+    The shared rule plus the two authentication codes: a token rotation
+    window is transient, and the event behind it is still real.
+    """
+
+    return (
+        is_retryable_delivery_status(status_code)
+        or status_code in AUTH_TRANSIENT_STATUSES
+    )
+
+
 class CollectorError(RuntimeError):
     def __init__(
         self,
@@ -55,6 +79,168 @@ class CollectorError(RuntimeError):
 
 class EventSink(Protocol):
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class DeliveryStatus(StrEnum):
+    """What became of one event handed to a sink (ARCH-G3)."""
+
+    #: The control plane accepted it.
+    DELIVERED = "DELIVERED"
+    #: The live post failed for a transient reason and the durable outbox took
+    #: the record; it will be replayed. For a collector's cursor this is as good
+    #: as delivered -- re-reading the source would only duplicate the record.
+    BUFFERED = "BUFFERED"
+    #: Neither delivered nor buffered: the event is lost unless the caller keeps
+    #: its own cursor pinned.
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    status: DeliveryStatus
+    response: dict[str, Any] | None = None
+    error: CollectorError | None = None
+
+    @property
+    def delivered(self) -> bool:
+        return self.status is DeliveryStatus.DELIVERED
+
+    @property
+    def buffered(self) -> bool:
+        return self.status is DeliveryStatus.BUFFERED
+
+    @property
+    def failed(self) -> bool:
+        return self.status is DeliveryStatus.FAILED
+
+    def raise_for_failure(self) -> None:
+        """Re-raise the sink's error when the event went nowhere."""
+
+        if not self.failed:
+            return
+        if self.error is not None:
+            raise self.error
+        raise CollectorError("collector event delivery failed")
+
+
+def _result_for_error(exc: CollectorError) -> DeliveryResult:
+    if exc.buffered and exc.replayable:
+        return DeliveryResult(DeliveryStatus.BUFFERED, error=exc)
+    return DeliveryResult(DeliveryStatus.FAILED, error=exc)
+
+
+def deliver_event(
+    sink: EventSink, path: str, payload: dict[str, Any]
+) -> DeliveryResult:
+    """Hand ``payload`` to ``sink`` and say what became of it, without raising.
+
+    "Buffered means delivered" is the sink's contract, owned here rather than
+    re-derived by each collector (ARCH-G3): only the kernel collector used to
+    read ``exc.buffered and exc.replayable``, the node log collector rolled its
+    journal cursor back and re-read the same window every poll, and the Fabric
+    Manager collector pinned its offset on the first SXID the outbox had
+    already taken. Sinks that implement ``deliver`` answer directly; any other
+    ``post``-only sink is wrapped. Exceptions other than ``CollectorError``
+    still propagate: they are the caller's failure, not a delivery verdict.
+    """
+
+    deliver = getattr(sink, "deliver", None)
+    if callable(deliver):
+        result = deliver(path, payload)
+        if isinstance(result, DeliveryResult):
+            return result
+    try:
+        response = sink.post(path, payload)
+    except CollectorError as exc:
+        return _result_for_error(exc)
+    return DeliveryResult(DeliveryStatus.DELIVERED, response=response)
+
+
+@dataclass(frozen=True)
+class OutboxFile:
+    """The durable NDJSON outbox one collector writes (ARCH-G2).
+
+    Shared by the sink and the ``gpu-fault-collector outbox`` command so an
+    operator reads exactly the records the sink will replay.
+    """
+
+    path: Path
+
+    def read(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        records = []
+        text = self.path.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                records.append(value)
+        return records
+
+    def write(self, records: list[dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(
+            "".join(
+                json.dumps(item, separators=(",", ":"), default=str) + "\n"
+                for item in records
+            ),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.path)
+
+    @staticmethod
+    def summarize(
+        records: list[dict[str, Any]], *, evictions_total: int = 0
+    ) -> dict[str, Any]:
+        replayable = sum(1 for record in records if record.get("replayable"))
+        failed_at = sorted(
+            str(record["failed_at"])
+            for record in records
+            if isinstance(record.get("failed_at"), str)
+        )
+        return {
+            "depth": len(records),
+            "replayable": replayable,
+            "dead": len(records) - replayable,
+            "evictions_total": evictions_total,
+            "oldest_failed_at": failed_at[0] if failed_at else None,
+        }
+
+    def stats(self) -> dict[str, Any]:
+        return self.summarize(self.read())
+
+    @staticmethod
+    def describe(index: int, record: dict[str, Any]) -> str:
+        """One line per record for an operator; never the payload."""
+
+        error = str(record.get("error") or "")[:120].replace("\n", " ")
+        state = "replayable" if record.get("replayable") else "dead"
+        return (
+            f"{index}\t{record.get('path')}\t{state}\t"
+            f"{record.get('failed_at')}\t{error}"
+        )
+
+    def requeue_dead(self, *, path_filter: str | None = None) -> int:
+        """Mark dead-lettered records replayable again; returns how many."""
+
+        records = self.read()
+        requeued = 0
+        for record in records:
+            if record.get("replayable"):
+                continue
+            if path_filter is not None and record.get("path") != path_filter:
+                continue
+            record["replayable"] = True
+            previous = str(record.get("error") or "")
+            record["error"] = f"requeued by operator: {previous}"[:500]
+            requeued += 1
+        if requeued:
+            self.write(records)
+        return requeued
 
 
 @dataclass(frozen=True)
@@ -139,6 +325,7 @@ class HttpEventSink:
         )
         if self.gzip_min_bytes < 0:
             raise ValueError("collector gzip threshold must not be negative")
+        self.outbox_evictions_total = 0
         self._outbox_lock = Lock()
         self._outbox_replay_state_lock = Lock()
         self._outbox_replay_active = False
@@ -163,6 +350,29 @@ class HttpEventSink:
         result = self._post_with_retry(path, payload, buffer_failure=True)
         self._kick_outbox_replay()
         return result
+
+    def deliver(self, path: str, payload: dict[str, Any]) -> DeliveryResult:
+        """``post`` that answers with a :class:`DeliveryResult` instead of raising.
+
+        A record the outbox took is ``BUFFERED``; anything else that failed
+        is ``FAILED`` with the error attached. See :func:`deliver_event`.
+        """
+
+        try:
+            response = self.post(path, payload)
+        except CollectorError as exc:
+            return _result_for_error(exc)
+        return DeliveryResult(DeliveryStatus.DELIVERED, response=response)
+
+    def outbox_stats(self) -> dict[str, Any]:
+        """Depth, replayable/dead split, evictions and the oldest failure."""
+
+        if self.outbox_path is None:
+            return OutboxFile.summarize([], evictions_total=self.outbox_evictions_total)
+        with self._outbox_lock:
+            return OutboxFile.summarize(
+                self._read_outbox(), evictions_total=self.outbox_evictions_total
+            )
 
     def wait_for_outbox_replay(self, timeout_seconds: float = 5) -> bool:
         """Wait for an already-started background replay worker.
@@ -326,7 +536,7 @@ class HttpEventSink:
                     return parsed
             except HTTPError as exc:
                 last_error = exc
-                if not is_retryable_delivery_status(exc.code):
+                if not is_retryable_collector_status(exc.code):
                     detail = exc.read().decode(errors="replace")
                     buffered = False
                     if buffer_failure:
@@ -438,6 +648,20 @@ class HttpEventSink:
             with self._outbox_lock:
                 records = self._read_outbox()
                 records.append(record)
+                evicted = len(records) - self.outbox_max_records
+                if evicted > 0:
+                    # The oldest records go first; they are the least likely
+                    # to still be wanted, but they are still loss and used to
+                    # be dropped silently (ARCH-G2).
+                    self.outbox_evictions_total += evicted
+                    LOGGER.warning(
+                        "collector outbox is full; evicted %d oldest record(s) "
+                        "(max_records=%d, evictions_total=%d, path=%s)",
+                        evicted,
+                        self.outbox_max_records,
+                        self.outbox_evictions_total,
+                        self.outbox_path,
+                    )
                 self._write_outbox(records[-self.outbox_max_records :])
             return True
         except OSError:
@@ -445,33 +669,14 @@ class HttpEventSink:
             return False
 
     def _read_outbox(self) -> list[dict[str, Any]]:
-        if self.outbox_path is None or not self.outbox_path.exists():
+        if self.outbox_path is None:
             return []
-        records = []
-        for line in self.outbox_path.read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines():
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                records.append(value)
-        return records
+        return OutboxFile(self.outbox_path).read()
 
     def _write_outbox(self, records: list[dict[str, Any]]) -> None:
         if self.outbox_path is None:
             return
-        self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.outbox_path.with_suffix(self.outbox_path.suffix + ".tmp")
-        temporary.write_text(
-            "".join(
-                json.dumps(item, separators=(",", ":"), default=str) + "\n"
-                for item in records
-            ),
-            encoding="utf-8",
-        )
-        os.replace(temporary, self.outbox_path)
+        OutboxFile(self.outbox_path).write(records)
 
     def _replay_outbox(self) -> _OutboxReplayResult:
         if self.outbox_path is None:
@@ -506,7 +711,26 @@ class HttpEventSink:
                         poll_receipt=False,
                     )
                 except Exception as exc:
-                    record["error"] = f"{type(exc).__name__}: {exc}"
+                    record["error"] = f"{type(exc).__name__}: {exc}"[:500]
+                    status = getattr(exc, "status_code", None)
+                    if (
+                        isinstance(exc, CollectorError)
+                        and isinstance(status, int)
+                        and 400 <= status < 500
+                        and not is_retryable_collector_status(status)
+                    ):
+                        # A verdict on the record itself (ARCH-G2): keeping it
+                        # replayable let ten poisoned heads fill every replay
+                        # window forever. It stays in the file, dead, for
+                        # ``gpu-fault-collector outbox`` to inspect or requeue.
+                        record["replayable"] = False
+                        LOGGER.warning(
+                            "collector outbox record dead-lettered at replay: "
+                            "path=%s status=%s failed_at=%s",
+                            record.get("path"),
+                            status,
+                            record.get("failed_at"),
+                        )
                     kept.append(record)
                 else:
                     delivered += 1

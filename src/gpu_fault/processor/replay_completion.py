@@ -6,6 +6,8 @@ import logging
 import time
 from typing import Any
 
+from gpu_fault.processor.rejected_events import record_replay_completion
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -150,6 +152,10 @@ def finalize_replay_response(
                 )
             raise completion_error
         outcome = "success"
+        # The row is committed with this status as its final answer; book
+        # it where an operator can see it. A 4xx on a fault channel is a
+        # fault thrown away after the collector's 202 (G1).
+        record_replay_completion(coordinator, item, status=status, body=body)
         LOGGER.info(
             "processor request completed request_id=%s path=%s "
             "lane=%s owner=%s epoch=%s status=%s duration_seconds=%.3f",

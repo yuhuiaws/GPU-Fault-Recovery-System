@@ -9,6 +9,7 @@ from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from gpu_fault.adapters.common import NodeActionPending
+from gpu_fault.adapters.node_action.lease_guard import lease_hold_reason
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -26,12 +27,19 @@ from gpu_fault.node_agent import (
     NodeActionCommand,
     NodeActionExecutionState,
     NodeActionResult,
+    NodeActionStatus,
     NodeActionSubmission,
     SignedNodeAction,
     sign_node_action,
     sign_result_query,
 )
 from gpu_fault.transport.http_client import urlopen
+
+# Agent answers that mean "ask again later with the same command": the agent
+# itself is unwell (5xx), or it asked for a pause (408/429). A 5xx after a
+# successful operation -- the ledger write failing behind a finished reset --
+# is the case that must not become a FAILED step.
+TRANSIENT_HTTP_STATUSES = frozenset({408, 429})
 
 
 class NodeActionTransportMixin:
@@ -41,6 +49,7 @@ class NodeActionTransportMixin:
     _maintenance_generations: Callable[..., Any]
     command_ttl: Any
     node_action_key_version: Any
+    node_action_retry_limit: int
     node_secrets: Any
     poll_timeout_seconds: Any
     registry: Any
@@ -98,6 +107,20 @@ class NodeActionTransportMixin:
         command_suffix: str,
         agent_generation: int | None = None,
     ) -> NodeActionResult | WorkflowStepOutcome:
+        hold_reason = lease_hold_reason()
+        if hold_reason is not None:
+            # The executor no longer holds (or was told to give up) its lease
+            # on this command. Nothing new may start; whatever the agent is
+            # already doing stays in its ledger for the next lease holder.
+            return WorkflowStepOutcome.waiting(
+                operation_id=context.idempotency_key,
+                details={
+                    "node_action_state": "LEASE_LOST",
+                    "node_action_not_started": True,
+                    "waiting_node": node_id,
+                    "reason": hold_reason,
+                },
+            )
         try:
             maintenance = self._maintenance_generations(context) is not None
             endpoint = self._endpoint(
@@ -160,28 +183,7 @@ class NodeActionTransportMixin:
                 },
             )
         except urllib_error.HTTPError as exc:
-            raw_detail = exc.read().decode(errors="replace")
-            structured: dict[str, Any] = {}
-            try:
-                parsed = json.loads(raw_detail)
-                detail = parsed.get("detail", parsed)
-                if isinstance(detail, dict):
-                    structured = detail
-            except json.JSONDecodeError:
-                pass
-            return WorkflowStepOutcome.failed(
-                f"node agent {node_id} rejected request: "
-                f"HTTP {exc.code}: "
-                + str(structured.get("message") or raw_detail or exc.reason),
-                details={
-                    "node_action_error_code": structured.get("code", "HTTP_REJECTION"),
-                    "node_action_retryable": bool(structured.get("retryable", False)),
-                    "node_action_requires_new_command": bool(
-                        structured.get("requires_new_command", False)
-                    ),
-                    "http_status": exc.code,
-                },
-            )
+            return self._classify_http_error(context, node_id, command, exc)
         except (
             TimeoutError,
             urllib_error.URLError,
@@ -199,6 +201,67 @@ class NodeActionTransportMixin:
             return WorkflowStepOutcome.failed(
                 f"node agent {node_id} request failed: {type(exc).__name__}: {exc}"
             )
+
+    @staticmethod
+    def _classify_http_error(
+        context: WorkflowStepContext,
+        node_id: str,
+        command: NodeActionCommand,
+        exc: urllib_error.HTTPError,
+    ) -> WorkflowStepOutcome:
+        raw_detail = exc.read().decode(errors="replace")
+        structured: dict[str, Any] = {}
+        try:
+            parsed = json.loads(raw_detail)
+            detail = parsed.get("detail", parsed)
+            if isinstance(detail, dict):
+                structured = detail
+        except json.JSONDecodeError:
+            pass
+        message = str(structured.get("message") or raw_detail or exc.reason)
+        code = str(structured.get("code", "HTTP_REJECTION"))
+        retryable = bool(structured.get("retryable", False))
+        requires_new_command = bool(structured.get("requires_new_command", False))
+        common = {
+            "node_action_command_id": command.command_id,
+            "node_action_error_code": code,
+            "node_action_retryable": retryable,
+            "node_action_requires_new_command": requires_new_command,
+            "http_status": exc.code,
+        }
+        if requires_new_command:
+            # STALE_AGENT_GENERATION, COMMAND_EXPIRED, STALE_FENCING_TOKEN: the
+            # agent will never accept this envelope again, but the step is not
+            # lost -- the next dispatch builds a fresh envelope (new issued_at
+            # and signature), and the control plane decides whether the
+            # workflow still holds the fence. Failing here turned a superseded
+            # command into a FAILED GPU.
+            return WorkflowStepOutcome.waiting(
+                operation_id=context.idempotency_key,
+                details={
+                    **common,
+                    "node_action_state": "NEW_COMMAND_REQUIRED",
+                    "waiting_node": node_id,
+                    "reason": f"node agent {node_id} requires a new command: "
+                    f"HTTP {exc.code} {code}: {message}",
+                },
+            )
+        if exc.code >= 500 or exc.code in TRANSIENT_HTTP_STATUSES or retryable:
+            return WorkflowStepOutcome.waiting(
+                operation_id=context.idempotency_key,
+                details={
+                    **common,
+                    "node_action_state": "TRANSPORT_RETRY",
+                    "node_action_transport_retry": True,
+                    "waiting_node": node_id,
+                    "reason": f"node agent {node_id} answered HTTP {exc.code} "
+                    f"{code}: {message}",
+                },
+            )
+        return WorkflowStepOutcome.failed(
+            f"node agent {node_id} rejected request: HTTP {exc.code}: {message}",
+            details=common,
+        )
 
     def _secret_for_node(self, cluster_id: str, node_id: str) -> str:
         key_version = self.node_action_key_version
@@ -270,6 +333,22 @@ class NodeActionTransportMixin:
             if exc.code != 404:
                 raise
             state = None
+        pending_details: dict[str, Any] = {"node_action_endpoint": endpoint}
+        if state is not None and self._should_resubmit(state):
+            # The agent's ledger holds a retryable failure and will run the
+            # command again as attempt + 1 when the same envelope is
+            # re-submitted; it never retries on its own. Polling alone left
+            # the step spinning on that row until its bound.
+            failed = state.result
+            if failed is not None:
+                pending_details.update(
+                    {
+                        "node_action_resubmitted": True,
+                        "node_action_attempt": failed.attempt + 1,
+                        "node_action_last_error": failed.error,
+                    }
+                )
+            state = None
         if state is None:
             request = urllib_request.Request(
                 endpoint.rstrip("/") + "/v1/node-actions/submit",
@@ -287,15 +366,52 @@ class NodeActionTransportMixin:
             ) as response:
                 state = NodeActionSubmission.model_validate_json(response.read())
         if state.state is NodeActionExecutionState.PENDING:
-            raise NodeActionPending(
-                command_id,
-                {
-                    "node_action_endpoint": endpoint,
-                },
-            )
+            raise NodeActionPending(command_id, pending_details)
         if state.result is None:
             raise RuntimeError("node action completed without a result")
-        return state.result
+        return self._retry_exhausted(state.result) or state.result
+
+    def _should_resubmit(self, state: NodeActionSubmission) -> bool:
+        result = state.result
+        return (
+            state.state is NodeActionExecutionState.FAILED
+            and result is not None
+            and result.status is NodeActionStatus.FAILED
+            and result.retryable
+            and result.attempt <= int(self.node_action_retry_limit)
+        )
+
+    def _retry_exhausted(self, result: NodeActionResult) -> NodeActionResult | None:
+        """A retryable failure past the re-submit bound becomes terminal.
+
+        Without this the step folds every retryable row into WAITING and the
+        only exit is the step bound; with it the operator sees how many times
+        the agent tried and what the last attempt said.
+        """
+
+        limit = int(self.node_action_retry_limit)
+        if not (
+            result.status is NodeActionStatus.FAILED
+            and result.retryable
+            and result.attempt > limit
+        ):
+            return None
+        return result.model_copy(
+            update={
+                "retryable": False,
+                "error": (
+                    f"node action failed after {result.attempt} attempts "
+                    f"(re-submit limit {limit}): "
+                    f"{result.error or 'unknown error'}"
+                ),
+                "details": {
+                    **result.details,
+                    "node_action_retry_exhausted": True,
+                    "node_action_attempts": result.attempt,
+                    "node_action_last_error": result.error,
+                },
+            }
+        )
 
     def _ssl_context(
         self,

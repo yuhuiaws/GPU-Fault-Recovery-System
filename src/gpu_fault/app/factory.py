@@ -250,10 +250,18 @@ def _configure_service_runtime(
             release_id=os.getenv("GPU_FAULT_RELEASE_ID", "local"),
             poll_seconds=float(os.getenv("GPU_FAULT_REGISTRY_POLL_SECONDS", "1")),
             stale_seconds=float(os.getenv("GPU_FAULT_REGISTRY_STALE_SECONDS", "10")),
+            # A Pod that starts during an Aurora writer failover must wait it
+            # out, not crash into a restart loop that needs Aurora again.
+            retry_budget_seconds=float(
+                os.getenv("GPU_FAULT_STARTUP_STORE_RETRY_SECONDS", "120")
+            ),
+            secret_config_sha256=ctx.regional_registry_secret_sha256,
         )
         if ctx.regional_mode
         else None
     )
+    ctx.bind_regional_registry_runtime(regional_auth_registry)
+    ctx.regional_registry_runtime = regional_auth_registry
     background_services_enabled = service_role in {
         "all",
         "worker",
@@ -683,6 +691,7 @@ def _install_domain_routes(
             ingest_telemetry_batch=(
                 telemetry_ingestion._ingest_processor_telemetry_batch_core
             ),
+            ingest_unresolved_signals=fault_ingestion.ingest_unresolved_signals,
         )
     )
     app.include_router(collector_router)
@@ -743,6 +752,8 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
     validate_direct_client_identity_environment()
     ctx = context or ApplicationContext.from_environment()
     fault_ingestion = FaultIngestionService(ctx)
+    # Exposed so /metrics can render fault_ingestion.unresolved_signal_totals.
+    ctx.fault_ingestion = fault_ingestion
     telemetry_context = TelemetryContextService(ctx)
     node_health_ingestion = NodeHealthIngestionService(ctx)
     telemetry_ingestion = TelemetryIngestionService(

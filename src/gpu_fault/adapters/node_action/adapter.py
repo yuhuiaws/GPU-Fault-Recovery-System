@@ -61,6 +61,7 @@ class NodeActionWorkflowAdapter(
         submit_timeout_seconds: int = 10,
         poll_timeout_seconds: int = 5,
         max_parallel_node_actions: int = 16,
+        node_action_retry_limit: int = 3,
     ) -> None:
         node_secrets = dict(node_secrets or {})
         if secret and len(secret) < 32:
@@ -116,6 +117,12 @@ class NodeActionWorkflowAdapter(
         if not 1 <= max_parallel_node_actions <= 64:
             raise ValueError("node action parallelism must be between 1 and 64")
         self.max_parallel_node_actions = max_parallel_node_actions
+        # Re-submits of one command after the agent stored a retryable
+        # failure. Zero would make every retryable failure terminal on the
+        # first poll; a large value only delays the step bound.
+        if not 0 <= node_action_retry_limit <= 20:
+            raise ValueError("node action retry limit must be between 0 and 20")
+        self.node_action_retry_limit = node_action_retry_limit
 
     @classmethod
     def from_environment(
@@ -174,6 +181,9 @@ class NodeActionWorkflowAdapter(
             ),
             max_parallel_node_actions=int(
                 os.getenv("GPU_FAULT_NODE_ACTION_MAX_PARALLEL", "16")
+            ),
+            node_action_retry_limit=int(
+                os.getenv("GPU_FAULT_NODE_ACTION_RETRY_LIMIT", "3")
             ),
         )
 

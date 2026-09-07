@@ -8,15 +8,22 @@ from gpu_fault.remote_command_models import (
     RemoteCommandStatus,
     lease_deadline,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import (
     NotFoundError,
     WorkflowLeaseError,
+)
+from gpu_fault.store.shared.remote_helpers import (
+    OPEN_REMOTE_COMMAND_STATUSES,
 )
 from gpu_fault.store.shared.remote_helpers import (
     remote_command_identity as _remote_command_identity,
 )
 from gpu_fault.store.shared.remote_helpers import (
     remote_command_stats as _remote_command_stats,
+)
+from gpu_fault.store.shared.remote_helpers import (
+    remote_command_step_space as _remote_command_step_space,
 )
 from gpu_fault.store.shared.remote_helpers import (
     unclaimed_expiry_update as _unclaimed_expiry_update,
@@ -67,6 +74,29 @@ class MemoryRemoteCommandMixin:
                 ),
                 key=lambda item: (item.created_at, item.command_id),
             )
+
+    def find_open_remote_command(
+        self,
+        workflow_request_id: str,
+        step_index: int,
+        command_step_space: str,
+        *,
+        exclude_command_id: str | None = None,
+    ) -> RemoteActionCommand | None:
+        with self._lock:
+            matches = sorted(
+                (
+                    item
+                    for item in self._remote_commands.values()
+                    if item.workflow_request_id == workflow_request_id
+                    and item.step_index == step_index
+                    and item.status in OPEN_REMOTE_COMMAND_STATUSES
+                    and item.command_id != exclude_command_id
+                    and _remote_command_step_space(item) == command_step_space
+                ),
+                key=lambda item: (item.created_at, item.command_id),
+            )
+        return matches[0] if matches else None
 
     def _open_remote_command_candidates(
         self,
@@ -264,7 +294,7 @@ class MemoryRemoteCommandMixin:
             ][:limit]
             for command_id in command_ids:
                 del self._remote_commands[command_id]
-            return len(command_ids)
+            return log_cleanup("remote_command", command_ids)
 
     def complete_remote_command(
         self,

@@ -126,6 +126,35 @@ def publish_current_registry(
     )
 
 
+def publish_staged_registry(release: Any) -> dict[str, Any]:
+    """Make the registry an upgrade just staged into the Secret durable.
+
+    The running control plane reads the durable Aurora head and ignores the
+    Secret once a head exists, so a release that only rewrote the Secret never
+    reached the fleet (review H3). This is the same publish-and-converge path
+    join and remove use; it runs inside the REGISTRY component so a failure
+    rolls the transaction back and a resume repeats it.
+    """
+
+    if release.runner.dry_run:
+        return {}
+    return publish_current_registry(
+        release,
+        reason=f"release {release.release_id} registry staged",
+    )
+
+
+def publish_restored_registry(release: Any) -> dict[str, Any]:
+    """Republish the Secret's restored backup after a rollback restored it."""
+
+    if release.runner.dry_run:
+        return {}
+    return publish_current_registry(
+        release,
+        reason=f"release {release.release_id} registry restored by rollback",
+    )
+
+
 def transition_join_registry(
     release: Any,
     cluster_id: str,

@@ -32,6 +32,7 @@ from ._support import (
     WorkflowStepOutcome,
     WorkflowStepStatus,
     _preempting_successor,
+    isolated_kubernetes_adapter,
     pytest,
     sign_agent_heartbeat,
     workflow_state,
@@ -213,7 +214,11 @@ def test_hyperpod_replace_is_blocked_when_spares_are_insufficient():
             reason="required=1, healthy=0",
         )
     )
-    adapter = HyperPodLifecycleStepAdapter(lifecycle, spare_coordinator=spares)
+    adapter = HyperPodLifecycleStepAdapter(
+        lifecycle,
+        spare_coordinator=spares,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
+    )
     step = copy_model(
         workflow.official_steps[0],
         execution_owner=adapter.owner,
@@ -241,7 +246,9 @@ def test_warm_spare_requires_enabled_coordinator_before_submission():
     store = build_store()
     _, workflow = workflow_state(store, [WorkflowOperation.REPLACE_NODE])
     lifecycle = FakeHyperPodLifecycle()
-    adapter = HyperPodLifecycleStepAdapter(lifecycle)
+    adapter = HyperPodLifecycleStepAdapter(
+        lifecycle, kubernetes_adapter=isolated_kubernetes_adapter()
+    )
     step = copy_model(
         workflow.official_steps[0],
         execution_owner=adapter.owner,
@@ -293,7 +300,10 @@ def test_pending_spare_health_check_is_retried():
     spares = PendingSpareCoordinator()
     node_actions = RecordingNodeActionAdapter()
     adapter = HyperPodLifecycleStepAdapter(
-        lifecycle, spare_coordinator=spares, node_action_adapter=node_actions
+        lifecycle,
+        spare_coordinator=spares,
+        node_action_adapter=node_actions,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
     )
     step = copy_model(
         workflow.official_steps[0],
@@ -350,6 +360,7 @@ def test_remote_pending_spare_health_check_is_retried():
         FakeHyperPodLifecycle(),
         spare_coordinator=spares,
         node_action_adapter=RecordingNodeActionAdapter(),
+        kubernetes_adapter=isolated_kubernetes_adapter(),
     )
     step = copy_model(
         workflow.official_steps[0],
@@ -421,6 +432,7 @@ def test_remote_pending_spare_snapshot_resumes_without_reallocation():
         FakeHyperPodLifecycle(),
         spare_coordinator=spares,
         node_action_adapter=node_actions,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
     )
     step = copy_model(
         workflow.official_steps[0],
@@ -475,7 +487,11 @@ def test_warm_spare_rejects_automatic_node_recovery_before_allocation():
             applicable=True, sufficient=True, required=1, selected_node_ids=("spare-a",)
         )
     )
-    adapter = HyperPodLifecycleStepAdapter(lifecycle, spare_coordinator=spares)
+    adapter = HyperPodLifecycleStepAdapter(
+        lifecycle,
+        spare_coordinator=spares,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
+    )
     adapter.dispatcher.preflight = lambda *_args, **_kwargs: (
         SimpleNamespace(
             safe_to_submit=False,
@@ -523,6 +539,7 @@ def test_hyperpod_replace_records_activated_spare_nodes():
         spare_coordinator=spares,
         node_action_adapter=node_actions,
         notification_sink=store,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
     )
     step = copy_model(
         workflow.official_steps[0],
@@ -638,7 +655,10 @@ def test_hyperpod_spare_checker_uses_node_agent_for_each_phase():
 
     node_actions = RecordingNodeActionAdapter()
     adapter = HyperPodLifecycleStepAdapter(
-        lifecycle, spare_coordinator=spares, node_action_adapter=node_actions
+        lifecycle,
+        spare_coordinator=spares,
+        node_action_adapter=node_actions,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
     )
     step = copy_model(
         workflow.official_steps[0],
@@ -749,6 +769,7 @@ def test_spare_checker_rejects_a_definitively_busy_answer():
             FakeHyperPodLifecycle(),
             spare_coordinator=spares,
             node_action_adapter=node_actions,
+            kubernetes_adapter=isolated_kubernetes_adapter(),
         )
         step = copy_model(
             workflow.official_steps[0],
@@ -795,7 +816,10 @@ def test_hyperpod_replace_maps_two_fault_nodes_to_two_warm_spares():
     )
     node_actions = RecordingNodeActionAdapter()
     adapter = HyperPodLifecycleStepAdapter(
-        lifecycle, spare_coordinator=spares, node_action_adapter=node_actions
+        lifecycle,
+        spare_coordinator=spares,
+        node_action_adapter=node_actions,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
     )
     step = copy_model(
         workflow.official_steps[0],
@@ -846,7 +870,11 @@ def test_hyperpod_automatic_recovery_cannot_bypass_spare_only_mode():
             reason="spare gate must not run",
         )
     )
-    adapter = HyperPodLifecycleStepAdapter(lifecycle, spare_coordinator=spares)
+    adapter = HyperPodLifecycleStepAdapter(
+        lifecycle,
+        spare_coordinator=spares,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
+    )
     step = copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
     store.save_workflow(copy_model(workflow, official_steps=[step]))
     active = active_workflow_executor(
@@ -896,7 +924,9 @@ def test_hyperpod_step_waits_for_external_confirmation() -> None:
     )
     _, workflow = workflow_state(store, [WorkflowOperation.RESTART_NODE])
     lifecycle = FakeHyperPodLifecycle()
-    adapter = HyperPodLifecycleStepAdapter(lifecycle, registry=fleet)
+    adapter = HyperPodLifecycleStepAdapter(
+        lifecycle, registry=fleet, kubernetes_adapter=isolated_kubernetes_adapter()
+    )
     step = copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
     workflow = copy_model(workflow, official_steps=[step])
     store.save_workflow(workflow)

@@ -188,6 +188,7 @@ def phase_release(
         "_upload_release": lambda _diff: calls.append("upload"),
         "_ensure_schema": lambda: calls.append("schema"),
         "_stage_registry": stage_registry,
+        "_publish_staged_registry": lambda: calls.append("publish-registry"),
         "_apply_cpu": lambda **kwargs: calls.append(
             "cpu-finalize" if kwargs.get("finalize") else "cpu-stage"
         ),

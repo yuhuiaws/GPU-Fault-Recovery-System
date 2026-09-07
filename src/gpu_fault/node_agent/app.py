@@ -11,9 +11,11 @@ from threading import Event, RLock, Thread
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
+from gpu_fault.logging_setup import configure_logging
 from gpu_fault.node_agent.config import executor_from_environment
 from gpu_fault.node_agent.executor import NodeActionExecutor
 from gpu_fault.node_agent.heartbeat import (
@@ -89,6 +91,15 @@ def _node_action_rejection(
             422,
             "TARGET_NODE_MISMATCH",
             False,
+            False,
+        )
+    elif "generation is not known yet" in normalized:
+        # The agent has not completed a heartbeat since it started; the
+        # command may be perfectly valid, so it is retryable as-is.
+        status, code, retryable, new_command = (
+            409,
+            "AGENT_GENERATION_UNKNOWN",
+            True,
             False,
         )
     elif "different agent generation" in normalized:
@@ -313,8 +324,37 @@ def create_node_agent_app(
     )
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, Any]:
-        return {"status": "ok"}
+    async def healthz() -> JSONResponse:
+        """Local health: 503 only when the ledger cannot be written.
+
+        Heartbeat staleness and the command counters are informational --
+        the control plane already fences a stale agent -- but they give an
+        operator on the node a view without reaching the control plane.
+        """
+
+        payload: dict[str, Any] = {"status": "ok"}
+        status_code = 200
+        ledger_state: dict[str, Any] = {"writable": True}
+        probe = getattr(agent.ledger, "probe_writable", None)
+        if callable(probe):
+            try:
+                probe()
+            except Exception as exc:  # noqa: BLE001 - any failure is "not writable"
+                ledger_state = {
+                    "writable": False,
+                    "error": type(exc).__name__,
+                    "reason": str(exc),
+                }
+                payload["status"] = "degraded"
+                status_code = 503
+        payload["ledger"] = ledger_state
+        heartbeat_health = getattr(reporter, "health_snapshot", None)
+        payload["heartbeat"] = (
+            heartbeat_health() if callable(heartbeat_health) else {"configured": False}
+        )
+        counters = getattr(agent, "counters_snapshot", None)
+        payload["counters"] = counters() if callable(counters) else {}
+        return JSONResponse(status_code=status_code, content=payload)
 
     @app.post("/v1/node-actions", response_model=NodeActionResult)
     def execute_action(
@@ -436,6 +476,9 @@ def run() -> None:
 
     import uvicorn
 
+    # uvicorn configures only its own loggers; without a root handler every
+    # INFO line the executor writes for a command is discarded before journald.
+    configure_logging()
     validate_gpu_fault_environment(process_name="gpu-fault-node-agent")
     host = os.getenv("GPU_FAULT_NODE_AGENT_HOST", _default_node_agent_host())
     port = int(os.getenv("GPU_FAULT_NODE_AGENT_PORT", "9099"))

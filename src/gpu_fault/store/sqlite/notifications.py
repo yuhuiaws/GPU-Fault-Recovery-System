@@ -12,6 +12,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.store.shared.notification_helpers import (
     bound_notifications,
+    delivery_stats_from_rows,
 )
 from gpu_fault.store.shared.notification_helpers import (
     with_incident_drill_label as _with_incident_drill_label,
@@ -97,6 +98,17 @@ class SqliteNotificationMixin:
             status = result.status if result is not None else NotificationStatus.QUEUED
             counts[status] += 1
         return counts
+
+    def notification_delivery_stats(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        observed_at = now or datetime.now(timezone.utc)
+        with self._lock:
+            deliveries = list(self._list("notification_delivery"))
+            results = {
+                item.notification_id: item for item in self._list("notification_result")
+            }
+        return delivery_stats_from_rows(deliveries, results, now=observed_at)
 
     def claim_notification_deliveries(
         self,

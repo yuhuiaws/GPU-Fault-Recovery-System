@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 from gpu_fault.processor import (
     ProcessorRequestStatus,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import StaleFencingTokenError
 
 
@@ -345,4 +345,4 @@ class SqliteProcessorLeaseMixin:
             ][:limit]
             for key in victims:
                 self._delete("processor_lane", key)
-            return len(victims)
+            return log_cleanup("processor_lane", victims)

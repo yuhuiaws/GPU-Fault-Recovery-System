@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
-
-from typing import Any, Callable, Collection, ContextManager
-
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Collection, ContextManager
 
 from gpu_fault.models import (
     FaultIncident,
@@ -12,25 +9,30 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
-from gpu_fault.store.shared.time import utc_text as _utc_text
-from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
+from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
 from gpu_fault.store.shared.errors import (
-    StaleWriteError,
-    WorkflowMergedError,
     RemediationBudgetError,
-    WorkflowLeaseError,
     StaleFencingTokenError,
+    StaleWriteError,
+    WorkflowLeaseError,
+    WorkflowMergedError,
 )
+from gpu_fault.store.shared.record_guards import (
+    record_matches_expected,
+    stale_incident_versions,
+)
+from gpu_fault.store.shared.remediation_budgets import (
+    apply_remediation_budget,
+    blocked_by_remediation_budget,
+    extend_remediation_budget,
+)
+from gpu_fault.store.shared.time import utc_text as _utc_text
 from gpu_fault.store.shared.transactional_workflows import (
     lease_extension_due,
     stale_workflow_versions,
     workflow_matches_expected,
 )
-from gpu_fault.store.shared.remediation_budgets import (
-    apply_remediation_budget,
-    extend_remediation_budget,
-    blocked_by_remediation_budget,
-)
+from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
 
 
 class SqliteWorkflowMixin:
@@ -44,8 +46,29 @@ class SqliteWorkflowMixin:
     _put: Callable[..., Any]
     _state_transaction: Callable[[str], ContextManager[None]]
 
-    def save_incident(self, incident: FaultIncident) -> None:
-        with self._lock:
+    def save_incident(
+        self,
+        incident: FaultIncident,
+        *,
+        expected: FaultIncident | None = None,
+    ) -> None:
+        """See ``WorkflowStore.save_incident`` (architecture review, item D1).
+
+        Read-compare-write inside one write transaction; the process lock
+        serializes every writer of this connection, so that is the CAS here.
+        """
+
+        with self._state_transaction(f"incident/{incident.incident_id}"):
+            current = self._get_optional("incident", incident.incident_id)
+            if expected is not None:
+                if not record_matches_expected(current, expected):
+                    raise StaleWriteError(
+                        f"incident/{incident.incident_id} changed since it was read"
+                    )
+            elif current is not None:
+                stale = stale_incident_versions(current, incident)
+                if stale is not None:
+                    raise stale
             self._put("incident", incident.incident_id, incident)
             self._link(
                 "incident_by_event",

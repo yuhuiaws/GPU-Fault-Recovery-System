@@ -27,6 +27,8 @@ class HostInventoryMixin:
     node_instance_type: Any
     pci_devices_root: Any
     runner: Callable[..., Any]
+    _nvidia_smi: Callable[..., Any]
+    GPU_QUERY_ARGV: tuple[str, ...]
 
     def _inventory_samples(
         self,
@@ -132,26 +134,20 @@ class HostInventoryMixin:
             *self._efa_inventory(_),
         ]
 
-    def _gpu_inventory(self, _: datetime) -> list[HostMetricSample]:
+    def _gpu_inventory(self, observed_at: datetime) -> list[HostMetricSample]:
         samples = []
         if self.expected_gpu_count is not None:
-            completed = self.runner(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=uuid",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
+            # Shares the utilization query of the same round (ARCH-G5): the
+            # UUID is its first CSV column.
+            completed = self._nvidia_smi(list(self.GPU_QUERY_ARGV), observed_at)
             if completed.returncode != 0:
                 raise CollectorError(
                     "GPU inventory query failed: " + completed.stderr.strip()
                 )
             gpu_uuids = {
-                line.strip() for line in completed.stdout.splitlines() if line.strip()
+                line.split(",", 1)[0].strip()
+                for line in completed.stdout.splitlines()
+                if line.strip()
             }
             samples.extend(
                 self._inventory_samples(

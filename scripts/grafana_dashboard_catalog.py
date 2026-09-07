@@ -73,6 +73,16 @@ def increase_by_control_plane(metric: str, window: str) -> str:
     return f"sum {BY_CONTROL_PLANE} (increase({series(metric)}[{window}]))"
 
 
+def _seconds_since(metric: str) -> str:
+    """Age of a ``*_timestamp_seconds`` gauge, read the way the alerts read it.
+
+    Process-level counters on the four-worker Pods are sampled one process per
+    scrape, so the liveness and last-seen alerts compare ``time()`` against the
+    newest stamp any process published instead of taking ``increase()``.
+    """
+    return f"time() - max {BY_CONTROL_PLANE} ({series(metric)})"
+
+
 def _queue_depth_panels() -> tuple[Panel, ...]:
     return (
         Panel(
@@ -621,6 +631,152 @@ CONTROL_PLANE_CAPACITY = Dashboard(
                 ),
             ),
         ),
+        Row(
+            "Loop liveness",
+            (
+                Panel(
+                    "Workflow dispatcher last cycle age",
+                    (
+                        Target(
+                            _seconds_since(
+                                "gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds"
+                            ),
+                            "{{control_plane_cluster}} {{region}}",
+                        ),
+                    ),
+                    unit="s",
+                    description=(
+                        "Seconds since any dispatcher replica stamped a cycle; "
+                        "a lease held elsewhere still stamps."
+                    ),
+                ),
+                Panel(
+                    "Periodic runner last cycle age",
+                    (
+                        Target(
+                            _seconds_since(
+                                "gpu_fault_periodic_last_cycle_timestamp_seconds"
+                            ),
+                            "{{control_plane_cluster}} {{region}}",
+                        ),
+                    ),
+                    unit="s",
+                ),
+                Panel(
+                    "Processor healthy per worker Pod",
+                    (
+                        Target(
+                            "min by (pod) ("
+                            + series(
+                                "gpu_fault_processor_healthy",
+                                'pod=~"gpu-fault-control-worker-.*"',
+                            )
+                            + ")",
+                            "{{pod}}",
+                        ),
+                    ),
+                    description="0 is a control-worker whose processor reports unhealthy.",
+                ),
+                Panel(
+                    "Active processor consumers",
+                    (
+                        Target(
+                            f"sum({series('gpu_fault_processor_active_consumer')})",
+                            "consumers",
+                        ),
+                    ),
+                    description="0 means no replica is consuming the processor queue.",
+                ),
+                Panel(
+                    "Spool consumer running and claim rounds (10m)",
+                    (
+                        Target(
+                            "min by (pod) ("
+                            + series(
+                                "gpu_fault_telemetry_spool_consumer_running",
+                                'pod=~"gpu-fault-telemetry-spool-worker-.*"',
+                            )
+                            + ")",
+                            "{{pod}} running",
+                        ),
+                        Target(
+                            "sum by (pod) (increase("
+                            + series(
+                                "gpu_fault_telemetry_spool_claim_rounds_total",
+                                'pod=~"gpu-fault-telemetry-spool-worker-.*"',
+                            )
+                            + "[10m]))",
+                            "{{pod}} claim rounds",
+                        ),
+                    ),
+                    description=(
+                        "A consumer that reports running but claims nothing for "
+                        "10m is stalled, not idle: an idle spool still claims."
+                    ),
+                ),
+            ),
+        ),
+        Row(
+            "Processor and periodic errors",
+            (
+                Panel(
+                    "Processor lease renewal failures (15m)",
+                    (
+                        Target(
+                            increase_by_control_plane(
+                                "gpu_fault_processor_renewal_fenced_total", "15m"
+                            ),
+                            "fenced",
+                        ),
+                        Target(
+                            increase_by_control_plane(
+                                "gpu_fault_processor_renewal_errors_total", "15m"
+                            ),
+                            "errors",
+                        ),
+                    ),
+                ),
+                Panel(
+                    "Processor fault events rejected (15m)",
+                    (
+                        Target(
+                            increase_by_control_plane(
+                                "gpu_fault_processor_fault_rejections_total", "15m"
+                            ),
+                            "{{control_plane_cluster}} {{region}}",
+                        ),
+                    ),
+                    description=(
+                        "Fault events the processor refused; sampled from one of "
+                        "four worker processes per scrape."
+                    ),
+                ),
+                Panel(
+                    "Periodic service error last seen age",
+                    (
+                        Target(
+                            _seconds_since(
+                                "gpu_fault_periodic_lease_error_last_seen_timestamp_seconds"
+                            ),
+                            "lease",
+                        ),
+                        Target(
+                            "time() - max by (control_plane_cluster, region, job) ("
+                            + series(
+                                "gpu_fault_periodic_job_error_last_seen_timestamp_seconds"
+                            )
+                            + ")",
+                            "{{job}}",
+                        ),
+                    ),
+                    unit="s",
+                    description=(
+                        "Seconds since the periodic runner last saw a lease or "
+                        "job error; small is bad."
+                    ),
+                ),
+            ),
+        ),
     ),
 )
 
@@ -825,6 +981,66 @@ ORCHESTRATION_INVARIANTS = Dashboard(
                             + ")",
                             "{{cluster_id}}",
                         ),
+                    ),
+                ),
+            ),
+        ),
+        Row(
+            "Pointers, agents and registry",
+            (
+                Panel(
+                    "Incident dangling workflow pointers",
+                    (
+                        Target(
+                            "max("
+                            + series("gpu_fault_incident_dangling_workflow_pointers")
+                            + ")",
+                            "dangling",
+                        ),
+                    ),
+                    description=(
+                        "Incidents whose workflow_request_id names a workflow that "
+                        "no longer exists."
+                    ),
+                ),
+                Panel(
+                    "Stale agents",
+                    (
+                        Target(
+                            f"max({series('gpu_fault_stale_agents')})",
+                            "stale",
+                        ),
+                    ),
+                    description="Node agents past their heartbeat deadline.",
+                ),
+                Panel(
+                    "Fleet pin drift nodes",
+                    (
+                        Target(
+                            "max by (cluster_id, kind) ("
+                            + cluster_series("gpu_fault_fleet_pin_drift_nodes")
+                            + ")",
+                            "{{cluster_id}} {{kind}}",
+                        ),
+                    ),
+                    description=(
+                        "PIN_AHEAD_OF_FLEET is a node pinned to a release the "
+                        "fleet has not reached."
+                    ),
+                ),
+                Panel(
+                    "Regional registry Secret drift",
+                    (
+                        Target(
+                            "max by (service_role) ("
+                            + series("gpu_fault_regional_registry_secret_drift")
+                            + ")",
+                            "{{service_role}}",
+                        ),
+                    ),
+                    description=(
+                        "1 when the registry Secret's configured digest differs "
+                        "from the durable head the replicas serve."
                     ),
                 ),
             ),
@@ -1092,6 +1308,100 @@ RECOVERY_OUTCOME = Dashboard(
                     description=(
                         "Pooled connection demand over the pool ceiling; above 1 "
                         "callers queue on checkout."
+                    ),
+                ),
+            ),
+        ),
+        Row(
+            "Dispatcher errors and notification outbox",
+            (
+                Panel(
+                    "Dispatch internal error last seen age",
+                    (
+                        Target(
+                            _seconds_since(
+                                "gpu_fault_workflow_dispatch_internal_error_last_seen_timestamp_seconds"
+                            ),
+                            "{{control_plane_cluster}} {{region}}",
+                        ),
+                    ),
+                    unit="s",
+                    description=(
+                        "Seconds since a dispatch cycle last hit an internal "
+                        "error; small is bad."
+                    ),
+                ),
+                Panel(
+                    "Failure handling abandoned last seen age",
+                    (
+                        Target(
+                            _seconds_since(
+                                "gpu_fault_workflow_dispatch_failure_handling_abandoned_last_seen_timestamp_seconds"
+                            ),
+                            "{{control_plane_cluster}} {{region}}",
+                        ),
+                    ),
+                    unit="s",
+                    description=(
+                        "Seconds since the dispatcher last gave up handling a "
+                        "step failure; small is bad."
+                    ),
+                ),
+                Panel(
+                    "Oldest undelivered notification age",
+                    (
+                        Target(
+                            "max("
+                            + series(
+                                "gpu_fault_notification_oldest_pending_age_seconds"
+                            )
+                            + ")",
+                            "oldest pending",
+                        ),
+                    ),
+                    unit="s",
+                    description=(
+                        "Age of the oldest PENDING/RETRY/LEASED delivery, counted "
+                        "from creation or the last operator re-queue."
+                    ),
+                ),
+                Panel(
+                    "Notification outbox draining",
+                    (
+                        Target(
+                            "max by (status) ("
+                            + series(
+                                "gpu_fault_notification_delivery_total",
+                                'status=~"PENDING|RETRY"',
+                            )
+                            + ")",
+                            "{{status}}",
+                        ),
+                        Target(
+                            _seconds_since(
+                                "gpu_fault_notification_dispatch_last_cycle_timestamp_seconds"
+                            ),
+                            "dispatch cycle age (s)",
+                        ),
+                    ),
+                    description=(
+                        "Undelivered rows next to the seconds since the outbox "
+                        "dispatcher last ran; rows with no cycle is a stuck outbox."
+                    ),
+                ),
+                Panel(
+                    "Expired notification last seen age",
+                    (
+                        Target(
+                            _seconds_since(
+                                "gpu_fault_notification_expired_last_seen_timestamp_seconds"
+                            ),
+                            "{{control_plane_cluster}} {{region}}",
+                        ),
+                    ),
+                    unit="s",
+                    description=(
+                        "Seconds since an advisory expired unsent; small is bad."
                     ),
                 ),
             ),

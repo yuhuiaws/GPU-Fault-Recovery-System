@@ -1,43 +1,50 @@
 from __future__ import annotations
 
-from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
-
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
 from gpu_fault.models import (
-    workflow_is_open,
     FaultIncident,
     IncidentState,
     RecoveryPlan,
+    WorkflowEvent,
+    WorkflowEventKind,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
+    append_workflow_event,
+    record_operator_event,
+    workflow_is_open,
 )
-from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
+from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
 from gpu_fault.store.shared.errors import (
-    WorkflowMergedError,
-    StaleFencingTokenError,
-    StaleWriteError,
     NotFoundError,
     RemediationBudgetError,
+    StaleFencingTokenError,
+    StaleWriteError,
     WorkflowLeaseError,
+    WorkflowMergedError,
+)
+from gpu_fault.store.shared.preemption import preemption_pending_update
+from gpu_fault.store.shared.record_guards import (
+    record_matches_expected,
+    stale_incident_versions,
+)
+from gpu_fault.store.shared.remediation_budgets import (
+    apply_remediation_budget,
+    blocked_by_remediation_budget,
+    extend_remediation_budget,
 )
 from gpu_fault.store.shared.transactional_workflows import (
     lease_extension_due,
     stale_workflow_versions,
     workflow_matches_expected,
 )
-from gpu_fault.store.shared.remediation_budgets import (
-    apply_remediation_budget,
-    extend_remediation_budget,
-    blocked_by_remediation_budget,
-)
+from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
 from gpu_fault.workflow_resolution import (
     reconciled_restore_records,
     retired_generation_records,
 )
-from gpu_fault.store.shared.preemption import preemption_pending_update
 
 if TYPE_CHECKING:
     from gpu_fault.regional import RemoteActionCommand
@@ -64,8 +71,25 @@ class MemoryWorkflowMixin:
     _replacement_fault_groups: Any
     _sxid_fault_groups: Any
 
-    def save_incident(self, incident: FaultIncident) -> None:
+    def save_incident(
+        self,
+        incident: FaultIncident,
+        *,
+        expected: FaultIncident | None = None,
+    ) -> None:
+        """See ``WorkflowStore.save_incident`` (architecture review, item D1)."""
+
         with self._lock:
+            current = self._incidents.get(incident.incident_id)
+            if expected is not None:
+                if not record_matches_expected(current, expected):
+                    raise StaleWriteError(
+                        f"incident/{incident.incident_id} changed since it was read"
+                    )
+            elif current is not None:
+                stale = stale_incident_versions(current, incident)
+                if stale is not None:
+                    raise stale
             self._incidents[incident.incident_id] = incident
             self._incident_by_event[incident.event_id] = incident.incident_id
 
@@ -99,6 +123,8 @@ class MemoryWorkflowMixin:
         expected_workflow_updated_at: datetime | None = None,
         reference: str,
         reconciled_at: datetime,
+        actor: str | None = None,
+        approval: Mapping[str, object] | None = None,
     ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
         with self._lock:
             workflow = self.get_workflow(workflow_request_id)
@@ -123,6 +149,22 @@ class MemoryWorkflowMixin:
                     reconciled_at=reconciled_at,
                 )
             )
+            # Same event, same write as the shared transactional mixin (I1):
+            # a refused reconcile raised above and records nothing.
+            updated_workflow = record_operator_event(
+                updated_workflow,
+                WorkflowEventKind.OPERATOR_RECONCILED,
+                actor=actor,
+                reference=reference,
+                previous_status=workflow.status,
+                at=reconciled_at,
+                details={
+                    "successor_workflow_id": successor_workflow_id,
+                    "expected_fencing_token": expected_fencing_token,
+                    "expected_execution_epoch": expected_execution_epoch,
+                    **dict(approval or {}),
+                },
+            )
             self._workflows[workflow_request_id] = updated_workflow
             self._incidents[incident.incident_id] = updated_incident
             self._plans[source_plan.plan_id] = updated_plan
@@ -136,6 +178,8 @@ class MemoryWorkflowMixin:
         expected_fencing_token: int,
         reference: str | None,
         reconciled_at: datetime,
+        actor: str | None = None,
+        approval: Mapping[str, object] | None = None,
     ) -> tuple[WorkflowRequest, FaultIncident]:
         """Terminalize a workflow whose incident moved to a later generation.
 
@@ -156,6 +200,8 @@ class MemoryWorkflowMixin:
                 expected_fencing_token=expected_fencing_token,
                 reference=reference,
                 reconciled_at=reconciled_at,
+                actor=actor,
+                approval=approval,
             )
             self._workflows[workflow_request_id] = updated_workflow
             self._incidents[incident.incident_id] = updated_incident
@@ -451,6 +497,8 @@ class MemoryWorkflowMixin:
         self,
         request_id: str,
         updates: Mapping[str, object],
+        *,
+        event: WorkflowEvent | None = None,
     ) -> WorkflowRequest:
         with self._lock:
             current = self._workflows.get(request_id)
@@ -463,6 +511,8 @@ class MemoryWorkflowMixin:
                     "updated_at": datetime.now(timezone.utc),
                 }
             )
+            if event is not None:
+                amended = append_workflow_event(amended, event)
             self._workflows[request_id] = amended
             return amended
 

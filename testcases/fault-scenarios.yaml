@@ -3074,6 +3074,61 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-016
   related_pytest: tests/regional/test_regional_control_plane.py::test_remote_hyperpod_submission_endpoints_enforce_cluster_binding
+- id: GF-REGIONAL-CMD-017
+  title: 多节点 barrier 命令在区域 executor 的 claim 边界被 fail-closed 持有，计数且永不到达适配器
+  category: regional-remote-command
+  level: live
+  risk: live-non-destructive
+  problem: >-
+    区域 executor 没有 barrier coordinator（barrier 状态在控制面 store，executor 只读），
+    一条 step 为多节点 RESET_ALL_GPUS_NVSWITCHES 的 remote command 若走到节点动作适配器，
+    _execute_multi_node_reset 会以一个读起来像"reset 失败"的裸 FAILED 收尾，甚至在 barrier 被错误接线时
+    真的 arm 一次全 fabric reset。claim 边界的 _barrier_hold 是唯一的 fail-closed 门，此前只有单元证据。
+  injection: >-
+    在合成集群 perf-cap-000（30 分钟自动过期的临时注册项，无任何 Node Agent，
+    agent_endpoint_allowed_cidrs 仅 loopback）直接向 store 播种一条 step 为 RESET_ALL_GPUS_NVSWITCHES、
+    node_ids 为两个合成节点名的 remote command；在 GPU 面起一个只 claim 该合成集群的探针 executor Pod
+    （部署镜像自带的 ClusterActionExecutor + 一个 owner 匹配、barriers=None、被调用即落盘的替身适配器）。
+    不注入任何 SXID，不触碰任何真实节点。
+  expected:
+  - "命令被持有为 WAITING：status_source=executor-barrier-unavailable，result_details 含 multi_node_barrier_unavailable=true、operation、node_ids、executor_id 与点名 barrier coordinator 缺失的 reason"
+  - 命令在整个观察期内保持可重新 claim（WAITING/PENDING），从不到达 SUCCEEDED 或 FAILED；探针停止后仍为非终态并被清理脚本删除
+  - executor 每轮 claim 使 barrier_unavailable_holds_total 加一（至少观察两轮），claimed_total 不小于该计数，unexpected_failures 与 reported_failures 均为 0
+  - claim-state breadcrumb 文件的 counters 与 executor metrics_snapshot 一致且记录了 barrier hold
+  - "executor 日志含 remote command held: multi-node barrier unavailable"
+  - 替身适配器从未被执行（无 adapter-executed 标记文件），播种集群的 registered_agents 为空
+  - 清理后数据库、注册表、Kubernetes 三处残留均为零，探针 Pod/ConfigMap 与合成注册项全部删除
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-017
+  related_pytest: tests/regional/test_cmd017_barrier_hold.py::test_the_held_command_contract_passes_on_the_fail_closed_record
+- id: GF-REGIONAL-CMD-018
+  title: 同一 workflow step 的开放兄弟命令在飞时，参数被改写后的再次派发被持有为 WAITING、计数，节点只执行一次
+  category: regional-remote-command
+  level: live
+  risk: live-non-destructive
+  problem: >-
+    remote command 的 command_id 是整个 step 的摘要。一次 merge 改写 step 参数后，下一次派发会得到不同的 id，
+    而上一个 id 对应的物理动作可能仍在节点上执行；修复前同一物理动作会被提交两次。
+    RegionalRemoteWorkflowAdapter 现在先查同 (workflow, step_index, step 空间) 且同 fencing_token 的开放兄弟命令，
+    命中即持有而不铸新命令（ARCH-D5），此前只有单元证据。
+  injection: >-
+    在 CPU API Pod 内用部署的 adapter 对合成集群 perf-cap-000 的一条 RUNNING 工作流派发一次（命令 A），
+    再以读副本为 expected 经 save_workflow 改写 step 参数后再次派发；随后起一个以本地幂等账本为"动作"的探针 executor
+    claim 并完成 A；删探针 Pod 后第三次派发（应铸出 B）并立即 cancel_remote_command。node_id 为合成名，无任何 Node Agent。
+  expected:
+  - "改写后的派发返回 WAITING：details.reason=OPEN_SIBLING_COMMAND、remote_command_id 指向 A、held_command_id 与 A 不同、mutation_submitted_by_control_plane=false"
+  - adapter.open_sibling_holds_total 恰为 1，且该 workflow 只有 A 一条开放命令
+  - 探针账本 physical_count=1 且只有一个幂等键；A 终态 SUCCEEDED
+  - A 终态后再次派发铸出 B（持有只作用于开放兄弟），B 被 cancel 为 FAILED 且从未被 claim
+  - 控制面 /metrics 导出 gpu_fault_remote_command_open_sibling_holds_total 家族
+  - 清理后数据库、注册表、Kubernetes 三处残留均为零
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-018
+  related_pytest: tests/regional/test_cmd018_open_sibling_hold.py::test_the_dispatch_contract_passes_on_a_held_rewrite
 - id: GF-REGIONAL-HA-001
   title: 删除 active-active 控制面副本后 API 与 dispatcher 继续工作
   category: regional-high-availability
@@ -3289,6 +3344,87 @@ test_cases:
   command:
   - python3
   - scripts/e2e/regional/audit_collector_outbox.py
+- id: GF-REGIONAL-NET-006
+  title: 动作执行期间丢失 command lease，executor 不在丢失的 lease 下提交结果并计数，重新 claim 后由幂等账本收尾
+  category: regional-network-resilience
+  level: live
+  risk: live-non-destructive
+  problem: >-
+    NET-002 证明的是动作结束后网络才中断、迟到结果被 409 拒绝；本用例证明动作仍在跑时 lease 就已丢失的那一侧：
+    CommandLeaseWatch 连续续租失败达到上限（或本地 lease 窗口过期）后，_execute_and_report 必须把结果扣留而不是
+    在自己已不能担保的 lease 下 POST，results_withheld_total 与 lease_lost_total 必须计数，
+    reported_failures 必须不动，且这些计数要出现在 claim-state breadcrumb 里。
+  injection: >-
+    在合成集群 perf-cap-000 播种一条 FREEZE_EVIDENCE remote command（node_id 为合成名，无 Node Agent）；
+    GPU 面探针 executor Pod 运行部署镜像自带的 ClusterActionExecutor（lease 60 s、续租失败上限 3），
+    其本地适配器在观察到网络封禁后把动作持续 100 s；封禁由 Pod 内 loopback 代理实现，
+    封禁期间对控制面的新连接直接拒绝（续租快速失败），120 s 后解除，150 s 自动回滚兜底。
+  expected:
+  - "动作返回时 lease 已被判定丢失：executor 日志含 regional command lease treated as lost 与 withheld a result under a lost lease，且不含结果提交的 rejected request (409)"
+  - "results_withheld_total=1、lease_lost_total>=1、lease_renewal_failures>=3、reported_failures=0、unexpected_failures=0、cancellations_observed_total=0，claimed_total=2（首次 claim 加一次重新 claim）"
+  - 动作线程上的 node-action lease guard 在动作结束时给出非空 hold reason（续租失败或本地过期），即一次此刻开始的节点动作会被拒绝
+  - 封禁解除后同一 executor 重新 claim 该命令并从幂等账本以 cached=true 收尾为 SUCCEEDED；物理副作用计数恰为 1
+  - 扣留期间命令保持 LEASED/PENDING，未出现任何终态；封禁在 120 s 后由 runner 解除，自动回滚未触发
+  - claim-state breadcrumb 的 counters 与 executor 最终 metrics_snapshot 逐项相等
+  - 清理后数据库、注册表、Kubernetes 三处残留均为零
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-006
+  related_pytest: tests/regional/test_net006_lease_loss.py::test_the_counter_contract_passes_on_one_withheld_result_and_one_reclaim
+- id: GF-REGIONAL-NET-007
+  title: 节点隔离步骤遭遇瞬时 Kubernetes API 故障时步骤 WAITING 重试而非 FAILED，故障消退后工作流照常收尾
+  category: regional-network-resilience
+  level: live
+  risk: live-node-mutation
+  problem: >-
+    ARCH-B1 把 Kubernetes 409/429/5xx 与 urllib3 超时/断连归为可重试适配器错误，让控制面 executor 的步骤进入 WAITING
+    （details.retryable_adapter_error）而不是 FAILED 并升级隔离。但在区域拓扑里 Kubernetes 调用发生在 GPU 面 cluster executor，
+    其异常出口原先只认 socket 级错误与 botocore 传输错误，不认 ApiException 与 urllib3 错误，一次真机的瞬时 API 故障
+    会以 executor-internal-error FAILED 收尾并升级到 ESCALATE_SUPPORT。ARCH-INTEGRATION 已把 retryable_adapter_error
+    接进 cluster executor 的异常出口（计数 retryable_adapter_errors_total）。本用例是这条对称契约在区域部署上的验收。
+  injection: >-
+    （设计，尚未实现驱动）在 GPU EKS 上为目标节点创建一条 ValidatingWebhookConfiguration：rules 仅 nodes 的 UPDATE，
+    objectSelector 仅 kubernetes.io/hostname=<目标节点>，matchConditions 仅 executor ServiceAccount 的 username，
+    failurePolicy=Fail、timeoutSeconds=1、clientConfig 指向不存在的 Service，使该节点上 executor 的 node patch 得到 HTTP 500；
+    随后按 COLLECT-017 A 段解绑一个 EFA function 开出 REMEDIATE_EFA_DRIVER 工作流（含 MARK_UNSCHEDULABLE 与 RESTORE_SCHEDULING），
+    60 s 后删除 webhook；由执行器镜像运行的 Job 作为 deadman 在到点时独立删除同名 webhook。不重启节点，不做 reset。
+  expected:
+  - 命中 500 的节点隔离步骤在 remote command 上为 WAITING，result_details 带可重试标记（retryable_transport_error 或区域回放的 retryable_adapter_error），控制面 step_execution 为 WAITING 而非 FAILED
+  - webhook 删除后同一步骤 SUCCEEDED，工作流按 COLLECT-017 A 段七步收尾为 SUCCEEDED，incident RECOVERED，节点最终 Ready 且可调度
+  - 全程不出现 ESCALATE_SUPPORT、QUARANTINE、RESTART_NODE、REPLACE_NODE；CloudTrail provider 变更动词集合为空
+  - webhook 与 deadman Job/ServiceAccount/ClusterRole/ClusterRoleBinding 零残留；EFA function 由控制面而非宿主 fail-safe 重绑
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-007
+  related_pytest: tests/execution/test_retryable_adapter_errors.py::test_transient_adapter_error_becomes_a_waiting_step_not_a_failure
+- id: GF-REGIONAL-NET-008
+  title: Collector outbox 的死信语义：403 保持可重放并在 token 恢复后送达，回放 4xx 死信并可 requeue，中断期间不重开 /dev/kmsg
+  category: regional-network-resilience
+  level: live
+  risk: live-kernel-log-injection
+  problem: >-
+    修复前 401/403 一次即死信（token 轮换窗口丢掉全节点故障流）、回放遇到确定性 4xx 永远占住重放窗口、
+    投递失败会让 kernel 采集器 reopen /dev/kmsg 到 live 端丢失中间行（ARCH-G2/G3/G4）。
+    gpu-fault-collector outbox list/stats/requeue-dead 是唯一的死信入口，此前没有真机证据。
+  injection: >-
+    A：在 gpu-fault-kernel-collector.service 上开 drop-in 环境窗口注入节点上随机生成的错误 cluster token 并重启该单元，
+    向真实 /dev/kmsg 用户态写入 2 条 monitor-only XID 63；B：在该单元停止（已 arm 兜底 start）时向 kernel.ndjson 追加一条
+    指向控制面不提供的 channel path 的 replayable 记录；关窗、启动，写一条 wake 行；C：NET-001 式 iptables 拒绝 TCP/443 90 s
+    （300 s 回滚定时器），期间再写一条 XID 63。
+  expected:
+  - A 期间 2 条记录进入 kernel outbox 且 replayable=true、error 含 403，outbox stats dead=0；服务 active 且 NRestarts 不变
+  - 关窗后 2 条各自恰好到达一次成为 NVIDIA_KERNEL 证据，outbox 中不再含其记录，replayable 归零
+  - 回放后种子记录 replayable=false、error 含 404，stats dead>=1；outbox list 只显示元数据、不含 payload
+  - requeue-dead 无 --yes 被拒；--yes 后输出 requeued 1 dead record，stats replayable>=1
+  - 中断前后 kernel 采集器 PID、InvocationID 与 /dev/kmsg fd 集合不变，fdinfo pos 不回退；中断期间写入的行在解封后恰到达一次
+  - 清理：窗口、防火墙规则、种子记录、Pod/ConfigMap 均为零残留
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-008
+  related_pytest: tests/regional/test_net008_outbox_dead_letter.py::test_the_transient_outbox_contract_passes_on_replayable_403_records
 - id: GF-REGIONAL-CAP-001
   title: 单集群队列打满时返回 429 且不影响其他集群
   category: regional-capacity
@@ -3439,6 +3575,8 @@ test_cases:
   - 前置必须核实 profile 里 gpuReset 是 OWN 而非 OBSERVE，否则 _owner 返回 None、RESET_GPU step 根本不生成
   - 节点动作寻址必须来自 fleet 心跳而非静态 map，过期节点应被显式拒绝为 agent lease is expired 或 agent is not registered，不得静默打到回收 IP 上的另一台机器
   - 判读顺序先确认 RESET_GPU step 是否被规划出来，再看 step error 是否为寻址类错误（no node action endpoint / not fleet-ready / not registered），最后才看节点 journal/ledger
+  - reset 后的 VALIDATE_GPU 必须为 step.gpu_uuids 中每一张 GPU 拿到晚于 readiness_after 的新鲜样本才 SUCCEEDED；任一 GPU 缺样本时 WAITING details 含 missing_recent_metrics_by_gpu[<uuid>]，不允许兄弟 GPU 的样本代答
+  - MARK_UNSCHEDULABLE 与 RESTORE_SCHEDULING 的 remote command result_details 含 node_baselines[node].before/after（unschedulable、taint_keys、resource_version），隔离后 after 带 gpu-fault.io/quarantined、恢复后 after 不带且 unschedulable 回到 previous-unschedulable；executor 每个副本的 GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS 为正数或未设（默认 30 s），每个 Kubernetes 调用都带该上限
   evidence:
     verdict: NOT_RUN
   automation: manual
@@ -3464,6 +3602,8 @@ test_cases:
   - GPU、host 和 fabric validation 全部通过后恢复可调度
   - CloudTrail 中没有 BatchReplaceClusterNodes
   - 控制面 EKS 比对结果为 IDENTICAL
+  - RESTART_NODE 提交前 executor 必须现场重读目标节点（node_id、kubernetes.io/hostname、hyperpod-<instance_id> 三个候选名）并观察到 spec.unschedulable=true、本 incident 的 gpu-fault.io/quarantined taint 与 gpu-fault.io/incident-id 注解；WAITING details 的 observed_isolation[node] 含 kubernetes_node、incident、fencing_token、resource_version，isolation_verified_nodes 只来自这次观测而不是 completed_operations 的记忆
+  - 任一候选名都读不到、或节点已被 uncordon/taint 被删/注解归属他人时 RESTART_NODE 立即 FAILED 且 details 含 safety_rejection=true 与 isolation_problems，不提交任何 provider 调用
   evidence:
     verdict: NOT_RUN
   automation: manual
@@ -3915,6 +4055,120 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-018
   related_pytest: tests/regional/test_destr018_lifetime_deadline.py::test_the_lifetime_contract_passes_on_the_intended_terminal_state
+- id: GF-REGIONAL-DESTR-019
+  title: Node Agent 空闲重启后同代际回归、/healthz 可写与计数、账本就地迁移、下一条真实命令留下完整审计轨迹
+  category: regional-destructive-acceptance
+  level: staging
+  risk: live-service-action
+  problem: >-
+    ARCH-C3/C4/C5 给 Node Agent 加了结构化命令日志、按 (command_id, attempt) 追加的审计账本与就地迁移、
+    以及带账本可写性/心跳/计数的 /healthz，此前只有单元证据。真机要证明：一次 Agent 重启不会退掉 incarnation
+    与 generation；部署 wheel 能把旧 schema 账本就地迁移且旧行可读、新 attempt 可追加；
+    重启后的第一条真实命令在 journald 留下 accepted/started/completed 三行且只含标识字段；
+    账本行带全部审计列；/healthz 计数恰移动一次。
+  injection: >-
+    在一台空闲 GPU 节点上（确认无任何 remote command 在飞、processor 队列为空）：先由宿主探针用 systemd 瞬态
+    定时器 arm 一个有界 fail-safe start，再 systemctl restart gpu-fault-node-agent.service 一次；
+    用部署 venv 里的 NodeActionLedger 打开一份按 84ce59f 之前 CREATE/ALTER 语句构造的临时旧 schema 账本
+    （只在 /var/lib/gpu-fault-acceptance 下，不碰真实账本）；然后向真实 /dev/kmsg 写入一条 solo XID 45
+    走 DESTR-010 已证明的 RESTART_FABRIC_MANAGER 两步工作流。不 reset、不 reboot、不隔离、不调用 provider。
+  expected:
+  - "重启前 /healthz 为 200：status=ok、ledger.writable=true、heartbeat.configured=true 且 last_success_at 非空、counters 恰含 accepted/completed/failed/rejected"
+  - 重启后 Agent MainPID 与 InvocationID 变化、boot_id 不变；控制面 agent 记录 lifecycle ACTIVE、generation 与 agent_incarnation_id 与基线相同、last_seen_at 晚于重启时刻；/healthz 计数全部归零且心跳年龄不超过 120 s
+  - "迁移演练：旧账本 user_version=0、主键仅 command_id，打开后 user_version=2、主键 (command_id, attempt)、审计列齐全、行数不变、results_legacy 不残留；旧行 attempt_history 读回一条、payload 可读；fencing 表保留且旧 token 仍被拒；追加 attempt 2 后 history 为 [1, 2]、get() 返回 attempt 2、exit_code 保留"
+  - XID 45 工作流恰为 FREEZE_EVIDENCE 与 RESTART_FABRIC_MANAGER 两步、owner 为 gpu-fault-control-plane/gpu-fault-node-agent、SUCCEEDED，不出现任何隔离/quiesce/reset/reboot 操作
+  - "journald（SyslogIdentifier=gpu-fault-node-agent）中该 command_id 恰有 accepted、started、completed 三行，每行含 command_id/incident_id/workflow_request_id/operation/node_id/fencing_token/agent_generation/gpu_count/attempt 九个字段且值与控制面一致，completed 行 status=SUCCEEDED 且 duration_ms 为整数；不含 parameters、GPU UUID 列表、signature、secret"
+  - "真实账本 PRAGMA user_version=2、主键 (command_id, attempt)；该命令恰一行 attempt=1、state=SUCCEEDED，incident_id/workflow_request_id/fencing_token 与控制面一致，started_at 早于 completed_at，parameters_digest 与 signature_digest 为 64 位 sha256，gpu_uuids 列非空，exit_code 为空；INTERRUPTED 行数与基线相同"
+  - "命令后 /healthz counters 为 accepted=1、completed=1、failed=0、rejected=0"
+  - CloudTrail provider 变更动词集合为空；节点 Kubernetes 状态与基线逐字段相同
+  - 清理后：fail-safe 定时器已解除且不留任何新增 gpu-fault timer、Agent 与 Fabric Manager 均 active、探针 Pod/ConfigMap 零残留、runtime identity 与 preflight 相同
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-019
+  related_pytest: tests/regional/test_destr019_node_probe.py::test_the_migration_drill_report_satisfies_the_case_verdict
+- id: GF-REGIONAL-DESTR-020
+  title: 隔离是观测出来的不是记住的：Kubernetes 不认识的别名节点让 MARK_UNSCHEDULABLE fail closed，任何节点都不被 cordon
+  category: regional-destructive-acceptance
+  level: staging
+  risk: live-non-destructive
+  problem: >-
+    ARCH-A5 之前 _isolate 把 read_node 404 记成 already_absent_nodes 当作"已隔离"成功，下游 reboot/replace 的 preflight 再从
+    isolation_verified_nodes 的记忆里放行；现在 404 → FAILED safety_rejection/absent，HyperPod 步骤也改为现场重读节点。
+    此前只有单元证据。真机要证明：一个 Kubernetes、fleet 与 provider 都不认识的 node_id 在第一条远端步骤就被拒绝，
+    没有任何真实节点被 cordon，且升级链本身也 fail closed。
+  injection: >-
+    经 executor 的 API 重放路径向控制面提交一条目录外 XID（策略给出 SITE_SAFETY 隔离计划、无任何物理步骤），
+    node_id 为 acceptance-alias-<run 摘要>：preflight 逐项核实它不是 Kubernetes 节点、没有 Node Agent、不在 GPU 节点清单。
+    不注入任何真实故障，不触碰任何真实节点。
+  expected:
+  - 别名 node_id 在 Kubernetes、fleet Agent 注册表与 GPU 节点清单中均不存在，preflight 逐项核实
+  - 目录外 XID 经 API 重放被接受（receipt 200），策略给出 SITE_SAFETY、safety_action=QUARANTINE、action 为空；工作流为 safety-only 的 FREEZE_EVIDENCE→MARK_UNSCHEDULABLE→QUARANTINE，不含任何物理操作
+  - MARK_UNSCHEDULABLE 的 remote command FAILED，result_details 含 safety_rejection=true、absent=true、node_id=别名，error 含 isolation cannot be observed；不存在其它操作的 remote command
+  - QUARANTINE 与任何 reset/reboot/replace 操作从未执行，completed_operations 不含隔离；workflow FAILED、incident node_ids 仅为别名且 state=ESCALATED
+  - 恰一次 support 升级：support incident effective_action=ESCALATE_OPERATOR、reasons[0] 以 containment_refused 开头、node_ids 仅为别名
+  - support 工作流步骤恰为 FREEZE_EVIDENCE→ESCALATE_SUPPORT 且终态 SUCCEEDED；别名上零 MARK_UNSCHEDULABLE/QUARANTINE/物理步骤（被拒绝的含容不再重规划隔离）
+  - 升级链深度 ≤1：观察窗内不出现 second-order（inc-support-after-workflow-support-after-…）incident 或 workflow
+  - 全部真实 GPU 节点的 unschedulable/taint/gpu-fault 注解与基线逐项相同，别名未成为节点；CloudTrail provider 变更动词集合为空
+  - 遗留的 FAILED incident 与 support 记录以 leftover_records 记入证据（无节点需恢复）
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-020
+  related_pytest: tests/regional/test_destr020_identity_mismatch_isolation.py::test_the_old_memory_based_isolation_is_a_failure
+- id: GF-REGIONAL-DESTR-021
+  title: 对抗性节点元数据下的 EFA 分层恢复：陈旧外来 plugin-restart 注解被接管、并发 409 下 RESTORE_SCHEDULING 仍收敛、隔离/恢复带前后快照
+  category: regional-destructive-acceptance
+  level: staging
+  risk: live-node-mutation
+  problem: >-
+    ARCH-A2 让节点 patch 每次重读并对 409 重试、耗尽后 WAITING 而非把节点永久留在 cordon；ARCH-A3 让 device-plugin 重启把
+    incident 写进注解、失败时清除、对超时的外来注解接管、缺 expected_count 时 fail closed；ARCH-A8 让 MARK_UNSCHEDULABLE 与
+    RESTORE_SCHEDULING 的结果带 before/after 调度快照。此前只有单元证据。真机要在真实 K8s API 的并发写入下证明这三件事。
+  injection: >-
+    在一台空闲 GPU 节点上先预写一组陈旧的外来 gpu-fault.io/efa-plugin-restart-* 注解（started-at 早于 restart_timeout+600 s），
+    再复用 COLLECT-017 A 段的注入（宿主探针 unbind 一个 EFA function，带有界 rebind fail-safe）触发七步 EFA 恢复工作流；
+    从注入到终态由本地有界写入器每 0.5 s patch 一次无害 tick 注解制造真实 409。不 reset、不 reboot、不 replace。
+  expected:
+  - 工作流恰为 FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、REMEDIATE_EFA_DRIVER、RESTART_EFA_DEVICE_PLUGIN、TRIGGER_HEALTH_SNAPSHOT、VALIDATE_FABRIC、RESTORE_SCHEDULING 七步且全部 SUCCEEDED，incident RECOVERED；不出现 quiesce/reset/reboot/replace
+  - 预置的陈旧外来 efa-plugin-restart 注解组被 RESTART_EFA_DEVICE_PLUGIN 接管：remote command result_details.node_results[node].took_over_incident 等于外来 incident，结束后四个注解键全部清除
+  - RESTART_EFA_DEVICE_PLUGIN 的 step 参数含正整数 expected_count 且等于节点 EFA allocatable 基线；node_results 的 allocatable ≥ expected
+  - MARK_UNSCHEDULABLE 的 result_details.node_baselines[node] 含 before/after（unschedulable、taint_keys、resource_version）：before 可调度、after cordon 且带 gpu-fault.io/quarantined，resource_version 变化
+  - RESTORE_SCHEDULING 的 node_baselines：before cordon → after 可调度、taint 消失、resource_version 变化
+  - 从注入到终态本地写入器每 0.5 s patch 一次 tick 注解（≥60 次、有界、结束后清除）；RESTORE_SCHEDULING 在并发冲突下仍 SUCCEEDED、从未 FAILED，观测到的 patch_conflict_retry 次数记入证据
+  - 结束后节点 Ready、可调度、无 gpu-fault.io 注解/taint、无 tick 注解、EFA allocatable 与基线一致、uid/boot_id 不变
+  - CloudTrail provider 变更动词集合为空；探针 Pod/ConfigMap 零残留；runtime identity 与 preflight 相同
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-021
+  related_pytest: tests/regional/test_destr021_adversarial_node_metadata.py::test_the_stale_foreign_annotation_is_taken_over_and_cleared
+- id: GF-REGIONAL-DESTR-022
+  title: 部署 executor 的 spare 预留巡检按 TTL 回收陈旧预留，热备全程保持 cordon
+  category: regional-destructive-acceptance
+  level: staging
+  risk: live-node-mutation
+  problem: >-
+    ARCH-A4b 给热备预留写入 gpu-fault.io/spare-reserved-at，并让巡检对 owner 已终止或 TTL 过期的预留 release；区域拓扑里
+    控制面没有 HyperPod 适配器，回收只能靠集群 executor 里 storeless 的 SpareReservationSweep 按 TTL 判定（ARCH-A4c 计数器
+    随 claim breadcrumb 落盘）。此前只有单元证据。真机要证明部署的 executor 真的在一个巡检周期内回收陈旧预留且不动其他任何东西。
+  injection: >-
+    在 DESTR-003/008 已声明的唯一热备节点上，用 kubectl patch 写入一个不存在于 store 的合成 incident 预留
+    （spare-reservation、回拨两天的 spare-reserved-at、spare-pool-state=ALLOCATED），不 uncordon；
+    等待部署 executor 的巡检回收。不触发任何 workflow、不调用 provider、不触碰其他节点。
+  expected:
+  - 注入前后热备节点始终 cordon（spec.unschedulable=true），本用例不 uncordon、不触碰其他节点、不调用任何 provider API
+  - 合成 incident 的预留（spare-reservation、回拨两天的 spare-reserved-at、spare-pool-state=ALLOCATED）在一个扫描周期内被部署的 cluster executor 释放：预留与时间戳注解消失、pool-state 回到 AVAILABLE
+  - "executor 日志恰有一行 reclaimed stale spare reservation: node=<spare> incident=<合成 id>，不出现其他节点/其他 incident 的回收行，也不出现 sweep failed"
+  - 每个 executor 副本 claim-state breadcrumb 的 counters.spare_reservations_reclaimed_total 不回退；breadcrumb 在回收时刻之后被重写的副本合计恰 +1
+  - 合成 incident 在 store 中始终不存在（前后查询均 NotFound），不产生任何 workflow 或 incident 记录
+  - 清理后热备节点的三项注解与 cordon 状态逐项等于声明基线，spare 标签与 taint 不变；其他 GPU 节点调度状态与基线相同；CloudTrail provider 变更动词集合为空
+  - 预置门禁：executor 必须 GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true 且 breadcrumb 含该计数器，否则拒绝执行（这是部署事实，不是用例缺陷）
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-022
+  related_pytest: tests/regional/test_destr022_spare_reservation_reclaim.py::test_the_counter_verdict_requires_the_increment_only_on_a_rewritten_breadcrumb
 - id: GF-REGIONAL-DESTR-013
   title: 硬约束否证 NodeRecovery 恒为 None 且全程不存在 BatchReplaceClusterNodes
   category: regional-destructive-acceptance
@@ -4165,6 +4419,7 @@ test_cases:
   - remove-cluster返回后旧token请求立即403且集群专属资源已删除或detach
   - 注销最后一个GPU集群后registry为显式空数组且CPU控制面保持Ready
   - uninstall删除方案资源但保留声明为keep的CPU/GPU底层集群
+  - join-cluster 发布新 registry revision 后，新集群 executor/Agent 的首个心跳与 claim 在任何 CPU Pod 重启之前即被接受（无 409 unknown cluster）；三个 CPU Deployment 的 Pod UID 与 restartCount 在 join 前后相同，且每个 Pod /healthz 的 regional_registry.secret_drift=false
   evidence:
     verdict: NOT_RUN
   automation: manual
@@ -4240,6 +4495,34 @@ test_cases:
   - tests/admin/test_release_deploy.py::test_profile_change_requires_approval_and_generates_version
   - tests/regional/test_regional_release_config_and_profile.py::test_runtime_profile_drift_requires_a_new_version
   - tests/hyperpod/test_training_submit_cli.py::test_site_supplies_runtime_profile_and_rejects_mismatch
+- id: GF-REGIONAL-BOOT-023
+  title: 发布审计历史只追加、注册表 durable 发布与 Secret 一致、rollback_compatible 声明在计划期被拒
+  category: regional-deployability
+  level: staging
+  risk: live-service-action
+  problem: >-
+    ARCH-H5 给每次 save_state 追加一条 gpu-fault-release-history 记录（release_id、phase、状态/计划摘要、操作者身份、
+    脱敏命令行）并把 previous 快照保留最近 3 组；ARCH-H3 把 registry 的 Secret 摘要与 durable head 摘要放进 /healthz；
+    ARCH-H2 删除了 schema_rollback_compatible 并拒绝 database.rollback_compatible: true 的清单。三者此前只有单元证据，
+    真机要证明部署的发布引擎真的写入并保留这些审计事实，且部署站点的 registry 两份事实一致。
+  injection: >-
+    使用 scripts/e2e/regional/run_boot023_release_history.py 对隔离站点执行一次 NOOP release（消费
+    boot020_release_candidates.py 生成的 noop 配置，走 RegionalRelease.noop 这条 gpu-fault-admin deploy 在 NOOP 分类下的同一路径），
+    前后读取 history ConfigMap、其管理端镜像、previous 快照 ConfigMap 与每个 CPU Pod 内的注册表摘要探针；
+    并把 noop 清单复制一份写入 database.rollback_compatible: true 交给发布配置解析器。不滚动任何 Deployment、不改 Secret、不发布 registry revision。
+  expected:
+  - 执行前该配置对 live 的分类必须为 NOOP 且 release state 处于 complete，否则拒绝执行
+  - NOOP release 后 gpu-fault-release-history 只追加不改写：既有条目前缀逐字相同，新增条目 release_id 等于 live release_id、phase=complete、timestamp 为 ISO-8601、state_sha256 为 64 位 sha256、plan_sha256 为 sha256 或 null、operator 非空、command 已脱敏（无凭据值、无 token 查询串），总条数不超过 200
+  - GPU_FAULT_RELEASE_HISTORY_DIR 下的 history.ndjson 镜像尾部与 ConfigMap 新增条目逐条相同
+  - previous 快照 ConfigMap（gpu-fault.io/release-previous-snapshot=true）分组数不超过 3 且 NOOP 前后完全相同
+  - 每个 CPU Pod 内计算的 Secret 配置摘要等于 durable head 的配置摘要，/healthz regional_registry.secret_drift=false、ready=true、secret_config_sha256 与探针一致，/livez 为 200；durable head generation 在 NOOP 前后不变
+  - "带 database.rollback_compatible: true 的清单被 parse_delivery_identity 以 ReleaseError 拒绝，错误信息同时说明原因（exact schema 匹配）与出路（--accept-schema-change）；不带该声明的同一清单仍被接受"
+  - 三个 CPU Deployment 与 executor 的 runtime identity 与 preflight 逐字段相同
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-023
+  related_pytest: tests/regional/test_boot023_release_history.py::test_the_real_parser_refuses_the_flag_and_the_verdict_accepts_its_message
 - id: GF-REGIONAL-AUTH-015
   title: fleet master 永不进入 GPU 节点
   category: regional-authentication
@@ -4318,6 +4601,34 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-009
   related_pytest: tests/regional/test_aurora_credential_refresh.py::test_rotation_restarts_every_configured_consumer
+- id: GF-REGIONAL-HA-010
+  title: Aurora 写入端故障转移只让控制面 NotReady 而不重启任何 Pod，启动退避有界
+  category: regional-high-availability
+  level: staging
+  risk: live-service-action
+  problem: >-
+    ARCH-H1 把 kubelet liveness 从依赖 Aurora 的 /healthz 改为进程本地的 /livez、registry stale 阈值 10→90 s、
+    启动 bootstrap 加了有界退避，ARCH-H3 让 /healthz 暴露 secret_drift；此前只有单元证据。真机要证明：一次 Aurora
+    writer failover 期间三个 CPU Deployment 没有任何容器被 kubelet 重启，readiness 可以 503 但 liveness 始终 200，
+    恢复落在 stale 窗口内；failover 期间新起的 Pod 在 Aurora 不可用时退避而不是 CrashLoopBackOff。
+  injection: >-
+    在无任何 remote command 在飞、processor 队列为空时调用 aws rds failover-db-cluster（HA-003 同一机制），
+    请求发出后立即删除一个 gpu-fault-api-ha 副本；每个 CPU Pod 内的采样器以 1 s 间隔读本地 /livez 与 /healthz
+    直到 readiness 恢复窗口结束。不注入任何故障、不触碰 GPU 面、不产生任何 workflow。
+  expected:
+  - 故障转移全程每个 CPU 控制面 Pod 的 /livez 每次采样均为 200，无一次非 200 或不可达
+  - /healthz 只允许 503（readiness），不得出现 500 等其它 5xx，也不得在 /livez 应答时不可达
+  - RDS 报告 available 后 GPU_FAULT_REGISTRY_STALE_SECONDS（读自 Pod 实际环境，默认 90 s）+30 s 内每个 Pod 的 /healthz 回到 200 且 regional_registry.ready=true
+  - 三个 CPU Deployment（gpu-fault-api-ha / gpu-fault-control-worker / gpu-fault-telemetry-spool-worker）所有既有 Pod 的 UID 不变、restartCount 增量为 0，Pod 数量不变
+  - 故障转移请求后立即删除的一个 gpu-fault-api-ha 副本在 GPU_FAULT_STARTUP_STORE_RETRY_SECONDS（默认 120 s）+180 s 内 Ready、restartCount=0，任一容器状态从未出现 CrashLoopBackOff；是否记录到 regional registry bootstrap attempt 退避日志作补充证据
+  - 故障转移前后每个 Pod /healthz 的 regional_registry.secret_drift=false、secret_config_sha256 非空、ready=true
+  - 采样时间线覆盖整个窗口：首个样本早于 failover 请求，末个样本晚于 readiness 恢复截止时刻；每 Pod 的 readiness 中断总秒数记入证据
+  - 全程无任何 remote command 在飞、processor 队列为空；三个 Deployment 回到期望副本数，runtime identity 与 preflight 相同
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-010
+  related_pytest: tests/regional/test_ha010_aurora_blackout_liveness.py::test_a_healthz_500_is_a_crash_not_a_refusal
 - id: GF-REGIONAL-NOTIFY-006
   title: 通知 dispatcher 的 service-role 装配与重启接管
   category: regional-notification
@@ -4344,6 +4655,29 @@ test_cases:
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-006
   pytest_nodeid: tests/notifications/test_notifications.py::test_only_the_worker_role_dispatches_the_outbox_through_the_lifespan
+- id: GF-REGIONAL-NOTIFY-007
+  title: 通知投递状态：瞬态失败是 RETRY 而非 FAILED，耗尽重试才是 DEAD 与终态 FAILED
+  category: regional-notification
+  level: live
+  risk: live-non-destructive
+  problem: >-
+    修复前每次投递失败都写 result=FAILED，一次 provider 抖动就触发 GpuFaultNotificationDeliveryFailing 这条 critical 告警。
+    ARCH-E1 之后 FAILED 是终态语义，RETRY 留在 delivery 行并由 gpu_fault_notification_delivery_total 暴露，此前只有单元证据。
+  injection: >-
+    在 control-worker Pod 内用隔离 InMemoryStore 与 Pod 的真实 SES notifier 跑发货的 dispatch_outbox：
+    第一条 DRILL 通知的首次 send 抛异常后第二轮真实发送；第二条 DRILL 通知的 send 永远失败且 max_attempts=1。
+    前后读部署 /metrics。不写任何生产行。
+  expected:
+  - 首轮后 notification_delivery_stats.by_status RETRY=1、无 result 行、dead_lettered_total=0；第二轮后 SENT=1 且 result=SENT 带 provider message id
+  - 耗尽后 by_status DEAD=1、result 为终态 FAILED、dead_lettered_total=1、provider 只被调用一次
+  - 部署导出 gpu_fault_notification_delivery_total{status}（含 PENDING/LEASED/RETRY/SENT/DEAD 五个序列）、oldest_pending_age、dead_lettered_total、dispatch_last_cycle_timestamp 四个家族
+  - 演练前后生产的 gpu_fault_notification_total{status=FAILED} 与 delivery_total{status=DEAD} 不上升
+  - GpuFaultNotificationDeliveryFailing 只读 result=FAILED、不读 RETRY，且其与 GpuFaultNotificationUndeliveredTooLong 的 runbook 锚点存在
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-007
+  related_pytest: tests/regional/test_notify007_delivery_states.py::test_the_retry_phase_contract_passes_when_retry_is_not_failed
 - id: GF-REGIONAL-CAP-005
   title: 生产 PostgreSQL 测试零 skip 门禁
   category: regional-capacity
@@ -5298,6 +5632,8 @@ test_cases:
   - remote_command_stats.by_status 的 PENDING+LEASED+WAITING 恰好减少被取消的条数
   - 重跑：compile-blocked/retired-generation 得到 already_closed/already_revoked 且 apply 空操作，orphaned-commands 的 apply 被拒且记录不变
   - 证据记录 store_backend（postgres 或 sqlite）与执行文本以模块源码为前缀，且只含摘要、不含 URL 与口令
+  - 每个被写的记录恰带一条归属事件（compile-blocked/orphaned-commands 为 OPERATOR_RECONCILED，retired-generation 为 OPERATOR_RETIRED_GENERATION）：actor 为 STS ARN 或 user@host、reference、admin_plan_sha256、运行时 plan_sha256、previous_status/new_status；被拒孪生无事件，重跑不新增事件
+  - apply 包在 command_log(kind=mutating) 内，日志落在 state-dir/logs/mutating/ 下
   evidence:
     verdict: NOT_RUN
   automation: command
@@ -5315,6 +5651,51 @@ test_cases:
   - --run-dir
   - artifacts/regional-acceptance/preempt036
   related_pytest: tests/regional/test_preempt036_stuck_workflow_reconcile.py::test_apply_closes_the_record_and_leaves_live_work_alone
+- id: GF-REGIONAL-PREEMPT-037
+  title: 调度循环判活：关闭 workflow dispatcher 后 last-cycle 时间戳老化，GpuFaultWorkflowDispatcherStalled 表达式在其 for 内成立，恢复后归零
+  category: regional-preemption
+  level: live
+  risk: live-service-action
+  problem: >-
+    dispatcher 导出的进度指标都由它自己的循环写入，线程死掉后每个指标都冻在最后一个健康值上。
+    ARCH-E3 在每轮开头盖 gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds 并新增告警，此前没有真机证据。
+  injection: >-
+    在 gpu-fault-control-worker 的 control-worker 容器上 kubectl set env GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER=false
+    （先记录基线，滚动全部副本），每 30 s 读各副本 /metrics 用规则文件里的阈值与 for 评估告警表达式，随后精确恢复基线。
+    只在没有任何 PENDING/RUNNING/WAITING 工作流时允许打开窗口。
+  expected:
+  - 窗口内所有 ready 副本读到 GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER=false
+  - time() - max(gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds) > 阈值 连续成立至少规则的 for 秒且不闪烁
+  - 同一时段 gpu_fault_periodic_last_cycle_timestamp_seconds 保持新鲜（只有 dispatcher 停了，进程没停）
+  - 规则读 gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds、severity=critical、runbook 锚点存在于运维手册
+  - 关窗后 Deployment env 与副本值精确回到基线（原本缺省则回到缺省），阈值秒内表达式变为 false
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-037调度循环判活
+  related_pytest: tests/regional/test_preempt037_dispatcher_liveness.py::test_the_stall_timeline_contract_passes_when_the_expression_holds_for_the_rule_for
+- id: GF-REGIONAL-PREEMPT-038
+  title: 原始证据钉在 incident 生命周期上：过期行在同集群开放 incident 点名其节点时不被清理，RECOVERED 后才删，且每次清理记录被删的键
+  category: regional-preemption
+  level: live
+  risk: live-non-destructive
+  problem: >-
+    RawEvidenceRecord 24 h 过期而 incident 永不删除，操作员打开 ESCALATED incident 时证据早已不在。
+    ARCH-D6 按 attempt 或 node+时间窗把记录钉到非 RECOVERED incident 上，ARCH-D7 让每次清理 INFO 记录键；此前只有单元证据。
+  injection: >-
+    在 control-worker Pod 内向真库插入两条已过期 raw_evidence（合成集群 audit-cluster：一条无关节点、一条被同集群
+    ESCALATED incident 点名的节点）与该 incident，观察部署的周期清理；再把 incident 改为 RECOVERED 继续观察；
+    finally 删除全部 audit-* 行。读 control-worker 日志。
+  expected:
+  - 无关过期行在 180 s 内被清理，同一轮及随后 15 s 内被钉住的行仍在
+  - incident 改为 RECOVERED 后被钉住的行在 180 s 内被清理
+  - "control-worker 日志含 cleanup raw_evidence deleted N rows; keys[:20]=... 且分别点名两条被删的键；没有 0 行的清理日志"
+  - finally 后以 audit- 为前缀的本次行数为 0
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-038证据钉在-incident-生命周期
+  related_pytest: tests/regional/test_preempt038_evidence_pins.py::test_the_audit_contract_passes_when_only_the_pinned_row_survives
 - id: GF-REGIONAL-WORKLOAD-001
   title: 用 gpu-training-submit 提交三节点 managed PyTorchJob
   category: regional-workload
@@ -5751,6 +6132,76 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-017
   related_pytest: tests/collectors/test_host.py::test_efa_inventory_distinguishes_unbound_driver_from_missing_pci
+- id: GF-REGIONAL-COLLECT-018
+  title: 202 之后被拒的故障层事件被计数、告警并落到节点采集器状态；无编号的 Xid 行成为 operator-review finding 而非静默丢弃
+  category: regional-collector
+  level: live
+  risk: live-kernel-log-injection
+  problem: >-
+    每个采集通道都是 receipt=True：ingress 解码 JSON 后回 202，handler 的真实裁决在处理器回放时才出现。
+    修复前回放 422 以 success 收尾，kernel 通道的 payload 漂移看起来像节点安静了（ARCH-G1）；
+    含 Xid 词但无编号的行则被吞掉（ARCH-G7）。
+  injection: >-
+    A：在目标节点用其自身配置的 sink（真实 token、TLS、端点）POST 一条带 strict model 禁止字段的
+    NvidiaKernelLogEvent（合成 API 注入，payload 自述如此）；B：向真实 /dev/kmsg 用户态写入一条
+    "NVRM: Xid (PCI:...): ," 无编号行；C：写一条 monitor-only XID 63 让一次真实接受的批次清除 erroring。
+  expected:
+  - "节点 NVIDIA_KERNEL 采集器状态出现 rejected-event: HTTP 422 条目并盖 last_error_at，且不回显 payload"
+  - gpu_fault_processor_fault_rejections_total 与 completions_by_path_status_total{path=nvidia-kernel,status_class=4xx} 各增加
+  - "控制面日志含 processor replay rejected a fault-layer event、request_id= 与 status=422，不含被拒 payload"
+  - gpu_fault_collector_silent_nodes{channel=NVIDIA_KERNEL} 不上升、silent_top_node 不点名该节点、erroring_nodes>=1
+  - 无编号行产生 unparsed_xid_line incident，其工作流只含 FREEZE_EVIDENCE、不含隔离/重启/reset，有 OPERATOR_REVIEW 通知，原始行保留为证据，gpu_fault_ingest_unresolved_fault_signals_total{kind=unparsed_xid_line} 增加
+  - 一条真实接受的批次后 last_success_at > last_error_at；节点无 ownership、可调度
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-018
+  related_pytest: tests/regional/test_collect018_rejected_event.py::test_the_rejected_status_contract_passes_on_a_rejected_event_row
+- id: GF-REGIONAL-COLLECT-019
+  title: nvidia-smi 挂起超过超时多轮，host collector 不重启、持续投递带断路器原因的错误批次，控制面报 erroring 而非 silent
+  category: regional-collector
+  level: live
+  risk: live-non-destructive
+  problem: >-
+    修复前一个挂起的 nvidia-smi 拖住整个 host collector，控制面把它当作 silent 并按连通性去排查。
+    ARCH-G5 给每轮一次共享调用、15 s 超时与 3 次连续超时开 4 轮的断路器，此前只有单元证据。
+  injection: >-
+    只在 gpu-fault-host-collector.service 的 PATH 最前放一个 sleep 30 s 后 exec 真实 nvidia-smi 的包装
+    （drop-in 位于 /run，600 s 后 deadman 自动关窗），重启该单元一次；结束后关窗再重启一次。真实二进制与 GPU 不动。
+  expected:
+  - HOST_TELEMETRY 采集器状态 errors 先出现 nvidia-smi ... timed out，达到 3 轮后出现 nvidia-smi circuit breaker open
+  - 窗口内该单元 ActiveState=active、NRestarts 与 MainPID 均不变
+  - gpu_fault_collector_erroring_nodes{channel=HOST_TELEMETRY}>=1 且 silent_nodes 不上升
+  - 关窗后一个 summary 周期内 last_success_at > last_error_at；drop-in 与窗口目录被删除
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-019
+  related_pytest: tests/regional/test_collect019_nvidia_smi_hang.py::test_the_erroring_status_contract_passes_on_timeout_then_breaker
+- id: GF-REGIONAL-COLLECT-020
+  title: 未配置期望 GPU 数时按实例类型推导；一次 inventory 查询少一个 UUID 即 CRITICAL identity finding、诊断而非重启，restore 后 marker 带退役字段
+  category: regional-collector
+  level: live
+  risk: live-isolation
+  problem: >-
+    修复前 UUID 集合变化只是一条证据行，没人会看；expected count 缺失时报不出任何东西。
+    ARCH-G6 让它成为 CRITICAL gpu_inventory_identity_changed（RUN_DCGM_DIAGNOSTIC+VALIDATE_GPU，不重启）并按实例类型推导期望数，
+    ARCH-E7 让区域 DCGM 完成也发通知，ARCH-I4 让退役 marker 保留 retired_at/retired_reason；此前只有单元证据。
+  injection: >-
+    只在 gpu-fault-metrics-collector.service 上：UnsetEnvironment GPU_FAULT_EXPECTED_GPU_COUNT，并在其 PATH 最前放 nvidia-smi 影子，
+    仅对第一次 --query-gpu=index,uuid,pci.bus_id,name 查询去掉一个 UUID 行、其余全部透传（drop-uuid:<uuid>:1，
+    低于 host collector 的 2 次 mismatch 阈值）。设备不动。incident 用 validation-first restore 工作流恢复。
+  expected:
+  - 少一个 UUID 的 GPU_INVENTORY 证据被保留，且其 expected_gpu_count 等于实例类型表值而非 null
+  - 出现 reasons 点名被移除 UUID 的 gpu_inventory_identity_changed incident；其工作流含 RUN_DCGM_DIAGNOSTIC/VALIDATE_GPU、不含 RESTART_NODE/REPLACE_NODE/RESET_*，到达终态
+  - 有 OPERATOR_REVIEW 通知与一条 DCGM 诊断完成通知
+  - 无 gpu_expected_count_unknown、无 gpu_inventory_mismatch，boot_id 不变
+  - restore 后 RECOVERED incident 的每个 marker 带 retired_at 与 retired_reason；节点无 ownership、无 taint、可调度
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-020
+  related_pytest: tests/regional/test_collect020_gpu_identity.py::test_the_identity_finding_contract_passes_on_a_diagnostic_workflow
 - id: GF-REGIONAL-COLLECT-015
   title: SXID ALWAYS_FATAL 经 provider 真机整机重启
   category: regional-collector

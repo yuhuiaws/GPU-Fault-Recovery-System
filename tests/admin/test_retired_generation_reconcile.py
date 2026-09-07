@@ -168,6 +168,7 @@ def test_the_shipped_source_imports_nothing_the_old_image_may_lack() -> None:
     allowed = {
         "__future__",
         "hashlib",
+        "inspect",
         "json",
         "sys",
         "datetime",
@@ -504,3 +505,50 @@ def test_a_changed_plan_names_the_field_that_moved(
             expected_plan_sha256=plan["plan_sha256"],
             reference="pre-deploy-6459c07ea279",
         )
+
+
+def test_apply_sends_the_operator_identity_and_the_driver_forwards_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The revocation event in the Pod must name who approved it (I1).
+
+    The admin side resolves the STS identity and puts it, with the admin plan
+    digest, into the apply payload; the shipped driver hands both to
+    ``apply_retired_generation_plan`` so the workflow event records them.
+    """
+
+    from tests.admin.conftest import TEST_OPERATOR_ARN
+
+    calls = _fake_runner(monkeypatch)
+    site = _site(tmp_path)
+    plan = reconcile.plan_retired_generation_reconcile(
+        site, tmp_path, workflow_ids=(WORKFLOW,)
+    )
+
+    result = reconcile.apply_retired_generation_reconcile(
+        site,
+        tmp_path,
+        expected_plan_sha256=plan["plan_sha256"],
+        reference="pre-deploy-6459c07ea279",
+    )
+
+    assert calls[-1]["mode"] == "apply"
+    assert calls[-1]["actor"] == TEST_OPERATOR_ARN
+    assert calls[-1]["admin_plan_sha256"] == plan["plan_sha256"]
+    assert result["actor"] == TEST_OPERATOR_ARN
+    archive = tmp_path / reconcile.RETIRED_GENERATION_HISTORY_PATH / plan["plan_sha256"]
+    applied = json.loads((archive / "applied.json").read_text(encoding="utf-8"))
+    assert applied["actor"] == TEST_OPERATOR_ARN
+
+    tree = ast.parse(reconcile.RETIRED_GENERATION_DRIVER)
+    forwarded = {
+        keyword.arg
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "apply_retired_generation_plan"
+        for keyword in node.keywords
+    }
+    assert {"actor", "admin_plan_sha256"} <= forwarded, (
+        f"the driver does not forward the identity to the apply: {forwarded}"
+    )

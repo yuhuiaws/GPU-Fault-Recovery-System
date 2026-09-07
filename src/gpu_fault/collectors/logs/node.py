@@ -27,7 +27,7 @@ from gpu_fault.log_rules import (
 
 
 from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.sinks import EventSink
+from gpu_fault.collectors.sinks import EventSink, deliver_event
 
 LOGGER = logging.getLogger(__name__)
 
@@ -136,6 +136,10 @@ class NodeLogCollector:
         # cannot tell "this happened once" from "this happens every poll", and
         # the second one is the one that needs a human.
         self._discarded: dict[str, int] = {}
+        # journald hands back a byte array for a MESSAGE that is not valid
+        # UTF-8; those are decoded with replacement and counted here so a
+        # driver line with one stray byte does not vanish from the batch.
+        self.binary_messages_total = 0
         self._cold_start_reason: str | None = "no state was loaded"
         self.state_path = Path(state_path) if state_path else None
         self.initial_tail_bytes = (
@@ -309,10 +313,23 @@ class NodeLogCollector:
         )
         try:
             if entries or periodic_due:
-                self.sink.post(
+                result = deliver_event(
+                    self.sink,
                     NODE_LOG_PATH,
                     batch.model_dump(mode="json"),
                 )
+                # A batch the outbox took is as good as delivered for the
+                # cursor (ARCH-G3): rolling back re-read the same window and
+                # re-buffered the same entries every poll. Only a batch that
+                # went nowhere pins the cursor.
+                result.raise_for_failure()
+                if result.buffered:
+                    LOGGER.warning(
+                        "node log batch persisted to the collector outbox; "
+                        "advancing the cursor: batch=%s error=%s",
+                        batch.batch_id,
+                        result.error,
+                    )
             if periodic_due:
                 self._next_health_summary = next_stable_phase(
                     collected_at,
@@ -550,7 +567,7 @@ class NodeLogCollector:
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            message = self._bounded_message(str(item.get("MESSAGE") or ""))
+            message = self._bounded_message(self._message_text(item.get("MESSAGE")))
             # A journal cursor carries the boot id and the journal file id, so
             # it is unique across nodes on its own. The fallback for a line
             # without one used to hash the raw line, and two nodes printing the
@@ -598,6 +615,21 @@ class NodeLogCollector:
                 default=str,
             ).encode("utf-8")
         ).hexdigest()
+
+    def _message_text(self, value: object) -> str:
+        """The MESSAGE field as text.
+
+        ``journalctl --output=json`` emits a JSON array of byte values when the
+        field is not valid UTF-8. ``str()`` of that list is ``"[78, 86, ...]"``,
+        which matches no rule, so the line was silently dropped (ARCH-G9).
+        """
+
+        if isinstance(value, list) and all(
+            isinstance(item, int) and 0 <= item <= 255 for item in value
+        ):
+            self.binary_messages_total += 1
+            return bytes(value).decode("utf-8", errors="replace")
+        return str(value or "")
 
     def _bounded_message(self, message: str) -> str:
         raw = message.encode("utf-8", errors="replace")

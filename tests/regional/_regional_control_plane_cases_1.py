@@ -287,11 +287,21 @@ def test_remote_command_digest_includes_step_parameters() -> None:
     second = copy_model(base.step, parameters={"target_driver_branch": 580})
 
     adapter.execute(replace(base, step=first))
-    adapter.execute(replace(base, step=second))
+    outcome = adapter.execute(replace(base, step=second))
 
-    command_ids = sorted(command.command_id for command in store.list_remote_commands())
-    assert len(command_ids) == 2
-    assert command_ids[0] != command_ids[1]
+    # The digest tells the two parameterisations apart, but the first command
+    # is still open for this step, so the second is held rather than minted
+    # (open-command invariant, ARCH-D5).
+    commands = store.list_remote_commands()
+    assert len(commands) == 1, "a second command was minted beside an open one"
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome
+    assert outcome.details["reason"] == "OPEN_SIBLING_COMMAND", outcome.details
+    assert outcome.details["held_command_id"] != commands[0].command_id, (
+        "the rewritten parameters must produce a different command digest"
+    )
+    assert outcome.details["remote_command_id"] == commands[0].command_id, (
+        "the hold must name the open sibling"
+    )
 
 
 def test_remote_command_digest_ignores_dag_scheduling_metadata() -> None:
@@ -322,9 +332,17 @@ def test_remote_command_digest_includes_rebound_nodes() -> None:
     rebound = copy_model(base.step, node_ids=["node-b"])
 
     adapter.execute(replace(base, step=base.step))
-    adapter.execute(replace(base, step=rebound))
+    outcome = adapter.execute(replace(base, step=rebound))
 
-    assert len(store.list_remote_commands()) == 2
+    # Rebinding the node changes the digest; the open first command holds the
+    # second instead of letting two actions target the step (ARCH-D5).
+    commands = store.list_remote_commands()
+    assert len(commands) == 1, "a second command was minted beside an open one"
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome
+    assert outcome.details["reason"] == "OPEN_SIBLING_COMMAND", outcome.details
+    assert outcome.details["held_command_id"] != commands[0].command_id, (
+        "the rebound node must produce a different command digest"
+    )
 
 
 def test_failed_remote_restart_releases_restart_budget() -> None:

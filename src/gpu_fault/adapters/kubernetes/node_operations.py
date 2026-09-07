@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -30,6 +32,40 @@ from gpu_fault.adapters.common import (
     NodeIsolationRejected,
     QUARANTINE_TAINT,
     quarantine_taint_value,
+)
+from gpu_fault.adapters.kubernetes.primitives import (
+    NodePatchConflict,
+    node_scheduling_snapshot,
+    patch_node_with_retry,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+ANNOTATION_EFA_PLUGIN_RESTART_INCIDENT = "gpu-fault.io/efa-plugin-restart-incident"
+
+ANNOTATION_GPU_PLUGIN_RESTART_INCIDENT = "gpu-fault.io/gpu-plugin-restart-incident"
+
+
+@dataclass(frozen=True)
+class _PluginRestartKeys:
+    operation: str
+    incident: str
+    pod_uid: str
+    started: str
+
+
+_EFA_PLUGIN_RESTART_KEYS = _PluginRestartKeys(
+    operation=ANNOTATION_EFA_PLUGIN_RESTART_OPERATION,
+    incident=ANNOTATION_EFA_PLUGIN_RESTART_INCIDENT,
+    pod_uid=ANNOTATION_EFA_PLUGIN_RESTART_POD_UID,
+    started=ANNOTATION_EFA_PLUGIN_RESTART_STARTED_AT,
+)
+
+_GPU_PLUGIN_RESTART_KEYS = _PluginRestartKeys(
+    operation=ANNOTATION_GPU_PLUGIN_RESTART_OPERATION,
+    incident=ANNOTATION_GPU_PLUGIN_RESTART_INCIDENT,
+    pod_uid=ANNOTATION_GPU_PLUGIN_RESTART_POD_UID,
+    started=ANNOTATION_GPU_PLUGIN_RESTART_STARTED_AT,
 )
 
 
@@ -74,154 +110,52 @@ class KubernetesNodeOperationsMixin:
                 ("vpc.amazonaws.com/efa" if efa else "nvidia.com/gpu"),
             )
         )
-        operation_annotation = (
-            ANNOTATION_EFA_PLUGIN_RESTART_OPERATION
-            if efa
-            else ANNOTATION_GPU_PLUGIN_RESTART_OPERATION
-        )
-        pod_uid_annotation = (
-            ANNOTATION_EFA_PLUGIN_RESTART_POD_UID
-            if efa
-            else ANNOTATION_GPU_PLUGIN_RESTART_POD_UID
-        )
-        started_annotation = (
-            ANNOTATION_EFA_PLUGIN_RESTART_STARTED_AT
-            if efa
-            else ANNOTATION_GPU_PLUGIN_RESTART_STARTED_AT
-        )
-        expected = int(parameters.get("expected_count", 1))
+        keys = _EFA_PLUGIN_RESTART_KEYS if efa else _GPU_PLUGIN_RESTART_KEYS
+        # The expected device count is what "restored" means. Defaulting it
+        # to 1 declared an 8-GPU node healthy the moment one device came
+        # back; without a known count there is nothing to judge against.
+        raw_expected = parameters.get("expected_count")
+        try:
+            expected = int(raw_expected) if raw_expected is not None else 0
+        except (TypeError, ValueError):
+            expected = 0
+        if expected < 1:
+            return WorkflowStepOutcome.failed(
+                "device plugin restart requires a positive expected_count for "
+                f"{resource_name}; refusing to judge node health without it",
+                details={
+                    "safety_rejection": True,
+                    "resource_name": resource_name,
+                    "expected_count": raw_expected,
+                },
+            )
         timeout_seconds = int(parameters.get("restart_timeout_seconds", 180))
         node_results: dict[str, dict[str, Any]] = {}
         waiting = False
         now = datetime.now(timezone.utc)
         for node_id in context.step.node_ids:
-            node = self.core.read_node(node_id)
-            allocatable = self._node_allocatable(node, resource_name)
-            annotations = self._annotations(node)
-            operation = annotations.get(operation_annotation)
-            old_uid = annotations.get(pod_uid_annotation, "")
-            started_raw = annotations.get(started_annotation)
-            pods = self._efa_plugin_pods(
-                node_id,
-                namespace=namespace,
-                label_selector=selector,
-            )
-            ready_new_pods = [
-                pod
-                for pod in pods
-                if self._pod_ready(pod) and self._pod_uid(pod) != old_uid
-            ]
-            if allocatable >= expected and (
-                operation is None
-                or operation == context.idempotency_key
-                and ready_new_pods
-            ):
-                if operation == context.idempotency_key:
-                    self.core.patch_node(
-                        node_id,
-                        {
-                            "metadata": {
-                                "resourceVersion": (self._resource_version(node)),
-                                "annotations": {
-                                    operation_annotation: None,
-                                    pod_uid_annotation: None,
-                                    started_annotation: None,
-                                },
-                            }
-                        },
-                    )
-                node_results[node_id] = {
-                    "allocatable": allocatable,
-                    "expected": expected,
-                    "already_healthy": operation is None,
-                    "replacement_pod_uids": [
-                        self._pod_uid(pod) for pod in ready_new_pods
-                    ],
-                }
-                continue
-            if operation and operation != context.idempotency_key:
-                return WorkflowStepOutcome.failed(
-                    f"node {node_id} has another EFA plugin restart "
-                    f"in progress: {operation}"
-                )
-            if operation == context.idempotency_key:
-                try:
-                    started = datetime.fromisoformat(
-                        str(started_raw).replace("Z", "+00:00")
-                    )
-                except (TypeError, ValueError):
-                    started = now
-                if (now - started).total_seconds() >= timeout_seconds:
-                    return WorkflowStepOutcome.failed(
-                        f"device plugin did not restore {resource_name} on {node_id}",
-                        details={
-                            "node_id": node_id,
-                            "allocatable": allocatable,
-                            "expected": expected,
-                            "plugin_pods": [self._pod_name(pod) for pod in pods],
-                        },
-                    )
-                waiting = True
-                node_results[node_id] = {
-                    "allocatable": allocatable,
-                    "expected": expected,
-                    "waiting_for_replacement_pod": True,
-                }
-                continue
-            if not pods:
-                self.core.patch_node(
+            try:
+                result = self._restart_device_plugin_node(
+                    context,
                     node_id,
-                    {
-                        "metadata": {
-                            "resourceVersion": self._resource_version(node),
-                            "annotations": {
-                                operation_annotation: (context.idempotency_key),
-                                pod_uid_annotation: "",
-                                started_annotation: now.isoformat(),
-                            },
-                        }
-                    },
+                    keys=keys,
+                    namespace=namespace,
+                    selector=selector,
+                    resource_name=resource_name,
+                    expected=expected,
+                    timeout_seconds=timeout_seconds,
+                    now=now,
                 )
+            except NodePatchConflict:
+                # The node is unchanged; the next pass re-reads and retries.
                 waiting = True
-                node_results[node_id] = {
-                    "allocatable": allocatable,
-                    "expected": expected,
-                    "waiting_for_daemonset_pod": True,
-                }
+                node_results[node_id] = {"patch_conflict_retry": True}
                 continue
-            if len(pods) != 1:
-                return WorkflowStepOutcome.failed(
-                    f"expected at most one device plugin Pod on "
-                    f"{node_id}, found {len(pods)}"
-                )
-            pod = pods[0]
-            pod_uid = self._pod_uid(pod)
-            pod_name = self._pod_name(pod)
-            self.core.patch_node(
-                node_id,
-                {
-                    "metadata": {
-                        "resourceVersion": self._resource_version(node),
-                        "annotations": {
-                            operation_annotation: context.idempotency_key,
-                            pod_uid_annotation: pod_uid,
-                            started_annotation: now.isoformat(),
-                        },
-                    }
-                },
-            )
-            self.core.delete_namespaced_pod(
-                pod_name,
-                namespace,
-                grace_period_seconds=0,
-            )
-            waiting = True
-            node_results[node_id] = {
-                "deleted_pod": f"{namespace}/{pod_name}",
-                "deleted_pod_uid": pod_uid,
-                "allocatable": allocatable,
-                "expected": expected,
-            }
+            if isinstance(result, WorkflowStepOutcome):
+                return result
+            node_result, node_waiting = result
+            waiting = waiting or node_waiting
+            node_results[node_id] = node_result
         if waiting:
             return WorkflowStepOutcome.waiting(
                 operation_id=context.idempotency_key,
@@ -230,6 +164,202 @@ class KubernetesNodeOperationsMixin:
         return WorkflowStepOutcome.succeeded(
             operation_id=context.idempotency_key,
             details={"node_results": node_results},
+        )
+
+    def _restart_device_plugin_node(
+        self,
+        context: WorkflowStepContext,
+        node_id: str,
+        *,
+        keys: _PluginRestartKeys,
+        namespace: str,
+        selector: str,
+        resource_name: str,
+        expected: int,
+        timeout_seconds: int,
+        now: datetime,
+    ) -> WorkflowStepOutcome | tuple[dict[str, Any], bool]:
+        node = self.core.read_node(node_id)
+        allocatable = self._node_allocatable(node, resource_name)
+        annotations = self._annotations(node)
+        operation = annotations.get(keys.operation)
+        old_uid = annotations.get(keys.pod_uid, "")
+        started = self._plugin_restart_started(annotations.get(keys.started))
+        took_over: str | None = None
+        if operation and operation != context.idempotency_key:
+            owner_incident = annotations.get(keys.incident)
+            if (
+                owner_incident != context.incident.incident_id
+                and not self._plugin_restart_is_stale(
+                    started, now=now, timeout_seconds=timeout_seconds
+                )
+            ):
+                return WorkflowStepOutcome.failed(
+                    f"node {node_id} has another device plugin restart "
+                    f"in progress: {operation}"
+                )
+            # The owner is this incident's own earlier workflow, or a foreign
+            # restart that outlived its own timeout: either way it will never
+            # clear its annotation, and leaving it there poisons every later
+            # restart on this node.
+            self._clear_plugin_restart(node_id, keys)
+            took_over = owner_incident or operation
+            operation = None
+            old_uid = ""
+            started = None
+        pods = self._efa_plugin_pods(
+            node_id,
+            namespace=namespace,
+            label_selector=selector,
+        )
+        ready_new_pods = [
+            pod
+            for pod in pods
+            if self._pod_ready(pod) and self._pod_uid(pod) != old_uid
+        ]
+        if allocatable >= expected and (operation is None or ready_new_pods):
+            if operation == context.idempotency_key:
+                self._clear_plugin_restart(node_id, keys)
+            result: dict[str, Any] = {
+                "allocatable": allocatable,
+                "expected": expected,
+                "already_healthy": operation is None,
+                "replacement_pod_uids": [self._pod_uid(pod) for pod in ready_new_pods],
+            }
+            if took_over is not None:
+                result["took_over_incident"] = took_over
+            return result, False
+        if operation == context.idempotency_key:
+            if started is None:
+                started = now
+            if (now - started).total_seconds() >= timeout_seconds:
+                self._clear_plugin_restart(node_id, keys)
+                return WorkflowStepOutcome.failed(
+                    f"device plugin did not restore {resource_name} on {node_id}",
+                    details={
+                        "node_id": node_id,
+                        "allocatable": allocatable,
+                        "expected": expected,
+                        "plugin_pods": [self._pod_name(pod) for pod in pods],
+                    },
+                )
+            return {
+                "allocatable": allocatable,
+                "expected": expected,
+                "waiting_for_replacement_pod": True,
+            }, True
+        if not pods:
+            self._mark_plugin_restart(node_id, keys, context, pod_uid="", now=now)
+            result = {
+                "allocatable": allocatable,
+                "expected": expected,
+                "waiting_for_daemonset_pod": True,
+            }
+            if took_over is not None:
+                result["took_over_incident"] = took_over
+            return result, True
+        if len(pods) != 1:
+            return WorkflowStepOutcome.failed(
+                f"expected at most one device plugin Pod on {node_id}, found {len(pods)}"
+            )
+        pod = pods[0]
+        pod_uid = self._pod_uid(pod)
+        pod_name = self._pod_name(pod)
+        self._mark_plugin_restart(node_id, keys, context, pod_uid=pod_uid, now=now)
+        try:
+            self.core.delete_namespaced_pod(
+                pod_name,
+                namespace,
+                grace_period_seconds=0,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) != 404:
+                # The annotation was written for a delete that never
+                # happened; left in place it would report "another restart
+                # in progress" to every later workflow.
+                try:
+                    self._clear_plugin_restart(node_id, keys)
+                except Exception:  # noqa: BLE001 - the delete error is the story
+                    LOGGER.exception(
+                        "cannot clear device plugin restart annotation on %s",
+                        node_id,
+                    )
+                raise
+        result = {
+            "deleted_pod": f"{namespace}/{pod_name}",
+            "deleted_pod_uid": pod_uid,
+            "allocatable": allocatable,
+            "expected": expected,
+        }
+        if took_over is not None:
+            result["took_over_incident"] = took_over
+        return result, True
+
+    @staticmethod
+    def _plugin_restart_started(raw: str | None) -> datetime | None:
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _plugin_restart_is_stale(
+        started: datetime | None,
+        *,
+        now: datetime,
+        timeout_seconds: int,
+    ) -> bool:
+        """A foreign restart annotation may be taken over once it is stale.
+
+        Age is the only evidence available: an annotation with no parsable
+        start time cannot be proven stale, so it stays refused (fail closed).
+        """
+        if started is None:
+            return False
+        return (now - started).total_seconds() >= timeout_seconds
+
+    def _mark_plugin_restart(
+        self,
+        node_id: str,
+        keys: _PluginRestartKeys,
+        context: WorkflowStepContext,
+        *,
+        pod_uid: str,
+        now: datetime,
+    ) -> None:
+        patch_node_with_retry(
+            self.core,
+            node_id,
+            lambda node: {
+                "metadata": {
+                    "resourceVersion": self._resource_version(node),
+                    "annotations": {
+                        keys.operation: context.idempotency_key,
+                        keys.incident: context.incident.incident_id,
+                        keys.pod_uid: pod_uid,
+                        keys.started: now.isoformat(),
+                    },
+                }
+            },
+        )
+
+    def _clear_plugin_restart(self, node_id: str, keys: _PluginRestartKeys) -> None:
+        patch_node_with_retry(
+            self.core,
+            node_id,
+            lambda node: {
+                "metadata": {
+                    "resourceVersion": self._resource_version(node),
+                    "annotations": {
+                        keys.operation: None,
+                        keys.incident: None,
+                        keys.pod_uid: None,
+                        keys.started: None,
+                    },
+                }
+            },
         )
 
     def _check_mechanicals(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
@@ -295,110 +425,197 @@ class KubernetesNodeOperationsMixin:
             },
         )
 
+    def _observed_snapshot(self, node_id: str) -> dict[str, Any]:
+        """Re-read the node so the recorded 'after' state is observed."""
+        try:
+            return node_scheduling_snapshot(self.core.read_node(node_id))
+        except Exception as exc:  # noqa: BLE001 - the patch already succeeded
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
     def _isolate(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
-        absent_nodes = []
+        baselines: dict[str, dict[str, Any]] = {}
+        conflicts: list[str] = []
         for node_id in context.step.node_ids:
-            for attempt in range(3):
-                try:
-                    node = self.core.read_node(node_id)
-                except Exception as exc:
-                    if getattr(exc, "status", None) == 404:
-                        absent_nodes.append(node_id)
-                        break
-                    raise
-                try:
-                    body = self._node_isolation_patch(node, context)
-                except NodeIsolationRejected as exc:
+            # Snapshot inside the callback: it sees the node as read before
+            # the patch, whatever object the client hands back afterwards.
+            before: dict[str, Any] = {}
+
+            def isolation_body(node: Any) -> dict[str, Any]:
+                before.clear()
+                before.update(node_scheduling_snapshot(node))
+                return self._node_isolation_patch(node, context)
+
+            try:
+                patch_node_with_retry(self.core, node_id, isolation_body)
+            except NodeIsolationRejected as exc:
+                return WorkflowStepOutcome.failed(
+                    str(exc),
+                    details={
+                        "safety_rejection": True,
+                        "node_id": node_id,
+                    },
+                )
+            except NodePatchConflict:
+                conflicts.append(node_id)
+                continue
+            except Exception as exc:
+                if getattr(exc, "status", None) == 404:
+                    # A node this workflow must isolate is not there to be
+                    # isolated. Calling that "already isolated" was memory
+                    # standing in for observation; nothing downstream can
+                    # verify a node that cannot be read.
                     return WorkflowStepOutcome.failed(
-                        str(exc),
+                        f"node {node_id} is absent; isolation cannot be observed",
                         details={
                             "safety_rejection": True,
                             "node_id": node_id,
+                            "absent": True,
                         },
                     )
-                try:
-                    self.core.patch_node(node_id, body)
-                    break
-                except Exception as exc:
-                    if getattr(exc, "status", None) != 409 or attempt == 2:
-                        raise
-        return WorkflowStepOutcome.succeeded(
-            operation_id=context.idempotency_key,
-            details={
-                "isolated_nodes": [
-                    node_id
-                    for node_id in context.step.node_ids
-                    if node_id not in absent_nodes
-                ],
-                "already_absent_nodes": absent_nodes,
-            },
-        )
-
-    def _restore(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
-        already_restored = []
-        for node_id in context.step.node_ids:
-            node = self.core.read_node(node_id)
-            annotations = self._annotations(node)
-            if (
-                ANNOTATION_INCIDENT not in annotations
-                and ANNOTATION_FENCING not in annotations
-                and not any(
-                    item.get("key") == QUARANTINE_TAINT for item in self._taints(node)
-                )
-            ):
-                # Nothing on the node says gpu-fault isolated it. A workflow
-                # that fail-closed at compile time never reached
-                # MARK_UNSCHEDULABLE, so the validated restore that closes its
-                # incident has nothing to undo here; refusing left such
-                # incidents ESCALATED forever (2026-09-06, REMEDIATE_EFA_DRIVER
-                # with no profile owner). Restoring a node nobody isolated is
-                # a no-op, not a theft of another incident's isolation, which
-                # the ownership check below still refuses.
-                already_restored.append(node_id)
-                continue
-            if annotations.get(
-                ANNOTATION_INCIDENT
-            ) != context.incident.incident_id or annotations.get(
-                ANNOTATION_FENCING
-            ) != str(context.workflow.fencing_token):
-                return WorkflowStepOutcome.failed(
-                    f"node {node_id} isolation ownership does not "
-                    "match incident/fencing token"
-                )
-            taints = [
-                item
-                for item in self._taints(node)
-                if item.get("key") != QUARANTINE_TAINT
-            ]
-            was_unschedulable = (
-                annotations.get(
-                    ANNOTATION_PREVIOUS_UNSCHEDULABLE,
-                    "false",
-                ).lower()
-                == "true"
-            )
-            self.core.patch_node(
-                node_id,
-                {
-                    "metadata": {
-                        "resourceVersion": self._resource_version(node),
-                        "annotations": {
-                            ANNOTATION_INCIDENT: None,
-                            ANNOTATION_FENCING: None,
-                            ANNOTATION_PREVIOUS_UNSCHEDULABLE: None,
-                        },
-                    },
-                    "spec": {
-                        "unschedulable": was_unschedulable,
-                        "taints": taints,
-                    },
+                raise
+            baselines[node_id] = {
+                "before": dict(before),
+                "after": self._observed_snapshot(node_id),
+            }
+        isolated = [
+            node_id for node_id in context.step.node_ids if node_id not in conflicts
+        ]
+        if conflicts:
+            return WorkflowStepOutcome.waiting(
+                details={
+                    "patch_conflict_retry": conflicts,
+                    "isolated_nodes": isolated,
+                    "node_baselines": baselines,
                 },
             )
         return WorkflowStepOutcome.succeeded(
             operation_id=context.idempotency_key,
             details={
-                "restored_nodes": context.step.node_ids,
+                "isolated_nodes": isolated,
+                "node_baselines": baselines,
+            },
+        )
+
+    def _gpu_fault_isolated(self, node: Any) -> bool:
+        annotations = self._annotations(node)
+        return (
+            ANNOTATION_INCIDENT in annotations
+            or ANNOTATION_FENCING in annotations
+            or any(item.get("key") == QUARANTINE_TAINT for item in self._taints(node))
+        )
+
+    def _node_restore_patch(
+        self, node: Any, context: WorkflowStepContext
+    ) -> dict[str, Any] | None:
+        if not self._gpu_fault_isolated(node):
+            # Nothing on the node says gpu-fault isolated it. A workflow
+            # that fail-closed at compile time never reached
+            # MARK_UNSCHEDULABLE, so the validated restore that closes its
+            # incident has nothing to undo here; refusing left such
+            # incidents ESCALATED forever (2026-09-06, REMEDIATE_EFA_DRIVER
+            # with no profile owner). Restoring a node nobody isolated is
+            # a no-op, not a theft of another incident's isolation, which
+            # the ownership check below still refuses.
+            return None
+        annotations = self._annotations(node)
+        if annotations.get(
+            ANNOTATION_INCIDENT
+        ) != context.incident.incident_id or annotations.get(ANNOTATION_FENCING) != str(
+            context.workflow.fencing_token
+        ):
+            raise NodeIsolationRejected(
+                "isolation ownership does not match incident/fencing token"
+            )
+        taints = [
+            item for item in self._taints(node) if item.get("key") != QUARANTINE_TAINT
+        ]
+        was_unschedulable = (
+            annotations.get(
+                ANNOTATION_PREVIOUS_UNSCHEDULABLE,
+                "false",
+            ).lower()
+            == "true"
+        )
+        return {
+            "metadata": {
+                "resourceVersion": self._resource_version(node),
+                "annotations": {
+                    ANNOTATION_INCIDENT: None,
+                    ANNOTATION_FENCING: None,
+                    ANNOTATION_PREVIOUS_UNSCHEDULABLE: None,
+                },
+            },
+            "spec": {
+                "unschedulable": was_unschedulable,
+                "taints": taints,
+            },
+        }
+
+    def _restore(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        already_restored: list[str] = []
+        absent: list[str] = []
+        conflicts: list[str] = []
+        baselines: dict[str, dict[str, Any]] = {}
+        for node_id in context.step.node_ids:
+            before: dict[str, Any] = {}
+            isolated_before: list[bool] = []
+
+            def restore_body(node: Any) -> dict[str, Any] | None:
+                before.clear()
+                before.update(node_scheduling_snapshot(node))
+                isolated_before[:] = [self._gpu_fault_isolated(node)]
+                return self._node_restore_patch(node, context)
+
+            try:
+                patch_node_with_retry(self.core, node_id, restore_body)
+            except NodeIsolationRejected as exc:
+                return WorkflowStepOutcome.failed(
+                    f"node {node_id} {exc}",
+                    details={"safety_rejection": True, "node_id": node_id},
+                )
+            except NodePatchConflict:
+                conflicts.append(node_id)
+                continue
+            except Exception as exc:
+                if getattr(exc, "status", None) == 404:
+                    # There is no node left to schedule onto; restoring it
+                    # is a no-op, exactly like a node nobody isolated.
+                    absent.append(node_id)
+                    continue
+                raise
+            if not any(isolated_before):
+                already_restored.append(node_id)
+                baselines[node_id] = {"before": dict(before), "after": dict(before)}
+                continue
+            baselines[node_id] = {
+                "before": dict(before),
+                "after": self._observed_snapshot(node_id),
+            }
+        restored = [
+            node_id
+            for node_id in context.step.node_ids
+            if node_id not in absent and node_id not in conflicts
+        ]
+        if conflicts:
+            # RESTORE_SCHEDULING is idempotent: the next pass re-reads the
+            # node and re-derives the patch, so a lost race is a retry, not
+            # a failure that leaves the node cordoned for good.
+            return WorkflowStepOutcome.waiting(
+                details={
+                    "patch_conflict_retry": conflicts,
+                    "restored_nodes": restored,
+                    "already_restored_nodes": already_restored,
+                    "absent_nodes": absent,
+                    "node_baselines": baselines,
+                },
+            )
+        return WorkflowStepOutcome.succeeded(
+            operation_id=context.idempotency_key,
+            details={
+                "restored_nodes": restored,
                 "already_restored_nodes": already_restored,
+                "absent_nodes": absent,
+                "node_baselines": baselines,
             },
         )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from gpu_fault.store.shared.errors import StaleWriteError
 from tests._builders import (
     copy_model,
     fault_incident,
@@ -463,6 +464,42 @@ def test_fencing_and_idempotent_execution(context: ApplicationContext) -> None:
     assert (
         context.store.get_incident(incident.incident_id).state
         is IncidentState.RECOVERED
+    )
+
+
+def test_simulate_refuses_to_overwrite_an_incident_moved_under_it(
+    context: ApplicationContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ARCH-D1: the incident write in ``simulate`` is a CAS on the read copy.
+
+    An incident another replica moved between the read and the write raises
+    ``StaleWriteError`` like a stale fencing token would, instead of being
+    overwritten with the simulated state.
+    """
+    _, incident, workflow = ingest(context, event(79, event_id="cas-reboot"))
+    store = context.store
+    original_get_incident = store.get_incident
+
+    def racing_get_incident(incident_id: str):
+        read = original_get_incident(incident_id)
+        store.save_incident(
+            copy_model(read, reasons=[*read.reasons, "moved by another replica"]),
+            expected=read,
+        )
+        return read
+
+    monkeypatch.setattr(store, "get_incident", racing_get_incident)
+
+    with pytest.raises(StaleWriteError):
+        context.orchestrator.simulate(workflow.request_id, workflow.fencing_token)
+
+    monkeypatch.undo()
+    moved = store.get_incident(incident.incident_id)
+    assert moved.state is not IncidentState.RECOVERED, (
+        "a stale simulate write reached the incident row"
+    )
+    assert "moved by another replica" in moved.reasons, (
+        "the other replica's write must survive the lost race"
     )
 
 

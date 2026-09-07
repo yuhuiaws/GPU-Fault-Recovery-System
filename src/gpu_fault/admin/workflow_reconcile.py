@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from gpu_fault import retired_generation
-from gpu_fault.admin import compile_blocked, orphaned_commands
+from gpu_fault.admin import compile_blocked, operator_identity, orphaned_commands
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite
@@ -67,16 +67,24 @@ if payload["mode"] == "plan":
     )
 elif payload["mode"] == "apply":
     options = {}
+    parameters = inspect.signature(apply_workflow_reconcile_plan).parameters
     # The executor's RESTART_WORKLOAD waiting cap decides which WAITING
     # restart reservations the terminalization releases; the module has no
     # executor config of its own, and an older deployed image's apply does
     # not take it.
-    if "waiting_ttl" in inspect.signature(apply_workflow_reconcile_plan).parameters:
+    if "waiting_ttl" in parameters:
         options["waiting_ttl"] = timedelta(
             seconds=context.production_executor_config.step_waiting_limit(
                 WorkflowOperation.RESTART_WORKLOAD
             )
         )
+    # The operator's identity and the admin-side plan digest go on the
+    # workflow's audit event; an image whose apply predates them cannot take
+    # them, and the write must still happen.
+    if "actor" in parameters:
+        options["actor"] = payload.get("actor")
+    if "admin_plan_sha256" in parameters:
+        options["admin_plan_sha256"] = payload.get("admin_plan_sha256")
     result = apply_workflow_reconcile_plan(
         store,
         workflow_ids=payload["workflow_ids"],
@@ -105,6 +113,8 @@ elif _payload["mode"] == "apply":
         workflow_ids=_payload["workflow_ids"],
         expected_plan_sha256=_payload["plan_sha256"],
         reference=_payload["reference"],
+        actor=_payload.get("actor"),
+        admin_plan_sha256=_payload.get("admin_plan_sha256"),
     )
 else:
     raise ValueError("unsupported retired generation reconcile mode")
@@ -151,6 +161,8 @@ elif _payload["mode"] == "apply":
         workflow_ids=_payload["workflow_ids"],
         expected_plan_sha256=_payload["plan_sha256"],
         reference=_payload["reference"],
+        actor=_payload.get("actor"),
+        admin_plan_sha256=_payload.get("admin_plan_sha256"),
     )
 else:
     raise ValueError("unsupported compile-blocked reconcile mode")
@@ -191,6 +203,8 @@ elif _payload["mode"] == "apply":
         workflow_ids=_payload["workflow_ids"],
         expected_plan_sha256=_payload["plan_sha256"],
         reference=_payload["reference"],
+        actor=_payload.get("actor"),
+        admin_plan_sha256=_payload.get("admin_plan_sha256"),
     )
 else:
     raise ValueError("unsupported orphaned-commands reconcile mode")
@@ -210,6 +224,33 @@ def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _apply_payload(
+    *,
+    workflow_ids: list[str],
+    runtime_plan_sha256: object,
+    admin_plan_sha256: str,
+    reference: str,
+    actor: str,
+) -> dict[str, Any]:
+    """The apply request every mode sends to the Pod.
+
+    Besides the ids, the runtime digest and the reference, it names the operator
+    (the STS caller ARN, or ``unknown-identity`` when it could not be read --
+    resolving it never blocks the apply) and the admin-side plan digest, so the
+    Pod can put both on the workflow's audit event (I1). The archived
+    ``applied.json`` carries the same identity.
+    """
+
+    return {
+        "mode": "apply",
+        "workflow_ids": workflow_ids,
+        "plan_sha256": runtime_plan_sha256,
+        "reference": reference,
+        "actor": actor,
+        "admin_plan_sha256": admin_plan_sha256,
+    }
 
 
 def _run_reconcile(
@@ -678,17 +719,20 @@ def apply_retired_generation_reconcile(
             "retired generation reconcile plan contains ineligible records: "
             + " | ".join(blocked)
         )
+    actor = operator_identity.resolve_operator_identity()
     result = _run_reconcile(
         site,
-        {
-            "mode": "apply",
-            "workflow_ids": workflow_ids,
-            "plan_sha256": current["runtime_plan_sha256"],
-            "reference": normalized_reference,
-        },
+        _apply_payload(
+            workflow_ids=workflow_ids,
+            runtime_plan_sha256=current["runtime_plan_sha256"],
+            admin_plan_sha256=digest,
+            reference=normalized_reference,
+            actor=actor,
+        ),
         script=script,
     )
     result["admin_plan_sha256"] = digest
+    result["actor"] = actor
     archive = state_dir / RETIRED_GENERATION_HISTORY_PATH / digest
     write_json_atomic(archive / "plan.json", plan)
     write_json_atomic(archive / "applied.json", result)
@@ -734,16 +778,19 @@ def apply_workflow_reconcile(
     rejected = [item for item in current["items"] if not item.get("eligible")]
     if rejected:
         raise BootstrapError("workflow reconcile plan contains ineligible records")
+    actor = operator_identity.resolve_operator_identity()
     result = _run_reconcile(
         site,
-        {
-            "mode": "apply",
-            "workflow_ids": workflow_ids,
-            "plan_sha256": current["runtime_plan_sha256"],
-            "reference": normalized_reference,
-        },
+        _apply_payload(
+            workflow_ids=workflow_ids,
+            runtime_plan_sha256=current["runtime_plan_sha256"],
+            admin_plan_sha256=digest,
+            reference=normalized_reference,
+            actor=actor,
+        ),
     )
     result["admin_plan_sha256"] = digest
+    result["actor"] = actor
     archive = state_dir / HISTORY_PATH / digest
     write_json_atomic(archive / "plan.json", plan)
     write_json_atomic(archive / "applied.json", result)
@@ -866,17 +913,20 @@ def apply_compile_blocked_reconcile(
             "compile-blocked reconcile plan contains ineligible records: "
             + " | ".join(blocked)
         )
+    actor = operator_identity.resolve_operator_identity()
     result = _run_reconcile(
         site,
-        {
-            "mode": "apply",
-            "workflow_ids": workflow_ids,
-            "plan_sha256": current["runtime_plan_sha256"],
-            "reference": normalized_reference,
-        },
+        _apply_payload(
+            workflow_ids=workflow_ids,
+            runtime_plan_sha256=current["runtime_plan_sha256"],
+            admin_plan_sha256=digest,
+            reference=normalized_reference,
+            actor=actor,
+        ),
         script=script,
     )
     result["admin_plan_sha256"] = digest
+    result["actor"] = actor
     archive = state_dir / COMPILE_BLOCKED_HISTORY_PATH / digest
     write_json_atomic(archive / "plan.json", plan)
     write_json_atomic(archive / "applied.json", result)
@@ -987,17 +1037,20 @@ def apply_orphaned_commands_reconcile(
             "orphaned-commands reconcile plan contains ineligible records: "
             + " | ".join(blocked)
         )
+    actor = operator_identity.resolve_operator_identity()
     result = _run_reconcile(
         site,
-        {
-            "mode": "apply",
-            "workflow_ids": workflow_ids,
-            "plan_sha256": current["runtime_plan_sha256"],
-            "reference": normalized_reference,
-        },
+        _apply_payload(
+            workflow_ids=workflow_ids,
+            runtime_plan_sha256=current["runtime_plan_sha256"],
+            admin_plan_sha256=digest,
+            reference=normalized_reference,
+            actor=actor,
+        ),
         script=script,
     )
     result["admin_plan_sha256"] = digest
+    result["actor"] = actor
     archive = state_dir / ORPHANED_COMMANDS_HISTORY_PATH / digest
     write_json_atomic(archive / "plan.json", plan)
     write_json_atomic(archive / "applied.json", result)

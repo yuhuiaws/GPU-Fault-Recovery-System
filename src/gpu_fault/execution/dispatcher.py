@@ -62,6 +62,7 @@ from gpu_fault.store import (
     WorkflowLeaseError,
 )
 from gpu_fault.store.contracts import ControlPlaneStore
+from gpu_fault.store.shared.errors import StaleWriteError
 from gpu_fault.store.shared.workflow_scan import dispatch_eligible_at
 from gpu_fault.workflow_resolution import (
     RETIRED_GENERATION_STATUSES,
@@ -130,6 +131,17 @@ class WorkflowDispatcher:
         # F-A5: retired generations the sweep may not close without an
         # operator (``workflow_retired_generation_awaiting_operator``).
         self.retired_generation_awaiting_operator = 0
+        # ARCH-E E3: proof the dispatch thread is still turning. Every other
+        # gauge here is written by the loop itself, so a dead thread freezes
+        # them at whatever healthy value they last had.
+        self.last_cycle_timestamp_seconds = 0.0
+        # Unix time of the newest event behind each counter. The counters are
+        # per process and a multi-process Pod is scraped one process at a
+        # time, so increase() over them misreads the interleaving as resets;
+        # a timestamp survives that, because max() of it across samples is
+        # the newest event whichever process reported it (ARCH-E E4).
+        self.internal_error_last_seen_timestamp_seconds = 0.0
+        self.failure_handling_abandoned_last_seen_timestamp_seconds = 0.0
         self._stop = Event()
         self._wake = Event()
         self._worker_pool = ThreadPoolExecutor(
@@ -158,6 +170,9 @@ class WorkflowDispatcher:
     MAX_SCAN_ROWS = 20_000
 
     def run_once(self) -> WorkflowDispatchReport:
+        # Stamped first: a cycle that finds the lease held elsewhere, or fails
+        # inside the store, is still a live thread.
+        self.last_cycle_timestamp_seconds = time.time()
         if self.config.dispatch_lease_seconds > 0 and not self._holds_dispatch_lease():
             return WorkflowDispatchReport(
                 scanned=0,
@@ -264,6 +279,7 @@ class WorkflowDispatcher:
                 # with its traceback (F-B4 (3)). It used to be written BLOCKED.
                 internal_errors += 1
                 self.internal_errors_total += 1
+                self.internal_error_last_seen_timestamp_seconds = time.time()
                 self._release_after_internal_error(workflow)
                 LOGGER.exception(
                     "workflow dispatch hit an internal error; workflow %s "
@@ -1422,6 +1438,9 @@ class WorkflowDispatcher:
             )
             if abandoned:
                 self.failure_handling_abandoned_total += 1
+                self.failure_handling_abandoned_last_seen_timestamp_seconds = (
+                    time.time()
+                )
             LOGGER.exception(
                 "failed workflow handler raised (attempt %d/%d%s): %s",
                 attempts,
@@ -1477,7 +1496,22 @@ class WorkflowDispatcher:
             WorkflowStatus.SUPERSEDED: PlanStatus.SUPERSEDED,
         }[status]
         if plan.status is not plan_status:
-            self.store.save_plan(plan.model_copy(update={"status": plan_status}))
+            try:
+                self.store.save_plan(
+                    plan.model_copy(update={"status": plan_status}), expected=plan
+                )
+            except StaleWriteError:
+                # Another writer moved the plan between the read above and
+                # this mirror write; the workflow outcome stands and the plan
+                # is left as that writer wrote it (ARCH-D5).
+                self.plan_sync_misses_total += 1
+                LOGGER.warning(
+                    "plan %s moved while mirroring workflow %s status %s; "
+                    "not overwritten",
+                    plan.plan_id,
+                    workflow.request_id,
+                    status.value,
+                )
 
     def run_forever(self) -> None:
         if not self.config.enabled:

@@ -122,6 +122,14 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_index_builder.py \
 	tests/processor/test_queue_priority_tiers.py \
 	tests/processor/test_routine_coalescing_boundaries.py \
+	tests/store/test_save_incident_guard.py \
+	tests/store/test_save_plan_guard.py \
+	tests/store/test_evidence_pinned_to_incident.py \
+	tests/store/test_postgres_find_open_remote_command.py \
+	tests/store/test_postgres_notification_delivery_lock.py \
+	tests/notifications/test_delivery_state.py \
+	tests/store/test_operator_event_recording.py \
+	tests/store/test_marker_retirement_history.py \
 	tests/store/test_store_contracts.py
 COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS) $(POSTGRES_TESTS),--ignore=$(test))
 

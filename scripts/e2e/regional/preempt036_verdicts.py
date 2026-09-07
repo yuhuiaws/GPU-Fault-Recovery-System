@@ -637,8 +637,157 @@ def workflow_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:
             "preempted_by_workflow_id": workflow.preempted_by_workflow_id,
             "execution_owner_id": workflow.execution_owner_id,
             "fencing_token": workflow.fencing_token,
+            # The attributed audit trail (ARCH-I1): who wrote, under which
+            # approval, from which status. Judged by ``event_errors``.
+            "events": [
+                {
+                    "kind": event.kind.value,
+                    "actor": event.actor,
+                    "status": event.status,
+                    "reason": event.reason,
+                    "details": dict(event.details),
+                }
+                for event in workflow.events
+                if event.kind.value in OPERATOR_EVENT_KINDS
+            ],
         }
     return snapshot
+
+
+# --------------------------------------------------------------------------- #
+# ARCH-I1: the operator write is attributed
+# --------------------------------------------------------------------------- #
+OPERATOR_RECONCILED_KIND = "OPERATOR_RECONCILED"
+OPERATOR_RETIRED_GENERATION_KIND = "OPERATOR_RETIRED_GENERATION"
+OPERATOR_EVENT_KINDS = frozenset(
+    {OPERATOR_RECONCILED_KIND, OPERATOR_RETIRED_GENERATION_KIND}
+)
+# Which event kind each mode appends to the record it acts on, and whether the
+# record's status changes under it (orphaned-commands leaves the FAILED
+# workflow as it was and only records the cancel).
+EVENT_KIND_BY_MODE = {
+    COMPILE_BLOCKED_MODE: OPERATOR_RECONCILED_KIND,
+    ORPHANED_COMMANDS_MODE: OPERATOR_RECONCILED_KIND,
+    RETIRED_GENERATION_MODE: OPERATOR_RETIRED_GENERATION_KIND,
+}
+STATUS_BEFORE_BY_MODE = {
+    COMPILE_BLOCKED_MODE: WorkflowStatus.BLOCKED.value,
+    ORPHANED_COMMANDS_MODE: WorkflowStatus.FAILED.value,
+    RETIRED_GENERATION_MODE: WorkflowStatus.RUNNING.value,
+}
+UNKNOWN_ACTOR = "unknown-identity"
+
+
+def event_errors(
+    snapshot: Mapping[str, Any],
+    seed: ModeSeed,
+    *,
+    actor: str,
+    admin_plan_sha256: str,
+    approved_plan_sha256: str,
+) -> list[str]:
+    """Every record the mode wrote carries one attributed event; no other does.
+
+    The event is the per-record projection of ``applied.json``: the operator
+    (STS ARN or user@host, never ``unknown-identity`` when one was sent), the
+    reference, the runtime digest the apply was bound to, the admin-side digest
+    the operator approved, and the status the write moved the record from and
+    to. Refused twins and untouched siblings must carry none.
+    """
+
+    errors: list[str] = []
+    kind = EVENT_KIND_BY_MODE[seed.mode]
+    for request_id in seed.actionable_ids:
+        events = [
+            item
+            for item in (snapshot.get(request_id) or {}).get("events") or []
+            if item.get("kind") == kind
+        ]
+        if len(events) != 1:
+            errors.append(
+                f"{request_id}: {len(events)} {kind} event(s), expected exactly 1"
+            )
+            continue
+        event = events[0]
+        details = event.get("details") or {}
+        if event.get("actor") != actor or actor == UNKNOWN_ACTOR:
+            errors.append(
+                f"{request_id}: event actor is {event.get('actor')!r}, expected {actor!r}"
+            )
+        if details.get("reference") != REFERENCE:
+            errors.append(
+                f"{request_id}: event reference is {details.get('reference')!r}"
+            )
+        if details.get("admin_plan_sha256") != admin_plan_sha256:
+            errors.append(
+                f"{request_id}: event admin_plan_sha256 is "
+                f"{details.get('admin_plan_sha256')!r}, expected the operator's digest"
+            )
+        runtime_digest = str(details.get("plan_sha256") or "")
+        if _SHA256.fullmatch(runtime_digest) is None:
+            errors.append(f"{request_id}: event carries no runtime plan_sha256")
+        elif not seed.settled_digest_differs and runtime_digest != approved_plan_sha256:
+            errors.append(
+                f"{request_id}: event plan_sha256 {runtime_digest!r} is not the "
+                f"approved {approved_plan_sha256!r}"
+            )
+        expected_before = STATUS_BEFORE_BY_MODE[seed.mode]
+        if details.get("previous_status") != expected_before:
+            errors.append(
+                f"{request_id}: event previous_status is "
+                f"{details.get('previous_status')!r}, expected {expected_before!r}"
+            )
+        expected_after = seed.statuses_after[request_id]
+        if details.get("new_status") != expected_after or event.get("status") != (
+            expected_after
+        ):
+            errors.append(
+                f"{request_id}: event new_status is {details.get('new_status')!r}, "
+                f"expected {expected_after!r}"
+            )
+        if REFERENCE not in str(event.get("reason") or ""):
+            errors.append(f"{request_id}: event reason does not carry {REFERENCE!r}")
+    for request_id in seed.refused_ids:
+        stray = (snapshot.get(request_id) or {}).get("events") or []
+        if stray:
+            errors.append(
+                f"{request_id}: a refused record carries {len(stray)} operator event(s)"
+            )
+    return errors
+
+
+def rerun_event_errors(
+    before: Mapping[str, Any], after: Mapping[str, Any], seed: ModeSeed
+) -> list[str]:
+    """A no-op or refused rerun appends nothing to the audit trail."""
+
+    errors: list[str] = []
+    for request_id in seed.workflow_ids:
+        earlier = (before.get(request_id) or {}).get("events") or []
+        later = (after.get(request_id) or {}).get("events") or []
+        if len(later) != len(earlier):
+            errors.append(
+                f"{request_id}: the rerun changed the operator event count "
+                f"{len(earlier)} -> {len(later)}"
+            )
+    return errors
+
+
+def command_log_errors(
+    log_path: Any, *, state_dir: Any, kind: str = "mutating"
+) -> list[str]:
+    """ARCH-I3: a mutating admin command's console log lands under logs/<kind>/."""
+
+    if log_path is None:
+        return ["the admin command log was not opened (state directory refused)"]
+    path = str(log_path)
+    expected_parent = str(state_dir / "logs" / kind)
+    errors: list[str] = []
+    if not path.startswith(expected_parent):
+        errors.append(f"command log {path} is not under {expected_parent}")
+    if not path.endswith(".log"):
+        errors.append(f"command log {path} is not a .log file")
+    return errors
 
 
 def command_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:

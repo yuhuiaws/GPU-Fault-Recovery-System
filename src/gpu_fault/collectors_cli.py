@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 from gpu_fault.collector_registry import (
     COLLECTOR_REGISTRY,
@@ -17,9 +19,84 @@ from gpu_fault.collectors import (
     sink_from_environment,
 )
 from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.sinks import EventSink
+from gpu_fault.collectors.sinks import EventSink, OutboxFile
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
+
+DEFAULT_OUTBOX_DIRECTORY = "/var/lib/gpu-fault/outbox"
+
+
+def _add_outbox_parser(
+    subcommands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """``gpu-fault-collector outbox {list,stats,requeue-dead}`` (ARCH-G2).
+
+    Reads the NDJSON outbox a collector writes; never the control plane.
+    ``list`` and ``stats`` show record metadata only -- a payload is fault
+    evidence and does not belong on a terminal. ``requeue-dead`` flips
+    dead-lettered records back to replayable and demands ``--yes`` because
+    a replayed verdict is retried by every collector restart until it
+    dead-letters again.
+    """
+
+    outbox = subcommands.add_parser(
+        "outbox", help="inspect or requeue a collector's durable outbox"
+    )
+    outbox.add_argument(
+        "--outbox-path",
+        default=os.getenv("GPU_FAULT_COLLECTOR_OUTBOX_PATH"),
+        help=(
+            "outbox file; defaults to GPU_FAULT_COLLECTOR_OUTBOX_PATH or "
+            f"{DEFAULT_OUTBOX_DIRECTORY}/<collector>.ndjson with --collector"
+        ),
+    )
+    outbox.add_argument(
+        "--collector",
+        default=None,
+        help="collector subcommand name whose default outbox to read",
+    )
+    actions = outbox.add_subparsers(dest="outbox_action", required=True)
+    actions.add_parser("list", help="one metadata line per buffered record")
+    actions.add_parser("stats", help="depth, replayable/dead split, oldest failure")
+    requeue = actions.add_parser(
+        "requeue-dead", help="mark dead-lettered records replayable again"
+    )
+    requeue.add_argument(
+        "--yes",
+        action="store_true",
+        help="required: confirm the dead records should be replayed",
+    )
+    requeue.add_argument(
+        "--path",
+        default=None,
+        help="only requeue records for this control-plane path",
+    )
+
+
+def _outbox_path(args: argparse.Namespace) -> Path:
+    if args.outbox_path:
+        return Path(args.outbox_path)
+    if args.collector:
+        return Path(DEFAULT_OUTBOX_DIRECTORY) / f"{args.collector}.ndjson"
+    raise SystemExit("outbox requires --outbox-path or --collector")
+
+
+def run_outbox_command(args: argparse.Namespace) -> None:
+    outbox = OutboxFile(_outbox_path(args))
+    if args.outbox_action == "list":
+        for index, record in enumerate(outbox.read()):
+            print(OutboxFile.describe(index, record))
+        return
+    if args.outbox_action == "stats":
+        print(json.dumps(outbox.stats(), sort_keys=True))
+        return
+    if not args.yes:
+        raise SystemExit(
+            "requeue-dead replays records the control plane already rejected; "
+            "pass --yes to confirm"
+        )
+    requeued = outbox.requeue_dead(path_filter=args.path)
+    print(f"requeued {requeued} dead record(s) in {outbox.path}")
 
 
 def _add_node_id(command: argparse.ArgumentParser) -> None:
@@ -152,6 +229,7 @@ def parser(
         add_arguments = CLI_ARGUMENTS.get(command)
         if add_arguments is not None:
             add_arguments(subparser)
+    _add_outbox_parser(subcommands)
     return result
 
 
@@ -198,9 +276,13 @@ def build_kubernetes_node_resources(
 
 def main() -> None:
     configure_logging()
-    validate_gpu_fault_environment(process_name="gpu-fault-collector")
     registry = collector_registry_with_plugins()
     args = parser(registry).parse_args()
+    if args.command == "outbox":
+        # An operator command on a file: no control-plane URL, no collector.
+        run_outbox_command(args)
+        return
+    validate_gpu_fault_environment(process_name="gpu-fault-collector")
     descriptor = registry[args.command]
     os.environ.setdefault(
         "GPU_FAULT_COLLECTOR_OUTBOX_PATH",

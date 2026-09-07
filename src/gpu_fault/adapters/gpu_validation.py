@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from gpu_fault.execution import (
     WorkflowStepContext,
@@ -431,16 +432,40 @@ class GpuValidationAdapter:
                     "row_remap_pending",
                 }
             )
-        names = {
-            item.sample.canonical_name
+        fresh = [
+            item
             for item in latest
             if now - item.observed_at <= max_age
             and (readiness_after is None or item.observed_at > readiness_after)
-        }
+        ]
+        names = {item.sample.canonical_name for item in fresh}
         missing = sorted(required - names)
         if context.step.operation is WorkflowOperation.VALIDATE_FABRIC:
             missing.extend(missing_fabric_metric_groups(names))
-        return {"missing_recent_metrics": missing} if missing else None
+        # The node-wide union above lets a sibling GPU answer for one that
+        # fell off the bus after RESET_GPU. When the step names its GPUs,
+        # every one of them must have reported for itself.
+        by_gpu: dict[str, list[str]] = {}
+        if required and context.step.gpu_uuids:
+            fresh_by_gpu: dict[str, set[str]] = {}
+            for item in fresh:
+                gpu_uuid = getattr(item.sample, "gpu_uuid", None)
+                if gpu_uuid:
+                    fresh_by_gpu.setdefault(str(gpu_uuid), set()).add(
+                        item.sample.canonical_name
+                    )
+            for gpu_uuid in dict.fromkeys(context.step.gpu_uuids):
+                gpu_missing = sorted(required - fresh_by_gpu.get(gpu_uuid, set()))
+                if gpu_missing:
+                    by_gpu[gpu_uuid] = gpu_missing
+        if not missing and not by_gpu:
+            return None
+        pending: dict[str, Any] = {}
+        if missing:
+            pending["missing_recent_metrics"] = missing
+        if by_gpu:
+            pending["missing_recent_metrics_by_gpu"] = by_gpu
+        return pending
 
     def _validate_fabric_metrics(self, latest, node_id, failures):
         link_states = [item.value for item in latest if item.name == "network_link_up"]

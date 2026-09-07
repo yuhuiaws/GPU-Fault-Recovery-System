@@ -22,7 +22,10 @@ from gpu_fault.notifications import (
     RestartGuardEmailBuilder,
 )
 from gpu_fault.adapters.kubernetes.node_operations import KubernetesNodeOperationsMixin
-from gpu_fault.adapters.kubernetes.primitives import KubernetesPrimitivesMixin
+from gpu_fault.adapters.kubernetes.primitives import (
+    KubernetesPrimitivesMixin,
+    kubernetes_request_timeout_seconds,
+)
 from gpu_fault.adapters.kubernetes.restart_operations import (
     KubernetesRestartOperationsMixin,
 )
@@ -62,6 +65,7 @@ class KubernetesWorkflowAdapter(
         workload_log_s3_uri: str | None = None,
         workload_log_s3_max_bytes: int = 104857600,
         workload_log_uploader=None,
+        request_timeout_seconds: float | None = None,
     ) -> None:
         if workload_log_tail_lines < 1:
             raise ValueError("workload log tail lines must be positive")
@@ -93,8 +97,15 @@ class KubernetesWorkflowAdapter(
         self.alert_sender = alert_sender
         self.restart_email_builder = RestartGuardEmailBuilder()
         self.mechanical_email_builder = Nvlink74MechanicalEmailBuilder()
+        self._bind_request_timeout(
+            kubernetes_request_timeout_seconds()
+            if request_timeout_seconds is None
+            else request_timeout_seconds
+        )
         if core_api is None or batch_api is None or custom_api is None:
-            core_api, batch_api, custom_api = self._clients()
+            core_api, batch_api, custom_api = self._clients(
+                self.request_timeout_seconds
+            )
         self.core = core_api
         self.batch = batch_api
         self.custom = custom_api

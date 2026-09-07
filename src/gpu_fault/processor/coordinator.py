@@ -307,6 +307,10 @@ class ProcessorCoordinator(
         self._completion_failures_total = 0
         self._completion_failure_releases_total = 0
         self._retry_horizon_failures_total = 0
+        # Replay completions by path and status class, and the subset that
+        # threw a fault-layer event away after the collector's 202 (G1).
+        self._completions_by_path_status: dict[str, dict[str, int]] = {}
+        self._fault_rejections_total = 0
         self._renewal_errors_total = 0
         self._renewal_fenced_total = 0
         self._stale_superseded_total = 0

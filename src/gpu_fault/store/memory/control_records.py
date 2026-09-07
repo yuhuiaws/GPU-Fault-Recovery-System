@@ -11,6 +11,7 @@ from gpu_fault.models import (
     DecisionStatus,
     DiagnosticRequest,
     EffectiveRuntimeProfile,
+    FaultIncident,
     NodeMarker,
     RecoveryAction,
     RecoveryPlan,
@@ -25,7 +26,13 @@ from gpu_fault.store.shared.attempt_observation_support import (
     reconcile_terminal_attempt_observations,
     terminalize_attempt_observation,
 )
-from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.store.shared.cleanup_log import log_cleanup
+from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
+from gpu_fault.store.shared.evidence_pins import (
+    EVIDENCE_PINNING_INCIDENT_STATES,
+    evidence_pinned,
+)
+from gpu_fault.store.shared.record_guards import record_matches_expected
 
 
 class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
@@ -44,6 +51,7 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     _attempt_event_keys: Any
     _events: Any
     _gpu_finding_history: Any
+    _incidents: dict[str, FaultIncident]
     _lock: Any
     _plans: Any
     _workflows: Any
@@ -118,11 +126,19 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     ) -> int:
         observed = now or datetime.now(timezone.utc)
         with self._lock:
+            # Records an open incident still needs are skipped, not deleted
+            # (architecture review 2026-09-07, item D6; ``evidence_pins``).
+            pinning = [
+                incident
+                for incident in self._incidents.values()
+                if incident.state in EVIDENCE_PINNING_INCIDENT_STATES
+            ]
             expired = sorted(
                 (
                     (key, item)
                     for key, item in self._raw_evidence.items()
                     if item.expires_at <= observed
+                    and not evidence_pinned(item, pinning)
                 ),
                 key=lambda value: (
                     value[1].expires_at,
@@ -131,7 +147,7 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
             )[:limit]
             for key, _ in expired:
                 self._raw_evidence.pop(key, None)
-        return len(expired)
+        return log_cleanup("raw_evidence", [item.record_id for _, item in expired])
 
     def cleanup_hot_state(
         self,
@@ -159,7 +175,9 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
             for key, _finding in expired:
                 self._gpu_finding_history.pop(key, None)
         return {
-            "gpu_finding_history": len(expired),
+            "gpu_finding_history": log_cleanup(
+                "gpu_finding_history", [key for key, _finding in expired]
+            ),
             "attempt_observation_terminalized": terminalized,
         }
 
@@ -447,8 +465,19 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
         with self._lock:
             self._triage_reports[report.request_id] = report
 
-    def save_plan(self, plan: RecoveryPlan) -> None:
+    def save_plan(
+        self,
+        plan: RecoveryPlan,
+        *,
+        expected: RecoveryPlan | None = None,
+    ) -> None:
+        """See ``CompletionStore.save_plan`` (architecture review, item D2)."""
+
         with self._lock:
+            if expected is not None and not record_matches_expected(
+                self._plans.get(plan.plan_id), expected
+            ):
+                raise StaleWriteError(f"plan/{plan.plan_id} changed since it was read")
             self._plans[plan.plan_id] = plan
 
     def get_plan(self, plan_id: str) -> RecoveryPlan:

@@ -7,21 +7,16 @@ from typing import TYPE_CHECKING
 from gpu_fault.schema_migrations import (
     LATEST_POSTGRES_SCHEMA_VERSION,
 )
-from gpu_fault.store.postgres.pool import (
-    PooledPostgresDatabase,
-    configure_writer_connection,
-)
-from gpu_fault.store.shared.errors import (
-    EfaTrafficAdminConflict as EfaTrafficAdminConflict,
-    NotFoundError as NotFoundError,
-    WorkflowLeaseError as WorkflowLeaseError,
-)
 from gpu_fault.store.postgres.collector_telemetry import PostgresCollectorTelemetryMixin
-from gpu_fault.store.postgres.core import PostgresCoreMixin
 from gpu_fault.store.postgres.control_records import PostgresControlRecordMixin
+from gpu_fault.store.postgres.core import PostgresCoreMixin
 from gpu_fault.store.postgres.fleet import PostgresFleetMixin
 from gpu_fault.store.postgres.gpu_telemetry import PostgresGpuTelemetryMixin
 from gpu_fault.store.postgres.notifications import PostgresNotificationMixin
+from gpu_fault.store.postgres.pool import (
+    PooledPostgresDatabase,
+    open_writer_pool,
+)
 from gpu_fault.store.postgres.processor_admin import PostgresProcessorAdminMixin
 from gpu_fault.store.postgres.processor_admission import PostgresProcessorAdmissionMixin
 from gpu_fault.store.postgres.processor_claims import PostgresProcessorClaimsMixin
@@ -33,6 +28,7 @@ from gpu_fault.store.postgres.processor_completion_runtime import (
 )
 from gpu_fault.store.postgres.processor_leases import PostgresProcessorLeaseMixin
 from gpu_fault.store.postgres.processor_storage import PostgresProcessorStorageMixin
+from gpu_fault.store.postgres.record_cas import PostgresRecordCasMixin
 from gpu_fault.store.postgres.remote_commands import PostgresRemoteCommandMixin
 from gpu_fault.store.postgres.schema_state import PostgresSchemaMixin
 from gpu_fault.store.postgres.telemetry_spool import PostgresTelemetrySpoolMixin
@@ -70,6 +66,7 @@ class PostgresStore(
     PostgresFleetMixin,
     PostgresNotificationMixin,
     PostgresRemoteCommandMixin,
+    PostgresRecordCasMixin,
     PostgresWorkflowMixin,
     PostgresXidMixin,
     PostgresGpuTelemetryMixin,
@@ -217,14 +214,13 @@ class PostgresStore(
             pool_kwargs["max_idle"] = pool_max_idle_seconds
         if pool_max_lifetime_seconds > 0:
             pool_kwargs["max_lifetime"] = pool_max_lifetime_seconds
-        self._pool = ConnectionPool(
-            conninfo=url,
+        self._pool = open_writer_pool(
+            ConnectionPool,
+            url,
             min_size=pool_min_size,
             max_size=pool_max_size,
             timeout=pool_timeout_seconds,
             kwargs=connection_kwargs,
-            configure=configure_writer_connection,
-            open=True,
             **pool_kwargs,
         )
         self._db = PooledPostgresDatabase(self._pool)

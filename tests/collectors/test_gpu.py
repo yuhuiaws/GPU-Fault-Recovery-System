@@ -693,7 +693,7 @@ def test_host_collector_reports_persistent_gpu_and_efa_card_loss(tmp_path) -> No
         )
 
     def runner(argv, **_kwargs):
-        assert "--query-gpu=uuid" in argv
+        assert "--query-gpu=uuid,utilization.gpu" in argv, argv
         return subprocess.CompletedProcess(
             argv, 0, stdout="\n".join(f"GPU-{index}" for index in range(7)), stderr=""
         )

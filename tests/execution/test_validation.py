@@ -117,7 +117,9 @@ def test_gpu_validation_ignores_findings_outside_reset_scope() -> None:
             return [
                 SimpleNamespace(
                     observed_at=now,
-                    sample=SimpleNamespace(canonical_name="gpu_temperature_c"),
+                    sample=SimpleNamespace(
+                        canonical_name="gpu_temperature_c", gpu_uuid="GPU-target"
+                    ),
                 )
             ]
 
@@ -719,7 +721,9 @@ def test_temperature_warning_validation_observes_cooldown() -> None:
             return [
                 SimpleNamespace(
                     observed_at=now,
-                    sample=SimpleNamespace(canonical_name="gpu_temperature_c"),
+                    sample=SimpleNamespace(
+                        canonical_name="gpu_temperature_c", gpu_uuid="GPU-a"
+                    ),
                 )
             ]
 
@@ -817,7 +821,9 @@ def test_correctable_memory_warning_validation_observes_grace() -> None:
             return [
                 SimpleNamespace(
                     observed_at=now,
-                    sample=SimpleNamespace(canonical_name="gpu_temperature_c"),
+                    sample=SimpleNamespace(
+                        canonical_name="gpu_temperature_c", gpu_uuid="GPU-a"
+                    ),
                 )
             ]
 

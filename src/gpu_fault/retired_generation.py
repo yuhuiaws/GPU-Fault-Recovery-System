@@ -31,10 +31,12 @@ or the shipped copy stops running against the deployed image.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, NamedTuple
+from typing import Any, Iterable, Mapping, NamedTuple
 
+import gpu_fault.models as _models
 from gpu_fault.models import (
     resolved_step_indexes,
     FaultIncident,
@@ -49,6 +51,15 @@ from gpu_fault.operation_registry import (
 )
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.store import NotFoundError
+
+# The attributed audit event (I1) is resolved as a capability of the deployed
+# ``gpu_fault.models``, not imported by name: this file's source is shipped
+# into the running Pod, and the image there may predate the event kind. When it
+# does, the revocation still happens and the string audit below is all there is.
+_RECORD_OPERATOR_EVENT: Any = getattr(_models, "record_operator_event", None)
+_OPERATOR_RETIRED_GENERATION: Any = getattr(
+    getattr(_models, "WorkflowEventKind", None), "OPERATOR_RETIRED_GENERATION", None
+)
 
 OPEN_REMOTE_STATUSES = {
     RemoteCommandStatus.PENDING,
@@ -365,8 +376,16 @@ def retired_generation_records(
     expected_fencing_token: int,
     reference: str | None,
     reconciled_at: datetime,
+    actor: str | None = None,
+    approval: Mapping[str, Any] | None = None,
 ) -> tuple[WorkflowRequest, FaultIncident]:
     """Terminalize a retired generation, re-verifying every condition first.
+
+    An operator write (one with a ``reference``) also appends an
+    ``OPERATOR_RETIRED_GENERATION`` event naming ``actor`` (the STS ARN), the
+    reference, the plan digests in ``approval`` and the status transition (I1),
+    when the running ``gpu_fault.models`` has the event kind. The dispatcher's
+    sweep passes no reference and leaves no operator event.
 
     Every caller re-derives the verdict here rather than trusting the one it
     computed earlier, so a record that became live between plan and apply is
@@ -415,6 +434,25 @@ def retired_generation_records(
             "updated_at": reconciled_at,
         }
     )
+    if (
+        reference is not None
+        and _RECORD_OPERATOR_EVENT is not None
+        and _OPERATOR_RETIRED_GENERATION is not None
+    ):
+        updated_workflow = _RECORD_OPERATOR_EVENT(
+            updated_workflow,
+            _OPERATOR_RETIRED_GENERATION,
+            actor=actor,
+            reference=reference,
+            previous_status=workflow.status,
+            at=reconciled_at,
+            details={
+                "successor_workflow_id": successor.request_id,
+                "expected_fencing_token": expected_fencing_token,
+                "incident_fencing_token": incident.fencing_token,
+                **dict(approval or {}),
+            },
+        )
     updated_incident = incident.model_copy(
         update={
             "reasons": list(dict.fromkeys([*incident.reasons, audit])),
@@ -672,15 +710,28 @@ def _revoke_planned_item(
     reference: str,
     applied_at: datetime,
     waiting_ttl: timedelta | None = None,
+    actor: str | None = None,
+    approval: Mapping[str, Any] | None = None,
 ) -> tuple[str, str | None]:
     transactional = getattr(store, "reconcile_retired_generation_workflow", None)
     if transactional is not None:
+        # The Store this runs against may be the previously deployed one, whose
+        # transactional write predates the attributed event; only hand it what
+        # its signature takes, or the apply fails with a TypeError at the one
+        # moment it is needed.
+        parameters = inspect.signature(transactional).parameters
+        attribution: dict[str, Any] = {}
+        if "actor" in parameters:
+            attribution["actor"] = actor
+        if "approval" in parameters:
+            attribution["approval"] = approval
         revoked, _ = transactional(
             item["request_id"],
             item["successor_workflow_id"],
             expected_fencing_token=int(item["fencing_token"]),
             reference=reference,
             reconciled_at=applied_at,
+            **attribution,
         )
     else:
         # The release that first carries this module has to be able to close a
@@ -704,12 +755,14 @@ def _revoke_planned_item(
             expected_fencing_token=int(item["fencing_token"]),
             reference=reference,
             reconciled_at=applied_at,
+            actor=actor,
+            approval=approval,
         )
         # Compare-and-set on the copy read above: the lease renewal named
         # there now surfaces as ``StaleWriteError`` (reported per item by the
         # caller) instead of being overwritten (store review 2026-09-07, item B).
         store.save_workflow(revoked, expected=workflow)
-        store.save_incident(updated_incident)
+        store.save_incident(updated_incident, expected=incident)
     return revoked.request_id, _release_restart_reservations(
         store, revoked, waiting_ttl=waiting_ttl
     )
@@ -833,8 +886,14 @@ def apply_retired_generation_plan(
     reference: str,
     now: datetime | None = None,
     waiting_ttl: timedelta | None = None,
+    actor: str | None = None,
+    admin_plan_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Cancel the open commands of a retired generation, then terminalize it.
+
+    ``actor`` is the operator's resolved STS identity and ``admin_plan_sha256``
+    the digest of the plan the operator approved on the admin side; with the
+    runtime digest they go on each revoked workflow's audit event (I1).
 
     Both passes happen here rather than asking the operator to run the command
     twice, because cancelling a ``PENDING`` or ``WAITING`` command settles it in
@@ -914,6 +973,9 @@ def apply_retired_generation_plan(
     applied: list[str] = []
     failures: dict[str, str] = {}
     warnings: list[str] = []
+    approval: dict[str, Any] = {"plan_sha256": expected_plan_sha256}
+    if admin_plan_sha256:
+        approval["admin_plan_sha256"] = admin_plan_sha256
     for item in plan["items"]:
         if item["already_revoked"]:
             continue
@@ -924,6 +986,8 @@ def apply_retired_generation_plan(
                 reference=reference,
                 applied_at=applied_at,
                 waiting_ttl=waiting_ttl,
+                actor=actor,
+                approval=approval,
             )
         except Exception as exc:  # noqa: BLE001 -- per-item isolation, reported
             # The rows already revoked above are committed; the operator has to
@@ -939,6 +1003,7 @@ def apply_retired_generation_plan(
         "plan_sha256": expected_plan_sha256,
         "settled_plan_sha256": settled["plan_sha256"],
         "reference": reference,
+        "actor": actor,
         "applied_at": applied_at.isoformat(),
         "applied_workflow_ids": sorted(applied),
         "already_revoked_workflow_ids": sorted(

@@ -145,6 +145,36 @@ def _dispatch_remote_node_action_completion(
             "node_ids": command.step.node_ids,
             "gpu_uuids": command.step.gpu_uuids,
         }
+    elif command.step.operation is WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES:
+        # The node-action adapter builds this itself only when it has a Store;
+        # the regional cluster executor has none, so on regional deployments
+        # the full-fabric reset was never mailed (ARCH-E E7). Same inputs and
+        # the same deduplication key as the adapter, so the two paths cannot
+        # both mail.
+        parameters = command.step.parameters
+        kind = NotificationKind.FABRIC_RESET_COMPLETED
+        values = {
+            **common,
+            "fabric_partition": parameters.get(
+                "fabric_partition", parameters.get("fabric_partitions_by_node")
+            ),
+            "sxid": parameters.get("sxid", parameters.get("sxids_by_node")),
+        }
+    elif command.step.operation is WorkflowOperation.RUN_DCGM_DIAGNOSTIC:
+        node_results = _dcgm_node_results(command)
+        if not node_results:
+            return []
+        kind = NotificationKind.DCGM_DIAGNOSTIC
+        values = {
+            "cluster_id": command.cluster_id,
+            "incident_id": command.incident.incident_id,
+            "workflow_id": command.workflow.request_id,
+            "event_id": command.incident.event_id,
+            "operation_id": command.idempotency_key,
+            "workload_ids": command.step.workload_ids,
+            "node_results": node_results,
+            "control_plane_action": _dcgm_control_plane_action(command, node_results),
+        }
     else:
         return []
     notification = service.builders.build(kind, **values)
@@ -152,6 +182,58 @@ def _dispatch_remote_node_action_completion(
     if notification.notification_id == existing_id:
         return []
     return [service.send(notification.notification_id)]
+
+
+def _dcgm_node_results(command: Any) -> dict[str, dict[str, Any]]:
+    """The per-node DCGM verdicts a remote command carried back, or nothing.
+
+    A FAILED command can be an executor-side rejection with no diagnostic in
+    it at all; a node result without a ``diagnostic_outcome`` was not a DCGM
+    result. Either way there is nothing to tell an administrator.
+    """
+
+    raw = command.result_details.get("node_results")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(node_id): value
+        for node_id, value in raw.items()
+        if isinstance(value, dict) and "diagnostic_outcome" in value
+    }
+
+
+def _dcgm_control_plane_action(
+    command: Any, node_results: dict[str, dict[str, Any]]
+) -> str:
+    """What the control plane did with the verdict, as the adapter recorded it.
+
+    The adapter persists ``control_plane_action`` in the step details (and so
+    in ``result_details``); an older executor that did not is judged the way
+    the adapter judges: any FAIL or INCONCLUSIVE node drains and quarantines.
+    """
+
+    recorded = command.result_details.get("control_plane_action")
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    destructive = any(
+        value.get("diagnostic_outcome") in {"FAIL", "INCONCLUSIVE"}
+        for value in node_results.values()
+    )
+    return "DRAIN_AND_QUARANTINE" if destructive else "COOLDOWN_AND_VALIDATE"
+
+
+def _reports_dcgm_verdict(command: Any) -> bool:
+    """A DCGM step that failed still carries the verdict the administrator is
+    owed -- a failed diagnostic is the case the mail exists for -- while every
+    other operation's FAILED result is an action that did not happen."""
+
+    from gpu_fault.regional import RemoteCommandStatus
+
+    return (
+        command.status is RemoteCommandStatus.FAILED
+        and command.step.operation is WorkflowOperation.RUN_DCGM_DIAGNOSTIC
+        and bool(_dcgm_node_results(command))
+    )
 
 
 class AdvisoryNotificationService:
@@ -275,6 +357,13 @@ class AdvisoryNotificationService:
         # duplicate work for the same incident remains serialized without
         # turning the whole process into a one-request service.
         self._locks = tuple(RLock() for _ in range(64))
+        # ARCH-E E1/E3: what the outbox gave up on, and proof the loop that
+        # drains it is still turning. Process-local, read by /metrics.
+        self.expired_total = 0
+        self.expired_last_seen_timestamp_seconds = 0.0
+        self.dead_lettered_total = 0
+        self.suppressed_drills_total = 0
+        self.last_cycle_timestamp_seconds = 0.0
         LOGGER.info(
             "notification delivery: %s",
             self.describe_delivery_mode(),
@@ -471,7 +560,9 @@ class AdvisoryNotificationService:
     def dispatch_remote_completion(self, command) -> list[NotificationResult]:
         from gpu_fault.regional import RemoteCommandStatus
 
-        if command.status is not RemoteCommandStatus.SUCCEEDED:
+        if command.status is not RemoteCommandStatus.SUCCEEDED and not (
+            _reports_dcgm_verdict(command)
+        ):
             return []
         results = []
         existing_id = command.result_details.get("notification_id")
@@ -617,6 +708,10 @@ class AdvisoryNotificationService:
         if lease_seconds < 30:
             raise ValueError("notification lease must be at least 30 seconds")
         now = datetime.now(timezone.utc)
+        # Stamped before any store call: the gauge answers "is the dispatcher
+        # thread alive", and a cycle that fails inside the store is a live
+        # thread with a store problem, which other signals report.
+        self.last_cycle_timestamp_seconds = now.timestamp()
         suppressed = self._establish_watermark(owner_id, now=now)
         deliveries = self.store.claim_notification_deliveries(
             owner_id,
@@ -644,6 +739,7 @@ class AdvisoryNotificationService:
                     reason=suppression,
                 )
                 suppressed_drills += 1
+                self.suppressed_drills_total += 1
                 continue
             deadline = self.delivery_deadline(notification, delivery)
             if deadline is not None and deadline <= now:
@@ -656,6 +752,8 @@ class AdvisoryNotificationService:
                     age_seconds=age,
                 )
                 expired += 1
+                self.expired_total += 1
+                self.expired_last_seen_timestamp_seconds = now.timestamp()
                 oldest_expired = max(oldest_expired, age)
                 continue
             recorded = self.store.get_notification_result(notification.notification_id)
@@ -739,6 +837,8 @@ class AdvisoryNotificationService:
                 result.status is not NotificationStatus.SENT
                 and attempts >= max_attempts
             )
+            if terminal:
+                self.dead_lettered_total += 1
             delay = min(
                 retry_max_seconds,
                 retry_base_seconds * (2 ** max(0, attempts - 1)),
@@ -808,15 +908,24 @@ class AdvisoryNotificationService:
             # replica sends it again, and its bookkeeping fails the
             # same way. Persist the outcome even though the lease is
             # gone -- the claim query skips anything already SENT.
-            self.store.save_notification_result(result)
+            #
+            # A failed attempt has nothing to protect: the row is
+            # claimable by whoever holds the lease now, and a FAILED
+            # result row is the terminal verdict the alert reads, not a
+            # note about one attempt (ARCH-E E1).
+            if result.status is NotificationStatus.SENT or terminal:
+                self.store.save_notification_result(result)
+                recorded = "recorded the outcome anyway to stop it being sent again"
+            else:
+                recorded = "the attempt is left to the current lease holder"
             LOGGER.warning(
                 "notification %s was %s but its delivery lease had "
-                "already expired; recorded the outcome anyway to stop "
-                "it being sent again (raise "
+                "already expired; %s (raise "
                 "GPU_FAULT_NOTIFICATION_LEASE_SECONDS above the time "
                 "a full batch takes)",
                 notification.notification_id,
                 result.status.value,
+                recorded,
             )
 
     def _release_throttled(

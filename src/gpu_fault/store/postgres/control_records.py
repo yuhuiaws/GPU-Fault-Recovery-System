@@ -19,10 +19,14 @@ from gpu_fault.store.shared.attempt_observation_support import (
     reconcile_terminal_attempt_observations,
     terminalize_attempt_observation,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
+from gpu_fault.store.shared.evidence_pins import (
+    EVIDENCE_PIN_WINDOW,
+    pinning_incident_state_values,
+)
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
-
 
 # Hot-state kind -> (dedicated table, dedicated timestamp column, legacy
 # timestamp expression). Shared by the counting status (CLI) and the EXISTS
@@ -412,26 +416,70 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
         limit: int = 1000,
     ) -> int:
         observed = now or datetime.now(timezone.utc)
+        # Records an open incident still needs are skipped, not deleted
+        # (architecture review 2026-09-07, item D6; see ``evidence_pins`` for
+        # the two bindings). The candidate walk is the expiry index; the
+        # NOT EXISTS probe touches only non-RECOVERED incidents through
+        # ``gpu_fault_incident_state_count``, and the LIMIT counts rows that
+        # will actually be deleted, so pinned rows cannot starve the sweep.
         with self._state_transaction("raw_evidence/cleanup"):
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """
                     WITH expired AS (
-                        SELECT key
-                        FROM gpu_fault_objects
-                        WHERE kind='raw_evidence'
-                          AND payload->>'expires_at' <= %s
-                        ORDER BY payload->>'expires_at', key
+                        SELECT e.key
+                        FROM gpu_fault_objects AS e
+                        WHERE e.kind='raw_evidence'
+                          AND e.payload->>'expires_at' <= %s
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM gpu_fault_objects AS i
+                              WHERE i.kind='incident'
+                                AND i.payload->>'state' = ANY(%s)
+                                AND i.payload->>'cluster_id'
+                                    = e.payload->>'cluster_id'
+                                AND (
+                                    (
+                                        i.payload->>'attempt_id' IS NOT NULL
+                                        AND e.payload->'attempt_ids'
+                                            ? (i.payload->>'attempt_id')
+                                    )
+                                    OR (
+                                        i.payload->'node_ids'
+                                            ? (e.payload->>'node_id')
+                                        AND (e.payload->>'observed_at')::timestamptz
+                                            BETWEEN
+                                              (i.payload->>'created_at')::timestamptz
+                                                - %s
+                                              AND
+                                              (i.payload->>'updated_at')::timestamptz
+                                                + %s
+                                    )
+                                )
+                          )
+                        ORDER BY e.payload->>'expires_at', e.key
                         LIMIT %s
+                    ),
+                    deleted AS (
+                        DELETE FROM gpu_fault_objects AS target
+                        USING expired
+                        WHERE target.kind='raw_evidence'
+                          AND target.key=expired.key
+                        RETURNING target.payload->>'record_id' AS record_id
                     )
-                    DELETE FROM gpu_fault_objects target
-                    USING expired
-                    WHERE target.kind='raw_evidence'
-                      AND target.key=expired.key
+                    SELECT record_id FROM deleted ORDER BY record_id
                     """,
-                    (_utc_text(observed), limit),
+                    (
+                        _utc_text(observed),
+                        pinning_incident_state_values(),
+                        EVIDENCE_PIN_WINDOW,
+                        EVIDENCE_PIN_WINDOW,
+                        limit,
+                    ),
                 )
-                return int(cursor.rowcount)
+                return log_cleanup(
+                    "raw_evidence", [row[0] for row in cursor.fetchall()]
+                )
 
     def backfill_hot_state_tables(self) -> dict[str, int]:
         counts = {}
@@ -681,18 +729,24 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                           AND payload->>'observed_at' <= %s
                         ORDER BY payload->>'observed_at', key
                         LIMIT %s
+                    ),
+                    deleted AS (
+                        DELETE FROM gpu_fault_objects AS target
+                        USING expired
+                        WHERE target.kind='gpu_finding_history'
+                          AND target.key=expired.key
+                        RETURNING target.key
                     )
-                    DELETE FROM gpu_fault_objects AS target
-                    USING expired
-                    WHERE target.kind='gpu_finding_history'
-                      AND target.key=expired.key
+                    SELECT key FROM deleted ORDER BY key
                     """,
                     (
                         _utc_text(observed - finding_history_retention),
                         limit,
                     ),
                 )
-                deleted["gpu_finding_history"] = cursor.rowcount
+                deleted["gpu_finding_history"] = log_cleanup(
+                    "gpu_finding_history", [row[0] for row in cursor.fetchall()]
+                )
         if self.hot_state_mode != "dedicated":
             # The ``attempt_observation`` kind in gpu_fault_objects had no
             # retention at all, so in legacy and dual mode a terminal row
@@ -769,14 +823,20 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                             WHERE {condition}
                             ORDER BY {timestamp_column}, key
                             LIMIT %s
+                        ),
+                        deleted AS (
+                            DELETE FROM {table} AS target
+                            USING expired
+                            WHERE target.key=expired.key
+                            RETURNING target.key
                         )
-                        DELETE FROM {table} AS target
-                        USING expired
-                        WHERE target.key=expired.key
+                        SELECT key FROM deleted ORDER BY key
                         """,
                         (cutoff, limit),
                     )
-                    deleted[name] = cursor.rowcount
+                    deleted[name] = log_cleanup(
+                        name, [row[0] for row in cursor.fetchall()]
+                    )
         return deleted
 
     def _cleanup_legacy_observations(
@@ -809,15 +869,21 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                           AND ({condition})
                         ORDER BY payload->'observation'->>'observed_at', key
                         LIMIT %s
+                    ),
+                    deleted AS (
+                        DELETE FROM gpu_fault_objects AS target
+                        USING expired
+                        WHERE target.kind='attempt_observation'
+                          AND target.key=expired.key
+                        RETURNING target.key
                     )
-                    DELETE FROM gpu_fault_objects AS target
-                    USING expired
-                    WHERE target.kind='attempt_observation'
-                      AND target.key=expired.key
+                    SELECT key FROM deleted ORDER BY key
                     """,
                     parameters,
                 )
-                return int(cursor.rowcount)
+                return log_cleanup(
+                    "attempt_observation_legacy", [row[0] for row in cursor.fetchall()]
+                )
 
     def completion_transaction(self, event_key: str) -> AbstractContextManager[None]:
         # One transaction, one advisory lock per event: the writes the

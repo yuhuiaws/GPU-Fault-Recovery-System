@@ -404,7 +404,7 @@ def _ledger_from_environment() -> NodeActionLedger:
             "/var/lib/gpu-fault/node-actions.db",
         ),
         retention_seconds=int(
-            os.getenv("GPU_FAULT_NODE_ACTION_RETENTION_SECONDS", "604800")
+            os.getenv("GPU_FAULT_NODE_ACTION_RETENTION_SECONDS", "2592000")
         ),
         max_results=int(os.getenv("GPU_FAULT_NODE_ACTION_MAX_RESULTS", "10000")),
     )

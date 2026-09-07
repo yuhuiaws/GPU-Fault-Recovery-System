@@ -9,11 +9,15 @@ from gpu_fault.remote_command_models import (
     RemoteCommandStatus,
     lease_deadline,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import (
     NotFoundError,
 )
 from gpu_fault.store.shared.remote_helpers import (
     remote_command_stats as _remote_command_stats,
+)
+from gpu_fault.store.shared.remote_helpers import (
+    remote_command_step_space as _remote_command_step_space,
 )
 from gpu_fault.store.shared.remote_helpers import (
     unclaimed_expiry_update as _unclaimed_expiry_update,
@@ -78,6 +82,36 @@ class SqliteRemoteCommandMixin:
             (model.model_validate_json(row[0]) for row in rows),
             key=lambda item: (item.created_at, item.command_id),
         )
+
+    def find_open_remote_command(
+        self,
+        workflow_request_id: str,
+        step_index: int,
+        command_step_space: str,
+        *,
+        exclude_command_id: str | None = None,
+    ) -> RemoteActionCommand | None:
+        # The step space lives on the embedded workflow (``safety_only`` or a
+        # SAFETY_PENDING status), so it is decided in Python on the few rows one
+        # workflow's step has; the SQL narrows to those rows first.
+        rows = self._db.execute(
+            """
+            SELECT payload FROM objects
+            WHERE kind='remote_command'
+              AND json_extract(payload, '$.workflow_request_id')=?
+              AND json_extract(payload, '$.step_index')=?
+              AND json_extract(payload, '$.status') IN ('PENDING', 'LEASED', 'WAITING')
+              AND key IS NOT ?
+            ORDER BY json_extract(payload, '$.created_at'), key
+            """,
+            (workflow_request_id, step_index, exclude_command_id),
+        ).fetchall()
+        model = self._models["remote_command"]
+        for row in rows:
+            command = model.model_validate_json(row[0])
+            if _remote_command_step_space(command) == command_step_space:
+                return command  # type: ignore[no-any-return]
+        return None
 
     def _open_remote_command_candidates(
         self,
@@ -234,7 +268,7 @@ class SqliteRemoteCommandMixin:
             ][:limit]
             for command_id in command_ids:
                 self._delete("remote_command", command_id)
-            return len(command_ids)
+            return log_cleanup("remote_command", command_ids)
 
     def cancel_remote_commands_for_workflow(
         self, workflow_request_id: str, *, reason: str

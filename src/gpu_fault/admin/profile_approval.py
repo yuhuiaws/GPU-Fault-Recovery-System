@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from gpu_fault.admin import operator_identity
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
 from gpu_fault.digests import SHA256_PATTERN
@@ -59,6 +60,8 @@ class ResolvedProfileApproval:
     reference: str
     plan_sha256: str
     relation: str
+    # ``None`` for a record written before approvals carried an approver (I2).
+    approver_identity: str | None = None
 
 
 def _utc_timestamp(value: datetime | None = None) -> str:
@@ -169,7 +172,16 @@ def _validated_approval_record(
         raise ProfileApprovalError("Profile approval timestamp is invalid") from exc
     if timestamp.tzinfo is None:
         raise ProfileApprovalError("Profile approval timestamp must include a timezone")
+    if "approver_identity" in document:
+        approver = document.get("approver_identity")
+        if not isinstance(approver, str) or not approver.strip():
+            raise ProfileApprovalError("Profile approval approver identity is invalid")
     return document
+
+
+def _approver_identity(document: dict[str, Any]) -> str | None:
+    approver = document.get("approver_identity")
+    return approver if isinstance(approver, str) and approver.strip() else None
 
 
 def profile_plan_path(state_dir: Path) -> Path:
@@ -262,6 +274,7 @@ def _write_superseded_result(
         "status": "SUPERSEDED",
         "plan_sha256": record["plan_sha256"],
         "reference": record["reference"],
+        "approver_identity": _approver_identity(record),
         "replacement_plan_sha256": replacement_plan_sha256,
         "reason": reason,
         "superseded_at": _utc_timestamp(superseded_at),
@@ -288,13 +301,29 @@ def approve_profile(
     reference: str,
     expected_plan_sha256: str,
     approved_at: datetime | None = None,
+    approver_identity: str | None = None,
 ) -> dict[str, Any]:
+    """Bind the operator's approval to the pending plan.
+
+    ``approver_identity`` names who approved (I2): the STS caller ARN when not
+    given, falling back to ``user@host`` so an approval is never anonymous. It
+    lives on the record and in the archive but *outside* ``plan_sha256``: that
+    digest binds the reviewed plan, is computed before anyone approves, and is
+    what the operator types back on ``--plan-sha256``; folding the approver in
+    would change it under them and make an approved plan unwinnable.
+    """
+
     normalized = reference.strip()
     if not APPROVAL_PATTERN.fullmatch(normalized):
         raise ProfileApprovalError("Profile approval reference has an invalid format")
     normalized_plan_sha256 = expected_plan_sha256.strip()
     if not SHA256_PATTERN.fullmatch(normalized_plan_sha256):
         raise ProfileApprovalError("reviewed Profile plan SHA-256 is invalid")
+    approver = (approver_identity or "").strip() or (
+        operator_identity.resolve_operator_identity(
+            fallback=operator_identity.local_operator_identity()
+        )
+    )
     with profile_approval_lock(state_dir):
         plan_path = profile_plan_path(state_dir)
         if not plan_path.is_file():
@@ -341,6 +370,7 @@ def approve_profile(
             "desired_version": str(plan.get("desired_version") or ""),
             "change_kind": str(plan.get("change_kind") or ""),
             "approved_at": _utc_timestamp(approved_at),
+            "approver_identity": approver,
         }
         _archive_initial_approval(
             state_dir,
@@ -415,6 +445,7 @@ def resolve_profile_approval(
         reference=str(record["reference"]),
         plan_sha256=approved_digest,
         relation=relation,
+        approver_identity=_approver_identity(record),
     )
 
 
@@ -501,6 +532,7 @@ def consume_profile_approval(
                 "status": "CONSUMED",
                 "plan_sha256": expected_plan_sha256,
                 "reference": record["reference"],
+                "approver_identity": _approver_identity(record),
                 "release_id": release_id,
                 "relation": relation,
                 "consumed_at": _utc_timestamp(consumed_at),

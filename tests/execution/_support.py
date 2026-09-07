@@ -515,6 +515,34 @@ def _storeless_isolation_context(core, provider):
     return adapter, context
 
 
+def isolated_kubernetes_adapter(
+    incident_id: str = "incident-active", fencing_token: int = 3
+) -> KubernetesWorkflowAdapter:
+    """A Kubernetes adapter whose (single, shared) node is isolated.
+
+    HyperPod steps read the node back before a provider mutation, so a
+    HyperPod adapter under test needs a scheduler that shows the node
+    cordoned, quarantine-tainted and annotated with the incident.
+    """
+    core = FakeCoreApi()
+    core.node["metadata"]["annotations"] = {
+        "gpu-fault.io/incident-id": incident_id,
+        "gpu-fault.io/fencing-token": str(fencing_token),
+        "gpu-fault.io/previous-unschedulable": "false",
+    }
+    core.node["spec"]["unschedulable"] = True
+    core.node["spec"]["taints"].append(
+        {
+            "key": "gpu-fault.io/quarantined",
+            "value": quarantine_taint_value(incident_id),
+            "effect": "NoSchedule",
+        }
+    )
+    return KubernetesWorkflowAdapter(
+        core_api=core, batch_api=UnusedApi(), custom_api=UnusedApi()
+    )
+
+
 def _managed_job_recovery_workflow(
     store: InMemoryStore,
     operation: WorkflowOperation,

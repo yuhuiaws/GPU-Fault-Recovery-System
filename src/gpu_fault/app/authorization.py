@@ -137,7 +137,9 @@ class ExplicitAuthorizationRegistry:
         inventory = {}
         for route in iter_api_routes(routes):
             path = route.path
-            if not (path.startswith("/v1/") or path in {"/healthz", "/metrics"}):
+            if not (
+                path.startswith("/v1/") or path in {"/healthz", "/livez", "/metrics"}
+            ):
                 continue
             bucket = getattr(
                 route.endpoint,

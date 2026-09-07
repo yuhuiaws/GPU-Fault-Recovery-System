@@ -214,9 +214,20 @@ class PeriodicServiceRunner:
         # refreshed by the drift job; a scrape only reads them.
         self.processor_counter_drift_abs: int = 0
         self.processor_counter_mismatched_clusters: int = 0
+        # ARCH-E E3: the runner's own heartbeat, and each job's last run. The
+        # counters above are written by the loop, so a dead thread leaves
+        # every one of them at a healthy-looking value.
+        self.last_cycle_timestamp_seconds = 0.0
+        self.job_last_run_timestamp_seconds: dict[str, float] = {}
+        # Newest error behind each error counter, as a Unix time: a scrape of a
+        # multi-process Pod samples one process, so an alert reads max() of
+        # these rather than increase() of the counters (ARCH-E E4).
+        self.lease_error_last_seen_timestamp_seconds = 0.0
+        self.job_error_last_seen_timestamp_seconds: dict[str, float] = {}
 
     def run(self) -> None:
         while not self.stop.wait(0.2):
+            self.last_cycle_timestamp_seconds = time.time()
             if not self._active():
                 continue
             self.run_all_due(time.monotonic())
@@ -253,10 +264,12 @@ class PeriodicServiceRunner:
                 self.periodic_job_errors_total[name] = (
                     self.periodic_job_errors_total.get(name, 0) + 1
                 )
+                self.job_error_last_seen_timestamp_seconds[name] = time.time()
                 LOGGER.exception("periodic service %s failed; continuing", name)
                 ran = True
             if ran:
                 now = time.monotonic()
+                self.job_last_run_timestamp_seconds[name] = time.time()
 
     def metrics_snapshot(self) -> dict[str, Any]:
         return {
@@ -274,6 +287,14 @@ class PeriodicServiceRunner:
             "processor_counter_drift_abs": self.processor_counter_drift_abs,
             "processor_counter_mismatched_clusters": (
                 self.processor_counter_mismatched_clusters
+            ),
+            "last_cycle_timestamp_seconds": self.last_cycle_timestamp_seconds,
+            "job_last_run_timestamp_seconds": dict(self.job_last_run_timestamp_seconds),
+            "lease_error_last_seen_timestamp_seconds": (
+                self.lease_error_last_seen_timestamp_seconds
+            ),
+            "job_error_last_seen_timestamp_seconds": dict(
+                self.job_error_last_seen_timestamp_seconds
             ),
         }
 
@@ -335,6 +356,7 @@ class PeriodicServiceRunner:
         except Exception:
             # A store hiccup means "not this tick", never "never again".
             self.periodic_lease_errors_total += 1
+            self.lease_error_last_seen_timestamp_seconds = time.time()
             LOGGER.exception("periodic task lease %s could not be taken", key)
             return False
         if lease.owner_id == self.processor.owner_id:

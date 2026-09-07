@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import logging
 import os
 import sqlite3
 import subprocess
@@ -41,6 +42,29 @@ from gpu_fault.node_agent.operations.registry import (
     operation_handler_name,
     validate_operation_handlers,
 )
+
+LOGGER = logging.getLogger(__name__)
+
+COUNTER_NAMES = ("accepted", "completed", "failed", "rejected")
+
+
+def _command_log_fields(command: NodeActionCommand, attempt: int) -> str:
+    """Structured key=value context for one command's journald lines.
+
+    Identifiers only: no parameters, GPU UUID lists, signatures or secrets.
+    """
+
+    return (
+        f"command_id={command.command_id} "
+        f"incident_id={command.incident_id} "
+        f"workflow_request_id={command.workflow_request_id} "
+        f"operation={command.operation.value} "
+        f"node_id={command.node_id} "
+        f"fencing_token={command.fencing_token} "
+        f"agent_generation={command.agent_generation} "
+        f"gpu_count={len(command.gpu_uuids)} "
+        f"attempt={attempt}"
+    )
 
 
 class NodeActionExecutor(
@@ -186,6 +210,8 @@ class NodeActionExecutor(
         self.ledger = ledger
         self._inflight_lock = RLock()
         self._inflight: dict[str, Event] = {}
+        self._counter_lock = RLock()
+        self._counters: dict[str, int] = dict.fromkeys(COUNTER_NAMES, 0)
         self.runner = runner
         self.device_client_finder = device_client_finder or self._device_clients
         self.gpu_device_path_finder = gpu_device_path_finder or self._gpu_device_paths
@@ -236,18 +262,44 @@ class NodeActionExecutor(
     def set_agent_generation(self, generation: int) -> None:
         self.agent_generation = generation
 
+    def _count(self, name: str) -> None:
+        with self._counter_lock:
+            self._counters[name] += 1
+
+    def counters_snapshot(self) -> dict[str, int]:
+        """Commands accepted / completed / failed / rejected since start."""
+
+        with self._counter_lock:
+            return dict(self._counters)
+
     def validate_submission(self, envelope: SignedNodeAction) -> NodeActionCommand:
+        try:
+            return self._validate_submission(envelope)
+        except ValueError as exc:
+            self._count("rejected")
+            LOGGER.warning(
+                "node action rejected %s reason=%s",
+                _command_log_fields(envelope.command, 0),
+                exc,
+            )
+            raise
+
+    def _validate_submission(self, envelope: SignedNodeAction) -> NodeActionCommand:
         command = envelope.command
         expected = sign_node_action(command, self.secret)
         if not hmac.compare_digest(expected, envelope.signature):
             raise ValueError("invalid node action signature")
         if command.node_id not in self.node_ids:
             raise ValueError("node action targets a different node")
-        if (
-            command.agent_generation is not None
-            and command.agent_generation != self.agent_generation
-        ):
-            raise ValueError("node action targets a different agent generation")
+        if command.agent_generation is not None:
+            if self.agent_generation is None:
+                # No heartbeat has succeeded yet, so this agent does not know
+                # its own generation. The command may well be addressed to it;
+                # answer "not yet" (retryable, same command) rather than
+                # "wrong agent" (which asks the control plane for a new one).
+                raise ValueError("node action agent generation is not known yet")
+            if command.agent_generation != self.agent_generation:
+                raise ValueError("node action targets a different agent generation")
         if command.operation not in self.allowed_operations:
             raise ValueError(f"operation {command.operation.value} is not allowed")
         now = self.now()
@@ -295,7 +347,13 @@ class NodeActionExecutor(
                 )
             return existing
 
-        self.ledger.mark_in_progress(command, attempt)
+        fields = _command_log_fields(command, attempt)
+        self._count("accepted")
+        LOGGER.info("node action accepted %s", fields)
+        self.ledger.mark_in_progress(command, attempt, signature=envelope.signature)
+        LOGGER.info("node action started %s", fields)
+        started = time.monotonic()
+        exit_code: int | None = None
         try:
             handler = getattr(self, operation_handler_name(command.operation))
             details = handler(command)
@@ -306,7 +364,15 @@ class NodeActionExecutor(
                 details=details,
                 attempt=attempt,
             )
+            self._count("completed")
+            LOGGER.info(
+                "node action completed %s status=SUCCEEDED duration_ms=%d",
+                fields,
+                int((time.monotonic() - started) * 1000),
+            )
         except Exception as exc:
+            returncode = getattr(exc, "returncode", None)
+            exit_code = returncode if isinstance(returncode, int) else None
             result = NodeActionResult(
                 command_id=command.command_id,
                 operation=command.operation,
@@ -315,8 +381,18 @@ class NodeActionExecutor(
                 retryable=self._retryable_action_error(exc),
                 attempt=attempt,
             )
+            self._count("failed")
+            LOGGER.info(
+                "node action failed %s status=FAILED error_class=%s "
+                "retryable=%s exit_code=%s duration_ms=%d",
+                fields,
+                type(exc).__name__,
+                result.retryable,
+                exit_code,
+                int((time.monotonic() - started) * 1000),
+            )
         try:
-            self.ledger.save(result)
+            self.ledger.save(result, exit_code=exit_code)
         finally:
             with self._inflight_lock:
                 self._inflight.pop(command.command_id, None)

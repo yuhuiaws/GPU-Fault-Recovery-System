@@ -6,7 +6,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Iterator
+from typing import IO, Iterator, NamedTuple
 
 ADMIN_LOG_DIRECTORY = Path("logs")
 ADMIN_LOG_ENVIRONMENT = "GPU_FAULT_ADMIN_LOG"
@@ -20,9 +20,51 @@ ADMIN_LOG_RETAINED = 100
 ADMIN_LOG_MAX_BYTES = 512 * 1024 * 1024
 
 
-def _log_path(state_dir: Path, command: str) -> Path:
-    directory = state_dir.expanduser().resolve() / ADMIN_LOG_DIRECTORY
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+class LogLimits(NamedTuple):
+    retained: int
+    max_bytes: int
+
+
+# One ceiling for every command meant a hundred `status` runs evicted the one
+# deploy log worth reading back (I3). Each kind now has its own directory under
+# `logs/` and its own ceiling, so a read-only flood can only ever evict other
+# read-only logs. Mutating logs are the ones that explain a failed rollout, so
+# they get the larger count; a caller that names no kind is treated as mutating,
+# because the safe mistake is keeping a `status` log too long, not losing a
+# deploy log.
+ADMIN_LOG_KIND_MUTATING = "mutating"
+ADMIN_LOG_KIND_READONLY = "readonly"
+ADMIN_LOG_LIMITS: dict[str, LogLimits] = {
+    ADMIN_LOG_KIND_MUTATING: LogLimits(retained=200, max_bytes=ADMIN_LOG_MAX_BYTES),
+    ADMIN_LOG_KIND_READONLY: LogLimits(
+        retained=ADMIN_LOG_RETAINED, max_bytes=64 * 1024 * 1024
+    ),
+}
+
+
+def admin_log_limits(kind: str) -> LogLimits:
+    try:
+        return ADMIN_LOG_LIMITS[kind]
+    except KeyError:
+        raise ValueError(
+            f"unknown admin log kind {kind!r}; expected one of "
+            f"{sorted(ADMIN_LOG_LIMITS)}"
+        ) from None
+
+
+def admin_log_directory(state_dir: Path, kind: str) -> Path:
+    """Where logs of ``kind`` live under the state directory (not created)."""
+
+    admin_log_limits(kind)
+    return state_dir.expanduser().resolve() / ADMIN_LOG_DIRECTORY / kind
+
+
+def _log_path(state_dir: Path, command: str, kind: str) -> Path:
+    directory = admin_log_directory(state_dir, kind)
+    # Both levels are created explicitly: ``parents=True`` applies ``mode`` to
+    # the leaf only, and the root sits beside kubeconfigs and cluster tokens.
+    directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.mkdir(mode=0o700, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return directory / f"{command}-{stamp}-{os.getpid()}.log"
 
@@ -133,7 +175,12 @@ def _teed(handle: IO[bytes]) -> Iterator[None]:
 
 
 @contextmanager
-def command_log(state_dir: object, *, command: str) -> Iterator[Path | None]:
+def command_log(
+    state_dir: object,
+    *,
+    command: str,
+    kind: str = ADMIN_LOG_KIND_MUTATING,
+) -> Iterator[Path | None]:
     """Record this invocation's console output under the private state directory.
 
     An administrator command that fails mid-deployment prints the only copy of
@@ -144,8 +191,14 @@ def command_log(state_dir: object, *, command: str) -> Iterator[Path | None]:
     A nested invocation -- the deploy path re-enters this CLI from the deploy
     host venv -- appends to the log the outer command already opened, so one
     operator action produces one file.
+
+    ``kind`` selects the directory and the ceiling (``ADMIN_LOG_LIMITS``):
+    ``readonly`` for commands that change nothing (``status``, diff, verify),
+    ``mutating`` -- the default -- for everything else. An unknown kind is
+    refused before anything is written.
     """
 
+    limits = admin_log_limits(kind)
     inherited = os.environ.get(ADMIN_LOG_ENVIRONMENT)
     if inherited:
         yield Path(inherited)
@@ -153,10 +206,15 @@ def command_log(state_dir: object, *, command: str) -> Iterator[Path | None]:
     if not isinstance(state_dir, Path):
         yield None
         return
-    path = _log_path(state_dir, command)
+    path = _log_path(state_dir, command, kind)
     with path.open("ab") as handle:
         path.chmod(0o600)
-        prune_admin_logs(path.parent)
+        prune_admin_logs(
+            path.parent, retained=limits.retained, max_bytes=limits.max_bytes
+        )
+        # Logs written before the per-kind split sit flat in ``logs/``; keep
+        # bounding them under the old ceiling so they age out rather than stay.
+        prune_admin_logs(path.parent.parent)
         os.environ[ADMIN_LOG_ENVIRONMENT] = str(path)
         try:
             with _teed(handle):

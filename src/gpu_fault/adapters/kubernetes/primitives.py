@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from typing import Any, Callable
 
 from gpu_fault.execution import (
@@ -16,6 +18,111 @@ from gpu_fault.adapters.common import (
     ANNOTATION_WORKFLOW,
 )
 
+NODE_PATCH_ATTEMPTS = 3
+NODE_PATCH_BACKOFF_SECONDS = 0.1
+
+
+class NodePatchConflict(RuntimeError):
+    """``patch_node`` still returned 409 after every bounded attempt.
+
+    The node is unchanged; the caller decides whether that is WAITING
+    (the operation is idempotent and a later pass may win) or FAILED.
+    """
+
+
+def kubernetes_request_timeout_seconds() -> float:
+    """Bounded per-request timeout for every Kubernetes API call.
+
+    The kubernetes client has no default: an apiserver that accepts the TCP
+    connection and never answers used to hold the executor thread forever,
+    and with it the workflow lease.
+    """
+    try:
+        value = float(os.getenv("GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS", "30"))
+    except ValueError as exc:
+        raise ValueError(
+            "GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS must be a positive number"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            "GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS must be a positive number"
+        )
+    return value
+
+
+def build_kubernetes_clients(
+    configuration: Any, *, request_timeout_seconds: float
+) -> tuple[Any, Any, Any]:
+    """CoreV1/BatchV1/CustomObjects APIs sharing one timeout-bounded client.
+
+    Every generated API method forwards ``_request_timeout`` from its own
+    kwargs, so the one place that can give all of them a default is the
+    ``ApiClient`` they share.
+    """
+    from kubernetes import client
+
+    class TimeoutApiClient(client.ApiClient):  # type: ignore[misc]
+        def call_api(self, *args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("_request_timeout") is None:
+                kwargs["_request_timeout"] = request_timeout_seconds
+            return super().call_api(*args, **kwargs)
+
+    api_client = TimeoutApiClient(configuration)
+    return (
+        client.CoreV1Api(api_client),
+        client.BatchV1Api(api_client),
+        client.CustomObjectsApi(api_client),
+    )
+
+
+def node_scheduling_snapshot(node: Any) -> dict[str, Any]:
+    """The scheduling baseline a node carries: what isolation/restore change."""
+    return {
+        "unschedulable": KubernetesPrimitivesMixin._unschedulable(node),
+        "taint_keys": sorted(
+            str(item.get("key")) for item in KubernetesPrimitivesMixin._taints(node)
+        ),
+        "resource_version": KubernetesPrimitivesMixin._resource_version(node),
+    }
+
+
+def patch_node_with_retry(
+    core: Any,
+    node_id: str,
+    build_body: Callable[[Any], dict[str, Any] | None],
+    *,
+    attempts: int = NODE_PATCH_ATTEMPTS,
+    backoff_seconds: float = NODE_PATCH_BACKOFF_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Read the node, patch what ``build_body`` derives from it, retry 409s.
+
+    Each retry re-reads the node so the mutation is recomputed against the
+    current object and its ``resourceVersion``; a stale body is never
+    resent. ``build_body`` returning ``None`` means nothing to patch. A 404
+    on the read propagates: only the caller knows whether an absent node is
+    a no-op or a safety rejection. Returns the node the successful (or
+    skipped) patch was derived from.
+    """
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        node = core.read_node(node_id)
+        body = build_body(node)
+        if body is None:
+            return node
+        try:
+            core.patch_node(node_id, body)
+            return node
+        except Exception as exc:
+            if getattr(exc, "status", None) != 409:
+                raise
+            last_error = exc
+            if attempt + 1 < attempts:
+                sleep(backoff_seconds * (attempt + 1))
+    raise NodePatchConflict(
+        f"node {node_id} patch conflicted {attempts} times"
+    ) from last_error
+
 
 class KubernetesPrimitivesMixin:
     # Attributes supplied by the composed concrete implementation.
@@ -26,7 +133,7 @@ class KubernetesPrimitivesMixin:
     custom: Any
 
     @staticmethod
-    def _clients() -> tuple[Any, Any, Any]:
+    def _clients(request_timeout_seconds: float) -> tuple[Any, Any, Any]:
         try:
             from kubernetes import client, config
         except ImportError as exc:
@@ -35,10 +142,9 @@ class KubernetesPrimitivesMixin:
             config.load_incluster_config()
         except config.ConfigException:
             config.load_kube_config()
-        return (
-            client.CoreV1Api(),
-            client.BatchV1Api(),
-            client.CustomObjectsApi(),
+        return build_kubernetes_clients(
+            client.Configuration.get_default_copy(),
+            request_timeout_seconds=request_timeout_seconds,
         )
 
     @staticmethod

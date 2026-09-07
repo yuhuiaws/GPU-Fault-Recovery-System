@@ -190,7 +190,6 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "add_marker",
         "amend_workflow",
         "apply_efa_traffic_admin_action",
-        "complete_notification_delivery",
         "complete_remote_command",
         "complete_xid_correlation",
         "create_incident_workflow_if_absent",
@@ -227,7 +226,6 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "get_xid_correlation",
         "get_xid_event",
         "get_xid_policy_decision",
-        "link_event_to_incident",
         "list_regional_registry_members",
         "merge_attempt_fault_workflow",
         "merge_replacement_workflow",
@@ -239,7 +237,6 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "reconcile_retired_generation_workflow",
         "record_xid74_occurrences",
         "release_job_restart",
-        "release_notification_delivery",
         "remote_command_cluster_health",
         "renew_remote_command_lease",
         "reserve_hyperpod_submission",
@@ -256,7 +253,6 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "save_hyperpod_submission",
         "save_incident_and_workflow",
         "save_notification_result",
-        "save_plan",
         "save_profile",
         "save_regional_cluster",
         "save_regional_registry_member",
@@ -547,10 +543,20 @@ def test_store_classes_cover_application_protocol() -> None:
 
 
 def test_applied_postgres_migration_checksums_are_immutable() -> None:
+    """Every released migration's checksum is pinned here, not just v1-v5.
+
+    ``SchemaMigration.checksum`` hashes ``inspect.getsource(apply)``, so editing
+    a comment inside a published ``_apply_*`` function changes the checksum the
+    production database has already recorded, and ``_validate_schema_migrations``
+    then refuses to start every replica. A mismatch below means "you changed a
+    published migration -- add a new one instead" (architecture review
+    2026-09-07, item D4). Extend the table when a version is released; never
+    edit a pinned value.
+    """
+
     historical = {
         migration.version: migration.checksum
         for migration in POSTGRES_SCHEMA_MIGRATIONS
-        if migration.version <= 5
     }
 
     assert historical == {
@@ -559,7 +565,17 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
         3: "2a82490502995bac570f3a533c53b899645630f786f260972a72c82641ac0680",
         4: "9ce8369e79e881c566bc429c72a157a0e7fe6a2557bcf2b4d050f2565db2b947",
         5: "884820da9fdf5521dad40dffd8a40b1a3acf415de1871f563202eafd083ebb97",
-    }
+        6: "f2168c5062fd705e4b4836c33dd050c9cd435f56e376e177bb81cfba3b6a4d8f",
+        7: "77cb4639ac956f515af3abd48e77cccd97d1d0e9a0bec97048400e70d9b0162d",
+        8: "751ff9491001fccab5240a4c10014f80e1145cf76436a4200c212bc6f8947058",
+        9: "23802f5494827329ac1b36e3f689c9c28a8a2a0ae19d53bd7fc99f4e65d96096",
+        10: "ffbb8e4a1f3b383c5126efc3e7f13bd4bebf8cd8a304775bb2ac219a53551f26",
+        11: "3cc0c8918c4fae0fec4c294d21af06a43b552e3387a6936efae7331b5c8d1b57",
+        12: "4b0e0447339441e31d0da248472dc0d025e0441ea48ac072850eb779d885aba7",
+    }, (
+        "a published migration's checksum changed: do not edit v1-v12 (not even "
+        "a comment inside its apply callback); append a new migration instead"
+    )
     assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 12
 
 

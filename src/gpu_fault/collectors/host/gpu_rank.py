@@ -31,21 +31,19 @@ class HostGpuRankMixin:
     rank_progress_min_cpu_cores: Any
     rank_progress_min_write_bps: Any
     runner: Callable[..., Any]
+    _nvidia_smi: Callable[..., Any]
 
-    def _gpu_utilization(self, _: datetime) -> list[HostMetricSample]:
+    #: One query feeds both the utilization samples and the GPU inventory
+    #: (``uuid`` is the first column), so a round shells out once for both.
+    GPU_QUERY_ARGV: tuple[str, ...] = (
+        "nvidia-smi",
+        "--query-gpu=uuid,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    )
+
+    def _gpu_utilization(self, observed_at: datetime) -> list[HostMetricSample]:
         self._last_gpu_utilization_percent = None
-        argv = [
-            "nvidia-smi",
-            "--query-gpu=uuid,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ]
-        completed = self.runner(
-            argv,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        completed = self._nvidia_smi(list(self.GPU_QUERY_ARGV), observed_at)
         if completed.returncode != 0:
             raise CollectorError(
                 "GPU utilization query failed: " + completed.stderr.strip()
@@ -84,20 +82,17 @@ class HostGpuRankMixin:
             detail,
         )
 
-    def _gpu_compute_pids(self) -> list[int]:
+    def _gpu_compute_pids(self, observed_at: datetime) -> list[int]:
         try:
-            completed = self.runner(
+            completed = self._nvidia_smi(
                 [
                     "nvidia-smi",
                     "--query-compute-apps=pid",
                     "--format=csv,noheader,nounits",
                 ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
+                observed_at,
             )
-        except OSError as exc:
+        except (OSError, CollectorError) as exc:
             self._warn_rank_liveness(str(exc))
             return []
         if completed.returncode != 0:
@@ -195,7 +190,7 @@ class HostGpuRankMixin:
 
         if not self.rank_liveness_enabled:
             return []
-        pids = self._gpu_compute_pids()
+        pids = self._gpu_compute_pids(observed_at)
         if not pids:
             self._rank_progress_at = None
             self._prune_rank_counters(set())

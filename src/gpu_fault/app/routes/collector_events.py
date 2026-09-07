@@ -26,6 +26,7 @@ from gpu_fault.async_store import (
 from gpu_fault.hma import (
     FabricManagerLogEvent,
     HmaIngestionResult,
+    HmaNormalizedBatch,
     NvidiaKernelLogEvent,
 )
 from gpu_fault.gpu_metrics import (
@@ -62,6 +63,12 @@ from gpu_fault.telemetry import (
 )
 
 
+def _ignore_unresolved_signals(
+    normalized: HmaNormalizedBatch, *, batch_id: str
+) -> NodeHealthIngestionResult | None:
+    return None
+
+
 @dataclass(frozen=True)
 class CollectorRouterDependencies:
     context: Any
@@ -82,6 +89,13 @@ class CollectorRouterDependencies:
     persist_host_telemetry: Callable
     finish_host_telemetry: Callable
     ingest_telemetry_batch: Callable
+    # Test fakes may leave this at the no-op; the production factory passes
+    # FaultIngestionService.ingest_unresolved_signals so an Xid/SXid line the
+    # normalizer could not read becomes a WARNING finding instead of silent
+    # evidence (G7).
+    ingest_unresolved_signals: Callable[..., NodeHealthIngestionResult | None] = (
+        _ignore_unresolved_signals
+    )
 
 
 def get_collector_dependencies() -> CollectorRouterDependencies:
@@ -125,6 +139,17 @@ async def ingest_collector_health(
 
     def ingest() -> dict[str, bool]:
         received_at = datetime.now(timezone.utc)
+        # The kernel collector reports its own losses as ``<name>:<count>``
+        # tokens (delivery-failures, kmsg-overflow, boot-time-reestimates)
+        # next to the bare "health-summary" marker. Those are collection
+        # errors: they set ``last_error_at`` so the erroring-nodes gauge sees
+        # a collector that is dropping lines. An all-zero summary carries no
+        # such token and only refreshes ``last_success_at`` (G4).
+        failure_tokens = [
+            reason
+            for reason in summary.edge_filter_reasons
+            if reason != "health-summary" and ":" in reason
+        ]
         dependencies.record_collector_status(
             summary.collector,
             summary.cluster_id,
@@ -132,6 +157,7 @@ async def ingest_collector_health(
             received_at,
             summary.summary_id,
             0,
+            [f"kernel collector reported {token}" for token in failure_tokens] or None,
         )
         return {"accepted": True}
 
@@ -185,6 +211,7 @@ async def ingest_nvidia_kernel(
             observed_at=enriched.observed_at,
             payload=enriched.model_dump(mode="json"),
         )
+        dependencies.ingest_unresolved_signals(normalized, batch_id=enriched.record_id)
         report_processor_replay_phase("kernel_fault_policy")
         result = HmaIngestionResult(
             normalized=normalized,
@@ -243,6 +270,7 @@ async def ingest_fabric_manager_log(
             observed_at=enriched.observed_at,
             payload=enriched.model_dump(mode="json"),
         )
+        dependencies.ingest_unresolved_signals(normalized, batch_id=enriched.record_id)
         result = HmaIngestionResult(
             normalized=normalized,
             decisions=[

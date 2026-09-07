@@ -84,7 +84,7 @@ def test_node_agent_async_submit_and_poll_preserves_long_action(
             completed.json()
         )
         assert completed.json()["result"]["details"] == {"long_action_completed": True}
-        assert client.get("/healthz").json() == {"status": "ok"}
+        assert client.get("/healthz").json()["status"] == "ok"
 
 
 def test_node_agent_result_query_migration_escape_hatch(tmp_path, monkeypatch) -> None:

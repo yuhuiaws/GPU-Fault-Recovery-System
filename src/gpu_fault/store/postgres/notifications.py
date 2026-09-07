@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 from gpu_fault.models import (
     AdvisoryNotification,
@@ -11,11 +10,18 @@ from gpu_fault.models import (
     NotificationResult,
     NotificationStatus,
 )
+from gpu_fault.store.shared.errors import NotFoundError, WorkflowLeaseError
 from gpu_fault.store.shared.notification_helpers import (
     with_incident_drill_label as _with_incident_drill_label,
 )
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
+)
+from gpu_fault.store.shared.notification_helpers import (
+    UNDELIVERED_STATUSES,
+    check_delivery_lease,
+    completed_delivery,
+    released_delivery,
 )
 
 
@@ -24,6 +30,7 @@ class PostgresNotificationMixin:
     _db: Any
     _decode: Callable[..., Any]
     _get: Callable[..., Any]
+    _get_for_update: Callable[..., Any]
     _get_link: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _put: Callable[..., Any]
@@ -78,6 +85,136 @@ class PostgresNotificationMixin:
         for status, count in rows:
             counts[NotificationStatus(status)] = int(count)
         return counts
+
+    def notification_delivery_stats(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        observed_at = now or datetime.now(timezone.utc)
+        # The CASE is ``effective_delivery_status`` in SQL: a SENT verdict wins
+        # over whatever the delivery row says, and a SKIPPED verdict on an
+        # undelivered row is the DEAD the dispatcher would write on claiming it.
+        # The anchor is ``delivery_age_anchor``: creation, or a later re-queue.
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    effective.status,
+                    COUNT(*),
+                    MIN(effective.anchor)
+                FROM (
+                    SELECT
+                        CASE
+                            WHEN result.payload->>'status'='SENT' THEN 'SENT'
+                            WHEN result.payload->>'status'='SKIPPED'
+                             AND delivery.payload->>'status' IN (
+                                 'PENDING', 'RETRY', 'LEASED'
+                             ) THEN 'DEAD'
+                            ELSE delivery.payload->>'status'
+                        END AS status,
+                        GREATEST(
+                            (delivery.payload->>'created_at')::timestamptz,
+                            COALESCE(
+                                (delivery.payload->>'requeued_at')::timestamptz,
+                                (delivery.payload->>'created_at')::timestamptz
+                            )
+                        ) AS anchor
+                    FROM gpu_fault_objects AS delivery
+                    LEFT JOIN gpu_fault_objects AS result
+                      ON result.kind='notification_result'
+                     AND result.key=delivery.key
+                    WHERE delivery.kind='notification_delivery'
+                ) AS effective
+                GROUP BY effective.status
+                """
+            )
+            rows = cursor.fetchall()
+        by_status = {status.value: 0 for status in NotificationDeliveryStatus}
+        pending = 0
+        oldest_anchor: datetime | None = None
+        for status_value, count, anchor in rows:
+            status = NotificationDeliveryStatus(status_value)
+            by_status[status.value] = int(count)
+            if status not in UNDELIVERED_STATUSES:
+                continue
+            pending += int(count)
+            if anchor is not None and (oldest_anchor is None or anchor < oldest_anchor):
+                oldest_anchor = anchor
+        return {
+            "by_status": by_status,
+            "pending": pending,
+            "oldest_pending_age_seconds": (
+                max(0.0, (observed_at - oldest_anchor).total_seconds())
+                if oldest_anchor is not None
+                else 0.0
+            ),
+        }
+
+    def complete_notification_delivery(
+        self,
+        notification_id: str,
+        *,
+        owner_id: str,
+        lease_epoch: int,
+        result: NotificationResult,
+        now: datetime,
+        retry_at: datetime | None = None,
+        terminal: bool = False,
+    ) -> NotificationDelivery:
+        """Finish an attempt under the row lock the claim query respects.
+
+        The inherited implementation serialised completers against each other
+        with an advisory lock, then read the row unlocked and wrote it back
+        whole. ``claim_notification_deliveries`` never takes that advisory
+        lock -- it locks rows with ``FOR UPDATE SKIP LOCKED`` -- so a claim for
+        an expired lease could land between the completer's read and its
+        write, and the write then put the completer's stale epoch and status
+        over the fresh claim (ARCH-E E2). ``_get_for_update`` takes the same
+        row lock the claim skips: a concurrent claim skips this row until the
+        completion commits, and a claim that got there first is seen as the
+        epoch mismatch it is.
+        """
+
+        with self._db.transaction():
+            current = check_delivery_lease(
+                self._get_for_update("notification_delivery", notification_id),
+                owner_id=owner_id,
+                lease_epoch=lease_epoch,
+                now=now,
+            )
+            value, record_result = completed_delivery(
+                current,
+                result=result,
+                now=now,
+                retry_at=retry_at,
+                terminal=terminal,
+            )
+            if record_result:
+                self._put("notification_result", notification_id, result)
+            self._put("notification_delivery", notification_id, value)
+            return value
+
+    def release_notification_delivery(
+        self,
+        notification_id: str,
+        *,
+        owner_id: str,
+        lease_epoch: int,
+        now: datetime,
+        retry_at: datetime,
+    ) -> NotificationDelivery | None:
+        with self._db.transaction():
+            try:
+                current = check_delivery_lease(
+                    self._get_for_update("notification_delivery", notification_id),
+                    owner_id=owner_id,
+                    lease_epoch=lease_epoch,
+                    now=None,
+                )
+            except (NotFoundError, WorkflowLeaseError):
+                return None
+            value = released_delivery(current, now=now, retry_at=retry_at)
+            self._put("notification_delivery", notification_id, value)
+            return value
 
     def claim_notification_deliveries(
         self,

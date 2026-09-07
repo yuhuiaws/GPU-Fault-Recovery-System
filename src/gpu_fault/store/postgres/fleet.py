@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -182,12 +183,12 @@ class PostgresFleetMixin:
                           AND objects.key=victims.key
                         RETURNING objects.key
                     )
-                    SELECT count(*) FROM deleted
+                    SELECT key FROM deleted ORDER BY key
                     """,
                     (_utc_text(older_than), limit),
                 )
-                row = cursor.fetchone()
-            return int(row[0]) if row else 0
+                keys = [row[0] for row in cursor.fetchall()]
+            return log_cleanup("fleet_deployment", keys)
 
     def replace_agent_if_matches(self, replacement, expected) -> bool:
         key = self._agent_key(

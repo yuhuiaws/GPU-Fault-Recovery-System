@@ -92,13 +92,14 @@ def requested_acceptance_mode(
 def schema_change_needs_acceptance(
     config: Any, changed: set[str] | frozenset[str]
 ) -> bool:
-    """Whether this diff is the case the transaction gate used to refuse."""
+    """Whether this diff is the case the transaction gate used to refuse.
 
-    return (
-        "database_schema" in changed
-        and bool(config.auto_rollback)
-        and not bool(config.schema_rollback_compatible)
-    )
+    A schema change is never rollback-compatible: the store requires an exact
+    schema version and migration history at start-up, so the old wheel cannot
+    run on the new schema. There is no flag to say otherwise any more.
+    """
+
+    return "database_schema" in changed and bool(config.auto_rollback)
 
 
 def recorded_acceptance(state: dict[str, Any] | None) -> dict[str, Any] | None:

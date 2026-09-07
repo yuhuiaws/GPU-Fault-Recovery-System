@@ -92,6 +92,18 @@ def render_processor_metrics_1(
             f"gpu_fault_processor_healthy {runtime['healthy']}",
         ]
     )
+    # ARCH-E E3: published once the processor stamps its claim loop
+    # (``claim.last_round_timestamp_seconds``); absent until then rather than
+    # a permanent zero, which would read as a loop that stopped at the epoch.
+    if "last_round_timestamp_seconds" in claim:
+        lines.extend(
+            [
+                "# HELP gpu_fault_processor_claim_last_round_timestamp_seconds Unix time this process's queue consumer last completed a claim round, rows or not (ARCH-E E3).",
+                "# TYPE gpu_fault_processor_claim_last_round_timestamp_seconds gauge",
+                "gpu_fault_processor_claim_last_round_timestamp_seconds "
+                f"{float(claim['last_round_timestamp_seconds']):.3f}",
+            ]
+        )
 
 
 def render_processor_metrics_2(
@@ -122,6 +134,24 @@ def render_processor_metrics_2(
             "# HELP gpu_fault_processor_retry_horizon_failures_total Requests completed as failed because they kept failing past the retry horizon (F-D4).",
             "# TYPE gpu_fault_processor_retry_horizon_failures_total counter",
             f"gpu_fault_processor_retry_horizon_failures_total {runtime.get('retry_horizon_failures_total', 0)}",
+            "# HELP gpu_fault_processor_fault_rejections_total Fault-layer collector events completed with a 4xx after the ingress 202 (G1).",
+            "# TYPE gpu_fault_processor_fault_rejections_total counter",
+            f"gpu_fault_processor_fault_rejections_total {runtime.get('fault_rejections_total', 0)}",
+            "# HELP gpu_fault_processor_completions_by_path_status_total Replay completions by channel path and HTTP status class (G1).",
+            "# TYPE gpu_fault_processor_completions_by_path_status_total counter",
+        ]
+    )
+    for path, by_status in sorted(
+        (runtime.get("completions_by_path_status") or {}).items()
+    ):
+        for status_class, count in sorted(by_status.items()):
+            lines.append(
+                "gpu_fault_processor_completions_by_path_status_total"
+                f'{{path="{_metrics_label_value(str(path))}",'
+                f'status_class="{_metrics_label_value(str(status_class))}"}} {count}'
+            )
+    lines.extend(
+        [
             "# HELP gpu_fault_processor_renewal_errors_total Lease renewals that hit a store error and were retried (F-D5).",
             "# TYPE gpu_fault_processor_renewal_errors_total counter",
             f"gpu_fault_processor_renewal_errors_total {runtime.get('renewal_errors_total', 0)}",
@@ -747,6 +777,16 @@ def render_spool_metrics_one(
             "gpu_fault_telemetry_spool_rejected_total"
             f'{{scope="{scope}"}} '
             f"{telemetry_spool_rejections[scope]}"
+        )
+    # ARCH-E E3: same contract as the processor claim stamp above.
+    if "last_cycle_timestamp_seconds" in spool_runtime:
+        lines.extend(
+            [
+                "# HELP gpu_fault_telemetry_spool_consumer_last_cycle_timestamp_seconds Unix time this process's spool consumer last completed a loop iteration (ARCH-E E3).",
+                "# TYPE gpu_fault_telemetry_spool_consumer_last_cycle_timestamp_seconds gauge",
+                "gpu_fault_telemetry_spool_consumer_last_cycle_timestamp_seconds "
+                f"{float(spool_runtime['last_cycle_timestamp_seconds']):.3f}",
+            ]
         )
     return spool_runtime
 

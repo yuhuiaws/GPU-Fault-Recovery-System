@@ -105,3 +105,23 @@ def test_the_second_batch_of_review_counters_reaches_the_metrics_endpoint(
         "gpu_fault_processor_notification_listener_connected 0",
     ):
         assert line in text, line
+
+
+def test_escalation_chain_counters_reach_the_metrics_endpoint(monkeypatch) -> None:
+    monkeypatch.setenv("GPU_FAULT_PROCESSOR_MODE", "active-active")
+    monkeypatch.setenv("POD_UID", "pod-metrics")
+    token = "processor-metrics-token-" + "x" * 32
+    context = ApplicationContext(execution_token=token)
+    app = create_app(context)
+
+    escalation = context.orchestrator._escalation
+    escalation.escalation_chain_terminated_total = 3
+    escalation.containment_refused_escalations_total = 4
+
+    text = _scrape(app)
+
+    for line in (
+        "gpu_fault_hardware_escalation_chain_terminated_total 3",
+        "gpu_fault_hardware_escalation_containment_refused_total 4",
+    ):
+        assert line in text, line

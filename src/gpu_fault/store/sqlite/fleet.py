@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from datetime import datetime
 
+from gpu_fault.store.shared.cleanup_log import log_cleanup
+
 if TYPE_CHECKING:
     from gpu_fault.fleet_deployment import FleetDeployment
 
@@ -136,7 +138,7 @@ class SqliteFleetMixin:
             ][:limit]
             for deployment_id in deployment_ids:
                 self._delete("fleet_deployment", deployment_id)
-            return len(deployment_ids)
+            return log_cleanup("fleet_deployment", deployment_ids)
 
     def list_barriers(self):
         return sorted(

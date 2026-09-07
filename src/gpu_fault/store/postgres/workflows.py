@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
-
-from typing import Any, Callable, Collection
-
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Collection
 
 from gpu_fault.models import (
     FaultIncident,
@@ -12,25 +9,26 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
-from gpu_fault.store.shared.time import utc_text as _utc_text
-from gpu_fault.store.shared.workflow_scan import dispatch_order_key
+from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
 from gpu_fault.store.shared.errors import (
     NotFoundError,
-    StaleWriteError,
-    WorkflowMergedError,
     RemediationBudgetError,
-    WorkflowLeaseError,
     StaleFencingTokenError,
+    StaleWriteError,
+    WorkflowLeaseError,
+    WorkflowMergedError,
 )
+from gpu_fault.store.shared.remediation_budgets import (
+    apply_remediation_budget,
+    blocked_by_remediation_budget,
+    extend_remediation_budget,
+)
+from gpu_fault.store.shared.time import utc_text as _utc_text
 from gpu_fault.store.shared.transactional_workflows import (
     lease_extension_due,
     stale_workflow_versions,
 )
-from gpu_fault.store.shared.remediation_budgets import (
-    apply_remediation_budget,
-    extend_remediation_budget,
-    blocked_by_remediation_budget,
-)
+from gpu_fault.store.shared.workflow_scan import dispatch_order_key
 
 
 class PostgresWorkflowMixin:
@@ -798,24 +796,6 @@ class PostgresWorkflowMixin:
                 f"workflow/{workflow.request_id} changed since it was read"
             )
         raise stale
-
-    def save_incident(self, incident: FaultIncident) -> None:
-        """Write the incident and its event link atomically.
-
-        The inherited version relies on the process-wide lock, which
-        PostgresStore neutralizes because it cannot span replicas. These
-        are two statements and the pool runs in autocommit, so without a
-        transaction a reader could see the event link before the incident
-        it points at.
-        """
-
-        with self._db.transaction():
-            self._put("incident", incident.incident_id, incident)
-            self._link(
-                "incident_by_event",
-                incident.event_id,
-                incident.incident_id,
-            )
 
     def save_workflow_if_leased(
         self,

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Callable, Mapping
 from urllib.parse import urlsplit
 
 
 DEFAULT_AGENT_ENDPOINT_PORTS = frozenset({9099})
+EndpointNetworks = tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
 NODE_ADDRESS_LABEL_PATTERN = re.compile(r"^ip-(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})$")
 
 
@@ -34,18 +36,42 @@ def parse_endpoint_networks(
     )
 
 
+class ClusterEndpointNetworks(dict[str, EndpointNetworks]):
+    """Per-cluster allow-list that resolves unseen clusters on first sight.
+
+    Built once at start-up from the store, the plain dict refused every cluster
+    joined online until the Pods restarted (review H4). The resolver reads the
+    registry runtime's current snapshot, so a committed or PENDING revision is
+    honoured immediately; a cluster the snapshot does not contain resolves to
+    ``None`` and the caller fails closed exactly as before. Nothing is cached:
+    a later revision that changes a cluster's CIDRs must win on the next
+    heartbeat, and a snapshot lookup is one lock and one dict read.
+    """
+
+    def __init__(
+        self,
+        initial: Mapping[str, EndpointNetworks] | None = None,
+        *,
+        resolver: Callable[[str], EndpointNetworks | None],
+    ) -> None:
+        super().__init__(initial or {})
+        self.resolver = resolver
+
+    def __missing__(self, cluster_id: str) -> EndpointNetworks:
+        networks = self.resolver(cluster_id)
+        if networks is None:
+            raise KeyError(cluster_id)
+        return networks
+
+
 def endpoint_networks_for_cluster(
     cluster_id: str,
-    configured: dict[
-        str,
-        tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
-    ],
-    fallback: tuple[
-        ipaddress.IPv4Network | ipaddress.IPv6Network,
-        ...,
-    ],
-) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
-    if not configured:
+    configured: Mapping[str, EndpointNetworks],
+    fallback: EndpointNetworks,
+) -> EndpointNetworks:
+    # An empty registry-backed map is still a per-cluster policy: it means "no
+    # cluster has been seen yet", never "use the global list for everyone".
+    if not configured and not isinstance(configured, ClusterEndpointNetworks):
         return fallback
     try:
         return configured[cluster_id]

@@ -42,7 +42,6 @@ def _release(*, state: dict | None = None, load_state: dict | None = None):
     release = SimpleNamespace(
         config=SimpleNamespace(
             auto_rollback=True,
-            schema_rollback_compatible=False,
             database_schema_version=12,
             aws_region="us-west-2",
             namespace="gpu-fault-system",
@@ -187,7 +186,7 @@ def test_an_accepted_transaction_does_not_roll_back_on_failure(monkeypatch) -> N
 
 def test_rollback_across_the_schema_names_the_snapshot_to_restore() -> None:
     release = SimpleNamespace(
-        config=SimpleNamespace(auto_rollback=True, schema_rollback_compatible=False),
+        config=SimpleNamespace(auto_rollback=True),
         state={
             "release_diff": {"changed": ["database_schema"]},
             "schema_change_acceptance": {

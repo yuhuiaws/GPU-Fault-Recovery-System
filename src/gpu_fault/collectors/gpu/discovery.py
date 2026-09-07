@@ -35,6 +35,31 @@ INSTANCE_ACCELERATOR_COUNTS = {
     "p6-b300.48xlarge": {"gpu": 8, "efa": 16},
 }
 
+
+def expected_accelerator_counts(instance_type: str | None) -> dict[str, int] | None:
+    """The GPU/EFA counts an instance type is built with, or ``None``.
+
+    HyperPod names the type with an ``ml.`` prefix that the table does not
+    carry; an unknown type answers ``None`` so a caller never invents a
+    count for hardware it cannot vouch for.
+    """
+
+    if not instance_type:
+        return None
+    normalized = instance_type.strip().lower().removeprefix("ml.")
+    return INSTANCE_ACCELERATOR_COUNTS.get(normalized)
+
+
+def expected_gpu_count_from_environment() -> int | None:
+    """``GPU_FAULT_EXPECTED_GPU_COUNT`` when set, else the instance type's count."""
+
+    explicit = os.getenv("GPU_FAULT_EXPECTED_GPU_COUNT")
+    if explicit:
+        return int(explicit)
+    counts = expected_accelerator_counts(os.getenv("GPU_FAULT_NODE_INSTANCE_TYPE"))
+    return counts["gpu"] if counts is not None else None
+
+
 NVIDIA_TEMPERATURE_LIMIT_TAGS = {
     "gpu_slowdown_temperature_c": ("gpu_temp_slow_threshold",),
     "gpu_shutdown_temperature_c": ("gpu_temp_max_threshold",),
@@ -338,7 +363,7 @@ def deliver_gpu_inventory(
     observed_at: datetime,
     runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> GpuInventorySnapshot:
-    expected = os.getenv("GPU_FAULT_EXPECTED_GPU_COUNT")
+    expected = expected_gpu_count_from_environment()
     snapshot = GpuInventorySnapshot(
         snapshot_id=(
             f"gpu-inventory-{node_id}-{int(observed_at.timestamp() * 1_000_000)}"
@@ -351,7 +376,7 @@ def deliver_gpu_inventory(
         source_boot_id=read_host_boot_id(),
         node_instance_id=(os.getenv("GPU_FAULT_NODE_INSTANCE_ID") or None),
         devices=query_gpu_inventory(runner),
-        expected_gpu_count=int(expected) if expected else None,
+        expected_gpu_count=expected,
         runtime_profile_version=context.runtime_profile_version,
         evidence_ref=f"nvidia-smi://{node_id}/inventory",
     )

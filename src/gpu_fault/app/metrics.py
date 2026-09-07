@@ -11,10 +11,13 @@ from gpu_fault.app.builtin_metric_contributors import (
     completion_state_metric_lines,
     control_loop_metric_lines,
     postgres_pool_metric_lines,
+    fleet_pin_drift_metric_lines,
     fleet_rollout_metric_lines,
     orchestration_metric_lines,
     policy_metric_lines,
+    regional_registry_metric_lines,
     remote_command_metric_lines,
+    spare_reservation_metric_lines,
 )
 from gpu_fault.app.metric_contributors import (
     MetricContributorRegistry,
@@ -169,6 +172,8 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
             "deadline_exceeded_total": 0,
             "completion_retries_total": 0,
             "completion_failures_total": 0,
+            "completions_by_path_status": {},
+            "fault_rejections_total": 0,
             "notifications_enabled": 0,
             "notifications_received_total": 0,
             "notifications_filtered_total": 0,
@@ -332,6 +337,9 @@ METRIC_CONTRIBUTORS.register(
     "fleet-rollout",
     fleet_rollout_metric_lines,
 )
+METRIC_CONTRIBUTORS.register("fleet-pin-drift", fleet_pin_drift_metric_lines)
+METRIC_CONTRIBUTORS.register("spare-reservations", spare_reservation_metric_lines)
+METRIC_CONTRIBUTORS.register("regional-registry", regional_registry_metric_lines)
 METRIC_CONTRIBUTORS.register("policy", policy_metric_lines)
 METRIC_CONTRIBUTORS.register(
     "orchestration",

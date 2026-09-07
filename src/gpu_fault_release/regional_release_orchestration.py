@@ -842,8 +842,18 @@ def run_upgrade_phases(
                     ),
                 )
             if not phase_done("registry-staged"):
+
+                def stage_registry_durably() -> bool:
+                    # Staging the Secret alone is invisible to running Pods,
+                    # which serve the durable head; publish there too and wait
+                    # for the fleet to converge, as join/remove do (H3).
+                    staged = bool(self._stage_registry())
+                    if staged:
+                        self._publish_staged_registry()
+                    return staged
+
                 registry_staged = bool(
-                    run_component(ReleaseComponent.REGISTRY, self._stage_registry)
+                    run_component(ReleaseComponent.REGISTRY, stage_registry_durably)
                 )
                 phase_complete("registry-staged")
             if not phase_done("cpu-staged"):
@@ -1100,7 +1110,8 @@ def _rollback_context(
         raise ReleaseError(
             "rollback is not transactional for: " + ", ".join(sorted(unsupported))
         )
-    if "database_schema" in changed and not self.config.schema_rollback_compatible:
+    if "database_schema" in changed:
+        # Never compatible: the old wheel requires the exact previous schema.
         acceptance = recorded_acceptance(loaded)
         snapshot = (acceptance or {}).get("snapshot_id")
         raise ReleaseError(
@@ -1136,7 +1147,8 @@ def _restore_rollback_cpu(
             source=str(cpu_secret["source"]),
             backup=str(cpu_secret["backup"]),
         )
-    self._restore_registry_backup()
+    if self._restore_registry_backup():
+        self._publish_restored_registry()
     preserve_role_config_maps = self._restore_cpu_role_config_maps(
         previous.get("cpu_role_config_maps")
     )
@@ -1200,7 +1212,8 @@ def _stage_rollback_controller(
             source=str(cpu_secret["source"]),
             backup=str(cpu_secret["backup"]),
         )
-    self._restore_registry_backup()
+    if self._restore_registry_backup():
+        self._publish_restored_registry()
     controller_config = rollback_controller_config(
         previous.get("agent_identities") or {}
     )

@@ -3,15 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
     RecoveryPlan,
+    WorkflowEventKind,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepStatus,
+    build_operator_event,
 )
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.retired_generation import (
@@ -247,6 +249,8 @@ def _close_never_changed(
     *,
     reference: str,
     applied_at: datetime,
+    actor: str | None = None,
+    approval: Mapping[str, object] | None = None,
 ) -> tuple[WorkflowRequest, FaultIncident, RecoveryPlan]:
     """Terminalize a BLOCKED record that never changed a node (F-B4 (4)).
 
@@ -291,6 +295,22 @@ def _close_never_changed(
             "preemption_reason": updated_workflow.preemption_reason,
             "superseded_at": updated_workflow.superseded_at,
         },
+        # The attributed audit record lands in the same write as the amend
+        # (I1): who closed it, under which approval, from which status.
+        event=build_operator_event(
+            updated_workflow,
+            WorkflowEventKind.OPERATOR_RECONCILED,
+            actor=actor,
+            reference=reference,
+            previous_status=workflow.status,
+            at=applied_at,
+            details={
+                "terminalization": NEVER_CHANGED,
+                "expected_fencing_token": int(item["fencing_token"]),
+                "expected_execution_epoch": int(item["execution_epoch"]),
+                **dict(approval or {}),
+            },
+        ),
     )
     store.save_plan(updated_plan)
     return amended, updated_incident, updated_plan
@@ -304,6 +324,8 @@ def apply_workflow_reconcile_plan(
     reference: str,
     now: datetime | None = None,
     waiting_ttl: timedelta | None = None,
+    actor: str | None = None,
+    admin_plan_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Apply an approved plan, one isolated write per item, always returning.
 
@@ -318,9 +340,22 @@ def apply_workflow_reconcile_plan(
     whose only record is a wait older than it is released too. This module has
     no executor config, so the caller supplies it; without it WAITING
     reservations are kept (the helper's own default).
+
+    ``actor`` (the operator's STS ARN) and ``admin_plan_sha256`` (the digest of
+    the plan the operator approved on the admin side) go on the
+    ``OPERATOR_RECONCILED`` event each write appends (I1); an unresolved actor is
+    recorded as ``unknown-identity`` rather than omitted.
     """
 
     applied_at = now or datetime.now(timezone.utc)
+    approval = {
+        key: value
+        for key, value in (
+            ("plan_sha256", expected_plan_sha256),
+            ("admin_plan_sha256", admin_plan_sha256),
+        )
+        if value is not None
+    }
     plan = build_workflow_reconcile_plan(
         store,
         workflow_ids,
@@ -340,7 +375,12 @@ def apply_workflow_reconcile_plan(
         try:
             if item["terminalization"] == NEVER_CHANGED:
                 updated_workflow, incident, source_plan = _close_never_changed(
-                    store, item, reference=reference, applied_at=applied_at
+                    store,
+                    item,
+                    reference=reference,
+                    applied_at=applied_at,
+                    actor=actor,
+                    approval=approval,
                 )
             else:
                 updated_workflow, incident, source_plan = (
@@ -354,6 +394,8 @@ def apply_workflow_reconcile_plan(
                         expected_workflow_updated_at=None,
                         reference=reference,
                         reconciled_at=applied_at,
+                        actor=actor,
+                        approval=approval,
                     )
                 )
         except Exception as exc:  # noqa: BLE001 -- per-item isolation, reported
@@ -380,6 +422,7 @@ def apply_workflow_reconcile_plan(
         "mode": "workflow-reconcile-apply",
         "plan_sha256": expected_plan_sha256,
         "reference": reference,
+        "actor": actor,
         "applied_at": applied_at.isoformat(),
         "applied_workflow_ids": applied,
         "failed_workflow_ids": sorted(failures),

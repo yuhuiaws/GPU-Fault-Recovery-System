@@ -12,6 +12,7 @@ from gpu_fault.fleet_deployment import DeploymentStatus
 from gpu_fault.models import (
     DecisionStatus,
     IncidentState,
+    NotificationDeliveryStatus,
     NotificationStatus,
     WorkflowOperation,
     WorkflowRequest,
@@ -95,13 +96,111 @@ def remote_command_metric_lines(
             "timestamp_seconds "
             f"{remote['executor_internal_error_last_seen_timestamp_seconds']:.6f}",
             "# HELP gpu_fault_remote_command_unclaimed_expired "
-            "Remote commands dead-lettered because no executor "
-            "claimed them before the deadline.",
+            "Retained remote commands the periodic sweep failed with "
+            "status_source=unclaimed-deadline-exceeded because no executor "
+            "claimed them within GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS; "
+            "falls as retention removes them.",
             "# TYPE gpu_fault_remote_command_unclaimed_expired gauge",
             "gpu_fault_remote_command_unclaimed_expired "
             f"{remote['unclaimed_expired_total']}",
         ]
     )
+    lines.extend(_open_sibling_hold_lines(context))
+    return lines
+
+
+def _open_sibling_hold_lines(context: object) -> list[str]:
+    """How often the regional adapter held a dispatch because another command
+    for the same workflow step was still open (ARCH-D5/D6).
+
+    The adapter is one of the executor's adapters rather than a context
+    attribute, so the counter is summed over every adapter that carries it.
+    Per process: only the replica whose dispatcher ran the step moves it."""
+
+    executor = getattr(context, "workflow_executor", None)
+    adapters = getattr(executor, "adapters", None) if executor is not None else None
+    held = 0
+    for adapter in adapters or ():
+        value = getattr(adapter, "open_sibling_holds_total", None)
+        if isinstance(value, int):
+            held += value
+    return [
+        "# HELP gpu_fault_remote_command_open_sibling_holds_total dispatches held because another command for the same workflow step was still open (ARCH-D5).",
+        "# TYPE gpu_fault_remote_command_open_sibling_holds_total counter",
+        f"gpu_fault_remote_command_open_sibling_holds_total {held}",
+    ]
+
+
+def spare_reservation_metric_lines(runtime: AppRuntime) -> list[str]:
+    """Spare-node reservations as of the spare-health controller's last scan
+    (ARCH-A4c/A3).
+
+    A reservation is a spare taken out of the pool for a failover that may
+    never finish; the reclaimer releases the ones whose incident ended or
+    whose TTL lapsed. The controller exists only where spare failover is
+    enabled, so a deployment without it publishes no series rather than a
+    zero that reads as "no reservations". The snapshot's ``observed_at`` is
+    an ISO string, not an epoch, and is deliberately not rendered.
+    """
+
+    controller = getattr(runtime.context, "spare_health_controller", None)
+    if controller is None:
+        return []
+    snapshot = controller.metrics_snapshot()
+
+    def read(name: str) -> int:
+        value = snapshot.get(name, 0)
+        return value if isinstance(value, int) else 0
+
+    return [
+        "# HELP gpu_fault_spare_reservations_active Spare nodes currently reserved for a failover, as of the spare-health controller's last scan (ARCH-A4).",
+        "# TYPE gpu_fault_spare_reservations_active gauge",
+        f"gpu_fault_spare_reservations_active {read('spare_reservations_active')}",
+        "# HELP gpu_fault_spare_reservations_reclaimed_total Spare reservations the spare-health controller released because their incident ended without consuming the spare or the reservation TTL lapsed (ARCH-A4).",
+        "# TYPE gpu_fault_spare_reservations_reclaimed_total counter",
+        "gpu_fault_spare_reservations_reclaimed_total "
+        f"{read('spare_reservations_reclaimed_total')}",
+    ]
+
+
+def regional_registry_metric_lines(runtime: AppRuntime) -> list[str]:
+    """Whether the regional registry Secret this process started from
+    disagrees with the durable registry head (ARCH-H2/H3).
+
+    The durable head wins -- join and remove publish there -- so drift means a
+    release that only rewrote the Secret never reached the running registry.
+    Only roles that run the registry runtime publish the flag; the runtime is
+    bound to the context by the application factory."""
+
+    registry_runtime = getattr(runtime.context, "regional_registry_runtime", None)
+    if registry_runtime is None:
+        return []
+    role = _escape_label(str(getattr(registry_runtime, "service_role", "")))
+    return [
+        "# HELP gpu_fault_regional_registry_secret_drift 1 when the regional registry Secret this process started from differs from the durable registry head, which is authoritative; republish the registry from the release config to reconcile (ARCH-H2).",
+        "# TYPE gpu_fault_regional_registry_secret_drift gauge",
+        "gpu_fault_regional_registry_secret_drift"
+        f'{{service_role="{role}"}} {int(bool(registry_runtime.secret_drift()))}',
+    ]
+
+
+def _unresolved_fault_signal_lines(service: object) -> list[str]:
+    """Kernel/fabric-manager lines that named an Xid/SXid the parser could
+    not resolve to a number or class, by kind (ARCH-G7). Absent -- not zero --
+    until the factory binds the ingestion service to the context."""
+
+    totals = getattr(service, "unresolved_signal_totals", None) if service else None
+    if not isinstance(totals, dict):
+        return []
+    lines = [
+        "# HELP gpu_fault_ingest_unresolved_fault_signals_total Fault-layer log lines carrying an Xid/SXid token whose number or classification could not be parsed; each opened an operator-review finding instead of a policy decision, by kind (ARCH-G7).",
+        "# TYPE gpu_fault_ingest_unresolved_fault_signals_total counter",
+    ]
+    for kind, count in sorted(totals.items()):
+        lines.append(
+            "gpu_fault_ingest_unresolved_fault_signals_total"
+            f'{{kind="{_escape_label(str(kind))}"}} {int(count)}'
+        )
     return lines
 
 
@@ -160,6 +259,36 @@ def fleet_rollout_metric_lines(
             "gpu_fault_fleet_rollout_never_started"
             f'{{cluster_id="{_escape_label(cluster_id)}"}} {planned[cluster_id]}'
         )
+    return lines
+
+
+def fleet_pin_drift_metric_lines(runtime: AppRuntime) -> list[str]:
+    """Nodes whose pinned artifact/version disagrees with the control plane,
+    split into the two verdicts readiness reaches (ARCH-E E5).
+
+    ``NODE_STALE`` is a node behind a pin its peers already run; the fix is
+    on the node. ``PIN_AHEAD_OF_FLEET`` is a pin no live agent in the cluster
+    runs: the control plane is waiting for a build that was never shipped,
+    and every node action on that cluster fails readiness until the pin is
+    corrected. The value is as of the cluster's latest readiness evaluation
+    in this process, so it clears on the next evaluation after the fix.
+    """
+
+    registry = getattr(runtime.context, "fleet_registry", None)
+    drift = getattr(registry, "pin_drift_nodes", None)
+    lines = [
+        "# HELP gpu_fault_fleet_pin_drift_nodes Nodes whose pinned agent version, artifact, policy, profile or config digest disagrees with the control plane, by cluster and drift kind, as of that cluster's latest readiness evaluation (ARCH-E E5).",
+        "# TYPE gpu_fault_fleet_pin_drift_nodes gauge",
+    ]
+    if not isinstance(drift, dict):
+        return lines
+    for cluster_id, counts in sorted(drift.items()):
+        for kind, count in sorted(counts.items()):
+            lines.append(
+                "gpu_fault_fleet_pin_drift_nodes"
+                f'{{cluster_id="{_escape_label(str(cluster_id))}",'
+                f'kind="{_escape_label(str(kind))}"}} {int(count)}'
+            )
     return lines
 
 
@@ -237,6 +366,17 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         lines.append(
             f'gpu_fault_workflow_merge_record_only_total{{reason="{reason}"}} {value}'
         )
+    escalation = getattr(orchestrator, "_escalation", None) if orchestrator else None
+    lines.extend(
+        [
+            "# HELP gpu_fault_hardware_escalation_chain_terminated_total Failed support-after workflows that were NOT escalated into another support workflow; the incident stayed ESCALATED for an operator (escalation chain bound, ARCH-ESCALATION-BOUND).",
+            "# TYPE gpu_fault_hardware_escalation_chain_terminated_total counter",
+            f"gpu_fault_hardware_escalation_chain_terminated_total {getattr(escalation, 'escalation_chain_terminated_total', 0) if escalation else 0}",
+            "# HELP gpu_fault_hardware_escalation_containment_refused_total Escalations whose containment steps all failed with a safety rejection, so the support workflow was compiled without any isolation step (ARCH-ESCALATION-BOUND).",
+            "# TYPE gpu_fault_hardware_escalation_containment_refused_total counter",
+            f"gpu_fault_hardware_escalation_containment_refused_total {getattr(escalation, 'containment_refused_escalations_total', 0) if escalation else 0}",
+        ]
+    )
     store = getattr(ctx, "store", None)
     archiver = getattr(ctx, "control_record_archiver", None)
     lines.extend(
@@ -274,7 +414,11 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
             "gpu_fault_control_record_archive_withheld_total"
             f'{{reason="{_escape_label(reason)}"}} {count}'
         )
+    lines.extend(_unresolved_fault_signal_lines(getattr(ctx, "fault_ingestion", None)))
     lines.extend(_dispatch_pending_state_lines(ctx, dispatcher))
+    lines.extend(
+        _notification_dispatch_lines(getattr(ctx, "advisory_notifications", None))
+    )
     snapshot = periodic.metrics_snapshot() if periodic is not None else {}
     lines.extend(_periodic_reconciliation_lines(snapshot))
     lines.extend(_processor_counter_mode_lines(store))
@@ -289,6 +433,7 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     )
     for job, count in sorted(snapshot.get("periodic_job_errors_total", {}).items()):
         lines.append(f'gpu_fault_periodic_job_errors_total{{job="{job}"}} {count}')
+    lines.extend(_periodic_liveness_lines(snapshot))
     for name, help_text in (
         (
             "cleanup_rows_total",
@@ -314,6 +459,37 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
                 f'gpu_fault_periodic_{name}{{job="{_escape_label(job)}"}} {count}'
             )
     return lines
+
+
+def _notification_dispatch_lines(service: object) -> list[str]:
+    """What the notification dispatcher gave up on, and when it last ran
+    (ARCH-E E1/E3). Per process: only replicas that drain the outbox move
+    these, so alerts sum or max them across the Deployment."""
+
+    def read(name: str, default: float) -> float | int:
+        if service is None:
+            return default
+        value = getattr(service, name, default)
+        return value if isinstance(value, (int, float)) else default
+
+    return [
+        "# HELP gpu_fault_notification_expired_total Notifications retired unsent because they were claimed past their shelf life (GPU_FAULT_NOTIFICATION_TTL_SECONDS); the outbox drained slower than it filled or was blocked (ARCH-E E1).",
+        "# TYPE gpu_fault_notification_expired_total counter",
+        f"gpu_fault_notification_expired_total {read('expired_total', 0)}",
+        "# HELP gpu_fault_notification_expired_last_seen_timestamp_seconds Unix time this process last retired a notification unsent past its shelf life; 0 if never. Alerts read max() of this rather than increase() of the counter (ARCH-E E4).",
+        "# TYPE gpu_fault_notification_expired_last_seen_timestamp_seconds gauge",
+        f"gpu_fault_notification_expired_last_seen_timestamp_seconds {read('expired_last_seen_timestamp_seconds', 0.0):.3f}",
+        "# HELP gpu_fault_notification_dead_lettered_total Notifications retired DEAD after exhausting GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS delivery attempts; each is an administrator who was never reached (ARCH-E E1).",
+        "# TYPE gpu_fault_notification_dead_lettered_total counter",
+        f"gpu_fault_notification_dead_lettered_total {read('dead_lettered_total', 0)}",
+        "# HELP gpu_fault_notification_suppressed_drills_total Drill notifications the dispatcher retired instead of mailing (GPU_FAULT_NOTIFICATION_DELIVER_DRILLS is off).",
+        "# TYPE gpu_fault_notification_suppressed_drills_total counter",
+        f"gpu_fault_notification_suppressed_drills_total {read('suppressed_drills_total', 0)}",
+        "# HELP gpu_fault_notification_dispatch_last_cycle_timestamp_seconds Unix time this process last started a notification outbox dispatch cycle; 0 on replicas that never drain the outbox (ARCH-E E3).",
+        "# TYPE gpu_fault_notification_dispatch_last_cycle_timestamp_seconds gauge",
+        "gpu_fault_notification_dispatch_last_cycle_timestamp_seconds "
+        f"{read('last_cycle_timestamp_seconds', 0.0):.3f}",
+    ]
 
 
 # Filter reasons a dispatch cycle always has a name for; exported at zero so
@@ -343,6 +519,15 @@ def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
         "# HELP gpu_fault_workflow_retired_generation_awaiting_operator Retired workflow generations the last dispatch cycle left for an operator instead of superseding (F-A5).",
         "# TYPE gpu_fault_workflow_retired_generation_awaiting_operator gauge",
         f"gpu_fault_workflow_retired_generation_awaiting_operator {read('retired_generation_awaiting_operator', 0)}",
+        "# HELP gpu_fault_workflow_dispatch_internal_error_last_seen_timestamp_seconds Unix time of this process's newest dispatch internal error (see gpu_fault_workflow_dispatch_internal_errors_total); 0 if none. Alerts read max() of this because a multi-process Pod is scraped one process at a time (ARCH-E E4).",
+        "# TYPE gpu_fault_workflow_dispatch_internal_error_last_seen_timestamp_seconds gauge",
+        f"gpu_fault_workflow_dispatch_internal_error_last_seen_timestamp_seconds {read('internal_error_last_seen_timestamp_seconds', 0.0):.3f}",
+        "# HELP gpu_fault_workflow_dispatch_failure_handling_abandoned_last_seen_timestamp_seconds Unix time this process last gave up on a failed workflow's failure handler (see gpu_fault_workflow_dispatch_failure_handling_abandoned_total); 0 if never (ARCH-E E4).",
+        "# TYPE gpu_fault_workflow_dispatch_failure_handling_abandoned_last_seen_timestamp_seconds gauge",
+        f"gpu_fault_workflow_dispatch_failure_handling_abandoned_last_seen_timestamp_seconds {read('failure_handling_abandoned_last_seen_timestamp_seconds', 0.0):.3f}",
+        "# HELP gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds Unix time this process last started a workflow dispatch cycle, lease held or not; 0 on replicas whose dispatcher never ran (ARCH-E E3).",
+        "# TYPE gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds gauge",
+        f"gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds {read('last_cycle_timestamp_seconds', 0.0):.3f}",
         "# HELP gpu_fault_workflow_dispatch_filtered_total Rows a dispatch cycle scanned and set aside, by reason, summed over the process (F-L1).",
         "# TYPE gpu_fault_workflow_dispatch_filtered_total counter",
     ]
@@ -356,6 +541,52 @@ def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
             "gpu_fault_workflow_dispatch_filtered_total"
             f'{{reason="{_escape_label(reason)}"}} {count}'
         )
+    return lines
+
+
+def _periodic_liveness_lines(snapshot: dict[str, object]) -> list[str]:
+    """When the periodic runner last ticked, and when each job last ran
+    (ARCH-E E3). The runner stamp is per process and moves on every tick
+    whether or not this replica owns any task lease; the per-job stamps move
+    only on the replica that ran the job, so an alert reads their max across
+    the Deployment."""
+
+    stamp = snapshot.get("last_cycle_timestamp_seconds", 0.0)
+    lines = [
+        "# HELP gpu_fault_periodic_last_cycle_timestamp_seconds Unix time this process's periodic service runner last completed a tick; 0 where the runner never started (ARCH-E E3).",
+        "# TYPE gpu_fault_periodic_last_cycle_timestamp_seconds gauge",
+        "gpu_fault_periodic_last_cycle_timestamp_seconds "
+        f"{stamp if isinstance(stamp, (int, float)) else 0.0:.3f}",
+        "# HELP gpu_fault_periodic_job_last_run_timestamp_seconds Unix time this process last ran a periodic job, by job; only the task-lease holder moves it (ARCH-E E3).",
+        "# TYPE gpu_fault_periodic_job_last_run_timestamp_seconds gauge",
+    ]
+    stamps = snapshot.get("job_last_run_timestamp_seconds", {})
+    if isinstance(stamps, dict):
+        for job, value in sorted(stamps.items()):
+            if isinstance(value, (int, float)):
+                lines.append(
+                    "gpu_fault_periodic_job_last_run_timestamp_seconds"
+                    f'{{job="{_escape_label(str(job))}"}} {value:.3f}'
+                )
+    lease_error = snapshot.get("lease_error_last_seen_timestamp_seconds", 0.0)
+    lines.extend(
+        [
+            "# HELP gpu_fault_periodic_lease_error_last_seen_timestamp_seconds Unix time of this process's newest failed task-lease attempt (see gpu_fault_periodic_lease_errors_total); 0 if none. Alerts read max() of this because a multi-process Pod is scraped one process at a time (ARCH-E E4).",
+            "# TYPE gpu_fault_periodic_lease_error_last_seen_timestamp_seconds gauge",
+            "gpu_fault_periodic_lease_error_last_seen_timestamp_seconds "
+            f"{lease_error if isinstance(lease_error, (int, float)) else 0.0:.3f}",
+            "# HELP gpu_fault_periodic_job_error_last_seen_timestamp_seconds Unix time of this process's newest exception in a periodic job, by job (see gpu_fault_periodic_job_errors_total) (ARCH-E E4).",
+            "# TYPE gpu_fault_periodic_job_error_last_seen_timestamp_seconds gauge",
+        ]
+    )
+    job_errors = snapshot.get("job_error_last_seen_timestamp_seconds", {})
+    if isinstance(job_errors, dict):
+        for job, value in sorted(job_errors.items()):
+            if isinstance(value, (int, float)):
+                lines.append(
+                    "gpu_fault_periodic_job_error_last_seen_timestamp_seconds"
+                    f'{{job="{_escape_label(str(job))}"}} {value:.3f}'
+                )
     return lines
 
 
@@ -997,6 +1228,30 @@ def _notification_lines(store: ControlPlaneStore) -> list[str]:
             "# HELP gpu_fault_notification_outbox_depth Notifications without a terminal delivery result.",
             "# TYPE gpu_fault_notification_outbox_depth gauge",
             f"gpu_fault_notification_outbox_depth {pending}",
+        ]
+    )
+    # ARCH-E E1: the outbox state machine itself. ``gpu_fault_notification_total``
+    # reads the result rows, which are terminal verdicts; a notification being
+    # retried has none, so the queue the dispatcher is actually working was
+    # invisible and its age unmeasured.
+    delivery = store.notification_delivery_stats()
+    lines.extend(
+        [
+            "# HELP gpu_fault_notification_delivery_total Notification outbox rows by delivery state as the outbox treats them: a row whose result is already SENT counts as SENT, a SKIPPED verdict on an undelivered row counts as DEAD (ARCH-E E1).",
+            "# TYPE gpu_fault_notification_delivery_total gauge",
+        ]
+    )
+    for status in NotificationDeliveryStatus:
+        lines.append(
+            f'gpu_fault_notification_delivery_total{{status="{status.value}"}} '
+            f"{delivery['by_status'].get(status.value, 0)}"
+        )
+    lines.extend(
+        [
+            "# HELP gpu_fault_notification_oldest_pending_age_seconds How long the oldest undelivered notification (PENDING, RETRY or LEASED) has waited since it was queued or last re-queued; 0 when nothing is undelivered (ARCH-E E1).",
+            "# TYPE gpu_fault_notification_oldest_pending_age_seconds gauge",
+            "gpu_fault_notification_oldest_pending_age_seconds "
+            f"{delivery['oldest_pending_age_seconds']:.6f}",
         ]
     )
     return lines

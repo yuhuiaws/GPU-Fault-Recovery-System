@@ -296,7 +296,7 @@ def test_legacy_cpu_manifest_digest_maps_to_all_roles() -> None:
         "database": {"rollback_compatible": False},
     }
 
-    _, _, digests, _, _, _ = CONFIG.parse_delivery_identity(
+    _, _, digests, _, _ = CONFIG.parse_delivery_identity(
         manifest, manifest["components"]
     )
 

@@ -319,6 +319,8 @@ def upgrade_release(*, staged: bool):
         _upload_release=lambda _diff: None,
         _validate_release_quick=lambda _plan: None,
         _stage_registry=lambda: staged,
+        # ARCH-H3: a staged Secret is published to the durable head at once.
+        _publish_staged_registry=lambda: None,
         _commit_registry_update=lambda: commits.append(None),
         _capture_active_agent_node_sets=lambda: {},
         _wait_candidate_cpu_agent_heartbeats=lambda _expected, **_kwargs: None,

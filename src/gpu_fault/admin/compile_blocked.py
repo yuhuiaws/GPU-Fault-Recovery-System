@@ -40,11 +40,20 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
+import gpu_fault.models as _models
 from gpu_fault.models import IncidentState, WorkflowRequest, WorkflowStatus
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.store import NotFoundError
+
+# Probed rather than imported: this source runs against the deployed image,
+# whose ``models`` may predate the attributed operator event (I1). Without it
+# the close still happens and the audit stays in ``preemption_reason``.
+_RECORD_OPERATOR_EVENT: Any = getattr(_models, "record_operator_event", None)
+_OPERATOR_RECONCILED: Any = getattr(
+    getattr(_models, "WorkflowEventKind", None), "OPERATOR_RECONCILED", None
+)
 
 PLAN_MODE = "compile-blocked-plan"
 APPLY_MODE = "compile-blocked-apply"
@@ -229,12 +238,16 @@ def closed_compile_blocked_record(
     expected_execution_epoch: int,
     reference: str,
     reconciled_at: datetime,
+    actor: str | None = None,
+    approval: Mapping[str, Any] | None = None,
 ) -> WorkflowRequest:
     """The SUPERSEDED form of ``workflow``, or a refusal if it moved.
 
     Re-derived from a fresh read at apply time: the approval bound the fencing
     token and epoch the operator saw, so a record that was claimed or re-planned
-    since is refused rather than closed under a stale reading.
+    since is refused rather than closed under a stale reading. ``actor`` and
+    ``approval`` go on the ``OPERATOR_RECONCILED`` event the returned copy
+    carries, so it lands in the same write as the close.
     """
 
     if workflow.status is not WorkflowStatus.BLOCKED:
@@ -245,7 +258,7 @@ def closed_compile_blocked_record(
         raise ValueError("workflow execution epoch changed since the plan was approved")
     if workflow.step_executions or workflow.completed_operations:
         raise ValueError("workflow was dispatched since the plan was approved")
-    return workflow.model_copy(
+    closed: WorkflowRequest = workflow.model_copy(
         update={
             "status": WorkflowStatus.SUPERSEDED,
             "preemption_reason": (
@@ -257,6 +270,23 @@ def closed_compile_blocked_record(
             "updated_at": reconciled_at,
         }
     )
+    if _RECORD_OPERATOR_EVENT is None or _OPERATOR_RECONCILED is None:
+        return closed
+    recorded: WorkflowRequest = _RECORD_OPERATOR_EVENT(
+        closed,
+        _OPERATOR_RECONCILED,
+        actor=actor,
+        reference=reference,
+        previous_status=workflow.status,
+        at=reconciled_at,
+        details={
+            "terminalization": CLOSE_MARKER,
+            "expected_fencing_token": expected_fencing_token,
+            "expected_execution_epoch": expected_execution_epoch,
+            **dict(approval or {}),
+        },
+    )
+    return recorded
 
 
 def apply_compile_blocked_plan(
@@ -266,6 +296,8 @@ def apply_compile_blocked_plan(
     expected_plan_sha256: str,
     reference: str,
     now: datetime | None = None,
+    actor: str | None = None,
+    admin_plan_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Apply an approved plan, one isolated write per item, always returning.
 
@@ -273,10 +305,19 @@ def apply_compile_blocked_plan(
     covers every field the verdict reads, so a match means the record handed to
     ``save_workflow`` is the one the operator reviewed. A record an earlier,
     partial apply already closed is skipped and named, so rerunning the same
-    command is safe.
+    command is safe. ``actor`` and ``admin_plan_sha256`` go on each record's
+    operator event (I1).
     """
 
     applied_at = now or datetime.now(timezone.utc)
+    approval = {
+        key: value
+        for key, value in (
+            ("plan_sha256", expected_plan_sha256),
+            ("admin_plan_sha256", admin_plan_sha256),
+        )
+        if value is not None
+    }
     requested = requested_workflow_ids(workflow_ids)
     plan = build_compile_blocked_plan(store, requested, now=applied_at)
     if plan["plan_sha256"] != expected_plan_sha256:
@@ -307,6 +348,8 @@ def apply_compile_blocked_plan(
                 expected_execution_epoch=int(item["execution_epoch"]),
                 reference=reference,
                 reconciled_at=applied_at,
+                actor=actor,
+                approval=approval,
             )
             # Compare-and-set on the row just read; a record that moved since
             # is reported as a per-item failure, not overwritten (store review
@@ -321,6 +364,7 @@ def apply_compile_blocked_plan(
         "mode": APPLY_MODE,
         "applied_at": applied_at.isoformat(),
         "reference": reference,
+        "actor": actor,
         "settled_plan_sha256": plan["plan_sha256"],
         "applied_workflow_ids": applied,
         "already_closed_workflow_ids": skipped,

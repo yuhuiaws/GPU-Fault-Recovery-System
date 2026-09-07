@@ -216,13 +216,16 @@ def aggregate_lines(rows: list[dict[str, Any]], *, top_n: int) -> list[str]:
             "gpu_fault_collector_last_success_age_seconds_max"
             f"{{{labels}}} {values['max_age']}"
         )
-    for rank, row in enumerate(top_rows(rows, top_n=top_n), 1):
+    # No ``rank`` label: the ordering is already the list order, and a label
+    # that changes whenever two nodes swap places turns one silent node into a
+    # new series per swap (ARCH-E E6). (cluster, collector, channel, node) is
+    # unique per row, so nothing collides without it.
+    for row in top_rows(rows, top_n=top_n):
         labels = _labels(
             row["cluster_id"],
             row["collector"],
             row["channel"],
             node_id=row["node_id"],
-            rank=rank,
         )
         lines.append(
             f"gpu_fault_collector_silent_top_node{{{labels}}} {int(row['silent'])}"
@@ -249,7 +252,6 @@ def _labels(
     channel: str,
     *,
     node_id: str | None = None,
-    rank: int | None = None,
 ) -> str:
     values = {
         "cluster_id": cluster_id,
@@ -258,8 +260,6 @@ def _labels(
     }
     if node_id is not None:
         values["node_id"] = node_id
-    if rank is not None:
-        values["rank"] = str(rank)
     return ",".join(
         f'{key}="{str(value).replace(chr(34), chr(92) + chr(34))}"'
         for key, value in values.items()

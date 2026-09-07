@@ -36,6 +36,7 @@ from ._support import (
     WorkflowStepStatus,
     derive_node_action_secret,
     io,
+    isolated_kubernetes_adapter,
     json,
     pytest,
     sign_agent_heartbeat,
@@ -120,6 +121,7 @@ def test_hyperpod_reboot_auto_confirms_new_ready_agent_incarnation(
         store=store,
         alert_sender=sent.append,
         post_reboot_stabilization_seconds=0,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
     )
     step = copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
     workflow = copy_model(workflow, official_steps=[step])
@@ -210,6 +212,7 @@ def test_hyperpod_replace_auto_confirms_and_rebinds_ready_new_instance() -> None
     class IsolationAdapter:
         def __init__(self) -> None:
             self.nodes = []
+            self.core = isolated_kubernetes_adapter().core
 
         def _isolate(self, context):
             self.nodes.extend(context.step.node_ids)
@@ -343,7 +346,10 @@ def test_hyperpod_reboot_waits_for_post_reboot_stabilization() -> None:
     )
     _, workflow = workflow_state(store, [WorkflowOperation.RESTART_NODE])
     adapter = HyperPodLifecycleStepAdapter(
-        ObservableLifecycle(), registry=fleet, post_reboot_stabilization_seconds=60
+        ObservableLifecycle(),
+        registry=fleet,
+        post_reboot_stabilization_seconds=60,
+        kubernetes_adapter=isolated_kubernetes_adapter(),
     )
     step = copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
     workflow = copy_model(workflow, official_steps=[step])
@@ -399,7 +405,9 @@ def test_hyperpod_preflight_failure_does_not_revoke_agent() -> None:
     store = build_store()
     _, workflow = workflow_state(store, [WorkflowOperation.RESTART_NODE])
     lifecycle = RejectingLifecycle()
-    adapter = HyperPodLifecycleStepAdapter(lifecycle, registry=object())
+    adapter = HyperPodLifecycleStepAdapter(
+        lifecycle, registry=object(), kubernetes_adapter=isolated_kubernetes_adapter()
+    )
     step = copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
     store.save_workflow(copy_model(workflow, official_steps=[step]))
     active = active_workflow_executor(
@@ -443,6 +451,7 @@ def test_hyperpod_preflight_credential_error_is_a_configuration_failure() -> Non
         # the agent-baseline lookup, so a bare object() would fail this
         # test for the wrong reason.
         registry=FleetRegistry(store, "agent-secret-" + "x" * 32, now=lambda: NOW),
+        kubernetes_adapter=isolated_kubernetes_adapter(),
     )
     step = copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
     store.save_workflow(copy_model(workflow, official_steps=[step]))
@@ -478,7 +487,11 @@ def test_hyperpod_preflight_defect_still_propagates() -> None:
 
     store = build_store()
     _, workflow = workflow_state(store, [WorkflowOperation.RESTART_NODE])
-    adapter = HyperPodLifecycleStepAdapter(BrokenLifecycle(), registry=object())
+    adapter = HyperPodLifecycleStepAdapter(
+        BrokenLifecycle(),
+        registry=object(),
+        kubernetes_adapter=isolated_kubernetes_adapter(),
+    )
     step = copy_model(workflow.official_steps[0], execution_owner=adapter.owner)
     store.save_workflow(copy_model(workflow, official_steps=[step]))
 
@@ -607,13 +620,17 @@ def test_node_action_http_rejection_preserves_structured_code() -> None:
         )
     )
 
-    assert outcome.status is WorkflowStepStatus.FAILED
-    assert outcome.details == {
-        "node_action_error_code": "COMMAND_EXPIRED",
-        "node_action_retryable": True,
-        "node_action_requires_new_command": True,
-        "http_status": 410,
-    }
+    # An expired command is not a failed GPU: the next dispatch signs a fresh
+    # envelope, so the step holds and says a new command is required.
+    assert outcome.status is WorkflowStepStatus.WAITING
+    assert outcome.details["node_action_state"] == "NEW_COMMAND_REQUIRED"
+    assert outcome.details["node_action_error_code"] == "COMMAND_EXPIRED"
+    assert outcome.details["node_action_retryable"] is True
+    assert outcome.details["node_action_requires_new_command"] is True
+    assert outcome.details["http_status"] == 410
+    assert outcome.details["node_action_command_id"] == (
+        "workflow/expired/node-a/agent-7"
+    )
 
 
 def test_retryable_node_action_failure_returns_waiting() -> None:

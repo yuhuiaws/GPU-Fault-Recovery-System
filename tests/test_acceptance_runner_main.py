@@ -32,7 +32,9 @@ from scripts.e2e.regional import live_driver_guard
 from scripts.e2e.regional.live_driver_guard import (
     CaseRunner,
     CaseSurface,
+    PlainCaseRunner,
     add_live_arguments,
+    run_plain_case,
     run_selected_case,
     run_standard_case,
 )
@@ -143,13 +145,23 @@ class Recorder:
     def install_abort_signals(self) -> None:
         self._note("install_abort_signals")
 
+    # -- the plain (settings-less) surface -----------------------------------
+
+    def plain_plan_details(self) -> dict[str, Any]:
+        self._note("plain_plan_details")
+        return {"static": "plan"}
+
+    def run_case(self, run_dir: Path, attempt: int, deadline: datetime) -> int:
+        self._note("run_case", run_dir, attempt, deadline)
+        return 5
+
     def build_plan(self, **kwargs: Any) -> dict[str, Any]:
         self._note("build_plan", **kwargs)
         return {
             "case_id": kwargs["case_id"],
             "confirmation": kwargs["confirmation"],
             "details": kwargs["details"],
-            "environment": kwargs["environment"],
+            "environment": kwargs.get("environment"),
         }
 
     def authorize_execution(
@@ -178,6 +190,15 @@ class Recorder:
             read_only_preflight=self.read_only_preflight,
             plan_details=self.plan_details,
             execute_case=self.execute_case,
+        )
+
+    def plain(self) -> PlainCaseRunner:
+        return PlainCaseRunner(
+            case_id=CASE_ID,
+            confirmation=CONFIRMATION,
+            parser=self.parser,
+            plan_details=self.plain_plan_details,
+            run_case=self.run_case,
         )
 
 
@@ -307,6 +328,73 @@ def test_execute_authorizes_then_runs_the_case_with_the_deadline(
     execute_args, _ = recorder.call("execute_case")
     assert execute_args == (recorder.settings, tmp_path, 2, DEADLINE)
     assert capsys.readouterr().out == ""
+
+
+def test_plain_case_prints_the_static_plan_after_installing_the_profile(
+    recorder: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The settings-less spine (CMD/NET hold cases) has no preflight and no
+    # environment snapshot, but it must still install the site profile before
+    # the parser exists: tests/regional/test_site_profile.py trusts this.
+    _argv(monkeypatch, tmp_path, "--plan", "--attempt", "4")
+
+    result = run_plain_case(recorder.plain())
+
+    assert result == 0
+    assert recorder.names == [
+        "install_site_profile",
+        "parser",
+        "plain_plan_details",
+        "build_plan",
+    ]
+    _, plan_kwargs = recorder.call("build_plan")
+    assert plan_kwargs == {
+        "run_dir": tmp_path,
+        "case_id": CASE_ID,
+        "attempt": 4,
+        "confirmation": CONFIRMATION,
+        "details": {"static": "plan"},
+    }
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["details"] == {"static": "plan"}, "the plan must be printed"
+
+
+def test_plain_case_authorizes_then_runs_with_the_deadline(
+    recorder: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _argv(
+        monkeypatch,
+        tmp_path,
+        "--execute",
+        "--confirm",
+        CONFIRMATION,
+        "--maintenance-window-end",
+        "2026-09-07T13:00:00Z",
+        "--attempt",
+        "2",
+    )
+
+    result = run_plain_case(recorder.plain())
+
+    assert result == 5
+    assert recorder.names == [
+        "install_site_profile",
+        "parser",
+        "authorize_execution",
+        "run_case",
+    ]
+    authorize_args, authorize_kwargs = recorder.call("authorize_execution")
+    assert authorize_args[0].confirm == CONFIRMATION
+    assert authorize_kwargs == {"case_id": CASE_ID, "confirmation": CONFIRMATION}
+    run_args, _ = recorder.call("run_case")
+    assert run_args == (tmp_path, 2, DEADLINE)
+    assert capsys.readouterr().out == "", "execution prints no plan"
 
 
 def test_the_umask_is_restricted_before_the_case_directory_exists(

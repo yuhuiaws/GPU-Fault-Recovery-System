@@ -9,7 +9,7 @@ phases:
     name: 可部署性
     maintenance_window: 分级
     entries:
-      - range: {prefix: BOOT, start: 11, end: 22}
+      - range: {prefix: BOOT, start: 11, end: 23}
   - sequence: 1
     name: 启动配置守卫
     maintenance_window: 否
@@ -38,15 +38,24 @@ phases:
     name: Remote command 协议
     maintenance_window: 建议
     entries:
-      - range: {prefix: CMD, start: 1, end: 16}
+      - range: {prefix: CMD, start: 1, end: 18}
     notes:
       - 优先使用隔离逻辑集群或测试控制面；不得在无维护窗口时把生产 Executor 缩容到 0。
       - CMD-011 使用 Executor 本地夹具，不依赖控制面注入畸形 command。
+      - CMD-017 只对合成集群 perf-cap-000 播种命令并用替身适配器的探针 executor claim，
+        不注入 SXID、不触碰真实节点。
+      - CMD-018 在 CPU API Pod 内用部署的 adapter 对合成集群 perf-cap-000 派发并改写 step，
+        探针 executor 的动作是本地账本；两条命令都无 Node Agent 可达。
   - sequence: 6
     name: Workflow 抢占与 DAG
     maintenance_window: 分级
     entries:
-      - range: {prefix: PREEMPT, start: 1, end: 36}
+      - range: {prefix: PREEMPT, start: 1, end: 38}
+    notes:
+      - PREEMPT-037 会把 gpu-fault-control-worker 的 GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER 置为 false
+        约 10 分钟并滚动副本；只在没有任何 PENDING/RUNNING/WAITING 工作流时执行，需要维护窗口，
+        不得与其他区域用例同窗执行。
+      - PREEMPT-038 只向真库写 audit-cluster 下的 audit-* 行并在 finally 删除，观察部署的周期清理。
   - sequence: 7
     name: 单集群闭环
     maintenance_window: 是
@@ -61,9 +70,10 @@ phases:
     name: 通知
     maintenance_window: 否
     entries:
-      - range: {prefix: NOTIFY, start: 1, end: 6}
+      - range: {prefix: NOTIFY, start: 1, end: 7}
     notes:
       - NOTIFY-001/002 复用已批准动作或隔离通知夹具，不为邮件验收重复执行 GPU reset。
+      - NOTIFY-007 在 control-worker Pod 内用隔离 InMemoryStore 演练投递状态，只发一封 DRILL 邮件，不写生产行。
   - sequence: 10
     name: 容量
     maintenance_window: 否
@@ -73,7 +83,7 @@ phases:
     name: 网络中断与补交
     maintenance_window: 建议
     entries:
-      - range: {prefix: NET, start: 1, end: 5}
+      - range: {prefix: NET, start: 1, end: 8}
   - sequence: 12
     name: 非破坏性 HA
     maintenance_window: 建议
@@ -81,6 +91,10 @@ phases:
       - case: GF-REGIONAL-HA-001
       - case: GF-REGIONAL-HA-002
       - range: {prefix: HA, start: 5, end: 9}
+      - case: GF-REGIONAL-HA-010
+    notes:
+      - HA-010 以 HA-001 PASS 为证据前置，在无任何 remote command 在飞时做一次 Aurora writer failover
+        并删除一个 gpu-fault-api-ha 副本；不注入故障、不触碰 GPU 面。
   - sequence: 13
     name: 破坏性能力验收（含非破坏性 fail-closed 负向用例）
     maintenance_window: 是
@@ -96,7 +110,15 @@ phases:
       - case: GF-REGIONAL-DESTR-016
       - case: GF-REGIONAL-DESTR-017
       - case: GF-REGIONAL-DESTR-018
+      - case: GF-REGIONAL-DESTR-019
+      - case: GF-REGIONAL-DESTR-020
+      - case: GF-REGIONAL-DESTR-021
     notes:
+      - DESTR-020 以 DESTR-001 PASS 为证据前置，对一个 Kubernetes 与 fleet 都不认识的别名 node_id 走 API 重放的目录外 XID
+        （SITE_SAFETY 隔离计划，无任何物理步骤），只证明 MARK_UNSCHEDULABLE 对 404 fail closed；别名没有 Node Agent 也没有
+        provider 节点，任何 reset/reboot 都不可能被 arm；support 升级恰一次（containment_refused，只 FREEZE_EVIDENCE→ESCALATE_SUPPORT），链深度 ≤1。
+      - DESTR-021 以 DESTR-020 PASS 为证据前置，复用 COLLECT-017 A 段的 EFA unbind 注入，在预写陈旧外来 plugin-restart 注解
+        与本地并发 tick 注解写入下走七步 EFA 恢复；不 reset、不 reboot、不 replace。
       - DESTR-011 必须先证明 provider replace 开关关闭。
       - DESTR-009 必须先于 DESTR-012。
       - DESTR-012 子用例严格按 B、A、D、C 执行。
@@ -110,14 +132,20 @@ phases:
         环境窗口把 GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS 与
         GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS 压到 180 s；窗口在注入前打开、
         静默后关闭，不得与其他区域用例同窗执行。
+      - DESTR-019 以 DESTR-010 PASS 为证据前置，只在无任何 remote command 在飞时重启一次
+        Node Agent（先 arm fail-safe start），随后走 DESTR-010 的 XID 45 两步工作流核对审计轨迹；
+        不含 reset/reboot/隔离。
   - sequence: 14
     name: Warm spare
     maintenance_window: 是
     entries:
       - case: GF-REGIONAL-DESTR-003
       - case: GF-REGIONAL-DESTR-008
+      - case: GF-REGIONAL-DESTR-022
       - case: GF-REGIONAL-DESTR-014
     notes:
+      - DESTR-022 以 DESTR-008 PASS 为证据前置，在 003/008 仍声明着的那台热备上写一个合成 incident 的陈旧预留，
+        只等部署 executor 的巡检按 TTL 回收；热备全程保持 cordon，不触发任何 workflow，必须在 DESTR-014 归还 spare 之前执行。
       - DESTR-014 不声明任何 warm spare（它要的正是 REPLACE_NODE 因热备不足而失败），
         执行前必须先按 DESTR-003 的 --release 归还已声明的 spare。
       - DESTR-014 含两次真实 BatchRebootClusterNodes，必须先于 DESTR-013 执行，
@@ -148,11 +176,15 @@ phases:
       - case: GF-REGIONAL-COLLECT-014
       - case: GF-REGIONAL-COLLECT-016
       - case: GF-REGIONAL-COLLECT-017
+      - range: {prefix: COLLECT, start: 18, end: 20}
       - case: GF-REGIONAL-COLLECT-015
     notes:
       - COLLECT-004 的expected-count替代路径会触发真实HyperPod reboot，必须在维护窗口执行。
       - 后六条包含 reset、EFA mutation、workload restart 或 reboot，
         必须在维护窗口执行。
+      - COLLECT-018/019/020 在一台空闲节点上开有界采集器窗口（合成 API 注入、nvidia-smi 影子、
+        drop-in 环境），不触碰 GPU；COLLECT-020 会 cordon 该节点做 DCGM 诊断再由 validation-first
+        restore 恢复，需要维护窗口，且仍排在 COLLECT-015 的 reboot 之前。
 do_not_run:
   - case: GF-REGIONAL-DESTR-004
     reason: provider replace 已由架构与 IAM 明确禁止，该用例已作废。

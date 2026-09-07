@@ -292,9 +292,7 @@ def test_a_snapshot_without_collector_objects_refuses_before_any_mutation() -> N
         }
     }
     release = SimpleNamespace(
-        config=SimpleNamespace(
-            auto_rollback=True, schema_rollback_compatible=True, clusters=()
-        ),
+        config=SimpleNamespace(auto_rollback=True, clusters=()),
         state={},
         _ensure_contexts=lambda: None,
         _require_cpu_secrets=lambda: None,
@@ -317,9 +315,7 @@ def test_adot_change_keeps_automatic_rollback_while_clusters_still_refuse() -> N
 
     def release(changed: frozenset[str]) -> SimpleNamespace:
         return SimpleNamespace(
-            config=SimpleNamespace(
-                auto_rollback=True, schema_rollback_compatible=False, clusters=()
-            ),
+            config=SimpleNamespace(auto_rollback=True, clusters=()),
             state={"release_diff": {"changed": sorted(changed)}},
             _ensure_contexts=lambda: None,
             _require_cpu_secrets=lambda: None,

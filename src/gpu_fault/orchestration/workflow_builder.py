@@ -22,6 +22,11 @@ from gpu_fault.policy import (
     XidEvent,
 )
 
+# The blocked reason both families write when a node-mutating plan meets an
+# UNKNOWN workload state; the fault family has spelt it this way since the
+# coordinator first carried the gate, so operators and tests match on it.
+WORKLOAD_STATE_UNKNOWN_REASON = "node workload state is UNKNOWN"
+
 
 def _xid74_operations(
     event: XidEvent, decision: FaultPolicyDecision
@@ -649,9 +654,24 @@ class WorkflowBuilder:
         node_ids: list[str],
         gpu_uuids: list[str],
         workload_ids: list[str],
+        *,
+        workload_state: WorkloadState | None = None,
     ) -> tuple[list[WorkflowStepSpec], list[str]]:
+        """Compile ``operations`` into steps, or say why they cannot run.
+
+        ``workload_state`` is the finding's or event's view of the node's
+        workload. When it is UNKNOWN and the plan acts on the node's current
+        state (``mutates_node``), the plan is refused here -- the one choke
+        point both the fault family and the node-health family compile
+        through -- so a reboot, a driver remediation or a plugin restart
+        cannot run under a training job nobody stopped (ARCH-B2). Containment
+        is exempt for the reason ``mutates_node`` gives.
+        """
+
         steps = []
         errors = []
+        if workload_state is WorkloadState.UNKNOWN and self.mutates_node(operations):
+            errors.append(WORKLOAD_STATE_UNKNOWN_REASON)
         for operation in operations:
             capability = self.operation_capability[operation]
             owner = self.owner(profile, capability)

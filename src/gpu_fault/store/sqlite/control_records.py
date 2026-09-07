@@ -9,6 +9,7 @@ from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
     DiagnosticRequest,
+    FaultIncident,
     NodeMarker,
     RecoveryAction,
     TerminalEvent,
@@ -19,6 +20,11 @@ from gpu_fault.store.shared.attempt_observation_support import (
     AttemptObservationTerminalSupport,
     reconcile_terminal_attempt_observations,
     terminalize_attempt_observation,
+)
+from gpu_fault.store.shared.cleanup_log import log_cleanup
+from gpu_fault.store.shared.evidence_pins import (
+    evidence_pinned,
+    pinning_incident_state_values,
 )
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
@@ -49,7 +55,7 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
         cutoff = _utc_text(observed - finding_history_retention)
         with self._state_transaction("hot_state/cleanup"):
             terminalized = reconcile_terminal_attempt_observations(self, limit)
-            cursor = self._db.execute(
+            rows = self._db.execute(
                 """
                 DELETE FROM objects
                 WHERE kind='gpu_finding_history'
@@ -65,12 +71,14 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
                       ), key
                       LIMIT ?
                   )
+                RETURNING key
                 """,
                 (cutoff, limit),
-            )
-            deleted = cursor.rowcount
+            ).fetchall()
         return {
-            "gpu_finding_history": deleted,
+            "gpu_finding_history": log_cleanup(
+                "gpu_finding_history", [row[0] for row in rows]
+            ),
             "attempt_observation_terminalized": terminalized,
         }
 
@@ -147,11 +155,23 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
         limit: int = 1000,
     ) -> int:
         observed = now or datetime.now(timezone.utc)
+        # Records an open incident still needs are skipped, not deleted
+        # (architecture review 2026-09-07, item D6; ``evidence_pins``). The
+        # pinning incidents are the non-RECOVERED ones, a small set.
+        placeholders = ", ".join("?" for _ in pinning_incident_state_values())
+        pinning = [
+            FaultIncident.model_validate_json(row[0])
+            for row in self._db.execute(
+                "SELECT payload FROM objects WHERE kind='incident'"
+                f" AND json_extract(payload, '$.state') IN ({placeholders})",
+                pinning_incident_state_values(),
+            ).fetchall()
+        ]
         expired = sorted(
             (
                 item
                 for item in self._list("raw_evidence")
-                if item.expires_at <= observed
+                if item.expires_at <= observed and not evidence_pinned(item, pinning)
             ),
             key=lambda item: (
                 item.expires_at,
@@ -172,7 +192,7 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
                         )
                     ),
                 )
-        return len(expired)
+        return log_cleanup("raw_evidence", [item.record_id for item in expired])
 
     def save_event_if_absent(self, event: TerminalEvent) -> bool:
         storage_key = self._state_key((event.cluster_id, event.attempt_id))

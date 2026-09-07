@@ -643,9 +643,14 @@ def test_a_tcp_retransmit_raises_no_finding_and_ships_no_batch() -> None:
 
 
 def test_genuine_network_error_counters_keep_their_finding() -> None:
-    """The removal is one metric, not the network category."""
+    """The removal is one metric, not the network category.
 
-    for name in ("network_errors_delta", "network_drops_delta", "rdma_errors_delta"):
+    ``network_drops_delta`` is no longer in this list on purpose: drops are a
+    congestion counter like retransmits and now need a sustain window
+    (tests/host_health/test_sustained_io_network_rules.py).
+    """
+
+    for name in ("network_errors_delta", "rdma_errors_delta"):
         policy = NodeHealthPolicy(build_store())
         findings = policy.evaluate_metrics(
             host_telemetry_batch(

@@ -166,8 +166,13 @@ spec:
                   key: clusters.json
             - name: GPU_FAULT_REGISTRY_POLL_SECONDS
               value: "1"
+            # 90 s covers an Aurora writer failover (typically 30-60 s) plus one
+            # poll and refresh cycle: readiness and cluster-token requests fail
+            # closed only when the registry is genuinely unreachable for longer
+            # than a failover, instead of flapping every Pod on a 10 s window.
+            # Liveness (/livez) never reads this; it is process-local.
             - name: GPU_FAULT_REGISTRY_STALE_SECONDS
-              value: "10"
+              value: "90"
             - name: GPU_FAULT_ENABLE_KUBERNETES_ADAPTER
               value: "false"
             - name: GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER
@@ -185,9 +190,13 @@ spec:
                 gpu-fault-kubernetes-adapter,
                 gpu-fault-node-agent,
                 gpu-fault-hyperpod-adapter
+          # Liveness is process-local: /livez never touches Aurora or the
+          # registry, so a writer failover makes Pods NotReady (readiness stays
+          # on /healthz) without restarting them into a start-up that needs
+          # Aurora again.
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /livez
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5

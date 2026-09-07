@@ -273,6 +273,7 @@ class DcgmMetricsCollector:
         self._next_health_summary_at: datetime | None = None
         self._next_inventory_at: datetime | None = None
         self._temperature_limit_samples: list[GpuMetricSample] | None = None
+        self._previous_devices: set[str] | None = None
 
     def collect_text(
         self,
@@ -530,13 +531,43 @@ class DcgmMetricsCollector:
                 candidates.add(f"{device}/power_limit_correlation")
         return candidates
 
+    @staticmethod
+    def _device_keys(batch: GpuMetricBatch) -> set[str]:
+        return {
+            sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
+            for sample in batch.samples
+        } - {"node"}
+
+    def _lost_devices(self, batch: GpuMetricBatch) -> set[str]:
+        """Devices the previous scrape reported and this one does not.
+
+        A GPU that falls off the bus stops appearing in the exporter output;
+        that used to register only as ``candidate-recovered`` (its confirmed
+        candidate stopped being observed), which reads as good news.
+        """
+
+        devices = self._device_keys(batch)
+        previous = self._previous_devices
+        self._previous_devices = devices
+        if previous is None:
+            return set()
+        return previous - devices
+
     def _should_deliver(self, batch: GpuMetricBatch) -> tuple[bool, list[str]]:
+        lost_devices = self._lost_devices(batch)
         if not self.edge_filter_enabled:
             for sample in batch.samples:
                 self._remember_value(self._sample_key(sample), sample.value)
             self._last_observed_at = batch.observed_at
             return True, ["filter-disabled"]
         reasons: list[str] = []
+        if lost_devices:
+            LOGGER.warning(
+                "DCGM scrape lost %d device(s) since the previous sample: %s",
+                len(lost_devices),
+                ",".join(sorted(lost_devices)),
+            )
+            reasons.append("device-lost")
         if self._last_delivered_at is None:
             reasons.append("initial-baseline")
         elif (
@@ -555,7 +586,12 @@ class DcgmMetricsCollector:
             for key, streak in self._candidate_streaks.items()
             if streak >= self.edge_confirmation_samples
         }
-        recovered = confirmed_candidates - candidates
+        recovered = {
+            key
+            for key in confirmed_candidates - candidates
+            # A candidate whose device vanished has not recovered.
+            if key.rsplit("/", 1)[0] not in lost_devices
+        }
         if recovered:
             reasons.append("candidate-recovered")
         next_streaks: dict[str, int] = {}

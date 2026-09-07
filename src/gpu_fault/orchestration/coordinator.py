@@ -713,6 +713,7 @@ class IncidentOrchestrator:
                         workflow,
                     )
                     if generation_ignore_reason is not None:
+                        read_correlated = correlated
                         correlated = correlated.model_copy(
                             update={
                                 "reasons": bounded_reasons(
@@ -724,7 +725,12 @@ class IncidentOrchestrator:
                                 "updated_at": datetime.now(timezone.utc),
                             }
                         )
-                        self.store.save_incident(correlated)
+                        # Compare-and-set on the copy read above (ARCH-D1):
+                        # ``StaleWriteError`` propagates like the
+                        # ``WorkflowFencingError`` this handler already
+                        # raises, and ingest retries the whole event with a
+                        # fresh read of the correlated incident.
+                        self.store.save_incident(correlated, expected=read_correlated)
                         self.store.link_event_to_incident(
                             event.event_id,
                             correlated.incident_id,
@@ -1631,6 +1637,7 @@ class IncidentOrchestrator:
 
             now = datetime.now(timezone.utc)
             read_workflow = workflow
+            read_incident = incident
             workflow = workflow.model_copy(
                 update={
                     "status": final_workflow_status,
@@ -1653,7 +1660,7 @@ class IncidentOrchestrator:
             # ``expected`` and stamps a merge revision on an existing row
             # (store review 2026-09-07, item B).
             self.store.save_workflow(workflow, expected=read_workflow)
-            self.store.save_incident(incident)
+            self.store.save_incident(incident, expected=read_incident)
             return WorkflowExecutionResult(
                 workflow_request_id=workflow.request_id,
                 incident_id=incident.incident_id,
@@ -1796,13 +1803,18 @@ class IncidentOrchestrator:
         else:
             blocked_reasons.append("runtime_profile_version is required for execution")
 
-        if self._builder.mutates_node(official_operations):
-            if event.workload_state is WorkloadState.UNKNOWN:
-                blocked_reasons.append("node workload state is UNKNOWN")
-            elif event.workload_state is WorkloadState.ACTIVE and not workload_ids:
-                blocked_reasons.append(
-                    "ACTIVE workload state requires affected_workload_ids"
-                )
+        # The UNKNOWN-state refusal moved into ``compile_steps`` so the
+        # node-health family shares it (ARCH-B2); the official compile below
+        # is handed the event's workload state. The ACTIVE check stays here:
+        # it is about the event naming its workloads, not about the plan.
+        if (
+            self._builder.mutates_node(official_operations)
+            and event.workload_state is WorkloadState.ACTIVE
+            and not workload_ids
+        ):
+            blocked_reasons.append(
+                "ACTIVE workload state requires affected_workload_ids"
+            )
 
         safety_steps, safety_errors = self._builder.compile_steps(
             safety_operations,
@@ -1817,6 +1829,7 @@ class IncidentOrchestrator:
             node_ids,
             gpu_uuids,
             workload_ids,
+            workload_state=event.workload_state,
         )
         official_steps = [
             step.model_copy(

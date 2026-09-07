@@ -296,7 +296,7 @@ def test_ledger_save_failure_releases_all_inflight_waiters(
     monkeypatch.setattr(
         agent.ledger,
         "save",
-        lambda _result: (_ for _ in ()).throw(OSError("ledger is full")),
+        lambda _result, **_kwargs: (_ for _ in ()).throw(OSError("ledger is full")),
     )
 
     with ThreadPoolExecutor(max_workers=2) as pool:

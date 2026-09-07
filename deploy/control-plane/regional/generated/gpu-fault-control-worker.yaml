@@ -211,7 +211,7 @@ spec:
         livenessProbe:
           failureThreshold: 2
           httpGet:
-            path: /healthz
+            path: /livez
             port: 8081
           initialDelaySeconds: 10
           periodSeconds: 5

@@ -140,10 +140,15 @@ def test_processor_replay_secret_is_separate_and_liveness_is_http() -> None:
     assert execution["key"] == "execution-token"
     assert replay["key"] == "processor-replay-secret"
     assert execution["key"] != replay["key"]
+    # ARCH-H1: liveness is process-local (/livez) so an Aurora failover does
+    # not restart every Pod; readiness keeps the store-backed /healthz.
     assert container(ingress)["livenessProbe"]["httpGet"] == {
-        "path": "/healthz",
+        "path": "/livez",
         "port": 8080,
-    }
+    }, "liveness must not depend on the store"
+    assert container(ingress)["readinessProbe"]["httpGet"]["path"] == "/healthz", (
+        "readiness must keep failing closed on the store"
+    )
 
 
 def test_control_plane_roles_and_adot_have_disruption_protection() -> None:

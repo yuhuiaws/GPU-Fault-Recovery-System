@@ -55,6 +55,16 @@ reboots, and a typo in a section name would silently drop every value in it.
 - `run_ha007_control_worker_shutdown.py`
 - `run_net002_command_recovery.py`
 - `run_net003_result_retry.py`
+- `run_net006_lease_loss_withheld_result.py`
+- `run_net008_outbox_dead_letter.py`
+- `run_cmd017_barrier_hold.py`
+- `run_cmd018_open_sibling_hold.py`
+- `run_notify007_delivery_states.py`
+- `run_preempt037_dispatcher_liveness.py`
+- `run_preempt038_evidence_pins.py`
+- `run_collect018_rejected_event.py`
+- `run_collect019_nvidia_smi_hang.py`
+- `run_collect020_gpu_identity.py`
 - `run_ha001_control_plane_failover.py`
 - `run_ha002_pdb_topology.py`
 - `run_ha003_aurora_failover_reset.py`
@@ -84,6 +94,12 @@ reboots, and a typo in a section name would silently drop every value in it.
 - `run_destr016_preempting_reboot.py`
 - `run_destr017_out_of_band_reboot_fence.py`
 - `run_destr018_lifetime_deadline.py`
+- `run_destr019_agent_restart_ledger.py`
+- `run_destr020_identity_mismatch_isolation.py`
+- `run_destr021_adversarial_node_metadata.py`
+- `run_destr022_spare_reservation_reclaim.py`
+- `run_ha010_aurora_blackout_liveness.py`
+- `run_boot023_release_history.py`
 - `run_preempt036_stuck_workflow_reconcile.py`
 - `run_collector_acceptance.py`
 - `run_collector_destructive.py`
@@ -274,6 +290,123 @@ Current classification:
   `destr018_verdicts.py`, including the three data-plane verdicts that read the
   Node Agent ledger against the cancellation moment. A node the deadline left
   isolated is restored only through the validation-first workflow.
+- DESTR-019 has a reusable manual live driver for what a Node Agent restart
+  must leave behind. It requires DESTR-010 PASS, refuses to restart while
+  any remote command is open, arms a bounded `systemd-run --on-active` start
+  of `gpu-fault-node-agent.service` *before* `systemctl restart`, and then
+  writes one solo XID 45 so the Fabric Manager restart DESTR-010 proved runs
+  again on the restarted Agent. It judges the Agent's `/healthz`
+  (`ledger.writable`, heartbeat, counters), the three structured journald
+  lines the command leaves, the ledger row's audit columns and
+  `PRAGMA user_version`, and drills the pre-audit ledger schema's in-place
+  migration on a scratch copy under `/var/lib/gpu-fault-acceptance` with the
+  deployed wheel. Its verdicts live in `destr019_verdicts.py`, its node-local
+  work in `probes/destr019_node_probe.py` (the only mutating verbs are
+  `restart`/`start` on the Agent unit and `stop`/`reset-failed` on the
+  fail-safe unit named after the run). It deliberately never restarts the
+  Agent with a command in flight: an interrupted action is failed closed as
+  `manual_confirmation_required`, and on a RESET_GPU workflow that climbs to
+  a provider reboot nothing on the node can stop.
+- DESTR-020 has a reusable manual live driver for the isolation identity
+  check (ARCH-A5). It requires DESTR-001 PASS and posts one API-replay XID 46
+  for an alias node id that neither Kubernetes nor the fleet knows, so the
+  RESET_GPU workflow's `MARK_UNSCHEDULABLE` reads a 404 and must fail closed
+  (`safety_rejection`, `absent`) instead of recording the node as "already
+  isolated"; no real node may change and no later step may be reached. The
+  alias has no Node Agent and no provider node, so no reset or reboot can be
+  armed from it. Its verdicts live in `destr020_verdicts.py`.
+- DESTR-021 has a reusable manual live driver for adversarial node metadata
+  (ARCH-A2/A3/A8). It requires DESTR-020 PASS, reuses COLLECT-017 A段's EFA
+  unbind injection on one idle node, pre-writes a stale foreign
+  `efa-plugin-restart-*` annotation set that `RESTART_EFA_DEVICE_PLUGIN` must
+  take over and clear, and runs a bounded local writer
+  (`probes/destr021_annotation_writer.py`) that patches a harmless tick
+  annotation every 0.5 s so `MARK_UNSCHEDULABLE`/`RESTORE_SCHEDULING` meet
+  real 409s; both steps must report `node_baselines[node].before/after`, the
+  restore must never fail, and the node must end clean. Its verdicts live in
+  `destr021_verdicts.py`.
+- DESTR-022 has a reusable manual live driver for the warm-spare reservation
+  sweep (ARCH-A4b/A4c). It requires DESTR-008 PASS, writes a synthetic
+  incident's stale reservation (`spare-reserved-at` two days old) on the
+  declared spare without uncordoning it, and waits for the deployed cluster
+  executor's `SpareReservationSweep` to release it, judged by the node
+  annotations, the executor log line and the claim-state breadcrumb counter
+  (`probes/destr022_executor_probe.py`). Its verdicts live in
+  `destr022_verdicts.py`; cleanup restores the recorded baseline.
+- HA-010 has a reusable manual live driver for control-plane liveness across
+  an Aurora writer failover (ARCH-H1/H3). It requires HA-001 PASS, refuses to
+  run with any remote command open, calls `failover-db-cluster` exactly as
+  HA-003 does, deletes one `gpu-fault-api-ha` replica right after the request,
+  and samples `/livez` and `/healthz` inside every CPU Pod
+  (`probes/ha010_probe.py`): liveness must stay 200, readiness may only 503 and
+  must return within the stale window, no pre-existing container may restart,
+  the replacement must not CrashLoop, and `secret_drift` must stay false. Its
+  verdicts live in `ha010_verdicts.py`.
+- BOOT-023 has a reusable manual live driver for the release audit surfaces
+  (ARCH-H2/H3/H5). It requires BOOT-020 PASS and the `noop` config that
+  `boot020_release_candidates.py configs` materialises, refuses anything that
+  does not classify as NOOP, runs `RegionalRelease.noop` once, and reads back
+  the append-only `gpu-fault-release-history` ConfigMap and its mirror, the
+  previous-snapshot retention, the per-Pod Secret-vs-durable registry digests
+  (`probes/boot023_registry_probe.py`) and the parser's refusal of
+  `database.rollback_compatible: true`. Its verdicts live in
+  `boot023_verdicts.py`.
+- COLLECT-018/019/020 and NET-008 share `collector_window_fixture.py` and
+  `probes/collector_window_probe.py`: one host probe that can open a bounded
+  change on one allow-listed collector unit of one idle node -- a systemd
+  drop-in under `/run/gpu-fault-acceptance/<digest>` that appends an env file
+  (only a probe-generated wrong cluster token), unsets
+  `GPU_FAULT_EXPECTED_GPU_COUNT`, or puts a `nvidia-smi` shadow first on PATH
+  (`hang:<s>` sleeps past the collector timeout; `drop-uuid:<uuid>:1` hides
+  one GPU line from exactly one inventory query, below the host collector's
+  mismatch threshold) -- with a `systemd-run --on-active` deadman that closes
+  it. It also writes labelled user-space `/dev/kmsg` lines (monitor-only XID
+  63, or an `Xid` line with no code), posts one deliberately incompatible
+  event through the node's own sink, drives the shipped
+  `gpu-fault-collector outbox` CLI, seeds/purges a retired-channel outbox
+  record only while the owning unit is stopped, and reuses NET-001's tagged
+  iptables reject. The Node Agent is not in its unit allow-list. Verdicts are
+  `collect018_verdicts.py`, `collect019_verdicts.py`, `collect020_verdicts.py`
+  and `net008_verdicts.py`.
+- CMD-018 (`run_cmd018_open_sibling_hold.py`, `cmd018_verdicts.py`) drives the
+  deployed `RegionalRemoteWorkflowAdapter` inside a CPU API Pod for a
+  `perf-cap-000` workflow: dispatch, rewrite the step's parameters through a
+  guarded `save_workflow`, dispatch again (held `OPEN_SIBLING_COMMAND`), let
+  `probes/cmd018_ledger_executor.py` finish the open sibling once, then show
+  the hold lifts and cancel what it mints. It reuses the registry, Pod and
+  postflight parts of `seeded_command_fixture.py`.
+- NOTIFY-007 (`run_notify007_delivery_states.py`,
+  `probes/notify007_delivery_drill.py`, `notify007_verdicts.py`) runs the
+  shipped `dispatch_outbox` in a control-worker Pod against an isolated
+  in-memory store with the Pod's SES notifier wrapped to fail once, then
+  always: RETRY without a result row, then SENT; DEAD with a terminal FAILED.
+- PREEMPT-037 (`run_preempt037_dispatcher_liveness.py`,
+  `preempt037_verdicts.py`) sets `GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER=false`
+  on the control-worker Deployment (baseline recorded first, restored
+  exactly) and evaluates `GpuFaultWorkflowDispatcherStalled` on the replicas'
+  `/metrics` with the rule file's threshold and `for`. It refuses while any
+  workflow is in flight.
+- PREEMPT-038 (`run_preempt038_evidence_pins.py`, `preempt038_verdicts.py`)
+  ships `audit_raw_evidence_periodic_cleanup.py` into a control-worker Pod:
+  two expired `audit-*` evidence rows and one ESCALATED `audit-cluster`
+  incident, the deployed sweep deletes the unrelated row, keeps the pinned
+  one until the incident is RECOVERED, and logs the deleted keys.
+- NET-006 and CMD-017 share `seeded_command_fixture.py`, the NET-002 shape
+  made reusable: a synthetic `perf-cap-000` registry entry that expires in 30
+  minutes, one remote command seeded straight into the store for node ids no
+  cluster carries, one probe executor Pod on the GPU plane running the
+  deployed `ClusterActionExecutor`, and a purge that reads back zero. NET-006
+  (`probes/net006_executor.py`) holds its action past the lease while a
+  loopback proxy refuses the control plane, so the executor must withhold the
+  result (`results_withheld_total`, `lease_lost_total`, no 409) and reclaim it
+  from the idempotency ledger. CMD-017 (`probes/cmd017_barrier_executor.py`)
+  seeds a two-node `RESET_ALL_GPUS_NVSWITCHES` for a stand-in adapter with
+  `barriers=None`; the executor must hold it at the claim boundary
+  (`status_source=executor-barrier-unavailable`,
+  `barrier_unavailable_holds_total`) and never reach the adapter. The
+  natural two-node SXID injection is deliberately not used: past
+  `VERIFY_NO_GPU_CLIENTS` a regressed claim boundary would arm two real
+  full-fabric resets with no on-node stop.
 - DESTR-003/008 have reusable manual warm-spare live drivers. DESTR-003
   requires DESTR-012 PASS and one already-declared, cordoned, topology-matched
   healthy spare. DESTR-008 requires DESTR-003 PASS and runs six independently

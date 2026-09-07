@@ -28,7 +28,8 @@ def test_every_application_route_declares_authorization_bucket() -> None:
     application_paths = {
         route.path
         for route in iter_api_routes(app.routes)
-        if route.path.startswith("/v1/") or route.path in {"/healthz", "/metrics"}
+        if route.path.startswith("/v1/")
+        or route.path in {"/healthz", "/livez", "/metrics"}
     }
     assert set(registry.inventory) == application_paths
     assert (

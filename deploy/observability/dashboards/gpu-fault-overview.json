@@ -240,7 +240,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "PENDING or SAFETY_PENDING workflows whose incident no longer points at them.",
+      "description": "PENDING or SAFETY_PENDING workflows whose incident no longer points at them.\n\nAlert GpuFaultOrphanWorkflows (warning, for 30m, > 0): docs/管理员日常运维.md#gpufaultorphanworkflows",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -252,7 +252,7 @@
             "showPoints": "never",
             "spanNulls": false,
             "thresholdsStyle": {
-              "mode": "off"
+              "mode": "line"
             }
           },
           "thresholds": {
@@ -261,6 +261,10 @@
               {
                 "color": "green",
                 "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.0
               }
             ]
           },

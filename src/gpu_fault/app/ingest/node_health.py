@@ -1,9 +1,68 @@
 from __future__ import annotations
 
+import hashlib
+
 from gpu_fault.host_health import (
     NodeHealthCategory,
+    NodeHealthFinding,
     NodeHealthIngestionResult,
 )
+from gpu_fault.models import AdvisoryNotification
+
+#: Findings that exist to put a human in the loop rather than to drive a
+#: recovery: an unparsable fault line, a GPU whose identity changed under the
+#: workload, a node whose GPU invariant nobody configured. Their incident
+#: carries only FREEZE_EVIDENCE / diagnostics, so without a notification the
+#: operator would have to find them by browsing incidents.
+OPERATOR_REVIEW_METRICS = frozenset(
+    {
+        "unparsed_xid_line",
+        "unparsed_sxid_line",
+        "unclassified_sxid",
+        "gpu_inventory_identity_changed",
+        "gpu_expected_count_unknown",
+    }
+)
+
+
+def operator_review_notification(
+    incident_id: str, finding: NodeHealthFinding
+) -> AdvisoryNotification:
+    scope = hashlib.sha256(
+        "/".join(
+            [
+                finding.cluster_id,
+                finding.node_id,
+                str(finding.metric_name),
+                finding.event_id,
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+    return AdvisoryNotification(
+        deduplication_key=f"operator-review/{scope}",
+        cluster_name=finding.cluster_id,
+        incident_id=incident_id,
+        subject=(
+            f"[GPU fault review] {finding.node_id} "
+            f"{finding.metric_name} ({finding.severity.value})"
+        ),
+        body_text=(
+            f"Cluster: {finding.cluster_id}\n"
+            f"Node: {finding.node_id}\n"
+            f"Finding: {finding.metric_name}\n"
+            f"Severity: {finding.severity.value}\n"
+            f"Reason: {finding.reason}\n"
+            f"Recommended action: {finding.recommended_action.value}\n"
+            f"Evidence: {finding.evidence_ref or 'n/a'}"
+        ),
+        support_case_draft=(
+            "Review the frozen evidence for this incident and decide whether "
+            "the signal is a real fault or a collector/catalog drift."
+        ),
+        evidence_refs=[finding.evidence_ref] if finding.evidence_ref else [],
+        category="OPERATOR_REVIEW",
+        priority=100,
+    )
 
 
 class NodeHealthIngestionService:
@@ -43,6 +102,12 @@ class NodeHealthIngestionService:
             }:
                 notification = self.context.advisory_notifications.preview_hardware_inventory_event(
                     incident.incident_id, finding
+                )
+                self.context.advisory_notifications.send(notification.notification_id)
+                notifications.append(notification.notification_id)
+            elif finding.metric_name in OPERATOR_REVIEW_METRICS:
+                notification = self.context.store.save_notification_if_absent(
+                    operator_review_notification(incident.incident_id, finding)
                 )
                 self.context.advisory_notifications.send(notification.notification_id)
                 notifications.append(notification.notification_id)

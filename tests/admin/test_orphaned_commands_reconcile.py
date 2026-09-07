@@ -105,6 +105,7 @@ def test_the_shipped_script_compiles_calls_both_entry_points_and_imports_safely(
     allowed = {
         "__future__",
         "hashlib",
+        "inspect",
         "json",
         "sys",
         "datetime",
@@ -141,11 +142,17 @@ def test_plan_and_apply_are_bound_to_site_digest_and_archive(
     result = reconcile.apply_orphaned_commands_reconcile(
         site, tmp_path, expected_plan_sha256=plan["plan_sha256"], reference="CHG-orphan"
     )
+    from tests.admin.conftest import TEST_OPERATOR_ARN
+
     assert calls[-1] == {
         "mode": "apply",
         "workflow_ids": [WORKFLOW],
         "plan_sha256": "b" * 64,
         "reference": "CHG-orphan",
+        # Every apply names the operator and the approved admin digest (I1);
+        # the driver forwards both to the runtime apply.
+        "actor": TEST_OPERATOR_ARN,
+        "admin_plan_sha256": plan["plan_sha256"],
     }, calls[-1]
     assert result["admin_plan_sha256"] == plan["plan_sha256"], result
     archive = tmp_path / reconcile.ORPHANED_COMMANDS_HISTORY_PATH / plan["plan_sha256"]

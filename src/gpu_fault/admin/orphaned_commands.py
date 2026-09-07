@@ -29,13 +29,24 @@ side sees the cancellation and stops. Shipped to the ingress Pod as source like
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
+import gpu_fault.models as _models
 from gpu_fault.models import WorkflowStatus
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.store import NotFoundError
+
+# Probed rather than imported: this source runs against the deployed image,
+# whose ``models`` may predate the attributed operator event (I1). Without it
+# the cancel still happens and the audit stays in the cancellation reason.
+_BUILD_OPERATOR_EVENT: Any = getattr(_models, "build_operator_event", None)
+_OPERATOR_RECONCILED: Any = getattr(
+    getattr(_models, "WorkflowEventKind", None), "OPERATOR_RECONCILED", None
+)
+AUDIT_ACTION = "cancelled orphaned remote commands"
 
 PLAN_MODE = "orphaned-commands-plan"
 APPLY_MODE = "orphaned-commands-apply"
@@ -170,6 +181,53 @@ def build_orphaned_commands_plan(
     return plan
 
 
+def _record_cancellation(
+    store: Any,
+    request_id: str,
+    cancelled: Mapping[str, int],
+    *,
+    reference: str,
+    applied_at: datetime,
+    actor: str | None,
+    approval: Mapping[str, Any],
+) -> None:
+    """Append the operator event for a cancel to the (unchanged) workflow.
+
+    The workflow is terminal and stays as it was; the event is the one place its
+    history says who cancelled the commands it left open, and under which
+    approval (I1). It goes through ``amend_workflow`` -- the out-of-lease write
+    -- only when the deployed Store's signature takes an ``event``: this source
+    runs against the previously deployed image, whose Store may not.
+    """
+
+    amend = getattr(store, "amend_workflow", None)
+    if (
+        amend is None
+        or _BUILD_OPERATOR_EVENT is None
+        or _OPERATOR_RECONCILED is None
+        or "event" not in inspect.signature(amend).parameters
+    ):
+        return
+    workflow = store.get_workflow(request_id)
+    amend(
+        request_id,
+        {},
+        event=_BUILD_OPERATOR_EVENT(
+            workflow,
+            _OPERATOR_RECONCILED,
+            actor=actor,
+            reference=reference,
+            previous_status=workflow.status,
+            at=applied_at,
+            details={
+                "action": AUDIT_ACTION,
+                "cancelled_remote_commands": dict(cancelled),
+                **dict(approval),
+            },
+        ),
+    )
+
+
 def apply_orphaned_commands_plan(
     store: Any,
     *,
@@ -177,15 +235,28 @@ def apply_orphaned_commands_plan(
     expected_plan_sha256: str,
     reference: str,
     now: datetime | None = None,
+    actor: str | None = None,
+    admin_plan_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Cancel the approved orphans, one workflow at a time, always returning.
 
     The plan is rebuilt and compared with the approval, so a command that was
     settled or a workflow that was revived since the review refuses the apply
-    instead of being acted on under a stale reading.
+    instead of being acted on under a stale reading. ``actor`` and
+    ``admin_plan_sha256`` go on the operator event each cancel leaves on its
+    workflow; a cancel whose event could not be written is still a cancel, and
+    is named under ``audit_warnings`` rather than ``failures``.
     """
 
     applied_at = now or datetime.now(timezone.utc)
+    approval = {
+        key: value
+        for key, value in (
+            ("plan_sha256", expected_plan_sha256),
+            ("admin_plan_sha256", admin_plan_sha256),
+        )
+        if value is not None
+    }
     requested = requested_workflow_ids(workflow_ids)
     plan = build_orphaned_commands_plan(store, requested, now=applied_at)
     if plan["plan_sha256"] != expected_plan_sha256:
@@ -202,6 +273,7 @@ def apply_orphaned_commands_plan(
         )
     cancelled: dict[str, dict[str, int]] = {}
     failures: dict[str, str] = {}
+    audit_warnings: dict[str, str] = {}
     for item in plan["items"]:
         request_id = str(item["request_id"])
         try:
@@ -217,15 +289,30 @@ def apply_orphaned_commands_plan(
             )
         except Exception as exc:  # noqa: BLE001 -- per-item isolation, reported
             failures[request_id] = f"{type(exc).__name__}: {exc}"
+            continue
+        try:
+            _record_cancellation(
+                store,
+                request_id,
+                cancelled[request_id],
+                reference=reference,
+                applied_at=applied_at,
+                actor=actor,
+                approval=approval,
+            )
+        except Exception as exc:  # noqa: BLE001 -- reported, the cancel happened
+            audit_warnings[request_id] = f"{type(exc).__name__}: {exc}"
     return {
         "schema_version": 1,
         "mode": APPLY_MODE,
         "applied_at": applied_at.isoformat(),
         "reference": reference,
+        "actor": actor,
         "settled_plan_sha256": plan["plan_sha256"],
         "applied_workflow_ids": sorted(cancelled),
         "cancelled_remote_commands": cancelled,
         "failed_workflow_ids": sorted(failures),
         "failures": failures,
+        "audit_warnings": audit_warnings,
         "records_deleted": 0,
     }

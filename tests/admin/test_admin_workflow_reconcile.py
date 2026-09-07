@@ -294,3 +294,113 @@ def test_plan_forwards_incident_and_blocked_kind_batches(
             "max_items": 50,
         }
     ]
+
+
+def _apply_runner(calls: list[dict]):
+    def run(_site_value, payload, **_kwargs):
+        calls.append(payload)
+        if payload["mode"] == "plan":
+            return _runtime_plan()
+        return {
+            "mode": "workflow-reconcile-apply",
+            "records_deleted": 0,
+            "applied_workflow_ids": ["workflow-blocked"],
+        }
+
+    return run
+
+
+def test_apply_attributes_the_write_to_the_resolved_operator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reference is free text; the write must also say *who* (I1).
+
+    The apply payload carries the STS caller identity and the admin-side plan
+    digest so the Pod records both on the workflow's event, and the archived
+    ``applied.json`` names the same identity.
+    """
+
+    from tests.admin.conftest import TEST_OPERATOR_ARN
+
+    calls: list[dict] = []
+    monkeypatch.setattr(reconcile, "_run_reconcile", _apply_runner(calls))
+    monkeypatch.setattr(
+        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+    )
+    site = _site(tmp_path)
+    plan = reconcile.plan_workflow_reconcile(
+        site, tmp_path, workflow_ids=("workflow-blocked",)
+    )
+
+    result = reconcile.apply_workflow_reconcile(
+        site, tmp_path, expected_plan_sha256=plan["plan_sha256"], reference="CHG-12345"
+    )
+
+    apply_payload = calls[-1]
+    assert apply_payload["mode"] == "apply"
+    assert apply_payload["actor"] == TEST_OPERATOR_ARN, (
+        "the apply payload does not carry the operator identity"
+    )
+    assert apply_payload["admin_plan_sha256"] == plan["plan_sha256"], (
+        "the apply payload does not carry the approved admin plan digest"
+    )
+    assert result["actor"] == TEST_OPERATOR_ARN
+    archive = tmp_path / reconcile.HISTORY_PATH / plan["plan_sha256"]
+    applied = json.loads((archive / "applied.json").read_text(encoding="utf-8"))
+    assert applied["actor"] == TEST_OPERATOR_ARN, (
+        "the archived result must name who applied it"
+    )
+
+
+def test_a_failed_identity_lookup_never_blocks_the_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpu_fault.admin import operator_identity
+
+    monkeypatch.setattr(
+        operator_identity, "caller_identity_arn", lambda **_kwargs: None
+    )
+    calls: list[dict] = []
+    monkeypatch.setattr(reconcile, "_run_reconcile", _apply_runner(calls))
+    monkeypatch.setattr(
+        reconcile.subprocess, "run", lambda *_args, **_kwargs: _node_result()
+    )
+    site = _site(tmp_path)
+    plan = reconcile.plan_workflow_reconcile(
+        site, tmp_path, workflow_ids=("workflow-blocked",)
+    )
+
+    result = reconcile.apply_workflow_reconcile(
+        site, tmp_path, expected_plan_sha256=plan["plan_sha256"], reference="CHG-12345"
+    )
+
+    assert calls[-1]["actor"] == operator_identity.UNKNOWN_IDENTITY
+    assert result["actor"] == operator_identity.UNKNOWN_IDENTITY, (
+        "an unresolved identity must be recorded as unknown, not block the write"
+    )
+
+
+def test_the_pod_script_only_forwards_what_the_deployed_apply_accepts() -> None:
+    """The restore script runs the *deployed* image's apply function.
+
+    A payload key the deployed signature does not know would make the whole
+    apply fail with a TypeError at the one moment it is needed, so the script
+    checks the signature before forwarding ``actor`` and ``admin_plan_sha256``,
+    the same way it already does for ``waiting_ttl``.
+    """
+
+    import ast
+
+    tree = ast.parse(reconcile.RECONCILE_SCRIPT)
+    compile(reconcile.RECONCILE_SCRIPT, "<workflow-reconcile>", "exec")
+    guarded_keys = {
+        node.left.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Constant)
+        and isinstance(node.left.value, str)
+    }
+    assert {"waiting_ttl", "actor", "admin_plan_sha256"} <= guarded_keys, (
+        f"the script forwards a key without checking the deployed signature: "
+        f"{guarded_keys}"
+    )

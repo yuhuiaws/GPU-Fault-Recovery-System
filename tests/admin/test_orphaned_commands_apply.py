@@ -11,7 +11,12 @@ from gpu_fault.admin.orphaned_commands import (
     apply_orphaned_commands_plan,
     build_orphaned_commands_plan,
 )
-from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
+from gpu_fault.models import (
+    IncidentState,
+    WorkflowEventKind,
+    WorkflowOperation,
+    WorkflowStatus,
+)
 from gpu_fault.regional import RemoteActionCommand
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from tests._builders import build_store, fault_incident, workflow_request, workflow_step
@@ -94,6 +99,44 @@ def test_an_open_command_of_a_failed_workflow_is_cancelled() -> None:
     assert store.get_workflow(WORKFLOW).status is WorkflowStatus.FAILED, (
         "the terminal workflow must be left as it was"
     )
+
+
+def test_the_cancel_leaves_an_attributed_event_on_the_workflow() -> None:
+    """The workflow stays terminal; its history says who cancelled what (I1)."""
+
+    store = build_store()
+    _orphan(store)
+    plan = build_orphaned_commands_plan(store, [WORKFLOW])
+    actor = "arn:aws:sts::123456789012:assumed-role/Admin/alice"
+
+    result = apply_orphaned_commands_plan(
+        store,
+        workflow_ids=[WORKFLOW],
+        expected_plan_sha256=plan["plan_sha256"],
+        reference=REFERENCE,
+        actor=actor,
+        admin_plan_sha256="c" * 64,
+    )
+
+    assert result["actor"] == actor, result
+    assert result["audit_warnings"] == {}, result
+    workflow = store.get_workflow(WORKFLOW)
+    assert workflow.status is WorkflowStatus.FAILED, "the status must not move"
+    events = [
+        event
+        for event in workflow.events
+        if event.kind is WorkflowEventKind.OPERATOR_RECONCILED
+    ]
+    assert len(events) == 1, f"expected one operator event, found {events}"
+    (event,) = events
+    assert event.actor == actor, "the STS identity must be the event actor"
+    assert event.details["previous_status"] == WorkflowStatus.FAILED.value, event
+    assert event.details["new_status"] == WorkflowStatus.FAILED.value, event
+    assert event.details["reference"] == REFERENCE, event
+    cancelled = result["cancelled_remote_commands"][WORKFLOW]
+    assert event.details["cancelled_remote_commands"] == cancelled, event
+    assert event.details["plan_sha256"] == plan["plan_sha256"], event
+    assert event.details["admin_plan_sha256"] == "c" * 64, event
 
 
 @pytest.mark.parametrize(

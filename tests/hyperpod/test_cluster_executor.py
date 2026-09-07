@@ -416,7 +416,7 @@ def test_a_failed_outcome_without_a_message_is_not_an_executor_internal_error() 
 
     executor = _executor(SilentAdapter("owner-a"))
 
-    result = executor._execute(_remote_command())
+    result = _execute(executor, _remote_command())
 
     assert result.status is RemoteCommandStatus.FAILED
     assert result.status_source is None
@@ -480,6 +480,12 @@ class RaisingAdapter(FakeAdapter):
         raise self.error
 
 
+def _execute(executor: ClusterActionExecutor, command) -> RemoteCommandResult:
+    """Drive the catch-all directly; the one private call these tests share."""
+
+    return executor._execute(command)
+
+
 def _executor(adapter) -> ClusterActionExecutor:
     return ClusterActionExecutor(
         FakeClient(),
@@ -529,7 +535,7 @@ def test_aws_misconfiguration_is_not_an_executor_internal_error() -> None:
         RaisingAdapter("owner-a", _botocore_error("NoCredentialsError"))
     )
 
-    result = executor._execute(_remote_command())
+    result = _execute(executor, _remote_command())
 
     assert result.status is RemoteCommandStatus.FAILED
     assert result.status_source == "executor-configuration-error"
@@ -545,7 +551,7 @@ def test_aws_misconfiguration_is_not_an_executor_internal_error() -> None:
 def test_executor_defect_is_still_an_internal_error() -> None:
     executor = _executor(RaisingAdapter("owner-a", AttributeError("core")))
 
-    result = executor._execute(_remote_command())
+    result = _execute(executor, _remote_command())
 
     assert result.status_source == "executor-internal-error"
     assert result.details["executor_internal_error"] is True
@@ -560,7 +566,7 @@ def test_temporary_dns_failure_keeps_command_retryable() -> None:
         )
     )
 
-    result = executor._execute(_remote_command())
+    result = _execute(executor, _remote_command())
 
     assert result.status is RemoteCommandStatus.WAITING
     assert result.status_source == "executor-retryable-transport"
@@ -570,12 +576,50 @@ def test_temporary_dns_failure_keeps_command_retryable() -> None:
     assert executor.unexpected_failures == 0
 
 
+def _api_exception(status: int) -> Exception:
+    exc = type(
+        "ApiException", (Exception,), {"__module__": "kubernetes.client.exceptions"}
+    )(f"({status}) Reason: HTTP {status}")
+    exc.status = status  # type: ignore[attr-defined]
+    return exc
+
+
+@pytest.mark.parametrize("status", [409, 429, 503])
+def test_transient_kubernetes_api_error_keeps_command_retryable(status: int) -> None:
+    """ARCH-B1 reached from the regional topology (ARCH-E2E-1 关键发现 1)."""
+
+    executor = _executor(RaisingAdapter("owner-a", _api_exception(status)))
+
+    result = _execute(executor, _remote_command())
+
+    assert result.status is RemoteCommandStatus.WAITING, result
+    assert result.status_source == "executor-retryable-adapter-error", result
+    assert result.details["retryable_adapter_error"] is True, result.details
+    assert result.details["reason"] == "RETRYABLE_ADAPTER_ERROR", result.details
+    assert result.details["exception_type"] == "ApiException", result.details
+    assert executor.retryable_adapter_errors_total == 1, "the retry was not counted"
+    assert executor.unexpected_failures == 0, "a transient answer is not a defect"
+    assert executor.metrics_snapshot()["retryable_adapter_errors_total"] == 1, (
+        "the breadcrumb must carry the counter"
+    )
+
+
+def test_definitive_kubernetes_api_error_still_fails_the_command() -> None:
+    executor = _executor(RaisingAdapter("owner-a", _api_exception(404)))
+
+    result = _execute(executor, _remote_command())
+
+    assert result.status is RemoteCommandStatus.FAILED, result
+    assert result.status_source == "executor-internal-error", result
+    assert executor.retryable_adapter_errors_total == 0, "a 404 is not retryable"
+
+
 def test_deliberate_rejection_is_neither() -> None:
     executor = _executor(
         RaisingAdapter("owner-a", ClusterExecutorError("stale fencing token"))
     )
 
-    result = executor._execute(_remote_command())
+    result = _execute(executor, _remote_command())
 
     assert result.status_source == "executor-rejected"
     assert executor.unexpected_failures == 0
@@ -665,7 +709,7 @@ def test_remote_executor_rechecks_fleet_before_destructive_action() -> None:
     command.workflow.safety_steps = []
     command.incident.cluster_id = "cluster-a"
 
-    result = executor._execute(command)
+    result = _execute(executor, command)
 
     assert result.status is RemoteCommandStatus.WAITING
     assert result.details["fleet_preflight_blocked"] is True

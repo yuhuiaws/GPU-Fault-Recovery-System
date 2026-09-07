@@ -94,6 +94,7 @@ class NvidiaSmiMetricsCollector:
         force_snapshot_path: str | None = None,
         now: Callable[[], datetime] | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
+        failure_backoff_threshold: int = 3,
     ) -> None:
         self.sink = sink
         self.context = context
@@ -132,9 +133,13 @@ class NvidiaSmiMetricsCollector:
                 ("/var/lib/gpu-fault/health-snapshot/gpu.request"),
             )
         )
+        self.failure_backoff_threshold = failure_backoff_threshold
+        if self.failure_backoff_threshold <= 0:
+            raise ValueError("nvidia-smi failure backoff threshold must be positive")
         self._last_inventory_delivered_at: datetime | None = None
         self._next_inventory_at: datetime | None = None
         self._temperature_limit_samples: list[GpuMetricSample] | None = None
+        self._consecutive_failures = 0
 
     def collect_once(self) -> GpuMetricBatch:
         timestamp = self.now()
@@ -231,12 +236,69 @@ class NvidiaSmiMetricsCollector:
             try:
                 self.collect_once()
                 succeeded = True
-            except CollectorError:
-                LOGGER.exception("nvidia-smi metrics collection failed")
+                self._consecutive_failures = 0
+            except Exception as exc:
+                # A hung nvidia-smi raises TimeoutExpired, which is not a
+                # CollectorError: the loop used to exit on it, and systemd
+                # restarted the collector into the same hang, so the node
+                # went silent at exactly the moment its driver wedged.
+                self._consecutive_failures += 1
+                LOGGER.exception(
+                    "nvidia-smi metrics collection failed (%d consecutive)",
+                    self._consecutive_failures,
+                )
+                self._report_collection_error(exc)
             if force_snapshot and succeeded:
                 self.force_snapshot_path.unlink(missing_ok=True)
                 force_snapshot = False
-            time.sleep(self.interval_seconds)
+            time.sleep(self.next_interval_seconds())
+
+    def next_interval_seconds(self) -> float:
+        """The sleep before the next round: the interval, doubled while failing.
+
+        The first ``failure_backoff_threshold - 1`` failures keep the normal
+        cadence so a transient blip is retried promptly; from the threshold on
+        the wait doubles per failure, capped at four intervals, so a wedged
+        driver is not hammered every round while still being probed.
+        """
+
+        excess = self._consecutive_failures - self.failure_backoff_threshold
+        if excess < 0:
+            return self.interval_seconds
+        return min(
+            self.interval_seconds * 4,
+            self.interval_seconds * float(2 ** (excess + 1)),
+        )
+
+    def _report_collection_error(self, exc: BaseException) -> None:
+        """Deliver an erroring, sample-less batch so the node is not silent."""
+
+        timestamp = self.now()
+        batch = GpuMetricBatch(
+            batch_id=(
+                f"nvidia-smi-{self.node_id}-{int(timestamp.timestamp() * 1_000_000)}"
+            ),
+            cluster_id=self.context.cluster_id,
+            node_id=self.node_id,
+            observed_at=timestamp,
+            collected_at=timestamp,
+            source=GpuMetricSource.NVIDIA_SMI,
+            samples=[],
+            collection_errors=[f"{type(exc).__name__}: {exc}"],
+            edge_filter_reasons=["collection-error"],
+            runtime_profile_version=(self.context.runtime_profile_version),
+            product=self.context.product,
+            driver_branch=self.context.driver_branch,
+            cuda_version=self.context.cuda_version,
+            workload_state=self.context.workload_state,
+            affected_workload_ids=(self.context.affected_workload_ids),
+            checkpoint_manifest_ref=(self.context.checkpoint_manifest_ref),
+            evidence_ref=f"nvidia-smi://{self.node_id}",
+        )
+        try:
+            self.sink.post(GPU_METRICS_PATH, batch.model_dump(mode="json"))
+        except Exception:
+            LOGGER.exception("nvidia-smi collection error report was not delivered")
 
     def _query(
         self,

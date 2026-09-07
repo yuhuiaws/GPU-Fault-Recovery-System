@@ -33,6 +33,46 @@ _XID_PATTERN = re.compile(
     r"(?::|=)?\s*(\d+)",
     re.IGNORECASE,
 )
+# The bare tokens the node-side collectors filter on. A line that carries one
+# of them but yields no code to ``_XID_PATTERN`` / ``_SXID_PATTERN`` is a
+# format drift the ingest side must name, not swallow: no code is invented and
+# the reason travels on the provider signal so the fault ingestion service can
+# turn it into a finding.
+_XID_TOKEN_PATTERN = re.compile(r"\bXid\b", re.IGNORECASE)
+_SXID_TOKEN_PATTERN = re.compile(r"\bSXid\b", re.IGNORECASE)
+UNPARSED_XID_REASON = "unparsed_xid_line"
+UNPARSED_SXID_REASON = "unparsed_sxid_line"
+UNCLASSIFIED_SXID_REASON = "unclassified_sxid"
+
+
+def unresolved_reason_kind(reason: str) -> str:
+    """The finding kind an unresolved provider-signal reason maps to."""
+
+    for kind in (UNPARSED_XID_REASON, UNPARSED_SXID_REASON):
+        if reason.startswith(kind):
+            return kind
+    return UNCLASSIFIED_SXID_REASON
+
+
+def _unparsed_line_reasons(
+    message: str,
+    xid_matches: list[tuple[str | None, int, str]],
+    sxid_matches: list[tuple[str | None, int, str]],
+) -> list[str]:
+    reasons = []
+    if not xid_matches and _XID_TOKEN_PATTERN.search(message):
+        reasons.append(
+            f"{UNPARSED_XID_REASON}: an Xid token is present but no "
+            "code could be extracted"
+        )
+    if not sxid_matches and _SXID_TOKEN_PATTERN.search(message):
+        reasons.append(
+            f"{UNPARSED_SXID_REASON}: an SXid token is present but no "
+            "code could be extracted"
+        )
+    return reasons
+
+
 _XID_REGISTER_PATTERN = re.compile(r"\b0x([0-9a-fA-F]+)\b")
 _NVLINK5_XIDS = frozenset(range(144, 151))
 _NVLINK5_REGISTER_TOKEN = r"(?:0[xX][0-9a-fA-F]{1,8}|[0-9a-fA-F]{8})"
@@ -500,6 +540,10 @@ class HyperPodHmaNormalizer:
             signal.signal_id,
             sxid_matches,
         )
+        unresolved = [
+            *_unparsed_line_reasons(event.message, xid_matches, sxid_matches),
+            *unresolved,
+        ]
         if unresolved:
             signal = signal.model_copy(update={"unresolved_reasons": unresolved})
         return HmaNormalizedBatch(
@@ -543,6 +587,10 @@ class HyperPodHmaNormalizer:
             signal.signal_id,
             sxid_matches,
         )
+        unresolved = [
+            *_unparsed_line_reasons(event.message, xid_matches, sxid_matches),
+            *unresolved,
+        ]
         if unresolved:
             signal = signal.model_copy(update={"unresolved_reasons": unresolved})
         return HmaNormalizedBatch(

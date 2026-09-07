@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from gpu_fault.admin import command_log as command_log_module
 from gpu_fault.admin.command_log import (
     ADMIN_LOG_ENVIRONMENT,
     command_log,
@@ -205,3 +206,79 @@ def test_the_tail_of_the_output_survives_the_shutdown(tmp_path: Path) -> None:
         f"{len(lines)} lines"
     )
     assert lines[-1] in recorded
+
+
+def test_logs_are_kept_per_kind_and_a_mutating_run_is_the_default(
+    tmp_path: Path,
+) -> None:
+    """A hundred ``status`` runs must never evict the one deploy log (I3).
+
+    The rotation counted every command against one ceiling, so the logs an
+    operator most needs to read back -- a deploy that failed halfway -- were the
+    ones the cheap, frequent read-only commands pushed out. Each kind now has its
+    own directory and ceiling. A caller that names no kind is treated as
+    mutating: the safe error is keeping a read-only log too long, not losing a
+    deploy log.
+    """
+
+    with command_log(tmp_path, command="deploy") as deploy_path:
+        pass
+    with command_log(tmp_path, command="status", kind="readonly") as status_path:
+        pass
+
+    assert deploy_path is not None and status_path is not None
+    root = tmp_path / "logs"
+    assert deploy_path.parent == root / "mutating", deploy_path
+    assert status_path.parent == root / "readonly", status_path
+    for directory in (deploy_path.parent, status_path.parent):
+        assert directory.stat().st_mode & 0o077 == 0, (
+            f"{directory} must stay private like the state directory"
+        )
+
+
+def test_readonly_pruning_never_touches_the_mutating_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "logs"
+    mutating = root / "mutating"
+    readonly = root / "readonly"
+    mutating.mkdir(parents=True, mode=0o700)
+    readonly.mkdir(mode=0o700)
+    _sized_logs(mutating, [100] * 5)
+    _sized_logs(readonly, [100] * 5)
+    monkeypatch.setitem(
+        command_log_module.ADMIN_LOG_LIMITS,
+        "readonly",
+        command_log_module.LogLimits(retained=2, max_bytes=1 << 20),
+    )
+
+    with command_log(tmp_path, command="status", kind="readonly"):
+        pass
+
+    assert len(list(mutating.glob("*.log"))) == 5, (
+        "opening a read-only log pruned the mutating directory"
+    )
+    kept = sorted(item.name for item in readonly.glob("*.log"))
+    assert len(kept) == 2, f"the read-only ceiling was not applied: {kept}"
+    assert "deploy-4.log" in kept, "pruning evicted a newer log before an older one"
+
+
+def test_the_mutating_ceiling_is_higher_than_the_readonly_one() -> None:
+    limits = command_log_module.ADMIN_LOG_LIMITS
+
+    assert set(limits) == {"mutating", "readonly"}
+    assert limits["mutating"].retained > limits["readonly"].retained, (
+        "mutating logs are the ones worth keeping; their count must not be the "
+        "smaller one"
+    )
+    assert limits["mutating"].max_bytes >= limits["readonly"].max_bytes
+
+
+def test_an_unknown_kind_is_refused_before_anything_is_written(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="kind"):
+        with command_log(tmp_path, command="deploy", kind="whatever"):
+            pass
+
+    assert not (tmp_path / "logs").exists(), (
+        "a refused kind still created a log directory"
+    )

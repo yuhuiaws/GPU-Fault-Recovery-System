@@ -13,12 +13,18 @@ and discovery refused any fleet with more than a thousand open workflows
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from gpu_fault.execution import restart_budget_preflight
-from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
+from gpu_fault.models import (
+    IncidentState,
+    WorkflowEventKind,
+    WorkflowOperation,
+    WorkflowStatus,
+)
 from gpu_fault.regional import RemoteActionCommand
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.retired_generation import (
@@ -30,6 +36,7 @@ from gpu_fault.retired_generation import (
     retired_generation_blockers,
     retired_generation_candidates,
 )
+from gpu_fault.store import SqliteStore
 from tests._builders import build_store, fault_incident, workflow_request, workflow_step
 
 NOW = datetime(2026, 9, 6, 8, 0, tzinfo=timezone.utc)
@@ -363,3 +370,84 @@ def test_the_pending_step_set_follows_safety_only_not_blocked_reasons() -> None:
 
     assert pending_destructive_operations(warned) == ["RESTART_NODE"]
     assert pending_destructive_operations(safety_only) == ["QUIESCE_GPU_SERVICES"]
+
+
+ACTOR = "arn:aws:sts::123456789012:assumed-role/Admin/alice"
+
+
+def _operator_events(store: Any, request_id: str) -> list[Any]:
+    return [
+        event
+        for event in store.get_workflow(request_id).events
+        if event.kind is WorkflowEventKind.OPERATOR_RETIRED_GENERATION
+    ]
+
+
+def test_the_revocation_leaves_an_attributed_event_on_the_workflow(
+    tmp_path: Path,
+) -> None:
+    """The audit was a sentence in ``preemption_reason`` (I1).
+
+    The revocation now also appends a ``WorkflowEvent`` in the same transaction:
+    who (STS ARN), which approval (both plan digests), and the status it moved
+    from and to. The SQLite store runs the shared transactional write; the memory
+    store keeps its own copy, covered below.
+    """
+
+    store = SqliteStore(str(tmp_path / "retired.db"))
+    try:
+        _incident_id, retired_id, current_id = retired_pair(
+            store, "a", command_status=None
+        )
+        plan = build_retired_generation_plan(store, [retired_id], now=NOW)
+
+        apply_retired_generation_plan(
+            store,
+            workflow_ids=[retired_id],
+            expected_plan_sha256=plan["plan_sha256"],
+            reference="pre-deploy-1",
+            now=NOW,
+            actor=ACTOR,
+            admin_plan_sha256="c" * 64,
+        )
+
+        events = _operator_events(store, retired_id)
+        assert len(events) == 1, f"expected one operator event, found {events}"
+        event = events[0]
+        assert event.actor == ACTOR
+        assert event.code == "OPERATOR_RETIRED_GENERATION"
+        assert event.at == NOW
+        assert event.status == WorkflowStatus.SUPERSEDED.value
+        assert event.details["previous_status"] == WorkflowStatus.RUNNING.value
+        assert event.details["new_status"] == WorkflowStatus.SUPERSEDED.value
+        assert event.details["reference"] == "pre-deploy-1"
+        assert event.details["successor_workflow_id"] == current_id
+        assert event.details["plan_sha256"] == plan["plan_sha256"]
+        assert event.details["admin_plan_sha256"] == "c" * 64
+        revoked = store.get_workflow(retired_id)
+        assert "pre-deploy-1" in (revoked.preemption_reason or ""), (
+            "the human-readable audit sentence must stay alongside the event"
+        )
+    finally:
+        store.close()
+
+
+def test_the_memory_store_revocation_records_the_event_too() -> None:
+    store = build_store()
+    _incident_id, retired_id, current_id = retired_pair(store, "m", command_status=None)
+    plan = build_retired_generation_plan(store, [retired_id], now=NOW)
+
+    apply_retired_generation_plan(
+        store,
+        workflow_ids=[retired_id],
+        expected_plan_sha256=plan["plan_sha256"],
+        reference="pre-deploy-2",
+        now=NOW,
+        actor=ACTOR,
+    )
+
+    events = _operator_events(store, retired_id)
+    assert len(events) == 1, f"expected one operator event, found {events}"
+    assert events[0].details["reference"] == "pre-deploy-2"
+    assert events[0].details["successor_workflow_id"] == current_id
+    assert events[0].actor == ACTOR, "the memory store must record the real actor"

@@ -268,3 +268,99 @@ def test_tampered_readable_site_identity_cannot_be_approved(tmp_path: Path) -> N
             reference="CHG-12345",
             expected_plan_sha256=str(plan["plan_sha256"]),
         )
+
+
+APPROVER = "arn:aws:sts::123456789012:assumed-role/Admin/alice"
+
+
+def test_the_approval_records_who_approved_outside_the_plan_digest(
+    tmp_path: Path,
+) -> None:
+    """An approval carried only a free-text reference and a time (I2).
+
+    The approver's identity now sits on the record, in the archive and in the
+    consumption audit. It stays *outside* ``plan_sha256``: that digest binds the
+    reviewed plan and is computed before anyone approves, so folding the
+    approver in would change the digest the operator was asked to type back.
+    """
+
+    plan = _plan()
+    admin_profile_approval.write_profile_plan(tmp_path, plan)
+
+    record = admin_profile_approval.approve_profile(
+        tmp_path,
+        reference="CHG-12345",
+        expected_plan_sha256=str(plan["plan_sha256"]),
+        approver_identity=APPROVER,
+    )
+
+    assert record["approver_identity"] == APPROVER
+    assert record["plan_sha256"] == plan["plan_sha256"], (
+        "the approver must not change the plan digest the operator reviewed"
+    )
+    archive = admin_profile_approval.profile_approval_archive_path(
+        tmp_path, str(plan["plan_sha256"])
+    )
+    archived = json.loads((archive / "approval.json").read_text())
+    assert archived["approver_identity"] == APPROVER, (
+        "the archived approval lost the approver"
+    )
+    resolved = admin_profile_approval.resolve_profile_approval(
+        tmp_path, current_plan=plan
+    )
+    assert resolved is not None
+    assert resolved.relation == "EXACT"
+    assert resolved.approver_identity == APPROVER
+
+    admin_profile_approval.consume_profile_approval(
+        tmp_path,
+        expected_plan_sha256=str(plan["plan_sha256"]),
+        release_id="release-1",
+        relation="EXACT",
+    )
+    consumed = json.loads((archive / "consumed.json").read_text())
+    assert consumed["approver_identity"] == APPROVER, (
+        "the consumption audit must name who approved what was consumed"
+    )
+
+
+def test_the_approver_defaults_to_the_resolved_operator(tmp_path: Path) -> None:
+    from tests.admin.conftest import TEST_OPERATOR_ARN
+
+    plan = _plan()
+    admin_profile_approval.write_profile_plan(tmp_path, plan)
+
+    record = admin_profile_approval.approve_profile(
+        tmp_path, reference="CHG-12345", expected_plan_sha256=str(plan["plan_sha256"])
+    )
+
+    assert record["approver_identity"] == TEST_OPERATOR_ARN, (
+        "without an explicit approver the STS caller identity must be recorded"
+    )
+
+
+def test_an_approval_written_before_the_field_existed_still_resolves(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    admin_profile_approval.write_profile_plan(tmp_path, plan)
+    record = admin_profile_approval.approve_profile(
+        tmp_path, reference="CHG-12345", expected_plan_sha256=str(plan["plan_sha256"])
+    )
+    legacy = {key: value for key, value in record.items() if key != "approver_identity"}
+    approval_path = admin_profile_approval.profile_approval_path(tmp_path)
+    approval_path.write_text(json.dumps(legacy), encoding="utf-8")
+    archive = admin_profile_approval.profile_approval_archive_path(
+        tmp_path, str(plan["plan_sha256"])
+    )
+    (archive / "approval.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    resolved = admin_profile_approval.resolve_profile_approval(
+        tmp_path, current_plan=plan
+    )
+
+    assert resolved is not None
+    assert resolved.reference == "CHG-12345"
+    assert resolved.approver_identity is None, (
+        "an older record has no approver; it must not be invented"
+    )

@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 
+from gpu_fault.app.ingest.node_health import NodeHealthIngestionService
 from gpu_fault.gpu_metrics import GpuInventorySnapshot
-from gpu_fault.models import WorkloadState
+from gpu_fault.hma import (
+    UNCLASSIFIED_SXID_REASON,
+    UNPARSED_SXID_REASON,
+    UNPARSED_XID_REASON,
+    HmaNormalizedBatch,
+    HmaProviderSignal,
+    unresolved_reason_kind,
+)
+from gpu_fault.host_health import (
+    NodeHealthCategory,
+    NodeHealthFinding,
+    NodeHealthIngestionResult,
+)
+from gpu_fault.models import RecoveryAction, Severity, WorkloadState
 from gpu_fault.policy import (
     ActionDisposition,
     FaultPolicyDecision,
@@ -12,12 +27,159 @@ from gpu_fault.policy import (
     XidEvent,
 )
 from gpu_fault.processor_diagnostics import report_processor_replay_phase
+from gpu_fault.store.shared.health_signals import finding_health_signal_key
+
+LOGGER = logging.getLogger(__name__)
+
+UNRESOLVED_SIGNAL_KINDS = (
+    UNPARSED_XID_REASON,
+    UNPARSED_SXID_REASON,
+    UNCLASSIFIED_SXID_REASON,
+)
 
 
 class FaultIngestionService:
     def __init__(self, context) -> None:
         self.context = context
         context.xid_correlation.finalizer = self.finalize_xid
+        # Per-kind count of provider signals whose fault line could not be
+        # resolved into an XID/SXID event. Exposed for the metrics snapshot;
+        # the finding below is the per-episode signal, this is the per-line
+        # one, so a drift that hits every line still shows its full rate.
+        self.unresolved_signal_totals: dict[str, int] = {}
+
+    def ingest_unresolved_signals(
+        self,
+        normalized: HmaNormalizedBatch,
+        *,
+        batch_id: str,
+    ) -> NodeHealthIngestionResult | None:
+        """Turn an unparsable fault line into something an operator sees.
+
+        The collectors forward every ``NVRM ... Xid`` and ``SXid`` line; when
+        the normalizer cannot extract a code (or an SXID's classification
+        word) the line used to land as evidence with ``status=success`` and
+        the reason in a response body nobody reads. A catalog or format drift
+        could therefore swallow real XIDs silently. Now every such line is a
+        WARNING and a counter, and the first one per node per episode opens a
+        WARNING node-health finding with ``COLLECT_EVIDENCE`` -- it freezes
+        evidence and routes to operator review without inventing a code and
+        without cordoning the node. A later line from the same node that does
+        parse ends the episode, so the next drift is reported again.
+        """
+
+        clears: list[tuple[str, bool, datetime, float]] = []
+        candidates: list[tuple[tuple[str, bool, datetime, float], NodeHealthFinding]]
+        candidates = []
+        for signal in normalized.provider_signals:
+            if not signal.unresolved_reasons:
+                clears.extend(
+                    (
+                        f"{signal.cluster_id}/{signal.node_id}/{kind}/node",
+                        False,
+                        signal.observed_at,
+                        0.0,
+                    )
+                    for kind in UNRESOLVED_SIGNAL_KINDS
+                )
+                continue
+            by_kind: dict[str, list[str]] = {}
+            for reason in signal.unresolved_reasons:
+                by_kind.setdefault(unresolved_reason_kind(reason), []).append(reason)
+            for kind, reasons in sorted(by_kind.items()):
+                self.unresolved_signal_totals[kind] = (
+                    self.unresolved_signal_totals.get(kind, 0) + 1
+                )
+                LOGGER.warning(
+                    "fault line could not be resolved; no code was invented "
+                    "kind=%s cluster=%s node=%s source=%s signal=%s reasons=%s",
+                    kind,
+                    signal.cluster_id,
+                    signal.node_id,
+                    signal.source.value,
+                    signal.signal_id,
+                    reasons,
+                )
+                finding = self._unresolved_signal_finding(
+                    signal, kind=kind, reasons=reasons, batch_id=batch_id
+                )
+                candidates.append(
+                    (
+                        (
+                            finding_health_signal_key(finding),
+                            True,
+                            signal.observed_at,
+                            0.0,
+                        ),
+                        finding,
+                    )
+                )
+        # The receive clock orders the episode: two kernel records can carry
+        # the same second, and a sample that is not newer on the state
+        # machine's clock is dropped as a replay.
+        received_at = datetime.now(timezone.utc)
+        if clears:
+            self.context.store.claim_health_signal_transitions(
+                clears, received_at=received_at
+            )
+        if not candidates:
+            return None
+        emitted = self.context.store.claim_health_signal_transitions(
+            [transition for transition, _ in candidates],
+            received_at=received_at,
+        )
+        findings = [
+            finding
+            for (_, finding), emit in zip(candidates, emitted, strict=True)
+            if emit
+        ]
+        if not findings:
+            return None
+        result = NodeHealthIngestionService(self.context).ingest(batch_id, findings)
+        notified_at = datetime.now(timezone.utc)
+        for finding in findings:
+            self.context.store.mark_health_signal_notified(
+                finding_health_signal_key(finding), notified_at=notified_at
+            )
+        return result
+
+    @staticmethod
+    def _unresolved_signal_finding(
+        signal: HmaProviderSignal,
+        *,
+        kind: str,
+        reasons: list[str],
+        batch_id: str,
+    ) -> NodeHealthFinding:
+        event_id = f"{signal.signal_id}-{kind}"
+        raw_message = (signal.raw_message or "")[:500] or None
+        return NodeHealthFinding(
+            finding_id=f"finding-{event_id}",
+            event_id=event_id,
+            cluster_id=signal.cluster_id,
+            node_id=signal.node_id,
+            observed_at=signal.observed_at,
+            category=NodeHealthCategory.GPU,
+            severity=Severity.WARNING,
+            reason=(
+                "a fault line from the node could not be resolved into an "
+                "XID/SXID event; operator review is required before the "
+                "signal is trusted or dismissed"
+            ),
+            recommended_action=RecoveryAction.COLLECT_EVIDENCE,
+            metric_name=kind,
+            value=1.0,
+            raw_message=raw_message,
+            evidence_ref=f"hma://{signal.source.value.lower()}/{signal.signal_id}",
+            diagnostic_parameters={
+                "unresolved_reasons": list(reasons),
+                "signal_source": signal.source.value,
+                "record_batch_id": batch_id,
+            },
+            policy_reference=(
+                "unresolved fault lines fail closed into operator review"
+            ),
+        )
 
     def _enrich_fault_identity(
         self,

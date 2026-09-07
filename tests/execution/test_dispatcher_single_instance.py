@@ -62,6 +62,12 @@ def _dispatcher(store, *, executor_id: str, **config):
     )
 
 
+def _mirror_plan(
+    dispatcher: WorkflowDispatcher, workflow, status: WorkflowStatus
+) -> None:
+    dispatcher._sync_plan(workflow, status)
+
+
 def _pending(store, request_id: str, incident_id: str, **values):
     incident = fault_incident(
         incident_id,
@@ -357,6 +363,49 @@ def test_plan_status_mirrors_the_workflow_status(workflow_status, plan_status) -
     store.save_workflow(workflow)
     dispatcher = _dispatcher(store, executor_id="executor-a")
 
-    dispatcher._sync_plan(workflow, workflow_status)
+    _mirror_plan(dispatcher, workflow, workflow_status)
 
     assert store.get_plan(plan.plan_id).status is plan_status
+
+
+def test_plan_mirror_yields_to_a_plan_another_writer_moved(monkeypatch) -> None:
+    """ARCH-D5: the mirror write is a CAS on the plan it read.
+
+    A plan moved between the dispatcher's read and its write is left as the
+    other writer put it; the miss is counted and logged, not fatal.
+    """
+    store = build_store()
+    plan = RecoveryPlan(
+        incident_id="inc-plan-race",
+        attempt_id="attempt-plan-race",
+        trigger="quick-triage:PASS",
+        runtime_profile_version="simulated-v1",
+        steps=[
+            {
+                "action": RecoveryAction.RESTART_WORKLOAD,
+                "node_ids": ["node-a"],
+                "execution_owner": "simulated-runtime",
+            }
+        ],
+    )
+    store.save_plan(plan)
+    _, workflow = workflow_state(store, [OP])
+    workflow = copy_model(workflow, source_plan_id=plan.plan_id)
+    store.save_workflow(workflow)
+    dispatcher = _dispatcher(store, executor_id="executor-a")
+    original_get_plan = store.get_plan
+
+    def racing_get_plan(plan_id: str):
+        read = original_get_plan(plan_id)
+        # Another writer lands between this read and the mirror write.
+        store.save_plan(copy_model(read, status=PlanStatus.SUPERSEDED))
+        return read
+
+    monkeypatch.setattr(store, "get_plan", racing_get_plan)
+
+    _mirror_plan(dispatcher, workflow, WorkflowStatus.FAILED)
+
+    assert store.get_plan(plan.plan_id).status is PlanStatus.SUPERSEDED, (
+        "the mirror write overwrote a plan another writer had moved"
+    )
+    assert dispatcher.plan_sync_misses_total == 1, "the stale mirror was not counted"

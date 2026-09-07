@@ -148,9 +148,26 @@ class WorkloadContext(StrictModel):
 
 
 class WorkloadTopologyService:
-    def __init__(self, store, *, max_age_seconds: int = 120) -> None:
+    def __init__(
+        self,
+        store,
+        *,
+        max_age_seconds: int = 120,
+        freshness_seconds: float = 600,
+    ) -> None:
+        if freshness_seconds <= 0:
+            raise ValueError("freshness_seconds must be positive")
+        if freshness_seconds < max_age_seconds:
+            raise ValueError(
+                "freshness_seconds must not be shorter than max_age_seconds: an "
+                "observation young enough to match a node must also count as "
+                "coverage of its cluster"
+            )
         self.store = store
         self.max_age_seconds = max_age_seconds
+        # How recently the cluster must have produced any attempt observation
+        # for "nothing matches this node" to mean IDLE rather than UNKNOWN.
+        self.freshness_seconds = freshness_seconds
 
     def observe(self, observation: AttemptObservation) -> None:
         self.store.save_attempt_observation(observation)
@@ -174,10 +191,22 @@ class WorkloadTopologyService:
         same cluster in one go read the cluster's observations once
         instead of once per node; the age filter below is what bounds
         staleness either way.
+
+        ``workload_state`` fails closed: IDLE needs fresh observation
+        coverage of the cluster (any attempt, any phase, observed within
+        ``freshness_seconds``) that simply does not name this node. A cluster
+        with no coverage -- the watcher down, the cluster silent, a stale
+        feed -- is UNKNOWN, which the compilers treat as "someone may be
+        using it" (design: monitoring loss is Unknown; ARCH-E2E-1 finding 2).
         """
 
         if observations is None:
             observations = self.store.list_attempt_observations(cluster_id)
+        covered = any(
+            (observed_at - observation.observed_at).total_seconds()
+            <= self.freshness_seconds
+            for observation in observations
+        )
         workloads: list[str] = []
         jobs: list[str] = []
         attempts: list[str] = []
@@ -234,8 +263,14 @@ class WorkloadTopologyService:
             ranks.extend(item.rank for item in matched)
             observed_gpu_uuids.extend(gpu for item in matched for gpu in item.gpu_uuids)
             profiles.append(observation.runtime_profile_version)
+        if attempts:
+            workload_state = "ACTIVE"
+        elif covered:
+            workload_state = "IDLE"
+        else:
+            workload_state = "UNKNOWN"
         return WorkloadContext(
-            workload_state="ACTIVE" if attempts else "IDLE",
+            workload_state=workload_state,
             workload_ids=list(dict.fromkeys(workloads)),
             job_ids=list(dict.fromkeys(jobs)),
             attempt_ids=list(dict.fromkeys(attempts)),

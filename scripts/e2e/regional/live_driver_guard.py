@@ -41,6 +41,8 @@ __all__ = [
     "build_plan",
     "environment_snapshot",
     "install_site_profile",
+    "PlainCaseRunner",
+    "run_plain_case",
     "run_selected_case",
     "run_standard_case",
 ]
@@ -306,6 +308,50 @@ def run_standard_case(case: CaseRunner[S]) -> int:
         case_id=case.case_id,
         confirmation=case.confirmation,
     )
+
+
+@dataclass(frozen=True)
+class PlainCaseRunner:
+    """A runner with no configured settings.
+
+    The plan is static (no read-only preflight, no environment snapshot) and
+    the case reads the site from the environment only when it executes; the
+    CMD/NET hold cases are this shape.
+    """
+
+    case_id: str
+    confirmation: str
+    parser: Callable[[], argparse.ArgumentParser]
+    plan_details: Callable[[], dict[str, Any]]
+    run_case: Callable[[Path, int, datetime], int]
+
+
+def run_plain_case(case: PlainCaseRunner) -> int:
+    """``run_standard_case`` for a ``PlainCaseRunner``.
+
+    Site profile first, then parse, then the ``0o077`` umask before anything
+    under ``--run-dir`` exists. Without ``--execute`` the static plan is
+    printed and the exit code is 0; with it, ``authorize_execution`` must pass
+    before ``run_case`` runs, and its verdict is the exit code.
+    """
+
+    install_site_profile()
+    arguments = case.parser().parse_args()
+    os.umask(0o077)
+    if not arguments.execute:
+        plan = build_plan(
+            run_dir=arguments.run_dir,
+            case_id=case.case_id,
+            attempt=arguments.attempt,
+            confirmation=case.confirmation,
+            details=case.plan_details(),
+        )
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return 0
+    deadline = authorize_execution(
+        arguments, case_id=case.case_id, confirmation=case.confirmation
+    )
+    return case.run_case(arguments.run_dir, arguments.attempt, deadline)
 
 
 def run_selected_case(case: CaseSurface[T]) -> int:

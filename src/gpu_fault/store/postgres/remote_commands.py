@@ -8,10 +8,14 @@ from gpu_fault.remote_command_models import (
     RemoteCommandStatus,
     lease_deadline,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.remote_helpers import (
     LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS,
     UNCLAIMED_DEADLINE_STATUS_SOURCE,
+)
+from gpu_fault.store.shared.remote_helpers import (
+    remote_command_step_space as _remote_command_step_space,
 )
 from gpu_fault.store.shared.remote_helpers import (
     unclaimed_expiry_update as _unclaimed_expiry_update,
@@ -79,6 +83,42 @@ class PostgresRemoteCommandMixin:
             cursor.execute(query, parameters)
             rows = cursor.fetchall()
         return [self._decode("remote_command", row[0]) for row in rows]
+
+    def find_open_remote_command(
+        self,
+        workflow_request_id: str,
+        step_index: int,
+        command_step_space: str,
+        *,
+        exclude_command_id: str | None = None,
+    ) -> RemoteActionCommand | None:
+        """See ``WorkflowStore.find_open_remote_command`` (item D5).
+
+        One index range scan on ``gpu_fault_remote_command_workflow_all``
+        (the workflow prefix), then the step and status predicates on the
+        handful of rows one workflow has; the step space is decided in Python
+        from the embedded workflow like the other backends.
+        """
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload FROM gpu_fault_objects
+                WHERE kind='remote_command'
+                  AND payload->>'workflow_request_id'=%s
+                  AND (payload->>'step_index')::int=%s
+                  AND payload->>'status' IN ('PENDING', 'LEASED', 'WAITING')
+                  AND key IS DISTINCT FROM %s
+                ORDER BY payload->>'created_at', key
+                """,
+                (workflow_request_id, step_index, exclude_command_id),
+            )
+            rows = cursor.fetchall()
+        for row in rows:
+            command = self._decode("remote_command", row[0])
+            if _remote_command_step_space(command) == command_step_space:
+                return command  # type: ignore[no-any-return]
+        return None
 
     def remote_command_stats(self, *, now: datetime | None = None) -> dict[str, Any]:
         observed_at = now or datetime.now(timezone.utc)
@@ -524,12 +564,12 @@ class PostgresRemoteCommandMixin:
                           AND objects.key=victims.key
                         RETURNING objects.key
                     )
-                    SELECT count(*) FROM deleted
+                    SELECT key FROM deleted ORDER BY key
                     """,
                     (_utc_text(older_than), limit),
                 )
-                row = cursor.fetchone()
-            return int(row[0]) if row else 0
+                keys = [row[0] for row in cursor.fetchall()]
+            return log_cleanup("remote_command", keys)
 
     def expire_unclaimed_remote_commands(
         self,

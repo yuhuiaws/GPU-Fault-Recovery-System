@@ -920,7 +920,13 @@ def test_kubernetes_adapter_retries_node_isolation_conflict() -> None:
     assert core.node["spec"]["unschedulable"] is True
 
 
-def test_kubernetes_adapter_treats_absent_node_as_isolated() -> None:
+def test_kubernetes_adapter_fails_closed_when_the_node_to_isolate_is_absent() -> None:
+    """A node that cannot be read cannot be shown isolated (A5).
+
+    The old outcome recorded ``already_absent_nodes`` and succeeded; nothing
+    downstream ever read that key, so a vanished node sailed into REBOOT.
+    """
+
     class MissingCore(FakeCoreApi):
         def read_node(self, _node_id):
             error = KeyError("node is gone")
@@ -946,9 +952,10 @@ def test_kubernetes_adapter_treats_absent_node_as_isolated() -> None:
         workflow.request_id,
     )
 
-    assert result.status is WorkflowStatus.SUCCEEDED
+    assert result.status is WorkflowStatus.FAILED
     execution = store.get_workflow(workflow.request_id).step_executions[0]
-    assert execution.details["already_absent_nodes"] == ["node-a"]
+    assert execution.details["safety_rejection"] is True
+    assert execution.details["absent"] is True
 
 
 def test_kubernetes_adapter_hashes_long_incident_id_for_taint() -> None:

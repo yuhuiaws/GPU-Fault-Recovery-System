@@ -8,8 +8,8 @@ import ssl
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from threading import Event, Thread
-from typing import Any
+from threading import Event, Lock, Thread
+from typing import Any, Callable
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
@@ -19,6 +19,7 @@ from gpu_fault.adapters import (
     KubernetesWorkflowAdapter,
     NodeActionWorkflowAdapter,
 )
+from gpu_fault.adapters.node_action.lease_guard import active_lease_guard
 from gpu_fault.aws_errors import (
     aws_configuration_error,
     missing_aws_credentials,
@@ -28,6 +29,7 @@ from gpu_fault.env_validation import (
 )
 from gpu_fault.env import env_bool
 from gpu_fault.execution import WorkflowStepContext
+from gpu_fault.execution.transient_errors import retryable_adapter_error
 from gpu_fault.execution.fleet_preflight import (
     command_requires_fleet_preflight,
     fleet_preflight_reason,
@@ -54,6 +56,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
     execution_phase,
 )
+from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
 from gpu_fault.regional import (
     RegionalExecutorReadinessRequest,
     RemoteActionCommand,
@@ -580,6 +583,161 @@ class RegionalIncidentOwnershipProvider:
         return report.known and report.terminal
 
 
+class CommandLeaseWatch:
+    """This executor's local view of one claimed command's lease.
+
+    Updated by the renewal thread, read by the executing thread (through the
+    node-action lease guard) and by ``_execute_and_report`` before it posts.
+    ``hold_reason()`` is non-None once the executor can no longer vouch for
+    the command: renewal failed ``failure_limit`` times in a row, the lease
+    window passed without a renewal landing, or the control plane asked for
+    cancellation. The first two mean another executor may already own the
+    command; the third means nothing new should start.
+    """
+
+    def __init__(
+        self,
+        *,
+        lease_seconds: int,
+        failure_limit: int,
+        clock: Callable[[], float],
+    ) -> None:
+        self.lease_seconds = lease_seconds
+        self.failure_limit = failure_limit
+        self.clock = clock
+        self._lock = Lock()
+        self.expires_at = clock() + lease_seconds
+        self.consecutive_failures = 0
+        self.lost_reason: str | None = None
+        self.cancellation_reason: str | None = None
+
+    def renewed(self, response: Any) -> str | None:
+        """Record a successful renewal; return the cancellation reason if any."""
+
+        with self._lock:
+            self.consecutive_failures = 0
+            self.expires_at = self.clock() + self.lease_seconds
+            requested_at = getattr(response, "cancellation_requested_at", None)
+            if requested_at is not None and self.cancellation_reason is None:
+                self.cancellation_reason = (
+                    getattr(response, "cancellation_reason", None)
+                    or "cancellation requested by the control plane"
+                )
+                return self.cancellation_reason
+        return None
+
+    def renewal_failed(self, error: BaseException) -> bool:
+        """Count one failed renewal; True when the lease is now treated as lost."""
+
+        with self._lock:
+            self.consecutive_failures += 1
+            if (
+                self.lost_reason is None
+                and self.consecutive_failures >= self.failure_limit
+            ):
+                self.lost_reason = (
+                    f"lease renewal failed {self.consecutive_failures} time(s) "
+                    f"in a row: {type(error).__name__}: {error}"
+                )
+                return True
+        return False
+
+    def lost(self) -> bool:
+        return self.lost_reason is not None or self.clock() >= self.expires_at
+
+    def hold_reason(self) -> str | None:
+        with self._lock:
+            if self.lost_reason is not None:
+                return self.lost_reason
+            if self.clock() >= self.expires_at:
+                return (
+                    f"lease expired locally after {self.lease_seconds}s "
+                    "without a successful renewal"
+                )
+            return self.cancellation_reason
+
+
+# ARCH-A4b: the regional executor has no store, so a stale warm-spare
+# reservation can only be judged by its timestamp. One day mirrors the
+# control-plane controller's default; five minutes between sweeps is far
+# below the TTL and costs one node list per sweep.
+SPARE_RESERVATION_TTL_SECONDS = 86400.0
+SPARE_RESERVATION_SWEEP_INTERVAL_SECONDS = 300.0
+
+
+class SpareReservationSweep:
+    """Reclaim warm-spare reservations whose owner can no longer be asked.
+
+    The control plane's ``HyperPodSpareHealthController`` reads the owning
+    workflow from its store; the regional executor is storeless, so
+    ``SpareReservationReclaimer`` runs here with ``store=None`` and only the
+    ``reserved-at`` TTL decides. A reservation without that annotation is kept
+    (no evidence of staleness), and a spare running GPU pods is never touched.
+    """
+
+    def __init__(
+        self,
+        coordinator: HyperPodSpareCoordinator,
+        *,
+        ttl_seconds: float = SPARE_RESERVATION_TTL_SECONDS,
+        interval_seconds: float = SPARE_RESERVATION_SWEEP_INTERVAL_SECONDS,
+        now: Callable[[], datetime] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        from gpu_fault.spare_health import SpareReservationReclaimer
+
+        self.coordinator = coordinator
+        self.interval_seconds = interval_seconds
+        self.clock = clock
+        self.reclaimer = SpareReservationReclaimer(
+            coordinator,
+            None,
+            now=now or (lambda: datetime.now(timezone.utc)),
+            ttl_seconds=ttl_seconds,
+        )
+        self.reclaimed_total = 0
+        self._next_due: float | None = None
+
+    def due(self) -> bool:
+        return self._next_due is None or self.clock() >= self._next_due
+
+    def run(self) -> list[str]:
+        """Sweep every spare-labelled node once; returns the nodes released."""
+
+        self._next_due = self.clock() + self.interval_seconds
+        released: list[str] = []
+        for node in self.coordinator.lifecycle.list_nodes(enrich=True):
+            if (
+                node.kubernetes_labels.get(self.coordinator.spare_label)
+                != self.coordinator.spare_label_value
+            ):
+                continue
+            node_name = self.coordinator._kubernetes_node_name(node)
+            if node_name is None:
+                continue
+            kubernetes_node = self.coordinator.core.read_node(node_name)
+            reservation = self.coordinator._annotation(kubernetes_node)
+            if not reservation:
+                continue
+            reason = self.reclaimer.reason(node_name, kubernetes_node, reservation)
+            if reason is None:
+                continue
+            self.coordinator.release([node_name], reservation)
+            self.reclaimed_total += 1
+            released.append(node_name)
+            LOGGER.warning(
+                "reclaimed stale spare reservation: node=%s incident=%s reason=%s",
+                node_name,
+                reservation,
+                reason,
+            )
+        return released
+
+
 class ClusterActionExecutor:
     def __init__(
         self,
@@ -595,6 +753,9 @@ class ClusterActionExecutor:
         confirm_cluster_name: str | None = None,
         claim_backoff_max_seconds: float = 60,
         claim_state_path: str | None = None,
+        lease_renewal_failure_limit: int = 3,
+        clock: Callable[[], float] = time.monotonic,
+        spare_reservation_sweep: SpareReservationSweep | None = None,
     ) -> None:
         if poll_seconds <= 0:
             raise ClusterExecutorError("cluster executor poll seconds must be positive")
@@ -614,6 +775,13 @@ class ClusterActionExecutor:
             raise ClusterExecutorError(
                 "claim backoff max must not be less than poll seconds"
             )
+        if not 1 <= lease_renewal_failure_limit <= 100:
+            raise ClusterExecutorError(
+                "cluster executor lease renewal failure limit must be between 1 and 100"
+            )
+        self.lease_renewal_failure_limit = lease_renewal_failure_limit
+        self.clock = clock
+        self.spare_reservation_sweep = spare_reservation_sweep
         self.client = client
         self.adapters = adapters
         self.executor_id = executor_id
@@ -645,6 +813,18 @@ class ClusterActionExecutor:
         self.reported_failures = 0
         self.unexpected_failures = 0
         self.lease_renewal_failures = 0
+        # Commands whose lease this executor stopped trusting (renewals
+        # exhausted or the window passed), results it therefore did not
+        # post, cancellations seen in a renew response, and multi-node
+        # barrier steps held because no coordinator is wired.
+        self.lease_lost_total = 0
+        self.results_withheld_total = 0
+        self.cancellations_observed_total = 0
+        self.barrier_unavailable_holds_total = 0
+        # Adapter exceptions that say nothing about the step (Kubernetes
+        # 409/429/5xx, urllib3 timeouts) reported WAITING instead of FAILED
+        # (ARCH-B1 reached from the regional topology).
+        self.retryable_adapter_errors_total = 0
         self.last_successful_claim_at: datetime | None = None
         # Whether the last claim cycle moved any command off WAITING. run()
         # takes the idle path when it did not, so a held command polls at
@@ -667,6 +847,37 @@ class ClusterActionExecutor:
             None,
         )
 
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """Every executor counter, for the claim breadcrumb and operators.
+
+        The executor Pod has no /metrics listener of its own; the readiness
+        probe already reads the claim-state breadcrumb out of process, so the
+        counters ride along in that file (``kubectl exec ... cat``) until a
+        scrape endpoint exists.
+        """
+
+        return {
+            "claimed_total": self.claimed_total,
+            "reported_failures": self.reported_failures,
+            "unexpected_failures": self.unexpected_failures,
+            "lease_renewal_failures": self.lease_renewal_failures,
+            "lease_lost_total": self.lease_lost_total,
+            "results_withheld_total": self.results_withheld_total,
+            "cancellations_observed_total": (self.cancellations_observed_total),
+            "barrier_unavailable_holds_total": (self.barrier_unavailable_holds_total),
+            "retryable_adapter_errors_total": self.retryable_adapter_errors_total,
+            "spare_reservations_reclaimed_total": (
+                self.spare_reservation_sweep.reclaimed_total
+                if self.spare_reservation_sweep is not None
+                else 0
+            ),
+            "last_successful_claim_at": (
+                self.last_successful_claim_at.isoformat()
+                if self.last_successful_claim_at is not None
+                else None
+            ),
+        }
+
     def _record_successful_claim(self, claimed_at: datetime) -> None:
         try:
             path = self.claim_state_path
@@ -677,6 +888,7 @@ class ClusterActionExecutor:
                         "executor_id": self.executor_id,
                         "execution_owners": self.execution_owners,
                         "last_successful_claim_at": (claimed_at.isoformat()),
+                        "counters": self.metrics_snapshot(),
                     },
                     handle,
                 )
@@ -703,8 +915,8 @@ class ClusterActionExecutor:
         # queue is empty. That is the only useful executor liveness
         # signal; the readiness marker file only proves pip install ran.
         self.last_successful_claim_at = datetime.now(timezone.utc)
-        self._record_successful_claim(self.last_successful_claim_at)
         self.claimed_total += len(commands)
+        self._record_successful_claim(self.last_successful_claim_at)
         self.last_cycle_advanced = True
         if commands:
             with ThreadPoolExecutor(
@@ -732,15 +944,44 @@ class ClusterActionExecutor:
 
     def _execute_and_report(self, command: RemoteActionCommand) -> RemoteCommandStatus:
         stop = Event()
+        watch = CommandLeaseWatch(
+            lease_seconds=self.lease_seconds,
+            failure_limit=self.lease_renewal_failure_limit,
+            clock=self.clock,
+        )
         renewer = Thread(
             target=self._renew_lease,
-            args=(command, stop),
+            args=(command, stop, watch),
             name=f"lease-{command.command_id[:24]}",
             daemon=True,
         )
         renewer.start()
+        # The node-action adapter reads this before every send, so a lost
+        # lease stops new node actions without widening the adapter API.
+        guard_token = active_lease_guard.set(watch.hold_reason)
         try:
             result = self._execute(command)
+            if watch.lost():
+                # Another executor may hold this command by now. The agent
+                # ledger keeps whatever ran; the next lease holder polls it
+                # by command_id. Posting here would race that holder's result
+                # under a lease this process no longer owns.
+                if watch.lost_reason is None:
+                    # Expired on the local clock without the renewer ever
+                    # declaring it lost; count it here, once.
+                    self.lease_lost_total += 1
+                self.results_withheld_total += 1
+                LOGGER.warning(
+                    "regional cluster executor withheld a result under a lost "
+                    "lease: command=%s cluster=%s operation=%s status=%s "
+                    "reason=%s",
+                    command.command_id,
+                    command.cluster_id,
+                    command.step.operation.value,
+                    result.status.value,
+                    watch.hold_reason(),
+                )
+                return RemoteCommandStatus.WAITING
             try:
                 self.client.complete(command, result)
             except ClusterExecutorError:
@@ -758,28 +999,70 @@ class ClusterActionExecutor:
                 self.reported_failures += 1
             return result.status
         finally:
+            active_lease_guard.reset(guard_token)
             stop.set()
             renewer.join(timeout=2)
 
-    def _renew_lease(self, command: RemoteActionCommand, stop: Event) -> None:
+    def _renew_lease(
+        self,
+        command: RemoteActionCommand,
+        stop: Event,
+        watch: CommandLeaseWatch | None = None,
+    ) -> None:
         # ``lease_seconds`` is validated to 10..7200 at construction, so a third
         # of it is never below 3.3s; the only clamp that can bind is the 30s
         # ceiling that keeps a long lease from going unrenewed for minutes.
         interval = min(30.0, self.lease_seconds / 3)
         while not stop.wait(interval):
             try:
-                self.client.renew(
+                renewed = self.client.renew(
                     command,
                     self.executor_id,
                     self.lease_seconds,
                 )
-            except Exception:
+            except Exception as exc:
                 self.lease_renewal_failures += 1
                 LOGGER.exception(
                     "regional command lease renewal failed: command=%s cluster=%s",
                     command.command_id,
                     command.cluster_id,
                 )
+                if watch is not None and watch.renewal_failed(exc):
+                    self.lease_lost_total += 1
+                    LOGGER.error(
+                        "regional command lease treated as lost; no further "
+                        "node actions will start and the result will not be "
+                        "posted: command=%s cluster=%s reason=%s",
+                        command.command_id,
+                        command.cluster_id,
+                        watch.lost_reason,
+                    )
+                    return
+                continue
+            if watch is None:
+                continue
+            cancellation = watch.renewed(renewed)
+            if cancellation is not None:
+                self.cancellations_observed_total += 1
+                LOGGER.warning(
+                    "regional command cancellation requested during execution; "
+                    "no further node actions will start: command=%s cluster=%s "
+                    "reason=%s",
+                    command.command_id,
+                    command.cluster_id,
+                    cancellation,
+                )
+
+    def sweep_spare_reservations(self) -> None:
+        """Run the periodic spare sweep when due; never raises (ARCH-A4b)."""
+
+        sweep = self.spare_reservation_sweep
+        if sweep is None or not sweep.due():
+            return
+        try:
+            sweep.run()
+        except Exception:  # noqa: BLE001 - housekeeping must not stop claims
+            LOGGER.warning("spare reservation sweep failed", exc_info=True)
 
     def run(self) -> None:
         consecutive_failures = 0
@@ -787,6 +1070,7 @@ class ClusterActionExecutor:
             try:
                 count = self.run_once()
                 consecutive_failures = 0
+                self.sweep_spare_reservations()
             except Exception as exc:
                 consecutive_failures += 1
                 delay = min(
@@ -863,6 +1147,9 @@ class ClusterActionExecutor:
                     "remote command requires exactly one local adapter; "
                     f"found {len(matches)}"
                 )
+            barrier_hold = self._barrier_hold(command, matches[0], lease_token)
+            if barrier_hold is not None:
+                return barrier_hold
             workflow = command.workflow
             if command.result_details:
                 previous = WorkflowStepExecution(
@@ -940,22 +1227,8 @@ class ClusterActionExecutor:
                 error=f"{type(exc).__name__}: {exc}",
             )
         except Exception as exc:
-            retryable = retryable_transport_result(
-                exc,
-                lease_token=lease_token,
-                executor_id=self.executor_id,
-            )
+            retryable = self._retryable_result(exc, command, lease_token)
             if retryable is not None:
-                LOGGER.warning(
-                    "regional cluster executor transport failed; "
-                    "command remains retryable: command=%s cluster=%s "
-                    "operation=%s nodes=%s: %s",
-                    command.command_id,
-                    command.cluster_id,
-                    command.step.operation.value,
-                    ",".join(command.step.node_ids),
-                    retryable.details["reason"],
-                )
                 return retryable
             configuration_reason = aws_configuration_error(exc)
             if configuration_reason is not None:
@@ -1015,6 +1288,119 @@ class ClusterActionExecutor:
                     "exception_type": type(exc).__name__,
                 },
             )
+
+    def _retryable_result(
+        self,
+        exc: BaseException,
+        command: RemoteActionCommand,
+        lease_token: str,
+    ) -> RemoteCommandResult | None:
+        """WAITING for an exception that says nothing about the step, else None.
+
+        Transport failures keep their established shape. An adapter error
+        ARCH-B1 classifies as retryable (a Kubernetes 409/429/5xx, a urllib3
+        timeout raised inside the adapter) gets the same treatment from the
+        regional topology: the command stays WAITING and is re-claimed,
+        bounded by the control plane's per-step waiting cap exactly like a
+        transport retry (ARCH-E2E-1 finding 1).
+        """
+
+        retryable = retryable_transport_result(
+            exc,
+            lease_token=lease_token,
+            executor_id=self.executor_id,
+        )
+        if retryable is not None:
+            LOGGER.warning(
+                "regional cluster executor transport failed; "
+                "command remains retryable: command=%s cluster=%s "
+                "operation=%s nodes=%s: %s",
+                command.command_id,
+                command.cluster_id,
+                command.step.operation.value,
+                ",".join(command.step.node_ids),
+                retryable.details["reason"],
+            )
+            return retryable
+        if not retryable_adapter_error(exc):
+            return None
+        self.retryable_adapter_errors_total += 1
+        LOGGER.warning(
+            "regional cluster executor adapter raised a retryable "
+            "error; command remains retryable: command=%s cluster=%s "
+            "operation=%s nodes=%s: %s: %s",
+            command.command_id,
+            command.cluster_id,
+            command.step.operation.value,
+            ",".join(command.step.node_ids),
+            type(exc).__name__,
+            exc,
+        )
+        return RemoteCommandResult(
+            lease_token=lease_token,
+            status=RemoteCommandStatus.WAITING,
+            status_source="executor-retryable-adapter-error",
+            details={
+                "retryable_adapter_error": True,
+                "reason": "RETRYABLE_ADAPTER_ERROR",
+                "executor_id": self.executor_id,
+                "exception_type": type(exc).__name__,
+                "adapter_error": str(exc)[:200],
+            },
+        )
+
+    def _barrier_hold(
+        self,
+        command: RemoteActionCommand,
+        adapter: Any,
+        lease_token: str,
+    ) -> RemoteCommandResult | None:
+        """Hold a multi-node barrier step this topology cannot coordinate.
+
+        ``BarrierCoordinator`` persists barrier state through the control-plane
+        store, which the regional executor does not have (REMOTE_STATE=true)
+        and which the control plane exposes read-only over the API. The
+        node-action adapter is therefore built with ``barriers=None`` here,
+        and ``_execute_multi_node_reset`` would answer with a bare FAILED that
+        reads like the reset itself failed. Refuse at the claim boundary
+        instead, with a reason and a counter.
+        """
+
+        if not (
+            command.step.operation in MULTI_NODE_BARRIER_OPERATIONS
+            and len(command.step.node_ids) > 1
+        ):
+            return None
+        if getattr(adapter, "barriers", None) is not None:
+            return None
+        self.barrier_unavailable_holds_total += 1
+        reason = (
+            f"{command.step.operation.value} across {len(command.step.node_ids)} "
+            "nodes needs a multi-node barrier coordinator, and this regional "
+            "executor has none (barrier state lives in the control-plane "
+            "store); split the step per node or run it from a topology with "
+            "a barrier coordinator"
+        )
+        LOGGER.warning(
+            "remote command held: multi-node barrier unavailable: command=%s "
+            "cluster=%s operation=%s nodes=%s",
+            command.command_id,
+            command.cluster_id,
+            command.step.operation.value,
+            ",".join(command.step.node_ids),
+        )
+        return RemoteCommandResult(
+            lease_token=lease_token,
+            status=RemoteCommandStatus.WAITING,
+            status_source="executor-barrier-unavailable",
+            details={
+                "multi_node_barrier_unavailable": True,
+                "operation": command.step.operation.value,
+                "node_ids": list(command.step.node_ids),
+                "reason": reason,
+                "executor_id": self.executor_id,
+            },
+        )
 
     def _retryable_control_plane_result(
         self,
@@ -1117,6 +1503,7 @@ def executor_from_environment() -> ClusterActionExecutor:
     store = None if use_remote_state else _persistent_store_from_environment()
     regional_client = _regional_client_from_environment()
     fleet_registry = RegionalFleetRegistry(regional_client)
+    spare_coordinator: HyperPodSpareCoordinator | None = None
     kubernetes_adapter = KubernetesWorkflowAdapter(
         owner=os.getenv(
             "GPU_FAULT_KUBERNETES_OWNER",
@@ -1199,7 +1586,6 @@ def executor_from_environment() -> ClusterActionExecutor:
                 else store
             ),
         )
-        spare_coordinator = None
         # Reboot confirmation always needs the fleet registry to compare
         # the pre-submit boot/incarnation baseline with the new Agent
         # heartbeat. Spare failover controls only replacement
@@ -1258,11 +1644,13 @@ def executor_from_environment() -> ClusterActionExecutor:
         for value in os.getenv("GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES", "").split(",")
         if value.strip()
     }
+    sweep = SpareReservationSweep(spare_coordinator) if spare_coordinator else None
     return ClusterActionExecutor(
         regional_client,
         adapters,
         executor_id=executor_id,
         allowed_namespaces=namespaces,
+        spare_reservation_sweep=sweep,
         poll_seconds=float(
             os.getenv(
                 "GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS",
@@ -1287,6 +1675,9 @@ def executor_from_environment() -> ClusterActionExecutor:
         # REPLACE_NODE fails the adapter's confirmation gate instead of
         # confirming itself.
         confirm_cluster_name=(hyperpod_confirm_cluster),
+        lease_renewal_failure_limit=int(
+            os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_LEASE_FAILURE_LIMIT", "3")
+        ),
     )
 
 

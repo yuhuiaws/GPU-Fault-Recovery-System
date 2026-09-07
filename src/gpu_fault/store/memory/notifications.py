@@ -21,6 +21,12 @@ from gpu_fault.store.shared.notification_helpers import (
 from gpu_fault.store.shared.notification_helpers import (
     with_incident_drill_label as _with_incident_drill_label,
 )
+from gpu_fault.store.shared.notification_helpers import (
+    check_delivery_lease,
+    completed_delivery,
+    delivery_stats_from_rows,
+    released_delivery,
+)
 
 
 class MemoryNotificationMixin:
@@ -249,35 +255,21 @@ class MemoryNotificationMixin:
         terminal: bool = False,
     ) -> NotificationDelivery:
         with self._lock:
-            current = self._notification_deliveries.get(notification_id)
-            if (
-                current is None
-                or current.status is not NotificationDeliveryStatus.LEASED
-                or current.lease_owner != owner_id
-                or current.lease_epoch != lease_epoch
-                or current.lease_expires_at is None
-                or current.lease_expires_at <= now
-            ):
-                raise WorkflowLeaseError("notification delivery lease is stale")
-            attempts = current.attempts + 1
-            if result.status is NotificationStatus.SENT:
-                status = NotificationDeliveryStatus.SENT
-            elif terminal:
-                status = NotificationDeliveryStatus.DEAD
-            else:
-                status = NotificationDeliveryStatus.RETRY
-            value = current.model_copy(
-                update={
-                    "status": status,
-                    "attempts": attempts,
-                    "available_at": retry_at or now,
-                    "lease_owner": None,
-                    "lease_expires_at": None,
-                    "last_error": result.reason,
-                    "updated_at": now,
-                }
+            current = check_delivery_lease(
+                self._notification_deliveries.get(notification_id),
+                owner_id=owner_id,
+                lease_epoch=lease_epoch,
+                now=now,
             )
-            self._notification_results[notification_id] = result
+            value, record_result = completed_delivery(
+                current,
+                result=result,
+                now=now,
+                retry_at=retry_at,
+                terminal=terminal,
+            )
+            if record_result:
+                self._notification_results[notification_id] = result
             self._notification_deliveries[notification_id] = value
             return value
 
@@ -302,23 +294,16 @@ class MemoryNotificationMixin:
         """
 
         with self._lock:
-            current = self._notification_deliveries.get(notification_id)
-            if (
-                current is None
-                or current.status is not NotificationDeliveryStatus.LEASED
-                or current.lease_owner != owner_id
-                or current.lease_epoch != lease_epoch
-            ):
+            try:
+                current = check_delivery_lease(
+                    self._notification_deliveries.get(notification_id),
+                    owner_id=owner_id,
+                    lease_epoch=lease_epoch,
+                    now=None,
+                )
+            except WorkflowLeaseError:
                 return None
-            value = current.model_copy(
-                update={
-                    "status": NotificationDeliveryStatus.RETRY,
-                    "available_at": retry_at,
-                    "lease_owner": None,
-                    "lease_expires_at": None,
-                    "updated_at": now,
-                }
-            )
+            value = released_delivery(current, now=now, retry_at=retry_at)
             self._notification_deliveries[notification_id] = value
             return value
 
@@ -355,6 +340,17 @@ class MemoryNotificationMixin:
                 )
                 counts[status] += 1
             return counts
+
+    def notification_delivery_stats(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        observed_at = now or datetime.now(timezone.utc)
+        with self._lock:
+            return delivery_stats_from_rows(
+                list(self._notification_deliveries.values()),
+                dict(self._notification_results),
+                now=observed_at,
+            )
 
     def save_notification_result(self, result: NotificationResult) -> None:
         with self._lock:

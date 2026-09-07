@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
+from gpu_fault.adapters.common import (
+    ANNOTATION_FENCING,
+    ANNOTATION_INCIDENT,
+    QUARANTINE_TAINT,
+    quarantine_taint_value,
+)
 from gpu_fault.adapters.hyperpod.confirmation import HyperPodConfirmationMixin
 from gpu_fault.adapters.hyperpod.notifications import HyperPodNotificationMixin
 from gpu_fault.adapters.kubernetes.adapter import KubernetesWorkflowAdapter
@@ -26,6 +33,7 @@ from gpu_fault.hyperpod_spares import (
 )
 from gpu_fault.models import (
     WorkflowOperation,
+    WorkflowRequest,
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
@@ -37,6 +45,14 @@ from gpu_fault.operation_registry import (
     OperationAdapter,
     operations_for_adapter,
 )
+
+
+@dataclass(frozen=True)
+class ObservedIsolation:
+    """What the scheduler currently shows for the nodes a step will mutate."""
+
+    verified: list[str]
+    nodes: dict[str, dict[str, Any]]
 
 
 class HyperPodLifecycleStepAdapter(
@@ -76,6 +92,139 @@ class HyperPodLifecycleStepAdapter(
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner == self.owner and step.operation in self.OPERATIONS
+
+    def release_spare_reservations(
+        self, workflow: WorkflowRequest, incident_id: str
+    ) -> list[str]:
+        """Release warm spares a REPLACE_NODE step reserved but never consumed.
+
+        A step that went WAITING with ``activated_spare_nodes`` and was then
+        ended by the watchdog, the lifetime bound or a preemption never ran
+        the ``except`` path that released them. The executor's terminal
+        path should call this for every non-SUCCEEDED end; spares named by
+        a SUCCEEDED failover are training nodes now and are kept.
+        """
+        if self.spare_coordinator is None:
+            return []
+        consumed: set[str] = set()
+        pending: list[str] = []
+        for execution in workflow.step_executions:
+            if execution.operation is not WorkflowOperation.REPLACE_NODE:
+                continue
+            nodes = [
+                str(item)
+                for item in execution.details.get("activated_spare_nodes") or []
+            ]
+            if execution.status is WorkflowStepStatus.SUCCEEDED:
+                consumed.update(nodes)
+            else:
+                pending.extend(nodes)
+        release = [node for node in dict.fromkeys(pending) if node not in consumed]
+        if release:
+            self.spare_coordinator.release(release, incident_id)
+        return release
+
+    def _kubernetes_node_candidates(self, node_id: str) -> list[str]:
+        candidates = [node_id]
+        try:
+            nodes = self.dispatcher.adapter.resolve_nodes([node_id])
+        except (AttributeError, HyperPodAdapterError, KeyError, ValueError):
+            return candidates
+        for node in nodes:
+            labels = getattr(node, "kubernetes_labels", {}) or {}
+            for candidate in (
+                labels.get("kubernetes.io/hostname"),
+                f"hyperpod-{node.instance_id}" if node.instance_id else None,
+            ):
+                if candidate and candidate not in candidates:
+                    candidates.append(str(candidate))
+        return candidates
+
+    @staticmethod
+    def _isolation_problems(node: Any, context: WorkflowStepContext) -> list[str]:
+        incident_id = context.incident.incident_id
+        problems = []
+        if not KubernetesWorkflowAdapter._unschedulable(node):
+            problems.append("spec.unschedulable is not true")
+        owned = {incident_id, quarantine_taint_value(incident_id)}
+        if not any(
+            item.get("key") == QUARANTINE_TAINT and item.get("value") in owned
+            for item in KubernetesWorkflowAdapter._taints(node)
+        ):
+            problems.append("quarantine taint for this incident is missing")
+        annotations = KubernetesWorkflowAdapter._annotations(node)
+        if annotations.get(ANNOTATION_INCIDENT) != incident_id:
+            problems.append(
+                "incident annotation is "
+                f"{annotations.get(ANNOTATION_INCIDENT)!r}, not this incident"
+            )
+        return problems
+
+    def _observe_isolation(
+        self, context: WorkflowStepContext
+    ) -> ObservedIsolation | WorkflowStepOutcome:
+        """Read each target node and require it to be isolated right now.
+
+        ``isolation_verified_nodes`` on the request and ``MARK_UNSCHEDULABLE``
+        in ``completed_operations`` are memories of an earlier step; a node
+        can be uncordoned, re-registered or renamed between that step and
+        the provider mutation. Unresolvable identity fails closed.
+        """
+        if self.kubernetes_adapter is None:
+            return WorkflowStepOutcome.failed(
+                "HyperPod mutation requires the Kubernetes adapter to observe "
+                "node isolation",
+                details={"safety_rejection": True},
+            )
+        core = self.kubernetes_adapter.core
+        verified: set[str] = set()
+        nodes: dict[str, dict[str, Any]] = {}
+        for node_id in context.step.node_ids:
+            candidates = self._kubernetes_node_candidates(node_id)
+            node = None
+            kubernetes_node = None
+            for candidate in candidates:
+                try:
+                    node = core.read_node(candidate)
+                except Exception as exc:
+                    if isinstance(exc, KeyError) or (
+                        getattr(exc, "status", None) == 404
+                    ):
+                        continue
+                    raise
+                kubernetes_node = candidate
+                break
+            if node is None or kubernetes_node is None:
+                return WorkflowStepOutcome.failed(
+                    f"cannot resolve Kubernetes node for {node_id}; isolation "
+                    "cannot be observed",
+                    details={
+                        "safety_rejection": True,
+                        "node_id": node_id,
+                        "candidates": candidates,
+                    },
+                )
+            problems = self._isolation_problems(node, context)
+            if problems:
+                return WorkflowStepOutcome.failed(
+                    f"node {node_id} is not isolated: " + "; ".join(problems),
+                    details={
+                        "safety_rejection": True,
+                        "node_id": node_id,
+                        "kubernetes_node": kubernetes_node,
+                        "isolation_problems": problems,
+                    },
+                )
+            annotations = KubernetesWorkflowAdapter._annotations(node)
+            nodes[node_id] = {
+                "kubernetes_node": kubernetes_node,
+                "unschedulable": True,
+                "incident": annotations.get(ANNOTATION_INCIDENT),
+                "fencing_token": annotations.get(ANNOTATION_FENCING),
+                "resource_version": KubernetesWorkflowAdapter._resource_version(node),
+            }
+            verified.update({node_id, kubernetes_node})
+        return ObservedIsolation(sorted(verified), nodes)
 
     def _allocate_spare_or_wait(
         self,
@@ -253,14 +402,13 @@ class HyperPodLifecycleStepAdapter(
             return WorkflowStepOutcome.failed(
                 "confirm_cluster_name is required for HyperPod mutation"
             )
-        isolation = sorted(
-            set(context.request.isolation_verified_nodes).union(
-                context.step.node_ids
-                if WorkflowOperation.MARK_UNSCHEDULABLE
-                in context.workflow.completed_operations
-                else []
-            )
-        )
+        # What the scheduler shows now, not what the workflow remembers: an
+        # unschedulable node carrying this incident's quarantine taint and
+        # annotation. Anything less refuses the provider mutation.
+        observed = self._observe_isolation(context)
+        if isinstance(observed, WorkflowStepOutcome):
+            return observed
+        isolation = list(observed.verified)
         warm_spare_only = (
             context.step.operation is WorkflowOperation.REPLACE_NODE
             and context.step.parameters.get("replacement_strategy")
@@ -393,5 +541,6 @@ class HyperPodLifecycleStepAdapter(
                 "provider_baselines": provider_baselines,
                 "activated_spare_nodes": [],
                 "requires_external_confirmation": True,
+                "observed_isolation": observed.nodes,
             },
         )

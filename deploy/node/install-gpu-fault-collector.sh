@@ -117,7 +117,7 @@ NODE_AGENT_TLS_KEY=""
 NODE_AGENT_TLS_CLIENT_CA=""
 NODE_HEARTBEAT_INTERVAL="30"
 NODE_INFLIGHT_WAIT_TIMEOUT_SECONDS="2100"
-NODE_ACTION_RETENTION_SECONDS="604800"
+NODE_ACTION_RETENTION_SECONDS="2592000"
 NODE_ACTION_MAX_RESULTS="10000"
 NODE_INSTANCE_ID=""
 RUNTIME_ROOT="/opt/gpu-fault"
@@ -156,7 +156,7 @@ usage() {
         "  --metrics-mode auto|dcgm|nvidia-smi" \
         "  --metrics-interval SECONDS      Default: 15" \
         "  --host-interval SECONDS         Default: 15" \
-        "  --expected-gpu-count COUNT      Expected visible GPUs; unset disables check" \
+        "  --expected-gpu-count COUNT      Expected visible GPUs; unset: from instance type" \
         "  --expected-efa-device-count COUNT Expected ACTIVE EFA devices; unset disables check" \
         "  --inventory-mismatch-samples N  Consecutive mismatches before action; default: 2" \
         "  --log-interval SECONDS          Default: 10" \
@@ -660,6 +660,23 @@ done
 [[ "${HOST_INTERVAL}" =~ ^[0-9]+([.][0-9]+)?$ &&
     "${HOST_INTERVAL}" != "0" ]] ||
     die "--host-interval must be a positive number"
+if [[ -z "${EXPECTED_GPU_COUNT}" && -n "${NODE_INSTANCE_TYPE}" ]]; then
+    # Mirrors INSTANCE_ACCELERATOR_COUNTS in collectors/gpu/discovery.py: the
+    # instance type already names the GPU count, so the inventory invariant
+    # is checked without an explicit --expected-gpu-count (ARCH-G6).
+    case "${NODE_INSTANCE_TYPE#ml.}" in
+        p5.4xlarge) EXPECTED_GPU_COUNT="1" ;;
+        p5.48xlarge|p5e.48xlarge|p5en.48xlarge|p6-b200.48xlarge|p6-b300.48xlarge)
+            EXPECTED_GPU_COUNT="8" ;;
+    esac
+    if [[ -n "${EXPECTED_GPU_COUNT}" ]]; then
+        printf 'Expected GPU count %s derived from instance type %s\n' \
+            "${EXPECTED_GPU_COUNT}" "${NODE_INSTANCE_TYPE}"
+    else
+        printf 'WARNING: instance type %s has no known GPU count; pass --expected-gpu-count\n' \
+            "${NODE_INSTANCE_TYPE}" >&2
+    fi
+fi
 if [[ -n "${EXPECTED_GPU_COUNT}" ]]; then
     [[ "${EXPECTED_GPU_COUNT}" =~ ^[1-9][0-9]*$ ]] ||
         die "--expected-gpu-count must be a positive integer"

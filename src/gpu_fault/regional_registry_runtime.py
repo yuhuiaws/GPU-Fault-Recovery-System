@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Event, RLock
@@ -12,7 +14,16 @@ from gpu_fault.regional import (
     RegionalRegistryMember,
     RegionalRegistryRevision,
 )
+from gpu_fault.regional_registry import regional_registry_config_sha256
 from gpu_fault.store import NotFoundError
+
+LOGGER = logging.getLogger(__name__)
+
+# Exponential backoff for a start-up that finds Aurora unavailable: a writer
+# failover takes 30-60 s and a Pod that crashes into a restart loop meanwhile
+# only needs Aurora again when it comes back.
+STARTUP_RETRY_INITIAL_SECONDS = 0.5
+STARTUP_RETRY_MAX_INTERVAL_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -59,6 +70,10 @@ class RegionalRegistryRuntime:
         self._target_content_sha256 = "0" * 64
         self._last_successful_refresh: datetime | None = None
         self._last_error: str | None = "regional registry has not loaded"
+        # Digest of the GPU_FAULT_REGIONAL_CLUSTERS_JSON Secret this process was
+        # started with; None when the caller did not supply one.
+        self.secret_config_sha256: str | None = None
+        self._secret_drift_logged: bool | None = None
 
     @classmethod
     def bootstrap(
@@ -71,8 +86,71 @@ class RegionalRegistryRuntime:
         poll_seconds: float = 1.0,
         stale_seconds: float = 10.0,
         now: Callable[[], datetime] | None = None,
+        retry_budget_seconds: float = 0.0,
+        sleep: Callable[[float], None] = time.sleep,
+        secret_config_sha256: str | None = None,
     ) -> RegionalRegistryRuntime:
+        """Load the durable head, retrying store failures within a budget.
+
+        ``retry_budget_seconds`` bounds how long start-up waits for the store
+        (Aurora) to answer before the failure propagates and the process exits;
+        zero keeps the old fail-immediately behaviour for tests and tools.
+        ``secret_config_sha256`` is the configured Secret's digest; a mismatch
+        with the durable head is logged and reported as ``secret_drift``.
+        """
+
         observed = now or (lambda: datetime.now(timezone.utc))
+        deadline = observed() + timedelta(seconds=retry_budget_seconds)
+        interval = STARTUP_RETRY_INITIAL_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                runtime = cls._bootstrap_once(
+                    store,
+                    member_id=member_id,
+                    service_role=service_role,
+                    release_id=release_id,
+                    poll_seconds=poll_seconds,
+                    stale_seconds=stale_seconds,
+                    now=observed,
+                )
+                runtime.secret_config_sha256 = secret_config_sha256
+                runtime._log_secret_drift()
+                return runtime
+            except ValueError:
+                # Configuration errors (poll/stale) are not store outages.
+                raise
+            except Exception as exc:
+                remaining = (deadline - observed()).total_seconds()
+                if remaining <= 0:
+                    raise
+                wait = min(interval, STARTUP_RETRY_MAX_INTERVAL_SECONDS, remaining)
+                LOGGER.warning(
+                    "regional registry bootstrap attempt %d failed (%s: %s); "
+                    "retrying in %.1fs with %.0fs of start-up budget left",
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                    wait,
+                    remaining,
+                )
+                sleep(wait)
+                interval = min(interval * 2, STARTUP_RETRY_MAX_INTERVAL_SECONDS)
+
+    @classmethod
+    def _bootstrap_once(
+        cls,
+        store: Any,
+        *,
+        member_id: str,
+        service_role: str,
+        release_id: str,
+        poll_seconds: float,
+        stale_seconds: float,
+        now: Callable[[], datetime],
+    ) -> RegionalRegistryRuntime:
+        observed = now
         try:
             store.get_regional_registry_head()
         except NotFoundError:
@@ -127,7 +205,43 @@ class RegionalRegistryRuntime:
                 <= timedelta(seconds=self.stale_seconds)
             )
 
+    def durable_config_sha256(self) -> str | None:
+        """Configured-view digest of the snapshot this process serves."""
+
+        with self._lock:
+            snapshot = self._snapshot
+        if snapshot is None:
+            return None
+        return regional_registry_config_sha256(snapshot.registrations.values())
+
+    def secret_drift(self) -> bool:
+        """Whether the start-up Secret and the durable head disagree.
+
+        The durable head wins (join/remove publish there); drift means the
+        Secret is stale and a release that only rewrote the Secret would not
+        reach the running registry (review H3).
+        """
+
+        if self.secret_config_sha256 is None:
+            return False
+        durable = self.durable_config_sha256()
+        return durable is not None and durable != self.secret_config_sha256
+
+    def _log_secret_drift(self) -> None:
+        drift = self.secret_drift()
+        if drift and self._secret_drift_logged is not True:
+            LOGGER.warning(
+                "regional registry Secret drifts from the durable head: "
+                "secret_config_sha256=%s durable_config_sha256=%s; the durable "
+                "head is authoritative, republish the registry from the release "
+                "config to reconcile",
+                self.secret_config_sha256,
+                self.durable_config_sha256(),
+            )
+        self._secret_drift_logged = drift
+
     def status(self) -> dict[str, Any]:
+        secret_drift = self.secret_drift()
         with self._lock:
             snapshot = self._snapshot
             return {
@@ -143,6 +257,8 @@ class RegionalRegistryRuntime:
                 "ready": self.is_ready(),
                 "last_successful_refresh": self._last_successful_refresh,
                 "error": self._last_error,
+                "secret_config_sha256": self.secret_config_sha256,
+                "secret_drift": secret_drift,
             }
 
     def refresh_once(self, *, raise_on_failure: bool = False) -> bool:
@@ -180,6 +296,7 @@ class RegionalRegistryRuntime:
             self.store.save_regional_registry_member(
                 self._member(snapshot, ready=True, observed_at=observed)
             )
+            self._log_secret_drift()
             return True
         except Exception as exc:
             with self._lock:

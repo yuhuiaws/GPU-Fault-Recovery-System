@@ -20,7 +20,7 @@ from gpu_fault.models import (
     TerminalEvent,
     TriageReport,
 )
-from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
 from gpu_fault.store.shared.primitives import (
     GetLink,
     GetOptionalRecord,
@@ -31,6 +31,7 @@ from gpu_fault.store.shared.primitives import (
     StateTransaction,
     state_key,
 )
+from gpu_fault.store.shared.record_guards import record_matches_expected
 
 
 class SharedControlRecordMixin:
@@ -148,8 +149,28 @@ class SharedControlRecordMixin:
         with self._statement_guard():
             self._put("triage", report.request_id, report)
 
-    def save_plan(self, plan: RecoveryPlan) -> None:
-        with self._statement_guard():
+    def save_plan(
+        self,
+        plan: RecoveryPlan,
+        *,
+        expected: RecoveryPlan | None = None,
+    ) -> None:
+        """See ``CompletionStore.save_plan`` (architecture review, item D2).
+
+        Without ``expected`` the write is the single-statement upsert it always
+        was. With it, the read-compare-write runs inside one write transaction
+        so the compare-and-set holds on both key/value backends.
+        """
+
+        if expected is None:
+            with self._statement_guard():
+                self._put("plan", plan.plan_id, plan)
+            return
+        with self._state_transaction(f"plan/{plan.plan_id}"):
+            if not record_matches_expected(
+                self._get_optional("plan", plan.plan_id), expected
+            ):
+                raise StaleWriteError(f"plan/{plan.plan_id} changed since it was read")
             self._put("plan", plan.plan_id, plan)
 
     def get_plan(self, plan_id: str) -> RecoveryPlan:

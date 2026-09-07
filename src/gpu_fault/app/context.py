@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from gpu_fault.adapters import (
     ControlPlaneEvidenceAdapter,
@@ -29,6 +31,7 @@ from gpu_fault.execution import (
     WorkflowDispatcherConfig,
     managed_recovery_timeout_seconds,
 )
+from gpu_fault.execution.executor import TerminalHook
 from gpu_fault.fleet import (
     BarrierCoordinator,
     FleetCompatibilityPolicy,
@@ -36,6 +39,7 @@ from gpu_fault.fleet import (
     node_action_secrets_from_environment,
     parse_endpoint_networks,
 )
+from gpu_fault.fleet_endpoint import ClusterEndpointNetworks
 from gpu_fault.gpu_metrics import (
     GpuMetricsService,
     GpuMetricsThresholds,
@@ -60,6 +64,9 @@ from gpu_fault.models import (
     Environment,
     ObservedCapability,
     RuntimeProfile,
+    WorkflowRequest,
+    WorkflowStatus,
+    WorkflowStepSpec,
 )
 from gpu_fault.notification_service import AdvisoryNotificationService
 from gpu_fault.notifications import notification_notifier_from_environment
@@ -68,6 +75,8 @@ from gpu_fault.passive import PassiveWorkflowCompiler
 from gpu_fault.policy import GpuFaultPolicyEngine
 from gpu_fault.regional import RegionalRemoteWorkflowAdapter
 from gpu_fault.regional_registry import (
+    configured_regional_registrations,
+    regional_registry_config_sha256,
     sync_regional_cluster_registry,
 )
 from gpu_fault.service import CompletionService
@@ -92,8 +101,47 @@ from gpu_fault.training_health import (
 from gpu_fault.watcher import CompletionWatcher
 from gpu_fault.xid_correlation import XidCorrelationCoordinator
 
+if TYPE_CHECKING:
+    from gpu_fault.app.ingest.faults import FaultIngestionService
+    from gpu_fault.fleet_endpoint import EndpointNetworks
+    from gpu_fault.regional import RegionalClusterRegistration
+    from gpu_fault.regional_registry_runtime import RegionalRegistryRuntime
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _LazyClusterObservers(dict[str, Any]):
+    """Observer map that builds one for an unseen registered cluster.
+
+    `RegionalHyperPodManagedRecoveryObserver` looks clusters up with `.get`,
+    which bypasses `__missing__`, so the override lives here. Observers are
+    cached once built: they hold an identity registry the refresh worker
+    iterates, so one per cluster is the invariant.
+    """
+
+    def __init__(
+        self,
+        initial: Mapping[str, Any] | None,
+        *,
+        resolver: Callable[[str], Any | None],
+    ) -> None:
+        super().__init__(initial or {})
+        self.resolver = resolver
+        self._build_lock = threading.Lock()
+
+    def get(self, cluster_id: str, default: Any = None) -> Any:
+        if cluster_id in self:
+            return self[cluster_id]
+        with self._build_lock:
+            if cluster_id in self:
+                return self[cluster_id]
+            observer = self.resolver(cluster_id)
+            if observer is None:
+                return default
+            self[cluster_id] = observer
+            return observer
+
+
 _pod_process_owner = pod_process_owner
 
 
@@ -153,7 +201,15 @@ class ApplicationContext:
             store=self.store,
         )
         self.node_health = NodeHealthPolicy(self.store)
-        self.topology = WorkloadTopologyService(self.store)
+        # IDLE needs fresh attempt-observation coverage of the cluster; a
+        # cluster nobody has observed within this window resolves UNKNOWN and
+        # destructive node-health plans compile BLOCKED NEEDS_OPERATOR there.
+        self.topology = WorkloadTopologyService(
+            self.store,
+            freshness_seconds=float(
+                os.getenv("GPU_FAULT_WORKLOAD_CONTEXT_FRESHNESS_SECONDS", "600")
+            ),
+        )
         self.nvswitch_topology = NvSwitchPortTopologyService(
             self.store,
             max_age_seconds=int(
@@ -231,6 +287,9 @@ class ApplicationContext:
             production_adapters or [],
             self.production_executor_config,
         )
+        register_spare_reservation_release(
+            self.workflow_executor, production_adapters or []
+        )
         self.workflow_executor.fleet_registry = fleet_registry
         self.workflow_executor.branch_escalator = _branch_escalator(self.orchestrator)
         self.execution_token = execution_token
@@ -242,6 +301,19 @@ class ApplicationContext:
         self.hyperpod_identity_registry = None
         self.hyperpod_identity_registries = []
         self.regional_mode = False
+        # Digest of the configured Secret registry, compared with the durable
+        # head by the registry runtime to report drift (review H3).
+        self.regional_registry_secret_sha256: str | None = None
+        # Set by the factory so /metrics can render the unresolved fault-line
+        # counters (ARCH-G7).
+        self.fault_ingestion: FaultIngestionService | None = None
+        # Bound by the factory in regional mode so /metrics can render the
+        # Secret-vs-durable registry drift gauge (ARCH-H3).
+        self.regional_registry_runtime: RegionalRegistryRuntime | None = None
+        # Set by `_managed_observer` in regional mode so a registry runtime can
+        # be bound later and unseen clusters get an observer on first sight.
+        self.regional_managed_observer = None
+        self.regional_observer_factory = None
         self.dispatcher = WorkflowDispatcher(
             self.store,
             self.workflow_executor,
@@ -265,6 +337,57 @@ class ApplicationContext:
         return (
             "active" if self.production_executor_config.enabled else "simulation-only"
         )
+
+    def bind_regional_registry_runtime(
+        self, runtime: RegionalRegistryRuntime | None
+    ) -> None:
+        """Let per-cluster policy follow the registry runtime, not start-up.
+
+        The fleet registry's endpoint allow-list and the managed-recovery
+        observer map were built once from the store, so a cluster joined online
+        was refused until every CPU Pod restarted (review H4). Both now resolve
+        an unseen cluster from the runtime's snapshot on first sight and fail
+        closed when the snapshot does not contain it.
+        """
+
+        if runtime is None or not self.regional_mode:
+            return
+
+        def registration_for(cluster_id: str) -> RegionalClusterRegistration | None:
+            try:
+                return runtime.snapshot().get(cluster_id)
+            except RuntimeError:
+                return None
+
+        if self.fleet_registry is not None:
+
+            def resolve_networks(cluster_id: str) -> EndpointNetworks | None:
+                registration = registration_for(cluster_id)
+                if registration is None:
+                    return None
+                return parse_endpoint_networks(
+                    ",".join(registration.agent_endpoint_allowed_cidrs)
+                )
+
+            self.fleet_registry.endpoint_allowed_networks_by_cluster = (
+                ClusterEndpointNetworks(
+                    self.fleet_registry.endpoint_allowed_networks_by_cluster,
+                    resolver=resolve_networks,
+                )
+            )
+        observer = self.regional_managed_observer
+        factory = self.regional_observer_factory
+        if observer is not None and factory is not None:
+
+            def resolve_observer(cluster_id: str) -> Any | None:
+                registration = registration_for(cluster_id)
+                if registration is None:
+                    return None
+                return factory(registration)
+
+            observer.observers = _LazyClusterObservers(
+                observer.observers, resolver=resolve_observer
+            )
 
     @classmethod
     def from_environment(cls) -> ApplicationContext:
@@ -311,6 +434,7 @@ class ApplicationContext:
             config,
             notification_sender=context.advisory_notifications.send,
         )
+        register_spare_reservation_release(context.workflow_executor, adapters)
         context.workflow_executor.fleet_registry = context.fleet_registry
         context.workflow_executor.branch_escalator = _branch_escalator(
             context.orchestrator
@@ -398,9 +522,13 @@ class ApplicationContext:
                 context.store,
                 settings.regional_cluster_values,
             )
+            context.regional_registry_secret_sha256 = regional_registry_config_sha256(
+                configured_regional_registrations(settings.regional_cluster_values)
+            )
         if settings.quick_diagnostics_enabled:
             try:
-                from kubernetes import client, config as kube_config
+                from kubernetes import client
+                from kubernetes import config as kube_config
                 from kubernetes.config.config_exception import (
                     ConfigException,
                 )
@@ -645,8 +773,10 @@ class ApplicationContext:
             timeout = timedelta(seconds=managed_recovery_timeout_seconds(os.environ))
             if context.regional_mode:
                 assert regional_remote_adapter is not None
-                observers = {}
-                for registration in context.store.list_regional_clusters():
+
+                def build_observer(
+                    registration: RegionalClusterRegistration,
+                ) -> HyperPodManagedRecoveryObserver:
                     lifecycle = HyperPodLifecycleAdapter(
                         HyperPodAdapterConfig.from_environment(
                             cluster_name=(registration.hyperpod_cluster_name),
@@ -655,17 +785,24 @@ class ApplicationContext:
                     )
                     identities = HyperPodIdentityRegistry(lifecycle, context.store)
                     context.hyperpod_identity_registries.append(identities)
-                    observers[registration.cluster_id] = (
-                        HyperPodManagedRecoveryObserver(
-                            identities,
-                            context.store,
-                            registry=context.fleet_registry,
-                            kubernetes_adapter=(regional_remote_adapter),
-                            timeout=timeout,
-                            alert_sender=(context.advisory_notifications.send),
-                        )
+                    return HyperPodManagedRecoveryObserver(
+                        identities,
+                        context.store,
+                        registry=context.fleet_registry,
+                        kubernetes_adapter=(regional_remote_adapter),
+                        timeout=timeout,
+                        alert_sender=(context.advisory_notifications.send),
                     )
+
+                observers = {
+                    registration.cluster_id: build_observer(registration)
+                    for registration in context.store.list_regional_clusters()
+                }
                 managed_observer = RegionalHyperPodManagedRecoveryObserver(observers)
+                # Kept so `bind_regional_registry_runtime` can extend the map
+                # for clusters joined after start-up (review H4).
+                context.regional_managed_observer = managed_observer
+                context.regional_observer_factory = build_observer
             else:
                 assert hp is not None
                 context.hyperpod_identity_registry = HyperPodIdentityRegistry(
@@ -818,6 +955,54 @@ def default_simulated_profile() -> EffectiveRuntimeProfile:
         ],
     )
     return compile_runtime_profile(profile)
+
+
+def spare_reservation_release_hook(adapter: object) -> TerminalHook:
+    """ARCH-A4: a terminal hook that gives back unconsumed warm spares.
+
+    ``adapter.release_spare_reservations(workflow, incident_id)`` releases the
+    spares a REPLACE_NODE step reserved but never consumed. It runs for every
+    end other than SUCCEEDED; spares named by a succeeded failover are
+    training nodes now. The executor isolates a raising hook (ARCH-B3), so
+    this one only has to stay quiet on the happy path.
+    """
+
+    def release(
+        workflow: WorkflowRequest,
+        incident: object,
+        steps: list[WorkflowStepSpec],
+    ) -> None:
+        del incident, steps
+        if workflow.status is WorkflowStatus.SUCCEEDED:
+            return
+        released = adapter.release_spare_reservations(  # type: ignore[attr-defined]
+            workflow, workflow.incident_id
+        )
+        if released:
+            LOGGER.warning(
+                "released warm spare reservations after workflow %s ended %s: %s",
+                workflow.request_id,
+                workflow.status.value,
+                ",".join(sorted(released)),
+            )
+
+    release.__qualname__ = (
+        f"{type(adapter).__name__}.release_spare_reservations:on_terminal"
+    )
+    return release
+
+
+def register_spare_reservation_release(
+    executor: ProductionWorkflowExecutor, adapters: list[object]
+) -> int:
+    """Attach the spare-release hook for every adapter that offers one."""
+
+    registered = 0
+    for adapter in adapters:
+        if callable(getattr(adapter, "release_spare_reservations", None)):
+            executor.on_terminal.append(spare_reservation_release_hook(adapter))
+            registered += 1
+    return registered
 
 
 def _branch_escalator(orchestrator: IncidentOrchestrator) -> BranchEscalator:

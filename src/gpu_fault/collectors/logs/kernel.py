@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import io
 import logging
@@ -23,10 +24,28 @@ from gpu_fault.collectors.logs.fabric_manager import (
     SXID_SUMMARY_PATTERN,
 )
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
-from gpu_fault.collectors.sinks import CollectorError, EventSink
+from gpu_fault.collectors.sinks import CollectorError, EventSink, deliver_event
 from gpu_fault.telemetry import CollectorKind
 
 LOGGER = logging.getLogger(__name__)
+
+#: Counters the kernel collector carries in its health summary (ARCH-G4). The
+#: summary used to say only "alive"; a stream that was quietly dropping records
+#: to its own delivery failures or to kernel ring overflows looked identical to
+#: a healthy one. The token is ``<name-with-dashes>:<count>`` and is appended to
+#: ``edge_filter_reasons`` only when the count is non-zero.
+HEALTH_COUNTER_NAMES = (
+    "delivery_failures",
+    "kmsg_overflow",
+    "boot_time_reestimates",
+)
+
+#: How far a monotonic-derived ``observed_at`` may sit from the collection time
+#: before the boot-time estimate is suspected of being stale (ARCH-G9). Records
+#: read late are legitimately old, so the re-estimate is rate limited and only
+#: changes anything when ``/proc/uptime`` and the wall clock disagree with it.
+BOOT_TIME_DRIFT_SECONDS = 5.0
+BOOT_TIME_REESTIMATE_MIN_INTERVAL_SECONDS = 60.0
 
 NVIDIA_EVENT_PATTERN = re.compile(r"(?:\bNVRM\b.*\bXid\b|\bSXid\b)", re.IGNORECASE)
 
@@ -53,6 +72,7 @@ class KernelLogCollector:
         start_at_end: bool = True,
         reopen_delay_seconds: float = 1.0,
         sleep: Callable[[float], None] = time.sleep,
+        uptime_path: str = "/proc/uptime",
     ) -> None:
         if reopen_delay_seconds <= 0:
             raise ValueError("kernel log reopen delay must be positive")
@@ -60,6 +80,7 @@ class KernelLogCollector:
         self.context = context
         self.node_id = node_id
         self.kmsg_path = kmsg_path
+        self.uptime_path = uptime_path
         self.boot_id = boot_id or self._read_boot_id()
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.start_at_end = start_at_end
@@ -69,7 +90,9 @@ class KernelLogCollector:
         self._seen: set[str] = set()
         self._deduplication_window = deduplication_window
         self._boot_time: datetime | None = None
+        self._boot_time_reestimated_at: datetime | None = None
         self._fallback_sequence = 0
+        self.health_counters: dict[str, int] = dict.fromkeys(HEALTH_COUNTER_NAMES, 0)
         self.health_summary_seconds = int(
             os.getenv("GPU_FAULT_KERNEL_HEALTH_SUMMARY_SECONDS", "300")
         )
@@ -107,36 +130,48 @@ class KernelLogCollector:
             collected_at = self.now()
             monotonic = parsed.get("monotonic_us")
             observed_at = self._observed_at(parsed, collected_at=collected_at)
-            try:
-                self.sink.post(
-                    NVIDIA_KERNEL_PATH,
-                    {
-                        **self.context.model_dump(mode="json"),
-                        "node_id": self.node_id,
-                        "record_id": record_id,
-                        "observed_at": observed_at.isoformat(),
-                        "source_monotonic_us": (int(monotonic) if monotonic else None),
-                        "source_boot_id": self.boot_id,
-                        "collected_at": collected_at.isoformat(),
-                        "message": message,
-                        "evidence_ref": (
-                            f"kmsg://{self.node_id}/{self.boot_id}/"
-                            f"{parsed.get('sequence') or record_id}"
-                        ),
-                    },
-                )
-            except CollectorError as exc:
-                if not (exc.buffered and exc.replayable):
-                    raise
+            result = deliver_event(
+                self.sink,
+                NVIDIA_KERNEL_PATH,
+                {
+                    **self.context.model_dump(mode="json"),
+                    "node_id": self.node_id,
+                    "record_id": record_id,
+                    "observed_at": observed_at.isoformat(),
+                    "source_monotonic_us": (int(monotonic) if monotonic else None),
+                    "source_boot_id": self.boot_id,
+                    "collected_at": collected_at.isoformat(),
+                    "message": message,
+                    "evidence_ref": (
+                        f"kmsg://{self.node_id}/{self.boot_id}/"
+                        f"{parsed.get('sequence') or record_id}"
+                    ),
+                },
+            )
+            # Every outcome remembers the record: the stream will not show
+            # it again, and re-posting a duplicate would help nobody.
+            self._remember(record_id)
+            if result.buffered:
                 LOGGER.warning(
                     "kernel event persisted to the collector outbox; "
                     "continuing live kmsg collection: record=%s error=%s",
                     record_id,
-                    exc,
+                    result.error,
                 )
-                self._remember(record_id)
                 continue
-            self._remember(record_id)
+            if result.failed:
+                # A rejected or unbuffered event is lost, and used to take
+                # the stream with it: the exception reopened /dev/kmsg at
+                # the live tail and dropped everything written in between
+                # (ARCH-G4). It is counted and the stream keeps reading.
+                self.health_counters["delivery_failures"] += 1
+                LOGGER.warning(
+                    "kernel event delivery failed and was not buffered; "
+                    "continuing live kmsg collection: record=%s error=%s",
+                    record_id,
+                    result.error,
+                )
+                continue
             stats = stats.model_copy(update={"delivered": stats.delivered + 1})
         return stats
 
@@ -159,7 +194,7 @@ class KernelLogCollector:
                                 "the live tail; refusing to replay the "
                                 "ring buffer"
                             ) from exc
-                    self._boot_time = self._estimate_boot_time()
+                    self.refresh_boot_time()
                     self._collect_live_stream(stream)
                     LOGGER.warning(
                         "kernel message stream ended; reopening %s",
@@ -201,7 +236,22 @@ class KernelLogCollector:
             ready, _, _ = select.select([descriptor], [], [], timeout)
             self._last_read_at = self.now()
             if ready:
-                line = stream.readline()
+                try:
+                    line = stream.readline()
+                except OSError as exc:
+                    if exc.errno != errno.EPIPE:
+                        raise
+                    # The kernel ring buffer overwrote records this reader
+                    # had not consumed yet. The next read returns the oldest
+                    # surviving record; reopening would seek to the live
+                    # tail and lose those too (ARCH-G4).
+                    self.health_counters["kmsg_overflow"] += 1
+                    LOGGER.warning(
+                        "kernel message ring overflow; records were lost "
+                        "before this reader consumed them (overflows=%d)",
+                        self.health_counters["kmsg_overflow"],
+                    )
+                    continue
                 if not line:
                     return
                 self.collect_lines([line])
@@ -231,6 +281,24 @@ class KernelLogCollector:
         )
         self._send_health_summary(observed_at)
 
+    def health_summary_reasons(self) -> list[str]:
+        """``["health-summary"]`` plus one ``name:count`` token per non-zero counter.
+
+        A healthy stream keeps exactly the routine reason so the summary stays
+        on its dedicated ``collector-health-nvidia_kernel`` lane and coalesces
+        as before. A stream with losses to report falls to the plain node lane
+        (``processor/models.py`` ``_compute_ordering_key``), which only orders
+        it behind that node's other work; coalescing still requires the same
+        path, so it can only be superseded by a later summary of its own.
+        """
+
+        reasons = ["health-summary"]
+        for name in HEALTH_COUNTER_NAMES:
+            count = self.health_counters.get(name, 0)
+            if count:
+                reasons.append(f"{name.replace('_', '-')}:{count}")
+        return reasons
+
     def _send_health_summary(self, observed_at: datetime) -> None:
         self.sink.post(
             COLLECTOR_HEALTH_PATH,
@@ -242,7 +310,7 @@ class KernelLogCollector:
                 "node_id": self.node_id,
                 "collector": CollectorKind.NVIDIA_KERNEL.value,
                 "observed_at": observed_at.isoformat(),
-                "edge_filter_reasons": ["health-summary"],
+                "edge_filter_reasons": self.health_summary_reasons(),
             },
         )
 
@@ -296,10 +364,20 @@ class KernelLogCollector:
         if monotonic is None or self._boot_time is None:
             return collected_at
         try:
-            observed_at = self._boot_time + timedelta(microseconds=int(monotonic))
+            offset = timedelta(microseconds=int(monotonic))
+            observed_at = self._boot_time + offset
         except (TypeError, ValueError, OverflowError):
             return collected_at
-        if observed_at > collected_at + timedelta(seconds=5):
+        drift = abs((observed_at - collected_at).total_seconds())
+        if drift > BOOT_TIME_DRIFT_SECONDS and self._maybe_reestimate_boot_time(
+            collected_at
+        ):
+            # The wall clock stepped (NTP) after the boot time was estimated,
+            # so every offset since was skewed by the step (ARCH-G9).
+            if self._boot_time is None:
+                return collected_at
+            observed_at = self._boot_time + offset
+        if observed_at > collected_at + timedelta(seconds=BOOT_TIME_DRIFT_SECONDS):
             LOGGER.warning(
                 "kernel event monotonic timestamp is in the future; "
                 "using collection time record=%s",
@@ -308,10 +386,49 @@ class KernelLogCollector:
             return collected_at
         return observed_at
 
+    def refresh_boot_time(self) -> None:
+        """Estimate the boot time from ``uptime_path`` and the wall clock now."""
+
+        self._boot_time = self._estimate_boot_time()
+        self._boot_time_reestimated_at = self.now()
+
+    def _maybe_reestimate_boot_time(self, collected_at: datetime) -> bool:
+        """Re-estimate once per rate-limit window; True when the estimate moved.
+
+        Only an estimate this collector made (``refresh_boot_time``) is ever
+        revised, and at most once a minute: a record that is merely old -- the
+        reader fell behind -- re-reads ``uptime_path`` and finds the same boot
+        time, so the check costs one small read and changes nothing.
+        """
+
+        previous_at = self._boot_time_reestimated_at
+        if (
+            previous_at is None
+            or (collected_at - previous_at).total_seconds()
+            < BOOT_TIME_REESTIMATE_MIN_INTERVAL_SECONDS
+        ):
+            return False
+        self._boot_time_reestimated_at = collected_at
+        previous = self._boot_time
+        estimate = self._estimate_boot_time()
+        if estimate is None or previous is None:
+            return False
+        if abs((estimate - previous).total_seconds()) <= 1.0:
+            return False
+        self._boot_time = estimate
+        self.health_counters["boot_time_reestimates"] += 1
+        LOGGER.warning(
+            "kernel boot time estimate moved by %.1fs; the wall clock stepped "
+            "since the stream was opened (reestimates=%d)",
+            (estimate - previous).total_seconds(),
+            self.health_counters["boot_time_reestimates"],
+        )
+        return True
+
     def _estimate_boot_time(self) -> datetime | None:
         try:
             uptime = float(
-                Path("/proc/uptime").read_text(encoding="ascii").split(maxsplit=1)[0]
+                Path(self.uptime_path).read_text(encoding="ascii").split(maxsplit=1)[0]
             )
         except (OSError, ValueError, IndexError):
             LOGGER.warning(

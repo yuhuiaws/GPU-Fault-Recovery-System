@@ -44,12 +44,15 @@ from scripts.e2e.regional.preempt036_verdicts import (
     apply_errors,
     case_verdict,
     command_errors,
+    command_log_errors,
     command_snapshot,
+    event_errors,
     open_command_errors,
     plan_errors,
     record_errors,
     refusal_errors,
     rerun_errors,
+    rerun_event_errors,
     safety_errors,
     seed_mode,
     workflow_snapshot,
@@ -72,12 +75,18 @@ def _store(tmp_path: Any, mode: str) -> SqliteStore:
     return SqliteStore(str(tmp_path / f"{mode}.db"))
 
 
+ACTOR = "arn:aws:sts::123456789012:assumed-role/acceptance/operator"
+ADMIN_DIGEST = "a" * 64
+
+
 def _apply(mode: str, store: Any, seed: ModeSeed, digest: str) -> dict[str, Any]:
     return APPLIERS[mode](
         store,
         workflow_ids=list(seed.actionable_ids),
         expected_plan_sha256=digest,
         reference=REFERENCE,
+        actor=ACTOR,
+        admin_plan_sha256=ADMIN_DIGEST,
     )
 
 
@@ -584,3 +593,91 @@ def test_verdict_and_error_aggregation_are_stage_ordered() -> None:
     assert all_errors(stages) == ["apply: b", "apply: a", "records: c"], (
         "aggregated errors must name their stage in stage order"
     )
+
+
+# --------------------------------------------------------------------------- #
+# ARCH-I1: the operator write is attributed
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("mode", MODES)
+def test_apply_attributes_every_written_record_to_the_operator(
+    tmp_path: Any, mode: str
+) -> None:
+    store = _store(tmp_path, mode)
+    seed = seed_mode(mode, store)
+    digest = str(BUILDERS[mode](store, list(seed.actionable_ids))["plan_sha256"])
+
+    _apply(mode, store, seed, digest)
+    after = workflow_snapshot(store, seed.workflow_ids)
+
+    assert (
+        event_errors(
+            after,
+            seed,
+            actor=ACTOR,
+            admin_plan_sha256=ADMIN_DIGEST,
+            approved_plan_sha256=digest,
+        )
+        == []
+    ), f"{mode}: the written records do not carry the attributed operator event"
+    rerun_plan = BUILDERS[mode](store, list(seed.actionable_ids))
+    if seed.rerun_contract == RERUN_REFUSED:
+        with pytest.raises(ValueError):
+            _apply(mode, store, seed, str(rerun_plan["plan_sha256"]))
+    else:
+        _apply(mode, store, seed, str(rerun_plan["plan_sha256"]))
+    assert (
+        rerun_event_errors(after, workflow_snapshot(store, seed.workflow_ids), seed)
+        == []
+    ), f"{mode}: a no-op or refused rerun appended an operator event"
+
+
+def test_event_errors_reports_an_unknown_actor_a_wrong_digest_and_a_stray_event(
+    tmp_path: Any,
+) -> None:
+    mode = COMPILE_BLOCKED_MODE
+    store = _store(tmp_path, mode)
+    seed = seed_mode(mode, store)
+    digest = str(BUILDERS[mode](store, list(seed.actionable_ids))["plan_sha256"])
+    result = APPLIERS[mode](
+        store,
+        workflow_ids=list(seed.actionable_ids),
+        expected_plan_sha256=digest,
+        reference=REFERENCE,
+    )
+    assert result["applied_workflow_ids"], result
+    after = workflow_snapshot(store, seed.workflow_ids)
+
+    errors = event_errors(
+        after,
+        seed,
+        actor="unknown-identity",
+        admin_plan_sha256=ADMIN_DIGEST,
+        approved_plan_sha256=digest,
+    )
+    joined = "\n".join(errors)
+    assert "event actor is" in joined, errors
+    assert "admin_plan_sha256" in joined, errors
+
+    stray = dict(after)
+    stray[seed.refused_ids[0]] = {
+        **after[seed.refused_ids[0]],
+        "events": [{"kind": "x"}],
+    }
+    assert "a refused record carries 1 operator event" in "\n".join(
+        event_errors(
+            stray,
+            seed,
+            actor=ACTOR,
+            admin_plan_sha256=ADMIN_DIGEST,
+            approved_plan_sha256=digest,
+        )
+    )
+
+
+def test_command_log_errors_requires_the_mutating_directory(tmp_path: Any) -> None:
+    state_dir = tmp_path / "state"
+    good = state_dir / "logs" / "mutating" / "20300101T000000Z-workflow-reconcile.log"
+    assert command_log_errors(good, state_dir=state_dir) == []
+    flat = state_dir / "logs" / "workflow-reconcile.log"
+    assert "is not under" in "\n".join(command_log_errors(flat, state_dir=state_dir))
+    assert "was not opened" in "\n".join(command_log_errors(None, state_dir=state_dir))

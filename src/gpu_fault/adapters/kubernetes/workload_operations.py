@@ -81,6 +81,17 @@ class KubernetesWorkloadOperationsMixin:
     workload_log_tail_lines: Any
     workload_log_uploader: Callable[..., Any]
 
+    def _bind_request_timeout(self, seconds: float) -> None:
+        """Per-request deadline for the log reads this mixin issues itself.
+
+        The shared ``ApiClient`` already bounds every generated call; this
+        keeps the bound explicit on the one call that streams a Pod log,
+        including when a caller injects its own core API.
+        """
+        if seconds <= 0:
+            raise ValueError("kubernetes request timeout must be positive")
+        self.request_timeout_seconds = seconds
+
     def _managed_job_recovery_conflict(
         self,
         workloads: list[tuple[str, str, str, str, Any]],
@@ -594,17 +605,24 @@ class KubernetesWorkloadOperationsMixin:
                             "error": str(exc),
                         }
                     )
-                self.core.patch_namespaced_pod(
-                    name,
-                    namespace,
-                    {
-                        "metadata": {
-                            "annotations": {
-                                ANNOTATION_TERMINATION_INCIDENT: (incident_id)
+                try:
+                    self.core.patch_namespaced_pod(
+                        name,
+                        namespace,
+                        {
+                            "metadata": {
+                                "annotations": {
+                                    ANNOTATION_TERMINATION_INCIDENT: (incident_id)
+                                }
                             }
-                        }
-                    },
-                )
+                        },
+                    )
+                except Exception as exc:
+                    # The Pod finished between list and patch: it is already
+                    # what this step is trying to make it.
+                    if getattr(exc, "status", None) != 404:
+                        raise
+                    continue
                 terminating_pods.append((namespace, name))
         return (
             sorted(set(terminating_pods)),
@@ -641,6 +659,10 @@ class KubernetesWorkloadOperationsMixin:
             raise ValueError(f"Pod {namespace}/{pod_name} has no training container")
 
         captured_at = datetime.now(timezone.utc)
+        # A synchronous log read of up to workload_log_s3_max_bytes with no
+        # deadline held the executor thread for as long as the apiserver
+        # cared to stream; both bounds are explicit here because a caller
+        # may inject a core API that is not the timeout-wrapped client.
         if self.workload_log_s3_uri:
             value = self.core.read_namespaced_pod_log(
                 pod_name,
@@ -648,6 +670,7 @@ class KubernetesWorkloadOperationsMixin:
                 container=container_name,
                 timestamps=True,
                 limit_bytes=self.workload_log_s3_max_bytes,
+                _request_timeout=self.request_timeout_seconds,
             )
             raw = (
                 value
@@ -662,6 +685,8 @@ class KubernetesWorkloadOperationsMixin:
                 container=container_name,
                 timestamps=True,
                 tail_lines=self.workload_log_tail_lines,
+                limit_bytes=self.workload_log_s3_max_bytes,
+                _request_timeout=self.request_timeout_seconds,
             )
             raw = (
                 value
