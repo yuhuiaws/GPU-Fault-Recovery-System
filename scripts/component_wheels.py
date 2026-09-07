@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import hashlib
 import json
 import os
@@ -268,9 +269,53 @@ def _lazy_exports(module: str) -> dict[str, str]:
     return exports
 
 
+# ``"gpu_fault.collectors.gpu.dcgm:build_from_environment"`` -- the shape a
+# registry, an entry point or ``_load_factory`` uses to name a callable without
+# importing it. The module half is a dependency the import walk cannot see.
+_FACTORY_REFERENCE = re.compile(
+    r"^(gpu_fault(?:\.[A-Za-z_][A-Za-z0-9_]*)+):[A-Za-z_]\w*$"
+)
+
+
+def referenced_modules(tree: ast.AST) -> set[str]:
+    """Modules named by string, not import: factory references and
+    ``import_module("gpu_fault....")`` literals.
+
+    The node-runtime wheel built on 2026-09-07 lost every collector the new
+    ``collector_registry`` names this way (dcgm, nvidia_smi, host, kernel,
+    fabric manager, node logs) and the node's collector services died with
+    ModuleNotFoundError; wheel contents have to follow these strings too.
+    """
+
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            match = _FACTORY_REFERENCE.match(node.value)
+            if match and match.group(1) in MODULES:
+                found.add(match.group(1))
+        elif isinstance(node, ast.Call):
+            callee = node.func
+            name = (
+                callee.attr
+                if isinstance(callee, ast.Attribute)
+                else callee.id
+                if isinstance(callee, ast.Name)
+                else ""
+            )
+            if name == "import_module" and node.args:
+                first = node.args[0]
+                if (
+                    isinstance(first, ast.Constant)
+                    and isinstance(first.value, str)
+                    and first.value in MODULES
+                ):
+                    found.add(first.value)
+    return found
+
+
 def _local_imports(module: str) -> set[str]:
     tree = ast.parse(MODULES[module].read_text(encoding="utf-8"))
-    found: set[str] = set()
+    found: set[str] = set(referenced_modules(tree))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
