@@ -5543,7 +5543,13 @@ test_cases:
   - 节点全程Ready、可调度、无taint
   - Node Agent ledger与provider mutation均为0
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: fc894308a7d059210073a88fa6a043113c751576b9215697ee7b0b8897e22857
+      components:
+        control_plane: a3ff5f1d58dab7332519817a439ba4666ee28d420e7787fc730501ee0f25ce6b
+        executor: 8b764a8d9249c9f14d18e1e99ae38ce1cfd72ea3bb42c2112b39e3d3374985bb
+        node_runtime: 81db935eadf744fac019ef882beeb51a58197fac48f943e53262f7e35ee24aed
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-009
   related_pytest: tests/execution/test_misc.py::test_mechanical_inspection_waits_for_incident_fenced_annotation
@@ -5675,7 +5681,13 @@ test_cases:
   - device-plugin Pod 删除后 accelerator allocatable 正确回收与恢复
   - 全程不触发节点 reboot 或 replace
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: e3a252f6a3ccbe930aa7128c43347f05e2b8a8c91a8105256a0adfb179bfbe7c
+      components:
+        control_plane: a3ff5f1d58dab7332519817a439ba4666ee28d420e7787fc730501ee0f25ce6b
+        executor: 8b764a8d9249c9f14d18e1e99ae38ce1cfd72ea3bb42c2112b39e3d3374985bb
+        node_runtime: 81db935eadf744fac019ef882beeb51a58197fac48f943e53262f7e35ee24aed
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-017
   related_pytest: tests/collectors/test_host.py::test_efa_inventory_distinguishes_unbound_driver_from_missing_pci
@@ -5696,7 +5708,13 @@ test_cases:
   - 绝不调用 BatchReplaceClusterNodes，ALLOW_HYPERPOD_REPLACE 为 false
   - HyperPod 任务 auto-resume 已关
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 49c1d2bf09ab54e44bcafff188823623a7d938c8a8c17599989bb76feb55af12
+      components:
+        control_plane: a3ff5f1d58dab7332519817a439ba4666ee28d420e7787fc730501ee0f25ce6b
+        executor: 8b764a8d9249c9f14d18e1e99ae38ce1cfd72ea3bb42c2112b39e3d3374985bb
+        node_runtime: 81db935eadf744fac019ef882beeb51a58197fac48f943e53262f7e35ee24aed
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-015
   related_pytest: tests/policy/test_policy.py::test_always_fatal_sxid_uses_host_restart_branch
