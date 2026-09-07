@@ -920,3 +920,27 @@ def test_parser_accepts_the_documented_arguments() -> None:
     help_text = parser.format_help()
     for option in ("--plan", "--execute", "--confirm", "--maintenance-window-end"):
         assert option in help_text
+
+
+def test_preflight_rejects_nodes_hosting_arbiters_or_all_dns_endpoints() -> None:
+    """Live 2026-09-07 attempt 3: both kube-dns replicas sat on node-a/node-b, the
+    parallel quiesce dropped both endpoints, and the executor's RESTORE step
+    died with gaierror. Spec precondition 2 also bars arbiter replicas."""
+    errors = destr015.preflight_errors(
+        nodes=NODES,
+        arbiter_pods={NODE_A: ["gpu-fault-system/gpu-fault-cluster-executor-x"]},
+        dns_nodes=[NODE_A, NODE_B],
+        **_preflight_arguments(),
+    )
+
+    assert any("arbiter Pods" in error and NODE_A in error for error in errors), errors
+    assert any("every kube-dns endpoint" in error for error in errors), errors
+    assert (
+        destr015.preflight_errors(
+            nodes=NODES,
+            arbiter_pods={"other-node": ["gpu-fault-system/executor"]},
+            dns_nodes=[NODE_A, "other-node"],
+            **_preflight_arguments(),
+        )
+        == []
+    )

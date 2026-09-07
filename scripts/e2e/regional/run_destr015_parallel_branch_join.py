@@ -120,10 +120,26 @@ def preflight_errors(
     tests: dict[str, Any],
     control_env: dict[str, Any],
     runtime_identity_errors: list[str],
+    arbiter_pods: dict[str, list[str]] | None = None,
+    dns_nodes: list[str] | None = None,
 ) -> list[str]:
     errors: list[str] = list(runtime_identity_errors)
     if len(set(nodes)) != 2:
         errors.append("the two target nodes are identical")
+    # Precondition 2 of the spec: neither node may host a controller or
+    # executor arbiter replica. And a pair that holds every kube-dns endpoint
+    # takes cluster DNS down when both are quiesced (kubelet stops, the nodes
+    # go NotReady, the endpoints drop) -- the executor then cannot resolve the
+    # control plane and the RESTORE step fails with gaierror, as it did live.
+    for node in nodes:
+        hosted = (arbiter_pods or {}).get(node) or []
+        if hosted:
+            errors.append(f"{node} hosts controller/executor arbiter Pods: {hosted}")
+    if dns_nodes is not None and dns_nodes and set(dns_nodes) <= set(nodes):
+        errors.append(
+            "the two target nodes hold every kube-dns endpoint; quiescing both "
+            "would take cluster DNS down"
+        )
     if not predecessor.get("valid"):
         errors.append("DESTR-012 predecessor evidence is not PASS")
     if not tests.get("passed"):
@@ -408,6 +424,65 @@ def control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
     }
 
 
+ARBITER_APPS = (
+    "gpu-fault-cluster-executor",
+    "gpu-fault-completion-watcher",
+    "gpu-fault-node-installer-reconciler",
+)
+
+
+def cluster_arbiter_placement(
+    regional: RegionalLiveFixture,
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Where the GPU cluster's arbiter replicas and kube-dns endpoints run.
+
+    Returns ``({node: [namespace/pod, ...]}, [kube-dns node, ...])`` for the
+    running Pods only; terminating Pods have already left the node's fate.
+    """
+
+    arbiters: dict[str, list[str]] = {}
+    pods = json.loads(
+        regional.kubectl(
+            "gpu",
+            "get",
+            "pod",
+            "-l",
+            f"app in ({','.join(ARBITER_APPS)})",
+            "-o",
+            "json",
+        )
+    )
+    for item in pods.get("items", []):
+        if item.get("metadata", {}).get("deletionTimestamp"):
+            continue
+        node = item.get("spec", {}).get("nodeName") or ""
+        if node:
+            name = f"{item['metadata'].get('namespace')}/{item['metadata'].get('name')}"
+            arbiters.setdefault(node, []).append(name)
+    dns = json.loads(
+        regional.kubectl(
+            "gpu",
+            "get",
+            "pod",
+            "-n",
+            "kube-system",
+            "-l",
+            "k8s-app=kube-dns",
+            "-o",
+            "json",
+        )
+    )
+    dns_nodes = sorted(
+        {
+            str(item.get("spec", {}).get("nodeName") or "")
+            for item in dns.get("items", [])
+            if not item.get("metadata", {}).get("deletionTimestamp")
+            and item.get("spec", {}).get("nodeName")
+        }
+    )
+    return {node: sorted(names) for node, names in arbiters.items()}, dns_nodes
+
+
 def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     if not settings.site_file.is_file() or not settings.manifest.is_file():
         raise RegionalFixtureError("site file or training manifest does not exist")
@@ -419,9 +494,12 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     tests = focused_tests(case_dir)
     predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
     env = control_env(regional)
+    arbiter_pods, dns_nodes = cluster_arbiter_placement(regional)
     result: dict[str, Any] = {
         "release_id": state.get("release_id"),
         "nodes": snapshots,
+        "arbiter_pods": arbiter_pods,
+        "dns_nodes": dns_nodes,
         "agents": {node: stores[node].get("agent") for node in settings.nodes},
         "store": state,
         "runtime_identity": runtime_identity,
@@ -445,6 +523,8 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         tests=tests,
         control_env=env,
         runtime_identity_errors=runtime_identity_errors(runtime_identity),
+        arbiter_pods=arbiter_pods,
+        dns_nodes=dns_nodes,
     )
     write_json_atomic(case_dir / "preflight.json", result)
     return result
