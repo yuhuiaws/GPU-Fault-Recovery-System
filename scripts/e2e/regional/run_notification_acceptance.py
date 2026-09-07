@@ -724,6 +724,11 @@ def foreign_gpu_reservations(
         spec = item.get("spec", {})
         if item.get("status", {}).get("phase") != "Running":
             continue
+        # A Pod already being deleted still reports phase Running while its
+        # containers stop; it is releasing the GPU, not holding it (live
+        # 2026-09-07: phase one's own Pod tripped this check for phase two).
+        if item.get("metadata", {}).get("deletionTimestamp"):
+            continue
         if spec.get("nodeName") not in nodes:
             continue
         reserved = sum(
@@ -955,6 +960,11 @@ def run_notify005(
                 )["records"]
             observations.append(observation)
             fixture.delete()
+            # The PyTorchJob is gone once delete returns; its Pods may still be
+            # terminating on the node, and the next phase must not see them.
+            deadline = time.monotonic() + 300
+            while fixture.pods() and time.monotonic() < deadline:
+                time.sleep(5)
         single_count = len(observations[0]["notifications"])
         three_count = len(observations[1]["notifications"])
         observed = [item for value in observations for item in value["notifications"]]
