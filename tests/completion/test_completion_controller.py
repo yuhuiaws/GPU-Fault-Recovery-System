@@ -244,6 +244,56 @@ def test_disappeared_running_attempt_emits_stopped_tombstone_after_grace() -> No
     assert [item["rank"] for item in terminal["allocation"]] == [0]
 
 
+def test_disappeared_attempt_takes_its_initiator_from_the_workload_object() -> None:
+    """DESTR-015 live: STOP_WORKLOADS annotated the Pods and suspended the
+    PyTorchJob; the Pods exited within one poll, so the watcher never saw the
+    annotation and the STOPPED tombstone read as a user stop. The stop step
+    also annotates the workload object, which outlives the Pods."""
+
+    class FakeCustom:
+        def get_namespaced_custom_object(self, group, version, namespace, plural, name):
+            assert (group, plural, namespace, name) == (
+                "kubeflow.org",
+                "pytorchjobs",
+                "default",
+                "trainer",
+            )
+            return {
+                "metadata": {
+                    "annotations": {
+                        "gpu-fault.io/termination-initiator-incident-id": "inc-stop"
+                    }
+                }
+            }
+
+    stopper = FakeStopper()
+    stopper.custom = FakeCustom()
+    stopper.batch = None
+    clock = Clock()
+    core = FakeCoreApi([pod(0, workload_ids=["default/pytorchjob/trainer"])])
+    sink = FakeSink()
+    subject = KubernetesCompletionController(
+        core,
+        sink,
+        cluster_id="hp-cluster",
+        cleanup_timeout_seconds=30,
+        now=clock,
+        workload_stopper=stopper,
+    )
+
+    subject.run_once()
+    core.pods = []
+    subject.run_once()
+    clock.value += timedelta(seconds=31)
+    subject.run_once()
+
+    terminal = next(
+        payload for path, payload in sink.posts if path == "/v1/attempts/terminal"
+    )
+    assert terminal["terminal_status"] == "STOPPED"
+    assert terminal["termination_initiator_incident_id"] == "inc-stop"
+
+
 def test_restart_restores_attempt_and_terminalizes_missing_pods() -> None:
     from gpu_fault.completion_outbox import KubernetesCompletionOutbox
 

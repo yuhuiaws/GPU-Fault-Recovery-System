@@ -25,6 +25,7 @@ from gpu_fault.completion_attempt_state import (
 )
 from gpu_fault.completion_metrics_server import start_completion_metrics_server
 from gpu_fault.completion_observation import (
+    TERMINATION_INCIDENT_ANNOTATION,
     MissingAttemptTracker,
     ObservationOnlyTracker,
     _clear_attempt,
@@ -73,7 +74,6 @@ PYTORCH_JOB_LABELS = (
     "training.kubeflow.org/job-name",
     "pytorch-job-name",
 )
-TERMINATION_INCIDENT_ANNOTATION = "gpu-fault.io/termination-initiator-incident-id"
 WORKLOAD_LOG_SNAPSHOT_ANNOTATION = "gpu-fault.io/workload-log-snapshot"
 RESTART_BUDGET_ANNOTATION = "gpu-fault.io/restart-budget"
 

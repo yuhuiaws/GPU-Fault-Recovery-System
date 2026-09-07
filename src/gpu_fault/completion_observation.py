@@ -7,6 +7,66 @@ from typing import Any, cast
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 
 LOGGER = logging.getLogger(__name__)
+TERMINATION_INCIDENT_ANNOTATION = "gpu-fault.io/termination-initiator-incident-id"
+_CUSTOM_WORKLOADS: dict[str, tuple[str, str, str]] = {
+    "pytorchjob": ("kubeflow.org", "v1", "pytorchjobs"),
+    "jobset": ("jobset.x-k8s.io", "v1alpha2", "jobsets"),
+}
+
+
+def _parse_workload_id(value: str) -> tuple[str, str, str]:
+    parts = value.split("/")
+    if len(parts) == 2:
+        return parts[0], "job", parts[1]
+    if len(parts) == 3:
+        return parts[0], parts[1].lower(), parts[2]
+    raise ValueError(f"invalid workload ID: {value}")
+
+
+def workload_termination_initiator(
+    controller: Any, workload_ids: list[str]
+) -> str | None:
+    """The initiator incident recorded on the workload object itself.
+
+    ``STOP_WORKLOADS`` writes ``gpu-fault.io/termination-initiator-incident-id``
+    on the Job/PyTorchJob/JobSet when it suspends it, so the annotation
+    survives the Pods. Read-only through the stopper's API clients; any failure
+    means "unknown", never an exception on the observation path.
+    """
+
+    stopper = controller.workload_stopper
+    batch = getattr(stopper, "batch", None)
+    custom = getattr(stopper, "custom", None)
+    for workload_id in workload_ids:
+        try:
+            namespace, kind, name = _parse_workload_id(workload_id)
+            raw: Any
+            if kind == "job":
+                if batch is None:
+                    continue
+                raw = batch.read_namespaced_job(name, namespace)
+            else:
+                if custom is None or kind not in _CUSTOM_WORKLOADS:
+                    continue
+                group, version, plural = _CUSTOM_WORKLOADS[kind]
+                raw = custom.get_namespaced_custom_object(
+                    group, version, namespace, plural, name
+                )
+            data: dict[str, Any] = (
+                raw if isinstance(raw, dict) else dict(controller.serializer(raw))
+            )
+        except Exception as exc:  # noqa: BLE001 - observation must not fail
+            LOGGER.debug(
+                "could not read workload %s for its initiator: %s", workload_id, exc
+            )
+            continue
+        metadata = data.get("metadata") or {}
+        annotations = metadata.get("annotations") or {}
+        initiator = annotations.get(TERMINATION_INCIDENT_ANNOTATION)
+        if initiator:
+            return str(initiator)
+    return None
+
 
 MANAGED_LABEL = "gpu-fault.io/managed"
 JOB_LABEL = "gpu-fault.io/job-id"
@@ -82,7 +142,7 @@ def reconcile_attempt_observation(
             AttemptObservation,
             previous.model_copy(update={"observed_at": observed_at}),
         )
-    return cast(
+    result = cast(
         AttemptObservation,
         controller._missing_attempts.observe_missing(
             attempt_id,
@@ -90,6 +150,23 @@ def reconcile_attempt_observation(
             observed_at,
         ),
     )
+    if (
+        result.workload_phase is WorkloadPhase.STOPPED
+        and result.termination_initiator_incident_id is None
+    ):
+        # STOP_WORKLOADS annotates the attempt Pods with the initiator incident
+        # and then suspends the workload; a Pod that exits within one poll of
+        # the patch is never observed annotated, so the tombstone would read
+        # as a user stop and the control plane would withdraw the workflow
+        # that is waiting to RESTART_WORKLOAD (DESTR-015, live). The stop step
+        # writes the same annotation on the workload object, which outlives
+        # the Pods, so read it from there before declaring the stop external.
+        initiator = workload_termination_initiator(controller, previous.workload_ids)
+        if initiator:
+            result = result.model_copy(
+                update={"termination_initiator_incident_id": initiator}
+            )
+    return result
 
 
 class ObservationOnlyTracker:
