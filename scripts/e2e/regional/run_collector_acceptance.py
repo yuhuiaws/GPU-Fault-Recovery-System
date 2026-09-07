@@ -689,6 +689,40 @@ def waiting_workflow(
     raise RegionalFixtureError(f"workflow did not reach WAITING: {last}")
 
 
+def mechanical_acknowledgement_details(
+    execution: dict[str, Any],
+    commands: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Where CHECK_MECHANICALS tells the operator what to write.
+
+    In the single-cluster adapter the step's own ``details`` carry
+    ``required_annotation`` and ``required_annotation_value``. On a regional
+    site the step is a remote node action: its ``details`` hold only
+    ``remote_command_id``/``remote_status`` pointers and the Node Agent's answer
+    -- annotation key, ``<incident_id>:<fencing_token>`` value, notification id
+    -- travels on the remote command's ``result_details`` (observed live on
+    COLLECT-009 attempt 2, which failed with "omitted annotation details" while
+    the command had them). Follow the pointer; prefer the step when it answers.
+    """
+
+    details = dict(execution.get("details") or {})
+    if details.get("required_annotation") and details.get("required_annotation_value"):
+        return details
+    command_id = str(details.get("remote_command_id") or "")
+    for command in commands or []:
+        if command_id and str(command.get("command_id")) != command_id:
+            continue
+        step = command.get("step") or {}
+        if not command_id and step.get("operation") != "CHECK_MECHANICALS":
+            continue
+        result = command.get("result_details") or {}
+        if result.get("required_annotation") and result.get(
+            "required_annotation_value"
+        ):
+            return {**details, **result}
+    return details
+
+
 def run_collect009(
     fixture: CollectorAcceptanceFixture,
     case_dir: Path,
@@ -718,7 +752,7 @@ def run_collect009(
         ),
         {},
     )
-    details = execution.get("details") or {}
+    details = mechanical_acknowledgement_details(execution, state.get("commands"))
     annotation = str(details.get("required_annotation") or "")
     expected = str(details.get("required_annotation_value") or "")
     if not annotation or not expected:
