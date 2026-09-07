@@ -109,6 +109,27 @@ def test_profile_path_prefers_the_flag_over_the_environment(tmp_path: Path) -> N
     assert site_profile_path([], {}) is None
 
 
+def test_a_runners_own_site_flag_is_not_taken_as_the_profile(tmp_path: Path) -> None:
+    """``--site <RegionalSite yaml>`` is a BOOT runner flag, not ``--site-profile``.
+
+    The pre-parser used argparse's default abbreviation matching, so a run with
+    ``--site /secure/.../site.yaml`` loaded site.yaml as the profile and failed
+    with "unknown sections: apiVersion, kind, metadata, spec" (BOOT-011, live).
+    """
+
+    assert site_profile_path(["--site", str(tmp_path / "site.yaml")], {}) is None
+    chosen = site_profile_path(
+        [
+            "--site-profile",
+            str(tmp_path / "profile.yaml"),
+            "--site",
+            str(tmp_path / "site.yaml"),
+        ],
+        {},
+    )
+    assert chosen == (tmp_path / "profile.yaml").resolve()
+
+
 def test_profile_only_supplies_flags_the_runner_actually_defines() -> None:
     # One profile describes the site, not one case, and the cases disagree on
     # flag names: the collector runners take --node, DESTR-003 takes

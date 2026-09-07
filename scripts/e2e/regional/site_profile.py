@@ -44,7 +44,10 @@ def site_profile_path(
 ) -> Path | None:
     """Resolve the profile a run should use, or None when it uses none."""
 
-    pre = argparse.ArgumentParser(add_help=False)
+    # allow_abbrev=False: with the default, argparse takes a runner's own
+    # ``--site <RegionalSite yaml>`` as an abbreviation of ``--site-profile`` and
+    # this pre-parser tries to load site.yaml as the profile (BOOT-011, live).
+    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument("--site-profile", default="")
     known, _ = pre.parse_known_args(list(argv))
     values = os.environ if environment is None else environment
