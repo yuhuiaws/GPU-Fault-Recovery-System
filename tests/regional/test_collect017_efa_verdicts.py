@@ -86,13 +86,16 @@ def _bundle() -> dict[str, Any]:
         "workflow": {
             "request_id": "workflow-d6cb833b779638eaafc386e4",
             "status": "SUCCEEDED",
+            "official_action": "REMEDIATE_EFA_DRIVER",
             "official_steps": steps,
             "step_executions": executions,
         },
         "remote_commands": remote_commands,
         "incident": {
             "state": "RECOVERED",
-            "official_action": "REMEDIATE_EFA_DRIVER",
+            # Observed live: official_action stays None, effective_action decides.
+            "official_action": None,
+            "effective_action": "REMEDIATE_EFA_DRIVER",
             "reasons": ["EFA PCI device is present but the efa driver is not bound"],
         },
     }
@@ -200,8 +203,12 @@ def test_restore_having_to_bind_is_not_a_pass() -> None:
         (lambda b: _move_result_to_other_node(b), "no Node Agent result"),
         (lambda b: b["incident"].__setitem__("state", "QUARANTINED"), "incident state"),
         (
-            lambda b: b["incident"].__setitem__("official_action", "RUN_DIAGNOSTICS"),
-            "official_action",
+            lambda b: b["incident"].__setitem__("effective_action", "RUN_DIAGNOSTICS"),
+            "incident action",
+        ),
+        (
+            lambda b: b["workflow"].__setitem__("official_action", "RUN_DIAGNOSTICS"),
+            "workflow official_action",
         ),
         (
             lambda b: b["incident"].__setitem__("reasons", ["link down"]),
@@ -232,3 +239,50 @@ def test_fail_safe_outlives_the_workflow_and_incident_waits() -> None:
         collect017.EFA_WORKFLOW_TIMEOUT_SECONDS
         + collect017.EFA_INCIDENT_TIMEOUT_SECONDS
     ), "a shorter fail-safe rebinds the function before the control plane can"
+
+
+def _plugin_bundle(steps: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        "workflow": {
+            "status": "SUCCEEDED",
+            "official_steps": [{"operation": op} for op in steps],
+            "step_executions": [
+                {"operation": op, "status": "SUCCEEDED"} for op in steps
+            ],
+        },
+        "incident": {"state": "RECOVERED"},
+    }
+
+
+@pytest.mark.parametrize(
+    "steps", [collect017.GPU_PLUGIN_STEPS, collect017.EFA_PLUGIN_STEPS]
+)
+def test_plugin_workflow_verdict_follows_the_documented_steps(
+    steps: tuple[str, ...],
+) -> None:
+    good = _plugin_bundle(steps)
+    assert collect017.plugin_workflow_errors(good, steps=steps, label="x") == []
+
+    extra = copy.deepcopy(good)
+    extra["workflow"]["official_steps"].insert(1, {"operation": "STOP_WORKLOADS"})
+    errors = collect017.plugin_workflow_errors(extra, steps=steps, label="x")
+    assert any("official steps" in item for item in errors), errors
+
+    failed_step = copy.deepcopy(good)
+    failed_step["workflow"]["step_executions"][1]["status"] = "FAILED"
+    failed_step["workflow"]["status"] = "FAILED"
+    errors = collect017.plugin_workflow_errors(failed_step, steps=steps, label="x")
+    assert any(steps[1] in item and "FAILED" in item for item in errors), errors
+    assert any("workflow status" in item for item in errors), errors
+
+    open_incident = copy.deepcopy(good)
+    open_incident["incident"]["state"] = "QUARANTINED"
+    errors = collect017.plugin_workflow_errors(open_incident, steps=steps, label="x")
+    assert errors == ["x incident state 'QUARANTINED' != RECOVERED"], errors
+
+
+def test_plugin_workflow_wait_outlives_two_collector_samples() -> None:
+    # 15s interval x 2 consecutive samples, plus ingestion and planning.
+    assert collect017.PLUGIN_WORKFLOW_PLAN_TIMEOUT_SECONDS >= 120, (
+        "the DaemonSet must stay excluded long enough for the collector to report"
+    )

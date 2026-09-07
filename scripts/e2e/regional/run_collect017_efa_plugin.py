@@ -267,9 +267,16 @@ def efa_unbind_errors(
     ]
     if operations != list(EFA_REMEDIATION_STEPS):
         errors.append(f"official steps {operations} != {list(EFA_REMEDIATION_STEPS)}")
-    if incident.get("official_action") != "REMEDIATE_EFA_DRIVER":
+    # Live, the incident's official_action is None for this path; the decided
+    # action is effective_action, and the workflow carries it as official_action.
+    incident_action = incident.get("effective_action") or incident.get(
+        "official_action"
+    )
+    if incident_action != "REMEDIATE_EFA_DRIVER":
+        errors.append(f"incident action {incident_action!r} != REMEDIATE_EFA_DRIVER")
+    if workflow.get("official_action") != "REMEDIATE_EFA_DRIVER":
         errors.append(
-            f"incident official_action {incident.get('official_action')!r} "
+            f"workflow official_action {workflow.get('official_action')!r} "
             "!= REMEDIATE_EFA_DRIVER"
         )
     reasons = " ".join(str(item) for item in incident.get("reasons") or [])
@@ -368,17 +375,7 @@ def run_efa_unbind(
     if not bound:
         raise RegionalFixtureError("no bound EFA BDF was discovered")
     bdf = str(bound[0]["pci_bdf"])
-    base_settings = base.Settings(
-        regional=settings.regional,
-        case_id=CASE_ID,
-        node=settings.node,
-        second_node=None,
-        host_probe_image=settings.host_probe_image,
-        hyperpod_cluster="",
-        executor_role_arn="",
-        site_file=settings.site_file,
-        predecessor_path=settings.predecessor_path,
-    )
+    base_settings = _base_settings(settings, settings.node)
     started_at = datetime.now(timezone.utc)
     injection = collector.execute(
         "unbind-efa",
@@ -456,6 +453,104 @@ def run_efa_unbind(
     }
 
 
+GPU_PLUGIN_STEPS = (
+    "FREEZE_EVIDENCE",
+    "RESTART_GPU_DEVICE_PLUGIN",
+    "TRIGGER_HEALTH_SNAPSHOT",
+    "VALIDATE_GPU",
+)
+EFA_PLUGIN_STEPS = (
+    "FREEZE_EVIDENCE",
+    "RESTART_EFA_DEVICE_PLUGIN",
+    "TRIGGER_HEALTH_SNAPSHOT",
+    "VALIDATE_FABRIC",
+)
+# The Kubernetes node-resource collector samples every 15s and needs two
+# consecutive mismatching samples before it reports; add ingestion, triage and
+# planning. Restoring the DaemonSet before the workflow exists (attempt 2 did,
+# right after allocatable hit 0) leaves the collector nothing to see.
+PLUGIN_WORKFLOW_PLAN_TIMEOUT_SECONDS = 240
+
+
+def _base_settings(settings: Settings, node: str) -> Any:
+    return base.Settings(
+        regional=settings.regional,
+        case_id=CASE_ID,
+        node=node,
+        second_node=None,
+        host_probe_image=settings.host_probe_image,
+        hyperpod_cluster="",
+        executor_role_arn="",
+        site_file=settings.site_file,
+        predecessor_path=settings.predecessor_path,
+    )
+
+
+def _wait_planned_workflow(
+    regional: RegionalLiveFixture,
+    settings: Settings,
+    *,
+    node: str,
+    operation: str,
+    observed_after: datetime,
+    timeout_seconds: int = PLUGIN_WORKFLOW_PLAN_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """The workflow that planned ``operation`` for ``node``, in any status.
+
+    ``base.latest_node_workflow`` waits for a terminal workflow; here the
+    injection must stay in place until the control plane has *planned* the
+    restart, and only then may the DaemonSet be restored so the step can run.
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = regional.cpu_python(
+            base.LATEST_NODE_WORKFLOW,
+            settings.regional.cluster_id,
+            node,
+            observed_after.isoformat(),
+        )
+        planned = base.workflow_planning(last, operation)
+        if planned is not None:
+            return planned
+        time.sleep(5)
+    raise RegionalFixtureError(
+        f"no workflow planned {operation} for {node} within {timeout_seconds}s: {last}"
+    )
+
+
+def plugin_workflow_errors(
+    bundle: dict[str, Any], *, steps: tuple[str, ...], label: str
+) -> list[str]:
+    """B/C verdict: the documented steps ran, all SUCCEEDED, incident RECOVERED."""
+
+    errors: list[str] = []
+    workflow = bundle.get("workflow") or {}
+    incident = bundle.get("incident") or {}
+    operations = [
+        str(item.get("operation")) for item in workflow.get("official_steps") or []
+    ]
+    if operations != list(steps):
+        errors.append(f"{label} official steps {operations} != {list(steps)}")
+    if workflow.get("status") != "SUCCEEDED":
+        errors.append(
+            f"{label} workflow status {workflow.get('status')!r} != SUCCEEDED"
+        )
+    statuses = {
+        str(item.get("operation")): item.get("status")
+        for item in workflow.get("step_executions") or []
+    }
+    for operation in steps:
+        if statuses.get(operation) != "SUCCEEDED":
+            errors.append(
+                f"{label} {operation} {statuses.get(operation)!r} != SUCCEEDED"
+            )
+    if incident.get("state") != "RECOVERED":
+        errors.append(f"{label} incident state {incident.get('state')!r} != RECOVERED")
+    return errors
+
+
 def run_gpu_plugin(
     settings: Settings,
     regional: RegionalLiveFixture,
@@ -469,33 +564,38 @@ def run_gpu_plugin(
     )
     info = plugin.discover()
     started_at = datetime.now(timezone.utc)
+    planned: dict[str, Any] = {}
     try:
         plugin.exclude_node()
-        plugin.wait_allocatable(0)
+        unavailable = plugin.wait_allocatable(0)
+        planned = _wait_planned_workflow(
+            regional,
+            settings,
+            node=settings.node,
+            operation="RESTART_GPU_DEVICE_PLUGIN",
+            observed_after=started_at,
+        )
         plugin.restore()
         plugin.wait_allocatable(baseline)
         workflow = base.latest_node_workflow(
             regional,
-            base.Settings(
-                regional=settings.regional,
-                case_id=CASE_ID,
-                node=settings.node,
-                second_node=None,
-                host_probe_image=settings.host_probe_image,
-                hyperpod_cluster="",
-                executor_role_arn="",
-                site_file=settings.site_file,
-                predecessor_path=settings.predecessor_path,
-            ),
+            _base_settings(settings, settings.node),
             observed_after=started_at,
             timeout_seconds=600,
         )
     finally:
         plugin.restore()
-    errors = []
-    if workflow["workflow"].get("status") != "SUCCEEDED":
-        errors.append("GPU device-plugin workflow failed")
-    return {"errors": errors, "plugin": info, "workflow": workflow}
+    errors = plugin_workflow_errors(
+        workflow, steps=GPU_PLUGIN_STEPS, label="GPU plugin"
+    )
+    return {
+        "errors": errors,
+        "plugin": info,
+        "baseline_allocatable": baseline,
+        "unavailable": unavailable,
+        "planned_workflow_id": planned.get("request_id"),
+        "workflow": workflow,
+    }
 
 
 def run_training_plugin(
@@ -556,7 +656,16 @@ def run_training_plugin(
         started_at = datetime.now(timezone.utc)
         plugin.exclude_node()
         plugin.wait_allocatable(0)
-        time.sleep(30)
+        # Hold the loss until the control plane has planned the restart (the
+        # collector needs two 15s samples), then check the training Pods rode
+        # through it untouched before handing the plugin back.
+        planned = _wait_planned_workflow(
+            regional,
+            settings,
+            node=target,
+            operation="RESTART_EFA_DEVICE_PLUGIN",
+            observed_after=started_at,
+        )
         during = workload.snapshot()
         if {str(item["uid"]) for item in during["pods"]} != uids:
             result["errors"].append("EFA plugin loss recreated training Pods")
@@ -564,17 +673,7 @@ def run_training_plugin(
         plugin.wait_allocatable(baseline)
         workflow = base.latest_node_workflow(
             regional,
-            base.Settings(
-                regional=settings.regional,
-                case_id=CASE_ID,
-                node=target,
-                second_node=None,
-                host_probe_image=settings.host_probe_image,
-                hyperpod_cluster="",
-                executor_role_arn="",
-                site_file=settings.site_file,
-                predecessor_path=settings.predecessor_path,
-            ),
+            _base_settings(settings, target),
             observed_after=started_at,
             timeout_seconds=600,
         )
@@ -584,11 +683,18 @@ def run_training_plugin(
         }
         if operations.intersection({"STOP_WORKLOADS", "RESTART_WORKLOAD"}):
             result["errors"].append("EFA plugin recovery restarted workload")
+        result["errors"].extend(
+            plugin_workflow_errors(workflow, steps=EFA_PLUGIN_STEPS, label="EFA plugin")
+        )
+        after = workload.snapshot()
+        if {str(item["uid"]) for item in after["pods"]} != uids:
+            result["errors"].append("training Pods changed after EFA plugin recovery")
         result.update(
             {
                 "target_node": target,
                 "pod_uids": sorted(uids),
                 "plugin": info,
+                "planned_workflow_id": planned.get("request_id"),
                 "workflow": workflow,
             }
         )
