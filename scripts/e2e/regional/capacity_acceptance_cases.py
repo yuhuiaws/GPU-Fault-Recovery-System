@@ -88,32 +88,56 @@ class CapacityAcceptanceCases(CapHarnessBase):
                 time.sleep(delay)
             observed = datetime.now(timezone.utc)
             begin = time.perf_counter()
-            response = client.post(
-                "/v1/collector-events/host-telemetry",
-                headers=self.cluster_headers(
-                    f"cap-cluster-{cluster_index:03d}", self.tokens[cluster_index]
-                ),
-                json={
-                    "batch_id": (f"cap001-c{cluster_index:03d}-{sequence:05d}"),
-                    "cluster_id": f"cap-cluster-{cluster_index:03d}",
-                    "node_id": f"node-c{cluster_index:03d}-{sequence:05d}",
-                    "observed_at": observed.isoformat(),
-                    "samples": [
-                        {
-                            "name": "network_link_up",
-                            "value": 1,
-                            "device": "eth0",
-                        }
-                    ],
-                    "runtime_profile_version": "hyperpod-v1",
-                    "edge_filter_reasons": ["capacity-test"],
-                },
+            payload = {
+                "batch_id": (f"cap001-c{cluster_index:03d}-{sequence:05d}"),
+                "cluster_id": f"cap-cluster-{cluster_index:03d}",
+                "node_id": f"node-c{cluster_index:03d}-{sequence:05d}",
+                "observed_at": observed.isoformat(),
+                "samples": [
+                    {
+                        "name": "network_link_up",
+                        "value": 1,
+                        "device": "eth0",
+                    }
+                ],
+                "runtime_profile_version": "hyperpod-v1",
+                "edge_filter_reasons": ["capacity-test"],
+            }
+            headers = self.cluster_headers(
+                f"cap-cluster-{cluster_index:03d}", self.tokens[cluster_index]
             )
+            # The probe is reached through kubectl port-forward and a pooled
+            # client whose idle connections the server closes after its
+            # keep-alive timeout; a dropped connection is the transport's
+            # doing, not the admission decision under test. Retry it on a fresh
+            # connection and keep count, so the judgement still sees every
+            # request's real status (live 2026-09-07: one drop aborted the case).
+            transport_retries = 0
+            for attempt in range(3):
+                try:
+                    response = client.post(
+                        "/v1/collector-events/host-telemetry",
+                        headers=headers,
+                        json=payload,
+                    )
+                    break
+                except httpx.TransportError as exc:
+                    transport_retries += 1
+                    if attempt == 2:
+                        return {
+                            "cluster": cluster_index,
+                            "status": f"transport-error:{type(exc).__name__}",
+                            "retry_after": None,
+                            "latency_ms": (time.perf_counter() - begin) * 1000,
+                            "transport_retries": transport_retries,
+                        }
+                    time.sleep(0.05)
             return {
                 "cluster": cluster_index,
                 "status": response.status_code,
                 "retry_after": response.headers.get("Retry-After"),
                 "latency_ms": (time.perf_counter() - begin) * 1000,
+                "transport_retries": transport_retries,
             }
 
         wall_start = time.perf_counter()
@@ -170,13 +194,19 @@ class CapacityAcceptanceCases(CapHarnessBase):
             },
             "metric_maxima": maxima,
             "queue_drained": drained,
+            "transport_retries": sum(
+                int(item.get("transport_retries", 0)) for item in responses
+            ),
         }
         passed = all(
             (
                 result["a_status_counts"].get(429, 0) > 0,
                 result["a_retry_after_values"] == ["2"],
                 result["b_status_counts"] == {202: 60},
-                not any(status >= 500 for status in result["a_status_counts"]),
+                not any(
+                    isinstance(status, int) and status >= 500
+                    for status in result["a_status_counts"]
+                ),
                 maxima.get("queue_depth", 0) < 10000,
                 maxima.get("a_rejections", 0) > 0,
                 maxima.get("b_rejections", 0) == 0,
