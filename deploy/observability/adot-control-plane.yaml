@@ -150,7 +150,7 @@ data:
                 # no tolerance for that -- so the family is named separately.
                 - action: keep
                   source_labels: [__name__]
-                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+|gpu_fault_postgres_.+|gpu_fault_periodic_.+|gpu_fault_health_signal_.+|gpu_fault_ingest_.+|gpu_fault_control_record_.+|gpu_fault_orphan_.+|gpu_fault_incident_.+|gpu_fault_incidents_.+|gpu_fault_completion_.+|gpu_fault_gpu_findings_.+
+                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+|gpu_fault_postgres_.+|gpu_fault_periodic_.+|gpu_fault_health_signal_.+|gpu_fault_ingest_.+|gpu_fault_control_record_.+|gpu_fault_orphan_.+|gpu_fault_incident_.+|gpu_fault_incidents_.+|gpu_fault_completion_.+|gpu_fault_gpu_findings_.+|gpu_fault_capacity_.+
                 # Dropped because they describe the collector, not the fleet.
                 # The receiver stamps every metric with the instrumentation
                 # scope it arrived under, and those labels then take part in

@@ -332,6 +332,73 @@ def test_aurora_instances_are_deleted_readers_before_writer() -> None:
     ]
 
 
+def test_created_grafana_workspace_is_deleted_and_absence_is_fine(
+    tmp_path, monkeypatch
+) -> None:
+    site = load_site(site_file(tmp_path))
+    calls: list[list[str]] = []
+
+    def grafana(arguments, **kwargs):
+        del kwargs
+        calls.append(list(arguments))
+        if "describe-workspace" in arguments or "delete-workspace" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                254,
+                stdout="",
+                stderr="An error occurred (ResourceNotFoundException) ...",
+            )
+        return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", grafana)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+    workspace = _resource("aws/grafana/workspace", "grafana_workspace", "g-created01")
+    account = _resource(
+        "aws/grafana/service-account", "grafana_service_account", "9"
+    ).model_copy(update={"attributes": {"workspace_id": "g-created01"}})
+
+    cleaner.validate_supported([workspace, account])
+    cleaner.delete(account)
+    cleaner.delete(workspace)
+
+    account_delete = next(
+        call for call in calls if "delete-workspace-service-account" in call
+    )
+    assert account_delete[1] == "grafana"
+    assert account_delete[account_delete.index("--workspace-id") + 1] == "g-created01"
+    assert account_delete[account_delete.index("--service-account-id") + 1] == "9"
+    delete = next(
+        call
+        for call in calls
+        if "delete-workspace" in call and "delete-workspace-service-account" not in call
+    )
+    assert delete[1] == "grafana", "the Grafana workspace was deleted through amp"
+    assert delete[delete.index("--workspace-id") + 1] == "g-created01"
+    assert delete[delete.index("--region") + 1] == "us-east-1"
+
+
+def test_the_hyperpod_owned_grafana_workspace_is_preserved_by_uninstall() -> None:
+    """``g-5b81a13d97`` was created by the HyperPod observability component; deploy
+    only tags it, so the registry records it as EXTERNAL and uninstall must not
+    adopt it the way it adopts REUSED solution resources."""
+
+    workspace = _resource(
+        "aws/grafana/workspace",
+        "grafana_workspace",
+        "g-5b81a13d97",
+        policy=InstallationResourceDeletePolicy.PRESERVE,
+    )
+
+    policy = _effective_policy(workspace, cpu_disposition="delete")
+    terminal = _terminal_resource(
+        workspace, policy=policy, now=datetime.now(timezone.utc)
+    )
+
+    assert workspace.ownership is InstallationResourceOwnership.EXTERNAL
+    assert policy is InstallationResourceDeletePolicy.PRESERVE
+    assert terminal.status is admin_uninstall.InstallationResourceStatus.PRESERVED
+
+
 def test_legacy_reused_solution_resource_is_adopted_for_deletion() -> None:
     resource = _resource(
         "aws/sns/topic",

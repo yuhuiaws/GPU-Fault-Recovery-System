@@ -12,6 +12,7 @@ from gpu_fault.admin.bootstrap_common import (
     run_parallel,
     safe_name,
 )
+from gpu_fault.admin.grafana import GrafanaSettings
 from gpu_fault.admin.notifications import NotificationRouting
 
 
@@ -52,6 +53,7 @@ def run_platform_prerequisite_tasks(
     runtime_image: str,
     aurora: dict[str, Any],
     fleet_master_file: Path,
+    grafana: GrafanaSettings | None = None,
 ) -> None:
     from gpu_fault.admin.bootstrap_services import (
         install_aurora_refresh,
@@ -75,6 +77,7 @@ def run_platform_prerequisite_tasks(
                 adot_image=adot_image,
                 alert_email=alert_email,
                 probe_only=probe_only,
+                grafana=grafana,
             ),
             "aurora_refresh": lambda: install_aurora_refresh(
                 task_runner,

@@ -104,6 +104,12 @@ class BootstrapRequest:
     staging_only_release: bool = False
     impact_base: str = "origin/main"
     dry_run: bool = False
+    # Amazon Managed Grafana dashboards (``gpu_fault.admin.grafana``): on by
+    # default, an explicit workspace id is operator input, ``grafana_create``
+    # opts into creating a workspace when the region has none.
+    grafana_enabled: bool = True
+    grafana_workspace_id: str | None = None
+    grafana_create: bool = False
 
 
 @dataclass(frozen=True)

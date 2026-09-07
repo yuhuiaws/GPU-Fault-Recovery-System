@@ -30,6 +30,7 @@ from gpu_fault.admin.bootstrap_platform_probes import (
     assert_monitoring_install_current,
     assert_node_action_keys_current,
 )
+from gpu_fault.admin.grafana import GrafanaSettings, ensure_grafana_dashboards
 from gpu_fault.admin.monitoring_subscriptions import (
     ensure_monitoring_subscriptions,
 )
@@ -1138,6 +1139,7 @@ def install_monitoring(
     adot_image: str,
     alert_email: str | None,
     probe_only: bool = False,
+    grafana: GrafanaSettings | None = None,
 ) -> dict[str, Any]:
     topic_name = monitoring["sns_topic_arn"].rsplit(":", 1)[-1]
     role_name = safe_name(f"gpu-fault-{site_id}-amp-writer", maximum=64)
@@ -1206,6 +1208,18 @@ def install_monitoring(
         service_account="gpu-fault-adot",
         role_arn=role["role_arn"],
     )
+    # Dashboards ride on this task so they are checkpointed with the AMP install
+    # they visualise and re-imported when the dashboard assets change; the step
+    # itself decides between a soft FAILED record and an operator-input error.
+    dashboards = ensure_grafana_dashboards(
+        runner,
+        settings=grafana,
+        cpu=cpu,
+        site_id=site_id,
+        amp_workspace_id=str(monitoring["workspace_id"]),
+        repository_root=repository_root,
+        probe_only=probe_only,
+    )
     return {
         **role,
         "association_id": association["association_id"],
@@ -1214,6 +1228,7 @@ def install_monitoring(
         "namespace": association["namespace"],
         "service_account": association["service_account"],
         "installer_output": output,
+        "grafana": dashboards,
     }
 
 

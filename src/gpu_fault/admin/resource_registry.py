@@ -15,18 +15,13 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     tag_map,
 )
+from gpu_fault.admin.grafana import grafana_installation_resources
 from gpu_fault.admin.resource_records import (
     foundation_ownership as _foundation_ownership,
 )
-from gpu_fault.admin.resource_records import (
-    ownership as _ownership,
-)
-from gpu_fault.admin.resource_records import (
-    policy as _policy,
-)
-from gpu_fault.admin.resource_records import (
-    record as _record,
-)
+from gpu_fault.admin.resource_records import ownership as _ownership
+from gpu_fault.admin.resource_records import policy as _policy
+from gpu_fault.admin.resource_records import record as _record
 from gpu_fault.admin.resource_records import (
     release_repository_resources as _release_repository_resources,
 )
@@ -504,7 +499,9 @@ def _monitoring_resources(
     config: Mapping[str, Any],
     state: Mapping[str, Any],
 ) -> list[InstallationResource]:
-    resources: list[InstallationResource] = []
+    resources = grafana_installation_resources(
+        site_id=site_id, region=region, account_id=account_id, state=state
+    )
     monitoring = state.get("monitoring_resources") or {}
     values = (
         (

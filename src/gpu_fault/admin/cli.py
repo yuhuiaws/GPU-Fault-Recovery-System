@@ -80,6 +80,11 @@ from gpu_fault.admin.failure_domain_map import (
     add_failure_domain_map_command,
     run_failure_domain_map_command,
 )
+from gpu_fault.admin.grafana import (
+    add_grafana_arguments,
+    grafana_environment,
+    grafana_request_fields,
+)
 from gpu_fault.admin.source_deploy import run_source_deploy
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
 from gpu_fault.models import BlockedKind
@@ -437,12 +442,7 @@ def parser() -> argparse.ArgumentParser:
             "STATE_DIR using the same command"
         ),
     )
-    deploy.add_argument(
-        "-f",
-        "--file",
-        type=Path,
-        help=argparse.SUPPRESS,
-    )
+    deploy.add_argument("-f", "--file", type=Path, help=argparse.SUPPRESS)
     deploy.add_argument(
         "--cpu-cluster-arn",
         metavar="CPU_ARN",
@@ -483,22 +483,15 @@ def parser() -> argparse.ArgumentParser:
         metavar="EMAIL",
         help="administrator email for SES fault notifications and SNS alerts",
     )
-    deploy.add_argument(
-        "--alert-email",
-        dest="alert_email",
-        help=argparse.SUPPRESS,
-    )
+    deploy.add_argument("--alert-email", dest="alert_email", help=argparse.SUPPRESS)
+    add_grafana_arguments(deploy)
     deploy.add_argument(
         "--staging-only-release",
         action="store_true",
         help=argparse.SUPPRESS,
     )
     _add_schema_change_arguments(deploy)
-    deploy.add_argument(
-        "--impact-base",
-        default="origin/main",
-        help=argparse.SUPPRESS,
-    )
+    deploy.add_argument("--impact-base", default="origin/main", help=argparse.SUPPRESS)
     deploy.add_argument(
         "--email-sender",
         help=argparse.SUPPRESS,
@@ -1451,7 +1444,10 @@ def run(arguments: argparse.Namespace) -> int:
                 admin_email=arguments.alert_email,
                 impact_base=getattr(arguments, "impact_base", "origin/main"),
                 current_directory=Path.cwd(),
-                extra_environment=schema_change_environment(arguments),
+                extra_environment={
+                    **schema_change_environment(arguments),
+                    **grafana_environment(arguments),
+                },
             )
         repository_root = (arguments.repo_root or Path.cwd()).resolve()
         with administrator_operation_lock(arguments.state_dir):
@@ -1475,6 +1471,7 @@ def run(arguments: argparse.Namespace) -> int:
                         False,
                     ),
                     impact_base=getattr(arguments, "impact_base", "origin/main"),
+                    **grafana_request_fields(arguments),
                 )
             )
         site_file = bootstrap_result.site_file

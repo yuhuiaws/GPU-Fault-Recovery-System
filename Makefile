@@ -125,7 +125,7 @@ POSTGRES_TESTS = \
 	tests/store/test_store_contracts.py
 COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS) $(POSTGRES_TESTS),--ignore=$(test))
 
-.PHONY: test test-postgres test-postgres-stress test-shuffled test-parallel test-parallel-release test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check check-static check-static-sequential python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check test-source-assertion-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check doc-anchor-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check lazy-export-check cfn-lint-check doc-facts-check pip-audit-check sbom ci-supply-chain-tools promtool-check
+.PHONY: test test-postgres test-postgres-stress test-shuffled test-parallel test-parallel-release test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check check-static check-static-sequential python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check test-source-assertion-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check doc-anchor-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check lazy-export-check cfn-lint-check doc-facts-check pip-audit-check sbom ci-supply-chain-tools promtool-check grafana-dashboards grafana-dashboards-check
 
 test:
 	$(PYTHON) -m pytest
@@ -372,6 +372,7 @@ docs-static-check:
 	$(MAKE) doc-anchor-check
 	$(MAKE) fault-evidence-check
 	$(MAKE) doc-facts-check
+	$(MAKE) grafana-dashboards-check
 
 doc-impact-check:
 	$(PYTHON) scripts/check-doc-impact.py
@@ -400,6 +401,15 @@ fault-evidence-check:
 # Declared prose facts (test-tree shape, collector auth model) against the code.
 doc-facts-check:
 	$(PYTHON) scripts/check-doc-facts.py
+
+# Grafana dashboards are rendered from scripts/grafana_dashboard_catalog.py and
+# deploy/observability/amp-rules.yaml (thresholds, runbook anchors); the JSON
+# under deploy/observability/dashboards/ is checked in and must match.
+grafana-dashboards:
+	$(PYTHON) scripts/build-grafana-dashboards.py
+
+grafana-dashboards-check:
+	$(PYTHON) scripts/build-grafana-dashboards.py --check
 
 config-check:
 	PYTHONPATH=src $(PYTHON) -m gpu_fault.config_cli validate \

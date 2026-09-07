@@ -32,6 +32,8 @@ SUPPORTED_RESOURCE_TYPES = frozenset(
         "eks_pod_identity_association",
         "gpu_eks",
         "gpu_hyperpod",
+        "grafana_service_account",
+        "grafana_workspace",
         "helm_release",
         "iam_oidc_provider",
         "iam_policy",
@@ -64,11 +66,13 @@ DELETE_PRIORITY = {
     "eks_pod_identity_association": 10,
     "ec2_route_table_association": 10,
     "route53_vpc_association": 10,
+    "grafana_service_account": 10,
     "nlb_listener": 20,
     "nlb": 30,
     "nlb_target_group": 40,
     "helm_release": 50,
     "amp_workspace": 60,
+    "grafana_workspace": 60,
     "sns_topic": 60,
     "sqs_queue": 60,
     "acm_certificate": 60,
@@ -103,10 +107,7 @@ class ResourceProbe:
         self.region = str(site.release_config["aws_region"])
         self.cpu_kubeconfig = str(site.release_config["cpu_kubeconfig"])
 
-    def validate_supported(
-        self,
-        resources: Iterable[InstallationResource],
-    ) -> None:
+    def validate_supported(self, resources: Iterable[InstallationResource]) -> None:
         unsupported = sorted(
             {
                 resource.resource_type
@@ -121,14 +122,7 @@ class ResourceProbe:
             )
 
     def _aws(self, service: str, operation: str, *arguments: str) -> list[str]:
-        return [
-            "aws",
-            service,
-            operation,
-            "--region",
-            self.region,
-            *arguments,
-        ]
+        return ["aws", service, operation, "--region", self.region, *arguments]
 
     def _exists_command(
         self,
@@ -146,10 +140,7 @@ class ResourceProbe:
             f"{result.stderr.strip()}"
         )
 
-    def _route53_records(
-        self,
-        resource: InstallationResource,
-    ) -> list[dict[str, Any]]:
+    def _route53_records(self, resource: InstallationResource) -> list[dict[str, Any]]:
         document = _json(
             self._aws(
                 "route53",
@@ -188,10 +179,7 @@ class ResourceProbe:
                     "--names",
                     identifier,
                 )
-            return self._exists_command(
-                arguments,
-                not_found=("LoadBalancerNotFound",),
-            )
+            return self._exists_command(arguments, not_found=("LoadBalancerNotFound",))
         if resource_type == "nlb_listener":
             return self._exists_command(
                 self._aws(
@@ -267,10 +255,7 @@ class ResourceProbe:
             )
         return None
 
-    def _exists_dns_and_monitoring(
-        self,
-        resource: InstallationResource,
-    ) -> bool | None:
+    def _exists_dns_and_monitoring(self, resource: InstallationResource) -> bool | None:
         resource_type = resource.resource_type
         identifier = resource.resource_id
         arn = resource.resource_arn or identifier
@@ -314,10 +299,7 @@ class ResourceProbe:
                 ),
                 not_found=("ResourceNotFoundException",),
             )
-        if resource_type in {
-            "secretsmanager_secret",
-            "rds_managed_secret",
-        }:
+        if resource_type in {"secretsmanager_secret", "rds_managed_secret"}:
             return self._exists_command(
                 self._aws(
                     "secretsmanager",
@@ -327,15 +309,29 @@ class ResourceProbe:
                 ),
                 not_found=("ResourceNotFoundException",),
             )
-        if resource_type == "amp_workspace":
+        if resource_type in {"amp_workspace", "grafana_workspace"}:
             return self._exists_command(
                 self._aws(
-                    "amp",
+                    resource_type.removesuffix("_workspace"),
                     "describe-workspace",
                     "--workspace-id",
                     identifier,
                 ),
                 not_found=("ResourceNotFoundException",),
+            )
+        if resource_type == "grafana_service_account":
+            document = _json(
+                self._aws(
+                    "grafana",
+                    "list-workspace-service-accounts",
+                    "--workspace-id",
+                    resource.attributes["workspace_id"],
+                ),
+                not_found=("ResourceNotFoundException",),
+            )
+            return any(
+                str(item.get("id")) == identifier
+                for item in (document or {}).get("serviceAccounts", [])
             )
         if resource_type == "sns_topic":
             return self._exists_command(
@@ -591,10 +587,7 @@ class ResourceDeletion(ResourceProbe):
                 + ", ".join(sorted(foreign))
             )
 
-    def _assert_oidc_provider_unused(
-        self,
-        resource: InstallationResource,
-    ) -> None:
+    def _assert_oidc_provider_unused(self, resource: InstallationResource) -> None:
         document = _json(["aws", "iam", "list-roles"])
         provider = resource.resource_arn or resource.resource_id
         users = [
@@ -612,10 +605,7 @@ class ResourceDeletion(ResourceProbe):
                 + ", ".join(sorted(users))
             )
 
-    def _assert_pod_identity_agent_unused(
-        self,
-        resource: InstallationResource,
-    ) -> None:
+    def _assert_pod_identity_agent_unused(self, resource: InstallationResource) -> None:
         document = _json(
             self._aws(
                 "eks",
@@ -990,12 +980,24 @@ class ResourceDeletion(ResourceProbe):
                         identifier,
                     ]
                 )
-        elif resource_type == "amp_workspace":
+        elif resource_type in {"amp_workspace", "grafana_workspace"}:
             _checked(
                 self._aws(
-                    "amp",
+                    resource_type.removesuffix("_workspace"),
                     "delete-workspace",
                     "--workspace-id",
+                    identifier,
+                ),
+                not_found=("ResourceNotFoundException",),
+            )
+        elif resource_type == "grafana_service_account":
+            _checked(
+                self._aws(
+                    "grafana",
+                    "delete-workspace-service-account",
+                    "--workspace-id",
+                    resource.attributes["workspace_id"],
+                    "--service-account-id",
                     identifier,
                 ),
                 not_found=("ResourceNotFoundException",),
@@ -1215,10 +1217,7 @@ class ResourceDeletion(ResourceProbe):
 
 
 class ClusterDeletion(ResourceDeletion):
-    def _aurora_cluster(
-        self,
-        cluster_id: str,
-    ) -> dict[str, Any] | None:
+    def _aurora_cluster(self, cluster_id: str) -> dict[str, Any] | None:
         document = _json(
             self._aws(
                 "rds",

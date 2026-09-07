@@ -373,6 +373,10 @@ class HealthSiteConfig:
     certificate_min_validity_days: int
     remote_command_max_unclaimed_seconds: int
     require_confirmed_sns_subscription: bool
+    # Amazon Managed Grafana: the workspace deploy resolved (or the operator
+    # pinned) and whether the dashboards are imported at all.
+    grafana_workspace_id: str | None = None
+    grafana_enabled: bool = True
 
     @classmethod
     def from_value(cls, value: object) -> HealthSiteConfig:
@@ -387,6 +391,8 @@ class HealthSiteConfig:
                 "certificateMinValidityDays",
                 "remoteCommandMaxUnclaimedSeconds",
                 "requireConfirmedSnsSubscription",
+                "grafanaWorkspaceId",
+                "grafanaEnabled",
             },
         )
         return cls(
@@ -426,6 +432,15 @@ class HealthSiteConfig:
             require_confirmed_sns_subscription=_boolean(
                 data.get("requireConfirmedSnsSubscription"),
                 "spec.health.requireConfirmedSnsSubscription",
+                default=True,
+            ),
+            grafana_workspace_id=_optional_text(
+                data.get("grafanaWorkspaceId"),
+                "spec.health.grafanaWorkspaceId",
+            ),
+            grafana_enabled=_boolean(
+                data.get("grafanaEnabled"),
+                "spec.health.grafanaEnabled",
                 default=True,
             ),
         )
@@ -873,6 +888,8 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             "require_confirmed_sns_subscription": (
                 health.require_confirmed_sns_subscription
             ),
+            "grafana_workspace_id": health.grafana_workspace_id,
+            "grafana_enabled": health.grafana_enabled,
         },
         "notifications": {
             "allow_email": site.spec.notifications.allow_email,

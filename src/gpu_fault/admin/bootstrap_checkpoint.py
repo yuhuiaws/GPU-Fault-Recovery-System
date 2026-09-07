@@ -12,6 +12,7 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     safe_name,
 )
+from gpu_fault.admin.grafana import dashboard_asset_digests
 
 # The one module still bound into a task digest, for the two tasks below that no
 # read-only probe re-proves.
@@ -33,6 +34,9 @@ BOOTSTRAP_RECONCILE_SOURCES = (
 # Assets the second-phase tasks execute or render. They belong to the per-task
 # inputs, not to the shared reconcile sources: a task must re-run when the asset
 # it applies changes, and must not re-run because an unrelated asset changed.
+# The Grafana dashboards (``deploy/observability/dashboards/*.json``) are a
+# directory rather than a fixed file list, so ``monitoring_install`` digests them
+# per file through ``dashboard_asset_digests`` instead of an entry here.
 BOOTSTRAP_TASK_ASSETS = (
     "deploy/node/provision-node-action-keys.sh",
     "deploy/observability/install-amp-monitoring.sh",
@@ -79,6 +83,8 @@ def _platform_task_digests(
     alert_email: str | None,
     control_plane_wheel_sha256: str | None,
     gpu_identity: Sequence[Mapping[str, Any]],
+    dashboards: Mapping[str, str],
+    grafana: Mapping[str, Any],
 ) -> dict[str, str]:
     """Digest the probe-before-ensure tasks against their real inputs.
 
@@ -106,6 +112,10 @@ def _platform_task_digests(
                 },
                 "adot_image": images.get("adot"),
                 "alert_email": alert_email,
+                # The Grafana step rides on this task: a changed dashboard or a
+                # changed --grafana option must re-run the import.
+                "dashboards": dict(dashboards),
+                "grafana": dict(grafana),
             },
         ),
         "aurora_refresh": task_digest(
@@ -289,6 +299,12 @@ def bind_bootstrap_inputs(
             alert_email=request.alert_email,
             control_plane_wheel_sha256=control_plane_wheel_sha256,
             gpu_identity=gpu_identity,
+            dashboards=dashboard_asset_digests(root),
+            grafana={
+                "enabled": request.grafana_enabled,
+                "workspace_id": request.grafana_workspace_id,
+                "create": request.grafana_create,
+            },
         ),
     }
     for cluster_identity in gpu_identity:

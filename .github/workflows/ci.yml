@@ -48,6 +48,7 @@ jobs:
       - run: python -m compileall -q src tests deploy scripts tools
       - run: python scripts/check-python-architecture.py
       - run: make lazy-export-check PYTHON=python
+      - run: make grafana-dashboards-check PYTHON=python
       - run: >-
           PYTHON=python
           deploy/control-plane/tools/update-deployment-contracts.sh --check

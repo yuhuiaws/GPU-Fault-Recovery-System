@@ -613,7 +613,7 @@ groups:
             editing Store rows.
       - alert: GpuFaultPostgresPoolOversubscribed
         expr: >-
-          max by (control_plane_cluster, region, role)
+          max by (control_plane_cluster, region, service_role)
           (gpu_fault_postgres_pool_oversubscription_ratio) > 1
         for: 10m
         labels:
@@ -622,7 +622,7 @@ groups:
           summary: A control-plane role can hold more connections than its pool has
           runbook_url: docs/管理员日常运维.md#gpufaultpostgrespooloversubscribed
           description: >-
-            The role's threads that can each hold a pooled PostgreSQL connection
+            Role {{ $labels.service_role }}: the threads that can each hold a pooled PostgreSQL connection
             outnumber the pool ceiling by {{ $value }}x; under load callers queue
             on checkout and the request deadline, not the database, becomes the
             limit.

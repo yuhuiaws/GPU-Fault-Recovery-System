@@ -60,6 +60,7 @@ from gpu_fault.admin.bootstrap_tasks import (
     run_platform_prerequisite_tasks,
 )
 from gpu_fault.admin.config import AuroraCapacityConfig
+from gpu_fault.admin.grafana import grafana_settings, grafana_site_health
 from gpu_fault.admin.notifications import NotificationRouting
 from gpu_fault.admin.release_repositories import prepare_signed_release
 
@@ -1867,6 +1868,7 @@ def _site_document(
     adot_image: str,
     admin_email: str,
     routing: NotificationRouting,
+    grafana_health: Mapping[str, Any],
 ) -> dict[str, Any]:
     cluster_documents = []
     for cluster in gpu_clusters:
@@ -1941,6 +1943,7 @@ def _site_document(
                 "certificateMinValidityDays": 30,
                 "remoteCommandMaxUnclaimedSeconds": 300,
                 "requireConfirmedSnsSubscription": True,
+                **grafana_health,
             },
             "notifications": {
                 "allowEmail": True,
@@ -1960,9 +1963,7 @@ def bootstrap_from_arns(
     *,
     runner: CommandRunner | None = None,
 ) -> BootstrapResult:
-    from gpu_fault.admin.bootstrap_services import (
-        _ensure_pod_identity_agent,
-    )
+    from gpu_fault.admin.bootstrap_services import _ensure_pod_identity_agent
     from gpu_fault.admin.notification_bootstrap import notification_routing
 
     validate_bootstrap_dependencies()
@@ -1996,11 +1997,7 @@ def bootstrap_from_arns(
         state_dir=request.state_dir,
     )
     namespace = "gpu-fault-system"
-    _ensure_namespace(
-        active_runner,
-        kubeconfig=cpu_kubeconfig,
-        namespace=namespace,
-    )
+    _ensure_namespace(active_runner, kubeconfig=cpu_kubeconfig, namespace=namespace)
     for cluster in managed_gpu_clusters:
         _ensure_namespace(
             active_runner,
@@ -2054,7 +2051,7 @@ def bootstrap_from_arns(
     }
     aurora = cast(dict[str, Any], first_phase["aurora"])
     monitoring = cast(dict[str, Any], first_phase["monitoring_resources"])
-
+    grafana = grafana_settings(request, existing_site=existing_site, state=state)
     run_platform_prerequisite_tasks(
         runner=active_runner,
         state=state,
@@ -2072,6 +2069,7 @@ def bootstrap_from_arns(
         runtime_image=str(release["images"]["runtime"]),
         aurora=aurora,
         fleet_master_file=fleet_master_file,
+        grafana=grafana,
     )
     state.phase("platform-prerequisites-ready")
     site_file = request.state_dir / "site.yaml"
@@ -2093,6 +2091,7 @@ def bootstrap_from_arns(
         adot_image=adot_image,
         admin_email=admin_email,
         routing=routing,
+        grafana_health=grafana_site_health(state, grafana),
     )
     return finalize_bootstrap_site(
         site_file, generated_site, existing_site, gpu_clusters, state, _write_yaml

@@ -17,9 +17,9 @@
   "files": {
     "deploy/hyperpod/deploy.sh": 3311,
     "deploy/node/install-gpu-fault-collector.sh": 1669,
-    "src/gpu_fault/admin/aws_cleanup.py": 1564,
-    "src/gpu_fault/admin/bootstrap.py": 2099,
-    "src/gpu_fault/admin/cli.py": 1609,
+    "src/gpu_fault/admin/aws_cleanup.py": 1563,
+    "src/gpu_fault/admin/bootstrap.py": 2098,
+    "src/gpu_fault/admin/cli.py": 1606,
     "src/gpu_fault/completion_controller.py": 1631,
     "src/gpu_fault/execution/dispatcher.py": 1504,
     "src/gpu_fault/execution/executor.py": 2158,

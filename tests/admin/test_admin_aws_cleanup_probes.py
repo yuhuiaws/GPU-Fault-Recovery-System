@@ -257,6 +257,20 @@ PROBES: list[tuple[str, dict[str, Any], list[str], str]] = [
         "ResourceNotFoundException",
     ),
     (
+        "grafana_workspace",
+        {"resource_id": "g-5b81a13d97"},
+        [
+            "aws",
+            "grafana",
+            "describe-workspace",
+            "--region",
+            REGION,
+            "--workspace-id",
+            "g-5b81a13d97",
+        ],
+        "ResourceNotFoundException",
+    ),
+    (
         "sns_topic",
         {"resource_id": "arn:sns:topic"},
         [
@@ -763,6 +777,74 @@ def test_a_deleted_queue_makes_its_binding_absent(
     )
 
 
+def _service_account() -> InstallationResource:
+    return _resource(
+        "grafana_service_account", "9", attributes={"workspace_id": "g-5b81a13d97"}
+    )
+
+
+def test_a_grafana_service_account_is_looked_up_inside_its_workspace(
+    cleaner: ResourceCleaner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Service accounts have no describe call, so presence is the id being listed."""
+
+    listed = json.dumps(
+        {
+            "serviceAccounts": [
+                {"id": "3", "name": "SageMakerObservability", "grafanaRole": "ADMIN"},
+                {"id": "9", "name": "gpu-fault-provisioner", "grafanaRole": "ADMIN"},
+            ]
+        }
+    )
+    aws = Aws(stdout=listed)
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", aws)
+
+    assert cleaner.exists(_service_account()) is True
+    assert aws.calls == [
+        [
+            "aws",
+            "grafana",
+            "list-workspace-service-accounts",
+            "--region",
+            REGION,
+            "--workspace-id",
+            "g-5b81a13d97",
+            "--output",
+            "json",
+        ]
+    ]
+
+    only_theirs = json.dumps(
+        {"serviceAccounts": [{"id": "3", "name": "SageMakerObservability"}]}
+    )
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", Aws(stdout=only_theirs))
+    assert cleaner.exists(_service_account()) is False
+
+
+def test_a_deleted_grafana_workspace_makes_our_service_account_absent(
+    cleaner: ResourceCleaner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        admin_aws_commands.subprocess,
+        "run",
+        Aws(
+            returncode=254,
+            stdout="",
+            stderr="An error occurred (ResourceNotFoundException) ...",
+        ),
+    )
+
+    assert cleaner.exists(_service_account()) is False
+
+    monkeypatch.setattr(
+        admin_aws_commands.subprocess,
+        "run",
+        Aws(returncode=254, stdout="", stderr="An error occurred (AccessDenied) ..."),
+    )
+    with pytest.raises(BootstrapError, match="AccessDenied"):
+        cleaner.exists(_service_account())
+
+
 def test_a_helm_release_is_probed_through_the_control_plane_kubeconfig(
     site: Any, cleaner: ResourceCleaner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -834,6 +916,7 @@ def test_every_supported_resource_type_has_a_probe(
         "vpc_region": REGION,
         "topic_arn": "arn:sns:a",
         "namespace": "kube-system",
+        "workspace_id": "g-5b81a13d97",
     }
 
     for resource_type in sorted(SUPPORTED_RESOURCE_TYPES - covered):
