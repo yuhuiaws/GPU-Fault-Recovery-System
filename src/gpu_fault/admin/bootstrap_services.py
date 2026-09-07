@@ -13,6 +13,10 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
+from gpu_fault.admin.artifact_configmaps import (
+    COMPRESSED_ARTIFACT_SUFFIX,
+    compress_artifact,
+)
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     BootstrapError,
@@ -1259,21 +1263,26 @@ def _upload_wheel_configmap(
         == 0
     )
     if not exists:
-        runner.run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(cpu_kubeconfig),
-                "-n",
-                namespace,
-                "create",
-                "configmap",
-                name,
-                f"--from-file={wheel}",
-            ],
-            mutate=True,
-            capture=False,
-        )
+        # xz-compressed: the control-plane wheel outgrew the 1 MiB ConfigMap
+        # ceiling, and nothing installs it from the mount at runtime.
+        with tempfile.TemporaryDirectory(prefix="gpu-fault-wheel-") as scratch:
+            stored_key = f"{wheel.name}{COMPRESSED_ARTIFACT_SUFFIX}"
+            source = compress_artifact(wheel, Path(scratch) / stored_key)
+            runner.run(
+                [
+                    "kubectl",
+                    "--kubeconfig",
+                    str(cpu_kubeconfig),
+                    "-n",
+                    namespace,
+                    "create",
+                    "configmap",
+                    name,
+                    f"--from-file={stored_key}={source}",
+                ],
+                mutate=True,
+                capture=False,
+            )
     return name
 
 

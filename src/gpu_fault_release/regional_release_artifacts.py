@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.admin.artifact_configmaps import (
+    COMPRESSED_ARTIFACT_SUFFIX,
+    artifact_binary_sha,
+    compress_artifact,
+)
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_diff import ReleaseDiff
 
@@ -40,6 +44,8 @@ def upload_config_map(
     key: str,
     path: Path,
     expected_sha: str,
+    *,
+    compress: bool = False,
 ) -> None:
     command = kubectl + [
         "-n",
@@ -55,17 +61,22 @@ def upload_config_map(
     if returncode == 0:
         value = json.loads(stdout)
     elif "NotFound" in stderr:
-        release.runner.run(
-            kubectl
-            + [
-                "-n",
-                release.config.namespace,
-                "create",
-                "configmap",
-                name,
-                f"--from-file={key}={path}",
-            ]
-        )
+        with tempfile.TemporaryDirectory(prefix="gpu-fault-artifact-") as scratch:
+            source, stored_key = path, key
+            if compress:
+                stored_key = key + COMPRESSED_ARTIFACT_SUFFIX
+                source = compress_artifact(path, Path(scratch) / stored_key)
+            release.runner.run(
+                kubectl
+                + [
+                    "-n",
+                    release.config.namespace,
+                    "create",
+                    "configmap",
+                    name,
+                    f"--from-file={stored_key}={source}",
+                ]
+            )
     else:
         raise ReleaseError(f"cannot inspect ConfigMap {name}: {stderr.strip()}")
     if release.runner.dry_run:
@@ -81,11 +92,12 @@ def upload_config_map(
                 name,
             ]
         )
-    encoded = (value.get("binaryData") or {}).get(key)
-    if not encoded:
+    found = artifact_binary_sha(value.get("binaryData") or {}, key)
+    if found is None:
         raise ReleaseError(f"{name}/{key} is missing")
-    if hashlib.sha256(base64.b64decode(encoded)).hexdigest() != expected_sha:
-        raise ReleaseError(f"{name}/{key} digest mismatch")
+    stored_key, digest = found
+    if digest != expected_sha:
+        raise ReleaseError(f"{name}/{stored_key} digest mismatch")
 
 
 def upload_release(release: Any, diff: ReleaseDiff | None = None) -> None:
@@ -97,6 +109,7 @@ def upload_release(release: Any, diff: ReleaseDiff | None = None) -> None:
             release.config.wheel.name,
             release.config.wheel,
             release.wheel_sha,
+            compress=True,
         )
 
     def upload_target(target: ClusterTarget) -> None:
@@ -109,6 +122,7 @@ def upload_release(release: Any, diff: ReleaseDiff | None = None) -> None:
                 release.config.executor_wheel.name,
                 release.config.executor_wheel,
                 release.executor_wheel_sha,
+                compress=True,
             )
         if diff is None or diff.has("node_runtime_wheel", "node_bundle"):
             upload_config_map(

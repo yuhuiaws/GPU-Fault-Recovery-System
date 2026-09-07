@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import os
@@ -52,6 +51,7 @@ from gpu_fault_release.regional_observability_rollback import (
     capture_observability_snapshot,
     restore_observability_snapshot,
 )
+from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
 from gpu_fault_release.regional_release_artifacts import (
     require_cpu_secrets,
     upload_config_map,
@@ -991,13 +991,10 @@ class RegionalRelease:
                 name,
             ]
         )
-        binary = value.get("binaryData") or {}
-        encoded = binary.get(preferred_key)
-        if encoded is None and binary:
-            encoded = next(iter(binary.values()))
-        if encoded is None:
+        found = artifact_binary_sha(value.get("binaryData") or {}, preferred_key)
+        if found is None:
             raise ReleaseError(f"{name} has no binaryData")
-        return hashlib.sha256(base64.b64decode(encoded)).hexdigest()
+        return found[1]
 
     def bootstrap(self) -> None:
         self._ensure_contexts()
@@ -1196,6 +1193,7 @@ class RegionalRelease:
             self.config.executor_wheel.name,
             self.config.executor_wheel,
             self.executor_wheel_sha,
+            compress=True,
         )
         self._upload_config_map(
             self._gpu(target),
