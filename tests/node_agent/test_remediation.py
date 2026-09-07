@@ -350,6 +350,109 @@ def test_efa_driver_remediation_accepts_already_bound_inventory(tmp_path) -> Non
     assert runner.commands == []
 
 
+def test_efa_driver_remediation_binds_through_modprobe_and_sysfs(
+    tmp_path, monkeypatch
+) -> None:
+    """The success path, modelled on what sysfs actually does.
+
+    Never executed on a real node before COLLECT-017 A, so the test plays the
+    kernel: ``modprobe efa`` registers the driver (the ``drivers/efa`` directory
+    and its ``bind`` file appear only then), and writing a BDF to ``bind``
+    creates the ``<device>/driver`` symlink. ``_bound_driver`` is left real, so
+    success is observed through the symlink the bind write produced -- not
+    through a patched answer.
+    """
+
+    pci_root = tmp_path / "pci"
+    drivers_root = tmp_path / "drivers"
+    driver_dir = drivers_root / "efa"
+    bind_path = driver_dir / "bind"
+    prebound, unbound = "0000:01:00.0", "0000:02:00.0"
+    for bdf in (prebound, unbound):
+        device = pci_root / bdf
+        device.mkdir(parents=True)
+        (device / "vendor").write_text("0x1d0f\n")
+        (device / "device").write_text("0xefa2\n")
+    gpu = pci_root / "0000:03:00.0"
+    gpu.mkdir()
+    (gpu / "vendor").write_text("0x10de\n")
+    (gpu / "device").write_text("0x2330\n")
+    (gpu / "driver").symlink_to(drivers_root / "nvidia")
+
+    class Kernel(FakeRunner):
+        def __call__(self, cmd, **kwargs):
+            if cmd[:1] == ["modprobe"]:
+                driver_dir.mkdir(parents=True)
+                bind_path.write_text("")
+                # The module is loaded once, with the previously bound function
+                # already claimed by the driver.
+                (pci_root / prebound / "driver").symlink_to(driver_dir)
+            return super().__call__(cmd, **kwargs)
+
+    runner = Kernel()
+    bind_writes: list[str] = []
+    original_write = Path.write_text
+
+    def write_text(path, data, *args, **kwargs):
+        if path == bind_path and data:
+            if not driver_dir.is_dir():
+                raise FileNotFoundError("drivers/efa does not exist before modprobe")
+            bdf = data.strip()
+            bind_writes.append(bdf)
+            (pci_root / bdf / "driver").symlink_to(driver_dir)
+            return len(data)
+        return original_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+    agent = node_action_executor(
+        tmp_path,
+        "efa-bind.db",
+        allowed_operations={WorkflowOperation.REMEDIATE_EFA_DRIVER},
+        efa_driver_remediation_enabled=True,
+        efa_pci_devices_root=str(pci_root),
+        efa_driver_bind_path=str(bind_path),
+        runner=runner,
+    )
+
+    result = agent.execute(
+        envelope(
+            command(
+                WorkflowOperation.REMEDIATE_EFA_DRIVER, parameters={"expected_count": 2}
+            )
+        )
+    )
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert runner.commands == [["modprobe", "efa"]], "module loaded exactly once"
+    assert bind_writes == [unbound], "only the unbound function is written to bind"
+    assert result.details == {
+        "expected_count": 2,
+        "pci_discovered_count": 2,
+        "driver_bound_count": 2,
+        "rebound_pci_bdfs": [unbound],
+        "already_bound": False,
+    }
+    for bdf in (prebound, unbound):
+        assert (pci_root / bdf / "driver").resolve(strict=True) == driver_dir.resolve()
+    assert (gpu / "driver").readlink() == drivers_root / "nvidia", "GPU untouched"
+
+    # Second run: sysfs already shows every function bound, nothing is loaded
+    # or written again.
+    rerun = agent.execute(
+        envelope(
+            command(
+                WorkflowOperation.REMEDIATE_EFA_DRIVER,
+                command_id="workflow/step2/node-a",
+                parameters={"expected_count": 2},
+            )
+        )
+    )
+    assert rerun.status is NodeActionStatus.SUCCEEDED, rerun.error
+    assert rerun.details["already_bound"] is True
+    assert runner.commands == [["modprobe", "efa"]]
+    assert bind_writes == [unbound]
+
+
 def test_efa_driver_remediation_refuses_missing_pci_device(tmp_path) -> None:
     pci_root = tmp_path / "pci"
     pci_root.mkdir()
