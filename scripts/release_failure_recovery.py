@@ -7,6 +7,42 @@ from typing import Any, Callable, Mapping, Protocol
 from gpu_fault.admin.rollback_alignment import reconcile_rollback_management
 
 
+# Mirrors ``regional_schema_change.ACCEPT_SCHEMA_CHANGE_ENV`` (pinned equal by
+# tests/regional/test_release_schema_change_acceptance.py).
+ACCEPT_SCHEMA_CHANGE_ENV = "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE"
+
+
+def schema_change_fail_forward(
+    deployment: Mapping[str, Any],
+    environment: Mapping[str, str],
+) -> str | None:
+    """Why this release runs fail-forward despite ``autoRollback: true``, or None.
+
+    The release engine refuses a schema change under automatic rollback unless
+    the operator accepted it (``--accept-schema-change``); when it did, a verify
+    or stability failure must not try the rollback either -- it would be refused
+    at the schema, after the components had already been moved back. The engine
+    owns the decision; this driver only mirrors it so the failure record says
+    ``SKIPPED_POLICY`` with the real reason instead of attempting the rollback.
+    With no readable diff the acceptance alone decides, since the engine will
+    have applied it to whatever diff it computed.
+    """
+
+    if not str(environment.get(ACCEPT_SCHEMA_CHANGE_ENV, "")).strip():
+        return None
+    next_deploy = deployment.get("next_deploy")
+    changed = (
+        set(next_deploy.get("changed") or []) if isinstance(next_deploy, dict) else None
+    )
+    if changed is not None and "database_schema" not in changed:
+        return None
+    return (
+        "schema change accepted for this transaction (--accept-schema-change); "
+        "rollback cannot cross a schema version, see the pre-schema snapshot in "
+        "gpu-fault-admin status"
+    )
+
+
 class PreparedRelease(Protocol):
     release_id: str
     state_dir: Path
@@ -144,7 +180,14 @@ def recover_release_failure(
     run_release_mode: RunReleaseMode,
     read_live_state: ReadLiveState,
     update_phase: UpdatePhase,
+    deployment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    # An accepted schema change (``--accept-schema-change``) runs the release
+    # fail-forward whatever the site says: the rollback would be refused at the
+    # schema. Decided here, next to the policy it overrides, so the failure
+    # record names the acceptance rather than ``spec.autoRollback``.
+    fail_forward_reason = schema_change_fail_forward(deployment or {}, environment)
+    automatic_rollback = automatic_rollback and fail_forward_reason is None
     failure_state: dict[str, Any] | None = None
     if not deployment_succeeded or commit_started:
         try:
@@ -225,7 +268,7 @@ def recover_release_failure(
     if deployment_succeeded and not automatic_rollback:
         return {
             "status": "SKIPPED_POLICY",
-            "reason": "site spec.autoRollback is false",
+            "reason": fail_forward_reason or "site spec.autoRollback is false",
         }
     if commit_started and failure_state is None:
         return {

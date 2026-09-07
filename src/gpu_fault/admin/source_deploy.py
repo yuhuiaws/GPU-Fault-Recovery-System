@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -93,6 +93,7 @@ def run_source_deploy(
     admin_email: str,
     impact_base: str,
     current_directory: Path,
+    extra_environment: Mapping[str, str] | None = None,
 ) -> int:
     repository_root = resolve_source_repository(
         state_dir,
@@ -125,6 +126,9 @@ def run_source_deploy(
         cwd=repository_root,
         env={
             **os.environ,
+            # Release-engine settings the operator gave on this command (the
+            # schema-change acceptance); every later hop inherits them.
+            **(extra_environment or {}),
             "PYTHONPATH": str(repository_root / "src"),
         },
         check=False,

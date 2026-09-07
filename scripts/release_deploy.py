@@ -98,6 +98,8 @@ VERIFICATION_REPORT = "verification-report.json"
 STABILITY_REPORT = "stability-report.json"
 RELEASE_SUMMARY_REPORT = "release-summary.json"
 EXPECTED_STATE_SHA256_ENV = "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256"
+
+
 QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
 
 
@@ -1229,6 +1231,7 @@ def _execute_release_locked(
     )
     deployment_succeeded = False
     commit_started = False
+    deployment: dict[str, Any] = {}
     try:
         deploy_command = [
             sys.executable,
@@ -1307,6 +1310,7 @@ def _execute_release_locked(
             deployment_succeeded=deployment_succeeded,
             commit_started=commit_started,
             automatic_rollback=automatic_rollback,
+            deployment=deployment,
             run_release_mode=_run_release_mode,
             read_live_state=read_live_release_state,
             update_phase=update_phase,

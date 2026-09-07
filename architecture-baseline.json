@@ -15,10 +15,10 @@
   },
   "cycles": [],
   "files": {
-    "deploy/control-plane/regional/regional_release_orchestration.py": 1731,
+    "deploy/control-plane/regional/regional_release_orchestration.py": 1782,
     "src/gpu_fault/admin/aws_cleanup.py": 1540,
     "src/gpu_fault/admin/bootstrap.py": 2078,
-    "src/gpu_fault/admin/cli.py": 1525,
+    "src/gpu_fault/admin/cli.py": 1580,
     "src/gpu_fault/completion_controller.py": 1634,
     "src/gpu_fault/execution/dispatcher.py": 1504,
     "src/gpu_fault/execution/executor.py": 2158,
@@ -28,7 +28,7 @@
     "src/gpu_fault/store/postgres/ddl.py": 1751
   },
   "functions": {
-    "deploy/control-plane/regional/regional_release_orchestration.py:run_upgrade_phases": 328,
+    "deploy/control-plane/regional/regional_release_orchestration.py:run_upgrade_phases": 346,
     "deploy/control-plane/regional/regional_release_orchestration.py:upgrade_gpu_clusters": 203,
     "deploy/control-plane/tools/render_control_plane_role_split.py:main": 648,
     "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 252,

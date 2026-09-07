@@ -1432,3 +1432,62 @@ def test_admin_cli_accepts_independent_email_routing() -> None:
     assert arguments.email_sender == "sender@example.com"
     assert arguments.email_recipient == ["ops@example.com", "oncall@example.com"]
     assert arguments.email_subject_prefix == "[PROD]"
+
+
+def test_accept_schema_change_travels_to_the_source_preparer_as_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """One flag on the public command; the release engine reads one variable.
+
+    The deploy is a chain of processes that each inherit their environment, so
+    the CLI sets the variable once and never has to thread a new argument
+    through the source preparer, the inner CLI or the release driver.
+    """
+
+    calls = []
+    monkeypatch.setattr(
+        admin_cli, "run_source_deploy", lambda **kwargs: calls.append(kwargs) or 0
+    )
+    monkeypatch.delenv(admin_cli.ACCEPT_SCHEMA_CHANGE_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    base = [
+        "deploy",
+        "--cpu-cluster-arn",
+        "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
+        "--gpu-cluster-arn",
+        "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
+        "--state-dir",
+        str(tmp_path / "state"),
+        "--admin-email",
+        "operations@example.com",
+    ]
+
+    assert admin_cli.run(admin_cli.parser().parse_args(base)) == 0
+    assert calls[-1]["extra_environment"] == {}, "no flag, no variable"
+    assert (
+        admin_cli.run(admin_cli.parser().parse_args([*base, "--accept-schema-change"]))
+        == 0
+    )
+    assert calls[-1]["extra_environment"] == {
+        admin_cli.ACCEPT_SCHEMA_CHANGE_ENV: "snapshot"
+    }
+    assert (
+        admin_cli.run(
+            admin_cli.parser().parse_args(
+                [*base, "--accept-schema-change-without-snapshot"]
+            )
+        )
+        == 0
+    )
+    assert calls[-1]["extra_environment"] == {
+        admin_cli.ACCEPT_SCHEMA_CHANGE_ENV: "no-snapshot"
+    }
+
+
+def test_an_explicit_schema_change_variable_wins_over_the_flag(monkeypatch) -> None:
+    monkeypatch.setenv(admin_cli.ACCEPT_SCHEMA_CHANGE_ENV, "no-snapshot")
+    arguments = admin_cli.parser().parse_args(
+        ["deploy", "--accept-schema-change", "--state-dir", "/tmp/x"]
+    )
+
+    assert admin_cli.schema_change_environment(arguments) == {}

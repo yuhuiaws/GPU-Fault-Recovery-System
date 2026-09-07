@@ -53,6 +53,12 @@ from regional_release_rollback_context import (
 from regional_release_rollback_context import (
     rollback_target_arguments as _rollback_target_arguments,
 )
+from regional_schema_change import (
+    SCHEMA_CHANGE_ACCEPTANCE_KEY,
+    ensure_schema_change_snapshot,
+    recorded_acceptance,
+    resolve_acceptance,
+)
 from regional_release_rollout_cleanup import (
     # Re-exported for the same reason, and bound as module globals rather than
     # called through the source module so a test that patches
@@ -162,22 +168,27 @@ def _validate_upgrade_transaction(
     self: Any,
     diff: ReleaseDiff,
     plan: ReleaseExecutionPlan,
-) -> None:
-    if (
-        "database_schema" in diff.changed
-        and self.config.auto_rollback
-        and not self.config.schema_rollback_compatible
-    ):
-        raise ReleaseError(
-            "automatic rollback across this PostgreSQL schema change "
-            "is not declared backward-compatible"
-        )
+    *,
+    resume: bool = False,
+) -> dict[str, Any] | None:
+    """Refuse before mutation, or return the schema-change acceptance to record.
+
+    A schema change under ``autoRollback: true`` used to be refused outright;
+    the operator had to edit the site to fail-forward. It is now refused unless
+    the command carried ``--accept-schema-change``, in which case the acceptance
+    (mode, time, later the snapshot) is returned for the transaction state and
+    the transaction runs fail-forward without touching the site
+    (``regional_schema_change``).
+    """
+
+    acceptance = resolve_acceptance(self, changed=diff.changed, resume=resume)
     non_transactional = diff.changed.intersection(NON_TRANSACTIONAL_CHANGES)
     if self.config.auto_rollback and non_transactional:
         raise ReleaseError(
             "automatic rollback is not yet transactional for: "
             + ", ".join(sorted(non_transactional))
         )
+    return acceptance
 
 
 def _require_compensable_observability_snapshot(
@@ -807,8 +818,26 @@ def run_upgrade_phases(
                     PHASE_CANDIDATE_PREFLIGHT, preflight_upgrade_mutations, self, plan
                 )
             if not phase_done("schema-ready"):
+                # The one backward path of an accepted schema change is a
+                # database restore, so the snapshot is taken here, before the
+                # schema Jobs, under the SCHEMA component: a failure to take it
+                # stops the release before the database has changed.
+                acceptance = recorded_acceptance(self.state)
+                if acceptance is not None:
+                    acceptance = run_component(
+                        ReleaseComponent.SCHEMA,
+                        lambda: ensure_schema_change_snapshot(self, acceptance),
+                    )
+                    self.state[SCHEMA_CHANGE_ACCEPTANCE_KEY] = acceptance
                 run_component(ReleaseComponent.SCHEMA, self._ensure_schema)
-                phase_complete("schema-ready")
+                phase_complete(
+                    "schema-ready",
+                    **(
+                        {SCHEMA_CHANGE_ACCEPTANCE_KEY: acceptance}
+                        if acceptance is not None
+                        else {}
+                    ),
+                )
             if not phase_done("registry-staged"):
                 registry_staged = bool(
                     run_component(ReleaseComponent.REGISTRY, self._stage_registry)
@@ -954,7 +983,7 @@ def upgrade_release(
         raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
     active_diff = diff or _default_release_diff()
     plan = build_execution_plan(active_diff)
-    _validate_upgrade_transaction(self, active_diff, plan)
+    acceptance = _validate_upgrade_transaction(self, active_diff, plan, resume=resume)
     (
         previous,
         completed_phases,
@@ -981,6 +1010,11 @@ def upgrade_release(
             previous_snapshot_sha256=canonical_sha256(previous),
             transaction_committed=False,
             release_lifecycle="PREPARING",
+            **(
+                {SCHEMA_CHANGE_ACCEPTANCE_KEY: acceptance}
+                if acceptance is not None
+                else {}
+            ),
             cluster_attempts={
                 target.cluster_id: {
                     "state": "PENDING",
@@ -1011,9 +1045,17 @@ def upgrade_release(
             completed_clusters=completed_clusters,
             registry_staged=registry_staged,
         )
-        if self.config.auto_rollback and not isinstance(
-            upgrade_error,
-            PartialClusterRolloutError,
+        # An accepted schema change runs fail-forward: the rollback would be
+        # refused at the schema anyway, and the operator was told so when they
+        # accepted. The state keeps the acceptance (and the snapshot id) for
+        # the recovery the manual describes.
+        if (
+            self.config.auto_rollback
+            and recorded_acceptance(self.state) is None
+            and not isinstance(
+                upgrade_error,
+                PartialClusterRolloutError,
+            )
         ):
             try:
                 self.rollback(state=previous)
@@ -1053,9 +1095,18 @@ def _rollback_context(
             "rollback is not transactional for: " + ", ".join(sorted(unsupported))
         )
     if "database_schema" in changed and not self.config.schema_rollback_compatible:
+        acceptance = recorded_acceptance(loaded)
+        snapshot = (acceptance or {}).get("snapshot_id")
         raise ReleaseError(
             "rollback across this PostgreSQL schema change is not "
             "declared backward-compatible"
+            + (
+                f"; restore the database from the pre-schema snapshot {snapshot} "
+                "first, then rerun the rollback"
+                if snapshot
+                else "; the database has to be restored to the previous schema "
+                "version by hand before a rollback can run"
+            )
         )
     return loaded, previous
 

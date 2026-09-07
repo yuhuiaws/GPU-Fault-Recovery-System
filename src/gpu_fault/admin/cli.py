@@ -95,6 +95,38 @@ QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
 QUICK_VALIDATION_EVIDENCE_FILE = "quick-validation.json"
 
 
+# Mirrors ``regional_schema_change.ACCEPT_SCHEMA_CHANGE_ENV`` and the two mode
+# values; ``tests/regional/test_release_schema_change_acceptance.py`` pins them
+# equal. The release engine reads the variable; the CLI only sets it.
+ACCEPT_SCHEMA_CHANGE_ENV = "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE"
+SCHEMA_CHANGE_SNAPSHOT_MODE = "snapshot"
+SCHEMA_CHANGE_NO_SNAPSHOT_MODE = "no-snapshot"
+
+
+def schema_change_environment(arguments: argparse.Namespace) -> dict[str, str]:
+    """The operator's consent to a schema-version release, for the release engine.
+
+    A release that changes the PostgreSQL schema cannot be rolled back (the new
+    wheel requires the exact version), so the engine refuses it under
+    ``autoRollback: true``. ``--accept-schema-change`` says once, on the command,
+    that the operator knows; the engine then takes an Aurora snapshot before the
+    schema Jobs and runs this one transaction fail-forward without touching
+    ``site.yaml``. ``--accept-schema-change-without-snapshot`` is the same
+    consent for a database nobody would restore. An explicit environment value
+    wins, as with the other release-engine variables. The engine ignores the
+    variable when the release does not change the schema, so passing the flag on
+    an ordinary release is harmless.
+    """
+
+    if os.environ.get(ACCEPT_SCHEMA_CHANGE_ENV, "").strip():
+        return {}
+    if getattr(arguments, "accept_schema_change_without_snapshot", False):
+        return {ACCEPT_SCHEMA_CHANGE_ENV: SCHEMA_CHANGE_NO_SNAPSHOT_MODE}
+    if getattr(arguments, "accept_schema_change", False):
+        return {ACCEPT_SCHEMA_CHANGE_ENV: SCHEMA_CHANGE_SNAPSHOT_MODE}
+    return {}
+
+
 def quick_validation_evidence_environment(
     arguments: argparse.Namespace,
 ) -> dict[str, str]:
@@ -200,6 +232,26 @@ def _add_managed_site_arguments(
             action="store_true",
             help="print the redacted generated release configuration",
         )
+
+
+def _add_schema_change_arguments(deploy: argparse.ArgumentParser) -> None:
+    deploy.add_argument(
+        "--accept-schema-change",
+        action="store_true",
+        help=(
+            "this release changes the PostgreSQL schema and cannot be rolled "
+            "back: take an Aurora snapshot first and run this one transaction "
+            "fail-forward without editing spec.autoRollback"
+        ),
+    )
+    deploy.add_argument(
+        "--accept-schema-change-without-snapshot",
+        action="store_true",
+        help=(
+            "like --accept-schema-change but without the Aurora snapshot; only "
+            "for a database nobody would restore"
+        ),
+    )
 
 
 def _add_capacity_options(command: argparse.ArgumentParser) -> None:
@@ -435,6 +487,7 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    _add_schema_change_arguments(deploy)
     deploy.add_argument(
         "--impact-base",
         default="origin/main",
@@ -1369,6 +1422,7 @@ def run(arguments: argparse.Namespace) -> int:
                 admin_email=arguments.alert_email,
                 impact_base=getattr(arguments, "impact_base", "origin/main"),
                 current_directory=Path.cwd(),
+                extra_environment=schema_change_environment(arguments),
             )
         repository_root = (arguments.repo_root or Path.cwd()).resolve()
         with administrator_operation_lock(arguments.state_dir):
@@ -1462,6 +1516,7 @@ def run(arguments: argparse.Namespace) -> int:
         environment = {
             **effective_environment(site),
             **quick_validation_evidence_environment(arguments),
+            **schema_change_environment(arguments),
         }
         if arguments.command == "deploy":
             preflight = subprocess.run(

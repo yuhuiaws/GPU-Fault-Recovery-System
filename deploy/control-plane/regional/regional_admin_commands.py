@@ -403,6 +403,9 @@ def build_release_summary(release: Any) -> dict[str, Any]:
             "transaction_committed": state.get("transaction_committed") is True,
             "release_lifecycle": state.get("release_lifecycle"),
             "state_sha256": release_state_sha256(state),
+            # Present only for a transaction that crossed a schema version with
+            # --accept-schema-change: the operator reads the snapshot id here.
+            "schema_change_acceptance": state.get("schema_change_acceptance"),
         }
         result["next_deploy"] = next_deploy(release, state)
     except Exception as exc:

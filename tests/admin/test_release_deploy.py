@@ -1215,3 +1215,76 @@ def test_a_stability_failure_still_records_the_verification_report(
     assert not (state_dir / release_deploy.STABILITY_REPORT).exists(), (
         "a failed stability window must not leave a stability report"
     )
+
+
+def test_recovery_names_the_accepted_schema_change_instead_of_the_site_policy(
+    tmp_path: Path,
+) -> None:
+    prepared = SimpleNamespace(release_id="release-a", state_dir=tmp_path)
+
+    result = release_failure_recovery.recover_release_failure(
+        prepared,
+        site_file=tmp_path / "site.yaml",
+        root=tmp_path,
+        environment={release_failure_recovery.ACCEPT_SCHEMA_CHANGE_ENV: "snapshot"},
+        failure_error="RuntimeError: verify failed",
+        failed_at="2026-09-07T10:00:00+00:00",
+        deployment_succeeded=True,
+        commit_started=False,
+        automatic_rollback=True,
+        deployment={"next_deploy": {"changed": ["database_schema"]}},
+        run_release_mode=lambda *_args, **_kwargs: None,
+        read_live_state=lambda _site: {"phase": "failed"},
+        update_phase=lambda *_args, **_kwargs: None,
+    )
+
+    assert result is not None
+    assert result["status"] == "SKIPPED_POLICY"
+    assert "accept-schema-change" in result["reason"]
+
+
+def test_execute_release_runs_an_accepted_schema_change_fail_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``autoRollback: true`` in the site, the acceptance in the environment: a
+    verify failure records SKIPPED_POLICY with the acceptance as the reason and
+    never invokes the rollback the engine would refuse."""
+
+    site = _site(tmp_path, monkeypatch)
+    monkeypatch.setenv(release_failure_recovery.ACCEPT_SCHEMA_CHANGE_ENV, "snapshot")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        release_deploy,
+        "_run",
+        lambda arguments, **_kwargs: commands.append(list(arguments)),
+    )
+
+    def run_json(arguments, **_kwargs):
+        if "verify" in arguments:
+            raise release_deploy.ReleaseDeployError("verify failed")
+        if "release-diff" in arguments:
+            return _release_diff("FULL", ["database_schema", "control_plane_wheel"])
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    with pytest.raises(release_deploy.ReleaseDeployError, match="verify failed"):
+        release_deploy.execute_release(
+            site,
+            run_checks=False,
+            live_state={
+                "runtime_profile_sha256": hashlib.sha256(
+                    profile.read_bytes()
+                ).hexdigest()
+            },
+        )
+
+    assert not any(command[1] == "rollback" for command in commands), (
+        "an accepted schema change invoked the rollback the engine refuses"
+    )
+    state = json.loads(
+        (site.parent / "release-deploy/release-a/state.json").read_text()
+    )
+    assert state["rollback"]["status"] == "SKIPPED_POLICY"
+    assert "accept-schema-change" in state["rollback"]["reason"]
