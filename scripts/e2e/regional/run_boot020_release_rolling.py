@@ -118,14 +118,20 @@ def _assert_rollback_scope(scenario: str, result: dict[str, Any]) -> None:
     plan = result.get("rollback_plan")
     assert isinstance(plan, dict), (scenario, result)
     clusters = plan.get("clusters") or {}
-    components = {component for values in clusters.values() for component in values}
+    # The rollback plan names data-plane components in lower case
+    # ("collector", "executor", "reconciler", "watcher", "agent"); live
+    # 2026-09-07 the executor stage failed on an upper-case comparison after a
+    # correct rollback.
+    components = {
+        str(component).lower() for values in clusters.values() for component in values
+    }
     if scenario == "control_plane":
         assert plan.get("restores_data_plane") is False, plan
     elif scenario == "executor":
-        assert "EXECUTOR" in components, plan
-        assert "AGENT" not in components, plan
+        assert "executor" in components, plan
+        assert "agent" not in components, plan
     elif scenario == "agent":
-        assert "AGENT" in components, plan
+        assert "agent" in components, plan
         assert plan.get("needs_controller") is True, plan
 
 

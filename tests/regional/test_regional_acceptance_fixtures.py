@@ -598,17 +598,19 @@ class FakeReleaseRollingBackend:
                 "needs_controller": False,
             },
             "executor": {
-                "clusters": {"cluster-a": ["EXECUTOR"]},
+                "clusters": {
+                    "cluster-a": ["collector", "executor", "reconciler", "watcher"]
+                },
                 "restores_data_plane": True,
                 "needs_controller": False,
             },
             "agent": {
-                "clusters": {"cluster-a": ["RECONCILER", "AGENT"]},
+                "clusters": {"cluster-a": ["reconciler", "agent"]},
                 "restores_data_plane": True,
                 "needs_controller": True,
             },
             "full": {
-                "clusters": {"cluster-a": ["EXECUTOR", "RECONCILER", "AGENT"]},
+                "clusters": {"cluster-a": ["executor", "reconciler", "agent"]},
                 "restores_data_plane": True,
                 "needs_controller": True,
             },
