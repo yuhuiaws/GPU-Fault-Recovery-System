@@ -11,7 +11,12 @@ import pytest
 import yaml
 
 from gpu_fault.admin.operation_lock import SITE_OPERATION_LOCK_FD_ENV
-from scripts import staging_deploy, staging_gate_caches, staging_state_hygiene
+from scripts import (
+    staging_deploy,
+    staging_gate_caches,
+    staging_live_evidence,
+    staging_state_hygiene,
+)
 
 
 def _signing_material(root: Path) -> staging_deploy.SigningMaterial:
@@ -46,12 +51,65 @@ def _source_identities() -> dict[str, object]:
 def _live_evidence() -> dict[str, object]:
     return {
         "site_sha256": "d" * 64,
+        "runtime_profile_sha256": "f" * 64,
+        "runtime_profile_policy_digest": "c" * 64,
         "release_id": "release-a",
         "state_sha256": "e" * 64,
         "phase": "complete",
         "transaction_committed": True,
         "next_deploy_kind": "NOOP",
     }
+
+
+def test_pending_profile_change_runs_the_release_on_unchanged_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    repository, state = _managed_state(tmp_path)
+    _install_admin_stub(state)
+    signing = _signing_material(state)
+    source = staging_deploy.SourceCheckout(
+        repository_root=repository,
+        git_commit="a" * 40,
+        fingerprint="a" * 64,
+        snapshot=False,
+        isolated=True,
+    )
+    previous = {
+        "schema_version": 1,
+        "status": "PASSED",
+        "identities": _source_identities(),
+        "source": {"fingerprint": source.fingerprint, "git_commit": source.git_commit},
+        "live": _live_evidence(),
+    }
+    events: list[str] = []
+    _stub_deploy_orchestration(
+        monkeypatch,
+        state=state,
+        source=source,
+        signing=signing,
+        previous=previous,
+        events=events,
+    )
+    readings: list[str] = []
+
+    def evidence(**_kwargs: object) -> dict[str, object]:
+        readings.append("read")
+        if len(readings) == 1:
+            raise staging_live_evidence.RuntimeProfileChangePending("EXPANSIVE")
+        events.append(EVIDENCE_EVENT)
+        return _live_evidence()
+
+    monkeypatch.setattr(staging_deploy, "collect_live_deploy_evidence", evidence)
+
+    result = staging_deploy.deploy(_deploy_arguments(repository, state))
+
+    assert result["deploy_mode"] == "APPLICATION_RELEASE"
+    assert DEPLOY_EVENT in events, (
+        "a pending Runtime Profile change on unchanged source deployed nothing"
+    )
+    assert readings == ["read", "read"], "the success record must be re-read"
+    assert events.index(DEPLOY_EVENT) < events.index("success")
 
 
 def test_signing_material_is_generated_once(

@@ -26,6 +26,7 @@ if __package__:
     )
     from scripts.staging_live_evidence import (
         LiveEvidenceError,
+        RuntimeProfileChangePending,
         collect_live_deploy_evidence,
         successful_source_live_matches,
     )
@@ -51,6 +52,7 @@ else:
     )
     from staging_live_evidence import (
         LiveEvidenceError,
+        RuntimeProfileChangePending,
         collect_live_deploy_evidence,
         successful_source_live_matches,
     )
@@ -877,7 +879,14 @@ def classify_source_deploy(
     source: SourceCheckout,
     site_exists: bool,
     live_matches: bool = False,
+    profile_change_pending: bool = False,
 ) -> str:
+    # A Runtime Profile template that differs from the live Profile needs the
+    # release engine's plan/approve stop, whatever the source identities say:
+    # DEPLOY_HOST_ONLY, QUALITY_ONLY and UNCHANGED all apply no release and
+    # would record the pending change as a success.
+    if profile_change_pending:
+        return "APPLICATION_RELEASE"
     if previous is None or not site_exists:
         return "APPLICATION_RELEASE"
     identities = previous.get("identities")
@@ -1290,6 +1299,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
         previous = load_successful_source_deploy(state_dir, signing=signing)
         venv = state_dir / "deployer-venv"
         live_evidence: dict[str, object] | None = None
+        profile_change_pending = False
         if (
             previous is not None
             and (state_dir / "site.yaml").is_file()
@@ -1302,6 +1312,10 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
                     venv=venv,
                     lock_fd=lock_fd,
                 )
+            except RuntimeProfileChangePending as exc:
+                print(f"+ {exc}; running the application release", file=sys.stderr)
+                live_evidence = None
+                profile_change_pending = True
             except (LiveEvidenceError, StagingDeployError):
                 live_evidence = None
         mode = classify_source_deploy(
@@ -1310,6 +1324,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
             source=source,
             site_exists=(state_dir / "site.yaml").is_file(),
             live_matches=successful_source_live_matches(previous, live_evidence),
+            profile_change_pending=profile_change_pending,
         )
         prepared_mode = mode
         trusted_ci_candidate = (

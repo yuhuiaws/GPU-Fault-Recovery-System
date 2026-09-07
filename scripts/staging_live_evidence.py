@@ -15,6 +15,74 @@ class LiveEvidenceError(RuntimeError):
     pass
 
 
+class RuntimeProfileChangePending(LiveEvidenceError):
+    """The site's Runtime Profile template no longer matches the live Profile."""
+
+
+def runtime_profile_policy_evidence(
+    site_file: Path,
+    *,
+    repository_root: Path,
+    runner=subprocess.run,
+) -> dict[str, object]:
+    """The live Runtime Profile's policy digest, or a refusal to call it unchanged.
+
+    The Profile template (``spec.runtimeProfile.templateSource``) lives outside
+    the source repository and outside the site file, so neither the source
+    fingerprint nor ``site_sha256`` moves when an operator edits it. Without
+    this reading a template-only change classified as ``UNCHANGED`` and skipped
+    the release engine -- and with it the ``profile-plan.json`` stop the change
+    needed (observed live on 2026-09-07: a new capability claim in the template
+    never reached the plan).
+
+    The plan comes from the release engine itself (``release_deploy.py
+    --profile-plan-json``), run the way ``gpu-fault-admin deploy`` runs it: this
+    interpreter with the snapshot's ``src`` on ``PYTHONPATH``. The deploy-host
+    bundle carries only the admin subset of ``gpu_fault``, so the planner cannot
+    be imported here; and a second implementation of "unchanged" would drift.
+    """
+
+    command = [
+        sys.executable,
+        str(repository_root / "scripts/release_deploy.py"),
+        "--site",
+        str(site_file),
+        "--profile-plan-json",
+    ]
+    print("+ " + " ".join(command), file=sys.stderr, flush=True)
+    completed = runner(
+        command,
+        cwd=repository_root,
+        env={**os.environ, "PYTHONPATH": str(repository_root / "src")},
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode:
+        raise LiveEvidenceError(
+            f"Runtime Profile plan failed ({completed.returncode}): "
+            + (completed.stderr or "").strip()
+        )
+    try:
+        payload = json.loads(completed.stdout or "")
+    except json.JSONDecodeError as exc:
+        raise LiveEvidenceError("Runtime Profile plan is invalid") from exc
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("policy_digest"), str
+    ):
+        raise LiveEvidenceError("Runtime Profile plan must be a JSON object")
+    change_kind = payload.get("change_kind")
+    if change_kind != "UNCHANGED":
+        raise RuntimeProfileChangePending(
+            "Runtime Profile template differs from the live Profile "
+            f"({change_kind}); the release engine must plan it"
+        )
+    return {
+        "runtime_profile_sha256": payload.get("live_profile_sha256"),
+        "runtime_profile_policy_digest": payload["policy_digest"],
+    }
+
+
 def collect_live_deploy_evidence(
     *,
     repository_root: Path,
@@ -78,6 +146,7 @@ def collect_live_deploy_evidence(
     site_file = state_dir / "site.yaml"
     return {
         "site_sha256": hashlib.sha256(site_file.read_bytes()).hexdigest(),
+        **runtime_profile_policy_evidence(site_file, repository_root=repository_root),
         "release_id": release_id,
         "state_sha256": state_sha256,
         "phase": "complete",

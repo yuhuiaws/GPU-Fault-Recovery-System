@@ -1379,13 +1379,48 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow a staging-only signed release; never use for production",
     )
+    parser.add_argument(
+        "--profile-plan-json",
+        action="store_true",
+        help=(
+            "read-only: print the Runtime Profile plan (template versus live "
+            "Profile) as JSON and exit without building or deploying anything"
+        ),
+    )
     return parser
+
+
+def print_profile_plan(site_file: Path) -> dict[str, Any]:
+    """The Runtime Profile plan the release would act on, without acting.
+
+    The staging fast path asks this before it calls a site UNCHANGED: the
+    Profile template lives outside the source repository and the site file, so
+    no other identity moves when it changes. Same planner, same live baseline
+    as ``execute_release`` -- the two cannot disagree about what "unchanged"
+    means. Nothing is written: no ``profile-plan.json``, no approval state.
+    """
+
+    try:
+        current_state = read_live_release_state(site_file)
+    except ReleaseStateNotFound:
+        current_state = {}
+    plan = plan_runtime_profile(
+        site_file,
+        live_profile_sha256=str(current_state.get("runtime_profile_sha256") or "")
+        or None,
+    )
+    payload = _profile_plan_payload(plan)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return payload
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
         site_file = resolve_site_file(arguments.site, os.environ)
+        if arguments.profile_plan_json:
+            print_profile_plan(site_file)
+            return 0
         if arguments.prebuilt_attestation is None:
             raise ReleaseDeployError(
                 "release-deploy requires a signed prebuilt attestation"

@@ -153,8 +153,12 @@ deploy-host archive保存在
 Git commit、源码fingerprint、应用/deploy-host身份和成功模式写入单独的本地Cosign签名
 `source-deploy-success.json`授权记录；记录缺失、签名不匹配或应用身份变化时不得走
 deploy-host-only快速路径。`UNCHANGED`还要求签名记录中的site摘要、live release ID、
-`phase=complete`、`transaction_committed=true`和release-state摘要与当前只读status
-完全一致，且`next_deploy.kind=NOOP`；任一漂移都回到受检application release。
+`phase=complete`、`transaction_committed=true`、release-state摘要和线上Runtime Profile
+策略摘要与当前只读status完全一致，且`next_deploy.kind=NOOP`；任一漂移都回到受检
+application release。Runtime Profile模板（`spec.runtimeProfile.templateSource`）位于仓库
+与site文件之外，所以线上证据还会用release engine的`plan_runtime_profile`把模板与线上
+Profile比对：只要不是`UNCHANGED`，任何模式（含deploy-host-only与quality-only）都改走
+application release，并按预期停在`release-deploy/profile-plan.json`等待审批。
 
 clean源码只有同时满足以下条件时才访问GitHub Actions：
 

@@ -131,6 +131,10 @@ jq '{
 
 `UNCHANGED`不会生成待审批Profile变更。
 
+只修改模板、代码与site不变的部署同样会生成计划：staging层在判定`UNCHANGED`前先用
+`plan_runtime_profile`把模板与线上Profile比对，存在待审批变更时直接走完整的
+application release路径。
+
 ## 5. 绑定外部批准
 
 将审核过的`plan_sha256`记录到变更单。取得批准后，原样传回命令：
