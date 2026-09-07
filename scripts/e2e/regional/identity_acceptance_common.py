@@ -18,6 +18,7 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from gpu_fault.admin.site import load_site  # noqa: E402
+from gpu_fault.regional import cluster_token_sha256  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
@@ -26,6 +27,89 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 EXECUTOR_APP = "gpu-fault-cluster-executor"
 CPU_APPS = ("gpu-fault-api-ha", "gpu-fault-control-worker")
 REGISTRY_SECRET = "gpu-fault-regional-clusters"
+REGISTRY_API_PREFIX = "/v1/regional/registry"
+REGISTRY_READY_TIMEOUT_SECONDS = 180
+
+# Runs inside a control-plane API Pod: the registry API is execution-token
+# scoped and the token lives only in that Pod's environment. The body carries
+# digests, never plaintext tokens (see durable_registry_payload).
+REGISTRY_API_PROBE = r"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+method, path = sys.argv[1], sys.argv[2]
+body = sys.argv[3] if len(sys.argv) > 3 else ""
+request = urllib.request.Request(
+    "http://127.0.0.1:8080" + path,
+    data=body.encode() if body else None,
+    method=method,
+    headers={
+        "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"],
+        "Content-Type": "application/json",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        status, text = response.status, response.read().decode()
+except urllib.error.HTTPError as exc:
+    status, text = exc.code, exc.read().decode()
+try:
+    value = json.loads(text)
+except ValueError:
+    value = {"raw": text[:2000]}
+print(json.dumps({"status": status, "body": value}))
+"""
+
+REGISTRY_REVISION_PROBE = r"""
+import json
+from gpu_fault.app import ApplicationContext
+store = ApplicationContext.from_environment().store
+head = store.get_regional_registry_head()
+revision = store.get_regional_registry_revision(head.generation)
+print(json.dumps({
+    "generation": head.generation,
+    "registrations": [item.model_dump(mode="json") for item in revision.registrations],
+}, default=str))
+"""
+
+
+def durable_registry_payload(
+    entries: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Registrations as the revision API takes them: digests, never plaintext.
+
+    The Secret-era helpers hand the registry plaintext ``token`` /
+    ``retiring_token`` fields (the control plane used to digest them at load).
+    ``RegionalClusterRegistration`` is strict and stores only ``token_sha256`` /
+    ``retiring_token_sha256``, so the digesting happens here, on the runner, and
+    the plaintext never reaches argv, logs or evidence. A rotated entry gets a
+    fresh ``updated_at``: the rotation window is measured from it.
+    """
+
+    observed = (now or datetime.now(timezone.utc)).isoformat().replace("+00:00", "Z")
+    payload: list[dict[str, Any]] = []
+    for entry in entries:
+        item = dict(entry)
+        rotated = False
+        token = item.pop("token", None)
+        if token:
+            item["token_sha256"] = cluster_token_sha256(str(token))
+            rotated = True
+        retiring = item.pop("retiring_token", None)
+        if retiring:
+            item["retiring_token_sha256"] = cluster_token_sha256(str(retiring))
+            rotated = True
+        if rotated:
+            item["updated_at"] = observed
+        payload.append(item)
+    return payload
+
+
 CONNECTION_SECRET = "gpu-fault-regional-connection"
 FORBIDDEN_NAMESPACE = "gf-forbidden-probe"
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
@@ -218,7 +302,75 @@ class IdentitySite:
             raise IdentityAcceptanceError("Pod probe did not return a JSON object")
         return cast(dict[str, Any], value)
 
+    # -- registry: durable revisions first, the bootstrap Secret only before any
+    # revision exists. Once the control plane has published a revision (every
+    # production site), ``clusters.json`` is a bootstrap copy that nothing
+    # reads; editing it and rolling the control plane changes nothing, and
+    # AUTH-016 lost its new token to a 403 that way (live, 2026-09-07).
+
+    def _api_pod(self) -> str:
+        target = next(iter(self.targets.values()))
+        pods = self.ready_pods("cpu", "gpu-fault-api-ha", target)
+        if not pods:
+            raise IdentityAcceptanceError("no Ready control-plane API Pod")
+        return pods[0]
+
+    def registry_api(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        target = next(iter(self.targets.values()))
+        arguments = [method, path]
+        if payload is not None:
+            arguments.append(json.dumps(payload, separators=(",", ":")))
+        return self.pod_json(
+            "cpu", target, self._api_pod(), REGISTRY_API_PROBE, *arguments
+        )
+
+    def registry_generation(self) -> int | None:
+        """The durable registry head generation, or None while the site still
+        runs from the bootstrap Secret."""
+
+        response = self.registry_api("GET", f"{REGISTRY_API_PREFIX}/status")
+        status = int(response.get("status") or 0)
+        if status == 404:
+            return None
+        if status != 200:
+            raise IdentityAcceptanceError(
+                f"registry status returned {status}: {response.get('body')}"
+            )
+        return int(response["body"]["generation"])
+
+    def wait_registry_ready(
+        self, minimum_generation: int, *, timeout_seconds: int | None = None
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + (
+            timeout_seconds or REGISTRY_READY_TIMEOUT_SECONDS
+        )
+        last: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            response = self.registry_api("GET", f"{REGISTRY_API_PREFIX}/status")
+            last = response.get("body") or {}
+            # RegionalRegistryStatus has no "ready" flag: the head is applied
+            # when every required member has acked it.
+            if (
+                int(response.get("status") or 0) == 200
+                and int(last.get("generation") or 0) >= minimum_generation
+                and "missing_member_ids" in last
+                and not last.get("missing_member_ids")
+            ):
+                return cast(dict[str, Any], last)
+            time.sleep(2)
+        raise IdentityAcceptanceError(
+            f"registry generation {minimum_generation} did not become ready: {last}"
+        )
+
     def registry(self) -> list[dict[str, Any]]:
+        if self.registry_generation() is not None:
+            target = next(iter(self.targets.values()))
+            revision = self.pod_json(
+                "cpu", target, self._api_pod(), REGISTRY_REVISION_PROBE
+            )
+            return cast(list[dict[str, Any]], revision["registrations"])
         value = json.loads(
             self.cpu(
                 "get",
@@ -233,7 +385,30 @@ class IdentitySite:
             json.loads(base64.b64decode(value["data"]["clusters.json"])),
         )
 
-    def write_registry(self, entries: list[dict[str, Any]]) -> None:
+    def write_registry(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        reason: str = "regional acceptance registry change",
+    ) -> None:
+        generation = self.registry_generation()
+        if generation is not None:
+            response = self.registry_api(
+                "POST",
+                f"{REGISTRY_API_PREFIX}/revisions",
+                {
+                    "expected_generation": generation,
+                    "registrations": durable_registry_payload(entries),
+                    "reason": reason,
+                },
+            )
+            if int(response.get("status") or 0) != 200:
+                raise IdentityAcceptanceError(
+                    f"registry revision publish returned {response.get('status')}: "
+                    f"{response.get('body')}"
+                )
+            self.wait_registry_ready(generation + 1)
+            return
         patch = {
             "stringData": {"clusters.json": json.dumps(entries, separators=(",", ":"))}
         }
@@ -248,6 +423,14 @@ class IdentitySite:
 
     def rollout_control(self) -> float:
         started = time.monotonic()
+        generation = self.registry_generation()
+        if generation is not None:
+            # A durable revision propagates through the registry runtime (1 s
+            # poll); the members ack it without a restart. Waiting for the ack
+            # is the "rollout" here, and its duration is the isolation delay the
+            # cases record.
+            self.wait_registry_ready(generation)
+            return time.monotonic() - started
         for deployment in CPU_APPS:
             self.cpu("rollout", "restart", f"deployment/{deployment}")
         for deployment in CPU_APPS:
