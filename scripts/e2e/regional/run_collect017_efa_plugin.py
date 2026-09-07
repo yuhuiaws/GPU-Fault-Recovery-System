@@ -173,6 +173,52 @@ EFA_WORKFLOW_TIMEOUT_SECONDS = 600
 EFA_INCIDENT_TIMEOUT_SECONDS = 180
 
 
+REMOTE_COMMANDS = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+
+request_id = sys.argv[1]
+store = ApplicationContext.from_environment().store
+commands = []
+for item in store.list_remote_commands(workflow_request_ids=[request_id]):
+    payload = item.model_dump(mode="json")
+    commands.append({
+        "command_id": payload.get("command_id"),
+        "step_index": payload.get("step_index"),
+        "operation": item.step.operation.value,
+        "status": payload.get("status"),
+        "error": payload.get("error"),
+        "result_details": payload.get("result_details") or {},
+    })
+print(json.dumps({"remote_commands": commands}, sort_keys=True, default=str))
+"""
+
+
+def remote_node_result(
+    bundle: dict[str, Any], *, operation: str, node: str
+) -> dict[str, Any] | None:
+    """What the Node Agent reported for ``operation`` on ``node``.
+
+    A remote step's ``details`` stay empty; the agent's result travels on the
+    remote command as ``result_details.node_results[<node>]`` (observed live:
+    ``rebound_pci_bdfs`` was there and nowhere else).
+    """
+
+    commands = [
+        item
+        for item in bundle.get("remote_commands") or []
+        if item.get("operation") == operation
+    ]
+    if not commands:
+        return None
+    details = commands[-1].get("result_details") or {}
+    node_results = details.get("node_results") or {}
+    result = node_results.get(node)
+    return cast(dict[str, Any], result) if isinstance(result, dict) else None
+
+
 def _bound_efa_devices(inventory: dict[str, Any]) -> list[dict[str, Any]]:
     """Functions the collector probe sees bound to ``efa`` (an ``efa_inventory``)."""
 
@@ -186,6 +232,7 @@ def _bound_efa_devices(inventory: dict[str, Any]) -> list[dict[str, Any]]:
 def efa_unbind_errors(
     bundle: dict[str, Any],
     *,
+    node: str,
     bdf: str,
     baseline: dict[str, Any],
     unbound: dict[str, Any],
@@ -196,7 +243,8 @@ def efa_unbind_errors(
 
     ``baseline``/``unbound``/``recovered`` are collector-probe ``efa_inventory``
     readings before the unbind, right after it, and after the workflow ended;
-    ``restore`` is what ``restore-efa`` observed before disarming the timer.
+    ``restore`` is what ``restore-efa`` observed before disarming the timer;
+    ``bundle`` carries the workflow, its incident and its remote commands.
     """
 
     errors: list[str] = []
@@ -240,13 +288,21 @@ def efa_unbind_errors(
         errors.append("REMEDIATE_EFA_DRIVER was never executed")
     else:
         step = remediation[-1]
-        details = step.get("details") or {}
         if step.get("status") != "SUCCEEDED":
             errors.append(
                 f"REMEDIATE_EFA_DRIVER status {step.get('status')!r} != SUCCEEDED"
             )
         if not str(step.get("adapter_operation_id") or "").startswith("remote/"):
             errors.append("REMEDIATE_EFA_DRIVER did not run as a remote node action")
+        details = (
+            remote_node_result(bundle, operation="REMEDIATE_EFA_DRIVER", node=node)
+            or {}
+        )
+        if not details:
+            errors.append(
+                f"no Node Agent result for REMEDIATE_EFA_DRIVER on {node} "
+                "(remote command result_details.node_results)"
+            )
         if details.get("rebound_pci_bdfs") != [bdf]:
             errors.append(
                 f"rebound_pci_bdfs {details.get('rebound_pci_bdfs')!r} != [{bdf!r}]"
@@ -365,6 +421,12 @@ def run_efa_unbind(
             discovered_count=int(baseline["discovered_count"]),
             timeout_seconds=30,
         )
+        request_id = str((bundle.get("workflow") or {}).get("request_id") or "")
+        if request_id:
+            bundle = {
+                **bundle,
+                **regional.cpu_python(REMOTE_COMMANDS, request_id),
+            }
     finally:
         restore = collector.execute(
             "restore-efa",
@@ -375,6 +437,7 @@ def run_efa_unbind(
         )
     errors = efa_unbind_errors(
         bundle,
+        node=settings.node,
         bdf=bdf,
         baseline=baseline,
         unbound=unbound,

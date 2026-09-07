@@ -18,6 +18,7 @@ from scripts.e2e.regional import run_collect017_efa_plugin as collect017
 
 BDF = "0000:6e:00.0"
 OTHER = "0000:6f:00.0"
+NODE = "hyperpod-node-a"
 
 
 def _inventory(*bdfs: str, active: int | None = None) -> dict[str, Any]:
@@ -47,26 +48,48 @@ def _bundle() -> dict[str, Any]:
                 if op in {"REMEDIATE_EFA_DRIVER", "RESTART_EFA_DEVICE_PLUGIN"}
                 else f"workflow-{i:06x}"
             ),
-            "details": (
-                {
-                    "expected_count": 2,
-                    "pci_discovered_count": 2,
-                    "driver_bound_count": 2,
-                    "rebound_pci_bdfs": [BDF],
-                    "already_bound": False,
-                }
-                if op == "REMEDIATE_EFA_DRIVER"
-                else {}
-            ),
+            # Remote steps keep empty details (observed live); the Node
+            # Agent's result rides on the remote command instead.
+            "details": {},
         }
         for i, op in enumerate(collect017.EFA_REMEDIATION_STEPS)
     ]
+    remote_commands = [
+        {
+            "command_id": "remote-72ab5309d3c46bcab846b290",
+            "step_index": 2,
+            "operation": "REMEDIATE_EFA_DRIVER",
+            "status": "SUCCEEDED",
+            "error": None,
+            "result_details": {
+                "node_results": {
+                    NODE: {
+                        "expected_count": 2,
+                        "pci_discovered_count": 2,
+                        "driver_bound_count": 2,
+                        "rebound_pci_bdfs": [BDF],
+                        "already_bound": False,
+                    }
+                }
+            },
+        },
+        {
+            "command_id": "remote-ec6a25ad721fb94c7ba97b66",
+            "step_index": 3,
+            "operation": "RESTART_EFA_DEVICE_PLUGIN",
+            "status": "SUCCEEDED",
+            "error": None,
+            "result_details": {"node_results": {NODE: {"already_healthy": True}}},
+        },
+    ]
     return {
         "workflow": {
+            "request_id": "workflow-d6cb833b779638eaafc386e4",
             "status": "SUCCEEDED",
             "official_steps": steps,
             "step_executions": executions,
         },
+        "remote_commands": remote_commands,
         "incident": {
             "state": "RECOVERED",
             "official_action": "REMEDIATE_EFA_DRIVER",
@@ -75,8 +98,26 @@ def _bundle() -> dict[str, Any]:
     }
 
 
+def _remediation(bundle: dict[str, Any]) -> dict[str, Any]:
+    """The Node Agent's REMEDIATE_EFA_DRIVER result for NODE inside ``bundle``."""
+
+    result = collect017.remote_node_result(
+        bundle, operation="REMEDIATE_EFA_DRIVER", node=NODE
+    )
+    assert result is not None, "fixture bundle lost its remediation result"
+    return result
+
+
+def _move_result_to_other_node(bundle: dict[str, Any]) -> None:
+    """The agent answered for a different node than the one the case chose."""
+
+    node_results = bundle["remote_commands"][0]["result_details"]["node_results"]
+    node_results["other-node"] = node_results.pop(NODE)
+
+
 def _verdict(**overrides: Any) -> list[str]:
     arguments: dict[str, Any] = {
+        "node": NODE,
         "bdf": BDF,
         "baseline": _inventory(BDF, OTHER),
         "unbound": _inventory(OTHER),
@@ -113,13 +154,7 @@ def test_fail_safe_timer_rebinding_is_not_a_pass() -> None:
     assert any("fail-safe timer" in item for item in errors), errors
 
     bundle = _bundle()
-    step = bundle["workflow"]["step_executions"][2]
-    step["details"] = {
-        "expected_count": 2,
-        "pci_discovered_count": 2,
-        "driver_bound_count": 2,
-        "already_bound": True,
-    }
+    _remediation(bundle).update({"already_bound": True, "rebound_pci_bdfs": []})
     errors = _verdict(bundle=bundle)
     assert any("already bound" in item for item in errors), errors
     assert any("rebound_pci_bdfs" in item for item in errors), errors
@@ -154,17 +189,15 @@ def test_restore_having_to_bind_is_not_a_pass() -> None:
             "remote node action",
         ),
         (
-            lambda b: b["workflow"]["step_executions"][2]["details"].__setitem__(
-                "rebound_pci_bdfs", [OTHER]
-            ),
+            lambda b: _remediation(b).__setitem__("rebound_pci_bdfs", [OTHER]),
             "rebound_pci_bdfs",
         ),
         (
-            lambda b: b["workflow"]["step_executions"][2]["details"].__setitem__(
-                "driver_bound_count", 1
-            ),
+            lambda b: _remediation(b).__setitem__("driver_bound_count", 1),
             "driver_bound_count",
         ),
+        (lambda b: b.__setitem__("remote_commands", []), "no Node Agent result"),
+        (lambda b: _move_result_to_other_node(b), "no Node Agent result"),
         (lambda b: b["incident"].__setitem__("state", "QUARANTINED"), "incident state"),
         (
             lambda b: b["incident"].__setitem__("official_action", "RUN_DIAGNOSTICS"),
