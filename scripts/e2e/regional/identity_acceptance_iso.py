@@ -261,8 +261,14 @@ commands = [
     for item in store.list_remote_commands()
     if item.workflow_request_id == workflow.request_id
 ]
+# WorkflowStepOutcome is a dataclass, not a pydantic model.
 print(json.dumps({
-    "outcome": outcome.model_dump(mode="json"),
+    "outcome": {
+        "status": outcome.status.value,
+        "adapter_operation_id": outcome.adapter_operation_id,
+        "error": outcome.error,
+        "details": outcome.details,
+    },
     "commands": commands,
     "workflow_id": workflow.request_id,
 }, sort_keys=True, default=str))
