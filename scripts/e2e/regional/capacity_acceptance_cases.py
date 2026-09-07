@@ -31,7 +31,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
             },
         )
         case_dir = self.run_dir / "CAP-001"
-        case_dir.mkdir(mode=0o700)
+        case_dir.mkdir(mode=0o700, exist_ok=True)
         monitor_stop = threading.Event()
         maxima: dict[str, float] = {}
         metrics_samples: list[dict[str, Any]] = []
@@ -398,7 +398,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
             },
         )
         case_dir = self.run_dir / "CAP-002"
-        case_dir.mkdir(mode=0o700)
+        case_dir.mkdir(mode=0o700, exist_ok=True)
         result: dict[str, Any] = {}
         passed = False
         try:
@@ -428,7 +428,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
             },
         )
         case_dir = self.run_dir / "CAP-003"
-        case_dir.mkdir(mode=0o700)
+        case_dir.mkdir(mode=0o700, exist_ok=True)
         started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
         results: list[dict[str, Any]] = []
         client = httpx.Client(base_url=probe.url, timeout=20)
@@ -722,7 +722,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
             },
         )
         case_dir = self.run_dir / "CAP-004"
-        case_dir.mkdir(mode=0o700)
+        case_dir.mkdir(mode=0o700, exist_ok=True)
         seed = self.kubectl(
             "exec",
             probe.pod,
