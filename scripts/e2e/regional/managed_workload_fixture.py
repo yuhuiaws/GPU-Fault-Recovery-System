@@ -244,6 +244,22 @@ class ManagedWorkloadFixture:
             check=False,
             timeout=300,
         )
+        # RESTART_WORKLOAD resubmits the workload under a new name
+        # (``<name>-r-<hash>``) that keeps this job id as a label. Deleting the
+        # source name alone leaves the restarted copy holding its GPUs for the
+        # rest of its lifetime, and every later live case then fails preflight
+        # with "GPU cluster already has a GPU workload".
+        self.regional.kubectl(
+            "gpu",
+            "delete",
+            self.resource,
+            "-l",
+            f"gpu-fault.io/job-id={self.settings.job_id}",
+            "--ignore-not-found",
+            "--wait=true",
+            check=False,
+            timeout=300,
+        )
 
     def submit(self) -> dict[str, Any]:
         self.delete()

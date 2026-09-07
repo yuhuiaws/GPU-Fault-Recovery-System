@@ -31,7 +31,8 @@
     "src/gpu_fault/processor/coordinator.py": 1656,
     "src/gpu_fault/store/postgres/ddl.py": 1751,
     "src/gpu_fault_release/regional_release_orchestration.py": 1814,
-    "src/gpu_fault_release/regional_release_state.py": 1514
+    "src/gpu_fault_release/regional_release_state.py": 1514,
+    "tests/regional/test_destructive_acceptance_fixtures.py": 1511
   },
   "functions": {
     "deploy/control-plane/tools/render_control_plane_role_split.py:main": 648,

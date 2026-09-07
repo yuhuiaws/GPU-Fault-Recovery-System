@@ -1474,3 +1474,38 @@ def test_physical_reset_is_proven_by_the_sampler_dip_not_by_journal_text() -> No
         baseline, twice, expected_gpu_count=8, target_bdf="0000:59:00"
     )
     assert any("more than one reset" in error for error in errors), errors
+
+
+def test_managed_workload_delete_also_removes_restarted_copies(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """RESTART_WORKLOAD resubmits the job as ``<name>-r-<hash>`` with the same
+    ``gpu-fault.io/job-id`` label; a name-only delete left that copy holding a
+    GPU for two hours and failed every later live preflight (DESTR-015)."""
+    site = tmp_path / "site.yaml"
+    site.write_text("schemaVersion: 1\n", encoding="utf-8")
+    regional = _regional(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        regional, "kubectl", lambda *args, **kwargs: calls.append(args) or ""
+    )
+    fixture = ManagedWorkloadFixture(
+        regional,
+        ManagedWorkloadSettings(
+            manifest=(REGIONAL / "manifests/training/xid11-single-node-job.yaml"),
+            site_file=site,
+            job_id="destr012-d-abc",
+            attempt_id="destr012-d-abc-a001",
+            restart_budget=1,
+            expected_pods=1,
+            expected_gpu_count=1,
+        ),
+    )
+
+    fixture.delete()
+
+    assert [call[:4] for call in calls] == [
+        ("gpu", "delete", "job", "gpu-fault-xid11-auto-resume-guard"),
+        ("gpu", "delete", "job", "-l"),
+    ], calls
+    assert "gpu-fault.io/job-id=destr012-d-abc" in calls[1], calls[1]
