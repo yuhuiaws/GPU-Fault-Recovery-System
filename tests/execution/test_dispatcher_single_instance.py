@@ -194,7 +194,15 @@ def test_dispatcher_sees_past_a_wall_of_filtered_rows() -> None:
 
 def test_dispatch_report_names_every_filter_that_held_a_row_back() -> None:
     store = build_store()
-    _pending(store, "wf-later", "inc-later", not_before=NOW + timedelta(days=1))
+    # The dispatcher compares not_before with the real clock, so "later" has to
+    # be relative to it: NOW is a fixed date and NOW + 1 day expired on
+    # 2026-09-06 19:00Z, failing the release gate that evening.
+    _pending(
+        store,
+        "wf-later",
+        "inc-later",
+        not_before=datetime.now(timezone.utc) + timedelta(days=1),
+    )
     _pending(store, "wf-behind", "inc-behind", predecessor_workflow_id="wf-open")
     store.save_workflow(
         workflow_request(
