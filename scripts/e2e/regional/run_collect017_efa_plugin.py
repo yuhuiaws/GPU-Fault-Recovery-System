@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -155,58 +155,242 @@ def read_only_preflight(
     return result
 
 
+EFA_REMEDIATION_STEPS = (
+    "FREEZE_EVIDENCE",
+    "MARK_UNSCHEDULABLE",
+    "REMEDIATE_EFA_DRIVER",
+    "RESTART_EFA_DEVICE_PLUGIN",
+    "TRIGGER_HEALTH_SNAPSHOT",
+    "VALIDATE_FABRIC",
+    "RESTORE_SCHEDULING",
+)
+# The host-side bind fail-safe only covers a runner that dies mid-case. It has
+# to outlive the workflow wait (600s) plus the incident wait, or it rebinds the
+# function itself and the Node Agent finds nothing to do -- a false PASS the
+# verdict below would catch, but as a flaky FAIL rather than a clean run.
+EFA_RESTORE_SECONDS = 900
+EFA_WORKFLOW_TIMEOUT_SECONDS = 600
+EFA_INCIDENT_TIMEOUT_SECONDS = 180
+
+
+def _bound_efa_devices(inventory: dict[str, Any]) -> list[dict[str, Any]]:
+    """Functions the collector probe sees bound to ``efa`` (an ``efa_inventory``)."""
+
+    return [
+        item
+        for item in inventory.get("devices") or []
+        if item.get("pci_bdf") and item.get("driver") == "efa"
+    ]
+
+
+def efa_unbind_errors(
+    bundle: dict[str, Any],
+    *,
+    bdf: str,
+    baseline: dict[str, Any],
+    unbound: dict[str, Any],
+    recovered: dict[str, Any],
+    restore: dict[str, Any],
+) -> list[str]:
+    """COLLECT-017 A verdict: the control plane, not the fail-safe, rebound it.
+
+    ``baseline``/``unbound``/``recovered`` are collector-probe ``efa_inventory``
+    readings before the unbind, right after it, and after the workflow ended;
+    ``restore`` is what ``restore-efa`` observed before disarming the timer.
+    """
+
+    errors: list[str] = []
+    workflow = bundle.get("workflow") or {}
+    incident = bundle.get("incident") or {}
+    expected = int(baseline["discovered_count"])
+
+    # Injection took effect and the collector saw exactly one function go.
+    if int(unbound["discovered_count"]) != expected - 1:
+        errors.append(
+            "collector did not observe the unbound function: discovered "
+            f"{unbound['discovered_count']} != {expected - 1}"
+        )
+    if any(item.get("pci_bdf") == bdf for item in _bound_efa_devices(unbound)):
+        errors.append(f"{bdf} still bound to efa after the unbind")
+
+    # The control plane compiled the documented remediation, in order.
+    operations = [
+        str(item.get("operation")) for item in workflow.get("official_steps") or []
+    ]
+    if operations != list(EFA_REMEDIATION_STEPS):
+        errors.append(f"official steps {operations} != {list(EFA_REMEDIATION_STEPS)}")
+    if incident.get("official_action") != "REMEDIATE_EFA_DRIVER":
+        errors.append(
+            f"incident official_action {incident.get('official_action')!r} "
+            "!= REMEDIATE_EFA_DRIVER"
+        )
+    reasons = " ".join(str(item) for item in incident.get("reasons") or [])
+    if "driver is not bound" not in reasons:
+        errors.append("incident reasons do not carry the DRIVER_UNBOUND finding")
+
+    # The Node Agent rebound exactly this function through modprobe + bind.
+    if workflow.get("status") != "SUCCEEDED":
+        errors.append(f"workflow status {workflow.get('status')!r} != SUCCEEDED")
+    remediation = [
+        item
+        for item in workflow.get("step_executions") or []
+        if item.get("operation") == "REMEDIATE_EFA_DRIVER"
+    ]
+    if not remediation:
+        errors.append("REMEDIATE_EFA_DRIVER was never executed")
+    else:
+        step = remediation[-1]
+        details = step.get("details") or {}
+        if step.get("status") != "SUCCEEDED":
+            errors.append(
+                f"REMEDIATE_EFA_DRIVER status {step.get('status')!r} != SUCCEEDED"
+            )
+        if not str(step.get("adapter_operation_id") or "").startswith("remote/"):
+            errors.append("REMEDIATE_EFA_DRIVER did not run as a remote node action")
+        if details.get("rebound_pci_bdfs") != [bdf]:
+            errors.append(
+                f"rebound_pci_bdfs {details.get('rebound_pci_bdfs')!r} != [{bdf!r}]"
+            )
+        if details.get("already_bound") is not False:
+            errors.append("Node Agent found the function already bound: nothing to do")
+        if details.get("driver_bound_count") != expected:
+            errors.append(
+                f"driver_bound_count {details.get('driver_bound_count')!r} != {expected}"
+            )
+
+    # Recovery is real on the host and the fail-safe never had to act.
+    if int(recovered["discovered_count"]) != expected:
+        errors.append(
+            f"discovered {recovered['discovered_count']} != baseline {expected}"
+        )
+    if int(recovered["active_count"]) != int(baseline["active_count"]):
+        errors.append(
+            f"ACTIVE {recovered['active_count']} != baseline {baseline['active_count']}"
+        )
+    if not any(item.get("pci_bdf") == bdf for item in _bound_efa_devices(recovered)):
+        errors.append(f"{bdf} is not bound to efa after the workflow")
+    if restore.get("already_bound") is not True:
+        errors.append("restore-efa had to bind the function itself")
+    if restore.get("timer_fired"):
+        errors.append(
+            "the host fail-safe timer rebound the function, not the control plane"
+        )
+    if restore.get("bound") is not True:
+        errors.append("function is not bound after restore-efa")
+
+    if incident.get("state") != "RECOVERED":
+        errors.append(f"incident state {incident.get('state')!r} != RECOVERED")
+    return errors
+
+
+def _wait_efa_inventory(
+    collector: CollectorAcceptanceFixture,
+    *,
+    discovered_count: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    snapshot = collector.snapshot()
+    while (
+        int(snapshot["efa_inventory"]["discovered_count"]) != discovered_count
+        and time.monotonic() < deadline
+    ):
+        time.sleep(3)
+        snapshot = collector.snapshot()
+    return cast(dict[str, Any], snapshot["efa_inventory"])
+
+
 def run_efa_unbind(
     settings: Settings,
     regional: RegionalLiveFixture,
     collector: CollectorAcceptanceFixture,
     attempt: int,
 ) -> dict[str, Any]:
-    snapshot = collector.snapshot()
-    efa_devices = [
-        item for item in snapshot["efa_inventory"]["devices"] if item.get("pci_bdf")
-    ]
-    if not efa_devices:
+    baseline_snapshot = collector.snapshot()
+    baseline = baseline_snapshot["efa_inventory"]
+    bound = _bound_efa_devices(baseline)
+    if not bound:
         raise RegionalFixtureError("no bound EFA BDF was discovered")
-    bdf = str(efa_devices[0]["pci_bdf"])
+    bdf = str(bound[0]["pci_bdf"])
+    base_settings = base.Settings(
+        regional=settings.regional,
+        case_id=CASE_ID,
+        node=settings.node,
+        second_node=None,
+        host_probe_image=settings.host_probe_image,
+        hyperpod_cluster="",
+        executor_role_arn="",
+        site_file=settings.site_file,
+        predecessor_path=settings.predecessor_path,
+    )
     started_at = datetime.now(timezone.utc)
-    collector.execute(
+    injection = collector.execute(
         "unbind-efa",
         "--run-id",
         f"c017-a-{attempt}",
         "--pci-bdf",
         bdf,
         "--restore-seconds",
-        "300",
+        str(EFA_RESTORE_SECONDS),
     )
+    unbound: dict[str, Any] = {}
+    recovered: dict[str, Any] = {}
+    bundle: dict[str, Any] = {}
     try:
-        workflow = base.latest_node_workflow(
+        unbound = _wait_efa_inventory(
+            collector,
+            discovered_count=int(baseline["discovered_count"]) - 1,
+            timeout_seconds=60,
+        )
+        bundle = base.latest_node_workflow(
             regional,
-            base.Settings(
-                regional=settings.regional,
-                case_id=CASE_ID,
-                node=settings.node,
-                second_node=None,
-                host_probe_image=settings.host_probe_image,
-                hyperpod_cluster="",
-                executor_role_arn="",
-                site_file=settings.site_file,
-                predecessor_path=settings.predecessor_path,
-            ),
+            base_settings,
             observed_after=started_at,
-            timeout_seconds=600,
+            timeout_seconds=EFA_WORKFLOW_TIMEOUT_SECONDS,
+        )
+        # The workflow closes before the incident does; give it its own wait.
+        deadline = time.monotonic() + EFA_INCIDENT_TIMEOUT_SECONDS
+        while (bundle.get("incident") or {}).get(
+            "state"
+        ) != "RECOVERED" and time.monotonic() < deadline:
+            time.sleep(5)
+            bundle = base.latest_node_workflow(
+                regional,
+                base_settings,
+                observed_after=started_at,
+                timeout_seconds=30,
+            )
+        recovered = _wait_efa_inventory(
+            collector,
+            discovered_count=int(baseline["discovered_count"]),
+            timeout_seconds=30,
         )
     finally:
-        collector.execute(
+        restore = collector.execute(
             "restore-efa",
             "--run-id",
             f"c017-a-{attempt}",
             "--pci-bdf",
             bdf,
         )
-    errors = []
-    if workflow["workflow"].get("status") != "SUCCEEDED":
-        errors.append("EFA driver remediation workflow failed")
-    return {"errors": errors, "efa_bdf": bdf, "workflow": workflow}
+    errors = efa_unbind_errors(
+        bundle,
+        bdf=bdf,
+        baseline=baseline,
+        unbound=unbound,
+        recovered=recovered,
+        restore=restore,
+    )
+    return {
+        "errors": errors,
+        "efa_bdf": bdf,
+        "injection": injection,
+        "baseline_inventory": baseline,
+        "unbound_inventory": unbound,
+        "recovered_inventory": recovered,
+        "restore": restore,
+        "workflow": bundle,
+    }
 
 
 def run_gpu_plugin(
@@ -376,7 +560,7 @@ def plan_details(preflight: dict[str, Any]) -> dict[str, Any]:
         "risk": "live-node-mutation",
         "predecessor": preflight["predecessor"],
         "mutation": (
-            "unbind one EFA function with an automatic bind timer, exclude one "
+            "unbind one EFA function with a 900s bind fail-safe, exclude one "
             "node from NVIDIA/EFA plugin DaemonSets, and verify allocatable recovery"
         ),
         "preflight_identity": {

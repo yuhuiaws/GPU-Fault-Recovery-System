@@ -690,15 +690,41 @@ def unbind_efa(arguments: argparse.Namespace) -> None:
 
 
 def restore_efa(arguments: argparse.Namespace) -> None:
+    """Disarm the bind fail-safe and say who rebound the function.
+
+    COLLECT-017 A passes only when the control plane's REMEDIATE_EFA_DRIVER
+    rebound the BDF, so the runner needs to know whether the function was
+    already bound when this ran (``already_bound``) and whether the fail-safe
+    timer's service had fired and done it instead (``timer_fired``). Both are
+    read before anything here changes them.
+    """
+
     run_id = safe_id(arguments.run_id, "run ID")
     bdf = normalize_bdf(arguments.pci_bdf)
     driver = Path("/sys/bus/pci/drivers/efa")
-    if not driver.joinpath(bdf).exists():
-        driver.joinpath("bind").write_text(bdf + "\n")
     unit = efa_restore_unit(run_id, bdf)
+    already_bound = driver.joinpath(bdf).exists()
+    timer_was_active = (
+        run(["systemctl", "is-active", unit + ".timer"], check=False).returncode == 0
+    )
+    started = run(
+        ["systemctl", "show", unit + ".service", "-p", "ExecMainStartTimestamp"],
+        check=False,
+    ).stdout.strip()
+    timer_fired = bool(started.split("=", 1)[-1].strip())
+    if not already_bound:
+        driver.joinpath("bind").write_text(bdf + "\n")
     run(["systemctl", "stop", unit + ".timer"], check=False)
     run(["systemctl", "reset-failed", unit + ".service"], check=False)
-    emit({"pci_bdf": bdf, "bound": driver.joinpath(bdf).exists()})
+    emit(
+        {
+            "pci_bdf": bdf,
+            "bound": driver.joinpath(bdf).exists(),
+            "already_bound": already_bound,
+            "timer_was_active": timer_was_active,
+            "timer_fired": timer_fired,
+        }
+    )
 
 
 def parser() -> argparse.ArgumentParser:
