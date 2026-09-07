@@ -817,3 +817,36 @@ def test_boot020_runner_refuses_to_resume_without_earlier_evidence(
     )
     with pytest.raises(RuntimeError, match="earlier stages have no recorded result"):
         run_release_rolling(FakeReleaseRollingBackend(), recorder, start_stage="agent")
+
+
+def test_probe_pod_commands_run_the_script_the_configmap_publishes() -> None:
+    """NET-002 once mounted ``net002_executor.py`` but exec'd a stale probe name.
+
+    Every live runner that ships a probe through a ConfigMap must exec the same
+    file name it publishes, or the pod dies with ENOENT before it is Ready.
+    """
+    import importlib
+
+    for module_name in (
+        "scripts.e2e.regional.run_net002_command_recovery",
+        "scripts.e2e.regional.run_net003_result_retry",
+        "scripts.e2e.regional.run_ha005_rollout_continuity",
+        "scripts.e2e.regional.run_ha006_executor_takeover",
+    ):
+        module = importlib.import_module(module_name)
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        published = f"/scripts/{module.SCRIPT.name}"
+        stale = [
+            line.strip()
+            for line in source.splitlines()
+            if '"/scripts/' in line
+            and "{SCRIPT.name}" not in line
+            and published not in line
+        ]
+        assert not stale, f"{module_name} execs a probe it does not publish: {stale}"
+        assert module.SCRIPT.is_file(), (
+            f"{module_name} probe is missing: {module.SCRIPT}"
+        )
+        assert "/scripts/{SCRIPT.name}" in source, (
+            f"{module_name} must exec SCRIPT.name"
+        )

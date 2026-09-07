@@ -419,7 +419,7 @@ def pod_manifest(image: str, identity: dict[str, object]) -> dict:
                     "image": image,
                     "command": [
                         "/opt/gpu-fault/executor/bin/python",
-                        "/scripts/net_executor_probe.py",
+                        f"/scripts/{SCRIPT.name}",
                     ],
                     "env": [
                         {
