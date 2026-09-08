@@ -214,6 +214,22 @@ def _ingest_hma(
             ]
         }
     )
+    # An HMA fault the normalizer could not read (a node cordoned for
+    # EfaError/InstanceUnreachable, an Xid line whose format drifted) used to
+    # be a silent 200: no decision, no counter, no finding. It now takes the
+    # same route the kernel and Fabric Manager collectors take
+    # (``collector_events.py``), so the cordon becomes a WARNING
+    # operator-review finding instead of nothing (F4). The service is reached
+    # through the context -- the same handle ``/metrics`` renders
+    # ``unresolved_signal_totals`` from -- because this router's dependencies
+    # are assembled per request and the fault ingestion service is a
+    # process-lifetime object.
+    fault_ingestion = getattr(dependencies.context, "fault_ingestion", None)
+    if fault_ingestion is not None and normalized.provider_signals:
+        fault_ingestion.ingest_unresolved_signals(
+            normalized,
+            batch_id=normalized.provider_signals[0].signal_id,
+        )
     result = HmaIngestionResult(
         normalized=normalized,
         decisions=[

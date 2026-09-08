@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from gpu_fault.models import StrictModel, WorkloadState
 from gpu_fault.policy import (
@@ -43,6 +43,14 @@ _SXID_TOKEN_PATTERN = re.compile(r"\bSXid\b", re.IGNORECASE)
 UNPARSED_XID_REASON = "unparsed_xid_line"
 UNPARSED_SXID_REASON = "unparsed_sxid_line"
 UNCLASSIFIED_SXID_REASON = "unclassified_sxid"
+# HMA cordons a node for faults that never name an XID/SXID (``EfaError``,
+# ``InstanceUnreachable``). The provider signal used to carry the cordon with
+# no reason at all, so the route answered 200 and nothing downstream saw it.
+# The reason prefix names the cause without inventing a code; it deliberately
+# maps to the ``UNCLASSIFIED_SXID_REASON`` *kind* (the catch-all bucket
+# ``unresolved_reason_kind`` already returns) because that kind is the one the
+# episode clear path and the operator-review notification list both know.
+UNRESOLVED_HEALTH_STATUS_REASON = "unresolved_hma_health_status"
 
 
 def unresolved_reason_kind(reason: str) -> str:
@@ -71,6 +79,39 @@ def _unparsed_line_reasons(
             "code could be extracted"
         )
     return reasons
+
+
+def _unresolved_health_status_reason(
+    *,
+    health_status: str | None,
+    unschedulable_taint: bool,
+    fault_types: list[str],
+    fault_reasons: list[str],
+) -> str | None:
+    """Why a cordoned node yielded no XID/SXID event, or ``None`` (F4).
+
+    HMA marks the node ``Unschedulable`` -- by label, by ``NoSchedule`` taint,
+    or both -- for fault types that carry no code at all (``EfaError``,
+    ``InstanceUnreachable``) as well as for XID faults. When no code came out
+    of the snapshot the cordon is still a fault the operator must see, so the
+    signal says so. The text is built only from the node's own labels: it is
+    identical for every observation of the same cordon, so the finding it
+    opens dedupes into one episode instead of one per resync.
+    """
+
+    if (health_status or "").strip().lower() != "unschedulable" and (
+        not unschedulable_taint
+    ):
+        return None
+    types = ", ".join(dict.fromkeys(fault_types)) or "none"
+    reasons = ", ".join(dict.fromkeys(fault_reasons)) or "none"
+    return (
+        f"{UNRESOLVED_HEALTH_STATUS_REASON}: HMA marked the node "
+        f"Unschedulable (health_status={health_status or 'absent'}, "
+        f"taint={'present' if unschedulable_taint else 'absent'}, "
+        f"fault_types=[{types}], fault_reasons=[{reasons}]) but no "
+        "XID/SXID code could be extracted"
+    )
 
 
 _XID_REGISTER_PATTERN = re.compile(r"\b0x([0-9a-fA-F]+)\b")
@@ -262,6 +303,21 @@ class HmaDeploymentProbe(StrictModel):
 class HmaIngestionResult(StrictModel):
     normalized: HmaNormalizedBatch
     decisions: list[FaultPolicyDecision] = Field(default_factory=list)
+    #: How many fault lines in this batch could not be resolved into an
+    #: XID/SXID event. ``decisions == [] and unresolved == 0`` is the only
+    #: shape that means "nothing to act on"; a non-zero count says the
+    #: provider reported a fault the control plane could not read, and an
+    #: operator-review finding was opened for it. Always derived from the
+    #: batch below so no caller can report a different number.
+    unresolved: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _count_unresolved(self) -> HmaIngestionResult:
+        self.unresolved = sum(
+            len(signal.unresolved_reasons)
+            for signal in self.normalized.provider_signals
+        )
+        return self
 
 
 class HyperPodHmaNormalizer:
@@ -387,6 +443,22 @@ class HyperPodHmaNormalizer:
             signal.signal_id,
             sxid_matches,
         )
+        unresolved = [
+            *_unparsed_line_reasons("\n".join(texts), xid_matches, sxid_matches),
+            *unresolved,
+        ]
+        if not unresolved and not xid_matches and not sxid_matches:
+            # Only when nothing else already explains the missing code: an
+            # Unschedulable node whose fault text drifted is reported as the
+            # drift (a narrower reason), not twice.
+            health_reason = _unresolved_health_status_reason(
+                health_status=signal.health_status,
+                unschedulable_taint=signal.unschedulable_taint,
+                fault_types=signal.fault_types,
+                fault_reasons=signal.fault_reasons,
+            )
+            if health_reason is not None:
+                unresolved = [health_reason]
         if unresolved:
             signal = signal.model_copy(update={"unresolved_reasons": unresolved})
         return HmaNormalizedBatch(
@@ -458,6 +530,11 @@ class HyperPodHmaNormalizer:
         unresolved = []
         if payload and HMA_DETECTION_EVENT not in payload:
             unresolved.append("CloudWatch message is not an HMA detection event")
+        # A detection event whose Xid/SXid text drifted is the same silent
+        # 200 the kernel route already refuses to answer (F4). The node's
+        # health status is not in this contract -- only the log line is -- so
+        # the cordon itself is reported by the Node source, not from here.
+        unresolved.extend(_unparsed_line_reasons(raw, xid_matches, sxid_matches))
         signal = HmaProviderSignal(
             signal_id=f"hma-log-{self._safe_id(event.log_event_id)}",
             source=HmaSource.CLOUDWATCH_LOG,

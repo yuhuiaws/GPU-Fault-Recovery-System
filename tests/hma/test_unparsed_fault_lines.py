@@ -12,14 +12,22 @@ inventing a code.
 
 from __future__ import annotations
 
+import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app.ingest.faults import FaultIngestionService
 from gpu_fault.hma import (
+    HMA_FAULT_REASONS,
+    HMA_FAULT_TYPES,
+    HMA_HEALTH_STATUS,
     UNPARSED_SXID_REASON,
     UNPARSED_XID_REASON,
+    UNRESOLVED_HEALTH_STATUS_REASON,
     FabricManagerLogEvent,
+    HmaCloudWatchLogEvent,
+    HmaNodeSnapshot,
+    HmaTaint,
     HyperPodHmaNormalizer,
     NvidiaKernelLogEvent,
 )
@@ -75,6 +83,130 @@ def test_fabric_manager_sxid_line_without_a_code_is_named_unparsed() -> None:
     assert result.sxid_events == []
     reasons = result.provider_signals[0].unresolved_reasons
     assert any(reason.startswith(UNPARSED_SXID_REASON) for reason in reasons), reasons
+
+
+def _unschedulable_snapshot(
+    node_id: str, *, fault_types: str, taint: bool, observed_at: datetime = NOW
+) -> HmaNodeSnapshot:
+    return HmaNodeSnapshot(
+        cluster_id="hp-cluster",
+        node_id=node_id,
+        observed_at=observed_at,
+        labels={
+            HMA_HEALTH_STATUS: "Unschedulable",
+            HMA_FAULT_TYPES: fault_types,
+            HMA_FAULT_REASONS: "InstanceUnreachable",
+        },
+        taints=(
+            [
+                HmaTaint(
+                    key=HMA_HEALTH_STATUS, value="Unschedulable", effect="NoSchedule"
+                )
+            ]
+            if taint
+            else []
+        ),
+        product="H100",
+    )
+
+
+def test_unschedulable_node_without_a_code_is_named_unresolved() -> None:
+    normalizer = HyperPodHmaNormalizer()
+
+    tainted = normalizer.normalize_node(
+        _unschedulable_snapshot("worker-1", fault_types="EfaError", taint=True)
+    )
+    labelled_only = normalizer.normalize_node(
+        _unschedulable_snapshot("worker-2", fault_types="EfaError", taint=False)
+    )
+
+    for result in (tainted, labelled_only):
+        assert result.xid_events == [] and result.sxid_events == [], (
+            "a code was invented for a node HMA never gave one for"
+        )
+        reasons = result.provider_signals[0].unresolved_reasons
+        assert any(
+            reason.startswith(UNRESOLVED_HEALTH_STATUS_REASON) for reason in reasons
+        ), reasons
+
+
+def test_unschedulable_node_without_a_taint_or_label_still_counts() -> None:
+    normalizer = HyperPodHmaNormalizer()
+
+    taint_only = normalizer.normalize_node(
+        HmaNodeSnapshot(
+            cluster_id="hp-cluster",
+            node_id="worker-3",
+            observed_at=NOW,
+            taints=[
+                HmaTaint(
+                    key=HMA_HEALTH_STATUS, value="Unschedulable", effect="NoSchedule"
+                )
+            ],
+        )
+    )
+    healthy = normalizer.normalize_node(
+        HmaNodeSnapshot(
+            cluster_id="hp-cluster",
+            node_id="worker-4",
+            observed_at=NOW,
+            labels={HMA_HEALTH_STATUS: "Schedulable"},
+        )
+    )
+
+    assert any(
+        reason.startswith(UNRESOLVED_HEALTH_STATUS_REASON)
+        for reason in taint_only.provider_signals[0].unresolved_reasons
+    ), "an HMA NoSchedule taint without the health label was swallowed"
+    assert healthy.provider_signals[0].unresolved_reasons == [], (
+        "a schedulable node opened an operator-review episode"
+    )
+
+
+def test_unschedulable_reason_text_is_stable_across_observations() -> None:
+    normalizer = HyperPodHmaNormalizer()
+
+    first = normalizer.normalize_node(
+        _unschedulable_snapshot("worker-1", fault_types="EfaError", taint=True)
+    )
+    later = normalizer.normalize_node(
+        _unschedulable_snapshot(
+            "worker-1",
+            fault_types="EfaError",
+            taint=True,
+            observed_at=NOW + timedelta(minutes=17),
+        )
+    )
+
+    assert (
+        first.provider_signals[0].unresolved_reasons
+        == later.provider_signals[0].unresolved_reasons
+    ), "the reason text moved with the clock, so findings would not dedupe"
+
+
+def test_cloudwatch_xid_line_without_a_code_is_named_unparsed() -> None:
+    result = HyperPodHmaNormalizer().normalize_cloudwatch(
+        HmaCloudWatchLogEvent(
+            cluster_id="hp-cluster",
+            node_id="worker-1",
+            log_event_id="hma-log-drift",
+            observed_at=NOW,
+            message=json.dumps(
+                {
+                    "details: ": {
+                        "reason": "XidHardwareFailure",
+                        "message": "NVRM: Xid (PCI:0000:b9:00): , pid=<unknown>",
+                    },
+                    "HealthMonitoringAgentDetectionEvent": "HealthEvent",
+                }
+            ),
+            product="H100",
+        )
+    )
+
+    assert result.xid_events == [], "a code was invented for an unparsable HMA line"
+    reasons = result.provider_signals[0].unresolved_reasons
+    assert any(reason.startswith(UNPARSED_XID_REASON) for reason in reasons), reasons
 
 
 def test_unparsed_signal_becomes_a_warning_finding_and_counter(caplog) -> None:

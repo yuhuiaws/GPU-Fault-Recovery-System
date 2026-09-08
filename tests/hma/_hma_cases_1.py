@@ -15,6 +15,8 @@ from gpu_fault.hma import (
     HMA_FAULT_REASONS,
     HMA_FAULT_TYPES,
     HMA_HEALTH_STATUS,
+    UNCLASSIFIED_SXID_REASON,
+    UNRESOLVED_HEALTH_STATUS_REASON,
     HmaCloudWatchLogEvent,
     HmaCondition,
     HmaNodeSnapshot,
@@ -22,7 +24,7 @@ from gpu_fault.hma import (
     HyperPodHmaNormalizer,
     NvidiaKernelLogEvent,
 )
-from gpu_fault.models import WorkflowOperation
+from gpu_fault.models import RecoveryAction, Severity, WorkflowOperation
 from gpu_fault.policy import SxidClassification, SxidLinkScope
 from gpu_fault.telemetry import CollectorKind
 from tests._builders import asgi_client, build_context, copy_model, gpu_metric_batch
@@ -1079,5 +1081,167 @@ def test_hma_and_kernel_observations_merge_into_one_incident() -> None:
                 kernel_decision["workflow_request_id"]
                 == (hma_decision["workflow_request_id"])
             )
+
+    asyncio.run(scenario())
+
+
+def test_hma_unschedulable_node_without_code_opens_warning_finding() -> None:
+    """HMA cordoned a node for a fault that carries no XID/SXID (F4).
+
+    ``EfaError`` / ``InstanceUnreachable`` never name a code, and neither does
+    an Xid line whose format drifted. The route used to answer 200 with an
+    empty decision list and no counter, so the cordon was invisible to the
+    control plane. It now opens the same WARNING operator-review finding the
+    kernel and Fabric Manager routes open for an unparsable line.
+    """
+
+    context = build_context()
+
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            response = await client.post(
+                "/v1/provider-events/hyperpod-hma/kubernetes-node",
+                json={
+                    "cluster_id": "hp-cluster",
+                    "observed_at": NOW.isoformat(),
+                    "runtime_profile_version": "simulated-v1",
+                    "product": "H100",
+                    "node": {
+                        "metadata": {
+                            "name": "worker-7",
+                            "labels": {
+                                HMA_HEALTH_STATUS: "Unschedulable",
+                                HMA_FAULT_TYPES: "EfaError",
+                                HMA_FAULT_REASONS: ("InstanceUnreachable"),
+                            },
+                        },
+                        "spec": {
+                            "taints": [
+                                {
+                                    "key": HMA_HEALTH_STATUS,
+                                    "value": "Unschedulable",
+                                    "effect": "NoSchedule",
+                                }
+                            ]
+                        },
+                    },
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["decisions"] == [], (
+            "a node without a parsable code reached the fault policy"
+        )
+        assert body["unresolved"] == 1, (
+            f"the route did not report the unresolved signal: {body}"
+        )
+        signal = body["normalized"]["provider_signals"][0]
+        assert any(
+            reason.startswith(UNRESOLVED_HEALTH_STATUS_REASON)
+            for reason in signal["unresolved_reasons"]
+        ), signal["unresolved_reasons"]
+        assert context.fault_ingestion.unresolved_signal_totals == {
+            UNCLASSIFIED_SXID_REASON: 1
+        }, "the route did not hand the unresolved HMA signal to the ingestion service"
+        state = context.store.get_health_signal_state(
+            f"hp-cluster/worker-7/{UNCLASSIFIED_SXID_REASON}/node"
+        )
+        assert state is not None and state.active, (
+            "no operator-review episode opened for the cordoned node"
+        )
+        (marker,) = context.store.list_markers()
+        assert marker.severity is Severity.WARNING, (
+            f"the finding was not a WARNING: {marker.severity}"
+        )
+        assert marker.recommended_action is RecoveryAction.COLLECT_EVIDENCE, (
+            f"the finding did not route to evidence collection: {marker}"
+        )
+        incident = context.store.get_incident(marker.incident_id)
+        assert incident is not None and incident.node_ids == ["worker-7"], (
+            "the finding did not open an incident on the cordoned node"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_hma_node_with_a_parsed_xid_does_not_double_count_as_unresolved() -> None:
+    """A cordon that *does* name a code stays a policy decision only (F4).
+
+    The unresolved path must not widen into a second report of the same fault:
+    the XID decision is the fault, and the node carries no operator-review
+    episode.
+    """
+
+    context = build_context()
+
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            response = await client.post(
+                "/v1/provider-events/hyperpod-hma/kubernetes-node",
+                json={
+                    "cluster_id": "hp-cluster",
+                    "observed_at": NOW.isoformat(),
+                    "runtime_profile_version": "simulated-v1",
+                    "product": "H100",
+                    "driver_branch": 575,
+                    "cuda_version": "12.9",
+                    "node": {
+                        "metadata": {
+                            "name": "worker-8",
+                            "labels": {
+                                HMA_HEALTH_STATUS: "Unschedulable",
+                                HMA_FAULT_TYPES: "NvidiaError",
+                                HMA_FAULT_REASONS: ("XidHardwareFailure"),
+                            },
+                            "annotations": {
+                                HMA_FAULT_DETAILS: json.dumps(
+                                    {
+                                        "faults": [
+                                            {
+                                                "timestamp": ("2026-07-20T10:00:00Z"),
+                                                "reason": ("XidHardwareFailure"),
+                                                "message": (
+                                                    "NVRM: Xid (PCI:0000:b9:00): 94"
+                                                ),
+                                            }
+                                        ]
+                                    }
+                                )
+                            },
+                        },
+                        "spec": {
+                            "taints": [
+                                {
+                                    "key": HMA_HEALTH_STATUS,
+                                    "value": "Unschedulable",
+                                    "effect": "NoSchedule",
+                                }
+                            ]
+                        },
+                    },
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert [item["xid"] for item in body["normalized"]["xid_events"]] == [94], (
+            f"the parsed XID was lost: {body['normalized']['xid_events']}"
+        )
+        assert body["unresolved"] == 0, (
+            f"a parsed XID was also reported as unresolved: {body}"
+        )
+        assert body["normalized"]["provider_signals"][0]["unresolved_reasons"] == [], (
+            "a parsed XID left an unresolved reason on the signal"
+        )
+        assert context.fault_ingestion.unresolved_signal_totals == {}, (
+            "a parsed XID was counted as an unresolved signal"
+        )
+        assert (
+            context.store.get_health_signal_state(
+                f"hp-cluster/worker-8/{UNCLASSIFIED_SXID_REASON}/node"
+            )
+            is None
+        ), "a parsed XID opened an operator-review episode"
 
     asyncio.run(scenario())
