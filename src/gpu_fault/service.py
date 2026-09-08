@@ -1,25 +1,18 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import NoReturn
 
 from gpu_fault.markers import marker_is_diagnostic, retire_markers_for_incident
 from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
-    DiagnosticRequest,
-    EffectiveRuntimeProfile,
     FaultIncident,
     IncidentState,
     NodeMarker,
     RecoveryAction,
     RecoveryPlan,
     TerminalEvent,
-    TriageFinding,
-    TriageOutcome,
-    TriageReport,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
@@ -27,7 +20,6 @@ from gpu_fault.models import (
     recovery_action_sort_key,
 )
 from gpu_fault.planner import PlanBuilder
-from gpu_fault.ports import DiagnosticPort
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 from gpu_fault.telemetry import (
@@ -40,15 +32,6 @@ from gpu_fault.watcher import (
     failure_containment_ids,
 )
 
-QUICK_CHECKS = [
-    "gpu-enumeration",
-    "dcgm-passive-health",
-    "xid-sxid-window",
-    "ecc-row-remap",
-    "nvlink-pcie",
-    "rdma-network",
-    "host-mce-oom",
-]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -60,18 +43,14 @@ class CompletionService:
     def __init__(
         self,
         store: ControlPlaneStore,
-        diagnostics: DiagnosticPort,
         planner: PlanBuilder | None = None,
         workflow_compiler=None,
         marker_window: timedelta = timedelta(minutes=10),
         evidence_service: EvidenceService | None = None,
         marker_ttl_seconds: int | None = None,
-        pending_triage_deadline: timedelta = timedelta(minutes=15),
     ) -> None:
         if marker_window <= timedelta(0):
             raise ValueError("marker_window must be positive")
-        if pending_triage_deadline <= timedelta(0):
-            raise ValueError("pending_triage_deadline must be positive")
         if (
             marker_ttl_seconds is not None
             and marker_window.total_seconds() > marker_ttl_seconds
@@ -86,22 +65,11 @@ class CompletionService:
                 f"exceed the marker TTL ({marker_ttl_seconds}s)"
             )
         self.store = store
-        self.diagnostics = diagnostics
         self.planner = planner or PlanBuilder()
         self.workflow_compiler = workflow_compiler
         self.marker_window = marker_window
         self.marker_ttl_seconds = marker_ttl_seconds
         self.evidence_service = evidence_service
-        # How long a decision may wait in PENDING_TRIAGE before
-        # ``reconcile_pending_triage`` expires it into a conservative plan.
-        self.pending_triage_deadline = pending_triage_deadline
-        # Decisions the watchdog could not expire, by exception type, and the
-        # newest such failure: a decision it cannot close (event or profile
-        # row missing) used to log a traceback every scan and count nowhere
-        # (control-plane review 2026-09-08, F-7). Exported by the periodic
-        # runner as gpu_fault_completion_pending_triage_reconcile_failures_total.
-        self.pending_triage_reconcile_failures_total: dict[str, int] = {}
-        self.pending_triage_reconcile_failure_last_seen_timestamp_seconds = 0.0
         # No process lock (F-G2 / P1-62G): active-active replicas serialize
         # on ``store.completion_transaction(event_key)`` instead, which is
         # also what makes the event row and its decision one write.
@@ -232,12 +200,11 @@ class CompletionService:
         self.store.get_profile(event.runtime_profile_version)
 
         # Everything persisted about this event -- the event row, the plan
-        # with its incident and workflow, the diagnostic request, the
-        # decision -- is written inside one store transaction keyed by the
-        # event (F-G2 (3)(5)). On PostgreSQL that is one advisory lock and
-        # one commit: a second replica deciding the same event waits, and a
-        # crash mid-way leaves no event row without a decision (P0-48B).
-        # The only remote call, quick-triage submission, comes after it.
+        # with its incident and workflow, the decision -- is written inside
+        # one store transaction keyed by the event (F-G2 (3)(5)). On
+        # PostgreSQL that is one advisory lock and one commit: a second
+        # replica deciding the same event waits, and a crash mid-way leaves
+        # no event row without a decision (P0-48B).
         with self.store.completion_transaction(event.event_key):
             existing = self.store.get_decision_by_event(event.event_key)
             if existing is not None:
@@ -253,13 +220,9 @@ class CompletionService:
                     "redelivery: event_key=%s",
                     event.event_key,
                 )
-            decision, triage_request = self._decide(
-                event, explicit_initiator, passive_containment
-            )
+            decision = self._decide(event, explicit_initiator, passive_containment)
             self.store.save_decision(decision)
-        if triage_request is None:
-            return decision
-        return self._submit_quick_triage(decision, triage_request)
+        return decision
 
     def _containment_gate(
         self, event: TerminalEvent
@@ -330,32 +293,28 @@ class CompletionService:
         event: TerminalEvent,
         explicit_initiator: FaultIncident | None,
         passive_containment: FaultIncident | None,
-    ) -> tuple[CompletionDecision, DiagnosticRequest | None]:
+    ) -> CompletionDecision:
         """Decide a terminal event. Runs inside the completion transaction.
 
-        Returns the decision and, when quick triage is needed, the diagnostic
-        request to submit *after* the transaction commits. The request is
-        persisted here so the decision's ``diagnostic_request_id`` resolves
-        (and ages) even if the submission itself fails.
+        Returns the decision. No longer creates triage requests; instead uses
+        the planner's without_hardware_evidence method to create a restart or
+        escalation plan directly.
         """
 
         if event.termination_initiator_incident_id and (
             explicit_initiator is None
             or explicit_initiator.event_type != "TRAINING_ATTEMPT_FAILURE_DETECTED"
         ):
-            return (
-                CompletionDecision(
-                    cluster_id=event.cluster_id,
-                    attempt_id=event.attempt_id,
-                    event_key=event.event_key,
-                    status=DecisionStatus.NO_ACTION,
-                    reason=(
-                        "termination was initiated by incident "
-                        f"{event.termination_initiator_incident_id}; "
-                        "continue that workflow without recursive recovery"
-                    ),
+            return CompletionDecision(
+                cluster_id=event.cluster_id,
+                attempt_id=event.attempt_id,
+                event_key=event.event_key,
+                status=DecisionStatus.NO_ACTION,
+                reason=(
+                    "termination was initiated by incident "
+                    f"{event.termination_initiator_incident_id}; "
+                    "continue that workflow without recursive recovery"
                 ),
-                None,
             )
 
         passive_failure_stop = (
@@ -371,15 +330,12 @@ class CompletionService:
                 else "training attempt succeeded"
             )
             self._withdraw_job_workflows(event, reason)
-            return (
-                CompletionDecision(
-                    cluster_id=event.cluster_id,
-                    attempt_id=event.attempt_id,
-                    event_key=event.event_key,
-                    status=DecisionStatus.NO_ACTION,
-                    reason=reason,
-                ),
-                None,
+            return CompletionDecision(
+                cluster_id=event.cluster_id,
+                attempt_id=event.attempt_id,
+                event_key=event.event_key,
+                status=DecisionStatus.NO_ACTION,
+                reason=reason,
             )
 
         matched = self._live_matching_markers(event)
@@ -400,20 +356,17 @@ class CompletionService:
                 and incident.workflow_request_id
                 and self._workflow_owns_workload_restart(incident.workflow_request_id)
             ):
-                return (
-                    CompletionDecision(
-                        cluster_id=event.cluster_id,
-                        attempt_id=event.attempt_id,
-                        event_key=event.event_key,
-                        status=DecisionStatus.NO_ACTION,
-                        reason=(
-                            "workload recovery is already owned by "
-                            "the existing incident workflow; observe "
-                            "that workflow without a second restart"
-                        ),
-                        matched_marker_ids=[item.marker_id for item in matched],
+                return CompletionDecision(
+                    cluster_id=event.cluster_id,
+                    attempt_id=event.attempt_id,
+                    event_key=event.event_key,
+                    status=DecisionStatus.NO_ACTION,
+                    reason=(
+                        "workload recovery is already owned by "
+                        "the existing incident workflow; observe "
+                        "that workflow without a second restart"
                     ),
-                    None,
+                    matched_marker_ids=[item.marker_id for item in matched],
                 )
             plan = (
                 self.planner.after_incident(event, incident, profile)
@@ -421,307 +374,57 @@ class CompletionService:
                 else self.planner.from_marker(event, selected, profile)
             )
             plan = self._save_plan(plan, event)
-            return (
-                CompletionDecision(
-                    cluster_id=event.cluster_id,
-                    attempt_id=event.attempt_id,
-                    event_key=event.event_key,
-                    status=DecisionStatus.PLAN_CREATED,
-                    reason=(
-                        "trusted allocation marker matched; "
-                        + (
-                            "node remediation is owned by the existing "
-                            "incident and only workload recovery was planned"
-                            if incident is not None
-                            else "reused existing incident action"
-                        )
-                    ),
-                    matched_marker_ids=[item.marker_id for item in matched],
-                    recovery_plan_id=plan.plan_id,
+            return CompletionDecision(
+                cluster_id=event.cluster_id,
+                attempt_id=event.attempt_id,
+                event_key=event.event_key,
+                status=DecisionStatus.PLAN_CREATED,
+                reason=(
+                    "trusted allocation marker matched; "
+                    + (
+                        "node remediation is owned by the existing "
+                        "incident and only workload recovery was planned"
+                        if incident is not None
+                        else "reused existing incident action"
+                    )
                 ),
-                None,
+                matched_marker_ids=[item.marker_id for item in matched],
+                recovery_plan_id=plan.plan_id,
             )
 
         if not event.allocation:
             profile = self.store.get_profile(event.runtime_profile_version)
             plan = self.planner.from_missing_allocation(event, profile)
             plan = self._save_plan(plan, event)
-            return (
-                CompletionDecision(
-                    cluster_id=event.cluster_id,
-                    attempt_id=event.attempt_id,
-                    event_key=event.event_key,
-                    status=DecisionStatus.PLAN_CREATED,
-                    reason=(
-                        "allocation snapshot is missing; triage is "
-                        "inconclusive and automatic restart is blocked"
-                    ),
-                    recovery_plan_id=plan.plan_id,
-                ),
-                None,
-            )
-
-        node_ids = sorted({item.node_id for item in event.allocation})
-        request = DiagnosticRequest(
-            cluster_id=event.cluster_id,
-            attempt_id=event.attempt_id,
-            node_ids=node_ids,
-            checks=QUICK_CHECKS,
-        )
-        self.store.save_diagnostic(request)
-        return (
-            CompletionDecision(
+            return CompletionDecision(
                 cluster_id=event.cluster_id,
                 attempt_id=event.attempt_id,
                 event_key=event.event_key,
-                status=DecisionStatus.PENDING_TRIAGE,
+                status=DecisionStatus.PLAN_CREATED,
                 reason=(
-                    "no trusted marker matched the allocation; quick triage requested"
+                    "allocation snapshot is missing; triage is "
+                    "inconclusive and automatic restart is blocked"
                 ),
-                diagnostic_request_id=request.request_id,
+                recovery_plan_id=plan.plan_id,
+            )
+
+        profile = self.store.get_profile(event.runtime_profile_version)
+        plan = self._save_plan(
+            self.planner.without_hardware_evidence(event, profile), event
+        )
+        return CompletionDecision(
+            cluster_id=event.cluster_id,
+            attempt_id=event.attempt_id,
+            event_key=event.event_key,
+            status=DecisionStatus.PLAN_CREATED,
+            reason=(
+                "no trusted marker matched the allocation; restarting once "
+                "within the job restart budget"
+                if plan.trigger == "no-hardware-evidence:RESTART"
+                else "no trusted marker matched and the profile cannot restart "
+                "the workload; escalated to an operator"
             ),
-            request,
-        )
-
-    def _submit_quick_triage(
-        self, decision: CompletionDecision, request: DiagnosticRequest
-    ) -> CompletionDecision:
-        """Submit quick triage after the PENDING_TRIAGE decision is committed.
-
-        A failed submission is logged, not raised: the decision is already
-        durable and ``reconcile_pending_triage`` owns it from here. Re-raising
-        would only make the data plane redeliver an event that is now a
-        duplicate.
-        """
-
-        try:
-            operation_id = self.diagnostics.submit(request)
-        except Exception:
-            LOGGER.exception(
-                "quick triage submission failed for %s; the decision stays "
-                "PENDING_TRIAGE until reconcile_pending_triage expires it",
-                decision.event_key,
-            )
-            return decision
-        if operation_id != request.request_id:
-            LOGGER.warning(
-                "diagnostic adapter returned operation %s for request %s; the "
-                "decision keeps the request id",
-                operation_id,
-                request.request_id,
-            )
-        # ``result`` is the seam of adapters that diagnose synchronously
-        # (the DCGM adapter); asynchronous ones report via /v1/triage-results.
-        result = getattr(self.diagnostics, "result", None)
-        report = result(operation_id) if result is not None else None
-        return self.handle_triage(report) if report is not None else decision
-
-    def handle_triage(self, report: TriageReport) -> CompletionDecision:
-        request = self.store.get_diagnostic(report.request_id)
-        if (
-            report.cluster_id is not None and request.cluster_id != report.cluster_id
-        ) or request.attempt_id != report.attempt_id:
-            self._reject_triage(
-                report, "triage report cluster/attempt does not match request"
-            )
-        if request.cluster_id is None:
-            self._reject_triage(report, "diagnostic request has no cluster identity")
-        report = report.model_copy(update={"cluster_id": request.cluster_id})
-        event_key = f"{request.cluster_id}/{report.attempt_id}/TrainingAttemptTerminal"
-        with self.store.completion_transaction(event_key):
-            decision = self.store.get_decision_by_attempt(
-                request.cluster_id, report.attempt_id
-            )
-            if decision.status is DecisionStatus.PLAN_CREATED:
-                return decision.model_copy(update={"duplicate": True})
-            if decision.status is not DecisionStatus.PENDING_TRIAGE:
-                self._reject_triage(report, "attempt is not waiting for quick triage")
-
-            expected_nodes = set(request.node_ids)
-            report_nodes = {item.node_id for item in report.findings}
-            if not report_nodes.issubset(expected_nodes):
-                self._reject_triage(
-                    report, "triage report contains nodes outside the allocation"
-                )
-
-            event = self.store.get_event_by_attempt(
-                request.cluster_id, report.attempt_id
-            )
-            profile = self.store.get_profile(event.runtime_profile_version)
-            plan = self.planner.from_triage(event, report.findings, profile)
-            self.store.save_triage_report(report)
-            plan = self._save_plan(plan, event)
-            updated = decision.model_copy(
-                update={
-                    "status": DecisionStatus.PLAN_CREATED,
-                    "reason": f"quick triage resolved as {plan.trigger}",
-                    "recovery_plan_id": plan.plan_id,
-                }
-            )
-            self.store.save_decision(updated)
-            return updated
-
-    @staticmethod
-    def _reject_triage(report: TriageReport, message: str) -> NoReturn:
-        # A rejected report is a 422 the data plane does not retry; without
-        # this line the control plane kept no trace of it (P1-62F (c)).
-        LOGGER.error(
-            "triage report rejected: %s (request=%s attempt=%s)",
-            message,
-            report.request_id,
-            report.attempt_id,
-        )
-        raise ValueError(message)
-
-    def reconcile_pending_triage(
-        self,
-        *,
-        now: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        """Expire decisions stuck in PENDING_TRIAGE (F-G2 (4) / P1-48E).
-
-        A decision leaves PENDING_TRIAGE only when a triage report arrives.
-        If it never does -- diagnostic pod evicted, report rejected with a
-        422 the data plane does not retry, submission failed -- the attempt
-        neither restarts nor escalates and nothing shows it. After
-        ``pending_triage_deadline`` each such decision is closed with the
-        conservative plan of ``from_missing_allocation`` (collect evidence,
-        escalate to an operator, automatic restart blocked); a synchronous
-        adapter's late result is applied instead when it is available.
-        """
-
-        observed = now or datetime.now(timezone.utc)
-        stale = self.store.list_decisions_by_status(
-            DecisionStatus.PENDING_TRIAGE,
-            older_than=observed - self.pending_triage_deadline,
-            limit=limit,
-        )
-        resolved: list[CompletionDecision] = []
-        for decision in stale:
-            try:
-                updated = self._expire_pending_triage(decision, observed)
-            except Exception as exc:  # noqa: BLE001 - one attempt must not block the rest
-                reason = type(exc).__name__
-                self.pending_triage_reconcile_failures_total[reason] = (
-                    self.pending_triage_reconcile_failures_total.get(reason, 0) + 1
-                )
-                self.pending_triage_reconcile_failure_last_seen_timestamp_seconds = (
-                    datetime.now(timezone.utc).timestamp()
-                )
-                LOGGER.exception(
-                    "could not expire PENDING_TRIAGE decision %s", decision.event_key
-                )
-                continue
-            if updated is not None:
-                resolved.append(updated)
-        return resolved
-
-    def _expire_pending_triage(
-        self, decision: CompletionDecision, now: datetime
-    ) -> CompletionDecision | None:
-        # The diagnostics adapter is read *before* the transaction: the body of
-        # a store transaction must be pure computation, and an HTTP adapter
-        # here held the ``completion/<key>`` advisory lock and a pooled
-        # connection for its full latency (store review 2026-09-07, item D).
-        # The decision is read once outside for the request id, then re-read
-        # under the lock, which decides whether the pre-fetched report is used.
-        current = self.store.get_decision_by_event(decision.event_key)
-        if current is None or current.status is not DecisionStatus.PENDING_TRIAGE:
-            return None
-        report: TriageReport | None = None
-        result: Callable[[str], TriageReport | None] | None = getattr(
-            self.diagnostics, "result", None
-        )
-        if result is not None and current.diagnostic_request_id:
-            report = result(current.diagnostic_request_id)
-        with self.store.completion_transaction(decision.event_key):
-            current = self.store.get_decision_by_event(decision.event_key)
-            if current is None or current.status is not DecisionStatus.PENDING_TRIAGE:
-                return None
-            if report is not None:
-                # ``handle_triage`` writes, so it stays inside the transaction.
-                try:
-                    return self.handle_triage(report)
-                except ValueError:
-                    LOGGER.exception(
-                        "late triage result for %s is unusable; expiring",
-                        decision.event_key,
-                    )
-            event = self.store.get_event_by_attempt(
-                current.cluster_id, current.attempt_id
-            )
-            profile = self.store.get_profile(event.runtime_profile_version)
-            deadline = int(self.pending_triage_deadline.total_seconds())
-            reason = (
-                f"quick triage did not report within {deadline}s; expired by the "
-                "control plane, automatic restart blocked"
-            )
-            self._record_triage_timeout(current, reason, now)
-            plan = self._save_plan(self._timeout_plan(event, profile, reason), event)
-            updated = current.model_copy(
-                update={
-                    "status": DecisionStatus.PLAN_CREATED,
-                    "reason": reason,
-                    "recovery_plan_id": plan.plan_id,
-                }
-            )
-            self.store.save_decision(updated)
-            LOGGER.warning(
-                "PENDING_TRIAGE decision %s expired into plan %s",
-                decision.event_key,
-                plan.plan_id,
-            )
-            return updated
-
-    def _record_triage_timeout(
-        self, decision: CompletionDecision, reason: str, now: datetime
-    ) -> None:
-        """Leave an INCONCLUSIVE report for the request that never reported,
-        so the audit trail shows why the plan exists."""
-
-        if not decision.diagnostic_request_id:
-            return
-        try:
-            request = self.store.get_diagnostic(decision.diagnostic_request_id)
-        except NotFoundError:
-            return
-        if not request.node_ids:
-            return
-        self.store.save_triage_report(
-            TriageReport(
-                request_id=request.request_id,
-                cluster_id=request.cluster_id,
-                attempt_id=request.attempt_id,
-                findings=[
-                    TriageFinding(
-                        node_id=node_id,
-                        outcome=TriageOutcome.INCONCLUSIVE,
-                        reason=reason,
-                    )
-                    for node_id in request.node_ids
-                ],
-                completed_at=now,
-            )
-        )
-
-    def _timeout_plan(
-        self, event: TerminalEvent, profile: EffectiveRuntimeProfile, reason: str
-    ) -> RecoveryPlan:
-        # Same conservative shape as a missing allocation: collect evidence,
-        # escalate, no automatic restart. A control-plane timeout is not
-        # evidence against the nodes, so nothing is quarantined.
-        plan = self.planner.from_missing_allocation(event, profile)
-        return plan.model_copy(
-            update={
-                "trigger": "quick-triage:TIMEOUT",
-                "steps": [
-                    step.model_copy(
-                        update={"parameters": {**step.parameters, "reason": reason}}
-                    )
-                    for step in plan.steps
-                ],
-            }
+            recovery_plan_id=plan.plan_id,
         )
 
     def _save_plan(self, plan: RecoveryPlan, event: TerminalEvent) -> RecoveryPlan:

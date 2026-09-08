@@ -16,6 +16,7 @@ from gpu_fault.app import ApplicationContext
 from gpu_fault.models import (
     DecisionStatus,
     IncidentState,
+    RecoveryAction,
     TerminalEvent,
     TerminalStatus,
     WorkflowOperation,
@@ -92,7 +93,7 @@ def test_a_job_stopped_by_rule_a_is_not_restarted(
     assert context.store.get_incident(JOB_INCIDENT).state is IncidentState.ESCALATED
 
 
-def test_the_same_exit_without_the_initiator_marker_is_still_triaged(
+def test_the_same_exit_without_the_initiator_marker_is_still_recovered(
     context: ApplicationContext, failed_event: TerminalEvent
 ) -> None:
     """The control: it is the initiator marker, not the FAILED workflow's
@@ -101,5 +102,7 @@ def test_the_same_exit_without_the_initiator_marker_is_still_triaged(
     _job_stopped_by_rule_a(context, failed_event)
 
     decision = context.completion.handle_terminal(failed_event)
+    plan = context.store.get_plan(decision.recovery_plan_id)
 
-    assert decision.status is DecisionStatus.PENDING_TRIAGE, decision
+    assert decision.status is DecisionStatus.PLAN_CREATED, decision
+    assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]

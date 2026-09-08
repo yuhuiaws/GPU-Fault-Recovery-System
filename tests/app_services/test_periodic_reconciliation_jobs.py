@@ -81,17 +81,7 @@ class _Store:
         return dict(self.status)
 
 
-class _Completion:
-    def __init__(self, moved: int) -> None:
-        self.moved = moved
-        self.calls: list[dict[str, object]] = []
-
-    def reconcile_pending_triage(self, *, now: datetime, limit: int) -> list[object]:
-        self.calls.append({"now": now, "limit": limit})
-        return [object() for _ in range(self.moved)]
-
-
-def _runner(store, *, completion=None, **config) -> PeriodicServiceRunner:
+def _runner(store, **config) -> PeriodicServiceRunner:
     processor = SimpleNamespace(
         is_healthy=lambda: True,
         active_consumers=False,
@@ -99,9 +89,7 @@ def _runner(store, *, completion=None, **config) -> PeriodicServiceRunner:
         owner_id="pod-a:1",
     )
     return PeriodicServiceRunner(
-        context=SimpleNamespace(
-            store=store, regional_mode=False, completion=completion
-        ),
+        context=SimpleNamespace(store=store, regional_mode=False, completion=None),
         processor=processor,
         stop=Event(),
         identity_registries=[],
@@ -194,23 +182,6 @@ def test_a_quiet_reclaim_round_logs_nothing_and_adds_nothing(caplog):
 # --- F-G2 (4) -----------------------------------------------------------------
 
 
-def test_pending_triage_reconciliation_uses_the_cleanup_batch_size():
-    completion = _Completion(moved=2)
-    runner = _runner(_Store(), completion=completion)
-
-    ran = runner._run_pending_triage(1000.0)
-
-    assert ran is True, "the pending-triage job did not run when due"
-    assert len(completion.calls) == 1
-    assert completion.calls[0]["limit"] == BATCH
-    observed = completion.calls[0]["now"]
-    assert isinstance(observed, datetime) and observed.tzinfo is timezone.utc, (
-        "the deadline must be judged on an aware UTC clock"
-    )
-    snapshot = runner.metrics_snapshot()
-    assert snapshot["completion_pending_triage_reconciled_total"] == 2
-
-
 # --- F-D10 P1-75F -------------------------------------------------------------
 
 
@@ -265,15 +236,13 @@ def test_the_drift_query_runs_on_the_runner_clock_not_the_scrape():
 
 def test_reconciliation_counters_reach_metrics():
     store = _Store(reclaimed=3)
-    runner = _runner(store, completion=_Completion(moved=2))
+    runner = _runner(store)
     runner._run_lease_reclaim(1000.0)
-    runner._run_pending_triage(1000.0)
     runtime = SimpleNamespace(context=SimpleNamespace(periodic_runner=runner))
 
     lines = control_loop_metric_lines(runtime)
 
     assert "gpu_fault_processor_expired_leases_reclaimed_total 3" in lines
-    assert "gpu_fault_completion_pending_triage_reconciled_total 2" in lines
     assert "# TYPE gpu_fault_processor_counter_drift_abs gauge" in lines
 
 
@@ -287,5 +256,5 @@ def test_the_new_jobs_take_their_turn_in_every_tick(monkeypatch):
 
     runner.run_all_due(1000.0)
 
-    for name in ("lease_reclaim", "pending_triage", "counter_drift"):
+    for name in ("lease_reclaim", "counter_drift"):
         assert name in ran, f"{name} is not part of the periodic tick: {ran}"

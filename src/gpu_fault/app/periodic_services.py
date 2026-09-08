@@ -279,7 +279,6 @@ class PeriodicServiceRunner:
         "archive",
         "silence",
         "lease_reclaim",
-        "pending_triage",
         "counter_drift",
     )
 
@@ -805,34 +804,6 @@ class PeriodicServiceRunner:
             self.config.lease_reclaim_interval,
             reclaim,
             "processor lease reclaim failed",
-        )
-
-    def _run_pending_triage(self, now: float) -> bool:
-        """Close decisions stuck in PENDING_TRIAGE past their deadline (F-G2 (4)).
-
-        A triage submission that never reported left the decision, and with
-        it the incident, waiting forever; the watchdog existed on the service
-        but nothing called it.
-        """
-
-        def reconcile() -> None:
-            moved = self.context.completion.reconcile_pending_triage(
-                now=datetime.now(timezone.utc),
-                limit=self.config.cleanup_batch_size,
-            )
-            if moved:
-                self.completion_pending_triage_reconciled_total += len(moved)
-                LOGGER.warning(
-                    "closed %s decisions stuck in PENDING_TRIAGE past the deadline",
-                    len(moved),
-                )
-
-        return self._run_scheduled(
-            "completion-pending-triage",
-            now,
-            self.config.pending_triage_interval,
-            reconcile,
-            "pending triage reconciliation failed",
         )
 
     def _run_counter_drift(self, now: float) -> bool:

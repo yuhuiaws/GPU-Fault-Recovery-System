@@ -92,12 +92,7 @@ class _OutageStore:
         return 0
 
 
-class _OutageCompletion:
-    def reconcile_pending_triage(self, **kwargs):
-        raise RuntimeError("could not connect to server")
-
-
-def _runner(store, completion, **config) -> PeriodicServiceRunner:
+def _runner(store, completion=None, **config) -> PeriodicServiceRunner:
     processor = SimpleNamespace(
         is_healthy=lambda: True,
         # Leader without consumers: no task-lease write, so the store outage
@@ -130,13 +125,13 @@ def _training_monitor_off(monkeypatch):
 
 
 def test_a_job_body_that_raises_is_counted_and_stamped_by_job() -> None:
-    runner = _runner(_OutageStore(), _OutageCompletion())
+    runner = _runner(_OutageStore())
     before = time.time()
 
     runner.run_all_due(1000.0)
 
     snapshot = runner.metrics_snapshot()
-    failing = {"lease_reclaim", "pending_triage", "counter_drift"}
+    failing = {"lease_reclaim", "counter_drift"}
     assert snapshot["periodic_job_errors_total"] == {name: 1 for name in failing}
     assert set(snapshot["job_error_last_seen_timestamp_seconds"]) == failing
     assert all(
@@ -150,18 +145,18 @@ def test_a_failed_job_does_not_refresh_its_last_run_stamp() -> None:
     round must look stalled, not freshly run. The cleanup, which did run,
     keeps its stamp."""
 
-    runner = _runner(_OutageStore(), _OutageCompletion())
+    runner = _runner(_OutageStore())
 
     runner.run_all_due(1000.0)
 
     stamps = runner.metrics_snapshot()["job_last_run_timestamp_seconds"]
     assert "cleanup" in stamps
-    assert not {"lease_reclaim", "pending_triage", "counter_drift"} & set(stamps)
+    assert not {"lease_reclaim", "counter_drift"} & set(stamps)
 
 
 def test_a_failed_job_is_rescheduled_and_counted_again_next_interval() -> None:
     store = _OutageStore()
-    runner = _runner(store, _OutageCompletion())
+    runner = _runner(store)
 
     runner.run_all_due(1000.0)
     runner.run_all_due(1000.0 + 1.0)
@@ -174,8 +169,8 @@ def test_a_failed_job_is_rescheduled_and_counted_again_next_interval() -> None:
 
 
 def test_a_failing_job_does_not_stop_the_jobs_behind_it_in_the_tick() -> None:
-    """``lease_reclaim`` fails; ``pending_triage`` and ``counter_drift`` behind
-    it still get their turn (F-F1 isolation, now through the real bodies)."""
+    """``lease_reclaim`` fails; ``counter_drift`` behind
+    it still gets its turn (F-F1 isolation, now through the real bodies)."""
 
     calls: list[str] = []
 
@@ -184,18 +179,11 @@ def test_a_failing_job_does_not_stop_the_jobs_behind_it_in_the_tick() -> None:
             calls.append("counter_drift")
             return {"expected_total": 0, "counter_total": 0, "mismatched_clusters": 0}
 
-    class _Completion:
-        def reconcile_pending_triage(self, **kwargs):
-            calls.append("pending_triage")
-            return []
-
-    runner = _runner(_Store(), _Completion())
+    runner = _runner(_Store())
 
     runner.run_all_due(1000.0)
 
-    assert calls == ["pending_triage", "counter_drift"]
+    assert calls == ["counter_drift"]
     snapshot = runner.metrics_snapshot()
     assert snapshot["periodic_job_errors_total"] == {"lease_reclaim": 1}
-    assert {"pending_triage", "counter_drift"} <= set(
-        snapshot["job_last_run_timestamp_seconds"]
-    )
+    assert "counter_drift" in snapshot["job_last_run_timestamp_seconds"]

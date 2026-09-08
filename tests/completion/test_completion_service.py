@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import pytest
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.diagnostics import KubernetesDcgmDiagnosticAdapter
 from gpu_fault.models import (
     DecisionStatus,
     IncidentState,
@@ -15,9 +14,6 @@ from gpu_fault.models import (
     Severity,
     TerminalEvent,
     TerminalStatus,
-    TriageFinding,
-    TriageOutcome,
-    TriageReport,
     WorkflowOperation,
     WorkflowStatus,
 )
@@ -65,10 +61,11 @@ def test_unrelated_marker_does_not_match(
     )
 
     decision = context.completion.handle_terminal(failed_event)
+    plan = context.store.get_plan(decision.recovery_plan_id)
 
-    assert decision.status is DecisionStatus.PENDING_TRIAGE
+    assert decision.status is DecisionStatus.PLAN_CREATED
     assert decision.matched_marker_ids == []
-    assert decision.diagnostic_request_id
+    assert plan.trigger == "no-hardware-evidence:RESTART"
 
 
 def test_failure_detection_creates_idempotent_containment_workflow(
@@ -143,7 +140,7 @@ def test_failure_detection_persists_workload_log_snapshot(
     assert evidence[0].payload["tail"] == "training output"
 
 
-def test_passive_containment_terminal_continues_to_triage(
+def test_passive_containment_terminal_continues_to_recovery(
     context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
 ) -> None:
     containment = context.completion.handle_failure_detected(
@@ -170,11 +167,13 @@ def test_passive_containment_terminal_continues_to_triage(
     context.store.save_workflow(copy_model(workflow, status=WorkflowStatus.SUCCEEDED))
 
     decision = context.completion.handle_terminal(terminal)
+    plan = context.store.get_plan(decision.recovery_plan_id)
 
-    assert decision.status is DecisionStatus.PENDING_TRIAGE
+    assert decision.status is DecisionStatus.PLAN_CREATED
+    assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
 
 
-def test_emergency_stopped_terminal_continues_to_triage(
+def test_emergency_stopped_terminal_continues_to_recovery(
     context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
 ) -> None:
     containment = context.completion.handle_failure_detected(
@@ -203,8 +202,10 @@ def test_emergency_stopped_terminal_continues_to_triage(
     )
 
     decision = context.completion.handle_terminal(terminal)
+    plan = context.store.get_plan(decision.recovery_plan_id)
 
-    assert decision.status is DecisionStatus.PENDING_TRIAGE
+    assert decision.status is DecisionStatus.PLAN_CREATED
+    assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
 
 
 def test_passive_terminal_waits_for_incident_creation(
@@ -282,83 +283,22 @@ def test_matching_marker_reuses_incident_and_is_idempotent(
     ]
 
 
-def test_quick_triage_pass_restarts_once_on_same_allocation(
-    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+def test_no_marker_restarts_once_within_budget(
+    context: ApplicationContext, failed_event: TerminalEvent
 ) -> None:
-    pending = context.completion.handle_terminal(failed_event)
-    report = TriageReport(
-        request_id=pending.diagnostic_request_id,
-        attempt_id=failed_event.attempt_id,
-        completed_at=ended_at + timedelta(seconds=30),
-        findings=[
-            TriageFinding(node_id="node-a", outcome=TriageOutcome.PASS),
-            TriageFinding(node_id="node-b", outcome=TriageOutcome.PASS),
-        ],
-    )
-
-    decision = context.completion.handle_triage(report)
+    decision = context.completion.handle_terminal(failed_event)
     plan = context.store.get_plan(decision.recovery_plan_id)
 
     assert decision.status is DecisionStatus.PLAN_CREATED
-    assert plan.trigger == "quick-triage:PASS"
+    assert "restart budget" in decision.reason
+    assert plan.trigger == "no-hardware-evidence:RESTART"
     assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
-    assert plan.steps[0].parameters["reuse_allocation"] is True
-
-
-def test_quick_triage_failure_creates_hardware_action(
-    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
-) -> None:
-    pending = context.completion.handle_terminal(failed_event)
-    report = TriageReport(
-        request_id=pending.diagnostic_request_id,
-        attempt_id=failed_event.attempt_id,
-        completed_at=ended_at + timedelta(seconds=30),
-        findings=[
-            TriageFinding(
-                node_id="node-a",
-                outcome=TriageOutcome.FAIL,
-                failed_checks=["gpu-enumeration"],
-                proposed_action=RecoveryAction.REPLACE_NODE,
-            )
-        ],
-    )
-
-    decision = context.completion.handle_triage(report)
-    plan = context.store.get_plan(decision.recovery_plan_id)
-
-    assert RecoveryAction.REPLACE_NODE in {step.action for step in plan.steps}
-    assert plan.avoid_node_ids == ["node-a"]
-
-
-def test_inconclusive_quarantines_and_moves_workload(
-    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
-) -> None:
-    pending = context.completion.handle_terminal(failed_event)
-    report = TriageReport(
-        request_id=pending.diagnostic_request_id,
-        attempt_id=failed_event.attempt_id,
-        completed_at=ended_at + timedelta(seconds=60),
-        findings=[
-            TriageFinding(
-                node_id="node-a",
-                outcome=TriageOutcome.INCONCLUSIVE,
-                reason="DCGM timeout",
-            ),
-            TriageFinding(node_id="node-b", outcome=TriageOutcome.PASS),
-        ],
-    )
-
-    decision = context.completion.handle_triage(report)
-    plan = context.store.get_plan(decision.recovery_plan_id)
-
-    assert plan.trigger == "quick-triage:INCONCLUSIVE"
-    assert plan.avoid_node_ids == ["node-a"]
-    assert [step.action for step in plan.steps] == [
-        RecoveryAction.MARK_UNSCHEDULABLE,
-        RecoveryAction.QUARANTINE,
-        RecoveryAction.RESTART_WORKLOAD,
-    ]
-    assert plan.steps[-1].parameters["reuse_allocation"] is False
+    # The plan has steps; if a workflow_compiler is configured, it will
+    # have compiled them into a workflow, but the test context does not
+    # provide one, so we check the plan directly.
+    assert len(plan.steps) == 1
+    restart_step = plan.steps[0]
+    assert restart_step.action == RecoveryAction.RESTART_WORKLOAD
 
 
 def test_stopped_attempt_does_not_restart(
@@ -480,30 +420,3 @@ def test_diagnostic_marker_creates_diagnostic_plan(
         RecoveryAction.RUN_DIAGNOSTICS,
     ]
     assert plan.avoid_node_ids == ["node-a"]
-
-
-def test_production_diagnostic_result_creates_plan_immediately(
-    context: ApplicationContext, failed_event: TerminalEvent
-) -> None:
-    class Core:
-        def read_node(self, _):
-            return {
-                "status": {
-                    "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}],
-                    "conditions": [{"type": "Ready", "status": "True"}],
-                }
-            }
-
-    adapter = KubernetesDcgmDiagnosticAdapter(
-        context.store,
-        Core(),
-        fetcher=lambda _url, _timeout: ('DCGM_FI_DEV_GPU_TEMP{gpu="0"} 42\n'),
-    )
-    context.diagnostics = adapter
-    context.completion = type(context.completion)(context.store, adapter)
-
-    decision = context.completion.handle_terminal(failed_event)
-
-    assert decision.status is DecisionStatus.PLAN_CREATED
-    plan = context.store.get_plan(decision.recovery_plan_id)
-    assert plan.trigger == "quick-triage:PASS"

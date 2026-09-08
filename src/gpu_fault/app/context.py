@@ -146,17 +146,6 @@ class _LazyClusterObservers(dict[str, Any]):
 _pod_process_owner = pod_process_owner
 
 
-def _pending_triage_deadline() -> timedelta:
-    """How long a decision may sit in PENDING_TRIAGE before the watchdog closes
-    it (F-G2 (4)). The service refuses a non-positive deadline; refusing it
-    here names the variable the operator has to fix."""
-
-    seconds = float(os.getenv("GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS", "900"))
-    if seconds <= 0:
-        raise ValueError("GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS must be positive")
-    return timedelta(seconds=seconds)
-
-
 class ApplicationContext:
     def __init__(
         self,
@@ -177,10 +166,8 @@ class ApplicationContext:
         self.policy = GpuFaultPolicyEngine()
         self.completion = CompletionService(
             self.store,
-            self.diagnostics,
             evidence_service=self.evidence,
             marker_ttl_seconds=self.policy.policy.marker_ttl_seconds,
-            pending_triage_deadline=_pending_triage_deadline(),
         )
         self.xid_correlation = XidCorrelationCoordinator(
             self.store,
@@ -567,14 +554,12 @@ class ApplicationContext:
             )
         context.completion = CompletionService(
             context.store,
-            context.diagnostics,
             evidence_service=context.evidence,
             workflow_compiler=PassiveWorkflowCompiler(
                 context.store,
                 evidence_owner=settings.evidence_owner,
             ),
             marker_ttl_seconds=context.policy.policy.marker_ttl_seconds,
-            pending_triage_deadline=_pending_triage_deadline(),
         )
         return context
 
