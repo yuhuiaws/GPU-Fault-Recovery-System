@@ -95,6 +95,24 @@ KMSG_RECORD_PATTERN = re.compile(
 )
 
 
+def _report_lost_at_shutdown(
+    counters: dict[str, int], lost: list[str], *, saved: int, reason: str
+) -> None:
+    """Count and name the records a shutdown drain could not account for."""
+
+    if not lost:
+        return
+    counters["delivery_dropped_at_shutdown"] += len(lost)
+    LOGGER.error(
+        "kernel collector stopped with %d record(s) it could neither deliver nor "
+        "buffer because %s; buffered %d in this drain, and these are lost: %s",
+        len(lost),
+        reason,
+        saved,
+        ", ".join(lost[:10]),
+    )
+
+
 class KernelLogCollector:
     def __init__(
         self,
@@ -343,48 +361,56 @@ class KernelLogCollector:
         pending: list[tuple[str, str, dict[str, Any]]],
         budget_seconds: float,
     ) -> None:
-        """Give every record left in the queue a verdict, once, inside a budget."""
+        """Give every record left in the queue a verdict, once, inside a budget.
+
+        Two things end it early -- the budget, and a *second* stop signal --
+        and the ``finally`` reports whichever did: an interrupt out of a post or
+        an outbox lock used to unwind straight out of the process, leaving the
+        rest with no verdict, no counter and no log line.
+        """
 
         if not pending:
             return
         buffer_for_replay = getattr(self.sink, "buffer_for_replay", None)
         deadline = time.monotonic() + max(0.0, budget_seconds)
         lost: list[str] = []
-        for index, (record_id, path, payload) in enumerate(pending):
-            if time.monotonic() >= deadline:
-                # One attempt each, and 2048 of them at ~47 s of retries -- or
-                # 2048 waits on an outbox lock the sink's own replay thread
-                # holds -- fits inside no stop timeout, so the rest is reported
-                # as lost rather than retried past the point systemd sends
-                # SIGKILL.
-                lost.extend(item[0] for item in pending[index:])
-                break
-            if buffer_for_replay is not None:
-                try:
-                    buffered = bool(buffer_for_replay(path, payload))
-                except Exception:
-                    LOGGER.exception(
-                        "kernel record could not be buffered for replay at "
-                        "shutdown: record=%s",
-                        record_id,
-                    )
-                    buffered = False
-                if buffered:
-                    self.health_counters["delivery_buffered_at_shutdown"] += 1
-                    continue
-                # ``False`` means no outbox is configured, or the write failed
-                # on a read-only or full volume. The record is still ours, so it
-                # gets the one delivery attempt it would have got without an
-                # outbox at all.
-            self._deliver_one(record_id, path, payload)
-        if lost:
-            self.health_counters["delivery_dropped_at_shutdown"] += len(lost)
-            LOGGER.error(
-                "kernel collector stopped with %d record(s) it could neither "
-                "deliver nor buffer within %.1fs; they are lost: %s",
-                len(lost),
-                budget_seconds,
-                ", ".join(lost[:10]),
+        saved = index = 0
+        reason = f"the {budget_seconds:.1f}s shutdown budget ran out"
+        try:
+            for index, (record_id, path, payload) in enumerate(pending):
+                if time.monotonic() >= deadline:
+                    # One attempt each, and 2048 of them at ~47 s of retries
+                    # -- or of waiting on an outbox lock the sink's own replay
+                    # thread holds -- fits inside no stop timeout, so the rest
+                    # is reported lost rather than retried past SIGKILL.
+                    lost.extend(item[0] for item in pending[index:])
+                    break
+                if buffer_for_replay is not None:
+                    try:
+                        buffered = bool(buffer_for_replay(path, payload))
+                    except Exception:
+                        LOGGER.exception(
+                            "kernel record could not be buffered for replay at "
+                            "shutdown: record=%s",
+                            record_id,
+                        )
+                        buffered = False
+                    if buffered:
+                        saved += 1
+                        self.health_counters["delivery_buffered_at_shutdown"] += 1
+                        continue
+                    # ``False`` means no outbox is configured, or the write
+                    # failed on a read-only or full volume: the record is still
+                    # ours, so it gets its one delivery attempt anyway.
+                self._deliver_one(record_id, path, payload)
+        except BaseException:
+            # Including the record this raised on: it has no verdict either.
+            lost = [item[0] for item in pending[index:]]
+            reason = "the shutdown drain was interrupted"
+            raise
+        finally:
+            _report_lost_at_shutdown(
+                self.health_counters, lost, saved=saved, reason=reason
             )
 
     def _submit(self, record_id: str, path: str, payload: dict[str, Any]) -> bool:

@@ -808,6 +808,65 @@ def test_the_shutdown_drain_stops_buffering_when_the_budget_is_gone() -> None:
     )
 
 
+class _InterruptedDrainSink(_SlowSink):
+    """The operator's second Ctrl-C lands while the drain is inside the sink.
+
+    A ``KeyboardInterrupt`` raised out of a blocking call is what a second
+    SIGINT looks like from here: the first record is buffered, the sink blocks on
+    the next one and the signal arrives.
+    """
+
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__(delay_seconds)
+        self.buffered: list[str] = []
+        self.interrupted = threading.Event()
+
+    def buffer_for_replay(self, path, payload):
+        if self.buffered:
+            self.interrupted.set()
+            raise KeyboardInterrupt
+        self.buffered.append(payload["record_id"])
+        return True
+
+
+def test_a_second_stop_signal_during_the_drain_counts_what_is_left(caplog) -> None:
+    """A drain that is interrupted must still say what it could not account for.
+
+    The first Ctrl-C starts the drain; a second one raises ``KeyboardInterrupt``
+    out of whatever the drain is blocked in. The records still in hand then had
+    no verdict, no counter and no log line at all -- exactly the silent loss the
+    drain exists to remove, reachable by pressing Ctrl-C twice or by a
+    supervisor that repeats its stop signal.
+    """
+
+    sink = _InterruptedDrainSink(delay_seconds=0.3)
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="boot-123", now=lambda: NOW
+    )
+    collector.start_delivery()
+    collector.collect_lines([FIRST, SECOND, THIRD, FOURTH])
+    assert sink.entered.wait(5), "the delivery thread never reached the sink"
+
+    with caplog.at_level(logging.ERROR, logger="gpu_fault.collectors.logs.kernel"):
+        with pytest.raises(KeyboardInterrupt):
+            collector.stop_delivery()
+
+    assert sink.interrupted.is_set(), "the drain never reached the interrupted record"
+    assert sink.buffered == ["kmsg-boot-123-43"], (
+        f"the drain did not buffer the record before the interrupt: {sink.buffered}"
+    )
+    assert collector.health_counters["delivery_dropped_at_shutdown"] == 2, (
+        "the records the interrupted drain still held were not counted: "
+        f"{collector.health_counters}"
+    )
+    assert "kmsg-boot-123-45" in caplog.text, (
+        f"the records the interrupt left unaccounted for were not named: {caplog.text}"
+    )
+    assert "buffered 1" in caplog.text, (
+        f"the interrupted drain did not report what it had already saved: {caplog.text}"
+    )
+
+
 class _WedgedSink:
     """Blocks inside ``post`` until it is released, then buffers on request."""
 
