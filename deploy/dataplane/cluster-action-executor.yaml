@@ -262,6 +262,31 @@ spec:
             periodSeconds: 15
             timeoutSeconds: 10
             failureThreshold: 4
+          # Liveness is a different question from readiness, and the readiness
+          # breadcrumb cannot answer it: /tmp/executor-claim-state.json is only
+          # written after a *successful* claim, so a control-plane outage makes
+          # it stale for a loop that is running perfectly.
+          #
+          # /tmp/executor-loop-alive is refreshed by the claim loop itself on
+          # every cycle *and* on a tick while a batch is still executing, so a
+          # legitimately long command (UPDATE_SOFTWARE_FIRMWARE, REPLACE_NODE)
+          # keeps the Pod alive while a claim loop that stopped turning -- a
+          # socket read with no timeout, a deadlock -- is restarted after 300s.
+          # No control-plane call: a regional outage must not restart both
+          # replicas of every cluster at once.
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os, sys, time;
+                  p = "/tmp/executor-loop-alive";
+                  sys.exit(0 if os.path.exists(p)
+                  and time.time() - os.path.getmtime(p) < 300 else 1)
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: 50m

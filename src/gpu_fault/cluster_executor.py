@@ -4,10 +4,12 @@ import json
 import logging
 import os
 import random
+import signal
 import socket
 import ssl
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_for_futures
 from datetime import datetime, timezone
 from http.client import HTTPException
 from threading import Event, Lock, Thread
@@ -60,7 +62,12 @@ from gpu_fault.models import (
     WorkflowStepStatus,
     execution_phase,
 )
-from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
+from gpu_fault.operation_registry import (
+    DESTRUCTIVE_OPERATIONS,
+    MULTI_NODE_BARRIER_OPERATIONS,
+    OperationAdapter,
+    operations_for_adapter,
+)
 from gpu_fault.regional import (
     RegionalExecutorReadinessRequest,
     RemoteActionCommand,
@@ -119,6 +126,29 @@ class ClusterExecutorClaimError(ClusterExecutorError):
 _RESULT_REPORT_ATTEMPTS = 3
 _RESULT_REPORT_BACKOFF_SECONDS = (0.5, 1.0)
 _RETRYABLE_REPORT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+# How long one claimed command may execute before this executor gives up on it.
+# Nothing else bounds ``_execute``: the lease renewer keeps a wedged command
+# LEASED for as long as the process lives, and ``claim`` excludes a leased
+# command, so no sibling replica can ever take it over. Half an hour is longer
+# than the slowest legitimate action (UPDATE_SOFTWARE_FIRMWARE, REPLACE_NODE)
+# and far shorter than "forever".
+DEFAULT_MAX_EXECUTION_SECONDS = 1800.0
+# The poll loop's liveness breadcrumb, refreshed every cycle *and* while a
+# batch is still running. The readiness breadcrumb cannot answer liveness: it
+# is only written after a successful claim, so a control-plane outage makes it
+# stale for a loop that is perfectly alive.
+DEFAULT_LIVENESS_STATE_PATH = "/tmp/executor-loop-alive"
+DEFAULT_LIVENESS_INTERVAL_SECONDS = 15.0
+# The age at which the container's liveness probe calls the loop wedged. Wide
+# enough that a slow cycle, a long claim or a paused scheduler cannot trip it.
+LIVENESS_STALE_AFTER_SECONDS = 300
+# Operations whose timeout leaves real state unknown: a node action may still
+# be running in the agent's ledger, and every destructive operation may have
+# half-applied. Their timeout demands manual confirmation instead of closing
+# the step silently.
+_TIMEOUT_UNKNOWN_STATE_OPERATIONS = (
+    operations_for_adapter(OperationAdapter.NODE_ACTION) | DESTRUCTIVE_OPERATIONS
+)
 # Transport failures reach the caller as several unrelated families, and only
 # HTTPError used to be converted. ``socket.timeout`` is an alias of
 # ``TimeoutError`` on 3.12 and is named here for readers, not for coverage.
@@ -929,6 +959,8 @@ class ClusterActionExecutor:
         claim_backoff_max_seconds: float = 60,
         claim_state_path: str | None = None,
         lease_renewal_failure_limit: int = 3,
+        max_execution_seconds: float = DEFAULT_MAX_EXECUTION_SECONDS,
+        liveness_interval_seconds: float = (DEFAULT_LIVENESS_INTERVAL_SECONDS),
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         spare_reservation_sweep: SpareReservationSweep | None = None,
@@ -955,7 +987,17 @@ class ClusterActionExecutor:
             raise ClusterExecutorError(
                 "cluster executor lease renewal failure limit must be between 1 and 100"
             )
+        if not 0 < max_execution_seconds <= 86400:
+            raise ClusterExecutorError(
+                "cluster executor max execution seconds must be between 0 and 86400"
+            )
+        if liveness_interval_seconds <= 0:
+            raise ClusterExecutorError(
+                "cluster executor liveness interval seconds must be positive"
+            )
         self.lease_renewal_failure_limit = lease_renewal_failure_limit
+        self.max_execution_seconds = max_execution_seconds
+        self.liveness_interval_seconds = liveness_interval_seconds
         self.clock = clock
         # Only the report backoff sleeps inside a command's own thread, so it
         # is injectable: a test must not really wait half a second to prove the
@@ -1013,6 +1055,16 @@ class ClusterActionExecutor:
         # 409/429/5xx, urllib3 timeouts) reported WAITING instead of FAILED
         # (ARCH-B1 reached from the regional topology).
         self.retryable_adapter_errors_total = 0
+        # Commands abandoned at ``max_execution_seconds`` (a counter), and the
+        # threads still stuck behind them (a gauge: Python cannot kill a
+        # thread, so an operator has to see them accumulate).
+        self.execution_timeouts_total = 0
+        self.stuck_executions = 0
+        # SIGTERM asks the loop to stop claiming and asks every in-flight
+        # command to stop renewing, so the lease lapses on the control plane's
+        # own schedule instead of being parked for a full window.
+        self._stop_requested = False
+        self._stop_reason: str | None = None
         self.last_successful_claim_at: datetime | None = None
         # Whether the last claim cycle moved any command off WAITING. run()
         # takes the idle path when it did not, so a held command polls at
@@ -1026,6 +1078,15 @@ class ClusterActionExecutor:
             "GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_STATE_PATH",
             "/tmp/executor-claim-state.json",
         )
+        # Beside the claim breadcrumb, never inside it: the liveness probe must
+        # be able to tell "the loop is turning" from "the last claim succeeded",
+        # which are different questions with different answers during a
+        # control-plane outage.
+        claim_state_directory = os.path.dirname(str(self.claim_state_path))
+        self.liveness_state_path = os.path.join(
+            claim_state_directory or ".",
+            os.path.basename(DEFAULT_LIVENESS_STATE_PATH),
+        )
         self.fleet_registry = next(
             (
                 registry
@@ -1034,6 +1095,83 @@ class ClusterActionExecutor:
             ),
             None,
         )
+
+    @property
+    def stop_requested(self) -> bool:
+        """Whether a signal asked this executor to wind down."""
+
+        return self._stop_requested
+
+    @property
+    def stop_reason(self) -> str | None:
+        return self._stop_reason
+
+    def request_stop(self, reason: str) -> None:
+        """Stop claiming, and stop renewing what is already in flight.
+
+        Renewal is the half that matters for recovery time. Without it a
+        rollout that kills the process mid-command leaves the command LEASED
+        for a full lease window (120s) before any sibling may re-claim it,
+        which is added directly to the incident's recovery time. Nothing is
+        cancelled here: the work already done is still reported, and the agent
+        ledger still holds whatever the node was doing.
+        """
+
+        self._stop_requested = True
+        self._stop_reason = reason
+        LOGGER.warning(
+            "regional cluster executor asked to stop: executor=%s reason=%s",
+            self.executor_id,
+            reason,
+        )
+
+    def _handle_stop_signal(self, signum: int, _frame: Any) -> None:
+        self.request_stop(f"{signal.Signals(signum).name} received")
+
+    def install_signal_handlers(self) -> None:
+        """Route SIGTERM into ``request_stop``.
+
+        Only SIGTERM: SIGINT must stay a KeyboardInterrupt so an interactive
+        run still dies on the first Ctrl-C.
+        """
+
+        try:
+            signal.signal(signal.SIGTERM, self._handle_stop_signal)
+        except ValueError:
+            # Only the main thread may install handlers. A library caller that
+            # runs the executor on a worker thread owns its own shutdown.
+            LOGGER.warning(
+                "could not install the SIGTERM handler outside the main thread"
+            )
+
+    def _record_liveness(self) -> None:
+        """Refresh the poll loop's own breadcrumb.
+
+        Written by the loop and never by a worker: the file's age has to mean
+        "the claim loop is turning", so that a wedged claim restarts the Pod
+        while a legitimately long command does not.
+        """
+
+        try:
+            temporary = f"{self.liveness_state_path}.tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "executor_id": self.executor_id,
+                        "updated_at": (datetime.now(timezone.utc).isoformat()),
+                        "stuck_executions": self.stuck_executions,
+                    },
+                    handle,
+                )
+            os.replace(temporary, self.liveness_state_path)
+        except OSError:
+            # A breadcrumb that cannot be written goes stale, and stale is the
+            # correct direction to fail in: the probe restarts the Pod.
+            LOGGER.warning(
+                "could not write executor liveness state to %s",
+                self.liveness_state_path,
+                exc_info=True,
+            )
 
     def _increment(self, counter: str, amount: int = 1) -> None:
         """Add to one shared counter under the counter lock."""
@@ -1065,6 +1203,8 @@ class ClusterActionExecutor:
             "cancellations_observed_total": (self.cancellations_observed_total),
             "barrier_unavailable_holds_total": (self.barrier_unavailable_holds_total),
             "retryable_adapter_errors_total": self.retryable_adapter_errors_total,
+            "execution_timeouts_total": self.execution_timeouts_total,
+            "stuck_executions": self.stuck_executions,
             "spare_reservations_reclaimed_total": (
                 self.spare_reservation_sweep.reclaimed_total
                 if self.spare_reservation_sweep is not None
@@ -1103,6 +1243,10 @@ class ClusterActionExecutor:
             )
 
     def run_once(self) -> int:
+        # Before the claim, not after: a claim that hangs must let the
+        # breadcrumb go stale, and a claim that fails must not (the loop is
+        # alive and merely cannot reach the control plane).
+        self._record_liveness()
         try:
             commands = self.client.claim(
                 self.executor_id,
@@ -1127,18 +1271,34 @@ class ClusterActionExecutor:
         self._record_successful_claim(self.last_successful_claim_at)
         self.last_cycle_advanced = True
         if commands:
-            with ThreadPoolExecutor(
+            pool = ThreadPoolExecutor(
                 max_workers=min(
                     self.max_concurrent_commands,
                     len(commands),
                 ),
                 thread_name_prefix="gpu-fault-command",
-            ) as pool:
+            )
+            try:
                 futures = [
                     pool.submit(self._execute_and_report, command)
                     for command in commands
                 ]
+                pending = set(futures)
+                while pending:
+                    # Every worker is bounded by ``max_execution_seconds``, so
+                    # this loop always ends; the tick exists so that a
+                    # twenty-minute REPLACE_NODE keeps refreshing the liveness
+                    # breadcrumb instead of looking like a wedged loop.
+                    _finished, pending = wait_for_futures(
+                        pending, timeout=self.liveness_interval_seconds
+                    )
+                    self._record_liveness()
                 statuses = [future.result() for future in futures]
+            finally:
+                # Never wait: a worker that abandoned a stuck command has
+                # returned, but the thread it abandoned may still be inside a
+                # call that cannot be interrupted.
+                pool.shutdown(wait=False)
             # A command that reports WAITING is re-claimable at once, so a
             # batch that only waited puts run() straight back into claim()
             # with nothing changed: on 2026-09-04 a single held
@@ -1191,9 +1351,8 @@ class ClusterActionExecutor:
         renewer.start()
         # The node-action adapter reads this before every send, so a lost
         # lease stops new node actions without widening the adapter API.
-        guard_token = active_lease_guard.set(watch.hold_reason)
         try:
-            result = self._execute(command)
+            result = self._execute_within_deadline(command, watch, stop)
             if watch.lost():
                 # Another executor may hold this command by now. The agent
                 # ledger keeps whatever ran; the next lease holder polls it
@@ -1222,9 +1381,134 @@ class ClusterActionExecutor:
                 return RemoteCommandStatus.WAITING
             return result.status
         finally:
-            active_lease_guard.reset(guard_token)
             stop.set()
             renewer.join(timeout=2)
+
+    def _execute_within_deadline(
+        self,
+        command: RemoteActionCommand,
+        watch: CommandLeaseWatch,
+        stop: Event,
+    ) -> RemoteCommandResult:
+        """Run one command on its own thread, bounded by the execution cap.
+
+        Nothing here can cancel the work: an adapter blocked in a boto3 call or
+        a socket read with no timeout stays blocked, and Python offers no way to
+        kill the thread. What the cap buys is that *this* executor stops
+        claiming to own the command -- it stops renewing the lease, reports an
+        unknown outcome, and lets the control plane decide -- instead of holding
+        it LEASED forever, where no sibling replica may take it over.
+
+        The thread is a daemon and the outcome is settled under a lock, so a
+        late result cannot be posted under a lease this executor stopped
+        renewing, and shutdown does not wait on the abandoned thread.
+        """
+
+        settled = Lock()
+        outcome: dict[str, Any] = {}
+
+        def execute() -> None:
+            # contextvars do not cross thread boundaries, so the adapter's
+            # lease guard has to be set on the thread that does the sending.
+            guard_token = active_lease_guard.set(watch.hold_reason)
+            try:
+                result: RemoteCommandResult | None = None
+                error: BaseException | None = None
+                try:
+                    result = self._execute(command)
+                except BaseException as exc:  # noqa: BLE001 - re-raised below
+                    error = exc
+                with settled:
+                    if outcome.get("abandoned"):
+                        self._increment("stuck_executions", -1)
+                        LOGGER.warning(
+                            "abandoned regional command finally returned after "
+                            "the execution cap; the result is discarded: "
+                            "command=%s cluster=%s operation=%s status=%s",
+                            command.command_id,
+                            command.cluster_id,
+                            command.step.operation.value,
+                            None if result is None else result.status.value,
+                            exc_info=error,
+                        )
+                        return
+                    if error is not None:
+                        outcome["error"] = error
+                    else:
+                        outcome["result"] = result
+            finally:
+                active_lease_guard.reset(guard_token)
+
+        worker = Thread(
+            target=execute,
+            name=f"cmd-{command.command_id[:24]}",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(self.max_execution_seconds)
+        with settled:
+            if "error" in outcome:
+                raise outcome["error"]
+            if "result" in outcome:
+                settled_result: RemoteCommandResult = outcome["result"]
+                return settled_result
+            outcome["abandoned"] = True
+            self._increment("execution_timeouts_total")
+            self._increment("stuck_executions")
+        # Stop the heartbeat before the verdict is posted: telling the control
+        # plane the lease is alive while reporting that the outcome is unknown
+        # would be two contradictory claims in the same cycle.
+        stop.set()
+        LOGGER.error(
+            "regional command exceeded the execution cap and was abandoned; "
+            "the thread cannot be killed and stays stuck: command=%s "
+            "cluster=%s operation=%s nodes=%s cap=%.1fs",
+            command.command_id,
+            command.cluster_id,
+            command.step.operation.value,
+            ",".join(command.step.node_ids),
+            self.max_execution_seconds,
+        )
+        return self._execution_timeout_result(command)
+
+    def _execution_timeout_result(
+        self, command: RemoteActionCommand
+    ) -> RemoteCommandResult:
+        """The verdict for a command this executor gave up waiting for.
+
+        FAILED, because the step did not succeed and the workflow must not stay
+        WAITING on a thread nobody will ever hear from again. But never a plain
+        failure for anything that mutates: the node action may be running in the
+        agent's ledger right now, so the result says the outcome is unknown and
+        demands manual confirmation -- the same shape an INTERRUPTED node action
+        reports.
+        """
+
+        operation = command.step.operation
+        details: dict[str, Any] = {
+            "execution_timeout": True,
+            "outcome_unknown": True,
+            "execution_timeout_seconds": (self.max_execution_seconds),
+            "operation": operation.value,
+        }
+        pointer = (command.result_details or {}).get("node_action_command_id")
+        if pointer is not None:
+            # The ledger row is the only way an operator can find out what the
+            # agent actually did.
+            details["node_action_command_id"] = pointer
+        if operation in _TIMEOUT_UNKNOWN_STATE_OPERATIONS:
+            details["manual_confirmation_required"] = True
+        return RemoteCommandResult(
+            lease_token=str(command.lease_token),
+            status=RemoteCommandStatus.FAILED,
+            status_source="executor-execution-timeout",
+            details=details,
+            error=(
+                f"executor abandoned {operation.value} after "
+                f"{self.max_execution_seconds:.0f}s; the outcome is unknown "
+                "and the operation may still be running on the node"
+            ),
+        )
 
     def _report_result(
         self,
@@ -1336,6 +1620,17 @@ class ClusterActionExecutor:
         # ceiling that keeps a long lease from going unrenewed for minutes.
         interval = min(30.0, self.lease_seconds / 3)
         while not stop.wait(interval):
+            if self._stop_requested:
+                # Renewing now would park the command for a full lease window
+                # after this process is gone. Let it lapse instead.
+                LOGGER.warning(
+                    "regional command lease left to lapse during shutdown: "
+                    "command=%s cluster=%s reason=%s",
+                    command.command_id,
+                    command.cluster_id,
+                    self._stop_reason,
+                )
+                return
             try:
                 renewed = self.client.renew(
                     command,
@@ -1388,7 +1683,7 @@ class ClusterActionExecutor:
 
     def run(self) -> None:
         consecutive_failures = 0
-        while True:
+        while not self._stop_requested:
             try:
                 count = self.run_once()
                 consecutive_failures = 0
@@ -1434,6 +1729,11 @@ class ClusterActionExecutor:
                 continue
             if count == 0 or not self.last_cycle_advanced:
                 time.sleep(self.poll_seconds)
+        LOGGER.warning(
+            "regional cluster executor stopped claiming: executor=%s reason=%s",
+            self.executor_id,
+            self._stop_reason,
+        )
 
     def _execute(self, command: RemoteActionCommand) -> RemoteCommandResult:
         lease_token = command.lease_token
@@ -1441,8 +1741,10 @@ class ClusterActionExecutor:
             raise ClusterExecutorError("claimed command has no lease token")
         try:
             self._validate(command)
-            if self.fleet_registry is not None and command_requires_fleet_preflight(
-                command.step.operation
+            if (
+                self.fleet_registry is not None
+                and command_requires_fleet_preflight(command.step.operation)
+                and not self._node_action_already_started(command)
             ):
                 steps = (
                     command.workflow.safety_steps
@@ -1699,6 +2001,25 @@ class ClusterActionExecutor:
                 },
             ),
         )
+
+    @staticmethod
+    def _node_action_already_started(command: RemoteActionCommand) -> bool:
+        """Whether this command's mutation is already under way on a node.
+
+        The adapter writes ``node_action_command_id`` once the agent has
+        accepted the command, so its presence in the replayed
+        ``result_details`` means the mutation cannot be called back: re-running
+        the destructive preflight buys nothing and costs two control-plane round
+        trips on every poll -- and worse, a rollout that starts meanwhile would
+        flip the poll to WAITING, stranding the only path to the outcome.
+
+        Nothing weaker counts. ``result_details`` also carries baselines, spare
+        state and retry counts from a cycle that was merely *held*, and treating
+        those as "started" would open the fail-closed gate in front of a
+        mutation that has not begun.
+        """
+
+        return bool((command.result_details or {}).get("node_action_command_id"))
 
     @staticmethod
     def _hold_details(
@@ -2063,6 +2384,12 @@ def executor_from_environment() -> ClusterActionExecutor:
         lease_renewal_failure_limit=int(
             os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_LEASE_FAILURE_LIMIT", "3")
         ),
+        max_execution_seconds=float(
+            os.getenv(
+                "GPU_FAULT_CLUSTER_EXECUTOR_MAX_EXECUTION_SECONDS",
+                str(DEFAULT_MAX_EXECUTION_SECONDS),
+            )
+        ),
     )
 
 
@@ -2142,4 +2469,8 @@ def readiness_probe() -> int:
 def main() -> None:
     configure_logging()
     validate_gpu_fault_environment(process_name="gpu-fault-cluster-executor")
-    executor_from_environment().run()
+    executor = executor_from_environment()
+    # Installed before the first claim: a rollout that arrives during the very
+    # first cycle must still release its lease instead of parking it.
+    executor.install_signal_handlers()
+    executor.run()
