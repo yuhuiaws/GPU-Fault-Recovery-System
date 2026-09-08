@@ -14,7 +14,14 @@ def test_wrapped_temporary_dns_failure_is_retryable() -> None:
     assert "temporary DNS failure" in (retryable_transport_error(error) or "")
 
 
-def test_permanent_dns_name_error_is_not_retryable() -> None:
+def test_a_name_error_for_a_fixed_endpoint_is_retryable() -> None:
+    """Live 2026-09-08 (DESTR-014): a sibling node's reboot took a CoreDNS
+    replica down and BatchRebootClusterNodes failed with EAI_NONAME for the
+    SageMaker endpoint -- a resolver disruption, not a permanent name error.
+    The endpoints this code calls never change, so every resolver failure is
+    transient."""
     error = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
-
-    assert retryable_transport_error(error) is None
+    reason = retryable_transport_error(RuntimeError("wrapped").with_traceback(None))
+    assert reason is None, "an unrelated error stays non-retryable"
+    assert retryable_transport_error(error) is not None, "EAI_NONAME must retry"
+    assert "DNS" in str(retryable_transport_error(error))

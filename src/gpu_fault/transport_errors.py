@@ -39,7 +39,14 @@ def retryable_transport_error(
         if current is None or id(current) in seen:
             return None
         seen.add(id(current))
-        if isinstance(current, socket.gaierror) and current.errno == socket.EAI_AGAIN:
+        if isinstance(current, socket.gaierror):
+            # Every resolver failure is transient for the fixed provider and
+            # control-plane endpoints this code calls: EAI_AGAIN by definition,
+            # and EAI_NONAME/EAI_FAIL when the cluster resolver itself is
+            # disrupted -- live 2026-09-08 (DESTR-014) a sibling node's reboot
+            # took a CoreDNS replica with it and BatchRebootClusterNodes on the
+            # other branch failed with "[Errno -2] Name or service not known",
+            # turning a DNS blip into a FAILED step and a support escalation.
             return f"temporary DNS failure: {current}"
         if isinstance(current, (TimeoutError, ConnectionError)):
             return f"temporary transport failure: {current}"
