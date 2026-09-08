@@ -39,6 +39,25 @@ SXID_SUMMARY_PATTERN = re.compile(
 FABRIC_MANAGER_SXID_PATTERN = SXID_SUMMARY_PATTERN
 
 
+def _read_boot_id() -> str:
+    """The kernel's boot id, or a marker that says it could not be read.
+
+    It scopes every file record id this collector mints, the same way
+    ``node.py`` scopes the ids of its training-log lines: a reused inode after
+    a reboot must not restart the offsets under ids that were already used. The
+    marker keeps ids unique per node and per file, it only stops distinguishing
+    boots, so a missing ``/proc`` must not stop log collection.
+    """
+
+    try:
+        return (
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+            or "unknown-boot"
+        )
+    except OSError:
+        return "unknown-boot"
+
+
 class FabricManagerLogCollector:
     """Collects SXIDs from Fabric Manager journald and file outputs."""
 
@@ -48,6 +67,7 @@ class FabricManagerLogCollector:
         context: CollectorContext,
         *,
         node_id: str,
+        boot_id: str | None = None,
         interval_seconds: float = 5,
         journal_enabled: bool = True,
         journal_identifiers: tuple[str, ...] = (
@@ -65,6 +85,7 @@ class FabricManagerLogCollector:
         self.sink = sink
         self.context = context
         self.node_id = node_id
+        self.boot_id = boot_id or _read_boot_id()
         self.interval_seconds = interval_seconds
         self.max_tracked_files = max_tracked_files
         self._files_bound_warned = False
@@ -79,6 +100,7 @@ class FabricManagerLogCollector:
         self._journal_cursor: str | None = None
         self._files: dict[str, dict[str, int]] = {}
         self._state_dirty = False
+        self._resync_warned = False
         self.health_summary_seconds = int(
             os.getenv(
                 "GPU_FAULT_FABRIC_MANAGER_HEALTH_SUMMARY_SECONDS",
@@ -271,6 +293,11 @@ class FabricManagerLogCollector:
         command = [
             "journalctl",
             "--output=json",
+            # Without --all journalctl encodes any field over 4096 bytes as a
+            # null value, so a long Fabric Manager line arrived as MESSAGE:
+            # null, matched no SXID pattern and was dropped without a trace.
+            # The collector bounds its own records.
+            "--all",
             "--no-pager",
             "--until",
             f"@{collected_at.timestamp()}",
@@ -326,10 +353,43 @@ class FabricManagerLogCollector:
         )
 
     def _file_records(self, collected_at: datetime) -> list[dict[str, Any]]:
+        """Every full line appended to the configured logs since the last poll.
+
+        The three steps are kept apart on purpose: what exists now, where each
+        file resumes, and only then what it says. Resolving every offset before
+        any read is what lets a rotated inode take its predecessor's checkpoint
+        whatever order the glob returns the two names in.
+        """
+
+        live = self._live_files()
         records: list[dict[str, Any]] = []
+        for key, stat, offset in self._resume_offsets(live):
+            try:
+                records.extend(self._records_from_file(key, stat, offset, collected_at))
+            except OSError as exc:
+                # A 0600 file under ProtectSystem=strict, or one that vanished
+                # between the stat and the open. The read used to raise out of
+                # the round and take the journal SXIDs of that round with it,
+                # every round, permanently (ARCH-G4).
+                LOGGER.warning(
+                    "Fabric Manager log file unreadable this round: %s (%s)",
+                    key,
+                    exc,
+                )
+                continue
+        self._bound_tracked_files({key for key, _stat in live})
+        return records
+
+    def _live_files(self) -> list[tuple[str, os.stat_result]]:
+        """The configured logs that exist and are readable enough to stat."""
+
+        live: list[tuple[str, os.stat_result]] = []
         seen: set[str] = set()
         for configured in self.log_paths:
             for path in sorted(Path("/").glob(configured.lstrip("/"))):
+                key = str(path)
+                if key in seen:
+                    continue
                 try:
                     if not path.is_file():
                         continue
@@ -344,17 +404,19 @@ class FabricManagerLogCollector:
                         exc,
                     )
                     continue
-                key = str(path)
                 seen.add(key)
-                previous = self._files.get(key)
-                identity_changed = previous is not None and (
-                    previous.get("device") != stat.st_dev
-                    or previous.get("inode") != stat.st_ino
-                )
-                truncated = previous is not None and stat.st_size < previous.get(
-                    "offset", 0
-                )
-                if previous is None:
+                live.append((key, stat))
+        return live
+
+    def _resume_offsets(
+        self, live: list[tuple[str, os.stat_result]]
+    ) -> list[tuple[str, os.stat_result, int]]:
+        plan: list[tuple[str, os.stat_result, int]] = []
+        for key, stat in live:
+            previous = self._files.get(key)
+            if previous is None:
+                inherited = self._inherit_rotated_offset(key, stat, live=live)
+                if inherited is None:
                     # Historical file content has no trustworthy node-generation
                     # boundary when the durable checkpoint is absent.
                     self._files[key] = {
@@ -364,69 +426,193 @@ class FabricManagerLogCollector:
                     }
                     self._state_dirty = True
                     continue
-                elif identity_changed or truncated:
-                    offset = 0
-                else:
-                    offset = min(previous.get("offset", 0), stat.st_size)
-                with path.open("r", encoding="utf-8", errors="replace") as stream:
-                    if offset > 0:
-                        stream.seek(offset - 1)
-                        previous_character = stream.read(1)
-                        stream.seek(offset)
-                        if previous_character != "\n":
-                            stream.readline()
-                            records.append(
-                                {
-                                    "message": "",
-                                    "_eligible": False,
-                                    "_checkpoint": {
-                                        "kind": "file",
-                                        "path": key,
-                                        "device": stat.st_dev,
-                                        "inode": stat.st_ino,
-                                        "offset": stream.tell(),
-                                    },
-                                }
-                            )
-                    while True:
-                        start = stream.tell()
-                        line = stream.readline()
-                        if not line:
-                            break
-                        if not line.endswith("\n"):
-                            stream.seek(start)
-                            break
-                        stable = f"{stat.st_dev}:{stat.st_ino}:{start}"
+                plan.append((key, stat, inherited))
+                continue
+            recorded = int(previous.get("offset", 0))
+            identity_changed = (
+                previous.get("device") != stat.st_dev
+                or previous.get("inode") != stat.st_ino
+            )
+            if identity_changed or stat.st_size < recorded:
+                plan.append((key, stat, 0))
+                continue
+            plan.append((key, stat, min(recorded, stat.st_size)))
+        return plan
+
+    def _inherit_rotated_offset(
+        self,
+        key: str,
+        stat: os.stat_result,
+        *,
+        live: list[tuple[str, os.stat_result]],
+    ) -> int | None:
+        """The checkpoint of this inode under the name it had before rotation.
+
+        logrotate renames ``fabricmanager.log`` to ``fabricmanager.1.log``, so
+        the same inode reappears under a name that has no checkpoint. Baselining
+        it at EOF discarded every line written between the last poll and the
+        rename -- including the fatal SXID that made Fabric Manager rotate. The
+        old name keeps a checkpoint at the start of its replacement, or loses it
+        altogether when nothing is there any more.
+        """
+
+        current = {name: (item.st_dev, item.st_ino) for name, item in live}
+        identity = (stat.st_dev, stat.st_ino)
+        for other, record in list(self._files.items()):
+            if other == key:
+                continue
+            if (record.get("device"), record.get("inode")) != identity:
+                continue
+            if current.get(other) == identity:
+                # Two names for one inode (a hard link, or two globs matching
+                # the same file): its checkpoint is not this key's to take.
+                continue
+            offset = min(int(record.get("offset", 0)), stat.st_size)
+            replacement = current.get(other)
+            if replacement is None:
+                del self._files[other]
+            else:
+                self._files[other] = {
+                    "device": replacement[0],
+                    "inode": replacement[1],
+                    "offset": 0,
+                }
+            self._files[key] = {
+                "device": stat.st_dev,
+                "inode": stat.st_ino,
+                "offset": offset,
+            }
+            self._state_dirty = True
+            LOGGER.warning(
+                "Fabric Manager log %s was rotated to %s; resuming its tail "
+                "at byte %d instead of baselining at the end",
+                other,
+                key,
+                offset,
+            )
+            return offset
+        return None
+
+    def _records_from_file(
+        self,
+        key: str,
+        stat: os.stat_result,
+        offset: int,
+        collected_at: datetime,
+    ) -> list[dict[str, Any]]:
+        """Read one file from ``offset`` in binary and decode line by line.
+
+        The offsets are byte offsets. They used to be ``TextIOWrapper.tell()``
+        cookies, which are opaque: they cannot be compared with ``st_size``, and
+        seeking one byte back from one could land inside a multibyte character.
+        """
+
+        records: list[dict[str, Any]] = []
+        with Path(key).open("rb") as stream:
+            if offset > 0:
+                stream.seek(offset - 1)
+                boundary = stream.read(1)
+                stream.seek(offset)
+                if boundary != b"\n":
+                    skipped = stream.readline()
+                    if skipped:
+                        self._warn_resumed_inside_a_line(key, offset)
                         records.append(
                             {
-                                "record_id": (
-                                    "fm-file-"
-                                    + hashlib.sha256(stable.encode()).hexdigest()
+                                "message": "",
+                                "_eligible": False,
+                                "_checkpoint": self._file_checkpoint(
+                                    key, stat, stream.tell()
                                 ),
-                                "observed_at": self._file_timestamp(
-                                    line, collected_at
-                                ).isoformat(),
-                                "message": line.rstrip("\n"),
-                                "source": "file",
-                                "_eligible": True,
-                                "_checkpoint": {
-                                    "kind": "file",
-                                    "path": key,
-                                    "device": stat.st_dev,
-                                    "inode": stat.st_ino,
-                                    "offset": stream.tell(),
-                                },
-                                "fields": {
-                                    "path": key,
-                                    "device": str(stat.st_dev),
-                                    "inode": str(stat.st_ino),
-                                    "offset": str(start),
-                                },
-                                "evidence_ref": (f"file://{key}#{stable}"),
                             }
                         )
-        self._bound_tracked_files(seen)
+            while True:
+                start = stream.tell()
+                raw = stream.readline()
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    # A line still being written: its checkpoint stays at
+                    # ``start`` so the next round reads it whole.
+                    break
+                message = raw.decode("utf-8", errors="replace").rstrip("\n")
+                stable = f"{stat.st_dev}:{stat.st_ino}:{start}"
+                records.append(
+                    {
+                        "record_id": (
+                            "fm-file-"
+                            + self._record_identity(stat.st_dev, stat.st_ino, start)
+                        ),
+                        "observed_at": self._file_timestamp(
+                            message, collected_at
+                        ).isoformat(),
+                        "message": message,
+                        "source": "file",
+                        "_eligible": True,
+                        "_checkpoint": self._file_checkpoint(key, stat, stream.tell()),
+                        "fields": {
+                            "path": key,
+                            "device": str(stat.st_dev),
+                            "inode": str(stat.st_ino),
+                            "offset": str(start),
+                        },
+                        "evidence_ref": (f"file://{self.node_id}{key}#{stable}"),
+                    }
+                )
         return records
+
+    @staticmethod
+    def _file_checkpoint(key: str, stat: os.stat_result, offset: int) -> dict[str, Any]:
+        return {
+            "kind": "file",
+            "path": key,
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+            "offset": offset,
+        }
+
+    def _record_identity(self, *parts: object) -> str:
+        """A record id that says which cluster, node and boot, and then what.
+
+        The control plane derives ``event_id`` from ``cluster_id`` and the
+        record id alone (``hma.py``), and treats a repeated ``event_id`` as a
+        duplicate. ``dev:ino:offset`` is not node-unique -- identically imaged
+        nodes share the device, and the same inode and offset for
+        ``/var/log/fabricmanager.log`` is plausible on one AMI -- so node B's
+        SXID was folded into node A's event and never recovered. This mirrors
+        ``node.py:_entry_identity``; the parts are JSON-encoded so no two part
+        lists can spell one string. The path is deliberately not a part: a
+        rotation renames the file and the line must keep its id.
+        """
+
+        return hashlib.sha256(
+            json.dumps(
+                [self.context.cluster_id, self.node_id, self.boot_id, *parts],
+                ensure_ascii=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _warn_resumed_inside_a_line(self, key: str, offset: int) -> None:
+        """Say once that a checkpoint did not land on a line boundary.
+
+        A checkpoint written before the offsets were bytes is a text cookie, and
+        one written by a crash mid-append can point anywhere. Either way the read
+        re-syncs to the next newline rather than deliver half a line, and that is
+        worth exactly one warning per process, not one per line.
+        """
+
+        if self._resync_warned:
+            return
+        self._resync_warned = True
+        LOGGER.warning(
+            "Fabric Manager log %s resumed at byte %d, which is not a line "
+            "boundary; re-syncing to the next line (an offset from before the "
+            "checkpoints were byte counts, or a torn append)",
+            key,
+            offset,
+        )
 
     def _bound_tracked_files(self, seen: set[str]) -> None:
         """Forget the oldest offsets of files the glob no longer finds.

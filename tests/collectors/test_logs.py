@@ -1051,3 +1051,256 @@ def test_fabric_manager_buffered_health_summary_is_not_a_failed_round(
     assert "log collection failed" not in caplog.text, (
         "a buffered health summary was reported as a failed collection round"
     )
+
+
+# --- Fabric Manager record identity, rotation and file-read guards (task 13) ---
+
+
+def _fabric_sxid_journal(cursor: str) -> str:
+    return json.dumps(
+        {
+            "__CURSOR": cursor,
+            "__REALTIME_TIMESTAMP": "1753012800000000",
+            "_SYSTEMD_UNIT": "nvidia-fabricmanager.service",
+            "MESSAGE": (
+                "nvidia-nvswitch3: SXid (PCI:0000:c1:00.0): 12020, "
+                "Fatal, Link 46 egress sequence ID error"
+            ),
+        }
+    )
+
+
+def test_fabric_manager_file_record_ids_are_node_scoped(tmp_path) -> None:
+    """Two nodes at the same path and offset must not mint one record id.
+
+    ``hma.py`` scopes the derived ``event_id`` to the cluster only, so node
+    uniqueness is the collector's job. Identically imaged nodes share the
+    device and inode of ``/var/log/fabricmanager.log``, so ``dev:ino:offset``
+    folded node B's SXID into node A's event -- the P0-38A class that
+    ``node.py:_entry_identity`` already fixed for training logs.
+    """
+
+    log = tmp_path / "fabricmanager.log"
+    log.write_text(
+        "nvidia-nvswitch0: SXid (PCI:0000:ab:00.0): 22013, Non-fatal, Link 12\n"
+    )
+    record_ids: dict[str, str] = {}
+    references: dict[str, str] = {}
+    for node_id in ("worker-a", "worker-b"):
+        state = tmp_path / f"state-{node_id}.json"
+        _write_fabric_file_state(state, log, offset=0)
+        sink = RecordingSink()
+        FabricManagerLogCollector(
+            sink,
+            context(),
+            node_id=node_id,
+            boot_id="boot-shared-by-the-image",
+            journal_enabled=False,
+            log_paths=[str(log)],
+            state_path=str(state),
+            now=lambda: NOW,
+        ).collect_once()
+        record_ids[node_id] = sink.requests[0][1]["record_id"]
+        references[node_id] = sink.requests[0][1]["evidence_ref"]
+
+    assert record_ids["worker-a"] != record_ids["worker-b"], (
+        "two nodes reading the same file offset shared one record id"
+    )
+    assert all(value.startswith("fm-file-") for value in record_ids.values()), (
+        "the record id prefix that names the source was dropped"
+    )
+    assert "worker-a" in references["worker-a"], (
+        "the evidence reference does not say which node the line came from"
+    )
+
+
+def test_fabric_manager_journal_asks_for_untruncated_fields(tmp_path) -> None:
+    """Without ``--all`` journalctl nulls any field over 4096 bytes.
+
+    ``_message_text(None)`` is ``""``, which matches no SXID pattern, so a long
+    Fabric Manager line was dropped without a trace on both the cold ``--since``
+    query and the resumed ``--after-cursor`` one.
+    """
+
+    calls: list[list[str]] = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        stdout = "" if "--after-cursor" in command else _fabric_sxid_journal("cursor-1")
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    collector = FabricManagerLogCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        state_path=str(tmp_path / "state.json"),
+        now=lambda: NOW,
+        runner=runner,
+    )
+
+    collector.collect_once()
+    collector.collect_once()
+
+    assert len(calls) == 2, f"expected a cold and a resumed journal query: {calls}"
+    assert all("--all" in command for command in calls), (
+        f"a journal query can still truncate fields over 4096 bytes: {calls}"
+    )
+
+
+def test_fabric_manager_reads_the_tail_of_a_renamed_log(tmp_path) -> None:
+    """A rotation must not baseline the old inode at EOF under its new name.
+
+    logrotate renames ``fabricmanager.log`` to ``fabricmanager.1.log``; the glob
+    then sees the old inode under a name that has no checkpoint, and baselining
+    it at EOF threw away every line written since the last poll -- including the
+    fatal SXID that made Fabric Manager rotate in the first place.
+    """
+
+    log = tmp_path / "fabricmanager.log"
+    log.write_text("Fabric Manager successfully configured\n")
+    state = tmp_path / "state.json"
+    sink = RecordingSink()
+
+    def build() -> FabricManagerLogCollector:
+        return FabricManagerLogCollector(
+            sink,
+            context(),
+            node_id="worker-1",
+            journal_enabled=False,
+            log_paths=[str(tmp_path / "fabricmanager*.log")],
+            state_path=str(state),
+            now=lambda: NOW,
+        )
+
+    build().collect_once()
+    with log.open("a") as stream:
+        stream.write(
+            "nvidia-nvswitch3: SXid (PCI:0000:c1:00.0): 12020, Fatal, "
+            "Link 46 written before the rotation\n"
+        )
+    log.rename(tmp_path / "fabricmanager.1.log")
+    log.write_text("")
+
+    stats = build().collect_once()
+
+    assert stats.delivered == 1, (
+        "the tail written between the last poll and the rotation was lost"
+    )
+    assert sink.requests[0][1]["message"].endswith("written before the rotation"), (
+        f"the wrong line was delivered: {sink.requests}"
+    )
+    assert (
+        str(tmp_path / "fabricmanager.1.log")
+        in (json.loads(state.read_text())["files"])
+    ), "the rotated file kept no checkpoint of its own"
+
+
+def test_fabric_manager_journal_survives_an_unreadable_configured_file(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """One 0600 log file must not discard the journal SXIDs of the round.
+
+    ``collect_once`` builds ``[*journal, *files]`` before it delivers anything,
+    so a ``PermissionError`` from the file tail threw away the journal records
+    of that round as well -- every round, permanently, for a file whose mode
+    never changes.
+    """
+
+    from pathlib import Path
+
+    log = tmp_path / "fabricmanager.log"
+    log.write_text("Fabric Manager successfully configured\n")
+    state = tmp_path / "state.json"
+    _write_fabric_file_state(state, log, offset=0)
+    real_open = Path.open
+
+    def refuse(self, *args, **kwargs):
+        if str(self) == str(log):
+            raise PermissionError(13, "Permission denied", str(log))
+        return real_open(self, *args, **kwargs)
+
+    def runner(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_fabric_sxid_journal("cursor-1"), stderr=""
+        )
+
+    sink = RecordingSink()
+    collector = FabricManagerLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        log_paths=[str(log)],
+        state_path=str(state),
+        now=lambda: NOW,
+        runner=runner,
+    )
+    monkeypatch.setattr(Path, "open", refuse)
+
+    with caplog.at_level(
+        logging.WARNING, logger="gpu_fault.collectors.logs.fabric_manager"
+    ):
+        stats = collector.collect_once()
+
+    assert stats.delivered == 1, (
+        "an unreadable file starved the journal source of the whole round"
+    )
+    assert sink.requests[0][1]["source"] == "journal", (
+        f"the journal SXID was not the delivered record: {sink.requests}"
+    )
+    assert "unreadable" in caplog.text.lower(), (
+        "the unreadable file was skipped without a warning"
+    )
+
+
+def test_fabric_manager_file_offsets_are_bytes_and_resync_to_a_line_boundary(
+    tmp_path, caplog
+) -> None:
+    """Offsets are byte offsets, and a stored one mid-character re-syncs once.
+
+    The offsets used to be ``TextIOWrapper.tell()`` cookies, so a stored value
+    could land inside a multibyte character; ``seek(offset - 1)`` then read a
+    replacement character instead of the newline. The read resumes at the next
+    line boundary, says so once, and the line that follows is delivered exactly
+    once.
+    """
+
+    first = "光纤管理器启动 [2026-08-13T12:34:56Z] configured\n"
+    second = (
+        "nvidia-nvswitch0: SXid (PCI:0000:ab:00.0): 22013, Non-fatal, "
+        "Link 12 SAW_MVB error\n"
+    )
+    log = tmp_path / "fabricmanager.log"
+    log.write_bytes((first + second).encode("utf-8"))
+    state = tmp_path / "state.json"
+    # Two bytes into the first character: a legacy cookie, not a line boundary.
+    _write_fabric_file_state(state, log, offset=2)
+    sink = RecordingSink()
+
+    def build() -> FabricManagerLogCollector:
+        return FabricManagerLogCollector(
+            sink,
+            context(),
+            node_id="worker-1",
+            journal_enabled=False,
+            log_paths=[str(log)],
+            state_path=str(state),
+            now=lambda: NOW,
+        )
+
+    with caplog.at_level(
+        logging.WARNING, logger="gpu_fault.collectors.logs.fabric_manager"
+    ):
+        stats = build().collect_once()
+    resumed = build().collect_once()
+
+    assert stats.delivered == 1, f"the SXID after the resync was lost: {sink.requests}"
+    assert sink.requests[0][1]["fields"]["offset"] == str(len(first.encode("utf-8"))), (
+        "the record offset is not the byte offset of the line"
+    )
+    assert json.loads(state.read_text())["files"][str(log)]["offset"] == (
+        log.stat().st_size
+    ), "the committed offset is not a byte count"
+    assert "line boundary" in caplog.text, (
+        "resuming inside a line was not reported once"
+    )
+    assert resumed.observed == 0, "the same line was read twice"
