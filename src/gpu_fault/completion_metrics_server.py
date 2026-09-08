@@ -3,7 +3,8 @@
 The completion controller is a watch/poll loop with no HTTP server of its own,
 so the counters it keeps (``reconcile_failures_total``,
 ``evicted_attempts_total``, ``restore_skipped_total``,
-``outbox_append_failures_total``) were only reachable from
+``outbox_append_failures_total``) and the outbox depth gauges
+(``outbox_depth``, ``outbox_quarantined_depth``) were only reachable from
 a debugger. This module exposes them in Prometheus text exposition on a
 daemon thread so the Pod can carry the same ``prometheus.io/scrape``
 annotations as every other GPU-fault workload.
@@ -53,8 +54,28 @@ COUNTERS: tuple[tuple[str, str, str], ...] = (
         "gpu_fault_completion_outbox_append_failures_total",
         "outbox_append_failures_total",
         "Critical completion events whose write-ahead ConfigMap copy could "
-        "not be written; they were delivered live without a buffered copy, so "
-        "any value above zero means a restart can lose an event.",
+        "not be written or cleared; delivery went ahead anyway, so any value "
+        "above zero means a restart can lose an event or replay a delivered "
+        "one.",
+    ),
+)
+
+# (metric name, controller attribute, help text) for values that go up and
+# down. Both are refreshed by the outbox replay that runs at the top of every
+# reconcile pass, so they lag a newly buffered record by at most one pass.
+GAUGES: tuple[tuple[str, str, str], ...] = (
+    (
+        "gpu_fault_completion_outbox_depth",
+        "outbox_depth",
+        "Critical completion events buffered in the write-ahead ConfigMap and "
+        "not yet accepted by the control plane.",
+    ),
+    (
+        "gpu_fault_completion_outbox_quarantined_depth",
+        "outbox_quarantined_depth",
+        "Buffered events the replay has given up on: it skips them for ever, "
+        "so they are delivered only by a later live POST or by an operator "
+        "replay. Anything above zero needs a look.",
     ),
 )
 
@@ -72,11 +93,12 @@ def render_completion_metrics(controller: Any) -> str:
     """Prometheus text exposition of the controller's counters."""
 
     lines: list[str] = []
-    for name, attribute, help_text in COUNTERS:
-        value = getattr(controller, attribute, 0)
-        lines.append(f"# HELP {name} {help_text}")
-        lines.append(f"# TYPE {name} counter")
-        lines.append(f"{name} {int(value)}")
+    for metrics, metric_type in ((COUNTERS, "counter"), (GAUGES, "gauge")):
+        for name, attribute, help_text in metrics:
+            value = getattr(controller, attribute, 0)
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} {metric_type}")
+            lines.append(f"{name} {int(value)}")
     return "\n".join(lines) + "\n"
 
 

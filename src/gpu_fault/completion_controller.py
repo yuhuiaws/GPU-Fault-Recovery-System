@@ -608,6 +608,23 @@ class KubernetesCompletionController:
 
         return int(getattr(self.sink, "append_failures_total", 0))
 
+    @property
+    def outbox_depth(self) -> int:
+        """Buffered critical events as of the last replay pass (F12)."""
+
+        return int(getattr(self.sink, "last_depth", 0))
+
+    @property
+    def outbox_quarantined_depth(self) -> int:
+        """Buffered events no replay will retry again (F12).
+
+        ``replay`` skips a quarantined record and no production caller passes
+        ``include_quarantined``, so anything above zero here is waiting on the
+        live path or on an operator, never on the loop.
+        """
+
+        return int(getattr(self.sink, "last_quarantined_depth", 0))
+
     def run_once(self) -> list[dict[str, Any]]:
         pods, _ = list_completion_pods(
             self.core_api,
@@ -795,18 +812,22 @@ class KubernetesCompletionController:
                     attempt_id,
                 )
                 return
-            self._terminal_sent.add(result.terminal_event.event_key)
             if completion_delivery_deferred(response):
                 # An earlier pass buffered this terminal and never delivered
-                # it; the outbox replay owns it from here, so posting it live
-                # again would only double the load (F8). Marking it sent is
-                # safe because the buffered record is what carries it.
+                # it; the outbox replay owns the retry (F8), so posting it live
+                # again this pass would only double the load. It is *not*
+                # delivered, so it must not be recorded as sent: replay
+                # quarantines a record after ``max_replay_attempts`` and then
+                # never touches it again, and the live path is what has to pick
+                # it up from there. The outbox suppresses the duplicate live
+                # POST for as long as the record really is replay's.
                 LOGGER.warning(
                     "training terminal for attempt %s is buffered in the "
                     "outbox; its delivery is owned by the replay",
                     attempt_id,
                 )
                 return
+            self._terminal_sent.add(result.terminal_event.event_key)
             LOGGER.info(
                 "training terminal submitted: attempt=%s status=%s event_key=%s",
                 attempt_id,

@@ -194,6 +194,13 @@ class KubernetesCompletionOutbox:
         # signal that the outbox ConfigMap is full or unwritable (F1/F12).
         self.append_failures_total = 0
         self._append_failures_logged: set[str] = set()
+        # Depth gauges as of the last replay pass, exported as
+        # ``gpu_fault_completion_outbox_depth`` /
+        # ``..._quarantined_depth``. A quarantined record is one no replay will
+        # ever pick up again, so it has to be visible without a ConfigMap read
+        # per scrape (F12).
+        self.last_depth = 0
+        self.last_quarantined_depth = 0
 
     @staticmethod
     def _record_key(path: str, payload: dict[str, Any]) -> str:
@@ -320,39 +327,55 @@ class KubernetesCompletionOutbox:
         self._mutate_data(update)
 
     def _append(self, key: str, path: str, payload: dict[str, Any]) -> bool:
-        """Buffer the pointer-sized copy; ``False`` when already buffered.
+        """Buffer the pointer-sized copy; ``True`` when the caller must post.
 
         A key that is already in the ConfigMap is a record an earlier pass
-        failed to deliver. ``replay`` owns it from then on, so the caller must
-        not post it live a second time in the same pass (F8).
+        failed to deliver, and ``replay`` owns it from then on, so the caller
+        must not post it live a second time in the same pass (F8) -- *unless*
+        that record is quarantined. ``replay`` skips a quarantined record for
+        ever (no production caller passes ``include_quarantined``), and it
+        quarantines after ``max_replay_attempts`` even for a transient outage,
+        so deferring to a replay that will never come would make the event
+        permanently undeliverable. For a quarantined key the live POST is the
+        only path left: the record is kept as it is -- attempts, quarantine
+        flag and last error stay readable -- and the caller removes it once
+        the control plane accepts the event.
         """
 
         buffered = pointer_sized_completion_payload(
             payload, max_tail_bytes=self.max_buffered_tail_bytes
         )
-        already_buffered = False
+        deliver_live = True
 
         def append(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            nonlocal already_buffered
-            already_buffered = any(item.get("key") == key for item in records)
-            if already_buffered:
+            nonlocal deliver_live
+            existing = next((item for item in records if item.get("key") == key), None)
+            if existing is not None:
+                deliver_live = bool(existing.get("quarantined", False))
                 return records
             return [*records, self._record(key, path, buffered)]
 
         self._mutate(append)
-        return not already_buffered
+        return deliver_live
 
-    def _count_append_failure(self, key: str, exc: BaseException) -> None:
-        """Count every write-ahead failure; log the first one per key.
+    def _count_append_failure(
+        self, key: str, exc: BaseException, *, stage: str = "buffer"
+    ) -> None:
+        """Count every outbox bookkeeping failure; log the first one per key.
 
-        The watcher reconciles every 30 s, so logging each pass would bury the
-        cause under its own repetition (the same rule as F9).
+        ``stage`` is ``"buffer"`` for the write-ahead append and ``"clear"``
+        for the removal that follows a successful delivery. Both mean the
+        ConfigMap could not be written, and both are counted the same way; only
+        the consequence differs, so only the message does. The watcher
+        reconciles every 30 s, so logging each pass would bury the cause under
+        its own repetition (the same rule as F9).
         """
 
         self.append_failures_total += 1
         if key in self._append_failures_logged:
             LOGGER.debug(
-                "completion outbox write-ahead still failing: key=%s (%s: %s)",
+                "completion outbox write (%s) still failing: key=%s (%s: %s)",
+                stage,
                 key,
                 type(exc).__name__,
                 exc,
@@ -361,6 +384,17 @@ class KubernetesCompletionOutbox:
         if len(self._append_failures_logged) >= _MAX_LOGGED_APPEND_FAILURES:
             self._append_failures_logged.clear()
         self._append_failures_logged.add(key)
+        if stage == "clear":
+            LOGGER.error(
+                "cannot clear the delivered critical completion event key=%s "
+                "(%s: %s); the control plane has already accepted it, so the "
+                "record stays buffered and the replay will re-send it (the "
+                "control plane deduplicates by event_key)",
+                key,
+                type(exc).__name__,
+                exc,
+            )
+            return
         LOGGER.error(
             "cannot write ahead critical completion event key=%s (%s: %s); "
             "delivering it live without a buffered copy -- a watcher restart "
@@ -488,7 +522,7 @@ class KubernetesCompletionOutbox:
         # problem: it still fails hard, before anything is attempted.
         key = self._record_key(path, payload)
         try:
-            appended = self._append(key, path, payload)
+            deliver_live = self._append(key, path, payload)
         except Exception as append_error:
             self._count_append_failure(key, append_error)
             try:
@@ -498,7 +532,7 @@ class KubernetesCompletionOutbox:
                 # name the buffer failure, which is what has to be fixed.
                 raise append_error from delivery_error
         self._append_failures_logged.discard(key)
-        if not appended:
+        if not deliver_live:
             LOGGER.info(
                 "critical completion event already buffered; leaving delivery "
                 "to the outbox replay: key=%s",
@@ -506,7 +540,15 @@ class KubernetesCompletionOutbox:
             )
             return {DEFERRED_TO_REPLAY: True}
         result = self.sink.post(path, payload)
-        self._remove(key)
+        try:
+            self._remove(key)
+        except Exception as removal_error:
+            # The control plane has the event; a ConfigMap that cannot be
+            # written must not turn that into a failed delivery, or the caller
+            # would arm its emergency fallback over an accepted event. The
+            # record stays and replay re-sends it; the control plane
+            # deduplicates by event_key.
+            self._count_append_failure(key, removal_error, stage="clear")
         return result
 
     def replay(self, *, include_quarantined: bool = False) -> int:
@@ -535,6 +577,8 @@ class KubernetesCompletionOutbox:
         batch = candidates[: self.replay_batch_size]
         deferred = len(candidates) - len(batch)
         replayed = quarantined = 0
+        drained: set[str] = set()
+        isolated: set[str] = set()
         deadline = self.monotonic() + self.replay_budget_seconds
         for index, record in enumerate(batch):
             if index > 0 and self.monotonic() >= deadline:
@@ -556,6 +600,7 @@ class KubernetesCompletionOutbox:
                 status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
                 if disposition == "quarantine" or attempts >= self.max_replay_attempts:
                     quarantined += 1
+                    isolated.add(key)
                     LOGGER.warning(
                         "completion outbox record quarantined after %d attempts: "
                         "key=%s status=%s error=%s",
@@ -586,13 +631,41 @@ class KubernetesCompletionOutbox:
             ) not in {"PENDING", "RUNNING"}:
                 self.remove_attempt_observation(payload)
             self._remove(key)
+            drained.add(key)
             replayed += 1
         self.last_replay = {
             "replayed": replayed,
             "deferred": deferred,
             "quarantined": quarantined,
         }
+        self._publish_depth(records, drained=drained, isolated=isolated)
         return replayed
+
+    def _publish_depth(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        drained: set[str],
+        isolated: set[str],
+    ) -> None:
+        """Refresh the exported depth gauges from the pass we just walked.
+
+        Derived from the snapshot ``replay`` already read rather than from a
+        second ConfigMap GET: the watcher reconciles every 30 s and the gauge
+        does not justify an extra API call per pass. It therefore reports the
+        depth as of the start of the pass minus what the pass drained, so a
+        record buffered later in the same reconcile shows up one pass later.
+        """
+
+        remaining = [
+            record for record in records if str(record.get("key")) not in drained
+        ]
+        self.last_depth = len(remaining)
+        self.last_quarantined_depth = sum(
+            1
+            for record in remaining
+            if record.get("quarantined", False) or str(record.get("key")) in isolated
+        )
 
     def depth(self) -> int:
         records, _resource_version = self._read()

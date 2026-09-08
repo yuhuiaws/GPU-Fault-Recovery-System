@@ -30,6 +30,8 @@ class FakeController:
     evicted_attempts_total = 5
     restore_skipped_total = 7
     outbox_append_failures_total = 9
+    outbox_depth = 4
+    outbox_quarantined_depth = 2
 
 
 def _ephemeral(controller: object) -> CompletionMetricsServer:
@@ -84,6 +86,30 @@ def test_metrics_endpoint_exposes_the_outbox_write_ahead_failure_counter() -> No
     assert f"# HELP {name} " in body, f"{name} has no HELP line: {body!r}"
     assert f"# TYPE {name} counter" in lines, f"{name} is not typed as a counter"
     assert f"{name} 9" in lines, f"{name} sample missing from {body!r}"
+
+
+def test_metrics_endpoint_exposes_the_outbox_depth_gauges() -> None:
+    """A quarantined record is one nobody replays: it has to be visible.
+
+    ``replay`` skips quarantined records for ever and no production caller
+    passes ``include_quarantined``, so a non-zero quarantined depth is an
+    operator action item, not a statistic.
+    """
+
+    server = _ephemeral(FakeController())
+    try:
+        _, _, body = _get(f"http://127.0.0.1:{server.port}/metrics")
+    finally:
+        server.stop()
+
+    lines = body.splitlines()
+    for name, value in (
+        ("gpu_fault_completion_outbox_depth", 4),
+        ("gpu_fault_completion_outbox_quarantined_depth", 2),
+    ):
+        assert f"# HELP {name} " in body, f"{name} has no HELP line: {body!r}"
+        assert f"# TYPE {name} gauge" in lines, f"{name} is not typed as a gauge"
+        assert f"{name} {value}" in lines, f"{name} sample missing from {body!r}"
 
 
 def test_metrics_endpoint_reads_live_counter_values_on_each_scrape() -> None:

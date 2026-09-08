@@ -381,3 +381,89 @@ def test_a_buffered_record_does_not_block_another_key() -> None:
     assert keys == ["cluster-a/attempt-a/failure-detected"], (
         f"only the undelivered record may stay buffered: {keys!r}"
     )
+
+
+class BrokenRemovalCore(ConfigMapCore):
+    """Appends fine; deleting a delivered record always fails.
+
+    Models the window in which the ConfigMap became unwritable (RBAC revoked,
+    quota exceeded, API server outage) *between* the write-ahead append and
+    the removal that follows a successful live POST.
+    """
+
+    def replace_namespaced_config_map(self, name, namespace, body):
+        before = len(json.loads(self.data["events.json"]))
+        after = len(json.loads(body["data"]["events.json"]))
+        if after < before:
+            raise FakeApiException(500)
+        return super().replace_namespaced_config_map(name, namespace, body)
+
+
+def test_a_quarantined_record_does_not_deadlock_the_live_post() -> None:
+    """A record ``replay`` has given up on must not silence the live path.
+
+    ``replay`` quarantines after ``max_replay_attempts`` (production default
+    20, one attempt per 30 s pass) even for a purely transient error, and then
+    skips the record for ever -- no production caller passes
+    ``include_quarantined``. If ``post`` still answered ``deferred_to_replay``
+    for that key, the event would become permanently undeliverable: the exact
+    F1 outcome (workload suspended, no incident) the deferral was added
+    around.
+    """
+
+    core = ConfigMapCore()
+    sink = RecordingSink(fail=True)
+    outbox = KubernetesCompletionOutbox(core, sink, max_replay_attempts=3)
+    with pytest.raises(OSError):
+        outbox.post("/v1/attempts/failure-detected", payload())
+    for _ in range(3):
+        assert outbox.replay() == 0, "the control plane is still down"
+    assert outbox.quarantined_depth() == 1, (
+        "three failed attempts with max_replay_attempts=3 must quarantine the "
+        f"record, depth={outbox.depth()}"
+    )
+
+    sink.fail = False
+    assert outbox.replay() == 0, (
+        "a quarantined record is no longer replay's to deliver, so the live "
+        f"path has to own it: {sink.posts!r}"
+    )
+    result = outbox.post("/v1/attempts/failure-detected", payload())
+
+    assert result == {"accepted": True}, (
+        f"the live POST must happen once replay has given up, got {result!r}"
+    )
+    assert sink.posts[-1] == ("/v1/attempts/failure-detected", payload()), (
+        f"the recovered sink must receive the event: {sink.posts!r}"
+    )
+    assert outbox.depth() == 0, (
+        "a live delivery must clear the quarantined record, "
+        f"{core.data['events.json']!r} is left"
+    )
+
+
+def test_a_delivered_event_is_not_undone_by_a_failed_removal() -> None:
+    """The bookkeeping write after a successful POST must not mask success.
+
+    ``_remove`` raising made ``post`` raise, and every caller reads that as
+    "the control plane never accepted this": the watcher then suspends the
+    workload 30 s later over an event the control plane already has.
+    """
+
+    core = BrokenRemovalCore()
+    sink = RecordingSink()
+    outbox = KubernetesCompletionOutbox(core, sink)
+
+    result = outbox.post("/v1/attempts/failure-detected", payload())
+
+    assert result == {"accepted": True}, (
+        f"the sink's response must be returned, got {result!r}"
+    )
+    assert outbox.append_failures_total == 1, (
+        "the failed removal must be counted like any other outbox write "
+        f"failure, got {outbox.append_failures_total}"
+    )
+    assert outbox.depth() == 1, (
+        "the record necessarily stays buffered; replay re-sends it and the "
+        "control plane deduplicates by event_key"
+    )

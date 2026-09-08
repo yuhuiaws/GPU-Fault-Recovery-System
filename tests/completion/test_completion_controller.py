@@ -1468,3 +1468,52 @@ def test_unwritable_outbox_still_delivers_and_is_counted() -> None:
         "each write-ahead failure must be counted and exported, got "
         f"{subject.outbox_append_failures_total}"
     )
+
+
+class TogglingSink(FakeSink):
+    """Fails every POST until ``fail`` is cleared."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = True
+
+    def post(self, path, payload):
+        self.posts.append((path, payload))
+        if self.fail:
+            raise RuntimeError("control plane unavailable")
+        return {"accepted": True}
+
+
+def test_a_deferred_terminal_is_not_recorded_as_sent() -> None:
+    """ "The buffered record carries it" is not a delivery guarantee.
+
+    Marking ``_terminal_sent`` on a ``deferred_to_replay`` answer retires the
+    live path for the lifetime of the process. Once ``replay`` quarantines the
+    record -- which it does after ``max_replay_attempts`` even for a transient
+    outage -- nothing would ever deliver the terminal event again. The live
+    path has to stay the owner until the control plane really accepts it.
+    """
+
+    core = FakeCoreApi([pod(0, exit_code=0)])
+    inner = TogglingSink()
+    outbox = KubernetesCompletionOutbox(core, inner, max_replay_attempts=1)
+    subject = KubernetesCompletionController(core, outbox, cluster_id="hp-cluster")
+
+    subject.run_once()  # live POST fails, the record is buffered
+    subject.run_once()  # replay fails and quarantines it; live POST fails too
+    assert outbox.quarantined_depth() == 1, (
+        "max_replay_attempts=1 must quarantine after the first replay, "
+        f"{core.config_map_data['events.json']!r}"
+    )
+
+    inner.fail = False
+    subject.run_once()
+
+    assert [path for path, _ in inner.posts] == ["/v1/attempts/terminal"] * 4, (
+        "one live attempt per pass plus the single replay attempt; the third "
+        f"pass must still try: {inner.posts!r}"
+    )
+    assert outbox.depth() == 0, (
+        "the recovered delivery must clear the buffered terminal, "
+        f"{core.config_map_data['events.json']!r} is left"
+    )
