@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from gpu_fault import node_installer_reconciler
+
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY_PATH = (
     ROOT / "deploy" / "control-plane" / "regional" / "cleanup-inventory.json"
@@ -122,3 +124,30 @@ def test_cleanup_inventory_generator_is_current() -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_cleanup_inventory_names_every_installer_annotation() -> None:
+    """Final review M3: the inventory and the reconciler share one list.
+
+    ``prepare-clean-redeploy.sh`` clears the node annotations the inventory
+    names; a name the reconciler writes but the inventory lacks survives a
+    clean redeploy, and ``installer-attempts`` carrying over means an hour of
+    inherited backoff.
+    """
+
+    written = {
+        value
+        for name, value in vars(node_installer_reconciler).items()
+        if name.startswith("INSTALLER_")
+        and name.endswith("_ANNOTATION")
+        and isinstance(value, str)
+    }
+    listed = set(inventory()["gpu"]["node_annotations"])
+    missing = written - listed
+    assert not missing, (
+        f"cleanup inventory lacks installer annotations: {sorted(missing)}"
+    )
+    assert set(node_installer_reconciler.INSTALLER_NODE_ANNOTATIONS) == written, (
+        "the reconciler's own list must be the complete one, so both consumers "
+        "can derive from it"
+    )

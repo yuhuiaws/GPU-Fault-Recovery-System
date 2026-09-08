@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,12 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from gpu_fault.node_installer_reconciler import (  # noqa: E402
+    INSTALLER_NODE_ANNOTATIONS,
+)
+
 OUTPUT = ROOT / "deploy" / "control-plane" / "regional" / "cleanup-inventory.json"
 MANIFEST_GLOBS = {
     "cpu": [
@@ -71,12 +78,10 @@ ORDER_ANNOTATION = ANNOTATION_PREFIX + "cleanup-order"
 ACTION_ANNOTATION = ANNOTATION_PREFIX + "cleanup-action"
 DEPLOY_ANNOTATION = ANNOTATION_PREFIX + "deploy-mode"
 DEPLOY_MODES = {"regional_reconciler", "regional_rollout"}
+# The installer annotations come from the reconciler that writes them, so a
+# new one cannot be missed here (final review M3).
 NODE_ANNOTATIONS = [
-    "gpu-fault.io/installer-version",
-    "gpu-fault.io/installer-config-digest",
-    "gpu-fault.io/installer-artifact-sha256",
-    "gpu-fault.io/installer-node-uid",
-    "gpu-fault.io/installer-state",
+    *INSTALLER_NODE_ANNOTATIONS,
     "gpu-fault.io/incident-id",
     "gpu-fault.io/fencing-token",
     "gpu-fault.io/previous-unschedulable",

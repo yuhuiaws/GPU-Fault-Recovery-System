@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 import yaml
 
+from gpu_fault import node_installer_reconciler
 from gpu_fault.admin import cluster_removal as admin_cluster_removal
 from gpu_fault.admin.cluster_removal import (
     RemoveClusterRequest,
@@ -515,3 +516,33 @@ def test_remove_final_checks_run_in_parallel(tmp_path, monkeypatch) -> None:
     _verify_removal_parallel(request, site.release_config["clusters"][0], site)
 
     assert maximum == 5
+
+
+def _annotations_the_reconciler_writes() -> set[str]:
+    """Every ``gpu-fault.io/installer-*`` annotation the reconciler defines."""
+
+    return {
+        value
+        for name, value in vars(node_installer_reconciler).items()
+        if name.startswith("INSTALLER_")
+        and name.endswith("_ANNOTATION")
+        and isinstance(value, str)
+    }
+
+
+def test_cluster_removal_clears_every_annotation_the_reconciler_writes() -> None:
+    """Final review M3 (Task 15 residual).
+
+    Removal cleared five installer annotations; the reconciler writes eleven.
+    ``installer-attempts`` and ``installer-retry-after`` survived a removal,
+    so a cluster added back later inherited a node's failure count and backed
+    off for up to an hour on its first failed install.
+    """
+
+    written = _annotations_the_reconciler_writes()
+    assert len(written) >= 11, f"the reconciler defines fewer than expected: {written}"
+    missing = written - set(admin_cluster_removal.INSTALLER_ANNOTATIONS)
+    assert not missing, (
+        "cluster removal must clear every installer annotation the reconciler "
+        f"writes, or a re-added cluster inherits it; not cleared: {sorted(missing)}"
+    )

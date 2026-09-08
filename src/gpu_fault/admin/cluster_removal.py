@@ -43,15 +43,12 @@ from gpu_fault.installation_resources import (
     InstallationResourceSnapshot,
     InstallationResourceStatus,
 )
+from gpu_fault.node_installer_reconciler import INSTALLER_NODE_ANNOTATIONS
 
 CONFIRMATION = "REMOVE_GPU_CLUSTER"
-INSTALLER_ANNOTATIONS = (
-    "gpu-fault.io/installer-version",
-    "gpu-fault.io/installer-config-digest",
-    "gpu-fault.io/installer-artifact-sha256",
-    "gpu-fault.io/installer-node-uid",
-    "gpu-fault.io/installer-state",
-)
+#: The reconciler's own list, not a copy: a hand-kept five-entry copy left
+#: ``installer-attempts`` (and five others) on the nodes of a removed cluster.
+INSTALLER_ANNOTATIONS = INSTALLER_NODE_ANNOTATIONS
 
 
 @dataclass(frozen=True)

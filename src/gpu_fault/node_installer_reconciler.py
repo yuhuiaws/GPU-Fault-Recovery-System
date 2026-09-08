@@ -42,6 +42,26 @@ INSTALLER_REASON_ANNOTATION = "gpu-fault.io/installer-reason"
 # without this the very next pass would recreate it and the slot would churn
 # every 5 s instead of being held for 840 s.
 INSTALLER_RETRY_AFTER_ANNOTATION = "gpu-fault.io/installer-retry-after"
+#: Every node annotation this reconciler writes, in one place, because two
+#: other things have to remove them all: cluster removal
+#: (``gpu_fault.admin.cluster_removal``) and the clean-redeploy inventory
+#: (``scripts/generate-cleanup-inventory.py``). Both used to list five of the
+#: eleven by hand, so ``installer-attempts`` and ``installer-retry-after``
+#: survived a removal and a re-added cluster inherited up to an hour of
+#: backoff on its first failed install.
+INSTALLER_NODE_ANNOTATIONS: tuple[str, ...] = (
+    INSTALLER_VERSION_ANNOTATION,
+    INSTALLER_DIGEST_ANNOTATION,
+    INSTALLER_ARTIFACT_ANNOTATION,
+    INSTALLER_BUNDLE_ANNOTATION,
+    INSTALLER_TEMPLATE_ANNOTATION,
+    INSTALLER_NODE_UID_ANNOTATION,
+    INSTALLER_STATE_ANNOTATION,
+    INSTALLER_BOOT_ID_ANNOTATION,
+    INSTALLER_ATTEMPTS_ANNOTATION,
+    INSTALLER_REASON_ANNOTATION,
+    INSTALLER_RETRY_AFTER_ANNOTATION,
+)
 DEFAULT_AGENT_PORT = 9099
 DEFAULT_REBOOT_GRACE_SECONDS = 600
 INSTALLER_JOB_LABEL = "gpu-fault.io/node-installer"
