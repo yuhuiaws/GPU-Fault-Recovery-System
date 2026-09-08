@@ -1221,3 +1221,196 @@ def test_flight_recorder_rejects_embedded_traversal(tmp_path) -> None:
     proc_root = tmp_path / "proc"
     with pytest.raises(ValueError):
         _fr_mapped_path(proc_root, 100, "/tmp/../../etc/passwd")
+
+
+def _field_diagnostic_agent(tmp_path, ledger_name: str, stdout: str):
+    """An agent whose Field Diagnostic exits 0 and prints ``stdout``."""
+
+    executable = tmp_path / "fielddiag"
+    executable.write_text("#!/bin/sh\n", encoding="ascii")
+    executable.chmod(0o755)
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+
+    class ReportRunner(FakeRunner):
+        def __call__(self, command, **kwargs):
+            if command and command[0] == str(executable):
+                self.commands.append(command)
+                return CompletedProcess(command, 0, stdout=stdout, stderr="")
+            return super().__call__(command, **kwargs)
+
+    return node_action_executor(
+        tmp_path,
+        ledger_name,
+        allowed_operations={WorkflowOperation.RUN_NVLINK74_WORKFLOW},
+        field_diagnostic_enabled=True,
+        field_diagnostic_command=(str(executable), "--link", "{link_id}"),
+        field_diagnostic_sha256=digest,
+        runner=ReportRunner(),
+        device_client_finder=no_device_clients,
+        sleep=lambda _: None,
+    )
+
+
+def _run_field_diagnostic(agent):
+    return agent.execute(
+        envelope(
+            command(
+                WorkflowOperation.RUN_NVLINK74_WORKFLOW,
+                parameters={"nvlink_link_id": 3},
+            )
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Error count: 0",
+        "ERROR: none detected",
+        "Errors: 0",
+        "Failure count: 0",
+        "NVLink error counters: 0",
+        "0 errors",
+        "No failures detected",
+    ],
+)
+def test_field_diagnostic_benign_error_lines_are_not_failures(tmp_path, line) -> None:
+    """A clean report that spells the word "error" is still a clean report.
+
+    The zero-suppression only understood "0 errors"/"no failures" -- the count
+    ahead of the noun. Every NVIDIA Field Diagnostic writes the count *after*
+    it ("Error count: 0") and reports "ERROR: none detected", so a GPU that
+    passed was reported as "reported failure despite exit status 0". That
+    verdict is what decides between an NVLink repair and an RMA, so a false
+    failure sends a healthy GPU for replacement.
+    """
+
+    agent = _field_diagnostic_agent(
+        tmp_path,
+        "benign.db",
+        f"Running NVLink diagnostic\n{line}\nOverall Result: PASS\n",
+    )
+
+    result = _run_field_diagnostic(agent)
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert result.details["field_diagnostic"] == "PASSED", result.details
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Overall Result: FAIL",
+        "ERROR: GPU 3 link 7 training failed",
+        "Error count: 5",
+        "FATAL: diagnostic aborted",
+        "Error count: 0 but Overall Result: FAIL",
+    ],
+)
+def test_field_diagnostic_real_failure_lines_still_fail(tmp_path, line) -> None:
+    """The zero-suppression must never swallow a genuine failure line."""
+
+    agent = _field_diagnostic_agent(
+        tmp_path, "real-failure.db", f"Running NVLink diagnostic\n{line}\n"
+    )
+
+    result = _run_field_diagnostic(agent)
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert "reported failure despite exit status 0" in (result.error or ""), (
+        result.error
+    )
+
+
+def test_diagnostic_retention_prunes_quick_diag_json(tmp_path) -> None:
+    """``dcgm-quick-diagnostic-*.json`` was written and never swept.
+
+    The retention sweep only globbed ``gpu-diagnostic-*.tar.gz``, so every
+    quick diagnostic left a JSON file behind for good in the same 0700
+    directory. On a node that flaps XIDs those accumulate one per attempt
+    until the root filesystem fills, which takes kubelet with it.
+    """
+
+    output_dir = tmp_path / "diagnostics"
+    output_dir.mkdir()
+    old = output_dir / "dcgm-quick-diagnostic-old.json"
+    newest = output_dir / "dcgm-quick-diagnostic-newest.json"
+    for path in (old, newest):
+        path.write_text("{}", encoding="utf-8")
+    stale = (NOW - timedelta(hours=2)).timestamp()
+    os.utime(old, (stale, stale))
+    fresh = (NOW - timedelta(minutes=1)).timestamp()
+    os.utime(newest, (fresh, fresh))
+    agent = node_action_executor(
+        tmp_path,
+        "quick-retention.db",
+        allowed_operations={WorkflowOperation.RUN_DCGM_DIAGNOSTIC},
+        diagnostic_output_dir=str(output_dir),
+        diagnostic_retention_seconds=3600,
+        diagnostic_max_archives=5,
+    )
+
+    removed = agent._cleanup_diagnostic_archives(now=NOW)
+
+    assert removed == [old.name], removed
+    assert newest.exists(), "the fresh quick diagnostic must survive"
+
+
+def test_diagnostic_retention_budgets_each_evidence_family(tmp_path) -> None:
+    """Quick diagnostics must not evict the bundle a support case waits on."""
+
+    output_dir = tmp_path / "diagnostics"
+    output_dir.mkdir()
+    bundle = output_dir / "gpu-diagnostic-keep.tar.gz"
+    bundle.write_bytes(b"archive")
+    quick = [output_dir / f"dcgm-quick-diagnostic-{index}.json" for index in range(3)]
+    for path in quick:
+        path.write_text("{}", encoding="utf-8")
+    for offset, path in enumerate((bundle, *quick)):
+        stamp = (NOW - timedelta(minutes=10 - offset)).timestamp()
+        os.utime(path, (stamp, stamp))
+    agent = node_action_executor(
+        tmp_path,
+        "family-retention.db",
+        allowed_operations={WorkflowOperation.RUN_DCGM_DIAGNOSTIC},
+        diagnostic_output_dir=str(output_dir),
+        diagnostic_retention_seconds=3600,
+        diagnostic_max_archives=2,
+    )
+
+    removed = agent._cleanup_diagnostic_archives(now=NOW)
+
+    assert bundle.exists(), "the only bundle must not be evicted by JSON files"
+    assert removed == [quick[0].name], removed
+
+
+def test_a_quick_diagnostic_sweeps_the_evidence_it_leaves_behind(tmp_path) -> None:
+    """Only a bundle collection ever ran the sweep, so quick diags never did.
+
+    A node whose only diagnostic operation is ``RUN_DCGM_DIAGNOSTIC`` -- the
+    common case, since it is the cheap first step of every XID plan -- would
+    keep every JSON forever even with the family now in the sweep.
+    """
+
+    output_dir = tmp_path / "diagnostics"
+    output_dir.mkdir()
+    stale_json = output_dir / "dcgm-quick-diagnostic-stale.json"
+    stale_json.write_text("{}", encoding="utf-8")
+    long_ago = (NOW - timedelta(days=3)).timestamp()
+    os.utime(stale_json, (long_ago, long_ago))
+    agent = node_action_executor(
+        tmp_path,
+        "quick-sweep.db",
+        allowed_operations={WorkflowOperation.RUN_DCGM_DIAGNOSTIC},
+        diagnostic_output_dir=str(output_dir),
+        diagnostic_retention_seconds=3600,
+        runner=lambda argv, **_: CompletedProcess(argv, 0, stdout="{}", stderr=""),
+        now=lambda: NOW,
+    )
+
+    result = agent.execute(envelope(command(WorkflowOperation.RUN_DCGM_DIAGNOSTIC)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert not stale_json.exists(), "the stale quick diagnostic must be swept"
+    fresh = result.details["evidence_ref"].removeprefix("file://")
+    assert Path(fresh).exists(), f"the evidence it just wrote must survive: {fresh}"

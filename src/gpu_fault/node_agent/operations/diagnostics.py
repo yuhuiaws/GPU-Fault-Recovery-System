@@ -25,6 +25,35 @@ from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
 
+FIELD_DIAGNOSTIC_FAILURE_PATTERN = re.compile(
+    r"\b(?:FAIL|FAILED|FAILURE|FATAL|ERROR)\b",
+    re.IGNORECASE,
+)
+
+# The phrases a *passing* Field Diagnostic uses to report a clean count. The
+# first alternative is the count ahead of the noun ("0 errors", "no failures");
+# the second is the count behind it, which is how NVIDIA's own tool writes it
+# ("Error count: 0", "NVLink error counters: 0", "ERROR: none detected") and
+# which used to fail every healthy GPU with "reported failure despite exit
+# status 0". Only a zero or "none" counts: "Error count: 5" is a failure.
+BENIGN_DIAGNOSTIC_COUNT_PATTERN = re.compile(
+    r"""
+      \b(?:0|no|none)\s+(?:errors?|failures?|faults?)
+        (?:\s+(?:detected|found|reported))?\b
+    | \b(?:errors?|failures?|faults?)
+        (?:\s+(?:count|counts|counters?))?
+        \s*[:=]\s*
+        (?:0+|none(?:\s+(?:detected|found|reported))?)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Every family of evidence this agent leaves in ``diagnostic_output_dir``.
+DIAGNOSTIC_EVIDENCE_PATTERNS = (
+    "gpu-diagnostic-*.tar.gz",
+    "dcgm-quick-diagnostic-*.json",
+)
+
 
 class DiagnosticOperationsMixin:
     # Attributes supplied by the composed concrete implementation.
@@ -184,19 +213,12 @@ class DiagnosticOperationsMixin:
         normalized = line.strip()
         if not normalized:
             return False
-        if re.search(
-            r"\b(?:0|no)\s+(?:errors?|failures?)\b",
-            normalized,
-            re.IGNORECASE,
-        ):
-            return False
-        return bool(
-            re.search(
-                r"\b(?:FAIL|FAILED|FAILURE|FATAL|ERROR)\b",
-                normalized,
-                re.IGNORECASE,
-            )
-        )
+        # Blank out the phrases that *report* a clean count and judge what is
+        # left. The old code suppressed the whole line on one benign phrase, so
+        # "Error count: 0 ... Overall Result: FAIL" would have passed once the
+        # counter spelling was understood.
+        remainder = BENIGN_DIAGNOSTIC_COUNT_PATTERN.sub(" ", normalized)
+        return bool(FIELD_DIAGNOSTIC_FAILURE_PATTERN.search(remainder))
 
     def _collect_diagnostic_bundle(self, command: NodeActionCommand) -> dict[str, Any]:
         self._cleanup_diagnostic_archives()
@@ -421,14 +443,30 @@ class DiagnosticOperationsMixin:
         return result
 
     def _cleanup_diagnostic_archives(self, now: datetime | None = None) -> list[str]:
+        """Prune every family of diagnostic evidence this agent writes.
+
+        The sweep used to glob only ``gpu-diagnostic-*.tar.gz``, so the JSON a
+        quick diagnostic writes for its evidence reference was never removed:
+        on a node that flaps XIDs those accumulate one per attempt in the same
+        0700 directory until the root filesystem fills, which takes kubelet
+        with it. Each family keeps its own count budget so a burst of quick
+        diagnostics cannot evict the bundle a support case is waiting on.
+        """
+
         if not self.diagnostic_output_dir.exists():
             return []
         timestamp = now or self.now()
         cutoff = (
             timestamp - timedelta(seconds=self.diagnostic_retention_seconds)
         ).timestamp()
+        removed: list[str] = []
+        for pattern in DIAGNOSTIC_EVIDENCE_PATTERNS:
+            removed.extend(self._prune_diagnostic_family(pattern, cutoff))
+        return removed
+
+    def _prune_diagnostic_family(self, pattern: str, cutoff: float) -> list[str]:
         archives = sorted(
-            self.diagnostic_output_dir.glob("gpu-diagnostic-*.tar.gz"),
+            self.diagnostic_output_dir.glob(pattern),
             key=lambda path: (
                 path.stat().st_mtime,
                 path.name,
@@ -510,6 +548,11 @@ class DiagnosticOperationsMixin:
             f"dcgm-quick-diagnostic-{evidence_key}.json"
         )
         self.diagnostic_output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Sweep before writing, the way ``_collect_diagnostic_bundle`` does: a
+        # node whose only diagnostic operation is the quick one would otherwise
+        # never run retention at all, and the sweep can never reach the file
+        # this call is about to produce.
+        self._cleanup_diagnostic_archives()
         output_path.write_text(output, encoding="utf-8", errors="replace")
         digest = hashlib.sha256(output_path.read_bytes()).hexdigest()
         evidence_ref = f"file://{output_path}"
