@@ -38,6 +38,102 @@ def test_recovery_outcome_alerts_cover_the_business_closed_loop() -> None:
         assert alert in alerts, f"recovery outcome alert is missing: {alert}"
 
 
+COMPLETION_WATCHER_ALERTS = {
+    # The 0/1 gauge for the routine attempt-state ConfigMap. Nothing on the
+    # delivery path reads that object, so its outage is invisible everywhere
+    # else; a restart inside the window re-derives attempts from live Pods and
+    # resolves a finished attempt's node as IDLE, which drops STOP_WORKLOADS
+    # from the reset plan.
+    "GpuFaultCompletionActiveStateUnavailable": (
+        "gpu_fault_completion_active_state_unavailable"
+    ),
+    # A failed write-ahead append no longer vetoes the POST, so this counter is
+    # the only trace that a delivered critical event was never buffered.
+    "GpuFaultCompletionOutboxAppendFailures": (
+        "gpu_fault_completion_outbox_append_failures_total"
+    ),
+}
+
+
+def test_the_completion_watcher_gauges_each_have_an_alert() -> None:
+    """Both families reached AMP with no rule reading them (data-plane review).
+
+    Each one reports a Completion Watcher ConfigMap that is refusing writes
+    while everything else stays green, so neither condition is reachable from
+    any other rule in the file.
+    """
+    alerts = {str(rule["alert"]) for rule in amp_rules()}
+
+    for alert, metric in COMPLETION_WATCHER_ALERTS.items():
+        assert alert in alerts, f"Completion Watcher alert is missing: {alert}"
+        assert metric in _expression(alert), (
+            f"{alert} must read {metric}: {_expression(alert)}"
+        )
+
+
+def test_the_completion_watcher_alerts_keep_the_grouping_labels() -> None:
+    """A label-less aggregation merges every control plane into one page.
+
+    Alertmanager groups on control_plane_cluster/region, so ``max(...)`` over
+    the whole fleet would name only the first control plane that trips.
+    """
+    for alert in COMPLETION_WATCHER_ALERTS:
+        assert "by (control_plane_cluster, region)" in _expression(alert), (
+            f"{alert} aggregates without the Alertmanager grouping labels: "
+            f"{_expression(alert)}"
+        )
+
+
+def test_the_completion_watcher_alerts_are_slow_warnings_with_a_card() -> None:
+    """15m is roughly fifteen of the watcher's own once-a-minute retries.
+
+    Long enough that a ConfigMap re-apply or a rollout clears by itself, and a
+    warning rather than a page because nothing is lost while the watcher stays
+    up: only a restart inside the window turns either gap into real damage.
+    """
+    for alert in COMPLETION_WATCHER_ALERTS:
+        rule = _rule(alert)
+        annotations = rule["annotations"]
+        assert isinstance(annotations, dict), f"{alert} has no annotations mapping"
+        assert rule["for"] == "15m", f"{alert} `for` is {rule['for']!r}, expected 15m"
+        assert rule["labels"] == {"severity": "warning"}, (
+            f"{alert} must be a warning, not {rule['labels']!r}"
+        )
+        expected = f"{MODULE.RUNBOOK_DOCUMENT}#{MODULE.markdown_anchor(alert)}"
+        assert annotations["runbook_url"] == expected, (
+            f"{alert} runbook anchor must be derived from its own name: "
+            f"{annotations['runbook_url']!r} != {expected!r}"
+        )
+
+
+def test_the_active_state_alert_is_a_state_test_not_a_threshold() -> None:
+    """The gauge is 0/1, so the rule fires on the state rather than on a count.
+
+    ``== 1`` also keeps the rule out of the Grafana threshold-line contract,
+    which only draws ``>``/``>=``/``<`` comparisons.
+    """
+    expression = _expression("GpuFaultCompletionActiveStateUnavailable")
+
+    assert expression == (
+        "max by (control_plane_cluster, region) "
+        "(gpu_fault_completion_active_state_unavailable) == 1"
+    ), f"unexpected expression shape: {expression}"
+
+
+def test_the_outbox_append_failure_alert_reads_a_windowed_increase() -> None:
+    """The counter only ever rises, so the alert has to read a window of it.
+
+    A bare ``> 0`` on the counter would stay firing for the life of the process
+    after one failure; ``increase(...[10m])`` resolves once appends recover.
+    """
+    expression = _expression("GpuFaultCompletionOutboxAppendFailures")
+
+    assert expression == (
+        "sum by (control_plane_cluster, region) "
+        "(increase(gpu_fault_completion_outbox_append_failures_total[10m])) > 0"
+    ), f"unexpected expression shape: {expression}"
+
+
 def defects_for(alert: str, annotations: dict[str, str]) -> list[str]:
     """Report only the defects about ``alert``.
 

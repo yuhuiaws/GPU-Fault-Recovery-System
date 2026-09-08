@@ -429,6 +429,45 @@ TELEMETRY_PIPELINE = Dashboard(
                 ),
             ),
         ),
+        Row(
+            "Completion Watcher",
+            (
+                Panel(
+                    "Completion attempt state unavailable",
+                    (
+                        Target(
+                            f"max {BY_CONTROL_PLANE} ("
+                            + series("gpu_fault_completion_active_state_unavailable")
+                            + ")",
+                            "{{control_plane_cluster}} {{region}}",
+                        ),
+                    ),
+                    kind="stat",
+                    description=(
+                        "1 while the routine attempt-state ConfigMap or the Role "
+                        "that names it is refusing. Delivery keeps working, so "
+                        "this is the only place the outage is visible."
+                    ),
+                ),
+                Panel(
+                    "Completion write-ahead append failures (10m increase)",
+                    (
+                        Target(
+                            increase_by_control_plane(
+                                "gpu_fault_completion_outbox_append_failures_total",
+                                "10m",
+                            ),
+                            "{{control_plane_cluster}} {{region}}",
+                        ),
+                    ),
+                    description=(
+                        "Each step is a critical completion event that was "
+                        "delivered without a write-ahead copy, so only a watcher "
+                        "restart turns it into a lost or replayed event."
+                    ),
+                ),
+            ),
+        ),
     ),
 )
 

@@ -17,6 +17,7 @@ from gpu_fault.completion_observation import (
     TERMINAL_ORIGIN_MISSING_TOMBSTONE,
     TERMINAL_ORIGIN_OBSERVED,
 )
+from gpu_fault.completion_outbox import CompletionOutboxFull
 from gpu_fault.models import Environment, TerminalEvent
 from gpu_fault.telemetry import (
     ATTEMPT_COVERAGE_PATH,
@@ -37,6 +38,16 @@ FINISHED_POD_PHASES = frozenset({"SUCCEEDED", "FAILED"})
 #: for the lifetime of the process; the oldest pair is dropped, so its next
 #: failure prints one more traceback and nothing is lost but a repeat.
 REPEATED_FAILURE_CAP = 1024
+#: Failures whose message states a measurement rather than only a cause.
+#: ``CompletionOutboxFull`` names the bytes it measured (``... exceeds its byte
+#: bound (13245 > 7000 bytes)``), and that number moves whenever any *other*
+#: attempt in the same document changes size -- a container restart is enough.
+#: Keying the log-once map on the text therefore reported a "new" failure on
+#: every pass, which is the storm this whole path exists to stop, so these are
+#: keyed on the exception type instead: one over-bound attempt is one problem
+#: however the measurement drifts. The DEBUG repeat still carries the current
+#: numbers, so the growth is visible to anyone who turns DEBUG on.
+MEASURED_FAILURES: tuple[type[BaseException], ...] = (CompletionOutboxFull,)
 
 
 @dataclass(frozen=True)
@@ -162,7 +173,9 @@ def log_attempt_failure(
 
     Keyed by ``action`` and the error text, not by the exception type: two
     malformed fields on the same attempt are two different problems, and the
-    same text is the same problem however many passes it survives.
+    same text is the same problem however many passes it survives. The
+    exceptions in ``MEASURED_FAILURES`` are keyed by type, because their text
+    embeds a measurement that moves without the problem changing.
     """
 
     seen = getattr(controller, "_reconcile_failures_logged", None)
@@ -172,7 +185,8 @@ def log_attempt_failure(
         seen = OrderedDict()
         controller._reconcile_failures_logged = seen
     description = f"{type(exc).__name__}: {exc}"
-    digest = hashlib.sha256(f"{action}/{description}".encode()).hexdigest()[:12]
+    identity = type(exc).__name__ if isinstance(exc, MEASURED_FAILURES) else description
+    digest = hashlib.sha256(f"{action}/{identity}".encode()).hexdigest()[:12]
     key = f"{attempt_id}/{digest}"
     if key in seen:
         seen.move_to_end(key)
@@ -357,9 +371,10 @@ def publish_attempt_observation(
     attempt_id: str,
 ) -> None:
     payload = observation.model_dump(mode="json")
-    # What is persisted is the compact record; what is posted is the payload.
-    # The control plane's contract must not change because the watcher stopped
-    # writing GPU UUIDs it can re-read from the Pod (F6).
+    # What is persisted is the compact record -- the spec plus each Pod's
+    # attribution identity, without the log tail and the other fields the next
+    # pass re-reads from a live Pod -- and what is posted is the whole payload.
+    # Shrinking the persisted copy must not shrink the control plane's (F6).
     record = attempt_state_record(payload)
     if observation.workload_phase in ACTIVE_PHASES:
         persist = getattr(controller.sink, "save_attempt_observation", None)

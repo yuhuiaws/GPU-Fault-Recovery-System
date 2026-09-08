@@ -118,6 +118,65 @@ groups:
             with GpuFaultControlPlaneMetricsMissing: both absent means the
             collector or the write path is down, this one alone means the
             self-telemetry reader or its keep filter changed.
+      # The Completion Watcher persists two ConfigMaps and only one of them is
+      # load-bearing at runtime: the write-ahead log carries critical events,
+      # while `gpu-fault-completion-watcher-outbox-active` carries the routine
+      # attempt state that a restart reads back. Because nothing on the
+      # delivery path touches the second one, a missing object or a Role that
+      # does not name it degrades in silence rather than crashing the watcher,
+      # and this gauge is the only report of it. The watcher re-probes the
+      # object once a minute, so `for: 15m` is roughly fifteen retries: long
+      # enough that a rollout or a ConfigMap re-apply passes unnoticed, short
+      # enough to reach an operator inside one shift. Warning, not critical:
+      # nothing is lost while the watcher stays up.
+      - alert: GpuFaultCompletionActiveStateUnavailable
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_completion_active_state_unavailable) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Completion Watcher attempt state is not being persisted
+          runbook_url: docs/管理员日常运维.md#gpufaultcompletionactivestateunavailable
+          description: >-
+            The routine attempt-state ConfigMap
+            (gpu-fault-completion-watcher-outbox-active), or the Role that names
+            it, is refusing with 404/403, so attempt state is not persisted.
+            Delivery and the write-ahead log are unaffected, but a watcher
+            restart in this window re-derives its attempts from live Pods only:
+            a fault on an attempt whose Pods are already gone then resolves the
+            node as IDLE instead of ACTIVE, and the reset plan built from that
+            would skip STOP_WORKLOADS. Apply
+            deploy/dataplane/completion-watcher.yaml -- both its ConfigMap and
+            its Role -- and nothing else; the watcher retries once a minute by
+            itself, so no restart is needed and the gauge clears on the first
+            call that succeeds.
+      # The write-ahead copy is what lets a critical completion event survive a
+      # watcher restart: buffered before the POST and cleared after it. A
+      # failed append no longer vetoes the POST, so the event is still
+      # delivered and this counter is the only trace that the log did not hold
+      # it. Any increase at all is a hole, hence `> 0` over a 10m window; the
+      # 15m `for` means one conflict during a rollout resolves by itself while
+      # a ConfigMap that is full or unwritable keeps the alert up. It is a
+      # warning because the loss needs a restart to become real.
+      - alert: GpuFaultCompletionOutboxAppendFailures
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_completion_outbox_append_failures_total[10m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Completion Watcher write-ahead appends are failing
+          runbook_url: docs/管理员日常运维.md#gpufaultcompletionoutboxappendfailures
+          description: >-
+            {{ $value }} critical completion event(s) in the last 10 minutes got
+            no write-ahead ConfigMap copy, so a restart of that watcher can lose
+            an event it never delivered or replay one it already did. Check the
+            outbox ConfigMap's size against the object ceiling and the watcher
+            Role's verbs on it before restarting anything: a restart is the one
+            action that turns this gap into an actual lost or duplicated event.
   - name: gpu-fault-control-plane-capacity
     rules:
       - alert: GpuFaultControlPlaneMetricsMissing

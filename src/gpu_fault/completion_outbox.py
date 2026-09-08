@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from gpu_fault.collectors.sinks import (
@@ -36,6 +37,11 @@ _MAX_LOGGED_APPEND_FAILURES = 1024
 #: Pods of routine state could fill it and the terminal event of a failing
 #: attempt could no longer be written ahead at all (F6).
 ACTIVE_STATE_SUFFIX = "-active"
+#: Key both objects use for attempt state: the one the WAL object carried
+#: before F6 split them, and the only key of ``<name>-active`` after it.
+ATTEMPT_STATE_KEY = "active-attempts.json"
+#: Key of the write-ahead log inside the WAL object.
+EVENT_LOG_KEY = "events.json"
 #: Statuses on ``<name>-active`` that mean "not there yet" rather than broken:
 #: 404 is the upgrade window before the manifest that adds the object, 403 the
 #: window before the Role that names it. Both are survivable -- attempt state is
@@ -221,6 +227,23 @@ def _remaining_depth(
     )
 
 
+def _observed_instant(record: dict[str, Any]) -> datetime | None:
+    """When ``record`` was observed, or ``None`` if it does not say.
+
+    Parsed rather than compared as text: pydantic renders a whole second as
+    ``...T10:00:00Z`` and anything else as ``...T10:00:00.500000Z``, and ``Z``
+    sorts *after* ``.``, so string order puts the earlier instant last. The
+    ``Z`` is spelled out for ``fromisoformat`` because Python before 3.11 does
+    not accept it.
+    """
+
+    text = str(record.get("observed_at") or "")
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _merge_legacy_attempt_state(
     legacy: dict[str, dict[str, Any]],
     current: dict[str, dict[str, Any]],
@@ -230,20 +253,106 @@ def _merge_legacy_attempt_state(
     "The object that already holds it wins" is wrong in one direction and "the
     legacy object wins" in the other: the migration can run again after a drop
     that failed, and by then the live process may have written a fresher record
-    for the same attempt. Both documents are ``model_dump(mode="json")``
-    output, so ``observed_at`` is an ISO-8601 UTC string and comparing the
-    strings compares the instants. A record without one loses, because every
-    record this release writes has one.
+    for the same attempt. A record whose timestamp cannot be read loses to one
+    that has a readable timestamp, and to nothing else.
     """
 
     merged = dict(current)
     for key, record in legacy.items():
         existing = merged.get(key)
-        if existing is None or str(record.get("observed_at") or "") > str(
-            existing.get("observed_at") or ""
-        ):
+        if existing is None:
+            merged[key] = record
+            continue
+        candidate = _observed_instant(record)
+        held = _observed_instant(existing)
+        if candidate is not None and (held is None or candidate > held):
             merged[key] = record
     return merged
+
+
+def _event_records(data: dict[str, str]) -> list[dict[str, Any]]:
+    """The write-ahead log of the WAL object, validated."""
+
+    document = json.loads(data.get(EVENT_LOG_KEY, "[]"))
+    if not isinstance(document, list) or any(
+        not isinstance(item, dict) for item in document
+    ):
+        raise RuntimeError("completion outbox ConfigMap contains invalid JSON")
+    return document
+
+
+def _buffered_record(
+    key: str,
+    path: str,
+    payload: dict[str, Any],
+    buffered_at: Any,
+) -> dict[str, Any]:
+    """A fresh write-ahead record: never delivered, never quarantined."""
+
+    return {
+        "key": key,
+        "path": path,
+        "payload": payload,
+        "buffered_at": buffered_at,
+        "attempts": 0,
+        "quarantined": False,
+    }
+
+
+def _record_field_update(
+    key: str, fields: dict[str, Any]
+) -> Callable[[list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Mutation that sets ``fields`` on the record with ``key``, if it is there."""
+
+    def update(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {**item, **fields} if item.get("key") == key else item for item in records
+        ]
+
+    return update
+
+
+def _attempt_records(data: dict[str, str]) -> dict[str, dict[str, Any]]:
+    """The attempt-state document of either object, validated."""
+
+    document = json.loads(data.get(ATTEMPT_STATE_KEY, "{}"))
+    if not isinstance(document, dict) or any(
+        not isinstance(key, str) or not isinstance(item, dict)
+        for key, item in document.items()
+    ):
+        raise RuntimeError("completion attempt state contains invalid JSON")
+    return document
+
+
+def _without_attempt_state(current: dict[str, str]) -> dict[str, str]:
+    """The WAL document with the migrated attempt-state key dropped."""
+
+    if ATTEMPT_STATE_KEY not in current:
+        return current
+    result = dict(current)
+    result.pop(ATTEMPT_STATE_KEY)
+    return result
+
+
+def _legacy_adoption(
+    legacy: dict[str, dict[str, Any]],
+) -> Callable[[dict[str, str]], dict[str, str]]:
+    """Mutation that merges ``legacy`` into ``<name>-active``."""
+
+    def adopt(current: dict[str, str]) -> dict[str, str]:
+        attempts = _merge_legacy_attempt_state(legacy, _attempt_records(current))
+        document = _attempt_document(attempts)
+        if document == current.get(ATTEMPT_STATE_KEY):
+            return current
+        result = dict(current)
+        result[ATTEMPT_STATE_KEY] = document
+        return result
+
+    return adopt
+
+
+def _sorted_records(attempts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(attempts[key]) for key in sorted(attempts)]
 
 
 def _attempt_document(attempts: dict[str, dict[str, Any]]) -> str:
@@ -331,6 +440,26 @@ class ActiveStateHealth:
             )
         return True
 
+    def owes_a_probe(self) -> bool:
+        """``True`` when the window has expired and nothing has probed yet.
+
+        The gauge only comes back down when a call succeeds, and on an idle
+        cluster no attempt-state call is ever made: without this the watcher
+        reports the outage for ever after the operator fixed it.
+        """
+
+        return bool(self.unavailable) and not self.degraded()
+
+    def defer(self) -> None:
+        """Hold the next probe for one window, leaving the report as it is.
+
+        For a probe that failed for a reason that is not "the object is not
+        there": the outage stands, and retrying it once a minute rather than
+        once a pass is what keeps a broken API server from being a log storm.
+        """
+
+        self._retry_at = self.now() + self.retry_seconds
+
     def usable(self) -> None:
         """Record that the object answered, so the gauge comes back down."""
 
@@ -358,8 +487,8 @@ class KubernetesCompletionOutbox:
     error chained onto it.
     """
 
-    DATA_KEY = "events.json"
-    ATTEMPTS_KEY = "active-attempts.json"
+    DATA_KEY = EVENT_LOG_KEY
+    ATTEMPTS_KEY = ATTEMPT_STATE_KEY
 
     def __init__(
         self,
@@ -439,32 +568,19 @@ class KubernetesCompletionOutbox:
         # resurrect an attempt that has since finished (I2).
         self._legacy_drop_pending = False
         self._legacy_drop_failure_logged = False
-        self._active_state = ActiveStateHealth(namespace, self.active_name, self.now)
+        # ``monotonic``, not ``now``: a wall clock that steps backwards (NTP, a
+        # suspended node) would hold the probe for as long as the step.
+        self._active_state = ActiveStateHealth(
+            namespace, self.active_name, self.monotonic
+        )
 
     def _read_data(self, name: str) -> tuple[dict[str, str], str | None]:
         value = self.core_api.read_namespaced_config_map(name, self.namespace)
         return _data(value), _resource_version(value)
 
-    def _events(self, data: dict[str, str]) -> list[dict[str, Any]]:
-        document = json.loads(data.get(self.DATA_KEY, "[]"))
-        if not isinstance(document, list) or any(
-            not isinstance(item, dict) for item in document
-        ):
-            raise RuntimeError("completion outbox ConfigMap contains invalid JSON")
-        return document
-
-    def _attempts(self, data: dict[str, str]) -> dict[str, dict[str, Any]]:
-        document = json.loads(data.get(self.ATTEMPTS_KEY, "{}"))
-        if not isinstance(document, dict) or any(
-            not isinstance(key, str) or not isinstance(item, dict)
-            for key, item in document.items()
-        ):
-            raise RuntimeError("completion attempt state contains invalid JSON")
-        return document
-
     def _read(self) -> tuple[list[dict[str, Any]], str | None]:
         data, resource_version = self._read_data(self.name)
-        records = self._events(data)
+        records = _event_records(data)
         self._note_depth(records)
         return records, resource_version
 
@@ -486,7 +602,7 @@ class KubernetesCompletionOutbox:
         # lives in its own object (F6), where the bound that matters is the
         # 1 MiB one every ConfigMap has: capping it at 256 attempts would refuse
         # to remember the 257th running job on a large cluster for no reason.
-        if len(self._events(data)) > self.max_records:
+        if len(_event_records(data)) > self.max_records:
             raise CompletionOutboxFull(
                 f"completion outbox exceeds its record bound of {self.max_records}"
             )
@@ -555,7 +671,7 @@ class KubernetesCompletionOutbox:
         written: list[dict[str, Any]] = []
 
         def update(data: dict[str, str]) -> dict[str, str]:
-            records = function(self._events(data))
+            records = function(_event_records(data))
             written[:] = records
             document = json.dumps(
                 records,
@@ -603,7 +719,7 @@ class KubernetesCompletionOutbox:
             if existing is not None:
                 deliver_live = bool(existing.get("quarantined", False))
                 return records
-            return [*records, self._record(key, path, buffered)]
+            return [*records, _buffered_record(key, path, buffered, self.now())]
 
         self._mutate(append)
         return deliver_live
@@ -654,22 +770,12 @@ class KubernetesCompletionOutbox:
             exc,
         )
 
-    def _record(self, key: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "key": key,
-            "path": path,
-            "payload": payload,
-            "buffered_at": self.now(),
-            "attempts": 0,
-            "quarantined": False,
-        }
-
     def _upsert_latest(self, path: str, payload: dict[str, Any]) -> str:
         key = _record_key(path, payload)
 
         def upsert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             retained = [item for item in records if item.get("key") != key]
-            return [*retained, self._record(key, path, payload)]
+            return [*retained, _buffered_record(key, path, payload, self.now())]
 
         self._mutate(upsert)
         return key
@@ -680,13 +786,7 @@ class KubernetesCompletionOutbox:
         )
 
     def _update(self, key: str, **fields: Any) -> None:
-        def update(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            return [
-                {**item, **fields} if item.get("key") == key else item
-                for item in records
-            ]
-
-        self._mutate(update)
+        self._mutate(_record_field_update(key, fields))
 
     def _reclaim_delivered(self, key: str, removal_error: BaseException) -> None:
         """Hand a delivered-but-unremovable record back to ``replay``.
@@ -731,15 +831,8 @@ class KubernetesCompletionOutbox:
         which is the state this arrived in, and the next write tries again.
         """
 
-        def drop(current: dict[str, str]) -> dict[str, str]:
-            if self.ATTEMPTS_KEY not in current:
-                return current
-            result = dict(current)
-            result.pop(self.ATTEMPTS_KEY)
-            return result
-
         try:
-            self._mutate_data(self.name, drop)
+            self._mutate_data(self.name, _without_attempt_state)
         except Exception as exc:
             if self._legacy_drop_failure_logged:
                 LOGGER.debug(
@@ -791,20 +884,11 @@ class KubernetesCompletionOutbox:
         self._legacy_state_migrated = True
         try:
             data, _resource_version = self._read_data(self.name)
-            legacy = self._attempts(data)
+            legacy = _attempt_records(data)
             if not legacy:
                 return
 
-            def adopt(current: dict[str, str]) -> dict[str, str]:
-                attempts = _merge_legacy_attempt_state(legacy, self._attempts(current))
-                document = _attempt_document(attempts)
-                if document == current.get(self.ATTEMPTS_KEY):
-                    return current
-                result = dict(current)
-                result[self.ATTEMPTS_KEY] = document
-                return result
-
-            self._mutate_data(self.active_name, adopt)
+            self._mutate_data(self.active_name, _legacy_adoption(legacy))
             self._legacy_drop_pending = True
             LOGGER.info(
                 "migrated %d persisted attempt observations from %s to %s",
@@ -825,22 +909,65 @@ class KubernetesCompletionOutbox:
         # readable from either object, so an owed drop is a repeat, not a loss.
         self._retry_legacy_drop()
 
+    def probe_active_state(self) -> None:
+        """Spend the one GET a recovered ``<name>-active`` is owed (I1).
+
+        Called from the top of every reconcile pass, because ``usable()`` is
+        only reached from a save/remove/load and an idle cluster makes none of
+        those: the operator applied the manifest and the gauge stayed at 1.
+        """
+
+        if not self._active_state.owes_a_probe():
+            return
+        try:
+            self.load_attempt_observations()
+        except Exception as exc:
+            self._active_state.defer()
+            LOGGER.warning(
+                "the owed probe of %s failed (%s: %s); retrying in one window",
+                self.active_name,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _degraded_attempt_observations(self) -> list[dict[str, Any]]:
+        """What a restart can still restore while ``<name>-active`` refuses.
+
+        A release that upgrades into a cluster whose new object (or Role) is not
+        applied yet has the previous release's records right there in the WAL
+        object, unmigrated. Returning nothing threw away the restart memory
+        this whole path exists for; they are read, not dropped, so the
+        migration still owns moving them.
+        """
+
+        try:
+            attempts = _attempt_records(self._read_data(self.name)[0])
+        except Exception as exc:
+            LOGGER.warning(
+                "cannot read the legacy attempt state from %s either (%s: %s)",
+                self.name,
+                type(exc).__name__,
+                exc,
+            )
+            return []
+        return _sorted_records(attempts)
+
     def load_attempt_observations(self) -> list[dict[str, Any]]:
         self._migrate_legacy_attempt_state()
         if self._active_state.degraded():
-            return []
+            return self._degraded_attempt_observations()
         try:
             data, _resource_version = self._read_data(self.active_name)
         except Exception as exc:
             if not self._active_state.refused(exc):
                 raise
-            return []
+            return self._degraded_attempt_observations()
         self._active_state.usable()
-        attempts = self._attempts(data)
+        attempts = _attempt_records(data)
         self._attempt_digests = {
             key: _attempt_digest(payload) for key, payload in attempts.items()
         }
-        return [dict(attempts[key]) for key in sorted(attempts)]
+        return _sorted_records(attempts)
 
     def save_attempt_observation(self, payload: dict[str, Any]) -> bool:
         key = _attempt_key(payload)
@@ -851,8 +978,17 @@ class KubernetesCompletionOutbox:
             return False
 
         def update(data: dict[str, str]) -> dict[str, str]:
-            attempts = self._attempts(data)
-            attempts[key] = dict(payload)
+            attempts = _attempt_records(data)
+            record = dict(payload)
+            if attempts.get(key) == record:
+                # The digest cache is an optimisation, not the guard: it is
+                # empty after a restart, after a migration and after every
+                # recovery from a degraded object, and ``dict.update`` always
+                # returns a new document, so the unchanged-mutation shortcut in
+                # ``_mutate_data`` never fired. One pass then rewrote the whole
+                # document once per attempt -- 125 attempts of ~830 KB each.
+                return data
+            attempts[key] = record
             result = dict(data)
             result[self.ATTEMPTS_KEY] = _attempt_document(attempts)
             return result
@@ -873,7 +1009,7 @@ class KubernetesCompletionOutbox:
             return
 
         def update(data: dict[str, str]) -> dict[str, str]:
-            attempts = self._attempts(data)
+            attempts = _attempt_records(data)
             if key not in attempts:
                 return data
             attempts.pop(key)
@@ -1159,9 +1295,18 @@ def completion_sink_from_environment(core_api: Any) -> KubernetesCompletionOutbo
 
 def replay_completion_outbox(sink: Any, logger: logging.Logger) -> None:
     replay = getattr(sink, "replay", None)
-    if replay is None:
+    if replay is not None:
+        try:
+            replay()
+        except Exception:
+            logger.exception("cannot replay Completion Watcher outbox")
+    # The same "top of every pass" hook pays for the one probe a recovered
+    # attempt-state object is owed: an idle cluster saves no attempt state, so
+    # nothing else would ever notice that the manifest was applied (I1).
+    probe = getattr(sink, "probe_active_state", None)
+    if probe is None:
         return
     try:
-        replay()
+        probe()
     except Exception:
-        logger.exception("cannot replay Completion Watcher outbox")
+        logger.exception("cannot probe the Completion Watcher attempt state")

@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from gpu_fault.completion_outbox import CompletionOutboxFull, KubernetesCompletionOutbox
+from gpu_fault.completion_outbox import (
+    CompletionOutboxFull,
+    KubernetesCompletionOutbox,
+    replay_completion_outbox,
+)
 
 
 OUTBOX_NAME = "gpu-fault-completion-watcher-outbox"
@@ -712,16 +716,18 @@ class UnavailableActiveState(ConfigMapCore):
     def __init__(self, status: int = 404) -> None:
         super().__init__()
         self.status = status
+        #: Cleared by a test that applies the manifest mid-run.
+        self.refusing = True
 
     def _refuse(self, name):
-        if name != ACTIVE_NAME:
+        if name != ACTIVE_NAME or not self.refusing:
             return
         error = RuntimeError(f"configmaps {name} is refused")
         error.status = self.status
         raise error
 
     def read_namespaced_config_map(self, name, namespace):
-        if name == ACTIVE_NAME:
+        if name == ACTIVE_NAME and self.refusing:
             # Recorded before it is refused: a GET the API server rejects still
             # costs the round trip this test is counting.
             self.reads.append(name)
@@ -743,7 +749,9 @@ def test_a_missing_active_state_is_probed_once_per_window() -> None:
 
     core = UnavailableActiveState()
     clock = [1_000.0]
-    outbox = KubernetesCompletionOutbox(core, RecordingSink(), now=lambda: clock[0])
+    outbox = KubernetesCompletionOutbox(
+        core, RecordingSink(), monotonic=lambda: clock[0]
+    )
 
     assert outbox.load_attempt_observations() == [], (
         "a missing active state must degrade, not raise"
@@ -846,4 +854,169 @@ def test_a_legacy_drop_that_failed_is_retried_before_it_can_resurrect() -> None:
     assert restarted.load_attempt_observations() == [], (
         "a finished attempt must not come back from the WAL object: "
         f"{restarted.load_attempt_observations()}"
+    )
+
+
+def test_a_migration_keeps_the_newer_observation_not_the_higher_string() -> None:
+    """The merge compares instants; ISO-8601 text does not sort as time.
+
+    Pydantic renders a whole second as ``...T10:00:00Z`` and every other
+    instant as ``...T10:00:00.500000Z``, and ``Z`` sorts after ``.``. So the
+    string comparison the adopt used ranked the *earlier* whole-second record
+    above the fresher one it was supposed to lose to, and a repeated migration
+    replaced a live record with a stale copy of itself.
+    """
+
+    core = ConfigMapCore()
+    key = "cluster-a/attempt-a"
+    stale = {
+        "cluster_id": "cluster-a",
+        "attempt_id": "attempt-a",
+        "workload_phase": "RUNNING",
+        "observed_at": "2026-09-08T10:00:00Z",
+    }
+    fresher = {
+        **stale,
+        "workload_phase": "STOPPED",
+        "observed_at": "2026-09-08T10:00:00.500000Z",
+    }
+    core.objects[OUTBOX_NAME]["active-attempts.json"] = json.dumps({key: stale})
+    core.objects[ACTIVE_NAME]["active-attempts.json"] = json.dumps({key: fresher})
+    outbox = KubernetesCompletionOutbox(core, RecordingSink())
+
+    assert outbox.load_attempt_observations() == [fresher], (
+        "the half-second-later record must survive the migration, got "
+        f"{outbox.load_attempt_observations()}"
+    )
+
+
+def test_a_recovered_active_state_is_probed_from_the_reconcile_top() -> None:
+    """The gauge has to come back down on a cluster that saves nothing (I1).
+
+    ``usable()`` is only reached from a load/save/remove, and an idle cluster
+    makes none of them: the operator applied the manifest and the watcher went
+    on reporting the outage for ever. The probe is spent where every pass
+    already goes, and at most once per retry window.
+    """
+
+    core = UnavailableActiveState()
+    clock = [1_000.0]
+    logger = logging.getLogger("test.probe")
+    outbox = KubernetesCompletionOutbox(
+        core, RecordingSink(), monotonic=lambda: clock[0]
+    )
+
+    assert outbox.load_attempt_observations() == [], (
+        "a missing active state must degrade, not raise"
+    )
+    core.refusing = False
+    core.reads.clear()
+    replay_completion_outbox(outbox, logger)
+    assert outbox.active_state_unavailable == 1, (
+        "the retry window must be respected even once the object is there"
+    )
+    probes = [name for name in core.reads if name == ACTIVE_NAME]
+    assert probes == [], f"no probe is owed inside the window: {core.reads}"
+
+    clock[0] += 61.0
+    replay_completion_outbox(outbox, logger)
+
+    assert outbox.active_state_unavailable == 0, (
+        "an applied object must clear the gauge on the next pass, got "
+        f"{outbox.active_state_unavailable}"
+    )
+    probes = [name for name in core.reads if name == ACTIVE_NAME]
+    assert probes == [ACTIVE_NAME], (
+        f"the recovery must cost exactly one GET: {core.reads}"
+    )
+    replay_completion_outbox(outbox, logger)
+    probes = [name for name in core.reads if name == ACTIVE_NAME]
+    assert probes == [ACTIVE_NAME], (
+        f"a healthy object must not be probed at all: {core.reads}"
+    )
+
+
+def test_a_degraded_active_state_still_restores_the_legacy_copy() -> None:
+    """An upgrade restart keeps its memory while ``<name>-active`` refuses.
+
+    The records of the previous release are in the WAL object, unmigrated and
+    perfectly readable; returning nothing threw away exactly the restart memory
+    that decides whether a fault on an attempt whose Pods are gone reads ACTIVE
+    or IDLE. They are read, not dropped: the migration still owns moving them.
+    """
+
+    core = UnavailableActiveState(403)
+    legacy = {
+        "cluster_id": "cluster-a",
+        "attempt_id": "attempt-legacy",
+        "workload_phase": "RUNNING",
+        "observed_at": "2026-09-08T10:00:00Z",
+    }
+    core.objects[OUTBOX_NAME]["active-attempts.json"] = json.dumps(
+        {"cluster-a/attempt-legacy": legacy}
+    )
+    outbox = KubernetesCompletionOutbox(core, RecordingSink())
+
+    restored = outbox.load_attempt_observations()
+
+    assert restored == [legacy], (
+        f"the legacy copy must be restored while the new object refuses: {restored}"
+    )
+    assert "active-attempts.json" in core.objects[OUTBOX_NAME], (
+        "the legacy copy must stay where the migration can still find it: "
+        f"{core.objects[OUTBOX_NAME]}"
+    )
+
+
+def test_a_recovered_active_state_does_not_rewrite_unchanged_records() -> None:
+    """A recovery must not cost one whole-document PUT per attempt.
+
+    ``_attempt_digests`` is empty after a restart, after a migration and after
+    every recovery, and the mutation always returned a new dict, so the
+    unchanged-mutation shortcut in ``_mutate_data`` never fired: the first pass
+    after a recovery rewrote the whole attempt-state document once per attempt
+    -- 125 attempts of ~830 KB is ~100 MB of writes in one pass, against an
+    object nothing in it had changed.
+    """
+
+    core = UnavailableActiveState()
+    clock = [1_000.0]
+    records = [
+        {
+            "cluster_id": "cluster-a",
+            "attempt_id": f"attempt-{index}",
+            "workload_phase": "RUNNING",
+            "observed_at": "2026-09-08T10:00:00Z",
+        }
+        for index in range(5)
+    ]
+    core.objects[ACTIVE_NAME]["active-attempts.json"] = json.dumps(
+        {f"cluster-a/{record['attempt_id']}": record for record in records}
+    )
+    outbox = KubernetesCompletionOutbox(
+        core, RecordingSink(), monotonic=lambda: clock[0]
+    )
+    assert outbox.load_attempt_observations() == [], (
+        "this test needs the object to have refused first"
+    )
+
+    core.refusing = False
+    clock[0] += 61.0
+    version = core.versions[ACTIVE_NAME]
+    for record in records:
+        outbox.save_attempt_observation(record)
+
+    assert core.versions[ACTIVE_NAME] == version, (
+        "a record the object already holds must not be written again, got "
+        f"{core.versions[ACTIVE_NAME] - version} whole-document writes"
+    )
+    assert outbox.active_state_unavailable == 0, (
+        "the first successful write must clear the gauge, got "
+        f"{outbox.active_state_unavailable}"
+    )
+    changed = {**records[0], "workload_phase": "STOPPED"}
+    outbox.save_attempt_observation(changed)
+    assert core.versions[ACTIVE_NAME] == version + 1, (
+        "a record that did change must still be written once, got "
+        f"{core.versions[ACTIVE_NAME] - version} writes"
     )

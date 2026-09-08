@@ -2,16 +2,23 @@
 
 The Completion Watcher keeps one record per running attempt in a ConfigMap so a
 restart does not lose the attempts it was watching. The record used to be the
-whole published observation -- every container with its GPU UUIDs, container id
-and cgroup path, ~1 KB per rank -- in the same ConfigMap as the critical
-write-ahead log, so a large fleet filled the object and the terminal event of a
-failing attempt could no longer be written ahead at all.
+whole published observation -- ~1 KB per rank, log tail and all -- in the same
+ConfigMap as the critical write-ahead log, so a large fleet filled the object
+and the terminal event of a failing attempt could no longer be written ahead at
+all. It is now the spec plus each Pod's identity, in its own object.
+
+What that identity has to include is the subject of the C1 case below: the GPU
+UUIDs, the container id, the cgroup path and the host pid are how a fault is
+attributed to a workload, so dropping them from the record made a restored
+attempt whose Pods are gone resolve as IDLE. What is dropped is the log
+snapshot, the restart count, the exit signal and the fabric partition.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -19,7 +26,7 @@ from gpu_fault.completion_attempt_state import active_pass_counts
 from gpu_fault.completion_attempt_store import POD_FIELDS, PODS_KEY, SPEC_FIELDS
 from gpu_fault.completion_controller import KubernetesCompletionController
 from gpu_fault.completion_metrics_server import render_completion_metrics
-from gpu_fault.completion_outbox import CompletionOutboxFull, KubernetesCompletionOutbox
+from gpu_fault.completion_outbox import KubernetesCompletionOutbox
 from gpu_fault.models import Environment
 from gpu_fault.telemetry import WorkloadContext, WorkloadTopologyService
 from gpu_fault.watcher import AttemptObservation
@@ -54,10 +61,19 @@ def training_pod(attempt_id: str, rank: int) -> dict:
     return item
 
 
-def watcher(core: FakeCoreApi, sink, clock) -> KubernetesCompletionController:
+def watcher(
+    core: FakeCoreApi, sink, clock, *, max_bytes: int = 900_000, monotonic=None
+) -> KubernetesCompletionController:
+    outbox = (
+        KubernetesCompletionOutbox(core, sink, max_bytes=max_bytes)
+        if monotonic is None
+        else KubernetesCompletionOutbox(
+            core, sink, max_bytes=max_bytes, monotonic=monotonic
+        )
+    )
     return KubernetesCompletionController(
         core,
-        KubernetesCompletionOutbox(core, sink),
+        outbox,
         cluster_id="hp-cluster",
         environment=Environment.HYPERPOD_EKS,
         cleanup_timeout_seconds=30,
@@ -170,10 +186,13 @@ def test_a_restored_attempt_posts_the_same_payload_as_before_the_restart() -> No
 def test_the_persisted_record_holds_the_spec_and_pod_identity_only() -> None:
     """The bytes that go into the ConfigMap are the ones a restart needs.
 
-    Everything else -- the GPU UUIDs, the container id, the cgroup path, the log
-    snapshot, the restart count -- is re-read from the live Pod on the very next
-    pass, and persisting it both filled the object and rewrote the whole document
-    every time one of those changed.
+    The Pod's attribution identity -- its GPU UUIDs, container id, cgroup path
+    and host pid -- is part of that, because a restart whose Pods are gone can
+    only republish what it persisted and a fault is attributed by exactly those
+    fields (C1). What is left out is what the next pass re-reads from a live Pod
+    and no fault is resolved by: the log snapshot, the restart count (which
+    rewrote the whole document every time a container restarted), the exit
+    signal and the fabric partition.
     """
 
     core = FakeCoreApi([training_pod("train-a1", rank) for rank in range(8)])
@@ -192,9 +211,24 @@ def test_the_persisted_record_holds_the_spec_and_pod_identity_only() -> None:
             f"nothing outside Pod identity may be persisted: {pod_record}"
         )
     document = core.config_map_data[ACTIVE_KEY]
-    for field in ("gpu_uuids", "cgroup_path", "container_id", "restart_count"):
+    for field in ("restart_count", "workload_log_snapshot", "signal"):
         assert field not in document, (
             f"{field} is re-read from the Pod and must not be persisted: {document}"
+        )
+    fields = {field for _key, field in POD_FIELDS}
+    for field in ("gpu_uuids", "container_id", "cgroup_path", "host_pid"):
+        assert field in fields, (
+            f"{field} is how a fault is attributed and must be persisted: {fields}"
+        )
+    assert GPU_UUIDS[0] in document, (
+        "the persisted record must carry the GPU UUIDs a fault names, not just "
+        f"a field called after them: {document[:200]}"
+    )
+    identity = record[PODS_KEY][0]
+    persisted = {field for key, field in POD_FIELDS if key in identity}
+    for field in ("gpu_uuids", "container_id", "cgroup_path"):
+        assert field in persisted, (
+            f"the fixture's Pod reports {field}, so the record must hold it: {identity}"
         )
 
 
@@ -292,6 +326,13 @@ def refuse_active_state(core: FakeCoreApi, status: int) -> None:
         return original(name, namespace)
 
     core.read_namespaced_config_map = read
+    core.refused_read = original
+
+
+def restore_active_state(core: FakeCoreApi) -> None:
+    """Apply the manifest: the object answers again from now on."""
+
+    core.read_namespaced_config_map = core.refused_read
 
 
 def test_a_refused_active_state_is_a_gauge_the_watcher_exports() -> None:
@@ -334,24 +375,89 @@ def test_an_unpersistable_attempt_is_reported_once_not_once_per_pass(caplog) -> 
     bound and the caller swallows it, so the only cost was the traceback -- once
     per over-bound attempt per reconcile pass, which is the same log storm F9
     exists to stop.
+
+    The real exception names the measurement (``... exceeds its byte bound
+    (13245 > 7000 bytes)``), and that number moves whenever any *other* attempt
+    in the same document changes size. Keying the already-reported set on the
+    message text therefore reported a "new" failure on every pass, which is why
+    the bound here is the real one and the attempt that fits keeps growing.
     """
 
-    core = FakeCoreApi([training_pod("train-a1", rank) for rank in range(8)])
-    subject = watcher(core, FakeSink(), Clock())
+    clock = Clock()
+    fitting = [training_pod("train-a1", rank) for rank in range(2)]
+    over_bound = [training_pod("train-b2", rank) for rank in range(2)]
+    probe = FakeCoreApi(deepcopy(fitting))
+    watcher(probe, FakeSink(), Clock()).run_once()
+    # A bound the attempt that fits stays inside as it grows, and the second
+    # attempt cannot possibly reach.
+    fits = len(ACTIVE_KEY.encode()) + len(probe.config_map_data[ACTIVE_KEY].encode())
+    core = FakeCoreApi(deepcopy(fitting) + deepcopy(over_bound))
+    sink = FakeSink()
+    subject = watcher(core, sink, clock, max_bytes=fits + 120)
 
-    def full(_record):
-        raise CompletionOutboxFull("active attempt state exceeds its byte bound")
-
-    subject.sink.save_attempt_observation = full
     with caplog.at_level(logging.DEBUG, logger="gpu_fault.completion_attempt_state"):
         for _ in range(3):
             subject.run_once()
+            for item in core.pods:
+                if item["metadata"]["labels"]["gpu-fault.io/attempt-id"] == "train-a1":
+                    # One byte more of cgroup path per pass: the document the
+                    # over-bound attempt is measured against is never the same
+                    # size twice, which is what the live cluster does too.
+                    item["metadata"]["annotations"]["gpu-fault.io/cgroup-path"] += "0"
 
-    levels = [
-        record.levelname
+    reported = [
+        record
         for record in caplog.records
         if "persist the active state of" in record.getMessage()
     ]
+    levels = [record.levelname for record in reported]
     assert levels == ["ERROR", "DEBUG", "DEBUG"], (
-        f"one ERROR then DEBUG per repetition, got {levels}"
+        f"one ERROR then DEBUG per repetition, got {levels}: "
+        f"{[record.getMessage() for record in reported]}"
+    )
+    repeats = [
+        record.getMessage() for record in reported if record.levelname == "DEBUG"
+    ]
+    assert repeats[0] != repeats[1], (
+        "this test only proves anything while the reported size keeps moving: "
+        f"{repeats}"
+    )
+    persisted = json.loads(core.config_map_data[ACTIVE_KEY])
+    assert list(persisted) == ["hp-cluster/train-a1"], (
+        f"the attempt that fits must still be persisted: {list(persisted)}"
+    )
+    posted = {
+        payload["attempt_id"]
+        for path, payload in sink.posts
+        if path == "/v1/workload-observations"
+    }
+    assert posted == {"train-a1", "train-b2"}, (
+        f"delivery must be unaffected by the refused record: {sorted(posted)}"
+    )
+
+
+def test_a_recovered_active_state_clears_the_gauge_on_an_idle_pass() -> None:
+    """The watcher itself has to notice that the manifest was applied (I1).
+
+    Nothing but a load/save/remove clears the gauge, and a cluster with no
+    managed Pods makes none of them: the operator applied
+    ``deploy/dataplane/completion-watcher.yaml`` and ``/metrics`` went on
+    reporting the outage until someone restarted the watcher.
+    """
+
+    core = FakeCoreApi([])
+    monotonic = [1_000.0]
+    refuse_active_state(core, 404)
+    subject = watcher(core, FakeSink(), Clock(), monotonic=lambda: monotonic[0])
+    assert subject.active_state_unavailable == 1, (
+        "this test needs the attempt-state object to be refusing at start-up"
+    )
+
+    restore_active_state(core)
+    monotonic[0] += 61.0
+    subject.run_once()
+
+    assert subject.active_state_unavailable == 0, (
+        "an idle pass after the object was applied must clear the gauge, got "
+        f"{subject.active_state_unavailable}"
     )
