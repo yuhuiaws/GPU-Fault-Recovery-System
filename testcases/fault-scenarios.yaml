@@ -4207,7 +4207,13 @@ test_cases:
   - 清理后热备节点的三项注解与 cordon 状态逐项等于声明基线，spare 标签与 taint 不变；其他 GPU 节点调度状态与基线相同；CloudTrail provider 变更动词集合为空
   - 预置门禁：executor 必须 GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true 且 breadcrumb 含该计数器，否则拒绝执行（这是部署事实，不是用例缺陷）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 3a83007748ea571fdd9497f3ac2d8a33ce6cbaab7f166abc6cd1efbd99764e2f
+      components:
+        control_plane: c061dde1320cc50fe7e5a620ad44bcb298396a9cc4d4fcd1c17af88ad525be25
+        executor: 4439a6a2d010b51e13108dec8e8af5c52ca121d65c62e8f8ad14ed811ef6b78b
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-022
   related_pytest: tests/regional/test_destr022_spare_reservation_reclaim.py::test_the_counter_verdict_requires_the_increment_only_on_a_rewritten_breadcrumb
