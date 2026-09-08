@@ -8,6 +8,7 @@ from ._support import (
     NodeActionStatus,
     Path,
     ServiceRunner,
+    TimeoutExpired,
     WorkflowOperation,
     command,
     envelope,
@@ -436,7 +437,7 @@ def test_second_command_id_cannot_reset_inside_one_quiesce_window(tmp_path) -> N
         "a second command must not reset inside one quiesce window"
     )
     assert second.retryable is False, "a refused second reset must not be retried"
-    assert "already issued" in second.error, second.error
+    assert "already claimed" in second.error, second.error
     assert len([item for item in runner.commands if "--gpu-reset" in item]) == 1, (
         "only one nvidia-smi --gpu-reset may run per quiesce window"
     )
@@ -456,7 +457,7 @@ def test_the_reset_window_is_claimed_once_and_not_by_remediation(tmp_path) -> No
 
     # Even the command that claimed the window may not reset twice: after a
     # timeout the first reset's outcome is unknown, so a retry is refused.
-    with pytest.raises(RuntimeError, match="already issued"):
+    with pytest.raises(RuntimeError, match="already claimed"):
         manager.assert_quiesced(
             incident_id="incident-a", command_id="workflow/r1/node-a"
         )
@@ -670,3 +671,203 @@ def test_long_mutation_requires_extended_quiesce_failsafe(
 
     with pytest.raises(ValueError, match="fail-safe window of at least 2100 seconds"):
         executor_from_environment(validate_runtime_paths=False)
+
+
+def _state_file(tmp_path) -> Path:
+    """The one quiesce state file, found the way an operator finds it."""
+
+    files = sorted((tmp_path / "quiesce").glob("quiesce-*.json"))
+    assert len(files) == 1, files
+    return files[0]
+
+
+def test_a_timed_out_client_probe_does_not_spend_the_reset_window(tmp_path) -> None:
+    # The compute-app probe runs before nvidia-smi --gpu-reset and its
+    # TimeoutExpired is retryable, so the control plane resubmits. If the
+    # window were claimed before the probe, that resubmit would be refused
+    # for a reset that never happened -- and the refusal would tell the
+    # operator that a reset had already been issued.
+    class ProbeTimeoutRunner(ServiceRunner):
+        """The compute-app probe times out once, before any reset is issued."""
+
+        def __init__(self) -> None:
+            super().__init__(active={"kubelet"})
+            self.probe_calls = 0
+
+        def __call__(self, value, **kwargs):
+            if any("--query-compute-apps" in part for part in value):
+                self.commands.append(value)
+                self.probe_calls += 1
+                if self.probe_calls == 1:
+                    raise TimeoutExpired(value, 15)
+                return CompletedProcess(value, 0, stdout="", stderr="")
+            return super().__call__(value, **kwargs)
+
+    runner = ProbeTimeoutRunner()
+    agent = quiesce_executor(tmp_path, runner)
+    agent.execute(envelope(command(WorkflowOperation.QUIESCE_GPU_SERVICES)))
+
+    first = agent.execute(
+        envelope(command(WorkflowOperation.RESET_GPU, command_id="workflow/r1/node-a"))
+    )
+    second = agent.execute(
+        envelope(command(WorkflowOperation.RESET_GPU, command_id="workflow/r2/node-a"))
+    )
+
+    assert first.status is NodeActionStatus.FAILED, "a timed-out probe fails the step"
+    assert first.retryable is True, (
+        "a probe that timed out says nothing about the GPU, so it stays retryable"
+    )
+    assert second.status is NodeActionStatus.SUCCEEDED, second.error
+    assert len([item for item in runner.commands if "--gpu-reset" in item]) == 1, (
+        "the resubmit must reset once: the timed-out probe never reset at all"
+    )
+
+
+def test_a_restore_whose_start_raises_records_restore_failed(tmp_path) -> None:
+    # systemctl start raising used to leave the file at RESTORING, which the
+    # next quiesce reads as "the writer died" and refuses until the fail-safe
+    # timer fires -- the dead end again, one failure later.
+    runner = ServiceRunner(active={"nvidia-dcgm", "kubelet"})
+    manager = quiesce_manager(tmp_path, runner)
+    manager.quiesce(incident_id="incident-a", workflow_request_id="workflow-a")
+    runner.fail_start = "kubelet"
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        manager.restore(incident_id="incident-a")
+
+    state = json.loads(_state_file(tmp_path).read_text(encoding="utf-8"))
+    assert state["phase"] == "RESTORE_FAILED", (
+        "a restore whose start raises must record RESTORE_FAILED, not RESTORING"
+    )
+
+    runner.fail_start = None
+    details = manager.quiesce(
+        incident_id="incident-a", workflow_request_id="workflow-a"
+    )
+
+    assert details["quiesced"] is True, "a RESTORE_FAILED window must be retryable"
+    assert "already_quiesced" not in details, "the retry must be a fresh quiesce"
+    assert runner.active == set(), "the retry must leave every service stopped"
+
+
+def test_a_failed_inline_restore_keeps_the_quiesce_window_closed(tmp_path) -> None:
+    runner = ServiceRunner(active={"nvidia-dcgm", "kubelet"}, fail_stop="nvidia-dcgm")
+    manager = quiesce_manager(tmp_path, runner)
+    with pytest.raises(RuntimeError, match="stop failed"):
+        manager.quiesce(incident_id="incident-a", workflow_request_id="workflow-a")
+    runner.fail_stop = None
+    runner.fail_start = "kubelet"
+
+    with pytest.raises(RuntimeError, match="could not be restored"):
+        manager.quiesce(incident_id="incident-a", workflow_request_id="workflow-a")
+
+    assert "nvidia-dcgm" in runner.active, (
+        "a quiesce refused after a failed restore must not stop services again"
+    )
+    assert sum(item[0] == "systemd-run" for item in runner.commands) == 1, (
+        "a refused quiesce must not arm a second fail-safe timer"
+    )
+
+
+@pytest.mark.parametrize("phase", ["ARMING", "QUIESCING", "RESTORING"])
+def test_a_mid_step_quiesce_state_is_left_to_the_failsafe_timer(
+    tmp_path, phase
+) -> None:
+    runner = ServiceRunner(active={"kubelet"})
+    manager = quiesce_manager(tmp_path, runner)
+    manager.quiesce(incident_id="incident-a", workflow_request_id="workflow-a")
+    state_path = _state_file(tmp_path)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["phase"] = phase
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = len(runner.commands)
+
+    with pytest.raises(RuntimeError, match="fail-safe restore remains armed"):
+        manager.quiesce(incident_id="incident-a", workflow_request_id="workflow-a")
+
+    assert runner.commands[before:] == [], (
+        f"a {phase} window means the writer died: the node state is unknown, "
+        "so nothing may be restored or stopped inline"
+    )
+
+
+def test_a_task_that_survives_sigkill_fails_the_quiesce(tmp_path, monkeypatch) -> None:
+    container_id = "d" * 64
+    clock = {"now": 0.0}
+
+    class Clock:
+        """A monotonic clock the sleeper advances, so waits cost no wall time."""
+
+        @staticmethod
+        def monotonic() -> float:
+            return clock["now"]
+
+    monkeypatch.setattr("gpu_fault.node_agent.quiesce.time", Clock)
+
+    class StuckTaskRunner(ServiceRunner):
+        """A container task that ignores SIGTERM and SIGKILL alike."""
+
+        def __call__(self, value, **kwargs):
+            if value[:6] == ["ctr", "-n", "k8s.io", "containers", "list", "--quiet"]:
+                self.commands.append(value)
+                return CompletedProcess(value, 0, stdout=f"{container_id}\n", stderr="")
+            if value[:5] == ["ctr", "-n", "k8s.io", "tasks", "list"]:
+                self.commands.append(value)
+                return CompletedProcess(
+                    value,
+                    0,
+                    stdout=f"TASK PID STATUS\n{container_id} 123 RUNNING\n",
+                    stderr="",
+                )
+            if value[:5] == ["ctr", "-n", "k8s.io", "tasks", "kill"]:
+                self.commands.append(value)
+                return CompletedProcess(value, 0, stdout="", stderr="")
+            return super().__call__(value, **kwargs)
+
+    runner = StuckTaskRunner(active={"kubelet"})
+    manager = GpuServiceQuiesceManager(
+        state_dir=str(tmp_path / "quiesce"),
+        containers=("aws-hyperpod/health-monitoring-agent",),
+        failsafe_seconds=30,
+        retry_seconds=10,
+        settle_seconds=0,
+        restore_settle_seconds=0,
+        container_stop_timeout_seconds=5,
+        restore_command="/opt/gpu-fault/restore",
+        runner=runner,
+        sleeper=lambda seconds: clock.update(now=clock["now"] + seconds),
+    )
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        manager.quiesce(incident_id="incident-a", workflow_request_id="workflow-a")
+
+    state = json.loads(_state_file(tmp_path).read_text(encoding="utf-8"))
+    assert state["phase"] == "QUIESCE_FAILED", (
+        "a task that survives SIGKILL must fail the quiesce, not pass it"
+    )
+    assert any(
+        item[:7] == ["ctr", "-n", "k8s.io", "tasks", "kill", "--signal", "SIGKILL"]
+        for item in runner.commands
+    ), "a task that ignored SIGTERM must be escalated to SIGKILL first"
+
+
+def test_a_state_file_without_a_reset_claim_still_allows_one_reset(tmp_path) -> None:
+    # State files written before the claim key existed must not be read as
+    # "already reset": the node would refuse every reset until a restore.
+    runner = ServiceRunner(active={"kubelet"})
+    manager = quiesce_manager(tmp_path, runner)
+    quiesced = manager.quiesce(
+        incident_id="incident-a", workflow_request_id="workflow-a"
+    )
+    state_path = Path(quiesced["state_path"])
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    del state["reset_issued"]
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    manager.assert_quiesced(incident_id="incident-a", command_id="workflow/r1/node-a")
+
+    with pytest.raises(RuntimeError, match="already claimed"):
+        manager.assert_quiesced(
+            incident_id="incident-a", command_id="workflow/r2/node-a"
+        )

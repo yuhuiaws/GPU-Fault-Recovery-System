@@ -699,10 +699,17 @@ class GpuServiceQuiesceManager:
             issued = state.get("reset_issued")
             if isinstance(issued, dict):
                 owner = issued.get("command_id") or "an earlier command"
+                # Never state that the reset ran: the claim is taken before
+                # nvidia-smi is spawned, so only that command's own result
+                # says whether the GPU was reset. An operator who read
+                # "already reset" here would reboot or replace a node that
+                # may never have been touched.
                 raise RuntimeError(
-                    "a GPU reset was already issued in this quiesce window by "
-                    f"{owner} at {issued.get('issued_at')}; refusing a second "
-                    "reset until the services are restored and re-quiesced"
+                    "the single GPU reset this quiesce window allows was "
+                    f"already claimed by {owner} at {issued.get('issued_at')}; "
+                    "read that command's result to learn whether the reset "
+                    "ran, and restore the GPU services and quiesce again "
+                    "before any further reset"
                 )
             state["reset_issued"] = {
                 "command_id": command_id,
@@ -846,21 +853,29 @@ class GpuServiceQuiesceManager:
         # with a clean claim even if this restore fails and keeps the file.
         state["reset_issued"] = None
         self._write_state(state_path, state)
-        for service in services:
-            self._run(
-                ["systemctl", "start", service],
-                check=True,
-                timeout=120,
-            )
-        inactive = [
-            service for service in services if not self._service_active(service)
-        ]
-        if inactive:
+        try:
+            for service in services:
+                self._run(
+                    ["systemctl", "start", service],
+                    check=True,
+                    timeout=120,
+                )
+            inactive = [
+                service for service in services if not self._service_active(service)
+            ]
+            if inactive:
+                raise RuntimeError(
+                    "restored services are not active: " + ", ".join(inactive)
+                )
+        except Exception:
+            # Every way a restore can fail records RESTORE_FAILED. A start
+            # that raises used to leave the file at RESTORING, which the next
+            # quiesce reads as a writer that died mid-step and refuses until
+            # the fail-safe timer fires: the dead end again, one failure
+            # later, with the GPU services still down.
             state["phase"] = "RESTORE_FAILED"
             self._write_state(state_path, state)
-            raise RuntimeError(
-                "restored services are not active: " + ", ".join(inactive)
-            )
+            raise
         pending_containers = self._wait_containers_restored(container_targets)
         self._run(
             ["systemctl", "stop", timer_unit + ".timer"],

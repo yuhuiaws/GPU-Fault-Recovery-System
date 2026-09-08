@@ -281,6 +281,10 @@ def quiesce_executor(tmp_path, runner) -> NodeActionExecutor:
         device_client_finder=no_device_clients,
         gpu_device_path_finder=lambda: {"GPU-a": "/dev/nvidia0"},
         now=lambda: NOW,
+        # The device-client sampling interval is real seconds and no quiesce
+        # test asserts on it; a reset samples twice (preflight, then the
+        # reset's own re-check), which is 8 s of waiting per reset.
+        sleep=lambda _: None,
     )
 
 

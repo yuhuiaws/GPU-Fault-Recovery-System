@@ -599,7 +599,16 @@ class NodeActionExecutor(
             quiesce_manager = self.quiesce_manager
             if quiesce_manager is None:
                 raise RuntimeError("GPU service quiesce manager is unavailable")
-            quiesce_manager.assert_quiesced(incident_id=command.incident_id)
+            # The quiesce window allows one reset, and the claim is spent even
+            # when the reset never runs. So every step that can refuse -- or
+            # time out retryably, which the control plane resubmits -- happens
+            # before the claim, and the claim happens immediately before
+            # nvidia-smi is spawned.
+            self._reset_gpu_preflight(command.gpu_uuids)
+            quiesce_manager.assert_quiesced(
+                incident_id=command.incident_id,
+                command_id=command.command_id,
+            )
         return self._reset_gpu(command.gpu_uuids)
 
     def _execute_reset_all(self, command: NodeActionCommand) -> dict[str, Any]:
@@ -608,7 +617,11 @@ class NodeActionExecutor(
         quiesce_manager = self.quiesce_manager
         if quiesce_manager is None:
             raise RuntimeError("GPU service quiesce manager is unavailable")
-        quiesce_manager.assert_quiesced(incident_id=command.incident_id)
+        self._reset_all_preflight(command.gpu_uuids)
+        quiesce_manager.assert_quiesced(
+            incident_id=command.incident_id,
+            command_id=command.command_id,
+        )
         return self._reset_all_gpus_nvswitches(command.gpu_uuids)
 
     def _execute_restore(self, command: NodeActionCommand) -> dict[str, Any]:

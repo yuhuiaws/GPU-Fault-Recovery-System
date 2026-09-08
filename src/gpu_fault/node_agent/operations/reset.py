@@ -54,7 +54,17 @@ class ResetOperationsMixin:
                 self._verify_no_clients(gpu_uuids)
         raise AssertionError("unreachable GPU reset retry state")
 
-    def _reset_gpu(self, gpu_uuids: list[str]) -> dict[str, Any]:
+    def _reset_gpu_preflight(self, gpu_uuids: list[str]) -> None:
+        """Everything a single-GPU reset can refuse on, before it resets.
+
+        The executor runs this before it claims the quiesce window's single
+        reset allowance. A config refusal, or a compute-app probe whose
+        ``TimeoutExpired`` is retryable, must not spend that allowance: the
+        resubmit the control plane sends would otherwise be refused for a
+        reset that never ran. ``_reset_gpu`` runs it again immediately before
+        nvidia-smi, so the check the reset relies on remains its own.
+        """
+
         if not self.reset_enabled:
             raise RuntimeError("GPU reset is disabled by node configuration")
         if not self.single_gpu_reset_supported:
@@ -65,6 +75,9 @@ class ResetOperationsMixin:
         if not gpu_uuids:
             raise RuntimeError("GPU reset requires explicit GPU UUID targets")
         self._verify_no_clients(gpu_uuids)
+
+    def _reset_gpu(self, gpu_uuids: list[str]) -> dict[str, Any]:
+        self._reset_gpu_preflight(gpu_uuids)
         reset_attempts = 0
         for gpu_uuid in gpu_uuids:
             reset_attempts += self._run_reset_with_busy_retry(
@@ -83,7 +96,14 @@ class ResetOperationsMixin:
             "reset_attempts": reset_attempts,
         }
 
-    def _reset_all_gpus_nvswitches(self, gpu_uuids: list[str]) -> dict[str, Any]:
+    def _reset_all_preflight(self, gpu_uuids: list[str]) -> list[str]:
+        """Verify a full fabric reset is allowed, and return the inventory.
+
+        Same reason as :meth:`_reset_gpu_preflight`: the inventory query and
+        the client probe can time out retryably, and neither has touched a
+        GPU, so they run before the quiesce window's reset is claimed.
+        """
+
         if not self.fabric_reset_enabled:
             raise RuntimeError(
                 "full GPU/NVSwitch reset is disabled by node configuration"
@@ -93,13 +113,17 @@ class ResetOperationsMixin:
             raise RuntimeError(
                 "full GPU/NVSwitch reset requires unique explicit GPU UUIDs"
             )
-        local_inventory = self._gpu_inventory()
+        local_inventory: list[str] = self._gpu_inventory()
         if requested != local_inventory:
             raise RuntimeError(
                 "requested GPU inventory does not match local inventory: "
                 f"requested={requested}; local={local_inventory}"
             )
         self._verify_no_clients(local_inventory)
+        return local_inventory
+
+    def _reset_all_gpus_nvswitches(self, gpu_uuids: list[str]) -> dict[str, Any]:
+        local_inventory = self._reset_all_preflight(gpu_uuids)
         reset_attempts = self._run_reset_with_busy_retry(
             ["nvidia-smi", "--gpu-reset"],
             gpu_uuids=local_inventory,
