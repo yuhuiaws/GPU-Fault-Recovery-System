@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.collectors.sinks import DeliveryStatus
+
 from ._support import (
     CollectorError,
     HttpEventSink,
@@ -9,6 +11,7 @@ from ._support import (
     _LocalControlPlane,
     io,
     json,
+    logging,
     pytest,
     sink_from_environment,
 )
@@ -543,38 +546,140 @@ def test_sqs_sink_and_consumer_private_delivery() -> None:
     assert sqs.deleted == ["receipt-1"]
 
 
-def test_non_json_2xx_is_a_collector_error(monkeypatch) -> None:
-    """F10: a proxy's HTML error page behind a 2xx must be a delivery verdict.
+class _StubResponse:
+    """A 2xx whose body the test chooses."""
 
-    ``json.JSONDecodeError`` is a ``ValueError``, so it escaped
+    def __init__(self, body: bytes, status: int = 200) -> None:
+        self.body = body
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self):
+        return self.body
+
+
+def test_a_garbage_2xx_body_is_retried_like_a_network_failure(
+    monkeypatch, caplog
+) -> None:
+    """F10: an unparseable 2xx is an unknown outcome, not a verdict.
+
+    ``json.JSONDecodeError`` is a ``ValueError``, so it used to escape
     ``deliver_event`` (which only maps ``CollectorError``) and tore down the
-    kernel collector's ``/dev/kmsg`` reader mid-batch.
+    kernel collector's ``/dev/kmsg`` reader mid-batch. Failing the post
+    outright was no better: a garbage 200 would then get a harsher verdict
+    than a 503, leaving no persistent record of the event at all.
     """
 
-    class Response:
-        status = 200
+    bodies = iter([b"<html>gateway maintenance</html>", b'{"accepted":true}'])
+    keys: list[str | None] = []
 
-        def __enter__(self):
-            return self
+    def urlopen_probe(request, **_kwargs):
+        keys.append(request.get_header("Idempotency-key"))
+        return _StubResponse(next(bodies))
 
-        def __exit__(self, *_args):
-            return None
-
-        def read(self):
-            return b"<html>gateway maintenance</html>"
-
-    monkeypatch.setattr(
-        "gpu_fault.collectors.sinks.urlopen", lambda *_args, **_kwargs: Response()
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", urlopen_probe)
+    sink = HttpEventSink(
+        "https://control", sleep=lambda _seconds: None, jitter=lambda _low, _high: 0
     )
-    sink = HttpEventSink("https://control", max_attempts=1)
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+        result = sink.post(
+            "/v1/collector-events/kernel", {"cluster_id": "c", "event_id": "e-1"}
+        )
+
+    assert result == {"accepted": True}, "the retried attempt was not delivered"
+    assert keys == ["e-1", "e-1"], "the retry did not carry the same dedup key"
+    warnings = [item for item in caplog.records if item.levelno == logging.WARNING]
+    assert len(warnings) == 1, "an unparseable body must be logged exactly once"
+    assert "non-JSON-object" in warnings[0].getMessage(), warnings[0].getMessage()
+
+
+def test_a_persistently_garbage_2xx_body_is_buffered_as_replayable(
+    monkeypatch, tmp_path
+) -> None:
+    """A JSON array is as unusable as HTML, and the event must survive it."""
+
+    attempts = 0
+
+    def urlopen_probe(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return _StubResponse(b"[]")
+
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", urlopen_probe)
+    outbox = tmp_path / "outbox.ndjson"
+    sink = HttpEventSink(
+        "https://control",
+        max_attempts=2,
+        outbox_path=str(outbox),
+        sleep=lambda _seconds: None,
+        jitter=lambda _low, _high: 0,
+    )
 
     with pytest.raises(CollectorError) as captured:
         sink.post("/v1/collector-events/kernel", {"cluster_id": "c", "event_id": "e-1"})
 
-    assert captured.value.status_code == 200, "the 2xx status was not carried"
-    assert not isinstance(captured.value, json.JSONDecodeError), (
-        "a raw JSON decode error still escapes the sink"
+    assert attempts == 2, "the unparseable body did not walk the retry ladder"
+    assert captured.value.buffered is True, "the event was dropped instead of buffered"
+    assert captured.value.replayable is True, "the buffered event is not replayable"
+    record = json.loads(outbox.read_text())
+    assert record["replayable"] is True, record
+    assert record["payload"]["event_id"] == "e-1", record
+
+
+def test_deliver_maps_a_garbage_2xx_body_to_buffered(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "gpu_fault.collectors.sinks.urlopen",
+        lambda *_args, **_kwargs: _StubResponse(b"<html>oops</html>"),
     )
+    outbox = tmp_path / "outbox.ndjson"
+    sink = HttpEventSink("https://control", max_attempts=1, outbox_path=str(outbox))
+
+    result = sink.deliver(
+        "/v1/collector-events/kernel", {"cluster_id": "c", "event_id": "e-1"}
+    )
+
+    assert result.status is DeliveryStatus.BUFFERED, result
+    assert isinstance(result.error, CollectorError), (
+        "a raw ValueError leaked out of the sink"
+    )
+    assert outbox.exists(), "the unparseable 2xx left no persistent record"
+
+
+def test_receipt_poll_retries_an_unreadable_receipt(monkeypatch) -> None:
+    """F11's other half: an unreadable receipt is not a completed request."""
+
+    calls: list[str] = []
+    sleeps: list[float] = []
+    bodies = iter(
+        [
+            b'{"accepted":true,"processor_request_id":"p-1",'
+            b'"status_url":"/v1/processor/requests/p-1"}',
+            b"<html>gateway maintenance</html>",
+            b'{"status":"CONTAINED"}',
+        ]
+    )
+
+    def urlopen_probe(request, **_kwargs):
+        calls.append(request.get_method())
+        body = next(bodies)
+        return _StubResponse(body, status=202 if len(calls) == 1 else 200)
+
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", urlopen_probe)
+    sink = HttpEventSink("https://control", sleep=sleeps.append)
+
+    result = sink.post(
+        "/v1/attempts/failure-detected", {"cluster_id": "cluster-a", "event_id": "e-1"}
+    )
+
+    assert result == {"status": "CONTAINED"}, result
+    assert calls == ["POST", "GET", "GET"], "the unreadable receipt was terminal"
+    assert sleeps == [0.25], sleeps
 
 
 def test_http_event_sink_caps_retry_after(monkeypatch) -> None:

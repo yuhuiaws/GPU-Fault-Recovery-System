@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gzip
 import json
 import logging
@@ -144,25 +145,61 @@ def event_idempotency_key(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _parse_json_body(body: bytes, status: int) -> Any:
-    """Decode a control-plane body, or fail as a delivery verdict.
+class _UnparseableBody(CollectorError):
+    """A 2xx whose body is not a JSON object: the outcome is unknown.
 
-    A proxy that answers 2xx with an HTML maintenance page used to raise
-    ``json.JSONDecodeError`` -- a ``ValueError``, not a ``CollectorError``, so
-    it escaped :func:`deliver_event` and tore the kernel collector's
+    Raised inside the request loops and never allowed to escape them. It is a
+    ``CollectorError`` only so that an unforeseen escape is still a delivery
+    verdict rather than the ``json.JSONDecodeError`` (a ``ValueError``) that
+    used to slip past :func:`deliver_event` and tear the kernel collector's
     ``/dev/kmsg`` reader down mid-batch (ARCH-G4).
+    """
+
+    def __init__(self, status: int, body: bytes) -> None:
+        excerpt = body[:120].decode("utf-8", errors="replace")
+        super().__init__(
+            f"control-plane returned a non-JSON-object body with HTTP {status}: "
+            f"{excerpt!r}",
+            status_code=status,
+        )
+
+
+def _parse_json_body(body: bytes, status: int) -> dict[str, Any]:
+    """Decode a control-plane JSON object, or report an unknown outcome.
+
+    Only an object counts: an array or a scalar is as unusable to the callers
+    as an HTML maintenance page, and both take the same "ask again" path, so
+    the ``dict`` the callers are typed for is the ``dict`` they get.
     """
 
     if not body:
         return {}
     try:
-        return json.loads(body)
+        parsed = json.loads(body)
     except ValueError as exc:
-        excerpt = body[:120].decode("utf-8", errors="replace")
-        raise CollectorError(
-            f"control-plane returned a non-JSON body with HTTP {status}: {excerpt!r}",
-            status_code=status,
-        ) from exc
+        raise _UnparseableBody(status, body) from exc
+    if not isinstance(parsed, dict):
+        raise _UnparseableBody(status, body)
+    return parsed
+
+
+def _read_error_detail(exc: HTTPError) -> str:
+    """Drain and close an ``HTTPError`` body, returning a short detail.
+
+    The transport's proxy fallback wraps a live socket, so a body that is not
+    read and closed leaks a connection for every retried poll.
+    """
+
+    detail = str(exc)
+    try:
+        body = exc.read()
+    except Exception:  # noqa: BLE001 - a consumed or dead body is not fatal
+        body = b""
+    if body:
+        detail = body.decode(errors="replace")
+    with contextlib.suppress(Exception):
+        exc.close()
+    return detail
 
 
 class DeliveryStatus(StrEnum):
@@ -572,25 +609,22 @@ class HttpEventSink:
             self._outbox_replay_requested = False
         try:
             outcome = self._replay_outbox()
-        except OSError:
-            # Catch-up work that could not be persisted is not a verdict on
-            # the event that just went out: the live post already succeeded.
-            # A full ``/var/lib`` used to raise ``OSError`` out of ``post()``
-            # and ``deliver()``, which reopened ``/dev/kmsg`` and dropped
-            # everything written in between (ARCH-G4). The next successful
-            # post kicks a fresh replay.
+        except Exception:
+            # Catch-up work that failed is never a verdict on the event that
+            # just went out: the live post already succeeded. A full
+            # ``/var/lib`` used to raise ``OSError`` out of ``post()`` and
+            # ``deliver()``, which reopened ``/dev/kmsg`` and dropped
+            # everything written in between (ARCH-G4); a reconcile bug must
+            # not fail a delivered post either. The next successful post
+            # kicks a fresh replay.
             LOGGER.exception(
-                "cannot rewrite the collector outbox after replay (path=%s)",
+                "collector outbox replay failed after a delivered post (path=%s)",
                 self.outbox_path,
             )
             with self._outbox_replay_state_lock:
                 self._outbox_replay_active = False
                 self._outbox_replay_thread = None
             return
-        except Exception:
-            with self._outbox_replay_state_lock:
-                self._outbox_replay_active = False
-            raise
         if not self._continue_outbox_replay(outcome):
             return
         thread = Thread(
@@ -677,7 +711,6 @@ class HttpEventSink:
                     parsed: dict[str, Any] = _parse_json_body(result, status)
                     if (
                         status == 202
-                        and isinstance(parsed, dict)
                         and parsed.get("processor_request_id")
                         and self._requires_processor_receipt(path)
                         and poll_receipt
@@ -687,6 +720,21 @@ class HttpEventSink:
                             headers=headers,
                         )
                     return parsed
+            except _UnparseableBody as exc:
+                # An unparseable 2xx is an unknown outcome, not a verdict on
+                # the event: the control plane may well have accepted it. It
+                # walks the same ladder as a network failure and, if the body
+                # never becomes usable, lands in the outbox as replayable --
+                # the retry and the replay carry the same Idempotency-Key, so
+                # the server dedupes a request that did get through. Treating
+                # it as terminal gave a garbage 200 a harsher verdict than a
+                # 503 and left the event with no persistent record at all.
+                last_error = exc
+                LOGGER.warning(
+                    "collector event will be retried: %s (path=%s)",
+                    exc,
+                    path,
+                )
             except HTTPError as exc:
                 last_error = exc
                 if not is_retryable_collector_status(exc.code):
@@ -780,16 +828,26 @@ class HttpEventSink:
                         continue
                     receipt: dict[str, Any] = _parse_json_body(payload, status)
                     return receipt
+            except _UnparseableBody as exc:
+                # An unreadable receipt is not a completed request: ask again
+                # until the deadline rather than failing a post whose 202 the
+                # control plane already accepted.
+                last_error = exc
+                self.sleep(delay)
+                delay = min(delay * 2, 2.0)
             except HTTPError as exc:
+                detail = _read_error_detail(exc)
                 if is_retryable_collector_status(exc.code):
                     # The 202 was accepted; a 503 from the store or a 429 on
                     # the status route says "ask again", not that the request
                     # failed. Polling stays bounded by the same deadline.
-                    last_error = exc
+                    last_error = CollectorError(
+                        f"processor receipt poll got HTTP {exc.code}: {detail}",
+                        status_code=exc.code,
+                    )
                     self.sleep(delay)
                     delay = min(delay * 2, 2.0)
                     continue
-                detail = exc.read().decode(errors="replace")
                 raise CollectorError(
                     f"processor request completed with HTTP {exc.code}: {detail}",
                     status_code=exc.code,
