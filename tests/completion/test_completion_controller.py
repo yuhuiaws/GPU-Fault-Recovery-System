@@ -1001,6 +1001,32 @@ def test_watch_uses_list_resource_version_and_modified_event() -> None:
     assert terminal["terminal_status"] == "FAILED"
 
 
+def test_watch_stream_passes_a_client_read_timeout() -> None:
+    """F3: without ``_request_timeout`` the watch blocks for ever.
+
+    ``kubernetes/client/rest.py`` leaves ``timeout=None`` when the kwarg is
+    absent, so an API-server endpoint that dies without an RST -- or a NAT
+    that drops the idle stream -- parks the watch thread with no relist, no
+    reconcile and no observations until someone deletes the Pod.
+    """
+    core = FakeCoreApi([pod(0)])
+    watched = FakeWatch([])
+    subject = KubernetesCompletionController(
+        core,
+        FakeSink(),
+        cluster_id="hp-cluster",
+        watch_factory=lambda: watched,
+        watch_timeout_seconds=30,
+    )
+
+    subject.run_watch_cycle()
+
+    assert watched.arguments[1]["_request_timeout"] == (5, 45), (
+        "stream must carry a (connect, read) client timeout above the server "
+        f"timeout: {watched.arguments[1]!r}"
+    )
+
+
 def test_watch_burst_reconciles_large_attempt_once_after_debounce() -> None:
     pods = [pod(index, expected_ranks=100) for index in range(100)]
     core = FakeCoreApi(pods)

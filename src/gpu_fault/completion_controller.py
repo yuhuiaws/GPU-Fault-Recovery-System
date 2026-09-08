@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from threading import RLock, Timer
+from threading import RLock, Timer, current_thread
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -77,6 +77,13 @@ PYTORCH_JOB_LABELS = (
 )
 WORKLOAD_LOG_SNAPSHOT_ANNOTATION = "gpu-fault.io/workload-log-snapshot"
 RESTART_BUDGET_ANNOTATION = "gpu-fault.io/restart-budget"
+# How long the end of a watch cycle waits for a debounce timer that is still
+# reconciling before it gives up and relies on ``reconcile_lock`` alone (F5).
+# One reconcile can legitimately take a terminal POST's retries plus the
+# 120 s processor receipt poll, so the budget is generous; blocking here only
+# delays the next relist, while returning early would let the two passes run
+# side by side, which is the defect.
+TIMER_JOIN_TIMEOUT_SECONDS = 300.0
 
 
 class CompletionControllerError(ValueError):
@@ -590,6 +597,18 @@ class KubernetesCompletionController:
         self.evicted_attempts_total = 0
         # Persisted attempt records skipped at start-up (set by the restore).
         self.restore_skipped_total = 0
+        # Liveness (F3): only a completed *full* pass moves this. A watch
+        # stream that hangs stops relisting, so the timestamp stops moving
+        # while an idle cluster -- which posts nothing at all -- keeps it
+        # fresh through the 30 s relist. ``started_at`` gives the probe a
+        # startup grace before the first pass finishes.
+        self.started_at: datetime = self.now()
+        self.last_cycle_completed_at: datetime | None = None
+        # One reconcile at a time per process (F5). The lock used to be a
+        # per-cycle local, so a debounce timer still inside ``_reconcile`` ran
+        # concurrently with the next cycle's full pass. It is an ``RLock`` so
+        # the inline zero-debounce flush on the watch thread can re-enter.
+        self.reconcile_lock = RLock()
         try:
             restore_persisted_attempt_observations(self)
         except ValueError as exc:
@@ -683,6 +702,9 @@ class KubernetesCompletionController:
                 LOGGER.exception("cannot reconcile attempt %s", attempt_id)
         if attempt_filter is None:
             self._evict_pruned_attempts(grouped)
+            # Liveness marker (F3): a filtered debounce pass does not count,
+            # because only a full pass proves the list/relist path still works.
+            self.last_cycle_completed_at = self.now()
         return results
 
     def _evict_pruned_attempts(self, grouped: dict[str, list[dict[str, Any]]]) -> None:
@@ -1003,6 +1025,17 @@ class KubernetesCompletionController:
                 LOGGER.exception("Kubernetes completion reconciliation failed")
             time.sleep(self.poll_interval_seconds)
 
+    def run_watch_cycle(self) -> None:
+        """One list + watch + reconcile cycle: the loop's unit of work.
+
+        ``run()`` never returns and ``run_once()`` only covers the polling
+        fallback, so this is the public seam for anything that wants a single
+        watch cycle -- a supervisor, an operator one-shot, or a test that has
+        to observe what the cycle's ``finally`` does.
+        """
+
+        self._run_watch_cycle()
+
     def _run_watch_cycle(self) -> None:
         pods, resource_version = list_completion_pods(
             self.core_api,
@@ -1011,12 +1044,22 @@ class KubernetesCompletionController:
         )
         serialized = [self.serializer(item) for item in pods]
         cache = {self._pod_key(pod): pod for pod in serialized}
-        self._reconcile(list(cache.values()))
+        # The previous cycle's debounce timer has been joined by that cycle's
+        # ``finally``, so this lock is normally free; taking it is what keeps a
+        # timer that outlived its cycle from running beside this pass (F5).
+        with self.reconcile_lock:
+            self._reconcile(list(cache.values()))
         cache_lock = RLock()
-        reconcile_lock = RLock()
         pending_lock = RLock()
         pending_attempts: set[str] = set()
         pending_timer: list[Timer | None] = [None]
+        # Timers stay reachable after they have fired so the ``finally`` can
+        # join a flush that is still running; ``pending_timer`` is cleared by
+        # the flush itself so ``schedule`` can arm the next one, which means a
+        # slow flush and a freshly armed timer can both be live (the reconcile
+        # lock serializes them). Finished timers are dropped on every arm, so
+        # the list holds at most the live ones.
+        started_timers: list[Timer] = []
 
         def attempt_id(pod: dict[str, Any] | None) -> str | None:
             if not pod:
@@ -1037,7 +1080,7 @@ class KubernetesCompletionController:
                 affected_pods = [
                     pod for pod in cache.values() if attempt_id(pod) in attempts
                 ]
-            with reconcile_lock:
+            with self.reconcile_lock:
                 self._reconcile(
                     affected_pods,
                     attempt_filter=attempts,
@@ -1059,6 +1102,10 @@ class KubernetesCompletionController:
                     )
                     timer.daemon = True
                     pending_timer[0] = timer
+                    started_timers[:] = [
+                        item for item in started_timers if item.is_alive()
+                    ]
+                    started_timers.append(timer)
                     timer.start()
                     return
             flush_pending()
@@ -1080,6 +1127,14 @@ class KubernetesCompletionController:
                     resource_version=resource_version or None,
                     timeout_seconds=self.watch_timeout_seconds,
                     allow_watch_bookmarks=True,
+                    # F3: without this the client leaves ``timeout=None`` and a
+                    # stream the API server drops without an RST (dead
+                    # endpoint, NAT idle eviction) parks this thread for ever:
+                    # no relist, no reconcile, and every node UNKNOWN after
+                    # 600 s. The read budget sits above the server-side
+                    # ``timeout_seconds`` so a healthy stream always ends by
+                    # the server closing it, never by the client.
+                    _request_timeout=(5, self.watch_timeout_seconds + 15),
                 ):
                     event_type = str(event.get("type", "")).upper()
                     raw_object = event.get("object")
@@ -1134,8 +1189,28 @@ class KubernetesCompletionController:
                 if timer is not None:
                     timer.cancel()
                     pending_timer[0] = None
-            flush_pending()
-            watcher.stop()
+                in_flight = [item for item in started_timers if item.is_alive()]
+                started_timers.clear()
+            # Join OUTSIDE every lock (F5). A timer that already fired holds no
+            # lock this thread wants, and this thread holds none it wants, so
+            # the join cannot deadlock; taking ``reconcile_lock`` here would.
+            for item in in_flight:
+                if item is current_thread():
+                    continue
+                item.join(timeout=TIMER_JOIN_TIMEOUT_SECONDS)
+                if item.is_alive():
+                    LOGGER.warning(
+                        "debounced reconcile still running after %ss; the next "
+                        "full pass will wait on the reconcile lock",
+                        TIMER_JOIN_TIMEOUT_SECONDS,
+                    )
+            # F11: the flush is the only step here that can raise (one bad Pod
+            # is enough), and skipping ``stop()`` leaked the API-server stream
+            # and its thread on every such cycle.
+            try:
+                flush_pending()
+            finally:
+                watcher.stop()
         LOGGER.info("Kubernetes Pod watch timed out; resyncing")
 
     def _list_method(self):

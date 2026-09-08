@@ -12,6 +12,8 @@ import threading
 import time
 from datetime import timedelta
 
+import pytest
+
 from gpu_fault.completion_controller import (
     KubernetesCompletionController,
     KubernetesWorkloadStopper,
@@ -23,6 +25,7 @@ from tests.completion.test_completion_controller import (
     Clock,
     FakeCoreApi,
     FakeSink,
+    FakeWatch,
     controller,
     pod,
 )
@@ -178,3 +181,162 @@ def test_log_capture_is_bounded_by_a_timeout() -> None:
     assert by_pod["worker-0"]["record_id"]
     assert "timed out" in by_pod["worker-1"]["capture_error"]
     assert set(core.request_timeouts) == {0.2}
+
+
+class OverlapRecordingSink(FakeSink):
+    """Records the thread and the time window of every POST (F5).
+
+    The sink is a constructor argument, so this instruments the reconcile path
+    through a public seam: no private attribute of the controller is patched.
+    """
+
+    def __init__(self, hold_seconds: float) -> None:
+        super().__init__()
+        self.hold_seconds = hold_seconds
+        self.windows: list[tuple[str, float, float]] = []
+        self.timer_post_started = threading.Event()
+        self._lock = threading.Lock()
+
+    def post(self, path, payload):
+        thread = threading.current_thread()
+        if thread is not threading.main_thread():
+            self.timer_post_started.set()
+        started = time.monotonic()
+        time.sleep(self.hold_seconds)
+        finished = time.monotonic()
+        with self._lock:
+            self.windows.append((thread.name, started, finished))
+        return {"accepted": True}
+
+
+class HandOffWatch(FakeWatch):
+    """Ends the stream only once the debounce timer is inside the sink."""
+
+    def __init__(self, events, started: threading.Event) -> None:
+        super().__init__(events)
+        self.started = started
+        self.handed_off = False
+
+    def stream(self, method, **kwargs):
+        self.arguments = (method.__name__, kwargs)
+        yield from self.events
+        self.handed_off = self.started.wait(10)
+
+
+def _overlapping(windows: list[tuple[str, float, float]]) -> tuple[str, str] | None:
+    for index, (name, start, end) in enumerate(windows):
+        for other_name, other_start, other_end in windows[index + 1 :]:
+            if name == other_name:
+                continue
+            if start < other_end and other_start < end:
+                return (name, other_name)
+    return None
+
+
+def test_timer_reconcile_never_overlaps_the_full_reconcile() -> None:
+    """F5: the debounce timer must not still be reconciling in the next cycle.
+
+    ``reconcile_lock`` was a per-cycle local, so a timer thread mid-reconcile
+    (a terminal POST can take four retries plus a 120 s receipt poll) ran
+    concurrently with the next cycle's full pass: duplicate POSTs, a
+    ``_terminal_sent`` set reassigned under a concurrent ``add``, two threads
+    passing the ``_workloads_stopped`` check, and racing outbox CAS writes.
+    """
+    sink = OverlapRecordingSink(0.3)
+    core = FakeCoreApi([pod(0)])
+    watches = [
+        HandOffWatch([{"type": "MODIFIED", "object": pod(0)}], sink.timer_post_started),
+        FakeWatch([]),
+    ]
+    subject = KubernetesCompletionController(
+        core,
+        sink,
+        cluster_id="hp-cluster",
+        watch_factory=lambda: watches.pop(0),
+        publish_observations=True,
+        reconcile_debounce_seconds=0.02,
+        now=lambda: NOW,
+    )
+
+    subject.run_watch_cycle()
+    subject.run_watch_cycle()
+
+    assert len(sink.windows) >= 3, (
+        f"expected an initial, a debounced and a second full pass POST: {sink.windows}"
+    )
+    assert {name for name, _, _ in sink.windows} != {threading.main_thread().name}, (
+        "the debounced reconcile never ran on a timer thread, so the test "
+        f"cannot observe an overlap: {sink.windows}"
+    )
+    overlap = _overlapping(sink.windows)
+    assert overlap is None, (
+        f"reconcile passes overlapped across threads {overlap}: {sink.windows}"
+    )
+
+
+class ArmedSerializer:
+    """A serializer that starts failing once the watch stream has ended."""
+
+    def __init__(self) -> None:
+        self.armed = False
+        self.calls = 0
+
+    def __call__(self, value):
+        self.calls += 1
+        if self.armed:
+            raise RuntimeError("serializer failed after the watch stream ended")
+        return value if isinstance(value, dict) else value.to_dict()
+
+
+class ArmingWatch(FakeWatch):
+    def __init__(self, events, serializer: ArmedSerializer) -> None:
+        super().__init__(events)
+        self.serializer = serializer
+
+    def stream(self, method, **kwargs):
+        self.arguments = (method.__name__, kwargs)
+        yield from self.events
+        self.serializer.armed = True
+
+
+def test_watcher_stops_even_when_flush_raises() -> None:
+    """F11: a raising final flush must not leak the watch connection.
+
+    ``finally: flush_pending(); watcher.stop()`` skipped ``stop()`` whenever
+    the flush raised, so every such cycle left the API-server stream and its
+    thread behind while ``_run_forever`` opened another one.
+    """
+    serializer = ArmedSerializer()
+    watched = ArmingWatch([{"type": "MODIFIED", "object": pod(0)}], serializer)
+    subject = KubernetesCompletionController(
+        FakeCoreApi([pod(0)]),
+        FakeSink(),
+        cluster_id="hp-cluster",
+        watch_factory=lambda: watched,
+        serializer=serializer,
+        reconcile_debounce_seconds=10,
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="serializer failed"):
+        subject.run_watch_cycle()
+
+    assert watched.stopped, "watcher.stop() must run even when the flush raises"
+
+
+def test_a_completed_full_pass_records_its_timestamp() -> None:
+    """F3/F12: liveness needs a value that only a completed pass moves."""
+    clock = Clock()
+    subject = controller(FakeCoreApi([pod(0)]), FakeSink(), clock)
+
+    assert subject.started_at == NOW, subject.started_at
+    assert subject.last_cycle_completed_at is None, (
+        "no full pass has completed yet, so there is no cycle timestamp"
+    )
+
+    clock.value += timedelta(seconds=5)
+    subject.run_once()
+
+    assert subject.last_cycle_completed_at == clock.value, (
+        f"a completed full pass must stamp the clock: {subject.last_cycle_completed_at}"
+    )
