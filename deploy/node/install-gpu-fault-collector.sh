@@ -390,6 +390,9 @@ finish_install_transaction() {
         rm -rf "${INSTALL_BACKUP}"
     fi
     if [[ "${status}" -ne 0 && "${STATE_ROOT_CREATED}" == "true" ]]; then
+        # A first install that warned about a degraded GPU and then died for an
+        # unrelated reason must still leave no state root behind.
+        rm -f /var/lib/gpu-fault/installer-degraded-gpu.json
         rmdir /var/lib/gpu-fault >/dev/null 2>&1 || true
     fi
     exit "${status}"
@@ -1134,45 +1137,62 @@ NODE_ACTION_DB="/var/lib/gpu-fault/node-actions.db"
 NODE_AGENT_STOP_TIMEOUT_SECONDS="1900"
 NODE_AGENT_LEDGER_POLL_SECONDS="5"
 SQLITE_COMMAND="$(command -v sqlite3 2>/dev/null || true)"
+# 读不出来的 ledger 不等于没有在途动作。
+# A corrupt database, a missing `results` table and a SQLITE_BUSY while the
+# Agent writes a row all produce zero rows, which would let a fail-closed gate
+# stop the Agent mid-operation. Both readers therefore keep their non-zero exit
+# status, and the caller treats "read failed" as "assume busy".
 in_progress_node_action_ids() {
     [[ -f "${NODE_ACTION_DB}" ]] || return 0
     if [[ -n "${SQLITE_COMMAND}" ]]; then
-        "${SQLITE_COMMAND}" -readonly "${NODE_ACTION_DB}" \
-            "SELECT command_id FROM results WHERE state = 'IN_PROGRESS';" \
-            2>/dev/null || true
+        "${SQLITE_COMMAND}" -readonly -cmd '.timeout 5000' "${NODE_ACTION_DB}" \
+            "SELECT command_id FROM results WHERE state = 'IN_PROGRESS';"
     else
         "${PYTHON_COMMAND}" -c '
 import sqlite3
 import sys
 
 try:
-    connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    connection = sqlite3.connect(
+        f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=5
+    )
     rows = connection.execute(
         "SELECT command_id FROM results WHERE state = ?", ("IN_PROGRESS",)
     ).fetchall()
-except sqlite3.Error:
-    raise SystemExit(0)
+except sqlite3.Error as error:
+    print(f"node action ledger read failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
 for row in rows:
     print(row[0])
-' "${NODE_ACTION_DB}" 2>/dev/null || true
+' "${NODE_ACTION_DB}"
     fi
 }
 wait_for_node_action_ledger_idle() {
     local deadline
     local pending
+    local unreadable
     deadline=$(( $(date +%s) + NODE_AGENT_STOP_TIMEOUT_SECONDS ))
     while :; do
-        pending="$(in_progress_node_action_ids | tr '\n' ' ')"
+        unreadable="false"
+        pending="$(in_progress_node_action_ids | tr '\n' ' ')" ||
+            unreadable="true"
         pending="${pending% }"
-        if [[ -z "${pending}" ]]; then
+        if [[ "${unreadable}" == "true" ]]; then
+            printf 'WARN  node action ledger unreadable (%s)\n' \
+                "${NODE_ACTION_DB}"
+        elif [[ -z "${pending}" ]]; then
             return 0
+        else
+            printf 'waiting for in-flight node actions: %s\n' "${pending}"
         fi
         if (( $(date +%s) >= deadline )); then
             break
         fi
-        printf 'waiting for in-flight node actions: %s\n' "${pending}"
         sleep "${NODE_AGENT_LEDGER_POLL_SECONDS}"
     done
+    if [[ "${unreadable}" == "true" ]]; then
+        die "node action ledger could not be read: ${NODE_ACTION_DB}"
+    fi
     die "node action agent has in-flight commands: ${pending}"
 }
 drain_node_agent_before_restart() {
@@ -1770,8 +1790,17 @@ systemctl daemon-reload
 systemctl enable gpu-fault-gpu-persistence.service
 if [[ "${NO_START}" == "false" ]]; then
     systemctl restart gpu-fault-gpu-persistence.service
-    if nvidia-smi --query-gpu=persistence_mode \
-        --format=csv,noheader |
+    # A query that fails outright prints nothing, and an empty stream has no
+    # line that differs from "Enabled" -- so the observation has to be captured
+    # before it is judged, or a dead driver would read as a healthy node and
+    # would even delete the marker an earlier install left behind.
+    persistence_modes="$(nvidia-smi --query-gpu=persistence_mode \
+        --format=csv,noheader 2>/dev/null || true)"
+    if [[ -z "${persistence_modes//[[:space:]]/}" ]]; then
+        printf 'WARN  GPU persistence mode (nvidia-smi reported no GPU)\n'
+        record_degraded_gpu_marker \
+            "nvidia-smi reported no persistence mode for any GPU"
+    elif printf '%s\n' "${persistence_modes}" |
         grep -Fvx "Enabled" >/dev/null; then
         printf 'WARN  GPU persistence mode (not enabled on every GPU)\n'
         record_degraded_gpu_marker \

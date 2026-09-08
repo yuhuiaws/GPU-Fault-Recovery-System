@@ -94,8 +94,22 @@ host_shell \
 systemd_state="$(host_shell "systemctl is-system-running 2>/dev/null || true")"
 [[ "${systemd_state}" == "running" || "${systemd_state}" == "degraded" ]] ||
     die "host systemd is not operational: ${systemd_state:-unknown}"
-host_shell "nvidia-smi -L >/dev/null" ||
-    die "NVIDIA driver cannot enumerate GPUs"
+# `nvidia-smi -L` exits non-zero as soon as one GPU is unreadable while it
+# still lists the healthy ones, and a node with one GPU off the bus is exactly
+# the node that needs the Agent. Only an empty enumeration blocks the rollout.
+# `host_shell` runs `bash -ceu`, so the fallback has to live inside the quoted
+# command.
+gpu_enumeration="$(
+    host_shell "nvidia-smi -L 2>/dev/null || printf 'ENUMERATION_FAILED\n'"
+)"
+enumerated_gpus="$(
+    printf '%s\n' "${gpu_enumeration}" | grep -c '^GPU [0-9]' || true
+)"
+(( enumerated_gpus > 0 )) || die "NVIDIA driver enumerated zero GPUs"
+if [[ "${gpu_enumeration}" == *ENUMERATION_FAILED* ]]; then
+    printf 'WARN  NVIDIA GPU enumeration (only %s GPU(s) are enumerable)\n' \
+        "${enumerated_gpus}"
+fi
 [[ -e "${HOST_ROOT}/dev/kmsg" ]] || die "host /dev/kmsg is unavailable"
 
 if compgen -G "${HOST_ROOT}/sys/class/infiniband/*" >/dev/null; then

@@ -876,6 +876,7 @@ def _run_verify(
     workspace: Path,
     *,
     persistence_modes: tuple[str, ...] = ("Enabled",),
+    persistence_exit: int = 0,
     enumerated_gpus: int = 8,
     enumeration_exit: int = 0,
     dcgm_metrics: bool = True,
@@ -903,7 +904,8 @@ def _run_verify(
         "nvidia-smi",
         'case "$*" in\n'
         f"*index,uuid,persistence_mode*) printf '%s' {shlex.quote(detailed)};;\n"
-        f"*persistence_mode*) printf '%s' {shlex.quote(modes)};;\n"
+        f"*persistence_mode*) printf '%s' {shlex.quote(modes)};"
+        f" exit {persistence_exit};;\n"
         f"-L) printf '%s' {shlex.quote(enumeration)}; exit {enumeration_exit};;\n"
         "*) printf '0, GPU-000000000000, 41, 300\\n';;\n"
         "esac\n"
@@ -1173,8 +1175,8 @@ def _ledger_drain_probe(target: Path) -> Path:
         "PYTHON_COMMAND=python3\n"
         'NODE_ACTION_DB="$1"\n'
         'SQLITE_COMMAND="$2"\n'
-        "NODE_AGENT_STOP_TIMEOUT_SECONDS=0\n"
-        "NODE_AGENT_LEDGER_POLL_SECONDS=1\n"
+        'NODE_AGENT_STOP_TIMEOUT_SECONDS="${3:-0}"\n'
+        'NODE_AGENT_LEDGER_POLL_SECONDS="${4:-1}"\n'
         "die() { printf 'DIE: %s\\n' \"$*\"; exit 1; }\n"
         f"{installer[start:end]}\n"
         "wait_for_node_action_ledger_idle\n"
@@ -1199,9 +1201,11 @@ def test_installer_refuses_to_restart_the_agent_mid_operation(tmp_path: Path) ->
     database = tmp_path / "node-actions.db"
     _ledger_with_state(database, IN_PROGRESS_STATE)
 
-    def drain(sqlite_command: str, db: Path) -> subprocess.CompletedProcess[str]:
+    def drain(
+        sqlite_command: str, db: Path, *, timeout: int = 0, poll: int = 1
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(probe), str(db), sqlite_command],
+            ["bash", str(probe), str(db), sqlite_command, str(timeout), str(poll)],
             capture_output=True,
             text=True,
             check=False,
@@ -1248,3 +1252,352 @@ def test_installer_drains_the_ledger_before_it_touches_the_agent_unit() -> None:
     )
     assert calls[0] < stop_loop, "stopping the unit interrupts the same operation"
     assert calls[1] < restart, "the restart must not preempt an in-flight command"
+
+
+def _drain(
+    probe: Path,
+    database: Path,
+    *,
+    sqlite_command: str = "",
+    timeout: int = 0,
+    poll: int = 1,
+    path: str = "/usr/bin:/bin",
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(probe), str(database), sqlite_command, str(timeout), str(poll)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": path},
+    )
+
+
+def test_installer_treats_an_unreadable_ledger_as_in_flight(tmp_path: Path) -> None:
+    """A ledger that cannot be read must not be mistaken for an idle one.
+
+    Both readers used to swallow every error and print nothing, which the wait
+    loop scored as "no in-flight commands" -- so a corrupt database, a ledger
+    whose ``results`` table has not been created yet and a ``SQLITE_BUSY`` from
+    the very write the guard is meant to notice all let the installer stop the
+    Agent in the middle of a node action. Read failure now keeps the installer
+    waiting and finally kills the install.
+    """
+
+    probe = _ledger_drain_probe(tmp_path)
+
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"this is not a SQLite database\n" * 64)
+    corrupted = _drain(probe, corrupt)
+    assert corrupted.returncode != 0, (
+        f"a corrupt ledger must block the restart: {corrupted.stdout}"
+    )
+    assert "WARN  node action ledger unreadable" in corrupted.stdout, corrupted.stdout
+    assert "DRAINED" not in corrupted.stdout, (
+        "an unreadable ledger must never report the Agent as drained"
+    )
+
+    tableless = tmp_path / "tableless.db"
+    with sqlite3.connect(tableless) as connection:
+        connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    without_table = _drain(probe, tableless)
+    assert without_table.returncode != 0, (
+        f"a ledger without the results table must block: {without_table.stdout}"
+    )
+    assert "DRAINED" not in without_table.stdout, without_table.stdout
+
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    argument_log = tmp_path / "sqlite3-args.txt"
+    _write_stub(
+        binaries,
+        "sqlite3",
+        f'printf \'%s\\n\' "$*" >> {shlex.quote(str(argument_log))}\n'
+        f'if [[ -f {shlex.quote(str(tmp_path / "BUSY_MARKER"))} ]];'
+        " then exit 0; fi\n"
+        "printf 'Error: database is locked\\n' >&2\n"
+        "exit 1\n",
+    )
+    settled = tmp_path / "settled.db"
+    _ledger_with_state(settled, "COMPLETED")
+    busy = _drain(probe, settled, sqlite_command=str(binaries / "sqlite3"))
+    assert busy.returncode != 0, f"a locked ledger must block: {busy.stdout}"
+    assert "WARN  node action ledger unreadable" in busy.stdout, busy.stdout
+    assert "DRAINED" not in busy.stdout, busy.stdout
+    assert ".timeout 5000" in argument_log.read_text(encoding="utf-8"), (
+        "the sqlite3 CLI has no busy timeout of its own, so the install must set one"
+    )
+
+    (tmp_path / "BUSY_MARKER").write_text("readable now\n", encoding="utf-8")
+    readable = _drain(
+        probe,
+        settled,
+        sqlite_command=str(binaries / "sqlite3"),
+        path=f"{binaries}:/usr/bin:/bin",
+    )
+    assert "DRAINED" in readable.stdout, (
+        f"a ledger that becomes readable must let the install proceed: {readable.stdout}"
+    )
+    assert readable.returncode == 0, readable.stdout + readable.stderr
+
+
+def test_installer_waits_for_an_in_flight_command_to_settle(tmp_path: Path) -> None:
+    """The wait loop must actually wait, not only die at the deadline."""
+
+    probe = _ledger_drain_probe(tmp_path)
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    _write_stub(
+        binaries,
+        "sqlite3",
+        f'marker={shlex.quote(str(tmp_path / "polled"))}\n'
+        'if [[ -f "${marker}" ]]; then exit 0; fi\n'
+        'printf served > "${marker}"\n'
+        "printf 'cmd-slow\\n'\n",
+    )
+    database = tmp_path / "node-actions.db"
+    _ledger_with_state(database, IN_PROGRESS_STATE)
+
+    result = _drain(
+        probe,
+        database,
+        sqlite_command=str(binaries / "sqlite3"),
+        timeout=5,
+        poll=1,
+    )
+
+    assert "waiting for in-flight node actions: cmd-slow" in result.stdout, (
+        f"the operator must see why the upgrade is paused: {result.stdout}"
+    )
+    assert "DRAINED" in result.stdout, (
+        f"the install must proceed once the command settles: {result.stdout}"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_installer_python_ledger_reader_has_a_busy_timeout() -> None:
+    installer = NODE_SCRIPTS[0].read_text()
+
+    assert 'f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=5' in installer, (
+        "the python ledger reader must wait out a writer instead of erroring at once"
+    )
+    assert "2>/dev/null || true\n    fi\n}" not in installer, (
+        "the ledger readers must not swallow their own failures"
+    )
+
+
+PERSISTENCE_BLOCK_START = (
+    '    persistence_modes="$(nvidia-smi --query-gpu=persistence_mode \\\n'
+    '        --format=csv,noheader 2>/dev/null || true)"'
+)
+PERSISTENCE_BLOCK_END = (
+    '    elif [[ "${DEGRADED_GPU_RECORDED}" == "false" ]]; then\n'
+    "        clear_degraded_gpu_marker\n"
+    "    fi"
+)
+
+
+def _persistence_probe(target: Path) -> Path:
+    """Run the installer's own persistence verdict with the marker calls stubbed."""
+    installer = NODE_SCRIPTS[0].read_text()
+    assert installer.count(PERSISTENCE_BLOCK_START) == 1, (
+        "the installer must capture the persistence query in exactly one place"
+    )
+    assert installer.count(PERSISTENCE_BLOCK_END) == 1, (
+        "the installer must decide about the degraded marker in one place"
+    )
+    start = installer.index(PERSISTENCE_BLOCK_START)
+    end = installer.index(PERSISTENCE_BLOCK_END) + len(PERSISTENCE_BLOCK_END)
+    probe = target / "persistence-probe.sh"
+    probe.write_text(
+        "set -euo pipefail\n"
+        'DEGRADED_GPU_RECORDED="false"\n'
+        "record_degraded_gpu_marker() { printf 'RECORDED %s\\n' \"$1\"; }\n"
+        "clear_degraded_gpu_marker() { printf 'CLEARED\\n'; }\n"
+        f"{installer[start:end]}\n",
+        encoding="utf-8",
+    )
+    return probe
+
+
+def test_installer_does_not_read_a_dead_driver_as_healthy_persistence(
+    tmp_path: Path,
+) -> None:
+    """An empty persistence query has no line that differs from "Enabled".
+
+    Piping a failed ``nvidia-smi`` into ``grep -Fvx Enabled`` therefore scored a
+    driver that answered nothing as "every GPU is in persistence mode", and the
+    new marker logic went one step further and deleted the marker an earlier
+    install had written.
+    """
+
+    probe = _persistence_probe(tmp_path)
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(probe)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={"PATH": f"{binaries}:/usr/bin:/bin", "NO_START": "false"},
+        )
+
+    _write_stub(binaries, "nvidia-smi", "exit 255\n")
+    dead = run()
+    assert dead.returncode == 0, (
+        f"a dead persistence query must not abort the install: {dead.stderr}"
+    )
+    assert "RECORDED" in dead.stdout, (
+        f"a driver that reports no GPU is a degraded GPU observation: {dead.stdout}"
+    )
+    assert "CLEARED" not in dead.stdout, (
+        "an unreadable driver must never clear a marker an earlier install wrote"
+    )
+
+    _write_stub(binaries, "nvidia-smi", "printf 'Enabled\\nEnabled\\n'\n")
+    healthy = run()
+    assert healthy.returncode == 0, healthy.stderr
+    assert "CLEARED" in healthy.stdout, (
+        f"a healthy node must drop a stale marker: {healthy.stdout}"
+    )
+    assert "RECORDED" not in healthy.stdout, healthy.stdout
+
+
+def test_verify_warns_when_the_persistence_query_answers_nothing(
+    tmp_path: Path,
+) -> None:
+    result = _run_verify(tmp_path, persistence_modes=(), persistence_exit=255)
+
+    assert "WARN  GPU persistence mode (nvidia-smi reported no GPU)" in result.stdout, (
+        f"an empty persistence query is not a pass: {result.stdout}"
+    )
+    assert "PASS  GPU persistence mode" not in result.stdout, result.stdout
+    assert result.returncode == 0, (
+        f"a GPU-health warning must not fail the verifier: {result.stdout}"
+    )
+    assert _summary(result.stdout)["warn"] >= 1, result.stdout
+
+
+def test_installer_rollback_removes_the_degraded_gpu_marker() -> None:
+    """A first install that warned and then died must leave no state root.
+
+    ``rmdir`` refuses a directory that still holds the marker, so the state root
+    the installer created would survive its own rollback.
+    """
+
+    installer = NODE_SCRIPTS[0].read_text()
+    branch = installer.index(
+        'if [[ "${status}" -ne 0 && "${STATE_ROOT_CREATED}" == "true" ]]; then'
+    )
+    removal = installer.index(
+        "rm -f /var/lib/gpu-fault/installer-degraded-gpu.json", branch
+    )
+    rmdir = installer.index("rmdir /var/lib/gpu-fault", branch)
+    assert removal < rmdir, (
+        "the marker must be removed before the state root is reclaimed"
+    )
+
+
+PREFLIGHT_ENUMERATION_START = (
+    'gpu_enumeration="$(\n'
+    "    host_shell \"nvidia-smi -L 2>/dev/null || printf 'ENUMERATION_FAILED\\n'\"\n"
+    ')"'
+)
+PREFLIGHT_ENUMERATION_END = (
+    'if [[ "${gpu_enumeration}" == *ENUMERATION_FAILED* ]]; then\n'
+    "    printf 'WARN  NVIDIA GPU enumeration (only %s GPU(s) are enumerable)\\n' \\\n"
+    '        "${enumerated_gpus}"\n'
+    "fi"
+)
+
+
+def _preflight_enumeration_probe(target: Path) -> Path:
+    """Run the preflight's own enumeration gate.
+
+    ``host_shell`` chroots into the host, which a unit test cannot do, so the
+    probe replaces it with the same ``bash -ceu`` the chroot would run -- that
+    is what makes the quoting of the fallback part of the contract.
+    """
+    preflight = (ROOT / "deploy/node/preflight-gpu-fault-node.sh").read_text()
+    assert preflight.count(PREFLIGHT_ENUMERATION_START) == 1, (
+        "the preflight must enumerate GPUs in exactly one place"
+    )
+    assert preflight.count(PREFLIGHT_ENUMERATION_END) == 1, (
+        "the preflight must warn about a partial enumeration in one place"
+    )
+    start = preflight.index(PREFLIGHT_ENUMERATION_START)
+    end = preflight.index(PREFLIGHT_ENUMERATION_END) + len(PREFLIGHT_ENUMERATION_END)
+    probe = target / "preflight-probe.sh"
+    probe.write_text(
+        "set -euo pipefail\n"
+        "die() { printf 'DIE: %s\\n' \"$*\"; exit 1; }\n"
+        "host_shell() { /bin/bash -ceu \"$1\"; }\n"
+        f"{preflight[start:end]}\n"
+        "printf 'PREFLIGHT_CONTINUED\\n'\n",
+        encoding="utf-8",
+    )
+    return probe
+
+
+def test_preflight_blocks_only_a_node_with_no_enumerable_gpu(tmp_path: Path) -> None:
+    """One unreadable GPU must not disqualify the node from getting the Agent.
+
+    ``nvidia-smi -L`` exits non-zero as soon as a single GPU is unreadable while
+    it still lists the healthy ones, so the old ``die`` kept the release
+    candidate off exactly the nodes that needed remediation.
+    """
+
+    probe = _preflight_enumeration_probe(tmp_path)
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(probe)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={"PATH": f"{binaries}:/usr/bin:/bin"},
+        )
+
+    healthy = "".join(f"GPU {index}: NVIDIA H100 80GB HBM3\n" for index in range(8))
+    _write_stub(binaries, "nvidia-smi", f"printf '%s' {shlex.quote(healthy)}\n")
+    intact = run()
+    assert intact.returncode == 0, intact.stdout + intact.stderr
+    assert "WARN" not in intact.stdout, intact.stdout
+    assert "PREFLIGHT_CONTINUED" in intact.stdout, intact.stdout
+
+    partial = "".join(f"GPU {index}: NVIDIA H100 80GB HBM3\n" for index in range(7))
+    _write_stub(
+        binaries,
+        "nvidia-smi",
+        f"printf '%s' {shlex.quote(partial)}\n"
+        "printf 'Unable to determine the device handle for GPU 7\\n' >&2\n"
+        "exit 255\n",
+    )
+    degraded = run()
+    assert degraded.returncode == 0, (
+        f"a partial enumeration must not block the rollout: {degraded.stdout}"
+    )
+    assert (
+        "WARN  NVIDIA GPU enumeration (only 7 GPU(s) are enumerable)"
+        in degraded.stdout
+    ), degraded.stdout
+    assert "PREFLIGHT_CONTINUED" in degraded.stdout, degraded.stdout
+
+    _write_stub(binaries, "nvidia-smi", "printf 'No devices were found\\n'\nexit 9\n")
+    empty = run()
+    assert empty.returncode != 0, (
+        f"a node with no enumerable GPU is still fatal: {empty.stdout}"
+    )
+    assert "DIE: NVIDIA driver enumerated zero GPUs" in empty.stdout, empty.stdout
+    assert "PREFLIGHT_CONTINUED" not in empty.stdout, empty.stdout
+
+
+def test_preflight_no_longer_dies_on_a_partial_enumeration() -> None:
+    preflight = (ROOT / "deploy/node/preflight-gpu-fault-node.sh").read_text()
+
+    assert "NVIDIA driver cannot enumerate GPUs" not in preflight, (
+        "a non-zero nvidia-smi -L is no longer by itself a preflight failure"
+    )

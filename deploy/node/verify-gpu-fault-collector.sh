@@ -164,8 +164,13 @@ check "Fabric Manager SXID collector service" systemctl is-active --quiet \
     gpu-fault-fabric-manager-collector.service
 check "GPU persistence service" systemctl is-active --quiet \
     gpu-fault-gpu-persistence.service
-if nvidia-smi --query-gpu=persistence_mode --format=csv,noheader |
-    grep -Fvx "Enabled" >/dev/null; then
+# An outright failed query prints nothing, and no line of an empty stream
+# differs from "Enabled", so capture the observation before judging it.
+persistence_modes="$(nvidia-smi --query-gpu=persistence_mode \
+    --format=csv,noheader 2>/dev/null || true)"
+if [[ -z "${persistence_modes//[[:space:]]/}" ]]; then
+    warn "GPU persistence mode" "nvidia-smi reported no GPU"
+elif printf '%s\n' "${persistence_modes}" | grep -Fvx "Enabled" >/dev/null; then
     warn "GPU persistence mode" "not enabled on every GPU"
 else
     ok "GPU persistence mode"
