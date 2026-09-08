@@ -158,7 +158,9 @@ def test_the_snapshot_reads_every_counter_the_renderer_needs() -> None:
     assert snapshot["dispatch_node_busy_timeouts_total"] == 2
     assert snapshot["lifetime_exceeded_total"] == 5
     assert snapshot["withdrawn_record_only_total"] == 0
-    assert all(isinstance(value, int) for value in snapshot.values())
+    assert all(isinstance(value, int) for value in snapshot.values()), (
+        "counters must publish as integers so sums stay exact across processes"
+    )
     assert process_counters.control_loop_counter_snapshot(object()) == {
         key: 0 for key, _, _ in process_counters.COUNTER_SOURCES
     }

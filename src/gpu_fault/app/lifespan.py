@@ -8,11 +8,11 @@ from dataclasses import dataclass
 from threading import Event, Thread
 from typing import Any, Callable
 
-from gpu_fault.app import process_counters
 from gpu_fault.app.runtime import EventLoopLag
 from gpu_fault.app.lifespan_workers import (
     start_nonprocessor_workers,
     start_notification_worker,
+    start_process_counters_worker,
     start_processor_threads,
     start_regional_registry_worker,
     start_spool_threads,
@@ -113,19 +113,7 @@ def create_lifespan(dependencies: LifespanDependencies):
             daemon=True,
         )
         collector_metrics_worker.start()
-        # Every process, every role: shares this process's control-loop
-        # counters with the Pod's other worker processes so a /metrics scrape
-        # answered by any of them reads the whole Pod (F-L1).
-        process_counters_worker = Thread(
-            target=process_counters.publish_forever,
-            args=(
-                lambda: process_counters.control_loop_counter_snapshot(ctx),
-                training_stop,
-            ),
-            name="gpu-fault-process-counters",
-            daemon=True,
-        )
-        process_counters_worker.start()
+        process_counters_worker = start_process_counters_worker(ctx, training_stop)
         processor_threads: list[Thread] = []
         diagnostics_worker = None
         identity_registries = [
@@ -233,10 +221,7 @@ def create_lifespan(dependencies: LifespanDependencies):
             shutdown.join(spare_worker, "spare health worker")
             shutdown.join(identity_worker, "identity refresh worker")
             shutdown.join(notification_worker, "notification dispatcher")
-            shutdown.join(
-                collector_metrics_worker,
-                "collector metrics snapshot",
-            )
+            shutdown.join(collector_metrics_worker, "collector metrics snapshot")
             shutdown.join(process_counters_worker, "process counters publisher")
             shutdown.join(registry_worker, "regional registry watcher")
             shutdown.join(

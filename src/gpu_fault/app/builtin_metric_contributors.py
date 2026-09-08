@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from collections.abc import Container, Sequence
 from datetime import datetime, timedelta, timezone
 
+import gpu_fault.app.process_counters as process_counters
 from gpu_fault.app.metric_scan_cache import metric_scan_cache
 from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.collector_requirements import agent_is_current
@@ -19,9 +20,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepStatus,
 )
-from gpu_fault.app import process_counters
 from gpu_fault.store.contracts import ControlPlaneStore
-
 
 # Upper bound on the rows either orphan inspection decodes per scrape; the
 # gauges saturate there rather than let a pathological table grow the render.

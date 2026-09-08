@@ -7,6 +7,7 @@ import time
 from threading import Event, Thread
 from typing import Any
 
+import gpu_fault.app.process_counters as process_counters
 from gpu_fault.app.periodic_services import PeriodicServiceRunner
 from gpu_fault.env_validation import training_health_monitor_enabled
 
@@ -319,6 +320,21 @@ def start_notification_worker(
     worker = Thread(
         target=dispatch,
         name="gpu-fault-notification-dispatcher",
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
+def start_process_counters_worker(context: Any, stop: Event) -> Thread:
+    """Share this process's control-loop counters with the Pod's other worker
+    processes so a /metrics scrape answered by any of them reads the whole Pod
+    (F-L1). Every process, every role; idle when sharing is off."""
+
+    worker = Thread(
+        target=process_counters.publish_forever,
+        args=(lambda: process_counters.control_loop_counter_snapshot(context), stop),
+        name="gpu-fault-process-counters",
         daemon=True,
     )
     worker.start()
