@@ -312,18 +312,23 @@ def ensure_cluster_parameter_group(
         names = ", ".join(
             f"'{name}'" for name, _value, _method in DIAGNOSTIC_PARAMETERS
         )
+        listed: Any = runner.aws_json(
+            aws_region,
+            "rds",
+            "describe-db-cluster-parameters",
+            "--db-cluster-parameter-group-name",
+            group,
+            "--query",
+            f"Parameters[?contains([{names}], ParameterName)]",
+        )
+        # `--query Parameters[...]` projects the list itself; only an unfiltered
+        # response still wraps it in {"Parameters": [...]}. The wrapped shape
+        # was the only one the first live run ever saw, because that run
+        # created the group and never listed it (live 2026-09-08).
+        items = listed if isinstance(listed, list) else (listed.get("Parameters") or [])
         current = {
             str(item.get("ParameterName")): str(item.get("ParameterValue") or "")
-            for item in runner.aws_json(
-                aws_region,
-                "rds",
-                "describe-db-cluster-parameters",
-                "--db-cluster-parameter-group-name",
-                group,
-                "--query",
-                f"Parameters[?contains([{names}], ParameterName)]",
-            ).get("Parameters")
-            or []
+            for item in items
         }
     if runner.dry_run and not exists:
         return group
