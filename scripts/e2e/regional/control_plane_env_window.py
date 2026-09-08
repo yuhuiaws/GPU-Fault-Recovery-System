@@ -643,13 +643,34 @@ def close_window(
                 sort_keys=True,
             )
         )
-    expected = {
-        name: (item["value"] if item["present"] else None)
-        for name, item in baseline["variables"].items()
-    }
-    record["replicas_after_close"] = converge(settings, regional, expected, sleep=sleep)
+    record["replicas_after_close"] = converge(
+        settings, regional, restored_expectation(record), sleep=sleep
+    )
     write_json_atomic(settings.baseline, record)
     return record
+
+
+def restored_expectation(record: dict[str, Any]) -> dict[str, str | None]:
+    """What every replica must read once the window is closed.
+
+    Not "None for every variable the baseline did not carry inline": two of
+    the six (managed recovery, lease) reach the worker through ``envFrom``
+    ConfigMaps, so a restored replica legitimately reads 1800/180 for them and
+    a None expectation can never converge -- observed live 2026-09-08, where
+    every close spun to its rollout timeout after the Deployment had already
+    been restored. The pre-window survey recorded what the replicas actually
+    read; that is the restore target. A record written without a survey falls
+    back to the inline baseline.
+    """
+
+    baseline = record["baseline"]["variables"]
+    replicas = (record.get("pre_window_survey") or {}).get("replicas") or []
+    if replicas:
+        return {name: observed_value(replicas, name) for name in baseline}
+    return {
+        name: (item["value"] if item["present"] else None)
+        for name, item in baseline.items()
+    }
 
 
 def without_survey(record: dict[str, Any]) -> dict[str, Any]:

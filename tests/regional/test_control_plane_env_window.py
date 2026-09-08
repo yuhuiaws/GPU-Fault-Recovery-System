@@ -472,3 +472,98 @@ def test_replica_env_still_raises_a_real_exec_failure() -> None:
             deployment=env_window.DEPLOYMENT,
             names=(LIFETIME,),
         )
+
+
+def _absent(names: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    return {name: {"present": False, "value": None} for name in names}
+
+
+def test_the_close_expects_what_replicas_read_before_the_window_not_none() -> None:
+    """Managed recovery and lease reach the worker via envFrom ConfigMaps, so a
+    restored replica reads 1800/180 for them while the Deployment holds them
+    inline as absent. Expecting None there never converges (live 2026-09-08)."""
+    pre = {MANAGED: "1800", LEASE: "180", LIFETIME: None, TIMEOUT: None}
+    record = {
+        "baseline": {"variables": _absent((LIFETIME, TIMEOUT, MANAGED, LEASE))},
+        "pre_window_survey": {
+            "replicas": [{"pod": "a", "values": pre}, {"pod": "b", "values": pre}]
+        },
+    }
+
+    expected = env_window.restored_expectation(record)
+
+    assert expected == pre
+    restored = [{"pod": "c", "values": pre}, {"pod": "d", "values": pre}]
+    assert env_window.converged(restored, expected) is True
+    assert env_window.converged(
+        restored, {LIFETIME: None, TIMEOUT: None, MANAGED: None, LEASE: None}
+    ) is False, "the old None expectation is exactly what could never converge"
+
+
+def test_the_close_falls_back_to_the_inline_baseline_without_a_survey() -> None:
+    record = {
+        "baseline": {
+            "variables": {
+                **_absent((LIFETIME, MANAGED)),
+                TIMEOUT: {"present": True, "value": "1800"},
+            }
+        }
+    }
+
+    assert env_window.restored_expectation(record) == {
+        LIFETIME: None,
+        MANAGED: None,
+        TIMEOUT: "1800",
+    }
+
+
+class _ClosableRegional:
+    """A Deployment already restored to baseline whose replicas read the
+    ConfigMap-sourced managed-recovery and lease values."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.values = {name: None for name in env_window.SURVEYED_VARIABLES}
+        self.values[MANAGED] = "1800"
+        self.values[LEASE] = "180"
+
+    def ready_pods(self, plane: str, app: str) -> list[dict[str, Any]]:
+        return [{"name": "a"}, {"name": "b"}]
+
+    def kubectl(self, plane: str, *arguments: str, **_: Any) -> str:
+        self.calls.append((plane, *arguments))
+        if arguments[0] == "exec":
+            return json.dumps(self.values)
+        if arguments[:2] == ("get", "deployment"):
+            return json.dumps(_deployment([]))
+        return "deployment rolled out"
+
+
+def test_close_window_converges_on_a_configmap_sourced_baseline(tmp_path: Path) -> None:
+    regional = _ClosableRegional()
+    baseline_path = tmp_path / "baseline.json"
+    pre_replicas = [{"pod": "old", "values": dict(regional.values)}]
+    baseline_path.write_text(
+        json.dumps(
+            {
+                "opened_at": "t0",
+                "assignments": {LIFETIME: "180"},
+                "baseline": env_window.deployment_env(regional),
+                "pre_window_survey": {"replicas": pre_replicas},
+            }
+        )
+    )
+    settings = env_window.Settings(baseline=baseline_path, rollout_timeout_seconds=5)
+    polls: list[float] = []
+
+    record = env_window.close_window(
+        settings, regional, {"observed_at": "t1"}, sleep=polls.append
+    )
+
+    assert record["closed_at"]
+    assert record["replicas_after_close"] == [
+        {"pod": "a", "values": regional.values},
+        {"pod": "b", "values": regional.values},
+    ]
+    assert polls == [], "a restored Deployment must converge on the first poll"
+    assert json.loads(baseline_path.read_text())["replicas_after_close"]
