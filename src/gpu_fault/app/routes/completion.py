@@ -26,6 +26,10 @@ from gpu_fault.app.ingest.workload_observations import (
     ingest_workload_observation,
 )
 from gpu_fault.service import CompletionPendingError
+from gpu_fault.telemetry import (
+    ATTEMPT_COVERAGE_PATH,
+    WorkloadCoverageHeartbeat,
+)
 from gpu_fault.watcher import (
     AttemptObservation,
     FailureContainmentDecision,
@@ -117,6 +121,32 @@ async def terminal(
         )
     except CompletionPendingError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    ATTEMPT_COVERAGE_PATH,
+    response_model=WorkloadCoverageHeartbeat,
+    status_code=202,
+)
+@authorization_bucket("cluster-token")
+async def observe_coverage(
+    heartbeat: WorkloadCoverageHeartbeat,
+    dependencies: CompletionRouterDependencies = Depends(get_completion_dependencies),
+) -> WorkloadCoverageHeartbeat:
+    """Record that a watcher completed a full pass over one cluster.
+
+    Weak, self-superseding evidence: the watcher sends it through its ordinary
+    sink, so a lost heartbeat is simply replaced by the next pass. 202 says
+    exactly that -- the statement was accepted, and an older one that lost the
+    race to a newer row is not an error the watcher can act on.
+    """
+
+    await _store_call(
+        dependencies,
+        dependencies.context.topology.observe_coverage,
+        heartbeat,
+    )
+    return heartbeat
 
 
 @router.post(
