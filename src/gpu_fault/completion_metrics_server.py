@@ -3,11 +3,12 @@
 The completion controller is a watch/poll loop with no HTTP server of its own,
 so the counters it keeps (``reconcile_failures_total``,
 ``evicted_attempts_total``, ``restore_skipped_total``,
-``outbox_append_failures_total``, ``reconcile_runs_total``,
-``metadata_takeovers_total``, ``resumed_attempts_total``), the outbox depth
-gauges (``outbox_depth``, ``outbox_quarantined_depth``) and the timestamp of
-the last completed full
-reconcile pass were only reachable from a debugger. This module exposes them in
+``outbox_append_failures_total``, ``outbox_expired_total``,
+``reconcile_runs_total``, ``metadata_takeovers_total``,
+``resumed_attempts_total``), the outbox depth gauges (``outbox_depth``,
+``outbox_quarantined_depth``), the liveness budget
+(``progress_stall_budget_seconds``) and the timestamp of the last completed
+full reconcile pass were only reachable from a debugger. This module exposes them in
 Prometheus text exposition on a daemon thread so the Pod can carry the same
 ``prometheus.io/scrape`` annotations as every other GPU-fault workload.
 
@@ -122,6 +123,16 @@ COUNTERS: tuple[tuple[str, str, str], ...] = (
         "above zero means a restart can lose an event or replay a delivered "
         "one.",
     ),
+    (
+        "gpu_fault_completion_outbox_expired_total",
+        "outbox_expired_total",
+        "Buffered completion records quarantined because every delivery "
+        "attempt failed retryably for 24 h since they were buffered. Each one "
+        "is a failure-detected or terminal event the control plane never "
+        "accepted; nothing delivers it now except the operator running "
+        "`gpu-fault-completion-watcher --replay-quarantined` in the watcher "
+        "Pod after fixing the cause.",
+    ),
 )
 
 # (metric name, controller attribute, help text) for values that go up and
@@ -148,9 +159,19 @@ GAUGES: tuple[tuple[str, str, str], ...] = (
     (
         "gpu_fault_completion_outbox_quarantined_depth",
         "outbox_quarantined_depth",
-        "Buffered records the replay has given up on: it skips them for ever, "
-        "so they are delivered only by a later live POST or by an operator "
-        "replay. Anything above zero needs a look.",
+        "Buffered records the loop's replay will not retry: rejected by a "
+        "non-retryable control-plane status, or expired after 24 h of "
+        "retryable failures. They are delivered only by a later live POST or "
+        "by the operator's `gpu-fault-completion-watcher --replay-quarantined` "
+        "one-shot. Anything above zero needs a look.",
+    ),
+    (
+        "gpu_fault_completion_watcher_progress_stall_budget_seconds",
+        "progress_stall_budget_seconds",
+        "Seconds the loop may finish nothing before /healthz reports it "
+        "stuck; derived from the delivery timeouts in use. Alert on "
+        "time() - gpu_fault_completion_watcher_last_progress_timestamp "
+        "approaching this value rather than on a hard-coded number.",
     ),
 )
 

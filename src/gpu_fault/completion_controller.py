@@ -23,6 +23,7 @@ from gpu_fault.completion_attempt_state import (
     AttemptSpec,
     active_pass_counts,
     cache_terminal_attempt_observation,
+    evict_pruned_attempts,
     log_reconcile_failure,
     publish_attempt_observation,
     publish_coverage_heartbeat,
@@ -35,10 +36,10 @@ from gpu_fault.completion_observation import (
     MissingAttemptTracker,
     ObservationOnlyTracker,
     TerminalObservationCache,
-    _clear_attempt,
     completion_list_arguments,
     is_unknown_profile_rejection,
     list_completion_pods,
+    observe_containers,
     pod_container_has_started,
     reconcile_attempt_observation,
 )
@@ -46,6 +47,8 @@ from gpu_fault.completion_outbox import (
     completion_delivery_deferred,
     completion_sink_from_environment,
     replay_completion_outbox,
+    replay_quarantined_once,
+    replay_quarantined_requested,
 )
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
@@ -231,6 +234,9 @@ class KubernetesWorkloadStopper:
         self.workload_log_s3_max_bytes = workload_log_s3_max_bytes
         self.workload_log_annotation_tail_bytes = workload_log_annotation_tail_bytes
         self.workload_log_uploader = workload_log_uploader
+        # Liveness (M1): the controller points this at its progress stamp, so
+        # each finished capture is a step and not the whole batch.
+        self.note_progress: Callable[[], None] = lambda: None
 
     def stop(
         self,
@@ -396,6 +402,7 @@ class KubernetesWorkloadStopper:
         try:
             for future in as_completed(futures, timeout=budget):
                 completed.append(future.result())
+                self.note_progress()
         except TimeoutError:
             for future, pod in futures.items():
                 if future.done():
@@ -681,6 +688,8 @@ class KubernetesCompletionController:
         )
         self.watch_factory = watch_factory
         self.workload_stopper = workload_stopper
+        if workload_stopper is not None and hasattr(workload_stopper, "capture_logs"):
+            workload_stopper.note_progress = self.note_progress
         self.emergency_fallback_seconds = emergency_fallback_seconds
         self.reconcile_debounce_seconds = reconcile_debounce_seconds
         self.publish_observations = publish_observations
@@ -819,14 +828,19 @@ class KubernetesCompletionController:
 
     @property
     def outbox_quarantined_depth(self) -> int:
-        """Buffered records no replay will retry again (F12).
+        """Buffered records the loop's replay will not retry again (F12).
 
-        ``replay`` skips a quarantined record and no production caller passes
-        ``include_quarantined``, so anything above zero here is waiting on the
-        live path or on an operator, never on the loop.
+        Anything above zero is waiting on the live path or on the operator's
+        ``--replay-quarantined`` one-shot, never on the loop.
         """
 
         return int(getattr(self.sink, "last_quarantined_depth", 0))
+
+    @property
+    def outbox_expired_total(self) -> int:
+        """Retryable records quarantined for age, not verdict (final review C1)."""
+
+        return int(getattr(self.sink, "expired_total", 0))
 
     def _sink_timing(self, attribute: str, default: float) -> float:
         """A delivery timeout read off the sink, or off the sink it wraps.
@@ -971,7 +985,7 @@ class KubernetesCompletionController:
                 log_reconcile_failure(self, attempt_id, exc)
             self.note_progress()
         if attempt_filter is None:
-            self._evict_pruned_attempts(grouped)
+            evict_pruned_attempts(self, grouped)
             # Not the liveness signal (see ``last_progress_at``): this is the
             # value humans alert on, and only a pass that relisted every Pod
             # moves it.
@@ -985,24 +999,6 @@ class KubernetesCompletionController:
                 reconcile_failures=self.reconcile_failures_total - failures_before,
             )
         return results
-
-    def _evict_pruned_attempts(self, grouped: dict[str, list[dict[str, Any]]]) -> None:
-        """Drop controller state for attempts the watcher core has pruned.
-
-        Only attempts with no live Pod are evicted: one whose Pods are still
-        listed is rebuilt from them on the next pass anyway, and dropping its
-        sent-keys would re-post its terminal. The watcher accumulates pruned
-        ids across filtered passes; a full pass drains them.
-        """
-        for attempt_id in sorted(self.watcher.take_pruned_attempt_ids()):
-            if attempt_id in grouped:
-                continue
-            _clear_attempt(self, attempt_id)
-            self.evicted_attempts_total += 1
-            LOGGER.info(
-                "evicted terminal attempt state after retention: attempt=%s",
-                attempt_id,
-            )
 
     def _reconcile_attempt(
         self,
@@ -1137,11 +1133,11 @@ class KubernetesCompletionController:
                 # An earlier pass buffered this terminal and never delivered
                 # it; the outbox replay owns the retry (F8), so posting it live
                 # again this pass would only double the load. It is *not*
-                # delivered, so it must not be recorded as sent: replay
-                # quarantines a record after ``max_replay_attempts`` and then
-                # never touches it again, and the live path is what has to pick
-                # it up from there. The outbox suppresses the duplicate live
-                # POST for as long as the record really is replay's.
+                # delivered, so it must not be recorded as sent: a record the
+                # control plane rejects is quarantined and never replayed by
+                # the loop again, and the live path is what has to pick it up
+                # from there. The outbox suppresses the duplicate live POST
+                # for as long as the record really is replay's.
                 LOGGER.warning(
                     "training terminal for attempt %s is buffered in the "
                     "outbox; its delivery is owned by the replay",
@@ -1568,7 +1564,7 @@ class KubernetesCompletionController:
             spec = self._attempt_specs[attempt_id]
 
         critical_pods = [pod for pod in pods if self._is_critical(pod)]
-        containers = [self._container(pod) for pod in critical_pods]
+        containers = observe_containers(self, critical_pods)
         started = any(
             pod_container_has_started(pod, item.container_name)
             for pod, item in zip(critical_pods, containers, strict=True)
@@ -2128,10 +2124,14 @@ def controller_from_environment() -> KubernetesCompletionController:
     )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     configure_logging()
     validate_gpu_fault_environment(process_name="gpu-fault-completion-watcher")
-    controller_from_environment().run()
+    controller = controller_from_environment()
+    if replay_quarantined_requested(argv):
+        # Operator one-shot (C1): one outbox pass, then exit -- never the loop.
+        raise SystemExit(replay_quarantined_once(controller.sink, LOGGER))
+    controller.run()
 
 
 if __name__ == "__main__":

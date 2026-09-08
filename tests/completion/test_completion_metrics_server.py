@@ -376,3 +376,38 @@ def test_server_thread_is_a_daemon() -> None:
         assert server.daemon_thread, "the serving thread must not block exit"
     finally:
         server.stop()
+
+
+def test_metrics_export_the_liveness_budget_next_to_the_progress_timestamp() -> None:
+    """Final review M2: an alert needs the limit next to the age it compares.
+
+    ``/healthz`` compares ``time() - last_progress_timestamp`` to the budget the
+    controller derives from its delivery timeouts; without the budget on the
+    same scrape an alert has to hard-code a number that a configuration change
+    silently invalidates.
+    """
+
+    body = render_completion_metrics(FakeController())
+
+    lines = body.splitlines()
+    budget = "gpu_fault_completion_watcher_progress_stall_budget_seconds"
+    assert f"# TYPE {budget} gauge" in lines, f"{budget} is not typed as a gauge"
+    assert f"{budget} 310" in lines, f"{budget} sample missing from {body!r}"
+    assert "gpu_fault_completion_watcher_last_progress_timestamp" in body, (
+        "the budget is only useful next to the timestamp it bounds"
+    )
+
+
+def test_metrics_export_the_outbox_expiry_counter() -> None:
+    """Final review C1: a retry record that aged out is a counted loss."""
+
+    class ExpiringController(FakeController):
+        outbox_expired_total = 3
+
+    body = render_completion_metrics(ExpiringController())
+
+    name = "gpu_fault_completion_outbox_expired_total"
+    lines = body.splitlines()
+    assert f"# HELP {name} " in body, f"{name} has no HELP line: {body!r}"
+    assert f"# TYPE {name} counter" in lines, f"{name} is not typed as a counter"
+    assert f"{name} 3" in lines, f"{name} sample missing from {body!r}"

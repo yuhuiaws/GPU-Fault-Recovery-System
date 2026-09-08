@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -63,6 +64,18 @@ ACTIVE_STATE_REPEAT_LOG_SECONDS = 3600.0
 #: Marker in the ``post`` result: nothing was delivered live because the record
 #: is still buffered, so ``replay`` owns it (F8).
 DEFERRED_TO_REPLAY = "deferred_to_replay"
+#: How long a record whose every failure was retryable is retried before it is
+#: quarantined as expired (final review C1). An attempt *count* was the bound
+#: before, and twenty failed passes -- ten minutes of control-plane outage --
+#: quarantined a terminal that nothing would ever deliver again once the
+#: watcher core had pruned its attempt. A day is long enough that no outage
+#: this system is designed to ride out trips it, and short enough that a
+#: record nobody can deliver does not sit in the ConfigMap unnoticed.
+DEFAULT_MAX_RETRY_AGE_SECONDS = 24 * 3600.0
+#: The one-shot operator mode of the watcher entrypoint: replay every buffered
+#: record, quarantined ones included, once, and exit. See
+#: ``replay_quarantined_once``.
+REPLAY_QUARANTINED_FLAG = "--replay-quarantined"
 
 
 class CompletionOutboxFull(RuntimeError):
@@ -145,8 +158,8 @@ def completion_delivery_disposition(exc: BaseException) -> str:
     Uses the same status-code rule as the collector sink
     (``is_retryable_delivery_status``) so that the two layers cannot disagree
     about a 409 or a 422 again (P0-64B). An exception that carries no status
-    -- a socket error, an unexpected bug -- is retried; the attempt counter
-    bounds it.
+    -- a socket error, an unexpected bug -- is retried; the record's age
+    (``DEFAULT_MAX_RETRY_AGE_SECONDS``) bounds it, never its attempt count.
     """
 
     if isinstance(exc, CollectorError):
@@ -224,6 +237,85 @@ def _remaining_depth(
         1
         for record in remaining
         if record.get("quarantined", False) or str(record.get("key")) in isolated
+    )
+
+
+def _buffered_attempt_ids(records: list[dict[str, Any]]) -> frozenset[str]:
+    """The attempt ids the write-ahead log still names.
+
+    Read off the record keys (``<cluster>/<attempt>/<kind>``) so the controller
+    can hold an attempt's state for as long as any event of it is buffered:
+    once it has evicted the attempt, a quarantined record has no live path
+    left and only the operator lever can deliver it.
+    """
+
+    ids = set()
+    for record in records:
+        parts = str(record.get("key") or "").split("/")
+        if len(parts) >= 2 and parts[1]:
+            ids.add(parts[1])
+    return frozenset(ids)
+
+
+def _replay_failure(
+    record: dict[str, Any],
+    exc: BaseException,
+    *,
+    now: float,
+    max_retry_age_seconds: float,
+) -> tuple[str, dict[str, Any]]:
+    """``(outcome, fields)`` for a record whose replay just failed.
+
+    ``outcome`` is ``"retry"``, ``"rejected"`` (a non-retryable status: the
+    control plane's verdict on the event) or ``"expired"`` (every failure was
+    retryable but the record has been buffered longer than
+    ``max_retry_age_seconds``). Only the last two quarantine. A record without
+    a readable ``buffered_at`` cannot expire: it keeps being retried, which is
+    the failure mode that loses nothing.
+    """
+
+    fields: dict[str, Any] = {
+        "attempts": int(record.get("attempts", 0)) + 1,
+        "last_status": (
+            getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        ),
+        "last_error": str(exc)[:500],
+    }
+    if completion_delivery_disposition(exc) == "quarantine":
+        outcome = "rejected"
+    else:
+        buffered_at = record.get("buffered_at")
+        age = now - float(buffered_at) if isinstance(buffered_at, (int, float)) else 0.0
+        if age < max_retry_age_seconds:
+            return "retry", fields
+        outcome = "expired"
+    fields.update(quarantined=True, quarantined_at=now, quarantine_reason=outcome)
+    return outcome, fields
+
+
+def _log_quarantine(
+    key: str, outcome: str, fields: dict[str, Any], exc: BaseException
+) -> None:
+    if outcome == "expired":
+        LOGGER.error(
+            "completion outbox record expired after %d retryable failures and "
+            "is quarantined: key=%s last_status=%s error=%s -- the control "
+            "plane never accepted it; once the cause is fixed, run "
+            "`gpu-fault-completion-watcher %s` in the watcher Pod to deliver it",
+            fields["attempts"],
+            key,
+            fields["last_status"],
+            exc,
+            REPLAY_QUARANTINED_FLAG,
+        )
+        return
+    LOGGER.warning(
+        "completion outbox record quarantined after %d attempts: "
+        "key=%s status=%s error=%s",
+        fields["attempts"],
+        key,
+        fields["last_status"],
+        exc,
     )
 
 
@@ -523,7 +615,7 @@ class KubernetesCompletionOutbox:
         max_buffered_tail_bytes: int = DEFAULT_BUFFERED_TAIL_BYTES,
         replay_batch_size: int = 32,
         replay_budget_seconds: float = 10.0,
-        max_replay_attempts: int = 20,
+        max_retry_age_seconds: float = DEFAULT_MAX_RETRY_AGE_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
         now: Callable[[], float] = time.time,
     ) -> None:
@@ -531,7 +623,7 @@ class KubernetesCompletionOutbox:
             raise ValueError("completion outbox bounds must be positive")
         if max_buffered_tail_bytes < 1:
             raise ValueError("completion outbox buffered tail bound must be positive")
-        if replay_budget_seconds <= 0 or max_replay_attempts < 1:
+        if replay_budget_seconds <= 0 or max_retry_age_seconds <= 0:
             raise ValueError("completion outbox replay bounds must be positive")
         self.core_api = core_api
         self.sink = sink
@@ -546,7 +638,7 @@ class KubernetesCompletionOutbox:
         self.max_buffered_tail_bytes = max_buffered_tail_bytes
         self.replay_batch_size = replay_batch_size
         self.replay_budget_seconds = replay_budget_seconds
-        self.max_replay_attempts = max_replay_attempts
+        self.max_retry_age_seconds = max_retry_age_seconds
         self.monotonic = monotonic
         self.now = now
         self.last_replay: dict[str, int] = {
@@ -554,6 +646,15 @@ class KubernetesCompletionOutbox:
             "deferred": 0,
             "quarantined": 0,
         }
+        # Retryable records quarantined for age; exported as
+        # ``gpu_fault_completion_outbox_expired_total``. Each one is an event
+        # the control plane never accepted in a day and nothing will deliver
+        # without the operator lever.
+        self.expired_total = 0
+        # Attempt ids the WAL named as of the last read or write we own, or
+        # ``None`` while that is unknown; the controller holds an attempt's
+        # state until its id is gone from here. Maintained beside the depth.
+        self.buffered_attempt_ids: frozenset[str] | None = None
         self._attempt_digests: dict[str, str] = {}
         # Critical events whose write-ahead copy could not be written. Exported
         # as ``gpu_fault_completion_outbox_append_failures_total``: since a
@@ -670,6 +771,7 @@ class KubernetesCompletionOutbox:
         self._known_quarantined = sum(
             1 for record in records if record.get("quarantined", False)
         )
+        self.buffered_attempt_ids = _buffered_attempt_ids(records)
 
     def _forget_depth(self) -> None:
         """Drop the in-process belief; the next replay must read the object.
@@ -681,6 +783,7 @@ class KubernetesCompletionOutbox:
 
         self._known_depth = None
         self._known_quarantined = None
+        self.buffered_attempt_ids = None
 
     def _mutate(
         self,
@@ -719,14 +822,13 @@ class KubernetesCompletionOutbox:
         A key that is already in the ConfigMap is a record an earlier pass
         failed to deliver, and ``replay`` owns it from then on, so the caller
         must not post it live a second time in the same pass (F8) -- *unless*
-        that record is quarantined. ``replay`` skips a quarantined record for
-        ever (no production caller passes ``include_quarantined``), and it
-        quarantines after ``max_replay_attempts`` even for a transient outage,
-        so deferring to a replay that will never come would make the event
-        permanently undeliverable. For a quarantined key the live POST is the
-        only path left: the record is kept as it is -- attempts, quarantine
-        flag and last error stay readable -- and the caller removes it once
-        the control plane accepts the event.
+        that record is quarantined. The loop's ``replay`` skips a quarantined
+        record (only the ``--replay-quarantined`` one-shot passes
+        ``include_quarantined``), so deferring to it would make the event
+        undeliverable until an operator acts. For a quarantined key the live
+        POST is the other path: the record is kept as it is -- attempts,
+        quarantine flag and last error stay readable -- and the caller
+        removes it once the control plane accepts the event.
         """
 
         buffered = pointer_sized_completion_payload(
@@ -1098,12 +1200,17 @@ class KubernetesCompletionOutbox:
         """Deliver buffered records, isolating each one (F-G1).
 
         A record whose delivery fails is kept and counted, never allowed to
-        stop the records behind it: a permanent rejection (or too many
-        attempts) quarantines it, a transient failure defers it to the next
-        cycle. Quarantined records are skipped unless ``include_quarantined``
-        is set, which is how an operator retries them after fixing the cause
-        (for example registering the runtime profile the control plane did
-        not know). The whole pass is bounded by ``replay_budget_seconds``.
+        stop the records behind it: a non-retryable status quarantines it as
+        ``rejected``, a retryable failure defers it to the next cycle until
+        the record is ``max_retry_age_seconds`` old, when it is quarantined as
+        ``expired`` and counted in ``expired_total``. Attempt count never
+        quarantines (final review C1). Quarantined records are skipped unless
+        ``include_quarantined`` is set; the one caller that sets it is the
+        operator's one-shot ``gpu-fault-completion-watcher --replay-quarantined``
+        (``kubectl exec`` into the watcher Pod, or a Job with the watcher's
+        environment), run after fixing the cause -- for example registering
+        the runtime profile the control plane did not know. The whole pass is
+        bounded by ``replay_budget_seconds``.
 
         What is re-sent is the buffered, pointer-sized record: its log tails
         are capped at ``max_buffered_tail_bytes`` per snapshot and flagged
@@ -1221,36 +1328,21 @@ class KubernetesCompletionOutbox:
             try:
                 self.sink.post(path, payload)
             except Exception as exc:
-                attempts = int(record.get("attempts", 0)) + 1
-                disposition = completion_delivery_disposition(exc)
-                status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-                if disposition == "quarantine" or attempts >= self.max_replay_attempts:
+                outcome, fields = _replay_failure(
+                    record,
+                    exc,
+                    now=self.now(),
+                    max_retry_age_seconds=self.max_retry_age_seconds,
+                )
+                if outcome == "retry":
+                    deferred += 1
+                else:
                     quarantined += 1
                     isolated.add(key)
-                    LOGGER.warning(
-                        "completion outbox record quarantined after %d attempts: "
-                        "key=%s status=%s error=%s",
-                        attempts,
-                        key,
-                        status,
-                        exc,
-                    )
-                    self._update(
-                        key,
-                        attempts=attempts,
-                        quarantined=True,
-                        quarantined_at=self.now(),
-                        last_status=status,
-                        last_error=str(exc)[:500],
-                    )
-                else:
-                    deferred += 1
-                    self._update(
-                        key,
-                        attempts=attempts,
-                        last_status=status,
-                        last_error=str(exc)[:500],
-                    )
+                    if outcome == "expired":
+                        self.expired_total += 1
+                    _log_quarantine(key, outcome, fields, exc)
+                self._update(key, **fields)
                 continue
             if path == WORKLOAD_OBSERVATION_PATH and str(
                 payload.get("workload_phase") or ""
@@ -1316,6 +1408,63 @@ def completion_sink_from_environment(core_api: Any) -> KubernetesCompletionOutbo
             os.getenv("GPU_FAULT_COMPLETION_OUTBOX_REPLAY_BATCH_SIZE", "32")
         ),
     )
+
+
+def replay_quarantined_requested(argv: Sequence[str] | None) -> bool:
+    """Whether the watcher was started in its one-shot replay mode.
+
+    Parsed here rather than in the controller module because that module is
+    at its architecture size limit and because the flag's meaning is this
+    module's: ``replay(include_quarantined=True)``, once.
+    """
+
+    parser = argparse.ArgumentParser(prog="gpu-fault-completion-watcher")
+    parser.add_argument(
+        REPLAY_QUARANTINED_FLAG,
+        action="store_true",
+        help=(
+            "replay every buffered completion record once, quarantined ones "
+            "included, then exit (0 when nothing is left quarantined, 1 "
+            "otherwise); run after fixing the cause the records were "
+            "quarantined for. Does not start the watch loop."
+        ),
+    )
+    return bool(parser.parse_args(argv).replay_quarantined)
+
+
+def replay_quarantined_once(outbox: Any, logger: logging.Logger) -> int:
+    """The operator lever behind ``--replay-quarantined``; returns the exit code.
+
+    One ``replay(include_quarantined=True)`` pass against the same ConfigMap
+    the live watcher writes, through the same optimistic-concurrency
+    (``resourceVersion``) writes, so it is safe to run beside the live Pod:
+    a record both deliver is removed once and the second removal is a no-op.
+    The pass is bounded like any other (``replay_batch_size`` records,
+    ``replay_budget_seconds``), so a backlog larger than one batch needs the
+    command run again; the exit code says whether anything is still
+    quarantined.
+    """
+
+    replayed = outbox.replay(include_quarantined=True)
+    remaining = int(getattr(outbox, "last_quarantined_depth", 0))
+    logger.info(
+        "one-shot replay of the completion outbox: replayed=%d deferred=%d "
+        "quarantined=%d still_quarantined=%d depth=%d",
+        replayed,
+        outbox.last_replay["deferred"],
+        outbox.last_replay["quarantined"],
+        remaining,
+        int(getattr(outbox, "last_depth", 0)),
+    )
+    if remaining:
+        logger.error(
+            "%d completion record(s) are still quarantined after the one-shot "
+            "replay; fix the cause each record's last_error names, or run the "
+            "command again if the batch bound cut the pass short",
+            remaining,
+        )
+        return 1
+    return 0
 
 
 def replay_completion_outbox(sink: Any, logger: logging.Logger) -> None:

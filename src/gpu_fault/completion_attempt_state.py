@@ -16,6 +16,7 @@ from gpu_fault.completion_attempt_store import (
 from gpu_fault.completion_observation import (
     TERMINAL_ORIGIN_MISSING_TOMBSTONE,
     TERMINAL_ORIGIN_OBSERVED,
+    _clear_attempt,
 )
 from gpu_fault.completion_outbox import CompletionOutboxFull
 from gpu_fault.models import Environment, TerminalEvent
@@ -237,6 +238,49 @@ def cache_terminal_attempt_observation(
             origin,
         ),
     )
+
+
+def evict_pruned_attempts(
+    controller: Any, grouped: dict[str, list[dict[str, Any]]]
+) -> None:
+    """Drop controller state for attempts the watcher core has pruned.
+
+    Only attempts with no live Pod are evicted: one whose Pods are still listed
+    is rebuilt from them on the next pass anyway, and dropping its sent-keys
+    would re-post its terminal. The watcher accumulates pruned ids across
+    filtered passes; a full pass drains them.
+
+    An attempt the write-ahead log still names is kept too (final review C1).
+    Eviction drops the cached terminal and the sent keys, which is the whole
+    live path; a record quarantined by the control plane's verdict has no
+    other path, and a record still in retry needs the live path to try each
+    pass. The outbox says which attempts it holds as of its last read or write
+    (``buffered_attempt_ids``); while that is unknown -- a write raised and the
+    next replay has not re-read yet -- nothing is evicted, because a wrong
+    "clean" costs an event and a wrong "held" costs one pass of memory. The
+    watcher core re-prunes the attempt on the next sibling observation, so the
+    id is offered again and evicted as soon as the log is clean.
+    """
+
+    held: frozenset[str] | None = getattr(
+        controller.sink, "buffered_attempt_ids", frozenset()
+    )
+    for attempt_id in sorted(controller.watcher.take_pruned_attempt_ids()):
+        if attempt_id in grouped:
+            continue
+        if held is None or attempt_id in held:
+            LOGGER.debug(
+                "keeping terminal attempt state past retention while the outbox "
+                "still buffers its events: attempt=%s",
+                attempt_id,
+            )
+            continue
+        _clear_attempt(controller, attempt_id)
+        controller.evicted_attempts_total += 1
+        LOGGER.info(
+            "evicted terminal attempt state after retention: attempt=%s",
+            attempt_id,
+        )
 
 
 def active_pass_counts(controller: Any, pods: list[dict[str, Any]]) -> tuple[int, int]:

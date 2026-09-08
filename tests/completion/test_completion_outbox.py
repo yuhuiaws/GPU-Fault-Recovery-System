@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gpu_fault.collectors import CollectorError
 from gpu_fault.completion_outbox import (
     CompletionOutboxFull,
     KubernetesCompletionOutbox,
@@ -431,28 +432,37 @@ class BrokenRemovalCore(ConfigMapCore):
         return super().replace_namespaced_config_map(name, namespace, body)
 
 
+class RejectingSink(RecordingSink):
+    """Answers a non-retryable 422 while ``fail`` is set; accepts otherwise."""
+
+    def post(self, path, payload):
+        self.posts.append((path, payload))
+        if self.fail:
+            raise CollectorError(
+                "collector event rejected (422): unknown", status_code=422
+            )
+        return {"accepted": True}
+
+
 def test_a_quarantined_record_does_not_deadlock_the_live_post() -> None:
     """A record ``replay`` has given up on must not silence the live path.
 
-    ``replay`` quarantines after ``max_replay_attempts`` (production default
-    20, one attempt per 30 s pass) even for a purely transient error, and then
-    skips the record for ever -- no production caller passes
-    ``include_quarantined``. If ``post`` still answered ``deferred_to_replay``
-    for that key, the event would become permanently undeliverable: the exact
-    F1 outcome (workload suspended, no incident) the deferral was added
-    around.
+    ``replay`` quarantines a record the control plane rejects with a
+    non-retryable status and then skips it -- only the operator's one-shot
+    passes ``include_quarantined``. If ``post`` still answered
+    ``deferred_to_replay`` for that key, the event would stay undeliverable
+    until the operator noticed: the exact F1 outcome (workload suspended, no
+    incident) the deferral was added around.
     """
 
     core = ConfigMapCore()
-    sink = RecordingSink(fail=True)
-    outbox = KubernetesCompletionOutbox(core, sink, max_replay_attempts=3)
-    with pytest.raises(OSError):
+    sink = RejectingSink(fail=True)
+    outbox = KubernetesCompletionOutbox(core, sink)
+    with pytest.raises(CollectorError):
         outbox.post("/v1/attempts/failure-detected", payload())
-    for _ in range(3):
-        assert outbox.replay() == 0, "the control plane is still down"
+    assert outbox.replay() == 0, "the control plane still rejects the event"
     assert outbox.quarantined_depth() == 1, (
-        "three failed attempts with max_replay_attempts=3 must quarantine the "
-        f"record, depth={outbox.depth()}"
+        f"a 422 verdict must quarantine the record, depth={outbox.depth()}"
     )
 
     sink.fail = False
@@ -545,12 +555,12 @@ def test_a_delivered_record_that_cannot_be_cleared_is_reclaimed_by_replay() -> N
     """
 
     core = OneBadRemovalCore()
-    sink = RecordingSink(fail=True)
-    outbox = KubernetesCompletionOutbox(core, sink, max_replay_attempts=1)
-    with pytest.raises(OSError):
+    sink = RejectingSink(fail=True)
+    outbox = KubernetesCompletionOutbox(core, sink)
+    with pytest.raises(CollectorError):
         outbox.post("/v1/attempts/failure-detected", payload())
-    assert outbox.replay() == 0, "the control plane is still down"
-    assert outbox.quarantined_depth() == 1, "one failed attempt must quarantine it"
+    assert outbox.replay() == 0, "the control plane still rejects the event"
+    assert outbox.quarantined_depth() == 1, "one 422 verdict must quarantine it"
 
     sink.fail = False
     result = outbox.post("/v1/attempts/failure-detected", payload())

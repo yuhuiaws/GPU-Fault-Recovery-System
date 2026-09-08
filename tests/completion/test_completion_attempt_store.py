@@ -232,6 +232,56 @@ def test_the_persisted_record_holds_the_spec_and_pod_identity_only() -> None:
         )
 
 
+def test_a_restored_attempt_inside_the_grace_is_republished_as_fresh() -> None:
+    """The grace re-post has to carry a fresh ``observed_at`` (final review I1).
+
+    Inside the missing-Pod grace the observation was republished unchanged,
+    ``observed_at`` included. For a restored attempt that timestamp is the last
+    structural change the previous process persisted -- hours old -- and the
+    control plane ignores an observation older than ``max_age_seconds``
+    (120 s), so past that point the RUNNING re-post was inert and the node
+    resolved IDLE: the same ACTIVE-to-IDLE flip C1 closed, reopened by a grace
+    (300 s in the shipped configuration) that is longer than the age limit.
+    """
+
+    clock = Clock()
+    pods = [training_pod("train-a1", rank) for rank in range(8)]
+    core = FakeCoreApi(pods)
+    watcher(core, FakeSink(), clock).run_once()
+    node_id = pods[0]["spec"]["nodeName"]
+
+    core.pods = []
+    clock.value = NOW + timedelta(seconds=121)
+    after = FakeSink()
+    restarted = watcher(core, after, clock)
+    restarted.run_once()
+
+    posted = [
+        AttemptObservation.model_validate(payload)
+        for path, payload in after.posts
+        if path == "/v1/workload-observations"
+    ]
+    assert posted, "the restored attempt must be republished inside the grace"
+    assert posted[-1].workload_phase.value == "RUNNING", posted[-1].workload_phase
+    assert posted[-1].observed_at == clock(), (
+        "the grace re-post must be stamped with the pass that made it, not the "
+        f"persisted instant: observed_at={posted[-1].observed_at} now={clock()}"
+    )
+    context = WorkloadTopologyService(
+        SimpleNamespace(get_workload_coverage_heartbeat=lambda _cluster: None)
+    ).resolve(
+        "hp-cluster",
+        node_id,
+        clock(),
+        observations=posted[-1:],
+        target_gpu_uuids={GPU_UUIDS[0]},
+    )
+    assert context.workload_state == "ACTIVE", (
+        "past max_age_seconds the stale re-post is ignored and the faulted GPU "
+        f"resolves IDLE, got {context.workload_state} {context.attempt_ids}"
+    )
+
+
 def test_a_restored_attempt_whose_pods_are_gone_still_resolves_active() -> None:
     """The persisted record has to carry the fault-attribution identity (C1).
 

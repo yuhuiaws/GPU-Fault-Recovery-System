@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, cast
 
-from gpu_fault.watcher import AttemptObservation, WorkloadPhase
+from gpu_fault.watcher import AttemptObservation, ContainerObservation, WorkloadPhase
 
 LOGGER = logging.getLogger(__name__)
 TERMINATION_INCIDENT_ANNOTATION = "gpu-fault.io/termination-initiator-incident-id"
@@ -339,7 +339,13 @@ class MissingAttemptTracker:
     ) -> AttemptObservation:
         missing_since = self.since.setdefault(attempt_id, observed_at)
         if (observed_at - missing_since).total_seconds() < self.grace_seconds:
-            return observation
+            # Republished as-is *except* for the instant (final review I1):
+            # the control plane ignores an observation older than its
+            # ``max_age_seconds`` (120 s), and for a restored attempt the
+            # persisted ``observed_at`` is hours old, so the RUNNING re-post
+            # inside a 300 s grace was inert after two minutes and the
+            # faulted GPU resolved IDLE -- the flip C1 exists to prevent.
+            return observation.model_copy(update={"observed_at": observed_at})
         self.tombstoned.add(attempt_id)
         return cast(
             AttemptObservation,
@@ -418,6 +424,25 @@ def restored_attempt_observation(
     return tombstone.model_copy(
         update={"workload_phase": phase, "containers": containers}
     )
+
+
+def observe_containers(
+    controller: Any, pods: list[dict[str, Any]]
+) -> list[ContainerObservation]:
+    """One ``ContainerObservation`` per Pod, stamping progress after each.
+
+    A RUNNING Pod without a GPU UUID annotation costs one ``nvidia-smi`` exec
+    (10 s on a hung kubelet), serially, and the in-memory backoff that spaces
+    the retries is lost on restart: 32 such Pods were 320 s of loop with
+    nothing refreshing the liveness clock, past the 310 s budget on a watcher
+    that was working (final review M1). Each Pod read is one finished step.
+    """
+
+    containers: list[ContainerObservation] = []
+    for pod in pods:
+        containers.append(controller._container(pod))
+        controller.note_progress()
+    return containers
 
 
 def reconcile_attempt_observation(

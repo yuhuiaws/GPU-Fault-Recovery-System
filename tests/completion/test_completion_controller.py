@@ -1984,7 +1984,7 @@ def test_unwritable_outbox_still_delivers_and_is_counted() -> None:
 
 
 class TogglingSink(FakeSink):
-    """Fails every POST until ``fail`` is cleared."""
+    """Rejects every POST with a non-retryable 422 until ``fail`` is cleared."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -1993,7 +1993,7 @@ class TogglingSink(FakeSink):
     def post(self, path, payload):
         self.posts.append((path, payload))
         if self.fail:
-            raise RuntimeError("control plane unavailable")
+            raise CollectorError("collector event rejected (422)", status_code=422)
         return {"accepted": True}
 
 
@@ -2002,20 +2002,20 @@ def test_a_deferred_terminal_is_not_recorded_as_sent() -> None:
 
     Marking ``_terminal_sent`` on a ``deferred_to_replay`` answer retires the
     live path for the lifetime of the process. Once ``replay`` quarantines the
-    record -- which it does after ``max_replay_attempts`` even for a transient
-    outage -- nothing would ever deliver the terminal event again. The live
-    path has to stay the owner until the control plane really accepts it.
+    record -- which it does on a non-retryable status -- nothing but the live
+    path would ever deliver the terminal event again. The live path has to
+    stay the owner until the control plane really accepts it.
     """
 
     core = FakeCoreApi([pod(0, exit_code=0)])
     inner = TogglingSink()
-    outbox = KubernetesCompletionOutbox(core, inner, max_replay_attempts=1)
+    outbox = KubernetesCompletionOutbox(core, inner)
     subject = KubernetesCompletionController(core, outbox, cluster_id="hp-cluster")
 
     subject.run_once()  # live POST fails, the record is buffered
-    subject.run_once()  # replay fails and quarantines it; live POST fails too
+    subject.run_once()  # replay is rejected and quarantines it; live POST fails too
     assert outbox.quarantined_depth() == 1, (
-        "max_replay_attempts=1 must quarantine after the first replay, "
+        "a 422 verdict must quarantine on the first replay, "
         f"{core.config_map_data['events.json']!r}"
     )
 

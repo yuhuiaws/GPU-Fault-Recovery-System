@@ -13,6 +13,7 @@ that the two layers classify a status code the same way.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -117,17 +118,89 @@ def test_a_transient_failure_keeps_the_record_and_continues_with_the_next() -> N
     assert outbox.last_replay == {"replayed": 1, "deferred": 1, "quarantined": 0}
 
 
-def test_repeated_transient_failures_eventually_quarantine() -> None:
+def test_repeated_transient_failures_never_quarantine_by_count() -> None:
+    """Final review C1: an outage is not a verdict on the record.
+
+    Twenty failed attempts used to quarantine a record whose every failure
+    was retryable -- about ten minutes of control-plane outage at one replay
+    per 30 s pass -- after which ``replay`` skipped it for ever.
+    """
+
     core = ConfigMapCore()
     _buffered(core, "attempt-a")
     sink = ScriptedSink({"attempt-a": OSError("down")})
-    outbox = KubernetesCompletionOutbox(core, sink, max_replay_attempts=3)
+    outbox = KubernetesCompletionOutbox(core, sink)
 
-    for _ in range(3):
+    for _ in range(25):
         outbox.replay()
 
-    assert outbox.quarantined_depth() == 1
-    assert _records(core)["cluster-a/attempt-a/terminal"]["attempts"] == 3
+    assert outbox.quarantined_depth() == 0, (
+        "a retryable failure must never quarantine a record however often it "
+        f"repeats: {_records(core)}"
+    )
+    assert _records(core)["cluster-a/attempt-a/terminal"]["attempts"] == 25
+    assert outbox.expired_total == 0
+
+
+def test_a_retry_disposition_older_than_a_day_expires_into_quarantine(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The bound on a retryable record is its age, not its attempt count.
+
+    Nothing that has failed for a whole day is a transient outage any more;
+    the record is quarantined so the operator lever can still push it, and
+    the expiry is counted and named so the loss is visible.
+    """
+
+    now = [1_000_000.0]
+    core = ConfigMapCore()
+    outbox = KubernetesCompletionOutbox(
+        core, ScriptedSink({"attempt-a": OSError("down")}), now=lambda: now[0]
+    )
+    with pytest.raises(OSError):
+        outbox.post(TERMINAL, payload("attempt-a"))
+
+    now[0] += 24 * 3600 - 1
+    outbox.replay()
+    assert outbox.quarantined_depth() == 0, (
+        f"one second short of a day is still a retry: {_records(core)}"
+    )
+
+    now[0] += 1
+    with caplog.at_level(logging.ERROR, logger="gpu_fault.completion_outbox"):
+        outbox.replay()
+
+    record = _records(core)["cluster-a/attempt-a/terminal"]
+    assert record["quarantined"] is True, f"a day-old retry must expire: {record}"
+    assert record["quarantine_reason"] == "expired", record
+    assert outbox.expired_total == 1, (
+        f"the expiry must be counted, expired_total={outbox.expired_total}"
+    )
+    assert outbox.last_replay["quarantined"] == 1
+    errors = [
+        message.getMessage()
+        for message in caplog.records
+        if message.levelno == logging.ERROR
+    ]
+    assert any("cluster-a/attempt-a/terminal" in text for text in errors), (
+        f"the expiry must be logged at ERROR with the record key: {errors}"
+    )
+
+
+def test_a_non_retryable_status_quarantines_on_first_sight() -> None:
+    core = ConfigMapCore()
+    _buffered(core, "attempt-a")
+    outbox = KubernetesCompletionOutbox(
+        core, ScriptedSink({"attempt-a": _rejected(422, "workload_ids is required")})
+    )
+
+    outbox.replay()
+
+    record = _records(core)["cluster-a/attempt-a/terminal"]
+    assert record["quarantined"] is True, record
+    assert record["quarantine_reason"] == "rejected", record
+    assert record["attempts"] == 1
+    assert outbox.expired_total == 0, "a verdict is not an expiry"
 
 
 def test_replay_respects_a_time_budget() -> None:

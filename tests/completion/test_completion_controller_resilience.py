@@ -696,3 +696,90 @@ def test_a_slow_outbox_replay_counts_as_progress() -> None:
     assert [status for _, status, _ in inner.health] == [200, 200, 200], (
         f"a replay that keeps delivering records is progress: {inner.health}"
     )
+
+
+class LogClockCore(FakeCoreApi):
+    """Every Pod log read burns fake wall clock, as a hung kubelet would."""
+
+    def __init__(self, pods, clock: Clock, hold_seconds: float) -> None:
+        super().__init__(pods)
+        self.clock = clock
+        self.hold_seconds = hold_seconds
+        self._lock = threading.Lock()
+
+    def read_namespaced_pod_log(self, *_args, **_kwargs):
+        with self._lock:
+            self.clock.value += timedelta(seconds=self.hold_seconds)
+        return "training log line\n"
+
+
+def test_each_finished_log_capture_counts_as_progress() -> None:
+    """Final review M1: the capture batch is not one step, each capture is.
+
+    ``capture_logs`` waits up to ``workload_log_timeout_seconds`` per wave of
+    eight Pods with nothing stamping progress in between, so a 107-rank
+    attempt on hung kubelets (420 s) outlasted the 310 s liveness budget on a
+    watcher that was working. Two captures of 150 s each here: without a stamp
+    per finished capture the failure-detected POST that follows finds the
+    loop 450 s past its last step.
+    """
+
+    clock = Clock()
+    box: list = []
+    core = LogClockCore(
+        [pod(0, exit_code=1, expected_ranks=2), pod(1, expected_ranks=2)], clock, 150.0
+    )
+    sink = DeliveryClockSink(clock, box, 150.0)
+    stopper = KubernetesWorkloadStopper(
+        batch_api=None, custom_api=None, core_api=core, workload_log_timeout_seconds=5
+    )
+    subject = KubernetesCompletionController(
+        core, sink, cluster_id="hp-cluster", now=clock, workload_stopper=stopper
+    )
+    box.append(subject)
+
+    subject.run_once()
+
+    health = [(path, status) for path, status, _ in sink.health]
+    assert health == [("/v1/attempts/failure-detected", 200)], (
+        "each finished log capture is a step the liveness probe must see, so "
+        f"the POST after two 150 s captures must find the loop live: {sink.health}"
+    )
+
+
+def test_each_gpu_uuid_discovery_counts_as_progress() -> None:
+    """Final review M1: the per-Pod ``nvidia-smi`` exec is a step too.
+
+    A RUNNING Pod without a GPU UUID annotation costs one 10 s exec, serially,
+    per Pod per pass, and the in-memory backoff is lost on restart: 32 such
+    Pods on hung kubelets are 320 s of unstamped loop. Three 150 s discoveries
+    here; the observation POST that follows samples the probe.
+    """
+
+    clock = Clock()
+    box: list = []
+
+    def resolve(_pod_body, _container_name):
+        clock.value += timedelta(seconds=150)
+        return ["GPU-discovered"]
+
+    sink = DeliveryClockSink(clock, box, 150.0)
+    subject = KubernetesCompletionController(
+        FakeCoreApi(
+            [pod(rank, include_gpu_uuids=False, expected_ranks=3) for rank in range(3)]
+        ),
+        sink,
+        cluster_id="hp-cluster",
+        now=clock,
+        publish_observations=True,
+        gpu_uuid_resolver=resolve,
+    )
+    box.append(subject)
+
+    subject.run_once()
+
+    health = [(path, status) for path, status, _ in sink.health]
+    assert health == [("/v1/workload-observations", 200)], (
+        "each GPU UUID discovery is a step the liveness probe must see, so the "
+        f"POST after three 150 s discoveries must find the loop live: {sink.health}"
+    )
