@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from gpu_fault.collectors.sinks import (
@@ -239,9 +239,15 @@ def _observed_instant(record: dict[str, Any]) -> datetime | None:
 
     text = str(record.get("observed_at") or "")
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        instant = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+    # A record without a zone is one an older release (or a hand edit) wrote,
+    # and UTC is the only zone anything in this system writes. Without this the
+    # comparison below raises ``TypeError`` inside the migration's own
+    # try/except, so the migration never completed and every load and every
+    # owed probe printed the same traceback again.
+    return instant if instant.tzinfo else instant.replace(tzinfo=timezone.utc)
 
 
 def _merge_legacy_attempt_state(
@@ -349,6 +355,21 @@ def _legacy_adoption(
         return result
 
     return adopt
+
+
+def _attempt_removal(key: str) -> Callable[[dict[str, str]], dict[str, str]]:
+    """Mutation that drops ``key`` from the attempt-state document."""
+
+    def update(data: dict[str, str]) -> dict[str, str]:
+        attempts = _attempt_records(data)
+        if key not in attempts:
+            return data
+        attempts.pop(key)
+        result = dict(data)
+        result[ATTEMPT_STATE_KEY] = _attempt_document(attempts)
+        return result
+
+    return update
 
 
 def _sorted_records(attempts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -915,6 +936,15 @@ class KubernetesCompletionOutbox:
         Called from the top of every reconcile pass, because ``usable()`` is
         only reached from a save/remove/load and an idle cluster makes none of
         those: the operator applied the manifest and the gauge stayed at 1.
+
+        The records this reads are deliberately thrown away: this is a flip of
+        the health flag (and the migration it drags along), not a restore.
+        Restoring is constructor-shaped -- it seeds the controller's trackers
+        before any pass has run -- so replaying it mid-life would overwrite
+        observations the live passes have since published with whatever the
+        object held, and re-arm the missing-attempt grace (F7) for attempts the
+        watcher is already watching. The state that matters after a recovery is
+        written back by the very next ``save_attempt_observation``.
         """
 
         if not self._active_state.owes_a_probe():
@@ -979,16 +1009,20 @@ class KubernetesCompletionOutbox:
 
         def update(data: dict[str, str]) -> dict[str, str]:
             attempts = _attempt_records(data)
-            record = dict(payload)
-            if attempts.get(key) == record:
-                # The digest cache is an optimisation, not the guard: it is
-                # empty after a restart, after a migration and after every
-                # recovery from a degraded object, and ``dict.update`` always
-                # returns a new document, so the unchanged-mutation shortcut in
-                # ``_mutate_data`` never fired. One pass then rewrote the whole
-                # document once per attempt -- 125 attempts of ~830 KB each.
+            stored = attempts.get(key)
+            if stored is not None and _attempt_digest(stored) == digest:
+                # The same test the digest cache applies, applied to what the
+                # object actually holds -- the cache itself cannot answer here
+                # because it is empty after a restart, after a migration and
+                # after every recovery from a degraded object, and the mutation
+                # always returns a new document, so ``_mutate_data``'s
+                # unchanged-mutation shortcut never fires on its own. One pass
+                # then rewrote the whole document once per attempt -- 125
+                # attempts of ~830 KB each. Comparing the records instead would
+                # be no guard at all: ``observed_at`` is stamped every pass and
+                # is exactly what ``_attempt_digest`` leaves out.
                 return data
-            attempts[key] = record
+            attempts[key] = dict(payload)
             result = dict(data)
             result[self.ATTEMPTS_KEY] = _attempt_document(attempts)
             return result
@@ -1008,17 +1042,8 @@ class KubernetesCompletionOutbox:
         if not self._before_active_state_write():
             return
 
-        def update(data: dict[str, str]) -> dict[str, str]:
-            attempts = _attempt_records(data)
-            if key not in attempts:
-                return data
-            attempts.pop(key)
-            result = dict(data)
-            result[self.ATTEMPTS_KEY] = _attempt_document(attempts)
-            return result
-
         try:
-            self._mutate_data(self.active_name, update)
+            self._mutate_data(self.active_name, _attempt_removal(key))
         except Exception as exc:
             if not self._active_state.refused(exc):
                 raise

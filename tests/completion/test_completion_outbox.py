@@ -890,6 +890,50 @@ def test_a_migration_keeps_the_newer_observation_not_the_higher_string() -> None
     )
 
 
+def test_a_migration_survives_a_timestamp_without_a_timezone(caplog) -> None:
+    """One naive timestamp must not wedge the migration for the process life.
+
+    ``datetime`` refuses to compare a naive instant with an aware one, and the
+    comparison happens inside the migration's own try/except: a single record
+    without a zone (an older release, a hand-edited ConfigMap) made every
+    migration attempt raise, so the legacy key was never dropped and every load
+    and every owed probe printed the same traceback again. Naive means UTC here,
+    which is the only zone anything in this system writes.
+    """
+
+    core = ConfigMapCore()
+    key = "cluster-a/attempt-a"
+    naive = {
+        "cluster_id": "cluster-a",
+        "attempt_id": "attempt-a",
+        "workload_phase": "STOPPED",
+        "observed_at": "2026-09-08T10:00:01",
+    }
+    aware = {
+        **naive,
+        "workload_phase": "RUNNING",
+        "observed_at": "2026-09-08T10:00:00Z",
+    }
+    core.objects[OUTBOX_NAME]["active-attempts.json"] = json.dumps({key: naive})
+    core.objects[ACTIVE_NAME]["active-attempts.json"] = json.dumps({key: aware})
+    outbox = KubernetesCompletionOutbox(core, RecordingSink())
+
+    with caplog.at_level(logging.ERROR, logger="gpu_fault.completion_outbox"):
+        restored = outbox.load_attempt_observations()
+
+    assert restored == [naive], (
+        f"the later of the two instants must win whatever its zone: {restored}"
+    )
+    assert "active-attempts.json" not in core.objects[OUTBOX_NAME], (
+        "the migration must complete, not raise inside its own try/except: "
+        f"{core.objects[OUTBOX_NAME]}"
+    )
+    assert caplog.records == [], (
+        "nothing about a missing zone is worth a traceback: "
+        f"{[record.getMessage() for record in caplog.records]}"
+    )
+
+
 def test_a_recovered_active_state_is_probed_from_the_reconcile_top() -> None:
     """The gauge has to come back down on a cluster that saves nothing (I1).
 
@@ -977,6 +1021,12 @@ def test_a_recovered_active_state_does_not_rewrite_unchanged_records() -> None:
     after a recovery rewrote the whole attempt-state document once per attempt
     -- 125 attempts of ~830 KB is ~100 MB of writes in one pass, against an
     object nothing in it had changed.
+
+    "Unchanged" has to mean what ``_attempt_digest`` means by it. ``observed_at``
+    is a spec field the watcher stamps on every single pass, so a record is never
+    byte-identical to the one already stored and a comparison of the dicts fires
+    exactly never on a live cluster -- which is why the saves below move
+    ``observed_at`` and nothing else.
     """
 
     core = UnavailableActiveState()
@@ -1004,7 +1054,10 @@ def test_a_recovered_active_state_does_not_rewrite_unchanged_records() -> None:
     clock[0] += 61.0
     version = core.versions[ACTIVE_NAME]
     for record in records:
-        outbox.save_attempt_observation(record)
+        # The next pass of a live watcher: same state, one minute later.
+        outbox.save_attempt_observation(
+            {**record, "observed_at": "2026-09-08T10:01:00Z"}
+        )
 
     assert core.versions[ACTIVE_NAME] == version, (
         "a record the object already holds must not be written again, got "
@@ -1014,9 +1067,17 @@ def test_a_recovered_active_state_does_not_rewrite_unchanged_records() -> None:
         "the first successful write must clear the gauge, got "
         f"{outbox.active_state_unavailable}"
     )
-    changed = {**records[0], "workload_phase": "STOPPED"}
+    changed = {
+        **records[0],
+        "workload_phase": "STOPPED",
+        "observed_at": "2026-09-08T10:01:00Z",
+    }
     outbox.save_attempt_observation(changed)
     assert core.versions[ACTIVE_NAME] == version + 1, (
         "a record that did change must still be written once, got "
         f"{core.versions[ACTIVE_NAME] - version} writes"
+    )
+    stored = json.loads(core.objects[ACTIVE_NAME]["active-attempts.json"])
+    assert stored["cluster-a/attempt-0"]["workload_phase"] == "STOPPED", (
+        f"the write that did happen must be the changed record: {stored}"
     )

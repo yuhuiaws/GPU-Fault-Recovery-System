@@ -118,6 +118,15 @@ groups:
             with GpuFaultControlPlaneMetricsMissing: both absent means the
             collector or the write path is down, this one alone means the
             self-telemetry reader or its keep filter changed.
+      # Scrape dependency: the Completion Watcher exposes these series on port
+      # 9109 inside the fault-domain cluster, and no ADOT collector scrapes it
+      # today -- adot-control-plane.yaml keeps only the api-ha, control-worker
+      # and telemetry-spool-worker jobs in gpu-fault-system. Until a data-plane
+      # scrape (or remote-write) path lands, both Completion Watcher rules below
+      # evaluate against no series and can never fire; the part to revisit then
+      # is the `by (control_plane_cluster, region)` clause, because a data-plane
+      # scrape has to carry those two labels for the grouping -- and for
+      # Alertmanager's own grouping -- to mean anything.
       # The Completion Watcher persists two ConfigMaps and only one of them is
       # load-bearing at runtime: the write-ahead log carries critical events,
       # while `gpu-fault-completion-watcher-outbox-active` carries the routine
@@ -152,6 +161,8 @@ groups:
             its Role -- and nothing else; the watcher retries once a minute by
             itself, so no restart is needed and the gauge clears on the first
             call that succeeds.
+      # Same scrape dependency as the rule above: nothing scrapes port 9109
+      # yet, so this one is inert until a data-plane scrape path exists.
       # The write-ahead copy is what lets a critical completion event survive a
       # watcher restart: buffered before the POST and cleared after it. A
       # failed append no longer vetoes the POST, so the event is still
