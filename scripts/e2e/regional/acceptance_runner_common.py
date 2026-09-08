@@ -84,3 +84,23 @@ class EvidenceRecorder:
         self.document["updated_at"] = utc_now()
         self.document["error"] = f"{type(exc).__name__}: {exc}"
         write_json_atomic(self.path, self.document)
+
+
+def processor_queue_backlog(queue: dict[str, Any] | None) -> int:
+    """The processor work a destructive preflight must wait out.
+
+    The store snapshot reports two depths. ``fault_backlog_depth`` counts the
+    reserved tier only -- control-plane actions and device events, the work a
+    case's injected event would queue behind and a control-worker roll could
+    disrupt. Total ``depth`` also counts routine telemetry (gpu-inventory,
+    evidence), which is idempotent across a roll and can livelock one lane on a
+    stale fencing token for ~120 s, so a gate on total depth flaps every
+    preflight on a healthy cluster (DESTR-018 attempt 5, DESTR-019 attempt 2,
+    2026-09-08). Gate on the fault tier when the snapshot carries it; an older
+    snapshot without the reading falls back to total depth.
+    """
+
+    values = queue or {}
+    if "fault_backlog_depth" in values:
+        return int(values.get("fault_backlog_depth") or 0)
+    return int(values.get("depth") or 0)

@@ -22,6 +22,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+
 CASE_ID = "GF-REGIONAL-DESTR-021"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-020"
 CONFIRMATION = "DESTR021_ADVERSARIAL_NODE_METADATA"
@@ -163,7 +165,7 @@ def preflight_errors(
         errors.append("target node reports no allocatable EFA devices")
     if bound_efa_functions < 1:
         errors.append("target node has no bound EFA function to unbind")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append("processor queue is not empty")
     if remote_commands.get("open_by_cluster"):
         errors.append("remote command queue is not empty")

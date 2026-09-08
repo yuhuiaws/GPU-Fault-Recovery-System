@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional import destr020_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional import run_collect017_efa_plugin as c017  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
     write_json_atomic,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
@@ -451,7 +452,7 @@ def _quiet_control_plane(run: _LiveRun) -> None:
         raise RegionalFixtureError(
             "remote commands are open; the alias workflow must not queue behind them"
         )
-    if int((state.get("queue") or {}).get("depth") or 0):
+    if processor_queue_backlog(state.get("queue") or {}):
         raise RegionalFixtureError(
             "the processor queue is not empty before the injection"
         )

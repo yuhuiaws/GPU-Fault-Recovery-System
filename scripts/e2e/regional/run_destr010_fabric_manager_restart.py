@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+
 if __package__:
     from .acceptance_runner_common import write_json_atomic
     from .host_probe_fixture import (
@@ -564,7 +566,7 @@ def validate_preflight(
         errors.append("target node already has an active workflow")
     if state["recent_xid_events"]:
         errors.append("target node has XID events inside the companion window")
-    if int(state["queue"].get("depth") or 0):
+    if processor_queue_backlog(state["queue"]):
         errors.append("processor queue is not empty")
     open_commands = state["remote_commands"].get("open_by_cluster") or {}
     if open_commands:

@@ -50,6 +50,7 @@ from scripts.e2e.regional import (  # noqa: E402
     run_destr002_hyperpod_reboot as reboot_case,
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
     write_json_atomic,
 )
 from scripts.e2e.regional.control_plane_env_window import (  # noqa: E402
@@ -225,7 +226,7 @@ def preflight_errors(
         errors.append("nodeReboot is not OWN by the HyperPod adapter")
     if (profile or {}).get("warnings"):
         errors.append("the runtime profile has warnings")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append("the processor queue is not empty")
     if remote_commands.get("open_by_cluster"):
         errors.append("the remote command queue is not empty")

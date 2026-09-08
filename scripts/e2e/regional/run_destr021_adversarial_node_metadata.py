@@ -40,6 +40,7 @@ from scripts.e2e.regional import destr021_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional import run_collect017_efa_plugin as c017  # noqa: E402
 from scripts.e2e.regional import run_collector_destructive as base  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
     write_json_atomic,
 )
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
@@ -407,7 +408,7 @@ def _quiet_control_plane(run: _LiveRun) -> None:
     write_json_atomic(run.case_dir / "store-before-injection.json", state)
     if (state.get("remote_commands") or {}).get("open_by_cluster"):
         raise RegionalFixtureError("remote commands are open; refusing to inject")
-    if int((state.get("queue") or {}).get("depth") or 0):
+    if processor_queue_backlog(state.get("queue") or {}):
         raise RegionalFixtureError("the processor queue is not empty before injection")
 
 

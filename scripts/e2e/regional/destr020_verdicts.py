@@ -28,6 +28,8 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Any
 
+from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+
 CASE_ID = "GF-REGIONAL-DESTR-020"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-001"
 CONFIRMATION = "DESTR020_IDENTITY_MISMATCH_ISOLATION"
@@ -168,7 +170,7 @@ def preflight_errors(
         errors.append("reference Node Agent names no runtime profile version")
     if reference_profile.get("warnings"):
         errors.append("runtime profile has warnings")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append("processor queue is not empty")
     if remote_commands.get("open_by_cluster"):
         errors.append("remote command queue is not empty")

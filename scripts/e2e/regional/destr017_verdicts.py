@@ -27,6 +27,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+
 # The official steps a single idle node's RESET_GPU workflow compiles to.
 OFFICIAL_OPERATIONS = (
     "FREEZE_EVIDENCE",
@@ -906,7 +908,7 @@ def preflight_errors(
         errors.append(f"{node} agent does not advertise {missing}")
     if profile.get("warnings"):
         errors.append(f"{node} runtime profile carries warnings: {profile['warnings']}")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append(f"processor queue is not empty: {queue}")
     for key in ("pending", "leased", "in_progress"):
         if int(remote_commands.get(key) or 0):

@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.e2e.regional import run_destr001_gpu_reset as reset_case  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
     write_json_atomic,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
@@ -312,7 +313,7 @@ def read_only_preflight(
         errors.append("gpuReset is not OWN by the Node Agent")
     if deployment["replicas"] != 2 or deployment["ready_replicas"] != 2:
         errors.append("cluster executor does not have two Ready replicas")
-    if int((state.get("queue") or {}).get("depth") or 0):
+    if processor_queue_backlog(state.get("queue") or {}):
         errors.append("processor queue is not empty")
     if (state.get("remote_commands") or {}).get("open_by_cluster"):
         errors.append("remote command queue is not empty")
