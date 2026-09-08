@@ -23,6 +23,39 @@ _COUNTER_FILES: dict[str, tuple[str, ...]] = {
     "network_drops_delta": ("rx_dropped", "tx_dropped"),
 }
 
+#: Delta samples the consumer reads as *latest values* rather than as events.
+#: A zero for these must still ship: ``NodeHealthPolicy.LATEST_METRICS_REQUIRED``
+#: persists them for VALIDATE_FABRIC, and the sustained rules
+#: (``METRIC_RULE_SUSTAIN_SECONDS["network_drops_delta"]``) can only *clear* a
+#: signal on a below-threshold reading -- a fabric validation with no fresh zero
+#: waits until its deadline instead. The PFC/ECN pair is here for the same
+#: reason: they are congestion state, not events, and there are two per netdev.
+_ZERO_IS_A_READING: frozenset[str] = frozenset(
+    {
+        "network_errors_delta",
+        "network_drops_delta",
+        "network_pfc_pause_delta",
+        "network_ecn_marks_delta",
+        "rdma_errors_delta",
+        "efa_rnr_errors_delta",
+        "efa_retry_errors_delta",
+        "efa_cq_errors_delta",
+    }
+)
+
+
+def _is_reportable(name: str, value: float) -> bool:
+    """Whether a delta sample earns its place in the batch.
+
+    A quiet p5en has 16 EFA ports and about 30 per-port deltas each, so roughly
+    500 zero-valued samples -- about 100 KB of JSON -- were posted every batch to
+    say that nothing happened (F-H8). Per-port traffic and per-counter deltas are
+    events: their absence *is* the zero. The names in
+    :data:`_ZERO_IS_A_READING` are not, and are kept whatever they read.
+    """
+
+    return value != 0.0 or name in _ZERO_IS_A_READING
+
 
 class HostNetworkMixin:
     # Attributes supplied by the composed concrete implementation.
@@ -142,7 +175,7 @@ class HostNetworkMixin:
                 total,
                 observed_at,
             )
-            if change:
+            if change and _is_reportable(metric, change[0]):
                 result.append(
                     self._sample(
                         metric,
@@ -292,7 +325,9 @@ class HostNetworkMixin:
                             value,
                             observed_at,
                         )
-                        if change:
+                        if change and _is_reportable(
+                            f"rdma_{counter}_delta", change[0]
+                        ):
                             result.append(
                                 self._sample(
                                     f"rdma_{counter}_delta",
@@ -313,7 +348,9 @@ class HostNetworkMixin:
                                 value,
                                 observed_at,
                             )
-                            if change:
+                            if change and _is_reportable(
+                                f"rdma_{counter}_delta", change[0]
+                            ):
                                 result.append(
                                     self._sample(
                                         f"rdma_{counter}_delta",
@@ -345,14 +382,18 @@ class HostNetworkMixin:
                     )
                     if change is None:
                         continue
-                    result.append(
-                        self._sample(
-                            metric,
-                            change[0],
-                            unit,
-                            f"{device.name}/{port.name}",
+                    if _is_reportable(metric, change[0]):
+                        result.append(
+                            self._sample(
+                                metric,
+                                change[0],
+                                unit,
+                                f"{device.name}/{port.name}",
+                            )
                         )
-                    )
+                    # The aggregate is accumulated whether or not the per-port
+                    # sample ships: zero traffic is the EFA signal, and the
+                    # traffic state machine reads only the aggregate.
                     if (has_rx_tx and counter in {"rx_bytes", "tx_bytes"}) or (
                         not has_rx_tx and counter in {"send_bytes", "recv_bytes"}
                     ):
@@ -441,5 +482,6 @@ class HostNetworkMixin:
             result.extend(
                 self._sample(metric, count, "events", interface)
                 for metric, count in counters.items()
+                if _is_reportable(metric, count)
             )
         return result

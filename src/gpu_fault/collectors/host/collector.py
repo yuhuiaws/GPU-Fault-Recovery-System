@@ -7,7 +7,6 @@ import shlex
 import socket
 import subprocess
 import time
-from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -18,7 +17,6 @@ from gpu_fault.models import WorkloadState
 from gpu_fault.host_health import (
     HostMetricSample,
     HostTelemetryBatch,
-    HostTelemetryHistoryPoint,
     NodeHealthPolicy,
 )
 
@@ -261,6 +259,13 @@ class HostTelemetryCollector(
                 ("/var/lib/gpu-fault/health-snapshot/host.request"),
             )
         )
+        # ``HostTelemetryBatch.context_history`` has always shipped empty: the
+        # control plane reads none of it, so the per-tick deque that fed it --
+        # 20 points of the full sample list, appended and never read (F-H8) --
+        # is gone. The bound stays configured and validated because the
+        # installer and the systemd unit still write it, and an operator who
+        # sets it to a nonsense value deserves the same startup failure as
+        # before.
         history_points = (
             history_max_points
             if history_max_points is not None
@@ -272,7 +277,6 @@ class HostTelemetryCollector(
             or self.startup_spread_seconds <= 0
         ):
             raise ValueError("host edge filter intervals and counts must be positive")
-        self._history: deque[HostTelemetryHistoryPoint] = deque(maxlen=history_points)
 
     def _configure_edge_thresholds(self) -> None:
         """The environment-tunable thresholds every edge reason is judged on.
@@ -522,13 +526,6 @@ class HostTelemetryCollector(
             workload_state=self.context.workload_state,
             affected_workload_ids=(self.context.affected_workload_ids),
             evidence_ref=f"host://{self.node_id}",
-        )
-        self._history.append(
-            HostTelemetryHistoryPoint(
-                observed_at=observed_at,
-                samples=samples,
-                collection_errors=errors,
-            )
         )
         reasons = self._edge_reasons(batch)
         delivery_reasons = reasons - self._active_edge_reasons
