@@ -73,6 +73,13 @@ class BoundedStatvfs:
     costs N threads once, not N threads every tick until ``TasksMax`` is
     exhausted. Unlike a shared pool, one wedged mount also cannot make every
     healthy mount behind it look unavailable.
+
+    Those parked workers do still accumulate -- one daemon thread and one dict
+    entry per mount that is hung right now, held until the syscall returns,
+    which for a file server that never comes back is never. ``max_in_flight``
+    keeps that ceiling here rather than in the unit's ``TasksMax``, where
+    hitting it means ``Thread.start()`` raises and breaks every *other* probe:
+    past the cap a mount is reported unavailable without a worker at all.
     """
 
     def __init__(
@@ -80,9 +87,11 @@ class BoundedStatvfs:
         statvfs: Callable[[str], os.statvfs_result],
         *,
         timeout_seconds: float = 5.0,
+        max_in_flight: int = 64,
     ) -> None:
         self._statvfs = statvfs
         self._timeout_seconds = timeout_seconds
+        self._max_in_flight = max_in_flight
         self._requests: queue.SimpleQueue[str] | None = None
         self._responses: (
             queue.SimpleQueue[tuple[os.statvfs_result | None, OSError | None]] | None
@@ -97,6 +106,12 @@ class BoundedStatvfs:
                     f"statvfs({mount}) from an earlier tick has not returned"
                 )
             del self._in_flight[mount]
+        self._retire_answered_probes()
+        if len(self._in_flight) >= self._max_in_flight:
+            raise TimeoutError(
+                f"{len(self._in_flight)} statvfs calls are already parked in the "
+                f"kernel; not starting one for {mount}"
+            )
         if self._requests is None or self._responses is None:
             self._start_worker()
         requests = self._requests
@@ -118,6 +133,20 @@ class BoundedStatvfs:
         if stat is None:  # pragma: no cover - defensive
             raise OSError(f"statvfs({mount}) returned nothing")
         return stat
+
+    def _retire_answered_probes(self) -> None:
+        """Free the slots of mounts whose abandoned syscall has since returned.
+
+        Without this the cap would be reached by mounts that recovered long ago
+        and are no longer probed -- an unmounted pod volume, say -- and a real
+        hang would then be refused a worker on their account.
+        """
+
+        answered = [
+            mount for mount, probe in self._in_flight.items() if probe.has_answered()
+        ]
+        for mount in answered:
+            del self._in_flight[mount]
 
     def _start_worker(self) -> None:
         requests: queue.SimpleQueue[str] = queue.SimpleQueue()

@@ -15,8 +15,8 @@ from gpu_fault.collectors.gpu.discovery import (
     discover_gpu_software_versions,
     normalize_gpu_product,
 )
-from gpu_fault.collectors.host.collector import BoundedProcessRunner
 from gpu_fault.collectors.models import CollectorContext
+from gpu_fault.collectors.process import BoundedProcessRunner
 from gpu_fault.collectors.sinks import (
     CollectorError,
     HttpEventSink,

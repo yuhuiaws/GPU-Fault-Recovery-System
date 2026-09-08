@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from gpu_fault.collectors.host.collector import BoundedProcessRunner
 from gpu_fault.collectors.host.system_metrics import BoundedStatvfs
+from gpu_fault.collectors.process import BoundedProcessRunner
 
 from ._support import (
     NOW,
@@ -43,7 +43,13 @@ class _WedgedChild:
     timeout handling (kill, then a *blocking* wait) could not return.
     """
 
-    def __init__(self, argv: list[str], released: threading.Event) -> None:
+    def __init__(
+        self,
+        argv: list[str],
+        released: threading.Event,
+        *,
+        immediate_timeout: bool = False,
+    ) -> None:
         self.args = argv
         # A real ``Popen`` always has a pid, and the reaper logs it.
         self.pid = 424242
@@ -53,8 +59,15 @@ class _WedgedChild:
         self.stdin = None
         self.kills = 0
         self._released = released
+        # ``immediate_timeout`` skips the caller's deadline without changing
+        # what the child does about SIGKILL: a test can then exercise the kill
+        # path of a call whose deadline is fixed by another module (discovery
+        # hard-codes 15 s) without spending it.
+        self._immediate_timeout = immediate_timeout
 
     def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        if self._immediate_timeout:
+            raise subprocess.TimeoutExpired(self.args, timeout or 0)
         if self._released.wait(timeout):
             return "", ""
         raise subprocess.TimeoutExpired(self.args, timeout or 0)
@@ -72,12 +85,15 @@ class _WedgedChild:
 class _WedgedChildFactory:
     """Hands out wedged children and releases them all on teardown."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, immediate_timeout: bool = False) -> None:
         self.released = threading.Event()
         self.children: list[_WedgedChild] = []
+        self._immediate_timeout = immediate_timeout
 
     def __call__(self, argv, **_kwargs) -> _WedgedChild:
-        child = _WedgedChild(list(argv), self.released)
+        child = _WedgedChild(
+            list(argv), self.released, immediate_timeout=self._immediate_timeout
+        )
         self.children.append(child)
         return child
 
@@ -664,6 +680,34 @@ def test_a_hung_mount_costs_one_worker_and_one_deadline_in_total() -> None:
     ), "a captured statvfs worker would keep the process alive"
 
 
+def test_the_probe_stops_parking_workers_at_its_in_flight_cap() -> None:
+    """Every hung mount parks one daemon thread until it answers.
+
+    That is one thread and one deadline per mount rather than per tick, but it
+    still accumulates: a pathological node -- hundreds of per-pod bind mounts
+    from a file server that is never coming back -- would walk up to
+    ``TasksMax=256`` and there ``Thread.start()`` raises, which breaks every
+    other probe rather than this one. The cap belongs in the code, not in the
+    unit file: past it a mount is reported unavailable without a worker.
+    """
+
+    released = threading.Event()
+    probe = BoundedStatvfs(
+        _blocking_statvfs(released), timeout_seconds=0.1, max_in_flight=3
+    )
+    before = _statvfs_workers()
+
+    try:
+        for index in range(12):
+            with pytest.raises(TimeoutError):
+                probe(f"/hung-{index}")
+        leaked = _statvfs_workers() - before
+    finally:
+        released.set()
+
+    assert leaked <= 3, f"12 wedged mounts parked {leaked} workers past a cap of 3"
+
+
 def test_a_recovered_mount_is_probed_again() -> None:
     """A mount whose worker finally answered must stop being reported dead."""
 
@@ -998,32 +1042,127 @@ def test_an_unreadable_counter_does_not_cost_the_interface_its_baseline(
     )
 
 
-def test_product_discovery_at_startup_cannot_hold_the_unit_in_activating(
-    monkeypatch: pytest.MonkeyPatch, wedged_children: _WedgedChildFactory
+def test_an_unreadable_drop_counter_does_not_eat_the_error_interval(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """Discovery runs *before* ``READY=1``, on the unbounded ``subprocess.run``.
+    """The samples are all-or-nothing per interface; the baselines were not.
+
+    ``network_errors_delta`` is computed first, and ``_delta`` *advances* the
+    baseline as it reads it. A ``tx_dropped`` that reads back empty then raised
+    after that write, so the error counters silently lost their interval: the
+    next tick compares against the value from the failed tick, reports the
+    delta of one interval as if it covered two, and the ratio the consumer's
+    error-rate rule computes is halved -- so a NIC erroring during exactly the
+    ticks whose drop counters are flaky under-reports for as long as that
+    lasts. Every field is read and validated before any baseline moves.
+    """
+
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ("_network",))
+    eth0 = _write_interface(tmp_path, "eth0", physical=True, operstate="up")
+    times = iter([NOW + timedelta(seconds=15 * index) for index in range(4)])
+    collector = HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        net_class_root=str(tmp_path),
+    )
+
+    collector.collect_once()
+    _set_counters(eth0, 5)
+    (eth0 / "statistics" / "tx_dropped").write_text("")
+    second = collector.collect_once()
+    _set_counters(eth0, 9)
+    third = collector.collect_once()
+
+    assert [item.name for item in second.samples if item.device == "eth0"] == [], (
+        "a half-read interface must contribute nothing"
+    )
+    errors = [
+        item.value
+        for item in third.samples
+        if item.name == "network_errors_delta" and item.device == "eth0"
+    ]
+    assert errors == [16], (
+        "the failed tick moved the error baseline, so two intervals of errors "
+        f"were reported as one: {errors}"
+    )
+
+
+def test_product_discovery_at_startup_cannot_hold_the_unit_in_activating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery runs *before* ``READY=1``, and used to be unbounded.
 
     On a node whose driver is already wedged the collector never reached its
     first tick, so with ``Type=notify`` systemd killed the unit every
     ``TimeoutStartSec`` and the installer's ``systemctl restart`` failed --
     rolling back the whole node install over a GPU fault we could have
-    reported.
+    reported. What has to be bounded here is the *second* wait: CPython's
+    ``subprocess.run`` kills the child and then waits for it forever, and a
+    child in uninterruptible sleep does not die on SIGKILL. The per-call
+    deadline itself is fixed by ``gpu/discovery.py`` and is covered by
+    ``test_a_bounded_runner_kills_a_child_that_outlives_its_timeout``.
     """
 
     from gpu_fault.collectors.context import context_from_environment
 
-    monkeypatch.setattr(subprocess, "Popen", wedged_children)
+    children = _WedgedChildFactory(immediate_timeout=True)
     monkeypatch.setenv("GPU_FAULT_CLUSTER_ID", "cluster-a")
     monkeypatch.setenv("GPU_FAULT_GPU_PRODUCT", "H100")
     monkeypatch.delenv("GPU_FAULT_GPU_PRODUCT_DISCOVERY", raising=False)
     monkeypatch.delenv("GPU_FAULT_DRIVER_BRANCH", raising=False)
 
     started = time.monotonic()
-    ctx = context_from_environment(discover_product=True)
+    try:
+        ctx = context_from_environment(
+            discover_product=True,
+            runner=BoundedProcessRunner(popen=children, kill_grace_seconds=0.25),
+        )
+    finally:
+        children.released.set()
     elapsed = time.monotonic() - started
 
-    assert elapsed < 60, f"startup discovery was not bounded: {elapsed:.1f}s"
-    assert ctx.cluster_id == "cluster-a", ctx
-    assert all(child.kills == 1 for child in wedged_children.children), (
+    assert children.children, "discovery did not go through the injected runner"
+    assert all(child.kills == 1 for child in children.children), (
         "the wedged discovery child was never killed"
+    )
+    assert elapsed < 5, (
+        f"startup discovery waited on a child that ignores SIGKILL: {elapsed:.1f}s"
+    )
+    assert ctx.cluster_id == "cluster-a", ctx
+    assert ctx.product == "H100", (
+        "a driver too sick to answer must not discard the configured product"
+    )
+
+
+def test_the_default_runner_resolves_popen_when_it_is_called(
+    monkeypatch: pytest.MonkeyPatch, wedged_children: _WedgedChildFactory
+) -> None:
+    """A ``popen`` default bound at import time makes this class untestable.
+
+    ``def __init__(self, *, popen=subprocess.Popen)`` captures the real
+    ``Popen`` when the module is imported, so a test that monkeypatches
+    ``subprocess.Popen`` never reaches the runner at all -- and a regression
+    test written that way passes whatever the product does, which is how the
+    unbounded startup path survived its own test.
+    """
+
+    monkeypatch.setattr(subprocess, "Popen", wedged_children)
+    runner = BoundedProcessRunner(kill_grace_seconds=0.25)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runner(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=0.25,
+            check=False,
+        )
+
+    assert [child.args for child in wedged_children.children] == [
+        ["nvidia-smi", "-L"]
+    ], "the runner did not use the process factory in force when it was called"
+    assert all(child.kills == 1 for child in wedged_children.children), (
+        "the timed-out child was not killed"
     )

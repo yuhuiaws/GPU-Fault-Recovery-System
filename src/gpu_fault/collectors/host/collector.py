@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import logging
 import os
 import shlex
 import socket
 import subprocess
-import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -27,6 +25,7 @@ from gpu_fault.host_health import (
 
 from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 from gpu_fault.collectors.models import CollectorContext
+from gpu_fault.collectors.process import BoundedProcessRunner
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
@@ -87,107 +86,6 @@ def _watchdog_heartbeat() -> Callable[[], None]:
         sd_notify("WATCHDOG=1")
 
     return ping
-
-
-def _reap_abandoned_process(argv: list[str], process: subprocess.Popen[str]) -> None:
-    """Wait out a killed child that has not left the kernel yet.
-
-    Runs on a daemon thread and touches nothing but its own child: the circuit
-    breaker and every other piece of collector state stay owned by the
-    collection thread.
-    """
-
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is not None:
-            with contextlib.suppress(OSError):
-                stream.close()
-    with contextlib.suppress(Exception):
-        process.wait()
-    LOGGER.info(
-        "abandoned %s (pid %s) finally exited with %s",
-        argv[0] if argv else "?",
-        process.pid,
-        process.returncode,
-    )
-
-
-class BoundedProcessRunner:
-    """``subprocess.run`` that a child in uninterruptible sleep cannot outlive.
-
-    CPython implements ``run(timeout=...)`` as ``kill()`` followed by a
-    *blocking* ``wait()``. The failure this collector exists to report --
-    nvidia-smi wedged inside the driver (XID 79, a GPU off the bus, a
-    fabric-manager hang) -- is exactly the case where SIGKILL is not acted on
-    until the syscall returns, so ``TimeoutExpired`` never reached the caller:
-    the nvidia-smi circuit breaker never engaged, ``collect_once`` never
-    returned, and the node sent no host telemetry at all. Here the second wait
-    is bounded too and a child that outlives it is handed to a daemon reaper,
-    so a call returns within ``timeout + kill_grace_seconds``. Every
-    ``self.runner`` call site shares this bound, so smartctl on a dying NVMe
-    and ethtool on a wedged EFA netdev cannot hold a tick either.
-    """
-
-    def __init__(
-        self,
-        *,
-        popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
-        kill_grace_seconds: float = 1.0,
-    ) -> None:
-        self.popen = popen
-        self.kill_grace_seconds = kill_grace_seconds
-
-    def __call__(
-        self,
-        argv: list[str],
-        *,
-        capture_output: bool = False,
-        text: bool = False,
-        timeout: float | None = None,
-        check: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
-        pipe = subprocess.PIPE if capture_output else None
-        process = self.popen(argv, stdout=pipe, stderr=pipe, text=text)
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self._abandon(argv, process)
-            raise
-        completed = subprocess.CompletedProcess(
-            argv, process.returncode or 0, stdout, stderr
-        )
-        if check:
-            completed.check_returncode()
-        return completed
-
-    def _abandon(self, argv: list[str], process: subprocess.Popen[str]) -> None:
-        with contextlib.suppress(OSError):
-            process.kill()
-        try:
-            process.wait(timeout=self.kill_grace_seconds)
-        except subprocess.TimeoutExpired:
-            pass
-        else:
-            # ``communicate`` timed out, so its pipes were never drained or
-            # closed. A tick runs every 15 s and the collector's RLIMIT_NOFILE
-            # is the unit's default, so leaking two descriptors per timed-out
-            # call ends in EMFILE -- where every probe fails, not just this one.
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    with contextlib.suppress(OSError):
-                        stream.close()
-            return
-        LOGGER.warning(
-            "%s did not die within %gs of SIGKILL (uninterruptible sleep in a "
-            "driver); abandoning it to a background reaper",
-            argv[0] if argv else "?",
-            self.kill_grace_seconds,
-        )
-        threading.Thread(
-            target=_reap_abandoned_process,
-            args=(argv, process),
-            name="gpu-fault-process-reaper",
-            daemon=True,
-        ).start()
 
 
 class HostTelemetryCollector(
@@ -308,6 +206,34 @@ class HostTelemetryCollector(
         #: :meth:`collect_once`).
         self._partial_samples: list[HostMetricSample] = []
         self._previous: dict[str, tuple[float, datetime]] = {}
+        self._configure_edge_filter(
+            edge_filter_enabled=edge_filter_enabled,
+            health_summary_seconds=health_summary_seconds,
+            history_max_points=history_max_points,
+            startup_spread_seconds=startup_spread_seconds,
+            force_snapshot_path=force_snapshot_path,
+        )
+        self._configure_edge_thresholds()
+        self._clock_ticks = float(os.sysconf("SC_CLK_TCK") or 100)
+        self._last_delivered_at: datetime | None = None
+        self._next_health_summary_at: datetime | None = None
+        self._active_edge_reasons: set[str] = set()
+        self._last_efa_rate: float | None = None
+        self._last_gpu_utilization_percent: float | None = None
+        self._rank_progress_at: datetime | None = None
+        self._rank_liveness_warned = False
+
+    def _configure_edge_filter(
+        self,
+        *,
+        edge_filter_enabled: bool | None,
+        health_summary_seconds: int | None,
+        history_max_points: int | None,
+        startup_spread_seconds: int | None,
+        force_snapshot_path: str | None,
+    ) -> None:
+        """When the collector posts a batch, and how much history it keeps."""
+
         self.edge_filter_enabled = (
             edge_filter_enabled
             if edge_filter_enabled is not None
@@ -346,6 +272,16 @@ class HostTelemetryCollector(
             or self.startup_spread_seconds <= 0
         ):
             raise ValueError("host edge filter intervals and counts must be positive")
+        self._history: deque[HostTelemetryHistoryPoint] = deque(maxlen=history_points)
+
+    def _configure_edge_thresholds(self) -> None:
+        """The environment-tunable thresholds every edge reason is judged on.
+
+        Validated here rather than where they are read: a threshold outside its
+        range silently disables the finding it belongs to, and a collector that
+        cannot report is worse than one that refuses to start.
+        """
+
         self.low_utilization_threshold_percent = float(
             os.getenv("GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT", "5")
         )
@@ -400,15 +336,6 @@ class HostTelemetryCollector(
                 "rank progress thresholds must be non-negative and the "
                 "GPU idle percentage must be from 0 to 100"
             )
-        self._clock_ticks = float(os.sysconf("SC_CLK_TCK") or 100)
-        self._history: deque[HostTelemetryHistoryPoint] = deque(maxlen=history_points)
-        self._last_delivered_at: datetime | None = None
-        self._next_health_summary_at: datetime | None = None
-        self._active_edge_reasons: set[str] = set()
-        self._last_efa_rate: float | None = None
-        self._last_gpu_utilization_percent: float | None = None
-        self._rank_progress_at: datetime | None = None
-        self._rank_liveness_warned = False
 
     #: Contributor methods, in collection order. This is a class constant rather
     #: than a literal inside :meth:`collect_once` so a caller that has to account

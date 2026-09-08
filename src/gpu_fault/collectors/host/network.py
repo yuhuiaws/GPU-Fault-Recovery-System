@@ -15,6 +15,14 @@ from gpu_fault.host_health import (
 
 LOGGER = logging.getLogger(__name__)
 
+#: The sysfs counters behind each per-interface delta sample. Read as one unit:
+#: ``_delta`` advances a baseline as it reads it, so a counter that fails to
+#: parse must not have consumed another counter's interval already.
+_COUNTER_FILES: dict[str, tuple[str, ...]] = {
+    "network_errors_delta": ("rx_errors", "tx_errors"),
+    "network_drops_delta": ("rx_dropped", "tx_dropped"),
+}
+
 
 class HostNetworkMixin:
     # Attributes supplied by the composed concrete implementation.
@@ -98,6 +106,19 @@ class HostNetworkMixin:
 
         name = interface.name
         state = (interface / "operstate").read_text().strip()
+        # Read and parse every counter *before* any baseline moves. ``_delta``
+        # advances the baseline as it reads it, so computing the error delta
+        # before the drop counters had even been parsed let an unparseable drop
+        # counter silently consume the error interval: the next tick then
+        # reported two intervals of errors as one, halving the rate the
+        # consumer's error-rate rule computes.
+        totals = {
+            metric: sum(
+                float((interface / "statistics" / filename).read_text())
+                for filename in files
+            )
+            for metric, files in _COUNTER_FILES.items()
+        }
         result = [
             self._sample(
                 "network_link_up",
@@ -115,18 +136,7 @@ class HostNetworkMixin:
                     name,
                 )
             )
-        stats = interface / "statistics"
-        for metric, files in {
-            "network_errors_delta": (
-                "rx_errors",
-                "tx_errors",
-            ),
-            "network_drops_delta": (
-                "rx_dropped",
-                "tx_dropped",
-            ),
-        }.items():
-            total = sum(float((stats / filename).read_text()) for filename in files)
+        for metric, total in totals.items():
             change = self._delta(
                 f"net/{name}/{metric}",
                 total,
