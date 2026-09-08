@@ -10,9 +10,11 @@ simply does not name the node (ARCH-E2E-1 关键发现 2).
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from pydantic import ValidationError
 
 from gpu_fault.telemetry import WorkloadCoverageHeartbeat, WorkloadTopologyService
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
@@ -157,12 +159,18 @@ def test_the_freshness_window_cannot_be_shorter_than_the_match_window() -> None:
         )
 
 
-def _heartbeat(*, observed_at: datetime, cluster_id: str = CLUSTER):
+def _heartbeat(
+    *,
+    observed_at: datetime,
+    cluster_id: str = CLUSTER,
+    watched_pods: int = 0,
+    watched_attempts: int = 0,
+):
     return WorkloadCoverageHeartbeat(
         cluster_id=cluster_id,
         observed_at=observed_at,
-        watched_pods=0,
-        watched_attempts=0,
+        watched_pods=watched_pods,
+        watched_attempts=watched_attempts,
         resource_version="4711",
         watcher_instance="completion-watcher-0",
     )
@@ -247,3 +255,103 @@ def test_the_coverage_heartbeat_window_is_configurable() -> None:
 def test_a_non_positive_coverage_window_is_refused(seconds: int) -> None:
     with pytest.raises(ValueError, match="coverage_freshness_seconds"):
         WorkloadTopologyService(build_store(), coverage_freshness_seconds=seconds)
+
+
+@pytest.mark.parametrize(("watched_pods", "watched_attempts"), [(0, 3), (8, 0), (8, 3)])
+def test_a_heartbeat_that_saw_workload_running_is_not_coverage(
+    watched_pods: int, watched_attempts: int
+) -> None:
+    """Only "I saw nothing running" separates an idle cluster from a lossy feed.
+
+    A pass that watched a live Pod or attempt and published no observation the
+    resolver can see means the observation was lost -- a per-attempt failure
+    swallowed to keep the pass alive, a dropped POST, a batch shed under load
+    while this reserved-capacity path still landed. Reading that as coverage
+    answers IDLE for a node that is training, and IDLE is what lets a plan skip
+    CHECKPOINT and STOP_WORKLOADS before it reboots the node.
+    """
+
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(
+        _heartbeat(
+            observed_at=NOW - timedelta(seconds=5),
+            watched_pods=watched_pods,
+            watched_attempts=watched_attempts,
+        )
+    )
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "UNKNOWN", (
+        "a heartbeat from a pass that still saw workload running is not "
+        f"evidence of an idle cluster: pods={watched_pods} "
+        f"attempts={watched_attempts}"
+    )
+
+
+def test_a_naive_heartbeat_stamp_is_refused_at_the_boundary() -> None:
+    with pytest.raises(ValidationError, match="timezone"):
+        _heartbeat(observed_at=NOW.replace(tzinfo=None))
+
+
+def test_a_heartbeat_stamp_from_another_offset_is_stored_as_utc() -> None:
+    heartbeat = _heartbeat(observed_at=NOW.astimezone(timezone(timedelta(hours=8))))
+
+    assert heartbeat.observed_at == NOW, heartbeat.observed_at
+    assert heartbeat.observed_at.utcoffset() == timedelta(0), (
+        "the stored stamp must be UTC so every reader compares like with like"
+    )
+
+
+def test_a_stored_heartbeat_with_a_naive_stamp_reads_as_no_coverage(caplog) -> None:
+    """A row an older release wrote must not raise on the fault ingest path."""
+
+    # Its own cluster: the report is deliberately once per cluster per process,
+    # so a test that asserts it must not share a cluster with another one.
+    poisoned_cluster = "cluster-with-a-naive-coverage-row"
+
+    class PoisonedStore:
+        def list_attempt_observations(self, _cluster_id: str) -> list:
+            return []
+
+        def get_workload_coverage_heartbeat(self, cluster_id: str):
+            # model_construct: exactly what a payload written before the model
+            # required a timezone deserialises to.
+            return WorkloadCoverageHeartbeat.model_construct(
+                cluster_id=cluster_id,
+                observed_at=NOW.replace(tzinfo=None),
+                watched_pods=0,
+                watched_attempts=0,
+                resource_version=None,
+                watcher_instance="completion-watcher-0",
+            )
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.telemetry"):
+        context = _topology(PoisonedStore()).resolve(poisoned_cluster, "node-1", NOW)
+
+    assert context.workload_state == "UNKNOWN", (
+        "an unusable coverage row must read as absent coverage, not raise and "
+        "not vouch for the cluster"
+    )
+    assert "ignoring the stored coverage heartbeat" in caplog.text, caplog.text
+
+
+def test_a_heartbeat_behind_the_stored_row_is_counted_and_reported(caplog) -> None:
+    store = build_store()
+    topology = _topology(store)
+
+    assert topology.observe_coverage(_heartbeat(observed_at=NOW)) is True, (
+        "the first heartbeat of a cluster is always accepted"
+    )
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.telemetry"):
+        accepted = topology.observe_coverage(
+            _heartbeat(observed_at=NOW - timedelta(seconds=5))
+        )
+
+    assert accepted is False, "a heartbeat behind the stored row must be refused"
+    assert topology.coverage_heartbeats_rejected_total == 1, (
+        "a refused heartbeat is what two watchers publishing for one cluster "
+        f"look like, so it is counted: {topology.coverage_heartbeats_rejected_total}"
+    )
+    assert "refused a coverage heartbeat" in caplog.text, caplog.text

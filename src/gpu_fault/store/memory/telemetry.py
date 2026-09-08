@@ -30,6 +30,7 @@ from gpu_fault.telemetry import (
     CollectorMetricsSnapshotRecord,
     CollectorStatus,
     WorkloadCoverageHeartbeat,
+    coverage_heartbeat_supersedes,
 )
 from gpu_fault.telemetry_models import (
     TelemetryMetricLatest,
@@ -399,7 +400,9 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
 
         with self._lock:
             previous = self._workload_coverage_heartbeats.get(heartbeat.cluster_id)
-            if previous is not None and heartbeat.observed_at <= previous.observed_at:
+            if previous is not None and not coverage_heartbeat_supersedes(
+                heartbeat, previous
+            ):
                 return False
             self._workload_coverage_heartbeats[heartbeat.cluster_id] = heartbeat
             return True

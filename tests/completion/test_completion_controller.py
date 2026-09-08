@@ -1264,9 +1264,10 @@ def test_unmanaged_jobset_observation_mode_never_contains_workload() -> None:
     result = subject.run_once()
 
     assert result[0]["observation_only"] is True
-    # The observation and the pass's coverage heartbeat, nothing that acts.
+    # The observation, and nothing that acts. The pass watched a running Pod,
+    # so it does not claim coverage of an idle cluster either.
     paths = [path for path, _payload in sink.posts]
-    assert paths == ["/v1/workload-observations", "/v1/attempts/coverage"], paths
+    assert paths == ["/v1/workload-observations"], paths
 
 
 def test_observation_only_attempt_is_pruned_after_missed_cycles() -> None:

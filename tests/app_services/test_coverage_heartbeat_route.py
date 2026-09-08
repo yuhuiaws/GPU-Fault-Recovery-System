@@ -72,6 +72,39 @@ def test_a_stored_heartbeat_makes_the_cluster_idle_instead_of_unknown() -> None:
     )
 
 
+def test_a_heartbeat_without_a_timezone_is_refused_and_stores_nothing() -> None:
+    """A naive stamp is not a time, and a stored one poisons the row.
+
+    Every reader compares this row against an aware ``now``, which raises on a
+    naive value -- on the fault ingest path, for the whole cluster. So it is
+    refused here rather than guessed at.
+    """
+
+    context = build_context()
+
+    async def scenario() -> int:
+        async with asgi_client(context) as client:
+            response = await client.post(
+                ATTEMPT_COVERAGE_PATH,
+                json={
+                    "cluster_id": CLUSTER,
+                    "observed_at": NOW.replace(tzinfo=None).isoformat(),
+                    "watched_pods": 0,
+                    "watched_attempts": 0,
+                    "resource_version": "4711",
+                    "watcher_instance": "completion-watcher-0",
+                },
+            )
+        return response.status_code
+
+    status = asyncio.run(scenario())
+
+    assert status == 422, f"a naive observed_at must be refused: {status}"
+    assert context.store.get_workload_coverage_heartbeat(CLUSTER) is None, (
+        "a refused heartbeat must not leave a row the resolver cannot compare"
+    )
+
+
 def test_a_coverage_heartbeat_without_the_cluster_token_is_refused() -> None:
     context = build_context()
     context.regional_mode = True

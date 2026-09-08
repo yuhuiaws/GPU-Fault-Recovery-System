@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Literal, Sequence, cast
 
+from pydantic import ValidationError
+
 from gpu_fault.attempt_observation_state import (
     attempt_observation_state_is_terminal,
     terminal_attempt_observation_state,
@@ -42,6 +44,8 @@ from gpu_fault.store.shared.telemetry_models import (
 from gpu_fault.telemetry import (
     CollectorMetricsSnapshotRecord,
     WorkloadCoverageHeartbeat,
+    coverage_heartbeat_supersedes,
+    warn_unusable_coverage_heartbeat,
 )
 from gpu_fault.telemetry_models import WorkloadObservationState
 from gpu_fault.training_models import TrainingProgressHeartbeat, TrainingProgressState
@@ -244,11 +248,10 @@ class SharedTelemetryRecordMixin:
 
         storage_key = self._state_key((heartbeat.cluster_id,))
         with self._state_transaction(f"workload_coverage_heartbeat/{storage_key}"):
-            previous = cast(
-                "WorkloadCoverageHeartbeat | None",
-                self._get_optional("workload_coverage_heartbeat", storage_key),
-            )
-            if previous is not None and heartbeat.observed_at <= previous.observed_at:
+            previous = self._read_coverage_heartbeat(heartbeat.cluster_id, storage_key)
+            if previous is not None and not coverage_heartbeat_supersedes(
+                heartbeat, previous
+            ):
                 return False
             self._put("workload_coverage_heartbeat", storage_key, heartbeat)
             return True
@@ -256,12 +259,31 @@ class SharedTelemetryRecordMixin:
     def get_workload_coverage_heartbeat(
         self, cluster_id: str
     ) -> WorkloadCoverageHeartbeat | None:
-        return cast(
-            "WorkloadCoverageHeartbeat | None",
-            self._get_optional(
-                "workload_coverage_heartbeat", self._state_key((cluster_id,))
-            ),
-        )
+        return self._read_coverage_heartbeat(cluster_id, self._state_key((cluster_id,)))
+
+    def _read_coverage_heartbeat(
+        self, cluster_id: str, storage_key: str
+    ) -> WorkloadCoverageHeartbeat | None:
+        """The stored row, or ``None`` when it cannot be read as one.
+
+        A payload an older release wrote -- a naive ``observed_at``, before the
+        model required a timezone -- no longer validates. Coverage is read on
+        the fault ingest path, where raising would fail the ingest of every
+        fault on the cluster, and it is read again by the writer, where
+        answering ``None`` is what lets the next heartbeat replace the row
+        instead of leaving it poisoned for ever.
+        """
+
+        try:
+            return cast(
+                "WorkloadCoverageHeartbeat | None",
+                self._get_optional("workload_coverage_heartbeat", storage_key),
+            )
+        except ValidationError:
+            warn_unusable_coverage_heartbeat(
+                cluster_id, "the stored payload is not a coverage heartbeat"
+            )
+            return None
 
     def observe_training_progress(
         self, progress: TrainingProgressHeartbeat

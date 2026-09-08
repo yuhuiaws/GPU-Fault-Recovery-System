@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 # ``CollectorKind`` and the producer view are rows of the collector registry;
 # they keep their historical import path here.
@@ -20,6 +21,8 @@ from gpu_fault.telemetry_models import (
     WorkloadObservationState as WorkloadObservationState,
 )
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
+
+LOGGER = logging.getLogger(__name__)
 
 
 def collector_producer(channel: CollectorKind) -> str:
@@ -149,23 +152,92 @@ class WorkloadCoverageHeartbeat(StrictModel):
     to mean both "nobody is watching" and "there is nothing to see", and the
     resolver had to fail closed on UNKNOWN for both (completion-watcher F4).
     This is the second statement made explicit: the watcher completed a full
-    pass at ``observed_at`` and found ``watched_attempts`` attempts across
-    ``watched_pods`` managed Pods -- zero being the interesting case.
+    pass over every namespace of the cluster at ``observed_at`` and still saw
+    ``watched_attempts`` attempts running across ``watched_pods`` running
+    managed Pods. Zero and zero is the only case that says anything -- see
+    ``WorkloadTopologyService._covered_by_heartbeat``.
 
     ``resource_version`` is the Kubernetes list revision the pass started from
     and ``watcher_instance`` names the process, so an operator can tell a
     heartbeat from a watcher that has since been replaced from a current one.
-    Neither is read by the resolver: coverage is decided by ``observed_at``
-    alone, which is what keeps a rolled-back watcher from claiming coverage
-    with a stale clock.
+    Neither is read by the resolver: coverage is decided by ``observed_at`` and
+    the two counts, which is what keeps a rolled-back watcher from claiming
+    coverage with a stale clock.
     """
 
     cluster_id: str
     observed_at: datetime
+    #: Managed Pods and attempts the pass still saw *running*. Only a pass that
+    #: saw nothing running may be read as coverage of an idle cluster, so both
+    #: are part of the statement and both are checked by the resolver.
     watched_pods: int = Field(default=0, ge=0)
     watched_attempts: int = Field(default=0, ge=0)
     resource_version: str | None = None
     watcher_instance: str
+
+    @field_validator("observed_at")
+    @classmethod
+    def _require_aware_observed_at(cls, value: datetime) -> datetime:
+        """Refuse a naive stamp at the boundary and store UTC.
+
+        Everything that reads this row compares it against an aware ``now``,
+        and that comparison raises ``TypeError`` on a naive value -- on the
+        fault ingest path, for every cluster, until the row is replaced. A
+        naive stamp is also not a time: guessing UTC for a watcher that meant
+        UTC+8 would either vouch for a cluster eight hours after it went busy
+        or freeze the row's monotonic guard for eight hours. So it is rejected
+        here, where the answer is a 422 the watcher's own metrics show.
+        """
+
+        if value.tzinfo is None:
+            raise ValueError("coverage heartbeat observed_at must include a timezone")
+        return value.astimezone(timezone.utc)
+
+
+#: Clusters already reported as carrying an unusable stored heartbeat. Coverage
+#: is read on the fault ingest path, so the report is logged once per cluster
+#: instead of once per fault.
+_UNUSABLE_COVERAGE_HEARTBEATS: set[str] = set()
+
+
+def warn_unusable_coverage_heartbeat(cluster_id: str, reason: str) -> None:
+    """Report once that a stored coverage row cannot be used at all."""
+
+    if cluster_id in _UNUSABLE_COVERAGE_HEARTBEATS:
+        return
+    _UNUSABLE_COVERAGE_HEARTBEATS.add(cluster_id)
+    LOGGER.warning(
+        "ignoring the stored coverage heartbeat of cluster %s: %s; the cluster "
+        "reads UNKNOWN until a watcher replaces the row",
+        cluster_id,
+        reason,
+    )
+
+
+def coverage_heartbeat_supersedes(
+    heartbeat: WorkloadCoverageHeartbeat,
+    previous: WorkloadCoverageHeartbeat,
+) -> bool:
+    """Whether ``heartbeat`` may replace the stored ``previous`` row.
+
+    The newest ``observed_at`` wins outright, so the last in-flight heartbeat
+    of a watcher a rollout has already replaced cannot age coverage backwards.
+
+    A stored stamp the new one cannot be compared against -- a naive value from
+    an older release, before the model rejected them -- is *replaced* rather
+    than defended: the guard exists to keep coverage from moving backwards, and
+    a row nothing can compare against is not coverage at all. Refusing here
+    would poison the cluster's single row for ever.
+    """
+
+    try:
+        return heartbeat.observed_at > previous.observed_at
+    except TypeError:
+        warn_unusable_coverage_heartbeat(
+            previous.cluster_id,
+            "its observed_at cannot be compared with an aware stamp",
+        )
+        return True
 
 
 class WorkloadContext(StrictModel):
@@ -209,6 +281,11 @@ class WorkloadTopologyService:
         # the only coverage an idle cluster produces. Defaults to the
         # observation window so one setting moves both.
         self.coverage_freshness_seconds = coverage_freshness_seconds
+        # Heartbeats the store refused because a newer row already stood. A few
+        # are ordinary (a watcher rollout overlaps); a rate near one per pass
+        # means two watchers are publishing for one cluster, or one of them has
+        # a clock far in the future and is holding the row.
+        self.coverage_heartbeats_rejected_total = 0
 
     def observe(self, observation: AttemptObservation) -> None:
         self.store.save_attempt_observation(observation)
@@ -221,7 +298,17 @@ class WorkloadTopologyService:
         rollout has already replaced cannot move coverage backwards.
         """
 
-        return bool(self.store.save_workload_coverage_heartbeat(heartbeat))
+        accepted = bool(self.store.save_workload_coverage_heartbeat(heartbeat))
+        if not accepted:
+            self.coverage_heartbeats_rejected_total += 1
+            LOGGER.warning(
+                "refused a coverage heartbeat behind the stored row: cluster=%s "
+                "watcher=%s observed_at=%s",
+                heartbeat.cluster_id,
+                heartbeat.watcher_instance,
+                heartbeat.observed_at.isoformat(),
+            )
+        return accepted
 
     def _covered_by_heartbeat(self, cluster_id: str, observed_at: datetime) -> bool:
         """Whether a watcher vouched for the whole cluster recently enough.
@@ -242,14 +329,36 @@ class WorkloadTopologyService:
         # missing method must not raise there, and the fallback is the closed
         # direction: UNKNOWN blocks, it does not permit.
         read = getattr(self.store, "get_workload_coverage_heartbeat", None)
-        heartbeat = read(cluster_id) if read is not None else None
+        heartbeat: WorkloadCoverageHeartbeat | None = (
+            read(cluster_id) if read is not None else None
+        )
         if heartbeat is None:
+            return False
+        # Coverage of an *idle* cluster is the only thing a heartbeat can prove.
+        # A pass that saw a running Pod or a live attempt saw workload the
+        # control plane should be hearing about in observations, and if it is
+        # not hearing about it -- a swallowed per-attempt failure, a dropped
+        # observation POST, an observation shed under load while this
+        # reserved-capacity path still landed -- then "no observation" means the
+        # feed is lossy, not that the cluster is idle. Reading such a heartbeat
+        # as coverage would answer IDLE for a node that is training, and IDLE
+        # skips CHECKPOINT and STOP_WORKLOADS before a reboot.
+        if heartbeat.watched_attempts or heartbeat.watched_pods:
             return False
         # The window is symmetric so ordinary clock skew between the watcher
         # and this process cannot silently retire coverage, while a stamp from
         # far in the future -- which the store's monotonic guard would then
         # keep -- stops counting instead of vouching for the cluster for ever.
-        age = (observed_at - heartbeat.observed_at).total_seconds()
+        try:
+            age = (observed_at - heartbeat.observed_at).total_seconds()
+        except TypeError:
+            # A row written before the model rejected naive stamps. Absent
+            # coverage is the closed answer, and the writer replaces the row.
+            warn_unusable_coverage_heartbeat(
+                cluster_id,
+                "its observed_at carries no timezone",
+            )
+            return False
         return abs(age) <= self.coverage_freshness_seconds
 
     def resolve(
@@ -277,7 +386,8 @@ class WorkloadTopologyService:
         attempt observation (any attempt, any phase, within
         ``freshness_seconds``) or -- for a cluster that is running nothing at
         all, and therefore publishes no observation -- the watcher's own
-        full-pass heartbeat within ``coverage_freshness_seconds``. A cluster
+        full-pass heartbeat within ``coverage_freshness_seconds`` that saw
+        nothing running at all. A cluster
         with neither -- the watcher down, the feed stale -- is UNKNOWN, which
         the compilers treat as "someone may be using it" (design: monitoring
         loss is Unknown; ARCH-E2E-1 finding 2, completion-watcher F4).

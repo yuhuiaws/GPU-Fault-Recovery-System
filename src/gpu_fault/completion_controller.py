@@ -21,6 +21,7 @@ from gpu_fault.collectors.sinks import RETRY_AFTER_CAP_SECONDS
 from gpu_fault.env import env_bool
 from gpu_fault.completion_attempt_state import (
     AttemptSpec,
+    active_pass_counts,
     cache_terminal_attempt_observation,
     publish_attempt_observation,
     publish_coverage_heartbeat,
@@ -640,6 +641,7 @@ class KubernetesCompletionController:
         terminal_retention_seconds: int = 3600,
         watcher_max_attempts: int = 10000,
         watcher_instance: str | None = None,
+        coverage_heartbeat_interval_seconds: float = 120,
     ) -> None:
         if not cluster_id:
             raise CompletionControllerError("cluster_id is required")
@@ -653,6 +655,10 @@ class KubernetesCompletionController:
             )
         if reconcile_debounce_seconds < 0:
             raise CompletionControllerError("reconcile debounce must be non-negative")
+        if coverage_heartbeat_interval_seconds < 0:
+            raise CompletionControllerError(
+                "coverage heartbeat interval must be non-negative"
+            )
         self.core_api = core_api
         # Every delivery through this sink refreshes the liveness clock, so the
         # largest legitimate unstamped gap is one delivery -- which is exactly
@@ -681,6 +687,12 @@ class KubernetesCompletionController:
         # tell a heartbeat from a watcher a rollout has replaced from a
         # current one. Never read by the resolver.
         self.watcher_instance = watcher_instance or socket.gethostname()
+        # How often an idle cluster's coverage may be restated. A fifth of the
+        # control plane's default coverage window (600 s), so four heartbeats
+        # can be lost before the cluster reads UNKNOWN, while the strictly
+        # ordered ingress lane this shares with workflow dispatch carries one
+        # write every two minutes instead of one per pass.
+        self.coverage_heartbeat_interval_seconds = coverage_heartbeat_interval_seconds
         self.observation_only = ObservationOnlyTracker(
             observe_unmanaged_workloads,
             observation_runtime_profile_version,
@@ -752,6 +764,12 @@ class KubernetesCompletionController:
         self.coverage_heartbeats_total = 0
         self.coverage_heartbeat_failures_total = 0
         self.last_coverage_heartbeat_at: datetime | None = None
+        # When a heartbeat was last *attempted*, which is what the rate limit
+        # counts: a refusing control plane must not be asked once per pass.
+        self._last_coverage_post_at: datetime | None = None
+        # A namespace-scoped watcher cannot vouch for a cluster, and says so
+        # once rather than on every pass.
+        self._coverage_scope_logged = False
         # The list revision the most recent relist started from; operator
         # context carried in the heartbeat, not an input to any decision.
         self._last_resource_version: str | None = None
@@ -920,6 +938,11 @@ class KubernetesCompletionController:
         self.reconcile_runs_total += 1
         self.reconciled_attempts_total += len(attempt_ids)
         observed_at = self.now()
+        # Per-attempt failures below are swallowed so one attempt cannot abort
+        # the pass; the coverage heartbeat has to know they happened, because a
+        # pass that failed to publish an observation must not then claim the
+        # cluster is idle.
+        failures_before = self.reconcile_failures_total
         for attempt_id in sorted(attempt_ids):
             attempt_pods = grouped.get(attempt_id, [])
             # The whole body is isolated, not just the observation step: a
@@ -942,11 +965,13 @@ class KubernetesCompletionController:
             # value humans alert on, and only a pass that relisted every Pod
             # moves it.
             self.last_cycle_completed_at = self.now()
+            active_pods, active_attempts = active_pass_counts(self, pods)
             publish_coverage_heartbeat(
                 self,
-                watched_pods=len(pods),
-                watched_attempts=len(grouped),
+                watched_pods=active_pods,
+                watched_attempts=active_attempts,
                 resource_version=self._last_resource_version,
+                reconcile_failures=self.reconcile_failures_total - failures_before,
             )
         return results
 

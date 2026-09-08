@@ -99,18 +99,20 @@ COUNTERS: tuple[tuple[str, str, str], ...] = (
     (
         "gpu_fault_completion_watcher_coverage_heartbeats_total",
         "coverage_heartbeats_total",
-        "Coverage heartbeats the control plane accepted: one per completed "
-        "full pass, the statement that lets an idle cluster read IDLE instead "
-        "of UNKNOWN. A flat line while passes keep completing means every "
-        "node-mutating plan on this cluster will be BLOCKED.",
+        "Coverage heartbeats posted -- acceptance is the control plane's to "
+        "report. One per completed full pass that saw nothing running, rate "
+        "limited to coverage_heartbeat_interval_seconds: the statement that "
+        "lets an idle cluster read IDLE instead of UNKNOWN. A flat line while "
+        "an idle cluster's passes keep completing means every node-mutating "
+        "plan on this cluster will be BLOCKED.",
     ),
     (
         "gpu_fault_completion_watcher_coverage_heartbeat_failures_total",
         "coverage_heartbeat_failures_total",
         "Coverage heartbeats that could not be delivered. Each one is dropped "
-        "rather than retried -- the next pass restates coverage -- so a low "
-        "rate is harmless and a rate near one per pass is the same outage as "
-        "a flat accepted counter.",
+        "rather than retried -- the next window restates coverage -- so a low "
+        "rate is harmless and a rate near one per window is the same outage as "
+        "a flat posted counter.",
     ),
     (
         "gpu_fault_completion_outbox_append_failures_total",
@@ -155,9 +157,9 @@ TIMESTAMPS: tuple[tuple[str, str, str], ...] = (
     (
         "gpu_fault_completion_watcher_last_coverage_heartbeat_timestamp",
         "last_coverage_heartbeat_at",
-        "Unix seconds at which the control plane last accepted a coverage "
-        "heartbeat; 0 before the first one. Older than the resolver's coverage "
-        "window means this cluster now reads UNKNOWN.",
+        "Unix seconds of the last coverage heartbeat this watcher delivered; 0 "
+        "before the first one. Older than the resolver's coverage window means "
+        "this cluster now reads UNKNOWN.",
     ),
     (
         "gpu_fault_completion_watcher_last_progress_timestamp",

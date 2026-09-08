@@ -148,14 +148,49 @@ def cache_terminal_attempt_observation(
     )
 
 
+def active_pass_counts(controller: Any, pods: list[dict[str, Any]]) -> tuple[int, int]:
+    """What a completed full pass still sees running: Pods, then attempts.
+
+    Both counts mean "in use by a workload", which is the only question the
+    coverage heartbeat answers, so neither is a raw total. A Succeeded Pod
+    holds no GPU and lingers until Kubernetes collects it -- counting it would
+    keep a cluster whose last job ended days ago from ever reading IDLE, the
+    live DESTR-016 case this exists for. An attempt kept only for its terminal
+    retention window is finished for the same reason.
+
+    An attempt this process still believes is PENDING or RUNNING counts even
+    when none of its Pods were listed: a restored attempt whose Pods this
+    process has never seen, or one inside its missing-attempt grace, is exactly
+    the state where the control plane has no fresh observation and IDLE would be
+    the fail-open answer.
+    """
+
+    active_pods = sum(
+        1
+        for item in pods
+        if (
+            (controller.serializer(item).get("status") or {}).get("phase") or ""
+        ).upper()
+        in {"PENDING", "RUNNING"}
+    )
+    active_attempts = sum(
+        1
+        for observation in controller._last_observations.values()
+        if observation.workload_phase in ACTIVE_PHASES
+    )
+    return active_pods, active_attempts
+
+
 def publish_coverage_heartbeat(
     controller: Any,
     *,
     watched_pods: int,
     watched_attempts: int,
     resource_version: str | None,
+    reconcile_failures: int,
 ) -> None:
-    """Tell the control plane this pass watched the whole cluster (F4).
+    """Tell the control plane this pass watched the whole cluster and it is idle
+    (F4).
 
     Only a completed full pass calls this, which is what makes the
     statement true: a pass that raised never reaches it, and a debounced
@@ -164,16 +199,55 @@ def publish_coverage_heartbeat(
     the control plane cannot see the attempts that *are* running would turn
     a busy node into an IDLE one, which is the fail-open direction.
 
+    Four more silences, each of them that same direction:
+
+    * A namespace-scoped watcher never vouches. It lists one namespace, so it
+      cannot say anything about a node running a job in another one, and the
+      control plane's answer is per cluster.
+    * A pass that saw a running Pod or a live attempt says nothing. The
+      heartbeat's only job is to distinguish "nothing to see" from "nobody
+      watching", and on a busy cluster the observations already answer that.
+    * A pass in which handling one attempt raised says nothing. Those failures
+      are swallowed per attempt on purpose, so a pass can finish having failed
+      to publish an observation -- and then "no observation" would be a lost
+      write, not an idle cluster.
+    * At most one heartbeat per ``coverage_heartbeat_interval_seconds``. The
+      row is superseded by design and the control plane's window is minutes, so
+      a heartbeat per pass is pure load on a strictly ordered, reserved-capacity
+      ingress path shared with workflow dispatch.
+
     Delivery failures are counted and dropped: the heartbeat is weak
     evidence with a natural retry (the next pass), and a control plane that
-    is refusing writes must not also fail the reconcile.
+    is refusing writes must not also fail the reconcile. The rate limit counts
+    attempts rather than successes, so a control plane that is refusing this
+    write is not asked again on every pass.
     """
 
     if not controller.publish_observations:
         return
+    if controller.namespace:
+        if not controller._coverage_scope_logged:
+            controller._coverage_scope_logged = True
+            LOGGER.info(
+                "watching namespace %s only, so this watcher publishes no coverage "
+                "heartbeat: an idle-cluster statement needs every namespace",
+                controller.namespace,
+            )
+        return
+    if watched_pods or watched_attempts or reconcile_failures:
+        return
+    observed_at = controller.now()
+    last = controller._last_coverage_post_at
+    if (
+        last is not None
+        and (observed_at - last).total_seconds()
+        < controller.coverage_heartbeat_interval_seconds
+    ):
+        return
+    controller._last_coverage_post_at = observed_at
     heartbeat = WorkloadCoverageHeartbeat(
         cluster_id=controller.cluster_id,
-        observed_at=controller.now(),
+        observed_at=observed_at,
         watched_pods=watched_pods,
         watched_attempts=watched_attempts,
         resource_version=resource_version,

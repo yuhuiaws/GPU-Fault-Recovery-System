@@ -129,6 +129,46 @@ def test_a_heartbeat_from_a_replaced_watcher_cannot_move_coverage_backwards(
     assert stored.observed_at == NOW, stored
 
 
+def test_a_row_with_a_naive_stamp_is_replaced_rather_than_defended(
+    coverage_store,
+) -> None:
+    """A row written before the model required a timezone must not poison a
+    cluster.
+
+    The monotonic guard compares the new stamp against the stored one, and that
+    comparison raises on a naive value: the row would refuse every replacement
+    for ever, and the read on the fault ingest path would raise instead of
+    answering "no coverage". ``model_construct`` is how such a row is written
+    without the model's validator -- which is exactly what an older release did.
+    """
+
+    poisoned = WorkloadCoverageHeartbeat.model_construct(
+        cluster_id=CLUSTER,
+        observed_at=NOW.replace(tzinfo=None),
+        watched_pods=0,
+        watched_attempts=0,
+        resource_version="4711",
+        watcher_instance="completion-watcher-0",
+    )
+    coverage_store.save_workload_coverage_heartbeat(poisoned)
+
+    accepted = coverage_store.save_workload_coverage_heartbeat(
+        _heartbeat(
+            observed_at=NOW - timedelta(seconds=300),
+            watcher_instance="completion-watcher-1",
+        )
+    )
+    stored = coverage_store.get_workload_coverage_heartbeat(CLUSTER)
+
+    assert accepted is True, (
+        "a heartbeat that cannot be compared with the stored row must replace "
+        "it, otherwise the cluster can never be vouched for again"
+    )
+    assert stored is not None, "the heartbeat row disappeared"
+    assert stored.observed_at == NOW - timedelta(seconds=300), stored
+    assert stored.watcher_instance == "completion-watcher-1", stored
+
+
 def test_each_cluster_keeps_its_own_heartbeat(coverage_store) -> None:
     coverage_store.save_workload_coverage_heartbeat(_heartbeat())
     coverage_store.save_workload_coverage_heartbeat(
