@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
@@ -586,6 +586,47 @@ class RegionalIncidentOwnershipProvider:
         return report.known and report.terminal
 
 
+# The ``status_source`` ``retryable_transport_result`` stamps on a WAITING
+# result. It is the one retryable class that names this executor's own
+# connectivity rather than the target's; the network-degraded back-off keys on
+# it alone.
+TRANSPORT_RETRYABLE_SOURCE = "executor-retryable-transport"
+
+
+def transport_degraded_idle_delay(
+    *,
+    cycles: int,
+    backoff_after: int,
+    poll_seconds: float,
+    cap: float,
+) -> float:
+    """Idle wait after ``cycles`` consecutive network-degraded run_once cycles.
+
+    Below ``backoff_after`` the executor keeps polling normally. At and past it
+    the wait doubles each further degraded cycle (capped at ``cap``), so an
+    executor that can reach the control plane but not the target stops
+    re-claiming the commands it cannot progress and a replica whose network
+    works claims them instead.
+    """
+
+    over = cycles - backoff_after
+    if over < 0:
+        return poll_seconds
+    return min(cap, poll_seconds * (1 << min(over + 1, 8)))
+
+
+class CommandOutcome(NamedTuple):
+    """What ``_execute_and_report`` tells ``run_once`` about one command.
+
+    ``transport_degraded`` is True when the command ended WAITING because this
+    executor could not reach the target on transport grounds -- the signal that
+    this Pod's network, not the work, is the problem.
+    """
+
+    status: "RemoteCommandStatus"
+    transport_degraded: bool
+
+
 class CommandLeaseWatch:
     """This executor's local view of one claimed command's lease.
 
@@ -676,6 +717,7 @@ class ClusterActionExecutor:
         claim_backoff_max_seconds: float = 60,
         claim_state_path: str | None = None,
         lease_renewal_failure_limit: int = 3,
+        transport_degraded_backoff_after: int = 3,
         clock: Callable[[], float] = time.monotonic,
         spare_reservation_sweep: SpareReservationSweep | None = None,
     ) -> None:
@@ -701,7 +743,12 @@ class ClusterActionExecutor:
             raise ClusterExecutorError(
                 "cluster executor lease renewal failure limit must be between 1 and 100"
             )
+        if not 1 <= transport_degraded_backoff_after <= 100:
+            raise ClusterExecutorError(
+                "cluster executor transport degraded backoff must be between 1 and 100"
+            )
         self.lease_renewal_failure_limit = lease_renewal_failure_limit
+        self.transport_degraded_backoff_after = transport_degraded_backoff_after
         self.clock = clock
         self.spare_reservation_sweep = spare_reservation_sweep
         self.client = client
@@ -747,6 +794,12 @@ class ClusterActionExecutor:
         # 409/429/5xx, urllib3 timeouts) reported WAITING instead of FAILED
         # (ARCH-B1 reached from the regional topology).
         self.retryable_adapter_errors_total = 0
+        # Actions that failed on this executor's own connectivity (gaierror,
+        # refused connection, timeout reaching the target): WAITING as retryable
+        # transport. Unlike adapter/control-plane retryables, the executor's
+        # network is the problem, not the target's -- see _idle_delay.
+        self.retryable_transport_errors_total = 0
+        self.consecutive_transport_degraded_cycles = 0
         self.last_successful_claim_at: datetime | None = None
         # Whether the last claim cycle moved any command off WAITING. run()
         # takes the idle path when it did not, so a held command polls at
@@ -788,6 +841,10 @@ class ClusterActionExecutor:
             "cancellations_observed_total": (self.cancellations_observed_total),
             "barrier_unavailable_holds_total": (self.barrier_unavailable_holds_total),
             "retryable_adapter_errors_total": self.retryable_adapter_errors_total,
+            "retryable_transport_errors_total": (self.retryable_transport_errors_total),
+            "consecutive_transport_degraded_cycles": (
+                self.consecutive_transport_degraded_cycles
+            ),
             "spare_reservations_reclaimed_total": (
                 self.spare_reservation_sweep.reclaimed_total
                 if self.spare_reservation_sweep is not None
@@ -852,7 +909,7 @@ class ClusterActionExecutor:
                     pool.submit(self._execute_and_report, command)
                     for command in commands
                 ]
-                statuses = [future.result() for future in futures]
+                outcomes = [future.result() for future in futures]
             # A command that reports WAITING is re-claimable at once, so a
             # batch that only waited puts run() straight back into claim()
             # with nothing changed: on 2026-09-04 a single held
@@ -860,11 +917,28 @@ class ClusterActionExecutor:
             # second across two replicas, and 759 identical log lines a
             # minute. Waiting is not progress, so it takes the idle path.
             self.last_cycle_advanced = any(
-                status is not RemoteCommandStatus.WAITING for status in statuses
+                outcome.status is not RemoteCommandStatus.WAITING
+                for outcome in outcomes
             )
+            # A whole cycle that advanced nothing and failed at least one
+            # command on this executor's own connectivity is a degraded
+            # cycle: run() backs off once enough of them stack up, so the
+            # command this executor keeps releasing lands on a replica whose
+            # network works. Any progress, or a WAITING that was the target's
+            # fault (an adapter 5xx, a control-plane 503), clears the streak.
+            if not self.last_cycle_advanced and any(
+                outcome.transport_degraded for outcome in outcomes
+            ):
+                self.consecutive_transport_degraded_cycles += 1
+            else:
+                self.consecutive_transport_degraded_cycles = 0
+        else:
+            # An empty claim round trip proves the control-plane route works
+            # and leaves nothing blocked, so it is not a degraded cycle.
+            self.consecutive_transport_degraded_cycles = 0
         return len(commands)
 
-    def _execute_and_report(self, command: RemoteActionCommand) -> RemoteCommandStatus:
+    def _execute_and_report(self, command: RemoteActionCommand) -> CommandOutcome:
         stop = Event()
         watch = CommandLeaseWatch(
             lease_seconds=self.lease_seconds,
@@ -903,7 +977,11 @@ class ClusterActionExecutor:
                     result.status.value,
                     watch.hold_reason(),
                 )
-                return RemoteCommandStatus.WAITING
+                # The lease was lost, not the network refused: the withheld
+                # result is already reclaimable, so this is not counted as a
+                # transport-degraded cycle.
+                return CommandOutcome(RemoteCommandStatus.WAITING, False)
+            transport_degraded = result.status_source == TRANSPORT_RETRYABLE_SOURCE
             try:
                 self.client.complete(command, result)
             except ClusterExecutorError:
@@ -919,7 +997,7 @@ class ClusterActionExecutor:
                     result.status.value,
                 )
                 self.reported_failures += 1
-            return result.status
+            return CommandOutcome(result.status, transport_degraded)
         finally:
             active_lease_guard.reset(guard_token)
             stop.set()
@@ -1022,7 +1100,17 @@ class ClusterActionExecutor:
                 time.sleep(delay)
                 continue
             if count == 0 or not self.last_cycle_advanced:
-                time.sleep(self.poll_seconds)
+                time.sleep(self._idle_delay())
+
+    def _idle_delay(self) -> float:
+        """How long run() waits before the next claim when nothing advanced."""
+
+        return transport_degraded_idle_delay(
+            cycles=self.consecutive_transport_degraded_cycles,
+            backoff_after=self.transport_degraded_backoff_after,
+            poll_seconds=self.poll_seconds,
+            cap=self.claim_backoff_max_seconds,
+        )
 
     def _execute(self, command: RemoteActionCommand) -> RemoteCommandResult:
         lease_token = command.lease_token
@@ -1233,6 +1321,7 @@ class ClusterActionExecutor:
             executor_id=self.executor_id,
         )
         if retryable is not None:
+            self.retryable_transport_errors_total += 1
             LOGGER.warning(
                 "regional cluster executor transport failed; "
                 "command remains retryable: command=%s cluster=%s "
@@ -1599,6 +1688,11 @@ def executor_from_environment() -> ClusterActionExecutor:
         confirm_cluster_name=(hyperpod_confirm_cluster),
         lease_renewal_failure_limit=int(
             os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_LEASE_FAILURE_LIMIT", "3")
+        ),
+        transport_degraded_backoff_after=int(
+            os.getenv(
+                "GPU_FAULT_CLUSTER_EXECUTOR_TRANSPORT_DEGRADED_BACKOFF_AFTER", "3"
+            )
         ),
     )
 
