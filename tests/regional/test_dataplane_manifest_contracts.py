@@ -550,11 +550,21 @@ def test_a_new_instance_type_changes_the_dcgm_component_digest(tmp_path: Path) -
         f"exporter's affinity is rendered from: {list(patterns)}"
     )
     before = file_set_identity(tmp_path, patterns)["sha256"]
+    # Derived from the table itself: a hard-coded entry line turns any rename or
+    # reformat of the inventory into a failure of this test rather than of the
+    # thing it guards.
+    source = inventory.read_text(encoding="utf-8")
+    known = sorted(RECONCILER_INVENTORY)[-1]
+    entry = next(
+        (line for line in source.splitlines(keepends=True) if f'"{known}": (' in line),
+        None,
+    )
+    assert entry is not None, (
+        f'the inventory no longer spells {known!r} as one `"type": (gpus, efas)` '
+        "line, so this test cannot add a supported type to it"
+    )
     inventory.write_text(
-        inventory.read_text(encoding="utf-8").replace(
-            '    "p6-b300.48xlarge": (8, 16),\n',
-            '    "p6-b300.48xlarge": (8, 16),\n    "p7-c400.48xlarge": (8, 16),\n',
-        ),
+        source.replace(entry, entry + entry.replace(known, "p7-c400.48xlarge")),
         encoding="utf-8",
     )
     after = file_set_identity(tmp_path, patterns)["sha256"]

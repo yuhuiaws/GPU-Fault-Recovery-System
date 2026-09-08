@@ -27,12 +27,15 @@ spec:
       # nodeSelector pinned that to one instance type, so every other
       # supported GPU type got zero Pods while `rollout status` passed
       # trivially. The list below is rendered by
-      # regional_gpu_bootstrap._render_gpu_dcgm_exporter from
-      # node_installer_reconciler._INVENTORY -- the same table the installer
-      # sizes GPU/EFA counts from -- with and without the `ml.` prefix,
-      # because HyperPod labels nodes `ml.<type>` and self-managed EKS does
-      # not. It stays fail-closed: an unsupported instance type still gets no
-      # exporter Pod at all.
+      # regional_release_rendering.render_dcgm_exporter_manifest -- the one
+      # renderer behind both the plan payload and the apply, so the DaemonSet an
+      # approver reads is the one that lands -- from
+      # node_installer_reconciler._INVENTORY, the same table the installer sizes
+      # GPU/EFA counts from, with and without the `ml.` prefix, because HyperPod
+      # labels nodes `ml.<type>` and self-managed EKS does not. It stays
+      # fail-closed twice over: an unsupported instance type still gets no
+      # exporter Pod at all, and a render that leaves the placeholder behind
+      # fails the release instead of shipping this file verbatim.
       priorityClassName: system-node-critical
       affinity:
         nodeAffinity:

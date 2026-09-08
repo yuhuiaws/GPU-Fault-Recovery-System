@@ -116,10 +116,13 @@ spec:
           # half-open apiserver connection blocks the cycle forever while the
           # Pod stays Running and the whole cluster's EFA/GPU advertisement
           # coverage goes quiet -- exactly the silence this collector exists to
-          # report. /tmp/node-resource-collector-alive is refreshed at the end
-          # of every cycle, including a cycle that failed, so the probe answers
-          # "is the loop turning" and never fires on an idle cluster: 300 s is
-          # 20 cycles at GPU_FAULT_KUBERNETES_RESOURCE_INTERVAL_SECONDS=15. No
+          # report. /tmp/node-resource-collector-alive is refreshed before the
+          # first cycle, after every node a cycle samples, and after every cycle
+          # including one that failed, so the probe answers "is the loop turning"
+          # without a large fleet's first pass -- one telemetry batch per GPU
+          # node, in series -- outlasting the threshold on its own. It never
+          # fires on an idle cluster: 300 s is 20 cycles at
+          # GPU_FAULT_KUBERNETES_RESOURCE_INTERVAL_SECONDS=15. No
           # control-plane call, so a regional outage cannot restart every
           # cluster's collector at once.
           livenessProbe:
