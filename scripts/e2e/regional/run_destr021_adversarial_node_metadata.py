@@ -646,6 +646,7 @@ def _stop_writer(run: _LiveRun) -> dict[str, Any]:
     run.writer.stop()
     run.writer.clear()
     report = run.writer.report()
+    report["achieved_interval_seconds"] = verdicts.writer_achieved_interval(report)
     write_json_atomic(run.case_dir / "writer.json", report)
     errors = verdicts.writer_errors(report)
     if errors:
