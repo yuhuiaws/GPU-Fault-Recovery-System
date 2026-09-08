@@ -29,10 +29,12 @@ from gpu_fault.completion_observation import (
     TERMINATION_INCIDENT_ANNOTATION,
     MissingAttemptTracker,
     ObservationOnlyTracker,
+    TerminalObservationCache,
     _clear_attempt,
     completion_list_arguments,
     is_unknown_profile_rejection,
     list_completion_pods,
+    pod_container_has_started,
     reconcile_attempt_observation,
 )
 from gpu_fault.completion_outbox import (
@@ -620,6 +622,7 @@ class KubernetesCompletionController:
         poll_interval_seconds: float = 5,
         watch_timeout_seconds: int = 30,
         cleanup_timeout_seconds: int = 120,
+        attempt_missing_grace_seconds: int = 300,
         now: Callable[[], datetime] | None = None,
         serializer: Callable[[Any], dict[str, Any]] | None = None,
         watch_factory: Callable[[], Any] | None = None,
@@ -657,6 +660,10 @@ class KubernetesCompletionController:
         self.poll_interval_seconds = poll_interval_seconds
         self.watch_timeout_seconds = watch_timeout_seconds
         self.cleanup_timeout_seconds = cleanup_timeout_seconds
+        # How long every Pod of an attempt may be absent before the attempt is
+        # tombstoned. Minutes, and separate from ``cleanup_timeout_seconds``:
+        # see ``MissingAttemptTracker`` (F2).
+        self.attempt_missing_grace_seconds = attempt_missing_grace_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.serializer = serializer or (
             lambda value: value if isinstance(value, dict) else value.to_dict()
@@ -681,8 +688,16 @@ class KubernetesCompletionController:
             raise CompletionControllerError(str(exc)) from exc
         self._attempt_specs: dict[str, AttemptSpec] = {}
         self._last_observations: dict[str, AttemptObservation] = {}
-        self._terminal_observations: dict[str, AttemptObservation] = {}
-        self._missing_attempts = MissingAttemptTracker()
+        self._terminal_observations = TerminalObservationCache()
+        # Attempts rebuilt from persisted state whose Pods this process has
+        # never seen (F7); the restore fills it.
+        self._restored_attempts: set[str] = set()
+        try:
+            self._missing_attempts = MissingAttemptTracker(
+                attempt_missing_grace_seconds
+            )
+        except ValueError as exc:
+            raise CompletionControllerError(str(exc)) from exc
         self._terminal_sent: set[str] = set()
         self._workloads_stopped: set[str] = set()
         self._failure_events = {}
@@ -692,6 +707,9 @@ class KubernetesCompletionController:
         self._gpu_uuid_cache: dict[str, list[str]] = {}
         self._gpu_uuid_failures: dict[str, tuple[int, datetime]] = {}
         self.metadata_takeovers_total = 0
+        # Attempts whose missing-Pod tombstone was withdrawn because Pods of
+        # that attempt-id came back (F2).
+        self.resumed_attempts_total = 0
         self.reconcile_runs_total = 0
         self.reconciled_attempts_total = 0
         # One attempt's reconcile raising is logged and counted here; it no
@@ -1465,7 +1483,12 @@ class KubernetesCompletionController:
         else:
             spec = self._attempt_specs[attempt_id]
 
-        containers = [self._container(pod) for pod in pods if self._is_critical(pod)]
+        critical_pods = [pod for pod in pods if self._is_critical(pod)]
+        containers = [self._container(pod) for pod in critical_pods]
+        started = any(
+            pod_container_has_started(pod, item.container_name)
+            for pod, item in zip(critical_pods, containers, strict=True)
+        )
         terminated = [item for item in containers if item.terminated]
         failed = [
             item
@@ -1483,9 +1506,12 @@ class KubernetesCompletionController:
             item.exit_code == 0 for item in terminated
         ):
             phase = WorkloadPhase.SUCCEEDED
-        elif containers:
+        elif containers and started:
             phase = WorkloadPhase.RUNNING
         else:
+            # A Pod that exists is not a Pod that started: unschedulable and
+            # image-pulling Pods carry no container state at all, and PENDING
+            # used to be unreachable once a Pod existed (F10).
             phase = WorkloadPhase.PENDING
         pod_start_times = [
             started_at
@@ -1538,8 +1564,38 @@ class KubernetesCompletionController:
             previous.runtime_profile_version,
             current.runtime_profile_version,
         )
+        self._forget_attempt_progress(attempt_id)
+
+    def resume_tombstoned_attempt(self, attempt_id: str) -> None:
+        """Withdraw a missing-Pod tombstone because the Pods came back (F2).
+
+        The tombstone claimed the attempt no longer existed; a live Pod under
+        the same attempt-id is proof it does. Everything derived from the
+        tombstone has to go -- the cached terminal, the sent terminal keys, the
+        core's attempt state -- or the returning ranks stay invisible and their
+        failure is never reported. Deliberately the same reset a metadata
+        takeover performs, minus the spec swap: the Pods are re-observed from
+        scratch on this very pass.
+        """
+
+        self.resumed_attempts_total += 1
+        LOGGER.warning(
+            "attempt %s was tombstoned as missing but its Pods are listed "
+            "again; withdrawing the tombstone and observing the Pods afresh",
+            attempt_id,
+        )
+        self._forget_attempt_progress(attempt_id)
+
+    def _forget_attempt_progress(self, attempt_id: str) -> None:
+        """Drop everything this process learned about one attempt-id.
+
+        ``_attempt_specs`` is deliberately left alone: both callers are about to
+        rebuild it from the Pods they are holding.
+        """
+
         self.watcher.reset_attempt(attempt_id)
         self._missing_attempts.clear(attempt_id)
+        self._restored_attempts.discard(attempt_id)
         self._last_observations.pop(attempt_id, None)
         self._terminal_observations.pop(attempt_id, None)
         self._failure_events.pop(attempt_id, None)
@@ -1923,6 +1979,12 @@ def controller_from_environment() -> KubernetesCompletionController:
             os.getenv(
                 "GPU_FAULT_WATCHER_CLEANUP_TIMEOUT_SECONDS",
                 "120",
+            )
+        ),
+        attempt_missing_grace_seconds=int(
+            os.getenv(
+                "GPU_FAULT_COMPLETION_ATTEMPT_MISSING_GRACE_SECONDS",
+                "300",
             )
         ),
         serializer=api_client.sanitize_for_serialization,

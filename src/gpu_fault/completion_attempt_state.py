@@ -7,6 +7,10 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from gpu_fault.attempt_observation_state import terminal_attempt_observation
+from gpu_fault.completion_observation import (
+    TERMINAL_ORIGIN_MISSING_TOMBSTONE,
+    TERMINAL_ORIGIN_OBSERVED,
+)
 from gpu_fault.models import Environment, TerminalEvent
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 
@@ -103,6 +107,11 @@ def restore_persisted_attempt_observations(controller: Any) -> None:
             attempt_spec_from_observation(observation)
         )
         controller._last_observations[observation.attempt_id] = observation
+        # This process has never seen a Pod of this attempt, so the absence of
+        # Pods proves nothing about how it ended: the tombstone path has to ask
+        # the workload object first (F7). Cleared as soon as one of its Pods is
+        # listed.
+        controller._restored_attempts.add(observation.attempt_id)
 
 
 def cache_terminal_attempt_observation(
@@ -111,12 +120,26 @@ def cache_terminal_attempt_observation(
     event: TerminalEvent,
     observation: AttemptObservation,
 ) -> AttemptObservation:
+    # The origin is decided before the tracker is cleared: only a terminal the
+    # tracker itself produced from missing Pods is a tombstone, and only a
+    # tombstone may be evicted later by Pods that come back (F2). A terminal
+    # that was read off Pod status -- including the TIMED_OUT of an attempt
+    # whose failure we did observe -- stays authoritative.
+    origin = (
+        TERMINAL_ORIGIN_MISSING_TOMBSTONE
+        if (
+            controller._missing_attempts.is_tombstoned(attempt_id)
+            and observation.workload_phase is WorkloadPhase.STOPPED
+        )
+        else TERMINAL_ORIGIN_OBSERVED
+    )
     controller._missing_attempts.clear(attempt_id)
     return cast(
         AttemptObservation,
         controller._terminal_observations.setdefault(
             attempt_id,
             terminal_attempt_observation(event, observation),
+            origin,
         ),
     )
 

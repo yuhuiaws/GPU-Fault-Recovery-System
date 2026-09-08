@@ -12,6 +12,18 @@ _CUSTOM_WORKLOADS: dict[str, tuple[str, str, str]] = {
     "pytorchjob": ("kubeflow.org", "v1", "pytorchjobs"),
     "jobset": ("jobset.x-k8s.io", "v1alpha2", "jobsets"),
 }
+# Terminal observations are cached per attempt and shadow every later pass, so
+# where one came from decides whether Pods that show up afterwards may evict
+# it: a terminal read off Pod status is evidence, a terminal derived from the
+# *absence* of Pods is a guess (F2).
+TERMINAL_ORIGIN_OBSERVED = "observed"
+TERMINAL_ORIGIN_MISSING_TOMBSTONE = "missing-tombstone"
+# (connect, read) budget for the workload-object reads on the reconcile path.
+# The kubernetes client leaves the read timeout unset by default, and a parked
+# API-server endpoint would then hold the whole reconcile forever (F3).
+WORKLOAD_READ_TIMEOUT = (5.0, 10.0)
+_SUCCESS_CONDITION_TYPES = frozenset({"complete", "completed", "succeeded"})
+_FAILURE_CONDITION_TYPES = frozenset({"failed"})
 
 
 def _parse_workload_id(value: str) -> tuple[str, str, str]:
@@ -34,31 +46,9 @@ def workload_termination_initiator(
     means "unknown", never an exception on the observation path.
     """
 
-    stopper = controller.workload_stopper
-    batch = getattr(stopper, "batch", None)
-    custom = getattr(stopper, "custom", None)
     for workload_id in workload_ids:
-        try:
-            namespace, kind, name = _parse_workload_id(workload_id)
-            raw: Any
-            if kind == "job":
-                if batch is None:
-                    continue
-                raw = batch.read_namespaced_job(name, namespace)
-            else:
-                if custom is None or kind not in _CUSTOM_WORKLOADS:
-                    continue
-                group, version, plural = _CUSTOM_WORKLOADS[kind]
-                raw = custom.get_namespaced_custom_object(
-                    group, version, namespace, plural, name
-                )
-            data: dict[str, Any] = (
-                raw if isinstance(raw, dict) else dict(controller.serializer(raw))
-            )
-        except Exception as exc:  # noqa: BLE001 - observation must not fail
-            LOGGER.debug(
-                "could not read workload %s for its initiator: %s", workload_id, exc
-            )
+        data = read_workload_object(controller, workload_id)
+        if data is None:
             continue
         metadata = data.get("metadata") or {}
         annotations = metadata.get("annotations") or {}
@@ -66,6 +56,143 @@ def workload_termination_initiator(
         if initiator:
             return str(initiator)
     return None
+
+
+def read_workload_object(controller: Any, workload_id: str) -> dict[str, Any] | None:
+    """The Job/PyTorchJob/JobSet behind ``namespace/kind/name``, or ``None``.
+
+    Read-only through the stopper's own API clients and bounded by
+    ``_request_timeout``: this runs on the reconcile path, where an unbounded
+    read of a wedged API-server endpoint would park the whole watcher. Any
+    failure -- absent object, RBAC, timeout, unparsable ID -- is "unknown",
+    never an exception on the observation path, and every caller has to fail
+    closed on ``None``.
+    """
+
+    stopper = controller.workload_stopper
+    try:
+        namespace, kind, name = _parse_workload_id(workload_id)
+        raw: Any
+        if kind == "job":
+            batch = getattr(stopper, "batch", None)
+            if batch is None:
+                return None
+            raw = batch.read_namespaced_job(
+                name, namespace, _request_timeout=WORKLOAD_READ_TIMEOUT
+            )
+        else:
+            custom = getattr(stopper, "custom", None)
+            if custom is None or kind not in _CUSTOM_WORKLOADS:
+                return None
+            group, version, plural = _CUSTOM_WORKLOADS[kind]
+            raw = custom.get_namespaced_custom_object(
+                group,
+                version,
+                namespace,
+                plural,
+                name,
+                _request_timeout=WORKLOAD_READ_TIMEOUT,
+            )
+    except Exception as exc:  # noqa: BLE001 - observation must not fail
+        LOGGER.debug("could not read workload %s: %s", workload_id, exc)
+        return None
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return dict(controller.serializer(raw))
+    except Exception as exc:  # noqa: BLE001 - observation must not fail
+        LOGGER.debug("could not deserialize workload %s: %s", workload_id, exc)
+        return None
+
+
+def pod_container_has_started(pod: dict[str, Any], container_name: str) -> bool:
+    """True when the Pod's training container is running or has terminated.
+
+    A Pod that exists is not a Pod that started: an unschedulable or
+    image-pulling Pod has no ``containerStatuses`` at all, and publishing it as
+    RUNNING misreported both the phase and ``started_at`` (F10).
+    """
+
+    status = pod.get("status") or {}
+    statuses = status.get("containerStatuses") or status.get("container_statuses") or []
+    selected: dict[str, Any] = next(
+        (item for item in statuses if item.get("name") == container_name),
+        {},
+    )
+    state = selected.get("state") or {}
+    # Presence, not truthiness: a freshly started container reports
+    # ``state: {running: {}}`` -- an empty, falsy dict.
+    return state.get("running") is not None or state.get("terminated") is not None
+
+
+def _as_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return 0
+    return int(value)
+
+
+def _completion_counts(status: dict[str, Any]) -> tuple[int, int]:
+    """Succeeded/failed replica counts across the kinds we manage.
+
+    ``Job`` reports them at the top level, ``PyTorchJob`` per replica type,
+    ``JobSet`` per replicated job, and all three also carry a terminal
+    condition. An unknown shape contributes nothing, which reads as "no
+    verdict" and leaves the caller with its fail-closed default.
+    """
+
+    succeeded = _as_count(status.get("succeeded"))
+    failed = _as_count(status.get("failed"))
+    replica_statuses = status.get("replicaStatuses") or status.get("replica_statuses")
+    if isinstance(replica_statuses, dict):
+        for group in replica_statuses.values():
+            if isinstance(group, dict):
+                succeeded += _as_count(group.get("succeeded"))
+                failed += _as_count(group.get("failed"))
+    replicated = status.get("replicatedJobsStatus") or status.get(
+        "replicated_jobs_status"
+    )
+    if isinstance(replicated, list):
+        for entry in replicated:
+            if isinstance(entry, dict):
+                succeeded += _as_count(entry.get("succeeded"))
+                failed += _as_count(entry.get("failed"))
+    for condition in status.get("conditions") or []:
+        if not isinstance(condition, dict):
+            continue
+        if str(condition.get("status", "")).lower() != "true":
+            continue
+        condition_type = str(condition.get("type", "")).lower()
+        if condition_type in _SUCCESS_CONDITION_TYPES:
+            succeeded += 1
+        elif condition_type in _FAILURE_CONDITION_TYPES:
+            failed += 1
+    return succeeded, failed
+
+
+def workload_object_phase(controller: Any, workload_ids: list[str]) -> WorkloadPhase:
+    """What the workload object says happened, defaulting to STOPPED (F7).
+
+    The Pods of an attempt that finished while the watcher was down are
+    garbage-collected (``ttlSecondsAfterFinished``, ``cleanPodPolicy``), so
+    their absence used to be recorded as a user stop and the job's workflows
+    were withdrawn. The workload object outlives its Pods and still carries the
+    outcome. An unreadable or verdict-less object stays STOPPED: this path must
+    never invent a success.
+    """
+
+    for workload_id in workload_ids:
+        data = read_workload_object(controller, workload_id)
+        if data is None:
+            continue
+        status = data.get("status") or {}
+        if not isinstance(status, dict):
+            continue
+        succeeded, failed = _completion_counts(status)
+        if succeeded > 0:
+            return WorkloadPhase.SUCCEEDED
+        if failed > 0:
+            return WorkloadPhase.FAILED
+    return WorkloadPhase.STOPPED
 
 
 MANAGED_LABEL = "gpu-fault.io/managed"
@@ -83,11 +210,30 @@ PYTORCH_JOB_LABELS = (
 
 
 class MissingAttemptTracker:
-    def __init__(self) -> None:
+    """Since when every Pod of an attempt has been absent, and for how long.
+
+    The grace is a *whole-attempt* budget of minutes, deliberately not
+    ``cleanup_timeout_seconds``: that one is the container-cleanup budget the
+    watcher core uses for the TIMED_OUT deadline of an attempt that already
+    reported a failure, and reusing it here declared a user stop 30 s after a
+    ``spec.suspend`` toggle or a Kueue readmission (F2).
+    """
+
+    def __init__(self, grace_seconds: float) -> None:
+        if grace_seconds < 1:
+            raise ValueError("attempt missing grace must be at least one second")
+        self.grace_seconds = grace_seconds
         self.since: dict[str, datetime] = {}
+        self.tombstoned: set[str] = set()
 
     def clear(self, attempt_id: str) -> None:
         self.since.pop(attempt_id, None)
+        self.tombstoned.discard(attempt_id)
+
+    def is_tombstoned(self, attempt_id: str) -> bool:
+        """True when this attempt's last observation was a missing tombstone."""
+
+        return attempt_id in self.tombstoned
 
     def observe_missing(
         self,
@@ -96,10 +242,9 @@ class MissingAttemptTracker:
         observed_at: datetime,
     ) -> AttemptObservation:
         missing_since = self.since.setdefault(attempt_id, observed_at)
-        if (
-            observed_at - missing_since
-        ).total_seconds() < observation.cleanup_timeout_seconds:
+        if (observed_at - missing_since).total_seconds() < self.grace_seconds:
             return observation
+        self.tombstoned.add(attempt_id)
         return cast(
             AttemptObservation,
             observation.model_copy(
@@ -110,6 +255,73 @@ class MissingAttemptTracker:
                 }
             ),
         )
+
+
+def restored_attempt_observation(
+    controller: Any,
+    attempt_id: str,
+    previous: AttemptObservation,
+    tombstone: AttemptObservation,
+    observed_at: datetime,
+) -> AttemptObservation:
+    """Replace a restored attempt's tombstone with the workload's own verdict.
+
+    Only attempts rebuilt from persisted state reach here: this process never
+    saw their Pods, so the absence of Pods says nothing about how they ended
+    (F7). The workload object is asked instead, and anything short of an
+    explicit succeeded/failed count leaves the tombstone in place.
+
+    The exit codes are synthesized from that verdict -- the Pods are gone, so
+    no real code exists -- because the watcher core only derives
+    SUCCEEDED/FAILED once every critical rank is terminated. Every rank gets
+    the same code, so none of them is singled out as the first failure.
+    """
+
+    phase = workload_object_phase(controller, previous.workload_ids)
+    if phase is WorkloadPhase.STOPPED:
+        return tombstone
+    critical = [item for item in previous.containers if item.critical]
+    if len(critical) < previous.expected_critical_ranks:
+        LOGGER.warning(
+            "restored attempt %s has %d of %d critical ranks persisted, so the "
+            "workload verdict %s cannot be attributed; recording the stop",
+            attempt_id,
+            len(critical),
+            previous.expected_critical_ranks,
+            phase.value,
+        )
+        return tombstone
+    if phase is WorkloadPhase.SUCCEEDED and any(
+        item.terminated and item.exit_code not in (0, None) for item in critical
+    ):
+        LOGGER.warning(
+            "restored attempt %s has a rank that exited non-zero, so the "
+            "workload success verdict is not trusted; recording the stop",
+            attempt_id,
+        )
+        return tombstone
+    exit_code = 0 if phase is WorkloadPhase.SUCCEEDED else 1
+    containers = [
+        item
+        if item.terminated
+        else item.model_copy(
+            update={
+                "terminated": True,
+                "exit_code": exit_code,
+                "finished_at": observed_at,
+            }
+        )
+        for item in critical
+    ]
+    LOGGER.warning(
+        "restored attempt %s has no Pods left and its workload object reports "
+        "%s; recording that instead of a stop",
+        attempt_id,
+        phase.value,
+    )
+    return tombstone.model_copy(
+        update={"workload_phase": phase, "containers": containers}
+    )
 
 
 def reconcile_attempt_observation(
@@ -123,10 +335,22 @@ def reconcile_attempt_observation(
         controller._terminal_observations.get(attempt_id),
     )
     if terminal is not None:
-        controller._missing_attempts.clear(attempt_id)
-        return terminal
+        if not (
+            attempt_pods
+            and controller._terminal_observations.is_missing_tombstone(attempt_id)
+        ):
+            # A terminal read off Pod status is evidence: Pods listed after it
+            # (a delayed relist, a replacement Pod) must not regress it.
+            controller._missing_attempts.clear(attempt_id)
+            return terminal
+        # The tombstone only ever meant "no Pod of this attempt is left", and
+        # live Pods under the same attempt-id disprove it. Forget everything
+        # derived from it -- including the sent terminal keys -- and observe the
+        # Pods as if the attempt were new, the way a metadata takeover does.
+        controller.resume_tombstoned_attempt(attempt_id)
     if attempt_pods:
         controller._missing_attempts.clear(attempt_id)
+        controller._restored_attempts.discard(attempt_id)
         return cast(
             AttemptObservation,
             controller._observation(attempt_id, attempt_pods, observed_at),
@@ -150,6 +374,13 @@ def reconcile_attempt_observation(
             observed_at,
         ),
     )
+    if (
+        result.workload_phase is WorkloadPhase.STOPPED
+        and attempt_id in controller._restored_attempts
+    ):
+        result = restored_attempt_observation(
+            controller, attempt_id, previous, result, observed_at
+        )
     if (
         result.workload_phase is WorkloadPhase.STOPPED
         and result.termination_initiator_incident_id is None
@@ -357,11 +588,59 @@ def is_unknown_profile_rejection(exc: BaseException) -> bool:
     )
 
 
+class TerminalObservationCache:
+    """Per-attempt terminal observations plus the origin that produced them.
+
+    The origin is what makes the eviction rule expressible (F2): a terminal
+    derived from Pod status is evidence and is never dropped, while a
+    ``missing-tombstone`` -- derived from the *absence* of Pods -- is dropped as
+    soon as Pods of that attempt-id are listed again. Terminal observations are
+    never persisted (only PENDING/RUNNING ones are), so no origin can be lost
+    across a restart: a restored attempt is active by construction and starts
+    with no cache entry at all.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[AttemptObservation, str]] = {}
+
+    def __contains__(self, attempt_id: object) -> bool:
+        return attempt_id in self._entries
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(self, attempt_id: str) -> AttemptObservation | None:
+        entry = self._entries.get(attempt_id)
+        return None if entry is None else entry[0]
+
+    def origin(self, attempt_id: str) -> str | None:
+        entry = self._entries.get(attempt_id)
+        return None if entry is None else entry[1]
+
+    def is_missing_tombstone(self, attempt_id: str) -> bool:
+        return self.origin(attempt_id) == TERMINAL_ORIGIN_MISSING_TOMBSTONE
+
+    def setdefault(
+        self,
+        attempt_id: str,
+        observation: AttemptObservation,
+        origin: str,
+    ) -> AttemptObservation:
+        return self._entries.setdefault(attempt_id, (observation, origin))[0]
+
+    def pop(
+        self, attempt_id: str, default: AttemptObservation | None = None
+    ) -> AttemptObservation | None:
+        entry = self._entries.pop(attempt_id, None)
+        return default if entry is None else entry[0]
+
+
 def _clear_attempt(controller, attempt_id: str) -> None:
     controller._attempt_specs.pop(attempt_id, None)
     controller._last_observations.pop(attempt_id, None)
     controller._terminal_observations.pop(attempt_id, None)
     controller._missing_attempts.clear(attempt_id)
+    controller._restored_attempts.discard(attempt_id)
     controller._failure_events.pop(attempt_id, None)
     controller._failure_sent.discard(attempt_id)
     controller._failure_delivery_started.pop(attempt_id, None)

@@ -220,6 +220,7 @@ def test_disappeared_running_attempt_emits_stopped_tombstone_after_grace() -> No
         sink,
         cluster_id="hp-cluster",
         cleanup_timeout_seconds=30,
+        attempt_missing_grace_seconds=30,
         now=clock,
         publish_observations=True,
     )
@@ -252,7 +253,12 @@ def test_disappeared_attempt_takes_its_initiator_from_the_workload_object() -> N
     also annotates the workload object, which outlives the Pods."""
 
     class FakeCustom:
-        def get_namespaced_custom_object(self, group, version, namespace, plural, name):
+        def get_namespaced_custom_object(
+            self, group, version, namespace, plural, name, **kwargs
+        ):
+            assert kwargs.get("_request_timeout") is not None, (
+                "the workload read on the observation path must be bounded"
+            )
             assert (group, plural, namespace, name) == (
                 "kubeflow.org",
                 "pytorchjobs",
@@ -278,6 +284,7 @@ def test_disappeared_attempt_takes_its_initiator_from_the_workload_object() -> N
         sink,
         cluster_id="hp-cluster",
         cleanup_timeout_seconds=30,
+        attempt_missing_grace_seconds=30,
         now=clock,
         workload_stopper=stopper,
     )
@@ -307,6 +314,7 @@ def test_restart_restores_attempt_and_terminalizes_missing_pods() -> None:
         first_sink,
         cluster_id="hp-cluster",
         cleanup_timeout_seconds=30,
+        attempt_missing_grace_seconds=30,
         now=clock,
         publish_observations=True,
     )
@@ -322,6 +330,7 @@ def test_restart_restores_attempt_and_terminalizes_missing_pods() -> None:
         restarted_sink,
         cluster_id="hp-cluster",
         cleanup_timeout_seconds=30,
+        attempt_missing_grace_seconds=30,
         now=clock,
         publish_observations=True,
     )
@@ -334,6 +343,272 @@ def test_restart_restores_attempt_and_terminalizes_missing_pods() -> None:
     ]
     assert observations[-1]["workload_phase"] == "STOPPED"
     assert json.loads(core.config_map_data["active-attempts.json"]) == {}
+
+
+def test_resumed_attempt_after_tombstone_reports_its_failure() -> None:
+    """F2: a missing-Pod tombstone is a guess, not an observation.
+
+    Every Pod of an attempt can be absent for minutes -- a ``spec.suspend``
+    toggle, Kueue preemption and readmission, an operator recreating Pods
+    after node loss -- and come back under the same attempt-id. The cached
+    STOPPED observation used to short-circuit every later pass, so the
+    returning ranks were invisible forever and their failure was never
+    reported.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0)])
+    sink = FakeSink()
+    subject = KubernetesCompletionController(
+        core,
+        sink,
+        cluster_id="hp-cluster",
+        cleanup_timeout_seconds=30,
+        attempt_missing_grace_seconds=30,
+        now=clock,
+        publish_observations=True,
+    )
+
+    subject.run_once()
+    core.pods = []
+    subject.run_once()
+    clock.value += timedelta(seconds=31)
+    subject.run_once()
+
+    statuses = [
+        payload["terminal_status"]
+        for path, payload in sink.posts
+        if path == "/v1/attempts/terminal"
+    ]
+    assert statuses == ["STOPPED"], f"expected one tombstone, got {statuses}"
+
+    core.pods = [pod(0, exit_code=1)]
+    clock.value += timedelta(seconds=5)
+    subject.run_once()
+
+    failures = [
+        payload
+        for path, payload in sink.posts
+        if path == "/v1/attempts/failure-detected"
+    ]
+    assert len(failures) == 1, f"resumed attempt reported no failure: {failures}"
+    assert failures[0]["exit_code"] == 1, failures[0]
+    statuses = [
+        payload["terminal_status"]
+        for path, payload in sink.posts
+        if path == "/v1/attempts/terminal"
+    ]
+    assert statuses == ["STOPPED", "FAILED"], (
+        f"the tombstone still shadows the resumed attempt: {statuses}"
+    )
+    published = [
+        payload for path, payload in sink.posts if path == "/v1/workload-observations"
+    ][-1]
+    assert published["workload_phase"] == "FAILED", published
+    assert subject.resumed_attempts_total == 1, "the resumed attempt was not counted"
+
+
+def test_missing_grace_is_independent_of_cleanup_timeout() -> None:
+    """F2: ``cleanup_timeout_seconds`` is a container-cleanup budget.
+
+    Reusing it as "the whole attempt is gone" declared a user stop after
+    30 s. The whole-attempt grace is minutes, and it must not push out the
+    TIMED_OUT deadline of an attempt that already reported a failure.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0)])
+    sink = FakeSink()
+    subject = KubernetesCompletionController(
+        core,
+        sink,
+        cluster_id="hp-cluster",
+        cleanup_timeout_seconds=30,
+        attempt_missing_grace_seconds=300,
+        now=clock,
+        publish_observations=True,
+    )
+
+    subject.run_once()
+    core.pods = []
+    clock.value += timedelta(seconds=31)
+    subject.run_once()
+
+    terminals = [path for path, _ in sink.posts if path == "/v1/attempts/terminal"]
+    assert terminals == [], f"tombstoned on the cleanup budget: {terminals}"
+    published = [
+        payload for path, payload in sink.posts if path == "/v1/workload-observations"
+    ][-1]
+    assert published["workload_phase"] == "RUNNING", published
+
+    clock.value += timedelta(seconds=300)
+    subject.run_once()
+
+    terminal = next(
+        payload for path, payload in sink.posts if path == "/v1/attempts/terminal"
+    )
+    assert terminal["terminal_status"] == "STOPPED", terminal
+
+    failing_clock = Clock()
+    failing_core = FakeCoreApi(
+        [pod(0, exit_code=1, expected_ranks=2), pod(1, expected_ranks=2)]
+    )
+    failing_sink = FakeSink()
+    failing = KubernetesCompletionController(
+        failing_core,
+        failing_sink,
+        cluster_id="hp-cluster",
+        cleanup_timeout_seconds=30,
+        now=failing_clock,
+    )
+    failing.run_once()
+    failing_core.pods = []
+    failing_clock.value += timedelta(seconds=31)
+    failing.run_once()
+
+    timed_out = next(
+        payload
+        for path, payload in failing_sink.posts
+        if path == "/v1/attempts/terminal"
+    )
+    assert timed_out["terminal_status"] == "TIMED_OUT", (
+        f"the longer missing grace delayed the cleanup timeout: {timed_out}"
+    )
+
+
+def test_restored_attempt_with_gc_pods_and_succeeded_job_is_succeeded() -> None:
+    """F7: a finish during watcher downtime is not a user stop.
+
+    The Pods of an attempt that finished while the watcher was down are
+    garbage-collected (``ttlSecondsAfterFinished``), so the restored RUNNING
+    attempt sees no Pods at all. The workload object still records the
+    outcome and outlives its Pods.
+    """
+
+    class FakeBatch:
+        def __init__(self, status) -> None:
+            self.status = status
+            self.reads = []
+
+        def read_namespaced_job(self, name, namespace, **kwargs):
+            self.reads.append((name, namespace, kwargs.get("_request_timeout")))
+            return {"metadata": {"name": name}, "status": dict(self.status)}
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0, workload_ids=["default/job/trainer"])])
+    delivered = FakeSink()
+    first = KubernetesCompletionController(
+        core,
+        KubernetesCompletionOutbox(core, delivered),
+        cluster_id="hp-cluster",
+        attempt_missing_grace_seconds=30,
+        now=clock,
+        publish_observations=True,
+    )
+    first.run_once()
+
+    core.pods = []
+    batch = FakeBatch({"succeeded": 1})
+    stopper = FakeStopper()
+    stopper.batch = batch
+    stopper.custom = None
+    restarted = KubernetesCompletionController(
+        core,
+        KubernetesCompletionOutbox(core, delivered),
+        cluster_id="hp-cluster",
+        attempt_missing_grace_seconds=30,
+        now=clock,
+        publish_observations=True,
+        workload_stopper=stopper,
+    )
+    restarted.run_once()
+    clock.value += timedelta(seconds=31)
+    restarted.run_once()
+
+    terminal = next(
+        payload for path, payload in delivered.posts if path == "/v1/attempts/terminal"
+    )
+    assert terminal["terminal_status"] == "SUCCEEDED", (
+        f"a job that finished during downtime was recorded as a stop: {terminal}"
+    )
+    assert batch.reads, "the workload object was never read"
+    assert batch.reads[0][2] is not None, (
+        f"the workload read is unbounded: {batch.reads[0]}"
+    )
+
+
+def test_unreadable_workload_object_keeps_the_restored_attempt_stopped() -> None:
+    """The workload-object read fails closed: unknown is a stop, not a success."""
+
+    class BrokenBatch:
+        def read_namespaced_job(self, name, namespace, **_kwargs):
+            raise RuntimeError("api server unavailable")
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0, workload_ids=["default/job/trainer"])])
+    delivered = FakeSink()
+    first = KubernetesCompletionController(
+        core,
+        KubernetesCompletionOutbox(core, delivered),
+        cluster_id="hp-cluster",
+        attempt_missing_grace_seconds=30,
+        now=clock,
+        publish_observations=True,
+    )
+    first.run_once()
+
+    core.pods = []
+    stopper = FakeStopper()
+    stopper.batch = BrokenBatch()
+    stopper.custom = None
+    restarted = KubernetesCompletionController(
+        core,
+        KubernetesCompletionOutbox(core, delivered),
+        cluster_id="hp-cluster",
+        attempt_missing_grace_seconds=30,
+        now=clock,
+        publish_observations=True,
+        workload_stopper=stopper,
+    )
+    restarted.run_once()
+    clock.value += timedelta(seconds=31)
+    restarted.run_once()
+
+    terminal = next(
+        payload for path, payload in delivered.posts if path == "/v1/attempts/terminal"
+    )
+    assert terminal["terminal_status"] == "STOPPED", (
+        f"an unreadable workload object must not invent an outcome: {terminal}"
+    )
+
+
+def test_pending_pod_without_statuses_is_pending() -> None:
+    """F10: an unscheduled Pod is not a running attempt."""
+
+    unscheduled = pod(0)
+    unscheduled["status"] = {"phase": "Pending"}
+    del unscheduled["spec"]["nodeName"]
+    sink = FakeSink()
+    subject = KubernetesCompletionController(
+        FakeCoreApi([unscheduled]),
+        sink,
+        cluster_id="hp-cluster",
+        now=lambda: NOW,
+        publish_observations=True,
+    )
+
+    subject.run_once()
+
+    published = [
+        payload for path, payload in sink.posts if path == "/v1/workload-observations"
+    ][-1]
+    assert published["workload_phase"] == "PENDING", published
+    assert published["started_at"] is None, (
+        f"an unscheduled Pod has no start time: {published}"
+    )
+    assert published["containers"][0]["node_id"] is None, (
+        f"an unscheduled Pod must not claim a node: {published}"
+    )
 
 
 def test_observation_uses_earliest_pod_start_with_creation_fallback() -> None:
