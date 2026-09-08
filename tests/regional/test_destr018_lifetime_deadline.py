@@ -1241,6 +1241,62 @@ def test_an_env_restored_to_a_different_template_fails_the_case() -> None:
     assert "differs from the pre-window baseline" in _text(errors)
 
 
+def test_the_open_window_may_change_the_worker_template() -> None:
+    """While the window is open, setting the managed env vars is the point, so
+    the worker's ``template_sha256`` is expected to differ and is not drift."""
+
+    before = _identity(generation=7)
+    after = _identity(generation=8, template="sha-in-window")
+    assert (
+        destr018.identity_errors(
+            before,
+            after,
+            worker_generation_delta=1,
+            allow_worker_template_change=True,
+        )
+        == []
+    )
+
+
+def test_the_open_window_still_catches_non_template_worker_drift() -> None:
+    """The template escape hatch is narrow: an off-by-one generation, a settling
+    rollout, a sibling deployment's drift, or a release-state change must still
+    fail even while the worker template is allowed to move."""
+
+    before = _identity(generation=7)
+    wrong_delta = _identity(generation=10, template="sha-in-window")
+    assert "generation is 10, not the 8" in _text(
+        destr018.identity_errors(
+            before,
+            wrong_delta,
+            worker_generation_delta=1,
+            allow_worker_template_change=True,
+        )
+    )
+
+    sibling = _identity(generation=8, template="sha-in-window")
+    sibling["deployments"]["cpu"]["gpu-fault-api-ha"]["template_sha256"] = "sha-other"
+    assert "gpu-fault-api-ha identity drifted" in _text(
+        destr018.identity_errors(
+            before,
+            sibling,
+            worker_generation_delta=1,
+            allow_worker_template_change=True,
+        )
+    )
+
+    released = _identity(generation=8, template="sha-in-window")
+    released["release_state"]["release_id"] = "rel-2"
+    assert "release state identity drifted" in _text(
+        destr018.identity_errors(
+            before,
+            released,
+            worker_generation_delta=1,
+            allow_worker_template_change=True,
+        )
+    )
+
+
 def test_an_unexplained_worker_rollout_fails_the_case() -> None:
     before = _identity(generation=7)
     after = _identity(generation=12)

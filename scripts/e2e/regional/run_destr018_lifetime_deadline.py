@@ -336,6 +336,7 @@ def identity_errors(
     after: dict[str, Any],
     *,
     worker_generation_delta: int,
+    allow_worker_template_change: bool = False,
 ) -> list[str]:
     """Judge a runtime identity across a deliberate control-worker rollout.
 
@@ -347,12 +348,24 @@ def identity_errors(
     that the env was restored exactly and not merely to an equivalent-looking
     list. Only the two generation counters are allowed to move, and only by the
     number of writes the window made.
+
+    ``allow_worker_template_change`` is for the one comparison taken *while the
+    window is open*: setting the managed env vars is the whole point of the
+    window, so the worker's ``template_sha256`` is expected to differ there and
+    must not be read as drift. The invariant that only the managed env changed
+    is still carried by ``release_state`` equality (image/wheel/manifest
+    digests), by the env-window record's own open decision, and above all by the
+    close comparison, which restores ``allow_worker_template_change=False`` and
+    so proves the digest returned to its pre-window value.
     """
 
     errors: list[str] = []
     if after.get("release_state") != before.get("release_state"):
         errors.append("regional release state identity drifted")
     counters = ("generation", "observed_generation")
+    worker_volatile = (
+        (*counters, "template_sha256") if allow_worker_template_change else counters
+    )
     for plane, deployments in (before.get("deployments") or {}).items():
         current_plane = (after.get("deployments") or {}).get(plane) or {}
         for name, expected in deployments.items():
@@ -365,10 +378,14 @@ def identity_errors(
                     errors.append(f"{plane} deployment {name} identity drifted")
                 continue
             stable = {
-                key: value for key, value in observed.items() if key not in counters
+                key: value
+                for key, value in observed.items()
+                if key not in worker_volatile
             }
             if stable != {
-                key: value for key, value in expected.items() if key not in counters
+                key: value
+                for key, value in expected.items()
+                if key not in worker_volatile
             }:
                 errors.append(
                     f"{env_window.DEPLOYMENT} differs from the pre-window "
@@ -785,11 +802,12 @@ def _open_and_arm(run: _LiveRun) -> None:
         run.preflight["runtime_identity"],
         in_window_identity,
         worker_generation_delta=1,
+        allow_worker_template_change=True,
     )
     if drift:
         raise RegionalFixtureError(
-            "the open env window changed more than the two managed "
-            f"variables: {'; '.join(drift)}"
+            "the open env window changed the control-worker in a way beyond its "
+            f"managed timing variables: {'; '.join(drift)}"
         )
     run.in_window_identity = in_window_identity
     run.metrics_before = worker_metrics(run.regional)
