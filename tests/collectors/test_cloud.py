@@ -1226,3 +1226,42 @@ def test_kubernetes_collector_forgets_a_node_that_loses_every_hma_key() -> None:
         "the same fault returning after every HMA key was removed was "
         "deduplicated against the digest of the first occurrence"
     )
+
+
+def test_node_resource_collector_refreshes_its_liveness_heartbeat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """``run`` had no health surface at all, so a wedged loop looked Ready.
+
+    ``list_node`` passes no request timeout, so a half-open apiserver
+    connection blocks the cycle forever while the Pod stays Running and Ready
+    and the whole cluster's EFA/GPU advertisement coverage goes quiet. The
+    Deployment's livenessProbe reads the age of this file, so it has to be
+    refreshed on every cycle -- including a cycle that failed, because liveness
+    answers "is the loop turning", not "did the sample succeed".
+    """
+
+    from gpu_fault.collectors.cloud import kubernetes as module
+
+    heartbeat = tmp_path / "node-resource-collector-alive"
+    monkeypatch.setattr(module, "NODE_RESOURCE_HEARTBEAT_PATH", str(heartbeat))
+
+    class _FailingCore:
+        def list_node(self, **_kwargs: Any) -> Any:
+            raise OSError("apiserver unreachable")
+
+    for core in (_two_node_core(), _FailingCore()):
+        heartbeat.unlink(missing_ok=True)
+        collector = KubernetesNodeResourceCollector(
+            RecordingSink(), context(), core_api=core, now=lambda: NOW
+        )
+        monkeypatch.setattr(
+            module.time, "sleep", lambda _seconds: (_ for _ in ()).throw(StopTheLoop())
+        )
+
+        with pytest.raises(StopTheLoop):
+            collector.run()
+
+        assert heartbeat.exists(), (
+            f"the cycle using {type(core).__name__} left no liveness heartbeat"
+        )

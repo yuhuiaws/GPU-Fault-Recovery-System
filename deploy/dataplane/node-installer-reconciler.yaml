@@ -55,6 +55,17 @@ rules:
       - "gpu-fault-node-installer-template"
       - "gpu-fault-node-installer-wave"
     verbs: ["get"]
+  # Read-only, and namespaced to the installer Jobs' own namespace. The
+  # reconciler has no `secrets` grant on purpose, so it cannot check whether a
+  # node has an entry in gpu-fault-node-action-keys; it reads the consequence
+  # off the Job's Pod instead (CreateContainerConfigError and the other
+  # never-started waiting reasons) and marks that node failed-permanent instead
+  # of burning an install slot for the full activeDeadlineSeconds every cycle.
+  # Without this grant that classification silently degrades to plain backoff.
+  # No `watch` (the pass is a poll), no `delete` (Job deletion cascades).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -105,8 +116,28 @@ spec:
         app: gpu-fault-node-installer-reconciler
     spec:
       serviceAccountName: gpu-fault-node-installer-reconciler
+      priorityClassName: system-cluster-critical
+      # A bare `operator: Exists` also tolerated node.kubernetes.io/not-ready
+      # and unreachable, so taint-based eviction never took this singleton off
+      # a dead node: the Deployment saw its one Pod and rescheduled nothing
+      # until the Node object itself was deleted, and no GPU node in the fleet
+      # was reconciled meanwhile. These are the two taints the other data-plane
+      # singletons tolerate, plus a bounded window on the node-death taints.
       tolerations:
-        - operator: Exists
+        - key: gpu-fault.io/quarantined
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 60
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 60
       containers:
         - name: reconciler
           image: public.ecr.aws/docker/library/python:3.12-slim
@@ -179,6 +210,32 @@ spec:
                 - test -f /tmp/reconciler-ready
             initialDelaySeconds: 2
             periodSeconds: 5
+          # Readiness is a start-up breadcrumb and cannot answer "is the loop
+          # turning": none of the reconciler's apiserver calls pass a request
+          # timeout, so one half-open connection blocks the pass forever while
+          # the Pod stays Running and Ready and no GPU node is reconciled
+          # again. /tmp/reconciler-heartbeat is refreshed at the end of *every*
+          # pass, including a pass that failed closed -- liveness answers
+          # whether the loop is alive, not whether reconciliation succeeded.
+          # 300 s is ~60 passes at GPU_FAULT_RECONCILE_SECONDS=5, so an idle or
+          # merely slow reconciler is never restarted; the initial delay covers
+          # the template load and the first LIST on a large cluster. No
+          # control-plane call: a regional outage must not restart every
+          # cluster's reconciler at once.
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os, sys, time;
+                  p = "/tmp/reconciler-heartbeat";
+                  sys.exit(0 if os.path.exists(p)
+                  and time.time() - os.path.getmtime(p) < 300 else 1)
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

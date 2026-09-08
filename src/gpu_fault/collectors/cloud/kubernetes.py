@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
@@ -32,6 +34,33 @@ LOGGER = logging.getLogger(__name__)
 #: What the apiserver answers once the requested ``resourceVersion`` has left
 #: its watch cache. It is the only response that makes a relist necessary.
 EXPIRED_RESOURCE_VERSION_STATUS = 410
+
+#: Refreshed at the end of every node-resource cycle. The Deployment's
+#: livenessProbe reads this file's age, which is the only way a wedged loop can
+#: be told from an idle one: ``list_node`` passes no request timeout, so a
+#: half-open apiserver connection blocks the cycle forever while the Pod stays
+#: Running and Ready. See deploy/dataplane/kubernetes-node-resource-collector
+#: .yaml, which mounts a writable /tmp because the container's root filesystem
+#: is read-only.
+NODE_RESOURCE_HEARTBEAT_PATH = "/tmp/node-resource-collector-alive"  # noqa: S108
+
+
+def _touch_node_resource_heartbeat() -> None:
+    """Prove the collect loop turned. Read by the Deployment's livenessProbe."""
+
+    try:
+        path = Path(NODE_RESOURCE_HEARTBEAT_PATH)
+        path.touch(exist_ok=True)
+        os.utime(path, None)
+    except OSError:
+        # Losing the heartbeat means liveness restarts this Pod, which is the
+        # right answer for a container that cannot write its own /tmp. It must
+        # not take the collection loop down with it.
+        LOGGER.warning(
+            "could not write node resource collector heartbeat %s",
+            NODE_RESOURCE_HEARTBEAT_PATH,
+            exc_info=True,
+        )
 
 
 def _iter_node_pages(list_node: Callable[..., Any], page_size: int) -> Iterator[Any]:
@@ -680,4 +709,7 @@ class KubernetesNodeResourceCollector:
                 self.collect_once()
             except Exception:
                 LOGGER.exception("Kubernetes node resource collection failed")
+            # After the guard, not inside it: liveness answers whether the loop
+            # is turning, and a cycle that failed and logged is still a turn.
+            _touch_node_resource_heartbeat()
             time.sleep(self.interval_seconds)
