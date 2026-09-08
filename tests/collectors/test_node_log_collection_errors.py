@@ -171,12 +171,16 @@ def test_an_overflowing_window_takes_the_oldest_and_leaves_the_rest(
     first = NOW - timedelta(seconds=30)
     second = NOW - timedelta(seconds=20)
     third = NOW - timedelta(seconds=10)
+    # In the order journalctl writes them, which is the only order a streamed
+    # read can see: the scan stops at the cap where it is, so what the batch
+    # keeps and where the cursor lands are decided by the stream, not by a sort
+    # over a window that was buffered whole.
     runner = _Journalctl(
         stdout="\n".join(
             [
-                _journal_line("cursor-3", f"{MATCHING} three", third),
                 _journal_line("cursor-1", f"{MATCHING} one", first),
                 _journal_line("cursor-2", f"{MATCHING} two", second),
+                _journal_line("cursor-3", f"{MATCHING} three", third),
             ]
         )
     )

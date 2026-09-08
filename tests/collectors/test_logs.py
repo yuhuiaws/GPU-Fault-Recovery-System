@@ -893,8 +893,18 @@ def test_kernel_collector_payload_accepts_official_xid_format() -> None:
 
 
 def test_node_log_collector_chunks_training_log_without_loss(tmp_path) -> None:
+    """A file larger than one batch is handed over in order, with no gap.
+
+    The lines match a rule on purpose: the entry cap counts what the batch would
+    keep, so lines that match nothing no longer spend it (they are bounded by the
+    scan budget instead).
+    """
+
     log = tmp_path / "training.log"
-    log.write_text("".join(f"line {index}\n" for index in range(5)), encoding="utf-8")
+    log.write_text(
+        "".join(f"machine check hardware error line {index}\n" for index in range(5)),
+        encoding="utf-8",
+    )
     collector = NodeLogCollector(
         RecordingSink(),
         context(),
@@ -911,9 +921,17 @@ def test_node_log_collector_chunks_training_log_without_loss(tmp_path) -> None:
     second = collector._training_logs(NOW)
     third = collector._training_logs(NOW)
 
-    assert [item.message for item in first] == ["line 0", "line 1"]
-    assert [item.message for item in second] == ["line 2", "line 3"]
-    assert [item.message for item in third] == ["line 4"]
+    assert [item.message for item in first] == [
+        "machine check hardware error line 0",
+        "machine check hardware error line 1",
+    ], f"the first chunk is the two oldest lines: {first}"
+    assert [item.message for item in second] == [
+        "machine check hardware error line 2",
+        "machine check hardware error line 3",
+    ], f"the second chunk resumes where the first stopped: {second}"
+    assert [item.message for item in third] == [
+        "machine check hardware error line 4"
+    ], f"the remainder is delivered, not skipped: {third}"
 
 
 def test_node_log_collector_truncates_oversize_entry(tmp_path) -> None:

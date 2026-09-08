@@ -519,6 +519,10 @@ def test_the_tracked_file_table_is_bounded_and_reports_what_it_forgot(
     The existence prune cannot help when every dated file is still on disk, so
     past the cap the least recently visited offsets go -- and that is reported,
     because a forgotten offset means the file is tailed rather than resumed.
+
+    The cap is four matched lines against four files of two, so each poll visits
+    two files and stops: what makes the table overflow is the second poll
+    tracking two files the first one did not.
     """
 
     _present_journalctl(monkeypatch)
@@ -530,7 +534,7 @@ def test_the_tracked_file_table_is_bounded_and_reports_what_it_forgot(
         state=state,
         training_log_paths=[str(tmp_path / "train-*.log")],
         initial_tail_bytes=8192,
-        max_entries_per_batch=2,
+        max_entries_per_batch=4,
     )
 
     collector.collect_once()
