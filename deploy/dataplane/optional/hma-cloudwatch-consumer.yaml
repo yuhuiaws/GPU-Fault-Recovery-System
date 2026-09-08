@@ -39,10 +39,32 @@ spec:
             - name: PATH
               value: >-
                 /opt/gpu-fault/executor/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            # See hma-watcher.yaml: the regional API answers an anonymous
+            # post with a non-retryable 401, so the connection Secret is not
+            # optional even for an optional component.
             - name: GPU_FAULT_CONTROL_PLANE_URL
-              value: http://gpu-fault-api-canary:8080
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: control-plane-url
+            - name: GPU_FAULT_CLUSTER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-id
+            - name: GPU_FAULT_CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-token
+            - name: SSL_CERT_FILE
+              value: /etc/gpu-fault/tls/ca.crt
             - name: GPU_FAULT_HMA_QUEUE_URL
               value: REPLACE_WITH_QUEUE_URL
+            # emptyDir-backed outbox: acceptable for an optional component,
+            # see hma-watcher.yaml.
+            - name: GPU_FAULT_COLLECTOR_OUTBOX_PATH
+              value: /var/lib/gpu-fault/outbox/sqs-hma.ndjson
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -50,13 +72,22 @@ spec:
             runAsNonRoot: true
             runAsUser: 65532
           volumeMounts:
+            - name: control-plane-ca
+              mountPath: /etc/gpu-fault/tls
+              readOnly: true
             # Writable state directory for the durable event outbox.
             - name: collector-state
               mountPath: /var/lib/gpu-fault
       volumes:
-        - name: artifact
-          configMap:
-            name: gpu-fault-executor-wheel-0100
+        # The `artifact` wheel ConfigMap volume that used to be declared here
+        # was never mounted by any container, so it only made the Pod
+        # unschedulable whenever the release renamed the wheel ConfigMap.
+        - name: control-plane-ca
+          secret:
+            secretName: gpu-fault-regional-connection
+            items:
+              - key: ca.crt
+                path: ca.crt
         - name: collector-state
           emptyDir:
             sizeLimit: 256Mi

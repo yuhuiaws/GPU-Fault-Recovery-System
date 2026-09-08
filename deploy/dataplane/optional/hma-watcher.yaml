@@ -45,8 +45,12 @@ spec:
         app: gpu-fault-hma-watcher
     spec:
       serviceAccountName: gpu-fault-hma-watcher
+      priorityClassName: system-cluster-critical
       tolerations:
         - key: gpu-fault.io/quarantined
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/unschedulable
           operator: Exists
           effect: NoSchedule
       containers:
@@ -65,12 +69,39 @@ spec:
             - name: PATH
               value: >-
                 /opt/gpu-fault/executor/bin:/opt/app-root/bin:/opt/app-root/src/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            # The regional API authorises this route with a cluster token and
+            # answers an anonymous post with 401, which the sink treats as a
+            # non-retryable error -- so the legacy in-cluster canary URL these
+            # manifests used to carry made the very first post a crash loop.
+            # Same Secret, keys and CA file as
+            # kubernetes-node-resource-collector.yaml.
             - name: GPU_FAULT_CONTROL_PLANE_URL
-              value: http://gpu-fault-api-canary:8080
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: control-plane-url
             - name: GPU_FAULT_CLUSTER_ID
-              value: REPLACE_WITH_CLUSTER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-id
+            - name: GPU_FAULT_CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gpu-fault-regional-connection
+                  key: cluster-token
+            - name: SSL_CERT_FILE
+              value: /etc/gpu-fault/tls/ca.crt
             - name: GPU_FAULT_RUNTIME_PROFILE_VERSION
               value: REPLACE_WITH_RUNTIME_PROFILE_VERSION
+            # Without an outbox path the BUFFERED branch of every delivery is
+            # unreachable: an undeliverable node record is dropped instead of
+            # replayed. emptyDir is deliberate for an optional component -- the
+            # buffer survives a control-plane outage, not a Pod restart, and no
+            # PersistentVolume is worth provisioning for a watcher nothing in
+            # the regional deploy installs.
+            - name: GPU_FAULT_COLLECTOR_OUTBOX_PATH
+              value: /var/lib/gpu-fault/outbox/kubernetes-hma.ndjson
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -81,6 +112,9 @@ spec:
             - name: artifact
               mountPath: /artifact
               readOnly: true
+            - name: control-plane-ca
+              mountPath: /etc/gpu-fault/tls
+              readOnly: true
             # Writable state directory for the durable event outbox.
             - name: collector-state
               mountPath: /var/lib/gpu-fault
@@ -88,6 +122,12 @@ spec:
         - name: artifact
           configMap:
             name: gpu-fault-executor-wheel-0100
+        - name: control-plane-ca
+          secret:
+            secretName: gpu-fault-regional-connection
+            items:
+              - key: ca.crt
+                path: ca.crt
         - name: collector-state
           emptyDir:
             sizeLimit: 256Mi
