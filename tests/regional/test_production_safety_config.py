@@ -8,6 +8,12 @@ from pathlib import Path
 
 import yaml
 
+from gpu_fault.collectors.sinks import HttpEventSink
+from gpu_fault.completion_controller import (
+    MAX_DELIVERY_BUDGET_SECONDS,
+    KubernetesCompletionController,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 GENERATED = ROOT / "deploy/control-plane/regional/generated"
 
@@ -684,6 +690,91 @@ def test_completion_watcher_probes_the_watch_loop_liveness() -> None:
     )
     assert "initialDelaySeconds" not in liveness, (
         f"a startup probe replaces the liveness delay: {liveness}"
+    )
+
+
+def test_completion_watcher_budget_stays_under_the_unknown_horizon() -> None:
+    """The restart budget the manifest implies must beat the 600 s horizon.
+
+    ``/healthz`` is derived, not configured: raising
+    ``GPU_FAULT_PROCESSOR_RECEIPT_TIMEOUT_SECONDS`` widens the window in which
+    a genuinely parked watch thread goes unnoticed. Past 600 s of silence every
+    node reads UNKNOWN and every node-mutating plan is BLOCKED, which is the
+    outage this probe exists to prevent, so the derived budget plus the kubelet
+    failure grace has to stay inside it. The 480 s cap is the backstop for a
+    timeout nobody rederived; the shipped timings must stay under it on their
+    own, or the cap silently becomes the real budget.
+    """
+    documents = list(
+        yaml.safe_load_all(
+            (ROOT / "deploy/dataplane/completion-watcher.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    deployment = next(item for item in documents if item.get("kind") == "Deployment")
+    watcher = container(deployment)
+    env = {item["name"]: item.get("value") for item in watcher.get("env", [])}
+    liveness = watcher["livenessProbe"]
+
+    # Drive the real derivation with the manifest's numbers instead of copying
+    # the formula: the shipped sink takes its other timings from these defaults.
+    sink = HttpEventSink(
+        "https://processor.invalid",
+        processor_receipt_timeout_seconds=float(
+            env["GPU_FAULT_PROCESSOR_RECEIPT_TIMEOUT_SECONDS"]
+        ),
+    )
+    subject = KubernetesCompletionController(
+        object(),
+        sink,
+        cluster_id="hp-cluster",
+        watch_timeout_seconds=int(env["GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS"]),
+    )
+    budget = subject.progress_stall_budget_seconds
+    grace = liveness["periodSeconds"] * liveness["failureThreshold"]
+
+    assert budget + grace < 600, (
+        "a parked watch thread must be restarted before the fleet reads "
+        f"UNKNOWN: {budget} s budget + {grace} s probe grace"
+    )
+    assert budget < MAX_DELIVERY_BUDGET_SECONDS, (
+        f"the shipped timings must derive their own budget; hitting the "
+        f"{MAX_DELIVERY_BUDGET_SECONDS} s cap means a receipt timeout long "
+        f"enough that the cap, not this Deployment, decides: {budget}"
+    )
+
+
+def test_completion_watcher_metrics_port_is_never_disabled() -> None:
+    """Port 0 disables the server, and the probes then kill the Pod forever.
+
+    ``metrics_port_from_environment`` still treats 0 as "no server", which is
+    fine for an operator debugging locally. In this Deployment three probes
+    read ``/healthz``, so a 0 here is a CrashLoop, not a quiet opt-out.
+    """
+    documents = list(
+        yaml.safe_load_all(
+            (ROOT / "deploy/dataplane/completion-watcher.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    deployment = next(item for item in documents if item.get("kind") == "Deployment")
+    watcher = container(deployment)
+    env = {item["name"]: item.get("value") for item in watcher.get("env", [])}
+    ports = {item.get("name"): item for item in watcher.get("ports", [])}
+    probes = ["startupProbe", "livenessProbe", "readinessProbe"]
+    configured = env.get("GPU_FAULT_COMPLETION_WATCHER_METRICS_PORT", "9109")
+
+    assert configured != "0", (
+        f"probes {probes} read /healthz, so the server cannot be disabled: {env}"
+    )
+    for name in probes:
+        assert watcher[name]["httpGet"]["port"] == int(configured), (
+            f"{name} must hit the port the server actually binds: {watcher[name]}"
+        )
+    assert ports["metrics"]["containerPort"] == int(configured), (
+        f"the declared port must match the served one: {ports} {configured}"
     )
 
 

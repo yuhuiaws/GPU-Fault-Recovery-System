@@ -16,6 +16,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from gpu_fault.collectors import EventSink
+from gpu_fault.collectors.sinks import RETRY_AFTER_CAP_SECONDS
 from gpu_fault.env import env_bool
 from gpu_fault.completion_attempt_state import (
     AttemptSpec,
@@ -85,10 +86,19 @@ RESTART_BUDGET_ANNOTATION = "gpu-fault.io/restart-budget"
 # and a window shorter than one legal delivery would kill a working watcher
 # mid-pass.
 #
-# The longest legal blocking step is one delivery: its HTTP attempts plus the
-# processor receipt poll that follows the accepted POST. The margin covers the
-# retry back-off sleeps and the surrounding bookkeeping.
+# The longest legal blocking step is one delivery, and one delivery is: every
+# HTTP attempt at its socket timeout, a capped ``Retry-After`` sleep between
+# them, and then the processor receipt poll that follows the accepted POST.
+# Deliveries are what stamp progress (see ``_ProgressStampingSink``), so this
+# really is the largest gap a working loop can produce; the margin covers the
+# non-blocking bookkeeping around it.
 PROGRESS_BUDGET_MARGIN_SECONDS = 60.0
+# A liveness window may not grow without limit: a node whose telemetry stops
+# reads UNKNOWN after 600 s and every node-mutating plan is then BLOCKED, so a
+# watcher that is really wedged has to be replaced well inside that horizon.
+# Only the delivery term is capped -- ``PROGRESS_BUDGET_RELISTS`` below is a
+# floor, and lowering it under one relist would fail a healthy watch.
+MAX_DELIVERY_BUDGET_SECONDS = 480.0
 # A stuck watch has also missed this many relists. The floor scales with the
 # watch timeout so an operator who raises
 # GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS does not create a restart loop.
@@ -103,6 +113,83 @@ MAX_SINK_CHAIN_DEPTH = 5
 
 class CompletionControllerError(ValueError):
     pass
+
+
+class _ProgressStampingSink:
+    """Sink proxy that stamps loop progress after every delivery returns.
+
+    The liveness budget is expressed in *one delivery*, and one delivery is the
+    only thing this loop does that can legitimately block for minutes (HTTP
+    attempts, a capped ``Retry-After`` sleep, then the processor receipt poll).
+    Stamping at the reconcile or attempt boundary was not enough: the outbox
+    replay delivers one record per buffered event before the first attempt even
+    starts, and a single failing attempt delivers an observation, a
+    failure-detected event and a terminal. Putting the stamp here makes "one
+    unstamped gap = at most one delivery" true by construction, so no future
+    call site can reintroduce the gap.
+
+    Everything else is delegated untouched, including the depth gauges and the
+    ``replay``/``stats`` helpers, so the proxy is invisible to its callers.
+    """
+
+    #: Delivery entry points: their return -- success or failure -- is a step.
+    STAMPED_METHODS = frozenset({"post", "deliver"})
+
+    def __init__(self, sink: Any, note_progress: Callable[[], None]) -> None:
+        self._sink = sink
+        self._note_progress = note_progress
+
+    @property
+    def wrapped_sink(self) -> Any:
+        """The sink underneath, for tests and for identity checks."""
+
+        return self._sink
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._sink, name)
+        if name in self.STAMPED_METHODS and callable(value):
+            return self._stamped(value)
+        return value
+
+    def _stamped(self, call: Callable[..., Any]) -> Callable[..., Any]:
+        def stamped(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return call(*args, **kwargs)
+            finally:
+                # ``finally``: a delivery that raised still proves the loop is
+                # moving, and the retry path is the loop working (I2).
+                self._note_progress()
+
+        return stamped
+
+
+def _stamping_sink(sink: Any, note_progress: Callable[[], None]) -> Any:
+    """Wrap ``sink`` -- and the sink it wraps -- for progress stamping.
+
+    ``KubernetesCompletionOutbox`` replays buffered records through the sink it
+    holds, so that inner one is wrapped in place; otherwise a backlog replay is
+    a single unstamped block at the top of every pass. A sink that will not
+    accept the swap keeps the outer wrap alone, which is still correct for the
+    live path.
+    """
+
+    inner = getattr(sink, "sink", None)
+    if (
+        inner is not None
+        and not isinstance(inner, _ProgressStampingSink)
+        and callable(getattr(inner, "post", None))
+    ):
+        try:
+            sink.sink = _ProgressStampingSink(inner, note_progress)
+        except (AttributeError, TypeError):
+            LOGGER.warning(
+                "cannot stamp progress on the buffered-record sink of %s; a "
+                "long replay will not refresh the liveness clock",
+                type(sink).__name__,
+            )
+    if isinstance(sink, _ProgressStampingSink):
+        return sink
+    return _ProgressStampingSink(sink, note_progress)
 
 
 class KubernetesWorkloadStopper:
@@ -560,7 +647,10 @@ class KubernetesCompletionController:
         if reconcile_debounce_seconds < 0:
             raise CompletionControllerError("reconcile debounce must be non-negative")
         self.core_api = core_api
-        self.sink = sink
+        # Every delivery through this sink refreshes the liveness clock, so the
+        # largest legitimate unstamped gap is one delivery -- which is exactly
+        # what ``progress_stall_budget_seconds`` is derived from.
+        self.sink = _stamping_sink(sink, self.note_progress)
         self.cluster_id = cluster_id
         self.environment = environment
         self.namespace = namespace
@@ -708,9 +798,14 @@ class KubernetesCompletionController:
             "timeout_seconds", DEFAULT_SINK_HTTP_TIMEOUT_SECONDS
         )
         attempts = self._sink_timing("max_attempts", DEFAULT_SINK_MAX_ATTEMPTS)
-        delivery = receipt + http_timeout * attempts + PROGRESS_BUDGET_MARGIN_SECONDS
+        delivery = (
+            receipt
+            + http_timeout * attempts
+            + RETRY_AFTER_CAP_SECONDS * max(attempts - 1.0, 0.0)
+            + PROGRESS_BUDGET_MARGIN_SECONDS
+        )
         relists = PROGRESS_BUDGET_RELISTS * float(self.watch_timeout_seconds)
-        return max(delivery, relists)
+        return max(min(delivery, MAX_DELIVERY_BUDGET_SECONDS), relists)
 
     def note_progress(self) -> None:
         """Record that the loop just finished a step (the liveness signal).

@@ -179,15 +179,20 @@ spec:
           # /healthz reports 503 only when the loop has finished no step at
           # all -- no relist, no watch event, no attempt, not even a failed
           # cycle returning to its retry sleep -- for a whole delivery budget
-          # (one processor receipt poll plus every HTTP attempt plus a margin:
-          # 220 s with the timeouts this Deployment sets). It reads one
+          # (one processor receipt poll plus every HTTP attempt plus a capped
+          # Retry-After sleep per retry plus a margin: 310 s with the timeouts
+          # this Deployment sets, and never over 480 s). Every delivery stamps
+          # that clock, so one unstamped gap is at most one delivery even when
+          # an attempt posts an observation, a failure-detected event and a
+          # terminal, or when a buffered outbox backlog replays. It reads one
           # timestamp off the controller: no API call, no reconcile lock, no
           # outbox read. That keeps three legitimate states healthy: an idle
           # cluster (posts nothing, relists every 30 s), a fault storm whose
           # pass spends minutes delivering terminals, and an API-server outage
           # the loop keeps retrying. failureThreshold 3 x periodSeconds 30
           # means a restart takes ~90 s of continuous failure on top of that
-          # budget.
+          # budget -- 400 s in all, still inside the 600 s UNKNOWN horizon
+          # above, which is why the delivery term is capped at all.
           #
           # The startupProbe, not /healthz, owns cold start: restoring the
           # persisted attempt state, the first list and the first full

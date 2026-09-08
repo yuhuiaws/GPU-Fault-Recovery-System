@@ -38,7 +38,9 @@ class FakeController:
     reconcile_runs_total = 21
     metadata_takeovers_total = 6
     watch_timeout_seconds = 30
-    progress_stall_budget_seconds = 220.0
+    # The value the shipped Deployment derives (120 s receipt poll + 4 x 10 s
+    # HTTP + 3 x 30 s Retry-After + 60 s margin).
+    progress_stall_budget_seconds = 310.0
 
     def __init__(
         self,
@@ -288,7 +290,7 @@ def test_healthz_passes_while_the_loop_keeps_making_progress() -> None:
     Liveness must key off the loop advancing, never off traffic: a cluster with
     no managed Pod posts nothing and must stay healthy.
     """
-    server = _ephemeral(FakeController(progress_age_seconds=219.0))
+    server = _ephemeral(FakeController(progress_age_seconds=309.0))
     try:
         status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
     finally:
@@ -299,14 +301,14 @@ def test_healthz_passes_while_the_loop_keeps_making_progress() -> None:
 
 def test_healthz_fails_when_progress_stops() -> None:
     """C1: a whole budget with no step forward is the restart signal."""
-    server = _ephemeral(FakeController(progress_age_seconds=221.0))
+    server = _ephemeral(FakeController(progress_age_seconds=311.0))
     try:
         status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
     finally:
         server.stop()
 
-    assert status == 503, f"221 s exceeds the 220 s budget: {status} {body!r}"
-    assert "221" in body, f"the body must name the progress age: {body!r}"
+    assert status == 503, f"311 s exceeds the 310 s budget: {status} {body!r}"
+    assert "311" in body, f"the body must name the progress age: {body!r}"
 
 
 def test_healthz_ignores_a_first_pass_that_has_not_finished() -> None:

@@ -137,12 +137,16 @@ TIMESTAMPS: tuple[tuple[str, str, str], ...] = (
         "probe read, so time() - this is what kubelet acts on.",
     ),
 )
-LAST_CYCLE_METRIC = TIMESTAMPS[0][0]
-LAST_PROGRESS_METRIC = TIMESTAMPS[1][0]
 
 
 def metrics_port_from_environment() -> int:
-    """The TCP port to serve on; ``0`` disables the server entirely."""
+    """The TCP port to serve on.
+
+    ``0`` disables the server, which is only safe where nothing probes it: the
+    shipped Deployment points its startup, liveness and readiness probes at
+    ``/healthz``, so disabling the server there means kubelet keeps killing the
+    Pod. ``tests/regional/test_production_safety_config.py`` pins that.
+    """
 
     port = int(os.getenv("GPU_FAULT_COMPLETION_WATCHER_METRICS_PORT", "9109"))
     if port < 0:

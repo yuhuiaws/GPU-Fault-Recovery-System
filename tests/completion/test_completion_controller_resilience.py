@@ -518,19 +518,27 @@ def test_the_liveness_budget_covers_one_blocking_delivery() -> None:
     """C1: one budget, derived from the delivery timeouts, not a constant."""
     defaults = controller(FakeCoreApi([]), FakeSink())
 
-    assert defaults.progress_stall_budget_seconds == 220.0, (
-        "120 s receipt poll + 4 x 10 s HTTP + 60 s margin: "
-        f"{defaults.progress_stall_budget_seconds}"
+    assert defaults.progress_stall_budget_seconds == 310.0, (
+        "120 s receipt poll + 4 x 10 s HTTP + 3 x 30 s Retry-After + 60 s "
+        f"margin: {defaults.progress_stall_budget_seconds}"
     )
 
     inner = TimedSink(
-        processor_receipt_timeout_seconds=300.0, timeout_seconds=20.0, max_attempts=3
+        processor_receipt_timeout_seconds=200.0, timeout_seconds=20.0, max_attempts=3
     )
     wrapped = controller(FakeCoreApi([]), WrappingSink(inner))
 
-    assert wrapped.progress_stall_budget_seconds == 420.0, (
+    assert wrapped.progress_stall_budget_seconds == 380.0, (
         "the outbox wrapper must not hide the inner sink's timeouts: "
         f"{wrapped.progress_stall_budget_seconds}"
+    )
+
+    patient_sink = TimedSink(processor_receipt_timeout_seconds=900.0)
+    capped = controller(FakeCoreApi([]), patient_sink)
+
+    assert capped.progress_stall_budget_seconds == 480.0, (
+        "a delivery budget past the 600 s UNKNOWN horizon must be capped: "
+        f"{capped.progress_stall_budget_seconds}"
     )
 
     patient_watch = KubernetesCompletionController(
@@ -542,6 +550,114 @@ def test_the_liveness_budget_covers_one_blocking_delivery() -> None:
     )
 
     assert patient_watch.progress_stall_budget_seconds == 1800.0, (
-        "three relists of a 600 s watch outrank the delivery budget: "
+        "the 480 s cap covers deliveries only; three relists of a 600 s watch "
+        "are still the floor: "
         f"{patient_watch.progress_stall_budget_seconds}"
+    )
+
+
+class DeliveryClockSink(FakeSink):
+    """Every delivery burns fake wall clock and samples ``/healthz``.
+
+    One POST is the unit the liveness budget is derived from, so the probe has
+    to be sampled per POST, not per attempt: a single attempt in the shipped
+    configuration delivers an observation, a failure-detected event and a
+    terminal, and the last two each wait out a processor receipt poll.
+    """
+
+    def __init__(self, clock: Clock, subject: list, hold_seconds: float) -> None:
+        super().__init__()
+        self.clock = clock
+        self.subject = subject
+        self.hold_seconds = hold_seconds
+        self.health: list[tuple[str, int, str]] = []
+
+    def post(self, path, payload):
+        self.clock.value += timedelta(seconds=self.hold_seconds)
+        status, body = evaluate_completion_health(self.subject[0])
+        self.health.append((path, status, body))
+        return super().post(path, payload)
+
+
+def test_every_delivery_in_one_attempt_counts_as_progress() -> None:
+    """C1 round 2: one attempt can span three deliveries, not one.
+
+    With ``GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS=true`` a failing rank makes
+    the pass deliver an observation, a failure-detected event and a terminal in
+    the *same* attempt, and the last two each wait out a 120 s processor
+    receipt poll. Stamping progress once per attempt therefore left a legal
+    block of two receipt polls plus the observation ladder unstamped, and a
+    processor backlog during a fault storm restarted a healthy watcher.
+    """
+    clock = Clock()
+    box: list = []
+    sink = DeliveryClockSink(clock, box, 150.0)
+    subject = KubernetesCompletionController(
+        FakeCoreApi([pod(0, exit_code=1)]),
+        sink,
+        cluster_id="hp-cluster",
+        publish_observations=True,
+        now=clock,
+    )
+    box.append(subject)
+
+    subject.run_once()
+
+    paths = [path for path, _, _ in sink.health]
+    assert paths == [
+        "/v1/workload-observations",
+        "/v1/attempts/failure-detected",
+        "/v1/attempts/terminal",
+    ], f"the shipped configuration delivers three events per failing attempt: {paths}"
+    assert [status for _, status, _ in sink.health] == [200, 200, 200], (
+        f"each returned delivery is progress: {sink.health}"
+    )
+
+
+class FakeOutbox(FakeSink):
+    """Outbox-shaped sink: buffered records are replayed through ``self.sink``.
+
+    The real ``KubernetesCompletionOutbox`` posts each buffered record through
+    the sink it wraps, so the wrap has to reach that inner sink too: a replay of
+    several records is otherwise one unstamped block at the top of the pass.
+    """
+
+    def __init__(self, inner: FakeSink, records: int) -> None:
+        super().__init__()
+        self.sink = inner
+        self.records = records
+        self.replays = 0
+
+    def replay(self) -> None:
+        self.replays += 1
+        for position in range(self.records):
+            self.sink.post("/v1/attempts/terminal", {"record": position})
+        self.records = 0
+
+    def post(self, path, payload):
+        return self.sink.post(path, payload)
+
+
+def test_a_slow_outbox_replay_counts_as_progress() -> None:
+    """C1 round 2: the replay runs before the first attempt stamp.
+
+    ``_reconcile`` replays the write-ahead buffer as its first step, and the
+    replay's own budget bounds it only from the second record on, so a backlog
+    of buffered terminals was a multi-delivery block with nothing stamping it.
+    """
+    clock = Clock()
+    box: list = []
+    inner = DeliveryClockSink(clock, box, 150.0)
+    subject = KubernetesCompletionController(
+        FakeCoreApi([]), FakeOutbox(inner, 3), cluster_id="hp-cluster", now=clock
+    )
+    box.append(subject)
+
+    subject.run_once()
+
+    assert len(inner.health) == 3, (
+        f"all three buffered records must have been replayed: {inner.posts}"
+    )
+    assert [status for _, status, _ in inner.health] == [200, 200, 200], (
+        f"a replay that keeps delivering records is progress: {inner.health}"
     )
