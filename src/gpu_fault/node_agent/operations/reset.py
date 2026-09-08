@@ -1,11 +1,35 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Callable
 
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
+
+
+class ResetOutcomeUnknown(RuntimeError):
+    """A reset whose result nobody can read any more.
+
+    ``nvidia-smi`` was killed at its deadline while the driver kept resetting,
+    so the GPU may or may not have been reset. Distinct from a reset that
+    failed cleanly, because it is what decides reboot versus replace.
+    """
+
+
+class ResetProgressError(RuntimeError):
+    """A reset failure that carries how far the per-GPU loop got.
+
+    The failure itself only names one GPU; an operator also needs the GPUs
+    that finished and the ones nothing touched, so those travel to the
+    workflow in the result details instead of only reaching the log.
+    """
+
+    def __init__(self, message: str, *, action_details: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.action_details = action_details
 
 
 class ResetOperationsMixin:
@@ -40,7 +64,7 @@ class ResetOperationsMixin:
                 # plane would resubmit, so convert it to a RuntimeError that
                 # nothing retries. Recovery is a human decision (re-quiesce,
                 # or reboot the node).
-                raise RuntimeError(
+                raise ResetOutcomeUnknown(
                     f"gpu reset outcome unknown after {timeout}s; "
                     "refusing to retry automatically"
                 ) from exc
@@ -76,20 +100,71 @@ class ResetOperationsMixin:
             raise RuntimeError("GPU reset requires explicit GPU UUID targets")
         self._verify_no_clients(gpu_uuids)
 
-    def _reset_gpu(self, gpu_uuids: list[str]) -> dict[str, Any]:
-        self._reset_gpu_preflight(gpu_uuids)
+    @contextmanager
+    def _pre_spawn_guard(self, *, window_claimed: bool) -> Iterator[None]:
+        """Make every step between the window claim and the reset final.
+
+        The quiesce window's single reset allowance is already spent here, so a
+        retryable failure would have the control plane resubmit into a claim it
+        can never pass -- a step that dies for a transient reason, reported to
+        the operator as if a reset had been issued. Anything that fails after
+        the claim is therefore a non-retryable failure for a human.
+
+        The claim is deliberately *not* released: nothing has read the node's
+        state, and reopening the window would allow a second reset on a GPU
+        whose first reset may already be running.
+        """
+
+        if not window_claimed:
+            yield
+            return
+        try:
+            yield
+        except Exception as exc:
+            raise RuntimeError(
+                f"reset window claimed but pre-spawn re-check failed: {exc}; "
+                "manual review required. The claim stays closed, so restore "
+                "the GPU services and quiesce again before any further reset"
+            ) from exc
+
+    def _reset_gpu(
+        self,
+        gpu_uuids: list[str],
+        *,
+        window_claimed: bool = False,
+    ) -> dict[str, Any]:
+        with self._pre_spawn_guard(window_claimed=window_claimed):
+            self._reset_gpu_preflight(gpu_uuids)
         reset_attempts = 0
-        for gpu_uuid in gpu_uuids:
-            reset_attempts += self._run_reset_with_busy_retry(
-                [
-                    "nvidia-smi",
-                    "--gpu-reset",
-                    "-i",
-                    gpu_uuid,
-                ],
-                gpu_uuids=[gpu_uuid],
-                timeout=120,
-            )
+        completed: list[str] = []
+        for index, gpu_uuid in enumerate(gpu_uuids):
+            try:
+                reset_attempts += self._run_reset_with_busy_retry(
+                    [
+                        "nvidia-smi",
+                        "--gpu-reset",
+                        "-i",
+                        gpu_uuid,
+                    ],
+                    gpu_uuids=[gpu_uuid],
+                    timeout=120,
+                )
+            except RuntimeError as exc:
+                # Report the loop's progress: the GPUs already reset, the one
+                # that failed (with or without a readable outcome) and the
+                # ones nothing touched. Only RuntimeError is wrapped, so the
+                # retryable classification of anything else is unchanged.
+                unknown = isinstance(exc, ResetOutcomeUnknown)
+                raise ResetProgressError(
+                    f"{exc} (GPU {gpu_uuid}, {index + 1} of {len(gpu_uuids)})",
+                    action_details={
+                        "reset_completed": completed,
+                        "reset_outcome_unknown": [gpu_uuid] if unknown else [],
+                        "reset_failed": [] if unknown else [gpu_uuid],
+                        "reset_not_attempted": gpu_uuids[index + 1 :],
+                    },
+                ) from exc
+            completed.append(gpu_uuid)
         return {
             "reset_gpu_uuids": gpu_uuids,
             "verified_no_gpu_clients": True,
@@ -122,8 +197,14 @@ class ResetOperationsMixin:
         self._verify_no_clients(local_inventory)
         return local_inventory
 
-    def _reset_all_gpus_nvswitches(self, gpu_uuids: list[str]) -> dict[str, Any]:
-        local_inventory = self._reset_all_preflight(gpu_uuids)
+    def _reset_all_gpus_nvswitches(
+        self,
+        gpu_uuids: list[str],
+        *,
+        window_claimed: bool = False,
+    ) -> dict[str, Any]:
+        with self._pre_spawn_guard(window_claimed=window_claimed):
+            local_inventory = self._reset_all_preflight(gpu_uuids)
         reset_attempts = self._run_reset_with_busy_retry(
             ["nvidia-smi", "--gpu-reset"],
             gpu_uuids=local_inventory,

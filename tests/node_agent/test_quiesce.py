@@ -724,6 +724,46 @@ def test_a_timed_out_client_probe_does_not_spend_the_reset_window(tmp_path) -> N
     )
 
 
+def test_a_probe_that_times_out_after_the_claim_is_not_retryable(tmp_path) -> None:
+    # The claim is taken between the pre-claim preflight and the reset's own
+    # re-check, and that re-check probes compute apps again. A retryable
+    # failure there would have the control plane resubmit into a claim it can
+    # never pass, so everything after the claim must be final.
+    class LateProbeTimeoutRunner(ServiceRunner):
+        """The compute-app probe times out only after the window is claimed."""
+
+        def __init__(self) -> None:
+            super().__init__(active={"kubelet"})
+            self.probe_calls = 0
+
+        def __call__(self, value, **kwargs):
+            if any("--query-compute-apps" in part for part in value):
+                self.commands.append(value)
+                self.probe_calls += 1
+                if self.probe_calls == 2:
+                    raise TimeoutExpired(value, 15)
+                return CompletedProcess(value, 0, stdout="", stderr="")
+            return super().__call__(value, **kwargs)
+
+    runner = LateProbeTimeoutRunner()
+    agent = quiesce_executor(tmp_path, runner)
+    agent.execute(envelope(command(WorkflowOperation.QUIESCE_GPU_SERVICES)))
+
+    result = agent.execute(
+        envelope(command(WorkflowOperation.RESET_GPU, command_id="workflow/r1/node-a"))
+    )
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert result.retryable is False, (
+        "a failure after the claim must never be resubmitted: the resubmit "
+        "would be refused by the claim it just took"
+    )
+    assert "pre-spawn re-check failed" in result.error, result.error
+    assert not any("--gpu-reset" in item for item in runner.commands), (
+        "the re-check failed, so no reset may have been issued"
+    )
+
+
 def test_a_restore_whose_start_raises_records_restore_failed(tmp_path) -> None:
     # systemctl start raising used to leave the file at RESTORING, which the
     # next quiesce reads as "the writer died" and refuses until the fail-safe

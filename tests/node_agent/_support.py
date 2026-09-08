@@ -58,17 +58,27 @@ class FakeRunner:
         clients: str = "",
         reset_error: str | None = None,
         reset_timeout_seconds: int | None = None,
+        reset_timeout_gpu_uuid: str | None = None,
     ) -> None:
         self.clients = clients
         self.reset_error = reset_error
         # A reset that never returns: subprocess.run SIGKILLs nvidia-smi while
-        # the in-kernel reset keeps going, so the outcome is unknown.
+        # the in-kernel reset keeps going, so the outcome is unknown. Pinning a
+        # GPU UUID stops a multi-GPU loop part way through.
         self.reset_timeout_seconds = reset_timeout_seconds
+        self.reset_timeout_gpu_uuid = reset_timeout_gpu_uuid
         self.commands: list[list[str]] = []
 
     def __call__(self, command, **_):
         self.commands.append(command)
-        if "--gpu-reset" in command and self.reset_timeout_seconds is not None:
+        if (
+            "--gpu-reset" in command
+            and self.reset_timeout_seconds is not None
+            and (
+                self.reset_timeout_gpu_uuid is None
+                or self.reset_timeout_gpu_uuid in command
+            )
+        ):
             raise TimeoutExpired(command, self.reset_timeout_seconds)
         if "--gpu-reset" in command and self.reset_error:
             raise CalledProcessError(255, command, stderr=self.reset_error)
@@ -94,6 +104,7 @@ def command(
     command_id: str = "workflow/step/node-a",
     fencing_token: int = 1,
     parameters: dict | None = None,
+    gpu_uuids: list[str] | None = None,
 ) -> NodeActionCommand:
     return NodeActionCommand(
         command_id=command_id,
@@ -102,7 +113,7 @@ def command(
         fencing_token=fencing_token,
         operation=operation,
         node_id="node-a",
-        gpu_uuids=["GPU-a"],
+        gpu_uuids=gpu_uuids if gpu_uuids is not None else ["GPU-a"],
         parameters=parameters or {},
         issued_at=NOW,
         expires_at=NOW + timedelta(minutes=2),

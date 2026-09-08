@@ -134,6 +134,31 @@ def test_gpu_reset_timeout_is_not_retryable_and_runs_once(tmp_path) -> None:
     )
 
 
+def test_a_reset_that_stops_mid_loop_reports_every_gpu_it_touched(tmp_path) -> None:
+    # Three GPUs, the second one's reset never returns. Which GPUs finished,
+    # which one's outcome nobody can read and which were never attempted is
+    # what decides reboot versus replace, so it must reach the result.
+    runner = FakeRunner(reset_timeout_seconds=120, reset_timeout_gpu_uuid="GPU-b")
+    agent = executor(tmp_path, runner)
+
+    result = agent.execute(
+        envelope(
+            command(WorkflowOperation.RESET_GPU, gpu_uuids=["GPU-a", "GPU-b", "GPU-c"])
+        )
+    )
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert result.retryable is False, "an unknown reset outcome is never retried"
+    assert "GPU-b" in result.error, result.error
+    assert result.details["reset_completed"] == ["GPU-a"], result.details
+    assert result.details["reset_outcome_unknown"] == ["GPU-b"], result.details
+    assert result.details["reset_not_attempted"] == ["GPU-c"], result.details
+    assert [item for item in runner.commands if "--gpu-reset" in item] == [
+        ["nvidia-smi", "--gpu-reset", "-i", "GPU-a"],
+        ["nvidia-smi", "--gpu-reset", "-i", "GPU-b"],
+    ], "the loop must stop at the GPU whose outcome is unknown"
+
+
 def test_gpu_reset_remains_disabled_without_node_opt_in(tmp_path) -> None:
     runner = FakeRunner()
     agent = node_action_executor(

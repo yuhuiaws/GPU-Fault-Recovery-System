@@ -37,6 +37,7 @@ from gpu_fault.node_agent.operations import (
     RemediationOperationsMixin,
     ResetOperationsMixin,
 )
+from gpu_fault.node_agent.operations.reset import ResetProgressError
 from gpu_fault.node_agent.operations.registry import (
     OPERATION_HANDLERS,
     operation_handler_name,
@@ -492,6 +493,15 @@ class NodeActionExecutor(
                 command_id=command.command_id,
                 operation=command.operation,
                 status=NodeActionStatus.FAILED,
+                # A failure that got part way through carries what it did:
+                # which GPUs a multi-GPU reset finished, which one's outcome
+                # nobody can read and which were never attempted decides
+                # reboot versus replace, and only the node knows it.
+                details=(
+                    dict(exc.action_details)
+                    if isinstance(exc, ResetProgressError)
+                    else {}
+                ),
                 error=f"{type(exc).__name__}: {exc}",
                 retryable=self._retryable_action_error(exc),
                 attempt=attempt,
@@ -595,21 +605,24 @@ class NodeActionExecutor(
         return self._trigger_health_snapshot()
 
     def _execute_reset_gpu(self, command: NodeActionCommand) -> dict[str, Any]:
+        window_claimed = False
         if self.service_quiesce_enabled:
             quiesce_manager = self.quiesce_manager
             if quiesce_manager is None:
                 raise RuntimeError("GPU service quiesce manager is unavailable")
             # The quiesce window allows one reset, and the claim is spent even
-            # when the reset never runs. So every step that can refuse -- or
-            # time out retryably, which the control plane resubmits -- happens
-            # before the claim, and the claim happens immediately before
-            # nvidia-smi is spawned.
+            # when the reset never runs. So every step that may fail for a
+            # transient reason runs before the claim, the claim is taken
+            # immediately before the reset, and ``window_claimed`` makes the
+            # reset's own re-check non-retryable: past this point a resubmit
+            # could only meet the claim it just took.
             self._reset_gpu_preflight(command.gpu_uuids)
             quiesce_manager.assert_quiesced(
                 incident_id=command.incident_id,
                 command_id=command.command_id,
             )
-        return self._reset_gpu(command.gpu_uuids)
+            window_claimed = True
+        return self._reset_gpu(command.gpu_uuids, window_claimed=window_claimed)
 
     def _execute_reset_all(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.service_quiesce_enabled:
@@ -622,7 +635,7 @@ class NodeActionExecutor(
             incident_id=command.incident_id,
             command_id=command.command_id,
         )
-        return self._reset_all_gpus_nvswitches(command.gpu_uuids)
+        return self._reset_all_gpus_nvswitches(command.gpu_uuids, window_claimed=True)
 
     def _execute_restore(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.service_quiesce_enabled:

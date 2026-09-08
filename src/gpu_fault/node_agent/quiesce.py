@@ -681,12 +681,16 @@ class GpuServiceQuiesceManager:
     ) -> None:
         """Fence a reset on the quiesce state and claim the window for it.
 
-        ``for_reset`` defaults to True because every caller is a reset path:
-        the claim is recorded under the same flock as the phase check and
-        before nvidia-smi is spawned, so a resubmit of a reset whose outcome
-        is unknown -- and any other command_id for the same incident -- is
-        refused instead of resetting the GPU a second time. A new window
-        needs a real restore plus a fresh quiesce, which clears the claim.
+        The claim is recorded under the same flock as the phase check and
+        before nvidia-smi is spawned, so a resubmit of a reset whose outcome is
+        unknown -- and any other command_id for the same incident -- is refused
+        instead of resetting the GPU a second time. A new window needs a real
+        restore plus a fresh quiesce, which clears the claim.
+
+        ``for_reset`` defaults to True so that a caller which forgets it fails
+        closed. Driver and firmware remediation are fenced on the same state
+        but are not resets, so they pass ``for_reset=False`` and leave the
+        window's single reset allowance alone.
         """
 
         state_path = self._state_path(incident_id)
