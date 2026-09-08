@@ -31,7 +31,6 @@ from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
-    deliver_event,
     deliver_or_raise,
 )
 from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
@@ -517,7 +516,7 @@ class DcgmMetricsCollector:
                     "edge_filter_reasons": reasons,
                 }
             )
-            result = deliver_or_raise(
+            deliver_or_raise(
                 self.sink,
                 GPU_METRICS_PATH,
                 batch.model_dump(mode="json"),
