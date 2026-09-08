@@ -38,34 +38,125 @@ from gpu_fault.policy import load_xid_policy
 LOGGER = logging.getLogger(__name__)
 
 
-def collector_service_states() -> dict[str, CollectorServiceState]:
-    result = {}
-    for unit in sorted(set(COLLECTOR_SYSTEMD_UNITS.values())):
-        try:
-            active = subprocess.run(
-                ["systemctl", "is-active", unit],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            enabled = subprocess.run(
-                ["systemctl", "is-enabled", unit],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
+def _collector_units() -> list[str]:
+    return sorted(set(COLLECTOR_SYSTEMD_UNITS.values()))
+
+
+class CollectorServiceStates:
+    """Collector unit states, with the enablement answer cached per unit.
+
+    Every heartbeat used to spawn two ``systemctl`` calls per collector unit,
+    in sequence, each with a 5 s timeout. While a quiesce holds kubelet down
+    systemd answers slowly, so one report took tens of seconds -- and the
+    interval is measured *after* the report, so the next tick slipped by the
+    same amount.
+
+    ``is-active`` is the live signal and is still asked every tick.
+    ``is-enabled`` changes only when a unit is installed or removed, and the
+    installer restarts this agent when it does, so a process-lifetime cache
+    would already be correct; it is refreshed anyway when the unit set changes
+    and every ``refresh_every`` ticks, so a hand-run ``systemctl disable`` is
+    reported within one refresh window. A call that fails is never cached.
+    """
+
+    def __init__(
+        self,
+        *,
+        units: Callable[[], list[str]] = _collector_units,
+        runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        refresh_every: int = 30,
+    ) -> None:
+        self._units = units
+        self._runner = runner
+        self._refresh_every = max(1, refresh_every)
+        self._enabled: dict[str, str] = {}
+        self._ticks = 0
+
+    def __call__(self) -> dict[str, CollectorServiceState]:
+        units = self._units()
+        refresh = self._ticks % self._refresh_every == 0 or set(units) != set(
+            self._enabled
+        )
+        self._ticks += 1
+        result: dict[str, CollectorServiceState] = {}
+        cached: dict[str, str] = {}
+        for unit in units:
+            active = self._query(["systemctl", "is-active", unit])
+            enabled = None if refresh else self._enabled.get(unit)
+            if enabled is None:
+                # A unit systemd knows nothing about answers "unknown" and
+                # that is cached too: leaving it out would make the unit set
+                # differ every tick and refresh the whole node every time.
+                enabled = self._query(["systemctl", "is-enabled", unit])
+            if enabled is not None:
+                cached[unit] = enabled
             result[unit] = CollectorServiceState(
-                active=(active.stdout or "").strip() or "unknown",
-                enabled=(enabled.stdout or "").strip() or "unknown",
+                active=active or "unknown",
+                enabled=enabled or "unknown",
+            )
+        self._enabled = cached
+        return result
+
+    def _query(self, argv: list[str]) -> str | None:
+        """The trimmed answer, or None when the call itself failed."""
+
+        try:
+            completed = self._runner(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            result[unit] = CollectorServiceState(
-                active="unknown",
-                enabled="unknown",
-            )
-    return result
+            return None
+        return (completed.stdout or "").strip() or "unknown"
+
+
+def collector_service_states() -> dict[str, CollectorServiceState]:
+    """One uncached reading of every collector unit's state."""
+
+    return CollectorServiceStates()()
+
+
+class XidPolicyVersion:
+    """The XID policy's mapping version, re-read only when the file changes.
+
+    The policy document was parsed *and* validated on every heartbeat tick for
+    a value that changes only when the file is replaced. The packaged catalog
+    cannot change under a running process, so it is read once; a file given by
+    path is re-read when its mtime or size moves, and an unreadable path is
+    handed to the loader so it reports the failure the way it always did.
+    """
+
+    def __init__(
+        self,
+        path: str | None,
+        *,
+        loader: Callable[[str | None], Any] = load_xid_policy,
+    ) -> None:
+        self._path = path
+        self._loader = loader
+        self._stamp: tuple[int, int] | None = None
+        self._version: str | None = None
+
+    def __call__(self) -> str:
+        reload_now, stamp = self._policy_file_stamp()
+        if not reload_now and self._version is not None and stamp == self._stamp:
+            return self._version
+        version = str(self._loader(self._path).mapping_version)
+        self._stamp = stamp
+        self._version = version
+        return version
+
+    def _policy_file_stamp(self) -> tuple[bool, tuple[int, int] | None]:
+        if self._path is None:
+            return False, None
+        try:
+            info = os.stat(self._path)
+        except OSError:
+            return True, None
+        return False, (info.st_mtime_ns, info.st_size)
 
 
 def _read_boot_id() -> str | None:
@@ -110,9 +201,7 @@ def heartbeat_reporter_from_environment(
     )
     policy_path = os.getenv("GPU_FAULT_XID_POLICY_PATH", "").strip() or None
 
-    def policy_version_provider() -> str:
-        return load_xid_policy(policy_path).mapping_version
-
+    policy_version_provider = XidPolicyVersion(policy_path)
     policy_version = policy_version_provider()
     config_digest = agent_config_digest(executor, runtime_profile)
     boot_id = _read_boot_id()
@@ -159,7 +248,7 @@ def heartbeat_reporter_from_environment(
         allowed_operations=sorted(
             executor.allowed_operations, key=lambda item: item.value
         ),
-        collector_status_provider=collector_service_states,
+        collector_status_provider=CollectorServiceStates(),
         installed_units_provider=read_installed_systemd_units,
         boot_id=boot_id,
         node_action_key_version=(executor.node_action_key_version),

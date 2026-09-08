@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from gpu_fault.node_agent.heartbeat import CollectorServiceStates, XidPolicyVersion
+
 from ._support import (
     SECRET,
     AgentHeartbeatRejected,
     AgentHeartbeatReporter,
+    CompletedProcess,
     Event,
     FakeRunner,
     GpuServiceQuiesceManager,
     HTTPError,
+    TimeoutExpired,
     WorkflowOperation,
     agent_config_digest,
     agent_config_payload,
@@ -17,6 +21,7 @@ from ._support import (
     logging,
     mock,
     node_action_executor,
+    os,
     pytest,
     run,
 )
@@ -421,3 +426,155 @@ def test_device_client_sampling_config_is_validated(tmp_path) -> None:
                 device_client_samples=samples,
                 device_client_sample_interval_seconds=interval,
             )
+
+
+def test_heartbeat_caches_unit_enablement_between_ticks() -> None:
+    """``systemctl is-enabled`` is asked once, not twice per unit per tick.
+
+    Every tick spawned two ``systemctl`` calls per collector unit with a 5 s
+    timeout each, in sequence. While a quiesce holds kubelet down systemd
+    answers slowly, so one report took tens of seconds and pushed the next one
+    out. Enablement only changes when the installer installs or removes a unit
+    -- and the installer restarts this agent -- so it is cached; ``is-active``
+    stays live.
+    """
+
+    calls: list[list[str]] = []
+
+    def runner(argv, **_):
+        calls.append(list(argv))
+        answer = "active" if argv[1] == "is-active" else "enabled"
+        return CompletedProcess(argv, 0, stdout=answer + "\n", stderr="")
+
+    states = CollectorServiceStates(
+        units=lambda: ["gpu-fault-host-collector.service"],
+        runner=runner,
+        refresh_every=30,
+    )
+
+    first = states()
+    second = states()
+
+    assert first == second, (first, second)
+    assert first["gpu-fault-host-collector.service"].enabled == "enabled", first
+    assert first["gpu-fault-host-collector.service"].active == "active", first
+    assert [argv[1] for argv in calls] == ["is-active", "is-enabled", "is-active"], (
+        calls
+    )
+
+
+def test_heartbeat_refreshes_unit_enablement_when_the_unit_set_changes() -> None:
+    """A newly installed unit has no cached answer, so it is asked for."""
+
+    calls: list[list[str]] = []
+    units = [["gpu-fault-host-collector.service"]]
+
+    def runner(argv, **_):
+        calls.append(list(argv))
+        return CompletedProcess(argv, 0, stdout="enabled\n", stderr="")
+
+    states = CollectorServiceStates(
+        units=lambda: units[0], runner=runner, refresh_every=30
+    )
+
+    states()
+    units[0] = [
+        "gpu-fault-host-collector.service",
+        "gpu-fault-metrics-collector.service",
+    ]
+    calls.clear()
+    second = states()
+
+    assert sorted(second) == units[0], second
+    assert [argv[1] for argv in calls].count("is-enabled") == 2, calls
+
+
+def test_heartbeat_refreshes_unit_enablement_every_refresh_interval() -> None:
+    """A hand-run ``systemctl disable`` is still reported, just not per tick."""
+
+    calls: list[list[str]] = []
+
+    def runner(argv, **_):
+        calls.append(list(argv))
+        return CompletedProcess(argv, 0, stdout="enabled\n", stderr="")
+
+    states = CollectorServiceStates(
+        units=lambda: ["gpu-fault-host-collector.service"],
+        runner=runner,
+        refresh_every=3,
+    )
+
+    for _ in range(4):
+        states()
+
+    assert [argv[1] for argv in calls].count("is-enabled") == 2, calls
+    assert [argv[1] for argv in calls].count("is-active") == 4, calls
+
+
+def test_heartbeat_unit_enablement_failure_is_not_cached() -> None:
+    """A timed-out ``is-enabled`` must not pin "unknown" for 30 ticks."""
+
+    answers = [TimeoutExpired(["systemctl"], 5), None]
+
+    def runner(argv, **_):
+        if argv[1] == "is-enabled":
+            answer = answers.pop(0) if answers else None
+            if answer is not None:
+                raise answer
+        return CompletedProcess(argv, 0, stdout="enabled\n", stderr="")
+
+    states = CollectorServiceStates(
+        units=lambda: ["gpu-fault-host-collector.service"],
+        runner=runner,
+        refresh_every=30,
+    )
+
+    first = states()
+    second = states()
+
+    assert first["gpu-fault-host-collector.service"].enabled == "unknown", first
+    assert second["gpu-fault-host-collector.service"].enabled == "enabled", second
+
+
+def test_heartbeat_reloads_the_xid_policy_only_when_its_mtime_changes(tmp_path) -> None:
+    """The policy file was parsed and validated on every heartbeat tick."""
+
+    policy_path = tmp_path / "xid-policy.yaml"
+    policy_path.write_text("catalog: v1\n", encoding="utf-8")
+    loads: list[str | None] = []
+
+    def loader(path):
+        loads.append(path)
+        return mock.Mock(mapping_version=f"policy-v{len(loads)}")
+
+    version = XidPolicyVersion(str(policy_path), loader=loader)
+
+    first = version()
+    second = version()
+    os.utime(policy_path, (1, 1))
+    third = version()
+
+    assert (first, second) == ("policy-v1", "policy-v1"), (first, second)
+    assert third == "policy-v2", third
+    assert loads == [str(policy_path), str(policy_path)], loads
+
+
+def test_heartbeat_caches_a_unit_systemd_does_not_know() -> None:
+    """An uninstalled collector unit must not refresh the whole set per tick."""
+
+    calls: list[list[str]] = []
+
+    def runner(argv, **_):
+        calls.append(list(argv))
+        return CompletedProcess(argv, 1, stdout="", stderr="Unit not found.\n")
+
+    states = CollectorServiceStates(
+        units=lambda: ["gpu-fault-host-collector.service"],
+        runner=runner,
+        refresh_every=30,
+    )
+
+    states()
+    states()
+
+    assert [argv[1] for argv in calls].count("is-enabled") == 1, calls
