@@ -485,6 +485,12 @@ class FaultIngestionService:
 
     def ingest_xid(self, event: XidEvent) -> FaultPolicyDecision:
         report_processor_replay_phase("xid_identity")
+        # xid_154_action is derived server-side from the XID 154 log line
+        # (see XidCorrelationCoordinator.prepare_xid154). Drop any inbound
+        # value at the ingest boundary so a client can never seed or steer
+        # the dynamic recovery action (security review H-10).
+        if event.xid_154_action is not None:
+            event = event.model_copy(update={"xid_154_action": None})
         event = self._enrich_fault_identity(event)
         if event.ingested_at is None:
             event = event.model_copy(update={"ingested_at": datetime.now(timezone.utc)})

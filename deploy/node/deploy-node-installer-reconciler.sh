@@ -293,13 +293,31 @@ render_installer_job() {
         --node "${node}" "$@"
 }
 
+# TEMPLATE_CONTENT_SHA256 pins the exact job.yaml bytes the reconciler will
+# load, so a later edit to the template ConfigMap cannot become a privileged
+# Pod on every node. In the render path it is the digest of the file we put in
+# the ConfigMap; with an override it is the digest of what that ConfigMap
+# holds right now, computed from the object rather than assumed.
 if [[ -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
     TEMPLATE_CONFIG_MAP="${TEMPLATE_CONFIG_MAP_OVERRIDE}"
-    kubectl_context -n "${NAMESPACE}" get configmap \
-        "${TEMPLATE_CONFIG_MAP}" >/dev/null
+    TEMPLATE_CONTENT_SHA256="$(
+        kubectl_context -n "${NAMESPACE}" get configmap \
+            "${TEMPLATE_CONFIG_MAP}" -o json |
+            python3 -c '
+import hashlib
+import json
+import sys
+
+text = (json.load(sys.stdin).get("data") or {}).get("job.yaml") or ""
+if not text.strip():
+    raise SystemExit("template ConfigMap has no job.yaml")
+print(hashlib.sha256(text.encode()).hexdigest())
+'
+    )"
 else
     render_installer_job "${NODE}" --render-only >"${MANIFEST}"
     TEMPLATE_SHA256="$(sha256sum "${MANIFEST}" | awk '{print $1}')"
+    TEMPLATE_CONTENT_SHA256="${TEMPLATE_SHA256}"
     TEMPLATE_CONFIG_MAP="gpu-fault-node-installer-template-${TEMPLATE_SHA256:0:12}"
 
     kubectl_context -n "${NAMESPACE}" create configmap \
@@ -322,6 +340,7 @@ sed \
     -e "s#REPLACE_WITH_INSTALLER_ARTIFACT_SHA256#${ARTIFACT_SHA256}#g" \
     -e "s#REPLACE_WITH_INSTALLER_BUNDLE_SHA256#${BUNDLE_SHA256}#g" \
     -e "s#REPLACE_WITH_INSTALLER_TEMPLATE_SHA256#${TEMPLATE_SOURCE_SHA256}#g" \
+    -e "s#REPLACE_WITH_INSTALLER_TEMPLATE_CONTENT_SHA256#${TEMPLATE_CONTENT_SHA256}#g" \
     -e "s#REPLACE_WITH_INSTALLER_MAX_UNAVAILABLE#${MAX_UNAVAILABLE}#g" \
     -e "s#REPLACE_WITH_INSTALLER_ACTIVE_DEADLINE_SECONDS#${ACTIVE_DEADLINE_SECONDS}#g" \
     -e "s#REPLACE_WITH_INSTALLER_ALLOWED_NODES#${ALLOWED_NODES}#g" \

@@ -347,11 +347,6 @@ if node not in data:
                 secretKeyRef:
                   name: ${CONNECTION_SECRET}
                   key: control-plane-url
-            - name: CONTROL_PLANE_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: ${CONNECTION_SECRET}
-                  key: cluster-token
             - name: CLUSTER_ID
               valueFrom:
                 secretKeyRef:
@@ -363,8 +358,17 @@ EOF
     CA_INSTALL_COMMAND='install -m 0644 /connection-secret/ca.crt /host/tmp/gpu-fault-control-plane-ca-${INSTALL_RUN_ID}.crt'
     # shellcheck disable=SC2016,SC1003 # Remote payload: ${INSTALL_RUN_ID} and the trailing line-continuation backslash are for the pod shell.
     CA_CHROOT_ENV='CONTROL_PLANE_CA_CERTIFICATE=/tmp/gpu-fault-control-plane-ca-${INSTALL_RUN_ID}.crt \'
-    # shellcheck disable=SC2016 # Remote payload; the token variables exist only inside the pod.
-    TOKEN_INSTALLER_ARGS='--token "${CONTROL_PLANE_TOKEN}" --ca-certificate "${CONTROL_PLANE_CA_CERTIFICATE}"'
+    # The bearer token never enters an argv: not the installer's (--token)
+    # and not /usr/bin/env's (VAR=value). The Job is hostPID, so any
+    # /proc/*/cmdline reader on the node would otherwise see it. It travels
+    # as a 0600 root-owned file from the mounted Secret, like the node
+    # action secret, and the installer reads it with --token-file.
+    # shellcheck disable=SC2016 # Remote payload; ${INSTALL_RUN_ID} expands in the pod.
+    TOKEN_INSTALL_COMMAND='install -m 0600 /connection-secret/cluster-token /host/tmp/gpu-fault-control-plane-token-${INSTALL_RUN_ID}'
+    # shellcheck disable=SC2016,SC1003 # Remote payload: ${INSTALL_RUN_ID} and the trailing line-continuation backslash are for the pod shell.
+    TOKEN_CHROOT_ENV='CONTROL_PLANE_TOKEN_FILE=/tmp/gpu-fault-control-plane-token-${INSTALL_RUN_ID} \'
+    # shellcheck disable=SC2016 # Remote payload; the path variables exist only inside the pod.
+    TOKEN_INSTALLER_ARGS='--token-file "${CONTROL_PLANE_TOKEN_FILE}" --ca-certificate "${CONTROL_PLANE_CA_CERTIFICATE}"'
     CONNECTION_SECRET_MOUNT="$(cat <<'EOF'
             - name: connection-secret
               mountPath: /connection-secret
@@ -378,6 +382,9 @@ EOF
             items:
               - key: ca.crt
                 path: ca.crt
+              - key: cluster-token
+                path: cluster-token
+                mode: 0400
 EOF
 )"
 else
@@ -396,14 +403,19 @@ else
     CONTROL_PLANE_ENV="$(cat <<EOF
             - name: CONTROL_PLANE_URL
               value: http://${CONTROL_PLANE_IP}:8080
-            - name: CONTROL_PLANE_TOKEN
-              value: ""
             - name: CLUSTER_ID
               value: ${CLUSTER_ID}
 EOF
 )"
     CA_INSTALL_COMMAND=":"
-    CA_CHROOT_ENV=""
+    # These splice into a backslash-continued /usr/bin/env argument list;
+    # an empty expansion would leave a blank line that ends the command
+    # early, so local mode renders harmless empty assignments instead.
+    # shellcheck disable=SC1003 # The trailing backslash is the pod shell's line continuation.
+    CA_CHROOT_ENV='CONTROL_PLANE_CA_CERTIFICATE= \'
+    TOKEN_INSTALL_COMMAND=":"
+    # shellcheck disable=SC1003 # The trailing backslash is the pod shell's line continuation.
+    TOKEN_CHROOT_ENV='CONTROL_PLANE_TOKEN_FILE= \'
     TOKEN_INSTALLER_ARGS=""
     CONNECTION_SECRET_MOUNT=""
     CONNECTION_SECRET_VOLUME=""
@@ -546,7 +558,7 @@ ${CONTROL_PLANE_ENV}
               value: "${ENABLE_NODE_LOG_COLLECTOR}"
             - name: ENABLE_NVIDIA_SMI_METRICS_COLLECTOR
               value: "${ENABLE_NVIDIA_SMI_METRICS_COLLECTOR}"
-          command: ["/bin/bash", "-ceu"]
+          command: ["/bin/bash", "-ceuo", "pipefail"]
           args:
             - |
               if [[ "\${PREFLIGHT_ONLY}" == "true" ]]; then
@@ -558,7 +570,20 @@ ${CONTROL_PLANE_ENV}
                 GPU_FAULT_REQUIRE_ROLLBACK_SLOT="\${REQUIRE_ROLLBACK_SLOT}" \
                 TARGET_NODE_NAME="\${TARGET_NODE_NAME}" \
                 TARGET_NODE_UID="\${TARGET_NODE_UID}" \
-                  /bin/bash -ceu '
+                  /bin/bash -ceu -o pipefail '
+                    expected_bundle_sha256="${INSTALLER_BUNDLE_SHA256}"
+                    [[ "\${expected_bundle_sha256}" =~ ^[0-9a-f]{64}$ ]] || {
+                      echo "ERROR: installer bundle SHA-256 was not rendered; refusing to extract" >&2
+                      exit 1
+                    }
+                    observed_bundle_sha256="\$(
+                      sha256sum "\${GPU_FAULT_PREFLIGHT_CANDIDATE_BUNDLE}"
+                    )"
+                    observed_bundle_sha256="\${observed_bundle_sha256%% *}"
+                    [[ "\${observed_bundle_sha256}" == "\${expected_bundle_sha256}" ]] || {
+                      echo "ERROR: installer bundle SHA-256 mismatch: expected \${expected_bundle_sha256} observed \${observed_bundle_sha256}" >&2
+                      exit 1
+                    }
                     tar -xOzf \
                       "\${GPU_FAULT_PREFLIGHT_CANDIDATE_BUNDLE}" \
                       gpu-fault-node-installer-${VERSION}/deploy/node/preflight-gpu-fault-node.sh |
@@ -572,6 +597,7 @@ ${CONTROL_PLANE_ENV}
               install -m 0600 /node-secret/node-action-secret \
                 "/host/tmp/gpu-fault-node-action-secret-\${INSTALL_RUN_ID}"
               ${CA_INSTALL_COMMAND}
+              ${TOKEN_INSTALL_COMMAND}
               chroot /host /usr/bin/env \
                 TARGET_NODE_NAME="\${TARGET_NODE_NAME}" \
                 TARGET_NODE_IP="\${TARGET_NODE_IP}" \
@@ -583,8 +609,8 @@ ${CONTROL_PLANE_ENV}
                 GPU_FAULT_NODE_COMPATIBILITY_DIGEST="\${NODE_COMPATIBILITY_DIGEST}" \
                 DERIVE_NODE_ACTION_SECRET="\${DERIVE_NODE_ACTION_SECRET}" \
                 CONTROL_PLANE_URL="\${CONTROL_PLANE_URL}" \
-                CONTROL_PLANE_TOKEN="\${CONTROL_PLANE_TOKEN}" \
                 ${CA_CHROOT_ENV}
+                ${TOKEN_CHROOT_ENV}
                 CLUSTER_ID="\${CLUSTER_ID}" \
                 RUNTIME_PROFILE="\${RUNTIME_PROFILE}" \
                 DIAGNOSTIC_S3_URI_B64="\${DIAGNOSTIC_S3_URI_B64}" \
@@ -625,20 +651,31 @@ ${CONTROL_PLANE_ENV}
                 GPU_FAULT_HOST_HISTORY_MAX_POINTS="\${HOST_HISTORY_MAX_POINTS}" \
                 ENABLE_NODE_LOG_COLLECTOR="\${ENABLE_NODE_LOG_COLLECTOR}" \
                 ENABLE_NVIDIA_SMI_METRICS_COLLECTOR="\${ENABLE_NVIDIA_SMI_METRICS_COLLECTOR}" \
-                /bin/bash -ceu '
+                /bin/bash -ceu -o pipefail '
               node_action_secret="/tmp/gpu-fault-node-action-secret-\${INSTALL_RUN_ID}"
               control_plane_ca="/tmp/gpu-fault-control-plane-ca-\${INSTALL_RUN_ID}.crt"
-              trap "rm -f \${node_action_secret} \${control_plane_ca}" EXIT
+              control_plane_token="/tmp/gpu-fault-control-plane-token-\${INSTALL_RUN_ID}"
+              trap "rm -f \${node_action_secret} \${control_plane_ca} \${control_plane_token}" EXIT
                   install -d -m 0755 /var/lock
                   exec 9>/var/lock/gpu-fault-installer.lock
                   flock -w "\${INSTALLER_LOCK_TIMEOUT_SECONDS}" 9 || {
                     echo "another GPU fault installer owns the node lock" >&2
                     exit 1
                   }
+                  bundle="/tmp/gpu-fault-node-installer-${VERSION}.tar.gz"
+                  expected_bundle_sha256="${INSTALLER_BUNDLE_SHA256}"
+                  [[ "\${expected_bundle_sha256}" =~ ^[0-9a-f]{64}$ ]] || {
+                    echo "ERROR: installer bundle SHA-256 was not rendered; refusing to extract" >&2
+                    exit 1
+                  }
+                  observed_bundle_sha256="\$(sha256sum "\${bundle}")"
+                  observed_bundle_sha256="\${observed_bundle_sha256%% *}"
+                  [[ "\${observed_bundle_sha256}" == "\${expected_bundle_sha256}" ]] || {
+                    echo "ERROR: installer bundle SHA-256 mismatch: expected \${expected_bundle_sha256} observed \${observed_bundle_sha256}" >&2
+                    exit 1
+                  }
                   rm -rf /tmp/gpu-fault-node-installer-${VERSION}
-                  tar -xzf \
-                    /tmp/gpu-fault-node-installer-${VERSION}.tar.gz \
-                    -C /tmp
+                  tar -xzf "\${bundle}" -C /tmp
                   cd /tmp/gpu-fault-node-installer-${VERSION}
                   required_interfaces=""
                   for interface_path in \
@@ -761,6 +798,7 @@ ${CONTROL_PLANE_ENV}
                   deploy/node/install-gpu-fault-collector.sh \
                     --control-plane-url "\${CONTROL_PLANE_URL}" \
                     ${TOKEN_INSTALLER_ARGS} \
+                    --wheel-sha256 "${INSTALLER_ARTIFACT_SHA256}" \
                     --cluster-id "\${CLUSTER_ID}" \
                     --runtime-profile-version "\${RUNTIME_PROFILE}" \
                     --node-id "\${TARGET_NODE_NAME}" \
@@ -844,7 +882,12 @@ while true; do
         fi
         exit 1
     fi
-    sleep 2
+    # The interval is spent inside a bounded `kubectl wait` instead of a timer,
+    # so a Job that completes early in it is read back at once. A non-zero exit
+    # (timeout, a Failed Job, a transient API error) only means "not yet": the
+    # read at the top of the loop still decides, exactly as before.
+    kubectl -n "${NAMESPACE}" wait "job/${JOB_NAME}" \
+        --for=condition=complete --timeout=2s >/dev/null 2>&1 || true
 done
 kubectl -n "${NAMESPACE}" logs "job/${JOB_NAME}" --all-containers
 if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then

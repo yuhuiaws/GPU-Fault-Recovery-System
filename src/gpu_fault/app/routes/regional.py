@@ -574,6 +574,7 @@ async def regional_spare_health(
         markers = blocking_spare_markers(
             ctx.store,
             aliases,
+            cluster_id=cluster_id,
             observed_after=health.observed_after,
         )
         if markers:

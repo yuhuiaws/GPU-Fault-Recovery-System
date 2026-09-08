@@ -478,3 +478,238 @@ def test_active_agent_node_sets_are_captured_before_cpu_rollout() -> None:
         "gpu-a": {"node_ids": ["node-a", "node-b"]},
         "gpu-b": {"node_ids": ["node-c"]},
     }
+
+
+class FakeClock:
+    """A monotonic clock the test advances, so a wait costs no wall time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class WatchRunner:
+    """A runner whose bounded `kubectl wait`/`rollout status` verdicts are scripted.
+
+    A ``False`` verdict consumes the wait's ``--timeout`` on the clock, the way
+    kubectl giving up at its timeout would; ``consume=False`` models kubectl
+    exiting non-zero at once (a transient API error).
+    """
+
+    dry_run = False
+
+    def __init__(self, clock: FakeClock, verdicts: list[bool], *, consume=True):
+        self.clock = clock
+        self.verdicts = list(verdicts)
+        self.consume = consume
+        self.waits: list[tuple[list[str], float]] = []
+
+    def probe(self, args, *, timeout_seconds=None):
+        self.waits.append((list(args), self.clock.now))
+        met = self.verdicts.pop(0) if self.verdicts else False
+        if not met and self.consume:
+            self.clock.now += _wait_timeout(args)
+        return met
+
+
+def _wait_timeout(args: list[str]) -> float:
+    (flag,) = [value for value in args if value.startswith("--timeout=")]
+    return float(flag.removeprefix("--timeout=").removesuffix("s"))
+
+
+def _watch_release(values, runner) -> SimpleNamespace:
+    responses = iter(values)
+    return SimpleNamespace(
+        runner=runner,
+        config=SimpleNamespace(namespace="gpu-fault-system"),
+        _gpu=lambda _target, *arguments: list(arguments),
+        _get_json=lambda _arguments: next(responses),
+    )
+
+
+def _wait(release, **overrides):
+    arguments = {"poll_seconds": 2, "timeout_seconds": 300}
+    arguments.update(overrides)
+    return WAIT.wait_deployment_rollout(
+        release, SimpleNamespace(cluster_id="gpu-a"), "executor", **arguments
+    )
+
+
+def test_rollout_wait_returns_the_moment_rollout_status_does(monkeypatch) -> None:
+    """The interval is a bounded `rollout status`, not a timer.
+
+    The old loop slept the whole poll interval after every inspection, so a
+    rollout that completed one second in was reported at the end of it. Now the
+    interval ends when kubectl sees the rollout complete, and the Deployment is
+    read back at once.
+    """
+
+    clock = FakeClock()
+    monkeypatch.setattr(WAIT, "time", clock)
+    runner = WatchRunner(clock, [True])
+    release = _watch_release(
+        [_deployment(), {"items": []}, _deployment(ready=1)], runner
+    )
+
+    result = _wait(release)
+
+    assert result["progress"] == [2, 1, 1, 1]
+    assert [args for args, _ in runner.waits] == [
+        [
+            "-n",
+            "gpu-fault-system",
+            "rollout",
+            "status",
+            "deployment/executor",
+            "--timeout=2s",
+        ]
+    ]
+    assert clock.sleeps == [], "a satisfied watch still slept the poll interval"
+    assert clock.now == 0.0
+
+
+def test_rollout_wait_bounds_every_watch_by_the_poll_interval_and_the_deadline(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(WAIT, "time", clock)
+    runner = WatchRunner(clock, [])
+    release = _watch_release([_deployment(), {"items": []}] * 10, runner)
+
+    with pytest.raises(WAIT.ReleaseError, match="exceeded 5 seconds"):
+        _wait(release, timeout_seconds=5, no_progress_timeout_seconds=100)
+
+    assert [(_wait_timeout(args), at) for args, at in runner.waits] == [
+        (2.0, 0.0),
+        (2.0, 2.0),
+        (1.0, 4.0),
+    ], "a watch outlived the poll interval or the release deadline"
+
+
+def test_rollout_wait_no_progress_timeout_is_judged_on_the_same_reads(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(WAIT, "time", clock)
+    runner = WatchRunner(clock, [])
+    release = _watch_release([_deployment(), {"items": []}] * 10, runner)
+
+    with pytest.raises(WAIT.ReleaseError, match="made no progress for 4 seconds"):
+        _wait(release, no_progress_timeout_seconds=4)
+
+    assert [at for _, at in runner.waits] == [0.0, 2.0]
+
+
+def test_rollout_wait_pod_failure_is_still_inspected_every_interval(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(WAIT, "time", clock)
+    runner = WatchRunner(clock, [])
+    release = _watch_release(
+        [_deployment(), {"items": []}, _deployment(), _pod_failure("CrashLoopBackOff")],
+        runner,
+    )
+
+    with pytest.raises(WAIT.ReleaseError, match="CrashLoopBackOff"):
+        _wait(release)
+
+    assert clock.now == 2.0, "the failing Pod was not inspected at the next interval"
+
+
+def test_rollout_wait_transient_watch_error_still_costs_the_interval(
+    monkeypatch,
+) -> None:
+    """kubectl exiting non-zero at once is "not yet", paid for like a timeout.
+
+    A transient API error must not make the next read happen sooner than the
+    old loop's would have -- that read would hit the same API server the watch
+    just found unwell, and its failure would abort the release.
+    """
+
+    clock = FakeClock()
+    monkeypatch.setattr(WAIT, "time", clock)
+    runner = WatchRunner(clock, [False], consume=False)
+    release = _watch_release(
+        [_deployment(), {"items": []}, _deployment(ready=1)], runner
+    )
+
+    result = _wait(release)
+
+    assert result["progress"] == [2, 1, 1, 1]
+    assert clock.sleeps == [2.0], "the shortfall of the interval was not slept"
+    assert clock.now == 2.0
+
+
+def test_rollout_wait_does_not_spin_when_kubectl_calls_it_complete_first(
+    monkeypatch,
+) -> None:
+    """`rollout status` stops at available; this barrier also wants Ready.
+
+    When kubectl says complete and the read disagrees, asking kubectl again would
+    answer at once, so that interval has to be a plain sleep or the loop spins.
+    """
+
+    clock = FakeClock()
+    monkeypatch.setattr(WAIT, "time", clock)
+    runner = WatchRunner(clock, [True, True])
+    release = _watch_release(
+        [
+            _deployment(),
+            {"items": []},
+            _deployment(),
+            {"items": []},
+            _deployment(ready=1),
+        ],
+        runner,
+    )
+
+    result = _wait(release)
+
+    assert result["progress"] == [2, 1, 1, 1]
+    assert len(runner.waits) == 1, "kubectl was asked again right after it said yes"
+    assert clock.sleeps == [2.0]
+
+
+def test_bounded_wait_sleeps_sub_second_intervals_instead_of_watching(
+    monkeypatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(WAIT, "time", clock)
+    runner = WatchRunner(clock, [True])
+
+    met = WAIT.bounded_kubectl_wait(
+        SimpleNamespace(runner=runner), ["wait", "pod/x"], seconds=0.4
+    )
+
+    assert met is False
+    assert runner.waits == [], "`--timeout=0s` means check once to kubectl"
+    assert clock.sleeps == [0.4]
+
+
+def test_bounded_wait_treats_a_killed_kubectl_as_not_yet(monkeypatch) -> None:
+    """The runner raises when kubectl outlives its --timeout; the sleep never did."""
+
+    clock = FakeClock()
+    monkeypatch.setattr(WAIT, "time", clock)
+
+    class HungRunner:
+        dry_run = False
+
+        def probe(self, _args, *, timeout_seconds=None):
+            clock.now += 1.0
+            raise WAIT.ReleaseError("probe timed out after 35s: kubectl")
+
+    met = WAIT.bounded_kubectl_wait(
+        SimpleNamespace(runner=HungRunner()), ["wait", "pod/x"], seconds=5
+    )
+
+    assert met is False
+    assert clock.sleeps == [4.0], "the rest of the interval was not slept"

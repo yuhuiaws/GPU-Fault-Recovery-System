@@ -818,3 +818,198 @@ def test_legacy_release_filter_removes_only_new_component_pins() -> None:
     }
 
     assert names == {"GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256"}
+
+
+# --------------------------------------------------------------------------
+# Rollback: the previous container environment is applied verbatim
+# --------------------------------------------------------------------------
+
+ROLE_DEPLOYMENTS = (
+    "gpu-fault-api-ha",
+    "gpu-fault-control-worker",
+    "gpu-fault-telemetry-spool-worker",
+)
+# Deployment -> (rendered container name, GPU_FAULT_SERVICE_ROLE)
+ROLE_CONTAINERS = {
+    "gpu-fault-api-ha": ("api", "ingress"),
+    "gpu-fault-control-worker": ("control-worker", "worker"),
+    "gpu-fault-telemetry-spool-worker": ("telemetry-spool-worker", "spool-worker"),
+}
+CONTAINER_ENV_FILE_VARIABLE = "GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE"
+
+
+def _render(extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy/control-plane/tools/render_control_plane_role_split.py"),
+            "--json",
+        ],
+        input=json.dumps(_deployment()),
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            **(extra_env or {}),
+        },
+    )
+
+
+def _rendered_deployments(result: subprocess.CompletedProcess) -> dict[str, dict]:
+    return {
+        item["metadata"]["name"]: item
+        for item in json.loads(result.stdout)["items"]
+        if item["kind"] == "Deployment"
+    }
+
+
+def _previous_container_env() -> dict[str, dict[str, dict[str, list]]]:
+    """An older release's env: fewer names than today's template, one extra."""
+
+    return {
+        name: {
+            ROLE_CONTAINERS[name][0]: {
+                "env": [
+                    {
+                        "name": "GPU_FAULT_SERVICE_ROLE",
+                        "value": ROLE_CONTAINERS[name][1],
+                    },
+                    {
+                        "name": "GPU_FAULT_STORE_URL",
+                        "valueFrom": {
+                            "secretKeyRef": {
+                                "name": "gpu-fault-aurora",
+                                "key": "postgres-url",
+                            }
+                        },
+                    },
+                    {"name": "GPU_FAULT_ONLY_THE_OLD_IMAGE_KNOWS", "value": "1"},
+                ],
+                "envFrom": [{"configMapRef": {"name": f"{name}-config-core"}}],
+            }
+        }
+        for name in ROLE_DEPLOYMENTS
+    }
+
+
+def test_role_split_restores_the_previous_container_env_verbatim(tmp_path) -> None:
+    """On rollback every rendered container ends with exactly the captured lists.
+
+    The current template's additions are gone and the previous release's
+    entries are back, refs and literals alike: the old image starts with the
+    environment it ran with, not the one the newer checkout would invent.
+    """
+
+    snapshot = _previous_container_env()
+    snapshot_file = tmp_path / "previous-container-env.json"
+    snapshot_file.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    result = _render({CONTAINER_ENV_FILE_VARIABLE: str(snapshot_file)})
+
+    assert result.returncode == 0, result.stderr
+    deployments = _rendered_deployments(result)
+    assert set(deployments) == set(ROLE_DEPLOYMENTS)
+    for name, item in deployments.items():
+        (container,) = item["spec"]["template"]["spec"]["containers"]
+        captured = snapshot[name][ROLE_CONTAINERS[name][0]]
+        assert container["name"] == ROLE_CONTAINERS[name][0], name
+        assert container["env"] == captured["env"], name
+        assert container["envFrom"] == captured["envFrom"], name
+    # Everything else the renderer decides is untouched by the substitution.
+    baseline = _rendered_deployments(_render())
+    for name in ROLE_DEPLOYMENTS:
+        for item in (deployments[name], baseline[name]):
+            for container in item["spec"]["template"]["spec"]["containers"]:
+                container.pop("env")
+                container.pop("envFrom")
+        assert deployments[name] == baseline[name], name
+
+
+def test_role_split_without_the_snapshot_variable_renders_from_the_template() -> None:
+    """The forward path is unchanged: no variable, no substitution."""
+
+    result = _render()
+
+    assert result.returncode == 0, result.stderr
+    items = {
+        item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
+    }
+    for name in ROLE_DEPLOYMENTS:
+        env = _effective_env(items, items[name])
+        assert "GPU_FAULT_ONLY_THE_OLD_IMAGE_KNOWS" not in env
+        assert env["GPU_FAULT_SERVICE_ROLE"] == ROLE_CONTAINERS[name][1]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "detail"),
+    [
+        pytest.param(
+            lambda snapshot: snapshot.pop("gpu-fault-control-worker"),
+            "does not cover rendered Deployments: gpu-fault-control-worker",
+            id="missing-deployment",
+        ),
+        pytest.param(
+            lambda snapshot: snapshot.__setitem__(
+                "gpu-fault-adot", snapshot["gpu-fault-api-ha"]
+            ),
+            "does not render: gpu-fault-adot",
+            id="unknown-deployment",
+        ),
+        pytest.param(
+            lambda snapshot: snapshot["gpu-fault-api-ha"].__setitem__(
+                "sidecar", snapshot["gpu-fault-api-ha"].pop("api")
+            ),
+            "gpu-fault-api-ha has no container named sidecar",
+            id="unknown-container",
+        ),
+        pytest.param(
+            lambda snapshot: snapshot["gpu-fault-api-ha"]["api"].pop("envFrom"),
+            "must carry exactly env and envFrom lists",
+            id="missing-envFrom",
+        ),
+        pytest.param(
+            lambda snapshot: snapshot["gpu-fault-api-ha"]["api"]["env"].append(
+                {"name": "GPU_FAULT_API_TOKEN", "value": "plaintext"}
+            ),
+            "sensitive env GPU_FAULT_API_TOKEN carries a literal value",
+            id="sensitive-literal",
+        ),
+        pytest.param(
+            lambda snapshot: snapshot["gpu-fault-api-ha"]["api"]["env"].append(
+                {"value": "nameless"}
+            ),
+            "has an env entry without a name",
+            id="nameless-entry",
+        ),
+    ],
+)
+def test_role_split_refuses_a_malformed_previous_container_env(
+    tmp_path, mutate, detail: str
+) -> None:
+    """A snapshot the render cannot apply verbatim stops the render.
+
+    Nothing is written: the render is the step before the apply, so the
+    failure lands before any Deployment is touched.
+    """
+
+    snapshot = _previous_container_env()
+    mutate(snapshot)
+    snapshot_file = tmp_path / "previous-container-env.json"
+    snapshot_file.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    result = _render({CONTAINER_ENV_FILE_VARIABLE: str(snapshot_file)})
+
+    assert result.returncode != 0
+    assert "previous container environment snapshot is invalid" in result.stderr
+    assert detail in result.stderr
+    assert result.stdout == ""
+
+
+def test_role_split_refuses_an_unreadable_previous_container_env(tmp_path) -> None:
+    result = _render({CONTAINER_ENV_FILE_VARIABLE: str(tmp_path / "missing.json")})
+
+    assert result.returncode != 0
+    assert "cannot read" in result.stderr
+    assert result.stdout == ""

@@ -1163,12 +1163,17 @@ def load_installation_resource_snapshot(path: Path) -> InstallationResourceSnaps
     actual = hashlib.sha256(path.read_bytes()).hexdigest()
     if actual != expected:
         raise BootstrapError(f"installation registry snapshot digest mismatch: {path}")
-    return cast(
+    snapshot = cast(
         InstallationResourceSnapshot,
         InstallationResourceSnapshot.model_validate_json(
             path.read_text(encoding="utf-8")
         ),
     )
+    # M-12: the on-disk digest above proves the file is intact; this proves the
+    # snapshot's own provenance seal matches its payload, so an unsealed or
+    # reseated snapshot can never be trusted as installed state.
+    snapshot.require_source_binding()
+    return snapshot
 
 
 def find_bootstrap_state(site: RenderedSite) -> dict[str, Any] | None:

@@ -78,6 +78,9 @@ class Legacy:
         }
         self.release_metadata = {"required-agent-config-digest": "a" * 64}
         self.allowed_namespaces = json.dumps(["training", "gpu-fault-system"])
+        # When set, overrides the ``cluster-id`` the connection Secret decodes to,
+        # so a test can feed discovery a malformed or path-escaping identity.
+        self.connection_cluster_id: str | None = None
         self.connection_keys = (
             "cluster-id",
             "cluster-token",
@@ -135,7 +138,11 @@ class Legacy:
         if name == "gpu-fault-regional-connection":
             context = command[command.index("--context") + 1]
             values = {
-                "cluster-id": context,
+                "cluster-id": (
+                    self.connection_cluster_id
+                    if self.connection_cluster_id is not None
+                    else context
+                ),
                 "cluster-token": "t" * 64,
                 "ca.crt": "certificate",
                 "control-plane-url": "https://control.internal",
@@ -638,4 +645,100 @@ def test_a_failed_kubectl_read_names_the_query(
     legacy.kubectl_failure = "Error from server (Forbidden): configmaps is forbidden"
 
     with pytest.raises(BootstrapError, match="legacy discovery failed: -n"):
+        legacy.discover(monkeypatch)
+
+
+def test_the_legit_executor_role_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H-12: an IAM role in the cluster's own account passes validation.
+
+    The default fixture role lives in ``ACCOUNT``, so discovery renders it into
+    the site unchanged -- the new check must not reject the legitimate value.
+    """
+
+    legacy = Legacy(tmp_path)
+
+    site = legacy.discover(monkeypatch)
+
+    assert (
+        site.release_config["clusters"][0]["executor_irsa_role_arn"]
+        == EXECUTOR_ROLE_ARN
+    )
+
+
+def test_an_executor_role_in_a_foreign_account_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H-12: the role ARN comes from an editable ServiceAccount annotation.
+
+    A well-formed ARN in someone else's account would otherwise have the CLI
+    trust -- and later assume -- a role outside the cluster's account, so it is
+    refused before it can reach the site.
+    """
+
+    legacy = Legacy(tmp_path)
+    foreign = "arn:aws:iam::111122223333:role/attacker"
+    legacy.executor_annotations = {"eks.amazonaws.com/role-arn": foreign}
+
+    with pytest.raises(BootstrapError, match="is not an IAM role in account"):
+        legacy.discover(monkeypatch)
+
+
+def test_a_malformed_executor_role_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H-12: a non-ARN annotation value is not a role at all."""
+
+    legacy = Legacy(tmp_path)
+    legacy.executor_annotations = {"eks.amazonaws.com/role-arn": "not-an-arn"}
+
+    with pytest.raises(BootstrapError, match="is not a valid ARN"):
+        legacy.discover(monkeypatch)
+
+
+def test_a_non_iam_executor_role_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H-12: only an ``iam`` ``role/`` resource is an assumable role.
+
+    A syntactically valid ARN for a different service (or a user) in the right
+    account is still not a role the executor may become.
+    """
+
+    legacy = Legacy(tmp_path)
+    legacy.executor_annotations = {
+        "eks.amazonaws.com/role-arn": f"arn:aws:iam::{ACCOUNT}:user/someone"
+    }
+
+    with pytest.raises(BootstrapError, match="is not an IAM role in account"):
+        legacy.discover(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "cluster_id",
+    [
+        "../../etc/cron.d/evil",
+        "a/b",
+        "with space",
+        "..",
+        "x" * 129,
+        "-leading-dash-ok-but-slash/",
+    ],
+)
+def test_a_malformed_connection_cluster_id_stops_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cluster_id: str
+) -> None:
+    """M-13: the cluster id is decoded from a Secret and names on-disk files.
+
+    An id with a path separator, a dot segment, an illegal character, or an
+    oversized length could escape the private state directory or be trusted as a
+    destructive target, so it is validated against the site identifier shape
+    before any file is written for it.
+    """
+
+    legacy = Legacy(tmp_path)
+    legacy.connection_cluster_id = cluster_id
+
+    with pytest.raises(BootstrapError, match="cluster-id"):
         legacy.discover(monkeypatch)

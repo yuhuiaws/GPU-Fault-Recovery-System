@@ -22,22 +22,34 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: gpu-fault-cluster-executor
+# Only what is genuinely cluster-scoped lives here: nodes (cordon, taint,
+# annotate -- RBAC cannot scope patch by label) and read/list/watch on the
+# workload kinds, because spare activation lists Pods across all namespaces
+# to prove a node is idle. The namespaced write verbs -- pods delete/patch,
+# jobs/pytorchjobs/jobsets create/patch -- are granted per workload
+# namespace by the Role + RoleBinding the GPU rollout renders for every
+# `allowed_namespaces` entry, plus one `pods delete` Role in the device
+# plugin namespace for RESTART_*_DEVICE_PLUGIN (regional_release_gpu_rollout
+# .render_workload_namespace_rbac). GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES
+# below is therefore no longer the only boundary: a command naming a
+# namespace outside the list is refused by the executor *and* by the API
+# server.
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "patch", "delete"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["get", "list", "watch", "patch", "create"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["kubeflow.org"]
     resources: ["pytorchjobs"]
-    verbs: ["get", "list", "watch", "patch", "create"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["jobset.x-k8s.io"]
     resources: ["jobsets"]
-    verbs: ["get", "list", "watch", "patch", "create"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

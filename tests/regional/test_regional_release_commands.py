@@ -350,6 +350,7 @@ def test_deploy_selects_initial_or_upgrade_path(
             "_load_state",
             lambda: {
                 "phase": phase,
+                "release_id": release.release_id,
                 "release_diff": {
                     "kind": "CONTROL_PLANE_ONLY",
                     "changed": ["control_plane_wheel"],
@@ -360,6 +361,123 @@ def test_deploy_selects_initial_or_upgrade_path(
     admin.run_deploy(release)
 
     assert calls == [expected]
+
+
+# --------------------------------------------------------------------------- #
+# M-23: a resume pins the approved-plan digest so the resumed apply refuses a
+# working tree that drifted since the transaction was planned; a fresh
+# transaction (initial bootstrap or a brand-new upgrade off a completed state)
+# must NOT pin, or it would enforce the wrong (or previous) transaction's plan.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("state_exists", "phase", "should_pin"),
+    [
+        (False, None, False),  # fresh bootstrap: nothing planned yet
+        (True, "bootstrap-cpu-ready", True),  # resuming a partial bootstrap
+        (True, "bootstrap-data-plane-progress", True),
+        (True, "failed", True),  # resuming an incomplete upgrade
+        (True, "partial-convergence", True),
+        (True, "rolled-back", False),  # re-entry renders a different plan
+        (True, "complete", False),  # brand-new upgrade off a finished state
+    ],
+)
+def test_deploy_pins_approved_plan_only_when_resuming(
+    tmp_path: Path, monkeypatch, state_exists: bool, phase: str | None, should_pin: bool
+) -> None:
+    module = MODULE
+    admin = ADMIN_COMMANDS_MODULE
+    release = module.RegionalRelease(
+        module.ReleaseConfig.load(config_file(tmp_path)), module.Runner(dry_run=False)
+    )
+    pins: list[str | None] = []
+    monkeypatch.setattr(release.runner, "probe", lambda _args, **_kwargs: state_exists)
+    monkeypatch.setattr(release, "bootstrap", lambda: None)
+    monkeypatch.setattr(release, "upgrade", lambda **_kwargs: None)
+    monkeypatch.setattr(release, "noop", lambda _diff: None)
+    monkeypatch.setattr(
+        release, "pin_approved_manifest_plan", lambda digest: pins.append(digest)
+    )
+    if state_exists:
+        monkeypatch.setattr(
+            release,
+            "_load_state",
+            lambda: {
+                "phase": phase,
+                # The same candidate as the recorded transaction: a plain resume,
+                # not a supersede.
+                "release_id": release.release_id,
+                "approved_manifest_sha256": "plan-digest",
+                "release_diff": {
+                    "kind": "CONTROL_PLANE_ONLY",
+                    "changed": ["control_plane_wheel"],
+                },
+            },
+        )
+
+    admin.run_deploy(release)
+
+    assert pins == (["plan-digest"] if should_pin else [])
+
+
+def test_resume_pins_the_approved_plan_digest(tmp_path: Path, monkeypatch) -> None:
+    module = MODULE
+    admin = ADMIN_COMMANDS_MODULE
+    release = module.RegionalRelease(
+        module.ReleaseConfig.load(config_file(tmp_path)), module.Runner(dry_run=False)
+    )
+    pins: list[str | None] = []
+    resumed: list[bool] = []
+    monkeypatch.setattr(
+        release,
+        "_load_state",
+        lambda: {
+            "phase": "failed",
+            "release_id": release.release_id,
+            "approved_manifest_sha256": "plan-digest",
+            "release_diff": {
+                "kind": "CONTROL_PLANE_ONLY",
+                "changed": ["control_plane_wheel"],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        release, "pin_approved_manifest_plan", lambda digest: pins.append(digest)
+    )
+    monkeypatch.setattr(
+        release, "upgrade", lambda **kwargs: resumed.append(kwargs.get("resume"))
+    )
+
+    admin.run_resume(release)
+
+    # Pinned before the resumed apply runs, with the persisted plan digest.
+    assert pins == ["plan-digest"]
+    assert resumed == [True]
+
+
+def test_saved_state_stickily_records_the_approved_manifest_digest(
+    tmp_path: Path,
+) -> None:
+    # The persisted ``approved_manifest_sha256`` follows the pinned approved
+    # digest when one is set (a resume), so a resume checkpoint cannot overwrite
+    # the original plan digest with the resuming process's (drifted) tree.
+    module = MODULE
+    release = module.RegionalRelease(
+        module.ReleaseConfig.load(config_file(tmp_path)), module.Runner(dry_run=True)
+    )
+
+    # Fresh transaction (nothing pinned): records the tree it is applying now.
+    release.approved_manifest_digest = None
+    module.save_state(release, "uploaded", previous=None)
+    assert release.state["approved_manifest_sha256"] == release.rendered_manifest_digest
+
+    # Resume (approved digest pinned): the pin wins even though the rendered
+    # working-tree digest differs.
+    release.approved_manifest_digest = "original-plan-digest"
+    module.save_state(release, "cpu-staged", previous=None)
+    assert release.state["approved_manifest_sha256"] == "original-plan-digest"
+    assert release.rendered_manifest_digest != "original-plan-digest"
 
 
 def test_bootstrap_live_checkpoint_recognizes_current_cpu_release(

@@ -255,6 +255,9 @@ spec:
         - mountPath: /etc/gpu-fault/failure-domains
           name: failure-domain-map
           readOnly: true
+        - mountPath: /etc/gpu-fault/rds
+          name: rds-ca-bundle
+          readOnly: true
         envFrom:
         - configMapRef:
             name: gpu-fault-control-worker-config-core
@@ -303,3 +306,6 @@ spec:
           name: gpu-fault-failure-domain-map
           optional: true
         name: failure-domain-map
+      - configMap:
+          name: gpu-fault-rds-ca-bundle
+        name: rds-ca-bundle

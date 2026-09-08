@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import hmac
 import logging
 import os
 import re
@@ -157,7 +158,7 @@ class NodeInstallerReconciler:
         config_digest: str,
         artifact_sha256: str,
         bundle_sha256: str | None = None,
-        template_sha256: str | None = None,
+        template_sha256: str,
         job_template: dict[str, Any],
         dcgm_metrics_url_template: str,
         node_action_keys_secret: str = ("gpu-fault-node-action-keys"),
@@ -183,9 +184,12 @@ class NodeInstallerReconciler:
             )
         self.artifact_sha256 = artifact_sha256
         self.bundle_sha256 = bundle_sha256 or artifact_sha256
-        self.template_sha256 = (
-            template_sha256 or hashlib.sha256(config_digest.encode()).hexdigest()
-        )
+        # The release's template-inputs digest, stamped on nodes and Jobs so a
+        # template change re-installs. It is an identity pin, not an integrity
+        # check of the text this process loaded -- that is
+        # ``load_job_template`` -- so it has no default: a made-up value here
+        # would let every node "match" a template nobody pinned.
+        self.template_sha256 = template_sha256
         for name, digest in (
             ("bundle", self.bundle_sha256),
             ("template", self.template_sha256),
@@ -495,6 +499,50 @@ def _required_env(name: str) -> str:
     return value
 
 
+TEMPLATE_CONTENT_SHA256_ENV = "GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256"
+
+
+def load_job_template(
+    template_data: bytes | str,
+    *,
+    expected_sha256: str | None,
+    origin: str,
+) -> dict[str, Any]:
+    """Parse the installer Job template only if it is the one the deploy pinned.
+
+    The template arrives from a ConfigMap in the reconciler's namespace, and
+    whatever it says becomes a privileged hostPath Pod on every GPU node with
+    that node's HMAC key mounted. Anyone who can update the ConfigMap would
+    therefore own the fleet -- unless the deploy also pins the exact bytes it
+    put there. ``expected_sha256`` is that pin
+    (:data:`TEMPLATE_CONTENT_SHA256_ENV`, the SHA-256 of the ``job.yaml`` text
+    the deploy script placed in the ConfigMap). No pin, or a pin that does not
+    match, is fatal at startup: the reconciler must not fall back to trusting
+    the cluster's copy.
+    """
+
+    raw = template_data if isinstance(template_data, bytes) else template_data.encode()
+    if not raw.strip():
+        raise RuntimeError(f"{origin} is empty")
+    expected = (expected_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise RuntimeError(
+            f"{TEMPLATE_CONTENT_SHA256_ENV} is required and must be the SHA-256 "
+            f"of the installer template text ({origin})"
+        )
+    actual = hashlib.sha256(raw).hexdigest()
+    if not hmac.compare_digest(actual, expected):
+        raise RuntimeError(
+            f"installer template {origin} does not match "
+            f"{TEMPLATE_CONTENT_SHA256_ENV}: expected {expected[:12]}..., "
+            f"loaded {actual[:12]}...; refusing to start"
+        )
+    template = yaml.safe_load(raw)
+    if not isinstance(template, dict):
+        raise RuntimeError(f"installer template {origin} is not a Job document")
+    return template
+
+
 def main() -> None:
     from kubernetes import client, config
 
@@ -525,13 +573,21 @@ def main() -> None:
     core = client.CoreV1Api()
     batch = client.BatchV1Api()
     template_path = os.environ.get("GPU_FAULT_INSTALLER_TEMPLATE_PATH", "").strip()
+    template_data: bytes | str
     if template_path:
-        template_text = Path(template_path).read_text()
+        # Bytes, not text: the pin is over the exact file the deploy wrote, and
+        # read_text() would fold line endings before hashing.
+        template_data = Path(template_path).read_bytes()
+        origin = template_path
     else:
         config_map = core.read_namespaced_config_map(template_name, namespace)
-        template_text = (config_map.data or {}).get("job.yaml", "")
-    if not template_text:
-        raise RuntimeError(f"{template_name}/job.yaml is empty")
+        template_data = (config_map.data or {}).get("job.yaml", "")
+        origin = f"{template_name}/job.yaml"
+    job_template = load_job_template(
+        template_data,
+        expected_sha256=os.environ.get(TEMPLATE_CONTENT_SHA256_ENV),
+        origin=origin,
+    )
     reconciler = NodeInstallerReconciler(
         core,
         batch,
@@ -541,8 +597,8 @@ def main() -> None:
         config_digest=_required_env("GPU_FAULT_INSTALLER_CONFIG_DIGEST"),
         artifact_sha256=_required_env("GPU_FAULT_INSTALLER_ARTIFACT_SHA256"),
         bundle_sha256=os.getenv("GPU_FAULT_INSTALLER_BUNDLE_SHA256") or None,
-        template_sha256=os.getenv("GPU_FAULT_INSTALLER_TEMPLATE_SHA256") or None,
-        job_template=yaml.safe_load(template_text),
+        template_sha256=_required_env("GPU_FAULT_INSTALLER_TEMPLATE_SHA256"),
+        job_template=job_template,
         dcgm_metrics_url_template=os.environ.get(
             "GPU_FAULT_DCGM_METRICS_URL",
             "http://127.0.0.1:9400/metrics",

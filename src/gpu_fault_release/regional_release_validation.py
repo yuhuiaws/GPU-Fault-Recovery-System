@@ -24,6 +24,7 @@ from gpu_fault_release.regional_release_runtime_identity import (
     exec_cpu_ingress_probe,
     validate_runtime_component_identity,
 )
+from gpu_fault_release.regional_release_state import require_digest_pinned_image
 
 ROOT = Path(__file__).resolve().parents[2]
 TRANSIENT_CRITICAL_ALERTS = frozenset({"GpuFaultStoreIoRejected"})
@@ -992,6 +993,9 @@ def validate_gpu_rollback_target(
     if ReleaseComponent.DCGM in components:
         expected_dcgm = old.get("dcgm_image")
         if expected_dcgm:
+            expected_dcgm = require_digest_pinned_image(
+                f"{target.cluster_id} rollback DCGM", expected_dcgm
+            )
             dcgm = release._get_json(
                 release._gpu(
                     target,
@@ -1096,7 +1100,9 @@ def validate_rollback(
     for key, expected in metadata.items():
         if current_metadata.get(key) != expected:
             raise ReleaseError(f"rollback release metadata mismatch: {key}")
-    expected_runtime_image = previous.get("runtime_image") or release.runtime_image
+    expected_runtime_image = require_digest_pinned_image(
+        "rollback runtime", previous.get("runtime_image") or release.runtime_image
+    )
     if restore_cpu:
         _validate_cpu_rollback(release, previous, expected_runtime_image)
         expected_profile = previous.get("runtime_profile_version")

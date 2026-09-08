@@ -161,6 +161,12 @@ def main() -> None:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--sqlite-path")
     source.add_argument("--source-postgres-url")
+    source.add_argument(
+        "--source-postgres-url-env",
+        metavar="NAME",
+        help="read the source PostgreSQL URL from environment variable NAME "
+        "(keeps the DSN off the process argv)",
+    )
     source.add_argument("--ensure-schema", action="store_true")
     source.add_argument("--build-indexes-concurrently", action="store_true")
     source.add_argument("--schema-preflight", action="store_true")
@@ -322,8 +328,16 @@ def main() -> None:
             arguments.sqlite_path, arguments.postgres_url
         )
     else:
+        source_url = arguments.source_postgres_url or os.environ.get(
+            arguments.source_postgres_url_env or "", ""
+        )
+        if not source_url:
+            parser.error(
+                "--source-postgres-url or a non-empty --source-postgres-url-env "
+                "is required"
+            )
         result = migrate_postgres_to_postgres(
-            arguments.source_postgres_url,
+            source_url,
             arguments.postgres_url,
         )
     print(f"migration complete: objects={result.objects} links={result.links}")

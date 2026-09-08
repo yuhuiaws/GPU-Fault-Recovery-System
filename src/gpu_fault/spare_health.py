@@ -577,6 +577,9 @@ class HyperPodSpareHealthController:
         candidates = self.store.list_active_markers_for_nodes(
             set(node.aliases),
             supported,
+            # Tenant scope (H-14): this cluster's markers only, so a
+            # same-named node in another tenant cannot drive remediation here.
+            self.coordinator.lifecycle.config.cluster_name,
         )
         for marker in candidates:
             try:

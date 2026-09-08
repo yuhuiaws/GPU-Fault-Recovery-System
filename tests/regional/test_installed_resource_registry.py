@@ -158,8 +158,8 @@ def test_first_sync_writes_only_resources_that_exist(tmp_path: Path) -> None:
     ]
 
 
-def test_sync_retains_live_legacy_resource_until_deleted(tmp_path: Path) -> None:
-    legacy = {
+def _legacy_resource() -> dict:
+    return {
         "kind": "deployment",
         "name": "gpu-fault-legacy",
         "scope": "namespaced",
@@ -167,6 +167,13 @@ def test_sync_retains_live_legacy_resource_until_deleted(tmp_path: Path) -> None
         "order": 90,
         "clean": "delete",
     }
+
+
+def test_sync_retains_live_legacy_resource_until_deleted(tmp_path: Path) -> None:
+    # A resource dropped from the design inventory but still live is retained
+    # only when it carries a provenance digest that re-verifies -- the genuine,
+    # provenance-stamped case that a prior sync would have written.
+    legacy = MODULE.stamp_provenance(_legacy_resource())
     kubectl = FakeKubectl(
         present={("deployment", "gpu-fault-api"), ("deployment", "gpu-fault-legacy")},
         existing={"schema_version": 1, "plane": "cpu", "resources": [legacy]},
@@ -186,6 +193,71 @@ def test_sync_retains_live_legacy_resource_until_deleted(tmp_path: Path) -> None
         ("deployment", "gpu-fault-legacy"),
     }
     assert sum(call.count("deployment") for call in kubectl.calls) == 1
+
+
+def test_sync_drops_retained_entry_without_provenance(tmp_path: Path) -> None:
+    # An entry carried over from the live ConfigMap with no provenance digest
+    # (an injected or legacy entry) must not be trusted as authoritative.
+    legacy = _legacy_resource()
+    assert MODULE.PROVENANCE_KEY not in legacy
+    kubectl = FakeKubectl(
+        present={("deployment", "gpu-fault-api"), ("deployment", "gpu-fault-legacy")},
+        existing={"schema_version": 1, "plane": "cpu", "resources": [legacy]},
+    )
+
+    document = MODULE.synchronize(
+        kubectl,
+        plane="cpu",
+        namespace="gpu-fault-system",
+        inventory_path=write_inventory(tmp_path),
+        release_id="release-b",
+        apply=False,
+    )
+
+    assert {(item["kind"], item["name"]) for item in document["resources"]} == {
+        ("deployment", "gpu-fault-api")
+    }
+
+
+def test_sync_drops_retained_entry_with_mismatched_provenance(tmp_path: Path) -> None:
+    # A tampered entry -- payload edited after the digest was recorded -- fails
+    # re-verification and is dropped rather than retained.
+    legacy = MODULE.stamp_provenance(_legacy_resource())
+    legacy["clean"] = "orphan"  # flip a field without re-stamping the digest
+    kubectl = FakeKubectl(
+        present={("deployment", "gpu-fault-api"), ("deployment", "gpu-fault-legacy")},
+        existing={"schema_version": 1, "plane": "cpu", "resources": [legacy]},
+    )
+
+    document = MODULE.synchronize(
+        kubectl,
+        plane="cpu",
+        namespace="gpu-fault-system",
+        inventory_path=write_inventory(tmp_path),
+        release_id="release-b",
+        apply=False,
+    )
+
+    assert {(item["kind"], item["name"]) for item in document["resources"]} == {
+        ("deployment", "gpu-fault-api")
+    }
+
+
+def test_sync_stamps_candidate_provenance(tmp_path: Path) -> None:
+    kubectl = FakeKubectl(present={("deployment", "gpu-fault-api")})
+
+    document = MODULE.synchronize(
+        kubectl,
+        plane="cpu",
+        namespace="gpu-fault-system",
+        inventory_path=write_inventory(tmp_path),
+        release_id="release-a",
+        apply=False,
+    )
+
+    assert document["resources"], "the live candidate should sync"
+    for resource in document["resources"]:
+        assert MODULE.provenance_is_verified(resource), resource
 
 
 def test_kubectl_reuses_one_exec_credential() -> None:

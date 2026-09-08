@@ -33,8 +33,11 @@ from pathlib import Path
 from typing import Any
 
 from gpu_fault_release.regional_dns import (
+    SERVICE_HOSTNAME_JSONPATH,
+    SERVICE_HOSTNAME_POLL_SECONDS,
     normalized_record_name,
     read_dns_record,
+    service_hostname_wait_args,
     submit_dns_change,
 )
 from gpu_fault_release.regional_manifest_snapshot import (
@@ -45,6 +48,7 @@ from gpu_fault_release.regional_manifest_snapshot import (
     snapshot_parts,
 )
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_rollout_wait import bounded_kubectl_wait
 
 ROOT = Path(__file__).resolve().parents[2]
 NLB_MANIFEST = ROOT / "deploy/control-plane/regional/regional-control-plane-nlb.yaml"
@@ -165,14 +169,19 @@ def _published_hostname(release: Any, namespace: str) -> str:
                     "service",
                     NLB_SERVICE,
                     "-o",
-                    "jsonpath={.status.loadBalancer.ingress[0].hostname}",
+                    f"jsonpath={SERVICE_HOSTNAME_JSONPATH}",
                 ),
                 capture=True,
             )
         ).strip()
         if hostname or time.monotonic() >= deadline:
             return hostname
-        time.sleep(5)
+        # Wake when the controller publishes the address, not up to 5s later.
+        bounded_kubectl_wait(
+            release,
+            service_hostname_wait_args(release, namespace, NLB_SERVICE),
+            seconds=min(SERVICE_HOSTNAME_POLL_SECONDS, deadline - time.monotonic()),
+        )
 
 
 def _require_record_target(

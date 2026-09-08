@@ -111,20 +111,37 @@ SCHEMA_JOB_MANIFESTS = (
 )
 
 
-def render_release_payload(release: Any) -> dict[str, Any]:
-    """The manifests and digests a release delivers, as one JSON-able payload."""
+def _payload_digest(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
-    return _render_release_payload(release)
+
+def render_release_payload(release: Any) -> dict[str, Any]:
+    """The manifests and digests a release delivers, as one JSON-able payload.
+
+    When the release carries an ``approved_manifest_digest`` -- the digest the
+    plan was reviewed and approved against -- the freshly rendered payload is
+    verified against it. Rendering reads the working tree, so re-reading it at
+    apply opens a TOCTOU window: the tree can change after the plan is approved
+    and before it is applied. Failing closed on a mismatch means the applied
+    artifact can only ever be the one that was planned.
+    """
+
+    payload = _render_release_payload(release)
+    approved = str(getattr(release, "approved_manifest_digest", "") or "")
+    if approved:
+        actual = _payload_digest(payload)
+        if actual != approved:
+            raise ReleaseError(
+                "release manifests changed between plan and apply: the working "
+                f"tree renders {actual} but the approved plan pinned {approved}"
+            )
+    return payload
 
 
 def rendered_release_manifest_sha256(release: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            render_release_payload(release),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    return _payload_digest(render_release_payload(release))
 
 
 def _render_release_payload(release: Any) -> dict[str, Any]:

@@ -24,11 +24,20 @@ from gpu_fault_release.regional_release_diff import (
     classify_release,
     diff_from_changed,
 )
+from gpu_fault_release.regional_release_orchestration import SUPERSEDABLE_PHASES
 from gpu_fault_release.regional_release_reporting import build_release_status
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_STATE_SHA256_ENV = "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256"
+# The operator's consent to open a new transaction for a different candidate
+# over a fail-forward transaction that stopped in `failed`/`partial-convergence`.
+# Set by `gpu-fault-admin deploy --supersede-failed-transaction` and read here,
+# travelling through the deploy's process chain as an environment variable like
+# `regional_schema_change.ACCEPT_SCHEMA_CHANGE_ENV`; `gpu_fault.admin.cli`
+# mirrors the spelling and a test pins the two equal.
+SUPERSEDE_FAILED_TRANSACTION_ENV = "GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION"
+SUPERSEDE_FAILED_TRANSACTION_FLAG = "--supersede-failed-transaction"
 RESUMABLE_PHASES = frozenset(
     {
         "preflight",
@@ -134,7 +143,110 @@ def _upgrade_resume_required(state: dict[str, Any]) -> bool:
     return str(state.get("phase") or "") in RESUMABLE_PHASES or _commit_pending(state)
 
 
+def supersede_requested(environment: dict[str, str] | None = None) -> bool:
+    """Whether this command carried ``--supersede-failed-transaction``."""
+
+    return bool(
+        (environment if environment is not None else os.environ)
+        .get(SUPERSEDE_FAILED_TRANSACTION_ENV, "")
+        .strip()
+    )
+
+
+def _terminal_failed_transaction(state: dict[str, Any]) -> bool:
+    """A fail-forward transaction that stopped: not mid-flight, not rolling back."""
+
+    return str(state.get("phase") or "") in SUPERSEDABLE_PHASES
+
+
+def _foreign_candidate(release: Any, state: dict[str, Any]) -> bool:
+    return str(state.get("release_id") or "") != str(release.release_id)
+
+
+def _refuse_foreign_candidate_resume(release: Any, state: dict[str, Any]) -> None:
+    """A failed fail-forward transaction only resumes the release that failed.
+
+    Before this check the mismatch surfaced deep in the engine as
+    ``resume release_id does not match the candidate``, which reads like a
+    tooling bug and names neither release nor the way out; live on 2026-09-07
+    the operator drove the engine from a hand-written script instead. The way
+    out is the supersede flag, and the message says so.
+    """
+
+    if not (_terminal_failed_transaction(state) and _foreign_candidate(release, state)):
+        return
+    raise ReleaseError(
+        f"release {state.get('release_id') or 'unknown'} stopped in phase "
+        f"{state.get('phase')} and the candidate {release.release_id} is a "
+        "different release; a failed fail-forward transaction only resumes the "
+        "release that failed. To open a new transaction for the candidate on "
+        "the last committed baseline, rerun the same deploy with "
+        f"{SUPERSEDE_FAILED_TRANSACTION_FLAG} (the components the failed release "
+        "already moved are re-rolled to the candidate)"
+    )
+
+
+def _require_supersede_target(release: Any, state: dict[str, Any] | None) -> None:
+    """Refuse the supersede flag anywhere it does not apply, naming why."""
+
+    if state is None:
+        raise ReleaseError(
+            f"{SUPERSEDE_FAILED_TRANSACTION_FLAG} requires a recorded release "
+            "transaction; this site has no release state yet"
+        )
+    phase = str(state.get("phase") or "") or "unknown"
+    if not _terminal_failed_transaction(state):
+        if phase in ROLLBACK_PHASES or _rollback_pending(state):
+            reason = "a rollback is in progress and must finish first"
+        elif _upgrade_resume_required(state):
+            reason = "the transaction is still resumable and belongs to no failure"
+        else:
+            reason = "there is no failed transaction to supersede"
+        raise ReleaseError(
+            f"{SUPERSEDE_FAILED_TRANSACTION_FLAG} only applies to a fail-forward "
+            f"transaction in {'/'.join(sorted(SUPERSEDABLE_PHASES))}; the recorded "
+            f"phase is {phase}: {reason}"
+        )
+    if not _foreign_candidate(release, state):
+        raise ReleaseError(
+            f"{SUPERSEDE_FAILED_TRANSACTION_FLAG} is for a different candidate; "
+            f"{release.release_id} is the release that failed, so rerun deploy "
+            "without the flag to resume it"
+        )
+
+
+def supersede_release_diff(release: Any, state: dict[str, Any]) -> ReleaseDiff:
+    """The diff a superseding transaction rolls: everything the candidate changes
+    against the committed baseline, plus everything the failed release moved.
+
+    ``retry_release_diff`` is exactly that union. The failed state's top-level
+    fields are the failed candidate's, so ``classify_release`` against it finds
+    every component where the new candidate differs from the failed one; the
+    persisted ``release_diff`` names every component the failed candidate
+    differed from the committed baseline in, whether or not it got to move it.
+    A component that differs between the new candidate and the committed
+    baseline is in one of those two sets, and a component the failed release
+    moved is in the second even when the new candidate matches the baseline
+    there -- it has to be rolled back to the baseline value, which only a
+    rollout of the new candidate does. The artifact checks against ``previous``
+    add the physical wheel/bundle names the digest fields do not carry.
+    """
+
+    return retry_release_diff(release, state)
+
+
 def next_deploy(release: Any, state: dict[str, Any]) -> dict[str, Any]:
+    if (
+        supersede_requested()
+        and _terminal_failed_transaction(state)
+        and _foreign_candidate(release, state)
+    ):
+        return {
+            **supersede_release_diff(release, state).as_dict(),
+            "resume": False,
+            "action": "upgrade",
+            "supersedes_release_id": state.get("release_id"),
+        }
     if _rollback_pending(state):
         return {
             **retry_release_diff(release, state).as_dict(),
@@ -226,6 +338,30 @@ def ensure_schema(release: Any) -> None:
     )
 
 
+def apply_rds_ca_bundle(release: Any) -> None:
+    """Ship the pinned AWS RDS CA bundle ConfigMap into the CPU namespace (M-6).
+
+    The control-plane DSN uses ``sslmode=verify-full`` (see
+    ``gpu_fault.admin.bootstrap._aurora_dsn``), so the schema-ensure Job, the
+    control-plane Deployment, the Aurora migration Jobs and the credential
+    refresh CronJob all mount ``gpu-fault-rds-ca-bundle`` non-optionally and set
+    ``GPU_FAULT_RDS_CA_BUNDLE`` at the mount path. This must run before any of
+    those Aurora consumers, or they stay in ``CreateContainerConfigError`` --
+    fail closed rather than fall back to an unverified connection. The bundle is
+    fetched from the official AWS truststore and checked against the pin baked
+    into the script; a digest mismatch aborts the deploy.
+    """
+
+    release.runner.run(
+        ["bash", str(ROOT / "deploy/control-plane/tools/apply-rds-ca-bundle.sh")],
+        env={
+            **os.environ,
+            "KUBECONFIG": release.config.cpu_kubeconfig,
+            "GPU_FAULT_NAMESPACE": release.config.namespace,
+        },
+    )
+
+
 def bootstrap_cpu_is_current(release: Any) -> bool:
     try:
         metadata = release._config_map_data("gpu-fault-release-metadata")
@@ -299,6 +435,11 @@ def run_deploy(release: Any) -> None:
             "regional release state disappeared after the deployment diff was calculated"
         )
     state = release._load_state() if state_exists else None
+    supersede = supersede_requested()
+    if supersede:
+        # The flag is consent to one specific thing; anywhere else it is refused
+        # with the reason rather than ignored, so it cannot become a habit.
+        _require_supersede_target(release, state)
     bootstrap_required = not state_exists or (
         state is not None and state.get("phase") in BOOTSTRAP_PHASES
     )
@@ -308,6 +449,12 @@ def run_deploy(release: Any) -> None:
                 "initial regional bootstrap requires at least one GPU cluster; "
                 "an empty cluster set is only valid after a completed deployment"
             )
+        # Resuming a partial bootstrap (state exists and its phase is a bootstrap
+        # phase): pin the digest that bootstrap was first planned against so the
+        # resumed apply refuses a working tree that drifted since it started
+        # (M-23). A fresh bootstrap (no prior state) leaves the pin unset.
+        if state is not None:
+            release.pin_approved_manifest_plan(state.get("approved_manifest_sha256"))
         release.bootstrap()
         return
     assert state is not None
@@ -321,9 +468,29 @@ def run_deploy(release: Any) -> None:
     if _commit_cleanup_pending(state):
         release.commit_release()
         return
-    if _upgrade_resume_required(state) or phase == "rolled-back":
+    if supersede:
+        # A new transaction for a different candidate over a stopped fail-forward
+        # one: not a resume, so no plan pin (M-23 originates a fresh digest), a
+        # baseline inherited from the failed transaction, and a diff that covers
+        # everything the failed release moved (`supersede_release_diff`).
         release.upgrade(
-            resume=_upgrade_resume_required(state),
+            resume=False,
+            diff=supersede_release_diff(release, state),
+            supersede=state,
+        )
+        return
+    _refuse_foreign_candidate_resume(release, state)
+    if _upgrade_resume_required(state) or phase == "rolled-back":
+        resume_required = _upgrade_resume_required(state)
+        # Only a genuine resume pins the approved plan (M-23): the persisted
+        # digest belongs to the in-progress transaction, so enforcing it on the
+        # resumed apply refuses a tree that drifted since the plan. A bare
+        # "rolled-back" re-entry renders a different (previous) manifest set, so
+        # it must not be pinned to the interrupted transaction's digest.
+        if resume_required:
+            release.pin_approved_manifest_plan(state.get("approved_manifest_sha256"))
+        release.upgrade(
+            resume=resume_required,
             diff=retry_release_diff(release, state),
         )
         return
@@ -379,6 +546,14 @@ def run_resume(release: Any) -> None:
             "resume requires an incomplete upgrade or rollback transaction; "
             f"current phase is {phase or 'unknown'}"
         )
+    # `resume` is the low-level same-release command; a different candidate is
+    # refused here with the deploy flag named rather than by the engine's
+    # release_id mismatch, which reads like a tooling bug.
+    _refuse_foreign_candidate_resume(release, state)
+    # Resume enforces the digest the transaction was planned against (M-23), so
+    # a working tree edited between the interrupted apply and this resume is
+    # refused rather than silently applied.
+    release.pin_approved_manifest_plan(state.get("approved_manifest_sha256"))
     release.upgrade(
         resume=True,
         diff=retry_release_diff(release, state),

@@ -163,3 +163,20 @@ class InstallationResourceSnapshot(StrictModel):
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+
+    def require_source_binding(self) -> Self:
+        """Reject a snapshot that is not bound to its own content digest.
+
+        ``source_sha256`` is the provenance seal a persisted snapshot carries.
+        It is optional so a freshly built snapshot can be minted and then sealed
+        (the builders ``model_copy`` the digest in, which bypasses validation),
+        but any record read back from disk and trusted as installed state must
+        carry a seal that matches its content. A ``None`` seal (an unsealed or
+        stripped snapshot) or a mismatched one has no verifiable origin, so it is
+        refused here rather than trusted as authoritative.
+        """
+        if self.source_sha256 is None:
+            raise ValueError("installation resource snapshot is not sealed")
+        if self.source_sha256 != self.digest():
+            raise ValueError("installation resource snapshot digest mismatch")
+        return self

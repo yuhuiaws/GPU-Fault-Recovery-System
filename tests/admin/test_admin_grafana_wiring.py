@@ -175,7 +175,7 @@ def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
                     {
                         "Role": {
                             "AssumeRolePolicyDocument": (
-                                admin_bootstrap_services.pod_identity_trust()
+                                admin_bootstrap_services.pod_identity_trust(_cluster())
                             ),
                             "Tags": [
                                 {

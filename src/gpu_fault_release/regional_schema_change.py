@@ -122,6 +122,7 @@ def resolve_acceptance(
     *,
     changed: set[str] | frozenset[str],
     resume: bool,
+    inherited: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """The acceptance this transaction runs under, or None when none is needed.
 
@@ -130,6 +131,13 @@ def resolve_acceptance(
     resume command is ignored in favour of the recorded one (the snapshot named
     there is the one that exists). Refuses -- before anything moves -- when the
     schema changes, automatic rollback is on, and nobody accepted.
+
+    ``inherited`` is the acceptance of a failed transaction this one supersedes
+    (``--supersede-failed-transaction``). It is carried only when it names the
+    schema version this candidate requires: that schema already moved under the
+    earlier consent and the snapshot named there is the one that exists. A
+    candidate that requires yet another version is a new schema change, and the
+    ordinary rule applies -- refuse unless this command accepted it.
     """
 
     if not schema_change_needs_acceptance(self.config, changed):
@@ -138,6 +146,10 @@ def resolve_acceptance(
         recorded = recorded_acceptance(self._load_state())
         if recorded is not None:
             return recorded
+    if inherited is not None:
+        accepted_version = int(inherited.get("database_schema_version") or 0)
+        if accepted_version == int(self.config.database_schema_version):
+            return dict(inherited)
     mode = requested_acceptance_mode()
     if mode is None:
         raise ReleaseError(refusal_message())

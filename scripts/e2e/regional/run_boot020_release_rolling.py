@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -18,7 +20,10 @@ from gpu_fault_release import regional_deployment_inventory  # noqa: E402
 from gpu_fault_release import regional_release_config  # noqa: E402
 from gpu_fault_release import regional_release_diff  # noqa: E402
 from gpu_fault_release import rollout as rollout_regional_release  # noqa: E402
-from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder  # noqa: E402
+from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    EvidenceRecorder,
+    utc_now,
+)
 
 CASE_ID = "GF-REGIONAL-BOOT-020"
 CONFIRMATION = "RUN_BOOT020_RELEASE_ROLLING"
@@ -159,6 +164,36 @@ STAGE_TERMINAL_KEY = {
 }
 
 
+def _passed_marker(stage: str) -> str:
+    """The record written only once every assertion in ``stage`` has passed.
+
+    ``STAGE_TERMINAL_KEY`` proves a stage recorded its last observation, but the
+    terminal assertions run *after* that record, so a stage can hold its
+    terminal key and still have failed. This marker is written strictly last, so
+    its presence is the only proof a stage may be replayed on a resume.
+    """
+
+    return f"{stage}_passed"
+
+
+def _stage_owns(key: str, stage: str) -> bool:
+    return key == stage or key.startswith(f"{stage}_")
+
+
+def resume_target(document: dict[str, Any]) -> tuple[int, str | None]:
+    """The first stage the evidence does not record as fully passed.
+
+    Returns its index and name, or ``(len(STAGES), None)`` when every stage
+    already carries its end-of-stage marker and there is nothing to resume.
+    """
+
+    stages = document.get("stages", {})
+    for index, stage in enumerate(STAGES):
+        if _passed_marker(stage) not in stages:
+            return index, stage
+    return len(STAGES), None
+
+
 def _assert_next_noop(
     backend: ReleaseRollingBackend,
     recorder: EvidenceRecorder,
@@ -177,32 +212,99 @@ def _assert_next_noop(
     assert following["kind"] == "NOOP", following
 
 
-def _stage_noop(backend: ReleaseRollingBackend, recorder: EvidenceRecorder) -> None:
+class _SnapshotChain:
+    """Hand a stage's fresh ``*_after`` snapshot to the next stage's ``*_before``.
+
+    A live snapshot costs 20-30 s of kubectl reads. Between stage N's
+    ``*_after`` and stage N+1's ``*_before`` this driver only classifies (a
+    read-only ``classify_release``) and writes recorder markers, so the two
+    would observe the same live state and the second read is pure cost.
+
+    The reuse is allowed only when the ``*_after`` was observed by this very
+    process: a record replayed from the evidence file describes an older
+    observation, and a ``--resume`` or ``--start-stage`` run has a convergence
+    deploy or an unknown history between the file's ``*_after`` and now. Those
+    paths, and ``noop_before`` (no predecessor), always observe afresh. A
+    reused record carries ``reused_from`` so the evidence says what it is, and
+    its ``next_deploy`` -- the one config-dependent field, informational only --
+    is the new stage's own classification, which is what a fresh
+    ``next_deploy`` returns for a committed ``complete`` release.
+    """
+
+    def __init__(self) -> None:
+        self._carry: tuple[str, dict[str, Any]] | None = None
+
+    def after(
+        self,
+        backend: ReleaseRollingBackend,
+        recorder: EvidenceRecorder,
+        stage: str,
+    ) -> dict[str, Any]:
+        key = f"{stage}_after"
+        fresh = False
+
+        def observe() -> dict[str, Any]:
+            nonlocal fresh
+            fresh = True
+            return backend.snapshot(stage)
+
+        value = recorder.stage(key, observe)
+        self._carry = (key, value) if fresh else None
+        return value
+
+    def before(
+        self,
+        backend: ReleaseRollingBackend,
+        recorder: EvidenceRecorder,
+        stage: str,
+        classification: dict[str, Any],
+    ) -> dict[str, Any]:
+        carry, self._carry = self._carry, None
+        index = STAGES.index(stage)
+        predecessor = f"{STAGES[index - 1]}_after" if index else None
+
+        def observe() -> dict[str, Any]:
+            if carry is not None and carry[0] == predecessor:
+                return {
+                    **copy.deepcopy(carry[1]),
+                    "next_deploy": copy.deepcopy(classification),
+                    "reused_from": carry[0],
+                }
+            return backend.snapshot(stage)
+
+        return recorder.stage(f"{stage}_before", observe)
+
+
+def _stage_noop(
+    backend: ReleaseRollingBackend,
+    recorder: EvidenceRecorder,
+    chain: _SnapshotChain,
+) -> None:
     noop_diff = recorder.stage("noop_classification", lambda: backend.classify("noop"))
     _assert_kind("noop", noop_diff)
+    # The first observation of the run: nothing precedes it, so it is never
+    # reused from an earlier snapshot.
     noop_before = recorder.stage("noop_before", lambda: backend.snapshot("noop"))
     noop_apply = recorder.stage(
         "noop_apply",
         lambda: backend.deploy("noop", diff=noop_diff),
     )
     assert noop_apply["phase"] == "complete", noop_apply
-    noop_after = recorder.stage("noop_after", lambda: backend.snapshot("noop"))
+    noop_after = chain.after(backend, recorder, "noop")
     _assert_noop(noop_before, noop_after)
 
 
 def _stage_control_plane(
     backend: ReleaseRollingBackend,
     recorder: EvidenceRecorder,
+    chain: _SnapshotChain,
 ) -> None:
     control_diff = recorder.stage(
         "control_plane_classification",
         lambda: backend.classify("control_plane"),
     )
     _assert_kind("control_plane", control_diff)
-    control_before = recorder.stage(
-        "control_plane_before",
-        lambda: backend.snapshot("control_plane"),
-    )
+    control_before = chain.before(backend, recorder, "control_plane", control_diff)
     control_failed = recorder.stage(
         "control_plane_injected_failure_and_rollback",
         lambda: backend.deploy(
@@ -225,10 +327,7 @@ def _stage_control_plane(
         lambda: backend.deploy("control_plane", diff=control_diff),
     )
     assert control_apply["phase"] == "complete", control_apply
-    control_after = recorder.stage(
-        "control_plane_after",
-        lambda: backend.snapshot("control_plane"),
-    )
+    control_after = chain.after(backend, recorder, "control_plane")
     _assert_control_plane_only(control_before, control_after)
     _assert_next_noop(backend, recorder, "control_plane")
 
@@ -236,16 +335,14 @@ def _stage_control_plane(
 def _stage_executor(
     backend: ReleaseRollingBackend,
     recorder: EvidenceRecorder,
+    chain: _SnapshotChain,
 ) -> None:
     executor_diff = recorder.stage(
         "executor_classification",
         lambda: backend.classify("executor"),
     )
     _assert_kind("executor", executor_diff)
-    executor_before = recorder.stage(
-        "executor_before",
-        lambda: backend.snapshot("executor"),
-    )
+    executor_before = chain.before(backend, recorder, "executor", executor_diff)
     executor_rolled_back = recorder.stage(
         "executor_injected_failure_and_rollback",
         lambda: backend.deploy(
@@ -285,24 +382,22 @@ def _stage_executor(
     )
     assert executor_resumed["phase"] == "complete", executor_resumed
     _assert_resume_rto("executor", executor_resumed)
-    executor_after = recorder.stage(
-        "executor_after",
-        lambda: backend.snapshot("executor"),
-    )
+    executor_after = chain.after(backend, recorder, "executor")
     _assert_data_plane_changed(executor_before, executor_after)
     _assert_next_noop(backend, recorder, "executor")
 
 
-def _stage_agent(backend: ReleaseRollingBackend, recorder: EvidenceRecorder) -> None:
+def _stage_agent(
+    backend: ReleaseRollingBackend,
+    recorder: EvidenceRecorder,
+    chain: _SnapshotChain,
+) -> None:
     agent_diff = recorder.stage(
         "agent_classification",
         lambda: backend.classify("agent"),
     )
     _assert_kind("agent", agent_diff)
-    agent_before = recorder.stage(
-        "agent_before",
-        lambda: backend.snapshot("agent"),
-    )
+    agent_before = chain.before(backend, recorder, "agent", agent_diff)
     agent_failed = recorder.stage(
         "agent_injected_failure_and_rollback",
         lambda: backend.deploy(
@@ -325,24 +420,22 @@ def _stage_agent(backend: ReleaseRollingBackend, recorder: EvidenceRecorder) -> 
         lambda: backend.deploy("agent", diff=agent_diff),
     )
     assert agent_apply["phase"] == "complete", agent_apply
-    agent_after = recorder.stage(
-        "agent_after",
-        lambda: backend.snapshot("agent"),
-    )
+    agent_after = chain.after(backend, recorder, "agent")
     _assert_data_plane_changed(agent_before, agent_after)
     _assert_next_noop(backend, recorder, "agent")
 
 
-def _stage_full(backend: ReleaseRollingBackend, recorder: EvidenceRecorder) -> None:
+def _stage_full(
+    backend: ReleaseRollingBackend,
+    recorder: EvidenceRecorder,
+    chain: _SnapshotChain,
+) -> None:
     full_diff = recorder.stage(
         "full_classification",
         lambda: backend.classify("full"),
     )
     _assert_kind("full", full_diff)
-    full_before = recorder.stage(
-        "full_before",
-        lambda: backend.snapshot("full"),
-    )
+    full_before = chain.before(backend, recorder, "full", full_diff)
     full_failed = recorder.stage(
         "full_injected_failure_and_rollback",
         lambda: backend.deploy(
@@ -365,15 +458,15 @@ def _stage_full(backend: ReleaseRollingBackend, recorder: EvidenceRecorder) -> N
         lambda: backend.deploy("full", diff=full_diff),
     )
     assert full_apply["phase"] == "complete", full_apply
-    full_after = recorder.stage(
-        "full_after",
-        lambda: backend.snapshot("full"),
-    )
+    full_after = chain.after(backend, recorder, "full")
     assert full_after["live"] != full_before["live"], (full_before, full_after)
     _assert_next_noop(backend, recorder, "full")
 
 
-STAGE_RUNNERS = {
+STAGE_RUNNERS: dict[
+    str,
+    Callable[[ReleaseRollingBackend, EvidenceRecorder, _SnapshotChain], None],
+] = {
     "noop": _stage_noop,
     "control_plane": _stage_control_plane,
     "executor": _stage_executor,
@@ -396,11 +489,16 @@ def run_release_rolling(
     when the evidence already holds each skipped stage's terminal record, and
     the resume is itself recorded so the report shows where the run restarted.
     A driver defect found mid-run then costs one stage, not the ~2 h whole.
+
+    Snapshots are chained: a stage's freshly observed ``*_after`` becomes the
+    next stage's ``*_before`` (see ``_SnapshotChain``). The chain starts empty
+    here, so whatever stage a run begins at observes its own ``*_before``.
     """
 
     if start_stage not in STAGES:
         raise ValueError(f"unknown BOOT-020 stage: {start_stage}")
     start = STAGES.index(start_stage)
+    chain = _SnapshotChain()
     try:
         if start:
             missing = [
@@ -426,11 +524,140 @@ def run_release_rolling(
                 },
             )
         for stage in STAGES[start:]:
-            STAGE_RUNNERS[stage](backend, recorder)
+            STAGE_RUNNERS[stage](backend, recorder, chain)
+            recorder.stage(
+                _passed_marker(stage),
+                lambda stage=stage: {"stage": stage, "passed_at": utc_now()},
+            )
         return recorder.complete()
     except BaseException as exc:
         recorder.fail(exc)
         raise
+
+
+def _discard_incomplete(recorder: EvidenceRecorder, index: int) -> list[str]:
+    """Drop the resume stage's partial records and every later stage's records.
+
+    The resume stage failed a driver assertion, so its recorded sub-stages were
+    taken against a live state the convergence is about to move; replaying them
+    would compare stale observations. Earlier, passed stages are left intact so
+    they still replay. Resume markers are dropped too so the resume re-records
+    where it restarted.
+    """
+
+    targets = STAGES[index:]
+    doomed = [
+        key
+        for key in recorder.document["stages"]
+        if key.startswith("resumed_at_")
+        or any(_stage_owns(key, stage) for stage in targets)
+    ]
+    return recorder.drop_stages(doomed)
+
+
+def _converge_to_precondition(
+    backend: ReleaseRollingBackend,
+    recorder: EvidenceRecorder,
+    index: int,
+) -> dict[str, Any]:
+    """Bring the live release back to the resume stage's precondition.
+
+    The resume stage begins by classifying its config against the state the
+    previous stage left, and asserting the classification. A failed stage's
+    auto-rollback left the live state at that precondition already, but pinned
+    at ``rolled-back``; classifying and deploying the previous stage's config is
+    a NOOP that clears the phase to ``complete`` without touching artifacts. In
+    the rarer case where the stage failed after applying its own config, the
+    same deploy really rolls the artifacts back to the precondition. Either way
+    the resume then runs exactly as a first pass would. This folds the
+    hand-written convergence step into the driver.
+    """
+
+    scenario = STAGES[index - 1]
+    diff = backend.classify(scenario)
+    applied = backend.deploy(scenario, diff=diff)
+    if applied.get("phase") != "complete":
+        raise RuntimeError(
+            f"BOOT-020 could not converge the live state to the {scenario} "
+            f"precondition before resuming: {applied}"
+        )
+    history = list(recorder.document.get("convergence", []))
+    history.append(
+        {
+            "converged_to": scenario,
+            "classification": diff,
+            "phase": applied.get("phase"),
+            "at": utc_now(),
+        }
+    )
+    recorder.note("convergence", history)
+    return applied
+
+
+def resume_release_rolling(
+    backend: ReleaseRollingBackend,
+    recorder: EvidenceRecorder,
+) -> dict[str, Any]:
+    """Continue a BOOT-020 run from the first stage its evidence lacks a pass.
+
+    Unlike ``--start-stage``, the resume point is read from the evidence, the
+    failed stage's partial records are discarded so it runs again from its
+    classification, and the live release state is converged back to that stage's
+    precondition first. A driver defect then costs the failed stage, not the
+    whole ~2 h contract, and no verdict changes: every assertion runs as it
+    would on a first pass.
+    """
+
+    index, stage = resume_target(recorder.document)
+    if stage is None:
+        return recorder.complete()
+    _discard_incomplete(recorder, index)
+    if index:
+        _converge_to_precondition(backend, recorder, index)
+    return run_release_rolling(backend, recorder, start_stage=stage)
+
+
+def _read_snapshot(release: Any):
+    """The engine's read snapshot when the release offers one, else a no-op.
+
+    Inside it every read-only ``kubectl get`` is served once from one
+    observation, and a nested ``read_snapshot`` -- ``_capture_previous`` opens
+    its own -- joins the outer one instead of discarding its warm cache.
+    """
+
+    factory = getattr(release, "_read_snapshot", None)
+    return factory() if callable(factory) else nullcontext()
+
+
+def deployment_generations(
+    release: Any,
+    args: list[str],
+    names: tuple[str, ...],
+) -> dict[str, int]:
+    """``metadata.generation`` of each named Deployment from ONE list read.
+
+    ``args`` is the kube-context prefix (``release._cpu()`` or
+    ``release._gpu(target)``); the argv is built exactly as the engine's
+    ``prime_deployment_snapshot`` builds it, so inside a read snapshot the list
+    ``_capture_previous`` already primed answers this without another kubectl
+    call. A Deployment absent from the list reads as generation 0 -- the value
+    the former per-name read fell back to when kubectl returned nothing (a
+    per-name read of a missing object would have raised instead; the compared
+    dicts keep the same key set either way, so no verdict moves).
+    """
+
+    listing = release._get_json(
+        args + ["-n", release.config.namespace, "get", "deployment"]
+    )
+    found: dict[str, int] = {}
+    for item in listing.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata", {}) or {}
+        name = metadata.get("name")
+        if name in names:
+            found[str(name)] = int(metadata.get("generation", 0))
+    return {name: found.get(name, 0) for name in names}
 
 
 class LiveReleaseRollingBackend:
@@ -458,45 +685,52 @@ class LiveReleaseRollingBackend:
         state = release._load_state()
         return self.diff_module.classify_release(release, state).as_dict()
 
+    def _next_deploy(self, release: Any, state: dict[str, Any]) -> Any:
+        """What ``build_release_summary(release)["next_deploy"]`` would hold.
+
+        ``build_release_summary`` first builds the whole release status
+        (metadata ConfigMap, wheel and template reads per cluster) that this
+        snapshot never records, then calls ``next_deploy(release, state)`` on a
+        state it re-loads; calling ``next_deploy`` on the state already loaded
+        yields the identical value. The summary swallowed a failure into
+        ``next_deploy_error`` and the snapshot recorded ``None`` for the field,
+        so that is kept -- the field is informational, never asserted.
+        """
+
+        try:
+            return self.commands.next_deploy(release, state)
+        except Exception:
+            return None
+
     def snapshot(self, scenario: str) -> dict[str, Any]:
+        """Observe the live release once.
+
+        Everything runs inside one read snapshot: the state ConfigMap is read
+        once and shared with ``_capture_previous`` (its own nested snapshot
+        joins this one), ``next_deploy`` reuses the reads the capture made,
+        and the generations come from the ``get deployment`` lists the capture
+        already primed -- one per kube context -- instead of one ``kubectl``
+        per Deployment. ``live`` is the engine's full previous-release capture,
+        untouched; only how it and the generations are read changed.
+        """
+
         release = self._release(scenario)
-        state = release._load_state()
-        live = release._capture_previous()
-        summary = self.commands.build_release_summary(release)
-        cpu_generations = {
-            name: int(
-                release._get_json(
-                    release._cpu(
-                        "-n",
-                        release.config.namespace,
-                        "get",
-                        "deployment",
-                        name,
-                    )
-                )
-                .get("metadata", {})
-                .get("generation", 0)
+        with _read_snapshot(release):
+            state = release._load_state()
+            live = release._capture_previous()
+            next_deploy = self._next_deploy(release, state)
+            cpu_generations = deployment_generations(
+                release,
+                release._cpu(),
+                self.inventory.CPU_RUNTIME_DEPLOYMENTS,
             )
-            for name in self.inventory.CPU_RUNTIME_DEPLOYMENTS
-        }
-        gpu_generations = {}
-        for target in release.config.clusters:
-            gpu_generations[target.cluster_id] = {
-                name: int(
-                    release._get_json(
-                        release._gpu(
-                            target,
-                            "-n",
-                            release.config.namespace,
-                            "get",
-                            "deployment",
-                            name,
-                        )
-                    )
-                    .get("metadata", {})
-                    .get("generation", 0)
+            gpu_generations = {
+                target.cluster_id: deployment_generations(
+                    release,
+                    release._gpu(target),
+                    self.inventory.DEPLOYMENTS,
                 )
-                for name in self.inventory.DEPLOYMENTS
+                for target in release.config.clusters
             }
         return {
             "phase": state.get("phase"),
@@ -504,7 +738,7 @@ class LiveReleaseRollingBackend:
             "live": live,
             "cpu_generations": cpu_generations,
             "gpu_generations": gpu_generations,
-            "next_deploy": summary.get("next_deploy"),
+            "next_deploy": next_deploy,
         }
 
     def _diff(self, value: dict[str, Any]):
@@ -587,11 +821,26 @@ def parser() -> argparse.ArgumentParser:
             "earlier stages' recorded results"
         ),
     )
+    value.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "resume automatically: read the evidence, converge the live state "
+            "back to the first unfinished stage's precondition, and restart "
+            "only that stage. Chooses the stage for you; do not pass "
+            "--start-stage with it"
+        ),
+    )
     return value
 
 
 def main() -> int:
     arguments = parser().parse_args()
+    if arguments.resume and arguments.start_stage != "noop":
+        raise SystemExit(
+            "--resume chooses the stage from the evidence; do not also pass "
+            "--start-stage"
+        )
     configs = {
         "noop": arguments.noop_config.resolve(),
         "control_plane": arguments.control_plane_config.resolve(),
@@ -615,7 +864,8 @@ def main() -> int:
             else os.getenv("KUBECONFIG")
         ),
         "configs": {name: str(path) for name, path in configs.items()},
-        "start_stage": arguments.start_stage,
+        "start_stage": "auto (--resume)" if arguments.resume else arguments.start_stage,
+        "resume": arguments.resume,
         "stages": [
             "verify NOOP makes no live artifact change",
             "assert CPU-only rollback T_safe and T_full",
@@ -641,11 +891,15 @@ def main() -> int:
         case_id=CASE_ID,
         inputs=inputs,
     )
-    result = run_release_rolling(
-        LiveReleaseRollingBackend(configs),
-        recorder,
-        start_stage=arguments.start_stage,
-    )
+    backend = LiveReleaseRollingBackend(configs)
+    if arguments.resume:
+        result = resume_release_rolling(backend, recorder)
+    else:
+        result = run_release_rolling(
+            backend,
+            recorder,
+            start_stage=arguments.start_stage,
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

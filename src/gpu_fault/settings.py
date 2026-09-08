@@ -57,8 +57,14 @@ class StoreSettings:
             postgres_pool_timeout_seconds=float(
                 values.get("GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS", "2")
             ),
+            # Default OFF: schema creation/alteration is a privileged, one-time
+            # migration concern, not something every API/worker replica should
+            # do on boot. Auto-init defaulting to True let any process with the
+            # store URL create or alter tables; the deploy/migration paths that
+            # legitimately need it set GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT
+            # explicitly (the generated regional configs already ship "false").
             postgres_auto_schema_init=env_bool(
-                "GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT", True, environ=values
+                "GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT", False, environ=values
             ),
         )
 
@@ -263,10 +269,26 @@ class ControlPlaneSettings:
                 "active executor requires an explicit "
                 "GPU_FAULT_ALLOWED_OPERATIONS allowlist"
             )
-        regional_mode = (
+        # The two modes are not equivalent in security: regional enforces
+        # per-cluster tenancy/authorization that single-cluster relaxes. The old
+        # ``== "regional"`` test treated *every* other value -- including a typo
+        # like "regionl" or an empty string -- as single-cluster, silently
+        # downgrading to the less isolated mode. Parse it explicitly so an
+        # unrecognised value fails closed instead. An unset value still resolves
+        # to single-cluster, but that path additionally requires the operator to
+        # opt in with GPU_FAULT_ALLOW_SINGLE_CLUSTER=true below, so the insecure
+        # mode is never selected without an explicit choice.
+        deployment_mode = (
             values.get("GPU_FAULT_DEPLOYMENT_MODE", "single-cluster").strip().lower()
-            == "regional"
         )
+        if deployment_mode not in ("regional", "single-cluster"):
+            raise RuntimeError(
+                "GPU_FAULT_DEPLOYMENT_MODE must be 'regional' or "
+                f"'single-cluster'; refusing to guess from {deployment_mode!r} "
+                "(an unrecognised value must not silently select the less "
+                "isolated single-cluster mode)"
+            )
+        regional_mode = deployment_mode == "regional"
         raw_clusters = values.get("GPU_FAULT_REGIONAL_CLUSTERS_JSON", "")
         cluster_values: tuple[dict, ...] = ()
         if raw_clusters:

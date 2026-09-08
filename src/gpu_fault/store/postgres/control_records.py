@@ -182,12 +182,26 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
         self,
         node_ids: set[str],
         actions: set[RecoveryAction],
+        cluster_id: str | None = None,
     ) -> list[NodeMarker]:
         if not node_ids or not actions:
             return []
+        # Tenant scope (H-14): when a cluster is given, require an exact match
+        # on the stamped cluster_id. A legacy marker whose cluster_id is JSON
+        # null yields SQL NULL here and so is excluded -- it is never matched
+        # to a specific cluster, so a colliding node_id in another tenant
+        # cannot read it.
+        tenant_clause = ""
+        parameters: list[object] = [
+            sorted(action.value for action in actions),
+            sorted(node_ids),
+        ]
+        if cluster_id is not None:
+            tenant_clause = "  AND payload->>'cluster_id'=%s\n"
+            parameters.append(cluster_id)
         with self._db.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT payload
                 FROM gpu_fault_objects
                 WHERE kind='marker'
@@ -195,12 +209,9 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                   AND payload->>'trusted'='true'
                   AND payload->>'recommended_action'=ANY(%s)
                   AND payload->'scope'->'node_ids' ?| %s
-                ORDER BY payload->>'observed_at' DESC, key DESC
+                {tenant_clause}                ORDER BY payload->>'observed_at' DESC, key DESC
                 """,
-                (
-                    sorted(action.value for action in actions),
-                    sorted(node_ids),
-                ),
+                tuple(parameters),
             )
             rows = cursor.fetchall()
         return [self._decode("marker", row[0]) for row in rows]

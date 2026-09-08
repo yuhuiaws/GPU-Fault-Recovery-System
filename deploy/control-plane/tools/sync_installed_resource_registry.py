@@ -203,6 +203,36 @@ def _identity(resource: dict[str, Any]) -> tuple[str, str]:
     return resource["kind"], resource["name"]
 
 
+PROVENANCE_KEY = "provenance_sha256"
+
+
+def _canonical_payload(resource: dict[str, Any]) -> bytes:
+    payload = {key: value for key, value in resource.items() if key != PROVENANCE_KEY}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _provenance_digest(resource: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_payload(resource)).hexdigest()
+
+
+def stamp_provenance(resource: dict[str, Any]) -> dict[str, Any]:
+    """Return the resource carrying a provenance digest over its full payload.
+
+    The digest covers every field except the digest itself, so any later edit
+    to a recorded entry -- an injected resource, a flipped `clean` verb, a
+    renamed target -- no longer matches and the entry stops being authoritative.
+    """
+
+    stamped = {key: value for key, value in resource.items() if key != PROVENANCE_KEY}
+    stamped[PROVENANCE_KEY] = _provenance_digest(stamped)
+    return stamped
+
+
+def provenance_is_verified(resource: dict[str, Any]) -> bool:
+    recorded = resource.get(PROVENANCE_KEY)
+    return bool(recorded) and recorded == _provenance_digest(resource)
+
+
 def synchronize(
     kubectl: Kubectl,
     *,
@@ -214,8 +244,12 @@ def synchronize(
 ) -> dict[str, Any]:
     source_text = inventory_path.read_text(encoding="utf-8")
     source = json.loads(source_text)
+    # Candidates come from the design inventory, whose integrity the document's
+    # `source_sha256` already covers, so each is stamped with a provenance digest
+    # over its own payload as it is admitted.
     candidates = {
-        _identity(resource): resource for resource in source[plane]["resources"]
+        _identity(resource): stamp_provenance(resource)
+        for resource in source[plane]["resources"]
     }
     existing_document = _registry(kubectl, namespace)
     if existing_document is not None and existing_document.get("plane") != plane:
@@ -228,9 +262,21 @@ def synchronize(
         *candidates,
         *sorted(set(existing) - set(candidates)),
     ]
-    resources = [
-        candidates.get(identity) or existing[identity] for identity in identities
-    ]
+    resources = []
+    for identity in identities:
+        candidate = candidates.get(identity)
+        if candidate is not None:
+            resources.append(candidate)
+            continue
+        # The design inventory no longer names this resource, so the only record
+        # of it is the mutable live ConfigMap. Retain it as authoritative only
+        # when its recorded provenance re-verifies against its own payload;
+        # otherwise a hand-edited or injected entry would be trusted without
+        # provenance. Drop it (rather than raise) so a forged entry cannot wedge
+        # every subsequent sync.
+        retained = existing[identity]
+        if provenance_is_verified(retained):
+            resources.append(retained)
     live = _live_identities(kubectl, namespace, resources)
     installed = [resource for resource in resources if _identity(resource) in live]
     document = {

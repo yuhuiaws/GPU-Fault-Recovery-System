@@ -625,6 +625,83 @@ def test_node_log_does_not_treat_efa_plugin_name_as_rdma_fault() -> None:
     assert findings == []
 
 
+def _mce_log_batch(source: str) -> NodeLogBatch:
+    return NodeLogBatch(
+        batch_id=f"mce-from-{source}",
+        cluster_id="cluster-a",
+        node_id="node-a",
+        collected_at=NOW,
+        entries=[
+            NodeLogEntry(
+                entry_id=f"entry-{source}",
+                source=source,
+                observed_at=NOW,
+                message="mce: Hardware Error: Machine check uncorrectable",
+            )
+        ],
+    )
+
+
+def test_fatal_log_rule_from_training_log_produces_no_trusted_marker() -> None:
+    """H-5: a workload-writable origin cannot forge a hardware-fatal fault.
+
+    The MCE rule drives QUARANTINE. A training log is a file the job writes,
+    so a job could otherwise print the kernel's machine-check text and have it
+    isolate the node. The trusted-source gate must drop the line entirely.
+    """
+
+    policy = NodeHealthPolicy(build_store())
+
+    findings = policy.evaluate_logs(_mce_log_batch("training-log"))
+
+    assert findings == []
+
+
+def test_fatal_log_rule_from_dmesg_produces_a_trusted_quarantine_marker() -> None:
+    """H-5 green half: the same text from the kernel ring buffer still fires.
+
+    Gating on origin must not blind the system to a real hardware fault, and
+    the resulting marker is trusted and stamped with its tenant (H-14).
+    """
+
+    policy = NodeHealthPolicy(build_store())
+
+    findings = policy.evaluate_logs(_mce_log_batch("dmesg"))
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.category.value == "MCE"
+    assert finding.recommended_action is RecoveryAction.QUARANTINE
+    marker = finding.marker()
+    assert marker.trusted is True
+    assert marker.recommended_action is RecoveryAction.QUARANTINE
+    assert marker.cluster_id == "cluster-a"
+
+
+def test_log_entry_without_a_source_is_treated_as_untrusted() -> None:
+    """A line whose origin the collector could not tag never matches.
+
+    ``source`` is a required field on ``NodeLogEntry`` today, but the matcher
+    reads it defensively so a future producer that omits it cannot fall
+    through to a trusted marker.
+    """
+
+    from types import SimpleNamespace
+
+    policy = NodeHealthPolicy(build_store())
+    entry = SimpleNamespace(message="mce: Hardware Error: Machine check uncorrectable")
+    batch = SimpleNamespace(
+        entries=[entry],
+        cluster_id="cluster-a",
+        node_id="node-a",
+        runtime_profile_version=None,
+        workload_state=None,
+        affected_workload_ids=[],
+    )
+
+    assert policy.evaluate_logs(batch) == []
+
+
 def test_gpu_low_utilization_email_is_aggregated_per_node(monkeypatch) -> None:
     monkeypatch.setenv("GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS", "15")
     notifier = RecordingNotifier()

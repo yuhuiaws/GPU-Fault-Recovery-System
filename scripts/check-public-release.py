@@ -42,12 +42,19 @@ TEXT_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+# Files this gate cannot scan without flagging its own detection material rather
+# than a real leak. Kept to the genuine minimum: this scanner itself and the
+# other identity-facing test files are deliberately NOT exempt, so a live
+# identifier that lands in any of them is caught like anywhere else.
 SCANNER_SOURCES = {
-    "scripts/check-public-release.py",
+    # This gate's own positive-case fixtures must embed values that trip every
+    # check to prove the gate fires, so this file can never scan clean.
     "tests/test_public_release.py",
+    # Its detection patterns spell one live home-directory path literally
+    # instead of splitting it across string concatenation the way its other
+    # patterns are, so scanning it would report the pattern, not a leak.
+    # Follow-up: split that one literal there and drop this entry.
     "tests/test_documentation_contracts.py",
-    "tests/test_fault_scenario_catalog.py",
-    "tests/test_script_assets.py",
 }
 PUBLIC_AWS_ACCOUNTS = {
     "000000000000",

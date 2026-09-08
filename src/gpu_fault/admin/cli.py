@@ -118,6 +118,10 @@ QUICK_VALIDATION_EVIDENCE_FILE = "quick-validation.json"
 ACCEPT_SCHEMA_CHANGE_ENV = "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE"
 SCHEMA_CHANGE_SNAPSHOT_MODE = "snapshot"
 SCHEMA_CHANGE_NO_SNAPSHOT_MODE = "no-snapshot"
+# Mirrors ``regional_admin_commands.SUPERSEDE_FAILED_TRANSACTION_ENV``; the same
+# test pins them equal. Set by ``--supersede-failed-transaction``, read by the
+# release engine's deploy entrypoint.
+SUPERSEDE_FAILED_TRANSACTION_ENV = "GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION"
 
 
 RELEASE_HISTORY_DIR_ENV = "GPU_FAULT_RELEASE_HISTORY_DIR"
@@ -158,6 +162,27 @@ def schema_change_environment(arguments: argparse.Namespace) -> dict[str, str]:
         return {ACCEPT_SCHEMA_CHANGE_ENV: SCHEMA_CHANGE_NO_SNAPSHOT_MODE}
     if getattr(arguments, "accept_schema_change", False):
         return {ACCEPT_SCHEMA_CHANGE_ENV: SCHEMA_CHANGE_SNAPSHOT_MODE}
+    return {}
+
+
+def supersede_environment(arguments: argparse.Namespace) -> dict[str, str]:
+    """The operator's consent to replace a failed fail-forward transaction.
+
+    A transaction that stopped in ``failed``/``partial-convergence`` only
+    resumes the release that failed; a deploy of a *different* candidate (the
+    fix) is refused with this flag named. ``--supersede-failed-transaction``
+    tells the engine to open a new transaction for the candidate whose rollback
+    baseline is the failed transaction's last committed release and whose diff
+    re-rolls everything the failed release moved. It travels as one variable for
+    the same reason the schema-change acceptance does; the engine refuses it
+    when the recorded transaction is not such a failure, so it cannot be left on
+    by habit.
+    """
+
+    if os.environ.get(SUPERSEDE_FAILED_TRANSACTION_ENV, "").strip():
+        return {}
+    if getattr(arguments, "supersede_failed_transaction", False):
+        return {SUPERSEDE_FAILED_TRANSACTION_ENV: "1"}
     return {}
 
 
@@ -284,6 +309,17 @@ def _add_schema_change_arguments(deploy: argparse.ArgumentParser) -> None:
         help=(
             "like --accept-schema-change but without the Aurora snapshot; only "
             "for a database nobody would restore"
+        ),
+    )
+    deploy.add_argument(
+        "--supersede-failed-transaction",
+        action="store_true",
+        help=(
+            "the recorded transaction is a fail-forward release that stopped in "
+            "failed/partial-convergence and this candidate is a different "
+            "release: open a new transaction for it on the last committed "
+            "baseline instead of resuming the failed one; refused in any other "
+            "state"
         ),
     )
 
@@ -1472,6 +1508,7 @@ def run(arguments: argparse.Namespace) -> int:
                 current_directory=Path.cwd(),
                 extra_environment={
                     **schema_change_environment(arguments),
+                    **supersede_environment(arguments),
                     **grafana_environment(arguments),
                 },
             )
@@ -1570,6 +1607,7 @@ def run(arguments: argparse.Namespace) -> int:
             **quick_validation_evidence_environment(arguments),
             **schema_change_environment(arguments),
             **release_history_environment(arguments),
+            **supersede_environment(arguments),
         }
         if arguments.command == "deploy":
             preflight = subprocess.run(

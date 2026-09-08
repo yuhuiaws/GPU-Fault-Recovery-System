@@ -476,6 +476,7 @@ class HyperPodSpareCoordinator:
         active_markers = blocking_spare_markers(
             self.store,
             set(node.aliases),
+            cluster_id=cluster_id,
             observed_after=observed_after,
         )
         if active_markers:

@@ -8,6 +8,7 @@ from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.models import RecoveryAction, WorkflowOperation
 from gpu_fault.policy import (
     ActionDisposition,
+    DynamicRecoveryAction,
     GpuFaultPolicyEngine,
     XidCorrelationStatus,
     XidEvent,
@@ -586,3 +587,88 @@ def test_xid74_sqlite_counter_is_durable_and_atomic(tmp_path) -> None:
     finally:
         first.close()
         second.close()
+
+
+# --- H-10: the server must own xid_154_action end to end ---
+
+_XID154_REBOOT_MESSAGE = (
+    "NVRM: Xid (PCI:0000:01:00): 154, GPU recovery action changed "
+    "from 0x0 (None) to 0x2 (Node Reboot Required)"
+)
+
+
+def test_prepare_xid154_ignores_client_supplied_action() -> None:
+    """A client-chosen action must never short-circuit server derivation."""
+    event = copy_model(
+        xid(154, "xid-154-client-steer", observed_at=NOW + timedelta(seconds=5)),
+        product="B200",
+        raw_message=_XID154_REBOOT_MESSAGE,
+        # The client asserts a *weaker* action than the log demands.
+        xid_154_action=DynamicRecoveryAction.RESET_GPU,
+    )
+
+    prepared = XidCorrelationCoordinator.prepare_xid154(event)
+
+    assert prepared.xid_154_action is DynamicRecoveryAction.RESTART_BM
+
+
+def test_prepare_xid154_clears_client_action_on_non_154_event() -> None:
+    """xid_154_action is meaningless for any other code and must be dropped."""
+    event = copy_model(
+        xid(63, "xid-63-poisoned"), xid_154_action=DynamicRecoveryAction.RESTART_BM
+    )
+
+    prepared = XidCorrelationCoordinator.prepare_xid154(event)
+
+    assert prepared.xid_154_action is None
+
+
+def test_prepare_xid154_clears_client_action_when_log_is_unparseable() -> None:
+    """No trustworthy log evidence means no dynamic action, client value or not."""
+    event = copy_model(
+        xid(154, "xid-154-no-log"),
+        product="B200",
+        raw_message="NVRM: Xid (PCI:0000:01:00): 154, unrelated text",
+        xid_154_action=DynamicRecoveryAction.RESET_GPU,
+    )
+
+    prepared = XidCorrelationCoordinator.prepare_xid154(event)
+
+    assert prepared.xid_154_action is None
+
+
+def test_client_cannot_steer_xid154_dynamic_action_end_to_end() -> None:
+    """Full ingest boundary: a poisoned client action does not reach the decision."""
+    store = build_store()
+    first = ApplicationContext(store=store)
+    second = ApplicationContext(store=store)
+    app_a = create_app(first)
+    app_b = create_app(second)
+    current = [NOW]
+    first.xid_correlation.now = lambda: current[0]
+    second.xid_correlation.now = lambda: current[0]
+    primary = copy_model(
+        xid(145, "xid-145-steer"),
+        product="B200",
+        driver_branch=575,
+        intr_info=4,
+        error_status=1,
+    )
+    summary = copy_model(
+        xid(154, "xid-154-steer", observed_at=NOW + timedelta(seconds=5)),
+        product="B200",
+        raw_message=_XID154_REBOOT_MESSAGE,
+        # Attacker tries to downgrade the reboot to a GPU reset.
+        xid_154_action=DynamicRecoveryAction.RESET_GPU,
+    )
+
+    asyncio.run(post_xid(app_a, primary))
+    asyncio.run(post_xid(app_b, summary))
+    current[0] += timedelta(seconds=36)
+    assert second.xid_correlation.run_once() == 2
+
+    primary_decision = store.get_xid_policy_decision("xid-145-steer")
+    # Server derivation from the log wins: Node Reboot Required -> REBOOT_NODE,
+    # not the client's RESET_GPU.
+    assert primary_decision.action is RecoveryAction.REBOOT_NODE
+    assert primary_decision.source.value == "NVIDIA_XID_154"

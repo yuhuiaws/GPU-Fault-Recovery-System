@@ -44,6 +44,8 @@ def test_admin_config_renders_and_targets_only_changed_cpu_role(
     release = MODULE.RegionalRelease(config, runner)
     monkeypatch.setattr(release, "_ensure_contexts", lambda: None)
     monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
+    monkeypatch.setattr(release, "_apply_rds_ca_bundle", lambda: None)
+    monkeypatch.setattr(release, "_refresh_aurora_credentials", lambda: None)
     monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
     monkeypatch.setattr(
         release, "_capture_previous", lambda **_kwargs: {"metadata": {}}

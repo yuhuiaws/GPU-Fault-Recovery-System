@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from gpu_fault.async_store import (
     AsyncStoreExecutor,
@@ -78,11 +78,33 @@ async def evaluate_xid(
 @authorization_bucket("cluster-token")
 async def xid_correlation_status(
     event_id: str,
+    authenticated_cluster: str | None = Header(
+        default=None,
+        alias="X-GPU-Fault-Cluster-ID",
+    ),
     dependencies: GpuEventRouterDependencies = Depends(get_gpu_event_dependencies),
 ) -> dict:
     def lookup() -> dict:
-        correlation = dependencies.context.store.get_xid_correlation(event_id)
-        decision = dependencies.context.store.get_xid_policy_decision(event_id)
+        ctx = dependencies.context
+        # The correlation is addressed by a global event id, so its owning
+        # cluster must be checked against the caller before any record is
+        # returned; the XID event carries the cluster_id (the correlation row
+        # does not) and shares the event id one-to-one.
+        event = ctx.store.get_xid_event(event_id)
+        if (
+            ctx.regional_mode
+            and authenticated_cluster
+            and event.cluster_id != authenticated_cluster
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "authenticated cluster cannot read an XID correlation "
+                    "from another cluster"
+                ),
+            )
+        correlation = ctx.store.get_xid_correlation(event_id)
+        decision = ctx.store.get_xid_policy_decision(event_id)
         return {
             "correlation": correlation.model_dump(mode="json"),
             "decision": (

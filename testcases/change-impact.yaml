@@ -177,6 +177,13 @@ rules:
       - tests/regional/test_regional_release_resume.py
       - tests/regional/test_release_diff.py
       - tests/regional/test_release_rollback_state.py
+      - tests/regional/test_release_rollback_container_env.py
+      - tests/regional/test_release_trust_security.py
+      - tests/regional/test_allowed_namespace_preflight.py
+      - tests/regional/test_release_supersede_failed_transaction.py
+      - tests/deploy/test_rds_ca_bundle_wiring.py
+      - tests/deploy/test_verify_control_plane_role_split_optional.py
+      - tests/regional/test_release_aurora_refresh_preflight.py
       - tests/test_artifact_consistency.py
     regional_cases:
       - GF-REGIONAL-BOOT-018..023
@@ -448,6 +455,8 @@ rules:
       - tests/node_agent/**
     pytest:
       - tests/node_agent
+      - tests/deploy/test_node_installer_security.py
+      - tests/regional/test_dataplane_rbac_security.py
       - tests/regional/test_production_safety_config.py
     regional_cases:
       - GF-REGIONAL-AUTH-015
@@ -544,6 +553,7 @@ rules:
       - tests/regional/test_capacity_probe.py
       - tests/regional/test_regional_capacity_suite.py
       - tests/regional/test_performance_defaults.py
+      - tests/test_regional_alerting_routes.py
     regional_cases:
       - GF-REGIONAL-CAP-001..005
       - GF-REGIONAL-HA-005..009
@@ -615,6 +625,7 @@ rules:
       - test-source-assertion-baseline.json
     pytest:
       - tests/test_doc_impact.py
+      - tests/test_workflow_supply_chain.py
     regional_cases: []
     checks:
       - docs-check
@@ -650,6 +661,7 @@ rules:
       - tests/regional/test_api_entrypoint.py
       - tests/regional/test_app_structure.py
       - tests/regional/test_plugins.py
+      - tests/app/test_route_tenancy_security.py
     regional_cases:
       - GF-REGIONAL-BOOT-001..015
       - GF-REGIONAL-AUTH-001..011

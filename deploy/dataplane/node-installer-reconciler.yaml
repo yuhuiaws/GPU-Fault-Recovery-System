@@ -18,10 +18,34 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: gpu-fault-node-installer-reconciler
+# Nodes only. The installer Jobs and the two ConfigMaps the reconciler reads
+# all live in its own namespace, so those grants are the namespaced Role
+# below: a cluster-wide `jobs create` would let this identity schedule
+# arbitrary Jobs in every namespace, which nothing here needs.
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-fault-node-installer-reconciler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpu-fault-node-installer-reconciler
+subjects:
+  - kind: ServiceAccount
+    name: gpu-fault-node-installer-reconciler
+    namespace: gpu-fault-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gpu-fault-node-installer-reconciler
+  namespace: gpu-fault-system
+rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -33,12 +57,13 @@ rules:
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: gpu-fault-node-installer-reconciler
+  namespace: gpu-fault-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: gpu-fault-node-installer-reconciler
 subjects:
   - kind: ServiceAccount
@@ -110,6 +135,15 @@ spec:
               value: REPLACE_WITH_INSTALLER_BUNDLE_SHA256
             - name: GPU_FAULT_INSTALLER_TEMPLATE_SHA256
               value: REPLACE_WITH_INSTALLER_TEMPLATE_SHA256
+            # SHA-256 of the exact job.yaml the deploy placed in the template
+            # ConfigMap below. The reconciler hashes what it loads and refuses
+            # to start on a mismatch or when this is missing: the template
+            # becomes a privileged hostPath Pod with the node's HMAC key on
+            # every GPU node, so the ConfigMap alone must not be trusted.
+            # Distinct from GPU_FAULT_INSTALLER_TEMPLATE_SHA256, which is the
+            # release-wide template-inputs digest stamped on nodes.
+            - name: GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256
+              value: REPLACE_WITH_INSTALLER_TEMPLATE_CONTENT_SHA256
             - name: GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP
               value: REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP
             - name: GPU_FAULT_INSTALLER_TEMPLATE_PATH

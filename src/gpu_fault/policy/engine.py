@@ -904,7 +904,20 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 ],
                 requires_operator=True,
             )
-        if event.classification is SxidClassification.ALWAYS_FATAL and rule is None:
+        if rule is None and event.classification in {
+            SxidClassification.ALWAYS_FATAL,
+            SxidClassification.FATAL,
+        }:
+            # Fail closed on any destructive severity the pinned catalog does
+            # not vouch for. Without this twin guard an unknown code claiming
+            # FATAL fell through to the runtime trunk branch and was granted a
+            # full RESET_ALL_GPUS_AND_NVSWITCHES on the strength of the
+            # client-supplied classification alone (security review H-9).
+            claimed = (
+                "Always Fatal"
+                if event.classification is SxidClassification.ALWAYS_FATAL
+                else "Fatal"
+            )
             return _Resolution(
                 source=ActionSource.NVIDIA_FABRIC_MANAGER,
                 disposition=ActionDisposition.BLOCKED_MISSING_EVIDENCE,
@@ -913,7 +926,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 action=None,
                 containment=Containment.UNKNOWN,
                 reasons=[
-                    f"SXID {event.sxid} claims Always Fatal but is absent from pinned NVIDIA Table 23"
+                    f"SXID {event.sxid} claims {claimed} but is absent from pinned NVIDIA Table 23"
                 ],
                 requires_operator=True,
             )
@@ -1339,6 +1352,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             }
         marker = NodeMarker(
             marker_id=f"marker-{event.event_id}",
+            cluster_id=event.cluster_id,
             source=f"gpu-fault-policy/{resolution.source.value.lower()}",
             trusted=True,
             incident_id=f"inc-{event.event_id}",

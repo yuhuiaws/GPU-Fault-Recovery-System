@@ -77,22 +77,29 @@ spec:
 
               node_env="${host_dir}/node-agent.env"
               if [ -f "${node_env}" ]; then
-                node_action_master="$(
-                  cat "${connection_dir}/node-action-secret"
-                )"
                 cluster_id="$(
                   cat "${connection_dir}/cluster-id"
                 )"
+                # The fleet master secret reaches the derivation over stdin
+                # and nothing else. This Pod runs hostPID + privileged, so
+                # an `env VAR=value cmd` argv would be readable by every
+                # process on the node through /proc/*/cmdline for as long
+                # as the derivation ran, and `unset` afterwards cannot
+                # retract that. The two non-secret identifiers travel as
+                # shell environment assignments (not argv) so the chrooted
+                # interpreter sees them without `env`.
                 node_action_secret="$(
-                  chroot /host /usr/bin/env \
-                    GPU_FAULT_FLEET_SECRET="${node_action_master}" \
-                    GPU_FAULT_CLUSTER_ID="${cluster_id}" \
-                    GPU_FAULT_NODE_ID="${TARGET_NODE_NAME}" \
-                    /opt/gpu-fault/venv/bin/python -c '
+                  GPU_FAULT_CLUSTER_ID="${cluster_id}" \
+                  GPU_FAULT_NODE_ID="${TARGET_NODE_NAME}" \
+                  chroot /host /opt/gpu-fault/venv/bin/python -c '
               import hashlib
               import hmac
               import os
+              import sys
 
+              fleet_secret = sys.stdin.read().strip()
+              if not fleet_secret:
+                  raise SystemExit("fleet master secret is empty")
               context = (
                   "gpu-fault/node-action/v1\0"
                   + os.environ["GPU_FAULT_CLUSTER_ID"]
@@ -101,16 +108,13 @@ spec:
               ).encode()
               print(
                   hmac.new(
-                      os.environ[
-                          "GPU_FAULT_FLEET_SECRET"
-                      ].encode(),
+                      fleet_secret.encode(),
                       context,
                       hashlib.sha256,
                   ).hexdigest()
               )
-              '
+              ' <"${connection_dir}/node-action-secret"
                 )"
-                unset node_action_master
                 upsert_env "${node_env}" \
                   GPU_FAULT_NODE_CONTROL_PLANE_URL "${endpoint}"
                 upsert_env "${node_env}" \
@@ -121,8 +125,16 @@ spec:
                   GPU_FAULT_NODE_ACTION_KEY_VERSION 2
                 upsert_env "${node_env}" \
                   GPU_FAULT_NODE_AGENT_HOST "${TARGET_NODE_IP}"
-                upsert_env "${node_env}" \
-                  GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT true
+                # Never downgrade the Agent's transport as a side effect
+                # of an endpoint migration. Plaintext is written only when
+                # MIGRATION_ALLOW_PLAINTEXT_NODE_AGENT (container env
+                # below) is exactly "true"; anything else leaves whatever
+                # the installer configured untouched.
+                allow_plaintext="${MIGRATION_ALLOW_PLAINTEXT_NODE_AGENT:-false}"
+                if [ "${allow_plaintext}" = "true" ]; then
+                  upsert_env "${node_env}" \
+                    GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT "${allow_plaintext}"
+                fi
                 upsert_env "${node_env}" SSL_CERT_FILE \
                   /etc/gpu-fault/control-plane-ca.crt
                 upsert_env "${node_env}" \
@@ -161,6 +173,12 @@ spec:
                 gpu-fault-log-collector.service 2>/dev/null || true
               sleep 3600
           env:
+            # Opt-in only. Set to "true" solely for a cluster whose Agents
+            # still run without client certificates and must keep answering
+            # during the migration; the default writes nothing, so a fleet
+            # that already speaks TLS is not silently downgraded.
+            - name: MIGRATION_ALLOW_PLAINTEXT_NODE_AGENT
+              value: "false"
             - name: TARGET_NODE_NAME
               valueFrom:
                 fieldRef:

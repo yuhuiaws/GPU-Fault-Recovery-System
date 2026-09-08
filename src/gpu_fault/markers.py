@@ -60,6 +60,7 @@ class MarkerLookupStore(Protocol):
         self,
         node_ids: set[str],
         actions: set[RecoveryAction],
+        cluster_id: str | None = None,
     ) -> list[NodeMarker]: ...
 
     def get_incident(self, incident_id: str) -> Any: ...
@@ -212,6 +213,7 @@ def blocking_spare_markers(
     store: MarkerLookupStore,
     node_ids: set[str],
     *,
+    cluster_id: str | None = None,
     observed_after: datetime | None = None,
     now: datetime | None = None,
 ) -> list[NodeMarker]:
@@ -220,6 +222,12 @@ def blocking_spare_markers(
     ``observed_after`` is how a caller asks "did anything go wrong *since* this
     moment", which is what a spare-health re-check after a repair wants; markers
     from before the repair are the reason the check is running.
+
+    ``cluster_id`` scopes the read to one tenant (H-14): ``node_ids`` collide
+    across clusters, so without it a spare in one cluster could be blocked by a
+    same-named node's marker in another. It is keyword-only and optional so
+    existing callers keep compiling, but a caller that omits it gets an
+    unscoped read -- every caller that resolves a real cluster must pass it.
     """
 
     if not node_ids:
@@ -228,6 +236,7 @@ def blocking_spare_markers(
     candidates = store.list_active_markers_for_nodes(
         node_ids,
         set(SPARE_BLOCKING_ACTIONS),
+        cluster_id,
     )
     return [
         marker

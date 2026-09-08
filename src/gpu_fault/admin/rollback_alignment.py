@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,6 +18,13 @@ from gpu_fault.admin.config import (
     persist_desired_admin_config,
 )
 from gpu_fault.admin.site import SiteConfigError
+
+# The recorded previous release_id becomes a directory name below the state
+# directory. It arrives from live release state the CLI did not author, so it is
+# bounded to the same anchored shape a release_id is validated against elsewhere
+# -- letters, digits and ``._-`` only -- so it can never carry a path separator
+# or ``..`` segment that would escape the state directory.
+RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def _consistent_previous_value(
@@ -360,6 +368,10 @@ def reconcile_rollback_management(
     release_id = str(
         ((live_state.get("previous") or {}).get("release_id") or "previous")
     )
+    if not RELEASE_ID_PATTERN.fullmatch(release_id):
+        raise SiteConfigError(
+            f"rolled-back previous release_id is malformed: {release_id!r}"
+        )
     management_manifest = (
         site_file.parent / "rollback-management" / release_id / "release.status.json"
     )

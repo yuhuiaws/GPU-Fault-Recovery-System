@@ -50,12 +50,16 @@ class Kubectl:
         self.documents = list(documents)
         self.architectures = list(architectures)
         self.calls: list[list[str]] = []
+        self.inputs: list[str] = []
 
     def __call__(
-        self, arguments: Sequence[Any], **_keywords: Any
+        self, arguments: Sequence[Any], **keywords: Any
     ) -> subprocess.CompletedProcess:
         argv = [str(item) for item in arguments]
         self.calls.append(argv)
+        stdin = keywords.get("input")
+        if isinstance(stdin, str):
+            self.inputs.append(stdin)
         line = " ".join(argv)
         if "jsonpath={.data.node-action-secret}" in line:
             encoded = base64.b64encode(self.master.encode()).decode()
@@ -81,14 +85,27 @@ class Kubectl:
     def matching(self, fragment: str) -> list[list[str]]:
         return [argv for argv in self.calls if fragment in " ".join(argv)]
 
+    def applied_secrets(self) -> list[dict[str, str]]:
+        """Every Secret manifest that reached kubectl over stdin (never argv)."""
+        secrets_seen: list[dict[str, str]] = []
+        for text in self.inputs:
+            try:
+                document = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(document, dict) and document.get("kind") == "Secret":
+                secrets_seen.append(
+                    {
+                        str(key): str(value)
+                        for key, value in (document.get("stringData") or {}).items()
+                    }
+                )
+        return secrets_seen
+
     def literals(self) -> dict[str, str]:
-        created = self.matching("create secret generic")
-        assert created, "the base Secret was never created"
-        return dict(
-            item.removeprefix("--from-literal=").split("=", 1)
-            for item in created[0]
-            if item.startswith("--from-literal=")
-        )
+        secrets_seen = self.applied_secrets()
+        assert secrets_seen, "the base Secret was never applied"
+        return secrets_seen[0]
 
 
 def _secrets(kubectl: Kubectl, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
@@ -156,9 +173,7 @@ def test_a_re_run_reads_the_existing_master_instead_of_replacing_it(
     master_file = _secrets(kubectl, monkeypatch, tmp_path)
 
     assert master_file.read_text(encoding="utf-8") == EXISTING_MASTER
-    assert kubectl.matching("create secret generic") == [], (
-        "an existing base Secret was overwritten"
-    )
+    assert kubectl.applied_secrets() == [], "an existing base Secret was overwritten"
 
 
 def test_the_secret_values_never_reach_the_command_log(
@@ -167,7 +182,9 @@ def test_the_secret_values_never_reach_the_command_log(
     """Bootstrap echoes every command it runs, and this one carries three keys.
 
     The operator's terminal and CI log would otherwise hold the fleet master secret
-    in clear text for as long as the log is kept.
+    in clear text for as long as the log is kept. The keys travel in the Secret
+    manifest over kubectl's stdin, so neither the echoed command nor the file
+    should ever contain them.
     """
 
     kubectl = Kubectl(present=False)
@@ -175,10 +192,39 @@ def test_the_secret_values_never_reach_the_command_log(
     master_file = _secrets(kubectl, monkeypatch, tmp_path)
     logged = capsys.readouterr().err
 
-    assert "<sensitive command>" in logged
     assert master_file.read_text(encoding="utf-8") not in logged
     for value in kubectl.literals().values():
         assert value not in logged, "a base secret was echoed to the log"
+
+
+def test_the_secret_values_never_reach_the_kubectl_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H-7: a secret on the argv is world-readable via /proc and shell history.
+
+    The base Secret is created by piping a manifest to ``kubectl apply -f -`` over
+    stdin, so no minted key may appear on any command line bootstrap constructs.
+    """
+
+    kubectl = Kubectl(present=False)
+
+    _secrets(kubectl, monkeypatch, tmp_path)
+
+    minted = kubectl.literals()
+    assert set(minted) == {
+        "execution-token",
+        "processor-replay-secret",
+        "node-action-secret",
+    }
+    assert not any(
+        argv for argv in kubectl.calls if any("--from-literal" in item for item in argv)
+    ), "a secret was passed with --from-literal"
+    for value in minted.values():
+        for argv in kubectl.calls:
+            assert value not in argv, "a secret value reached the kubectl argv"
+            assert not any(value in item for item in argv), (
+                "a secret value was embedded in a kubectl argument"
+            )
 
 
 def test_an_existing_master_is_read_back_from_its_stored_encoding(

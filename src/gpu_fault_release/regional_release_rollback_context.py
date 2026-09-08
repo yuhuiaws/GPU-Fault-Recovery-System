@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import copy
+import json
 import os
+from pathlib import Path
 from typing import Any
 
+from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_notifications import notification_digest
 from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseError
 from gpu_fault_release.regional_release_diff import ReleaseComponent
 from gpu_fault_release.regional_release_progress import RollbackCompensationPlan
 from gpu_fault_release.regional_release_rendering import (
     admin_config_renderer_environment,
+)
+from gpu_fault_release.regional_release_state import (
+    SENSITIVE_CONFIG_KEY,
+    require_digest_pinned_image,
 )
 
 
@@ -33,9 +41,12 @@ def rollback_target_arguments(
         "node_compatibility": (
             metadata.get("required-agent-compatibility-digest") or artifact
         ),
-        "runtime_image": runtime_image,
-        "node_installer_image": (
-            previous.get("node_installer_image") or release.node_installer_image
+        "runtime_image": require_digest_pinned_image(
+            "rollback target runtime", runtime_image
+        ),
+        "node_installer_image": require_digest_pinned_image(
+            "rollback target Node Installer",
+            previous.get("node_installer_image") or release.node_installer_image,
         ),
     }
 
@@ -80,7 +91,9 @@ def rollback_identity_context(
         metadata.get("required-regional-executor-compatibility-digest")
         or executor_artifact
     )
-    runtime_image = str(previous.get("runtime_image") or release.runtime_image)
+    runtime_image = require_digest_pinned_image(
+        "rollback runtime", previous.get("runtime_image") or release.runtime_image
+    )
     return (
         metadata,
         cpu_wheel,
@@ -91,6 +104,97 @@ def rollback_identity_context(
         executor_compatibility,
         runtime_image,
     )
+
+
+# The renderer reads the previous container environment from this file on
+# rollback; see CONTAINER_ENV_FILE_VARIABLE in render_control_plane_role_split.
+CONTAINER_ENV_FILE_VARIABLE = "GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE"
+CONTAINER_ENV_FILE_NAME = "previous-container-env.json"
+
+
+def _invalid_container_env(detail: str) -> ReleaseError:
+    return ReleaseError(
+        f"previous CPU role container environment snapshot is invalid: {detail}"
+    )
+
+
+def previous_container_env_snapshot(
+    snapshot: object,
+) -> dict[str, dict[str, dict[str, list[Any]]]] | None:
+    """The validated ``cpu_role_container_env`` snapshot, or None to fall back.
+
+    None means the transaction was opened before the capture existed; the
+    caller renders the previous Deployments from the current template as it
+    always did and records that it did. Anything present must be exactly the
+    shape `cpu_role_container_env` writes -- every CPU role Deployment, each
+    container carrying its ``env`` and ``envFrom`` lists, no literal under a
+    sensitive-looking name -- because the renderer applies it verbatim and a
+    half-covered environment is what this snapshot exists to prevent.
+    """
+
+    if snapshot is None or snapshot == {}:
+        return None
+    if not isinstance(snapshot, dict):
+        raise _invalid_container_env("expected a Deployment mapping")
+    expected = set(inventory.CPU_RUNTIME_DEPLOYMENTS)
+    names = {name for name in snapshot if isinstance(name, str)}
+    if len(names) != len(snapshot) or names != expected:
+        raise _invalid_container_env(
+            "Deployments do not match the CPU role inventory: "
+            + ", ".join(sorted(str(name) for name in snapshot))
+        )
+    validated: dict[str, dict[str, dict[str, list[Any]]]] = {}
+    for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
+        containers = snapshot[deployment]
+        if not isinstance(containers, dict) or not containers:
+            raise _invalid_container_env(f"{deployment} lists no containers")
+        validated[deployment] = {}
+        for container, spec in containers.items():
+            if (
+                not isinstance(container, str)
+                or not isinstance(spec, dict)
+                or set(spec) != {"env", "envFrom"}
+                or not isinstance(spec["env"], list)
+                or not isinstance(spec["envFrom"], list)
+            ):
+                raise _invalid_container_env(
+                    f"{deployment}/{container} must carry exactly env and envFrom lists"
+                )
+            for item in spec["env"]:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    raise _invalid_container_env(
+                        f"{deployment}/{container} has an env entry without a name"
+                    )
+                if ("value" in item) == ("valueFrom" in item):
+                    raise _invalid_container_env(
+                        f"{deployment}/{container} env {item['name']} must define "
+                        "exactly one of value or valueFrom"
+                    )
+                if "value" in item and SENSITIVE_CONFIG_KEY.search(item["name"]):
+                    raise _invalid_container_env(
+                        f"{deployment}/{container} sensitive env {item['name']} "
+                        "carries a literal value"
+                    )
+            if not all(isinstance(source, dict) for source in spec["envFrom"]):
+                raise _invalid_container_env(
+                    f"{deployment}/{container} has a malformed envFrom entry"
+                )
+            validated[deployment][container] = {
+                "env": copy.deepcopy(spec["env"]),
+                "envFrom": copy.deepcopy(spec["envFrom"]),
+            }
+    return validated
+
+
+def write_rollback_container_env(
+    snapshot: dict[str, dict[str, dict[str, list[Any]]]],
+    directory: Path,
+) -> str:
+    """Write the validated snapshot where the renderer will read it from."""
+
+    path = directory / CONTAINER_ENV_FILE_NAME
+    path.write_text(json.dumps(snapshot, sort_keys=True), encoding="utf-8")
+    return str(path)
 
 
 def build_rollback_environment(
@@ -104,6 +208,7 @@ def build_rollback_environment(
     runtime_profile_version: str,
     runtime_image: str,
     preserve_role_config_maps: bool = False,
+    previous_container_env_file: str | None = None,
 ) -> dict[str, str]:
     legacy_component_pins = not any(
         metadata.get(name)
@@ -113,7 +218,7 @@ def build_rollback_environment(
             "required-regional-executor-compatibility-digest",
         )
     )
-    return {
+    environment = {
         **os.environ,
         **admin_config_renderer_environment(rollback_config.admin_config),
         "KUBECONFIG": rollback_config.cpu_kubeconfig,
@@ -168,3 +273,9 @@ def build_rollback_environment(
         "GPU_FAULT_FINALIZE_AGENT_PIN": "true",
         "GPU_FAULT_FINALIZE_DATA_PLANE_PIN": "true",
     }
+    # Set only from the validated snapshot; never inherited from the caller's
+    # shell, so a stray variable cannot turn a forward render into a rollback.
+    environment.pop(CONTAINER_ENV_FILE_VARIABLE, None)
+    if previous_container_env_file:
+        environment[CONTAINER_ENV_FILE_VARIABLE] = previous_container_env_file
+    return environment

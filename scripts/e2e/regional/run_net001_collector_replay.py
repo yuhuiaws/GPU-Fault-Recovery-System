@@ -33,6 +33,12 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 
 CASE_ID = "GF-REGIONAL-NET-001"
 CONFIRMATION = "NET001_COLLECTOR_OUTBOX_REPLAY"
+# Hard ceiling k8s enforces on the privileged host-tool Pod, matching the
+# container's own `sleep 7200` guard so a wedged Pod (a stuck exec, a lost
+# cleanup) is reaped instead of running unbounded on the node. This is a Pod,
+# not a Job, so `restartPolicy: Never` -- not `backoffLimit` -- is what bounds
+# restarts; `backoffLimit` is a batch/v1 Job field and is rejected on a Pod.
+POD_DEADLINE_SECONDS = 7200
 HOST_TOOL = Path(__file__).with_name("probes") / "net001_node_probe.py"
 SERVICES = (
     "gpu-fault-kernel-collector.service",
@@ -210,6 +216,7 @@ class Runner:
             },
             "spec": {
                 "restartPolicy": "Never",
+                "activeDeadlineSeconds": POD_DEADLINE_SECONDS,
                 "nodeName": self.settings.target_node,
                 "hostPID": True,
                 "hostNetwork": True,

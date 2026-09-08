@@ -261,6 +261,22 @@ def _labels(
     if node_id is not None:
         values["node_id"] = node_id
     return ",".join(
-        f'{key}="{str(value).replace(chr(34), chr(92) + chr(34))}"'
-        for key, value in values.items()
+        f'{key}="{_escape_label_value(str(value))}"' for key, value in values.items()
     )
+
+
+def _escape_label_value(value: str) -> str:
+    """Escape a Prometheus/OpenMetrics label value.
+
+    The exposition format requires three escapes in label values, and the
+    backslash must be escaped first so the escapes it introduces for the
+    newline and the quote are not themselves re-escaped:
+
+        backslash -> ``\\\\``   newline -> ``\\n``   double-quote -> ``\\"``
+
+    Escaping only the quote (the previous behaviour) let a crafted label value
+    -- one carrying a raw backslash or newline -- break out of its quoted
+    string and inject or truncate metric lines.
+    """
+
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')

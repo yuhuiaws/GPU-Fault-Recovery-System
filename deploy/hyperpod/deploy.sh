@@ -2939,7 +2939,7 @@ install_node_agents() {
 
 deploy_node_installer_reconciler() {
     local node node_ip dcgm_metrics_url node_dcgm_mode manifest
-    local template_config_map
+    local template_config_map template_content_sha256
     node="$(
         kubectl get nodes \
             -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}" \
@@ -2962,9 +2962,13 @@ deploy_node_installer_reconciler() {
     run_node_installer_job \
         "${node}" "${dcgm_metrics_url}" "${node_dcgm_mode}" \
         --render-only >"${manifest}"
-    template_config_map="gpu-fault-node-installer-template-$(
-        sha256sum "${manifest}" | awk '{print substr($1, 1, 12)}'
-    )"
+    # TEMPLATE_CONTENT_SHA256 pins the exact job.yaml bytes the reconciler
+    # loads from the template ConfigMap, so a later edit to that ConfigMap
+    # cannot become a privileged Pod on every node. Mirror the regional path
+    # (deploy/node/deploy-node-installer-reconciler.sh): the full digest is the
+    # content pin and its 12-char prefix names the ConfigMap.
+    template_content_sha256="$(sha256sum "${manifest}" | awk '{print $1}')"
+    template_config_map="gpu-fault-node-installer-template-${template_content_sha256:0:12}"
     kubectl -n "${NAMESPACE}" create configmap \
         "${template_config_map}" \
         --from-file="job.yaml=${manifest}" \
@@ -2976,6 +2980,7 @@ deploy_node_installer_reconciler() {
         -e "s#REPLACE_WITH_INSTALLER_VERSION#${VERSION}#g" \
         -e "s#REPLACE_WITH_INSTALLER_CONFIG_DIGEST#${CONFIG_DIGEST}#g" \
         -e "s#REPLACE_WITH_INSTALLER_ARTIFACT_SHA256#${NODE_WHEEL_SHA256}#g" \
+        -e "s#REPLACE_WITH_INSTALLER_TEMPLATE_CONTENT_SHA256#${template_content_sha256}#g" \
         -e "s#REPLACE_WITH_INSTALLER_TEMPLATE_CONFIG_MAP#${template_config_map}#g" \
         -e "s#REPLACE_WITH_DCGM_METRICS_URL#${DCGM_METRICS_URL_TEMPLATE}#g" \
         -e "s#gpu-fault-executor-wheel-0100#${EXECUTOR_WHEEL_CONFIGMAP_NAME}#g" \

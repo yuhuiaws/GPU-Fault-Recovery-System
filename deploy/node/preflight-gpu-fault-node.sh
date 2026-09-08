@@ -59,7 +59,8 @@ for required_member in \
     /deploy/systemd/gpu-fault-node-agent.service \
     /deploy/systemd/gpu-fault-host-collector.service \
     /deploy/systemd/gpu-fault-kernel-collector.service \
-    /deploy/systemd/gpu-fault-metrics-collector.service; do
+    /deploy/systemd/gpu-fault-metrics-collector.service \
+    /requirements/node-runtime.lock; do
     printf '%s\n' "${bundle_members[@]}" |
         grep -q "${required_member}$" ||
         die "candidate installer bundle is missing ${required_member}"

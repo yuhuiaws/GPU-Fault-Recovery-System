@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from threading import RLock
 from typing import TYPE_CHECKING
@@ -83,6 +84,30 @@ class SqliteStore(
     with PostgreSQL or DynamoDB conditional writes.
     """
 
+    # SQLite state that lives on disk (not an in-memory or shared-cache DB).
+    _ON_DISK = staticmethod(
+        lambda path: bool(path)
+        and path != ":memory:"
+        and not path.startswith("file::memory:")
+    )
+
+    @staticmethod
+    def _restrict_state_dir(path: str) -> None:
+        if not SqliteStore._ON_DISK(path):
+            return
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+
+    @staticmethod
+    def _restrict_state_file(path: str) -> None:
+        if not SqliteStore._ON_DISK(path):
+            return
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            candidate = f"{path}{suffix}"
+            if os.path.exists(candidate):
+                os.chmod(candidate, 0o600)
+
     def __init__(self, path: str) -> None:
         # One connection for the process, so every statement and every
         # transaction runs under this lock (see ``_statement_guard`` and
@@ -91,13 +116,22 @@ class SqliteStore(
         self._telemetry_spool = {}
         self._models = record_models()
         self.path = path
+        # The state file holds tenant fault data and cluster tokens, so it
+        # must never inherit a permissive process umask. Create the parent
+        # directory 0700 and the DB file (plus its WAL sidecars) 0600, and
+        # do so before any sensitive row is written (security review M-7).
+        self._restrict_state_dir(path)
         self._db = sqlite3.connect(
             path,
             check_same_thread=False,
             isolation_level=None,
         )
+        self._restrict_state_file(path)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
+        # journal_mode=WAL creates the -wal/-shm sidecars, which carry the
+        # same tenant data; tighten them too now that they exist.
+        self._restrict_state_file(path)
         self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS objects (

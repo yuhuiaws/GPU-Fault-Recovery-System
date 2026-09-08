@@ -27,6 +27,10 @@ spec:
                 secretKeyRef:
                   name: gpu-fault-aurora
                   key: postgres-url
+            # The Aurora DSN uses sslmode=verify-full, so the RDS CA bundle
+            # mounted below must be readable at this path.
+            - name: GPU_FAULT_RDS_CA_BUNDLE
+              value: /etc/gpu-fault/rds/ca-bundle.pem
           resources:
             requests:
               cpu: 250m
@@ -42,7 +46,13 @@ spec:
             - name: artifact
               mountPath: /artifact
               readOnly: true
+            - name: rds-ca-bundle
+              mountPath: /etc/gpu-fault/rds
+              readOnly: true
       volumes:
         - name: artifact
           configMap:
             name: REPLACE_WITH_WHEEL_CONFIGMAP
+        - name: rds-ca-bundle
+          configMap:
+            name: gpu-fault-rds-ca-bundle

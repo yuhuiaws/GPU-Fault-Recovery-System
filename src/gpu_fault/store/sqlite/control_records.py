@@ -382,6 +382,7 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
         self,
         node_ids: set[str],
         actions: set[RecoveryAction],
+        cluster_id: str | None = None,
     ) -> list[NodeMarker]:
         if not node_ids or not actions:
             return []
@@ -393,6 +394,10 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
                 and marker.trusted
                 and marker.recommended_action in actions
                 and set(marker.scope.node_ids).intersection(node_ids)
+                # Tenant scope (H-14): a legacy marker with no cluster_id is
+                # never matched to a specific cluster, so a colliding node_id
+                # in another tenant cannot read it.
+                and (cluster_id is None or marker.cluster_id == cluster_id)
             ),
             key=lambda marker: marker.observed_at,
             reverse=True,

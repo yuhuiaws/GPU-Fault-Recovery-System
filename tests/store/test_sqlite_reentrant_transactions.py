@@ -134,3 +134,32 @@ def test_a_successful_outer_transaction_commits_every_nested_write(store) -> Non
     state = store.get_health_signal_state(KEY)
     assert state is not None, "the claim inside the transaction must be committed"
     assert state.active is True
+
+
+def test_sqlite_db_file_is_owner_only(tmp_path) -> None:
+    """M-7: the on-disk state file holds tenant fault data and tokens.
+
+    It must never be created with the process umask (which is commonly
+    world/group readable); every persisted file must be 0600 and the
+    containing directory 0700.
+    """
+    import os
+    import stat
+
+    db_dir = tmp_path / "secure-state"
+    db_path = db_dir / "state.db"
+    store = SqliteStore(str(db_path))
+    try:
+        # Force the WAL sidecar files into existence with a real write.
+        store.save_incident(_incident("perm-check"))
+        for suffix in ("", "-wal", "-shm"):
+            candidate = db_dir / f"state.db{suffix}"
+            if candidate.exists():
+                mode = stat.S_IMODE(os.stat(candidate).st_mode)
+                assert mode == 0o600, (
+                    f"{candidate.name} mode is {oct(mode)}, expected 0o600"
+                )
+        dir_mode = stat.S_IMODE(os.stat(db_dir).st_mode)
+        assert dir_mode == 0o700, f"dir mode is {oct(dir_mode)}, expected 0o700"
+    finally:
+        store.close()

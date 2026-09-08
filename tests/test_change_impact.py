@@ -228,3 +228,32 @@ def test_make_targets_execute_pytest_but_never_execute_regional_cases() -> None:
     assert "--execute" in test_impact
     assert "--regional-only" in regional_plan
     assert "--execute" not in regional_plan
+
+
+def test_test_asset_without_a_guard_test_escalates_to_full() -> None:
+    """A path that only matches the ``changed-tests`` fallback but is not an
+    existing ``tests/*.py`` file (so nothing gets added to pytest and no
+    regional case runs) must fail safe to the full superset instead of
+    deploying with an empty, narrow selection that skips its guard tests."""
+
+    plan = MODULE.build_plan(
+        ["tests/regional/fixtures/injected-manifest.json"], settings()
+    )
+
+    assert plan.full is True
+    assert any("no guard tests mapped" in reason for reason in plan.reasons), (
+        "an unmapped test asset did not record its fail-safe escalation"
+    )
+
+
+def test_existing_test_module_still_avoids_full_escalation() -> None:
+    """The fail-safe must not fire for a real ``tests/*.py`` module: it is
+    added to pytest directly, so a narrow selection remains correct."""
+
+    plan = MODULE.build_plan(["tests/notifications/test_notifications.py"], settings())
+
+    assert plan.full is False
+    assert "tests/notifications/test_notifications.py" in plan.pytest_targets
+    assert not any("no guard tests mapped" in reason for reason in plan.reasons), (
+        plan.reasons
+    )

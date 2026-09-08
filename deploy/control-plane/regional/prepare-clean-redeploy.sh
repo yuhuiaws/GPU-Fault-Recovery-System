@@ -1118,16 +1118,43 @@ clear_node_metadata() {
     local annotation
     local label
     local arguments=()
+    local nodes=()
+    # `--all` walks every node the context can reach and would strip metadata
+    # from nodes owned by other tenants of a shared cluster, not just this
+    # deployment's. A node is ours iff it still carries one of the gpu-fault.io
+    # labels or annotations this deployment set, so resolve that exact set from
+    # the target cluster's API and touch nothing outside it. This whole step
+    # already runs only under `--mode reset --execute`, which is gated by
+    # `--confirm-reset RESET_GPU_FAULT_INSTALLATION`.
+    mapfile -t nodes < <(
+        gpu_kubectl "${context}" get nodes -o json |
+            GPU_FAULT_METADATA_KEYS="$(
+                printf '%s\n' "${GPU_NODE_ANNOTATIONS[@]}" "${GPU_NODE_LABELS[@]}"
+            )" python3 -c '
+import json
+import os
+import sys
+
+keys = {k for k in os.environ.get("GPU_FAULT_METADATA_KEYS", "").splitlines() if k}
+document = json.load(sys.stdin)
+for item in document.get("items", []):
+    meta = item.get("metadata", {})
+    present = set(meta.get("labels") or {}) | set(meta.get("annotations") or {})
+    if present & keys:
+        print(meta.get("name", ""))
+'
+    )
+    ((${#nodes[@]})) || return 0
     for annotation in "${GPU_NODE_ANNOTATIONS[@]}"; do
         arguments+=("${annotation}-")
     done
-    gpu_kubectl "${context}" annotate nodes --all --overwrite \
+    gpu_kubectl "${context}" annotate nodes "${nodes[@]}" --overwrite \
         "${arguments[@]}"
     arguments=()
     for label in "${GPU_NODE_LABELS[@]}"; do
         arguments+=("${label}-")
     done
-    gpu_kubectl "${context}" label nodes --all --overwrite \
+    gpu_kubectl "${context}" label nodes "${nodes[@]}" --overwrite \
         "${arguments[@]}"
 }
 

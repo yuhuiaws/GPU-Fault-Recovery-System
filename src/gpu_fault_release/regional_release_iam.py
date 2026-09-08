@@ -28,11 +28,25 @@ def validate_executor_iam_documents(
             if statement.get("NotAction") is not None:
                 forbidden.append("Allow/NotAction")
                 continue
+            if statement.get("NotResource") is not None:
+                forbidden.append("Allow/NotResource")
+                continue
+            raw_resource = statement.get("Resource", [])
+            resources = (
+                raw_resource if isinstance(raw_resource, list) else [raw_resource]
+            )
+            for resource in resources:
+                if str(resource).strip() == "*":
+                    forbidden.append('Resource "*"')
             raw = statement.get("Action", [])
             actions = raw if isinstance(raw, list) else [raw]
             for action in actions:
                 normalized = str(action).lower()
-                if normalized.startswith("ses:"):
+                # Least privilege: reject the account-wide wildcard and any
+                # service-wide wildcard (`iam:*`, `sts:*`, `sagemaker:*`, ...).
+                if normalized == "*" or normalized.endswith(":*"):
+                    forbidden.append(str(action))
+                elif normalized.startswith("ses:"):
                     forbidden.append(str(action))
                 elif (
                     normalized.startswith("sagemaker:")

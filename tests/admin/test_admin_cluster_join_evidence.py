@@ -156,3 +156,28 @@ def test_join_verification_evidence_expires(
             now=verified_at
             + timedelta(seconds=evidence.VERIFICATION_MAX_AGE_SECONDS + 1),
         )
+
+
+@pytest.mark.parametrize(
+    "cluster_id", ["with space", "..", "x" * 200, "", "tab\tinside"]
+)
+def test_a_malformed_joined_cluster_id_is_rejected(cluster_id: str) -> None:
+    """M-13: the joined cluster id decides which cluster is activated.
+
+    It should always arrive already validated from the site document, so a value
+    that does not match the anchored identifier shape is refused before it keys
+    the registry-state comparison the activation boundary rests on.
+    """
+
+    baseline = _snapshot(states={"gpu-a": "ACTIVE", "gpu-b": "PENDING"})
+
+    with pytest.raises(BootstrapError, match="cluster identity is malformed"):
+        evidence.build_verified_membership_evidence(
+            baseline,
+            baseline,
+            candidate_site_sha256="d" * 64,
+            source_site_sha256="e" * 64,
+            source_site_non_membership_sha256="f" * 64,
+            candidate_cluster_ids=["gpu-a", "gpu-b"],
+            cluster_id=cluster_id,
+        )

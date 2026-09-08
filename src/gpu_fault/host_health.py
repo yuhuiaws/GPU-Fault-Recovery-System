@@ -205,6 +205,9 @@ class NodeHealthFinding(StrictModel):
         return NodeMarker(
             marker_id=f"marker-{self.event_id}",
             source=("gpu-fault-policy/" + self.policy_source.lower().replace("_", "-")),
+            # Stamp the tenant so a scoped marker read cannot cross clusters
+            # (H-14). The finding always carries a non-empty cluster_id.
+            cluster_id=self.cluster_id,
             trusted=True,
             incident_id=f"inc-{self.event_id}",
             observed_at=self.observed_at,
@@ -1216,9 +1219,16 @@ class NodeHealthPolicy:
             Severity.FATAL: 3,
         }
         for entry in batch.entries:
+            entry_source = getattr(entry, "source", None)
             matches = []
             for rule_index, rule in enumerate(self.LOG_RULES):
                 if not rule.pattern.search(entry.message):
+                    continue
+                # Trusted-source gate (H-5): a hardware-fatal rule may only
+                # fire from a kernel/journal origin a workload cannot forge.
+                # An entry from a disallowed or absent origin is skipped so it
+                # can never produce a trusted isolation/quarantine marker.
+                if not rule.allows(entry_source):
                     continue
                 matches.append(
                     (

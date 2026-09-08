@@ -17,25 +17,29 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: gpu-fault-completion-watcher
+# Read-only across the cluster. The watcher runs one Pod watch over every
+# namespace (list_pod_for_all_namespaces), which RBAC cannot scope, so the
+# read verbs stay cluster-wide. Every write -- annotating Pods, suspending
+# Jobs/PyTorchJobs/JobSets, reading Pod logs and the `nvidia-smi` exec that
+# GPU_FAULT_DISCOVER_POD_GPU_UUIDS enables -- is granted per workload
+# namespace by the Role + RoleBinding the GPU rollout renders for each
+# `allowed_namespaces` entry (regional_release_gpu_rollout
+# .render_workload_namespace_rbac). `pods/exec` in particular must never be
+# cluster-wide: resourceNames does not apply to subresources, so a
+# ClusterRole grant is a shell into every Pod on the cluster.
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "patch"]
-  - apiGroups: [""]
-    resources: ["pods/exec"]
-    verbs: ["get", "create"]
-  - apiGroups: [""]
-    resources: ["pods/log"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["get", "patch"]
+    verbs: ["get"]
   - apiGroups: ["kubeflow.org"]
     resources: ["pytorchjobs"]
-    verbs: ["get", "patch"]
+    verbs: ["get"]
   - apiGroups: ["jobset.x-k8s.io"]
     resources: ["jobsets"]
-    verbs: ["get", "patch"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["gpu-fault-completion-watcher-outbox"]

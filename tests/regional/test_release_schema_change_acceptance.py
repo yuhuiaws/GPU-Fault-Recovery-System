@@ -52,6 +52,8 @@ def _release(*, state: dict | None = None, load_state: dict | None = None):
         state=state if state is not None else {},
         _ensure_contexts=lambda: None,
         _require_cpu_secrets=lambda: None,
+        _apply_rds_ca_bundle=lambda: None,
+        _refresh_aurora_credentials=lambda: None,
         _remote_commands_are_idle=lambda: True,
         _load_state=lambda: dict(load_state or {}),
         _capture_previous=lambda **_kwargs: (_ for _ in ()).throw(ValidationPassed()),
@@ -149,6 +151,12 @@ def test_an_accepted_transaction_does_not_roll_back_on_failure(monkeypatch) -> N
             pass
 
         def _require_cpu_secrets(self) -> None:
+            pass
+
+        def _apply_rds_ca_bundle(self) -> None:
+            pass
+
+        def _refresh_aurora_credentials(self) -> None:
             pass
 
         def _remote_commands_are_idle(self) -> bool:

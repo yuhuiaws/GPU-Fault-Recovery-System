@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from datetime import UTC, datetime
 import threading
 import time
 import uuid
@@ -49,6 +50,10 @@ from gpu_fault_release.regional_release_rollback_context import (
     # rollback flow even though the environment assembly now lives beside the
     # other rollback identity helpers.
     build_rollback_environment as build_rollback_environment,
+)
+from gpu_fault_release.regional_release_rollback_context import (
+    previous_container_env_snapshot,
+    write_rollback_container_env,
 )
 from gpu_fault_release.regional_release_rollback_context import (
     rollback_identity_context as _rollback_identity_context,
@@ -106,6 +111,15 @@ ROOT = Path(__file__).resolve().parents[2]
 # nothing left to roll back *to* in it. Compensating that is a separate design,
 # not a snapshot.
 NON_TRANSACTIONAL_CHANGES = frozenset({"clusters"})
+# The terminal phases of a fail-forward transaction that stopped: nothing is
+# still moving, nothing rolled back, the site is a mixture of the failed
+# candidate and the last committed release. Only a transaction in one of these
+# phases may be superseded by a different candidate (`upgrade_release` with
+# `supersede=`); every other phase either resumes the same release or continues
+# a rollback.
+SUPERSEDABLE_PHASES = frozenset({"failed", "partial-convergence"})
+# The release-state key that records the transaction a new one took over from.
+SUPERSEDED_TRANSACTION_KEY = "superseded_transaction"
 
 
 def _apply_rollback_cpu_environment(
@@ -173,6 +187,7 @@ def _validate_upgrade_transaction(
     plan: ReleaseExecutionPlan,
     *,
     resume: bool = False,
+    supersede: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Refuse before mutation, or return the schema-change acceptance to record.
 
@@ -182,9 +197,20 @@ def _validate_upgrade_transaction(
     (mode, time, later the snapshot) is returned for the transaction state and
     the transaction runs fail-forward without touching the site
     (``regional_schema_change``).
+
+    A transaction that supersedes a failed one inherits that transaction's
+    acceptance when it covers the same schema version: the schema already moved
+    and cannot be un-moved, so re-asking would only teach operators to pass the
+    flag by habit. A candidate that moves the schema again is a new schema
+    change and needs its own acceptance.
     """
 
-    acceptance = resolve_acceptance(self, changed=diff.changed, resume=resume)
+    acceptance = resolve_acceptance(
+        self,
+        changed=diff.changed,
+        resume=resume,
+        inherited=recorded_acceptance(supersede) if supersede is not None else None,
+    )
     non_transactional = diff.changed.intersection(NON_TRANSACTIONAL_CHANGES)
     if self.config.auto_rollback and non_transactional:
         raise ReleaseError(
@@ -246,12 +272,86 @@ def _require_compensable_endpoint_snapshot(
         )
 
 
+def inherit_superseded_previous(
+    self: Any,
+    failed: dict[str, Any],
+) -> dict[str, Any]:
+    """The baseline a superseding transaction rolls back to: the failed one's.
+
+    A failed fail-forward transaction left the site as a mixture of the failed
+    candidate and the last committed release. Capturing a fresh ``previous``
+    from that mixture would make it the rollback target of the next transaction,
+    so an automatic rollback would "restore" half of a release that never
+    committed. The committed release is exactly what the failed transaction
+    captured as its own ``previous`` -- including the Secret backups it took,
+    which are still in place because only a commit or a rollback deletes them --
+    so the new transaction inherits that snapshot instead. Every check the
+    inherited snapshot has to pass is checked here, before anything moves.
+    """
+
+    failed_id = str(failed.get("release_id") or "")
+    phase = str(failed.get("phase") or "")
+    if phase not in SUPERSEDABLE_PHASES:
+        raise ReleaseError(
+            f"only a transaction in {'/'.join(sorted(SUPERSEDABLE_PHASES))} can be "
+            f"superseded; release {failed_id or 'unknown'} is in phase "
+            f"{phase or 'unknown'}"
+        )
+    if failed_id == str(self.release_id):
+        raise ReleaseError(
+            f"release {failed_id} is the failed candidate itself; "
+            "rerun deploy without the supersede flag to resume it"
+        )
+    previous = failed.get("previous")
+    if not isinstance(previous, dict) or not previous:
+        raise ReleaseError(
+            f"failed release {failed_id} has no previous baseline to inherit"
+        )
+    expected_sha = str(failed.get("previous_snapshot_sha256") or "")
+    if not expected_sha:
+        raise ReleaseError("superseded previous baseline digest is missing")
+    if canonical_sha256(previous) != expected_sha:
+        raise ReleaseError("superseded previous baseline digest drifted")
+    if not isinstance(previous.get("secret_backups"), dict):
+        raise ReleaseError(
+            f"failed release {failed_id} recorded no Secret backups to inherit"
+        )
+    expected_ids = {target.cluster_id for target in self.config.clusters}
+    if set(failed.get("cluster_ids") or []) != expected_ids:
+        raise ReleaseError("supersede cluster membership drifted")
+    inherited: dict[str, Any] = json.loads(json.dumps(previous))
+    return inherited
+
+
+def superseded_transaction_record(failed: dict[str, Any]) -> dict[str, Any]:
+    """What the new transaction records about the one it took over from."""
+
+    record: dict[str, Any] = {
+        "release_id": failed.get("release_id"),
+        "phase": failed.get("phase"),
+        "superseded_at": datetime.now(UTC).isoformat(),
+    }
+    for name in (
+        "updated_at_epoch",
+        "original_failure",
+        "release_lifecycle",
+        "release_diff",
+        "completed_phases",
+        "completed_cluster_ids",
+        SCHEMA_CHANGE_ACCEPTANCE_KEY,
+    ):
+        if failed.get(name) is not None:
+            record[name] = failed[name]
+    return record
+
+
 def _upgrade_context(
     self: Any,
     *,
     resume: bool,
     diff: ReleaseDiff,
     plan: ReleaseExecutionPlan,
+    supersede: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], set[str], set[str], bool]:
     loaded = self._load_state() if resume else {}
     if resume:
@@ -267,8 +367,11 @@ def _upgrade_context(
         completed_clusters = set(loaded.get("completed_cluster_ids") or [])
         registry_staged = bool(loaded.get("registry_staged", False))
     else:
-        previous = self._capture_previous(plan=plan)
-        previous["secret_backups"] = self._backup_release_secrets()
+        if supersede is not None:
+            previous = inherit_superseded_previous(self, supersede)
+        else:
+            previous = self._capture_previous(plan=plan)
+            previous["secret_backups"] = self._backup_release_secrets()
         completed_phases = set()
         completed_clusters = set()
         registry_staged = False
@@ -989,14 +1092,45 @@ def upgrade_release(
     *,
     resume: bool = False,
     diff: ReleaseDiff | None = None,
+    supersede: dict[str, Any] | None = None,
 ) -> None:
+    """Run one upgrade transaction: new, resumed, or superseding a failed one.
+
+    ``supersede`` is the loaded state of a fail-forward transaction that
+    stopped in ``failed``/``partial-convergence`` and whose candidate is not
+    this release. The new transaction then starts from that transaction's
+    ``previous`` (the last committed release, see
+    ``inherit_superseded_previous``) instead of capturing the mixed live state,
+    records the transaction it replaced under ``superseded_transaction``, and
+    carries the earlier schema-change acceptance when it still applies. It is
+    otherwise an ordinary new transaction: fresh checkpoints, ``autoRollback``
+    from the site, the manifest plan digest originated here (M-23) rather than
+    pinned to the failed transaction's.
+    """
+
+    if resume and supersede is not None:
+        raise ReleaseError("a superseding transaction cannot also be a resume")
     self._ensure_contexts()
     self._require_cpu_secrets()
+    # Ensure the RDS CA bundle ConfigMap exists (M-6) before re-applying the
+    # control-plane roles (or a schema-ensure Job) that mount it verify-full;
+    # on the first upgrade after this change an existing cluster has no bundle
+    # yet, so an un-wired apply would wedge in CreateContainerConfigError.
+    self._apply_rds_ca_bundle()
+    # Copy the current Aurora password into the Secret before anything restarts
+    # a Pod against it; fail closed. A rotation that the refresh CronJob has not
+    # caught up with yet makes every new control-plane Pod die on password
+    # authentication failed, and a rollout that hits that window fails for a
+    # reason that looks like a broken release (2026-09-07, rollback-failed).
+    # After the CA bundle because the refresh Job mounts it.
+    self._refresh_aurora_credentials()
     if not self._remote_commands_are_idle():
         raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
     active_diff = diff or _default_release_diff()
     plan = build_execution_plan(active_diff)
-    acceptance = _validate_upgrade_transaction(self, active_diff, plan, resume=resume)
+    acceptance = _validate_upgrade_transaction(
+        self, active_diff, plan, resume=resume, supersede=supersede
+    )
     (
         previous,
         completed_phases,
@@ -1007,6 +1141,7 @@ def upgrade_release(
         resume=resume,
         diff=active_diff,
         plan=plan,
+        supersede=supersede,
     )
     if not resume:
         # A new transaction must not inherit rollback checkpoints or failure
@@ -1015,6 +1150,11 @@ def upgrade_release(
         self._save_state(
             "preflight",
             previous=previous,
+            **(
+                {SUPERSEDED_TRANSACTION_KEY: superseded_transaction_record(supersede)}
+                if supersede is not None
+                else {}
+            ),
             # Folded into every fleet deployment id of this transaction, so a
             # candidate re-applied after its rollback gets a fresh rollout.
             fleet_rollout_transaction=uuid.uuid4().hex[:12],
@@ -1138,7 +1278,36 @@ def _restore_rollback_cpu(
     config_digest: str,
     runtime_profile_version: str,
     runtime_image: str,
-) -> None:
+) -> dict[str, Any]:
+    """Put the previous control plane back and say how its env was rebuilt.
+
+    Returns the phase details recorded in ``rollback_timing``: whether the
+    previous Deployments' container environment came from the transaction's
+    own snapshot or, for a transaction opened before that capture existed,
+    from the current template. The distinction is what makes a later
+    ``unknown GPU_FAULT environment variable`` rollback failure explainable.
+    """
+
+    # Validated before the first mutation: a malformed snapshot stops the
+    # rollback while the Secret, registry and role ConfigMaps are untouched.
+    container_env = previous_container_env_snapshot(
+        previous.get("cpu_role_container_env")
+    )
+    if container_env is None:
+        details = {
+            "cpu_container_env": "current-template",
+            "cpu_container_env_note": (
+                "previous snapshot predates the container environment capture; "
+                "the previous image starts with the current template's env names"
+            ),
+        }
+        narrate_step(
+            "rollback-cpu-container-env",
+            source="current-template",
+            reason="snapshot-predates-capture",
+        )
+    else:
+        details = {"cpu_container_env": "snapshot"}
     previous_admin_config = AdminConfig.from_mapping(previous.get("admin_config") or {})
     cpu_secret = (previous.get("secret_backups") or {}).get("cpu") or {}
     if cpu_secret.get("backup"):
@@ -1157,21 +1326,28 @@ def _restore_rollback_cpu(
         cpu_wheel,
         self.config.wheel.name,
     )
-    environment = build_rollback_environment(
-        rollback_config=self.config.for_rollback(
-            config_digest,
-            admin_config=previous_admin_config,
-        ),
-        metadata=metadata,
-        cpu_wheel=cpu_wheel,
-        cpu_sha=cpu_sha,
-        artifact=artifact,
-        config_digest=config_digest,
-        runtime_profile_version=runtime_profile_version,
-        runtime_image=runtime_image,
-        preserve_role_config_maps=preserve_role_config_maps,
-    )
-    _apply_rollback_cpu_environment(self, environment)
+    with tempfile.TemporaryDirectory(prefix="gpu-fault-rollback-inputs-") as inputs:
+        container_env_file = (
+            write_rollback_container_env(container_env, Path(inputs))
+            if container_env is not None
+            else None
+        )
+        environment = build_rollback_environment(
+            rollback_config=self.config.for_rollback(
+                config_digest,
+                admin_config=previous_admin_config,
+            ),
+            metadata=metadata,
+            cpu_wheel=cpu_wheel,
+            cpu_sha=cpu_sha,
+            artifact=artifact,
+            config_digest=config_digest,
+            runtime_profile_version=runtime_profile_version,
+            runtime_image=runtime_image,
+            preserve_role_config_maps=preserve_role_config_maps,
+            previous_container_env_file=container_env_file,
+        )
+        _apply_rollback_cpu_environment(self, environment)
     refresh_exists = self.runner.probe(
         self._cpu(
             "-n",
@@ -1192,6 +1368,7 @@ def _restore_rollback_cpu(
                 f"refresh={runtime_image}",
             )
         )
+    return details
 
 
 def _stage_rollback_controller(
@@ -1603,6 +1780,96 @@ def _restore_regional_singletons(
         )
 
 
+def _rollback_phase_runner(
+    self: Any,
+    *,
+    timing: dict[str, Any],
+    previous: dict[str, Any],
+    loaded: dict[str, Any],
+    compensation: Any,
+    completed_phases: set[str],
+    completed_clusters: set[str],
+) -> tuple[
+    Callable[[str, str], None],
+    Callable[[str, str, Exception], None],
+    Callable[..., None],
+    Callable[[str, str, str, Callable[[], object]], None],
+]:
+    """The rollback's phase bookkeeping: start, fail, checkpoint, run.
+
+    Every phase persists the same durable record (progress sets, plan, timing,
+    lifecycle) so a crash mid-rollback resumes from the last checkpoint; these
+    closures share that record so no phase can persist a partial one.
+    """
+
+    def save_progress(
+        phase: str,
+        *,
+        release_lifecycle: str = "ROLLING_BACK",
+    ) -> None:
+        merge_rollback_wave_timings(self, timing)
+        self._save_state(
+            phase,
+            previous=previous,
+            rollback_completed_phases=sorted(completed_phases),
+            rollback_completed_cluster_ids=sorted(completed_clusters),
+            rollback_plan=compensation.as_dict(),
+            rollback_timing=timing,
+            release_lifecycle=release_lifecycle,
+            original_failure=loaded.get("original_failure"),
+        )
+
+    def start_phase(name: str, phase: str) -> None:
+        start_timed_entry(timing, "phases", name)
+        save_progress(phase, release_lifecycle="FAILED")
+
+    def fail_phase(name: str, phase: str, error: Exception) -> None:
+        complete_timed_entry(
+            timing,
+            "phases",
+            name,
+            status="FAILED",
+            details={"error": f"{type(error).__name__}: {error}"},
+        )
+        save_progress(phase)
+
+    def checkpoint(
+        phase: str,
+        *,
+        timing_name: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if timing_name is not None:
+            complete_timed_entry(timing, "phases", timing_name, details=details)
+        completed_phases.add(phase)
+        save_progress(phase)
+
+    def run_phase(
+        name: str,
+        started_phase: str,
+        completed_phase: str,
+        action: Callable[[], object],
+    ) -> None:
+        if completed_phase in completed_phases:
+            return
+        start_phase(name, started_phase)
+        try:
+            outcome = action()
+        except Exception as exc:
+            fail_phase(name, started_phase, exc)
+            raise
+        # A phase that returns a mapping is describing how it did its work
+        # (the CPU restore says where the container env came from); that goes
+        # into the durable timing record beside the phase's duration.
+        checkpoint(
+            completed_phase,
+            timing_name=name,
+            details=outcome if isinstance(outcome, dict) else None,
+        )
+
+    return start_phase, fail_phase, checkpoint, run_phase
+
+
 def rollback_release(
     self: Any,
     *,
@@ -1611,6 +1878,11 @@ def rollback_release(
     loaded, previous = _rollback_context(self, state)
     if not previous:
         return
+    # The compensating restore restarts the control-plane roles; on 2026-09-07
+    # it restarted them into a password RDS had rotated mid-transaction and the
+    # release landed in rollback-failed. Fresh credentials first, fail closed,
+    # before any restore is even planned.
+    self._refresh_aurora_credentials()
     compensation = build_rollback_compensation_plan(
         loaded,
         (target.cluster_id for target in self.config.clusters),
@@ -1658,58 +1930,15 @@ def rollback_release(
         completed_clusters=completed_clusters,
     )
 
-    def save_progress(
-        phase: str,
-        *,
-        release_lifecycle: str = "ROLLING_BACK",
-    ) -> None:
-        merge_rollback_wave_timings(self, timing)
-        self._save_state(
-            phase,
-            previous=previous,
-            rollback_completed_phases=sorted(completed_phases),
-            rollback_completed_cluster_ids=sorted(completed_clusters),
-            rollback_plan=compensation.as_dict(),
-            rollback_timing=timing,
-            release_lifecycle=release_lifecycle,
-            original_failure=loaded.get("original_failure"),
-        )
-
-    def start_phase(name: str, phase: str) -> None:
-        start_timed_entry(timing, "phases", name)
-        save_progress(phase, release_lifecycle="FAILED")
-
-    def fail_phase(name: str, phase: str, error: Exception) -> None:
-        complete_timed_entry(
-            timing,
-            "phases",
-            name,
-            status="FAILED",
-            details={"error": f"{type(error).__name__}: {error}"},
-        )
-        save_progress(phase)
-
-    def checkpoint(phase: str, *, timing_name: str | None = None) -> None:
-        if timing_name is not None:
-            complete_timed_entry(timing, "phases", timing_name)
-        completed_phases.add(phase)
-        save_progress(phase)
-
-    def run_phase(
-        name: str,
-        started_phase: str,
-        completed_phase: str,
-        action: Callable[[], None],
-    ) -> None:
-        if completed_phase in completed_phases:
-            return
-        start_phase(name, started_phase)
-        try:
-            action()
-        except Exception as exc:
-            fail_phase(name, started_phase, exc)
-            raise
-        checkpoint(completed_phase, timing_name=name)
+    start_phase, fail_phase, checkpoint, run_phase = _rollback_phase_runner(
+        self,
+        timing=timing,
+        previous=previous,
+        loaded=loaded,
+        compensation=compensation,
+        completed_phases=completed_phases,
+        completed_clusters=completed_clusters,
+    )
 
     if "rollback-started" not in completed_phases:
         checkpoint("rollback-started")

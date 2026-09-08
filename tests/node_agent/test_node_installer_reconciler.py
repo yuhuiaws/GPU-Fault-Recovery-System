@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from gpu_fault.node_installer_reconciler import (
     INSTALLER_ARTIFACT_ANNOTATION,
@@ -14,13 +16,97 @@ from gpu_fault.node_installer_reconciler import (
     INSTALLER_STATE_ANNOTATION,
     INSTALLER_TEMPLATE_ANNOTATION,
     INSTALLER_VERSION_ANNOTATION,
+    TEMPLATE_CONTENT_SHA256_ENV,
     NodeInstallerReconciler,
+    load_job_template,
 )
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
 ARTIFACT = "a" * 64
 BUNDLE = "c" * 64
 TEMPLATE = "d" * 64
+
+
+def test_template_text_must_match_the_pinned_content_digest():
+    """The ConfigMap is in the cluster; the pin is in the deploy. They must agree.
+
+    Whoever can update gpu-fault-node-installer-template-* would otherwise
+    choose what runs as a privileged hostPath Pod on every GPU node, with that
+    node's HMAC key mounted. The reconciler therefore hashes the exact bytes it
+    loads and compares them to the digest the deploy stamped into its env.
+    """
+
+    text = yaml.safe_dump(template(), sort_keys=False)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+
+    assert load_job_template(text, expected_sha256=digest, origin="cm/job.yaml") == (
+        template()
+    )
+    # Bytes and str hash the same way, so the mounted-file path and the
+    # ConfigMap path cannot disagree about one template.
+    assert (
+        load_job_template(
+            text.encode(), expected_sha256=digest.upper(), origin="cm/job.yaml"
+        )
+        == template()
+    )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        load_job_template(text + "\n# edited", expected_sha256=digest, origin="x")
+    with pytest.raises(RuntimeError, match="does not match"):
+        load_job_template(text, expected_sha256="0" * 64, origin="x")
+
+
+@pytest.mark.parametrize("missing", [None, "", "   ", "not-a-digest", "ab" * 31])
+def test_template_load_fails_closed_without_a_usable_pin(missing):
+    text = yaml.safe_dump(template(), sort_keys=False)
+
+    with pytest.raises(RuntimeError, match=TEMPLATE_CONTENT_SHA256_ENV):
+        load_job_template(text, expected_sha256=missing, origin="cm/job.yaml")
+
+
+def test_template_load_rejects_empty_and_non_document_templates():
+    digest = hashlib.sha256(b"").hexdigest()
+    with pytest.raises(RuntimeError, match="is empty"):
+        load_job_template("", expected_sha256=digest, origin="cm/job.yaml")
+
+    scalar = "just-a-string\n"
+    with pytest.raises(RuntimeError, match="not a Job document"):
+        load_job_template(
+            scalar,
+            expected_sha256=hashlib.sha256(scalar.encode()).hexdigest(),
+            origin="cm/job.yaml",
+        )
+
+
+def test_reconciler_requires_an_explicit_template_identity_pin():
+    """No fallback digest: a value derived from the config digest matched anything."""
+
+    with pytest.raises(TypeError):
+        NodeInstallerReconciler(  # type: ignore[call-arg]
+            CoreApi([]),
+            BatchApi(),
+            namespace="gpu-fault-system",
+            cluster_name="hp-cluster-a",
+            version="0.10.0",
+            config_digest="config-sha",
+            artifact_sha256=ARTIFACT,
+            job_template=template(),
+            dcgm_metrics_url_template="http://{node_ip}:9400/metrics",
+        )
+    with pytest.raises(ValueError, match="template SHA-256"):
+        NodeInstallerReconciler(
+            CoreApi([]),
+            BatchApi(),
+            namespace="gpu-fault-system",
+            cluster_name="hp-cluster-a",
+            version="0.10.0",
+            config_digest="config-sha",
+            artifact_sha256=ARTIFACT,
+            template_sha256="REPLACE_WITH_INSTALLER_TEMPLATE_SHA256",
+            job_template=template(),
+            dcgm_metrics_url_template="http://{node_ip}:9400/metrics",
+        )
 
 
 class ApiError(Exception):

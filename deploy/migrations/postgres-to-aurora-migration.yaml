@@ -18,11 +18,15 @@ spec:
               cpu: "1"
               memory: 1Gi
           image: public.ecr.aws/docker/library/python:3.12-slim
-          command: ["/bin/sh", "-c"]
-          args:
-            - >-
-              exec gpu-fault-store-migrate
-              --source-postgres-url "$SOURCE_POSTGRES_URL"
+          # No shell, and no DSN on the command line: both database URLs
+          # reach the tool as environment variables it reads itself
+          # (GPU_FAULT_STORE_URL for the target, SOURCE_POSTGRES_URL named by
+          # --source-postgres-url-env for the source). A `sh -c` expanding
+          # "$SOURCE_POSTGRES_URL" put the full Aurora master DSN into the
+          # argv of a process that runs for the length of the copy, where
+          # `kubectl get pod -o yaml`, `ps` and every log shipper can see it.
+          command: ["gpu-fault-store-migrate"]
+          args: ["--source-postgres-url-env", "SOURCE_POSTGRES_URL"]
           env:
             - name: PATH
               value: >-
@@ -37,11 +41,21 @@ spec:
                 secretKeyRef:
                   name: gpu-fault-aurora
                   key: postgres-url
+            # The Aurora target DSN uses sslmode=verify-full, so the RDS CA
+            # bundle mounted below must be readable at this path.
+            - name: GPU_FAULT_RDS_CA_BUNDLE
+              value: /etc/gpu-fault/rds/ca-bundle.pem
           volumeMounts:
             - name: artifact
               mountPath: /artifact
+              readOnly: true
+            - name: rds-ca-bundle
+              mountPath: /etc/gpu-fault/rds
               readOnly: true
       volumes:
         - name: artifact
           configMap:
             name: gpu-fault-control-plane-wheel-0100
+        - name: rds-ca-bundle
+          configMap:
+            name: gpu-fault-rds-ca-bundle

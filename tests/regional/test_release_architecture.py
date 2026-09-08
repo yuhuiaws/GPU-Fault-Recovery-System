@@ -618,7 +618,9 @@ def test_rollback_rejects_non_transactional_cluster_change(tmp_path: Path) -> No
         release.rollback(state={"metadata": {}, "cpu_wheel": "old-wheel"})
 
 
-def test_rollback_accepts_endpoint_change_once_compensated(tmp_path: Path) -> None:
+def test_rollback_accepts_endpoint_change_once_compensated(
+    tmp_path: Path, monkeypatch
+) -> None:
     """The endpoint left ``NON_TRANSACTIONAL_CHANGES`` when it gained a snapshot.
 
     ``regional_endpoint_rollback`` captures the live NLB Service and the Route53
@@ -631,6 +633,9 @@ def test_rollback_accepts_endpoint_change_once_compensated(tmp_path: Path) -> No
     release.state = {
         "release_diff": {"kind": "DATA_PLANE_COMPATIBLE", "changed": ["endpoint"]}
     }
+    # The credential refresh preflight probes the live CronJob; this test is
+    # about the transactional guard, not the site.
+    monkeypatch.setattr(release, "_refresh_aurora_credentials", lambda: None)
 
     with pytest.raises(MODULE.ReleaseError, match="previous Agent identities"):
         release.rollback(state={"metadata": {}, "cpu_wheel": "old-wheel"})

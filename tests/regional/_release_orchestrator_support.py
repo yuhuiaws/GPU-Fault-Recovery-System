@@ -186,6 +186,8 @@ def phase_release(
         "bundle_cm": "bundle",
         "node_wheel_sha": "a" * 64,
         "_upload_release": lambda _diff: calls.append("upload"),
+        "_apply_rds_ca_bundle": lambda: calls.append("rds-ca-bundle"),
+        "_refresh_aurora_credentials": lambda: calls.append("aurora-refresh"),
         "_ensure_schema": lambda: calls.append("schema"),
         "_stage_registry": stage_registry,
         "_publish_staged_registry": lambda: calls.append("publish-registry"),

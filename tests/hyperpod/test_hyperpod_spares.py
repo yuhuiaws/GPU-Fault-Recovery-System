@@ -1016,6 +1016,7 @@ def test_shortage_reason_names_each_rejected_candidate_gate():
 
 def _advisory_marker(node_id: str, *, action, severity):
     return NodeMarker(
+        cluster_id="hp-cluster",
         source="gpu-fault-policy/site-node-health",
         trusted=True,
         incident_id=f"inc-{node_id}-{action.value.lower()}",

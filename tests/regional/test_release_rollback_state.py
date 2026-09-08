@@ -23,6 +23,12 @@ from gpu_fault_release import rollout as MODULE
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# A rollback target's runtime image must be digest-pinned (H-13): a mutable tag
+# could be re-pointed between plan approval and apply. The sinks that consume the
+# previous release's runtime image reject anything that is not `...@sha256:<hex>`.
+PREVIOUS_RUNTIME_IMAGE = "registry.example/runtime@sha256:" + "e" * 64
+PREVIOUS_INSTALLER_IMAGE = "registry.example/installer@sha256:" + "f" * 64
+
 
 def _legacy_agent_identity(node_ids: tuple[str, ...] = ("node-a",)) -> dict:
     return {
@@ -199,7 +205,7 @@ def test_cpu_only_rollback_identity_does_not_require_agent_snapshots() -> None:
     )
     previous = {
         "cpu_wheel": "previous-cpu-wheel",
-        "runtime_image": "previous-runtime",
+        "runtime_image": PREVIOUS_RUNTIME_IMAGE,
         "metadata": {
             "required-agent-artifact-sha256": "a" * 64,
             "required-agent-config-digest": "b" * 64,
@@ -210,7 +216,7 @@ def test_cpu_only_rollback_identity_does_not_require_agent_snapshots() -> None:
     result = ROLLBACK_CONTEXT.rollback_identity_context(release, previous, compensation)
 
     assert result[1] == "previous-cpu-wheel"
-    assert result[-1] == "previous-runtime"
+    assert result[-1] == PREVIOUS_RUNTIME_IMAGE
 
 
 def test_schema_job_manifest_change_keeps_automatic_rollback_available() -> None:
@@ -222,6 +228,8 @@ def test_schema_job_manifest_change_keeps_automatic_rollback_available() -> None
         state={"release_diff": {"changed": ["schema_manifests"]}},
         _ensure_contexts=lambda: None,
         _require_cpu_secrets=lambda: None,
+        _apply_rds_ca_bundle=lambda: None,
+        _refresh_aurora_credentials=lambda: None,
         _remote_commands_are_idle=lambda: True,
         _capture_previous=lambda **_kwargs: (_ for _ in ()).throw(ValidationPassed()),
     )
@@ -243,6 +251,8 @@ def test_database_schema_change_still_requires_rollback_compatibility() -> None:
         state={"release_diff": {"changed": ["database_schema"]}},
         _ensure_contexts=lambda: None,
         _require_cpu_secrets=lambda: None,
+        _apply_rds_ca_bundle=lambda: None,
+        _refresh_aurora_credentials=lambda: None,
         _remote_commands_are_idle=lambda: True,
     )
     diff = DIFF.ReleaseDiff(
@@ -957,7 +967,8 @@ def _rollback_previous(*cluster_ids: str) -> dict:
             "required-regional-executor-artifact-sha256": "executor",
         },
         "cpu_wheel": "wheel",
-        "runtime_image": "previous-runtime",
+        "runtime_image": PREVIOUS_RUNTIME_IMAGE,
+        "node_installer_image": PREVIOUS_INSTALLER_IMAGE,
         "runtime_profile_version": "profile-v1",
         "agent_identities": {
             cluster_id: _legacy_agent_identity()
@@ -1016,6 +1027,7 @@ def rollback_release_fake(
                 SimpleNamespace(cluster_id=cluster_id) for cluster_id in cluster_ids
             )
         ),
+        _refresh_aurora_credentials=lambda: None,
         _save_state=lambda phase, **_updates: saved.append(phase),
     )
 
@@ -1083,12 +1095,15 @@ def test_rollback_verifier_receives_previous_runtime_image(
 
     VALIDATION.validate_rollback(
         release,
-        {"runtime_image": "previous-runtime", "runtime_profile_version": "profile-v1"},
+        {
+            "runtime_image": PREVIOUS_RUNTIME_IMAGE,
+            "runtime_profile_version": "profile-v1",
+        },
     )
 
-    assert checked == ["previous-runtime", "previous-runtime"]
+    assert checked == [PREVIOUS_RUNTIME_IMAGE, PREVIOUS_RUNTIME_IMAGE]
     assert [env["GPU_FAULT_RUNTIME_IMAGE"] for env in verifier_envs] == [
-        "previous-runtime"
+        PREVIOUS_RUNTIME_IMAGE
     ]
 
 

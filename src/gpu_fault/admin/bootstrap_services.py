@@ -207,7 +207,18 @@ def _ensure_pod_identity_agent(
     return result
 
 
-def _pod_identity_trust() -> dict[str, Any]:
+def _pod_identity_trust(cluster: ClusterIdentity) -> dict[str, Any]:
+    """Trust policy for an EKS Pod Identity role, scoped to one cluster.
+
+    The EKS Auth service (``pods.eks.amazonaws.com``) is the principal that
+    assumes this role on a pod's behalf. With no ``Condition`` the service can
+    act as a confused deputy: any cluster in the account (or, absent the account
+    guard, the partition) could be pointed at this role. EKS Pod Identity
+    populates ``aws:SourceArn`` with the assuming cluster's ARN and
+    ``aws:SourceAccount`` with its account, so pinning both keys restricts the
+    trust to this one cluster instead of every cluster the service fronts.
+    """
+
     return {
         "Version": "2012-10-17",
         "Statement": [
@@ -215,13 +226,17 @@ def _pod_identity_trust() -> dict[str, Any]:
                 "Effect": "Allow",
                 "Principal": {"Service": "pods.eks.amazonaws.com"},
                 "Action": ["sts:AssumeRole", "sts:TagSession"],
+                "Condition": {
+                    "StringEquals": {"aws:SourceAccount": cluster.account_id},
+                    "ArnEquals": {"aws:SourceArn": cluster.eks_arn},
+                },
             }
         ],
     }
 
 
-def pod_identity_trust() -> dict[str, Any]:
-    return _pod_identity_trust()
+def pod_identity_trust(cluster: ClusterIdentity) -> dict[str, Any]:
+    return _pod_identity_trust(cluster)
 
 
 def _normalized_document(value: object) -> object:
@@ -576,7 +591,7 @@ def ensure_control_plane_role(
         runner,
         account_id=cpu.account_id,
         role_name=role_name,
-        trust=_pod_identity_trust(),
+        trust=_pod_identity_trust(cpu),
         policy_name="GPUFaultRegionalObserve",
         policy=control_plane_policy_document(
             region=cpu.region,
@@ -1151,7 +1166,7 @@ def install_monitoring(
         runner,
         account_id=cpu.account_id,
         role_name=role_name,
-        trust=_pod_identity_trust(),
+        trust=_pod_identity_trust(cpu),
         policy_name="gpu-fault-amp-remote-write",
         policy={
             "Version": "2012-10-17",
@@ -1355,7 +1370,7 @@ def install_aurora_refresh(
         runner,
         account_id=cpu.account_id,
         role_name=role_name,
-        trust=_pod_identity_trust(),
+        trust=_pod_identity_trust(cpu),
         policy_name="ReadAuroraManagedMasterSecret",
         policy={"Version": "2012-10-17", "Statement": statements},
         site_id=site_id,

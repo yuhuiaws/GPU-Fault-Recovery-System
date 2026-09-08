@@ -42,10 +42,12 @@ def marker(
     trusted: bool = True,
     active: bool = True,
     expires_at: datetime | None = None,
+    cluster_id: str | None = None,
 ) -> NodeMarker:
     return NodeMarker(
         marker_id=marker_id,
         source="test-agent",
+        cluster_id=cluster_id,
         trusted=trusted,
         active=active,
         incident_id=incident_id,
@@ -308,6 +310,53 @@ def test_blocking_spare_markers_with_no_aliases_reads_nothing() -> None:
     _refuse_full_scan(store)
 
     assert blocking_spare_markers(store, set(), now=NOW) == []
+
+
+def test_markers_do_not_cross_tenant_boundaries() -> None:
+    """H-14: a node_id colliding across clusters must not leak markers.
+
+    Two tenants both run a ``node-a``. A blocking marker raised in ``alpha``
+    must be invisible to a scoped read for ``beta`` and visible to ``alpha``.
+    """
+
+    store = build_store()
+    _seed_incident_workflow(store, status=WorkflowStatus.BLOCKED)
+    store.add_marker(
+        marker(
+            marker_id="alpha-blocking",
+            scope=MarkerScope(node_ids=["node-a"]),
+            cluster_id="alpha",
+        )
+    )
+    _refuse_full_scan(store)
+
+    other_tenant = blocking_spare_markers(store, {"node-a"}, cluster_id="beta", now=NOW)
+    own_tenant = blocking_spare_markers(store, {"node-a"}, cluster_id="alpha", now=NOW)
+
+    assert other_tenant == []
+    assert [item.marker_id for item in own_tenant] == ["alpha-blocking"]
+
+
+def test_scoped_read_never_matches_a_legacy_marker_without_a_cluster() -> None:
+    """A marker with no stamped cluster is never claimed by a specific tenant.
+
+    Legacy rows predate the tenant stamp; matching one to any cluster that
+    asked would re-open the cross-tenant read, so a scoped query drops it.
+    """
+
+    store = build_store()
+    _seed_incident_workflow(store, status=WorkflowStatus.BLOCKED)
+    store.add_marker(
+        marker(
+            marker_id="legacy", scope=MarkerScope(node_ids=["node-a"]), cluster_id=None
+        )
+    )
+
+    scoped = blocking_spare_markers(store, {"node-a"}, cluster_id="alpha", now=NOW)
+    unscoped = blocking_spare_markers(store, {"node-a"}, now=NOW)
+
+    assert scoped == []
+    assert [item.marker_id for item in unscoped] == ["legacy"]
 
 
 def test_no_production_module_reads_the_whole_marker_table() -> None:

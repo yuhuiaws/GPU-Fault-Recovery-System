@@ -253,6 +253,29 @@ def test_the_control_plane_policy_pins_email_to_the_verified_sender() -> None:
     }
 
 
+def test_the_pod_identity_trust_is_scoped_to_one_cluster() -> None:
+    """The EKS Auth service can act as a confused deputy without a Condition.
+
+    ``pods.eks.amazonaws.com`` fronts every cluster in the account; with no
+    Condition any of them could be pointed at this role. Pinning the assuming
+    cluster's ARN and account restricts the trust to exactly this cluster.
+    """
+
+    cluster = _cluster()
+    trust = pod_identity_trust(cluster)
+    statement = trust["Statement"][0]
+
+    assert statement["Principal"] == {"Service": "pods.eks.amazonaws.com"}
+    assert statement["Condition"] == {
+        "StringEquals": {"aws:SourceAccount": cluster.account_id},
+        "ArnEquals": {"aws:SourceArn": cluster.eks_arn},
+    }
+    # A different cluster in the same account produces a different trust, so the
+    # scope really is per-cluster and not merely per-account.
+    other = replace(cluster, eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/other")
+    assert pod_identity_trust(other) != trust
+
+
 def test_the_executor_policy_allows_reboot_only_on_its_own_cluster() -> None:
     """One executor cannot act on another cluster, and cannot send e-mail.
 
@@ -302,7 +325,7 @@ def test_a_fresh_account_gets_the_addon_role_and_binding(
     )
     create = account.mutations("create-role")[0]
     assert json.loads(create[create.index("--assume-role-policy-document") + 1]) == (
-        pod_identity_trust()
+        pod_identity_trust(_cluster())
     )
     assert f"Key={SITE_TAG_KEY},Value={SITE}" in create
     assert account.mutations("put-role-policy"), (
@@ -333,7 +356,7 @@ def test_an_existing_identity_that_already_matches_is_left_alone(
     account.service_account_exists = True
     account.role_exists = True
     account.role_tags = [{"Key": SITE_TAG_KEY, "Value": SITE}]
-    account.role_trust = pod_identity_trust()
+    account.role_trust = pod_identity_trust(_cluster())
     account.role_policy = control_plane_policy_document(
         region=REGION, account_id=ACCOUNT
     )
@@ -410,7 +433,7 @@ def test_an_inline_policy_that_cannot_be_read_stops_bootstrap(
     account = Account()
     account.role_exists = True
     account.role_tags = [{"Key": SITE_TAG_KEY, "Value": SITE}]
-    account.role_trust = pod_identity_trust()
+    account.role_trust = pod_identity_trust(_cluster())
     account.policy_lookup = (
         254,
         "AccessDenied: not authorized to perform iam:GetRolePolicy",
@@ -480,7 +503,7 @@ def test_two_associations_for_one_service_account_stop_bootstrap(
     account.service_account_exists = True
     account.role_exists = True
     account.role_tags = [{"Key": SITE_TAG_KEY, "Value": SITE}]
-    account.role_trust = pod_identity_trust()
+    account.role_trust = pod_identity_trust(_cluster())
     account.role_policy = control_plane_policy_document(
         region=REGION, account_id=ACCOUNT
     )

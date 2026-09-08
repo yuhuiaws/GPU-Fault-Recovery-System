@@ -11,6 +11,15 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# kubectl invocation pinned to the operator-named target. main() replaces both
+# once --context (and any --kubeconfig) are known, so no command in this file
+# can fall back to the ambient kubeconfig context and silently mutate whatever
+# cluster happens to be current -- this case applies a privileged Pod and execs
+# into the control plane.
+KUBE_PREFIX: list[str] = ["kubectl"]
+# The same base without --context, for `kubectl config` queries that reject it.
+KUBE_CONFIG_PREFIX: list[str] = ["kubectl"]
+
 CASES = {
     "safe-only": {
         "test_case_id": "GF-LIVE-XID74-SAFE-20260726",
@@ -167,7 +176,7 @@ def kubectl(
     input_text: str | None = None,
 ) -> str:
     return run(
-        ["kubectl", "-n", namespace, *arguments],
+        [*KUBE_PREFIX, "-n", namespace, *arguments],
         input_text=input_text,
     )
 
@@ -177,7 +186,7 @@ def snapshot(
     node: str,
     job_id: str,
 ) -> dict[str, Any]:
-    node_value = json.loads(run(["kubectl", "get", "node", node, "-o", "json"]))
+    node_value = json.loads(run([*KUBE_PREFIX, "get", "node", node, "-o", "json"]))
     pods = json.loads(
         kubectl(
             namespace,
@@ -605,6 +614,49 @@ def evaluate_assertions(
     return assertions
 
 
+def configure_kube_target(kubeconfig: str | None, context: str) -> None:
+    """Pin every kubectl call in this run to one kubeconfig and context."""
+    global KUBE_PREFIX, KUBE_CONFIG_PREFIX
+    base = ["kubectl"]
+    if kubeconfig:
+        base = [*base, "--kubeconfig", kubeconfig]
+    KUBE_CONFIG_PREFIX = list(base)
+    KUBE_PREFIX = [*base, "--context", context]
+
+
+def assert_live_target(args: argparse.Namespace) -> None:
+    """Refuse to mutate a cluster without explicit, double-stated opt-in.
+
+    This case is destructive -- it applies a privileged Pod that writes the host
+    ``/dev/kmsg`` and execs into the control-plane Deployment. Requiring an
+    explicit ``--live-run`` and a ``--confirm-context`` that exactly repeats
+    ``--context`` means a copy-pasted command cannot run against the wrong
+    (for example, production) cluster by inheriting an ambient kubeconfig
+    context.
+    """
+    if not args.live_run:
+        raise SystemExit(
+            "refusing to run: this case mutates a live cluster (privileged "
+            "injection Pod plus control-plane exec); pass --live-run to proceed"
+        )
+    if args.confirm_context != args.context:
+        raise SystemExit(
+            "refusing to run: --confirm-context must exactly repeat --context "
+            f"({args.context!r}); got {args.confirm_context!r}"
+        )
+
+
+def verify_context_available(context: str) -> None:
+    """Fail fast, read-only, if the pinned context is absent from kubeconfig."""
+    names = run([*KUBE_CONFIG_PREFIX, "config", "get-contexts", "-o", "name"])
+    available = {line.strip() for line in names.splitlines() if line.strip()}
+    if context not in available:
+        raise SystemExit(
+            f"refusing to run: context {context!r} is not present in the "
+            "kubeconfig; available contexts: " + ", ".join(sorted(available))
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run one recorded HyperPod /dev/kmsg XID 74 case."
@@ -614,6 +666,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--node", required=True)
     parser.add_argument("--pci-bdf", required=True)
+    parser.add_argument(
+        "--context",
+        required=True,
+        help="kube context to pin every kubectl call to (the target cluster)",
+    )
+    parser.add_argument(
+        "--confirm-context",
+        default="",
+        help="must exactly repeat --context; guards against the wrong cluster",
+    )
+    parser.add_argument(
+        "--kubeconfig",
+        default=None,
+        help="kubeconfig path to pin (defaults to the ambient KUBECONFIG)",
+    )
+    parser.add_argument(
+        "--live-run",
+        action="store_true",
+        help=(
+            "required acknowledgement that this mutates a live cluster; without "
+            "it the case refuses to run"
+        ),
+    )
     parser.add_argument("--namespace", default="gpu-fault-system")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--link-id", type=int, default=3)
@@ -657,6 +732,11 @@ def validate_case_flags(
 def main() -> int:
     args = build_parser().parse_args()
     case = CASES[args.case]
+    # Live-safety gate: pin the target, require explicit opt-in and a repeated
+    # context, and prove the context exists before anything is applied.
+    assert_live_target(args)
+    configure_kube_target(args.kubeconfig, args.context)
+    verify_context_available(args.context)
     try:
         validate_case_flags(
             case,
@@ -680,30 +760,48 @@ def main() -> int:
         args.link_id,
         case.get("repetitions", 1),
     )
+    pod_name = manifest["metadata"]["name"]
     kubectl(
         args.namespace,
         ["apply", "-f", "-"],
         input_text=json.dumps(manifest),
     )
-    pod_name = manifest["metadata"]["name"]
-    kubectl(
-        args.namespace,
-        [
-            "wait",
-            "--for=jsonpath={.status.phase}=Succeeded",
-            f"pod/{pod_name}",
-            "--timeout=90s",
-        ],
-    )
-    evidence = wait_for_evidence(
-        args.namespace,
-        args.cluster_id,
-        args.node,
-        started.isoformat(),
-        case["registers"],
-        args.timeout,
-    )
-    after = snapshot(args.namespace, args.node, args.job_id)
+    try:
+        kubectl(
+            args.namespace,
+            [
+                "wait",
+                "--for=jsonpath={.status.phase}=Succeeded",
+                f"pod/{pod_name}",
+                "--timeout=90s",
+            ],
+        )
+        evidence = wait_for_evidence(
+            args.namespace,
+            args.cluster_id,
+            args.node,
+            started.isoformat(),
+            case["registers"],
+            args.timeout,
+        )
+        after = snapshot(args.namespace, args.node, args.job_id)
+    finally:
+        # Always remove the injection Pod we created, even if the wait, the
+        # evidence poll, or the after-snapshot raised, so a failed run never
+        # leaks a privileged Pod on the node.
+        try:
+            kubectl(
+                args.namespace,
+                [
+                    "delete",
+                    "pod",
+                    pod_name,
+                    "--ignore-not-found",
+                    "--wait=false",
+                ],
+            )
+        except RuntimeError as exc:
+            print(f"WARNING: failed to delete injection pod {pod_name}: {exc}")
     assertions = evaluate_assertions(
         case=case,
         evidence=evidence,

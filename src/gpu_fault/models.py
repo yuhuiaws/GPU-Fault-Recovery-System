@@ -527,6 +527,13 @@ class MarkerScope(StrictModel):
 class NodeMarker(StrictModel):
     marker_id: str = Field(default_factory=lambda: f"marker-{uuid4()}")
     source: str
+    # Tenant that owns this marker (H-14). node_ids collide across clusters,
+    # so a scoped marker read must filter on this to keep one tenant from
+    # reading or applying another tenant's markers. Optional for backward
+    # compatibility with legacy rows and marker producers that have not yet
+    # been threaded a cluster; a scoped read treats a missing cluster_id
+    # conservatively and never matches it to a specific cluster.
+    cluster_id: str | None = None
     trusted: bool = False
     incident_id: str
     observed_at: datetime

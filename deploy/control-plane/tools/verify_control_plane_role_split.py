@@ -30,7 +30,11 @@ import subprocess
 import sys
 
 NAMESPACE = os.getenv("GPU_FAULT_NAMESPACE", "gpu-fault-system")
-_CONFIG_MAP_CACHE: dict[str, dict[str, str]] = {}
+# name -> data, or None once kubectl has answered NotFound. Absence is
+# cached like presence so an optional ConfigMap referenced from several
+# places costs one lookup, and so a later required reference to the same
+# name still fails (see config_map_data).
+_CONFIG_MAP_CACHE: dict[str, dict[str, str] | None] = {}
 
 # Kept in step with PROCESSOR_POOL_ENV in
 # render_control_plane_role_split.py.
@@ -73,37 +77,74 @@ def container(item: dict, name: str) -> dict:
     raise SystemExit(f"{item['metadata']['name']} has no {name} container")
 
 
-def config_map_data(name: str) -> dict[str, str]:
-    if name in _CONFIG_MAP_CACHE:
-        return _CONFIG_MAP_CACHE[name]
-    result = subprocess.run(
-        [
-            "kubectl",
-            "-n",
-            NAMESPACE,
-            "get",
-            "configmap",
-            name,
-            "-o",
-            "json",
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
+def config_map_data(name: str, *, optional: bool = False) -> dict[str, str] | None:
+    """Return a ConfigMap's ``data``, following kubelet's ``optional`` rule.
+
+    A ConfigMap the API server reports as NotFound is an error for a
+    required reference and ``None`` for an optional one - exactly what
+    kubelet does when it builds the container environment, so the
+    verifier never turns an ``optional: true`` declaration in the
+    Deployment template into a required one. Any other kubectl failure
+    (unreachable API server, RBAC) is fatal regardless of ``optional``:
+    kubelet tolerates a ConfigMap that does not exist, not one it could
+    not read, and reading "unreachable" as "absent" would silently unset
+    variables the template meant to carry.
+    """
+
+    if name not in _CONFIG_MAP_CACHE:
+        result = subprocess.run(
+            [
+                "kubectl",
+                "-n",
+                NAMESPACE,
+                "get",
+                "configmap",
+                name,
+                "-o",
+                "json",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            _CONFIG_MAP_CACHE[name] = json.loads(result.stdout).get("data") or {}
+        elif "NotFound" in (result.stderr or ""):
+            _CONFIG_MAP_CACHE[name] = None
+        else:
+            raise SystemExit(
+                f"ConfigMap {name} could not be read: "
+                + (
+                    (result.stderr or "").strip()
+                    or f"kubectl exited {result.returncode}"
+                )
+            )
+    data = _CONFIG_MAP_CACHE[name]
+    if data is None and not optional:
         raise SystemExit(f"ConfigMap {name} is missing")
-    data = json.loads(result.stdout).get("data") or {}
-    _CONFIG_MAP_CACHE[name] = data
     return data
 
 
 def env_values(item: dict) -> dict[str, str | None]:
+    """Resolve a container's environment the way kubelet would.
+
+    ``envFrom.configMapRef`` and ``valueFrom.configMapKeyRef`` honour
+    ``optional: true``: an absent optional ConfigMap contributes nothing
+    (envFrom) or leaves the variable unset (``None``, keyRef), and so does
+    a present ConfigMap that lacks the referenced key. The Deployment
+    template relies on this for ``gpu-fault-failure-domain-map``, which a
+    site may legitimately not have.
+    """
+
     values: dict[str, str | None] = {}
     for source in item.get("envFrom") or []:
         reference = source.get("configMapRef")
         if reference and reference.get("name"):
-            values.update(config_map_data(reference["name"]))
+            data = config_map_data(
+                reference["name"], optional=bool(reference.get("optional"))
+            )
+            if data is not None:
+                values.update(data)
     for entry in item.get("env") or []:
         name = entry.get("name")
         if not name:
@@ -113,7 +154,10 @@ def env_values(item: dict) -> dict[str, str | None]:
             continue
         reference = entry.get("valueFrom", {}).get("configMapKeyRef")
         if reference and reference.get("name"):
-            values[name] = config_map_data(reference["name"]).get(reference.get("key"))
+            data = config_map_data(
+                reference["name"], optional=bool(reference.get("optional"))
+            )
+            values[name] = None if data is None else data.get(reference.get("key"))
         else:
             values[name] = None
     return values

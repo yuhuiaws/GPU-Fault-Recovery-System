@@ -210,10 +210,15 @@ def test_deploy_only_resumes_an_unrolled_back_release(
     expected_diff = module.diff_from_changed({"control_plane_wheel"})
     calls: list[dict[str, object]] = []
     release = SimpleNamespace(
+        # The same release as the recorded transaction: a `failed` phase only
+        # resumes its own candidate (a different one is refused, see
+        # tests/regional/test_release_supersede_failed_transaction.py).
+        release_id="previous-candidate",
         config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
         _cpu=lambda *args: ["kubectl", *args],
         runner=SimpleNamespace(probe=lambda _args: True),
         _load_state=lambda: {"phase": phase, "release_id": "previous-candidate"},
+        pin_approved_manifest_plan=lambda _digest: None,
         upgrade=lambda **kwargs: calls.append(kwargs),
     )
     monkeypatch.setattr(
@@ -231,7 +236,9 @@ def test_explicit_resume_reuses_the_checkpoint_retry_diff(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
     state = {"phase": "registry-staged", "release_id": "candidate-release"}
     release = SimpleNamespace(
-        _load_state=lambda: state, upgrade=lambda **kwargs: calls.append(kwargs)
+        _load_state=lambda: state,
+        pin_approved_manifest_plan=lambda _digest: None,
+        upgrade=lambda **kwargs: calls.append(kwargs),
     )
     monkeypatch.setattr(
         module, "retry_release_diff", lambda _release, value: expected_diff

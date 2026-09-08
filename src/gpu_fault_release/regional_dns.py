@@ -9,8 +9,30 @@ from pathlib import Path
 from typing import Any
 
 from gpu_fault_release.regional_release_config import ReleaseError, render_nlb_manifest
+from gpu_fault_release.regional_release_rollout_wait import bounded_kubectl_wait
 
 ROOT = Path(__file__).resolve().parents[2]
+SERVICE_HOSTNAME_JSONPATH = "{.status.loadBalancer.ingress[0].hostname}"
+SERVICE_HOSTNAME_POLL_SECONDS = 5.0
+
+
+def service_hostname_wait_args(release: Any, namespace: str, service: str) -> list[str]:
+    """The ``kubectl wait`` that returns once ``service`` publishes a hostname.
+
+    The value is unknown until the load balancer controller writes it, so this
+    waits on the field existing (``--for=jsonpath`` without a value, kubectl
+    1.28+) rather than on a value.
+    """
+
+    return list(
+        release._cpu(
+            "-n",
+            namespace,
+            "wait",
+            f"service/{service}",
+            f"--for=jsonpath={SERVICE_HOSTNAME_JSONPATH}",
+        )
+    )
 
 
 def _aws_json(
@@ -133,7 +155,14 @@ def verify_control_plane_dns_prerequisites(release: Any) -> None:
         raise ReleaseError("ACM certificate is expired")
 
 
-def _wait_service_hostname(release: Any) -> str:
+def wait_service_hostname(release: Any) -> str:
+    """Return the NLB Service's published hostname, waiting up to 600s for it.
+
+    Each empty read is followed by a bounded ``kubectl wait`` on the hostname
+    jsonpath, so the loop wakes when the controller publishes the address
+    rather than a fixed interval later. A dry run answers ``""`` after one read.
+    """
+
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
         hostname = release.runner.run(
@@ -144,7 +173,7 @@ def _wait_service_hostname(release: Any) -> str:
                 "service",
                 "gpu-fault-api-nlb",
                 "-o",
-                "jsonpath={.status.loadBalancer.ingress[0].hostname}",
+                f"jsonpath={SERVICE_HOSTNAME_JSONPATH}",
             ),
             capture=True,
         )
@@ -152,7 +181,14 @@ def _wait_service_hostname(release: Any) -> str:
             return hostname
         if release.runner.dry_run:
             return ""
-        time.sleep(5)
+        # Wake when the controller publishes the address, not up to 5s later.
+        bounded_kubectl_wait(
+            release,
+            service_hostname_wait_args(
+                release, release.config.namespace, "gpu-fault-api-nlb"
+            ),
+            seconds=min(SERVICE_HOSTNAME_POLL_SECONDS, deadline - time.monotonic()),
+        )
     raise ReleaseError("NLB Service did not publish a hostname within 600s")
 
 
@@ -477,7 +513,7 @@ def ensure_cname_points_at(release: Any, hostname: str) -> None:
 
 
 def ensure_control_plane_dns(release: Any) -> None:
-    hostname = _wait_service_hostname(release)
+    hostname = wait_service_hostname(release)
     if release.runner.dry_run and not hostname:
         return
     load_balancer_arn = _wait_nlb_active(release, hostname)

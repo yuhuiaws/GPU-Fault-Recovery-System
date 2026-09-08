@@ -99,9 +99,7 @@ class FlightRecorderOperationsMixin:
             raw_candidates.append(Path(f"{base}{rank}.pipe"))
             raw_candidates.append(Path(f"{base}{rank}"))
         raw_candidates.append(Path(base))
-        candidates = [
-            self._process_namespace_path(pid, path) for path in raw_candidates
-        ]
+        candidates = self._process_namespace_paths(pid, raw_candidates)
         pipe = next(
             (
                 path
@@ -143,14 +141,41 @@ class FlightRecorderOperationsMixin:
         }
 
     @staticmethod
-    def _process_namespace_path_for_root(proc_root: Path, pid: int, path: Path) -> Path:
-        relative = Path(*path.parts[1:]) if path.is_absolute() else path
-        return (
-            proc_root / str(pid) / ("root" if path.is_absolute() else "cwd") / relative
-        )
+    def process_namespace_path_for_root(proc_root: Path, pid: int, path: Path) -> Path:
+        # ``path`` is read from the training container's environment
+        # (TORCH_NCCL_DEBUG_INFO_* variables), so it is attacker-influenced.
+        # Map it into the container's mount namespace as the root-owned Agent
+        # sees it (``/proc/<pid>/root`` for absolute paths, ``/cwd`` for
+        # relative ones) and refuse anything that would escape that base via
+        # ``..`` segments or an absolute anchor. Stripping ``parts[1:]`` alone
+        # does not stop traversal, so a crafted value could otherwise steer a
+        # privileged read or FIFO write outside the base (security review M-8).
+        is_absolute = path.is_absolute()
+        base = proc_root / str(pid) / ("root" if is_absolute else "cwd")
+        parts = path.parts[1:] if is_absolute else path.parts
+        if any(part == ".." for part in parts):
+            raise ValueError(f"refusing path traversal in namespace path: {path}")
+        candidate = base.joinpath(*parts)
+        if not candidate.resolve().is_relative_to(base.resolve()):
+            raise ValueError(f"namespace path escapes container base: {path}")
+        return candidate
 
     def _process_namespace_path(self, pid: int, path: Path) -> Path:
-        return self._process_namespace_path_for_root(self.proc_root, pid, path)
+        return self.process_namespace_path_for_root(self.proc_root, pid, path)
+
+    def _process_namespace_paths(
+        self, pid: int, raw_candidates: list[Path]
+    ) -> list[Path]:
+        """Map candidates into the namespace, dropping any that escape it."""
+        mapped = []
+        for path in raw_candidates:
+            try:
+                mapped.append(self._process_namespace_path(pid, path))
+            except ValueError:
+                # A traversal attempt is contained by simply never producing
+                # a usable candidate for it; legitimate candidates still map.
+                continue
+        return mapped
 
     def _flight_dump_candidates(
         self,
@@ -173,9 +198,7 @@ class FlightRecorderOperationsMixin:
             )
         if base:
             raw_candidates.append(Path(f"{base}.json"))
-        candidates = [
-            self._process_namespace_path(pid, path) for path in raw_candidates
-        ]
+        candidates = self._process_namespace_paths(pid, raw_candidates)
         if pipe is not None:
             candidates.extend(
                 [
@@ -187,12 +210,12 @@ class FlightRecorderOperationsMixin:
         if rank is not None:
             candidates.extend(
                 [
-                    FlightRecorderOperationsMixin._process_namespace_path_for_root(
+                    FlightRecorderOperationsMixin.process_namespace_path_for_root(
                         self.proc_root,
                         pid,
                         Path(f"/tmp/nccl_trace_rank_{rank}"),
                     ),
-                    FlightRecorderOperationsMixin._process_namespace_path_for_root(
+                    FlightRecorderOperationsMixin.process_namespace_path_for_root(
                         self.proc_root,
                         pid,
                         Path(f"/tmp/nccl_trace_rank_{rank}.json"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -24,6 +25,18 @@ from gpu_fault.admin.bootstrap_services import (
 
 LBC_VERSION = "v2.17.1"
 LBC_CHART_VERSION = "1.17.1"
+# ``LBC_VERSION`` is a git tag, and a tag is a mutable ref: whoever controls the
+# upstream repo can move it to different bytes, and this deploy would hand those
+# bytes straight to ``iam:CreatePolicy``. The chart is version-pinned but its
+# manifest is fetched over the network too, so the only artifact we can pin by
+# content from here is the IAM policy JSON. This is the SHA-256 of
+# ``docs/install/iam_policy.json`` at the ``LBC_VERSION`` tag; the fetch is
+# rejected unless it matches, so a moved tag or a tampered fetch fails closed
+# instead of installing an unreviewed policy. Recompute with
+# ``curl -fsSL <raw url> | sha256sum`` when bumping ``LBC_VERSION``.
+LBC_IAM_POLICY_SHA256 = (
+    "16f232c9d9f79366fe949c4550ad517a202380058a9e48d45a4e215044a20a6a"
+)
 
 
 def _controller_ready(runner: CommandRunner, cpu_kubeconfig: Path) -> bool:
@@ -243,6 +256,16 @@ def ensure_load_balancer_controller(
             mutate=True,
             capture=False,
         )
+        fetched = policy_file.read_bytes()
+        digest = hashlib.sha256(fetched).hexdigest()
+        if digest != LBC_IAM_POLICY_SHA256:
+            raise BootstrapError(
+                "aws-load-balancer-controller iam_policy.json at "
+                f"{LBC_VERSION} does not match the pinned checksum "
+                f"(expected {LBC_IAM_POLICY_SHA256}, fetched {digest}); "
+                "the upstream tag may have moved or the download was tampered "
+                "with -- refusing to create an unreviewed IAM policy"
+            )
         runner.run(
             [
                 "aws",
@@ -263,7 +286,7 @@ def ensure_load_balancer_controller(
         runner,
         account_id=cpu.account_id,
         role_name=role_name,
-        trust=_pod_identity_trust(),
+        trust=_pod_identity_trust(cpu),
         policy_name=None,
         policy=None,
         site_id=site_id,

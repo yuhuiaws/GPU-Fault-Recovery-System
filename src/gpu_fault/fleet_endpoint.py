@@ -81,6 +81,15 @@ def endpoint_networks_for_cluster(
         ) from exc
 
 
+def _is_ip_literal(host: str) -> bool:
+    """Whether ``host`` is a bare IPv4/IPv6 literal rather than a name."""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
 def _routable_private_address(
     host: str,
     allowed_networks: tuple[
@@ -142,7 +151,13 @@ def validate_agent_endpoint(
         node_id.lower(),
         node_id.split(".", 1)[0].lower(),
     }
-    if host in identities:
+    # A bare IP endpoint is only ever accepted through the routable-private
+    # gate below, even when it happens to equal the client-supplied node_id.
+    # Otherwise a node that advertises itself as, e.g., "169.254.169.254" would
+    # turn the identity shortcut into an SSRF against the instance metadata
+    # service (or any link-local/loopback address the node names itself).
+    host_is_ip = _is_ip_literal(host)
+    if not host_is_ip and host in identities:
         return
     if _routable_private_address(
         host,

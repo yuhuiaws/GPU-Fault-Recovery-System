@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -29,6 +31,358 @@ ProgressCallback = Callable[[ProgressSelection, str, dict[str, Any] | None], Non
 COMPLETION_WATCHER_STATE_CONFIG_MAP = "gpu-fault-completion-watcher-outbox"
 HYPERPOD_CLUSTER_LABEL = "sagemaker.amazonaws.com/cluster-name"
 NODE_INVENTORY_ATTRIBUTE = "_gpu_node_inventory"
+#: Label on every Role/RoleBinding this module renders into a workload
+#: namespace. Pruning selects by it, so nothing an operator created by hand in
+#: the same namespace is ever touched.
+WORKLOAD_NAMESPACE_RBAC_LABEL = "gpu-fault.io/workload-namespace-rbac"
+#: Where the GPU/EFA device plugin DaemonSets run. RESTART_*_DEVICE_PLUGIN
+#: deletes one plugin Pod there (adapters/kubernetes/node_operations.py,
+#: ``plugin_namespace`` defaults to kube-system), which is the only Pod delete
+#: the executor performs outside a workload namespace.
+DEVICE_PLUGIN_NAMESPACES = ("kube-system",)
+EXECUTOR_SERVICE_ACCOUNT = "gpu-fault-cluster-executor"
+WATCHER_SERVICE_ACCOUNT = "gpu-fault-completion-watcher"
+DEVICE_PLUGIN_ROLE = f"{EXECUTOR_SERVICE_ACCOUNT}-device-plugin"
+
+#: The label every GPU training Pod carries once it has been through
+#: ``gpu-fault-training-submit``/``gpu-fault-workload-annotate`` -- and the exact
+#: selector the Completion Watcher lists managed workloads by (see
+#: ``gpu_fault.completion_observation.MANAGED_LABEL`` /
+#: ``list_completion_pods``). Reusing it means the coverage preflight sees
+#: precisely the Pods the data plane will be asked to recover, nothing more.
+#: Kept as a literal rather than imported so the release module stays free of
+#: the watcher's Kubernetes-client import chain; a unit test asserts the two
+#: never drift.
+MANAGED_WORKLOAD_LABEL = "gpu-fault.io/managed"
+
+#: Pod phases that mean the workload is finished and will never call for
+#: recovery, so a training Pod sitting in one of them cannot be orphaned by a
+#: missing RBAC grant.
+TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
+
+#: The namespaced write verbs the executor needs to restart or stop a workload
+#: (adapters/kubernetes/{workload,restart}_operations.py, primitives.py). Read
+#: verbs are not repeated here: the ClusterRole already grants get/list/watch,
+#: which spare activation needs across every namespace.
+EXECUTOR_WORKLOAD_RULES: tuple[dict[str, Any], ...] = (
+    {"apiGroups": [""], "resources": ["pods"], "verbs": ["patch", "delete"]},
+    {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create", "patch"]},
+    {
+        "apiGroups": ["kubeflow.org"],
+        "resources": ["pytorchjobs"],
+        "verbs": ["create", "patch"],
+    },
+    {
+        "apiGroups": ["jobset.x-k8s.io"],
+        "resources": ["jobsets"],
+        "verbs": ["create", "patch"],
+    },
+)
+
+#: What the Completion Watcher does *to* a training Pod or its owner: annotate
+#: it, suspend the owner on the passive-stop fallback, capture its log, and --
+#: with GPU_FAULT_DISCOVER_POD_GPU_UUIDS -- exec ``nvidia-smi --query-gpu=uuid``
+#: in the training container. ``pods/exec`` is here and nowhere else:
+#: resourceNames cannot scope a subresource, so a namespaced Role is the only
+#: grant that does not open a shell into every Pod on the cluster.
+WATCHER_WORKLOAD_RULES: tuple[dict[str, Any], ...] = (
+    {"apiGroups": [""], "resources": ["pods"], "verbs": ["patch"]},
+    {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["get", "create"]},
+    {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+    {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["patch"]},
+    {"apiGroups": ["kubeflow.org"], "resources": ["pytorchjobs"], "verbs": ["patch"]},
+    {"apiGroups": ["jobset.x-k8s.io"], "resources": ["jobsets"], "verbs": ["patch"]},
+)
+
+DEVICE_PLUGIN_RULES: tuple[dict[str, Any], ...] = (
+    {"apiGroups": [""], "resources": ["pods"], "verbs": ["delete"]},
+)
+
+
+def _rbac_metadata(name: str, namespace: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "namespace": namespace,
+        "labels": {WORKLOAD_NAMESPACE_RBAC_LABEL: "true"},
+    }
+
+
+def _role(
+    name: str, namespace: str, rules: tuple[dict[str, Any], ...]
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "Role",
+        "metadata": _rbac_metadata(name, namespace),
+        "rules": [dict(rule) for rule in rules],
+    }
+
+
+def _role_binding(
+    name: str,
+    namespace: str,
+    *,
+    service_account: str,
+    system_namespace: str,
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": _rbac_metadata(name, namespace),
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "Role",
+            "name": name,
+        },
+        "subjects": [
+            {
+                "kind": "ServiceAccount",
+                "name": service_account,
+                "namespace": system_namespace,
+            }
+        ],
+    }
+
+
+def _role_pair(
+    name: str,
+    namespace: str,
+    rules: tuple[dict[str, Any], ...],
+    *,
+    service_account: str,
+    system_namespace: str,
+) -> list[dict[str, Any]]:
+    return [
+        _role(name, namespace, rules),
+        _role_binding(
+            name,
+            namespace,
+            service_account=service_account,
+            system_namespace=system_namespace,
+        ),
+    ]
+
+
+def render_workload_namespace_rbac(
+    allowed_namespaces: tuple[str, ...] | list[str] | frozenset[str],
+    *,
+    system_namespace: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Role + RoleBinding pairs for every namespace the data plane may write to.
+
+    The ClusterRoles in ``deploy/dataplane`` are read-only on workload kinds;
+    this is where the write verbs live, one Role per ``allowed_namespaces``
+    entry per identity, so the API server enforces the same boundary the
+    executor checks in ``GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES``. The result
+    is keyed by the Deployment whose manifest the documents travel with, so
+    each pair is applied in the same ``kubectl apply`` -- and the same
+    ``--dry-run=server`` preflight -- as the identity it binds.
+    """
+
+    namespaces = sorted({str(item).strip() for item in allowed_namespaces if item})
+    executor: list[dict[str, Any]] = []
+    watcher: list[dict[str, Any]] = []
+    for namespace in namespaces:
+        executor.extend(
+            _role_pair(
+                EXECUTOR_SERVICE_ACCOUNT,
+                namespace,
+                EXECUTOR_WORKLOAD_RULES,
+                service_account=EXECUTOR_SERVICE_ACCOUNT,
+                system_namespace=system_namespace,
+            )
+        )
+        watcher.extend(
+            _role_pair(
+                WATCHER_SERVICE_ACCOUNT,
+                namespace,
+                WATCHER_WORKLOAD_RULES,
+                service_account=WATCHER_SERVICE_ACCOUNT,
+                system_namespace=system_namespace,
+            )
+        )
+    for namespace in DEVICE_PLUGIN_NAMESPACES:
+        executor.extend(
+            _role_pair(
+                DEVICE_PLUGIN_ROLE,
+                namespace,
+                DEVICE_PLUGIN_RULES,
+                service_account=EXECUTOR_SERVICE_ACCOUNT,
+                system_namespace=system_namespace,
+            )
+        )
+    return {
+        inventory.GPU_EXECUTOR_DEPLOYMENT: executor,
+        inventory.GPU_WATCHER_DEPLOYMENT: watcher,
+    }
+
+
+def rbac_namespaces(allowed_namespaces: tuple[str, ...] | list[str]) -> frozenset[str]:
+    """Every namespace a rendered Role may legitimately live in."""
+
+    return frozenset(
+        {str(item).strip() for item in allowed_namespaces if item}
+        | set(DEVICE_PLUGIN_NAMESPACES)
+    )
+
+
+def managed_workload_namespaces(release: Any, target: ClusterTarget) -> list[str]:
+    """Namespaces that currently hold a live GPU training Pod.
+
+    Read-only. Lists the Pods carrying ``gpu-fault.io/managed=true`` across
+    every namespace -- the same selector the Completion Watcher uses to find
+    the workloads it manages -- and returns the sorted namespaces of those not
+    already in a terminal phase. A Pod that has ``Succeeded`` or ``Failed`` is
+    done and will never need recovery, so its namespace is not reported.
+    """
+
+    listing = release._get_json(
+        release._gpu(
+            target,
+            "get",
+            "pods",
+            "--all-namespaces",
+            "-l",
+            f"{MANAGED_WORKLOAD_LABEL}=true",
+        )
+    )
+    namespaces: set[str] = set()
+    for item in listing.get("items", []):
+        phase = str((item.get("status") or {}).get("phase") or "")
+        if phase in TERMINAL_POD_PHASES:
+            continue
+        namespace = str((item.get("metadata") or {}).get("namespace") or "").strip()
+        if namespace:
+            namespaces.add(namespace)
+    return sorted(namespaces)
+
+
+def preflight_allowed_namespace_coverage(release: Any, target: ClusterTarget) -> None:
+    """Fail closed before rollout if a live training Pod sits outside the allow-list.
+
+    The rollout renders workload Role/RoleBindings *only* for the namespaces in
+    ``allowed_namespaces`` (:func:`render_workload_namespace_rbac`), and both the
+    cluster executor and the control plane reject any ``workload_id`` whose
+    namespace is not in that list. A training Pod in a namespace the operator
+    forgot to register therefore gets a silent 403 at recovery time -- the worst
+    moment to discover it. This turns that post-rollout silence into a loud
+    pre-rollout signal: it names the uncovered namespaces and stops the rollout.
+
+    Strictly read-only by contract. It never widens ``allowed_namespaces`` --
+    silently expanding RBAC would be a privilege-escalation risk -- so the
+    operator must add the missing namespace to the cluster registration and
+    re-run. A target without the ``allowed_namespaces`` attribute (a test
+    double) is left alone, exactly as the RBAC rendering leaves it alone.
+    """
+
+    allowed = getattr(target, "allowed_namespaces", None)
+    if allowed is None:
+        return
+    covered = {str(item).strip() for item in allowed if item}
+    live = managed_workload_namespaces(release, target)
+    uncovered = [namespace for namespace in live if namespace not in covered]
+    # Print the coverage the rollout is about to authorise even when it passes,
+    # so a green preflight still shows the operator precisely which namespaces
+    # will be RBAC-authorised and which live workloads they cover.
+    print(
+        f"{target.cluster_id}: GPU training namespace coverage -- "
+        f"allowed_namespaces={sorted(covered)}, "
+        f"live managed workload namespaces={live}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if uncovered:
+        raise ReleaseError(
+            f"{target.cluster_id}: GPU training workloads run in "
+            f"namespace(s) not in allowed_namespaces: {', '.join(uncovered)}. "
+            "The rendered RBAC and the executor/control-plane allow-list will "
+            "not cover them, so the data plane would 403 when it tries to "
+            "recover those workloads. Add the namespace(s) to this cluster's "
+            "registration allowed_namespaces and re-run; the rollout will not "
+            "widen the allow-list for you."
+        )
+
+
+def append_workload_namespace_rbac(
+    manifests: dict[str, str],
+    target: ClusterTarget,
+    *,
+    system_namespace: str,
+) -> dict[str, str]:
+    """Attach each identity's namespaced RBAC to its Deployment manifest text.
+
+    A target without ``allowed_namespaces`` (the attribute, not an empty
+    tuple) is a test double and is left alone; a real target with an empty
+    list still gets the device-plugin Role, because RESTART_*_DEVICE_PLUGIN is
+    a node operation that does not go through a workload namespace.
+    """
+
+    allowed = getattr(target, "allowed_namespaces", None)
+    if allowed is None:
+        return manifests
+    documents = render_workload_namespace_rbac(
+        tuple(allowed), system_namespace=system_namespace
+    )
+    for deployment, items in documents.items():
+        if deployment not in manifests or not items:
+            continue
+        manifests[deployment] = (
+            manifests[deployment].rstrip()
+            + "\n---\n"
+            + yaml.safe_dump_all(items, sort_keys=False)
+        )
+    return manifests
+
+
+def prune_workload_namespace_rbac(release: Any, target: ClusterTarget) -> list[str]:
+    """Delete this module's Roles from namespaces no longer in the allow-list.
+
+    ``kubectl apply`` never removes what an earlier release created, so a
+    namespace dropped from ``allowed_namespaces`` would keep its write grants
+    forever. Selection is by label only, so hand-made objects in the same
+    namespace are never touched. Returns the namespaces that were pruned.
+    """
+
+    allowed = getattr(target, "allowed_namespaces", None)
+    if allowed is None or release.runner.dry_run:
+        return []
+    keep = rbac_namespaces(tuple(allowed))
+    raw = release.runner.run(
+        release._gpu(
+            target,
+            "get",
+            "rolebindings",
+            "--all-namespaces",
+            "-l",
+            f"{WORKLOAD_NAMESPACE_RBAC_LABEL}=true",
+            "-o",
+            "json",
+        ),
+        capture=True,
+    )
+    listing = json.loads(raw) if raw else {}
+    stale = sorted(
+        {
+            str(((item.get("metadata") or {}).get("namespace")) or "")
+            for item in listing.get("items", [])
+        }
+        - keep
+        - {""}
+    )
+    for namespace in stale:
+        release.runner.run(
+            release._gpu(
+                target,
+                "-n",
+                namespace,
+                "delete",
+                "rolebinding,role",
+                "-l",
+                f"{WORKLOAD_NAMESPACE_RBAC_LABEL}=true",
+                "--ignore-not-found",
+            )
+        )
+    return stale
 
 
 def gpu_node_command(release: Any, target: ClusterTarget) -> list[str]:
@@ -312,7 +666,11 @@ def _gpu_deployment_manifests(
             target,
             manifests[inventory.GPU_WATCHER_DEPLOYMENT],
         )
-    return manifests
+    return append_workload_namespace_rbac(
+        manifests,
+        target,
+        system_namespace=release.config.namespace,
+    )
 
 
 def preflight_gpu_deployments(
@@ -327,6 +685,7 @@ def preflight_gpu_deployments(
     executor_artifact_sha: str | None = None,
     executor_compatibility_digest: str | None = None,
 ) -> None:
+    preflight_allowed_namespace_coverage(release, target)
     manifests = _gpu_deployment_manifests(
         release,
         target,
@@ -358,6 +717,7 @@ def apply_gpu_deployments(
     executor_artifact_sha: str | None = None,
     executor_compatibility_digest: str | None = None,
 ) -> None:
+    preflight_allowed_namespace_coverage(release, target)
     manifests = _gpu_deployment_manifests(
         release,
         target,
@@ -416,6 +776,8 @@ def apply_gpu_deployments(
                         f"{target.cluster_id} Deployment {deployment} rollout "
                         f"failed: {exc}"
                     ) from exc
+    if inventory.GPU_EXECUTOR_DEPLOYMENT in manifests:
+        prune_workload_namespace_rbac(release, target)
 
 
 def upgrade_gpu_target(

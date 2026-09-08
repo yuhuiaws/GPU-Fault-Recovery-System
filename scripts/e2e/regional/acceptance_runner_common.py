@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from gpu_fault.admin.atomic_json import write_json_atomic as _write_document
 
@@ -71,6 +71,35 @@ class EvidenceRecorder:
         self.document["updated_at"] = utc_now()
         write_json_atomic(self.path, self.document)
         return result
+
+    def note(self, key: str, value: Any) -> Any:
+        """Record a top-level observation that is persisted but never replayed.
+
+        ``stage`` records a step whose result a rerun must not recompute;
+        ``note`` records a step a rerun must repeat -- converging the live state
+        before a resume -- so it always overwrites and lives outside ``stages``.
+        """
+
+        self.document[key] = value
+        self.document["updated_at"] = utc_now()
+        write_json_atomic(self.path, self.document)
+        return value
+
+    def drop_stages(self, names: Iterable[str]) -> list[str]:
+        """Forget recorded stages so a rerun re-executes them from scratch.
+
+        A stage that failed a driver assertion left partial records taken
+        against a live state a resume moves away from; dropping them makes the
+        stage run again instead of replaying stale observations.
+        """
+
+        dropped = [name for name in names if name in self.document["stages"]]
+        for name in dropped:
+            del self.document["stages"][name]
+        if dropped:
+            self.document["updated_at"] = utc_now()
+            write_json_atomic(self.path, self.document)
+        return dropped
 
     def complete(self) -> dict[str, Any]:
         self.document["status"] = "COMPLETED"

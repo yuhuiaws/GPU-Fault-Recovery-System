@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -11,12 +13,18 @@ from gpu_fault.admin import bootstrap as admin_bootstrap
 from gpu_fault.admin import bootstrap_dependencies as admin_bootstrap_dependencies
 from gpu_fault.admin import release_artifacts as admin_release_artifacts
 from gpu_fault.admin import release_repositories as admin_release_repositories
-from gpu_fault.admin.bootstrap import _unused_subnet_cidrs
+from gpu_fault.admin.bootstrap import (
+    RDS_CA_BUNDLE_ENVIRONMENT,
+    _aurora_dsn,
+    _secret_manifest,
+    _unused_subnet_cidrs,
+)
 from gpu_fault.admin.bootstrap_common import (
     Arn,
     BootstrapError,
     BootstrapState,
     run_parallel,
+    write_secret,
 )
 from gpu_fault.admin.config import AuroraCapacityConfig
 from gpu_fault.admin.release_repositories import ensure_release_repositories
@@ -954,3 +962,136 @@ def test_legacy_bootstrap_state_revalidates_exclusive_resources(tmp_path) -> Non
 
     assert state.value["schema_version"] == 3, "legacy state was not upgraded"
     assert state.value["completed_tasks"] == [], "ownership tasks were not invalidated"
+
+
+def test_secret_manifest_carries_values_in_string_data_not_argv() -> None:
+    """H-7: the Secret is built as a manifest for ``kubectl apply -f -``.
+
+    The values live in ``stringData`` -- which kubectl base64-encodes into the
+    same ``data`` a ``--from-literal`` would -- and travel over stdin, so nothing
+    puts them on a command line where /proc and shell history could expose them.
+    """
+
+    rendered = _secret_manifest(
+        name="gpu-fault-aurora",
+        namespace="gpu-fault-system",
+        string_data={"postgres-url": "postgresql://u:p@host:5432/db", "arn": "a"},
+    )
+    document = json.loads(rendered)
+
+    assert document["kind"] == "Secret"
+    assert document["type"] == "Opaque"
+    assert document["metadata"] == {
+        "name": "gpu-fault-aurora",
+        "namespace": "gpu-fault-system",
+    }
+    assert document["stringData"] == {
+        "postgres-url": "postgresql://u:p@host:5432/db",
+        "arn": "a",
+    }
+    assert "data" not in document, "stringData avoids pre-encoding on the host"
+
+
+def test_aurora_dsn_verifies_the_server_certificate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M-6: with the RDS CA bundle wired the DSN uses sslmode=verify-full.
+
+    verify-full authenticates the server against the mounted bundle, closing the
+    man-in-the-middle that plain ``require`` accepts.
+    """
+
+    monkeypatch.setenv(RDS_CA_BUNDLE_ENVIRONMENT, "/etc/gpu-fault/rds-ca.pem")
+
+    url = _aurora_dsn(
+        username="gpu_fault", password="p@ss/word", endpoint="aurora.internal"
+    )
+
+    assert url.startswith(
+        "postgresql://gpu_fault:p%40ss%2Fword@aurora.internal:5432/"
+    ), url
+    assert "sslmode=verify-full" in url
+    assert "sslrootcert=/etc/gpu-fault/rds-ca.pem" in url
+    assert "sslmode=require" not in url
+
+
+def test_aurora_dsn_refuses_when_no_ca_bundle_is_wired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M-6: without a CA bundle we refuse rather than silently keep require.
+
+    A ``require`` DSN encrypts but does not verify the server, so falling back to
+    it would leave the control-plane connection open to a MITM without warning.
+    """
+
+    monkeypatch.delenv(RDS_CA_BUNDLE_ENVIRONMENT, raising=False)
+
+    with pytest.raises(BootstrapError, match=RDS_CA_BUNDLE_ENVIRONMENT):
+        _aurora_dsn(username="gpu_fault", password="secret", endpoint="aurora.internal")
+
+
+def test_write_secret_creates_a_private_file(tmp_path: Path) -> None:
+    """M-5: a freshly written secret file is 0600 the instant it exists.
+
+    The file is created with ``O_CREAT | O_EXCL`` at mode 0600, so it is never
+    briefly world-readable at the umask default before a later chmod narrows it.
+    """
+
+    path = tmp_path / "secure" / "fleet-master"
+
+    write_secret(path, "s" * 64)
+
+    assert path.read_text(encoding="utf-8") == "s" * 64
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_write_secret_is_0600_even_under_a_permissive_umask(tmp_path: Path) -> None:
+    """M-5: the create mode does not depend on the process umask.
+
+    A bootstrap invoked with a wide umask must still leave the secret owner-only.
+    """
+
+    path = tmp_path / "fleet-master"
+    previous = os.umask(0o000)
+    try:
+        write_secret(path, "value")
+    finally:
+        os.umask(previous)
+
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_secret_does_not_clobber_an_existing_file(tmp_path: Path) -> None:
+    """M-5: the write-once contract is preserved.
+
+    The fleet master key is reused across runs; regenerating it would invalidate
+    the fleet, so an existing file keeps its content while the mode is re-asserted.
+    """
+
+    path = tmp_path / "fleet-master"
+    path.write_text("original", encoding="utf-8")
+    path.chmod(0o644)
+
+    write_secret(path, "replacement")
+
+    assert path.read_text(encoding="utf-8") == "original"
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_secret_refuses_a_pre_planted_symlink(tmp_path: Path) -> None:
+    """M-5: a symlink at the target is an attempt to hijack the secret.
+
+    Writing through it would put the content -- or a widened mode -- onto a file
+    the attacker chose, so the write is refused rather than following the link.
+    """
+
+    target = tmp_path / "attacker-owned"
+    target.write_text("planted", encoding="utf-8")
+    path = tmp_path / "fleet-master"
+    path.symlink_to(target)
+
+    with pytest.raises(BootstrapError, match="symlink"):
+        write_secret(path, "value")
+
+    assert target.read_text(encoding="utf-8") == "planted"

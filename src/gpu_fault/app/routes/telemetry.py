@@ -244,11 +244,28 @@ async def scan_training_health(
 async def latest_training_progress(
     cluster_id: str,
     attempt_id: str,
+    authenticated_cluster: str | None = Header(
+        default=None,
+        alias="X-GPU-Fault-Cluster-ID",
+    ),
     dependencies: TelemetryRouterDependencies = Depends(get_telemetry_dependencies),
 ) -> list[TrainingProgressHeartbeat]:
+    ctx = dependencies.context
+    if (
+        ctx.regional_mode
+        and authenticated_cluster
+        and cluster_id != authenticated_cluster
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "authenticated cluster cannot read training progress "
+                "for another cluster"
+            ),
+        )
     return await _store_call(
         dependencies,
-        dependencies.context.store.list_training_progress,
+        ctx.store.list_training_progress,
         cluster_id,
         attempt_id,
     )

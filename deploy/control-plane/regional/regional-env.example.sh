@@ -35,6 +35,15 @@ NODE_BUNDLE="$(
 )"
 export NODE_BUNDLE
 export EXECUTOR_IRSA_ROLE_ARN='REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN'
+# In-Pod path of the RDS CA bundle. bootstrap (gpu-fault-admin deploy) bakes
+# this value into the gpu-fault-aurora Secret's postgres-url as
+# sslrootcert=..., so it must equal the path the CA bundle ConfigMap is
+# mounted at in every Pod (see apply-rds-ca-bundle.sh and the control-plane,
+# migration and credential-refresh manifests). The file need not exist on the
+# deploy host: only the path value is baked in. bootstrap refuses to build the
+# DSN if this is unset.
+export GPU_FAULT_RDS_CA_BUNDLE='/etc/gpu-fault/rds/ca-bundle.pem'
+
 export GPU_FAULT_RUNTIME_IMAGE='public.ecr.aws/docker/library/python:3.12-slim'
 export GPU_FAULT_NODE_INSTALLER_IMAGE='public.ecr.aws/amazonlinux/amazonlinux:2023'
 export GPU_FAULT_DCGM_EXPORTER_IMAGE='nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04'

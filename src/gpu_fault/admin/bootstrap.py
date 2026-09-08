@@ -69,6 +69,62 @@ DEFAULT_ADOT_IMAGE_AMD64 = (
     "sha256:bb72328152c72fb9662056759b275f7cc85e115db12bbb114fbea9f68dc4816c"
 )
 REGIONAL_PROFILE_SOURCE = "config/runtime-profile.regional-hyperpod-safe.example.yaml"
+RDS_CA_BUNDLE_ENVIRONMENT = "GPU_FAULT_RDS_CA_BUNDLE"
+
+
+def _secret_manifest(
+    *,
+    name: str,
+    namespace: str,
+    string_data: Mapping[str, str],
+) -> str:
+    """Render an Opaque Secret as a manifest for ``kubectl apply -f -``.
+
+    The values are carried in ``stringData`` so kubectl base64-encodes them into
+    ``data`` exactly as ``--from-literal`` would, leaving the resulting Secret
+    identical. The point of the manifest is that it is fed to kubectl over stdin
+    instead of on the argv: a secret on the command line is world-readable via
+    ``/proc/<pid>/cmdline`` and lands in shell history, and stdin is neither.
+    """
+    document = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"name": name, "namespace": namespace},
+        "type": "Opaque",
+        "stringData": {str(key): str(value) for key, value in string_data.items()},
+    }
+    return json.dumps(document)
+
+
+def _aurora_dsn(*, username: str, password: str, endpoint: str) -> str:
+    """Build the control-plane Postgres DSN with an authenticated TLS channel.
+
+    ``sslmode=require`` encrypts the connection but does not verify the server
+    certificate, so it accepts a man-in-the-middle that presents any cert. The
+    DSN is consumed inside the control-plane Pod, so the RDS CA bundle must be
+    mounted there and its in-Pod path supplied via ``GPU_FAULT_RDS_CA_BUNDLE``;
+    the connection then uses ``sslmode=verify-full`` against that bundle. When
+    the bundle is not wired we refuse rather than silently emit an unverified
+    ``require`` DSN.
+    """
+    ca_bundle = os.getenv(RDS_CA_BUNDLE_ENVIRONMENT, "").strip()
+    if not ca_bundle:
+        raise BootstrapError(
+            "control-plane Postgres TLS cannot be verified: set "
+            f"{RDS_CA_BUNDLE_ENVIRONMENT} to the in-Pod path of the RDS CA "
+            "bundle so the DSN can use sslmode=verify-full instead of an "
+            "unverified sslmode=require"
+        )
+    query = "sslmode=verify-full&sslrootcert=" + quote(ca_bundle, safe="/")
+    return (
+        "postgresql://"
+        + quote(username, safe="")
+        + ":"
+        + quote(password, safe="")
+        + "@"
+        + endpoint
+        + f":5432/gpu_fault?{query}"
+    )
 
 
 def _cluster_name_from_eks_arn(value: str) -> str:
@@ -268,19 +324,12 @@ def _ensure_base_secrets(
             "processor-replay-secret": secrets.token_hex(32),
             "node-action-secret": secrets.token_hex(32),
         }
-        command = [
-            "kubectl",
-            "--kubeconfig",
-            str(cpu_kubeconfig),
-            "-n",
-            namespace,
-            "create",
-            "secret",
-            "generic",
-            secret_name,
-        ]
-        command.extend(f"--from-literal={key}={value}" for key, value in values.items())
-        runner.run(command, mutate=True, sensitive=True, capture=False)
+        manifest = _secret_manifest(
+            name=secret_name,
+            namespace=namespace,
+            string_data=values,
+        )
+        _kubectl_apply(runner, cpu_kubeconfig, manifest)
         master = values["node-action-secret"]
     else:
         encoded = runner.run(
@@ -1782,33 +1831,18 @@ def _ensure_aurora(
             sensitive=True,
         )
     )
-    url = (
-        "postgresql://"
-        + quote(secret_value["username"], safe="")
-        + ":"
-        + quote(secret_value["password"], safe="")
-        + "@"
-        + database["Endpoint"]
-        + ":5432/gpu_fault?sslmode=require"
+    url = _aurora_dsn(
+        username=secret_value["username"],
+        password=secret_value["password"],
+        endpoint=database["Endpoint"],
     )
-    manifest = runner.run(
-        [
-            "kubectl",
-            "--kubeconfig",
-            str(cpu_kubeconfig),
-            "-n",
-            namespace,
-            "create",
-            "secret",
-            "generic",
-            "gpu-fault-aurora",
-            f"--from-literal=postgres-url={url}",
-            f"--from-literal=master-secret-arn={secret_arn}",
-            "--dry-run=client",
-            "-o",
-            "yaml",
-        ],
-        sensitive=True,
+    manifest = _secret_manifest(
+        name="gpu-fault-aurora",
+        namespace=namespace,
+        string_data={
+            "postgres-url": url,
+            "master-secret-arn": secret_arn,
+        },
     )
     _kubectl_apply(runner, cpu_kubeconfig, manifest)
     return {

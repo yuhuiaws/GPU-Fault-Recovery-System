@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 import yaml
 
 from gpu_fault.admin.config import (
@@ -18,6 +19,7 @@ from gpu_fault.admin.rollback_alignment import (
     reconcile_rollback_management,
     rollback_management_document,
 )
+from gpu_fault.admin.site import SiteConfigError
 
 
 def _fixture(tmp_path: Path):
@@ -425,3 +427,23 @@ def test_rollback_still_restores_capacity_the_snapshot_does_record(
     _document, restored, _root = rollback_management_document(site, live_state)
 
     assert restored.aurora == recorded.aurora
+
+
+@pytest.mark.parametrize(
+    "release_id", ["../../etc/evil", "with/slash", "..", "x" * 200]
+)
+def test_a_malformed_previous_release_id_is_rejected(
+    tmp_path: Path, release_id: str
+) -> None:
+    """M-13: the recorded release_id becomes a directory below the state dir.
+
+    It arrives from live release state the CLI did not author, so a value with a
+    path separator or ``..`` segment would place the management manifest outside
+    the state directory. It is bounded to the anchored release_id shape first.
+    """
+
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+    live_state["previous"]["release_id"] = release_id
+
+    with pytest.raises(SiteConfigError, match="release_id is malformed"):
+        reconcile_rollback_management(site, live_state, source="rollback:test")

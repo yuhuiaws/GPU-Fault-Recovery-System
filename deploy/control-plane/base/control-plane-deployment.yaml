@@ -100,6 +100,11 @@ spec:
                 secretKeyRef:
                   name: gpu-fault-aurora
                   key: postgres-url
+            # The Aurora DSN uses sslmode=verify-full, so the RDS CA bundle
+            # mounted below must be readable here. Aligns with the path baked
+            # into the DSN by gpu_fault.admin.bootstrap._aurora_dsn.
+            - name: GPU_FAULT_RDS_CA_BUNDLE
+              value: /etc/gpu-fault/rds/ca-bundle.pem
             - name: GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS
               value: "180"
             - name: GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER
@@ -585,6 +590,13 @@ spec:
             - name: failure-domain-map
               mountPath: /etc/gpu-fault/failure-domains
               readOnly: true
+            # The RDS CA bundle lands at /etc/gpu-fault/rds/ca-bundle.pem, the
+            # path GPU_FAULT_RDS_CA_BUNDLE points at. Not optional: without a
+            # verified bundle the DSN cannot authenticate the server, so a
+            # missing ConfigMap must wedge the Pod rather than run unverified.
+            - name: rds-ca-bundle
+              mountPath: /etc/gpu-fault/rds
+              readOnly: true
       volumes:
         - name: artifact
           configMap:
@@ -596,6 +608,9 @@ spec:
           configMap:
             name: gpu-fault-failure-domain-map
             optional: true
+        - name: rds-ca-bundle
+          configMap:
+            name: gpu-fault-rds-ca-bundle
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

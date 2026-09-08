@@ -467,6 +467,7 @@ def build_plan(
     selected_rules: dict[str, Rule] = {}
     unmatched: list[str] = []
     fallback_files: list[str] = []
+    uncovered: list[str] = []
     normalized = tuple(dict.fromkeys(sorted(changed_files)))
     for changed in normalized:
         primary = [
@@ -490,6 +491,21 @@ def build_plan(
             fallback_files.append(changed)
         for rule in matches:
             selected_rules[rule.id] = rule
+        # Fail-safe: a file that matched only a non-full fallback contributing no
+        # pytest targets and no regional cases is not actually exercised unless
+        # it is a test file that will be added to pytest directly. Rather than
+        # let such a change deploy with an empty/narrow selection that skips its
+        # guard tests, escalate to the full superset.
+        if not primary:
+            chosen = matches[0]
+            contributes = bool(chosen.pytest) or bool(chosen.regional_cases)
+            auto_added = (
+                changed.startswith("tests/")
+                and changed.endswith(".py")
+                and (root / changed).is_file()
+            )
+            if not chosen.full and not contributes and not auto_added:
+                uncovered.append(changed)
     counted_domains = sorted(
         rule.id for rule in selected_rules.values() if rule.counts_as_domain
     )
@@ -498,6 +514,9 @@ def build_plan(
     if unmatched:
         full = True
         reasons.append("unmatched files: " + ", ".join(unmatched))
+    if uncovered:
+        full = True
+        reasons.append("no guard tests mapped for: " + ", ".join(uncovered))
     if fallback_files:
         reasons.append("fail-closed fallback: " + ", ".join(fallback_files))
     forcing = sorted(rule.id for rule in selected_rules.values() if rule.full)

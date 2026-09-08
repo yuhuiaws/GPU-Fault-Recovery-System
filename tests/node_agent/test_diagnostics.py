@@ -1175,3 +1175,49 @@ def test_field_diagnostic_rejects_unpinned_executable(tmp_path) -> None:
             field_diagnostic_command=(str(executable),),
             field_diagnostic_sha256="0" * 64,
         )
+
+
+# --- M-8: flight-recorder path mapping must not escape the container view ---
+
+
+def _fr_mapped_path(proc_root, pid, path):
+    from gpu_fault.node_agent.operations.flight_recorder import (
+        FlightRecorderOperationsMixin,
+    )
+
+    return FlightRecorderOperationsMixin.process_namespace_path_for_root(
+        Path(proc_root), pid, Path(path)
+    )
+
+
+def test_flight_recorder_maps_absolute_path_into_container_root(tmp_path) -> None:
+    proc_root = tmp_path / "proc"
+    mapped = _fr_mapped_path(proc_root, 100, "/tmp/nccl_trace_")
+    base = (proc_root / "100" / "root").resolve()
+    assert mapped.resolve().is_relative_to(base), mapped
+    assert mapped.name == "nccl_trace_"
+
+
+def test_flight_recorder_maps_relative_path_into_container_cwd(tmp_path) -> None:
+    proc_root = tmp_path / "proc"
+    mapped = _fr_mapped_path(proc_root, 100, "nccl_trace_7.json")
+    base = (proc_root / "100" / "cwd").resolve()
+    assert mapped.resolve().is_relative_to(base), mapped
+
+
+def test_flight_recorder_rejects_absolute_traversal(tmp_path) -> None:
+    proc_root = tmp_path / "proc"
+    with pytest.raises(ValueError):
+        _fr_mapped_path(proc_root, 100, "/../../etc/passwd")
+
+
+def test_flight_recorder_rejects_relative_traversal(tmp_path) -> None:
+    proc_root = tmp_path / "proc"
+    with pytest.raises(ValueError):
+        _fr_mapped_path(proc_root, 100, "../../etc/passwd")
+
+
+def test_flight_recorder_rejects_embedded_traversal(tmp_path) -> None:
+    proc_root = tmp_path / "proc"
+    with pytest.raises(ValueError):
+        _fr_mapped_path(proc_root, 100, "/tmp/../../etc/passwd")

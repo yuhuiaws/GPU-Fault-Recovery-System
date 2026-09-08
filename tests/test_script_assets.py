@@ -275,7 +275,9 @@ def test_ci_runs_and_uploads_fault_scenario_report() -> None:
         in steps[runner_index]["run"]
     )
     assert upload["if"] == "always()"
-    assert upload["uses"] == "actions/upload-artifact@v4"
+    # Pinned to a full commit SHA (M-21); the pin format is enforced by
+    # tests/test_workflow_supply_chain.py, so here we only assert the action.
+    assert upload["uses"].split("@")[0] == "actions/upload-artifact"
     assert upload["with"] == {
         "name": "fault-test-report",
         "path": "artifacts/coverage-combined/fault-report.json",
@@ -354,7 +356,7 @@ def test_release_verifies_all_ci_signatures_before_aws() -> None:
     aws = next(
         index
         for index, step in enumerate(steps)
-        if step.get("uses") == "aws-actions/configure-aws-credentials@v4"
+        if step.get("uses", "").split("@")[0] == "aws-actions/configure-aws-credentials"
     )
 
     assert ci_gate < candidate < unit < shards < aws

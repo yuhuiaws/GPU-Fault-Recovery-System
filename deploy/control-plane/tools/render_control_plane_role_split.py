@@ -26,7 +26,7 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -164,6 +164,123 @@ def externalize_literal_env(
         env_from.append({"configMapRef": {"name": name}})
     container["envFrom"] = env_from
     return config_maps
+
+
+# Rollback only. The release engine snapshots each CPU role Deployment's
+# container ``env``/``envFrom`` before an upgrade and, on rollback, points this
+# variable at a JSON file holding that snapshot. The previous image then gets
+# exactly the environment it ran with: the application fails fast on any
+# ``GPU_FAULT_*`` name it does not know, so a template rendered from the newer
+# checkout (which is the only checkout the engine has) would hand the older
+# image names it rejects. Unset on every forward render.
+CONTAINER_ENV_FILE_VARIABLE = "GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE"
+
+
+def _invalid_container_env(detail: str) -> SystemExit:
+    return SystemExit(
+        f"{CONTAINER_ENV_FILE_VARIABLE}: previous container environment "
+        f"snapshot is invalid: {detail}"
+    )
+
+
+def load_previous_container_env() -> (
+    dict[str, dict[str, dict[str, list[dict[str, Any]]]]] | None
+):
+    """Read the rollback env snapshot, or None when there is none to apply."""
+
+    path = os.getenv(CONTAINER_ENV_FILE_VARIABLE, "").strip()
+    if not path:
+        return None
+    try:
+        snapshot = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise _invalid_container_env(f"cannot read {path}: {exc}") from exc
+    if not isinstance(snapshot, dict) or not snapshot:
+        raise _invalid_container_env("expected a non-empty Deployment mapping")
+    for deployment_name, containers in snapshot.items():
+        if not isinstance(deployment_name, str) or not isinstance(containers, dict):
+            raise _invalid_container_env("Deployment entries must map container names")
+        if not containers:
+            raise _invalid_container_env(f"{deployment_name} lists no containers")
+        for container_name, spec in containers.items():
+            if (
+                not isinstance(container_name, str)
+                or not isinstance(spec, dict)
+                or set(spec) != {"env", "envFrom"}
+                or not isinstance(spec["env"], list)
+                or not isinstance(spec["envFrom"], list)
+            ):
+                raise _invalid_container_env(
+                    f"{deployment_name}/{container_name} must carry exactly "
+                    "env and envFrom lists"
+                )
+            for item in spec["env"]:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    raise _invalid_container_env(
+                        f"{deployment_name}/{container_name} has an env entry "
+                        "without a name"
+                    )
+                if ("value" in item) == ("valueFrom" in item):
+                    raise _invalid_container_env(
+                        f"{deployment_name}/{container_name} env {item['name']} "
+                        "must define exactly one of value or valueFrom"
+                    )
+                if "value" in item and SENSITIVE_ENV.search(item["name"]):
+                    raise _invalid_container_env(
+                        f"{deployment_name}/{container_name} sensitive env "
+                        f"{item['name']} carries a literal value"
+                    )
+            for source in spec["envFrom"]:
+                if not isinstance(source, dict):
+                    raise _invalid_container_env(
+                        f"{deployment_name}/{container_name} has a malformed "
+                        "envFrom entry"
+                    )
+    return snapshot
+
+
+def restore_previous_container_env(
+    deployments: list[dict[str, Any]],
+    snapshot: dict[str, dict[str, dict[str, list[dict[str, Any]]]]],
+) -> None:
+    """Replace every rendered container's env/envFrom with the snapshot's.
+
+    Verbatim in both directions: the snapshot must name every rendered
+    Deployment and only rendered Deployments, and every container it names
+    must exist in the render. A partial substitution would leave the previous
+    image with either names it rejects or names it needs.
+    """
+
+    rendered = {item["metadata"]["name"]: item for item in deployments}
+    unknown = sorted(set(snapshot) - set(rendered))
+    if unknown:
+        raise _invalid_container_env(
+            "names Deployments the role split does not render: " + ", ".join(unknown)
+        )
+    missing = sorted(set(rendered) - set(snapshot))
+    if missing:
+        raise _invalid_container_env(
+            "does not cover rendered Deployments: " + ", ".join(missing)
+        )
+    for deployment_name, containers in snapshot.items():
+        pod_spec = rendered[deployment_name]["spec"]["template"]["spec"]
+        by_name = {
+            container["name"]: container
+            for container in [
+                *pod_spec.get("initContainers", []),
+                *pod_spec.get("containers", []),
+            ]
+        }
+        unknown_containers = sorted(set(containers) - set(by_name))
+        if unknown_containers:
+            raise _invalid_container_env(
+                f"{deployment_name} has no container named "
+                + ", ".join(unknown_containers)
+            )
+        for container_name, spec in containers.items():
+            container = by_name[container_name]
+            container["env"] = copy.deepcopy(spec["env"])
+            container["envFrom"] = copy.deepcopy(spec["envFrom"])
 
 
 def set_env(container: dict, name: str, value: str) -> None:
@@ -604,6 +721,7 @@ def parse_options() -> tuple[argparse.Namespace, AdminConfig]:
 
 def main() -> None:
     options, admin_config = parse_options()
+    previous_container_env = load_previous_container_env()
 
     source = read_source(options.json)
     deployment = copy.deepcopy(source)
@@ -1191,6 +1309,17 @@ def main() -> None:
             namespace=namespace,
         ),
     ]
+    if previous_container_env is not None:
+        # After externalization, so the substituted lists replace the whole
+        # rendered environment (literals and refs alike) and nothing from the
+        # current template survives beside them. The role ConfigMaps rendered
+        # above are still emitted; on rollback the engine restores the
+        # previous ConfigMap data and the apply step leaves the rendered ones
+        # unapplied (GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS).
+        restore_previous_container_env(
+            [deployment, worker_deployment, spool_deployment],
+            previous_container_env,
+        )
     if not options.out_dir:
         print(
             json.dumps(

@@ -11,7 +11,7 @@ from typing import Any
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
-from gpu_fault.admin.site import RenderedSite
+from gpu_fault.admin.site import IDENTIFIER_PATTERN, RenderedSite
 from gpu_fault.release_state_snapshot import (
     ReleaseStateSnapshotError,
     hydrate_previous_snapshot,
@@ -53,6 +53,21 @@ RELEASE_IDENTITY_FIELDS = (
     "dcgm_image",
     "adot_image",
 )
+
+
+def _require_cluster_id(value: str) -> str:
+    """Bound a cluster id to the site schema's shape before it selects a target.
+
+    The joined cluster id is compared against registry state read from the live
+    control plane and decides which cluster crosses the PENDING/ACTIVE boundary.
+    It should always arrive already validated from the site document, so an id
+    that does not match the anchored identifier shape means the caller is
+    trusting an out-of-band value -- reject it rather than key the registry
+    comparison on it.
+    """
+    if not IDENTIFIER_PATTERN.fullmatch(str(value)):
+        raise BootstrapError(f"join cluster identity is malformed: {value!r}")
+    return str(value)
 
 
 def join_activation_is_irreversible(state: dict[str, Any]) -> bool:
@@ -241,6 +256,7 @@ def build_verified_membership_evidence(
     batch_id: str | None = None,
     verified_at: datetime | None = None,
 ) -> dict[str, Any]:
+    cluster_id = _require_cluster_id(cluster_id)
     compared = (
         "live_release_state_sha256",
         "live_release_identity_sha256",
@@ -284,6 +300,7 @@ def validate_verified_membership(
     cluster_id: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    cluster_id = _require_cluster_id(cluster_id)
     if evidence.get("cluster_id") != cluster_id:
         raise BootstrapError("join verification evidence cluster identity drifted")
     candidate_sha256 = file_sha256(candidate_site.source)
@@ -397,6 +414,7 @@ def final_membership_identity(
     cluster_id: str,
     verified_at: str,
 ) -> dict[str, Any]:
+    cluster_id = _require_cluster_id(cluster_id)
     snapshot = membership_runtime_snapshot(site)
     cluster_states = _mapping(
         snapshot.get("registry_cluster_states") or {},

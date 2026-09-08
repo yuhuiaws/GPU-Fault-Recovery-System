@@ -296,6 +296,8 @@ def test_a_snapshot_without_collector_objects_refuses_before_any_mutation() -> N
         state={},
         _ensure_contexts=lambda: None,
         _require_cpu_secrets=lambda: None,
+        _apply_rds_ca_bundle=lambda: None,
+        _refresh_aurora_credentials=lambda: None,
         _remote_commands_are_idle=lambda: True,
         _capture_previous=lambda **_kwargs: dict(legacy),
         _backup_release_secrets=lambda: {},
@@ -319,6 +321,8 @@ def test_adot_change_keeps_automatic_rollback_while_clusters_still_refuse() -> N
             state={"release_diff": {"changed": sorted(changed)}},
             _ensure_contexts=lambda: None,
             _require_cpu_secrets=lambda: None,
+            _apply_rds_ca_bundle=lambda: None,
+            _refresh_aurora_credentials=lambda: None,
             _remote_commands_are_idle=lambda: True,
             _capture_previous=lambda **_kwargs: (_ for _ in ()).throw(
                 ValidationPassed()

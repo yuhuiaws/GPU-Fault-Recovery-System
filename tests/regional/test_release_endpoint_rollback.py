@@ -297,3 +297,174 @@ def test_restore_refuses_a_snapshot_it_cannot_put_back(snapshot: object) -> None
         ENDPOINT.restore_endpoint_snapshot(release, snapshot)
 
     assert release.calls == [], "a snapshot that cannot be restored still mutated state"
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class PublishingRelease(Release):
+    """A Service whose hostname appears only after ``blank_reads`` empty reads.
+
+    The bounded `kubectl wait` verdicts are scripted; a ``False`` consumes the
+    wait's ``--timeout`` on the clock, as kubectl giving up at it would.
+    """
+
+    def __init__(self, clock: FakeClock, *, blank_reads: int, verdicts: list[bool]):
+        super().__init__(service=_live_service(), record=_record(CANDIDATE_TARGET))
+        self.clock = clock
+        self.blank_reads = blank_reads
+        self.verdicts = list(verdicts)
+        self.waits: list[tuple[list[str], float]] = []
+        self.runner = SimpleNamespace(run=self._run, probe=self._probe, dry_run=False)
+
+    def _run(self, arguments: list[str], **kwargs: Any) -> str:
+        if "get" in arguments and "jsonpath" in " ".join(arguments):
+            self.calls.append(list(arguments))
+            if self.blank_reads:
+                self.blank_reads -= 1
+                return ""
+            return self.published
+        return super()._run(arguments, **kwargs)
+
+    def _probe(self, arguments: list[str], *, timeout_seconds=None) -> bool:
+        self.waits.append((list(arguments), self.clock.now))
+        met = self.verdicts.pop(0) if self.verdicts else False
+        if not met:
+            self.clock.now += _wait_timeout(arguments)
+        return met
+
+
+def _wait_timeout(arguments: list[str]) -> float:
+    (flag,) = [value for value in arguments if value.startswith("--timeout=")]
+    return float(flag.removeprefix("--timeout=").removesuffix("s"))
+
+
+def _patch_clock(monkeypatch, clock: FakeClock) -> None:
+    from gpu_fault_release import regional_dns as DNS
+    from gpu_fault_release import regional_release_rollout_wait as WAIT
+
+    for module in (ENDPOINT, DNS, WAIT):
+        monkeypatch.setattr(module, "time", clock)
+
+
+def _restored_previous_snapshot() -> dict[str, Any]:
+    """The snapshot whose restore has to prove the record names the hostname
+    the restored Service publishes."""
+
+    return _snapshot(
+        objects=[_previous_service()], absent=[], record=_record(PREVIOUS_TARGET)
+    )
+
+
+def _hostname_reads(release: Release) -> list[list[str]]:
+    return [
+        arguments
+        for arguments in release.calls
+        if "get" in arguments and "jsonpath" in " ".join(arguments)
+    ]
+
+
+def test_published_hostname_wakes_when_the_service_publishes_it(monkeypatch) -> None:
+    """The 5s between reads is spent in `kubectl wait`, not a timer."""
+
+    clock = FakeClock()
+    _patch_clock(monkeypatch, clock)
+    release = PublishingRelease(clock, blank_reads=1, verdicts=[True])
+
+    ENDPOINT.restore_endpoint_snapshot(release, _restored_previous_snapshot())
+
+    # The record named the hostname the second read published, so the restore
+    # accepted it; one blank read, one watch, one read that answered.
+    assert release.dns_actions() == [("UPSERT", _record(PREVIOUS_TARGET))]
+    assert len(_hostname_reads(release)) == 2
+    assert [arguments[3:] for arguments, _ in release.waits] == [
+        [
+            "-n",
+            "gpu-fault-system",
+            "wait",
+            "service/gpu-fault-api-nlb",
+            "--for=jsonpath={.status.loadBalancer.ingress[0].hostname}",
+            "--timeout=5s",
+        ]
+    ]
+    assert release.waits[0][0][:3] == ["kubectl", "--kubeconfig", "/secure/cpu"]
+    assert clock.sleeps == [] and clock.now == 0.0
+
+
+def test_published_hostname_keeps_its_deadline_and_verdict(monkeypatch) -> None:
+    clock = FakeClock()
+    _patch_clock(monkeypatch, clock)
+    release = PublishingRelease(clock, blank_reads=10_000, verdicts=[])
+
+    with pytest.raises(
+        MODULE.ReleaseError, match="publishes no load balancer hostname"
+    ):
+        ENDPOINT.restore_endpoint_snapshot(release, _restored_previous_snapshot())
+
+    assert clock.now == ENDPOINT.PUBLISHED_HOSTNAME_TIMEOUT_SECONDS
+    assert all(
+        _wait_timeout(arguments) <= ENDPOINT.PUBLISHED_HOSTNAME_TIMEOUT_SECONDS - at
+        for arguments, at in release.waits
+    ), "a watch was allowed to outlive the deadline"
+    assert len(release.waits) == ENDPOINT.PUBLISHED_HOSTNAME_TIMEOUT_SECONDS // 5
+
+
+def test_nlb_service_hostname_wait_wakes_on_the_same_watch(monkeypatch) -> None:
+    from gpu_fault_release import regional_dns as DNS
+
+    clock = FakeClock()
+    _patch_clock(monkeypatch, clock)
+    release = PublishingRelease(clock, blank_reads=2, verdicts=[False, True])
+
+    hostname = DNS.wait_service_hostname(release)
+
+    assert hostname == PREVIOUS_TARGET
+    assert [(arguments[5:], at) for arguments, at in release.waits] == [
+        (
+            [
+                "wait",
+                "service/gpu-fault-api-nlb",
+                "--for=jsonpath={.status.loadBalancer.ingress[0].hostname}",
+                "--timeout=5s",
+            ],
+            0.0,
+        ),
+        (
+            [
+                "wait",
+                "service/gpu-fault-api-nlb",
+                "--for=jsonpath={.status.loadBalancer.ingress[0].hostname}",
+                "--timeout=5s",
+            ],
+            5.0,
+        ),
+    ]
+    assert clock.sleeps == []
+
+
+def test_nlb_service_hostname_wait_still_fails_at_600s(monkeypatch) -> None:
+    from gpu_fault_release import regional_dns as DNS
+
+    clock = FakeClock()
+    _patch_clock(monkeypatch, clock)
+    release = PublishingRelease(clock, blank_reads=10_000, verdicts=[])
+
+    with pytest.raises(
+        MODULE.ReleaseError, match="did not publish a hostname within 600s"
+    ):
+        DNS.wait_service_hostname(release)
+
+    assert clock.now == 600.0
+    assert all(
+        _wait_timeout(arguments) <= 600 - at for arguments, at in release.waits
+    ), release.waits

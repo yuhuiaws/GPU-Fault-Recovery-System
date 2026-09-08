@@ -138,7 +138,7 @@ def test_parallel_bootstrap_probe_reuses_healthy_completed_task(tmp_path: Path) 
 def test_healthy_iam_role_probe_performs_no_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trust = admin_bootstrap_services.pod_identity_trust()
+    trust = admin_bootstrap_services.pod_identity_trust(_cluster())
     policy = {
         "Version": "2012-10-17",
         "Statement": [{"Effect": "Allow", "Action": "example:Read", "Resource": "*"}],
@@ -702,7 +702,7 @@ def test_healthy_monitoring_install_probe_runs_no_installer(
                     {
                         "Role": {
                             "AssumeRolePolicyDocument": (
-                                admin_bootstrap_services.pod_identity_trust()
+                                admin_bootstrap_services.pod_identity_trust(_cluster())
                             ),
                             "Tags": [
                                 {
@@ -1028,7 +1028,7 @@ def _control_plane_identity_runner(calls: list[list[str]]):
     healthy path and refuses any mutation.
     """
 
-    trust = admin_bootstrap_services.pod_identity_trust()
+    trust = admin_bootstrap_services.pod_identity_trust(_cluster())
     policy = admin_bootstrap_services.control_plane_policy_document(
         region="us-east-1", account_id="123456789012"
     )
@@ -1163,7 +1163,7 @@ def test_ensure_role_reads_each_role_once(monkeypatch: pytest.MonkeyPatch) -> No
         runner,
         account_id="123456789012",
         role_name="gpu-fault-site-a-control",
-        trust=admin_bootstrap_services.pod_identity_trust(),
+        trust=admin_bootstrap_services.pod_identity_trust(_cluster()),
         policy_name="GPUFaultRegionalObserve",
         policy=admin_bootstrap_services.control_plane_policy_document(
             region="us-east-1", account_id="123456789012"

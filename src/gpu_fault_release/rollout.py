@@ -22,12 +22,14 @@ from gpu_fault_release.regional_admin_commands import (
     bootstrap_cpu_is_current,
     build_full_status,
     build_release_diff,
+    apply_rds_ca_bundle,
     build_release_summary,
     ensure_schema,
     run_deploy,
     run_resume,
     stage_noop_release,
 )
+from gpu_fault_release.regional_aurora_credentials import refresh_aurora_credentials
 from gpu_fault_release.regional_dns import apply_control_plane_nlb
 from gpu_fault_release.regional_endpoint_rollback import (
     capture_endpoint_snapshot,
@@ -150,6 +152,7 @@ from gpu_fault_release.regional_release_rendering import (
     DEFAULT_DCGM_EXPORTER_IMAGE,
     DEFAULT_RUNTIME_IMAGE,
     build_cpu_apply_environment,
+    render_release_payload,
     rendered_release_manifest_sha256,
     stamp_gpu_deployments,
 )
@@ -175,6 +178,7 @@ from gpu_fault_release.regional_release_state import (
     load_state,
     prime_deployment_snapshot,
     read_snapshot,
+    require_digest_pinned_image,
     save_state,
     template_bundle,
 )
@@ -503,6 +507,8 @@ class RegionalRelease:
     _ensure_connection_secret = ensure_connection_secret
     _ensure_gpu_namespace = ensure_gpu_namespace
     _ensure_schema = ensure_schema
+    _apply_rds_ca_bundle = apply_rds_ca_bundle
+    _refresh_aurora_credentials = refresh_aurora_credentials
     _get_json = get_json
     _load_state = load_state
     _prime_deployment_snapshot = prime_deployment_snapshot
@@ -536,6 +542,11 @@ class RegionalRelease:
         self.config = config
         self.runner = runner
         self.release_id = config.release_id
+        # The digest the plan was approved against. Left unset during
+        # construction so the initial render (which produces the digest itself)
+        # is not verified against nothing; the apply path populates it from the
+        # approved plan and every later render is checked against it.
+        self.approved_manifest_digest: str | None = None
         self.wheel_sha = self._sha256(config.wheel)
         self.executor_wheel_sha = self._sha256(config.executor_wheel)
         self.node_wheel_sha = self._sha256(config.node_wheel)
@@ -791,13 +802,15 @@ class RegionalRelease:
             and rollback_result.get("status") == "PASSED"
             and isinstance(previous, dict)
         ):
-            self.runtime_image = str(
+            self.runtime_image = require_digest_pinned_image(
+                "rolled-back runtime",
                 previous.get("runtime_image")
                 or previous.get("live_runtime_image")
-                or self.runtime_image
+                or self.runtime_image,
             )
-            self.node_installer_image = str(
-                previous.get("node_installer_image") or self.node_installer_image
+            self.node_installer_image = require_digest_pinned_image(
+                "rolled-back Node Installer",
+                previous.get("node_installer_image") or self.node_installer_image,
             )
             self.adot_image = str(previous.get("adot_image") or self.adot_image)
             dcgm_images = {
@@ -813,6 +826,27 @@ class RegionalRelease:
         adopted_runtime = str(state.get("adopted_live_runtime_image") or "").strip()
         if adopted_runtime:
             self.runtime_image = adopted_runtime
+
+    def pin_approved_manifest_plan(self, digest: str | None) -> None:
+        """Bind apply to the rendered-manifest digest the plan was approved on.
+
+        Once pinned, every render of the release payload is verified against
+        this digest, so a working-tree change made after the plan was approved
+        and before it is applied is refused rather than silently applied.
+        """
+
+        self.approved_manifest_digest = str(digest).strip() if digest else None
+
+    def enforce_manifest_plan_pin(self) -> None:
+        """Fail closed if the working tree drifted from the approved plan.
+
+        A no-op until ``pin_approved_manifest_plan`` has been given a digest.
+        Rendering the payload raises when the recomputed digest does not match
+        the pin.
+        """
+
+        if self.approved_manifest_digest:
+            render_release_payload(self)
 
     def _apply_cpu(
         self,
@@ -831,6 +865,8 @@ class RegionalRelease:
         restart that puts those roles on the new compatibility window.
         """
 
+        # Refuse to apply CPU manifests that no longer match the approved plan.
+        self.enforce_manifest_plan_pin()
         ensure_notification_secret(self)
         environment = build_cpu_apply_environment(self, finalize=finalize)
         environment["GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS"] = ",".join(
@@ -1025,6 +1061,9 @@ class RegionalRelease:
             self._cpu("apply", "-f", "-"),
             input_text=prerequisites,
         )
+        # The namespace now exists; ship the RDS CA bundle before any Aurora
+        # consumer (schema-ensure Job, control-plane roles) mounts it (M-6).
+        self._apply_rds_ca_bundle()
         completed_cluster_ids, cpu_checkpoint, check_live_cpu = (
             bootstrap_resume_context(self.state, self.release_id)
         )

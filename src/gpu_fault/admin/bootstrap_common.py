@@ -468,11 +468,30 @@ def run_parallel(
 
 
 def write_secret(path: Path, value: str) -> None:
+    """Write a secret file exactly once, at 0600, without a clobber window.
+
+    The contract is write-once: an existing file is left untouched (the fleet
+    master key is reused across runs and regenerating it would invalidate the
+    fleet). ``O_CREAT | O_EXCL`` makes that atomic -- there is no gap between a
+    ``path.exists()`` check and the write for an attacker to plant a symlink
+    into, and the 0600 mode is set as the file is created rather than widened
+    from the umask default afterwards. A symlink already sitting at the path is
+    refused rather than followed.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
-    if not path.exists():
-        path.write_text(value, encoding="utf-8")
-    path.chmod(0o600)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        if os.path.islink(path):
+            raise BootstrapError(f"refusing to write a secret over a symlink: {path}")
+        os.chmod(path, 0o600)
+        return
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(value)
+    finally:
+        os.chmod(path, 0o600)
 
 
 def write_yaml(path: Path, value: dict[str, Any]) -> None:

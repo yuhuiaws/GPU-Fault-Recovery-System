@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import ipaddress
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from threading import RLock
@@ -108,6 +111,31 @@ from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 
 
+# A fleet node identifier is a bare host label (Kubernetes node name, HyperPod
+# instance id, or EC2 private DNS name). Anchor it so a client-supplied value
+# cannot smuggle whitespace, control characters, path traversal, URL userinfo,
+# or scheme/port punctuation into anything that later treats it as an identity
+# or a connection host.
+NODE_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
+
+# One PEM certificate block. Matched non-greedily so a bundle yields one match
+# per certificate and every block in the chain gets validated, not just the
+# first one.
+CERTIFICATE_PEM_BLOCK = re.compile(
+    r"-----BEGIN CERTIFICATE-----(?P<body>.*?)-----END CERTIFICATE-----",
+    re.DOTALL,
+)
+
+
+def validate_node_identifier(value: str) -> str:
+    if not NODE_ID_PATTERN.fullmatch(value):
+        raise ValueError(
+            "node_id must be a bare host label of letters, digits, '.', '-' or "
+            "'_' (no whitespace, control characters, or path separators)"
+        )
+    return value
+
+
 class AgentHeartbeat(StrictModel):
     heartbeat_id: str = Field(default_factory=lambda: f"heartbeat-{uuid4()}")
     cluster_id: str
@@ -136,6 +164,11 @@ class AgentHeartbeat(StrictModel):
     agent_incarnation_id: str | None = None
     observed_at: datetime
 
+    @field_validator("node_id")
+    @classmethod
+    def validate_node_id(cls, value: str) -> str:
+        return validate_node_identifier(value)
+
     @field_validator("endpoint")
     @classmethod
     def validate_endpoint(cls, value: str) -> str:
@@ -154,7 +187,37 @@ class AgentHeartbeat(StrictModel):
             or not normalized.endswith("-----END CERTIFICATE-----")
             or len(normalized) > 65536
         ):
-            raise ValueError("agent TLS certificate must be one PEM certificate")
+            raise ValueError(
+                "agent TLS certificate must be one or more PEM certificates"
+            )
+        # Validate the whole chain, not just the first block: a bundle can hide
+        # a malformed trailing certificate behind a well-formed leaf. Every
+        # BEGIN/END block must carry a non-empty base64 body, and the gaps
+        # between and around the blocks must be whitespace only, so a bundle
+        # cannot smuggle arbitrary bytes past the shape check.
+        blocks = list(CERTIFICATE_PEM_BLOCK.finditer(normalized))
+        if not blocks:
+            raise ValueError(
+                "agent TLS certificate must be one or more PEM certificates"
+            )
+        cursor = 0
+        for block in blocks:
+            if normalized[cursor : block.start()].strip():
+                raise ValueError(
+                    "agent TLS certificate has content outside a PEM block"
+                )
+            body = "".join(block.group("body").split())
+            try:
+                decoded = base64.b64decode(body, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(
+                    "agent TLS certificate PEM block is not valid base64"
+                ) from exc
+            if not decoded:
+                raise ValueError("agent TLS certificate PEM block is empty")
+            cursor = block.end()
+        if normalized[cursor:].strip():
+            raise ValueError("agent TLS certificate has content outside a PEM block")
         return normalized + "\n"
 
     @field_validator(

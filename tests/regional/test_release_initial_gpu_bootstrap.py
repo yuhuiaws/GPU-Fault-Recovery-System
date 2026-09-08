@@ -122,6 +122,7 @@ def test_initial_bootstrap_uses_atomic_registry_then_parallel_gpu_workers(
         _cpu=lambda *arguments: list(arguments),
         _save_state=lambda phase, **_updates: calls.append(f"state:{phase}"),
         _ensure_contexts=recorder("contexts"),
+        _apply_rds_ca_bundle=recorder("rds-ca-bundle"),
         _require_cpu_secrets=recorder("cpu-secrets"),
         _initialize_registry=recorder("initialize-registry"),
         _update_registry=lambda *_a, **_k: pytest.fail(
@@ -144,6 +145,7 @@ def test_initial_bootstrap_uses_atomic_registry_then_parallel_gpu_workers(
 
     assert calls == [
         "contexts",
+        "rds-ca-bundle",
         "state:bootstrap-started",
         "cpu-secrets",
         "initialize-registry",

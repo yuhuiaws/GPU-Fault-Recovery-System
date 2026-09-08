@@ -421,6 +421,23 @@ def template_container_image(
     return None
 
 
+def require_digest_pinned_image(description: str, image: str | None) -> str:
+    """Reject any image reference that is not pinned to an immutable digest.
+
+    A mutable tag (`:latest`, `:v1`, ...) can be re-pointed after a plan is
+    approved, so every image that reaches a release/rollback/resume sink must
+    carry a `...@sha256:<64hex>` digest. Returns the stripped, verified value.
+    """
+
+    text = str(image or "").strip()
+    if not DIGEST_IMAGE.fullmatch(text):
+        raise ReleaseError(
+            f"{description} image is not digest-pinned "
+            f"(expected ...@sha256:<64 hex chars>): {text or '<empty>'}"
+        )
+    return text
+
+
 def require_consistent_images(
     description: str,
     images: dict[str, str | None],
@@ -460,10 +477,17 @@ def config_map_binary_key(
     return keys[0] if len(keys) == 1 else None
 
 
-def cpu_role_config_maps(release: Any) -> dict[str, dict[str, str]]:
-    names: set[str] = set()
-    for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
-        value = release._get_json(
+def cpu_role_deployments(release: Any) -> dict[str, dict[str, Any]]:
+    """Read every CPU role Deployment once, keyed by name.
+
+    Both role snapshots (`cpu_role_config_maps`, `cpu_role_container_env`)
+    are cut from these documents, so the capture pays one read per Deployment
+    rather than one per snapshot. A missing Deployment fails the read here,
+    before either snapshot is built.
+    """
+
+    return {
+        deployment: release._get_json(
             release._cpu(
                 "-n",
                 release.config.namespace,
@@ -472,11 +496,76 @@ def cpu_role_config_maps(release: Any) -> dict[str, dict[str, str]]:
                 deployment,
             )
         )
-        pod_spec = value.get("spec", {}).get("template", {}).get("spec", {})
-        for container in [
-            *pod_spec.get("initContainers", []),
-            *pod_spec.get("containers", []),
-        ]:
+        for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
+    }
+
+
+def _pod_containers(document: dict[str, Any]) -> list[dict[str, Any]]:
+    pod_spec = document.get("spec", {}).get("template", {}).get("spec", {})
+    return [
+        *pod_spec.get("initContainers", []),
+        *pod_spec.get("containers", []),
+    ]
+
+
+def cpu_role_container_env(
+    release: Any,
+    deployments: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, dict[str, list[Any]]]]:
+    """Each CPU role container's ``env`` and ``envFrom`` lists, verbatim.
+
+    This is what a rollback re-applies to the previous image: the application
+    fails fast on ``GPU_FAULT_*`` names it does not know, and the only
+    Deployment template the engine can render is the *current* one. The lists
+    are refs and literals from our own rendered manifest; a literal under a
+    sensitive-looking name is refused rather than copied into the snapshot,
+    which mirrors the role ConfigMap capture.
+    """
+
+    if deployments is None:
+        deployments = cpu_role_deployments(release)
+    snapshot: dict[str, dict[str, dict[str, list[Any]]]] = {}
+    for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
+        document = deployments[deployment]
+        containers: dict[str, dict[str, list[Any]]] = {}
+        for container in _pod_containers(document):
+            name = container.get("name")
+            if not isinstance(name, str) or not name:
+                raise ReleaseError(
+                    f"deployment {deployment} has a container without a name"
+                )
+            env = copy.deepcopy(list(container.get("env") or []))
+            sensitive = sorted(
+                str(item.get("name"))
+                for item in env
+                if isinstance(item, dict)
+                and "value" in item
+                and SENSITIVE_CONFIG_KEY.search(str(item.get("name") or ""))
+            )
+            if sensitive:
+                raise ReleaseError(
+                    f"deployment {deployment} container {name} carries literal "
+                    "values under sensitive-looking env names: " + ", ".join(sensitive)
+                )
+            containers[name] = {
+                "env": env,
+                "envFrom": copy.deepcopy(list(container.get("envFrom") or [])),
+            }
+        if not containers:
+            raise ReleaseError(f"deployment {deployment} has no containers")
+        snapshot[deployment] = containers
+    return snapshot
+
+
+def cpu_role_config_maps(
+    release: Any,
+    deployments: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, str]]:
+    if deployments is None:
+        deployments = cpu_role_deployments(release)
+    names: set[str] = set()
+    for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
+        for container in _pod_containers(deployments[deployment]):
             for source in container.get("envFrom", []):
                 name = (source.get("configMapRef") or {}).get("name")
                 if (
@@ -1003,7 +1092,13 @@ def _capture_previous(
                 raise ReleaseError(
                     f"{target.cluster_id} active Agent set does not match HyperPod nodes"
                 )
-    role_config_maps = cpu_role_config_maps(release) if capture_cpu else {}
+    role_deployments = cpu_role_deployments(release) if capture_cpu else {}
+    role_config_maps = (
+        cpu_role_config_maps(release, role_deployments) if capture_cpu else {}
+    )
+    role_container_env = (
+        cpu_role_container_env(release, role_deployments) if capture_cpu else {}
+    )
     admin_config = (
         captured_admin_config(release, role_config_maps)
         if capture_cpu
@@ -1063,6 +1158,7 @@ def _capture_previous(
         "cpu_wheel": cpu_wheel,
         "cpu_wheel_sha256": cpu_wheel_sha256,
         "cpu_role_config_maps": role_config_maps,
+        "cpu_role_container_env": role_container_env,
         "admin_config": admin_config.as_dict(),
         "executor_internal_error_total": int(
             remote.get("executor_internal_error_total", 0) or 0
@@ -1455,6 +1551,17 @@ def _write_state(release: Any, phase: str, **updates: Any) -> str:
                 release.config.delivery_component_digests.get("endpoint")
             ),
             "rendered_manifest_sha256": release.rendered_manifest_digest,
+            # The rendered-manifest digest the in-progress transaction was first
+            # planned against (M-23). Sticky across resume checkpoints: the
+            # resume entrypoint pins ``approved_manifest_digest`` from the
+            # loaded state before any checkpoint, so this preserves the original
+            # digest even though ``rendered_manifest_sha256`` above tracks the
+            # (possibly drifted) working tree of whichever process is running.
+            # A fresh transaction leaves it unpinned and records the tree it is
+            # applying now; a resume records the digest it must not drift from.
+            "approved_manifest_sha256": (
+                release.approved_manifest_digest or release.rendered_manifest_digest
+            ),
             "node_template_sha256": release.node_template_sha,
             "runtime_image": release.runtime_image,
             "node_installer_image": release.node_installer_image,

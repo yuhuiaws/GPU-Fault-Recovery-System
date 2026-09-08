@@ -28,6 +28,53 @@ def _kubectl_timeout(timeout_seconds: float) -> str:
     return f"{whole}s"
 
 
+def bounded_kubectl_wait(release: Any, wait_args: list[str], *, seconds: float) -> bool:
+    """Spend at most ``seconds`` on a ``kubectl wait``/``rollout status``.
+
+    A poll loop used to sleep a fixed interval between reads, so a condition that
+    held one second into the interval was noticed at its end. This runs the
+    wait the caller built with ``--timeout`` set to the interval -- never to the
+    release's whole deadline -- so the loop wakes the moment the condition holds
+    and, at the latest, when the interval it would have slept has passed.
+
+    The answer is advisory. ``True`` says kubectl saw the condition; ``False``
+    covers the timeout and every other non-zero exit, a transient API error
+    included. Either way the caller re-reads the object exactly as it did
+    before, so nothing here changes what is judged or when it fails. A wait
+    that gives up early without the condition still costs the full interval:
+    the next read then happens no sooner than the old loop's would have, and an
+    API server that answered one call with an error gets the same pause it used
+    to get before the next one. Intervals under a second sleep instead --
+    ``--timeout=0s`` means "check once" to kubectl, and a fraction cannot be
+    expressed.
+    """
+
+    if seconds < 1:
+        if seconds > 0:
+            time.sleep(seconds)
+        return False
+    whole = int(seconds)
+    started = time.monotonic()
+    try:
+        met = bool(
+            release.runner.probe(
+                [*wait_args, f"--timeout={whole}s"],
+                timeout_seconds=whole + 30,
+            )
+        )
+    except ReleaseError:
+        # A kubectl that outlives its own --timeout is killed by the runner and
+        # reported as an error. The old sleep could not fail here, so neither
+        # does this: it is "not yet", and the caller's next read decides.
+        met = False
+    if met:
+        return True
+    shortfall = seconds - (time.monotonic() - started)
+    if shortfall > 0:
+        time.sleep(shortfall)
+    return False
+
+
 def _selector(deployment: dict[str, Any]) -> str:
     labels = (deployment.get("spec") or {}).get("selector", {}).get("matchLabels", {})
     if not isinstance(labels, dict) or not labels:
@@ -132,6 +179,7 @@ def wait_deployment_rollout(
     deadline = started + timeout_seconds
     last_progress_at = started
     last_progress: tuple[int, int, int, int] | None = None
+    kubectl_saw_completion = False
     while time.monotonic() < deadline:
         deployment = release._get_json(
             release._gpu(
@@ -190,7 +238,31 @@ def wait_deployment_rollout(
                 f"{target.cluster_id} Deployment {deployment_name} made no "
                 f"progress for {int(no_progress)} seconds; progress={progress}"
             )
-        time.sleep(poll_seconds)
+        # The interval between inspections is spent inside `rollout status`
+        # rather than a timer, so a rollout that completes early in it is read
+        # back at once; the Pod inspection above still runs every interval, so a
+        # Pod that cannot start is caught exactly when it used to be.
+        interval = min(poll_seconds, max(0.0, deadline - time.monotonic()))
+        if kubectl_saw_completion:
+            # kubectl already called the rollout complete and the read above
+            # disagreed (`rollout status` stops at "available"; this barrier also
+            # wants every replica Ready and none unavailable). Asking again would
+            # answer at once and spin, so this interval is a plain sleep.
+            time.sleep(interval)
+            kubectl_saw_completion = False
+            continue
+        kubectl_saw_completion = bounded_kubectl_wait(
+            release,
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "rollout",
+                "status",
+                f"deployment/{deployment_name}",
+            ),
+            seconds=interval,
+        )
     raise ReleaseError(
         f"{target.cluster_id} Deployment {deployment_name} exceeded "
         f"{int(timeout_seconds)} seconds"

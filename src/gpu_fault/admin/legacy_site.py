@@ -18,6 +18,7 @@ from gpu_fault.admin.bootstrap import (
 from gpu_fault.admin.bootstrap_aurora import cluster_parameter_group_name
 from gpu_fault.admin.bootstrap_common import (
     BOOTSTRAP_STATE_VERSION,
+    Arn,
     BootstrapError,
     ClusterIdentity,
     CommandRunner,
@@ -25,7 +26,7 @@ from gpu_fault.admin.bootstrap_common import (
     write_yaml,
 )
 from gpu_fault.admin.bootstrap_site import cluster_alias
-from gpu_fault.admin.site import RenderedSite, load_site
+from gpu_fault.admin.site import IDENTIFIER_PATTERN, RenderedSite, load_site
 from gpu_fault.release_state_snapshot import (
     ReleaseStateSnapshotError,
     hydrate_previous_snapshot,
@@ -66,6 +67,68 @@ def _decode_secret(document: dict[str, Any], key: str) -> str:
     if not value:
         raise BootstrapError(f"legacy Secret is missing {key}")
     return base64.b64decode(value).decode()
+
+
+def _require_account_role(role_arn: str, *, cluster: ClusterIdentity) -> str:
+    """Reject an executor role ARN that is not an IAM role in this account.
+
+    The value is read from a Kubernetes ServiceAccount annotation, which anyone
+    with edit access to the cluster can rewrite. It later names the IAM role the
+    control plane assumes for this cluster, so a foreign-account, wrong-service,
+    or otherwise malformed ARN is a privilege-escalation vector rather than a
+    discovery detail. The cluster's own account and partition are the authority
+    the value must belong to.
+    """
+    try:
+        arn = Arn.parse(role_arn)
+    except BootstrapError as exc:
+        raise BootstrapError(
+            f"{cluster.context}: executor IAM role {role_arn!r} is not a valid ARN"
+        ) from exc
+    try:
+        expected_partition = Arn.parse(cluster.eks_arn).partition
+    except BootstrapError:
+        expected_partition = "aws"
+    kind, separator, name = arn.resource.partition("/")
+    if (
+        arn.service != "iam"
+        or arn.region != ""
+        or arn.partition != expected_partition
+        or arn.account != cluster.account_id
+        or kind != "role"
+        or not separator
+        or not name
+    ):
+        raise BootstrapError(
+            f"{cluster.context}: executor IAM role {role_arn!r} is not an IAM role "
+            f"in account {cluster.account_id}"
+        )
+    return role_arn
+
+
+def _validated_cluster_id(value: str, *, secure_dir: Path) -> str:
+    """Validate a cluster id decoded from a Kubernetes Secret before trusting it.
+
+    The id is read from the ``gpu-fault-regional-connection`` Secret and is used
+    both to name per-cluster secret files on disk and, downstream, to select the
+    cluster uninstall may destroy. An unvalidated value can carry a path
+    separator (escaping the private state directory) or characters the rest of
+    the site loader would later reject anyway, so it is bounded to the same
+    anchored identifier shape the site schema enforces and to a single, in-scope
+    filename component here.
+    """
+    if not IDENTIFIER_PATTERN.fullmatch(value):
+        raise BootstrapError(f"legacy connection cluster-id is malformed: {value!r}")
+    if "/" in value or value in {".", ".."}:
+        raise BootstrapError(
+            f"legacy connection cluster-id is unsafe as a path: {value!r}"
+        )
+    resolved_parent = (secure_dir / f"{value}.token").resolve().parent
+    if resolved_parent != secure_dir.resolve():
+        raise BootstrapError(
+            f"legacy connection cluster-id escapes the state directory: {value!r}"
+        )
+    return value
 
 
 def _write_json_private(path: Path, value: dict[str, Any]) -> None:
@@ -170,7 +233,7 @@ def _executor_role(
         raise BootstrapError(
             f"{cluster.context}: executor ServiceAccount has no IAM role"
         )
-    return str(role_arn)
+    return _require_account_role(str(role_arn), cluster=cluster)
 
 
 def _aurora(
@@ -413,7 +476,10 @@ def _write_live_secrets(
                 "json",
             ],
         )
-        cluster_id = _decode_secret(connection, "cluster-id")
+        cluster_id = _validated_cluster_id(
+            _decode_secret(connection, "cluster-id"),
+            secure_dir=secure_dir,
+        )
         token_file = secure_dir / f"{cluster_id}.token"
         ca_file = secure_dir / f"{cluster_id}.ca.crt"
         _write_live_secret(token_file, _decode_secret(connection, "cluster-token"))

@@ -8,6 +8,7 @@ whether an existing release is ours to reuse.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,20 @@ from tests.admin._bootstrap_support import _cluster
 
 ROLE_ARN = "arn:aws:iam::123456789012:role/gpu-fault-site-a-lbc"
 POLICY_ARN = "arn:aws:iam::123456789012:policy/gpu-fault-site-a-lbc-policy"
+
+# The pinned digest in the module is captured at import time, before the autouse
+# fixture below repoints it, so ``test_the_iam_policy_pin_is_recorded`` can lock
+# the shipped value even while other tests run against a stand-in.
+_SHIPPED_IAM_POLICY_SHA256 = lbc.LBC_IAM_POLICY_SHA256
+# Stand-in bytes the fake ``curl`` writes; the fixture pins the module checksum
+# to their digest so the happy path verifies exactly what the fake produced.
+POLICY_BYTES = b'{"Version":"2012-10-17","Statement":[]}\n'
+POLICY_SHA256 = hashlib.sha256(POLICY_BYTES).hexdigest()
+
+
+@pytest.fixture(autouse=True)
+def _pin_iam_policy_checksum(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(lbc, "LBC_IAM_POLICY_SHA256", POLICY_SHA256)
 
 
 def _deployment(image: str, *, replicas: int, ready: int) -> dict[str, Any]:
@@ -59,6 +74,7 @@ class Runner:
         values: dict[str, Any] | None = None,
         policy_tags: list[dict[str, str]] | None = None,
         attached: Sequence[str] = (),
+        policy_bytes: bytes = POLICY_BYTES,
     ) -> None:
         self.deployments = deployments or []
         self.deployment_error = deployment_error
@@ -66,11 +82,18 @@ class Runner:
         self.values = values if values is not None else _values()
         self.policy_tags = policy_tags if policy_tags is not None else []
         self.attached = tuple(attached)
+        self.policy_bytes = policy_bytes
         self.calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
 
     def run(self, arguments: Sequence[str], **keywords: Any) -> str:
         command = tuple(arguments)
         self.calls.append((command, keywords))
+        if command[0] == "curl":
+            # The real curl writes the fetched policy to the path after -fsSLo;
+            # mirror that so the checksum verification has bytes to hash.
+            target = Path(command[command.index("-fsSLo") + 1])
+            target.write_bytes(self.policy_bytes)
+            return ""
         if command[0] == "kubectl" and "get" in command:
             if self.deployment_error:
                 raise BootstrapError("kubectl get deployment failed")
@@ -334,3 +357,40 @@ def test_an_undecidable_helm_status_stops_bootstrap(
 
     with pytest.raises(BootstrapError, match="cannot determine"):
         _ensure(Runner(), tmp_path)
+
+
+def test_a_tampered_iam_policy_download_stops_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A moved upstream tag or a tampered fetch must not reach create-policy.
+
+    ``LBC_VERSION`` is a mutable git tag, so the fetched ``iam_policy.json`` is
+    verified against a pinned digest before it becomes an IAM policy. Bytes that
+    do not match the pin fail closed instead of granting an unreviewed policy.
+    """
+
+    _stub_collaborators(monkeypatch)
+    _stub_processes(
+        monkeypatch, helm=(1, "Error: release: not found"), policy_exists=False
+    )
+    runner = Runner(policy_bytes=b'{"Statement": "tampered"}\n')
+
+    with pytest.raises(BootstrapError, match="pinned checksum"):
+        _ensure(runner, tmp_path)
+
+    assert not any("create-policy" in command for command in runner.commands()), (
+        "an unverified IAM policy was created despite the checksum mismatch"
+    )
+
+
+def test_the_iam_policy_pin_is_recorded() -> None:
+    """The shipped pin is the SHA-256 of iam_policy.json at ``LBC_VERSION``.
+
+    Recompute with ``curl -fsSL <raw url> | sha256sum`` when bumping the version;
+    this locks the value so an accidental edit to either is caught.
+    """
+
+    assert lbc.LBC_VERSION == "v2.17.1"
+    assert _SHIPPED_IAM_POLICY_SHA256 == (
+        "16f232c9d9f79366fe949c4550ad517a202380058a9e48d45a4e215044a20a6a"
+    )

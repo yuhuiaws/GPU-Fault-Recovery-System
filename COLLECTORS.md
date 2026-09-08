@@ -144,6 +144,8 @@ sudo deploy/node/install-gpu-fault-collector.sh \
   --cluster-id <gpu-hyperpod-cluster> \
   --runtime-profile-version hyperpod-v1 \
   --node-id "$(hostname -f)" \
+  --token-file /etc/gpu-fault/execution-token \
+  --wheel-sha256 "${RELEASE_WHEEL_SHA256}" \
   --metrics-mode auto \
   --dcgm-exporter existing \
   --enable-node-agent \
@@ -151,6 +153,10 @@ sudo deploy/node/install-gpu-fault-collector.sh \
   --node-instance-id "${EC2_INSTANCE_ID}" \
   --node-agent-advertise-url "https://${NODE_PRIVATE_IP}:9099"
 ```
+
+`--wheel-sha256` 取自受签名发布清单（不是安装包内的 wheel），`--token-file` 指向权限
+`0600` 的 token 文件；依赖默认以 `requirements/node-runtime.lock` 的哈希锁通过
+`--require-hashes` 安装。三者的完整语义见本节末尾的安全参数说明。
 
 生成可上传到 S3、SSM Distributor 或节点镜像流水线的自包含安装包：
 
@@ -279,6 +285,17 @@ sudo journalctl -u gpu-fault-kernel-collector -u gpu-fault-metrics-collector
 wheel 及完整依赖目录。访问 token 写入权限为 `0600` 的
 `/etc/gpu-fault/collector.env`，不会写入 systemd unit。自检不仅检查本地服务和
 exporter，还会等待 `/v1/gpu-metrics/.../latest` 出现该节点的实际样本。
+
+安装器对供应链失败关闭，三个安全参数必须一并提供：
+
+- `--token-file PATH` — 从权限 `0600` 的文件读取 bearer token，避免 token 出现在
+  `argv`（`--token` 仍可用但会暴露在进程列表中，仅用于临时调试）。
+- `--wheel-sha256 HEX` — 期望的项目 wheel SHA-256，**必须来自受签名的发布清单，而非
+  安装包自身**；安装器会把它与 release manifest 中的摘要比对，不一致即失败关闭。
+- `--dependency-lock PATH` — 第三方依赖的哈希锁，默认 `requirements/node-runtime.lock`
+  （只覆盖节点闭包的窄依赖集，而非控制面的 `runtime.lock`）。安装器始终以
+  `pip install --require-hashes --no-deps` 安装，锁内每个分发都带 `--hash=sha256:`，
+  因此不会在线解析任何未固定的包。
 
 ## GPU Metrics
 

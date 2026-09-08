@@ -50,8 +50,9 @@ SUPPLY_CHAIN_TOOLS_VENV ?= /tmp/gpu-fault-supply-chain-tools
 SUPPLY_CHAIN_PYTHON ?= $(firstword $(wildcard $(SUPPLY_CHAIN_TOOLS_VENV)/bin/python) $(PYTHON))
 SUPPLY_CHAIN_BIN = $(dir $(SUPPLY_CHAIN_PYTHON))
 # Every lock a shipped artifact is installed from: runtime.lock builds the
-# runtime image, build.lock and deploy-host.lock go into the deploy-host bundle.
-SHIPPED_LOCKS = requirements/build.lock requirements/runtime.lock requirements/deploy-host.lock
+# runtime image, build.lock and deploy-host.lock go into the deploy-host bundle,
+# and node-runtime.lock is what the node installer hash-pins onto every GPU node.
+SHIPPED_LOCKS = requirements/build.lock requirements/runtime.lock requirements/deploy-host.lock requirements/node-runtime.lock
 PIP_AUDIT_IGNORE_FILE = requirements/pip-audit-ignore.txt
 CFN_TEMPLATES = deploy/aws/lambda/*.yaml
 SBOM_DIR = dist/sbom

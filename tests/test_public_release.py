@@ -41,7 +41,7 @@ def test_public_release_scan_uses_git_without_python_pathspec(tmp_path: Path) ->
     (tmp_path / "README.md").write_text("public documentation\n", encoding="utf-8")
     ignored = tmp_path / "ignored"
     ignored.mkdir()
-    (ignored / "live.md").write_text("node i-0305bbcc538883eb6\n", encoding="utf-8")
+    (ignored / "live.md").write_text("node i-0123456789abcdef0\n", encoding="utf-8")
 
     command = (
         "import runpy,sys;"
@@ -60,20 +60,28 @@ def test_public_release_scan_uses_git_without_python_pathspec(tmp_path: Path) ->
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+# These are positive-case fixtures: each value must trip a check to prove the
+# gate fires, so they cannot be allowlisted placeholders. They are nonetheless
+# written as obviously-synthetic values (all-zero accounts/UUIDs, sequential
+# hex ids) rather than real-looking site identities, so that even though this
+# file is exempt from the scan, no plausible live identifier is embedded here.
 @pytest.mark.parametrize(
     ("content", "message"),
     [
-        ("arn:aws:eks:us-west-2:514385905925:cluster/site\n", "customer AWS account"),
-        ("node i-0305bbcc538883eb6\n", "concrete EC2 instance ID"),
-        ("network vpc-0123abc456def7890\n", "concrete AWS resource ID"),
-        ("endpoint 10.91.48.46\n", "site private address"),
-        ("cluster eks-cluster-hypd-site\n", "site-specific resource name"),
+        (
+            "arn:aws:eks:us-west-2:999999999999:cluster/example\n",
+            "customer AWS account",
+        ),
+        ("node i-0123456789abcdef0\n", "concrete EC2 instance ID"),
+        ("network vpc-0123456789abcdef0\n", "concrete AWS resource ID"),
+        ("endpoint 10.91.0.1\n", "site private address"),
+        ("cluster eks-cluster-hypd-example\n", "site-specific resource name"),
         ("email operator@amazon.com\n", "personal email"),
         (
-            "boot 8ca90906-755a-4cd8-b27e-44382277cf70\n",
+            "boot 00000000-0000-0000-0000-000000000000\n",
             "raw UUID in public documentation",
         ),
-        ("node 026c36a28c56ea610\n", "raw node identity in public documentation"),
+        ("node 0123456789abcdef0\n", "raw node identity in public documentation"),
     ],
 )
 def test_public_release_gate_rejects_live_identity(
@@ -89,7 +97,7 @@ def test_public_release_gate_honors_private_archive_boundary(tmp_path: Path) -> 
     (tmp_path / ".gitignore").write_text("/internal-docs/\n", encoding="utf-8")
     internal = tmp_path / "internal-docs"
     internal.mkdir()
-    (internal / "live.md").write_text("node i-0305bbcc538883eb6\n", encoding="utf-8")
+    (internal / "live.md").write_text("node i-0123456789abcdef0\n", encoding="utf-8")
     (tmp_path / "README.md").write_text("public documentation\n", encoding="utf-8")
 
     result = run_check(tmp_path)
@@ -116,7 +124,7 @@ def test_public_release_gate_allows_documented_placeholders(tmp_path: Path) -> N
 # Comfortably more than one shard's worth of bytes, so the scan has to cut the
 # file up and stitch the line numbers back together.
 SHARDED_FILE_LINES = 2000
-SHARDED_FILE_LINE = "node i-0305bbcc538883eb6 " + "x" * 700
+SHARDED_FILE_LINE = "node i-0123456789abcdef0 " + "x" * 700
 
 
 def sharded_tree(tmp_path: Path, *, filler_files: int) -> Path:
@@ -179,7 +187,7 @@ def test_public_release_verdict_cache_reuses_only_identical_content(
     assert second.returncode == 0, second.stdout + second.stderr
     assert "reused" in second.stdout
 
-    (tree / "docs/public.md").write_text("node i-0305bbcc538883eb6\n", encoding="utf-8")
+    (tree / "docs/public.md").write_text("node i-0123456789abcdef0\n", encoding="utf-8")
     third = run_check(tree, "--verdict-cache", str(cache))
 
     assert third.returncode == 1
@@ -189,7 +197,7 @@ def test_public_release_verdict_cache_reuses_only_identical_content(
 def test_public_release_verdict_cache_records_nothing_on_failure(
     tmp_path: Path,
 ) -> None:
-    tree = public_tree(tmp_path / "tree", "node i-0305bbcc538883eb6\n")
+    tree = public_tree(tmp_path / "tree", "node i-0123456789abcdef0\n")
     cache = tmp_path / "verdict.json"
 
     result = run_check(tree, "--verdict-cache", str(cache))
@@ -204,3 +212,34 @@ def test_public_release_gate_is_wired_into_local_and_ci_checks() -> None:
 
     assert "$(MAKE) public-release-check" in makefile
     assert "scripts/check-public-release.py" in workflow
+
+
+@pytest.mark.parametrize(
+    "scanner_relative_path",
+    [
+        "scripts/check-public-release.py",
+        "tests/test_fault_scenario_catalog.py",
+        "tests/test_script_assets.py",
+    ],
+)
+def test_public_release_gate_scans_its_own_scanner_files(
+    tmp_path: Path, scanner_relative_path: str
+) -> None:
+    """The scanner and its clean sibling tests are no longer self-exempt.
+
+    A live identity that lands in the scanner itself, or in an identity-facing
+    test that has no legitimate reason to embed one, must be caught like any
+    other file. Only the two files that cannot be scanned clean -- this test's
+    own positive fixtures and the documentation-contract patterns -- stay
+    exempt, so this asserts every other former exemption is gone.
+    """
+
+    (tmp_path / ".gitignore").write_text("", encoding="utf-8")
+    target = tmp_path / scanner_relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("leaked node i-0123456789abcdef0\n", encoding="utf-8")
+
+    result = run_check(tmp_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"{scanner_relative_path}:1: concrete EC2 instance ID" in result.stderr

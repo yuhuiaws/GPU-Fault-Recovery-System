@@ -15,6 +15,7 @@ from gpu_fault_release.regional_release_gpu_rollout import (
 )
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
+from gpu_fault_release.regional_release_state import require_digest_pinned_image
 from gpu_fault_release.regional_release_validation import validate_gpu_rollback_target
 
 GPU_COMPONENTS = frozenset(
@@ -473,7 +474,10 @@ def validate_resume_checkpoint(
     planned_gpu = frozenset(plan.nodes).intersection(GPU_COMPONENTS)
     if not planned_gpu:
         return
-    previous_runtime = str(previous.get("runtime_image") or release.runtime_image)
+    previous_runtime = require_digest_pinned_image(
+        "resume previous runtime",
+        previous.get("runtime_image") or release.runtime_image,
+    )
     for target in release.config.clusters:
         identity = (previous.get("agent_identities") or {}).get(target.cluster_id)
         if not isinstance(identity, dict):

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import random
 
 import pytest
 
 from gpu_fault.release_state_snapshot import (
     ReleaseStateSnapshotError,
+    canonical_previous_bytes,
     encode_previous_snapshot,
     hydrate_previous_snapshot,
 )
@@ -75,3 +77,43 @@ def test_legacy_inline_previous_snapshot_remains_supported() -> None:
     )
 
     assert hydrated["previous"] == previous
+
+
+def test_inline_previous_snapshot_is_bound_to_its_recorded_digest() -> None:
+    """M-12: an inline snapshot with a recorded digest must match it.
+
+    The digest is the provenance binding, so an inline ``previous`` that carries
+    one is accepted only when it hashes to that value.
+    """
+
+    previous = {"release_id": "legacy", "clusters": {"gpu-a": {"x": "y"}}}
+    digest = hashlib.sha256(canonical_previous_bytes(previous)).hexdigest()
+
+    hydrated = hydrate_previous_snapshot(
+        {"phase": "failed", "previous": previous, "previous_snapshot_sha256": digest},
+        lambda _name: pytest.fail("inline state read an external snapshot"),
+    )
+
+    assert hydrated["previous"] == previous
+
+
+def test_tampered_inline_previous_snapshot_is_rejected() -> None:
+    """M-12: a tampered inline snapshot no longer passes as the rollback baseline.
+
+    Before provenance binding an inline ``previous`` was trusted verbatim; now a
+    recorded digest that the content does not hash to is a hard rejection.
+    """
+
+    previous = {"release_id": "legacy", "clusters": {"gpu-a": {"x": "y"}}}
+    honest_digest = hashlib.sha256(canonical_previous_bytes(previous)).hexdigest()
+    tampered = {**previous, "clusters": {"gpu-a": {"x": "z"}}}
+
+    with pytest.raises(ReleaseStateSnapshotError, match="inline previous snapshot"):
+        hydrate_previous_snapshot(
+            {
+                "phase": "failed",
+                "previous": tampered,
+                "previous_snapshot_sha256": honest_digest,
+            },
+            lambda _name: pytest.fail("tampered state read an external snapshot"),
+        )

@@ -10,6 +10,7 @@ CERTIFICATE_MIN_VALIDITY_SECONDS="${GPU_FAULT_CERTIFICATE_MIN_VALIDITY_SECONDS:-
 CLUSTER_ID=""
 PROFILE_VERSION=""
 TOKEN=""
+TOKEN_FILE=""
 NODE_ID="$(hostname -f 2>/dev/null || hostname)"
 NODE_INSTANCE_TYPE=""
 GPU_PRODUCT=""
@@ -57,7 +58,14 @@ DCGM_EXPORTER_MODE="existing"
 DCGM_METRICS_URL="http://127.0.0.1:9400/metrics"
 DCGM_EXPORTER_IMAGE=""
 WHEEL=""
+# The expected wheel digest must come from outside the bundle: the Job
+# renders it from the release the control plane pinned, so a tampered
+# bundle cannot vouch for its own wheel. There is no empty bypass.
+EXPECTED_WHEEL_SHA256=""
 WHEELHOUSE=""
+# Hash lock for the node runtime's dependency closure; every dependency
+# installs with --require-hashes so nothing is resolved online unpinned.
+DEPENDENCY_LOCK=""
 PY_SPY_VERSION="0.4.1"
 PY_SPY_BINARY_SHA256="e7c2de2dc54449ec88c086f1859555b4e34e63ccdcf3f8804496f9306cd44de6"
 PYTHON_COMMAND="python3"
@@ -146,7 +154,8 @@ usage() {
         "Options:" \
         "  --node-id ID                    Default: host FQDN" \
         "  --node-instance-type TYPE       EC2/HyperPod instance type" \
-        "  --token TOKEN                   Optional bearer token" \
+        "  --token TOKEN                   Optional bearer token (visible on argv; prefer --token-file)" \
+        "  --token-file PATH               Read the bearer token from a 0600 file" \
         "  --ca-certificate PATH           Private CA PEM for HTTPS control plane" \
         "  --certificate-min-validity-seconds N  Reject CA/leaf expiry inside N seconds" \
         "  --gpu-product PRODUCT" \
@@ -172,7 +181,9 @@ usage() {
         "  --dcgm-metrics-url URL          Default: http://127.0.0.1:9400/metrics" \
         "  --dcgm-exporter-image IMAGE     Required with --dcgm-exporter docker" \
         "  --wheel PATH                    Default: newest wheel under dist/" \
+        "  --wheel-sha256 HEX              Required expected wheel SHA-256 (from the release, not the bundle)" \
         "  --wheelhouse DIR                Install dependencies without an index" \
+        "  --dependency-lock PATH          Hash lock for dependencies; default: requirements/node-runtime.lock" \
         "  --python-command PATH           Python 3.12+ executable" \
         "  --disable-kernel                Do not install the /dev/kmsg collector" \
         "  --enable-node-log-collector     Enable system/training log collection; default: disabled" \
@@ -485,6 +496,7 @@ while [[ $# -gt 0 ]]; do
         --cluster-id) require_value "$@"; CLUSTER_ID="$2"; shift 2 ;;
         --runtime-profile-version) require_value "$@"; PROFILE_VERSION="$2"; shift 2 ;;
         --token) require_value "$@"; TOKEN="$2"; shift 2 ;;
+        --token-file) require_value "$@"; TOKEN_FILE="$2"; shift 2 ;;
         --ca-certificate) require_value "$@"; CONTROL_PLANE_CA_CERTIFICATE="$2"; shift 2 ;;
         --certificate-min-validity-seconds) require_value "$@"; CERTIFICATE_MIN_VALIDITY_SECONDS="$2"; shift 2 ;;
         --node-id) require_value "$@"; NODE_ID="$2"; shift 2 ;;
@@ -517,7 +529,9 @@ while [[ $# -gt 0 ]]; do
         --dcgm-metrics-url) require_value "$@"; DCGM_METRICS_URL="$2"; shift 2 ;;
         --dcgm-exporter-image) require_value "$@"; DCGM_EXPORTER_IMAGE="$2"; shift 2 ;;
         --wheel) require_value "$@"; WHEEL="$2"; shift 2 ;;
+        --wheel-sha256) require_value "$@"; EXPECTED_WHEEL_SHA256="$2"; shift 2 ;;
         --wheelhouse) require_value "$@"; WHEELHOUSE="$2"; shift 2 ;;
+        --dependency-lock) require_value "$@"; DEPENDENCY_LOCK="$2"; shift 2 ;;
         --python-command) require_value "$@"; PYTHON_COMMAND="$2"; shift 2 ;;
         --disable-kernel) DISABLE_KERNEL="true"; shift ;;
         --enable-node-log-collector) ENABLE_NODE_LOG_COLLECTOR="true"; shift ;;
@@ -596,6 +610,15 @@ fi
 [[ -n "${CONTROL_PLANE_URL}" ]] || die "--control-plane-url is required"
 [[ -n "${CLUSTER_ID}" ]] || die "--cluster-id is required"
 [[ -n "${PROFILE_VERSION}" ]] || die "--runtime-profile-version is required"
+if [[ -n "${TOKEN}" && -n "${TOKEN_FILE}" ]]; then
+    die "use only one bearer token input"
+fi
+if [[ -n "${TOKEN_FILE}" ]]; then
+    [[ "${TOKEN_FILE}" == /* ]] || die "--token-file must be an absolute path"
+    [[ -r "${TOKEN_FILE}" ]] || die "bearer token file is not readable"
+    IFS= read -r TOKEN < "${TOKEN_FILE}" || [[ -n "${TOKEN}" ]]
+    [[ -n "${TOKEN}" ]] || die "bearer token file is empty"
+fi
 [[ "${CERTIFICATE_MIN_VALIDITY_SECONDS}" =~ ^[1-9][0-9]*$ ]] ||
     die "--certificate-min-validity-seconds must be positive"
 if [[ -n "${CONTROL_PLANE_CA_CERTIFICATE}" ]]; then
@@ -829,6 +852,9 @@ else:
     print(f"DNS:{node_id},IP:{host}")
 PY
         )"
+        # Create the key 0600 before openssl writes into it, so the
+        # private key is never observable at the umask default.
+        install -m 0600 /dev/null "${NODE_AGENT_TLS_KEY}"
         openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
             -days 397 \
             -subj "/CN=${NODE_ID}" \
@@ -1064,9 +1090,13 @@ dcgm_ready() {
 # find -maxdepth 1 -type f，checkout 里一个都匹配不到，直接 die
 # "collector wheel not found"。指针存在时用指针并核对 wheel_sha256，
 # 避免在多份 release 里按 mtime 猜。
-EXPECTED_WHEEL_SHA256=""
+#
+# 期望的 wheel 摘要必须来自安装包之外（--wheel-sha256，由 Job 从控制面
+# 钉住的 release 渲染）。安装包内的 current-release.json 只做一致性
+# 交叉核对，不能替代外部摘要，也没有"为空即放行"的旁路。
+MANIFEST_WHEEL_SHA256=""
+RELEASE_MANIFEST="${REPO_DIR}/dist/current-release.json"
 if [[ -z "${WHEEL}" ]]; then
-    RELEASE_MANIFEST="${REPO_DIR}/dist/current-release.json"
     if [[ -f "${RELEASE_MANIFEST}" ]]; then
         MANIFEST_WHEEL="$("${PYTHON_COMMAND}" -c \
             'import json, pathlib, sys
@@ -1079,7 +1109,7 @@ print(component.get("wheel_sha256", manifest["wheel_sha256"]))' \
             "${RELEASE_MANIFEST}" "${REPO_DIR}")" ||
             die "cannot read release manifest: ${RELEASE_MANIFEST}"
         WHEEL="${MANIFEST_WHEEL%%$'\n'*}"
-        EXPECTED_WHEEL_SHA256="${MANIFEST_WHEEL##*$'\n'}"
+        MANIFEST_WHEEL_SHA256="${MANIFEST_WHEEL##*$'\n'}"
     else
         WHEEL="$(find "${REPO_DIR}/dist" -maxdepth 1 -type f \
             -name 'gpu_fault_node_runtime-*.whl' -printf '%T@ %p\n' 2>/dev/null |
@@ -1088,10 +1118,28 @@ print(component.get("wheel_sha256", manifest["wheel_sha256"]))' \
 fi
 [[ -n "${WHEEL}" && -f "${WHEEL}" ]] ||
     die "collector wheel not found; pass --wheel PATH"
+EXPECTED_WHEEL_SHA256="$(
+    printf '%s' "${EXPECTED_WHEEL_SHA256}" | tr '[:upper:]' '[:lower:]'
+)"
+[[ "${EXPECTED_WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
+    die "expected wheel SHA-256 is required; pass --wheel-sha256 HEX from the pinned release"
+[[ -z "${MANIFEST_WHEEL_SHA256}" ||
+    "${MANIFEST_WHEEL_SHA256}" == "${EXPECTED_WHEEL_SHA256}" ]] ||
+    die "release manifest ${RELEASE_MANIFEST} wheel sha256 ${MANIFEST_WHEEL_SHA256} does not match --wheel-sha256 ${EXPECTED_WHEEL_SHA256}"
 WHEEL_SHA256="$(sha256sum "${WHEEL}" | cut -d' ' -f1)"
-[[ -z "${EXPECTED_WHEEL_SHA256}" ||
-    "${WHEEL_SHA256}" == "${EXPECTED_WHEEL_SHA256}" ]] ||
-    die "wheel ${WHEEL} sha256 ${WHEEL_SHA256} does not match ${RELEASE_MANIFEST}"
+[[ "${WHEEL_SHA256}" == "${EXPECTED_WHEEL_SHA256}" ]] ||
+    die "wheel ${WHEEL} sha256 ${WHEEL_SHA256} does not match expected ${EXPECTED_WHEEL_SHA256}"
+if [[ -z "${DEPENDENCY_LOCK}" ]]; then
+    # The narrow node-runtime lock, not the broad control-plane runtime.lock:
+    # it pins only the node collector/agent's true runtime import closure
+    # (boto3, fastapi, kubernetes, pydantic, PyYAML, uvicorn + transitive),
+    # each with sha256 hashes, so --require-hashes installs nothing extra.
+    DEPENDENCY_LOCK="${REPO_DIR}/requirements/node-runtime.lock"
+fi
+[[ -f "${DEPENDENCY_LOCK}" ]] ||
+    die "dependency hash lock not found: ${DEPENDENCY_LOCK}; pass --dependency-lock PATH"
+grep -q -- '--hash=sha256:' "${DEPENDENCY_LOCK}" ||
+    die "dependency lock ${DEPENDENCY_LOCK} carries no --hash pins"
 
 if [[ "${DCGM_EXPORTER_MODE}" == "docker" ]]; then
     [[ "${METRICS_MODE}" != "nvidia-smi" ]] ||
@@ -1165,7 +1213,14 @@ prepare_runtime_slot() {
     fi
     install -d -m 0755 "${release_dir}"
     "${PYTHON_COMMAND}" -m venv "${release_dir}/venv"
-    PIP_ARGS=(install --upgrade "${WHEEL}[collectors]")
+    # The dependency closure comes from the hash lock only: --require-hashes
+    # makes pip refuse any file whose digest is not pinned, and --no-deps
+    # stops it from resolving anything the lock does not name. The wheel
+    # itself was digest-checked above and installs with no index at all.
+    PIP_ARGS=(
+        install --require-hashes --no-deps
+        --requirement "${DEPENDENCY_LOCK}"
+    )
     if [[ -n "${WHEELHOUSE}" ]]; then
         [[ -d "${WHEELHOUSE}" ]] ||
             die "wheelhouse does not exist: ${WHEELHOUSE}"
@@ -1173,7 +1228,7 @@ prepare_runtime_slot() {
     fi
     "${release_dir}/venv/bin/python" -m pip "${PIP_ARGS[@]}"
     "${release_dir}/venv/bin/python" -m pip install \
-        --force-reinstall --no-deps "${WHEEL}"
+        --no-index --no-deps "${WHEEL}"
     record_digest="$(runtime_record_digest "${release_dir}")" ||
         die "node runtime RECORD validation failed"
     printf '%s\n' "${expected_artifact}" > "${release_dir}/artifact.sha256"
@@ -1282,6 +1337,11 @@ write_env() {
     printf '%s=%s\n' "${key}" "$(systemd_quote "${value}")"
 }
 
+# Secret-bearing env files are created 0600 before anything is written to
+# them. A bare `{ ... } > file` would create the file at the umask default
+# (0644) and expose the bearer token and node action secret until the
+# trailing chmod; install(1) truncates an existing file and sets the mode.
+install -m 0600 /dev/null /etc/gpu-fault/collector.env
 {
     write_env GPU_FAULT_CONTROL_PLANE_URL "${CONTROL_PLANE_URL}"
     write_env GPU_FAULT_CLUSTER_ID "${CLUSTER_ID}"
@@ -1387,6 +1447,7 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
     if [[ "${ALLOW_FIRMWARE_UPDATE}" == "true" ]]; then
         NODE_ALLOWED_OPERATIONS+=",UPDATE_SOFTWARE_FIRMWARE"
     fi
+    install -m 0600 /dev/null /etc/gpu-fault/node-agent.env
     {
         write_env GPU_FAULT_NODE_ACTION_SECRET "${NODE_ACTION_SECRET}"
         write_env GPU_FAULT_NODE_ACTION_KEY_VERSION \
@@ -1527,6 +1588,7 @@ if [[ "${DCGM_EXPORTER_MODE}" == "docker" ]]; then
         "${REPO_DIR}/deploy/systemd/gpu-fault-dcgm-exporter.service" \
         > /etc/systemd/system/gpu-fault-dcgm-exporter.service
     chmod 0644 /etc/systemd/system/gpu-fault-dcgm-exporter.service
+    install -m 0600 /dev/null /etc/gpu-fault/dcgm-exporter.env
     {
         write_env GPU_FAULT_DCGM_EXPORTER_IMAGE "${DCGM_EXPORTER_IMAGE}"
     } > /etc/gpu-fault/dcgm-exporter.env

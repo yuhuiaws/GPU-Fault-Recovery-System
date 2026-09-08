@@ -124,6 +124,25 @@ def test_node_rollout_preflight_is_read_only_and_server_validated() -> None:
     assert "host has less than" in preflight
 
 
+def test_installer_job_wait_is_event_driven_but_the_read_still_judges() -> None:
+    """The 2s between Job reads is a bounded `kubectl wait`, not a timer.
+
+    The wait only shortens the interval: a Complete Job ends it at once, while a
+    Failed Job or a transient API error just exhausts the 2s bound and the
+    condition read at the top of the loop decides, exactly as before.
+    """
+
+    job = (ROOT / "deploy/node/run-hyperpod-installer-job.sh").read_text()
+    loop = job.split("deadline=$((SECONDS + INSTALLER_ACTIVE_DEADLINE_SECONDS", 1)[1]
+    loop = loop.split("done", 1)[0]
+
+    assert "sleep 2" not in loop
+    assert 'wait "job/${JOB_NAME}"' in loop
+    assert "--for=condition=complete --timeout=2s" in loop
+    assert "|| true" in loop, "a timed-out wait must not abort the loop"
+    assert '"${condition}" == *Failed*' in loop
+
+
 def test_hyperpod_installer_supports_regional_connection_secret() -> None:
     installer = NODE_SCRIPTS[4].read_text()
 
@@ -140,7 +159,9 @@ def test_hyperpod_installer_supports_regional_connection_secret() -> None:
     assert 'NODE_ACTION_SECRET_KEY="${NODE_NAME}"' in installer
     assert 'DERIVE_NODE_ACTION_SECRET="false"' in installer
     assert "/node-secret/node-action-secret" in installer
-    assert '--token "${CONTROL_PLANE_TOKEN}"' in installer
+    # The bearer token reaches the installer as a 0600 file, never on argv.
+    assert '--token-file "${CONTROL_PLANE_TOKEN_FILE}"' in installer
+    assert '--token "' not in installer
     assert '--ca-certificate "${CONTROL_PLANE_CA_CERTIFICATE}"' in installer
 
 
@@ -685,8 +706,10 @@ def test_install_and_uninstall_restore_pending_quiesce_state() -> None:
     assert "uninstall aborted" in uninstaller
 
 
-WHEEL_BLOCK_START = 'EXPECTED_WHEEL_SHA256=""'
-WHEEL_BLOCK_END = 'does not match ${RELEASE_MANIFEST}"'
+WHEEL_BLOCK_START = 'MANIFEST_WHEEL_SHA256=""'
+WHEEL_BLOCK_END = (
+    'sha256 ${WHEEL_SHA256} does not match expected ${EXPECTED_WHEEL_SHA256}"'
+)
 
 
 def _wheel_discovery_probe(target: Path) -> Path:
@@ -697,6 +720,9 @@ def _wheel_discovery_probe(target: Path) -> Path:
     bundle flattens the wheel into ``dist/``, so the rule looked right, while
     a repo checkout keeps it in the content-addressed ``dist/<release_id>/``
     and every checkout install died with "collector wheel not found".
+
+    The probe takes the expected wheel digest as its second argument, the
+    way the Job passes ``--wheel-sha256``; the digest is a hard gate.
     """
     installer = NODE_SCRIPTS[0].read_text()
     assert installer.count(WHEEL_BLOCK_START) == 1
@@ -707,6 +733,7 @@ def _wheel_discovery_probe(target: Path) -> Path:
     probe.write_text(
         "set -euo pipefail\n"
         'REPO_DIR="$1"\n'
+        'EXPECTED_WHEEL_SHA256="${2:-}"\n'
         "PYTHON_COMMAND=python3\n"
         'WHEEL=""\n'
         "die() { printf 'DIE: %s\\n' \"$*\"; exit 1; }\n"
@@ -717,9 +744,14 @@ def _wheel_discovery_probe(target: Path) -> Path:
     return probe
 
 
-def _run_probe(probe: Path, repo_dir: Path) -> subprocess.CompletedProcess[str]:
+def _run_probe(
+    probe: Path, repo_dir: Path, expected: str = ""
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(probe), str(repo_dir)], capture_output=True, text=True, check=False
+        ["bash", str(probe), str(repo_dir), expected],
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
@@ -739,7 +771,7 @@ def test_installer_finds_the_wheel_in_both_release_layouts(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    result = _run_probe(probe, checkout)
+    result = _run_probe(probe, checkout, digest)
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"WHEEL={wheel}" in result.stdout
     assert f"SHA={digest}" in result.stdout
@@ -749,7 +781,7 @@ def test_installer_finds_the_wheel_in_both_release_layouts(tmp_path: Path) -> No
     flat.parent.mkdir(parents=True)
     flat.write_bytes(b"bundle-wheel")
 
-    result = _run_probe(probe, bundle)
+    result = _run_probe(probe, bundle, hashlib.sha256(b"bundle-wheel").hexdigest())
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"WHEEL={flat}" in result.stdout
 
@@ -760,23 +792,21 @@ def test_installer_refuses_a_wheel_the_release_manifest_disowns(tmp_path: Path) 
     wheel = checkout / "dist/2ebb8d337fca/gpu_fault_control_plane-0.10.0.whl"
     wheel.parent.mkdir(parents=True)
     wheel.write_bytes(b"tampered")
+    original = hashlib.sha256(b"original").hexdigest()
     (checkout / "dist/current-release.json").write_text(
         json.dumps(
-            {
-                "wheel": wheel.relative_to(checkout).as_posix(),
-                "wheel_sha256": hashlib.sha256(b"original").hexdigest(),
-            }
+            {"wheel": wheel.relative_to(checkout).as_posix(), "wheel_sha256": original}
         ),
         encoding="utf-8",
     )
 
-    result = _run_probe(probe, checkout)
+    result = _run_probe(probe, checkout, original)
     assert result.returncode != 0
     assert "does not match" in result.stdout
 
     empty = tmp_path / "empty"
     (empty / "dist").mkdir(parents=True)
-    result = _run_probe(probe, empty)
+    result = _run_probe(probe, empty, original)
     assert result.returncode != 0
     assert "collector wheel not found" in result.stdout
 

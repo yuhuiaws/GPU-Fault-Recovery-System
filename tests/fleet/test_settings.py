@@ -39,7 +39,52 @@ def test_blank_settings_switch_means_its_default() -> None:
     settings = ControlPlaneSettings.from_mapping(values)
 
     assert settings.store is not None
-    assert settings.store.postgres_auto_schema_init is True
+    # Auto schema init defaults OFF: creating/altering tables is a privileged
+    # migration step, not something every replica does on boot.
+    assert settings.store.postgres_auto_schema_init is False
+
+
+def test_auto_schema_init_defaults_off_when_unset() -> None:
+    values = active_values()
+    values.pop("GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT", None)
+
+    settings = ControlPlaneSettings.from_mapping(values)
+
+    assert settings.store is not None
+    assert settings.store.postgres_auto_schema_init is False
+
+
+def test_unrecognised_deployment_mode_fails_closed() -> None:
+    """A typo must not silently downgrade to the less isolated mode.
+
+    ``regional`` enforces per-cluster tenancy that ``single-cluster`` relaxes;
+    the parser used to treat every non-``regional`` value as single-cluster, so
+    a value like ``"regionl"`` would quietly pick the weaker mode.
+    """
+
+    values = active_values()
+    values["GPU_FAULT_DEPLOYMENT_MODE"] = "regionl"
+
+    with pytest.raises(RuntimeError, match="GPU_FAULT_DEPLOYMENT_MODE"):
+        ControlPlaneSettings.from_mapping(values)
+
+
+def test_deployment_mode_unset_stays_single_cluster_with_opt_in() -> None:
+    """An unset mode still resolves to single-cluster, but only with the opt-in.
+
+    Dropping the ``GPU_FAULT_ALLOW_SINGLE_CLUSTER`` acknowledgement then fails
+    closed, so the insecure mode is never selected without an explicit choice.
+    """
+
+    values = active_values()
+    values.pop("GPU_FAULT_DEPLOYMENT_MODE", None)
+
+    settings = ControlPlaneSettings.from_mapping(values)
+    assert settings.regional_mode is False
+
+    values.pop("GPU_FAULT_ALLOW_SINGLE_CLUSTER")
+    with pytest.raises(RuntimeError, match="Canary-only"):
+        ControlPlaneSettings.from_mapping(values)
 
 
 def test_simulation_settings_do_not_require_active_secrets() -> None:

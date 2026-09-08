@@ -345,7 +345,47 @@ def _live_rule_defects(path: Path) -> tuple[list[str], set[str]]:
     return defects, groups
 
 
-def _alertmanager_defects(path: Path) -> tuple[list[str], list[str]]:
+def _route_defects(
+    route: Any,
+    receivers: list[str],
+    *,
+    location: str = "root route",
+    require_receiver: bool = True,
+) -> list[str]:
+    """Validate one route node's receiver and recurse into its children.
+
+    Alertmanager delivers on the matching leaf route's receiver, so a bad
+    receiver buried in a nested ``routes`` entry misroutes or drops the page
+    just as surely as a bad root receiver. Every node is therefore checked at
+    every depth. A child may omit ``receiver`` to inherit its parent's, which is
+    why only the root is required to name one; any receiver a node does declare
+    must resolve to a valid SNS receiver.
+    """
+    if not isinstance(route, dict):
+        return [f"Alertmanager {location} is not a mapping"]
+    defects: list[str] = []
+    receiver = str(route.get("receiver", ""))
+    if receiver and receiver not in receivers:
+        defects.append(
+            f"Alertmanager {location} selects an unknown receiver: {receiver}"
+        )
+    elif not receiver and require_receiver:
+        defects.append(
+            f"Alertmanager {location} does not select a valid SNS receiver: <unset>"
+        )
+    for index, child in enumerate(route.get("routes") or []):
+        defects.extend(
+            _route_defects(
+                child,
+                receivers,
+                location=f"{location} > routes[{index}]",
+                require_receiver=False,
+            )
+        )
+    return defects
+
+
+def alertmanager_defects(path: Path) -> tuple[list[str], list[str]]:
     outer = _yaml(path) or {}
     config: Any = outer.get("alertmanager_config", outer)
     if isinstance(config, str):
@@ -370,12 +410,7 @@ def _alertmanager_defects(path: Path) -> tuple[list[str], list[str]]:
             receivers.append(str(receiver.get("name", "<unnamed>")))
     if not receivers:
         defects.append("live Alertmanager has no valid SNS receiver")
-    route_receiver = str((config.get("route") or {}).get("receiver", ""))
-    if route_receiver not in receivers:
-        defects.append(
-            "Alertmanager root route does not select a valid SNS "
-            f"receiver: {route_receiver or '<unset>'}"
-        )
+    defects.extend(_route_defects(config.get("route") or {}, receivers))
     return defects, receivers
 
 
@@ -401,7 +436,7 @@ def main() -> int:
         defects.extend(live_defects)
         print("AMP_RULE_GROUPS=", ",".join(sorted(groups)))
 
-        manager_defects, receivers = _alertmanager_defects(args.live_alertmanager)
+        manager_defects, receivers = alertmanager_defects(args.live_alertmanager)
         defects.extend(manager_defects)
         print(
             "ALERTMANAGER_SNS_RECEIVERS=",

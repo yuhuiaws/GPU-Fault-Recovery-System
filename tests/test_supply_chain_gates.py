@@ -29,6 +29,7 @@ SHIPPED_LOCKS = (
     "requirements/build.lock",
     "requirements/runtime.lock",
     "requirements/deploy-host.lock",
+    "requirements/node-runtime.lock",
 )
 NEW_TARGETS = (
     "lazy-export-check",

@@ -453,6 +453,7 @@ class PlanBuilder:
                 self.from_marker(
                     event,
                     NodeMarker(
+                        cluster_id=event.cluster_id,
                         source="quick-triage",
                         trusted=True,
                         incident_id=incident_id,

@@ -102,10 +102,17 @@ class XidCorrelationCoordinator:
 
     @staticmethod
     def prepare_xid154(event: XidEvent) -> XidEvent:
-        if event.xid != 154 or event.xid_154_action is not None:
+        # ``xid_154_action`` is server-owned: it is derived solely from the
+        # NVIDIA XID 154 log line, never from a client-supplied field. A
+        # client that pre-set it must not be able to short-circuit (or steer)
+        # this derivation, so the value is always recomputed here and any
+        # inbound value is discarded (security review H-10).
+        if event.xid != 154:
+            if event.xid_154_action is not None:
+                return event.model_copy(update={"xid_154_action": None})
             return event
         action = parse_xid154_action(event.raw_message)
-        if action is None:
+        if action is event.xid_154_action:
             return event
         return event.model_copy(update={"xid_154_action": action})
 

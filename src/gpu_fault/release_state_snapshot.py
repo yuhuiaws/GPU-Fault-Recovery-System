@@ -138,6 +138,20 @@ def hydrate_previous_snapshot(
             return hydrated
         if not isinstance(inline, dict):
             raise ReleaseStateSnapshotError("inline previous snapshot is invalid")
+        # An inline snapshot with no reference is otherwise trusted verbatim. If
+        # the release state recorded a digest for it, bind the record to that
+        # digest so a tampered inline ``previous`` is rejected rather than
+        # carried forward as the rollback baseline.
+        recorded_digest = str(hydrated.get("previous_snapshot_sha256") or "")
+        if recorded_digest:
+            if not SHA256_PATTERN.fullmatch(recorded_digest):
+                raise ReleaseStateSnapshotError("previous snapshot sha256 is invalid")
+            if hashlib.sha256(canonical_previous_bytes(inline)).hexdigest() != (
+                recorded_digest
+            ):
+                raise ReleaseStateSnapshotError(
+                    "inline previous snapshot digest changed"
+                )
         return hydrated
     reference = _validated_reference(reference_value)
     expected_digest = str(reference["sha256"])
