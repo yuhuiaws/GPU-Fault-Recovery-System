@@ -440,15 +440,25 @@ from gpu_fault.store import NotFoundError
 # than a queue that happened to look idle.
 def drained_queue_stats(store, attempts=20, pause=0.5):
     samples = []
+    fault_backlog_depth = 0
     for index in range(attempts):
         stats = store.processor_queue_stats()
         samples.append(stats)
+        fault_backlog_depth = int(store.processor_fault_backlog_depth())
+        # Total depth 0 stays the drain signal for every caller reading
+        # ``depth``; the loop is unchanged for them. ``fault_backlog_depth`` is
+        # recorded alongside for a caller that only cares about roll-unsafe
+        # work: routine telemetry (gpu-inventory, evidence -- priority above the
+        # reserved tier) is idempotent, a control-worker roll cannot harm it,
+        # and one gpu-inventory lane can livelock on a stale fencing token for
+        # ~120s, so total depth may never reach 0 within this window.
         if not int(stats.get("depth") or 0):
             break
         if index + 1 < attempts:
             time.sleep(pause)
     result = dict(samples[-1])
     result["samples"] = len(samples)
+    result["fault_backlog_depth"] = fault_backlog_depth
     result["max_sampled_depth"] = max(
         int(item.get("depth") or 0) for item in samples
     )

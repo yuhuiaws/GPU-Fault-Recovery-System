@@ -1191,6 +1191,38 @@ def test_the_preflight_refuses_a_busy_or_isolated_or_faulted_node(
     )
 
 
+def test_the_preflight_gates_on_the_fault_tier_not_routine_telemetry(
+    tmp_path: Path,
+) -> None:
+    """The env window rolls the control-worker, so the gate must be clear of
+    roll-unsafe fault-tier work. A routine gpu-inventory backlog (the stale
+    fencing-token livelock) leaves total depth non-zero while the fault tier is
+    empty, and must not flap this preflight."""
+
+    fault_busy = _state()
+    fault_busy["queue"] = {"depth": 2, "fault_backlog_depth": 2}
+    assert "processor fault-tier backlog is not empty (2)" in _text(
+        _preflight_errors(tmp_path, state=fault_busy)
+    )
+
+    routine_only = _state()
+    routine_only["queue"] = {"depth": 1, "fault_backlog_depth": 0}
+    assert _preflight_errors(tmp_path, state=routine_only) == []
+
+
+def test_the_preflight_falls_back_to_total_depth_without_a_fault_reading(
+    tmp_path: Path,
+) -> None:
+    """A snapshot from before the fault-tier reading existed still gates on the
+    total depth, so the check never silently becomes a no-op."""
+
+    legacy = _state()
+    legacy["queue"] = {"depth": 1}
+    assert "processor queue is not empty" in _text(
+        _preflight_errors(tmp_path, state=legacy)
+    )
+
+
 def _rolled_out(generation: int, template: str) -> dict[str, Any]:
     return {
         "generation": generation,

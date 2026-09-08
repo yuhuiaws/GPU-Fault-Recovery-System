@@ -462,7 +462,22 @@ def preflight_errors(
         errors.append("gpuReset is not OWN by the Node Agent")
     if (state.get("profile") or {}).get("warnings"):
         errors.append("runtime profile has warnings")
-    if int((state.get("queue") or {}).get("depth") or 0):
+    queue = state.get("queue") or {}
+    # The env window rolls the control-worker Deployment, so the gate must be
+    # clear of any processor work that a worker roll could disrupt -- the
+    # reserved fault tier (control-plane actions and device events). Routine
+    # telemetry (gpu-inventory, evidence) sits above that tier, is idempotent
+    # across a roll, and a single gpu-inventory lane can livelock on a stale
+    # fencing token for ~120s, so gating on total depth flaps this preflight for
+    # a condition the roll is indifferent to. Fall back to total depth if an
+    # older snapshot carries no fault-tier reading.
+    if "fault_backlog_depth" in queue:
+        fault_backlog = int(queue.get("fault_backlog_depth") or 0)
+        if fault_backlog:
+            errors.append(
+                f"processor fault-tier backlog is not empty ({fault_backlog})"
+            )
+    elif int(queue.get("depth") or 0):
         errors.append("processor queue is not empty")
     if (state.get("remote_commands") or {}).get("open_by_cluster"):
         errors.append("remote command queue is not empty")
