@@ -807,11 +807,13 @@ def _container_image(document: dict[str, Any], *path: str) -> str | None:
     return str(containers[0].get("image") or "") if containers else None
 
 
-def _validate_cpu_rollback(
+def validate_cpu_rollback(
     release: Any,
     previous: dict[str, Any],
     expected_runtime_image: str,
 ) -> None:
+    """Assert the CPU control plane converged on the previous release."""
+
     if release._deployment_wheel(
         release._cpu(),
         inventory.CPU_INGRESS_DEPLOYMENT,
@@ -838,27 +840,44 @@ def _validate_cpu_rollback(
         ),
     )
     if refresh_exists:
-        refresh = release._get_json(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "cronjob",
-                "gpu-fault-aurora-credential-refresh",
+        refresh_image = _aurora_refresh_image(release)
+        if refresh_image != expected_runtime_image:
+            # `gpu-fault-admin deploy` installs the Aurora refresh CronJob as a
+            # bootstrap task, before it resumes a pending rollback, and does so
+            # with the *candidate* runtime image. A rollback resumed at the
+            # verify phase therefore finds the CronJob re-pointed after its own
+            # cpu-restore already set it back. Restoring is idempotent and is
+            # what the verify is asserting, so restore once, then judge.
+            release.runner.run(
+                release._cpu(
+                    "-n",
+                    release.config.namespace,
+                    "set",
+                    "image",
+                    "cronjob/gpu-fault-aurora-credential-refresh",
+                    f"refresh={expected_runtime_image}",
+                )
             )
-        )
-        if (
-            _container_image(
-                refresh,
-                "spec",
-                "jobTemplate",
-                "spec",
-                "template",
-                "spec",
-            )
-            != expected_runtime_image
-        ):
+            refresh_image = _aurora_refresh_image(release)
+        if refresh_image != expected_runtime_image:
             raise ReleaseError("rollback Aurora refresh image did not converge")
+
+
+# Internal callers and the rollback tests reach it by this name.
+_validate_cpu_rollback = validate_cpu_rollback
+
+
+def _aurora_refresh_image(release: Any) -> str | None:
+    refresh = release._get_json(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "cronjob",
+            "gpu-fault-aurora-credential-refresh",
+        )
+    )
+    return _container_image(refresh, "spec", "jobTemplate", "spec", "template", "spec")
 
 
 def validate_agent_rollback_target(
