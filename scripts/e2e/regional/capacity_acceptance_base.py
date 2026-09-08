@@ -280,7 +280,6 @@ class CapCoreHarness:
             "GPU_FAULT_ALLOW_HYPERPOD_REPLACE": "false",
             "GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER": "false",
             "GPU_FAULT_ENABLE_AGENT_REGISTRY": "false",
-            "GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS": "false",
             "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL": "true",
             "GPU_FAULT_ALLOW_EMAIL": "false",
             "GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY": "false",

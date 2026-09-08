@@ -215,19 +215,4 @@ REVIEW_COUNTER_PANELS = (
         "Archive candidates that failed with an exception other than a safety "
         "refusal, by exception type (F-8).",
     ),
-    _panel(
-        "PENDING_TRIAGE reconcile failures",
-        (
-            (
-                _increase(
-                    "gpu_fault_completion_pending_triage_reconcile_failures_total",
-                    "30m",
-                    "control_plane_cluster, region, reason",
-                ),
-                "{{reason}}",
-            ),
-        ),
-        "Attempts to expire an overdue PENDING_TRIAGE decision that raised, by "
-        "exception type; the decision stays pending and is retried (F-7).",
-    ),
 )

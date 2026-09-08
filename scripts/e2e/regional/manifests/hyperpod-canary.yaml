@@ -34,12 +34,8 @@ spec:
             - name: http
               containerPort: 8080
           env:
-            - name: GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS
-              value: "true"
             - name: GPU_FAULT_ALLOW_SINGLE_CLUSTER
               value: "true"
-            - name: GPU_FAULT_DCGM_EXPORTER_PORT
-              value: "9400"
           readinessProbe:
             httpGet:
               path: /healthz

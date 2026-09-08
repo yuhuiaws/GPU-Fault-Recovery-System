@@ -183,8 +183,6 @@ spec:
               value: "true"
             - name: GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER
               value: "false"
-            - name: GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS
-              value: "false"
             - name: GPU_FAULT_REMOTE_EXECUTION_OWNERS
               value: >-
                 gpu-fault-kubernetes-adapter,

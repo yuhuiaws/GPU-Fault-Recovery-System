@@ -379,12 +379,6 @@ spec:
               value: "3600"
             - name: GPU_FAULT_SPARE_UNAVAILABLE_ALERT_SECONDS
               value: "86400"
-            - name: GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS
-              value: "true"
-            - name: GPU_FAULT_DCGM_EXPORTER_PORT
-              value: "9400"
-            - name: GPU_FAULT_QUICK_DIAGNOSTIC_TIMEOUT_SECONDS
-              value: "10"
             - name: GPU_FAULT_NODE_AGENT_ENDPOINTS
               value: "{}"
             - name: GPU_FAULT_REQUIRED_AGENT_VERSION

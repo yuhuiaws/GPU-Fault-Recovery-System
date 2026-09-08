@@ -50,7 +50,6 @@ def _config(**overrides) -> PeriodicServiceConfig:
         silent_after={kind: 300.0 for kind in CollectorKind},
         silent_alert_interval=3600.0,
         lease_reclaim_interval=INTERVAL,
-        pending_triage_interval=INTERVAL,
         counter_drift_interval=INTERVAL,
     )
     return replace(base, **overrides)

@@ -541,12 +541,12 @@ groups:
           runbook_url: docs/管理员日常运维.md#gpufaultperiodicrunnerstalled
           description: >-
             Training health, spare health, identity refresh, cleanup, archive,
-            collector-silence detection, lease reclaim, PENDING_TRIAGE
-            reconciliation and counter drift all run from this one thread, and
-            none of their counters will move while it is down.
+            collector-silence detection, lease reclaim and counter drift all
+            run from this one thread, and none of their counters will move
+            while it is down.
             gpu_fault_periodic_job_last_run_timestamp_seconds says which job
             ran last. Check the control-worker Pods and the runner thread;
-            one blocked store call inside a job stops all nine.
+            one blocked store call inside a job stops all eight.
       # Signals the control plane has exported for a long time with no rule
       # reading them (ARCH-E E4). Per-replica families from metrics_sections.py:
       # which Pod is affected is the point, so they carry `pod`.
@@ -1067,24 +1067,6 @@ groups:
             reason label (exception type) and the archiver log; S3 permission
             or bucket errors keep every candidate failing, so retention
             silently stops reclaiming.
-      - alert: GpuFaultPendingTriageReconcileFailing
-        expr: >-
-          sum by (control_plane_cluster, region)
-          (increase(gpu_fault_completion_pending_triage_reconcile_failures_total[30m])) > 0
-        for: 0m
-        labels:
-          severity: warning
-        annotations:
-          summary: The PENDING_TRIAGE watchdog cannot expire a decision
-          runbook_url: docs/管理员日常运维.md#gpufaultpendingtriagereconcilefailing
-          description: >-
-            {{ $value }} attempt(s) in thirty minutes to expire an overdue
-            PENDING_TRIAGE decision raised (F-7): the decision stays pending,
-            the conservative plan is not compiled, and the watchdog retries
-            every tick. The reason label is the exception type; a missing
-            event or profile row is the usual cause. Compare with
-            GpuFaultCompletionPendingTriageBacklog, which counts the decisions
-            themselves.
   - name: gpu-fault-recovery-outcome
     rules:
       # BLOCKED is the fail-closed terminal state: the workflow stopped because
@@ -1637,37 +1619,11 @@ groups:
             read the oldest waiting workflow via
             gpu_fault_workflow_pending_age_seconds_max and its
             remediation_budget_last_blocked_reason.
-      # The completion path records every attempt outcome as a decision. A
-      # decision left in PENDING_TRIAGE is one the system could not classify
-      # on arrival and parked for a bounded look
-      # (GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS, default 900s); a periodic
-      # job (GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS) is meant to resolve each
-      # one once its deadline passes. `for` is twice the default deadline, so
-      # the job has had one full deadline plus a scan to act and did not --
-      # the residue is a stall in triage, not a slow attempt.
-      - alert: GpuFaultCompletionPendingTriageBacklog
-        expr: >-
-          max by (control_plane_cluster, region)
-          (gpu_fault_completion_decisions{status="PENDING_TRIAGE"}) > 0
-        for: 30m
-        labels:
-          severity: warning
-        annotations:
-          summary: Completion decisions are stuck in PENDING_TRIAGE
-          runbook_url: docs/管理员日常运维.md#gpufaultcompletionpendingtriagebacklog
-          description: >-
-            {{ $value }} attempt decision(s) have stayed PENDING_TRIAGE for
-            longer than twice the triage deadline, so the reconcile job is not
-            resolving them and the attempts they describe have neither a plan
-            nor a no-action verdict. Check
-            gpu_fault_completion_pending_triage_reconciled_total is still
-            moving and read the periodic job errors before touching a decision.
-      # The other half of the same invariant: a completion event with no
-      # decision row at all. Every persisted event is meant to be decided in
-      # the same transaction; one without a decision was recorded and then
-      # never judged, and nothing downstream will ever look at it again. The
-      # same 30m: an event can legitimately be a scrape ahead of its decision,
-      # never half an hour ahead.
+      # A completion event with no decision row at all. Every persisted event
+      # is meant to be decided in the same transaction; one without a decision
+      # was recorded and then never judged, and nothing downstream will ever
+      # look at it again. 30m because an event can legitimately be a scrape
+      # ahead of its decision, never half an hour ahead.
       - alert: GpuFaultCompletionEventsWithoutDecision
         expr: >-
           max by (control_plane_cluster, region)

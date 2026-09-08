@@ -475,7 +475,7 @@ categories:
       - name: GPU_FAULT_NOTIFICATION_RETENTION_SECONDS
         description: "终态通知记录保留秒数（默认 30 天）；≤0 关闭清理。delivery 仍在 PENDING/RETRY/LEASED 或 incident 仍存在的不删。"
       - name: GPU_FAULT_COMPLETION_RECORD_RETENTION_SECONDS
-        description: "completion event/decision/diagnostic 记录保留秒数（默认 30 天）；≤0 关闭清理。PENDING_TRIAGE 或仍被 incident 引用的不删。"
+        description: "completion event/decision 记录保留秒数（默认 30 天）；≤0 关闭清理。仍被 incident 引用的不删。"
       - name: GPU_FAULT_REGISTRY_MEMBER_RETENTION_SECONDS
         description: "区域 registry 成员心跳记录的保留秒数（默认 1 天）；≤0 关闭清理。仅 regional 角色运行该清扫。"
       - name: GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS

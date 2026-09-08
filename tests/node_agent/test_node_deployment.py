@@ -47,7 +47,6 @@ def test_hyperpod_canary_env_values_are_complete() -> None:
         'expected all(("value" in item) != ("valueFrom" in item) for item in env) to be truthy'
     )
     values = {item["name"]: item.get("value") for item in env}
-    assert values["GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS"] == "true"
     assert values["GPU_FAULT_ALLOW_SINGLE_CLUSTER"] == "true"
 
 

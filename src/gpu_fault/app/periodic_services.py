@@ -46,17 +46,15 @@ class PeriodicServiceConfig:
     # F-D5: how often LEASED processor rows whose lease lapsed go back to
     # PENDING outside the claim window.
     lease_reclaim_interval: float = 30.0
-    # F-G2 (4): how often decisions stuck in PENDING_TRIAGE are re-examined.
-    pending_triage_interval: float = 60.0
     # F-D10 (P1-75F): how often the processor counter table is compared with
     # the queue rows it summarises. A full-table count, so never per scrape.
     counter_drift_interval: float = 60.0
     # Control-plane review 2026-09-08, F-8: incidents one archive round may
     # take, and retention for the kinds that had no cleanup path at all --
     # inactive markers, terminal notifications (with their delivery, result
-    # and dedup link), completion records (decision + event + diagnostic +
-    # triage) and registry heartbeat rows of processes that are gone. A
-    # non-positive retention switches that sweep off.
+    # and dedup link), completion records (decision + event) and registry
+    # heartbeat rows of processes that are gone. A non-positive retention
+    # switches that sweep off.
     archive_batch_size: int = 200
     marker_retention: float = 2592000.0
     notification_retention: float = 2592000.0
@@ -75,8 +73,6 @@ class PeriodicServiceConfig:
             raise ValueError(
                 "GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS must be positive"
             )
-        if self.pending_triage_interval <= 0:
-            raise ValueError("GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS must be positive")
         if self.counter_drift_interval <= 0:
             raise ValueError(
                 "GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS must be positive"
@@ -187,9 +183,6 @@ class PeriodicServiceConfig:
             lease_reclaim_interval=float(
                 os.getenv("GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS", "30")
             ),
-            pending_triage_interval=float(
-                os.getenv("GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS", "60")
-            ),
             counter_drift_interval=float(
                 os.getenv("GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS", "60")
             ),
@@ -246,8 +239,6 @@ class PeriodicServiceRunner:
         self._cleanup_rotation = 0
         # F-D5: LEASED rows whose lease lapsed and were handed back to PENDING.
         self.processor_expired_leases_reclaimed_total: int = 0
-        # F-G2 (4): PENDING_TRIAGE decisions the watchdog moved on.
-        self.completion_pending_triage_reconciled_total: int = 0
         # F-D10 (P1-75F): the last measured gap between queue rows and the
         # counter table, and the clusters whose counters disagree. Gauges
         # refreshed by the drift job; a scrape only reads them.
@@ -326,24 +317,6 @@ class PeriodicServiceRunner:
             "cleanup_job_errors_total": dict(self.cleanup_job_errors_total),
             "processor_expired_leases_reclaimed_total": (
                 self.processor_expired_leases_reclaimed_total
-            ),
-            "completion_pending_triage_reconciled_total": (
-                self.completion_pending_triage_reconciled_total
-            ),
-            "completion_pending_triage_reconcile_failures_total": dict(
-                getattr(
-                    getattr(self.context, "completion", None),
-                    "pending_triage_reconcile_failures_total",
-                    None,
-                )
-                or {}
-            ),
-            "completion_pending_triage_reconcile_failure_last_seen_timestamp_seconds": (
-                getattr(
-                    getattr(self.context, "completion", None),
-                    "pending_triage_reconcile_failure_last_seen_timestamp_seconds",
-                    0.0,
-                )
             ),
             "processor_counter_drift_abs": self.processor_counter_drift_abs,
             "processor_counter_mismatched_clusters": (
@@ -588,7 +561,7 @@ class PeriodicServiceRunner:
         the archiver bundles those with the incident (F-I1) -- and takes only
         rows in a terminal state: inactive markers, notifications whose
         delivery is SENT/DEAD (never PENDING/RETRY/LEASED) and completion
-        decisions past PENDING_TRIAGE.
+        decisions whose attempt event aged out.
         """
 
         cfg = self.config

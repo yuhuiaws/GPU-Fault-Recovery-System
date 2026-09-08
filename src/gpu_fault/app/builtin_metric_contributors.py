@@ -448,7 +448,7 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         _notification_dispatch_lines(getattr(ctx, "advisory_notifications", None))
     )
     snapshot = periodic.metrics_snapshot() if periodic is not None else {}
-    lines.extend(_control_loop_review_lines(dispatcher, archiver, snapshot))
+    lines.extend(_control_loop_review_lines(dispatcher, archiver))
     lines.extend(_periodic_reconciliation_lines(snapshot))
     lines.extend(_processor_counter_mode_lines(store))
     lines.extend(
@@ -500,16 +500,13 @@ def _labelled_counter(
     return lines
 
 
-def _control_loop_review_lines(
-    dispatcher: object, archiver: object, snapshot: dict[str, object]
-) -> list[str]:
+def _control_loop_review_lines(dispatcher: object, archiver: object) -> list[str]:
     """Counters the control-plane review 2026-09-08 added (D-4, F-7, F-8).
 
     Each is a failure that used to be a log line and nothing else: a dispatcher
-    sweep path that raised, an archiver run that failed on one incident, a
-    PENDING_TRIAGE reconciliation that could not be applied. The archiver's
-    success count sits beside its errors so a rate of zero can be told from a
-    retention that is switched off.
+    sweep path that raised, an archiver run that failed on one incident. The
+    archiver's success count sits beside its errors so a rate of zero can be
+    told from a retention that is switched off.
     """
 
     lines = _labelled_counter(
@@ -533,25 +530,6 @@ def _control_loop_review_lines(
             "reason",
             getattr(archiver, "errors_total", None) if archiver else None,
         )
-    )
-    lines.extend(
-        _labelled_counter(
-            "gpu_fault_completion_pending_triage_reconcile_failures_total",
-            "PENDING_TRIAGE decisions the watchdog could not expire, by exception type; the decision stays PENDING_TRIAGE and is retried next tick (F-7).",
-            "reason",
-            snapshot.get("completion_pending_triage_reconcile_failures_total"),
-        )
-    )
-    last_seen = snapshot.get(
-        "completion_pending_triage_reconcile_failure_last_seen_timestamp_seconds"
-    )
-    lines.extend(
-        [
-            "# HELP gpu_fault_completion_pending_triage_reconcile_failure_last_seen_timestamp_seconds Unix time the PENDING_TRIAGE watchdog last failed to expire a decision; 0 if never (F-7).",
-            "# TYPE gpu_fault_completion_pending_triage_reconcile_failure_last_seen_timestamp_seconds gauge",
-            "gpu_fault_completion_pending_triage_reconcile_failure_last_seen_timestamp_seconds "
-            f"{float(last_seen) if isinstance(last_seen, (int, float)) else 0.0:.3f}",
-        ]
     )
     return lines
 
@@ -694,9 +672,8 @@ def _periodic_liveness_lines(snapshot: dict[str, object]) -> list[str]:
 
 def _periodic_reconciliation_lines(snapshot: dict[str, object]) -> list[str]:
     """The reconciliation jobs the periodic runner grew in batch 3: lease
-    reclaim (F-D5), the PENDING_TRIAGE watchdog (F-G2 (4)) and processor
-    counter drift (F-D10). The drift gauges are refreshed by the job, so a
-    scrape never counts the queue table."""
+    reclaim (F-D5) and processor counter drift (F-D10). The drift gauges are
+    refreshed by the job, so a scrape never counts the queue table."""
 
     def read(name: str) -> int:
         value = snapshot.get(name, 0)
@@ -706,9 +683,6 @@ def _periodic_reconciliation_lines(snapshot: dict[str, object]) -> list[str]:
         "# HELP gpu_fault_processor_expired_leases_reclaimed_total LEASED processor requests whose lease had lapsed and were handed back to PENDING by the periodic reclaim (F-D5).",
         "# TYPE gpu_fault_processor_expired_leases_reclaimed_total counter",
         f"gpu_fault_processor_expired_leases_reclaimed_total {read('processor_expired_leases_reclaimed_total')}",
-        "# HELP gpu_fault_completion_pending_triage_reconciled_total Decisions stuck in PENDING_TRIAGE past the deadline that the watchdog closed (F-G2).",
-        "# TYPE gpu_fault_completion_pending_triage_reconciled_total counter",
-        f"gpu_fault_completion_pending_triage_reconciled_total {read('completion_pending_triage_reconciled_total')}",
         "# HELP gpu_fault_processor_counter_drift_abs Absolute gap between incomplete processor queue rows and the per-cluster counter table, as of the last drift scan (F-D10).",
         "# TYPE gpu_fault_processor_counter_drift_abs gauge",
         f"gpu_fault_processor_counter_drift_abs {read('processor_counter_drift_abs')}",
@@ -754,8 +728,7 @@ def _processor_counter_mode_lines(store: object) -> list[str]:
 def completion_state_metric_lines(runtime: AppRuntime) -> list[str]:
     """Where the completion path and the incidents stand, as gauges (F-L1).
 
-    A decision that stays PENDING_TRIAGE is a triage that never reported; a
-    terminal event without a decision is the poisoned shape of P0-48B; the
+    A terminal event without a decision is the poisoned shape of P0-48B; the
     ESCALATED incident bucket is the operator queue; a CRITICAL GPU finding
     closed without an incident is the one deliberate exception of F-M1.
     Each is a server-side count, never a decode of the rows.

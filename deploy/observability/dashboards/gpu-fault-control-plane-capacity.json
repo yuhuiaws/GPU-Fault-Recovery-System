@@ -532,7 +532,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
+        "w": 8,
         "x": 0,
         "y": 19
       },
@@ -603,8 +603,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 6,
+        "w": 8,
+        "x": 8,
         "y": 19
       },
       "id": 11,
@@ -674,8 +674,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
+        "w": 8,
+        "x": 16,
         "y": 19
       },
       "id": 12,
@@ -707,77 +707,6 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "gpu-fault-amp"
-      },
-      "description": "Attempts to expire an overdue PENDING_TRIAGE decision that raised, by exception type; the decision stays pending and is retried (F-7).\n\nAlert GpuFaultPendingTriageReconcileFailing (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultpendingtriagereconcilefailing",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "fillOpacity": 10,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "spanNulls": false,
-            "thresholdsStyle": {
-              "mode": "line"
-            }
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.0
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 19
-      },
-      "id": 13,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "gpu-fault-amp"
-          },
-          "expr": "sum by (control_plane_cluster, region, reason) (increase(gpu_fault_completion_pending_triage_reconcile_failures_total{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[30m]))",
-          "instant": false,
-          "legendFormat": "{{reason}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "PENDING_TRIAGE reconcile failures",
-      "type": "timeseries"
-    },
-    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -785,7 +714,7 @@
         "x": 0,
         "y": 27
       },
-      "id": 14,
+      "id": 13,
       "panels": [],
       "title": "Processor queue",
       "type": "row"
@@ -837,7 +766,7 @@
         "x": 0,
         "y": 28
       },
-      "id": 15,
+      "id": 14,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -908,7 +837,7 @@
         "x": 6,
         "y": 28
       },
-      "id": 16,
+      "id": 15,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -979,7 +908,7 @@
         "x": 12,
         "y": 28
       },
-      "id": 17,
+      "id": 16,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1046,7 +975,7 @@
         "x": 18,
         "y": 28
       },
-      "id": 18,
+      "id": 17,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1082,7 +1011,7 @@
         "x": 0,
         "y": 36
       },
-      "id": 19,
+      "id": 18,
       "panels": [],
       "title": "Metric scan truncation",
       "type": "row"
@@ -1126,7 +1055,7 @@
         "x": 0,
         "y": 37
       },
-      "id": 20,
+      "id": 19,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1193,7 +1122,7 @@
         "x": 12,
         "y": 37
       },
-      "id": 21,
+      "id": 20,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1229,7 +1158,7 @@
         "x": 0,
         "y": 45
       },
-      "id": 22,
+      "id": 21,
       "panels": [],
       "title": "Admission and Store I/O",
       "type": "row"
@@ -1277,7 +1206,7 @@
         "x": 0,
         "y": 46
       },
-      "id": 23,
+      "id": 22,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1348,7 +1277,7 @@
         "x": 8,
         "y": 46
       },
-      "id": 24,
+      "id": 23,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1419,7 +1348,7 @@
         "x": 16,
         "y": 46
       },
-      "id": 25,
+      "id": 24,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1455,7 +1384,7 @@
         "x": 0,
         "y": 54
       },
-      "id": 26,
+      "id": 25,
       "panels": [],
       "title": "Latency, leases and counters",
       "type": "row"
@@ -1503,7 +1432,7 @@
         "x": 0,
         "y": 55
       },
-      "id": 27,
+      "id": 26,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1574,7 +1503,7 @@
         "x": 8,
         "y": 55
       },
-      "id": 28,
+      "id": 27,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1645,7 +1574,7 @@
         "x": 16,
         "y": 55
       },
-      "id": 29,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1692,7 +1621,7 @@
         "x": 0,
         "y": 63
       },
-      "id": 30,
+      "id": 29,
       "panels": [],
       "title": "Telemetry spool",
       "type": "row"
@@ -1727,7 +1656,7 @@
         "x": 0,
         "y": 64
       },
-      "id": 31,
+      "id": 30,
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -1801,7 +1730,7 @@
         "x": 8,
         "y": 64
       },
-      "id": 32,
+      "id": 31,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1872,7 +1801,7 @@
         "x": 16,
         "y": 64
       },
-      "id": 33,
+      "id": 32,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1943,7 +1872,7 @@
         "x": 0,
         "y": 72
       },
-      "id": 34,
+      "id": 33,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2014,7 +1943,7 @@
         "x": 12,
         "y": 72
       },
-      "id": 35,
+      "id": 34,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2050,7 +1979,7 @@
         "x": 0,
         "y": 80
       },
-      "id": 36,
+      "id": 35,
       "panels": [],
       "title": "Loop liveness",
       "type": "row"
@@ -2098,7 +2027,7 @@
         "x": 0,
         "y": 81
       },
-      "id": 37,
+      "id": 36,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2169,7 +2098,7 @@
         "x": 8,
         "y": 81
       },
-      "id": 38,
+      "id": 37,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2236,7 +2165,7 @@
         "x": 16,
         "y": 81
       },
-      "id": 39,
+      "id": 38,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2303,7 +2232,7 @@
         "x": 0,
         "y": 89
       },
-      "id": 40,
+      "id": 39,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2370,7 +2299,7 @@
         "x": 12,
         "y": 89
       },
-      "id": 41,
+      "id": 40,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2417,7 +2346,7 @@
         "x": 0,
         "y": 97
       },
-      "id": 42,
+      "id": 41,
       "panels": [],
       "title": "Processor and periodic errors",
       "type": "row"
@@ -2465,7 +2394,7 @@
         "x": 0,
         "y": 98
       },
-      "id": 43,
+      "id": 42,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2547,7 +2476,7 @@
         "x": 8,
         "y": 98
       },
-      "id": 44,
+      "id": 43,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2618,7 +2547,7 @@
         "x": 16,
         "y": 98
       },
-      "id": 45,
+      "id": 44,
       "options": {
         "legend": {
           "displayMode": "list",

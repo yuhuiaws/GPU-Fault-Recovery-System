@@ -1284,7 +1284,10 @@ RECOVERY_OUTCOME = Dashboard(
                             "{{status}}",
                         ),
                     ),
-                    description="PENDING_TRIAGE is the backlog the alert watches.",
+                    description=(
+                        "NO_ACTION and PLAN_CREATED are the only terminal "
+                        "statuses; a rising count is load, not backlog."
+                    ),
                 ),
                 Panel(
                     "Completion events without a decision",

@@ -519,9 +519,6 @@ BATCH3_ALERTS = {
         "increase(gpu_fault_processor_expired_leases_reclaimed_total[10m])"
     ),
     "GpuFaultProcessorCounterDrift": "gpu_fault_processor_counter_drift_abs",
-    "GpuFaultCompletionPendingTriageBacklog": (
-        'gpu_fault_completion_decisions{status="PENDING_TRIAGE"}'
-    ),
     "GpuFaultCompletionEventsWithoutDecision": (
         "gpu_fault_completion_events_without_decision"
     ),
@@ -548,13 +545,12 @@ def test_the_periodic_job_gauges_each_have_an_alert() -> None:
         assert metric in _expression(alert), (alert, _expression(alert))
 
 
-def test_the_pending_triage_backlog_waits_twice_the_deadline() -> None:
-    """900s is the default GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS.
+def test_the_undecided_event_alert_waits_thirty_minutes() -> None:
+    """An event can be a scrape ahead of its decision, never half an hour.
 
-    The reconcile job gets one full deadline plus a scan interval to act; only a
-    decision still PENDING_TRIAGE after twice that is a stall rather than a lag.
+    Both are written in the same transaction, so any gap is a scrape landing
+    between the two writes; 30m makes the alert a stall report, not a race.
     """
-    assert _rule("GpuFaultCompletionPendingTriageBacklog")["for"] == "30m"
     assert _rule("GpuFaultCompletionEventsWithoutDecision")["for"] == "30m"
 
 
@@ -607,11 +603,9 @@ def test_the_keep_list_admits_the_completion_incident_and_finding_families() -> 
         {
             "alert": "Probe",
             "expr": (
-                'gpu_fault_completion_decisions{status="PENDING_TRIAGE"} + '
                 "gpu_fault_completion_events_without_decision + "
                 'gpu_fault_incidents_by_state{state="ESCALATED"} + '
-                "gpu_fault_gpu_findings_without_incident_total + "
-                "gpu_fault_completion_pending_triage_reconciled_total"
+                "gpu_fault_gpu_findings_without_incident_total"
             ),
         }
     ]
@@ -746,9 +740,6 @@ def test_the_review_counters_each_have_an_alert() -> None:
         ),
         "GpuFaultNotificationDeliveryErrors": "gpu_fault_notification_delivery_errors_total",
         "GpuFaultControlRecordArchiveErrors": "gpu_fault_control_record_archive_errors_total",
-        "GpuFaultPendingTriageReconcileFailing": (
-            "gpu_fault_completion_pending_triage_reconcile_failures_total"
-        ),
         "GpuFaultAuroraCredentialRefreshFailing": (
             "gpu_fault_aurora_credential_refresh_last_run_ok"
         ),

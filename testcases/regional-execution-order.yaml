@@ -21,7 +21,12 @@ phases:
     name: 启动配置守卫
     maintenance_window: 否
     entries:
-      - range: {prefix: BOOT, start: 1, end: 10}
+      # BOOT-006 is in do_not_run: the guard it drove ("regional control
+      # plane cannot run in-cluster quick diagnostics against its own EKS")
+      # was deleted with the quick-diagnostics path, so there is no switch
+      # left to set and nothing to refuse.
+      - range: {prefix: BOOT, start: 1, end: 5}
+      - range: {prefix: BOOT, start: 7, end: 10}
   - sequence: 2
     name: 身份边界
     maintenance_window: 分级
@@ -238,6 +243,10 @@ phases:
         drop-in 环境），不触碰 GPU；COLLECT-020 会 cordon 该节点做 DCGM 诊断再由 validation-first
         restore 恢复，需要维护窗口，且仍排在 COLLECT-015 的 reboot 之前。
 do_not_run:
+  - case: GF-REGIONAL-BOOT-006
+    reason: >-
+      它驱动的 in-cluster quick diagnostics 守卫已随该路径一起删除，
+      GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS 不再存在，该守卫已不存在，用例作废。
   - case: GF-REGIONAL-DESTR-004
     reason: provider replace 已由架构与 IAM 明确禁止，该用例已作废。
   - case: GF-REGIONAL-AUTH-012

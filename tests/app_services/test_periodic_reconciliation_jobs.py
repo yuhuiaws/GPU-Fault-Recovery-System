@@ -1,13 +1,12 @@
-"""Three reconciliation jobs whose store halves existed without a caller.
+"""Two reconciliation jobs whose store halves existed without a caller.
 
 F-D5: ``reclaim_expired_processor_leases`` hands lapsed LEASED rows back to
 PENDING, but only the claim window called it, and only inside its horizon.
-F-G2 (4): ``CompletionService.reconcile_pending_triage`` closes decisions
-stuck in PENDING_TRIAGE, but nothing scheduled it. F-D10 (P1-75F): the
-processor queue keeps a per-cluster counter table beside the rows; drift
-between the two was only visible to an admin CLI. Each now runs on the
-periodic runner, counted and exported, and the drift query -- a full-table
-count -- runs on the runner's clock, never inside a ``/metrics`` scrape.
+F-D10 (P1-75F): the processor queue keeps a per-cluster counter table beside
+the rows; drift between the two was only visible to an admin CLI. Each now
+runs on the periodic runner, counted and exported, and the drift query -- a
+full-table count -- runs on the runner's clock, never inside a ``/metrics``
+scrape.
 """
 
 from __future__ import annotations
@@ -105,7 +104,6 @@ def _runner(store, **config) -> PeriodicServiceRunner:
 def test_reconciliation_intervals_have_their_documented_defaults(monkeypatch):
     for name in (
         "GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS",
-        "GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS",
         "GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -113,19 +111,16 @@ def test_reconciliation_intervals_have_their_documented_defaults(monkeypatch):
     config = PeriodicServiceConfig.from_environment()
 
     assert config.lease_reclaim_interval == 30.0
-    assert config.pending_triage_interval == 60.0
     assert config.counter_drift_interval == 60.0
 
 
 def test_reconciliation_intervals_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS", "7")
-    monkeypatch.setenv("GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS", "8")
     monkeypatch.setenv("GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS", "9")
 
     config = PeriodicServiceConfig.from_environment()
 
     assert config.lease_reclaim_interval == 7.0
-    assert config.pending_triage_interval == 8.0
     assert config.counter_drift_interval == 9.0
 
 
@@ -133,7 +128,6 @@ def test_reconciliation_intervals_are_read_from_the_environment(monkeypatch):
     "name",
     [
         "GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS",
-        "GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS",
         "GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS",
     ],
 )

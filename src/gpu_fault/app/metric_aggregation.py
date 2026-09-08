@@ -152,7 +152,6 @@ _ANY = (
 # Timestamps (newest event anywhere in the Pod), ages and durations read as
 # the worst process, high-water marks, and "any process is in this state".
 _MAX = (
-    "gpu_fault_completion_pending_triage_reconcile_failure_last_seen_timestamp_seconds",
     "gpu_fault_notification_delivery_error_last_seen_timestamp_seconds",
     "gpu_fault_notification_dispatch_last_cycle_timestamp_seconds",
     "gpu_fault_notification_expired_last_seen_timestamp_seconds",
@@ -215,8 +214,6 @@ _PER_PROCESS = ("gpu_fault_processor_notification_shard",)
 # Counters, summaries/histograms, and gauges that add up across processes.
 _SUM = (
     "gpu_fault_ambiguous_attempt_ownership_total",
-    "gpu_fault_completion_pending_triage_reconcile_failures_total",
-    "gpu_fault_completion_pending_triage_reconciled_total",
     "gpu_fault_control_record_archive_archived_total",
     "gpu_fault_control_record_archive_errors_total",
     "gpu_fault_control_record_archive_withheld_total",

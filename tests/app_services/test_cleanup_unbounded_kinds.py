@@ -4,8 +4,9 @@ records and registry heartbeat rows.
 Control-plane review 2026-09-08, F-8 / G-9 (and F-5 for the registry rows).
 ``grep "DELETE FROM gpu_fault_objects"`` never touched ``marker``,
 ``notification``, ``notification_delivery``, ``notification_result``,
-``decision``, ``event`` or ``regional_registry_member``; every provider event scanned the whole marker
-kind and every scrape aggregated the whole notification kind. Each sweep here
+``decision``, ``event`` or ``regional_registry_member``; every provider
+event scanned the whole marker kind and every scrape aggregated the whole
+notification kind. Each sweep here
 takes only settled rows past retention and keeps anything an incident that
 still exists references -- the archiver bundles those with the incident (F-I1).
 """

@@ -2218,20 +2218,22 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-005
   related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot005_regional_mode_refuses_the_central_hyperpod_adapter
 - id: GF-REGIONAL-BOOT-006
-  title: 区域模式禁止 in-cluster quick diagnostics
+  title: 【已作废】区域模式禁止 in-cluster quick diagnostics
   category: regional-startup-guard
   level: live
   risk: non-destructive
-  problem: 控制面在自身 EKS 里创建诊断 Pod 会污染控制面并产生误判。
-  injection: 一次性验证 Deployment 设置 GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS=true。
+  problem: >-
+    本用例已整条作废，不得执行。它驱动的守卫（regional control plane cannot run
+    in-cluster quick diagnostics against its own EKS）随 quick diagnostics 路径
+    一起删除，GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS 已不存在，没有可设置的开关，
+    也没有可被拒绝的启动。
+  injection: 不执行。
   expected:
-  - 日志出现 regional control plane cannot run in-cluster quick diagnostics against its own EKS
-  - Pod 不进入 Ready
+  - 本用例作废，不产生执行结论；被删除的守卫没有替代用例
   evidence:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-006
-  related_pytest: tests/regional/test_regional_boot_guard_acceptance.py::test_boot006_regional_mode_refuses_in_cluster_quick_diagnostics
 - id: GF-REGIONAL-BOOT-007
   title: 集群 token 长度下界精确为 32 字符
   category: regional-startup-guard
@@ -2288,7 +2290,7 @@ test_cases:
   expected:
   - 三副本环境变量输出完全一致
   - GPU_FAULT_DEPLOYMENT_MODE=regional
-  - 五个危险 ENABLE_*（KUBERNETES_ADAPTER、HYPERPOD_ADAPTER、QUICK_DIAGNOSTICS、NODE_ACTION_ADAPTER、HYPERPOD_SPARE_FAILOVER）全为 false
+  - 四个危险 ENABLE_*（KUBERNETES_ADAPTER、HYPERPOD_ADAPTER、NODE_ACTION_ADAPTER、HYPERPOD_SPARE_FAILOVER）全为 false
   - ENABLE_HYPERPOD_MANAGED_OBSERVER 与 ENABLE_AGENT_REGISTRY 均为 true（BOOT-009 要求的合法配对，不是危险开关）
   - GPU_FAULT_HYPERPOD_CLUSTER 未出现，GPU_FAULT_PROCESSOR_MODE=active-active
   - 每个注册集群的 collector-status 返回 200

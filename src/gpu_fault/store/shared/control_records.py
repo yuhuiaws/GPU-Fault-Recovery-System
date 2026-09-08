@@ -1,7 +1,7 @@
 """Control-record templates shared by the key/value stores.
 
-Decisions, markers, diagnostics, plans, profiles, restart budgets and the
-HyperPod identity/submission records are single rows keyed by their own id.
+Decisions, markers, plans, profiles, restart budgets and the HyperPod
+identity/submission records are single rows keyed by their own id.
 Every method here is one ``_get``/``_put`` or a short ``_state_transaction``
 over them, and runs unchanged on SQLite and PostgreSQL.
 """
