@@ -38,15 +38,25 @@ class FakeController:
     reconcile_runs_total = 21
     metadata_takeovers_total = 6
     watch_timeout_seconds = 30
+    progress_stall_budget_seconds = 220.0
 
     def __init__(
-        self, *, cycle_age_seconds: float | None = 5.0, uptime_seconds: float = 12.0
+        self,
+        *,
+        cycle_age_seconds: float | None = 5.0,
+        progress_age_seconds: float | None = 5.0,
+        uptime_seconds: float = 12.0,
     ) -> None:
         self.started_at = NOW - timedelta(seconds=uptime_seconds)
         self.last_cycle_completed_at = (
             None
             if cycle_age_seconds is None
             else NOW - timedelta(seconds=cycle_age_seconds)
+        )
+        self.last_progress_at = (
+            None
+            if progress_age_seconds is None
+            else NOW - timedelta(seconds=progress_age_seconds)
         )
 
     def now(self) -> datetime:
@@ -230,6 +240,9 @@ def test_render_handles_a_controller_without_restore_counter() -> None:
     assert "gpu_fault_completion_watcher_last_cycle_completed_timestamp 0" in body, (
         f"a controller with no completed pass must report 0, not raise: {body!r}"
     )
+    assert "gpu_fault_completion_watcher_last_progress_timestamp 0" in body, (
+        f"a controller with no progress stamp must report 0, not raise: {body!r}"
+    )
 
 
 def test_metrics_export_cycle_age_and_outbox_stats() -> None:
@@ -253,6 +266,13 @@ def test_metrics_export_cycle_age_and_outbox_stats() -> None:
     )
     expected = int((NOW - timedelta(seconds=5)).timestamp())
     assert f"{stamp} {expected}" in lines, f"{stamp} sample missing from {body!r}"
+    progress = "gpu_fault_completion_watcher_last_progress_timestamp"
+    assert f"# TYPE {progress} gauge" in lines, (
+        f"{progress} is not typed as a gauge: {body!r}"
+    )
+    assert f"{progress} {expected}" in lines, (
+        f"the value /healthz judges must be scrapable too: {body!r}"
+    )
     for name, value in (
         ("gpu_fault_completion_controller_reconcile_runs_total", 21),
         ("gpu_fault_completion_controller_metadata_takeovers_total", 6),
@@ -262,55 +282,69 @@ def test_metrics_export_cycle_age_and_outbox_stats() -> None:
         assert f"{name} {value}" in lines, f"{name} sample missing from {body!r}"
 
 
-def test_healthz_passes_while_full_passes_keep_completing() -> None:
+def test_healthz_passes_while_the_loop_keeps_making_progress() -> None:
     """A healthy idle cluster still relists every watch timeout.
 
-    Liveness must key off the reconcile pass, never off traffic: a cluster with
+    Liveness must key off the loop advancing, never off traffic: a cluster with
     no managed Pod posts nothing and must stay healthy.
     """
-    server = _ephemeral(FakeController(cycle_age_seconds=29.0))
+    server = _ephemeral(FakeController(progress_age_seconds=219.0))
     try:
         status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
     finally:
         server.stop()
 
-    assert status == 200, f"a 29 s old cycle is healthy: {status} {body!r}"
+    assert status == 200, f"progress inside the budget is healthy: {status} {body!r}"
 
 
-def test_healthz_fails_when_the_cycle_is_stale() -> None:
-    """F3: three missed relists is the restart signal."""
-    server = _ephemeral(FakeController(cycle_age_seconds=91.0))
+def test_healthz_fails_when_progress_stops() -> None:
+    """C1: a whole budget with no step forward is the restart signal."""
+    server = _ephemeral(FakeController(progress_age_seconds=221.0))
     try:
         status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
     finally:
         server.stop()
 
-    assert status == 503, f"a 91 s old cycle exceeds 3 x 30 s: {status} {body!r}"
-    assert "91" in body, f"the body must name the cycle age: {body!r}"
+    assert status == 503, f"221 s exceeds the 220 s budget: {status} {body!r}"
+    assert "221" in body, f"the body must name the progress age: {body!r}"
 
 
-@pytest.mark.parametrize(
-    "uptime_seconds, expected",
-    [(29.0, 200), (31.0, 503)],
-    ids=["inside-grace", "past-grace"],
-)
-def test_healthz_grants_one_watch_timeout_of_startup_grace(
-    uptime_seconds: float, expected: int
-) -> None:
-    """Before the first pass the probe waits exactly one watch timeout.
+def test_healthz_ignores_a_first_pass_that_has_not_finished() -> None:
+    """C1/I3: cold-start tolerance belongs to the startupProbe, not here.
 
-    The initial list plus a full reconcile of every attempt takes time; failing
-    the probe during it would CrashLoop the watcher on a large cluster.
+    A pass that is still running is making progress, so /healthz says 200 even
+    though no full pass has completed and the process has been up far longer
+    than one watch timeout. The old dual criterion (cycle timestamp plus a one
+    watch-timeout grace from start) failed a slow first pass on a large
+    cluster.
     """
     server = _ephemeral(
-        FakeController(cycle_age_seconds=None, uptime_seconds=uptime_seconds)
+        FakeController(
+            cycle_age_seconds=None, progress_age_seconds=1.0, uptime_seconds=600.0
+        )
     )
     try:
         status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
     finally:
         server.stop()
 
-    assert status == expected, f"uptime={uptime_seconds}s: {status} {body!r}"
+    assert status == 200, f"an unfinished but advancing pass is alive: {body!r}"
+
+
+def test_healthz_falls_back_to_three_watch_timeouts_without_a_budget() -> None:
+    """An older controller exposes no budget; the probe still has to work."""
+
+    class NoBudget(FakeController):
+        progress_stall_budget_seconds = None
+
+    for age, expected in ((89.0, 200), (91.0, 503)):
+        server = _ephemeral(NoBudget(progress_age_seconds=age))
+        try:
+            status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
+        finally:
+            server.stop()
+
+        assert status == expected, f"age={age}s vs 3 x 30 s: {status} {body!r}"
 
 
 def test_healthz_is_unavailable_not_failing_for_a_controller_without_a_clock() -> None:

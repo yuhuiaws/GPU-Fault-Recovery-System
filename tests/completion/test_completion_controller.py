@@ -988,7 +988,7 @@ def test_watch_uses_list_resource_version_and_modified_event() -> None:
         core, sink, cluster_id="hp-cluster", watch_factory=lambda: watched
     )
 
-    subject._run_watch_cycle()
+    subject.run_watch_cycle()
 
     assert core.list_calls == 1
     assert watched.stopped, "expected watched.stopped to be truthy"
@@ -1041,7 +1041,7 @@ def test_watch_burst_reconciles_large_attempt_once_after_debounce() -> None:
         reconcile_debounce_seconds=10,
     )
 
-    subject._run_watch_cycle()
+    subject.run_watch_cycle()
 
     observations = [
         payload for path, payload in sink.posts if path == "/v1/workload-observations"
@@ -1070,7 +1070,7 @@ def test_watch_event_only_reconciles_affected_attempt() -> None:
         reconcile_debounce_seconds=10,
     )
 
-    subject._run_watch_cycle()
+    subject.run_watch_cycle()
 
     attempts = [
         payload["attempt_id"]
@@ -1089,7 +1089,7 @@ def test_watch_deleted_event_removes_pod_from_cache() -> None:
         core, sink, cluster_id="hp-cluster", watch_factory=lambda: watched
     )
 
-    subject._run_watch_cycle()
+    subject.run_watch_cycle()
 
     assert sink.posts == []
     assert watched.stopped, "expected watched.stopped to be truthy"
@@ -1110,7 +1110,7 @@ def test_expired_resource_version_stops_cycle_for_relist() -> None:
         core, sink, cluster_id="hp-cluster", watch_factory=lambda: watched
     )
 
-    subject._run_watch_cycle()
+    subject.run_watch_cycle()
 
     assert watched.stopped, "expected watched.stopped to be truthy"
     assert sink.posts == []
@@ -1124,7 +1124,7 @@ def test_http_410_watch_exception_stops_cycle_for_relist() -> None:
         core, sink, cluster_id="hp-cluster", watch_factory=lambda: watched
     )
 
-    subject._run_watch_cycle()
+    subject.run_watch_cycle()
 
     assert watched.stopped, "expected watched.stopped to be truthy"
     assert sink.posts == []

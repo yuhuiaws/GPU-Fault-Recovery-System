@@ -18,6 +18,7 @@ from gpu_fault.completion_controller import (
     KubernetesCompletionController,
     KubernetesWorkloadStopper,
 )
+from gpu_fault.completion_metrics_server import evaluate_completion_health
 from gpu_fault.models import Environment
 from tests._builders import attempt_observation
 from tests.completion.test_completion_controller import (
@@ -339,4 +340,208 @@ def test_a_completed_full_pass_records_its_timestamp() -> None:
 
     assert subject.last_cycle_completed_at == clock.value, (
         f"a completed full pass must stamp the clock: {subject.last_cycle_completed_at}"
+    )
+
+
+class LoopStop(BaseException):
+    """Escapes ``except Exception`` so a test can end ``run()``'s loop."""
+
+
+class ClockBurningSink(FakeSink):
+    """A POST that burns fake wall clock, like a 120 s receipt poll does.
+
+    Records what ``/healthz`` would answer *while* the POST is in flight,
+    which is the moment the old cycle-age probe judged the loop dead.
+    """
+
+    def __init__(self, clock: Clock, subject: list, hold_seconds: float) -> None:
+        super().__init__()
+        self.clock = clock
+        self.subject = subject
+        self.hold_seconds = hold_seconds
+        self.health: list[tuple[int, str]] = []
+
+    def post(self, path, payload):
+        self.clock.value += timedelta(seconds=self.hold_seconds)
+        self.health.append(evaluate_completion_health(self.subject[0]))
+        return super().post(path, payload)
+
+
+def test_a_slow_but_advancing_pass_stays_live() -> None:
+    """C1: a legitimately slow pass must not be restarted mid-flight.
+
+    Judging liveness on the *cycle* timestamp made the window (3 x 30 s watch
+    timeout) smaller than one legal pass: a fault storm delivering two
+    terminals, each waiting out a 120 s processor receipt poll, crossed the
+    window while the loop was working, and kubelet killed the only Completion
+    Watcher there is. Progress, not cycle completion, is the signal.
+    """
+    clock = Clock()
+    box: list = []
+    sink = ClockBurningSink(clock, box, 150.0)
+    second = pod(0, exit_code=0, attempt_id="train-b1")
+    second["metadata"]["uid"] = "pod-b"
+    second["metadata"]["name"] = "worker-b"
+    subject = controller(FakeCoreApi([pod(0, exit_code=0), second]), sink, clock)
+    box.append(subject)
+
+    subject.run_once()
+
+    assert len(sink.health) == 2, (
+        f"both attempts must have posted a terminal: {sink.posts}"
+    )
+    assert [status for status, _ in sink.health] == [200, 200], (
+        f"a pass that keeps finishing attempts is alive: {sink.health}"
+    )
+    status, body = evaluate_completion_health(subject)
+    assert status == 200, f"the finished pass must be healthy: {body}"
+
+
+class StalledListCoreApi(FakeCoreApi):
+    """A LIST that burns the whole budget without returning."""
+
+    def __init__(self, clock: Clock, subject: list, stall_seconds: float) -> None:
+        super().__init__([])
+        self.clock = clock
+        self.subject = subject
+        self.stall_seconds = stall_seconds
+        self.health: list[tuple[int, str]] = []
+
+    def list_pod_for_all_namespaces(self, **kwargs):
+        self.clock.value += timedelta(seconds=self.stall_seconds)
+        self.health.append(evaluate_completion_health(self.subject[0]))
+        return super().list_pod_for_all_namespaces(**kwargs)
+
+
+def test_a_hung_list_fails_the_health_probe() -> None:
+    """C1: the probe still has to catch the hang it was built for.
+
+    Nothing in the loop makes progress while the LIST (or the watch stream
+    behind it) is parked, so once the budget is spent /healthz must fail and
+    let kubelet replace the Pod.
+    """
+    clock = Clock()
+    box: list = []
+    core = StalledListCoreApi(clock, box, 600.0)
+    subject = controller(core, FakeSink(), clock)
+    box.append(subject)
+    budget = subject.progress_stall_budget_seconds
+
+    subject.run_once()
+
+    assert core.stall_seconds > budget, (
+        f"the test must stall past the {budget}s budget to prove anything"
+    )
+    statuses = [status for status, _ in core.health]
+    assert statuses == [503], (
+        f"a loop that made no progress for {core.stall_seconds}s is stuck: "
+        f"{core.health}"
+    )
+
+
+class ApiOutageCoreApi(FakeCoreApi):
+    """Fails every LIST, then ends the loop after ``iterations`` of it."""
+
+    def __init__(
+        self, clock: Clock, subject: list, iterations: int, step_seconds: float
+    ) -> None:
+        super().__init__([])
+        self.clock = clock
+        self.subject = subject
+        self.iterations = iterations
+        self.step_seconds = step_seconds
+        self.calls = 0
+        self.health: list[tuple[int, str]] = []
+
+    def list_pod_for_all_namespaces(self, **_kwargs):
+        self.calls += 1
+        if self.calls > self.iterations:
+            raise LoopStop
+        self.clock.value += timedelta(seconds=self.step_seconds)
+        self.health.append(evaluate_completion_health(self.subject[0]))
+        raise RuntimeError("kubernetes API is unavailable")
+
+
+def test_a_continuous_api_outage_does_not_restart_the_watcher() -> None:
+    """I2: a failing API server is not a stuck loop.
+
+    The retry path is the loop working: it lists, fails, logs, sleeps and
+    lists again. Restarting the watcher into a CrashLoop there would only add
+    a cold start (state restore, relist) to an outage, and would delay
+    recovery exactly when the control plane is already degraded.
+    """
+    clock = Clock()
+    box: list = []
+    core = ApiOutageCoreApi(clock, box, 10, 30.0)
+    subject = KubernetesCompletionController(
+        core,
+        FakeSink(),
+        cluster_id="hp-cluster",
+        poll_interval_seconds=0.001,
+        watch_factory=lambda: FakeWatch([]),
+        now=clock,
+    )
+    box.append(subject)
+
+    with pytest.raises(LoopStop):
+        subject.run(metrics_port=0)
+
+    assert len(core.health) == 10, (
+        f"the loop must have retried ten times: {core.calls} LIST calls"
+    )
+    assert {status for status, _ in core.health} == {200}, (
+        f"an outage the loop keeps retrying is not a stuck loop: {core.health}"
+    )
+    assert subject.last_cycle_completed_at is None, (
+        "no full pass completed, so the alerting metric must stay unset"
+    )
+
+
+class TimedSink(FakeSink):
+    """Carries the HTTP timing knobs the real ``HttpEventSink`` exposes."""
+
+    def __init__(self, **timings: float) -> None:
+        super().__init__()
+        for name, value in timings.items():
+            setattr(self, name, value)
+
+
+class WrappingSink(FakeSink):
+    """An outbox-shaped sink: the timings live on the sink it wraps."""
+
+    def __init__(self, inner: FakeSink) -> None:
+        super().__init__()
+        self.sink = inner
+
+
+def test_the_liveness_budget_covers_one_blocking_delivery() -> None:
+    """C1: one budget, derived from the delivery timeouts, not a constant."""
+    defaults = controller(FakeCoreApi([]), FakeSink())
+
+    assert defaults.progress_stall_budget_seconds == 220.0, (
+        "120 s receipt poll + 4 x 10 s HTTP + 60 s margin: "
+        f"{defaults.progress_stall_budget_seconds}"
+    )
+
+    inner = TimedSink(
+        processor_receipt_timeout_seconds=300.0, timeout_seconds=20.0, max_attempts=3
+    )
+    wrapped = controller(FakeCoreApi([]), WrappingSink(inner))
+
+    assert wrapped.progress_stall_budget_seconds == 420.0, (
+        "the outbox wrapper must not hide the inner sink's timeouts: "
+        f"{wrapped.progress_stall_budget_seconds}"
+    )
+
+    patient_watch = KubernetesCompletionController(
+        FakeCoreApi([]),
+        FakeSink(),
+        cluster_id="hp-cluster",
+        watch_timeout_seconds=600,
+        now=lambda: NOW,
+    )
+
+    assert patient_watch.progress_stall_budget_seconds == 1800.0, (
+        "three relists of a 600 s watch outrank the delivery budget: "
+        f"{patient_watch.progress_stall_budget_seconds}"
     )

@@ -56,7 +56,6 @@
   "tests/completion/test_completion_controller.py:subject._last_observations": 2,
   "tests/completion/test_completion_controller.py:subject._observation": 3,
   "tests/completion/test_completion_controller.py:subject._reconcile": 2,
-  "tests/completion/test_completion_controller.py:subject._run_watch_cycle": 6,
   "tests/completion/test_completion_controller.py:subject._spec_from_pods": 1,
   "tests/completion/test_completion_controller.py:subject._workload_ids": 3,
   "tests/completion/test_completion_controller_resilience.py:subject._attempt_specs": 2,

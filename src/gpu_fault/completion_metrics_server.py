@@ -10,17 +10,23 @@ reconcile pass were only reachable from a debugger. This module exposes them in
 Prometheus text exposition on a daemon thread so the Pod can carry the same
 ``prometheus.io/scrape`` annotations as every other GPU-fault workload.
 
-``/healthz`` turns that last value into the Pod's liveness signal (F3). A watch
-stream the API server drops without an RST used to park the only thread that
-relists Pods: no relist, no reconcile, no observations, and ten minutes later
-every node reads UNKNOWN so every node-mutating plan is BLOCKED. The probe
-therefore fails only on a stuck *loop* -- three watch timeouts with no
-completed full pass -- never on an idle cluster, which posts nothing at all yet
-keeps completing a pass on every relist.
+``/healthz`` turns the loop's *progress* timestamp into the Pod's liveness
+signal (F3). A watch stream the API server drops without an RST used to park
+the only thread that relists Pods: no relist, no reconcile, no observations,
+and ten minutes later every node reads UNKNOWN so every node-mutating plan is
+BLOCKED. The probe fails only when the loop has finished nothing at all for a
+whole delivery budget (``progress_stall_budget_seconds``). It stays green for
+an idle cluster, which posts nothing yet relists every watch timeout, for a
+slow pass that keeps finishing attempts, and for an API-server outage the loop
+keeps retrying -- none of those is a stuck loop, and restarting the single
+Completion Watcher there would only add a cold start to an incident.
 
-The server is strictly best-effort: a port that cannot be bound is logged at
-ERROR and the controller keeps running without metrics. Nothing here may
-raise into the watch loop.
+Nothing here may raise into the watch loop, and an unreadable controller
+reports healthy. But the server is no longer optional: the liveness probe reads
+this endpoint, so a port that cannot be bound (or ``PORT=0``) now means kubelet
+keeps killing the Pod instead of running it without metrics. Both are logged at
+ERROR/INFO and the loop still starts, which is what makes the failure visible
+in the Pod's restart count rather than silent.
 """
 
 from __future__ import annotations
@@ -39,16 +45,13 @@ DEFAULT_METRICS_PORT = 9109
 BIND_ADDRESS = "0.0.0.0"
 METRICS_PATH = "/metrics"
 HEALTH_PATH = "/healthz"
-# A stuck watch is one that has missed three relists. The window has to be a
-# multiple of the watch timeout, not a constant: an operator who raises
-# GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS must not turn the probe into a
-# restart loop.
+# The controller derives the real window from its delivery timeouts and
+# publishes it as ``progress_stall_budget_seconds``. These two only cover a
+# controller that does not expose it: a stuck watch has also missed three
+# relists, and the fallback stays a multiple of the watch timeout so an
+# operator who raises GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS cannot turn the
+# probe into a restart loop.
 HEALTH_STALE_CYCLE_MULTIPLIER = 3
-# Before the first pass completes there is nothing to compare against, so the
-# probe grants exactly one watch timeout of grace from process start: enough
-# for the initial list plus a full reconcile of every attempt on a large
-# cluster, short enough that a list that never returns is caught.
-HEALTH_STARTUP_GRACE_CYCLES = 1
 DEFAULT_WATCH_TIMEOUT_SECONDS = 30.0
 
 # (metric name, controller attribute, help text). Every entry is a counter that
@@ -115,13 +118,27 @@ GAUGES: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
-LAST_CYCLE_METRIC = "gpu_fault_completion_watcher_last_cycle_completed_timestamp"
-LAST_CYCLE_HELP = (
-    "Unix seconds at which the last *full* reconcile pass completed; 0 before "
-    "the first one. Only a pass that relisted every Pod moves it, so "
-    "time() - this is the watch loop's staleness even on a cluster with no "
-    "managed job. This is the value /healthz and the liveness probe read."
+# (metric name, controller attribute, help text) for the two timestamps.
+TIMESTAMPS: tuple[tuple[str, str, str], ...] = (
+    (
+        "gpu_fault_completion_watcher_last_cycle_completed_timestamp",
+        "last_cycle_completed_at",
+        "Unix seconds at which the last *full* reconcile pass completed; 0 "
+        "before the first one. Only a pass that relisted every Pod moves it. "
+        "This is the value humans alert on -- it can legitimately lag by more "
+        "than one watch timeout, so it is not what /healthz judges.",
+    ),
+    (
+        "gpu_fault_completion_watcher_last_progress_timestamp",
+        "last_progress_at",
+        "Unix seconds at which the loop last finished a step: a relist, a "
+        "watch event, one attempt's reconcile, or a failed cycle going back "
+        "to its retry sleep. This is the value /healthz and the liveness "
+        "probe read, so time() - this is what kubelet acts on.",
+    ),
 )
+LAST_CYCLE_METRIC = TIMESTAMPS[0][0]
+LAST_PROGRESS_METRIC = TIMESTAMPS[1][0]
 
 
 def metrics_port_from_environment() -> int:
@@ -161,12 +178,10 @@ def render_completion_metrics(controller: Any) -> str:
             lines.append(f"# HELP {name} {help_text}")
             lines.append(f"# TYPE {name} {metric_type}")
             lines.append(f"{name} {int(value)}")
-    lines.append(f"# HELP {LAST_CYCLE_METRIC} {LAST_CYCLE_HELP}")
-    lines.append(f"# TYPE {LAST_CYCLE_METRIC} gauge")
-    lines.append(
-        f"{LAST_CYCLE_METRIC} "
-        f"{_epoch_seconds(getattr(controller, 'last_cycle_completed_at', None))}"
-    )
+    for name, attribute, help_text in TIMESTAMPS:
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} gauge")
+        lines.append(f"{name} {_epoch_seconds(getattr(controller, attribute, None))}")
     return "\n".join(lines) + "\n"
 
 
@@ -182,20 +197,20 @@ def _controller_now(controller: Any) -> datetime | None:
     return datetime.now(timezone.utc)
 
 
-def evaluate_completion_health(controller: Any) -> tuple[int, str]:
-    """``(status, body)`` for ``/healthz``: 503 only when the loop is stuck.
+def _stall_budget_seconds(controller: Any) -> float:
+    """The liveness window: the controller's own budget, or three relists.
 
-    The reconcile pass is the liveness signal, never the traffic: a cluster
-    with no managed Pod posts nothing at all and must stay healthy, while a
-    watch stream that hangs stops the 30 s relist and is the one failure this
-    probe exists to end. Before the first pass the check falls back to a single
-    watch timeout of startup grace.
-
-    An unreadable controller (a clock that is not a datetime, a missing
-    attribute) reports healthy: a bug in this evaluator must not restart a
-    working watcher.
+    The controller derives it from the delivery timeouts it actually uses, so
+    the probe cannot drift away from what one legal blocking step costs. The
+    fallback exists for a controller (or a test double) that predates it.
     """
 
+    budget = getattr(controller, "progress_stall_budget_seconds", None)
+    try:
+        if budget is not None and float(budget) > 0:
+            return float(budget)
+    except (TypeError, ValueError):
+        pass
     watch_timeout = DEFAULT_WATCH_TIMEOUT_SECONDS
     configured = getattr(controller, "watch_timeout_seconds", None)
     try:
@@ -203,39 +218,45 @@ def evaluate_completion_health(controller: Any) -> tuple[int, str]:
             watch_timeout = float(configured)
     except (TypeError, ValueError):
         pass
+    return HEALTH_STALE_CYCLE_MULTIPLIER * watch_timeout
+
+
+def evaluate_completion_health(controller: Any) -> tuple[int, str]:
+    """``(status, body)`` for ``/healthz``: 503 only when the loop is stuck.
+
+    Progress is the signal, never traffic and never pass completion: a cluster
+    with no managed Pod posts nothing, a fault storm can spend minutes inside
+    one pass, and an API-server outage can fail every list -- all three are the
+    loop working, and all three keep this at 200. What the probe catches is a
+    step that never returns (a watch stream the API server dropped without an
+    RST, a parked LIST), which finishes nothing and so stops the clock.
+
+    Cold start is *not* handled here: the Deployment's ``startupProbe`` owns
+    it, so this stays a single criterion.
+
+    An unreadable controller (a clock that is not a datetime, a missing
+    attribute) reports healthy: a bug in this evaluator must not restart a
+    working watcher.
+    """
 
     now = _controller_now(controller)
-    last_cycle = getattr(controller, "last_cycle_completed_at", None)
-    started_at = getattr(controller, "started_at", None)
     if now is None:
         return 200, "health unknown: the controller exposes no usable clock\n"
+    last_progress = getattr(controller, "last_progress_at", None)
+    if not isinstance(last_progress, datetime):
+        return 200, "health unknown: last_progress_at is not a timestamp\n"
 
-    if last_cycle is None:
-        if not isinstance(started_at, datetime):
-            return 200, "health unknown: no start time and no completed pass\n"
-        grace = HEALTH_STARTUP_GRACE_CYCLES * watch_timeout
-        age = (now - started_at).total_seconds()
-        if age <= grace:
-            return 200, f"starting: {age:.1f}s of {grace:.1f}s startup grace used\n"
-        return (
-            503,
-            f"stuck: no reconcile pass completed {age:.1f}s after start "
-            f"(grace {grace:.1f}s)\n",
-        )
-
-    if not isinstance(last_cycle, datetime):
-        return 200, "health unknown: last_cycle_completed_at is not a timestamp\n"
-    limit = HEALTH_STALE_CYCLE_MULTIPLIER * watch_timeout
-    age = (now - last_cycle).total_seconds()
+    limit = _stall_budget_seconds(controller)
+    age = (now - last_progress).total_seconds()
     if age <= limit:
         return (
             200,
-            f"ok: last full reconcile pass {age:.1f}s ago (limit {limit:.1f}s)\n",
+            f"ok: the loop last made progress {age:.1f}s ago (limit {limit:.1f}s)\n",
         )
     return (
         503,
-        f"stuck: last full reconcile pass {age:.1f}s ago, over the "
-        f"{limit:.1f}s limit of {HEALTH_STALE_CYCLE_MULTIPLIER} watch timeouts\n",
+        f"stuck: the loop has finished nothing for {age:.1f}s, over its "
+        f"{limit:.1f}s budget\n",
     )
 
 

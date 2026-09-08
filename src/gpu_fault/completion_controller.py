@@ -77,13 +77,28 @@ PYTORCH_JOB_LABELS = (
 )
 WORKLOAD_LOG_SNAPSHOT_ANNOTATION = "gpu-fault.io/workload-log-snapshot"
 RESTART_BUDGET_ANNOTATION = "gpu-fault.io/restart-budget"
-# How long the end of a watch cycle waits for a debounce timer that is still
-# reconciling before it gives up and relies on ``reconcile_lock`` alone (F5).
-# One reconcile can legitimately take a terminal POST's retries plus the
-# 120 s processor receipt poll, so the budget is generous; blocking here only
-# delays the next relist, while returning early would let the two passes run
-# side by side, which is the defect.
-TIMER_JOIN_TIMEOUT_SECONDS = 300.0
+# One budget answers both "how long may the loop spend inside a single
+# blocking step before it counts as stuck?" (the /healthz liveness window, F3)
+# and "how long does the end of a watch cycle wait for a debounce timer that is
+# still reconciling?" (F5). They have to be the same number: a join that
+# outlives the liveness window would guarantee a restart every time it fired,
+# and a window shorter than one legal delivery would kill a working watcher
+# mid-pass.
+#
+# The longest legal blocking step is one delivery: its HTTP attempts plus the
+# processor receipt poll that follows the accepted POST. The margin covers the
+# retry back-off sleeps and the surrounding bookkeeping.
+PROGRESS_BUDGET_MARGIN_SECONDS = 60.0
+# A stuck watch has also missed this many relists. The floor scales with the
+# watch timeout so an operator who raises
+# GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS does not create a restart loop.
+PROGRESS_BUDGET_RELISTS = 3
+# Used only when the sink hides its timings (a test double, a future sink).
+DEFAULT_SINK_RECEIPT_TIMEOUT_SECONDS = 120.0
+DEFAULT_SINK_HTTP_TIMEOUT_SECONDS = 10.0
+DEFAULT_SINK_MAX_ATTEMPTS = 4.0
+# The sink may be an outbox wrapping the HTTP sink that owns the timeouts.
+MAX_SINK_CHAIN_DEPTH = 5
 
 
 class CompletionControllerError(ValueError):
@@ -597,12 +612,16 @@ class KubernetesCompletionController:
         self.evicted_attempts_total = 0
         # Persisted attempt records skipped at start-up (set by the restore).
         self.restore_skipped_total = 0
-        # Liveness (F3): only a completed *full* pass moves this. A watch
-        # stream that hangs stops relisting, so the timestamp stops moving
-        # while an idle cluster -- which posts nothing at all -- keeps it
-        # fresh through the 30 s relist. ``started_at`` gives the probe a
-        # startup grace before the first pass finishes.
+        # Liveness (F3/C1): ``last_progress_at`` is what /healthz judges, and
+        # every step the loop finishes moves it -- a relist, one attempt's
+        # reconcile, one watch event, even a failed cycle that went back to the
+        # retry sleep. A hung watch stream or a parked LIST finishes nothing, so
+        # it stops moving, while a slow-but-working pass and an idle cluster
+        # both keep it fresh. ``last_cycle_completed_at`` is deliberately *not*
+        # the probe's signal: one full pass can legitimately outlast several
+        # watch timeouts. It stays as the metric humans alert on.
         self.started_at: datetime = self.now()
+        self.last_progress_at: datetime = self.started_at
         self.last_cycle_completed_at: datetime | None = None
         # One reconcile at a time per process (F5). The lock used to be a
         # per-cycle local, so a debounce timer still inside ``_reconcile`` ran
@@ -648,15 +667,88 @@ class KubernetesCompletionController:
 
         return int(getattr(self.sink, "last_quarantined_depth", 0))
 
+    def _sink_timing(self, attribute: str, default: float) -> float:
+        """A delivery timeout read off the sink, or off the sink it wraps.
+
+        ``KubernetesCompletionOutbox`` fronts the HTTP sink that owns the
+        timeouts, so the value has to be looked up down the chain. Anything
+        unreadable falls back to the shipped default: this feeds a liveness
+        window, so it must never raise and never return zero.
+        """
+
+        sink: Any = self.sink
+        for _ in range(MAX_SINK_CHAIN_DEPTH):
+            if sink is None:
+                break
+            value = getattr(sink, attribute, None)
+            try:
+                if value is not None and float(value) > 0:
+                    return float(value)
+            except (TypeError, ValueError):
+                pass
+            sink = getattr(sink, "sink", None)
+        return default
+
+    @property
+    def progress_stall_budget_seconds(self) -> float:
+        """How long the loop may finish nothing before it counts as stuck.
+
+        Derived, not configured: one whole delivery (every HTTP attempt plus
+        the processor receipt poll) with a margin, and never less than
+        ``PROGRESS_BUDGET_RELISTS`` watch timeouts. ``/healthz`` and the timer
+        join in ``run_watch_cycle`` both read it, so a join that fires can
+        never by itself push the Pod past the liveness window.
+        """
+
+        receipt = self._sink_timing(
+            "processor_receipt_timeout_seconds",
+            DEFAULT_SINK_RECEIPT_TIMEOUT_SECONDS,
+        )
+        http_timeout = self._sink_timing(
+            "timeout_seconds", DEFAULT_SINK_HTTP_TIMEOUT_SECONDS
+        )
+        attempts = self._sink_timing("max_attempts", DEFAULT_SINK_MAX_ATTEMPTS)
+        delivery = receipt + http_timeout * attempts + PROGRESS_BUDGET_MARGIN_SECONDS
+        relists = PROGRESS_BUDGET_RELISTS * float(self.watch_timeout_seconds)
+        return max(delivery, relists)
+
+    def note_progress(self) -> None:
+        """Record that the loop just finished a step (the liveness signal).
+
+        Called around every blocking step rather than once per pass, so a slow
+        pass reads as alive and only a step that never returns reads as stuck.
+        """
+
+        self.last_progress_at = self.now()
+
     def run_once(self) -> list[dict[str, Any]]:
         pods, _ = list_completion_pods(
             self.core_api,
             self.namespace,
             self.observation_only.enabled,
         )
+        self.note_progress()
         return self._reconcile(pods)
 
     def _reconcile(
+        self,
+        pods: list[dict[str, Any]],
+        *,
+        attempt_filter: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """One reconcile pass, serialized against every other pass (F5).
+
+        The lock lives here rather than at the call sites so every entry point
+        -- the cycle's full pass, a debounce flush on a timer thread, the
+        polling fallback's ``run_once`` -- is covered structurally and a new
+        caller cannot forget it. It is an ``RLock``, so a nested pass on the
+        same thread still works.
+        """
+
+        with self.reconcile_lock:
+            return self._reconcile_pass(pods, attempt_filter=attempt_filter)
+
+    def _reconcile_pass(
         self,
         pods: list[dict[str, Any]],
         *,
@@ -695,15 +787,22 @@ class KubernetesCompletionController:
             # The whole body is isolated, not just the observation step: a
             # failure anywhere in one attempt's handling used to abort the
             # pass for every attempt after it in sort order (P1-47A).
+            # Liveness (C1): one attempt is the smallest unit the pass can
+            # finish, and handling it can block for a whole delivery, so the
+            # stamp goes on both sides of it. Stamping once per pass instead
+            # made a storm of terminals look like a hung loop.
+            self.note_progress()
             try:
                 self._reconcile_attempt(attempt_id, attempt_pods, observed_at, results)
             except Exception:
                 self.reconcile_failures_total += 1
                 LOGGER.exception("cannot reconcile attempt %s", attempt_id)
+            self.note_progress()
         if attempt_filter is None:
             self._evict_pruned_attempts(grouped)
-            # Liveness marker (F3): a filtered debounce pass does not count,
-            # because only a full pass proves the list/relist path still works.
+            # Not the liveness signal (see ``last_progress_at``): this is the
+            # value humans alert on, and only a pass that relisted every Pod
+            # moves it.
             self.last_cycle_completed_at = self.now()
         return results
 
@@ -995,9 +1094,15 @@ class KubernetesCompletionController:
             ",".join(spec.workload_ids),
         )
 
-    def run(self) -> None:
-        # Best-effort: a bind failure is logged and the loop runs unmetered.
-        metrics_server = start_completion_metrics_server(self)
+    def run(self, *, metrics_port: int | None = None) -> None:
+        """Serve ``/metrics`` + ``/healthz`` and loop until the process ends.
+
+        ``metrics_port`` overrides the environment setting; ``0`` disables the
+        server, which the Deployment must never do -- the liveness probe reads
+        that endpoint, so no server means kubelet keeps restarting the Pod.
+        """
+
+        metrics_server = start_completion_metrics_server(self, port=metrics_port)
         try:
             self._run_forever()
         finally:
@@ -1011,18 +1116,26 @@ class KubernetesCompletionController:
             return
 
         while True:
+            # Reaching the top of the loop is progress, and so is coming back
+            # from a failure (I2): an API server that refuses every LIST keeps
+            # the loop turning, and CrashLooping the only Completion Watcher
+            # during a control-plane outage would only add a cold start to it.
+            self.note_progress()
             try:
-                self._run_watch_cycle()
+                self.run_watch_cycle()
             except Exception:
                 LOGGER.exception("Kubernetes Pod watch cycle failed; retrying")
+                self.note_progress()
                 time.sleep(self.poll_interval_seconds)
 
     def _run_polling(self) -> None:
         while True:
+            self.note_progress()
             try:
                 self.run_once()
             except Exception:
                 LOGGER.exception("Kubernetes completion reconciliation failed")
+            self.note_progress()
             time.sleep(self.poll_interval_seconds)
 
     def run_watch_cycle(self) -> None:
@@ -1034,21 +1147,17 @@ class KubernetesCompletionController:
         to observe what the cycle's ``finally`` does.
         """
 
-        self._run_watch_cycle()
-
-    def _run_watch_cycle(self) -> None:
         pods, resource_version = list_completion_pods(
             self.core_api,
             self.namespace,
             self.observation_only.enabled,
         )
+        self.note_progress()
         serialized = [self.serializer(item) for item in pods]
         cache = {self._pod_key(pod): pod for pod in serialized}
-        # The previous cycle's debounce timer has been joined by that cycle's
-        # ``finally``, so this lock is normally free; taking it is what keeps a
-        # timer that outlived its cycle from running beside this pass (F5).
-        with self.reconcile_lock:
-            self._reconcile(list(cache.values()))
+        # ``_reconcile`` takes ``reconcile_lock`` itself (F5), which is what
+        # keeps a timer that outlived its cycle from running beside this pass.
+        self._reconcile(list(cache.values()))
         cache_lock = RLock()
         pending_lock = RLock()
         pending_attempts: set[str] = set()
@@ -1080,11 +1189,10 @@ class KubernetesCompletionController:
                 affected_pods = [
                     pod for pod in cache.values() if attempt_id(pod) in attempts
                 ]
-            with self.reconcile_lock:
-                self._reconcile(
-                    affected_pods,
-                    attempt_filter=attempts,
-                )
+            self._reconcile(
+                affected_pods,
+                attempt_filter=attempts,
+            )
 
         def schedule(attempts: set[str]) -> None:
             if not attempts:
@@ -1159,6 +1267,9 @@ class KubernetesCompletionController:
                             event_type,
                         )
                         continue
+                    # An event delivered and applied is progress: a busy
+                    # stream keeps the probe green between relists.
+                    self.note_progress()
                     key = self._pod_key(pod)
                     with cache_lock:
                         previous = cache.get(key)
@@ -1194,15 +1305,16 @@ class KubernetesCompletionController:
             # Join OUTSIDE every lock (F5). A timer that already fired holds no
             # lock this thread wants, and this thread holds none it wants, so
             # the join cannot deadlock; taking ``reconcile_lock`` here would.
+            join_timeout = self.progress_stall_budget_seconds
             for item in in_flight:
                 if item is current_thread():
                     continue
-                item.join(timeout=TIMER_JOIN_TIMEOUT_SECONDS)
+                item.join(timeout=join_timeout)
                 if item.is_alive():
                     LOGGER.warning(
                         "debounced reconcile still running after %ss; the next "
                         "full pass will wait on the reconcile lock",
-                        TIMER_JOIN_TIMEOUT_SECONDS,
+                        join_timeout,
                     )
             # F11: the flush is the only step here that can raise (one bad Pod
             # is enough), and skipping ``stop()`` leaked the API-server stream

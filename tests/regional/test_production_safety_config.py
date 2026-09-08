@@ -645,9 +645,9 @@ def test_completion_watcher_probes_the_watch_loop_liveness() -> None:
     The watch had no client read timeout and the Deployment had no probe, so a
     silently dropped connection parked the only thread that relists Pods: ten
     minutes later every node reads UNKNOWN and every node-mutating plan is
-    BLOCKED. ``/healthz`` fails only when no full reconcile pass has completed
-    for three watch timeouts, which an idle cluster never triggers because the
-    30 s relist is what moves the timestamp.
+    BLOCKED. ``/healthz`` fails only when the loop has taken no step forward
+    for a whole delivery budget, which an idle cluster never triggers because
+    the 30 s relist is itself progress.
     """
     documents = list(
         yaml.safe_load_all(
@@ -661,6 +661,7 @@ def test_completion_watcher_probes_the_watch_loop_liveness() -> None:
     ports = {item.get("name"): item for item in watcher.get("ports", [])}
     liveness = watcher["livenessProbe"]
     readiness = watcher["readinessProbe"]
+    startup = watcher["startupProbe"]
 
     assert liveness["httpGet"]["path"] == "/healthz", liveness
     assert liveness["httpGet"]["port"] == ports["metrics"]["containerPort"], (
@@ -670,6 +671,19 @@ def test_completion_watcher_probes_the_watch_loop_liveness() -> None:
     assert liveness["failureThreshold"] == 3, liveness
     assert readiness["httpGet"] == liveness["httpGet"], (
         f"readiness must read the same endpoint: {readiness}"
+    )
+    assert startup["httpGet"] == liveness["httpGet"], (
+        f"the startup probe must read the same endpoint: {startup}"
+    )
+    # I3: cold start (attempt-state restore, first list, first full reconcile)
+    # is the startup probe's job, so /healthz itself needs no grace window and
+    # the liveness threshold stays tight for a running loop.
+    assert startup["periodSeconds"] == 30, startup
+    assert startup["failureThreshold"] >= 20, (
+        f"cold start needs at least ten minutes of tolerance: {startup}"
+    )
+    assert "initialDelaySeconds" not in liveness, (
+        f"a startup probe replaces the liveness delay: {liveness}"
     )
 
 
