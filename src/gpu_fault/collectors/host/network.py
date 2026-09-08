@@ -20,62 +20,133 @@ class HostNetworkMixin:
     # Attributes supplied by the composed concrete implementation.
     _delta: Callable[..., Any]
     _is_efa_device: Callable[..., Any]
+    _previous: dict[str, tuple[float, datetime]]
     _sample: Callable[..., Any]
     infiniband_root: Any
+    net_class_root: Path
     required_interfaces: Any
     runner: Callable[..., Any]
 
     def _network(self, observed_at: datetime) -> list[HostMetricSample]:
-        result = []
-        for interface in Path("/sys/class/net").iterdir():
+        """Link state and error/drop counters for the node's real interfaces.
+
+        Every read is guarded per interface and every virtual interface is
+        skipped. Pod churn on an EKS node creates and deletes ``veth``/``eni``
+        pairs constantly: one deleted between ``iterdir`` and ``read_text``
+        raised ``FileNotFoundError`` and discarded the whole tick's network
+        samples -- including ``network_link_down`` for a required interface,
+        the one CRITICAL signal here -- and every transient veth was reported
+        as a device of its own, growing the control plane's latest-metrics rows
+        and tripping the ``network_drops_delta`` rule on drops that are routine
+        on a veth (F-H4).
+        """
+
+        result: list[HostMetricSample] = []
+        seen: set[str] = set()
+        try:
+            interfaces = sorted(self.net_class_root.iterdir())
+        except OSError as exc:
+            LOGGER.warning("cannot list %s: %s", self.net_class_root, exc)
+            return result
+        for interface in interfaces:
             name = interface.name
             if name == "lo":
                 continue
-            state = (interface / "operstate").read_text().strip()
+            try:
+                if not self._is_reported_interface(interface):
+                    continue
+                samples = self._interface_samples(interface, observed_at)
+            except OSError:
+                # The interface went away mid-read; the next tick either sees
+                # it again or prunes its counters.
+                continue
+            seen.add(name)
+            result.extend(samples)
+        self._prune_interface_counters(seen)
+        return result
+
+    def _is_reported_interface(self, interface: Path) -> bool:
+        """Whether one ``/sys/class/net`` entry is worth a sample.
+
+        A required interface always is. Otherwise only interfaces with a
+        parent device are: a bridge, a tunnel and a pod's veth have none.
+        """
+
+        if interface.name in self.required_interfaces:
+            return True
+        return (interface / "device").exists()
+
+    def _interface_samples(
+        self, interface: Path, observed_at: datetime
+    ) -> list[HostMetricSample]:
+        """Every sample for one interface, or nothing if any read fails.
+
+        Built as a unit so a half-read interface contributes nothing rather
+        than a link state without its counters.
+        """
+
+        name = interface.name
+        state = (interface / "operstate").read_text().strip()
+        result = [
+            self._sample(
+                "network_link_up",
+                1 if state == "up" else 0,
+                None,
+                name,
+            )
+        ]
+        if name in self.required_interfaces:
             result.append(
                 self._sample(
-                    "network_link_up",
-                    1 if state == "up" else 0,
+                    "network_link_down",
+                    0 if state == "up" else 1,
                     None,
                     name,
                 )
             )
-            if name in self.required_interfaces:
+        stats = interface / "statistics"
+        for metric, files in {
+            "network_errors_delta": (
+                "rx_errors",
+                "tx_errors",
+            ),
+            "network_drops_delta": (
+                "rx_dropped",
+                "tx_dropped",
+            ),
+        }.items():
+            total = sum(float((stats / filename).read_text()) for filename in files)
+            change = self._delta(
+                f"net/{name}/{metric}",
+                total,
+                observed_at,
+            )
+            if change:
                 result.append(
                     self._sample(
-                        "network_link_down",
-                        0 if state == "up" else 1,
-                        None,
+                        metric,
+                        change[0],
+                        "packets",
                         name,
                     )
                 )
-            stats = interface / "statistics"
-            for metric, files in {
-                "network_errors_delta": (
-                    "rx_errors",
-                    "tx_errors",
-                ),
-                "network_drops_delta": (
-                    "rx_dropped",
-                    "tx_dropped",
-                ),
-            }.items():
-                total = sum(float((stats / filename).read_text()) for filename in files)
-                change = self._delta(
-                    f"net/{name}/{metric}",
-                    total,
-                    observed_at,
-                )
-                if change:
-                    result.append(
-                        self._sample(
-                            metric,
-                            change[0],
-                            "packets",
-                            name,
-                        )
-                    )
         return result
+
+    def _prune_interface_counters(self, seen: set[str]) -> None:
+        """Drop the counter baselines of interfaces this tick did not see.
+
+        A node runs this collector for weeks across thousands of pods; without
+        this the ``net/<interface>/`` keys grow for every veth that ever
+        existed (the ``rank/`` keys are pruned the same way).
+        """
+
+        stale = [
+            key
+            for key in self._previous
+            if key.startswith("net/") and key.split("/")[1] not in seen
+        ]
+        for key in stale:
+            del self._previous[key]
 
     def _tcp(self, observed_at: datetime) -> list[HostMetricSample]:
         lines = Path("/proc/net/snmp").read_text().splitlines()

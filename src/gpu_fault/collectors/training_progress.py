@@ -7,14 +7,15 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
+
+from pydantic import ValidationError
 
 from gpu_fault.channel_registry import TRAINING_PROGRESS_PATH
 from gpu_fault.training_health import TrainingProgressHeartbeat
 
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.sinks import (
-    CollectorError,
     EventSink,
     deliver_event,
 )
@@ -51,34 +52,10 @@ class TrainingProgressCollector:
         self.gpu_uuids = gpu_uuids or []
         self.interval_seconds = interval_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
+        self._warned_progress_errors: set[str] = set()
 
     def collect_once(self) -> TrainingProgressHeartbeat:
-        value = {}
-        if self.progress_path.exists():
-            parsed = json.loads(self.progress_path.read_text(encoding="utf-8"))
-            if not isinstance(parsed, dict):
-                raise CollectorError(
-                    "training progress file must contain a JSON object"
-                )
-            value = parsed
-        heartbeat = TrainingProgressHeartbeat(
-            cluster_id=self.cluster_id,
-            attempt_id=self.attempt_id,
-            rank=self.rank,
-            observed_at=self.now(),
-            node_id=self.node_id,
-            pod_uid=self.pod_uid,
-            container_name=self.container_name,
-            gpu_uuids=self.gpu_uuids,
-            step=value.get("step"),
-            samples_per_second=value.get("samples_per_second"),
-            loss=value.get("loss"),
-            numerical_error=bool(value.get("numerical_error", False)),
-            checkpoint_ref=value.get("checkpoint_ref"),
-            labels={
-                str(key): str(item) for key, item in (value.get("labels") or {}).items()
-            },
-        )
+        heartbeat = self._heartbeat()
         result = deliver_event(
             self.sink,
             TRAINING_PROGRESS_PATH,
@@ -95,6 +72,74 @@ class TrainingProgressCollector:
                 result.error,
             )
         return heartbeat
+
+    def _heartbeat(self) -> TrainingProgressHeartbeat:
+        """This cycle's heartbeat; a bad progress file is not a missing rank.
+
+        The file is written by the application. A non-object ``labels``, a
+        negative or fractional ``step``, a ``loss`` that is not a number, or a
+        non-atomic rewrite caught torn all raised before the post, so the cycle
+        shipped nothing -- and 120 s of that is what the consumer reads as
+        "training rank heartbeat timed out", a CRITICAL hang finding for a rank
+        that was running fine (F-H3). Stall detection needs ``step``; liveness
+        does not, so the heartbeat still goes out with the progress fields unset
+        and the parse error named in ``labels['progress_error']``.
+        """
+
+        try:
+            return self._build_heartbeat(self._read_progress())
+        except (OSError, ValueError, ValidationError) as exc:
+            error = type(exc).__name__
+            if error not in self._warned_progress_errors:
+                self._warned_progress_errors.add(error)
+                LOGGER.warning(
+                    "training progress file %s is unusable (%s: %s); reporting "
+                    "rank %s as alive with no progress fields",
+                    self.progress_path,
+                    error,
+                    exc,
+                    self.rank,
+                )
+            return self._build_heartbeat({}, progress_error=error)
+
+    def _read_progress(self) -> dict[str, Any]:
+        if not self.progress_path.exists():
+            return {}
+        parsed = json.loads(self.progress_path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("training progress file must contain a JSON object")
+        labels = parsed.get("labels")
+        if labels is not None and not isinstance(labels, dict):
+            raise ValueError(
+                "training progress labels must be a JSON object, not "
+                f"{type(labels).__name__}"
+            )
+        return parsed
+
+    def _build_heartbeat(
+        self, value: dict[str, Any], *, progress_error: str | None = None
+    ) -> TrainingProgressHeartbeat:
+        labels = {
+            str(key): str(item) for key, item in (value.get("labels") or {}).items()
+        }
+        if progress_error is not None:
+            labels["progress_error"] = progress_error
+        return TrainingProgressHeartbeat(
+            cluster_id=self.cluster_id,
+            attempt_id=self.attempt_id,
+            rank=self.rank,
+            observed_at=self.now(),
+            node_id=self.node_id,
+            pod_uid=self.pod_uid,
+            container_name=self.container_name,
+            gpu_uuids=self.gpu_uuids,
+            step=value.get("step"),
+            samples_per_second=value.get("samples_per_second"),
+            loss=value.get("loss"),
+            numerical_error=bool(value.get("numerical_error", False)),
+            checkpoint_ref=value.get("checkpoint_ref"),
+            labels=labels,
+        )
 
     def run(self) -> None:
         while True:

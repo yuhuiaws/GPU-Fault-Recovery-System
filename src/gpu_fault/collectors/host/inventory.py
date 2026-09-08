@@ -20,12 +20,14 @@ LOGGER = logging.getLogger(__name__)
 class HostInventoryMixin:
     # Attributes supplied by the composed concrete implementation.
     _inventory_mismatch_counts: Any
+    _partial_samples: list[HostMetricSample]
     expected_efa_device_count: Any
     expected_gpu_count: Any
     infiniband_root: Any
     inventory_mismatch_consecutive_samples: Any
     node_instance_type: Any
     pci_devices_root: Any
+    proc_root: Path
     runner: Callable[..., Any]
     _nvidia_smi: Callable[..., Any]
     GPU_QUERY_ARGV: tuple[str, ...]
@@ -135,20 +137,40 @@ class HostInventoryMixin:
         ]
 
     def _gpu_inventory(self, observed_at: datetime) -> list[HostMetricSample]:
-        samples = []
+        samples: list[HostMetricSample] = []
         if self.expected_gpu_count is not None:
             # Shares the utilization query of the same round (ARCH-G5): the
-            # UUID is its first CSV column.
+            # UUID is its first CSV column. A query that never answered raises
+            # out of here with no samples on purpose: a timeout says nothing
+            # about how many GPUs are installed, and reporting zero active GPUs
+            # would mint a CRITICAL REBOOT_NODE finding for a slow driver.
             completed = self._nvidia_smi(list(self.GPU_QUERY_ARGV), observed_at)
-            if completed.returncode != 0:
-                raise CollectorError(
-                    "GPU inventory query failed: " + completed.stderr.strip()
-                )
             gpu_uuids = {
                 line.split(",", 1)[0].strip()
                 for line in completed.stdout.splitlines()
-                if line.strip()
+                if line.strip() and line.split(",", 1)[0].strip()
             }
+            if completed.returncode != 0:
+                # A GPU that falls off the bus commonly makes ``--query-gpu``
+                # exit non-zero ("Unable to determine the device handle for
+                # GPU ...") after listing the GPUs that still answer. Raising
+                # here skipped ``_inventory_samples`` entirely, so
+                # ``gpu_inventory_mismatch`` never reached the consumer and the
+                # rule the query exists to feed could not fire (F-H6). The
+                # samples ride out on ``_partial_samples`` and the error still
+                # names the contributor.
+                self._partial_samples.extend(
+                    self._inventory_samples(
+                        resource="gpu",
+                        expected=self.expected_gpu_count,
+                        observed=len(gpu_uuids),
+                        discovered=self._discovered_gpu_count(),
+                        extra_labels={"failure_mode": "DRIVER_QUERY_FAILED"},
+                    )
+                )
+                raise CollectorError(
+                    "GPU inventory query failed: " + completed.stderr.strip()
+                )
             samples.extend(
                 self._inventory_samples(
                     resource="gpu",
@@ -157,6 +179,21 @@ class HostInventoryMixin:
                 )
             )
         return samples
+
+    def _discovered_gpu_count(self) -> int:
+        """GPUs the driver has bound, counted without ``nvidia-smi``.
+
+        ``/proc/driver/nvidia/gpus/<pci-address>`` is one directory per GPU the
+        kernel module attached, which is the same role ``pci_devices_root``
+        plays for EFA: it separates "the device is gone" from "the userspace
+        query failed".
+        """
+
+        root = self.proc_root / "driver" / "nvidia" / "gpus"
+        try:
+            return sum(1 for entry in root.iterdir() if entry.is_dir())
+        except OSError:
+            return 0
 
     def _efa_inventory(self, _: datetime) -> list[HostMetricSample]:
         samples = []

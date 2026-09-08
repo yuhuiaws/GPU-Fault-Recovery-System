@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import shlex
+import socket
 import subprocess
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -33,9 +36,132 @@ from gpu_fault.collectors.sinks import (
 from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
 from gpu_fault.collectors.host.network import HostNetworkMixin
-from gpu_fault.collectors.host.system_metrics import HostSystemMetricsMixin
+from gpu_fault.collectors.host.system_metrics import (
+    BoundedStatvfs,
+    HostSystemMetricsMixin,
+)
 
 LOGGER = logging.getLogger(__name__)
+
+
+def sd_notify(state: str) -> bool:
+    """Send one ``sd_notify(3)`` datagram, or do nothing off systemd.
+
+    ``Type=notify`` with ``WatchdogSec=`` is the only thing that makes a wedged
+    collector visible to the supervisor: every contributor reads the host, and
+    both ``statvfs`` on a hard NFS/Lustre mount and ``nvidia-smi`` inside a hung
+    driver block in uninterruptible sleep, where the unit stays
+    "active (running)" forever and ``Restart=always`` never fires. Returns
+    whether a notification was sent, so a collector run by hand (no
+    ``NOTIFY_SOCKET``) is a no-op rather than an error.
+    """
+
+    address = os.getenv("NOTIFY_SOCKET")
+    if not address:
+        return False
+    if address.startswith("@"):
+        # An abstract namespace socket: systemd writes the leading NUL as "@".
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify_socket:
+            notify_socket.connect(address)
+            notify_socket.sendall(state.encode("utf-8"))
+    except OSError as exc:
+        LOGGER.warning("could not notify systemd (%s): %s", state, exc)
+        return False
+    return True
+
+
+def _reap_abandoned_process(argv: list[str], process: subprocess.Popen[str]) -> None:
+    """Wait out a killed child that has not left the kernel yet.
+
+    Runs on a daemon thread and touches nothing but its own child: the circuit
+    breaker and every other piece of collector state stay owned by the
+    collection thread.
+    """
+
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
+    with contextlib.suppress(Exception):
+        process.wait()
+    LOGGER.info(
+        "abandoned %s (pid %s) finally exited with %s",
+        argv[0] if argv else "?",
+        process.pid,
+        process.returncode,
+    )
+
+
+class BoundedProcessRunner:
+    """``subprocess.run`` that a child in uninterruptible sleep cannot outlive.
+
+    CPython implements ``run(timeout=...)`` as ``kill()`` followed by a
+    *blocking* ``wait()``. The failure this collector exists to report --
+    nvidia-smi wedged inside the driver (XID 79, a GPU off the bus, a
+    fabric-manager hang) -- is exactly the case where SIGKILL is not acted on
+    until the syscall returns, so ``TimeoutExpired`` never reached the caller:
+    the nvidia-smi circuit breaker never engaged, ``collect_once`` never
+    returned, and the node sent no host telemetry at all. Here the second wait
+    is bounded too and a child that outlives it is handed to a daemon reaper,
+    so a call returns within ``timeout + kill_grace_seconds``. Every
+    ``self.runner`` call site shares this bound, so smartctl on a dying NVMe
+    and ethtool on a wedged EFA netdev cannot hold a tick either.
+    """
+
+    def __init__(
+        self,
+        *,
+        popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
+        kill_grace_seconds: float = 1.0,
+    ) -> None:
+        self.popen = popen
+        self.kill_grace_seconds = kill_grace_seconds
+
+    def __call__(
+        self,
+        argv: list[str],
+        *,
+        capture_output: bool = False,
+        text: bool = False,
+        timeout: float | None = None,
+        check: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        pipe = subprocess.PIPE if capture_output else None
+        process = self.popen(argv, stdout=pipe, stderr=pipe, text=text)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._abandon(argv, process)
+            raise
+        completed = subprocess.CompletedProcess(
+            argv, process.returncode or 0, stdout, stderr
+        )
+        if check:
+            completed.check_returncode()
+        return completed
+
+    def _abandon(self, argv: list[str], process: subprocess.Popen[str]) -> None:
+        with contextlib.suppress(OSError):
+            process.kill()
+        try:
+            process.wait(timeout=self.kill_grace_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        LOGGER.warning(
+            "%s did not die within %gs of SIGKILL (uninterruptible sleep in a "
+            "driver); abandoning it to a background reaper",
+            argv[0] if argv else "?",
+            self.kill_grace_seconds,
+        )
+        threading.Thread(
+            target=_reap_abandoned_process,
+            args=(argv, process),
+            name="gpu-fault-process-reaper",
+            daemon=True,
+        ).start()
 
 
 class HostTelemetryCollector(
@@ -56,6 +182,7 @@ class HostTelemetryCollector(
         filesystems: list[str] | None = None,
         required_interfaces: list[str] | None = None,
         infiniband_root: str = "/sys/class/infiniband",
+        net_class_root: str = "/sys/class/net",
         proc_root: str = "/proc",
         pci_devices_root: str | None = None,
         node_instance_type: str | None = None,
@@ -64,7 +191,9 @@ class HostTelemetryCollector(
         inventory_mismatch_consecutive_samples: int = 2,
         nvswitch_topology_command: list[str] | None = None,
         now: Callable[[], datetime] | None = None,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        statvfs: Callable[[str], os.statvfs_result] | None = None,
+        statvfs_timeout_seconds: float = 5,
         edge_filter_enabled: bool | None = None,
         health_summary_seconds: int | None = None,
         history_max_points: int | None = None,
@@ -81,6 +210,7 @@ class HostTelemetryCollector(
         self.filesystems = filesystems or ["/", "/var", "/tmp"]
         self.required_interfaces = set(required_interfaces or [])
         self.infiniband_root = Path(infiniband_root)
+        self.net_class_root = Path(net_class_root)
         self.proc_root = Path(proc_root)
         self.pci_devices_root = (
             Path(pci_devices_root)
@@ -129,7 +259,21 @@ class HostTelemetryCollector(
             else shlex.split(os.getenv("GPU_FAULT_NVSWITCH_TOPOLOGY_COMMAND", ""))
         )
         self.now = now or (lambda: datetime.now(timezone.utc))
-        self.runner = runner
+        # The default runner bounds its own kill path; ``subprocess.run`` does
+        # not, and a D-state nvidia-smi wedged the whole collector in it.
+        self.runner = runner if runner is not None else BoundedProcessRunner()
+        if statvfs_timeout_seconds <= 0:
+            raise ValueError("statvfs timeout must be positive")
+        self.statvfs_timeout_seconds = statvfs_timeout_seconds
+        self._statvfs_probe = BoundedStatvfs(
+            statvfs if statvfs is not None else os.statvfs,
+            timeout_seconds=statvfs_timeout_seconds,
+        )
+        self._statvfs_tick: datetime | None = None
+        self._unresponsive_mounts: set[str] = set()
+        #: Samples a contributor produced before it failed (see
+        #: :meth:`collect_once`).
+        self._partial_samples: list[HostMetricSample] = []
         self._previous: dict[str, tuple[float, datetime]] = {}
         self.edge_filter_enabled = (
             edge_filter_enabled
@@ -378,6 +522,15 @@ class HostTelemetryCollector(
                 samples.extend(collector(observed_at))
             except Exception as exc:
                 errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            # A contributor that fails *after* it has something the consumer
+            # needs parks it here rather than returning it, so the failure
+            # still names the contributor and still opens an edge. The GPU
+            # inventory does this on a failed driver query: the raise used to
+            # discard the ``gpu_inventory_mismatch`` sample that is the whole
+            # point of the query (F-H6).
+            if self._partial_samples:
+                samples.extend(self._partial_samples)
+                self._partial_samples.clear()
         batch = HostTelemetryBatch(
             batch_id=(
                 f"host-{self.node_id}-{int(observed_at.timestamp() * 1_000_000)}"
@@ -526,6 +679,13 @@ class HostTelemetryCollector(
         return reasons
 
     def run(self) -> None:
+        # ``Type=notify``: announce readiness before the startup spread so the
+        # unit does not sit in "activating" for the length of the spread, then
+        # ping the watchdog once per completed tick. A tick that never
+        # completes -- a mount or a driver that never answers -- stops the
+        # pings and systemd restarts the unit, which is the last line of
+        # defence behind the per-call bounds below.
+        sd_notify("READY=1")
         force_snapshot = self.force_snapshot_path.exists()
         if not force_snapshot:
             startup_time = self.now()
@@ -551,6 +711,10 @@ class HostTelemetryCollector(
             if force_snapshot and succeeded:
                 self.force_snapshot_path.unlink(missing_ok=True)
                 force_snapshot = False
+            # A tick whose delivery failed still completed: the process is
+            # alive and reading the host, and a control plane that rejects a
+            # batch must not restart every collector in the fleet.
+            sd_notify("WATCHDOG=1")
             time.sleep(self.interval_seconds)
 
     @staticmethod

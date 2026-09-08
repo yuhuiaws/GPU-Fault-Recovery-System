@@ -284,6 +284,25 @@ def test_systemd_collectors_use_environment_node_id() -> None:
     assert "SupplementaryGroups=systemd-journal" in fabric
 
 
+def test_host_collector_unit_is_watchdog_supervised() -> None:
+    """A wedged host collector must look wedged to systemd.
+
+    Every contributor of the host collector reads the host: ``statvfs`` on a
+    hard NFS/Lustre mount and ``nvidia-smi`` inside a hung driver both block in
+    uninterruptible sleep, and with ``Type=simple`` and no watchdog the unit
+    stayed "active (running)" forever, so ``Restart=always`` never fired and
+    the node that most needed telemetry sent none. ``Type=notify`` plus
+    ``WatchdogSec=`` makes a tick that never completes a restart
+    (``run()`` sends ``READY=1`` once and ``WATCHDOG=1`` per completed tick).
+    """
+
+    unit = (ROOT / "deploy/systemd/gpu-fault-host-collector.service").read_text()
+
+    assert "Type=notify" in unit, "the collector's watchdog needs Type=notify"
+    assert "WatchdogSec=90" in unit, "a wedged tick must be restarted, not ignored"
+    assert "Restart=always" in unit, "the watchdog restart needs a restart policy"
+
+
 def test_node_runtime_uses_content_addressed_atomic_slots() -> None:
     installer = NODE_SCRIPTS[0].read_text()
     runtime_units = (

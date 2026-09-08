@@ -4,7 +4,15 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# ``notify`` plus a watchdog is the only thing that recovers a wedged
+# collector: the process stays alive with every thread blocked (nvidia-smi in
+# D state, statvfs on a dead NFS mount), so ``Restart=always`` never fires and
+# the node reports no host telemetry at all until someone notices. ``run()``
+# sends READY=1 once and WATCHDOG=1 after each completed tick, so a tick that
+# never finishes makes systemd kill and restart the unit.
+Type=notify
+NotifyAccess=main
+WatchdogSec=90
 EnvironmentFile=/etc/gpu-fault/collector.env
 ExecStart=/opt/gpu-fault/current/venv/bin/gpu-fault-collector host
 Restart=always

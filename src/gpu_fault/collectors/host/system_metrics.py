@@ -5,7 +5,9 @@ from typing import Any, Callable
 import json
 import logging
 import os
+import queue
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -17,15 +19,136 @@ from gpu_fault.host_health import (
 
 LOGGER = logging.getLogger(__name__)
 
+#: Sentinel that retires an abandoned ``statvfs`` worker once its mount
+#: answers, so a mount that recovers does not leave the thread behind.
+_RETIRE = "\0retire"
+
+
+class BoundedStatvfs:
+    """``os.statvfs`` a hung mount cannot wedge the caller with.
+
+    ``statvfs`` on a hard NFS mount or a Lustre client in MDS recovery blocks
+    in uninterruptible sleep, and the collector calls it once per configured
+    mount and once per shared mount per tick -- so the very condition
+    ``shared_filesystem_unavailable`` exists to report stopped every batch,
+    including the batch that would have reported it. The syscall cannot be
+    cancelled, so it runs on a worker thread and the caller gives up after
+    ``timeout_seconds`` with ``TimeoutError`` (an ``OSError``, which the
+    callers already read as "this mount is unavailable").
+
+    A worker a hung mount captured is abandoned and replaced on the next
+    probe. That costs one daemon thread per wedged mount rather than one
+    thread per mount per tick, and -- unlike a shared pool -- one wedged mount
+    cannot make every healthy mount look unavailable behind it. The abandoned
+    worker retires itself if its mount ever answers.
+    """
+
+    def __init__(
+        self,
+        statvfs: Callable[[str], os.statvfs_result],
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        self._statvfs = statvfs
+        self._timeout_seconds = timeout_seconds
+        self._requests: queue.SimpleQueue[str] | None = None
+        self._responses: (
+            queue.SimpleQueue[tuple[os.statvfs_result | None, OSError | None]] | None
+        ) = None
+
+    def __call__(self, mount: str) -> os.statvfs_result:
+        if self._requests is None or self._responses is None:
+            self._start_worker()
+        requests = self._requests
+        responses = self._responses
+        if requests is None or responses is None:  # pragma: no cover - defensive
+            raise OSError(f"no statvfs worker for {mount}")
+        requests.put(mount)
+        try:
+            stat, error = responses.get(timeout=self._timeout_seconds)
+        except queue.Empty:
+            requests.put(_RETIRE)
+            self._requests = None
+            self._responses = None
+            raise TimeoutError(
+                f"statvfs({mount}) did not answer within {self._timeout_seconds:g}s"
+            ) from None
+        if error is not None:
+            raise error
+        if stat is None:  # pragma: no cover - defensive
+            raise OSError(f"statvfs({mount}) returned nothing")
+        return stat
+
+    def _start_worker(self) -> None:
+        requests: queue.SimpleQueue[str] = queue.SimpleQueue()
+        responses: queue.SimpleQueue[
+            tuple[os.statvfs_result | None, OSError | None]
+        ] = queue.SimpleQueue()
+        threading.Thread(
+            target=self._serve,
+            args=(requests, responses),
+            name="gpu-fault-statvfs",
+            daemon=True,
+        ).start()
+        self._requests = requests
+        self._responses = responses
+
+    def _serve(
+        self,
+        requests: queue.SimpleQueue[str],
+        responses: queue.SimpleQueue[tuple[os.statvfs_result | None, OSError | None]],
+    ) -> None:
+        while True:
+            mount = requests.get()
+            if mount == _RETIRE:
+                return
+            try:
+                responses.put((self._statvfs(mount), None))
+            except OSError as exc:
+                responses.put((None, exc))
+            except Exception as exc:  # pragma: no cover - defensive
+                responses.put((None, OSError(str(exc))))
+
 
 class HostSystemMetricsMixin:
     # Attributes supplied by the composed concrete implementation.
     filesystems: Any
+    statvfs_timeout_seconds: float
 
     _delta: Callable[..., Any]
     _previous: Any
     _sample: Callable[..., Any]
+    _statvfs_probe: Callable[[str], os.statvfs_result]
+    _statvfs_tick: datetime | None
+    _unresponsive_mounts: set[str]
     runner: Callable[..., Any]
+
+    def _probe_mount(self, mount: str, observed_at: datetime) -> os.statvfs_result:
+        """``statvfs`` with a deadline, at most once per mount per tick.
+
+        A mount that missed its deadline is not asked again in the same tick:
+        the configured filesystem list and ``/proc/self/mountinfo`` overlap on
+        an FSx or NFS path, and paying the deadline once per contributor would
+        multiply the tick's worst case by the number of contributors that name
+        the mount.
+        """
+
+        if self._statvfs_tick != observed_at:
+            self._statvfs_tick = observed_at
+            self._unresponsive_mounts.clear()
+        if mount in self._unresponsive_mounts:
+            raise TimeoutError(f"{mount} already missed its statvfs deadline this tick")
+        try:
+            return self._statvfs_probe(mount)
+        except TimeoutError:
+            self._unresponsive_mounts.add(mount)
+            LOGGER.warning(
+                "statvfs(%s) did not answer within %gs; reporting the mount as "
+                "unavailable",
+                mount,
+                self.statvfs_timeout_seconds,
+            )
+            raise
 
     def _cpu(self, observed_at: datetime) -> list[HostMetricSample]:
         fields = [
@@ -108,12 +231,27 @@ class HostSystemMetricsMixin:
             ),
         ]
 
-    def _filesystems(self, _: datetime) -> list[HostMetricSample]:
+    def _filesystems(self, observed_at: datetime) -> list[HostMetricSample]:
         result = []
         for mount in dict.fromkeys(self.filesystems):
-            if not os.path.exists(mount):
+            # No ``os.path.exists`` guard: ``stat`` blocks on a dead mount for
+            # the same reason ``statvfs`` does, and ``statvfs`` already reports
+            # a missing path as ENOENT.
+            try:
+                stat = self._probe_mount(mount, observed_at)
+            except TimeoutError:
+                # ``GPU_FAULT_FILESYSTEMS`` may name an FSx or NFS path, and a
+                # local mount that stops answering is worse news still; either
+                # way the consumer's rule for "this mount is not usable" is
+                # ``shared_filesystem_unavailable``.
+                result.append(
+                    self._sample("shared_filesystem_unavailable", 1, None, mount)
+                )
                 continue
-            stat = os.statvfs(mount)
+            except OSError:
+                # A configured mount that this node does not have is not a
+                # fault; it was skipped before this guard existed too.
+                continue
             total = stat.f_blocks * stat.f_frsize
             available = stat.f_bavail * stat.f_frsize
             if total:
@@ -173,7 +311,7 @@ class HostSystemMetricsMixin:
                 )
         return max(candidates)[1] if candidates else None
 
-    def _shared_filesystems(self, _: datetime) -> list[HostMetricSample]:
+    def _shared_filesystems(self, observed_at: datetime) -> list[HostMetricSample]:
         result = []
         mountinfo = Path("/proc/self/mountinfo")
         if not mountinfo.exists():
@@ -188,7 +326,10 @@ class HostSystemMetricsMixin:
                 continue
             mount = fields[4].replace("\\040", " ")
             try:
-                stat = os.statvfs(mount)
+                # ``TimeoutError`` is an ``OSError``: a mount that never
+                # answers lands in the same "unavailable" branch as one that
+                # answers ESTALE, which is what the CRITICAL rule wants.
+                stat = self._probe_mount(mount, observed_at)
                 total = stat.f_blocks * stat.f_frsize
                 available = stat.f_bavail * stat.f_frsize
                 result.append(
