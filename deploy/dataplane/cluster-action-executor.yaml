@@ -84,11 +84,16 @@ spec:
         app: gpu-fault-cluster-executor
     spec:
       serviceAccountName: gpu-fault-cluster-executor
-      # The executor handles SIGTERM itself: it stops claiming and finishes the
-      # batch it already holds. The kubelet's 30 s default cut that short and
-      # SIGKILLed it mid-command, which leaves the claim to expire and the step
-      # to be retried by another replica. No preStop hook -- the process, not a
-      # sleep, decides when it is done.
+      # The executor handles SIGTERM itself (`request_stop`): it stops
+      # claiming and stops renewing the leases it holds. 60 s covers what a
+      # short command needs to finish and report -- the kubelet's 30 s default
+      # SIGKILLed those mid-command. It does NOT cover a long command (a field
+      # diagnostic or firmware update runs up to 1800 s, DEFAULT_MAX_EXECUTION_SECONDS):
+      # that one is SIGKILLed with the Pod, and recovery relies on the lease it
+      # stopped renewing expiring after the 120 s LEASED window so a sibling
+      # re-claims it (a command that already hit the cap was abandoned with a
+      # verdict, and the abandoned-worker hold refuses its later sends). No
+      # preStop hook -- the process, not a sleep, decides when it is done.
       terminationGracePeriodSeconds: 60
       tolerations:
         - key: gpu-fault.io/quarantined

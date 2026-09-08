@@ -94,8 +94,9 @@ spec:
   # attempt specs and observations, the missing-attempt tracker and the
   # `_terminal_sent` / `_failure_sent` / `_workloads_stopped` sets in the
   # process; only the write-ahead outbox and the active-attempt snapshot
-  # are durable, in the shared ConfigMap above, written with a
-  # resourceVersion compare-and-swap that gives up after three 409s. Two
+  # are durable, each in its own ConfigMap above (`-outbox` and
+  # `-outbox-active`), written with a resourceVersion compare-and-swap
+  # that gives up after three 409s. Two
   # replicas overlapping during a rollout each run their own Pod watch and
   # reconcile every attempt. The control plane is idempotent on event_key
   # for /v1/attempts/terminal and /v1/attempts/failure-detected (the second
@@ -129,6 +130,9 @@ spec:
         app: gpu-fault-completion-watcher
     spec:
       serviceAccountName: gpu-fault-completion-watcher
+      # A preempted singleton is a silent outage: past 600 s without this Pod
+      # every node reads UNKNOWN and every node-mutating plan is BLOCKED.
+      priorityClassName: system-cluster-critical
       tolerations:
         - key: gpu-fault.io/quarantined
           operator: Exists

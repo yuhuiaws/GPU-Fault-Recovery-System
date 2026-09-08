@@ -470,10 +470,11 @@ def test_reconciler_tolerations_are_bounded() -> None:
         )
 
 
-#: ``completion-watcher.yaml`` is a singleton too, but its manifest belongs to
-#: another work package in this review; its missing priority class is reported
-#: rather than changed here.
+#: Every ``replicas: 1`` Deployment on the data plane. A preempted Completion
+#: Watcher is the worst of the three: past 600 s of silence every node reads
+#: UNKNOWN and every node-mutating plan is BLOCKED.
 PRIORITY_CLASS_SINGLETONS = (
+    "completion-watcher.yaml",
     "kubernetes-node-resource-collector.yaml",
     "node-installer-reconciler.yaml",
 )
